@@ -1,4 +1,4 @@
-# ADR 0093: Resume storm-shield — cold harness spawns get a quiet guest
+# ADR 0094: Resume storm-shield — cold harness spawns get a quiet guest
 
 - Status: **Proposed** — mechanism designed from the ADR 0092 WS0
   measurement campaign; moves to Accepted after the dev-VM spike

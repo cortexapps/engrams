@@ -272,7 +272,7 @@ async fn run(args: Args) -> std::io::Result<()> {
     // PTP device. Must run inside the runtime — it spawns the tick loop.
     engram_agentd::clock::init();
 
-    // ADR 0093: a (re)started agentd owns no storm shield, so any
+    // ADR 0094: a (re)started agentd owns no storm shield, so any
     // state-T process is an orphaned freeze (captured mid-shield, or the
     // thaw timer died with the RefreshAgent re-exec) — resume them.
     // Cheap no-op on a normal boot.

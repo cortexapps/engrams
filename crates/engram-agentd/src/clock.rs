@@ -29,7 +29,7 @@ const PTP_DEVICE: &str = "/dev/ptp0";
 /// stepping needlessly in steady state.
 const STEP_THRESHOLD_NANOS: i128 = 2 * NANOS_PER_SEC;
 
-/// ADR 0093: a step this large means "we just resumed from a snapshot"
+/// ADR 0094: a step this large means "we just resumed from a snapshot"
 /// (idle windows are minutes-to-days), not drift. Drives the resume
 /// marker the storm shield keys on.
 const RESUME_SCALE_NANOS: i128 = 60 * NANOS_PER_SEC;
@@ -104,7 +104,7 @@ impl ClockSync {
                     offset_secs = (diff / NANOS_PER_SEC) as i64,
                     "stepped guest clock to host PTP"
                 );
-                // ADR 0093: a resume-scale step is the only guest-visible
+                // ADR 0094: a resume-scale step is the only guest-visible
                 // signal that a restore just happened — record it durably
                 // (fresh creates re-exec agentd, so process state won't
                 // survive) so the harness supervisor's cold-spawn arm can

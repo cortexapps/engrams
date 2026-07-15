@@ -190,7 +190,7 @@ impl HarnessSupervisor {
         // correct clock right after a resume. The periodic tick keeps a
         // long-running harness corrected across later resumes.
         crate::clock::sync_now();
-        // ADR 0093: a cold spawn right after a resume races the guest's
+        // ADR 0094: a cold spawn right after a resume races the guest's
         // wake-up stampede (measured 40 s to first reply vs 2.7 s quiet;
         // nice and the memory substrate both measured ineffective). Freeze
         // the resumed workload for the cold-start window — a detached

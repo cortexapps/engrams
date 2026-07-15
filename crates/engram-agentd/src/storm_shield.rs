@@ -1,4 +1,4 @@
-//! ADR 0093: the resume storm-shield.
+//! ADR 0094: the resume storm-shield.
 //!
 //! A cold harness spawn on a just-resumed guest races the warm stack's
 //! wake-up stampede (JVM GC catch-up, health-check retries, timer
@@ -155,7 +155,7 @@ pub fn engage() -> Option<ShieldGuard> {
     tracing::info!(
         frozen = stopped.len(),
         grace_secs = SHIELD_GRACE.as_secs(),
-        "storm shield engaged: workload frozen for the harness cold start (ADR 0093)",
+        "storm shield engaged: workload frozen for the harness cold start (ADR 0094)",
     );
     let state = Arc::new(ShieldState {
         pids: stopped,
