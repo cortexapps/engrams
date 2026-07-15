@@ -17,7 +17,9 @@ use dashmap::DashMap;
 use engram_agentd::{
     read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
 };
-use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink, SandboxBackend, UploadSink};
+use engram_core::traits::sandbox::{
+    ForgeSink, HarnessByteStream, HarnessSink, SandboxBackend, UploadSink,
+};
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
@@ -155,6 +157,14 @@ pub struct VzBackend {
     /// bridge passes guest-initiated 1026 connections to this sink
     /// in the same way `engram-sandbox-firecracker` does.
     harness_sink: Mutex<Option<HarnessSink>>,
+    /// ADR 0023/0096: latest forge-credential sink (set by
+    /// `set_forge_sink`). The vsock bridge hands each guest-initiated
+    /// port-1028 connection to it — one vsock stream per credential
+    /// exchange, exactly as `engram-sandbox-firecracker` serves over
+    /// vsock. Until ADR 0096 this was the one FC channel VZ didn't
+    /// serve: the trait-default no-op ate the sink and in-guest
+    /// `forge-credential` dials were refused.
+    forge_sink: Mutex<Option<ForgeSink>>,
     /// ADR 0026: latest artifact-upload sink (set by `set_upload_sink`).
     /// The vsock bridge hands each guest-initiated port-1029 connection to
     /// it — one vsock stream per upload, exactly as
@@ -185,6 +195,7 @@ impl VzBackend {
             cfg,
             sandboxes: DashMap::new(),
             harness_sink: Mutex::new(None),
+            forge_sink: Mutex::new(None),
             upload_sink: Mutex::new(None),
             chunk_store: None,
         })
@@ -421,12 +432,14 @@ impl VzBackend {
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
 
         let harness_sink = self.harness_sink.lock().clone();
+        let forge_sink = self.forge_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
         let (bridge, connector) = VsockBridge::start(
             vm.raw_clone(),
             vm.queue_clone(),
             vsock_uds_path.clone(),
             harness_sink,
+            forge_sink,
             upload_sink,
         )
         .await
@@ -651,15 +664,18 @@ impl SandboxBackend for VzBackend {
         // <vsock_uds>_1024 agentd UDS immediately so a subsequent
         // start_agent / exec_stream dial can't race a not-yet-bound
         // window, and registers the guest-initiated listeners (harness
-        // 1026, upload 1029, ready 1027). The returned connector serves
-        // the port relay (guest vsock 1030) via `open_guest_stream`.
+        // 1026, forge 1028, upload 1029, ready 1027). The returned
+        // connector serves the port relay (guest vsock 1030) via
+        // `open_guest_stream`.
         let harness_sink = self.harness_sink.lock().clone();
+        let forge_sink = self.forge_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
         let (bridge, connector) = VsockBridge::start(
             vm.raw_clone(),
             vm.queue_clone(),
             vsock_uds_path.clone(),
             harness_sink,
+            forge_sink,
             upload_sink,
         )
         .await
@@ -761,6 +777,10 @@ impl SandboxBackend for VzBackend {
                 format!("SpawnHarness: unexpected response: {other:?}").into(),
             )),
         }
+    }
+
+    fn set_forge_sink(&self, sink: ForgeSink) {
+        *self.forge_sink.lock() = Some(sink);
     }
 
     fn set_harness_sink(&self, sink: HarnessSink) {
