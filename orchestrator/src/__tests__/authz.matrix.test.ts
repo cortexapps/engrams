@@ -168,12 +168,13 @@ function makeTransport(serverUrl: string): Transport {
 }
 
 function fakePendingCalls(rows: PendingToolCallRow[]): PendingToolCallStore {
-  const byId = new Map(rows.map((row) => [row.toolCallId, row]));
+  const key = (sessionId: string, toolCallId: string) => `${sessionId}\0${toolCallId}`;
+  const byId = new Map(rows.map((row) => [key(row.sessionId, row.toolCallId), row]));
   return {
     recordRequested: async () => {},
     markSubmitted: async () => {},
     markCompleted: async () => {},
-    find: async (toolCallId) => byId.get(toolCallId) ?? null,
+    find: async (sessionId, toolCallId) => byId.get(key(sessionId, toolCallId)) ?? null,
     listUnsubmittedSessionCallsBefore: async () => [],
   };
 }
@@ -416,6 +417,23 @@ describe("CompleteToolCall external handling guard", () => {
         sessionId: SESSION_OF_A,
         toolCallId: "session-call",
         resultJson: JSON.stringify({ "Deploy now?": 42 }),
+      }),
+      Code.InvalidArgument,
+    );
+    expect(orch.upstreamCallCount.value).toBe(0);
+  });
+
+  test("protocol error envelope cannot bypass a session tool output schema", async () => {
+    const orch = completeToolCallTransport(
+      makeGetSession(MEMBER_A, "user"),
+      fakePendingCalls([pendingRow("session-call", "session")]),
+    );
+    const client = createClient(SessionService, orch.transport);
+    await expectCode(
+      () => client.completeToolCall({
+        sessionId: SESSION_OF_A,
+        toolCallId: "session-call",
+        resultJson: JSON.stringify({ error: "pretend this was answered" }),
       }),
       Code.InvalidArgument,
     );

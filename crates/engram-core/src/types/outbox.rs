@@ -14,6 +14,13 @@ use serde::{Deserialize, Serialize};
 
 use super::ids::SessionId;
 
+/// Globally unique durable identity for one session-scoped tool result.
+/// Tool-call ids are minted by untrusted harnesses and are not unique across
+/// sessions, while `session_outbox.prompt_id` is a global primary key.
+pub fn tool_result_outbox_id(session_id: SessionId, tool_call_id: &str) -> String {
+    format!("tool_result:{session_id}:{tool_call_id}")
+}
+
 /// What kind of command the row carries. Mirrors the CHECK constraint
 /// on `session_outbox.kind`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -56,8 +63,9 @@ impl OutboxKind {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxRow {
     /// Client-minted for prompts (ADR 0052); legacy rows may contain
-    /// `answer:<tool_call_id>`; `tool_result:<tool_call_id>` identifies
-    /// generic tool results.
+    /// `answer:<tool_call_id>`;
+    /// `tool_result:<session_id>:<tool_call_id>` identifies generic tool
+    /// results without trusting call ids to be globally unique.
     /// PRIMARY KEY — a retried enqueue is a no-op.
     pub prompt_id: String,
     pub session_id: SessionId,
@@ -78,7 +86,8 @@ pub struct OutboxRow {
 
 #[cfg(test)]
 mod tests {
-    use super::OutboxKind;
+    use super::{tool_result_outbox_id, OutboxKind};
+    use crate::SessionId;
 
     #[test]
     fn outbox_kind_strings_round_trip() {
@@ -91,5 +100,19 @@ mod tests {
             assert_eq!(OutboxKind::parse(encoded), Some(kind));
         }
         assert_eq!(OutboxKind::parse("unknown"), None);
+    }
+
+    #[test]
+    fn tool_result_ids_are_namespaced_by_session() {
+        let first = SessionId::new();
+        let second = SessionId::new();
+        assert_ne!(
+            tool_result_outbox_id(first, "call-1"),
+            tool_result_outbox_id(second, "call-1")
+        );
+        assert_eq!(
+            tool_result_outbox_id(first, "call-1"),
+            format!("tool_result:{first}:call-1")
+        );
     }
 }

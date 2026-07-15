@@ -52,10 +52,11 @@ function fixture(options: {
   const submitted: string[] = [];
   const pending: PendingToolCallStore = {
     recordRequested: async () => {},
-    markSubmitted: async (toolCallId) => void submitted.push(toolCallId),
+    markSubmitted: async (sessionId, toolCallId) =>
+      void submitted.push(`${sessionId}:${toolCallId}`),
     markCompleted: async () => {},
-    find: async (toolCallId) => ({
-      sessionId: "session-1",
+    find: async (sessionId, toolCallId) => ({
+      sessionId,
       toolCallId,
       toolName: "save_memory",
       handling: "handled",
@@ -170,6 +171,6 @@ describe("tool exec plain functions", () => {
     const outcome = await executeToolCall(f.input, f.deps);
 
     await expect(submitToolExecution(f.input, outcome, f.deps)).resolves.toBeUndefined();
-    expect(f.submitted).toEqual(["call-1"]);
+    expect(f.submitted).toEqual(["session-1:call-1"]);
   });
 });

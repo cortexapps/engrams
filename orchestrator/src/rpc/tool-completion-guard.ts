@@ -13,7 +13,7 @@ import {
   makePendingToolCallStore,
   type PendingToolCallStore,
 } from "../tools/pending-tool-calls.ts";
-import { validateToolResult } from "../tools/complete.ts";
+import { validateToolOutput } from "../tools/complete.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 
 export function makeExternalToolCompletionGuard(deps?: {
@@ -31,8 +31,8 @@ export function makeExternalToolCompletionGuard(deps?: {
     }
 
     const pendingCalls = deps?.pendingCalls ?? makePendingToolCallStore();
-    const row = await pendingCalls.find(request.toolCallId);
-    if (!row || row.sessionId !== request.sessionId) {
+    const row = await pendingCalls.find(request.sessionId, request.toolCallId);
+    if (!row) {
       throw new ConnectError("tool call not found", Code.NotFound);
     }
     if (row.handling !== "session") {
@@ -56,7 +56,7 @@ export function makeExternalToolCompletionGuard(deps?: {
       throw new ConnectError(`invalid result for tool ${row.toolName}`, Code.InvalidArgument);
     }
     try {
-      validateToolResult(tool, result);
+      validateToolOutput(tool, result);
     } catch {
       throw new ConnectError(`invalid result for tool ${row.toolName}`, Code.InvalidArgument);
     }

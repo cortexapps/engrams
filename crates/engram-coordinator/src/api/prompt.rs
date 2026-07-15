@@ -163,9 +163,8 @@ pub(crate) async fn send_prompt_core(
 }
 
 /// ADR 0089: accept an opaque result for an orchestrator-registered tool.
-/// The submitted event is persisted before the durable outbox row so
-/// surfaces can resolve the pending call immediately, even when delivery
-/// must wait for an idle session to resume.
+/// The submitted event and durable outbox row commit atomically so surfaces
+/// never lock a pending call that has no delivery obligation.
 pub(crate) async fn complete_tool_call_core(
     state: &SharedState,
     id: SessionId,
@@ -183,24 +182,13 @@ pub(crate) async fn complete_tool_call_core(
         )));
     }
 
-    state
-        .emit(
-            id,
-            SessionEvent::ToolResultSubmitted {
-                tool_call_id: tool_call_id.clone(),
-                result_json: result_json.clone(),
-                at: chrono::Utc::now(),
-            },
-        )
-        .await?;
-
     let row = engram_core::types::outbox::OutboxRow {
-        prompt_id: format!("tool_result:{tool_call_id}"),
+        prompt_id: engram_core::types::outbox::tool_result_outbox_id(id, &tool_call_id),
         session_id: id,
         kind: engram_core::types::outbox::OutboxKind::ToolResult,
         payload: serde_json::json!({
-            "tool_call_id": tool_call_id,
-            "result_json": result_json,
+            "tool_call_id": tool_call_id.clone(),
+            "result_json": result_json.clone(),
         }),
         created_at: chrono::Utc::now(),
         attempts: 0,
@@ -209,11 +197,16 @@ pub(crate) async fn complete_tool_call_core(
         acked_at: None,
     };
     state
-        .services
-        .meta
-        .outbox_enqueue(&row)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enqueue tool result: {e}")))?;
+        .emit_with_outbox(
+            id,
+            SessionEvent::ToolResultSubmitted {
+                tool_call_id,
+                result_json,
+                at: chrono::Utc::now(),
+            },
+            &row,
+        )
+        .await?;
     crate::outbox_delivery::enqueue_deliver_op(state, id).await;
     state.outbox_wake.notify_one();
     Ok("tool result queued")

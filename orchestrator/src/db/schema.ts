@@ -100,7 +100,10 @@ export const pendingToolCall = pgTable(
     completedAt: timestamp("completed_at", { withTimezone: true }),
   },
   (t) => [
-    uniqueIndex("pending_tool_calls_tool_call_id_unique").on(t.toolCallId),
+    uniqueIndex("pending_tool_calls_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
     index("pending_tool_calls_session_idx").on(t.sessionId),
   ],
 );

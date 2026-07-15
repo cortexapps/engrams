@@ -14,12 +14,14 @@ import {
 
 function pendingRecorder() {
   const requested: PendingToolCallInput[] = [];
-  const submitted: Array<{ toolCallId: string; at: Date }> = [];
-  const completed: Array<{ toolCallId: string; at: Date }> = [];
+  const submitted: Array<{ sessionId: string; toolCallId: string; at: Date }> = [];
+  const completed: Array<{ sessionId: string; toolCallId: string; at: Date }> = [];
   const store: PendingToolCallStore = {
     recordRequested: async (input) => void requested.push(input),
-    markSubmitted: async (toolCallId, at) => void submitted.push({ toolCallId, at }),
-    markCompleted: async (toolCallId, at) => void completed.push({ toolCallId, at }),
+    markSubmitted: async (sessionId, toolCallId, at) =>
+      void submitted.push({ sessionId, toolCallId, at }),
+    markCompleted: async (sessionId, toolCallId, at) =>
+      void completed.push({ sessionId, toolCallId, at }),
     find: async () => null,
     listUnsubmittedSessionCallsBefore: async () => [],
   };
@@ -71,8 +73,13 @@ describe("tool consumer", () => {
 
     await consumer.handle(ev, { sessionId: "session-1" });
     await consumer.handle(ev, { sessionId: "session-1" });
+    await consumer.handle(ev, { sessionId: "session-2" });
 
-    expect(workflowIds).toEqual(["toolexec:call-1", "toolexec:call-1"]);
+    expect(workflowIds).toEqual([
+      "toolexec:session-1:call-1",
+      "toolexec:session-1:call-1",
+      "toolexec:session-2:call-1",
+    ]);
   });
 
   test("ask_user_question is bookkept as session-handled and never dispatched", async () => {
@@ -149,10 +156,18 @@ describe("tool consumer", () => {
       requestedAt: new Date("2026-07-13T12:00:00.000Z"),
     });
     expect(pending.submitted).toEqual([
-      { toolCallId: "call-1", at: new Date("2026-07-13T12:01:00.000Z") },
+      {
+        sessionId: "session-1",
+        toolCallId: "call-1",
+        at: new Date("2026-07-13T12:01:00.000Z"),
+      },
     ]);
     expect(pending.completed).toEqual([
-      { toolCallId: "call-1", at: new Date("2026-07-13T12:02:00.000Z") },
+      {
+        sessionId: "session-1",
+        toolCallId: "call-1",
+        at: new Date("2026-07-13T12:02:00.000Z"),
+      },
     ]);
   });
 });

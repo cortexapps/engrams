@@ -141,6 +141,13 @@
       "when": 1784050570757,
       "tag": "0019_sad_cyclops",
       "breakpoints": true
+    },
+    {
+      "idx": 20,
+      "version": "7",
+      "when": 1784137559861,
+      "tag": "0020_namespace_tool_calls",
+      "breakpoints": true
     }
   ]
 }

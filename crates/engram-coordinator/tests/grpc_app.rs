@@ -1009,9 +1009,8 @@ async fn complete_tool_call_appends_submitted_event_and_enqueues_outbox() {
     drop(events);
 
     let outbox = meta.outbox.lock();
-    let row = outbox
-        .get("tool_result:call_1")
-        .expect("tool result outbox row");
+    let outbox_id = engram_core::types::outbox::tool_result_outbox_id(session_id, "call_1");
+    let row = outbox.get(&outbox_id).expect("tool result outbox row");
     assert_eq!(row.kind, engram_core::types::outbox::OutboxKind::ToolResult);
     assert_eq!(row.payload["tool_call_id"], "call_1");
     assert_eq!(row.payload["result_json"], r#" { "saved": true } "#);
@@ -1099,9 +1098,55 @@ async fn complete_tool_call_is_idempotent_on_tool_call_id() {
 
     let outbox = meta.outbox.lock();
     assert_eq!(outbox.len(), 1, "prompt_id uniqueness must dedupe retries");
+    let outbox_id = engram_core::types::outbox::tool_result_outbox_id(session_id, "call_1");
     assert_eq!(
-        outbox["tool_result:call_1"].payload["result_json"], r#"{"saved":true}"#,
+        outbox[&outbox_id].payload["result_json"], r#"{"saved":true}"#,
         "the first accepted row wins"
+    );
+}
+
+#[tokio::test]
+async fn complete_tool_call_namespaces_outbox_identity_by_session() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let first = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed first session");
+    let second = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed second session");
+    let service = complete_tool_call_service(state);
+
+    for session_id in [first, second] {
+        service
+            .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+                session_id: session_id.to_string(),
+                tool_call_id: "shared-call".into(),
+                result_json: r#"{"saved":true}"#.into(),
+            }))
+            .await
+            .expect("same call id in another session must succeed");
+    }
+
+    let outbox = meta.outbox.lock();
+    assert!(
+        outbox.contains_key(&engram_core::types::outbox::tool_result_outbox_id(
+            first,
+            "shared-call"
+        ))
+    );
+    assert!(
+        outbox.contains_key(&engram_core::types::outbox::tool_result_outbox_id(
+            second,
+            "shared-call"
+        ))
     );
 }
 

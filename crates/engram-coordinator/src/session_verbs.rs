@@ -1179,7 +1179,7 @@ mod tests {
         tool_call_id: &str,
     ) -> engram_core::types::outbox::OutboxRow {
         engram_core::types::outbox::OutboxRow {
-            prompt_id: format!("tool_result:{tool_call_id}"),
+            prompt_id: engram_core::types::outbox::tool_result_outbox_id(id, tool_call_id),
             session_id: id,
             kind: engram_core::types::outbox::OutboxKind::ToolResult,
             payload: serde_json::json!({
@@ -1376,7 +1376,9 @@ mod tests {
         assert!(
             mini.acked_outbox
                 .lock()
-                .contains(&"tool_result:call_1".to_string()),
+                .contains(&engram_core::types::outbox::tool_result_outbox_id(
+                    id, "call_1",
+                )),
             "the completed delivery lane retires the ToolResult row"
         );
     }

@@ -19,9 +19,9 @@ export interface PendingToolCallRow extends PendingToolCallInput {
 
 export interface PendingToolCallStore {
   recordRequested(input: PendingToolCallInput): Promise<void>;
-  markSubmitted(toolCallId: string, at: Date): Promise<void>;
-  markCompleted(toolCallId: string, at: Date): Promise<void>;
-  find(toolCallId: string): Promise<PendingToolCallRow | null>;
+  markSubmitted(sessionId: string, toolCallId: string, at: Date): Promise<void>;
+  markCompleted(sessionId: string, toolCallId: string, at: Date): Promise<void>;
+  find(sessionId: string, toolCallId: string): Promise<PendingToolCallRow | null>;
   listUnsubmittedSessionCallsBefore(cutoff: Date): Promise<PendingToolCallRow[]>;
 }
 
@@ -49,28 +49,45 @@ export function makePendingToolCallStore(
       await db
         .insert(pendingToolCallTable)
         .values(input)
-        .onConflictDoNothing({ target: pendingToolCallTable.toolCallId });
+        .onConflictDoNothing({
+          target: [pendingToolCallTable.sessionId, pendingToolCallTable.toolCallId],
+        });
     },
 
-    async markSubmitted(toolCallId, at) {
+    async markSubmitted(sessionId, toolCallId, at) {
       await db
         .update(pendingToolCallTable)
         .set({ submittedAt: at })
-        .where(eq(pendingToolCallTable.toolCallId, toolCallId));
+        .where(
+          and(
+            eq(pendingToolCallTable.sessionId, sessionId),
+            eq(pendingToolCallTable.toolCallId, toolCallId),
+          ),
+        );
     },
 
-    async markCompleted(toolCallId, at) {
+    async markCompleted(sessionId, toolCallId, at) {
       await db
         .update(pendingToolCallTable)
         .set({ completedAt: at })
-        .where(eq(pendingToolCallTable.toolCallId, toolCallId));
+        .where(
+          and(
+            eq(pendingToolCallTable.sessionId, sessionId),
+            eq(pendingToolCallTable.toolCallId, toolCallId),
+          ),
+        );
     },
 
-    async find(toolCallId) {
+    async find(sessionId, toolCallId) {
       const rows = await db
         .select()
         .from(pendingToolCallTable)
-        .where(eq(pendingToolCallTable.toolCallId, toolCallId))
+        .where(
+          and(
+            eq(pendingToolCallTable.sessionId, sessionId),
+            eq(pendingToolCallTable.toolCallId, toolCallId),
+          ),
+        )
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
     },

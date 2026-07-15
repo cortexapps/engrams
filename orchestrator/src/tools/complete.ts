@@ -28,11 +28,15 @@ function isProtocolErrorResult(result: unknown): result is { error: string } {
  * `{"error":"<message>"}` is the sole protocol-level exception to a tool's
  * output schema; dispatch uses it for denied/invalid/failed calls.
  */
-export function validateToolResult(tool: RegisteredTool, result: unknown): unknown {
-  if (isProtocolErrorResult(result)) return result;
+export function validateToolOutput(tool: RegisteredTool, result: unknown): unknown {
   const parsed = tool.output.safeParse(result);
   if (!parsed.success) throw new Error(`invalid result for tool ${tool.name}`);
   return parsed.data;
+}
+
+function validateHandledToolResult(tool: RegisteredTool, result: unknown): unknown {
+  if (isProtocolErrorResult(result)) return result;
+  return validateToolOutput(tool, result);
 }
 
 /** Validate a known tool's result before invoking the injected completer. */
@@ -41,8 +45,11 @@ export async function completeToolResult(
   completer: ToolCallCompleter,
   request: { sessionId: string; toolCallId: string },
   result: unknown,
+  allowProtocolError = false,
 ): Promise<string> {
-  const validated = validateToolResult(tool, result);
+  const validated = allowProtocolError
+    ? validateHandledToolResult(tool, result)
+    : validateToolOutput(tool, result);
   const resultJson = JSON.stringify(validated);
   await completer.completeToolCall({ ...request, resultJson });
   return resultJson;
@@ -56,13 +63,23 @@ export async function completeRegisteredToolCall(
   toolCallId: string,
   result: unknown,
 ): Promise<void> {
-  const pending = await deps.pendingCalls.find(toolCallId);
-  if (!pending || pending.sessionId !== sessionId) {
+  const pending = await deps.pendingCalls.find(sessionId, toolCallId);
+  if (!pending) {
     throw new Error(`pending tool call not found: ${toolCallId}`);
   }
   const tool = registry.get(pending.toolName);
   if (!tool) throw new Error(`tool is not registered: ${pending.toolName}`);
 
-  await completeToolResult(tool, deps.completer, { sessionId, toolCallId }, result);
-  await deps.pendingCalls.markSubmitted(toolCallId, (deps.now ?? (() => new Date()))());
+  await completeToolResult(
+    tool,
+    deps.completer,
+    { sessionId, toolCallId },
+    result,
+    pending.handling === "handled",
+  );
+  await deps.pendingCalls.markSubmitted(
+    sessionId,
+    toolCallId,
+    (deps.now ?? (() => new Date()))(),
+  );
 }
