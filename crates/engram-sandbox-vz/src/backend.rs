@@ -353,6 +353,17 @@ impl VzBackend {
         if let Some(mounts) = mounts_override {
             spec.aux_ro_drives = mounts;
         }
+        // ADR 0080/0096: re-resolve symbolic stamped slots against this
+        // host's CURRENT stamp, exactly like create() — the manifest may
+        // carry `sha256 = None` slots (a backend-level spec resolves at
+        // attach, and create() never writes the resolution back), and an
+        // unresolved slot is skipped at attach, which cold-boots a guest
+        // with no agentd bundle → the init shim panics the kernel. A
+        // no-op for coordinator-resolved specs (sha already pinned); for
+        // symbolic ones this is also the honest resume semantic — VZ's
+        // cold boot picks up the host's current agentd generation, the
+        // cold-boot analogue of FC's post-resume RefreshAgent.
+        self.resolve_agentd_slot(&mut spec.aux_ro_drives)?;
         let snapshot_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::Snapshot(
                 "snapshot manifest missing rootfs_source — cannot restore without a \
