@@ -27,23 +27,41 @@ if [ -n "${ENGRAM_SANDBOX_BACKEND:-}" ]; then
     exit 0
 fi
 
-# Rule (keep in lockstep with ADR 0024's table):
-#   /dev/kvm present & readable  -> firecracker
-#   else macOS && arm64          -> vz
-#   else                         -> process
-if [ -r /dev/kvm ]; then
-    echo firecracker
-    exit 0
+# Rule (keep in lockstep with ADR 0024's table; ADR 0096 made each arm a
+# *capability* probe, not a platform check — a host that looks the part
+# but can't actually run the VMM degrades to `process` instead of
+# handing the stack a backend that fails at first boot):
+#   /dev/kvm present & read-writable            -> firecracker
+#   else macOS && arm64 && kern.hv_support = 1  -> vz
+#   else                                        -> process
+if [ -e /dev/kvm ]; then
+    # FC opens /dev/kvm read-write; a readable-but-not-writable node
+    # (wrong group, no kvm membership) fails at VM create, not here.
+    if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
+        echo firecracker
+        exit 0
+    fi
+    echo "detect-backend: /dev/kvm exists but is not read-writable" \
+         "(add $(id -un) to the kvm group?) — falling back" >&2
 fi
 
 UNAME_S="$(uname -s)"
 UNAME_M="$(uname -m)"
 if [ "$UNAME_S" = "Darwin" ] && { [ "$UNAME_M" = "arm64" ] || [ "$UNAME_M" = "aarch64" ]; }; then
-    echo vz
-    exit 0
+    # Virtualization.framework needs the hypervisor to actually be
+    # available — a Mac VM without nested virtualization (an engrams
+    # session, some CI runners) reports kern.hv_support=0 and every VZ
+    # API call would fail. Degrade to process there.
+    if [ "$(sysctl -n kern.hv_support 2>/dev/null || echo 0)" = "1" ]; then
+        echo vz
+        exit 0
+    fi
+    echo "detect-backend: Apple Silicon but kern.hv_support != 1" \
+         "(inside a VM without nested virtualization?) — falling back" >&2
 fi
 
-# No KVM, not Apple Silicon: fall back to the un-isolated process
-# backend (product-plane / web-only dev; coordinator mode=all). The
-# Tiltfile sets ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND=1 in that case.
+# No usable KVM, no usable Virtualization.framework: fall back to the
+# un-isolated process backend, which always runs the combined topology
+# (coordinator mode=all — dev_split in the Tiltfile keys off this word).
+# The Tiltfile sets ENGRAM_ALLOW_INSECURE_PROCESS_BACKEND=1 in that case.
 echo process
