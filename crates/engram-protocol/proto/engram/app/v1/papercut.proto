@@ -1,0 +1,63 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "engram/app/v1/profile.proto";
+import "google/protobuf/timestamp.proto";
+
+service PapercutService {
+  rpc ListPapercuts(ListPapercutsRequest) returns (ListPapercutsResponse);
+  rpc ArchivePapercut(ArchivePapercutRequest) returns (ArchivePapercutResponse);
+  rpc UnarchivePapercut(UnarchivePapercutRequest) returns (UnarchivePapercutResponse);
+  rpc StartFixTask(StartFixTaskRequest) returns (StartFixTaskResponse);
+}
+
+message Papercut {
+  string id = 1;
+  string summary = 2;
+  string description = 3;
+  string category = 4;
+  // Empty means unset.
+  string severity = 5;
+  repeated string tags = 6;
+  string session_id = 7;
+  string task_id = 8;
+  // Empty means no fix task.
+  string fix_task_id = 9;
+  bool archived = 10;
+  google.protobuf.Timestamp created_at = 11;
+  ProfileSnapshot profile = 12;
+}
+
+message ListPapercutsRequest {
+  bool include_archived = 1;
+}
+
+message ListPapercutsResponse {
+  repeated Papercut papercuts = 1;
+}
+
+message ArchivePapercutRequest {
+  string id = 1;
+}
+
+message ArchivePapercutResponse {
+  Papercut papercut = 1;
+}
+
+message UnarchivePapercutRequest {
+  string id = 1;
+}
+
+message UnarchivePapercutResponse {
+  Papercut papercut = 1;
+}
+
+message StartFixTaskRequest {
+  string id = 1;
+}
+
+message StartFixTaskResponse {
+  string task_id = 1;
+  string session_id = 2;
+}
