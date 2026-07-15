@@ -1942,7 +1942,7 @@ jobs:
         with:
           path: ~/.cache/engram-vz-test
           key: vz-test-artifacts-${{ hashFiles('crates/engram-sandbox-vz/scripts/pull-kernel.sh', 'crates/engram-sandbox-vz/scripts/make-test-rootfs.sh') }}
-      - name: Pull VZ kernel (Kata arm64)
+      - name: Pull VZ kernel (engram arm64 Image, ADR 0096)
         if: always()
         run: bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
       - name: Stage rootfs placeholder (for the non-booting config-validation test)
