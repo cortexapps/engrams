@@ -847,6 +847,28 @@ impl SandboxBackend for VzBackend {
         Ok(Some(stream))
     }
 
+    /// ADR 0096: external pause — the coordinator's rung-2 park.
+    /// Forwards to the (idempotent) queue-dispatched `VzVm::pause`.
+    /// Until this override, VZ inherited the trait-default no-op and a
+    /// park "succeeded" while the guest kept running.
+    async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vm = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vm.clone()
+        };
+        vm.pause().await.map_err(SandboxError::from)
+    }
+
+    /// Symmetric un-park companion to [`Self::pause`] (idempotent on a
+    /// running VM).
+    async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vm = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vm.clone()
+        };
+        vm.resume().await.map_err(SandboxError::from)
+    }
+
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let (vm, spec, rootfs_path, vsock_uds_path) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
@@ -867,7 +889,20 @@ impl SandboxBackend for VzBackend {
         // clone is about to copy. Best-effort: a flush failure (agent not
         // up, slow boot) shouldn't abort the snapshot — we fall back to the
         // last ext4 commit, same as before this call existed.
-        self.flush_guest_fs(id, &vsock_uds_path).await;
+        //
+        // ADR 0096: skip it when the VM is already externally paused
+        // (park→snapshot descent) — a frozen guest can't answer the
+        // Sync RPC, and burning the 5s timeout against it stalls every
+        // rung-2→3 descent. A parked guest also can't be dirtying new
+        // pages, so the clone reflects whatever the pre-park state
+        // flushed (the evictor pairs park with a prior snapshot).
+        let already_paused =
+            vm.state().await == objc2_virtualization::VZVirtualMachineState::Paused;
+        if already_paused {
+            tracing::debug!(sandbox_id = %id, "vz: snapshot of a parked VM — skipping guest fs flush");
+        } else {
+            self.flush_guest_fs(id, &vsock_uds_path).await;
+        }
 
         // ADR 0007 Phase 6: allocate snapshot id + derive staging
         // dir from it. Coord no longer dictates layout.
@@ -896,7 +931,16 @@ impl SandboxBackend for VzBackend {
         vm.pause().await?;
         let snapshot_rootfs = dest.join(SNAPSHOT_ROOTFS_FILENAME);
         let clone_result = clone_or_copy(&rootfs_path, &snapshot_rootfs).await;
-        let resume_result = vm.resume().await;
+        // ADR 0096: snapshot must not have the side effect of
+        // UN-parking — if the VM was externally paused (rung-2 park)
+        // before we got here, leave it paused; the evictor owns the
+        // park state and this is usually the rung-2→3 descent right
+        // before destroy.
+        let resume_result = if already_paused {
+            Ok(())
+        } else {
+            vm.resume().await
+        };
         clone_result.map_err(SandboxError::from)?;
         // If clone succeeded but resume failed, the VM is stuck
         // paused — surface the resume error so the caller can

@@ -428,6 +428,70 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     backend.destroy(id).await.expect("destroy");
 }
 
+/// ADR 0096: external pause/resume — the coordinator's rung-2 park.
+/// Until ADR 0096 `VzBackend` inherited the trait-default no-ops, so a
+/// park "succeeded" while the guest kept running. Pins:
+///   - pause actually freezes the guest (an exec makes no progress),
+///   - snapshot of a PARKED VM works (the rung-2→3 descent: idempotent
+///     pause + flush skipped) and does NOT un-park as a side effect,
+///   - resume revives the guest and the vsock control channel still
+///     answers (the ADR 0074 lesson from FC: never assume
+///     vsock-survives-resume — pin it).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
+async fn e2e_vz_pause_freezes_and_resume_revives() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let backend = backend(&env, work.path(), true);
+
+    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    await_agent(&backend, id).await;
+    let (out, code) = exec(&backend, id, "echo pre-pause").await;
+    assert_eq!(code, Some(0), "pre-pause exec; out={out}");
+
+    // Park. A frozen guest can't serve a fresh exec: either the vsock
+    // dial hangs (timeout) or it fails fast and the stream ends with NO
+    // Exit event (`code=None`). Only a completed `Some(0)` exec proves
+    // the guest is still running.
+    backend.pause(id).await.expect("pause");
+    backend.pause(id).await.expect("pause is idempotent");
+    let frozen = tokio::time::timeout(
+        Duration::from_secs(3),
+        exec(&backend, id, "echo should-not-run"),
+    )
+    .await;
+    assert!(
+        !matches!(&frozen, Ok((_, Some(0)))),
+        "exec completed against a paused VM — pause didn't freeze the guest: {frozen:?}",
+    );
+
+    // Snapshot of the parked VM (rung-2→3 descent): idempotent pause,
+    // flush skipped, and the VM stays parked afterwards.
+    let meta = backend.snapshot(id).await.expect("snapshot of parked VM");
+    assert!(meta.disk_manifest.is_some(), "parked snapshot still chunks");
+    let still_frozen = tokio::time::timeout(
+        Duration::from_secs(3),
+        exec(&backend, id, "echo should-still-not-run"),
+    )
+    .await;
+    assert!(
+        !matches!(&still_frozen, Ok((_, Some(0)))),
+        "snapshot un-parked the VM as a side effect: {still_frozen:?}",
+    );
+
+    // Un-park: the guest revives and the control channel answers.
+    backend.resume(id).await.expect("resume");
+    backend.resume(id).await.expect("resume is idempotent");
+    let (out, code) = exec(&backend, id, "echo post-resume").await;
+    assert_eq!(code, Some(0), "post-resume exec; out={out}");
+    assert!(out.contains("post-resume"), "post-resume stdout: {out}");
+
+    backend.destroy(id).await.expect("destroy");
+}
+
 /// ADR 0023/0096: the in-guest forge credential broker over vsock 1028 —
 /// the VZ mirror of FC's `forge_loopback.rs`. Registers a `ForgeSink`
 /// that echoes the broker token back inside the minted password, runs

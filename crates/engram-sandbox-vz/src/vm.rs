@@ -24,7 +24,7 @@ use objc2_virtualization::{
     VZSerialPortConfiguration, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration,
+    VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 
 use engram_core::types::sandbox::AuxRoDrive;
@@ -297,10 +297,44 @@ impl VzVm {
         .await
     }
 
-    /// Pause the VM. Required before `save`. Used by snapshot
-    /// in task 29 — reachable but unused as of task 27.
-    #[allow(dead_code)]
+    /// Read the VM's current state (queue-dispatched — Apple's
+    /// threading contract puts every `VZVirtualMachine` access on the
+    /// VM's dispatch queue, property reads included). ADR 0096: the
+    /// idempotence guards below and `probe_sandbox`'s ground-truth
+    /// liveness check both key off this.
+    pub async fn state(&self) -> VZVirtualMachineState {
+        let (tx, rx) = oneshot::channel();
+        let vm = Sendable(self.vm.clone());
+        let tx = std::sync::Mutex::new(Some(tx));
+        self.queue.exec_async(move || {
+            // Move the WHOLE `Sendable` in — edition-2021 disjoint
+            // capture would otherwise capture only the `.0` field (a
+            // bare non-Send `Retained`), defeating the wrapper.
+            let vm = vm;
+            // SAFETY: vm is retained for the closure's lifetime and we
+            // are on the VM's dispatch queue.
+            let st = unsafe { vm.0.state() };
+            if let Some(tx) = tx.lock().expect("state oneshot mutex").take() {
+                let _ = tx.send(st);
+            }
+        });
+        // A dropped channel means the queue died mid-teardown; report
+        // Error rather than panicking a probe path.
+        rx.await.unwrap_or(VZVirtualMachineState::Error)
+    }
+
+    /// Pause the VM. Required before `save`; the external park path
+    /// (`SandboxBackend::pause`, ADR 0096) and `snapshot()` both use it.
+    ///
+    /// Idempotent: pausing an already-paused VM is a no-op `Ok(())` —
+    /// the trait's documented contract (matching FC), and load-bearing
+    /// for the park→snapshot descent: `snapshot()` pauses
+    /// unconditionally, and VZ would otherwise surface an
+    /// "invalid state transition" NSError on a parked VM.
     pub async fn pause(&self) -> Result<(), VzError> {
+        if self.state().await == VZVirtualMachineState::Paused {
+            return Ok(());
+        }
         self.dispatch_op("pause", |vm, completion| {
             // SAFETY: see `start`.
             unsafe { vm.pauseWithCompletionHandler(completion) }
@@ -308,9 +342,12 @@ impl VzVm {
         .await
     }
 
-    /// Resume from a paused state. Used by snapshot in task 29.
-    #[allow(dead_code)]
+    /// Resume from a paused state. Idempotent on an already-running VM
+    /// (see `pause`).
     pub async fn resume(&self) -> Result<(), VzError> {
+        if self.state().await == VZVirtualMachineState::Running {
+            return Ok(());
+        }
         self.dispatch_op("resume", |vm, completion| {
             // SAFETY: see `start`.
             unsafe { vm.resumeWithCompletionHandler(completion) }
