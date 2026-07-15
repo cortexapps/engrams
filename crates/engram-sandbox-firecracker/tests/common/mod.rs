@@ -530,7 +530,16 @@ pub async fn bake_fixture_ext4(
         std::fs::create_dir_all(parent).expect("out_ext4 parent");
     }
     // ADR 0093: pure-Rust deterministic pack — no mke2fs, no gate.
-    tokio::task::block_in_place(|| pack_tree(tree.path(), out_ext4)).expect("pack_tree");
+    // spawn_blocking (not block_in_place): #[tokio::test] runtimes are
+    // current-thread, where block_in_place panics.
+    {
+        let tree_path = tree.path().to_path_buf();
+        let out = out_ext4.to_path_buf();
+        tokio::task::spawn_blocking(move || pack_tree(&tree_path, &out))
+            .await
+            .expect("pack_tree join")
+            .expect("pack_tree");
+    }
     // Chunk the ext4 into the content-addressed store, mirroring the retired
     // Builder's ext4 branch: content-derived ref, idempotent put.
     let manifest = chunk_store

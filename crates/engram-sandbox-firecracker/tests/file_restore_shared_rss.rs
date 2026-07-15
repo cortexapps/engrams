@@ -52,7 +52,7 @@ use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, RestoreM
 use engram_storage_local::LocalBlobStorage;
 use tempfile::TempDir;
 
-use common::{fc_preflight, require_bin};
+use common::fc_preflight;
 
 const SIBLINGS: usize = 3;
 const BLOB_MIB: u64 = 64;
