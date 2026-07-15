@@ -73,9 +73,10 @@ data:
   # (has a sane default) so the gauge is meaningful even when the
   # operator hasn't tuned it — see the TODO on storage.kubeletEvictPct.
   ENGRAM_KUBELET_EVICT_PCT: {{ .Values.storage.kubeletEvictPct | quote }}
-  {{- if .Values.storage.dedicatedDevice }}
-  # ADR 0070: paired with storage.dedicatedDevice — node-prep formats +
-  # mounts the device at workDirHostPath; the host-agent refuses to
+  {{- if .Values.storage.dedicatedDevices }}
+  # ADR 0070: paired with storage.dedicatedDevices — node-prep formats +
+  # mounts the device (or RAID0 array) at workDirHostPath; the host-agent
+  # refuses to
   # start unless that mount actually landed (guards the
   # base-shm-startup-race failure class: a rolled pod starting before
   # the mount is visible would otherwise silently write to the boot disk).
