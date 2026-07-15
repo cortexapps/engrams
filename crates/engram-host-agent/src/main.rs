@@ -460,8 +460,13 @@ async fn main() -> Result<(), HostAgentError> {
                     })?;
                 // ADR 0061: VZ reads skill bundles from the same staged
                 // dir the host-agent reports its `current_bundles` from.
+                // ADR 0096 D6: pass the egress proxy/DNS ports into every
+                // guest — the init shim installs the in-guest DNAT
+                // redirect (soft steering; the proxy already binds
+                // 0.0.0.0, reachable at the VZ NAT gateway).
                 let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel)
-                    .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env());
+                    .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env())
+                    .with_egress_ports(cli.egress_proxy_port, cli.egress_dns_port);
                 fc_for_reattach = None;
                 // ADR 0007: attach the chunk store so `snapshot()` chunks
                 // the rootfs clone and reports the manifest ref. Without

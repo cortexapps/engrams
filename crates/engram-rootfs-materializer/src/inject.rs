@@ -157,8 +157,10 @@ mark fs_mounts_done
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
 # we do it here. Backend-aware by the guest's OWN address: VZ guests
 # get 192.168.64.x from Apple's DHCP and the NAT gateway
-# (192.168.64.1) answers DNS, so it goes first (VZ dev has no egress
-# proxy). FC guests live in the 10.200/16 netns pool behind the
+# (192.168.64.1) answers DNS, so it goes first. (When the host passes
+# ENGRAM_EGRESS, the redirect below DNATs :53 to the filtering DNS
+# proxy regardless of this entry — ADR 0096 D6.) FC guests live in
+# the 10.200/16 netns pool behind the
 # MANDATORY egress proxy (issue #240): the host iptables REDIRECTs
 # guest {udp,tcp}/53 to the filtering DNS proxy regardless of the
 # destination IP, and that proxy NXDOMAINs anything outside
@@ -278,6 +280,52 @@ for dev in /dev/vd*; do
     fi
 done
 mark bundles_mounted
+# ADR 0096 D6: SOFT egress steering on VZ. The VZ backend passes
+# ENGRAM_EGRESS=<proxy_port>:<dns_port> on the kernel cmdline (env
+# form, so the kernel hands it to PID 1); FC never sets it — its
+# REDIRECT lives host-side in the netns. When present, DNAT guest
+# tcp/443 and {udp,tcp}/53 to the egress proxy on the NAT gateway,
+# so the ADR 0006/0056 proxy plane (SNI dial, CA, inject/observe,
+# allow_hosts) is exercised on macOS dev too. SOFT enforcement by
+# design: the guest is root and can flush these rules; macOS NAT
+# stays open underneath (isolation remains FC-only). The gateway is
+# derived from the default route, not hardcoded — Apple assigns it.
+# An image without iptables logs and stays open-egress.
+if [ -n "${ENGRAM_EGRESS:-}" ]; then
+    # PID 1 has no PATH yet (the full export happens below, before
+    # exec) — set it here so `command -v` and the tool itself resolve.
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export PATH
+    egress_ok=""
+    if command -v iptables >/dev/null 2>&1; then
+        gw_hex=""
+        if [ -r /proc/net/route ]; then
+            while read -r _rt_if rt_dest rt_gw _rt_rest; do
+                if [ "$rt_dest" = "00000000" ]; then
+                    gw_hex="$rt_gw"
+                    break
+                fi
+            done < /proc/net/route
+        fi
+        if [ -n "$gw_hex" ]; then
+            # Gateway hex is the network-order address printed
+            # little-endian: "0140A8C0" -> 192.168.64.1.
+            gw="$((0x$(echo "$gw_hex" | cut -c7-8))).$((0x$(echo "$gw_hex" | cut -c5-6))).$((0x$(echo "$gw_hex" | cut -c3-4))).$((0x$(echo "$gw_hex" | cut -c1-2)))"
+            ep="${ENGRAM_EGRESS%%:*}"
+            ed="${ENGRAM_EGRESS##*:}"
+            if iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination "$gw:$ep" 2>/dev/null \
+               && iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null \
+               && iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null; then
+                egress_ok=1
+                echo "engram-init: egress steering active -> $gw:$ep (443) / $gw:$ed (53)" >&2
+            fi
+        fi
+    fi
+    if [ -z "$egress_ok" ]; then
+        echo "engram-init: WARN: ENGRAM_EGRESS set but steering not installed (no iptables in image, or no default route) — open egress" >&2
+    fi
+fi
+mark egress_steered
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).

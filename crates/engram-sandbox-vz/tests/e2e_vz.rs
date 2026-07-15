@@ -429,6 +429,47 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     backend.destroy(id).await.expect("destroy");
 }
 
+/// ADR 0096 D6: soft egress steering. The backend passes
+/// `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline; the init shim
+/// derives the NAT gateway from the guest's default route and installs
+/// DNAT rules for tcp/443 + {udp,tcp}/53 pointing at the egress proxy.
+/// This pins the cmdline → shim → netfilter chain (the test rootfs
+/// carries Alpine's iptables; images without it warn + stay open). The
+/// full traffic path (proxy SNI dial, CA, allow_hosts) is exercised by
+/// `just dev` — the backend-level harness runs no proxy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
+async fn e2e_vz_egress_steering_installs_guest_redirect() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let b = VzBackend::new(
+        work.path().join("sb"),
+        VzConfig::with_kernel(env.kernel.clone())
+            .with_bundle_dir(env.bundle_dir.clone())
+            .with_egress_ports(18443, 18053),
+    )
+    .expect("VzBackend::new");
+
+    let id = b.create(spec(&env.rootfs)).await.expect("create");
+    await_agent(&b, id).await;
+
+    let (out, code) = exec(&b, id, "iptables -t nat -S OUTPUT").await;
+    assert_eq!(code, Some(0), "iptables list; out={out}");
+    assert!(
+        out.contains("--dport 443") && out.contains(":18443"),
+        "443 DNAT to the proxy port must be installed; rules: {out}",
+    );
+    assert!(
+        out.contains("--dport 53") && out.contains(":18053"),
+        "53 DNAT to the dns port must be installed; rules: {out}",
+    );
+
+    b.destroy(id).await.expect("destroy");
+}
+
 /// ADR 0096 (ADR 0009 §4, VZ edition): crash detection. A guest that
 /// stops its VM out from under the host-agent must be noticed eagerly:
 /// the `VZVirtualMachineDelegate` shim flips the dead flag,

@@ -49,6 +49,35 @@ if [ ! -f "${TARBALL}" ] || [ "$(sha256_of "${TARBALL}")" != "${ALPINE_SHA256}" 
     mv "${TARBALL}.tmp" "${TARBALL}"
 fi
 
+# Pinned Alpine packages layered onto the tree (an .apk is a tar.gz):
+# iptables + its libs, so the live e2e can exercise the ADR 0096 D6
+# in-guest egress redirect (the init shim degrades to a warning when
+# an image carries no iptables). Musl-linked — fine here, the tree IS
+# an Alpine userland.
+APKS="iptables-1.8.11-r1 libxtables-1.8.11-r1 libip4tc-1.8.11-r1 libmnl-1.0.5-r2 libnftnl-1.2.9-r0"
+apk_sha() {
+    case "$1" in
+        iptables-1.8.11-r1)  echo 0a10fe634e3525082a1219487cd044d987ac4a55ed5aa551bf758e81223e1cfb ;;
+        libxtables-1.8.11-r1) echo e84f0d6b69d4318f297056d00ccbe433e6c7d163fe6767405e373248c42e3e88 ;;
+        libip4tc-1.8.11-r1)  echo 6418c50ff5287f6aca02ba7d8baab7cfe729a898793c9a8856cf8975b3f759c2 ;;
+        libmnl-1.0.5-r2)     echo 213a7e87553bed3d9159b2e74d2627885c259883e61714b357949ca806eb1f8d ;;
+        libnftnl-1.2.9-r0)   echo 6912a5d56b31d3365b8dd0d6339bd70a2bfc9e25dab0c387f77174113c43e664 ;;
+    esac
+}
+for pkg in ${APKS}; do
+    f="${CACHE_DIR}/${pkg}.apk"
+    if [ ! -f "$f" ] || [ "$(sha256_of "$f")" != "$(apk_sha "$pkg")" ]; then
+        curl -fSL --retry 3 -o "$f.tmp" \
+            "https://dl-cdn.alpinelinux.org/alpine/v3.22/main/aarch64/${pkg}.apk"
+        got="$(sha256_of "$f.tmp")"
+        [ "$got" = "$(apk_sha "$pkg")" ] || {
+            echo "make-test-rootfs: sha256 mismatch for ${pkg}.apk" >&2
+            rm -f "$f.tmp"; exit 1
+        }
+        mv "$f.tmp" "$f"
+    fi
+done
+
 # Fresh tree every run. Extract as the current user (no mknod entries in
 # the minirootfs, so no root needed); ownership in the packed image is
 # whatever the host files carry — the guest runs as root, which reads
@@ -57,6 +86,10 @@ TREE="$(dirname "${OUT}")/.rootfs-tree"
 rm -rf "${TREE}"
 mkdir -p "${TREE}"
 tar -xzf "${TARBALL}" -C "${TREE}"
+for pkg in ${APKS}; do
+    # .apk = tar.gz; strip the .PKGINFO/.SIGN control entries.
+    tar -xzf "${CACHE_DIR}/${pkg}.apk" -C "${TREE}" --exclude '.*' 2>/dev/null || true
+done
 
 # Guest test helper for the relay/HOL e2e (see the example's header for
 # why this replaces socat).

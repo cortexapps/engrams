@@ -51,9 +51,16 @@ pub struct VzConfig {
     /// `CONFIG_VIRTIO_BLK=y`, `CONFIG_VIRTIO_NET=y`,
     /// `CONFIG_VIRTIO_CONSOLE=y`. Cached at
     /// `~/.cache/engram-vz-test/vmlinux-arm64` by default. The
-    /// canonical source is `just pull-kernel`, which fetches
-    /// the Kata Containers static kernel.
+    /// canonical source is `just pull-kernel`, which fetches the
+    /// engram arm64 kernel Image (ADR 0025/0096 — the same owned
+    /// config prod's FC guests boot).
     pub kernel_path: PathBuf,
+    /// ADR 0096 D6: host egress proxy + DNS-proxy ports, passed to the
+    /// guest as `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline so
+    /// the init shim installs the in-guest DNAT redirect (SOFT
+    /// enforcement — see the shim). `None` (tests, ad-hoc) boots with
+    /// open egress and no cmdline token.
+    pub egress_ports: Option<(u16, u16)>,
     /// Default RAM in MiB applied when `SandboxSpec::memory.max_mib`
     /// is zero or unset. VZ minimum is 128 MiB.
     pub default_memory_mib: u32,
@@ -72,6 +79,7 @@ impl VzConfig {
     pub fn with_kernel(kernel_path: impl Into<PathBuf>) -> Self {
         Self {
             kernel_path: kernel_path.into(),
+            egress_ports: None,
             default_memory_mib: 512,
             default_vcpus: 1,
             bundle_dir: PathBuf::from(AuxRoDrive::SHARED_DIR),
@@ -82,6 +90,13 @@ impl VzConfig {
     /// (`ENGRAM_BUNDLE_DIR` in dev, `/var/lib/engram/shared` in prod).
     pub fn with_bundle_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.bundle_dir = dir.into();
+        self
+    }
+
+    /// ADR 0096 D6: pass the host egress proxy + DNS-proxy ports into
+    /// every guest (in-guest soft steering).
+    pub fn with_egress_ports(mut self, proxy: u16, dns: u16) -> Self {
+        self.egress_ports = Some((proxy, dns));
         self
     }
 }
@@ -412,7 +427,8 @@ impl VzBackend {
             memory_mib,
             vcpus,
         )
-        .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone());
+        .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone())
+        .with_egress_ports(self.cfg.egress_ports);
         let vm = VzVm::new(vm_cfg)?;
         if let Err(e) = vm.start().await {
             let _ = tokio::fs::remove_file(&rootfs_path).await;
@@ -518,20 +534,26 @@ where
 
 /// Logged at-most-once per backend instance when a session asks for
 /// egress filtering VZ can't enforce. Apple's
-/// `VZNATNetworkDeviceAttachment` is opaque: the host shares its
-/// networking stack with the guest with no insertable filter, so a
-/// non-empty `manifest.network.allow_hosts` is unenforceable here.
-/// Production isolation lives on FC; VZ stays "open egress, warn".
-fn warn_vz_ignores_allow_hosts_once(network: &engram_core::types::NetworkPolicy) {
+/// `VZNATNetworkDeviceAttachment` is opaque: no host-side insertable
+/// filter exists, so VZ cannot HARD-enforce `manifest.network.allow_hosts`
+/// the way FC's netns iptables do. ADR 0096 D6 added SOFT steering — the
+/// init shim DNATs guest 443/53 to the egress proxy when the host passes
+/// `ENGRAM_EGRESS`, so the proxy plane (SNI dial, allow_hosts filtering,
+/// CA, inject/observe) IS exercised on dev — but a root guest can flush
+/// its own rules, and images without iptables stay open. Warn once so
+/// nobody mistakes dev steering for isolation; production hard isolation
+/// lives on FC.
+fn warn_vz_soft_egress_once(network: &engram_core::types::NetworkPolicy) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     let restrictive = matches!(network.default, engram_core::types::NetworkDefault::Deny)
         && !network.allow_hosts.is_empty();
     if restrictive && !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
-            "VZ does not enforce manifest.network.allow_hosts; macOS's NAT path is \
-             opaque. Sessions on this backend get open egress. Use the Firecracker \
-             backend on Linux for production hard-isolation networking."
+            "VZ enforces manifest.network.allow_hosts only via SOFT in-guest \
+             steering (ADR 0096 D6) — a root guest can bypass it, and images \
+             without iptables get open egress. Use the Firecracker backend on \
+             Linux for production hard-isolation networking."
         );
     }
 }
@@ -549,7 +571,7 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        warn_vz_ignores_allow_hosts_once(&spec.network);
+        warn_vz_soft_egress_once(&spec.network);
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
                 "VzBackend requires SandboxSpec.rootfs_source — an ext4 with the \
@@ -636,7 +658,8 @@ impl SandboxBackend for VzBackend {
         // capture these are sentinel placeholders (sha = None) and attach
         // nothing (except the agentd slot, resolved above); a plain
         // cold-create with resolved drives attaches them.
-        .with_aux_ro_drives(aux_ro_drives, self.cfg.bundle_dir.clone());
+        .with_aux_ro_drives(aux_ro_drives, self.cfg.bundle_dir.clone())
+        .with_egress_ports(self.cfg.egress_ports);
         let vm = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
