@@ -48,6 +48,9 @@ import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
+import { getDb } from "./db/client.ts";
+import { makePapercutStore } from "./db/papercuts.ts";
+import { tools } from "./tools/registry.ts";
 
 const app = new Hono();
 
@@ -185,7 +188,7 @@ setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
-registerBuiltinTools();
+registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 const listenerManager = makeProductionListenerManager();

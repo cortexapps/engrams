@@ -14,6 +14,7 @@ import { expect, test, describe } from "bun:test";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
 import type { ImagesClient } from "../../rpc/profiles.ts";
 import type { Db, HarnessCatalogClient } from "../../rpc/task-create.ts";
+import { PAPERCUT_SYSTEM_PROMPT } from "../../tools/papercut-prompt.ts";
 import { makeThreadControlPlane } from "../thread-control-plane.ts";
 
 const profileRow = (): ProfileRow => ({
@@ -104,7 +105,9 @@ describe("makeThreadControlPlane", () => {
       threadWorkflowId: "thread-wf-1",
     });
 
-    expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe("You were triggered from Slack.");
+    expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
+      `You were triggered from Slack.\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+    );
     // records[0] = task, records[1] = primary task_session.
     expect(records[0]).toMatchObject({
       type: "slack_thread",

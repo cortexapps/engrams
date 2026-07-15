@@ -1,8 +1,31 @@
 import { describe, expect, test } from "bun:test";
 
+import type {
+  PapercutInput,
+  PapercutStore,
+} from "../../db/papercuts.ts";
 import { registerBuiltinTools } from "../builtin.ts";
 import { compileToolManifest } from "../manifest.ts";
 import { createToolRegistry } from "../registry.ts";
+
+function papercutRecorder(): { store: PapercutStore; inserted: PapercutInput[] } {
+  const inserted: PapercutInput[] = [];
+  const store: PapercutStore = {
+    async insert(row) {
+      inserted.push(row);
+      return "papercut-1";
+    },
+    async list() {
+      return [];
+    },
+    async get() {
+      return null;
+    },
+    async setArchived() {},
+    async setFixTask() {},
+  };
+  return { store, inserted };
+}
 
 describe("built-in tools", () => {
   test("registers ask_user_question with the canonical AUQ contract", () => {
@@ -47,7 +70,12 @@ describe("built-in tools", () => {
     const registry = createToolRegistry();
     registerBuiltinTools(registry);
 
-    expect(compileToolManifest(registry)).toEqual([{
+    const manifest = compileToolManifest(registry);
+    expect(manifest.map((tool) => tool.name)).toEqual([
+      "ask_user_question",
+      "papercut",
+    ]);
+    expect(manifest[0]).toEqual({
       name: "ask_user_question",
       description: "Ask the user one or more structured questions.",
       inputSchema: {
@@ -88,6 +116,61 @@ describe("built-in tools", () => {
         claude: "AskUserQuestion",
         codex: "requestUserInput",
       },
+    });
+  });
+
+  test("papercut is included for a profile with zero capabilities", () => {
+    const registry = createToolRegistry();
+    registerBuiltinTools(registry);
+
+    const manifest = compileToolManifest(registry, []);
+    expect(manifest.map((tool) => tool.name)).toEqual([
+      "ask_user_question",
+      "papercut",
+    ]);
+    expect(manifest.find((tool) => tool.name === "papercut")).toMatchObject({
+      execution: "sync",
+      nativeBindings: {},
+    });
+  });
+
+  test("papercut handler persists the tool arguments and session context", async () => {
+    const registry = createToolRegistry();
+    const papercuts = papercutRecorder();
+    registerBuiltinTools(registry, { papercuts: papercuts.store });
+
+    const tool = registry.get("papercut");
+    if (!tool || tool.handling !== "handled") throw new Error("papercut tool not registered");
+    const output = await tool.handler(
+      {
+        sessionId: "session-1",
+        taskId: "task-1",
+        profileId: "profile-1",
+        userId: "user-1",
+        capabilities: [],
+        toolCallId: "call-1",
+        toolName: "papercut",
+      },
+      tool.input.parse({
+        summary: "Command output was unclear",
+        description: "The error omitted the failing file; a path would have helped.",
+        category: "tooling",
+        severity: "medium",
+        tags: ["errors", "cli"],
+      }),
+    );
+
+    expect(output).toEqual({ logged: true, id: "papercut-1" });
+    expect(papercuts.inserted).toEqual([{
+      summary: "Command output was unclear",
+      description: "The error omitted the failing file; a path would have helped.",
+      category: "tooling",
+      severity: "medium",
+      tags: ["errors", "cli"],
+      sessionId: "session-1",
+      taskId: "task-1",
+      profileId: "profile-1",
+      userId: "user-1",
     }]);
   });
 });
