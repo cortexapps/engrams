@@ -506,9 +506,13 @@ impl NamespaceBuilder {
                     let (parent, nm) = self.ensure_parent(&rel)?;
                     let d = self.next_decl();
                     // Target verbatim; stamped AT the epoch (parity).
+                    // Mode is FORCED to 0o777: Linux has no lchmod —
+                    // a symlink's mode is always 0o777 on the tree the
+                    // legacy pack read, whatever the tar header said.
+                    let _ = mode;
                     let ino = self.push_ino(NsInode {
                         kind: InoKind::Symlink(target),
-                        meta: Meta::new(mode, uid, gid, epoch_ts()),
+                        meta: Meta::new(0o777, uid, gid, epoch_ts()),
                         xattrs: Vec::new(),
                         nlink: 1,
                         size: 0,
