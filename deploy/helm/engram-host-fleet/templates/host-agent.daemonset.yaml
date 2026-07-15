@@ -102,6 +102,22 @@ spec:
           args:
             - |
               set -eu
+              {{- if .Values.storage.dedicatedDevices }}
+              # ADR 0070/0095: when the work dir lives on a dedicated
+              # device, WAIT for node-prep's mount before staging.
+              # Prod incident 2026-07-15 (fresh NVMe node bringup): this
+              # init raced node-prep, staged bundles into the boot-disk
+              # hostPath, and the RAID0 mount then landed ON TOP —
+              # shadowing the stamp; the host-agent came up healthy (its
+              # own REQUIRE_MOUNTPOINT gate passed) but with no bundles
+              # ("no bundle stamp" every heartbeat) until a pod restart.
+              # Same gate the main container enforces, applied to the
+              # writer that must land INSIDE the mount.
+              until awk '$2 == "/var/lib/engram" {found=1} END {exit !found}' /proc/mounts; do
+                echo "[stage-node-assets] waiting for node-prep to mount /var/lib/engram (dedicated device)"
+                sleep 2
+              done
+              {{- end }}
               cp /assets/firecracker /opt/engram/firecracker
               cp /assets/vmlinux     /opt/engram/vmlinux
               chmod 0755 /opt/engram/firecracker
