@@ -114,6 +114,60 @@ report as `pack` then `chunk` by fill progress.
 - Perf: local dev-brain A/B via the mat-profile driver, recorded here
   at close.
 
+## Close (2026-07-15)
+
+All gates green; flips to Accepted after the first prod re-enable on
+this build (the honest-lifecycle pattern: code-complete ≠
+prod-validated).
+
+**Measured — local dev-brain** (551,775 entries, 37 layers, 30 GiB
+image, Apple Silicon; mat-profile driver, local blob store):
+
+| leg | prod (#664 build) | streaming (local) |
+|---|---|---|
+| flatten / declare | 176 s | **12.6–17.1 s** (pipelined under pull) |
+| pack / seal | 108 s | **0.6–0.7 s** |
+| chunk / fill+upload | 129 s | **41–48 s** (fused; 907 chunks up, 885 zero-elided) |
+| non-network compute | ~413 s | **~55–70 s** |
+
+`partial_buffer_high_water` = 32 MiB — the dense-prefix emission claim
+holds with ~64× headroom under the 2 GiB cap. Double-run reproduced
+the identical `ManifestRef` (`24f0fb1e-…@v1`) with identical chunk
+sets: content-derived identity holds on the full real namespace.
+Legacy A/B: full semantic parity (names/kinds/modes/owners/mtimes/
+targets/content/hardlink-groups) across whiteouts, opaque dirs,
+usrmerge, setuid, multi-extent files; only normalizations were
+unprivileged-run artifacts (sidecar ownership, macOS symlink umask).
+`just check`: 1625/1625.
+
+**Divergences found during implementation:**
+
+1. **Symlink modes are forced 0o777** — the A/B caught the adapter
+   honoring tar's symlink mode; Linux has no lchmod, so the tree the
+   legacy pack read never did. (The one real bug the A/B existed to
+   catch.)
+2. **Declaration-order bootstrapping**: implied parent dirs must take
+   their declaration sequence BEFORE the entry that implies them, or
+   replay orders children ahead of parents.
+3. **GNU-sparse tar entries** zero-pad to the declared size on a short
+   read (warn-logged) — parity with the legacy engine, which wrote
+   whatever the tar crate yielded.
+4. `inject_init` survives (fixture-tree bakes pack via
+   `stream_pack::pack_tree`, which walks the shim up); only the
+   enable pipeline's tree write retired.
+5. `nbd_chunked_disk`'s debugfs INSPECTION stays (distro-provided,
+   graceful skip) — it post-hoc edits arbitrary pre-existing images,
+   which is not a packer concern.
+
+**Cross-repo follow-ups:** engrams-internal references the deleted
+`setup-reproducible-mke2fs` composite action (companion cleanup
+needed); mkext4 0.0.3 pin bump once the flat-dir fix ships.
+
 ## Commit chain
 
-(recorded at close)
+`ADR 0093 (Proposed)` → `deps: pin mkext4 =0.0.2` → `chunk-store:
+streaming region chunker` → `ADR 0093: clean break` → `materializer:
+tar→mkext4 namespace adapter` → `materializer: wire the streaming
+pack` → `gates: one-time legacy A/B` → `retire e2fsprogs/mke2fs
+everywhere` → `unset the mke2fs-era knobs` → `ADR 0093 close (this
+commit)`.
