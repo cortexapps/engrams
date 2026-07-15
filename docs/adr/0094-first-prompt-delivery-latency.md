@@ -1,6 +1,8 @@
 # ADR 0094: First-prompt delivery latency — wake the deliver op when the boot completes
 
-- Status: **Proposed** — root-caused + fixed 2026-07-15; dev-VM validated.
+- Status: **Proposed** — root-caused + fixed 2026-07-15; local-stack (VZ)
+  reproduced + validated. See "Correction" — the first cut (PR #676) wired
+  the wake onto the wrong boot path and did not move TTFM.
 - Date: 2026-07-15
 - Supersedes the abandoned "resume storm-shield" draft that first held
   this number (PR #675, closed unmerged — see Rejected alternatives).
@@ -43,32 +45,89 @@ arrived.
 This is the **same class ADR 0079 already fixed for resumes**: a
 `Resume{flavor=for_delivery}` (prompt-after-idle) left its sibling
 Deliver backed off, and ADR 0079 wakes it on the resume's success. The
-*fresh-create* boot (`CreateBoot`) was never given the same wake.
+*fresh-create* boot was never given the same wake.
+
+## Correction (2026-07-15, local VZ stack) — the wake was on the wrong path
+
+PR #676's first cut extended the wake to the **`CreateBoot` op** (the
+queue-scanner's `enqueue_boot_op`). Measuring it on the local stack
+showed **no movement** — because a capacity-available create *never runs
+a `CreateBoot` op*. `reserve_placement` binds a host at request time and
+the create boots **out-of-op**, straight through
+`session_boot::boot_on_reserved_host` (`SessionFence::unfenced()`); only
+a create that finds *no* capacity is parked on the queue and later booted
+via the `CreateBoot` op. So #676 wired the wake onto the rare (no-host)
+path and left the common one untouched — the deliver still waited out its
+backoff on every normal create.
+
+Ground truth from `session_ops` for a fresh create: **no `CreateBoot`
+row exists**, only the create-time `deliver` rows, whose `not_before`
+stayed pinned at the backoff value (never pulled to boot-done). Exactly
+the "#676 didn't help" signature.
 
 ## Decision
 
-Extend the ADR 0079 sibling-deliver wake to `CreateBoot`: when the boot
-op finishes (Done, or the session goes terminal), call
-`op_wake_queued_kind(session_id, Deliver)` so the executor's next claim
-forwards the prompt in <100 ms instead of waiting out the backoff. Same
-Done-or-session-terminal gate as the resume case — a boot that merely
-retries must not wake the deliver (that would reset its backoff into an
-unpaced failure loop); a boot that fails *terminally* wakes it so the
-`gone`/failed path stays fast (the woken deliver drops its rows and
-completes).
+Wake the sibling Deliver at the **Active-transition tail of
+`boot_on_reserved_host`** — the single chokepoint **both** boot paths
+funnel through (the direct capacity-available create *and* the
+`CreateBoot` op's verb both call it). `start_agent` has already attached
+the harness by that point, so the prompt is deliverable the instant we
+flip `Active`; `op_wake_queued_kind(session_id, Deliver)` pulls the
+backed-off deliver's `not_before` to now + NOTIFYs, and the executor
+forwards in <100 ms. Idempotent (0 rows matched when there is no
+create-time prompt, or when the completion re-drive already claimed it);
+the 5 s fallback poll still backstops a missed NOTIFY.
 
-One `match` on `op.kind` now covers both boot ops (`CreateBoot` always;
-`Resume` only for `flavor=for_delivery`). No new op, no wire change, no
-knob. Delivery durability is unchanged — the Deliver op is still the
-durable owner; this only makes it *ready sooner*. If the wake NOTIFY is
-missed (crash), the 5 s fallback poll still backstops as before.
+The `CreateBoot`-op wake from #676 is **kept** — it is not redundant: it
+covers (a) a *terminal boot failure* (the tail wake never runs — the fn
+returns `Err` — so the op-level Done-or-terminal wake keeps the
+`gone`/failed path fast) and (b) `Resume{flavor=for_delivery}`. The two
+wakes overlap only on the `CreateBoot` *success* path, where the second
+is a harmless no-op. No new op, no wire change, no knob; delivery
+durability is unchanged (the Deliver op is still the durable owner).
 
-## Validation
+## Validation (local VZ stack, prod-shape coordinator path)
 
-Dev VM, prod dev-brain base restore, egress allow-listed so claude
-completes a real turn: create → first assistant token drops from ~40 s
-to ≈ boot (~5 s) + claude cold-start (~2–3 s), with the prompt forwarded
-within ~100 ms of `Active` instead of ~36 s later.
+Demo image, claude harness, create-with-prompt. `prompt_received →
+run_started` **before**: ~5.0 s (deliver op `not_before` pinned at its
+`(attempts+1)×2 s` backoff, then a ~1 s fallback-poll claim). **After**:
+the deliver op's `not_before` is pulled to boot-`Active` and it *finishes
+forwarding within ~15 ms of Active* — the coordinator-side cost is gone.
+End-to-end `prompt_received → run_started` lands at ~2.7 s.
+
+The prod impact is larger than the local delta: local boot is ~0.5 s so
+the deliver defers only once (attempts=1, 4 s); on prod dev-brain the
+slow base-restore makes it defer repeatedly, so the *accumulated* linear
+backoff is what reached ~36 s. Removing it collapses that whole staircase
+to boot + <100 ms.
+
+## Open items (measured 2026-07-15, not yet fixed here)
+
+1. **Residual ~2.2 s `Active → run_started` on the VZ backend.** With the
+   coordinator fixed, the deliver forwards to the host `cmd_tx` at
+   boot+~15 ms, but the prompt does not reach the in-guest harness
+   `cmd_rx` (→ `start_turn` → `RunStarted`) for a **rock-steady ~2.17 s**
+   (2.18/2.21/2.20 across runs). Host side is instant (`writer_loop` is
+   recv→write, no batching); the gap is in the host→guest command
+   transport. This is the **VZ vsock bridge (macOS dev only)** — prod is
+   Firecracker vsock, a different path — so it must be re-measured on the
+   dev VM / Firecracker before assuming it exists in prod. Tracked
+   separately; not addressed by this change.
+2. **`run_started → first response` (the ~33 s the users actually feel)**
+   is a *turn-execution* number, downstream of everything here, and is
+   **not reproduced** on the local stack — the demo image's claude errors
+   instantly ("Not logged in", no API key), so the real turn never runs.
+   Reproducing it needs claude reaching the API from inside the guest
+   (injected key) on the dev VM. Untouched by this ADR.
+3. **"Broken steering / queued messages" is queue-by-design, not a
+   delivery bug.** The claude adapter QUEUES a `Prompt` that arrives
+   mid-turn (`pending.push_back`, emits `PromptQueued`) and only writes it
+   to claude when the current turn's `result` lands, then runs it
+   back-to-back; the only in-flight *redirect* is an explicit
+   `HarnessCommand::Interrupt` (`control_request` → abort → then the
+   queued prompt runs). A second stdin `user` line does not interrupt.
+   Whether the product wants true steering (interrupt-then-inject) is a
+   separate decision; the mechanism is not lossy.
 
 ## Rejected alternatives (how we found it)
 
@@ -86,10 +145,16 @@ within ~100 ms of `Active` instead of ~36 s later.
 
 ## Consequences
 
-- The dominant TTFM cost on fresh creates is removed; TTFM is now bounded
-  by real boot + claude cold-start, not a scheduler backoff.
-- The harness adapter and the guest stampede are exonerated — no shield,
-  no nice-boost, no adapter surgery needed for first-prompt latency.
+- The **coordinator-side** deliver backoff — the fresh-create staircase
+  that reached ~36 s on prod dev-brain — is removed; the prompt is
+  forwarded within ~100 ms of `Active`. This is the prod-relevant win.
+- TTFM is **not** fully closed by this change: two measured gaps remain
+  downstream (the VZ ~2.2 s command-transport residual, and the
+  `run_started → response` turn latency) — see Open items. Do not read
+  this ADR as "TTFM solved."
+- The harness adapter's *invocation* is exonerated as a fixed-overhead
+  source (the persistent stream-json path is ~4–6 s to first token on
+  fast HW, same order as bare claude); no shield, no nice-boost.
 - ADR 0092's density work (File-unpinned base, lazy base-shm, orphan
   reap) is untouched and remains correct; only its TTFM attribution is
   superseded here.
