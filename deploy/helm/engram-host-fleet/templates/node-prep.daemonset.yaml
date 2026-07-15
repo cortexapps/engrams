@@ -97,7 +97,8 @@ spec:
                    echo "[node-prep] {{ $dev }} has no filesystem; mkfs.ext4"; \
                    mkfs.ext4 -F -E nodiscard {{ $dev }}; \
                  fi; \
-                 mountpoint -q {{ $.Values.storage.workDirHostPath }} || mount {{ $dev }} {{ $.Values.storage.workDirHostPath }}' \
+                 mountpoint -q {{ $.Values.storage.workDirHostPath }} || mount {{ $dev }} {{ $.Values.storage.workDirHostPath }}; \
+                 touch {{ $.Values.storage.workDirHostPath }}/.engram-node-prep-mounted' \
                 2>&1 || echo "[node-prep] dedicated volume mount FAILED (host-agent will refuse to start: ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true)"
               {{- else }}
               {{- $md := "/dev/md/engram-work" }}
@@ -113,7 +114,8 @@ spec:
                    echo "[node-prep] {{ $md }} has no filesystem; mkfs.ext4"; \
                    mkfs.ext4 -F -E nodiscard {{ $md }}; \
                  fi; \
-                 mountpoint -q {{ $.Values.storage.workDirHostPath }} || mount {{ $md }} {{ $.Values.storage.workDirHostPath }}' \
+                 mountpoint -q {{ $.Values.storage.workDirHostPath }} || mount {{ $md }} {{ $.Values.storage.workDirHostPath }}; \
+                 touch {{ $.Values.storage.workDirHostPath }}/.engram-node-prep-mounted' \
                 2>&1 || echo "[node-prep] dedicated volume mount FAILED (host-agent will refuse to start: ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true)"
               {{- end }}
               {{- end }}
