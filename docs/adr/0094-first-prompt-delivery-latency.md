@@ -103,22 +103,38 @@ to boot + <100 ms.
 
 ## Open items (measured 2026-07-15, not yet fixed here)
 
-1. **Residual ~2.2 s `Active → run_started` on the VZ backend.** With the
+1. **Residual ~2.2 s `Active → run_started`, first-turn only.** With the
    coordinator fixed, the deliver forwards to the host `cmd_tx` at
-   boot+~15 ms, but the prompt does not reach the in-guest harness
-   `cmd_rx` (→ `start_turn` → `RunStarted`) for a **rock-steady ~2.17 s**
-   (2.18/2.21/2.20 across runs). Host side is instant (`writer_loop` is
-   recv→write, no batching); the gap is in the host→guest command
-   transport. This is the **VZ vsock bridge (macOS dev only)** — prod is
-   Firecracker vsock, a different path — so it must be re-measured on the
-   dev VM / Firecracker before assuming it exists in prod. Tracked
-   separately; not addressed by this change.
+   boot+~15 ms and the command reaches the **in-guest engine `cmd_rx` in
+   ~24 ms** (guest-instrumented) — the wire is fast. Yet `run_started` is
+   recorded a **rock-steady ~2.2 s** later. Bisected with logs on both
+   ends (measured on the local VZ stack, with a real API-backed turn):
+   - the host→coord event sink is fast (every event appends in ≤22 ms);
+   - the coord `reader_loop` sits `read_msg`-blocked waiting for
+     `run_started` from the guest for the whole ~2.2 s;
+   - so the hold is **guest-side**, between the engine dequeuing the first
+     Prompt and `run_started` reaching the wire — inside the harness
+     `start_turn`→`emit`→`pump_events` path (`emit` is *not* channel
+     backpressure: the event channel is 1024-deep). It is **first-turn
+     only**: a follow-up prompt to the already-warm harness reaches
+     `run_started` in **~30 ms**.
+   This code is **shared across backends** (harness SDK + adapter, not the
+   VZ vsock bridge), so it may affect prod too — must be re-measured on the
+   dev VM / Firecracker. The exact sub-cause (which `pump_events` write
+   stalls, and why only the first) needs one more guest log line; local
+   iteration is currently gated by the all-bundles `just bundles-vz`
+   rebuild (~20 min per harness change). Tracked separately; not addressed
+   here.
 2. **`run_started → first response` (the ~33 s the users actually feel)**
-   is a *turn-execution* number, downstream of everything here, and is
-   **not reproduced** on the local stack — the demo image's claude errors
-   instantly ("Not logged in", no API key), so the real turn never runs.
-   Reproducing it needs claude reaching the API from inside the guest
-   (injected key) on the dev VM. Untouched by this ADR.
+   is a *turn-execution* number, downstream of everything here. Locally
+   (demo image, real API key injected) a full claude turn is **~2.3–2.8 s
+   — matching bare claude, so the harness wrapper does not inflate it**;
+   the ~33 s does **not** reproduce on the demo image and is dev-brain-
+   specific (heavy MCP/context/tools). Reproducing it needs the real
+   dev-brain base on the dev VM (Firecracker) — the prod image is
+   amd64-only, so it can't run on the arm64 VZ backend, and building
+   dev-brain locally for arm64 is impractical (four private repos + a
+   long Gradle/pnpm prewarm). Untouched by this ADR.
 3. **"Broken steering / queued messages" is queue-by-design, not a
    delivery bug.** The claude adapter QUEUES a `Prompt` that arrives
    mid-turn (`pending.push_back`, emits `PromptQueued`) and only writes it
