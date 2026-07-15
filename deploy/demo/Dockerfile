@@ -14,4 +14,4 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         git ca-certificates curl socat iproute2 \
     && rm -rf /var/lib/apt/lists/*
 
-RUN mkdir -p /workspace/.engram
+RUN mkdir -p /workspace/.engrams

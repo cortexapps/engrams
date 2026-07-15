@@ -14,8 +14,8 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio::sync::{mpsc, Notify};
 
-const DEFAULT_CODEX_HOME: &str = "/workspace/.engram/codex";
-const THREAD_ID_FILE: &str = "/workspace/.engram/codex-thread-id";
+const DEFAULT_CODEX_HOME: &str = "/workspace/.engrams/codex";
+const THREAD_ID_FILE: &str = "/workspace/.engrams/codex-thread-id";
 const MAX_SUMMARY: usize = 4096;
 
 #[derive(Parser, Clone, Debug)]
