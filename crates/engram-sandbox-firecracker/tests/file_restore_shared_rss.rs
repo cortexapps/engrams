@@ -8,10 +8,10 @@
 //!     RAM) and re-reads it every second — a guest working set that
 //!     every sibling re-touches after restore, so the shared pages
 //!     actually fault in and become measurable. The init is packed in
-//!     via `Mke2fsPacker` (`mke2fs -d` builds the whole tree at FS
+//!     at bake time (the packer builds the whole tree at FS
 //!     creation, computing correct `metadata_csum` for every block) —
 //!     NOT a post-hoc `debugfs write`, which lands the file's data
-//!     blocks with mismatched checksums on some e2fsprogs versions
+//!     blocks with mismatched checksums under post-hoc debugfs edits
 //!     (1.47.0 on ubuntu-24.04 CI runners): the guest kernel then
 //!     fails to `execve` the injected init with `EBADMSG` and panics
 //!     ("Requested init … failed (error -74)") before it can be
@@ -30,7 +30,7 @@
 //! Numbers print as `SPIKE:` lines — they are ADR 0022's shared-RSS
 //! measurement and ADR 0028 P1's restore-latency datapoint.
 //!
-//! Gating: Linux + KVM + firecracker + Docker + `mke2fs` (e2fsprogs).
+//! Gating: Linux + KVM + firecracker + Docker.
 //! Run:
 //!
 //! ```sh
@@ -67,7 +67,7 @@ const BLOB_MIB: u64 = 64;
 /// dead socket. So every step is best-effort and the final loop is
 /// unconditional; a failed mount/fill then surfaces as the host-side
 /// RSS-floor assertion (the honest signal), not a dead VM. Baked via
-/// `mke2fs -d` (see the module docs) so the guest kernel can actually
+/// at pack time (see the module docs) so the guest kernel can actually
 /// `execve` it.
 ///
 /// The read loop is `md5sum`, NOT `cat`: busybox `cat` copies via
@@ -87,15 +87,12 @@ head -c 67108864 /dev/urandom > /tmp/blob 2>/dev/null || true\n\
 while true; do md5sum /tmp/blob > /dev/null 2>&1 || true; sleep 1; done\n";
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker + mke2fs; bakes a rootfs and boots microVMs"]
+#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
 async fn file_backend_siblings_share_clean_pages() {
     let env = match fc_preflight() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") {
-        return;
-    }
     let Some(busybox) = common::find_busybox() else {
         eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
         return;
@@ -108,7 +105,7 @@ async fn file_backend_siblings_share_clean_pages() {
     // snapshot socket with no clue why it died.
     std::env::set_var("ENGRAM_FC_KEEP_JAIL_ON_FAILURE", "1");
 
-    // ---- 1. Bake a self-driving rootfs (init baked in via mke2fs -d) ----
+    // ---- 1. Bake a self-driving rootfs (init baked into the pack) ----
     let baked = bake_spike_rootfs(&busybox).await;
 
     // ---- 2. Boot, let the blob fill, snapshot, destroy ----
@@ -250,15 +247,12 @@ async fn file_backend_siblings_share_clean_pages() {
 /// by the `effective_restore_mode_bifurcates_create_vs_resume` unit test +
 /// `snapshot_uffd.rs`.
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + Docker + mke2fs; bakes a rootfs and boots microVMs"]
+#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
 async fn file_backend_base_create_shares_residency_memfile() {
     let env = match fc_preflight() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") {
-        return;
-    }
     let Some(busybox) = common::find_busybox() else {
         eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
         return;
@@ -436,15 +430,12 @@ async fn file_backend_base_create_shares_residency_memfile() {
 /// Skips cleanly without `ENGRAM_FC_FORK_BIN` (the substrate is fork-only)
 /// or a built `engram-uffd-handler`.
 #[tokio::test]
-#[ignore = "requires Linux + KVM + ENGRAM_FC_FORK_BIN + Docker + mke2fs + built engram-uffd-handler"]
+#[ignore = "requires Linux + KVM + ENGRAM_FC_FORK_BIN + Docker + built engram-uffd-handler"]
 async fn substrate_base_create_density_and_latency_parity() {
     let env = match fc_preflight() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") {
-        return;
-    }
     let Some(busybox) = common::find_busybox() else {
         eprintln!("SKIP: no static busybox (apt install busybox-static or set BUSYBOX_STATIC)");
         return;
@@ -712,7 +703,7 @@ async fn substrate_base_create_density_and_latency_parity() {
     );
 }
 
-/// Bake the self-driving spike rootfs (init baked in via `mke2fs -d`; see
+/// Bake the self-driving spike rootfs (init baked into the pack; see
 /// the module docs for why post-hoc `debugfs write` is avoided). Returns
 /// the ext4 rootfs path plus the tempdirs backing it — the caller must
 /// keep `Baked` alive for as long as the rootfs is in use.

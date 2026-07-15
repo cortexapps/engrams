@@ -24,7 +24,7 @@ pub enum MaterializeStage {
     Pull,
     /// Whiteout-aware layer application into one tree.
     Flatten,
-    /// Deterministic mke2fs pack of the flattened tree.
+    /// Layout seal (ADR 0093: replay + freeze; wire name kept).
     Pack,
     /// Chunking the packed ext4 into the content-addressed store.
     Chunk,
@@ -120,7 +120,7 @@ pub enum MaterializeFailureKind {
     /// — so this retries under the attempts budget.
     Pull,
     /// The image content itself can't materialize (unsupported layer
-    /// mediaType, hostile tar, mke2fs pack failure). Deterministic —
+    /// mediaType, hostile tar, pack failure). Deterministic —
     /// retrying re-downloads the same bytes for nothing.
     Image,
     /// Chunk-store / BlobStorage write failure. Transient (GCS).

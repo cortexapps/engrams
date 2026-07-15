@@ -31,7 +31,6 @@
 //! [`OciRuntimeDefaults`]: engram_core::types::image::OciRuntimeDefaults
 
 pub mod ext4;
-pub mod flatten;
 pub mod inject;
 pub mod pull;
 pub mod stream_pack;
@@ -41,17 +40,14 @@ use std::path::{Path, PathBuf};
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::types::image::OciRuntimeDefaults;
 
-pub use ext4::{
-    clamp_mtimes, recommended_size, recursive_size, Ext4Error, Ext4Packer, Mke2fsPacker,
-};
-pub use flatten::{
-    apply_layer, default_write_concurrency, ChannelReader, EntryMeta, FlattenError, FlattenStats,
-    Flattener, SkippedXattr, TreeMetadata,
-};
-pub use inject::{inject_init, InitInjection, Transport, DEFAULT_INIT_SHIM};
+pub use ext4::{inode_count_for, recommended_size, DETERMINISTIC_EPOCH_SECS};
+pub use inject::{inject_init, rendered_init_shim, InitInjection, Transport, DEFAULT_INIT_SHIM};
 pub use pull::{
     download_layer, layer_compression, pull_image, resolve_image, LayerCompression, LayerPlan,
     Platform, PullError, PulledImage, PulledLayer, ResolvedImage,
+};
+pub use stream_pack::{
+    pack_tree, ChannelReader, FlattenError, NamespaceBuilder, SealedImage, SkippedXattr,
 };
 
 /// Download look-ahead for the pull/flatten pipeline: up to this many
@@ -80,7 +76,7 @@ pub fn estimated_peak_scratch_bytes(compressed_image_bytes: u64) -> u64 {
 fn decode_layer(
     path: &std::path::Path,
     compression: LayerCompression,
-) -> Result<flatten::ChannelReader, std::io::Error> {
+) -> Result<stream_pack::ChannelReader, std::io::Error> {
     let reader = std::io::BufReader::new(std::fs::File::open(path)?);
     let decoder: Box<dyn std::io::Read + Send> = match compression {
         LayerCompression::Gzip => Box::new(flate2::read::GzDecoder::new(reader)),
@@ -92,7 +88,7 @@ fn decode_layer(
         ),
         LayerCompression::None => Box::new(reader),
     };
-    flatten::ChannelReader::spawn(decoder)
+    stream_pack::ChannelReader::spawn(decoder)
 }
 
 /// Result of one materialize: everything phase 3b's RPC reply needs.
@@ -118,7 +114,6 @@ pub struct Materialized {
 pub enum MaterializeError {
     Pull(PullError),
     Flatten(FlattenError),
-    Ext4(Ext4Error),
     ChunkStore(engram_chunk_store::ChunkStoreError),
     Io(std::io::Error),
 }
@@ -128,7 +123,6 @@ impl std::fmt::Display for MaterializeError {
         match self {
             Self::Pull(e) => write!(f, "pull: {e}"),
             Self::Flatten(e) => write!(f, "flatten: {e}"),
-            Self::Ext4(e) => write!(f, "ext4 pack: {e}"),
             Self::ChunkStore(e) => write!(f, "chunk store: {e}"),
             Self::Io(e) => write!(f, "io: {e}"),
         }
@@ -140,7 +134,6 @@ impl std::error::Error for MaterializeError {
         match self {
             Self::Pull(e) => Some(e),
             Self::Flatten(e) => Some(e),
-            Self::Ext4(e) => Some(e),
             Self::ChunkStore(e) => Some(e),
             Self::Io(e) => Some(e),
         }
@@ -155,11 +148,6 @@ impl From<PullError> for MaterializeError {
 impl From<FlattenError> for MaterializeError {
     fn from(e: FlattenError) -> Self {
         Self::Flatten(e)
-    }
-}
-impl From<Ext4Error> for MaterializeError {
-    fn from(e: Ext4Error) -> Self {
-        Self::Ext4(e)
     }
 }
 impl From<engram_chunk_store::ChunkStoreError> for MaterializeError {

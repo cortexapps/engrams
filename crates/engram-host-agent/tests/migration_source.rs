@@ -53,7 +53,7 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "mke2fs", "mksquashfs"] {
+    for bin in ["firecracker", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)

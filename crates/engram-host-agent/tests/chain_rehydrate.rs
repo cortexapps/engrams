@@ -25,7 +25,7 @@
 //! two roll simulations, no long sleeps.
 //!
 //! Gating mirrors `checkpoint_chain.rs` (Linux + KVM + firecracker +
-//! mke2fs + musl agentd). Run on the dev-vm:
+//! musl agentd). Run on the dev-vm:
 //!
 //! ```sh
 //! cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
@@ -112,7 +112,7 @@ async fn survivor_chain_rehydrates_across_a_roll_and_torn_captures_fall_back_to_
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "mke2fs", "mksquashfs"] {
+    for bin in ["firecracker", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)

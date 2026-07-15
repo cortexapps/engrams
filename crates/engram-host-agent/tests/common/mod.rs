@@ -13,9 +13,7 @@ use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::image::OciRuntimeDefaults;
 use engram_host_agent::pooled_backend::PooledBackend;
-use engram_rootfs_materializer::{
-    inject_init, recommended_size, recursive_size, Ext4Packer, InitInjection, Mke2fsPacker,
-};
+use engram_rootfs_materializer::{inject_init, pack_tree, InitInjection};
 use std::future::Future;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -396,7 +394,7 @@ pub fn copy_host_tool_with_closure(
 }
 
 /// ADR 0080 §D: bake a fixture ext4 rootfs WITHOUT docker (mirror of the FC
-/// crate's helper). Gate callers with a `mke2fs` PATH check + [`find_busybox`].
+/// crate's helper). Gate callers with [`find_busybox`] (pure-Rust pack).
 pub async fn bake_fixture_ext4(
     out_ext4: &Path,
     chunk_store: &ChunkStore,
@@ -415,11 +413,8 @@ pub async fn bake_fixture_ext4(
     if let Some(parent) = out_ext4.parent() {
         std::fs::create_dir_all(parent).expect("out_ext4 parent");
     }
-    let dir_size = recursive_size(tree.path()).await.expect("recursive_size");
-    Mke2fsPacker::default()
-        .pack(tree.path(), out_ext4, recommended_size(dir_size))
-        .await
-        .expect("mke2fs pack (is a >=1.47.1 mke2fs on PATH / ENGRAM_MKE2FS?)");
+    // ADR 0093: pure-Rust deterministic pack — no mke2fs, no gate.
+    tokio::task::block_in_place(|| pack_tree(tree.path(), out_ext4)).expect("pack_tree");
     let manifest = chunk_store
         .chunk_file(out_ext4, ManifestKind::Disk, None)
         .await

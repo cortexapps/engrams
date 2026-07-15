@@ -5,8 +5,8 @@
 //! Drives the real enable pipeline — `create_or_get_enable_job` →
 //! `enable_scanner` → host-side `materialize_image` (the REAL
 //! `engram-rootfs-materializer` pipeline: pull → flatten → inject →
-//! pack → chunk, with only the mke2fs pack swapped for a deterministic
-//! fake packer so the test needs no e2fsprogs) → content-keyed capture
+//! pack → chunk (ADR 0093 streaming pack end to end, a deterministic
+//! streaming pack, pure Rust — no e2fsprogs) → content-keyed capture
 //! reuse → `enabled_images` upsert — against a fake in-process docker
 //! registry serving a STANDARD OCI image under two tags with shared
 //! layers, and a fake host that counts `materialize_image` +
@@ -27,7 +27,6 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
@@ -265,7 +264,7 @@ impl HostClient for FakeCaptureHost {
         unreachable!()
     }
 
-    /// ADR 0080 phase 3b: the real materializer pipeline, minus mke2fs.
+    /// ADR 0080 phase 3b / ADR 0093: the real materializer pipeline.
     async fn materialize_image(
         &self,
         image_uri: &str,

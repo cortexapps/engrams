@@ -32,7 +32,138 @@ use std::io::Read;
 use mkext4::build::Timespec;
 use mkext4::{FsBuilder, InodeCount, InodeHandle, Layout, Meta, Options, SpecialKind, ROOT};
 
-use crate::flatten::{FlattenError, SkippedXattr};
+// Relocated from the retired flatten engine (ADR 0093): the error
+// vocabulary, the skipped-xattr record, and the decompressor thread.
+
+/// Layer-application errors (unchanged vocabulary from the retired
+/// tree flatten — `MaterializeError::Flatten` keeps its meaning).
+#[derive(Debug)]
+pub enum FlattenError {
+    Io(std::io::Error),
+    /// Zip-slip: an entry (or hardlink target) escapes the tree.
+    PathEscape(String),
+    /// A hardlink whose target doesn't exist in the tree built so far.
+    HardlinkTarget {
+        path: String,
+        target: String,
+    },
+    /// Malformed tar (unreadable header fields, missing link name, …).
+    Malformed(String),
+}
+
+impl std::fmt::Display for FlattenError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Io(e) => write!(f, "io: {e}"),
+            Self::PathEscape(p) => {
+                write!(f, "layer entry escapes the rootfs (zip-slip rejected): {p}")
+            }
+            Self::HardlinkTarget { path, target } => {
+                write!(f, "hardlink {path} -> {target}: target not in tree")
+            }
+            Self::Malformed(m) => write!(f, "malformed layer tar: {m}"),
+        }
+    }
+}
+
+impl std::error::Error for FlattenError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Io(e) => Some(e),
+            _ => None,
+        }
+    }
+}
+
+impl From<std::io::Error> for FlattenError {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// An xattr the image could not carry (unsupported namespace) —
+/// collected, never silently lost.
+#[derive(Clone, Debug)]
+pub struct SkippedXattr {
+    pub path: String,
+    pub name: String,
+    pub error: String,
+}
+
+/// Runs a `Read` (in practice: a decompressor) on its own thread and
+/// re-exposes it as a `Read` of ~1 MiB blocks — inflate never
+/// serializes with the consuming pass. Dropping the reader early
+/// disconnects the channel and the thread exits on its next send.
+pub struct ChannelReader {
+    rx: std::sync::mpsc::Receiver<std::io::Result<Vec<u8>>>,
+    cur: Vec<u8>,
+    pos: usize,
+    done: bool,
+    _thread: std::thread::JoinHandle<()>,
+}
+
+impl ChannelReader {
+    const BLOCK: usize = 1024 * 1024;
+    const DEPTH: usize = 8;
+
+    pub fn spawn<R: Read + Send + 'static>(mut src: R) -> std::io::Result<Self> {
+        let (tx, rx) = std::sync::mpsc::sync_channel::<std::io::Result<Vec<u8>>>(Self::DEPTH);
+        let thread = std::thread::Builder::new()
+            .name("layer-inflate".into())
+            .spawn(move || loop {
+                let mut buf = vec![0u8; Self::BLOCK];
+                match src.read(&mut buf) {
+                    Ok(0) => return, // EOF: drop tx, reader sees Ok(0)
+                    Ok(n) => {
+                        buf.truncate(n);
+                        if tx.send(Ok(buf)).is_err() {
+                            return; // consumer gone (early drop / error)
+                        }
+                    }
+                    Err(e) => {
+                        let _ = tx.send(Err(e));
+                        return;
+                    }
+                }
+            })?;
+        Ok(Self {
+            rx,
+            cur: Vec::new(),
+            pos: 0,
+            done: false,
+            _thread: thread,
+        })
+    }
+}
+
+impl Read for ChannelReader {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        loop {
+            if self.pos < self.cur.len() {
+                let n = out.len().min(self.cur.len() - self.pos);
+                out[..n].copy_from_slice(&self.cur[self.pos..self.pos + n]);
+                self.pos += n;
+                return Ok(n);
+            }
+            if self.done {
+                return Ok(0);
+            }
+            match self.rx.recv() {
+                Ok(Ok(block)) => {
+                    self.cur = block;
+                    self.pos = 0;
+                }
+                Ok(Err(e)) => {
+                    self.done = true;
+                    return Err(e);
+                }
+                Err(_) => {
+                    self.done = true; // producer finished (EOF)
+                }
+            }
+        }
+    }
+}
 
 /// Opaque-dir whiteout marker (`.wh..wh..opq`).
 const OPAQUE_MARKER: &str = ".wh..wh..opq";
@@ -67,6 +198,9 @@ enum FillSrc {
     Layer(usize, u64),
     /// Index into [`NamespaceBuilder::synthetic`] (the init shim).
     Synthetic(usize),
+    /// Caller-supplied reader at fill time, keyed by caller index
+    /// ([`pack_tree`]'s host files).
+    External(usize),
 }
 
 enum InoKind {
@@ -372,6 +506,116 @@ impl NamespaceBuilder {
             decl: d,
         });
         self.nodes[parent].children.insert(name.to_string(), id);
+        Ok(())
+    }
+
+    /// [`pack_tree`] declares: a directory (parents implied).
+    pub fn declare_dir(&mut self, rel: &str, meta: Meta) -> Result<(), FlattenError> {
+        let rel = self.resolve_scoped(rel)?;
+        self.remove_name(&rel);
+        let (parent, name) = self.ensure_parent(&rel)?;
+        let name = name.to_string();
+        let d = self.next_decl();
+        let ino = self.push_ino(NsInode {
+            kind: InoKind::Dir,
+            meta,
+            xattrs: Vec::new(),
+            nlink: 1,
+            size: 0,
+            src: None,
+        });
+        let id = self.push_node(NsNode {
+            ino,
+            children: BTreeMap::new(),
+            decl: d,
+        });
+        self.nodes[parent].children.insert(name, id);
+        Ok(())
+    }
+
+    /// [`pack_tree`] declares: a symlink (target verbatim).
+    pub fn declare_symlink(
+        &mut self,
+        rel: &str,
+        target: &str,
+        meta: Meta,
+    ) -> Result<(), FlattenError> {
+        let rel = self.resolve_scoped(rel)?;
+        self.remove_name(&rel);
+        let (parent, name) = self.ensure_parent(&rel)?;
+        let name = name.to_string();
+        let d = self.next_decl();
+        let ino = self.push_ino(NsInode {
+            kind: InoKind::Symlink(target.to_string()),
+            meta,
+            xattrs: Vec::new(),
+            nlink: 1,
+            size: 0,
+            src: None,
+        });
+        let id = self.push_node(NsNode {
+            ino,
+            children: BTreeMap::new(),
+            decl: d,
+        });
+        self.nodes[parent].children.insert(name, id);
+        Ok(())
+    }
+
+    /// [`pack_tree`] declares: an additional name for `target_rel`'s
+    /// inode (which must already be declared).
+    pub fn declare_hardlink(&mut self, rel: &str, target_rel: &str) -> Result<(), FlattenError> {
+        let rel = self.resolve_scoped(rel)?;
+        let target_rel = self.resolve_scoped(target_rel)?;
+        let target_node = self
+            .lookup(&target_rel)
+            .ok_or_else(|| FlattenError::HardlinkTarget {
+                path: rel.clone(),
+                target: target_rel.clone(),
+            })?;
+        let target_ino = self.nodes[target_node].ino;
+        self.remove_name(&rel);
+        let (parent, name) = self.ensure_parent(&rel)?;
+        let name = name.to_string();
+        let d = self.next_decl();
+        self.inos[target_ino].nlink += 1;
+        let id = self.push_node(NsNode {
+            ino: target_ino,
+            children: BTreeMap::new(),
+            decl: d,
+        });
+        self.nodes[parent].children.insert(name, id);
+        Ok(())
+    }
+
+    /// [`pack_tree`] declares: a regular file whose bytes arrive at
+    /// fill time from a caller-keyed external reader.
+    pub fn declare_file_external(
+        &mut self,
+        rel: &str,
+        meta: Meta,
+        size: u64,
+        external_idx: usize,
+    ) -> Result<(), FlattenError> {
+        let rel = self.resolve_scoped(rel)?;
+        self.remove_name(&rel);
+        let (parent, name) = self.ensure_parent(&rel)?;
+        let name = name.to_string();
+        let d = self.next_decl();
+        let ino = self.push_ino(NsInode {
+            kind: InoKind::File,
+            meta,
+            xattrs: Vec::new(),
+            nlink: 1,
+            size,
+            src: Some(FillSrc::External(external_idx)),
+        });
+        let id = self.push_node(NsNode {
+            ino,
+            children: BTreeMap::new(),
+            decl: d,
+        });
+        self.nodes[parent].children.insert(name, id);
         Ok(())
     }
 
@@ -709,6 +953,8 @@ impl NamespaceBuilder {
         let mut fill_plan: Vec<BTreeMap<u64, (InodeHandle, u64)>> =
             vec![BTreeMap::new(); self.layer_idx];
         let mut synthetic_plan: Vec<(usize, InodeHandle, u64)> = Vec::new();
+        let mut external_plan: std::collections::BTreeMap<usize, (InodeHandle, u64)> =
+            std::collections::BTreeMap::new();
 
         for (_, node, parent, name) in names {
             let parent_h = handles[parent].expect("parents declared first");
@@ -733,6 +979,9 @@ impl NamespaceBuilder {
                             }
                             Some(FillSrc::Synthetic(i)) => {
                                 synthetic_plan.push((i, h, ino.size));
+                            }
+                            Some(FillSrc::External(i)) => {
+                                external_plan.insert(i, (h, ino.size));
                             }
                             None => unreachable!("regular file without a fill source"),
                         }
@@ -764,6 +1013,7 @@ impl NamespaceBuilder {
             layout,
             fill_plan,
             synthetic_plan,
+            external_plan,
             synthetic: self.synthetic,
             skipped_xattrs,
             entry_count,
@@ -777,6 +1027,7 @@ pub struct SealedImage {
     /// Per layer: tar entry seq → (handle, declared size), ascending.
     fill_plan: Vec<BTreeMap<u64, (InodeHandle, u64)>>,
     synthetic_plan: Vec<(usize, InodeHandle, u64)>,
+    external_plan: std::collections::BTreeMap<usize, (InodeHandle, u64)>,
     synthetic: Vec<Vec<u8>>,
     pub skipped_xattrs: Vec<SkippedXattr>,
     pub entry_count: u64,
@@ -843,6 +1094,22 @@ impl SealedImage {
         Ok(())
     }
 
+    /// Fill one externally-sourced file ([`pack_tree`]). A file whose
+    /// every name was overwritten during declaration is absent from
+    /// the plan — silently skipped, matching layer-fill semantics.
+    pub fn fill_external<S: mkext4::sink::RegionSink>(
+        &self,
+        w: &mut mkext4::build::ImageWriter<'_, S>,
+        external_idx: usize,
+        reader: &mut impl Read,
+    ) -> Result<(), FlattenError> {
+        let Some(&(handle, size)) = self.external_plan.get(&external_idx) else {
+            return Ok(());
+        };
+        let mut exact = ExactLen::new(reader, size);
+        w.fill(handle, &mut exact).map_err(mk_err)
+    }
+
     /// Fill the synthetic files (init shim) from memory. Call after
     /// the last layer.
     pub fn fill_synthetic<S: mkext4::sink::RegionSink>(
@@ -856,6 +1123,73 @@ impl SealedImage {
         }
         Ok(())
     }
+}
+
+/// ADR 0080 §D / ADR 0093: pack a host directory TREE into a
+/// deterministic ext4 image — the drop-in replacement for `mke2fs -d`
+/// (fixture bakes, the dev demo; the enable pipeline never touches a
+/// tree). Sorted walk = declaration order; the same clamps as the
+/// layer path (files `min(mtime, epoch)`, dirs/symlinks AT the
+/// epoch); hardlinks detected via (dev, ino). Fixture trees carry no
+/// xattrs/specials — not walked. Returns the image length.
+pub fn pack_tree(root: &std::path::Path, out: &std::path::Path) -> Result<u64, FlattenError> {
+    use std::os::unix::fs::MetadataExt;
+
+    let mut b_paths: Vec<(std::path::PathBuf, String)> = Vec::new(); // (abs, rel) files to fill
+    let mut ns = NamespaceBuilder::new();
+    // Iterative sorted walk: (abs dir, rel prefix).
+    let mut stack: Vec<(std::path::PathBuf, String)> = vec![(root.to_path_buf(), String::new())];
+    // Declared inodes by (dev, ino) for hardlink detection.
+    let mut seen: std::collections::HashMap<(u64, u64), String> = std::collections::HashMap::new();
+    while let Some((dir, prefix)) = stack.pop() {
+        let mut entries: Vec<_> = std::fs::read_dir(&dir)?.collect::<Result<Vec<_>, _>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for e in entries {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let rel = if prefix.is_empty() {
+                name.clone()
+            } else {
+                format!("{prefix}/{name}")
+            };
+            let md = std::fs::symlink_metadata(e.path())?;
+            let mode = (md.mode() & 0o7777) as u16;
+            let (uid, gid) = (md.uid(), md.gid());
+            if md.is_dir() {
+                ns.declare_dir(&rel, Meta::new(mode, uid, gid, epoch_ts()))?;
+                stack.push((e.path(), rel));
+            } else if md.file_type().is_symlink() {
+                let target = std::fs::read_link(e.path())?.to_string_lossy().into_owned();
+                ns.declare_symlink(&rel, &target, Meta::new(0o777, uid, gid, epoch_ts()))?;
+            } else if md.is_file() {
+                if md.nlink() > 1 {
+                    if let Some(first) = seen.get(&(md.dev(), md.ino())) {
+                        ns.declare_hardlink(&rel, first)?;
+                        continue;
+                    }
+                    seen.insert((md.dev(), md.ino()), rel.clone());
+                }
+                let mtime = md.mtime().clamp(0, EPOCH);
+                let idx = b_paths.len();
+                ns.declare_file_external(
+                    &rel,
+                    Meta::new(mode, uid, gid, (mtime, 0)),
+                    md.len(),
+                    idx,
+                )?;
+                b_paths.push((e.path(), rel));
+            }
+        }
+    }
+    let sealed = ns.seal()?;
+    let image_len = sealed.image_len();
+    let mut sink = mkext4::sink::FileSink::create(out, image_len).map_err(FlattenError::Io)?;
+    let mut w = sealed.begin(&mut sink)?;
+    for (i, (abs, _rel)) in b_paths.iter().enumerate() {
+        let mut f = std::fs::File::open(abs)?;
+        sealed.fill_external(&mut w, i, &mut f)?;
+    }
+    SealedImage::finish_writer(w)?;
+    Ok(image_len)
 }
 
 /// Adapter: mkext4's RegionSink onto the chunk store's RegionChunker.

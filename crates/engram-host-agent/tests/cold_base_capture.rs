@@ -24,7 +24,7 @@
 //!      and its own result reports `freshly_captured: false` (no
 //!      second `cold_bases` row minted).
 //!
-//! Linux + KVM + firecracker + Docker + mke2fs + musl agentd only (same
+//! Linux + KVM + firecracker + Docker + musl agentd only (same
 //! gating as `warm_hook_capture.rs`, whose `TestEnv` harness this
 //! mirrors). Run on the dev-vm:
 //!
@@ -477,7 +477,7 @@ impl TestEnv {
             eprintln!("SKIP: /dev/kvm not present");
             return None;
         }
-        for bin in ["firecracker", "mke2fs", "mksquashfs"] {
+        for bin in ["firecracker", "mksquashfs"] {
             let missing = std::env::var_os("PATH")
                 .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
                 .unwrap_or(true);
