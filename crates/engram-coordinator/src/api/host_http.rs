@@ -2076,4 +2076,132 @@ mod tests {
             2
         ));
     }
+
+    /// ADR 0095: `attach_warm_peers` seed-selection matrix.
+    mod warm_peers {
+        use super::*;
+        use chrono::Utc;
+        use engram_core::types::host::{
+            HostCapacity, HostMetadata, HostRecord, HostStatus, HostUtilization,
+        };
+        use engram_core::HostId;
+        use engram_protocol::heartbeat::ManifestDigest;
+
+        fn hid(id: u128) -> HostId {
+            HostId(uuid::Uuid::from_u128(id))
+        }
+
+        fn host(id: u128, ready: &[&str]) -> HostRecord {
+            HostRecord {
+                id: hid(id),
+                hostname: format!("h{id}"),
+                cloud_metadata: HostMetadata::default(),
+                capacity: HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: 0,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: HostUtilization::default(),
+                status: HostStatus::Ready,
+                last_heartbeat_at: Utc::now(),
+                host_addr: Some(format!("http://10.0.0.{id}:9101")),
+                ready_images: ready.iter().map(|s| s.to_string()).collect(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+                wire_version: 0, // 0 = not-yet-reported, tolerated
+                stages_images: true,
+                capabilities: Default::default(),
+            }
+        }
+
+        fn image_ref(digest: &str) -> EnabledImageRef {
+            EnabledImageRef {
+                image_uri: "localhost/x:1".into(),
+                manifest_digest: ManifestDigest::new(digest.to_string()),
+                base_snapshot_id: engram_core::SnapshotId::new(),
+                base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef {
+                    manifest_id: uuid::Uuid::nil(),
+                    version: 1,
+                },
+                base_snapshot_memory_manifest: None,
+                warm_peers: Vec::new(),
+            }
+        }
+
+        const D: &str = "sha256:aaa";
+
+        #[test]
+        fn seeds_ready_holders_excluding_recipient_capped_at_two() {
+            let hosts = vec![
+                host(1, &[D]),
+                host(2, &[D]),
+                host(3, &[D]),
+                host(4, &["sha256:other"]),
+            ];
+            let mut refs = vec![image_ref(D)];
+            attach_warm_peers(&mut refs, &hosts, hid(1));
+            let peers = &refs[0].warm_peers;
+            assert_eq!(peers.len(), 2, "capped at {WARM_PEER_SEEDS}");
+            assert!(
+                peers.iter().all(|p| p.host_id != hid(1)),
+                "recipient must never seed itself"
+            );
+            assert!(
+                peers.iter().all(|p| p.host_id != hid(4)),
+                "a host without the digest must not seed it"
+            );
+        }
+
+        #[test]
+        fn cordoned_host_still_seeds_but_dead_and_skewed_do_not() {
+            let mut cordoned = host(2, &[D]);
+            cordoned.cordoned = true; // mid-drain: warmest seed there is
+            let mut dead = host(3, &[D]);
+            dead.last_heartbeat_at = Utc::now() - chrono::Duration::hours(1);
+            let mut skewed = host(4, &[D]);
+            skewed.wire_version = engram_protocol::WIRE_VERSION - 1;
+            let mut addrless = host(5, &[D]);
+            addrless.host_addr = None;
+            let hosts = vec![cordoned, dead, skewed, addrless];
+            let mut refs = vec![image_ref(D)];
+            attach_warm_peers(&mut refs, &hosts, hid(1));
+            let peers = &refs[0].warm_peers;
+            assert_eq!(
+                peers.iter().map(|p| p.host_id).collect::<Vec<_>>(),
+                vec![hid(2)],
+                "cordoned seeds; dead / wire-skewed / addr-less never do"
+            );
+        }
+
+        #[test]
+        fn no_candidates_means_empty_hints_never_self() {
+            let hosts = vec![host(1, &[D])]; // only the recipient itself
+            let mut refs = vec![image_ref(D)];
+            attach_warm_peers(&mut refs, &hosts, hid(1));
+            assert!(refs[0].warm_peers.is_empty());
+        }
+
+        #[test]
+        fn rotation_spreads_recipients_across_seeds() {
+            let hosts: Vec<HostRecord> = (2..=5).map(|i| host(i, &[D])).collect();
+            // Different recipients should not all camp on the same
+            // first seed. With 4 candidates and a hash rotation, at
+            // least two distinct primaries must appear across a set of
+            // recipients (deterministic given fixed UUIDs).
+            let primaries: std::collections::HashSet<_> = (10u128..30)
+                .map(|r| {
+                    let mut refs = vec![image_ref(D)];
+                    attach_warm_peers(&mut refs, &hosts, hid(r));
+                    refs[0].warm_peers[0].host_id
+                })
+                .collect();
+            assert!(
+                primaries.len() >= 2,
+                "hash rotation must spread primaries, got {primaries:?}"
+            );
+        }
+    }
 }

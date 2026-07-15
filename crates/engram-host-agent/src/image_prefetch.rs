@@ -199,7 +199,10 @@ impl ImageReadiness {
         self.inner.read().contains(digest)
     }
 
-    fn mark_ready(&self, digest: ManifestDigest) {
+    /// `pub` for the peer-fill integration tests (which stand up a
+    /// serving host without a live supervisor); in production the
+    /// prefetch supervisor is the sole writer.
+    pub fn mark_ready(&self, digest: ManifestDigest) {
         self.inner.write().insert(digest);
     }
 

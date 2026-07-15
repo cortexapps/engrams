@@ -217,20 +217,56 @@ deferred to its phase 3 lands here).
   fleet's scale; the anonymous-miss case stays GCS and is counted).
 - Teleport (`MigrationRegistry`/`migration_fetch`/seal) semantics.
 
-## Evidence (2026-07 baselines)
+## Evidence (re-derived 2026-07-14/15 UTC; Cloud Logging + prod PG)
 
-Re-derived at PR time from Cloud Logging + prod PG (`enable_jobs`,
-`session_events`, `snapshots`) — the fleet has no retained metrics
-backend, so every number is sourced+windowed inline. Headlines: enable
-prestage fan-out ≈ 22 min (dev-brain, `enable_jobs` ready-gap);
-dev-brain base set = 1,808 × 16 MiB disk + ~42.5k × 512 KiB memory
-chunks ≈ 50 GiB; GCS chunk fetch mean ~100 ms (capture-heavy window);
-cross-host resume ~10 s class vs 0.61 s affinity-local (ADR 0078 P2
-measurement). Fleet-stability precondition applies to all peer-win
-claims: on a 1-host fleet there is no peer and the design degrades to
-today's path by contract.
+The fleet has no retained metrics backend (pod-local `/metrics` only),
+so rows are sourced+windowed inline; "unavailable" is stated rather
+than estimated. Fleet during collection: 1 live host + churn — the
+fleet-stability precondition applies to every peer-win claim.
 
-<!-- P0 evidence table lands here before the PR opens. -->
+**Enable prestage** (`enable_jobs`, last 4 enables, 2026-07-15 ~02:30Z):
+
+| image | total | fan-out gap (last capture stage → ready) | disk chunks | base-mem chunks |
+|---|---|---|---|---|
+| dev-brain | 41.5 min | **22.1 min** | 1,808 (×16 MiB = 28.25 GiB) | 44,338 |
+| dev-engrams | 201 s | 14.2 s | 656 | 775 |
+| demo | 56 s | 14.3 s | 24 | 309 |
+| engineering-blog (reused_full) | 34 s | **0.37 s** | 176 | (reused) |
+
+Readings: the recaptured-image floor is ~14 s nearly independent of
+disk chunk count (base-memfile materialization, not chunk fill);
+`reused_full` — chunks already resident — collapses the gap to 0.37 s,
+the strongest single argument for resident/peer fill; dev-brain's
+22 min is memory-snapshot-object-count-bound (44k × ~0.5 MiB) and the
+host logs show a **re-prefetch churn loop** ("base chunks no longer
+resolvable locally; flipping to not-ready") — the 300 GiB disk
+LRU-evicts just-pulled base chunks mid-prestage. The NVMe prerequisite
+attacks the churn; the peer tier attacks the refill cost.
+
+**Fetch decomposition** (`engram_chunk_fetch_seconds`, one host, ~2 h
+capture-heavy window, n=148k GCS / 341k NVMe): GCS fetch mean 100 ms
+per chunk (p50 ~45 ms, p95 ~300–500 ms); NVMe read of a landed chunk
+2.0 ms. The histogram times ONLY the fetch closure — landing is
+un-instrumented; no dirty-writeback signal is exposed. Verdict: the
+paths are GCS-round-trip-bound, not landing-bound, at current scale.
+
+**Resume** (`session_events`, 14 d): resumed 100, recovered 85,
+evicted 139. Cross-host vs affinity-local wall-clock is currently NOT
+derivable (the `resumed` event is a completion marker; `host_id` nulls
+on teardown; coord pods too young) — the trusted anchors remain ADR
+0078 P2's prod-measured 0.61 s affinity-local restore vs the 92 s GCS
+page-in class. `engram_chunk_fill_total{source=gcs}` on the observed
+host: 148k fills / 460 GiB in one enable burst.
+
+**Transport bench** (loopback, release build, Apple dev box — the
+acceptance gate; re-measure on a Linux host at flip time): the tuned
+shape (4 conns × 16 MiB windows + adaptive, 4 MiB CRC32C frames)
+sustains **1,112 MiB/s** end-to-end through the real serve arm, CRC,
+and cache landing (1,323 MiB/s at 8 conns; raw-TCP loopback ceiling
+3,694 MiB/s). The pre-0095 teleport shape's ~20 MB/s/stream artifact is
+confirmed config, not gRPC physics. **Verdict: tuned tonic ships; a raw
+TCP data plane buys nothing under the NVMe write cap** (§Hardware) and
+would add a second listener + protocol surface.
 
 ## Acceptance criteria
 
@@ -250,4 +286,44 @@ today's path by contract.
 
 ## Divergence log
 
-- (updates land here as implementation proceeds)
+- **Fault-time peer tier: built but not wired.** The plan called for a
+  fault-time peer binding in the populate closures as the resume tail's
+  safety net. The dest-side pre-pass is SYNCHRONOUS over the full
+  divergent set (the ADR 0045 C1-proven shape — a background pull loses
+  the wake-up race), so by construction there is no post-restore fault
+  window to serve; a mid-pull peer death leaves the remainder to the
+  fault path's existing local→GCS chain, which is today's behavior.
+  `PeerBinding` (peer_fill.rs) is the ready building block if p90
+  divergent sets ever justify a hot-sync/tail-async split; wiring it
+  into the populate closures via `ChunkCache::get_with_source` (which
+  sha256-verifies fault-time singles — at one chunk per fault the hash
+  is noise) is deliberately deferred until measured need.
+- **`Snapshot` scope is observational, not validated.** The serving
+  host has no authoritative local index of snapshot ids (the
+  coordinator only hints requesters at the capturing host), so the
+  serve arm validates `BaseImage` against its ready set and counts
+  `Snapshot` as-is — hash-capability + resident-only remains the gate.
+- **BaseImage scope checks `ready`, not ready∪prestaging** — a
+  prestaging host may not hold the chunks yet, and the coordinator only
+  seeds from `ready_images` anyway.
+- **Evacuation gained hints too**: the snapshot-rehome leg stamps its
+  draining (cordoned-but-alive) source — `host_can_serve_chunks`
+  deliberately ignores the cordon bit, which also lets mid-drain hosts
+  keep seeding base images during rolls.
+- **Backpressure gets one jittered retry** in the prefetch pre-pass
+  (2–5 s, pid-keyed) before falling to GCS — a saturated seed at enable
+  fan-out is busy, not dead; still bounded, never a ladder.
+- **CI shape**: the tier's contract is pinned by a cross-platform
+  loopback integration test (`tests/peer_fill_loopback.rs` — real gRPC
+  server, real pull machinery, scrub + serve-gate + backpressure +
+  bounded-dial assertions) that runs in the ordinary Rust lanes on
+  every platform, instead of a new KVM-gated FC test: the tier is
+  VM-independent by design, and a booted FC guest would add wall-clock
+  without adding coverage of any property above (AGENTS.md: size to
+  the property). The bench (`tests/peer_transport_bench.rs`) is
+  `#[ignore]`'d/manual.
+- **Wire posture**: the heartbeat-ack `warm_peers` field and the
+  `PeerChunkGet` RPC are independently mixed-roll-safe; the WIRE 15→16
+  bump is pinned to the `SnapshotMetadata.peer_hints` bincode addition
+  and makes the whole feature's deploy posture explicit (lockstep
+  coord+host roll, skewed hosts drain via `host_wire_version_ok`).

@@ -108,11 +108,27 @@ pub struct PeerServe {
 
 impl PeerServe {
     pub fn new(cache: ChunkCache, ready: Arc<ImageReadiness>) -> Arc<Self> {
+        Self::with_limits(
+            cache,
+            ready,
+            serve_streams_from_env(),
+            frame_bytes_from_env(),
+        )
+    }
+
+    /// Explicit-limits constructor — tests pin the stream cap / frame
+    /// size instead of racing process-global env vars.
+    pub fn with_limits(
+        cache: ChunkCache,
+        ready: Arc<ImageReadiness>,
+        streams: usize,
+        frame_bytes: usize,
+    ) -> Arc<Self> {
         Arc::new(Self {
             cache,
             ready,
-            semaphore: Arc::new(Semaphore::new(serve_streams_from_env())),
-            frame_bytes: frame_bytes_from_env(),
+            semaphore: Arc::new(Semaphore::new(streams)),
+            frame_bytes: frame_bytes.max(1),
         })
     }
 

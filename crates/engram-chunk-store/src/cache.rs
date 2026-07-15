@@ -3271,4 +3271,119 @@ mod tests {
             "pinned chunk must survive free-space-floor eviction",
         );
     }
+
+    /// ADR 0095: an unverified-origin landing is locally readable but
+    /// NOT servable onward until the scrubber sha256s it; a good chunk
+    /// clears its marker, and the read path serves it afterwards.
+    #[tokio::test]
+    async fn put_unverified_marks_then_scrub_clears() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = b"peer-landed bytes".to_vec();
+        let h = ChunkHash::of(&body);
+        cache.put_unverified_no_evict(h, &body).await.unwrap();
+        // Locally readable (CRC-checked upstream; trust-on-read)...
+        assert!(cache.contains(h).await);
+        // ...but gated from onward serving until scrubbed.
+        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
+        // Scrub (direct call — the spawned loop is timing, not logic).
+        assert!(cache.scrub_one(h).await > 0);
+        let served = cache.read_verified_for_serve(h).await.unwrap();
+        assert_eq!(served.as_deref(), Some(body.as_slice()));
+    }
+
+    /// ADR 0095 §Integrity: a peer-landed chunk whose content does not
+    /// match its claimed hash (source rot / serve bug) is deleted by
+    /// the scrub — the next read misses and refetches through the
+    /// verifying GCS populate; it is never served onward.
+    #[tokio::test]
+    async fn scrub_deletes_corrupt_peer_landing() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let honest = b"the real content".to_vec();
+        let h = ChunkHash::of(&honest);
+        cache
+            .put_unverified_no_evict(h, b"corrupt impostor bytes")
+            .await
+            .unwrap();
+        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
+        cache.scrub_one(h).await;
+        assert!(
+            !cache.contains(h).await,
+            "corrupt chunk must be deleted, not kept",
+        );
+        assert!(cache.read_verified_for_serve(h).await.unwrap().is_none());
+    }
+
+    /// ADR 0095: the spawned scrubber drains the live queue AND the
+    /// boot-time marker scan (crash recovery), and a marker whose chunk
+    /// was evicted mid-queue is reaped without error.
+    #[tokio::test]
+    async fn scrubber_drains_queue_and_boot_scan() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        // Landed BEFORE the scrubber exists — covered by the boot scan.
+        let pre = b"landed before scrubber".to_vec();
+        let pre_h = ChunkHash::of(&pre);
+        cache.put_unverified_no_evict(pre_h, &pre).await.unwrap();
+        // A stale marker with no chunk (evicted mid-queue).
+        let ghost = ChunkHash::of(b"ghost");
+        let ghost_marker = cache.marker_path_for(ghost);
+        fs::create_dir_all(ghost_marker.parent().unwrap())
+            .await
+            .unwrap();
+        crate::cache::write_atomic(&ghost_marker, b"")
+            .await
+            .unwrap();
+        let _scrubber = cache.spawn_scrubber(u64::MAX);
+        // Landed AFTER — covered by the live queue.
+        let post = b"landed after scrubber".to_vec();
+        let post_h = ChunkHash::of(&post);
+        cache.put_unverified_no_evict(post_h, &post).await.unwrap();
+        for _ in 0..300 {
+            let pre_ok = cache
+                .read_verified_for_serve(pre_h)
+                .await
+                .unwrap()
+                .is_some();
+            let post_ok = cache
+                .read_verified_for_serve(post_h)
+                .await
+                .unwrap()
+                .is_some();
+            let ghost_gone = !fs::try_exists(cache.marker_path_for(ghost))
+                .await
+                .unwrap_or(true);
+            if pre_ok && post_ok && ghost_gone {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        panic!("scrubber did not drain the backlog within 3s");
+    }
+
+    /// ADR 0095: `get_with_source` keeps the populate contract of `get`
+    /// (verify-on-populate, write-through) while letting the closure
+    /// report a peer source — and a hash mismatch from a "peer" closure
+    /// still refuses to land, exactly like a corrupt GCS fetch.
+    #[tokio::test]
+    async fn get_with_source_verifies_peer_bytes_too() {
+        let (cache, _store, _b, _c) = setup(NO_CEILING).await;
+        let body = Bytes::from_static(b"fault-time peer chunk");
+        let h = ChunkHash::of(&body);
+        let got = cache
+            .get_with_source(h, || async { Ok((body.clone(), FillSource::Peer)) })
+            .await
+            .unwrap();
+        assert_eq!(got, body);
+        assert!(cache.contains(h).await);
+        // Verified at populate ⇒ immediately servable onward.
+        assert!(cache.read_verified_for_serve(h).await.unwrap().is_some());
+
+        let wrong = ChunkHash::of(b"something else");
+        let err = cache
+            .get_with_source(wrong, || async {
+                Ok((Bytes::from_static(b"not that"), FillSource::Peer))
+            })
+            .await;
+        assert!(matches!(err, Err(ChunkStoreError::HashMismatch { .. })));
+        assert!(!cache.contains(wrong).await);
+    }
 }
