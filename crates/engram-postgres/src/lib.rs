@@ -1723,7 +1723,6 @@ impl MetadataStore for PostgresStore {
             WHERE sandbox_id = $1 AND host_id = $2
               AND status NOT IN ('failed','completed','dead')
             LIMIT 1
-                      AND status IN ('pending','created','active','unreachable',
             "#,
         )
         .bind(sandbox_id.as_uuid())
@@ -5269,19 +5268,22 @@ impl MetadataStore for PostgresStore {
         capture_phase: Option<&str>,
         warm_stage: Option<&str>,
         output_tail: Option<&str>,
+        warm_stages: Option<&serde_json::Value>,
     ) -> Result<(), MetaError> {
         // UNFENCED on purpose (ADR 0084 P1b): `capture_jobs` owns
         // fencing/execution now, this is a cosmetic dashboard mirror the
         // heartbeat reconcile drives regardless of which coordinator pod
         // (if any) holds the enable job's claim. `COALESCE` so a report
         // with no rendered phase (`assigned`/`done`/`failed`) doesn't
-        // blank the last-known warm-hook stage/output.
+        // blank the last-known warm-hook stage/output — or, ADR 0088
+        // addendum, the last-known capture timeline.
         sqlx::query(
             r#"
             UPDATE enable_jobs
                SET capture_phase = COALESCE($2, capture_phase),
                    warm_stage = COALESCE($3, warm_stage),
                    output_tail = COALESCE($4, output_tail),
+                   warm_stages = COALESCE($5, warm_stages),
                    updated_at = NOW()
              WHERE id = $1
             "#,
@@ -5290,6 +5292,7 @@ impl MetadataStore for PostgresStore {
         .bind(capture_phase)
         .bind(warm_stage)
         .bind(output_tail)
+        .bind(warm_stages)
         .execute(&self.pool)
         .await
         .map_err(db_err)?;

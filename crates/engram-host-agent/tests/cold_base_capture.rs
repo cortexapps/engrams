@@ -235,6 +235,216 @@ async fn cold_base_hit_skips_the_second_cold_boot_and_dedupes_the_overlay() {
     );
 }
 
+/// Wraps a real `BlobStorage`, delaying each chunk PUT slightly and
+/// timestamping the last one — the observability the deferred-seed
+/// overlap assertion needs (ADR 0088 addendum).
+struct SlowStampingBlobStorage {
+    inner: Arc<dyn BlobStorage>,
+    delay: std::time::Duration,
+    last_chunk_put_at: Arc<parking_lot::Mutex<Option<Instant>>>,
+}
+
+#[async_trait]
+impl BlobStorage for SlowStampingBlobStorage {
+    async fn put_streaming(
+        &self,
+        key: &str,
+        body: ByteStream,
+    ) -> Result<u64, engram_core::error::BlobError> {
+        let is_chunk = key.starts_with("chunks/");
+        if is_chunk {
+            tokio::time::sleep(self.delay).await;
+        }
+        let r = self.inner.put_streaming(key, body).await;
+        if is_chunk {
+            *self.last_chunk_put_at.lock() = Some(Instant::now());
+        }
+        r
+    }
+    async fn get_streaming(&self, key: &str) -> Result<ByteStream, engram_core::error::BlobError> {
+        self.inner.get_streaming(key).await
+    }
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<engram_core::traits::BlobObjectMeta, engram_core::error::BlobError> {
+        self.inner.head(key).await
+    }
+    async fn delete(&self, key: &str) -> Result<(), engram_core::error::BlobError> {
+        self.inner.delete(key).await
+    }
+    async fn list_prefix(
+        &self,
+        prefix: &str,
+    ) -> Result<Vec<String>, engram_core::error::BlobError> {
+        self.inner.list_prefix(prefix).await
+    }
+}
+
+/// Drain `rx` into a timestamped frame log (the tests assert against
+/// phase/detail arrival order).
+fn spawn_frame_log(
+    mut rx: tokio::sync::mpsc::Receiver<engram_core::types::CaptureProgress>,
+) -> Arc<parking_lot::Mutex<Vec<(Instant, engram_core::types::CaptureProgress)>>> {
+    let log: Arc<parking_lot::Mutex<Vec<(Instant, engram_core::types::CaptureProgress)>>> =
+        Arc::default();
+    let log2 = Arc::clone(&log);
+    tokio::spawn(async move {
+        while let Some(f) = rx.recv().await {
+            log2.lock().push((Instant::now(), f));
+        }
+    });
+    log
+}
+
+/// ADR 0088 addendum: the cold-base seed's `finish()` (chunk+upload)
+/// must run CONCURRENTLY with the warm hook — the last seed chunk PUT
+/// lands strictly after the hook has started — and the join barrier's
+/// `cold-base upload` progress leg must be observable. Every PUT is
+/// delayed a few ms so the seed upload provably outlives the hook's
+/// start even on a fast runner; the property is overlap, not
+/// throughput (least-time sizing per repo convention).
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
+async fn seed_upload_overlaps_the_warm_hook() {
+    let Some(env) = TestEnv::gate() else { return };
+    let last_put = Arc::new(parking_lot::Mutex::new(None));
+    let slow_blob: Arc<dyn BlobStorage> = Arc::new(SlowStampingBlobStorage {
+        inner: env.blob.clone(),
+        delay: std::time::Duration::from_millis(15),
+        last_chunk_put_at: Arc::clone(&last_put),
+    });
+    let pooled = env.pooled_with_blob(slow_blob);
+    let rootfs = env.bake("engram-seed-overlap-test").await;
+
+    let warm = WarmConfig {
+        command: vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "echo warm-overlap-marker > /dev/shm/overlap".into(),
+        ],
+        timeout_secs: Some(60),
+        workdir: None,
+        env: Vec::new(),
+        network: None,
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let frames = spawn_frame_log(rx);
+
+    pooled
+        .build_base_snapshot(
+            BuildBaseSnapshotRequest {
+                spec: env.spec(&rootfs),
+                warm: Some(warm),
+                capture_env: Default::default(),
+                capture_egress: None,
+                cold_base_plan: ColdBasePlan::Miss {
+                    content_key: "fc-test-seed-overlap-key".to_string(),
+                    reason: engram_core::types::capture_job::ColdBaseMissReason::NoCandidate,
+                },
+            },
+            tx,
+        )
+        .await
+        .expect("deferred-seed capture must succeed");
+
+    let frames = frames.lock().clone();
+    let warm_started_at = frames
+        .iter()
+        .find(|(_, f)| matches!(f.phase, engram_core::types::CapturePhase::Warm))
+        .map(|(t, _)| *t)
+        .expect("a Warm-phase frame must have been emitted");
+    assert!(
+        frames
+            .iter()
+            .any(|(_, f)| f.detail.as_deref() == Some("cold-base upload")),
+        "the join barrier must emit its `cold-base upload` leg frame",
+    );
+    let last_put_at = last_put
+        .lock()
+        .expect("the seed must have uploaded at least one chunk");
+    assert!(
+        last_put_at > warm_started_at,
+        "the seed upload must still be in flight after the warm hook started \
+         (deferred finish) — last chunk PUT landed {:?} BEFORE the hook",
+        warm_started_at.duration_since(last_put_at),
+    );
+}
+
+/// A warm hook that exits non-zero while the deferred seed upload is
+/// still in flight: the join barrier must settle the upload (await,
+/// never abort), then surface the HOOK's failure as the primary error.
+#[tokio::test]
+#[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
+async fn hook_failure_still_joins_the_deferred_seed() {
+    let Some(env) = TestEnv::gate() else { return };
+    let last_put = Arc::new(parking_lot::Mutex::new(None));
+    let slow_blob: Arc<dyn BlobStorage> = Arc::new(SlowStampingBlobStorage {
+        inner: env.blob.clone(),
+        delay: std::time::Duration::from_millis(15),
+        last_chunk_put_at: Arc::clone(&last_put),
+    });
+    let pooled = env.pooled_with_blob(slow_blob);
+    let rootfs = env.bake("engram-seed-hookfail-test").await;
+
+    let warm = WarmConfig {
+        command: vec!["/bin/sh".into(), "-c".into(), "exit 1".into()],
+        timeout_secs: Some(60),
+        workdir: None,
+        env: Vec::new(),
+        network: None,
+    };
+    let (tx, rx) = tokio::sync::mpsc::channel(64);
+    let frames = spawn_frame_log(rx);
+
+    let err = pooled
+        .build_base_snapshot(
+            BuildBaseSnapshotRequest {
+                spec: env.spec(&rootfs),
+                warm: Some(warm),
+                capture_env: Default::default(),
+                capture_egress: None,
+                cold_base_plan: ColdBasePlan::Miss {
+                    content_key: "fc-test-seed-hookfail-key".to_string(),
+                    reason: engram_core::types::capture_job::ColdBaseMissReason::NoCandidate,
+                },
+            },
+            tx,
+        )
+        .await
+        .expect_err("a non-zero warm hook must fail the capture");
+
+    // The hook's failure is the primary error (not the seed's state).
+    match &err {
+        engram_core::error::SandboxError::CaptureFailed(f) => {
+            assert!(
+                matches!(
+                    f.kind,
+                    engram_core::types::CaptureFailureKind::WarmExitNonZero
+                ),
+                "expected WarmExitNonZero, got {:?}",
+                f.kind,
+            );
+        }
+        other => panic!("expected CaptureFailed, got {other:?}"),
+    }
+    // Await-not-abort: the join barrier ran (its leg frame was emitted)
+    // and the seed's chunk PUTs completed rather than being cancelled
+    // mid-write (a timestamp exists ⇒ the upload stream was driven to
+    // its last chunk, not dropped).
+    assert!(
+        frames
+            .lock()
+            .iter()
+            .any(|(_, f)| f.detail.as_deref() == Some("cold-base upload")),
+        "the join barrier must run on the hook-failure path too",
+    );
+    assert!(
+        last_put.lock().is_some(),
+        "the deferred seed upload must have been driven to completion, not aborted",
+    );
+}
+
 // ---- test harness (mirrors `warm_hook_capture.rs`'s `TestEnv` — test
 // fixtures don't cross crate boundaries, so this is intentionally
 // duplicated rather than shared) -------------------------------------
@@ -317,6 +527,16 @@ impl TestEnv {
     /// deliberately leave it unwired). Blob storage is wrapped to count
     /// chunk uploads.
     fn pooled(&self, puts: Arc<AtomicUsize>) -> Arc<PooledBackend> {
+        let counting_blob: Arc<dyn BlobStorage> = Arc::new(CountingBlobStorage {
+            inner: self.blob.clone(),
+            puts,
+        });
+        self.pooled_with_blob(counting_blob)
+    }
+
+    /// [`Self::pooled`] with an arbitrary blob wrapper (the deferred-seed
+    /// tests inject delay/timestamp instrumentation instead of counting).
+    fn pooled_with_blob(&self, blob: Arc<dyn BlobStorage>) -> Arc<PooledBackend> {
         let mut cfg = FirecrackerConfig::with_kernel(self.kernel.clone());
         cfg.bundle_dir = self.staged.bundle_dir.clone();
         cfg.net_pool = None;
@@ -325,17 +545,13 @@ impl TestEnv {
         cfg.default_boot_args =
             "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
         let inner = Arc::new(FirecrackerBackend::new(self.work.path(), cfg));
-        let counting_blob: Arc<dyn BlobStorage> = Arc::new(CountingBlobStorage {
-            inner: self.blob.clone(),
-            puts,
-        });
-        let counting_store = ChunkStore::new(counting_blob);
+        let store = ChunkStore::new(blob);
         let mut cache_cfg =
             engram_chunk_store::cache::ChunkCacheConfig::new(self.work.path().join("chunk-cache"));
         cache_cfg.budget_bytes = 1024 * 1024 * 1024;
         Arc::new(
             PooledBackend::new(inner)
-                .with_chunk_store(counting_store, self.work.path().join("materialize"))
+                .with_chunk_store(store, self.work.path().join("materialize"))
                 .with_chunk_cache(engram_chunk_store::ChunkCache::new(cache_cfg))
                 .with_checkpoint_dir(self.work.path().join("checkpoints")),
         )

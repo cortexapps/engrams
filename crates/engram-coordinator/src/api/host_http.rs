@@ -246,6 +246,127 @@ pub async fn register(
         }
     };
 
+    // Survivor egress re-registration (2026-07-13 dfa0face incident): the
+    // egress proxy's guest registry died with the old pod (it holds
+    // resolved secrets — in-memory by design), so a pidfd-reattached
+    // survivor keeps its VM but loses ALL egress: every guest packet is
+    // rejected (`UnknownGuest` NXDOMAIN / "no session for source IP")
+    // until something re-registers it. The host can't rebuild the policy
+    // alone; re-derive it from durable state exactly like resume does
+    // (`build_resume_egress_policy`) and push it over the gRPC channel
+    // registered above. Detached: inject resolution can round-trip a mint
+    // provider, and the register response must not wait on it.
+    // Bounded-retry per survivor: registration races the host's own
+    // startup (the reattach pass populates guest endpoints; a mint
+    // provider can blip), so one fire-and-forget attempt could strand a
+    // survivor egress-less on a transient. Exhaustion logs loudly and
+    // degrades to the pre-fix posture (egress dead until evict_local →
+    // resume recovers the session).
+    {
+        let state = state.clone();
+        let survivors = rehydrate_sandboxes.clone();
+        let host_id = req.host_id;
+        tokio::spawn(async move {
+            const ATTEMPTS: u32 = 5;
+            const RETRY_GAP: std::time::Duration = std::time::Duration::from_secs(10);
+            for s in survivors {
+                let mut done = false;
+                for attempt in 1..=ATTEMPTS {
+                    if attempt > 1 {
+                        tokio::time::sleep(RETRY_GAP).await;
+                    }
+                    let session = match state.services.meta.get_session(s.session_id).await {
+                        Ok(sess) => sess,
+                        Err(e) => {
+                            tracing::debug!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                attempt,
+                                error = %e,
+                                "survivor egress re-push: session lookup failed",
+                            );
+                            continue;
+                        }
+                    };
+                    if session.sandbox_id != Some(s.sandbox_id) {
+                        done = true; // moved on since the register snapshot
+                        break;
+                    }
+                    // STRICT build (adversarial-review finding): a lossy
+                    // build turns transient PG/secret/mint failures into a
+                    // REDUCED policy whose apply "succeeds" and suppresses
+                    // every remaining retry — permanently downgrading a
+                    // healthy running session. Err = retry.
+                    let policy = match crate::api::sessions::build_survivor_egress_policy(
+                        &state,
+                        s.session_id,
+                        s.sandbox_id,
+                        &session.image,
+                    )
+                    .await
+                    {
+                        Ok(Some(policy)) => policy,
+                        Ok(None) => {
+                            // No guest IP yet (reattach still settling) or a
+                            // genuinely IP-less backend — retry either way;
+                            // the exhaustion log below is the verdict.
+                            tracing::debug!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                sandbox_id = %s.sandbox_id,
+                                attempt,
+                                "survivor egress re-push: no guest IP / policy yet",
+                            );
+                            continue;
+                        }
+                        Err(e) => {
+                            tracing::debug!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                sandbox_id = %s.sandbox_id,
+                                attempt,
+                                error = %e,
+                                "survivor egress re-push: strict policy rebuild failed",
+                            );
+                            continue;
+                        }
+                    };
+                    match state.services.host.apply_egress_policy(policy).await {
+                        Ok(()) => {
+                            tracing::info!(
+                                %host_id,
+                                session_id = %s.session_id,
+                                sandbox_id = %s.sandbox_id,
+                                attempt,
+                                "survivor egress re-registered after host restart",
+                            );
+                            done = true;
+                            break;
+                        }
+                        Err(e) => tracing::debug!(
+                            %host_id,
+                            session_id = %s.session_id,
+                            sandbox_id = %s.sandbox_id,
+                            attempt,
+                            error = %e,
+                            "survivor egress re-push attempt failed",
+                        ),
+                    }
+                }
+                if !done {
+                    tracing::warn!(
+                        %host_id,
+                        session_id = %s.session_id,
+                        sandbox_id = %s.sandbox_id,
+                        attempts = ATTEMPTS,
+                        "survivor egress re-push exhausted its retries; survivor stays \
+                         egress-less (recover via evict_local → resume)",
+                    );
+                }
+            }
+        });
+    }
+
     tracing::info!(
         host_id = %req.host_id,
         host_addr = %req.host_addr,
@@ -730,10 +851,13 @@ pub async fn heartbeat(
     // ADR 0090: drive the documented remediation for quarantined
     // survivors (NBD rehydrate failed after a roll — VM possibly live,
     // disk unserved). Enqueue `evict_local` (full capture, no park) for
-    // each survivor the session still owns; `session_ops::enqueue`
-    // returns `Duplicate` for the re-adverts every 5s heartbeat carries,
-    // so this is idempotent. Pre-fix, nothing consumed the host's WARN
-    // and the teardown reconciler's orphan path SIGKILLed the VM.
+    // each survivor the session still owns. Dedup keys ONLY on the
+    // idempotency key (ADR 0079 finding #4 — active-state-scoped), so the
+    // re-adverts every 5s heartbeat carries MUST pass one; a key-less
+    // enqueue inserts a fresh queued row per heartbeat (ADR 0093: 423
+    // rows piled up behind one wedged evict in the 2026-07-13 incident).
+    // Pre-ADR-0090, nothing consumed the host's WARN and the teardown
+    // reconciler's orphan path SIGKILLed the VM.
     for q in &hb.quarantined_survivors {
         match state.services.meta.get_session(q.session_id).await {
             Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
@@ -745,8 +869,15 @@ pub async fn heartbeat(
                         "target": "idle",
                         "allow_park": false,
                         "nominated": false,
+                        // Quarantine flavor: the survivor's disk is unserved, so
+                        // the evict verb bounds each capture attempt and, on
+                        // budget exhaustion, destroys the crippled VM + falls
+                        // back to HostLost (rewind-to-checkpoint is the designed
+                        // blast radius; an unbounded retry loop locking the
+                        // user out is not).
+                        "quarantine": true,
                     }),
-                    None,
+                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
                 )
                 .await
                 {
@@ -869,7 +1000,24 @@ pub async fn heartbeat(
         if let (true, Some(row)) = (applied, &row) {
             let capture_phase = capture_job_stage_to_phase(report.stage);
             let warm_stage = report.progress.as_ref().and_then(|p| p.detail.as_deref());
-            let output_tail = report.progress.as_ref().and_then(|p| p.log_tail.as_deref());
+            // Empty-string tails must NOT reach the COALESCE mirror: the
+            // seed's dump/upload leg frames carry no hook output, and
+            // `COALESCE('', old)` takes '' — the 2026-07-14 dev-brain
+            // failure wiped the very hook tail the column exists to
+            // preserve (the diagnosis survived only in host logs).
+            let output_tail = report
+                .progress
+                .as_ref()
+                .and_then(|p| p.log_tail.as_deref())
+                .filter(|t| !t.is_empty());
+            // ADR 0088 addendum: the capture timeline → the (previously
+            // orphaned) `enable_jobs.warm_stages` column. Empty ⇒ None
+            // ⇒ COALESCE keeps the last-known timeline.
+            let warm_stages = report
+                .progress
+                .as_ref()
+                .filter(|p| !p.warm_stages.is_empty())
+                .and_then(|p| serde_json::to_value(&p.warm_stages).ok());
             if let Err(e) = state
                 .services
                 .meta
@@ -878,6 +1026,7 @@ pub async fn heartbeat(
                     capture_phase.map(|p| p.as_str()),
                     warm_stage,
                     output_tail,
+                    warm_stages.as_ref(),
                 )
                 .await
             {
@@ -1463,8 +1612,15 @@ pub async fn sandbox_ownership(
     State(state): State<SharedState>,
     Path((_host_id, session_id, sandbox_id)): Path<(HostId, SessionId, SandboxId)>,
 ) -> Result<Json<SandboxOwnershipResponse>, ApiError> {
+    // ADR 0092 hardening: a terminal row owns nothing, even if its
+    // `sandbox_id` column still carries the binding — a create that
+    // failed AFTER the VM spawned flips the session Failed and leans on
+    // the teardown reconciler to reap the live VM; answering
+    // `owned=true` here kept those orphans alive (and their guest
+    // memory pinned) indefinitely. Mirrors `session_owning_sandbox`'s
+    // non-terminal predicate.
     let owned = match state.services.meta.get_session(session_id).await {
-        Ok(s) => s.sandbox_id == Some(sandbox_id),
+        Ok(s) => s.sandbox_id == Some(sandbox_id) && !s.status.is_terminal(),
         Err(engram_core::MetaError::NotFound) => false,
         Err(e) => return Err(ApiError::Internal(format!("get_session: {e}"))),
     };
@@ -1582,6 +1738,35 @@ mod tests {
         }
     }
 
+    /// ADR 0092 hardening: a terminal session whose `sandbox_id` column
+    /// still carries the binding must answer `owned=false`. Before this,
+    /// a create that failed after the VM spawned (session flipped Failed,
+    /// binding never cleared) kept its orphan alive forever: the host's
+    /// teardown reconciler asked here, got `owned=true`, and never
+    /// counted an orphan strike.
+    #[tokio::test]
+    async fn sandbox_ownership_denies_terminal_sessions() {
+        let sid = engram_core::SessionId::new();
+        let sandbox = SandboxId::new();
+        for (status, want) in [
+            (SessionState::Active, true),
+            (SessionState::Idle, true),
+            (SessionState::Failed, false),
+            (SessionState::Completed, false),
+            (SessionState::Dead, false),
+        ] {
+            let (state, _meta, _tmp) =
+                build_state_for_session(session_with_status(sid, sandbox, status));
+            let Json(resp) = sandbox_ownership(
+                State(state),
+                Path((engram_core::HostId::new(), sid, sandbox)),
+            )
+            .await
+            .expect("handler");
+            assert_eq!(resp.owned, want, "status {status:?}: expected owned={want}");
+        }
+    }
+
     /// Issue #215: a heartbeat that OMITS `running_sandboxes_known`
     /// (pre-fix host-agent mid-roll) must deserialize to `true` so the
     /// coord keeps reconciling against its list — same behaviour as
@@ -1675,6 +1860,55 @@ mod tests {
         assert!(
             *meta.reconcile_probe_calls.lock() >= 1,
             "reconcile must run once the persist succeeds"
+        );
+    }
+
+    /// 2026-07-13 incident regression: the ADR 0090 quarantined-survivor
+    /// arm fires on EVERY 5s heartbeat, and `session_ops` dedup keys
+    /// ONLY on the idempotency key — a key-less enqueue inserts a fresh
+    /// queued row per heartbeat (423 piled up behind one wedged evict in
+    /// prod). Pin that re-adverts collapse to ONE keyed row. The seeded
+    /// running evict keeps the lane busy so the first advert's row stays
+    /// `queued` (never claimed/driven) and the second advert must dedup
+    /// against it.
+    #[tokio::test]
+    async fn quarantined_survivor_readverts_dedup_to_one_op() {
+        let host_id = HostId::new();
+        let sandbox_id = SandboxId::new();
+        let session_id = engram_core::SessionId::new();
+        let mut session = session_with_status(session_id, sandbox_id, SessionState::Active);
+        session.host_id = Some(host_id);
+        let (state, meta, _local) = build_state_for_session(session);
+        meta.ops
+            .seed_running(session_id, engram_core::types::session_op::OpKind::Evict);
+
+        let hb_json = serde_json::json!({
+            "capacity": { "total_mib": 1024, "used_mib": 0, "running_sandboxes": 1 },
+            "running_sandboxes": [sandbox_id],
+            "quarantined_survivors": [
+                { "sandbox_id": sandbox_id, "session_id": session_id },
+            ],
+        });
+        for tick in 0..2 {
+            let hb: HeartbeatRequest =
+                serde_json::from_value(hb_json.clone()).expect("deserialize heartbeat");
+            let result = heartbeat(State(state.clone()), Path(host_id), Json(hb)).await;
+            assert!(result.is_ok(), "heartbeat tick {tick}: {:?}", result.err());
+        }
+
+        let keyed: Vec<_> = meta
+            .ops
+            .all()
+            .into_iter()
+            .filter(|o| {
+                o.idempotency_key.as_deref()
+                    == Some(format!("adr0090-quarantine:{sandbox_id}").as_str())
+            })
+            .collect();
+        assert_eq!(
+            keyed.len(),
+            1,
+            "re-advertised quarantined survivor must dedup to one keyed evict op, got {keyed:#?}",
         );
     }
 

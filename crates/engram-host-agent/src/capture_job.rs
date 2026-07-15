@@ -113,6 +113,70 @@ fn stage_from_phase(phase: engram_core::types::CapturePhase) -> CaptureJobStage 
     }
 }
 
+/// ADR 0088 addendum: the synthetic timeline leg a progress frame
+/// belongs to. `Snapshot` frames are disambiguated by detail — the
+/// Miss+warm path emits `cold-base memory dump` / `cold-base upload`
+/// legs; the closing capture has no detail.
+fn capture_leg_name(progress: &CaptureProgress) -> String {
+    use engram_core::types::CapturePhase;
+    match progress.phase {
+        CapturePhase::Boot => "[capture] boot".to_string(),
+        CapturePhase::Warm => "[capture] warm hook".to_string(),
+        CapturePhase::Snapshot => match progress.detail.as_deref() {
+            Some(d) => format!("[capture] {d}"),
+            None => "[capture] final snapshot".to_string(),
+        },
+    }
+}
+
+/// Advance the capture-leg timeline (the `advance_materialize_stages`
+/// twin): a re-send of the open leg (keepalive) is a no-op; a new leg
+/// closes the open one — returned so the caller can record its
+/// duration — and opens the next.
+fn advance_capture_legs(
+    legs: &mut Vec<engram_core::types::WarmStageRecord>,
+    name: String,
+) -> Option<engram_core::types::WarmStageRecord> {
+    if let Some(open) = legs.last() {
+        if open.ended_at.is_none() && open.name == name {
+            return None; // keepalive of the open leg
+        }
+    }
+    let closed = close_open_capture_leg(legs);
+    legs.push(engram_core::types::WarmStageRecord {
+        name,
+        started_at: chrono::Utc::now(),
+        ended_at: None,
+        outcome: engram_core::types::WarmStageOutcome::Running,
+    });
+    closed
+}
+
+fn close_open_capture_leg(
+    legs: &mut [engram_core::types::WarmStageRecord],
+) -> Option<engram_core::types::WarmStageRecord> {
+    let open = legs.last_mut().filter(|l| l.ended_at.is_none())?;
+    open.ended_at = Some(chrono::Utc::now());
+    open.outcome = engram_core::types::WarmStageOutcome::Done;
+    Some(open.clone())
+}
+
+/// One `engram_capture_leg_seconds` sample per closed leg, labelled by
+/// a slug of the leg name (`[capture] cold-base upload` →
+/// `cold_base_upload`) — the aggregate view of where capture wall-time
+/// goes, the ADR 0088 addendum's before/after instrument.
+fn record_capture_leg(closed: &engram_core::types::WarmStageRecord) {
+    let Some(ended) = closed.ended_at else { return };
+    let secs = (ended - closed.started_at).as_seconds_f64().max(0.0);
+    let leg: String = closed
+        .name
+        .trim_start_matches("[capture] ")
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    metrics::histogram!(crate::metrics::CAPTURE_LEG_SECONDS, "leg" => leg).record(secs);
+}
+
 /// One job's live-execution bookkeeping — what lets a stale (lower-
 /// epoch) attempt be detected and cancelled the instant a fresher
 /// assignment arrives.
@@ -423,6 +487,14 @@ impl CaptureJobExecutor {
                 .await
         });
 
+        // ADR 0088 addendum: the capture timeline — one synthetic
+        // `[capture] …` leg per distinct progress frame (keepalive
+        // re-sends coalesce), each closed leg recorded to the
+        // `engram_capture_leg_seconds` histogram. The emitted
+        // `warm_stages` = these legs followed by the hook's own stage
+        // history (which every Warm frame carries in full).
+        let mut capture_legs: Vec<engram_core::types::WarmStageRecord> = Vec::new();
+        let mut hook_stages: Vec<engram_core::types::WarmStageRecord> = Vec::new();
         while let Some(progress) = progress_rx.recv().await {
             if let Some(sid) = progress.sandbox_id {
                 record.sandbox_id = Some(sid);
@@ -432,10 +504,20 @@ impl CaptureJobExecutor {
                     }
                 }
             }
+            if let Some(closed) =
+                advance_capture_legs(&mut capture_legs, capture_leg_name(&progress))
+            {
+                record_capture_leg(&closed);
+            }
+            if !progress.warm_stages.is_empty() {
+                hook_stages = progress.warm_stages.clone();
+            }
             record.stage = stage_from_phase(progress.phase);
             if let Err(e) = record.persist(&self.records_dir).await {
                 tracing::warn!(%job_id, error = %e, "capture job: failed to persist progress record");
             }
+            let mut warm_stages = capture_legs.clone();
+            warm_stages.extend(hook_stages.iter().cloned());
             self.reports.insert(
                 job_id,
                 CaptureJobReport {
@@ -445,6 +527,7 @@ impl CaptureJobExecutor {
                     progress: Some(CaptureJobProgress {
                         detail: progress.detail.clone(),
                         log_tail: Some(progress.output_tail.clone()),
+                        warm_stages,
                     }),
                     fc_snapshot_version: self.fc_snapshot_version.clone(),
                     terminal: None,
@@ -485,13 +568,36 @@ impl CaptureJobExecutor {
         if let Err(e) = record.persist(&self.records_dir).await {
             tracing::warn!(%job_id, error = %e, "capture job: failed to persist terminal record");
         }
+        // ADR 0088 addendum: a successful terminal closes the open
+        // capture leg (complete durations in the durable timeline) and
+        // carries the final timeline; a failed terminal leaves the open
+        // leg open — same abandoned-stage semantics as `warm_stages` —
+        // and carries it as-is so the timeline shows where it died.
+        let final_progress = {
+            if matches!(terminal, CaptureTerminalReport::Done { .. }) {
+                if let Some(closed) = close_open_capture_leg(&mut capture_legs) {
+                    record_capture_leg(&closed);
+                }
+            }
+            let mut warm_stages = capture_legs.clone();
+            warm_stages.extend(hook_stages.iter().cloned());
+            if warm_stages.is_empty() {
+                None
+            } else {
+                Some(CaptureJobProgress {
+                    detail: None,
+                    log_tail: None,
+                    warm_stages,
+                })
+            }
+        };
         self.reports.insert(
             job_id,
             CaptureJobReport {
                 job_id,
                 epoch,
                 stage: record.stage,
-                progress: None,
+                progress: final_progress,
                 fc_snapshot_version: self.fc_snapshot_version.clone(),
                 terminal: Some(terminal),
             },
@@ -617,6 +723,34 @@ mod tests {
             // Hold the "VM" open long enough for the test to observe the
             // live-sandbox exemption before completing.
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            // ADR 0088 addendum: a hook frame (carrying its own stage
+            // history) then the closing snapshot frame — the executor
+            // synthesizes `[capture]` legs from these transitions.
+            let _ = progress
+                .send(CaptureProgress {
+                    phase: engram_core::types::CapturePhase::Warm,
+                    sandbox_id: Some(id),
+                    warm_stage: Some("deps-up".into()),
+                    detail: None,
+                    output_tail: "hook output".into(),
+                    warm_stages: vec![engram_core::types::WarmStageRecord {
+                        name: "deps-up".into(),
+                        started_at: chrono::Utc::now(),
+                        ended_at: Some(chrono::Utc::now()),
+                        outcome: engram_core::types::WarmStageOutcome::Done,
+                    }],
+                })
+                .await;
+            let _ = progress
+                .send(CaptureProgress {
+                    phase: engram_core::types::CapturePhase::Snapshot,
+                    sandbox_id: Some(id),
+                    warm_stage: None,
+                    detail: None,
+                    output_tail: String::new(),
+                    warm_stages: Vec::new(),
+                })
+                .await;
             self.destroy(id).await?;
             Ok(engram_core::types::capture_job::CaptureJobResult {
                 snapshot: SnapshotMetadata {
@@ -684,6 +818,48 @@ mod tests {
             "the exemption must be cleared once the job finishes",
         );
         assert_eq!(backend.destroy_calls.load(Ordering::SeqCst), 1);
+    }
+
+    /// ADR 0088 addendum: the terminal Done report carries the capture
+    /// timeline — synthetic `[capture]` legs (all closed on success)
+    /// followed by the hook's own stage history.
+    #[tokio::test]
+    async fn terminal_report_carries_the_closed_capture_timeline() {
+        let backend = Arc::new(MockBackend {
+            create_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            last_destroyed: Mutex::new(None),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let executor = CaptureJobExecutor::new(backend, tmp.path().join("capture-jobs"), None);
+        let job_id = CaptureJobId::new();
+        executor.start(job_id, 1, spec("timeline-test"));
+        wait_for_terminal(&executor, job_id).await;
+
+        let report = executor
+            .reports
+            .get(&job_id)
+            .expect("terminal report")
+            .clone();
+        let stages = report
+            .progress
+            .expect("Done terminal must carry the timeline")
+            .warm_stages;
+        let names: Vec<&str> = stages.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "[capture] boot",
+                "[capture] warm hook",
+                "[capture] final snapshot",
+                "deps-up",
+            ],
+            "synthetic legs in frame order, hook stages appended"
+        );
+        assert!(
+            stages[..3].iter().all(|s| s.ended_at.is_some()),
+            "every synthetic leg must be closed on a Done terminal: {stages:?}"
+        );
     }
 
     /// Stale-epoch cancel: an assignment at a HIGHER epoch than what's

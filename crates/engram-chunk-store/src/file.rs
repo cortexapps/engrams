@@ -29,13 +29,49 @@ use crate::manifest::{ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHE
 use crate::store::ChunkStore;
 
 /// ADR 0039 item #19: bounded concurrency for the per-chunk GCS I/O in
-/// the re-chunk paths (`chunk_file`, `update_for_dirty_ranges_sparse`).
+/// the sparse re-chunk path (`update_for_dirty_ranges_sparse`).
 /// Chunk puts are content-addressed/idempotent and keyed by offset, so
 /// they're order-independent — we fan them out instead of awaiting one
 /// at a time (~16 ms/chunk serial). 32 sits well under a 10 Gbps host
 /// NIC's saturation at the 512 KiB memory / 16 MiB disk chunk sizes and
 /// below GCS per-object rate limits (mirrors the prefetch bound).
 const SPARSE_RECHUNK_CONCURRENCY: usize = 32;
+
+/// Where the wall-clock of a [`ChunkStore::chunk_file_into`] run went.
+/// The 2026-07-13 incident's full memory re-chunk was invisible in
+/// metrics (the enclosing `snapshot_finish_seconds` wraps it whole):
+/// per-phase timings let callers export a scan-vs-upload breakdown so
+/// a slow capture is diagnosable from the metrics endpoint instead of
+/// log archaeology.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ChunkFileStats {
+    /// Cumulative wall-time spent producing chunks from the source
+    /// file (reads + zero-checks; after the pipelined reader, time the
+    /// consumer spent waiting on the reader). When this dominates, the
+    /// re-chunk is scan-bound (storage tier / read path).
+    pub scan_seconds: f64,
+    /// Cumulative wall-time spent flushing chunk windows to the store
+    /// (hash + dedup HEAD + PUT). When this dominates, the re-chunk is
+    /// upload-bound (network / GCS).
+    pub flush_seconds: f64,
+    /// Total bytes read from the source file (the file length).
+    pub bytes_scanned: u64,
+    /// Non-zero chunks uploaded (zero-elided chunks never leave the
+    /// scan).
+    pub chunks_uploaded: u64,
+    /// Bytes across the uploaded chunks.
+    pub bytes_uploaded: u64,
+}
+
+/// ADR 0088 addendum: upload width for `chunk_file`'s streaming
+/// read→upload pipeline. The old stop-and-wait window (read 32, drain
+/// 32) capped effective GCS throughput at ~60-80 MiB/s on the enable
+/// path; a continuous `try_buffer_unordered` keeps the sequential NVMe
+/// reads feeding uploads with no drain stalls. Peak buffered RAM =
+/// width × chunk_size (1 GiB at 16 MiB disk chunks — fine on a host,
+/// bounded, and the host-global UploadBudget arbitrates the wire when
+/// other upload workloads run concurrently).
+const CHUNK_UPLOAD_CONCURRENCY: usize = 64;
 
 impl ChunkStore {
     /// Walk a file in `chunk_size` blocks, PUT each non-zero block
@@ -57,6 +93,7 @@ impl ChunkStore {
     ) -> Result<Manifest> {
         self.chunk_file_into(path, kind, chunk_size, None, None)
             .await
+            .map(|(manifest, _)| manifest)
     }
 
     /// Like [`Self::chunk_file`], but also write-throughs each produced
@@ -77,9 +114,9 @@ impl ChunkStore {
         // zero-elided windows too, so callers get a monotone fraction
         // with a known denominator (the enable UI's progress bar).
         progress: Option<&(dyn Fn(u64, u64) + Send + Sync)>,
-    ) -> Result<Manifest> {
+    ) -> Result<(Manifest, ChunkFileStats)> {
         let chunk_size = chunk_size.unwrap_or_else(|| kind.default_chunk_size());
-        let mut file = fs::File::open(path).await?;
+        let file = fs::File::open(path).await?;
         let meta = file.metadata().await?;
         let total_bytes = meta.len();
         let windows_total = total_bytes.div_ceil(chunk_size);
@@ -95,91 +132,138 @@ impl ChunkStore {
             annotations: serde_json::Value::Null,
         };
 
-        // ADR 0039 item #19: the per-chunk GCS put dominates here
-        // (~16 ms each), so awaiting one chunk at a time made an 8 GiB
-        // memory re-chunk (~16 K × 512 KiB) take minutes. The reads are
-        // cheap local I/O off a single handle (kept sequential), but the
-        // puts are content-addressed/idempotent and order-independent —
-        // so we read a window of up to `SPARSE_RECHUNK_CONCURRENCY`
-        // non-zero chunks into owned buffers, fan their puts out with
-        // `buffer_unordered`, then drain the window before reading the
-        // next one. This bounds resident RAM at concurrency × chunk_size
-        // (no whole-image buffering) while still overlapping the network.
-        let mut buf = vec![0u8; chunk_size as usize];
-        let mut offset: u64 = 0;
-        let mut window: Vec<(u64, Bytes)> = Vec::with_capacity(SPARSE_RECHUNK_CONCURRENCY);
-        while offset < total_bytes {
-            let want = chunk_size.min(total_bytes - offset) as usize;
-            let slice = &mut buf[..want];
-            file.read_exact(slice).await?;
+        // Merged pipeline (incident 2026-07-13 + ADR 0088 addendum):
+        //
+        // - SCAN side (#662): a dedicated blocking reader streams the
+        //   file in large sequential blocks (kernel readahead engages —
+        //   the old per-512 KiB `tokio::fs` round-trips capped scans at
+        //   ~45 MB/s on a network PD), zero-checks on the blocking
+        //   thread, and feeds non-zero `(offset, bytes)` chunks through
+        //   a byte-bounded channel.
+        // - UPLOAD side (ADR 0088 addendum): a continuous pipeline of up
+        //   to CHUNK_UPLOAD_CONCURRENCY in-flight puts. The previous
+        //   window shape (fill 32, drain 32) let every window's slowest
+        //   put stall 31 idle peers; here a completed put's slot refills
+        //   immediately from the channel, so wall-clock is
+        //   ~max(scan, upload) with no drain stalls. Resident RAM stays
+        //   bounded: in-flight puts × chunk_size, plus the channel's
+        //   byte budget, plus one read block.
+        //
+        // Stats attribution: consumer time blocked on the reader with
+        // NOTHING in flight = scan-bound (`scan_seconds`); consumer time
+        // awaiting a put completion = upload-bound (`flush_seconds`).
+        // Mixed phases attribute to the side actually being waited on,
+        // preserving the which-side-dominates diagnostic.
+        use futures::stream::{FuturesUnordered, StreamExt};
 
-            if !is_all_zero(slice) {
-                window.push((offset, Bytes::copy_from_slice(slice)));
+        let mut stats = ChunkFileStats {
+            bytes_scanned: total_bytes,
+            ..Default::default()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<(u64, Bytes)>>(
+            rechunk_channel_capacity(chunk_size),
+        );
+        let std_file = file.into_std().await;
+        tokio::task::spawn_blocking(move || {
+            read_nonzero_chunks(std_file, total_bytes, chunk_size, &tx)
+        });
+
+        let put_one = |offset: u64, bytes: Bytes| {
+            let store = self.clone();
+            let cache = cache.cloned();
+            async move {
+                let hash = store.put_chunk(&bytes).await?;
+                // ADR 0039 (sticky-everywhere): write-through so the
+                // capturing host keeps its chunk on local NVMe and never
+                // re-fetches its own write from GCS. Best-effort — the
+                // chunk is durable in the store regardless.
+                if let Some(cache) = &cache {
+                    if let Err(e) = cache.put(hash, &bytes).await {
+                        tracing::warn!(
+                            %hash,
+                            error = %e,
+                            "chunk_file write-through to local cache failed (chunk durable in store)",
+                        );
+                    }
+                }
+                Ok::<_, crate::error::ChunkStoreError>(ChunkRef { offset, hash })
             }
-            offset += want as u64;
+        };
 
-            if window.len() == SPARSE_RECHUNK_CONCURRENCY {
-                self.flush_chunk_window(std::mem::take(&mut window), &mut manifest, cache)
-                    .await?;
-                if let Some(report) = progress {
-                    report(offset.div_ceil(chunk_size), windows_total);
+        let mut inflight = FuturesUnordered::new();
+        let mut refs: Vec<ChunkRef> = Vec::new();
+        let mut done_reading = false;
+        let mut scanned_hi: u64 = 0;
+        let mut completed: u64 = 0;
+        let issue = |offset: u64,
+                     bytes: Bytes,
+                     stats: &mut ChunkFileStats,
+                     scanned_hi: &mut u64,
+                     inflight: &mut FuturesUnordered<_>| {
+            stats.chunks_uploaded += 1;
+            stats.bytes_uploaded += bytes.len() as u64;
+            *scanned_hi = offset + bytes.len() as u64;
+            inflight.push(put_one(offset, bytes));
+        };
+        while !done_reading || !inflight.is_empty() {
+            // Top up the in-flight set without blocking.
+            while !done_reading && inflight.len() < CHUNK_UPLOAD_CONCURRENCY {
+                match rx.try_recv() {
+                    Ok(Ok((offset, bytes))) => {
+                        issue(offset, bytes, &mut stats, &mut scanned_hi, &mut inflight)
+                    }
+                    Ok(Err(e)) => return Err(e.into()),
+                    Err(tokio::sync::mpsc::error::TryRecvError::Empty) => break,
+                    Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                        done_reading = true;
+                    }
                 }
             }
-        }
-        if !window.is_empty() {
-            self.flush_chunk_window(window, &mut manifest, cache)
-                .await?;
+            if inflight.is_empty() {
+                if done_reading {
+                    break;
+                }
+                // Starved: nothing to upload, block on the reader.
+                let scan_start = std::time::Instant::now();
+                let item = rx.recv().await;
+                stats.scan_seconds += scan_start.elapsed().as_secs_f64();
+                match item {
+                    Some(Ok((offset, bytes))) => {
+                        issue(offset, bytes, &mut stats, &mut scanned_hi, &mut inflight)
+                    }
+                    Some(Err(e)) => return Err(e.into()),
+                    None => done_reading = true,
+                }
+            } else {
+                // Await one completion; its slot refills next iteration.
+                let flush_start = std::time::Instant::now();
+                let done_put = inflight.next().await.expect("non-empty inflight");
+                stats.flush_seconds += flush_start.elapsed().as_secs_f64();
+                refs.push(done_put?);
+                completed += 1;
+                if completed.is_multiple_of(SPARSE_RECHUNK_CONCURRENCY as u64) {
+                    if let Some(report) = progress {
+                        // The issued high-water lags the reader's scan
+                        // position by the channel depth — still a
+                        // monotone fraction of windows_total (the
+                        // reader sends in offset order).
+                        report(
+                            scanned_hi.div_ceil(chunk_size).min(windows_total),
+                            windows_total,
+                        );
+                    }
+                }
+            }
         }
         if let Some(report) = progress {
             report(windows_total, windows_total);
         }
-        // Windows are read + appended in offset order and each window is
-        // internally re-sorted, so `manifest.chunks` stays offset-sorted.
-
-        Ok(manifest)
-    }
-
-    /// Put a window of non-zero `(offset, bytes)` chunks concurrently
-    /// (bounded by [`SPARSE_RECHUNK_CONCURRENCY`]) and append the
-    /// resulting `ChunkRef`s to `manifest` in offset order. Used by
-    /// [`Self::chunk_file`] to overlap the per-chunk GCS puts.
-    async fn flush_chunk_window(
-        &self,
-        window: Vec<(u64, Bytes)>,
-        manifest: &mut Manifest,
-        cache: Option<&ChunkCache>,
-    ) -> Result<()> {
-        use futures::stream::{self, StreamExt, TryStreamExt};
-        let mut refs: Vec<ChunkRef> = stream::iter(window)
-            .map(|(offset, bytes)| {
-                let store = self.clone();
-                let cache = cache.cloned();
-                async move {
-                    let hash = store.put_chunk(&bytes).await?;
-                    // ADR 0039 (sticky-everywhere): write-through so the
-                    // capturing host keeps its chunk on local NVMe and never
-                    // re-fetches its own write from GCS. Best-effort — the
-                    // chunk is durable in the store regardless.
-                    if let Some(cache) = &cache {
-                        if let Err(e) = cache.put(hash, &bytes).await {
-                            tracing::warn!(
-                                %hash,
-                                error = %e,
-                                "chunk_file write-through to local cache failed (chunk durable in store)",
-                            );
-                        }
-                    }
-                    Ok::<_, crate::error::ChunkStoreError>(ChunkRef { offset, hash })
-                }
-            })
-            .buffer_unordered(SPARSE_RECHUNK_CONCURRENCY)
-            .try_collect()
-            .await?;
-        // `buffer_unordered` yields in completion order — restore the
-        // offset ordering the manifest invariant requires.
+        // Puts complete out of order — restore the offset ordering the
+        // manifest invariant requires.
         refs.sort_by_key(|c| c.offset);
-        manifest.chunks.extend(refs);
-        Ok(())
+        manifest.chunks = refs;
+
+        Ok((manifest, stats))
     }
 
     /// ADR 0038 / 0039: produce the next full-image manifest from a
@@ -521,6 +605,95 @@ fn is_all_zero(buf: &[u8]) -> bool {
     buf.iter().all(|&b| b == 0)
 }
 
+/// Target size of one sequential read in [`read_nonzero_chunks`].
+/// Large enough that the kernel's readahead pipeline stays engaged on a
+/// network PD (where per-request latency, not bandwidth, capped the old
+/// chunk-at-a-time scan at ~45 MB/s); small enough that one in-flight
+/// block plus the channel backlog stays tens-of-MiB resident.
+const RECHUNK_READ_BLOCK_BYTES: u64 = 8 * 1024 * 1024;
+
+/// Byte budget for chunks queued between the reader and the consumer —
+/// the pipeline's read-ahead, ON TOP of the in-flight flush window
+/// (`SPARSE_RECHUNK_CONCURRENCY` chunks, pre-existing ADR 0039
+/// behavior) and one read block. An item-count bound alone would let
+/// 16 MiB DISK chunks (rootfs materialization) queue ~1 GiB per
+/// operation and OOM the host-agent under concurrent materializes;
+/// deriving the capacity from bytes keeps the added buffering flat
+/// across chunk sizes (64 MiB), while 512 KiB memory chunks still get
+/// deep-enough read-ahead to hide PD latency.
+const RECHUNK_CHANNEL_BYTE_BUDGET: u64 = 64 * 1024 * 1024;
+
+/// Channel capacity (in chunks) for [`ChunkStore::chunk_file_into`]'s
+/// reader→consumer queue: the byte budget divided by the chunk size,
+/// clamped to [1, 2 × SPARSE_RECHUNK_CONCURRENCY].
+fn rechunk_channel_capacity(chunk_size: u64) -> usize {
+    usize::try_from(RECHUNK_CHANNEL_BYTE_BUDGET / chunk_size.max(1))
+        .unwrap_or(1)
+        .clamp(1, SPARSE_RECHUNK_CONCURRENCY * 2)
+}
+
+/// Blocking-side reader for [`ChunkStore::chunk_file_into`]: stream the
+/// first `total_bytes` of `file` in large sequential reads (a multiple
+/// of `chunk_size`), split each block into `chunk_size` pieces,
+/// zero-check on this thread, and send the non-zero `(offset, bytes)`
+/// chunks (each an owned copy — the shared read block is reused, and
+/// per-chunk copies keep a mostly-zero block from pinning its whole
+/// buffer in the channel). Terminates when the consumer drops the
+/// receiver (upload error / caller cancelled): `blocking_send` fails
+/// and the thread exits. A short read before `total_bytes` is an error
+/// (the staged snapshot files this scans are immutable and
+/// fully-written).
+fn read_nonzero_chunks(
+    mut file: std::fs::File,
+    total_bytes: u64,
+    chunk_size: u64,
+    tx: &tokio::sync::mpsc::Sender<std::io::Result<(u64, Bytes)>>,
+) {
+    use std::io::Read;
+    let chunks_per_block = (RECHUNK_READ_BLOCK_BYTES / chunk_size).max(1);
+    let block_bytes = chunks_per_block * chunk_size;
+    let mut buf = vec![0u8; block_bytes as usize];
+    let mut offset: u64 = 0;
+    while offset < total_bytes {
+        let want = block_bytes.min(total_bytes - offset) as usize;
+        let mut filled = 0usize;
+        while filled < want {
+            match file.read(&mut buf[filled..want]) {
+                Ok(0) => {
+                    let _ = tx.blocking_send(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!(
+                            "file truncated at {} of {total_bytes} bytes",
+                            offset + filled as u64
+                        ),
+                    )));
+                    return;
+                }
+                Ok(n) => filled += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    let _ = tx.blocking_send(Err(e));
+                    return;
+                }
+            }
+        }
+        let mut pos = 0usize;
+        while pos < want {
+            let len = (chunk_size as usize).min(want - pos);
+            let slice = &buf[pos..pos + len];
+            if !is_all_zero(slice)
+                && tx
+                    .blocking_send(Ok((offset + pos as u64, Bytes::copy_from_slice(slice))))
+                    .is_err()
+            {
+                return;
+            }
+            pos += len;
+        }
+        offset += want as u64;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -533,6 +706,107 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
         (ChunkStore::new(blob), dir)
+    }
+
+    /// The pipelined reader surfaces a short read as `UnexpectedEof`
+    /// instead of silently producing a truncated manifest — `chunk_file`
+    /// snapshots the length up front and the staged files it scans are
+    /// immutable, so a mismatch is corruption, not a race to tolerate.
+    #[tokio::test]
+    async fn reader_truncation_surfaces_unexpected_eof() {
+        let work = tempfile::tempdir().unwrap();
+        let src = work.path().join("short.bin");
+        fs::write(&src, vec![7u8; 1024]).await.unwrap();
+
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        let file = std::fs::File::open(&src).unwrap();
+        // Claim the file is longer than it is: the reader must error at
+        // the boundary rather than hand back fewer bytes.
+        tokio::task::spawn_blocking(move || read_nonzero_chunks(file, 2048, 512, &tx));
+
+        let mut saw_err = false;
+        while let Some(item) = rx.recv().await {
+            match item {
+                Ok((offset, bytes)) => assert!(offset + bytes.len() as u64 <= 1024),
+                Err(e) => {
+                    assert_eq!(e.kind(), std::io::ErrorKind::UnexpectedEof);
+                    saw_err = true;
+                }
+            }
+        }
+        assert!(saw_err, "truncation must surface as an Err item");
+    }
+
+    /// An upload failure mid-scan must propagate out of `chunk_file`
+    /// promptly: the consumer returns `Err`, dropping the channel
+    /// receiver, and the blocked reader thread exits on its next
+    /// `blocking_send` — no hang, no detached reader spinning.
+    #[tokio::test]
+    async fn upload_error_propagates_without_hanging() {
+        let blob_dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> =
+            Arc::new(LocalBlobStorage::new(blob_dir.path().join("missing")));
+        let s = ChunkStore::new(blob);
+        // Parent exists but the store root is a FILE, so every put's
+        // create-under-root fails deterministically (works as root too,
+        // unlike a chmod-based fixture).
+        std::fs::write(blob_dir.path().join("missing"), b"not a dir").unwrap();
+
+        let work = tempfile::tempdir().unwrap();
+        let src = work.path().join("src.bin");
+        // All-ones so every chunk is non-zero and the reader outpaces
+        // the failing uploads (forcing it to park on the full channel).
+        fs::write(&src, vec![1u8; 4 * 1024 * 1024]).await.unwrap();
+
+        let res = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            s.chunk_file(&src, ManifestKind::Memory, Some(64 * 1024)),
+        )
+        .await
+        .expect("chunk_file must not hang after an upload error");
+        assert!(res.is_err(), "upload failure must propagate");
+    }
+
+    /// The reader→consumer queue is bounded by BYTES, not items — a
+    /// flat item count let production 16 MiB disk chunks (rootfs
+    /// materialization) queue ~1 GiB per operation.
+    #[test]
+    fn rechunk_channel_capacity_is_byte_bounded() {
+        // 512 KiB memory chunks: budget allows 128, clamped to 64 —
+        // deep read-ahead, ≤ 32 MiB queued.
+        assert_eq!(
+            super::rechunk_channel_capacity(512 * 1024),
+            SPARSE_RECHUNK_CONCURRENCY * 2
+        );
+        // 16 MiB disk chunks: 4 × 16 MiB = the 64 MiB budget.
+        assert_eq!(super::rechunk_channel_capacity(16 * 1024 * 1024), 4);
+        // A chunk bigger than the whole budget still gets a slot.
+        assert_eq!(super::rechunk_channel_capacity(256 * 1024 * 1024), 1);
+    }
+
+    /// `ChunkFileStats` accounting matches the manifest the same call
+    /// produced (Fix B feeds these into the re-chunk histogram —
+    /// mislabeled stats would misdiagnose the next slow capture).
+    #[tokio::test]
+    async fn chunk_file_stats_match_manifest() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let src = work.path().join("src.bin");
+        let cs = 512 * 1024u64;
+        // Chunks: [non-zero][zero][non-zero][short non-zero tail].
+        let mut data = vec![0u8; (3 * cs + 100) as usize];
+        data[..cs as usize].fill(3);
+        data[(2 * cs) as usize..].fill(5);
+        fs::write(&src, &data).await.unwrap();
+
+        let (manifest, stats) = s
+            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), None, None)
+            .await
+            .unwrap();
+        assert_eq!(manifest.chunks.len(), 3);
+        assert_eq!(stats.chunks_uploaded, 3);
+        assert_eq!(stats.bytes_scanned, data.len() as u64);
+        assert_eq!(stats.bytes_uploaded, 2 * cs + 100);
     }
 
     #[tokio::test]
@@ -1136,6 +1410,126 @@ mod tests {
         let dest = work.path().join("dest.bin");
         s.materialize_to_file(&m, &dest).await.unwrap();
         assert_eq!(fs::read(&dest).await.unwrap(), data);
+    }
+
+    /// Progress contract under the streaming pipeline (ADR 0088
+    /// addendum): nondecreasing `done`, constant denominator, final
+    /// call is exactly (total, total).
+    #[tokio::test]
+    async fn chunk_file_progress_is_monotone_with_fixed_denominator() {
+        let (s, _d) = store().await;
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+        let n_chunks = CHUNK_UPLOAD_CONCURRENCY * 2 + 9;
+        let mut data = vec![0u8; n_chunks * cs as usize];
+        for c in 0..n_chunks {
+            data[c * cs as usize..(c + 1) * cs as usize].fill(((c % 251) + 1) as u8);
+        }
+        // Two zero windows mixed in: they must count toward `done`.
+        data[3 * cs as usize..4 * cs as usize].fill(0);
+        data[70 * cs as usize..71 * cs as usize].fill(0);
+        let src = work.path().join("big.bin");
+        fs::write(&src, &data).await.unwrap();
+
+        let calls: std::sync::Mutex<Vec<(u64, u64)>> = std::sync::Mutex::new(Vec::new());
+        let report = |done: u64, total: u64| {
+            calls.lock().unwrap().push((done, total));
+        };
+        let (m, _stats) = s
+            .chunk_file_into(&src, ManifestKind::Memory, Some(cs), None, Some(&report))
+            .await
+            .unwrap();
+        assert_eq!(m.chunks.len(), n_chunks - 2);
+
+        let calls = calls.lock().unwrap().clone();
+        assert!(!calls.is_empty());
+        let total = n_chunks as u64;
+        let mut prev = 0;
+        for (done, t) in &calls {
+            assert_eq!(*t, total, "denominator must never change");
+            assert!(*done >= prev, "done must be nondecreasing: {calls:?}");
+            prev = *done;
+        }
+        assert_eq!(*calls.last().unwrap(), (total, total));
+    }
+
+    /// The pipeline must bound in-flight puts at
+    /// CHUNK_UPLOAD_CONCURRENCY — pull-based backpressure, not
+    /// unbounded fan-out.
+    #[tokio::test]
+    async fn chunk_file_bounds_in_flight_puts() {
+        use engram_core::traits::{BlobObjectMeta, ByteStream};
+        use engram_core::BlobError;
+        use std::result::Result as StdResult;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Blob wrapper with a high-water gauge on concurrent puts.
+        struct GaugedBlob {
+            inner: Arc<dyn BlobStorage>,
+            live: AtomicUsize,
+            high_water: AtomicUsize,
+        }
+        #[async_trait::async_trait]
+        impl BlobStorage for GaugedBlob {
+            async fn put_streaming(
+                &self,
+                key: &str,
+                body: ByteStream,
+            ) -> StdResult<u64, BlobError> {
+                let live = self.live.fetch_add(1, Ordering::SeqCst) + 1;
+                self.high_water.fetch_max(live, Ordering::SeqCst);
+                // Hold the slot briefly so overlap is observable.
+                tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+                let r = self.inner.put_streaming(key, body).await;
+                self.live.fetch_sub(1, Ordering::SeqCst);
+                r
+            }
+            async fn get_streaming(&self, key: &str) -> StdResult<ByteStream, BlobError> {
+                self.inner.get_streaming(key).await
+            }
+            async fn head(&self, key: &str) -> StdResult<BlobObjectMeta, BlobError> {
+                self.inner.head(key).await
+            }
+            async fn delete(&self, key: &str) -> StdResult<(), BlobError> {
+                self.inner.delete(key).await
+            }
+            async fn list_prefix(&self, prefix: &str) -> StdResult<Vec<String>, BlobError> {
+                self.inner.list_prefix(prefix).await
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let gauged = Arc::new(GaugedBlob {
+            inner: Arc::new(LocalBlobStorage::new(dir.path().to_path_buf())),
+            live: AtomicUsize::new(0),
+            high_water: AtomicUsize::new(0),
+        });
+        let s = ChunkStore::new(gauged.clone() as Arc<dyn BlobStorage>);
+
+        let work = tempfile::tempdir().unwrap();
+        let cs: u64 = 4096;
+        let n_chunks = CHUNK_UPLOAD_CONCURRENCY * 3;
+        let mut data = vec![0u8; n_chunks * cs as usize];
+        for c in 0..n_chunks {
+            data[c * cs as usize..(c + 1) * cs as usize].fill(((c % 251) + 1) as u8);
+        }
+        let src = work.path().join("big.bin");
+        fs::write(&src, &data).await.unwrap();
+
+        let m = s
+            .chunk_file(&src, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+        assert_eq!(m.chunks.len(), n_chunks);
+        let high = gauged.high_water.load(Ordering::SeqCst);
+        assert!(
+            high <= CHUNK_UPLOAD_CONCURRENCY,
+            "in-flight puts must stay ≤ {CHUNK_UPLOAD_CONCURRENCY}, saw {high}"
+        );
+        assert!(
+            high > 1,
+            "puts must actually overlap (saw high-water {high})"
+        );
     }
 
     /// The sparse re-chunk fans its per-dirty-chunk get/overlay/put out

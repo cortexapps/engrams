@@ -527,6 +527,12 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         # Must be listed here: the host-agent runs under sudo
         # --preserve-env=<these keys>, which scrubs unlisted vars.
         'ENGRAM_FC_UFFD_BASE_DIR': env_or('ENGRAM_FC_UFFD_BASE_DIR', ''),
+        # ADR 0092: fresh-create File override + memfile pin + lazy base-shm
+        # (all default to today's behavior; the sudo preserve-list is
+        # auto-derived from these keys).
+        'ENGRAM_FC_FRESH_RESTORE_MODE': env_or('ENGRAM_FC_FRESH_RESTORE_MODE', ''),
+        'ENGRAM_FC_BASE_MEMFILE_PIN': env_or('ENGRAM_FC_BASE_MEMFILE_PIN', ''),
+        'ENGRAM_FC_BASE_SHM_MODE': env_or('ENGRAM_FC_BASE_SHM_MODE', ''),
         # gRPC plumbing — coord dials advertise, host-agent listens on
         # bind. Same machine in dev, so loopback works for both.
         'ENGRAM_GRPC_LISTEN_ADDR': '127.0.0.1:' + grpc_port,

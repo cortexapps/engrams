@@ -300,6 +300,13 @@ async fn main() -> Result<(), HostAgentError> {
         .await
         .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;
 
+    // ADR 0088 addendum: ONE host-global upload budget shared by every
+    // ChunkStore this process builds — materialize chunking, capture
+    // memory-seed/diff chunking, and the NBD disk flush all acquire
+    // from the same FIFO pool, so concurrent bulk uploads share the
+    // NIC instead of stacking on it (`ENGRAM_UPLOAD_BUDGET_PERMITS`).
+    let upload_budget = engram_chunk_store::UploadBudget::from_env_or_default();
+
     // ADR 0009 §6: when the backend is FC, keep a typed Arc on the
     // side so the host-agent's startup live-attach pass can call
     // `reattach_sandbox` (the trait can't downcast `dyn`). `None`
@@ -377,6 +384,10 @@ async fn main() -> Result<(), HostAgentError> {
             // to the chunk-native UFFD handler (lazy memory, no memory.bin
             // materialize). Defaults to File.
             fc_cfg.restore_mode = engram_sandbox_firecracker::restore_mode_from_env();
+            // ADR 0092: fresh-create backend override (File-unpinned
+            // density path on substrate hosts). Read once at startup.
+            fc_cfg.fresh_restore_override =
+                engram_sandbox_firecracker::fresh_restore_mode_from_env();
             // Point the UFFD handler's READ-ONLY view at the SAME
             // chunk cache the PooledBackend's restore-prefetch warms
             // (`chunk-cache`, see below). ADR 0075: the handler never
@@ -458,7 +469,8 @@ async fn main() -> Result<(), HostAgentError> {
                 // of None, and the coordinator's HEAD-verify rejects the
                 // enable ("chunked manifests failed HEAD-verify"). Shares
                 // the same `blob` Arc as the PooledBackend wrapper below.
-                let cs = engram_chunk_store::ChunkStore::new(blob.clone());
+                let cs = engram_chunk_store::ChunkStore::new(blob.clone())
+                    .with_upload_budget(upload_budget.clone());
                 Arc::new(
                     engram_sandbox_vz::VzBackend::new(cli.work_dir.clone(), vz_cfg)
                         .map_err(|e| HostAgentError::Config(format!("vz backend: {e}")))?
@@ -514,8 +526,9 @@ async fn main() -> Result<(), HostAgentError> {
     // (`work_dir/chunk-cache`) as a write-through tier, so a chunk this host
     // produces — e.g. an idle-eviction re-chunk of divergent memory — is
     // served locally on the next resume instead of re-fetched from GCS.
-    let chunk_store =
-        engram_chunk_store::ChunkStore::new(blob).with_chunk_cache(chunk_cache.clone());
+    let chunk_store = engram_chunk_store::ChunkStore::new(blob)
+        .with_chunk_cache(chunk_cache.clone())
+        .with_upload_budget(upload_budget);
 
     // ADR 0075: spawn the substrate populate server now both halves
     // exist. The uffd base dir mirrors the FC config default (env

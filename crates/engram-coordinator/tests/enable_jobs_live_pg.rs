@@ -204,15 +204,21 @@ async fn progress_state_failure_and_retry_round_trip() {
     // `mirror_capture_progress_to_enable_job` (the heartbeat reconcile's
     // own verb), so the retry-reset assertion further down still has a
     // prior attempt's progress actually present to prove it gets
-    // cleared, not just vacuously absent. The new verb never populates
-    // `warm_stage_started_at`/`warm_stages` (P1b's lossier
-    // `CaptureJobProgress` wire shape carries no stage HISTORY, only the
-    // current phase/stage/tail), so this test no longer asserts on them.
+    // cleared, not just vacuously absent. ADR 0088 addendum: the verb
+    // now ALSO mirrors the capture timeline into `warm_stages`
+    // (COALESCE — a stage-less report keeps the last-known timeline).
+    let timeline = serde_json::json!([{
+        "name": "[capture] boot",
+        "started_at": chrono::Utc::now(),
+        "ended_at": chrono::Utc::now(),
+        "outcome": "done",
+    }]);
     meta.mirror_capture_progress_to_enable_job(
         job.id,
         Some(engram_core::types::CapturePhase::Warm.as_str()),
         Some("install-deps"),
         Some("some hook output"),
+        Some(&timeline),
     )
     .await
     .expect("stamp capture progress");
@@ -223,6 +229,21 @@ async fn progress_state_failure_and_retry_round_trip() {
     );
     assert_eq!(got.warm_stage.as_deref(), Some("install-deps"));
     assert_eq!(got.output_tail.as_deref(), Some("some hook output"));
+    assert_eq!(got.warm_stages.len(), 1, "capture timeline mirrored");
+    assert_eq!(got.warm_stages[0].name, "[capture] boot");
+
+    // A follow-up report with NO timeline keeps the last-known one.
+    meta.mirror_capture_progress_to_enable_job(
+        job.id,
+        Some(engram_core::types::CapturePhase::Snapshot.as_str()),
+        None,
+        None,
+        None,
+    )
+    .await
+    .expect("stage-less mirror");
+    let got = meta.get_enable_job(job.id).await.unwrap().unwrap();
+    assert_eq!(got.warm_stages.len(), 1, "COALESCE keeps the timeline");
 
     // Progress: total stamped once, done advances.
     meta.update_enable_job_progress(job.id, "pod-a", 0, Some(625))

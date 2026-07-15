@@ -6,8 +6,11 @@
 //!      chunk in the host-local NVMe cache (no blob-store PUT).
 //!   2. `migration_abort` resumes the guest in place with ZERO loss —
 //!      markers written before the capture survive, the guest accepts
-//!      new exec, and the next checkpoint diffs on the intact chain
-//!      (the aborted capture's unpublished v+1 ref is safely re-minted).
+//!      new exec, and the next checkpoint is a FULL on a fresh lineage:
+//!      the capture's diff consumed the KVM dirty bitmap while its
+//!      manifest stayed unpublished (durability is the dest's), so the
+//!      chain is retired at capture — a post-abort diff against the old
+//!      head would silently omit the pre-capture dirty pages.
 //!   3. The FULL same-host teleport loop over real gRPC (ADR 0045 C1
 //!      PR3): capture VM2 -> destination-style restore with a
 //!      `migration_source` rider pulls the export over a live tonic
@@ -202,19 +205,23 @@ async fn migration_capture_freezes_abort_resumes_commit_destroys() {
         .expect("abort");
     let check = exec(&pooled, vm, "sha256sum /dev/shm/marker1 | cut -d' ' -f1").await;
     assert_eq!(check.trim(), sum, "marker survives the aborted move");
-    // The chain is intact: the next checkpoint diffs and re-mints the
-    // never-published v+1 without a version conflict.
+    // The capture's diff consumed the KVM dirty bitmap and its v+1
+    // manifest was never published (the dest's catch-up owns that), so
+    // the chain was retired at capture: the post-abort checkpoint MUST
+    // be a Full on a fresh lineage. A diff re-minting m1's v+1 here
+    // would silently omit every page dirtied before the capture (the
+    // marker!) — the manifest would restore pre-marker bytes at those
+    // pages while claiming the post-marker cut.
     let ckpt2 = pooled
         .checkpoint_sandbox(vm)
         .await
         .expect("post-abort checkpoint");
     let m2 = ckpt2.memory_manifest.expect("post-abort manifest");
-    assert_eq!(m2.manifest_id, m1.manifest_id);
-    assert_eq!(
-        m2.version,
-        m1.version + 1,
-        "aborted capture's ref re-minted cleanly"
+    assert_ne!(
+        m2.manifest_id, m1.manifest_id,
+        "post-abort capture must NOT diff on the retired chain"
     );
+    assert_eq!(m2.version, 1, "fresh Full lineage after an aborted move");
     pooled.destroy(vm).await.expect("destroy vm1");
 
     // ---- 5. The full same-host teleport loop over real gRPC ----

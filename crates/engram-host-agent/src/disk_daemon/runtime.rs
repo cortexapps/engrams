@@ -572,6 +572,14 @@ pub async fn attach_manifest(
     // resume / recovery, which attach the session's own forked id.
     fork_at_attach: bool,
 ) -> Result<NbdSandboxState, NbdRuntimeError> {
+    // The attach-time manifest id becomes the kernel's recorded
+    // `/sys/block/nbdN/backend` — INFORMATIONAL ONLY. It must never be
+    // treated as the device's identity: the manifest identity legitimately
+    // changes over the device's life (the ADR 0077 fork publishes flushes
+    // under a private id this connect-time value never sees), which is why
+    // [`reattach_manifest`] echoes the kernel's own recorded value instead
+    // of re-deriving one (2026-07-13 dfa0face incident: re-deriving from
+    // the live ref EINVAL'd every forked-chain survivor's rehydrate).
     let backend_id = disk_manifest_ref.manifest_id.to_string();
     let backend =
         ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await?;
@@ -628,7 +636,33 @@ pub async fn reattach_manifest(
     slot: NbdSlot,
     threshold_bytes: u64,
 ) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
-    let backend_id = disk_manifest_ref.manifest_id.to_string();
+    // The kernel strcmp-verifies `NBD_ATTR_BACKEND_IDENTIFIER` against the
+    // CONNECT-time value at RECONFIGURE (and REQUIRES one when the device
+    // has it recorded) — but the connect-time value is a manifest id and
+    // manifest identity legitimately changes over the device's life (the
+    // ADR 0077 fork publishes flushes under a private id, so the rehydrate
+    // ref's id and the connect-time id diverge for every fresh-created
+    // session; 2026-07-13 dfa0face: every such rehydrate died EINVAL and
+    // the survivor's disk stayed dead). Echo the kernel's own durable
+    // record of the connect-time value (`/sys/block/nbdN/backend`) instead
+    // of re-deriving one — deterministic for every host-agent generation.
+    // The device↔sandbox pinning that actually protects against serving
+    // the wrong disk is the caller's (`rootfs_device(sandbox_id)` →
+    // `pool.claim` on that exact device); the kernel identifier is
+    // informational. Fall back to the ref's manifest id only when sysfs
+    // has no record (never netlink-configured — the RECONFIGURE will fail
+    // regardless, with the right error).
+    let backend_id = match kernel_backend_identifier(slot.path()) {
+        Some(kernel_id) => kernel_id,
+        None => {
+            tracing::warn!(
+                device = %slot.path().display(),
+                "no kernel-recorded NBD backend identifier; falling back to the \
+                 rehydrate ref's manifest id",
+            );
+            disk_manifest_ref.manifest_id.to_string()
+        }
+    };
     let backend =
         match ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await
         {
@@ -645,6 +679,16 @@ pub async fn reattach_manifest(
         handle,
         slot,
     })
+}
+
+/// The identifier the kernel recorded at CONNECT time —
+/// `/sys/block/nbdN/backend`. `None` when the attr is missing/unreadable
+/// (device never netlink-configured, or pre-identifier kernel).
+fn kernel_backend_identifier(nbd_device: &Path) -> Option<String> {
+    let name = nbd_device.file_name()?.to_str()?;
+    let raw = std::fs::read_to_string(format!("/sys/block/{name}/backend")).ok()?;
+    let id = raw.trim();
+    (!id.is_empty()).then(|| id.to_string())
 }
 
 async fn attach_backend(

@@ -18,14 +18,37 @@ pub fn init(addr: SocketAddr) {
     let buckets = &[
         0.005, 0.010, 0.025, 0.050, 0.100, 0.200, 0.500, 1.0, 2.5, 5.0, 10.0, 30.0,
     ];
+    // Capture-pipeline histograms measure GiB-scale work (full memory
+    // re-chunk, disk upload, FC snapshot writes) that legitimately runs
+    // minutes — the 2026-07-13 incident's full re-chunk ran 40+. With
+    // the default 30 s cap every such sample lands in +Inf and the
+    // histogram can't distinguish "90 s" from "2 h". Wide log-scale
+    // buckets for exactly those metrics; `Matcher::Full` wins over the
+    // `_seconds` suffix rule, so this is purely additive.
+    let capture_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 2400.0, 3600.0, 7200.0,
+    ];
 
-    let builder = PrometheusBuilder::new()
+    let mut builder = PrometheusBuilder::new()
         .with_http_listener(addr)
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Suffix("_seconds".to_string()),
             buckets,
         )
         .expect("install histogram buckets");
+    for name in [
+        RECHUNK_SECONDS,
+        SNAPSHOT_CREATE_SECONDS,
+        SNAPSHOT_FINISH_SECONDS,
+        EVICTION_FINALIZE_STAGE_SECONDS,
+    ] {
+        builder = builder
+            .set_buckets_for_metric(
+                metrics_exporter_prometheus::Matcher::Full(name.to_string()),
+                capture_buckets,
+            )
+            .expect("install capture histogram buckets");
+    }
 
     match builder.install() {
         Ok(()) => {
@@ -174,6 +197,33 @@ pub const SNAPSHOT_CREATE_SECONDS: &str = "engram_snapshot_create_seconds";
 /// upload + memory re-chunk + portable blobs) — the previously-invisible
 /// half of "the snapshot is just slow". Labels: type=full|diff, outcome.
 pub const SNAPSHOT_FINISH_SECONDS: &str = "engram_snapshot_finish_seconds";
+/// Incident 2026-07-13: phase breakdown of a FULL memory re-chunk
+/// (`chunk_memory_to_store`) — the multi-GiB scan+upload that a capture
+/// pays when it has no checkpoint chain. `snapshot_finish_seconds`
+/// wraps it whole; this splits where the time went. Labels:
+/// - `phase`: `scan` (sequential read + zero-check of the memory image)
+///   | `upload` (window flushes: hash + dedup HEAD + GCS PUT).
+/// - `source`: `snapshot_finish` (composed snapshot post phase) |
+///   `evict_finalize` (eviction finalize job).
+/// - `outcome`: `success` | `error`.
+pub const RECHUNK_SECONDS: &str = "engram_rechunk_seconds";
+/// Counter siblings of [`RECHUNK_SECONDS`] (label: `source`): total
+/// bytes scanned from memory images vs bytes actually uploaded (the
+/// non-zero remainder). The ratio is the zero-elision density — low
+/// density means the scan phase dominates by construction.
+pub const RECHUNK_BYTES_SCANNED_TOTAL: &str = "engram_rechunk_bytes_scanned_total";
+pub const RECHUNK_BYTES_UPLOADED_TOTAL: &str = "engram_rechunk_bytes_uploaded_total";
+
+/// ADR 0088 addendum: histogram of each closed capture-timeline leg's
+/// wall-clock, recorded by the capture-job executor as its synthetic
+/// `[capture]` legs close. Labels: `leg` = `boot` |
+/// `cold_base_memory_dump` | `warm_hook` | `cold_base_upload` |
+/// `final_snapshot` (slug of the leg name). The capture pipeline in
+/// one query — `SNAPSHOT_CREATE/FINISH_SECONDS` remain the per-
+/// snapshot-call views; this is the per-enable-leg view the overhaul
+/// is benchmarked against. Warm-hook SUB-stages ride the existing
+/// `engram_warm_stage_seconds` (see `record_warm_stage_metrics`).
+pub const CAPTURE_LEG_SECONDS: &str = "engram_capture_leg_seconds";
 
 /// ADR 0038 B0: histogram of how long a capture waited to acquire the
 /// per-sandbox capture lock. The gridlock signal — the 5fadd364

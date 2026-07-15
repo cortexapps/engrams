@@ -70,6 +70,11 @@ type PinnedManifests = Arc<Mutex<HashMap<ManifestDigest, Vec<ChunkHash>>>>;
 /// we chose not to write would wedge the image unready forever.
 type TrackedBaseShm = Arc<Mutex<HashMap<ManifestDigest, PathBuf>>>;
 
+/// ADR 0092: digests whose base-shm pre-warm was headroom-skipped and is
+/// owed a retry on the next recheck tick (the skip used to be sticky —
+/// nothing re-attempted the write when tmpfs freed).
+type HeadroomSkipped = Arc<Mutex<HashSet<ManifestDigest>>>;
+
 /// ADR 0022 Option A: resolves a base snapshot's id to its on-disk
 /// snapshot dir (`<work_dir>/snapshots/<id>`). Supplied by the
 /// host-agent as `pooled.snapshot_path_for` so the residency-materialized
@@ -243,6 +248,50 @@ fn concurrency_from_env() -> usize {
         .unwrap_or(DEFAULT_PREFETCH_CONCURRENCY)
 }
 
+/// ADR 0092: population policy for the tmpfs (resume) base-shm.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BaseShmMode {
+    /// Eagerly pre-warm the full non-hole base at image residency
+    /// (today's behavior; pins the whole base in tmpfs).
+    Full,
+    /// Never pre-warm: the uffd handler creates/sizes the base and
+    /// populates canonical pages on first fault from the NVMe cache, so
+    /// tmpfs holds only what resumed sessions actually touch. Fresh
+    /// creates should pair this with `ENGRAM_FC_FRESH_RESTORE_MODE=file`
+    /// (the memfile path) so they don't repopulate it either.
+    Lazy,
+}
+
+/// `ENGRAM_FC_BASE_SHM_MODE` ∈ {`full` (default), `lazy`}, read once at
+/// startup (mirrors `restore_mode_from_env`'s parse/warn shape).
+fn base_shm_mode_from_env() -> BaseShmMode {
+    static MODE: std::sync::OnceLock<BaseShmMode> = std::sync::OnceLock::new();
+    *MODE.get_or_init(|| match std::env::var("ENGRAM_FC_BASE_SHM_MODE") {
+        Ok(s) if s.eq_ignore_ascii_case("lazy") => BaseShmMode::Lazy,
+        Ok(s) if !s.trim().is_empty() && !s.eq_ignore_ascii_case("full") => {
+            tracing::warn!(value = %s, "unrecognised ENGRAM_FC_BASE_SHM_MODE; defaulting to full");
+            BaseShmMode::Full
+        }
+        _ => BaseShmMode::Full,
+    })
+}
+
+/// ADR 0092: `ENGRAM_FC_BASE_MEMFILE_PIN` ∈ {`1` (default), `0`/`off`} —
+/// gates the memfile mlock. Unpinned, the base's residency is ordinary
+/// reclaimable page cache: the kernel evicts cold base pages under
+/// pressure and re-faults them from NVMe (~4.7 s worst case, measured)
+/// instead of the host OOMing — the density configuration the ADR 0092
+/// canary runs. Read once at startup.
+fn memfile_pin_enabled() -> bool {
+    static PIN: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PIN.get_or_init(|| {
+        !matches!(
+            std::env::var("ENGRAM_FC_BASE_MEMFILE_PIN"),
+            Ok(s) if s == "0" || s.eq_ignore_ascii_case("off")
+        )
+    })
+}
+
 /// Periodic re-check. Catches LRU evictions of chunks from
 /// `ChunkCache` — if any chunk for a ready image is no longer
 /// resolvable through tier 1, flip the image back to not-ready so
@@ -302,6 +351,13 @@ pub fn spawn_supervisor(
         let pinned_manifests: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
         // ADR 0045 addendum: digest → the base shm file readiness rests on.
         let tracked_base_shm: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        // ADR 0092: headroom-skipped pre-warms owed a retry (see recheck).
+        let headroom_skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
+        tracing::info!(
+            base_shm_mode = ?base_shm_mode_from_env(),
+            memfile_pin = memfile_pin_enabled(),
+            "image prefetch: ADR 0092 residency policy",
+        );
         // The watch channel's initial value is an empty Vec, NOT a
         // heartbeat ack — only iterations after the first `changed()`
         // carry an authoritative enabled set the GC may act on.
@@ -322,6 +378,7 @@ pub fn spawn_supervisor(
                 pinned_manifests.clone(),
                 ram_ledger.clone(),
                 tracked_base_shm.clone(),
+                headroom_skipped.clone(),
             )
             .await;
 
@@ -373,6 +430,7 @@ async fn reconcile(
     pinned_manifests: PinnedManifests,
     ram_ledger: Arc<crate::ram_ledger::RamLedger>,
     tracked_base_shm: TrackedBaseShm,
+    headroom_skipped: HeadroomSkipped,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -469,23 +527,57 @@ async fn reconcile(
                 .lock()
                 .get(&image.manifest_digest)
                 .is_none_or(|p| p.exists());
-            if still_warm && base_shm_intact {
+            // ADR 0092: the same honesty for the File-mode base memfile —
+            // an out-of-band rm (even under a live mlock, which pins the
+            // unlinked inode invisibly) must re-materialize, not leave
+            // fresh creates opening a ghost path.
+            let memfile_path = memfiles.get(&image.manifest_digest).map(|s| s.path.clone());
+            let memfile_intact = match &memfile_path {
+                Some(p) => tokio::fs::try_exists(p).await.unwrap_or(true),
+                None => true,
+            };
+            // ADR 0092: a headroom-skipped pre-warm retries on every
+            // recheck tick until it lands.
+            let headroom_retry = headroom_skipped.lock().contains(&image.manifest_digest);
+            if still_warm && base_shm_intact && memfile_intact && !headroom_retry {
                 continue;
             }
-            if base_shm_intact {
-                tracing::warn!(
+            if still_warm && base_shm_intact && memfile_intact {
+                // Retry-only pass: readiness is NOT flipped — sessions keep
+                // flowing on the handler's lazy backstop while we re-run
+                // `prefetch_one`, whose pre-warm arm re-checks headroom and
+                // is exists-idempotent.
+                tracing::info!(
                     image_uri = %image.image_uri,
                     digest = image.manifest_digest.as_str(),
-                    "ready image's base chunks no longer resolvable locally; flipping to not-ready for re-prefetch",
+                    "retrying headroom-skipped base shm pre-warm",
                 );
             } else {
-                tracing::warn!(
-                    image_uri = %image.image_uri,
-                    digest = image.manifest_digest.as_str(),
-                    "ready image's base shm file vanished; flipping to not-ready to re-warm it",
-                );
+                if !memfile_intact {
+                    tracing::warn!(
+                        image_uri = %image.image_uri,
+                        digest = image.manifest_digest.as_str(),
+                        "ready image's base memfile vanished; flipping to not-ready to re-materialize",
+                    );
+                    // Drop the stale entry — its pin (if any) holds the
+                    // unlinked inode; the re-prefetch re-materializes and
+                    // the pin loop re-pins the new file.
+                    memfiles.remove(&image.manifest_digest);
+                } else if base_shm_intact {
+                    tracing::warn!(
+                        image_uri = %image.image_uri,
+                        digest = image.manifest_digest.as_str(),
+                        "ready image's base chunks no longer resolvable locally; flipping to not-ready for re-prefetch",
+                    );
+                } else {
+                    tracing::warn!(
+                        image_uri = %image.image_uri,
+                        digest = image.manifest_digest.as_str(),
+                        "ready image's base shm file vanished; flipping to not-ready to re-warm it",
+                    );
+                }
+                readiness.mark_unready(&image.manifest_digest);
             }
-            readiness.mark_unready(&image.manifest_digest);
             // fall through to re-prefetch (prefetch_one re-warms the chunks;
             // the pin set is already recorded so it skips re-pinning).
         }
@@ -514,6 +606,7 @@ async fn reconcile(
         let pinned_manifests = pinned_manifests.clone();
         let ram_ledger = ram_ledger.clone();
         let tracked_base_shm = tracked_base_shm.clone();
+        let headroom_skipped = headroom_skipped.clone();
         tokio::spawn(async move {
             match prefetch_one(
                 &image,
@@ -555,6 +648,15 @@ async fn reconcile(
                             tracked_base_shm.lock().remove(&image.manifest_digest);
                         }
                     }
+                    // ADR 0092: record (or clear) the retry debt. Same
+                    // overwrite semantics as the tracking entry above.
+                    if warmed.base_shm_headroom_skipped {
+                        headroom_skipped
+                            .lock()
+                            .insert(image.manifest_digest.clone());
+                    } else {
+                        headroom_skipped.lock().remove(&image.manifest_digest);
+                    }
                     readiness.mark_ready(image.manifest_digest.clone());
                     tracing::info!(
                         image_uri = %image.image_uri,
@@ -594,10 +696,16 @@ async fn reconcile(
             continue; // not materialized yet; a later tick will pin it
         }
         let p = path.clone();
-        let pin = tokio::task::spawn_blocking(move || pin_memfile(&p))
-            .await
-            .ok()
-            .flatten();
+        // ADR 0092: `ENGRAM_FC_BASE_MEMFILE_PIN=0` leaves the memfile's
+        // residency to the kernel (reclaimable page cache) — no mlock.
+        let pin = if memfile_pin_enabled() {
+            tokio::task::spawn_blocking(move || pin_memfile(&p))
+                .await
+                .ok()
+                .flatten()
+        } else {
+            None
+        };
         if pin.is_some() {
             if let Some(state) = memfiles.get_mut(digest) {
                 state.pin = pin;
@@ -606,14 +714,17 @@ async fn reconcile(
     }
 
     // ADR 0070: gauge summed on-disk bytes of every currently-tracked
-    // base memfile — unevictable disk (mlock'd, reclaimed only on
-    // image-disable), part of the same "floor the budget can't touch"
-    // accounting as pinned chunk bytes (see engram-chunk-store's
-    // engram_chunk_cache_pinned_bytes). Runs every tick, including the
-    // LRU-recheck; reads 0 when density is off (`memfiles` stays empty).
-    // A metadata() failure (not yet materialized, or racing the disable
-    // reclaim above) just skips that entry — best-effort, same tolerance
-    // as the pin loop above.
+    // base memfile — disk the chunk sweeper can't evict (reclaimed only
+    // on image-disable; mlock'd too when the pin is on), part of the
+    // same "floor the budget can't touch" accounting as pinned chunk
+    // bytes (see engram-chunk-store's engram_chunk_cache_pinned_bytes).
+    // Allocated bytes (st_blocks), not apparent length: the memfiles are
+    // sparse (dev-brain: 24 GiB apparent, ~21 GiB non-hole) and both the
+    // gauge and the reserve below account real disk consumption. Runs
+    // every tick, including the LRU-recheck; reads 0 when density is off
+    // (`memfiles` stays empty). A metadata() failure (not yet
+    // materialized, or racing the disable reclaim above) just skips that
+    // entry — best-effort, same tolerance as the pin loop above.
     //
     // Collect owned paths FIRST, then await: `MemfileState::pin` holds a
     // raw `*mut libc::c_void` (only `unsafe impl Send`, never `Sync`), so
@@ -626,10 +737,32 @@ async fn reconcile(
     let mut memfile_bytes: u64 = 0;
     for path in memfile_paths {
         if let Ok(meta) = tokio::fs::metadata(&path).await {
-            memfile_bytes += meta.len();
+            memfile_bytes += allocated_bytes(&meta);
         }
     }
     ::metrics::gauge!(crate::metrics::HOST_BASE_MEMFILE_BYTES).set(memfile_bytes as f64);
+    // ADR 0092: the memfiles live on the same filesystem as the chunk
+    // cache (both under the work dir) and its sweeper can't evict them —
+    // reserve their allocated bytes out of the cache's ceiling so the
+    // cache yields the space instead of racing the memfiles to the
+    // kubelet eviction line (the 2026-07-14 w8wq DiskPressure incident:
+    // a warm at-budget cache + 40 GB of unbudgeted memfiles).
+    chunk_cache.set_co_tenant_reserved(memfile_bytes);
+}
+
+/// Allocated (on-disk) bytes of a file: `st_blocks × 512` on unix, so a
+/// sparse memfile reserves what it actually consumes; apparent length
+/// elsewhere (VZ/macOS dev, where the memfile path is never taken).
+fn allocated_bytes(meta: &std::fs::Metadata) -> u64 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        meta.blocks().saturating_mul(512)
+    }
+    #[cfg(not(unix))]
+    {
+        meta.len()
+    }
 }
 
 /// The outcome of [`prefetch_one`]: the total chunk count warmed (for
@@ -648,6 +781,10 @@ struct WarmedManifest {
     /// or the pre-warm was headroom-skipped / failed (lazy-path images
     /// must not gate readiness on a file nothing will write).
     base_shm: Option<PathBuf>,
+    /// ADR 0092: the pre-warm was wanted but skipped for tmpfs headroom —
+    /// the supervisor records a retry debt so the recheck re-attempts it
+    /// (the skip used to be sticky).
+    base_shm_headroom_skipped: bool,
 }
 
 /// Warm an enabled image's base-snapshot working set on local NVMe so the
@@ -737,6 +874,7 @@ async fn prefetch_one(
     // ADR 0045 addendum: the base shm file readiness will rest on, if any
     // (see `WarmedManifest::base_shm`).
     let mut base_shm: Option<PathBuf> = None;
+    let mut base_shm_headroom_skipped = false;
 
     // (2) ADR 0021 P2 (memory residency) — the base snapshot's memory image.
     // The UFFD handler pages these chunks in when the guest resumes; warming
@@ -772,7 +910,13 @@ async fn prefetch_one(
         // HOLES (the handler's ZEROPAGE arm owns zero pages — v2b
         // semantics). Best-effort: a tmpfs hiccup must not block image
         // readiness; the lazy path is the backstop.
-        if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env() {
+        // ADR 0092 `lazy`: never pre-warm — the handler populates the
+        // base on fault, so tmpfs holds only the resume working set.
+        // (`filter` keeps the arm's 70-line body untouched; the mode is
+        // logged once at supervisor start.)
+        if let Some(base_dir) = engram_sandbox_firecracker::uffd_base_dir_from_env()
+            .filter(|_| base_shm_mode_from_env() == BaseShmMode::Full)
+        {
             let base_path = engram_sandbox_firecracker::uffd_base_path_in(&base_dir, &memory_ref);
             if tokio::fs::metadata(&base_path).await.is_ok() {
                 // Already present — pre-warmed by a prior tick, or a pod
@@ -797,6 +941,7 @@ async fn prefetch_one(
                 let headroom_mib = crate::ram_ledger::tmpfs_free_mib(&base_dir);
                 let needed_mib = pending_bytes.div_ceil(1024 * 1024);
                 if headroom_mib.is_some_and(|free| free < needed_mib) {
+                    base_shm_headroom_skipped = true;
                     ::metrics::counter!(
                         crate::metrics::BASE_SHM_PREWARM_SKIPPED_TOTAL,
                         "reason" => "tmpfs_headroom"
@@ -875,6 +1020,7 @@ async fn prefetch_one(
         chunk_count: total,
         hashes: pin_hashes,
         base_shm,
+        base_shm_headroom_skipped,
     })
 }
 
@@ -1313,6 +1459,7 @@ mod tests {
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
         let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
 
         let base_id = SnapshotId::new();
@@ -1342,6 +1489,7 @@ mod tests {
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
+            skipped.clone(),
         )
         .await;
         for _ in 0..200 {
@@ -1373,6 +1521,7 @@ mod tests {
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
+            skipped.clone(),
         )
         .await;
         assert!(!readiness.contains(&img.manifest_digest), "now unready");
@@ -1392,6 +1541,7 @@ mod tests {
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
         let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
         let base_id = SnapshotId::new();
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
@@ -1408,6 +1558,7 @@ mod tests {
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
+            skipped.clone(),
         )
         .await;
         for _ in 0..200 {
@@ -1447,6 +1598,7 @@ mod tests {
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
+            skipped.clone(),
         )
         .await;
         assert!(
@@ -1468,6 +1620,7 @@ mod tests {
         let readiness = ImageReadiness::new();
         let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
         let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
         let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
         let base_id = SnapshotId::new();
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
@@ -1486,6 +1639,7 @@ mod tests {
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
+            skipped.clone(),
         )
         .await;
         for _ in 0..200 {
@@ -1513,6 +1667,7 @@ mod tests {
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
+            skipped.clone(),
         )
         .await;
         assert!(
@@ -1536,6 +1691,7 @@ mod tests {
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
+            skipped.clone(),
         )
         .await;
         assert!(
@@ -1617,6 +1773,356 @@ mod tests {
         assert_eq!(std::fs::read(&expected_path).unwrap(), mem_bytes);
 
         unsafe { std::env::remove_var("ENGRAM_FC_UFFD_BASE_DIR") };
+    }
+
+    /// ADR 0092 `lazy`: the pre-warm arm is skipped entirely — no file, no
+    /// tracking, no pending charge — the handler populates on fault.
+    /// (Env mutation is safe: nextest is process-per-test, and the mode
+    /// OnceLock is first read inside this test's process.)
+    #[tokio::test]
+    async fn lazy_mode_skips_base_shm_prewarm() {
+        #[cfg(target_os = "linux")]
+        let base_dir = tempfile::Builder::new()
+            .prefix("engram-lazy-test-")
+            .tempdir_in("/dev/shm")
+            .unwrap();
+        #[cfg(not(target_os = "linux"))]
+        let base_dir = tempfile::tempdir().unwrap();
+        // SAFETY: nextest process-per-test; no concurrent env readers.
+        unsafe { std::env::set_var("ENGRAM_FC_UFFD_BASE_DIR", base_dir.path()) };
+        unsafe { std::env::set_var("ENGRAM_FC_BASE_SHM_MODE", "lazy") };
+
+        let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
+        let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
+        let expected_path =
+            engram_sandbox_firecracker::uffd_base_path_in(base_dir.path(), &mem_ref);
+
+        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
+            .await
+            .unwrap();
+        assert_eq!(warmed.base_shm, None, "lazy: nothing tracked");
+        assert!(!warmed.base_shm_headroom_skipped, "lazy is not a skip-debt");
+        assert!(
+            !expected_path.exists(),
+            "lazy: the base file is the handler's to create, not the pre-warm's",
+        );
+        // The NVMe warm (chunk pins) is untouched by the mode.
+        assert!(warmed.chunk_count > 0);
+
+        unsafe { std::env::remove_var("ENGRAM_FC_UFFD_BASE_DIR") };
+        unsafe { std::env::remove_var("ENGRAM_FC_BASE_SHM_MODE") };
+    }
+
+    /// ADR 0092: a headroom-skip is a retry debt, not a readiness event —
+    /// the recheck re-runs `prefetch_one` while the image STAYS ready
+    /// (sessions keep flowing on the lazy backstop), and the debt clears
+    /// once a pre-warm lands.
+    #[tokio::test]
+    async fn headroom_retry_reprefetches_without_flipping_readiness() {
+        let (store, cache, _dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
+
+        // Seed ready.
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(readiness.contains(&img.manifest_digest), "ready");
+
+        // Simulate a headroom-skipped pre-warm from a prior tick. The
+        // retry pass must NOT flip readiness (zero-permit semaphore parks
+        // the re-prefetch so the non-flip is observable).
+        skipped.lock().insert(img.manifest_digest.clone());
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            Arc::new(Semaphore::new(0)),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        assert!(
+            readiness.contains(&img.manifest_digest),
+            "a headroom retry must keep the image READY (the lazy path backstops)",
+        );
+
+        // With permits, the retry completes and clears the debt (the
+        // substrate env is unset here, so the pre-warm arm no-ops and
+        // reports no skip — the marker must still be dropped).
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if !skipped.lock().contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            !skipped.lock().contains(&img.manifest_digest),
+            "a completed retry clears the debt",
+        );
+        assert!(readiness.contains(&img.manifest_digest), "still ready");
+    }
+
+    /// ADR 0092: a vanished base memfile (out-of-band rm — even under a
+    /// live mlock, which silently pins the unlinked inode) flips the image
+    /// unready and drops the stale `memfiles` entry so the re-prefetch
+    /// re-materializes.
+    #[tokio::test]
+    async fn reconcile_flips_ready_when_base_memfile_vanishes() {
+        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
+
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(readiness.contains(&img.manifest_digest), "ready");
+
+        // Track a memfile that exists: readiness holds.
+        let memfile = dir.path().join("memory.bin");
+        std::fs::write(&memfile, b"resident").unwrap();
+        memfiles.insert(
+            img.manifest_digest.clone(),
+            MemfileState {
+                path: memfile.clone(),
+                pin: None,
+            },
+        );
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        assert!(
+            readiness.contains(&img.manifest_digest),
+            "an intact memfile must not disturb readiness",
+        );
+
+        // rm the memfile → unready + entry dropped for re-materialization.
+        std::fs::remove_file(&memfile).unwrap();
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            Arc::new(Semaphore::new(0)),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        assert!(
+            !readiness.contains(&img.manifest_digest),
+            "a vanished memfile must flip the image unready",
+        );
+        assert!(
+            !memfiles.contains_key(&img.manifest_digest),
+            "the stale memfiles entry must be dropped so re-prefetch re-materializes",
+        );
+    }
+
+    #[tokio::test]
+    async fn reconcile_publishes_memfile_bytes_as_the_cache_co_tenant_reserve() {
+        // ADR 0092: the memfiles share the chunk cache's filesystem and
+        // its sweeper can't evict them — every reconcile tick publishes
+        // their allocated bytes as the cache's co-tenant reserve so the
+        // cache stops aiming for disk the memfiles occupy (the 2026-07-14
+        // w8wq DiskPressure incident: at-budget warm cache + 40 GB of
+        // unbudgeted memfiles).
+        let (store, cache, dir, disk_ref, mem_ref, _mem_bytes) = seed().await;
+        let sem = Arc::new(Semaphore::new(8));
+        let ledger = Arc::new(crate::ram_ledger::RamLedger::new());
+        let readiness = ImageReadiness::new();
+        let pinned: PinnedManifests = Arc::new(Mutex::new(HashMap::new()));
+        let tracked: TrackedBaseShm = Arc::new(Mutex::new(HashMap::new()));
+        let skipped: HeadroomSkipped = Arc::new(Mutex::new(HashSet::new()));
+        let mut memfiles: HashMap<ManifestDigest, MemfileState> = HashMap::new();
+        let img = image_ref(SnapshotId::new(), disk_ref, Some(mem_ref));
+
+        // Make the image ready first — the disable-reclaim arm below keys
+        // on readiness (same order as the vanish test above).
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        for _ in 0..200 {
+            if readiness.contains(&img.manifest_digest) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(readiness.contains(&img.manifest_digest), "ready");
+
+        let memfile = dir.path().join("memory.bin");
+        {
+            use std::io::Write;
+            let mut f = std::fs::File::create(&memfile).unwrap();
+            f.write_all(&[0xAB; 8192]).unwrap();
+            // Force block allocation: APFS/ext4 delayed allocation can
+            // report st_blocks=0 until the write is flushed, making the
+            // expected value racy against reconcile's later read.
+            f.sync_all().unwrap();
+        }
+        let expected = allocated_bytes(&std::fs::metadata(&memfile).unwrap());
+        assert!(expected > 0, "allocated bytes must be visible after sync");
+        memfiles.insert(
+            img.manifest_digest.clone(),
+            MemfileState {
+                path: memfile.clone(),
+                pin: None,
+            },
+        );
+        reconcile(
+            std::slice::from_ref(&img),
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        assert_eq!(
+            cache.co_tenant_reserved(),
+            expected,
+            "the tick must reserve the memfile's allocated bytes out of the cache ceiling",
+        );
+
+        // Image disabled → memfile reclaimed → the reserve returns to 0.
+        reconcile(
+            &[],
+            readiness.clone(),
+            store.clone(),
+            cache.clone(),
+            sem.clone(),
+            None,
+            &mut memfiles,
+            pinned.clone(),
+            ledger.clone(),
+            tracked.clone(),
+            skipped.clone(),
+        )
+        .await;
+        assert_eq!(
+            cache.co_tenant_reserved(),
+            0,
+            "disabling the image must release its reserve",
+        );
+    }
+
+    /// ADR 0092 env parsers (one env value per test — the getters cache in
+    /// a OnceLock and nextest is process-per-test).
+    #[test]
+    fn base_shm_mode_env_parses_lazy() {
+        unsafe { std::env::set_var("ENGRAM_FC_BASE_SHM_MODE", "LaZy") };
+        assert_eq!(base_shm_mode_from_env(), BaseShmMode::Lazy);
+    }
+
+    #[test]
+    fn memfile_pin_env_disables_the_mlock() {
+        unsafe { std::env::set_var("ENGRAM_FC_BASE_MEMFILE_PIN", "0") };
+        assert!(!memfile_pin_enabled());
+    }
+
+    #[test]
+    fn residency_env_defaults_are_todays_behavior() {
+        unsafe { std::env::remove_var("ENGRAM_FC_BASE_SHM_MODE") };
+        unsafe { std::env::remove_var("ENGRAM_FC_BASE_MEMFILE_PIN") };
+        assert_eq!(base_shm_mode_from_env(), BaseShmMode::Full);
+        assert!(memfile_pin_enabled());
     }
 }
 

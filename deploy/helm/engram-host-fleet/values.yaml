@@ -69,6 +69,19 @@ firecracker:
   # the v2 forked firecracker (engrams#164+). Under workDirHostPath so it
   # survives pod restarts (K2 reattach).
   uffdBaseDir: ""     # e.g. /var/lib/engram/shm
+  # ADR 0092: the density knobs. Chart-DEFAULTED to the reclaimable-
+  # residency config (prod-canaried 2026-07-14: TTFM parity, File-mode
+  # fresh creates confirmed, ~21.7 GiB/host of pinned tmpfs retired):
+  # fresh creates restore File-mode from the per-image NVMe memfile,
+  # nothing is mlocked (the kernel reclaims cold base pages under
+  # pressure), and the resume-only tmpfs base populates lazily on fault
+  # instead of an eager ~45 s/image pre-warm. Set "" to fall back to the
+  # binary defaults (substrate-derived fresh mode + mlock pin + eager
+  # pre-warm). baseMemfilePin MUST stay a quoted string — a bare 0 is
+  # falsy under the configmap's `with` and silently drops the env var.
+  freshRestoreMode: "file" # "" (derived) | file | uffd — fresh creates only
+  baseMemfilePin: "0"      # "" / "1" (mlock) | "0" (reclaimable cache, default)
+  baseShmMode: "lazy"      # "" / full (eager pre-warm) | lazy (default)
   # tmpfs size cap for uffdBaseDir (one base per enabled template; each
   # file is guest-RAM-sized but populated lazily + hole-punchable).
   uffdBaseTmpfsSize: 32g

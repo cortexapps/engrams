@@ -435,9 +435,7 @@ async fn golden_diff_flatten_vs_docker_export() {
             LayerCompression::Zstd => apply_layer(
                 &rootfs,
                 &mut tree_meta,
-                ruzstd::decoding::StreamingDecoder::new(reader)
-                    .map_err(|e| std::io::Error::other(e.to_string()))
-                    .expect("zstd decoder"),
+                zstd::stream::read::Decoder::with_buffer(reader).expect("zstd decoder"),
             ),
             LayerCompression::None => apply_layer(&rootfs, &mut tree_meta, reader),
         }

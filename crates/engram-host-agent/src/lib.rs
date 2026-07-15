@@ -327,6 +327,16 @@ impl HostAgent {
                 // incoming snapshot_begin, or resume_pending_finalizes
                 // below all rely on it for the terminal destroy call).
                 arc.set_self_ref(&arc);
+                // Re-seed checkpoint chains for pidfd-reattached
+                // survivors from their durable chain-head records (and
+                // GC records for sandboxes that didn't survive). Must
+                // run before the checkpoint driver, the eviction
+                // redrive, and coordinator registration — the first
+                // post-roll capture of every survivor rides the diff
+                // path instead of a FULL multi-GiB memory re-chunk
+                // (2026-07-13 incident: a survivor's evict capture ran
+                // 40+ minutes).
+                arc.rehydrate_chain_heads().await;
                 arc
             };
             // ADR 0084 P1b: the capture-job executor + durable-record
@@ -1115,15 +1125,23 @@ impl HostAgent {
                     // against the lazily-populated base shm instead, and
                     // the eager multi-second per-template materialization
                     // is retired along with the memfile it built.
+                    // ADR 0092: the memfile is needed whenever fresh
+                    // creates take the File path — derived (no substrate
+                    // dir) OR explicitly overridden onto a substrate host
+                    // (`ENGRAM_FC_FRESH_RESTORE_MODE=file`, the
+                    // reclaimable-residency density config).
+                    let fresh_is_file =
+                        match engram_sandbox_firecracker::fresh_restore_mode_from_env() {
+                            Some(m) => m == engram_sandbox_firecracker::RestoreMode::File,
+                            None => engram_sandbox_firecracker::uffd_base_dir_from_env().is_none(),
+                        };
                     let base_memfile_dir: Option<image_prefetch::SnapshotDirResolver> =
-                        engram_sandbox_firecracker::uffd_base_dir_from_env()
-                            .is_none()
-                            .then(|| {
-                                let p = pooled.clone();
-                                let resolver: image_prefetch::SnapshotDirResolver =
-                                    std::sync::Arc::new(move |id| p.snapshot_path_for(id));
-                                resolver
-                            });
+                        fresh_is_file.then(|| {
+                            let p = pooled.clone();
+                            let resolver: image_prefetch::SnapshotDirResolver =
+                                std::sync::Arc::new(move |id| p.snapshot_path_for(id));
+                            resolver
+                        });
                     let (tx, _handle) = image_prefetch::spawn_supervisor(
                         chunk_store,
                         chunk_cache,

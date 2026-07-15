@@ -2372,8 +2372,18 @@ pub trait MetadataStore: Send + Sync {
         capture_phase: Option<&str>,
         warm_stage: Option<&str>,
         output_tail: Option<&str>,
+        // ADR 0088 addendum: the capture timeline (JSON array of
+        // `WarmStageRecord`) for `enable_jobs.warm_stages`; `None`
+        // keeps the last-known timeline (COALESCE, like the rest).
+        warm_stages: Option<&serde_json::Value>,
     ) -> Result<(), MetaError> {
-        let _ = (enable_job_id, capture_phase, warm_stage, output_tail);
+        let _ = (
+            enable_job_id,
+            capture_phase,
+            warm_stage,
+            output_tail,
+            warm_stages,
+        );
         Ok(())
     }
 

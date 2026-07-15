@@ -342,11 +342,39 @@ impl HarnessSupervisor {
         let child = crate::reaper::spawn_tracked(&mut cmd)
             .map_err(|e| std::io::Error::new(e.kind(), format!("spawn {:?}: {e}", argv0)))?;
         let pid = child.id();
+        boost_harness_priority(pid);
         tracing::info!(pid = ?pid, argv0 = %argv0, argc = req.argv.len(), "harness child running");
         guard.current_child = Some(child);
         Ok(pid)
     }
 }
+
+/// ADR 0092 (goal 2): the harness's first-message latency lever. A fresh
+/// harness spawns exactly when a resumed guest's warm stack stampedes
+/// every vCPU (JVM GC catch-up + timer floods after the clock step) —
+/// measured 39–41 s to first reply vs 2.7 s on a quiet guest, ~15×
+/// CPU dilution for a child that needs ~1 s of CPU. A negative nice lets
+/// the first prompt cut through the wake-up herd.
+///
+/// Parent-side rather than `pre_exec` (the workspace forbids unsafe
+/// code); the microseconds before it applies are irrelevant at this
+/// scale. Best-effort: agentd is root PID 1 in the guest so it succeeds
+/// there; unprivileged hosts (unit tests) get EACCES and the harness
+/// keeps nice 0. The reattach path is untouched by design — a reattached
+/// warm harness has no cold start to protect.
+#[cfg(target_os = "linux")]
+fn boost_harness_priority(pid: Option<u32>) {
+    const HARNESS_NICE: i32 = -10;
+    let Some(pid) = pid else { return };
+    let Ok(raw) = i32::try_from(pid) else { return };
+    match rustix::process::setpriority_process(rustix::process::Pid::from_raw(raw), HARNESS_NICE) {
+        Ok(()) => tracing::info!(pid, nice = HARNESS_NICE, "harness priority boosted"),
+        Err(e) => tracing::debug!(pid, error = %e, "harness priority boost unavailable"),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn boost_harness_priority(_pid: Option<u32>) {}
 
 #[cfg(test)]
 mod tests {
@@ -425,6 +453,45 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let pid4 = sup2.spawn(short).await.unwrap().expect("pid");
         assert_ne!(pid3, pid4, "exited child must be reaped and respawned");
+    }
+
+    /// ADR 0092: a fresh spawn gets the priority boost — nice -10 when
+    /// the caller may renice (root, as agentd is in the guest), and an
+    /// untouched nice 0 when it may not (unprivileged CI): the boost is
+    /// best-effort by design and must never fail the spawn.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn spawn_boosts_priority_when_privileged() {
+        let sup = HarnessSupervisor::new();
+        let pid = sup
+            .spawn(SpawnHarnessRequest {
+                argv: vec!["/bin/sh".into(), "-c".into(), "sleep 30".into()],
+                env: HashMap::new(),
+                session_env: HashMap::new(),
+                host_ca_pem: None,
+            })
+            .await
+            .unwrap()
+            .expect("pid");
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("proc stat");
+        // Field 19 (1-indexed) is nice; count from after the
+        // parenthesized comm so command names with spaces can't skew it.
+        let nice: i32 = stat
+            .rsplit(')')
+            .next()
+            .and_then(|rest| rest.split_whitespace().nth(16))
+            .expect("nice field")
+            .parse()
+            .expect("nice parses");
+        let expect = if rustix::process::geteuid().is_root() {
+            -10
+        } else {
+            0
+        };
+        assert_eq!(nice, expect, "spawned harness nice");
+        let _ = std::process::Command::new("kill")
+            .arg(pid.to_string())
+            .status();
     }
 
     #[tokio::test]

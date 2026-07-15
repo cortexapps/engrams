@@ -61,6 +61,15 @@ pub fn init(addr: SocketAddr) {
         1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 900.0, 1200.0, 1800.0,
     ];
 
+    // ADR 0088 addendum (enable-leg overhaul): materialize legs span four
+    // decades — a demo-image pull is ~3 s, a dev-brain flatten was measured
+    // at 74 min pre-overhaul. Same wide-regime problem as prestage; the
+    // spread must keep resolving multi-minute flattens after the overhaul
+    // lands so regressions stay visible.
+    let materialize_stage_buckets = &[
+        1.0, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 2400.0, 4800.0,
+    ];
+
     // ADR 0048 (queue fairness): queue waits are minutes-scale, not
     // seconds-scale — a stuck queue can wait the full 30-minute timeout.
     // Same Full()-beats-Suffix() precedence as the eviction override above.
@@ -89,6 +98,13 @@ pub fn init(addr: SocketAddr) {
             prestage_buckets,
         )
         .expect("install prestage histogram buckets")
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(
+                ENABLE_MATERIALIZE_STAGE_SECONDS.to_string(),
+            ),
+            materialize_stage_buckets,
+        )
+        .expect("install materialize-stage histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(QUEUE_WAIT_SECONDS.to_string()),
             queue_wait_buckets,
@@ -239,7 +255,17 @@ pub const EVICTION_UNPARKED_PAUSED_TOTAL: &str = "engram_eviction_unparked_pause
 /// Counter (ADR 0074 rung reaper). Parked sessions DESCENDED to a full
 /// eviction — the user never returned within the dwell cap, or the host
 /// came under memory pressure and the parked VM's RAM had to be
-/// reclaimed. Labelled by `reason` (`dwell` | `pressure`).
+/// reclaimed. Labelled by `reason`:
+/// - `pressure` — the host lost memory headroom (ADR 0074's intended
+///   primary, now normally the ONLY, descent trigger).
+/// - `hard_ttl` — the absolute ceiling: parked past the idle hard TTL
+///   (8h default) with nobody returning.
+/// - `dwell` — the retired clock-based descent, re-armed by an operator
+///   via `ENGRAM_PARK_DWELL_SECS` (off by default; see the ADR 0074
+///   addendum for why a clock must not reclaim RAM).
+///
+/// A sustained `dwell`/`hard_ttl` rate with zero `pressure` means the
+/// fleet is rebuilding guests (~27s each) that it had the RAM to keep.
 pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_total";
 /// Counter (ADR 0073 phase 4). Heartbeats reporting a RUNNING sandbox
 /// for an Active session with NO attached harness — the demoted
@@ -376,6 +402,16 @@ pub const HEARTBEAT_PERSIST_FAILURES_TOTAL: &str = "engram_heartbeat_persist_fai
 /// large image; the per-image SLO canary is the end-to-end guard that
 /// first-create-after-refresh stays inside budget.
 pub const ENABLE_PRESTAGE_SECONDS: &str = "engram_enable_prestage_seconds";
+
+/// Histogram (ADR 0088 addendum: enable-leg overhaul). Wall time of each
+/// closed materialize stage, recorded by the enable scanner's progress
+/// consumer as the stage timeline advances (and at the success-path close
+/// of the final `chunk` stage). Labels: `stage` = `pull` / `flatten` /
+/// `pack` / `chunk`. The reset-on-`pull` retry path records nothing — a
+/// killed attempt's open stage has no honest duration. This is the
+/// before/after instrument for the overhaul's flatten + chunk-pipeline
+/// work; the durable twin is `enable_jobs.materialize_stages`.
+pub const ENABLE_MATERIALIZE_STAGE_SECONDS: &str = "engram_enable_materialize_stage_seconds";
 
 /// Counter (ADR 0036 amendment, issue #538). Per-host prestage outcomes
 /// recorded at the end of each `prestaging` stage. Labels: `outcome` =

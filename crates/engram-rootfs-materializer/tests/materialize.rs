@@ -504,3 +504,251 @@ async fn materialize_scrubs_scratch_on_error() {
         "scratch must be scrubbed on the error path too"
     );
 }
+
+// ---------------------------------------------------------------
+// Pull/flatten pipeline (ADR 0088 addendum).
+// ---------------------------------------------------------------
+
+/// Fake packer that records the flattened tree (rel → bytes for
+/// regular files, plus a tombstone check by omission) instead of
+/// running mke2fs — lets pipeline tests assert layer-ordering
+/// semantics without ext4 tooling.
+#[derive(Clone, Default)]
+struct TreeProbePacker {
+    tree: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+}
+
+#[async_trait::async_trait]
+impl engram_rootfs_materializer::Ext4Packer for TreeProbePacker {
+    async fn pack(
+        &self,
+        src_dir: &std::path::Path,
+        dst_image: &std::path::Path,
+        _size_bytes: u64,
+    ) -> Result<(), engram_rootfs_materializer::Ext4Error> {
+        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut HashMap<String, Vec<u8>>) {
+            for e in std::fs::read_dir(dir).unwrap() {
+                let p = e.unwrap().path();
+                let m = std::fs::symlink_metadata(&p).unwrap();
+                if m.is_dir() {
+                    walk(root, &p, out);
+                } else if m.is_file() {
+                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
+                    out.insert(rel, std::fs::read(&p).unwrap());
+                }
+            }
+        }
+        let mut tree = HashMap::new();
+        walk(src_dir, src_dir, &mut tree);
+        *self.tree.lock() = tree;
+        std::fs::write(dst_image, b"probe-ext4").map_err(engram_rootfs_materializer::Ext4Error::Io)
+    }
+}
+
+/// Publish an arm64-only image whose layers are the given raw tars
+/// (gzipped on the wire).
+async fn publish_gzip_layers(layer_tars: Vec<Vec<u8>>) -> Fixture {
+    let (addr, reg, shutdown) = spawn_registry().await;
+    let mut layer_descs = Vec::new();
+    for tar in layer_tars {
+        let (digest, size) = reg.add_blob(gzip(&tar));
+        layer_descs.push(serde_json::json!({
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": digest,
+            "size": size
+        }));
+    }
+    let config = serde_json::json!({
+        "architecture": "arm64",
+        "os": "linux",
+        "config": { "Env": [], "WorkingDir": "/" },
+        "rootfs": { "type": "layers", "diff_ids": [] }
+    });
+    let (cfg_digest, cfg_size) = reg.add_blob(serde_json::to_vec(&config).unwrap());
+    let manifest = serde_json::json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": cfg_digest,
+            "size": cfg_size
+        },
+        "layers": layer_descs
+    });
+    reg.add_manifest(
+        Some("latest"),
+        "application/vnd.oci.image.manifest.v1+json",
+        serde_json::to_vec(&manifest).unwrap(),
+    );
+    Fixture {
+        uri: format!("127.0.0.1:{}/img:latest", addr.port()),
+        reg,
+        _shutdown: shutdown,
+    }
+}
+
+fn probe_materializer(probe: &TreeProbePacker) -> Materializer {
+    Materializer::with_packer(
+        oci_client(),
+        InitInjection {
+            vsock_port: 1024,
+            transport: Transport::Vsock,
+            init_script: None,
+        },
+        Arc::new(probe.clone()),
+    )
+}
+
+/// Three layers whose semantics only hold under IN-ORDER apply
+/// (layer 2 whiteouts layer 1's file; layer 3 overwrites layer 2's):
+/// the buffered download pipeline must deliver in manifest order even
+/// though downloads run concurrently.
+#[tokio::test]
+async fn pipelined_layers_apply_in_order() {
+    let mut l1 = tar::Builder::new(Vec::new());
+    tar_file(&mut l1, "a", 0o644, b"v1");
+    tar_file(&mut l1, "keep", 0o644, b"k");
+    l1.finish().unwrap();
+    let mut l2 = tar::Builder::new(Vec::new());
+    tar_file(&mut l2, ".wh.a", 0o644, b"");
+    tar_file(&mut l2, "b", 0o644, b"v2");
+    l2.finish().unwrap();
+    let mut l3 = tar::Builder::new(Vec::new());
+    tar_file(&mut l3, "b", 0o644, b"v3-longer");
+    l3.finish().unwrap();
+
+    let fx = publish_gzip_layers(vec![
+        l1.into_inner().unwrap(),
+        l2.into_inner().unwrap(),
+        l3.into_inner().unwrap(),
+    ])
+    .await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
+        engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
+    ));
+    let scratch = tempfile::tempdir().unwrap();
+    let probe = TreeProbePacker::default();
+
+    probe_materializer(&probe)
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            None,
+        )
+        .await
+        .expect("pipelined materialize");
+
+    let tree = probe.tree.lock().clone();
+    assert!(
+        !tree.contains_key("a"),
+        "layer-2 whiteout must remove layer-1's file"
+    );
+    assert_eq!(tree.get("keep").map(Vec::as_slice), Some(&b"k"[..]));
+    assert_eq!(
+        tree.get("b").map(Vec::as_slice),
+        Some(&b"v3-longer"[..]),
+        "layer 3 must overwrite layer 2 (in-order apply)"
+    );
+}
+
+/// A mid-pull failure (layer blob vanishes) fails the materialize with
+/// the PULL error (not the flattener's truncation echo) and scrubs
+/// scratch.
+#[tokio::test]
+async fn mid_pull_failure_fails_and_scrubs() {
+    let mut l1 = tar::Builder::new(Vec::new());
+    tar_file(&mut l1, "ok", 0o644, b"fine");
+    l1.finish().unwrap();
+    let mut l2 = tar::Builder::new(Vec::new());
+    tar_file(&mut l2, "later", 0o644, b"never lands");
+    l2.finish().unwrap();
+
+    let fx = publish_gzip_layers(vec![l1.into_inner().unwrap(), l2.into_inner().unwrap()]).await;
+    // Vanish layer 2's blob AFTER the manifest is published: resolve
+    // succeeds, the download 404s.
+    {
+        let mut blobs = fx.reg.blobs.lock();
+        let gone: Vec<String> = blobs
+            .iter()
+            .filter(|(_, v)| {
+                let mut gz = flate2::read::GzDecoder::new(std::io::Cursor::new(v.to_vec()));
+                let mut out = Vec::new();
+                std::io::Read::read_to_end(&mut gz, &mut out)
+                    .map(|_| out.windows(5).any(|w| w == b"later"))
+                    .unwrap_or(false)
+            })
+            .map(|(k, _)| k.clone())
+            .collect();
+        assert_eq!(gone.len(), 1, "exactly the second layer blob");
+        for k in gone {
+            blobs.remove(&k);
+        }
+    }
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
+        engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
+    ));
+    let scratch = tempfile::tempdir().unwrap();
+    let probe = TreeProbePacker::default();
+
+    let err = probe_materializer(&probe)
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            None,
+        )
+        .await
+        .expect_err("vanished layer blob must fail the materialize");
+    assert!(
+        err.to_string().starts_with("pull:"),
+        "the pull error must win over the flatten truncation echo: {err}"
+    );
+    assert!(
+        std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
+        "scratch must be scrubbed on the mid-pull error path"
+    );
+}
+
+/// Small-image fast path: a single tiny layer round-trips through the
+/// pipeline with no behavioral change (the no-regression guard for
+/// demo-class images).
+#[tokio::test]
+async fn single_layer_small_image_fast_path() {
+    let mut l1 = tar::Builder::new(Vec::new());
+    tar_file(&mut l1, "hello", 0o644, b"world");
+    l1.finish().unwrap();
+    let fx = publish_gzip_layers(vec![l1.into_inner().unwrap()]).await;
+
+    let store_dir = tempfile::tempdir().unwrap();
+    let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
+        engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
+    ));
+    let scratch = tempfile::tempdir().unwrap();
+    let probe = TreeProbePacker::default();
+
+    let out = probe_materializer(&probe)
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            None,
+        )
+        .await
+        .expect("single-layer materialize");
+    assert_eq!(
+        probe.tree.lock().get("hello").map(Vec::as_slice),
+        Some(&b"world"[..])
+    );
+    assert!(out.manifest_digest.starts_with("sha256:"));
+    assert!(
+        std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
+        "scratch scrubbed"
+    );
+}

@@ -439,6 +439,23 @@ mod tests {
                 progress: Some(CaptureJobProgress {
                     detail: Some("install-deps".into()),
                     log_tail: Some("Successfully installed foo-1.2.3".into()),
+                    // ADR 0088 addendum: the capture timeline rides the
+                    // report too — one closed synthetic leg + one open
+                    // hook stage exercises both serde shapes.
+                    warm_stages: vec![
+                        engram_core::types::WarmStageRecord {
+                            name: "[capture] boot".into(),
+                            started_at: chrono::Utc::now(),
+                            ended_at: Some(chrono::Utc::now()),
+                            outcome: engram_core::types::WarmStageOutcome::Done,
+                        },
+                        engram_core::types::WarmStageRecord {
+                            name: "install-deps".into(),
+                            started_at: chrono::Utc::now(),
+                            ended_at: None,
+                            outcome: engram_core::types::WarmStageOutcome::Running,
+                        },
+                    ],
                 }),
                 fc_snapshot_version: Some("v6".into()),
                 terminal: None,
@@ -501,6 +518,30 @@ mod tests {
             }
             other => panic!("expected Done, got {other:?}"),
         }
+        // ADR 0088 addendum: the capture timeline round-trips (closed
+        // synthetic leg + open hook stage).
+        let stages = &back.capture_job_reports[0]
+            .progress
+            .as_ref()
+            .unwrap()
+            .warm_stages;
+        assert_eq!(stages.len(), 2);
+        assert_eq!(stages[0].name, "[capture] boot");
+        assert!(stages[0].ended_at.is_some());
+        assert_eq!(stages[1].name, "install-deps");
+        assert!(stages[1].ended_at.is_none());
+    }
+
+    /// ADR 0088 addendum rollout interop: a `CaptureJobProgress` from a
+    /// host-agent that predates the capture timeline (no `warm_stages`
+    /// key) must decode to an empty timeline, not fail.
+    #[test]
+    fn capture_progress_without_warm_stages_decodes_empty() {
+        use engram_core::types::CaptureJobProgress;
+        let old = r#"{"detail":"install-deps","log_tail":"tail"}"#;
+        let p: CaptureJobProgress = serde_json::from_str(old).unwrap();
+        assert_eq!(p.detail.as_deref(), Some("install-deps"));
+        assert!(p.warm_stages.is_empty());
     }
 
     /// Rollout interop: a heartbeat from a pre-ADR-0084 host-agent omits

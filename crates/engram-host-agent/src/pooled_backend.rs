@@ -580,6 +580,12 @@ pub struct PooledBackend {
     /// stays pure-Full and the periodic driver no-ops — the rollout
     /// gate, and the natural state for non-FC backends.
     checkpoint_dir: Option<PathBuf>,
+    /// Durable mirror of the chain heads (survivor rehydrate after a
+    /// pod roll) — every record mutation routes through this store so
+    /// a cancelled persist's detached tail can never resurrect a record
+    /// a later capture invalidated (see [`crate::checkpoint::ChainHeadStore`]).
+    /// `Some` ⟺ `checkpoint_dir` is `Some`.
+    chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
     /// ADR 0028 Fix A: per-sandbox rolling chain state. Present once
     /// the first (Full, seeding) checkpoint completed; every
     /// subsequent `snapshot()` on that sandbox — periodic checkpoint
@@ -711,6 +717,63 @@ fn progress_line_detail(line: &crate::warm_progress::WarmProgressLine) -> Option
 /// Record `engram_warm_hook_stage_seconds` for every CLOSED stage in a
 /// `[warm]`-hook stage history (the still-open stage, if any — `outcome:
 /// Running` — has no duration to record).
+/// ADR 0088 addendum (adversarial-review fix): the pre-seed balloon
+/// inflate with rollback-safe cleanup. Returns:
+///
+/// - `Ok(true)` — the inflate PATCH landed (whatever the guest granted,
+///   including 0 MiB): the caller OWES a confirmed `balloon_release`
+///   before any guest workload runs.
+/// - `Ok(false)` — no balloon in play (target 0, the TYPED no-device
+///   `InvalidSpec`, or a failed reclaim that was successfully
+///   normalized back to deflated): dense seed, nothing to release.
+/// - `Err` — the reclaim failed AND the balloon could not be confirmed
+///   deflated: the capture must fail rather than run a warm hook in a
+///   possibly-starved guest.
+///
+/// The reclaim's `InvalidSpec` is the only fail-open path; every other
+/// reclaim error is treated as "the inflate target may have landed"
+/// (it is PATCHed before the first statistics poll) and normalized via
+/// release-and-confirm.
+async fn balloon_inflate_for_seed(
+    inner: &dyn SandboxBackend,
+    id: SandboxId,
+    target_mib: u64,
+    deadline: std::time::Duration,
+) -> Result<bool, SandboxError> {
+    if target_mib == 0 {
+        return Ok(false);
+    }
+    match inner.balloon_reclaim(id, target_mib, deadline).await {
+        // Even a 0-MiB grant means the target PATCH landed — release.
+        Ok(_granted_mib) => Ok(true),
+        Err(SandboxError::InvalidSpec(msg)) => {
+            tracing::info!(
+                sandbox_id = %id,
+                detail = %msg,
+                "no balloon available; taking a dense cold-base seed",
+            );
+            Ok(false)
+        }
+        Err(reclaim_err) => {
+            tracing::warn!(
+                sandbox_id = %id,
+                error = %reclaim_err,
+                "balloon reclaim failed after the inflate may have landed; normalizing via release",
+            );
+            match inner.balloon_release(id).await {
+                // Confirmed deflated: safe to proceed with a dense seed.
+                Ok(()) => Ok(false),
+                // No device ⇒ the inflate PATCH never landed either.
+                Err(SandboxError::InvalidSpec(_)) => Ok(false),
+                Err(release_err) => Err(SandboxError::Snapshot(format!(
+                    "balloon reclaim failed ({reclaim_err}) and the normalizing release also \
+                     failed ({release_err}); balloon state unknown"
+                ))),
+            }
+        }
+    }
+}
+
 fn record_warm_stage_metrics(stages: &[engram_core::types::WarmStageRecord]) {
     use engram_core::types::WarmStageOutcome;
     for stage in stages {
@@ -1661,6 +1724,7 @@ impl PooledBackend {
             live_manifest_publisher: Arc::new(crate::disk_daemon::NoOpLiveManifestPublisher),
             live_manifest_publisher_handle: None,
             checkpoint_dir: None,
+            chain_heads: None,
             checkpoint_chains: Arc::new(DashMap::new()),
             capture_locks: Arc::new(DashMap::new()),
             snapshot_waits: Arc::new(DashMap::new()),
@@ -1744,6 +1808,7 @@ impl PooledBackend {
     /// this, `snapshot()` stays pure-Full and the periodic driver
     /// no-ops.
     pub fn with_checkpoint_dir(mut self, dir: PathBuf) -> Self {
+        self.chain_heads = Some(Arc::new(crate::checkpoint::ChainHeadStore::new(&dir)));
         self.checkpoint_dir = Some(dir);
         self
     }
@@ -1802,8 +1867,44 @@ impl PooledBackend {
             last_snapshot_unix_ms: self.last_snapshot_unix_ms.clone(),
             checkpoint_chains: self.checkpoint_chains.clone(),
             checkpoint_dir: self.checkpoint_dir.clone(),
+            chain_heads: self.chain_heads.clone(),
             session_bindings: self.session_bindings.clone(),
         }
+    }
+
+    /// ADR 0088 addendum: the deferred-finish flavor of `snapshot()`,
+    /// used by the cold-base seed so its multi-GiB upload runs
+    /// CONCURRENTLY with the warm hook instead of blocking it. The
+    /// capture_phase (pause → dump to local NVMe → resume) stays
+    /// synchronous — the FC dirty bitmap is consumed inside it, which
+    /// is exactly what makes hook-dirtied pages the final Diff's dirty
+    /// set — then `finish()` (disk flush upload, memory chunk upload,
+    /// portable blobs, chain seed) runs on a spawned task holding the
+    /// capture-lock guard, so the final snapshot's own `capture_phase`
+    /// naturally serializes behind it even if the hook is instant.
+    ///
+    /// Callers MUST `join()` (never drop/abort) before taking another
+    /// snapshot of `id` and before reporting the capture durable:
+    /// - join-before-final-snapshot ⇒ the chain is seeded
+    ///   (`advance_checkpoint_state` is finish()'s last step) so the
+    ///   final capture stays a Diff;
+    /// - aborting mid-finish could leak a snapshot dir the
+    ///   `inflight_snapshots` bookkeeping no longer tracks;
+    /// - a joined `Ok` is the SAME durability barrier `snapshot()`
+    ///   provides, moved in wall-clock only.
+    pub(crate) async fn snapshot_deferred(
+        &self,
+        id: SandboxId,
+    ) -> Result<DeferredSnapshot, SandboxError> {
+        let (capture_guard, cap) = self.capture_phase(id).await?;
+        self.spawn_trace_publish(id);
+        let finisher = self.finisher();
+        Ok(DeferredSnapshot {
+            handle: tokio::spawn(async move {
+                let _guard = capture_guard;
+                finisher.finish(id, cap).await
+            }),
+        })
     }
 
     /// Issue #529: install the weak self-reference `snapshot_begin`'s
@@ -1967,6 +2068,28 @@ impl PooledBackend {
             .checkpoint_chains
             .get(&id)
             .map(|c| (c.manifest_ref, c.manifest.clone()));
+
+        // Write-ahead invalidate of the durable chain-head record: BOTH
+        // snapshot flavors below consume+reset the KVM dirty bitmap the
+        // moment FC runs `PUT /snapshot/create`, and from that instant
+        // the on-disk record — the seed source for survivor rehydrate
+        // after a pod roll — would describe a baseline the bitmap no
+        // longer has. Remove it BEFORE the create (under the capture
+        // lock, before the pause); it is re-written only after the chain
+        // durably advances (`advance_checkpoint_state`). A crash
+        // anywhere between leaves no record → the survivor's next
+        // capture is a safe Full. The 2026-07-13 roll tore a capture in
+        // exactly this window (post-processing died at 22:23:46 with the
+        // bitmap consumed), which is why the coordinator's snapshots
+        // rows can never be the rehydrate seed source. A failed unlink
+        // (non-NotFound) aborts the capture: nothing is paused or
+        // consumed yet, and proceeding would leave a stale record the
+        // create is about to falsify.
+        if let Some(store) = &self.chain_heads {
+            store.invalidate(id).map_err(|e| {
+                SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
+            })?;
+        }
 
         // ADR 0014 issue #1/#2: if a prior snapshot for this sandbox
         // was produced but never committed (caller's downstream
@@ -2165,6 +2288,7 @@ impl PooledBackend {
                 if chain_prev.is_some() {
                     poison_checkpoint_chain_after_failed_diff(
                         &self.checkpoint_chains,
+                        self.chain_heads.as_deref(),
                         id,
                         "fc snapshot_diff create",
                     );
@@ -2873,6 +2997,13 @@ impl PooledBackend {
         #[cfg(target_os = "linux")]
         let nbd = self.nbd_sandboxes.get(&id).map(|e| e.backend.clone());
         let inline_disks = self.inline_disk_manifests.clone();
+        // For the deferred chain-head commit below: the in-RAM seed
+        // above precedes chunk durability, so the durable record must
+        // wait for the catch-up's put_manifest — a pod roll mid-catch-up
+        // then rehydrates nothing (Full, safe) instead of a head whose
+        // chunks never reached GCS.
+        let chain_heads = self.chain_heads.clone();
+        let chain_session = self.session_bindings.get(&id).map(|s| *s);
         let handle = tokio::spawn(async move {
             let _capture_guard = capture_guard;
             // 1. Upload every pulled chunk (content-addressed,
@@ -2924,6 +3055,22 @@ impl PooledBackend {
                 .put_manifest(mig.memory_manifest_ref, &mem_manifest)
                 .await
                 .map_err(|e| SandboxError::Snapshot(format!("publish mem manifest: {e}")))?;
+            // The chain head is durable now — commit its record (the
+            // capture_guard is still held, so no capture can have
+            // invalidated in between). Best-effort like every other
+            // chain-head write.
+            if let Some(store) = &chain_heads {
+                let record = crate::checkpoint::ChainHeadRecord {
+                    sandbox_id: id,
+                    manifest_ref: mig.memory_manifest_ref,
+                    session_id: chain_session,
+                    updated_at: chrono::Utc::now(),
+                };
+                if let Err(e) = store.persist(record).await {
+                    tracing::warn!(sandbox_id = %id, error = %e,
+                        "migration catch-up: chain-head record write failed");
+                }
+            }
             // 3. Publish the disk manifest with the shared-lineage
             //    conflict-retry (mirror flush_upload's rule).
             let mut disk_ref_final = None;
@@ -3047,6 +3194,100 @@ impl PooledBackend {
 
     pub fn checkpoint_records_dir(&self) -> Option<PathBuf> {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
+    }
+
+    /// Test-only view of a sandbox's in-RAM chain head.
+    #[cfg(test)]
+    pub(crate) fn chain_head_for_test(
+        &self,
+        id: SandboxId,
+    ) -> Option<engram_core::types::manifest::ManifestRef> {
+        self.checkpoint_chains.get(&id).map(|c| c.manifest_ref)
+    }
+
+    /// Re-seed checkpoint chains for VMs that survived a host-agent
+    /// restart (pidfd reattach, ADR 0044 K2 / ADR 0090), from the
+    /// durable [`crate::checkpoint::ChainHeadRecord`]s — and GC records
+    /// whose sandbox did NOT survive. Called once at startup, after the
+    /// reattach pass and `set_self_ref`, BEFORE anything that can start
+    /// a capture (checkpoint driver, eviction redrive, coordinator
+    /// registration): a survivor's first post-roll capture then rides
+    /// the O(dirty-set) diff path instead of a FULL multi-GiB re-chunk
+    /// (the 2026-07-13 incident's 40-minute evict).
+    ///
+    /// Torn-capture safety is inherited from the record's write-ahead
+    /// protocol (see the record's type doc): a record only exists if no
+    /// FC snapshot create ran since the chain durably advanced, so
+    /// seeding from it is exactly as sound as never having lost the
+    /// DashMap. NBD-quarantined survivors seed too — the disk plane's
+    /// health is orthogonal to the KVM dirty bitmap, and their
+    /// evict_local capture is precisely the one that must not be a
+    /// Full.
+    pub async fn rehydrate_chain_heads(&self) {
+        let Some(store) = self.chain_heads.clone() else {
+            return;
+        };
+        let Some(chunk_store) = self.chunk_store.clone() else {
+            return;
+        };
+        let live: std::collections::HashSet<SandboxId> = match self.inner.list().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(error = %e, "chain-head rehydrate: backend list failed; skipping");
+                return;
+            }
+        };
+        let dir = store.dir().to_path_buf();
+        for record in crate::checkpoint::ChainHeadRecord::load_all(&dir).await {
+            let id = record.sandbox_id;
+            if !live.contains(&id) {
+                // The sandbox didn't survive (node reboot, destroyed
+                // while the record write raced teardown) — the record
+                // is unreachable; sweep it.
+                store.remove_best_effort(id);
+                continue;
+            }
+            // Serialize against any capture already running for this
+            // sandbox: a capture that won the lock first has already
+            // write-ahead-removed the record, so the re-read below
+            // no-ops — without the lock, "read record → capture
+            // invalidates + creates (bitmap reset) → seed stale head"
+            // would rebuild exactly the corrupt diff this protocol
+            // exists to prevent.
+            let lock = self.capture_lock(id);
+            let _guard = lock.lock_owned().await;
+            if self.checkpoint_chains.contains_key(&id) {
+                continue;
+            }
+            let Some(record) = crate::checkpoint::ChainHeadRecord::load(&dir, id).await else {
+                continue;
+            };
+            match chunk_store.get_manifest(record.manifest_ref).await {
+                Ok(manifest) => {
+                    self.checkpoint_chains.insert(
+                        id,
+                        crate::checkpoint::CheckpointChain {
+                            manifest_ref: record.manifest_ref,
+                            manifest,
+                        },
+                    );
+                    tracing::info!(
+                        sandbox_id = %id,
+                        session_id = ?record.session_id,
+                        manifest = %record.manifest_ref,
+                        "chain head rehydrated from durable record; survivor's next capture will diff",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        manifest = %record.manifest_ref,
+                        error = %e,
+                        "chain-head rehydrate: manifest fetch failed; next capture falls back to Full",
+                    );
+                }
+            }
+        }
     }
 
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
@@ -4488,9 +4729,18 @@ pub(crate) struct SnapshotCapture {
 /// sites.)
 fn poison_checkpoint_chain_after_failed_diff(
     chains: &DashMap<SandboxId, crate::checkpoint::CheckpointChain>,
+    chain_heads: Option<&crate::checkpoint::ChainHeadStore>,
     id: SandboxId,
     failed_step: &str,
 ) {
+    // The durable chain-head record was already write-ahead-removed
+    // before the FC create (capture_phase / migration_capture), so this
+    // is the defensive double-unlink — the poison must never leave a
+    // record a post-roll rehydrate could seed from. (It also bumps the
+    // store epoch, fencing any straggling persist.)
+    if let Some(store) = chain_heads {
+        store.remove_best_effort(id);
+    }
     if chains.remove(&id).is_some() {
         metrics::counter!(crate::metrics::CHECKPOINT_CHAIN_POISONED_TOTAL).increment(1);
         tracing::warn!(
@@ -4499,6 +4749,25 @@ fn poison_checkpoint_chain_after_failed_diff(
             "diff capture failed after FC consumed the dirty bitmap; \
              checkpoint chain dropped — next capture will be a FULL snapshot",
         );
+    }
+}
+
+/// ADR 0088 addendum: a snapshot whose `capture_phase` completed
+/// synchronously but whose `finish()` runs on a spawned task — see
+/// [`PooledBackend::snapshot_deferred`] for the contract (always
+/// `join()`, never drop).
+pub(crate) struct DeferredSnapshot {
+    handle: tokio::task::JoinHandle<Result<SnapshotMetadata, SandboxError>>,
+}
+
+impl DeferredSnapshot {
+    pub(crate) async fn join(self) -> Result<SnapshotMetadata, SandboxError> {
+        match self.handle.await {
+            Ok(result) => result,
+            Err(e) => Err(SandboxError::Snapshot(format!(
+                "deferred snapshot finish task died: {e}"
+            ))),
+        }
     }
 }
 
@@ -4520,6 +4789,7 @@ pub(crate) struct SnapshotFinisher {
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
     checkpoint_dir: Option<PathBuf>,
+    chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
 }
 
@@ -4660,8 +4930,13 @@ impl SnapshotFinisher {
                 if fs::metadata(&mem_path).await.is_err() {
                     return Ok(metadata);
                 }
-                let mref = chunk_memory_to_store(chunk_store, &mem_path, self.chunk_cache.as_ref())
-                    .await?;
+                let mref = chunk_memory_to_store(
+                    chunk_store,
+                    &mem_path,
+                    self.chunk_cache.as_ref(),
+                    "snapshot_finish",
+                )
+                .await?;
                 // ADR 0039: the dump is now durable in the chunk store and
                 // the chain seeds from the manifest (not this file) — drop
                 // the GiB-scale memory.bin so committed snapshot dirs stay
@@ -4788,6 +5063,7 @@ impl SnapshotFinisher {
                 if chain_prev.is_some() {
                     poison_checkpoint_chain_after_failed_diff(
                         &self.checkpoint_chains,
+                        self.chain_heads.as_deref(),
                         id,
                         "snapshot post-processing",
                     );
@@ -4826,6 +5102,40 @@ impl SnapshotFinisher {
         self.checkpoint_dir.as_ref().map(|d| d.join("records"))
     }
 
+    /// Durably mirror the in-RAM chain head at `manifest_ref` (which
+    /// MUST already be published in the chunk store — every caller sits
+    /// after a successful `put_manifest` or a fetch of an existing
+    /// manifest). Best-effort: a failed write just means a post-roll
+    /// rehydrate finds no record and the survivor's next capture is a
+    /// Full — safe, slower, and self-healing at the next checkpoint.
+    /// Routed through the [`crate::checkpoint::ChainHeadStore`] so a
+    /// cancelled write's detached tail can never outlive a later
+    /// invalidate.
+    async fn persist_chain_head(
+        &self,
+        id: SandboxId,
+        manifest_ref: engram_core::types::manifest::ManifestRef,
+    ) {
+        let Some(store) = &self.chain_heads else {
+            return;
+        };
+        let record = crate::checkpoint::ChainHeadRecord {
+            sandbox_id: id,
+            manifest_ref,
+            session_id: self.session_bindings.get(&id).map(|s| *s),
+            updated_at: chrono::Utc::now(),
+        };
+        if let Err(e) = store.persist(record).await {
+            tracing::warn!(
+                sandbox_id = %id,
+                manifest = %manifest_ref,
+                error = %e,
+                "durable chain-head write failed; a pod roll before the next \
+                 checkpoint costs this sandbox one Full capture",
+            );
+        }
+    }
+
     async fn advance_checkpoint_state(
         &self,
         id: SandboxId,
@@ -4845,17 +5155,21 @@ impl SnapshotFinisher {
 
         match next_manifest {
             // Diff capture: the sparse re-chunk already ran in the post
-            // block; just advance the chain's manifest pointer.
+            // block; just advance the chain's manifest pointer, then
+            // re-commit the durable chain-head record the capture's
+            // write-ahead invalidate removed.
             Some(next) => {
                 if let Some(mut chain) = self.checkpoint_chains.get_mut(&id) {
                     chain.manifest_ref = memory_ref;
                     chain.manifest = next;
                 }
+                self.persist_chain_head(id, memory_ref).await;
             }
             // Full capture: seed the chain manifest-only from the manifest
             // we just published (ADR 0039 — no local rolling image; the
             // memory.bin was chunked + removed in the post block).
-            // Subsequent captures ride the sparse diff path.
+            // Subsequent captures ride the sparse diff path. (The seed
+            // persists the chain-head record itself.)
             None => {
                 self.seed_checkpoint_chain_sparse(id, memory_ref).await;
             }
@@ -4950,6 +5264,9 @@ impl SnapshotFinisher {
                 manifest,
             },
         );
+        // The fork manifest is durable (put_manifest above succeeded) —
+        // commit the chain-head record so the chain survives a pod roll.
+        self.persist_chain_head(id, fork_ref).await;
         tracing::info!(
             sandbox_id = %id,
             src = %src_ref,
@@ -4994,6 +5311,10 @@ impl SnapshotFinisher {
                         manifest,
                     },
                 );
+                // The seed source is a published manifest (we just
+                // fetched it) — commit the chain-head record so the
+                // chain survives a pod roll.
+                self.persist_chain_head(id, memory_ref).await;
                 tracing::info!(
                     sandbox_id = %id,
                     manifest = %memory_ref,
@@ -5017,11 +5338,14 @@ pub(crate) async fn chunk_memory_to_store(
     chunk_store: &ChunkStore,
     memory_bin: &std::path::Path,
     cache: Option<&ChunkCache>,
+    // `source` label for the re-chunk histogram: which capture flavor
+    // paid for this full-image scan (`snapshot_finish` | `evict_finalize`).
+    source: &'static str,
 ) -> Result<engram_core::types::manifest::ManifestRef, SandboxError> {
     // ADR 0039 (sticky-everywhere): write-through the base memory chunks
     // into the host's local cache as they're uploaded, so the capturing
     // host keeps them local instead of re-fetching its own writes.
-    let manifest = chunk_store
+    let res = chunk_store
         .chunk_file_into(
             memory_bin,
             engram_chunk_store::ManifestKind::Memory,
@@ -5029,10 +5353,39 @@ pub(crate) async fn chunk_memory_to_store(
             cache,
             None,
         )
-        .await
-        .map_err(|e| {
-            SandboxError::Snapshot(format!("chunk memory.bin {}: {e}", memory_bin.display(),))
-        })?;
+        .await;
+    let outcome = if res.is_ok() { "success" } else { "error" };
+    if let Ok((_, stats)) = &res {
+        for (phase, seconds) in [
+            ("scan", stats.scan_seconds),
+            ("upload", stats.flush_seconds),
+        ] {
+            metrics::histogram!(
+                crate::metrics::RECHUNK_SECONDS,
+                "phase" => phase,
+                "source" => source,
+                "outcome" => outcome,
+            )
+            .record(seconds);
+        }
+        metrics::counter!(crate::metrics::RECHUNK_BYTES_SCANNED_TOTAL, "source" => source)
+            .increment(stats.bytes_scanned);
+        metrics::counter!(crate::metrics::RECHUNK_BYTES_UPLOADED_TOTAL, "source" => source)
+            .increment(stats.bytes_uploaded);
+        tracing::info!(
+            memory_bin = %memory_bin.display(),
+            source,
+            scan_ms = (stats.scan_seconds * 1000.0) as u64,
+            upload_ms = (stats.flush_seconds * 1000.0) as u64,
+            bytes_scanned = stats.bytes_scanned,
+            chunks_uploaded = stats.chunks_uploaded,
+            bytes_uploaded = stats.bytes_uploaded,
+            "full memory re-chunk phase breakdown",
+        );
+    }
+    let (manifest, _) = res.map_err(|e| {
+        SandboxError::Snapshot(format!("chunk memory.bin {}: {e}", memory_bin.display(),))
+    })?;
     let manifest_ref = engram_core::types::manifest::ManifestRef::new();
     chunk_store
         .put_manifest(manifest_ref, &manifest)
@@ -5653,6 +6006,7 @@ impl SandboxBackend for PooledBackend {
                     if chain_prev.is_some() {
                         poison_checkpoint_chain_after_failed_diff(
                             &self.checkpoint_chains,
+                            self.chain_heads.as_deref(),
                             id,
                             "eviction disk-pending persist",
                         );
@@ -5711,6 +6065,7 @@ impl SandboxBackend for PooledBackend {
             if record.chain_prev_ref.is_some() {
                 poison_checkpoint_chain_after_failed_diff(
                     &self.checkpoint_chains,
+                    self.chain_heads.as_deref(),
                     id,
                     "eviction finalizer unavailable",
                 );
@@ -5732,6 +6087,7 @@ impl SandboxBackend for PooledBackend {
             if record.chain_prev_ref.is_some() {
                 poison_checkpoint_chain_after_failed_diff(
                     &self.checkpoint_chains,
+                    self.chain_heads.as_deref(),
                     id,
                     "eviction finalize-record persist",
                 );
@@ -6367,6 +6723,21 @@ impl SandboxBackend for PooledBackend {
         // Checkpoint fence: held for the export's lifetime.
         let capture_guard = self.capture_lock(id).lock_owned().await;
 
+        // Write-ahead invalidate of the durable chain-head record — the
+        // C1 diff create below consumes the KVM dirty bitmap exactly
+        // like capture_phase's (see the comment there). Note the C2
+        // post-copy capture (`migration_capture_postcopy`) deliberately
+        // does NOT invalidate: its fork-v3 vmstate-only snapshot never
+        // touches the bitmap (persist.rs gates the memory dump on
+        // `!vmstate_only`), and an aborted C2 resumes with bitmap AND
+        // chain intact — removing the record there would needlessly
+        // cost the survivor a Full after a later roll.
+        if let Some(store) = &self.chain_heads {
+            store.invalidate(id).map_err(|e| {
+                SandboxError::Snapshot(format!("chain-head write-ahead invalidate: {e}"))
+            })?;
+        }
+
         match self.inner.wait_agent_ready(id).await {
             Ok(()) => {}
             Err(SandboxError::InvalidSpec(_)) => {}
@@ -6471,11 +6842,45 @@ impl SandboxBackend for PooledBackend {
         // success — re-pause immediately (the guest is mid-move; its
         // post-capture execution would be discarded anyway, exactly
         // the D5 argument).
-        let metadata = self
-            .inner
-            .snapshot_diff(id)
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("migration diff capture: {e}")))?;
+        let create_res = self.inner.snapshot_diff(id).await;
+        // The diff just consumed+reset the KVM dirty bitmap, but its
+        // resulting manifest only becomes durable on the DESTINATION
+        // (the re-chunk below sinks to the local cache; the dest's
+        // catch-up publishes). If this export is later ABORTED (explicit
+        // abort or the TTL sweep's AbortInPlace) the guest resumes here
+        // with a bitmap baseline the local chain head does not describe
+        // — a subsequent diff against it would silently omit every page
+        // dirtied before this capture, the same corruption class the
+        // failed-diff poison exists for. Retire the chain (and its
+        // durable record, already write-ahead-removed above) NOW, on
+        // success and failure alike: commit destroys the sandbox anyway,
+        // and an abort costs one recovery Full instead of a
+        // silently-incomplete diff. (Advancing the chain to the new ref
+        // instead would be unsound: its chunks are cache-only until the
+        // dest publishes.)
+        let metadata = match create_res {
+            Ok(m) => {
+                if self.checkpoint_chains.remove(&id).is_some() {
+                    tracing::info!(
+                        sandbox_id = %id,
+                        "C1 capture consumed the dirty bitmap; chain retired — an aborted \
+                         move's next capture will be a FULL snapshot",
+                    );
+                }
+                m
+            }
+            Err(e) => {
+                poison_checkpoint_chain_after_failed_diff(
+                    &self.checkpoint_chains,
+                    self.chain_heads.as_deref(),
+                    id,
+                    "migration diff capture",
+                );
+                return Err(SandboxError::Snapshot(format!(
+                    "migration diff capture: {e}"
+                )));
+            }
+        };
         if let Err(e) = self.inner.pause(id).await {
             tracing::debug!(sandbox_id = %id, error = %e, "post-capture re-pause failed (benign)");
         }
@@ -7106,6 +7511,9 @@ impl SandboxBackend for PooledBackend {
         // running unaffected: it is a pure function of `dest` + the chunk
         // store, never the live sandbox, and this method deletes neither.
         let _ = self.checkpoint_chains.remove(&id);
+        if let Some(store) = &self.chain_heads {
+            store.remove_best_effort(id);
+        }
         let _ = self.capture_locks.remove(&id);
         // Issue #221: reclaim any unconsumed `snapshot_wait` slot. The
         // entry is now kept-until-consumed (so a cancelled coordinator
@@ -7224,6 +7632,9 @@ impl SandboxBackend for PooledBackend {
         let mut session_env = spec.env.clone();
         session_env.extend(capture_env);
         let is_warm = warm.is_some();
+        // Captured before `spec` moves into `create` — the balloon
+        // reclaim target below derives from guest RAM size.
+        let guest_mem_mib = u64::from(spec.memory.max_mib);
 
         // ---- stage 1: a LIVE VM at (or converging toward) agentd-ready
         // — restore the cold base on a Hit (no cold boot at all), else
@@ -7268,6 +7679,11 @@ impl SandboxBackend for PooledBackend {
                 if let Some(memory_ref) = memory_ref {
                     self.seed_checkpoint_chain_forked(id, memory_ref).await;
                 }
+                // ADR 0088 addendum: a balloon-era cold base was dumped
+                // with the balloon INFLATED — the deflate happens inside
+                // the teardown-covered capture block below (so a deflate
+                // failure destroys the restored VM instead of leaking it
+                // to the reconcile).
                 self.spawn_prefault_stats_probe(id);
                 id
             }
@@ -7316,6 +7732,40 @@ impl SandboxBackend for PooledBackend {
             }
             drop(boot_keepalive);
 
+            // ADR 0088 addendum (adversarial-review fix): a balloon-era
+            // cold base was dumped with the balloon INFLATED, so a Hit
+            // restore comes up ballooned — deflate AND CONFIRM
+            // (`balloon_release`'s contract) before anything runs in the
+            // guest. Only the TYPED no-device outcome (`InvalidSpec` — a
+            // legacy balloon-less base, or a non-FC backend) is a no-op;
+            // any other failure fails the capture (inside this block, so
+            // the teardown below destroys the VM rather than leaking it).
+            if matches!(cold_base_plan, ColdBasePlan::Hit { .. }) {
+                match self.inner.balloon_release(id).await {
+                    Ok(()) => {}
+                    Err(SandboxError::InvalidSpec(msg)) => {
+                        tracing::debug!(
+                            sandbox_id = %id,
+                            detail = %msg,
+                            "cold-base restore: no balloon device to deflate (legacy base)",
+                        );
+                    }
+                    Err(e) => {
+                        return Err(SandboxError::CaptureFailed(
+                            engram_core::types::CaptureFailure {
+                                kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                                stage: Some("booting".to_string()),
+                                tail: String::new(),
+                                message: format!(
+                                    "balloon deflate after cold-base restore failed: {e} — \
+                                     refusing to run the warm hook in a possibly-starved guest"
+                                ),
+                            },
+                        ));
+                    }
+                }
+            }
+
             // ADR 0084 §B3: a WARM image on a MISS needs its OWN cold
             // base minted before the hook runs (the hook must land on
             // top of an established base, not fold into the artifact's
@@ -7331,7 +7781,16 @@ impl SandboxBackend for PooledBackend {
             // cold-base concept), `Hit` (already have one — the restore
             // above seeded the chain sparse off IT), and warm-less
             // (its single final snapshot below IS the cold base).
-            let minted_cold_base = if is_warm && matches!(cold_base_plan, ColdBasePlan::Miss { .. })
+            // ADR 0088 addendum: only the DUMP blocks the hook now. The
+            // seed's finish() (the 40s–11.5min chunk+upload leg measured
+            // in prod) runs on a spawned task concurrent with the warm
+            // hook and is joined — success AND failure paths — before
+            // the final snapshot below (join-before-final keeps the
+            // final capture a Diff and keeps the durability barrier
+            // ahead of the CaptureJobResult, exactly as the inline
+            // shape did).
+            let deferred_cold_base = if is_warm
+                && matches!(cold_base_plan, ColdBasePlan::Miss { .. })
             {
                 #[cfg(target_os = "linux")]
                 if let Some(state) = self.nbd_sandboxes.get(&id) {
@@ -7341,13 +7800,49 @@ impl SandboxBackend for PooledBackend {
                     phase: engram_core::types::CapturePhase::Snapshot,
                     sandbox_id: Some(id),
                     warm_stage: None,
-                    detail: Some("cold-base capture".to_string()),
+                    detail: Some("cold-base memory dump".to_string()),
                     output_tail: String::new(),
                     warm_stages: Vec::new(),
                 };
                 let _ = progress.try_send(cold_base_event.clone());
                 let cold_base_keepalive = spawn_leg_keepalive(progress.clone(), cold_base_event);
-                let meta = self.snapshot(id).await.map_err(|e| {
+
+                // ADR 0088 addendum: shrink the seed. Inflating the
+                // balloon hands the guest's free pages back to the host
+                // (`MADV_DONTNEED`), so the dense dump reads zeros there
+                // and the all-zero 512 KiB elision drops them from the
+                // memory manifest (~guest-RAM → ~touched-pages).
+                // Fail-open is limited to the TYPED no-balloon outcome
+                // (kill switch, legacy kernel, VZ) — any other reclaim
+                // failure means the inflate target may have landed, and
+                // `balloon_inflate_for_seed` normalizes (release-and-
+                // confirm) or fails the capture rather than ever running
+                // the warm hook in a possibly-starved guest
+                // (adversarial-review fix). The reserve keeps the
+                // paused-adjacent guest comfortably functional while
+                // inflated.
+                const BALLOON_RESERVE_MIB: u64 = 1536;
+                let balloon_target = guest_mem_mib.saturating_sub(BALLOON_RESERVE_MIB);
+                let inflated = balloon_inflate_for_seed(
+                    self.inner.as_ref(),
+                    id,
+                    balloon_target,
+                    std::time::Duration::from_secs(30),
+                )
+                .await
+                .map_err(|e| {
+                    SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
+                        kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                        stage: Some("booting".to_string()),
+                        tail: String::new(),
+                        message: format!(
+                            "balloon state could not be normalized before the cold-base dump: \
+                             {e} — refusing to run the warm hook in a possibly-starved guest"
+                        ),
+                    })
+                })?;
+
+                let deferred = self.snapshot_deferred(id).await.map_err(|e| {
                     SandboxError::CaptureFailed(engram_core::types::CaptureFailure {
                         kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
                         stage: Some("booting".to_string()),
@@ -7356,7 +7851,35 @@ impl SandboxBackend for PooledBackend {
                     })
                 });
                 drop(cold_base_keepalive);
-                Some(meta?)
+                let deferred = deferred?;
+
+                // FAIL-LOUD deflate: a warm hook in a balloon-starved
+                // guest (~1.5 GiB effective) is a guaranteed slow OOM-
+                // flavored failure 20 minutes later — better to fail in
+                // seconds here. `balloon_release` CONFIRMS actual==0
+                // before returning; `InvalidSpec` here is ALSO fatal
+                // (the device demonstrably existed at inflate time).
+                // Only reached when the inflate landed.
+                if inflated {
+                    if let Err(e) = self.inner.balloon_release(id).await {
+                        // The deferred finish must still be settled
+                        // (await-never-abort) before surfacing.
+                        let seed = deferred.join().await;
+                        tracing::warn!(sandbox_id = %id, seed_ok = seed.is_ok(), "balloon deflate failed; seed settled before aborting");
+                        return Err(SandboxError::CaptureFailed(
+                            engram_core::types::CaptureFailure {
+                                kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                                stage: Some("booting".to_string()),
+                                tail: String::new(),
+                                message: format!(
+                                    "balloon deflate after the cold-base dump failed: {e} — \
+                                     refusing to run the warm hook in a memory-starved guest"
+                                ),
+                            },
+                        ));
+                    }
+                }
+                Some(deferred)
             } else {
                 None
             };
@@ -7384,10 +7907,76 @@ impl SandboxBackend for PooledBackend {
             // output — the diagnosis a `status None` / vsock-lost failure
             // used to lose entirely.
             let mut warm_tail = crate::warm_progress::OutputTail::default();
-            if let Some(warm) = &warm {
-                warm_tail = self
+            // The hook result is NOT `?`-returned before the seed join
+            // below — the deferred finish must always be awaited (never
+            // dropped/aborted; see `snapshot_deferred`'s contract).
+            let hook_result = match &warm {
+                Some(warm) => self
                     .run_warm_hook(id, warm, &session_env, &progress)
-                    .await?;
+                    .await
+                    .map(Some),
+                None => Ok(None),
+            };
+
+            // ---- JOIN BARRIER (ADR 0088 addendum) ----
+            // Settle the deferred cold-base seed on success AND failure
+            // paths. Under its own keepalive: the upload may still have
+            // minutes left when a short hook finishes, and the claim
+            // lease must not expire while we wait it out.
+            let seed_result: Option<Result<SnapshotMetadata, SandboxError>> =
+                match deferred_cold_base {
+                    Some(deferred) => {
+                        let upload_event = engram_core::types::CaptureProgress {
+                            phase: engram_core::types::CapturePhase::Snapshot,
+                            sandbox_id: Some(id),
+                            warm_stage: None,
+                            detail: Some("cold-base upload".to_string()),
+                            output_tail: String::new(),
+                            warm_stages: Vec::new(),
+                        };
+                        let _ = progress.try_send(upload_event.clone());
+                        let upload_keepalive =
+                            spawn_leg_keepalive(progress.clone(), upload_event);
+                        let joined = deferred.join().await;
+                        drop(upload_keepalive);
+                        Some(joined)
+                    }
+                    None => None,
+                };
+
+            // Error priority: the hook's failure is the actionable one
+            // (it aborts today too); a concurrent seed failure is logged
+            // alongside rather than masking it.
+            match hook_result {
+                Ok(Some(tail)) => warm_tail = tail,
+                Ok(None) => {}
+                Err(e) => {
+                    if let Some(Err(seed_err)) = &seed_result {
+                        tracing::warn!(
+                            sandbox_id = %id,
+                            error = %seed_err,
+                            "cold-base seed upload also failed while the warm hook was failing",
+                        );
+                    }
+                    return Err(e);
+                }
+            }
+            let minted_cold_base = match seed_result {
+                None => None,
+                Some(Ok(meta)) => Some(meta),
+                Some(Err(e)) => {
+                    return Err(SandboxError::CaptureFailed(
+                        engram_core::types::CaptureFailure {
+                            kind: engram_core::types::CaptureFailureKind::SnapshotFailed,
+                            stage: Some("booting".to_string()),
+                            tail: warm_tail.render(),
+                            message: format!("cold-base capture failed: {e}"),
+                        },
+                    ))
+                }
+            };
+
+            if warm.is_some() {
                 // Incident 2026-07-10 mitigation: flush the guest's dirty
                 // page cache to the (durably captured) disk BEFORE the
                 // final snapshot. The memory image is REQUIRED to carry
@@ -12752,10 +13341,13 @@ mod tests {
         let in_flight_path = checkpoint_dir
             .join("finalize")
             .join(format!("{snapshot_id}.json"));
-        assert!(
-            !in_flight_path.exists(),
-            "the in-flight record must be gone once quarantined"
-        );
+        // `quarantine()` persists the failed/ copy FIRST, then deletes
+        // the in-flight record — observing the former does not imply
+        // the latter yet (flaked under full-suite load).
+        wait_for("in-flight record cleared after quarantine", || {
+            !in_flight_path.exists()
+        })
+        .await;
         assert!(
             !pooled.pending_finalizes.contains_key(&sandbox_id),
             "pending_finalizes must be cleared on quarantine"
@@ -12835,5 +13427,371 @@ mod tests {
             matches!(err, SandboxError::InvalidSpec(_)),
             "expected InvalidSpec (the idle_evictor's composed-path fallback signal), got {err:?}"
         );
+    }
+
+    // ─── durable chain-head record (survivor rehydrate after a pod roll) ───
+
+    fn chain_head_file(checkpoint_dir: &Path, id: SandboxId) -> PathBuf {
+        crate::checkpoint::ChainHeadRecord::subdir(checkpoint_dir).join(format!("{id}.json"))
+    }
+
+    /// The write-ahead protocol end to end on the composed snapshot
+    /// path: (1) a successful Full capture commits a chain-head record
+    /// matching the published memory manifest; (2) the next capture
+    /// takes the diff path (chain seeded) and — because the write-ahead
+    /// invalidate runs BEFORE the FC create — a failed diff create
+    /// leaves NO record (the torn-capture property from the 2026-07-13
+    /// incident) and drops the chain; (3) the capture after that is a
+    /// Full again and re-commits the record.
+    #[tokio::test]
+    async fn chain_head_record_follows_the_write_ahead_protocol() {
+        let (pooled, _cs, ckpt_dir, _destroy) = finalize_test_backend(None).await;
+        let id = SandboxId::new();
+
+        // (1) Full capture → chain seeded → record committed.
+        let meta = pooled.snapshot(id).await.expect("full capture");
+        let mem_ref = meta.memory_manifest.expect("memory manifest chunked");
+        let record = crate::checkpoint::ChainHeadRecord::load(
+            &crate::checkpoint::ChainHeadRecord::subdir(&ckpt_dir),
+            id,
+        )
+        .await
+        .expect("chain-head record committed after the Full");
+        assert_eq!(record.manifest_ref, mem_ref);
+        assert_eq!(pooled.chain_head_for_test(id), Some(mem_ref));
+
+        // (2) The chain routes the next capture to snapshot_diff, which
+        // the fake backend doesn't support — a create failure AFTER the
+        // write-ahead invalidate. The record must be gone and the chain
+        // poisoned; nothing may have resurrected the record.
+        pooled
+            .snapshot(id)
+            .await
+            .expect_err("diff create must fail on the fake backend");
+        assert!(
+            !chain_head_file(&ckpt_dir, id).exists(),
+            "failed diff must leave no chain-head record (write-ahead invalidate)"
+        );
+        assert_eq!(
+            pooled.chain_head_for_test(id),
+            None,
+            "failed diff create must poison the in-RAM chain"
+        );
+
+        // (3) Chain-less again → Full succeeds → record re-committed.
+        let meta = pooled.snapshot(id).await.expect("post-poison full capture");
+        let mem_ref = meta.memory_manifest.expect("memory manifest chunked");
+        let record = crate::checkpoint::ChainHeadRecord::load(
+            &crate::checkpoint::ChainHeadRecord::subdir(&ckpt_dir),
+            id,
+        )
+        .await
+        .expect("record re-committed by the recovery Full");
+        assert_eq!(record.manifest_ref, mem_ref);
+
+        // destroy removes the record with the chain.
+        use engram_core::traits::SandboxBackend as _;
+        pooled.destroy(id).await.expect("destroy");
+        assert!(!chain_head_file(&ckpt_dir, id).exists());
+    }
+
+    /// `FakeCaptureBackend` with a configurable `list()` — the survivor
+    /// set `rehydrate_chain_heads` seeds from.
+    #[derive(Clone)]
+    struct SurvivorListBackend {
+        inner: FakeCaptureBackend,
+        survivors: Vec<SandboxId>,
+    }
+    #[async_trait]
+    impl SandboxBackend for SurvivorListBackend {
+        async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn exec_stream(
+            &self,
+            _: SandboxId,
+            _: ExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        fn supports_diff_checkpoints(&self) -> bool {
+            true
+        }
+        async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+            self.inner.snapshot(id).await
+        }
+        fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+            self.inner.snapshot_path_for(id)
+        }
+        async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+            Err(SandboxError::InvalidSpec("unused".into()))
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.inner.destroy(id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(self.survivors.clone())
+        }
+        async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    /// The pod-roll simulation at the unit level: generation A captures
+    /// (committing the chain-head record) and dies; generation B — a
+    /// fresh `PooledBackend` on the same checkpoint_dir + chunk store,
+    /// whose backend reattached the survivor — rehydrates the chain from
+    /// the record. Records for sandboxes that did NOT survive are GC'd,
+    /// and a torn record seeds nothing.
+    #[tokio::test]
+    async fn rehydrate_chain_heads_seeds_survivors_and_gcs_strays() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(tmp.path().join("blob")),
+        );
+        let cs = ChunkStore::new(blob);
+        let checkpoint_dir = tmp.path().join("checkpoints");
+        let fake = FakeCaptureBackend {
+            payload: finalize_payload(),
+            staging_root: tmp.path().join("fc-snaps"),
+            destroy_calls: Arc::new(PlMutex::new(Vec::new())),
+        };
+
+        let survivor = SandboxId::new();
+        let dead = SandboxId::new();
+        let torn = SandboxId::new();
+
+        // Generation A: capture the survivor AND the dead sandbox —
+        // both get chain-head records.
+        let gen_a = {
+            let p = PooledBackend::new(Arc::new(fake.clone()) as Arc<dyn SandboxBackend>)
+                .with_chunk_store(cs.clone(), tmp.path().join("materialize-a"))
+                .with_checkpoint_dir(checkpoint_dir.clone());
+            let arc = Arc::new(p);
+            arc.set_self_ref(&arc);
+            arc
+        };
+        let survivor_meta = gen_a.snapshot(survivor).await.expect("survivor capture");
+        let survivor_ref = survivor_meta.memory_manifest.expect("chunked");
+        gen_a.snapshot(dead).await.expect("dead-sandbox capture");
+        // A torn (unparseable) record for a third "survivor".
+        let chains_dir = crate::checkpoint::ChainHeadRecord::subdir(&checkpoint_dir);
+        tokio::fs::write(chains_dir.join(format!("{torn}.json")), b"not json")
+            .await
+            .unwrap();
+        drop(gen_a); // the roll
+
+        // Generation B: only `survivor` (and the torn id) reattached.
+        let gen_b = {
+            let p = PooledBackend::new(Arc::new(SurvivorListBackend {
+                inner: fake,
+                survivors: vec![survivor, torn],
+            }) as Arc<dyn SandboxBackend>)
+            .with_chunk_store(cs, tmp.path().join("materialize-b"))
+            .with_checkpoint_dir(checkpoint_dir.clone());
+            let arc = Arc::new(p);
+            arc.set_self_ref(&arc);
+            arc
+        };
+        assert_eq!(gen_b.chain_head_for_test(survivor), None, "fresh map");
+        gen_b.rehydrate_chain_heads().await;
+
+        assert_eq!(
+            gen_b.chain_head_for_test(survivor),
+            Some(survivor_ref),
+            "survivor's chain must be re-seeded from the durable record"
+        );
+        assert!(
+            !chain_head_file(&checkpoint_dir, dead).exists(),
+            "record for a non-surviving sandbox must be GC'd"
+        );
+        assert_eq!(
+            gen_b.chain_head_for_test(torn),
+            None,
+            "a torn record must seed nothing (treated as absent)"
+        );
+    }
+
+    // ---- balloon_inflate_for_seed matrix (adversarial-review fix) ----
+    //
+    // The invariant under test: after ANY outcome, either the balloon is
+    // provably deflated / absent (Ok(false)), or the caller has been told
+    // it owes a confirmed release (Ok(true)), or the capture fails (Err).
+    // There is no path that proceeds with the balloon state unknown.
+
+    mod balloon_matrix {
+        use super::super::balloon_inflate_for_seed;
+        use async_trait::async_trait;
+        use engram_core::traits::sandbox::SandboxBackend;
+        use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+        use engram_core::types::snapshot::SnapshotMetadata;
+        use engram_core::{SandboxError, SandboxId};
+        use std::path::PathBuf;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Mutex;
+
+        struct BalloonMock {
+            reclaim_result: Mutex<Option<Result<u64, SandboxError>>>,
+            release_result: Mutex<Option<Result<(), SandboxError>>>,
+            release_calls: AtomicUsize,
+        }
+
+        impl BalloonMock {
+            fn new(reclaim: Result<u64, SandboxError>, release: Result<(), SandboxError>) -> Self {
+                Self {
+                    reclaim_result: Mutex::new(Some(reclaim)),
+                    release_result: Mutex::new(Some(release)),
+                    release_calls: AtomicUsize::new(0),
+                }
+            }
+        }
+
+        #[async_trait]
+        impl SandboxBackend for BalloonMock {
+            async fn balloon_reclaim(
+                &self,
+                _: SandboxId,
+                _: u64,
+                _: std::time::Duration,
+            ) -> Result<u64, SandboxError> {
+                self.reclaim_result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("reclaim called once")
+            }
+            async fn balloon_release(&self, _: SandboxId) -> Result<(), SandboxError> {
+                self.release_calls.fetch_add(1, Ordering::SeqCst);
+                self.release_result
+                    .lock()
+                    .unwrap()
+                    .take()
+                    .expect("release called at most once")
+            }
+
+            // ---- unused required surface ----
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                unreachable!()
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                unreachable!()
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                unreachable!()
+            }
+            fn snapshot_path_for(&self, _: engram_core::SnapshotId) -> PathBuf {
+                unreachable!()
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                unreachable!()
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                unreachable!()
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                unreachable!()
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                unreachable!()
+            }
+        }
+
+        fn vm_err(msg: &str) -> SandboxError {
+            SandboxError::Vm(msg.to_string().into())
+        }
+
+        const DL: std::time::Duration = std::time::Duration::from_secs(1);
+
+        /// A landed inflate — even a 0-MiB grant — obligates a release.
+        #[tokio::test]
+        async fn landed_inflate_owes_a_release() {
+            for granted in [0u64, 512] {
+                let mock = BalloonMock::new(Ok(granted), Ok(()));
+                let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                    .await
+                    .unwrap();
+                assert!(
+                    inflated,
+                    "granted={granted}: caller must be told to release"
+                );
+                assert_eq!(
+                    mock.release_calls.load(Ordering::SeqCst),
+                    0,
+                    "the helper itself must not release on the happy path \
+                     (the caller releases after the dump)"
+                );
+            }
+        }
+
+        /// The TYPED no-device outcome is the only fail-open: dense
+        /// seed, no release owed, no release attempted.
+        #[tokio::test]
+        async fn typed_no_device_is_fail_open() {
+            let mock = BalloonMock::new(
+                Err(SandboxError::InvalidSpec("no balloon device".into())),
+                Ok(()),
+            );
+            let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                .await
+                .unwrap();
+            assert!(!inflated);
+            assert_eq!(mock.release_calls.load(Ordering::SeqCst), 0);
+        }
+
+        /// An untyped reclaim failure (the inflate PATCH may have
+        /// landed) is normalized via release-and-confirm; a confirmed
+        /// release means a safe dense seed.
+        #[tokio::test]
+        async fn untyped_reclaim_failure_normalizes_via_release() {
+            let mock = BalloonMock::new(Err(vm_err("stats poll: connection reset")), Ok(()));
+            let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                .await
+                .unwrap();
+            assert!(!inflated, "normalized ⇒ dense seed, nothing owed");
+            assert_eq!(
+                mock.release_calls.load(Ordering::SeqCst),
+                1,
+                "the normalizing release MUST run on an untyped reclaim failure"
+            );
+        }
+
+        /// Reclaim failed AND the normalizing release failed: the
+        /// balloon state is unknown — the capture must fail, never
+        /// proceed to a warm hook.
+        #[tokio::test]
+        async fn unnormalizable_balloon_state_fails_the_capture() {
+            let mock = BalloonMock::new(
+                Err(vm_err("stats poll: connection reset")),
+                Err(SandboxError::Snapshot("deflate did not complete".into())),
+            );
+            let err = balloon_inflate_for_seed(&mock, SandboxId::new(), 1024, DL)
+                .await
+                .expect_err("unknown balloon state must fail the capture");
+            assert!(
+                err.to_string().contains("balloon state unknown"),
+                "error must say why: {err}"
+            );
+            assert_eq!(mock.release_calls.load(Ordering::SeqCst), 1);
+        }
+
+        /// Target 0 (tiny guest ≤ the reserve): no balloon interaction
+        /// at all.
+        #[tokio::test]
+        async fn zero_target_never_touches_the_balloon() {
+            let mock = BalloonMock::new(Ok(0), Ok(()));
+            let inflated = balloon_inflate_for_seed(&mock, SandboxId::new(), 0, DL)
+                .await
+                .unwrap();
+            assert!(!inflated);
+            assert_eq!(mock.release_calls.load(Ordering::SeqCst), 0);
+            assert!(
+                mock.reclaim_result.lock().unwrap().is_some(),
+                "reclaim must not have been called"
+            );
+        }
     }
 }

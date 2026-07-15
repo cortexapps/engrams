@@ -557,6 +557,7 @@ async fn run_memory_leg(
                     chunk_store,
                     &mem_path,
                     f.chunk_cache.as_ref(),
+                    "evict_finalize",
                 )
                 .await?;
                 consumed = Some(mem_path);

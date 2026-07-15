@@ -310,6 +310,11 @@ pub struct FirecrackerConfig {
     /// spawns engram-uffd-handler and serves pages on demand (fast,
     /// requires Linux + the handler binary on the host).
     pub restore_mode: RestoreMode,
+    /// ADR 0092: fresh-create memory backend override. `None` = derived
+    /// (`uffd_base_dir` set ⇒ Uffd, else File). `Some(File)` restores
+    /// fresh creates from the per-image memfile even on a substrate host
+    /// (reclaimable page-cache residency); resumes are unaffected.
+    pub fresh_restore_override: Option<RestoreMode>,
     /// ADR 0028: arm KVM dirty-page tracking on every VM — cold
     /// creates via `MachineConfig.track_dirty_pages`, restores via
     /// `enable_diff_snapshots` at `snapshot/load` — so periodic
@@ -319,6 +324,14 @@ pub struct FirecrackerConfig {
     /// write-protect cost that's only worth paying when diffs are
     /// actually taken.
     pub track_dirty_pages: bool,
+    /// ADR 0088 addendum: attach a (deflated, `deflate_on_oom`)
+    /// virtio-balloon device to every fresh-created VM, pre-boot. The
+    /// capture-time seed shrink inflates it before the cold-base dump
+    /// so untouched pages elide from the memory manifest; restored VMs
+    /// inherit whatever device set rides their snapshot's `state.bin`
+    /// (this flag only affects `create`). Kill switch:
+    /// `ENGRAM_FC_BALLOON=0`.
+    pub balloon: bool,
     /// Engram CIDR pool — every sandbox gets a unique /30 carved out
     /// of this. `Some(10.200.0.0)` (the default) provisions per-VM
     /// TAPs + iptables rules; production deployments always want
@@ -448,6 +461,29 @@ pub fn restore_mode_from_env() -> RestoreMode {
             RestoreMode::Uffd
         }
         _ => RestoreMode::Uffd,
+    }
+}
+
+/// ADR 0092: override the *fresh-create* memory backend independently of
+/// the substrate. Unset/empty ⇒ `None` (the derived default:
+/// `effective_restore_mode` picks Uffd when `uffd_base_dir` is set, File
+/// otherwise). `file` lets a substrate host — which still needs
+/// UFFD+base-shm for resumes — restore fresh creates from the per-image
+/// memfile instead, whose residency is reclaimable page cache (the
+/// density win; pair with `ENGRAM_FC_BASE_MEMFILE_PIN=0`). `uffd` pins
+/// the derived substrate behavior explicitly.
+pub fn fresh_restore_mode_from_env() -> Option<RestoreMode> {
+    match std::env::var("ENGRAM_FC_FRESH_RESTORE_MODE") {
+        Ok(s) if s.eq_ignore_ascii_case("file") => Some(RestoreMode::File),
+        Ok(s) if s.eq_ignore_ascii_case("uffd") => Some(RestoreMode::Uffd),
+        Ok(s) if !s.trim().is_empty() => {
+            tracing::warn!(
+                value = %s,
+                "unrecognised ENGRAM_FC_FRESH_RESTORE_MODE; using the derived default",
+            );
+            None
+        }
+        _ => None,
     }
 }
 
@@ -582,7 +618,9 @@ impl FirecrackerConfig {
             uffd_handler_bin: PathBuf::from("engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
+            fresh_restore_override: None,
             track_dirty_pages: false,
+            balloon: std::env::var("ENGRAM_FC_BALLOON").map_or(true, |v| v != "0"),
             host_id: None,
             uffd_cache_root: None,
             uffd_substrate_sock: None,
@@ -1092,6 +1130,12 @@ impl FirecrackerBackend {
     /// job is now derived, not configured).
     fn effective_restore_mode(&self, fresh: bool) -> RestoreMode {
         if fresh {
+            // ADR 0092: explicit override first — `file` on a substrate
+            // host restores fresh creates from the per-image memfile
+            // (reclaimable page-cache residency) while resumes keep Uffd.
+            if let Some(m) = self.config.fresh_restore_override {
+                return m;
+            }
             if self.config.uffd_base_dir.is_some() {
                 RestoreMode::Uffd
             } else {
@@ -2119,6 +2163,17 @@ impl FirecrackerBackend {
             cpu_template: self.config.cpu_template.clone(),
         })
         .await?;
+        // ADR 0088 addendum: the balloon must be attached BEFORE
+        // InstanceStart (FC rejects post-boot device adds). Attached
+        // deflated; only the capture-time seed shrink ever inflates it.
+        if self.config.balloon {
+            api.put_balloon(&client::BalloonConfig {
+                amount_mib: 0,
+                deflate_on_oom: true,
+                stats_polling_interval_s: 1,
+            })
+            .await?;
+        }
         // Append the per-sandbox `ip=...` to the kernel cmdline so
         // CONFIG_IP_PNP brings up eth0 with the guest's static
         // address before init runs. Skipped when networking is
@@ -4406,6 +4461,137 @@ impl SandboxBackend for FirecrackerBackend {
         FirecrackerClient::new(&socket).pause().await
     }
 
+    /// ADR 0088 addendum: inflate toward `target_mib`, polling
+    /// `GET /balloon/statistics` until the guest's `actual_mib`
+    /// stabilizes (two identical consecutive reads at/after a partial
+    /// grant) or `deadline` elapses. Whatever the guest granted by
+    /// then is accepted — partial inflation still elides partially. A
+    /// VM without the device surfaces FC's 400 as `InvalidSpec` via
+    /// `patch_balloon`, which callers treat as fail-open.
+    async fn balloon_reclaim(
+        &self,
+        id: SandboxId,
+        target_mib: u64,
+        deadline: std::time::Duration,
+    ) -> Result<u64, SandboxError> {
+        let socket = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .state
+            .firecracker_socket
+            .clone();
+        let api = FirecrackerClient::new(&socket);
+        // Adversarial-review fix: the initial PATCH is the one place
+        // "400 ⇒ no balloon device" is a sound, TYPED inference (the
+        // request is fixed-shape) — surface it as InvalidSpec so
+        // callers can distinguish "nothing to release" from "balloon
+        // state unknown".
+        api.patch_balloon(target_mib).await.map_err(|e| {
+            if client::is_balloon_device_missing(&e) {
+                SandboxError::InvalidSpec(format!("no balloon device in this VM: {e}"))
+            } else {
+                e
+            }
+        })?;
+        let started = std::time::Instant::now();
+        let mut last_actual = 0u64;
+        let mut stable_reads = 0u32;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Adversarial-review fix: from here the inflate PATCH has
+            // LANDED — any polling error must not strand the balloon at
+            // the high target. Best-effort rollback before propagating;
+            // the caller still owes a release-and-confirm on this path.
+            let stats = match api.get_balloon_statistics().await {
+                Ok(s) => s,
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "balloon statistics poll failed after inflate PATCH; rolling target back to 0",
+                    );
+                    if let Err(rollback) = api.patch_balloon(0).await {
+                        tracing::warn!(sandbox_id = %id, error = %rollback, "balloon rollback PATCH failed too");
+                    }
+                    return Err(e);
+                }
+            };
+            if stats.actual_mib >= target_mib {
+                last_actual = stats.actual_mib;
+                break;
+            }
+            if stats.actual_mib == last_actual && stats.actual_mib > 0 {
+                stable_reads += 1;
+                // Two identical sub-target reads = the guest has given
+                // what it can; more waiting won't reclaim more.
+                if stable_reads >= 2 {
+                    break;
+                }
+            } else {
+                stable_reads = 0;
+                last_actual = stats.actual_mib;
+            }
+            if started.elapsed() >= deadline {
+                break;
+            }
+        }
+        tracing::info!(
+            sandbox_id = %id,
+            target_mib,
+            actual_mib = last_actual,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "balloon reclaim settled",
+        );
+        Ok(last_actual)
+    }
+
+    /// Adversarial-review fix: a release is only a release once the
+    /// GUEST has taken its pages back — the target PATCH is
+    /// asynchronous (the reclaim loop above exists precisely because
+    /// target ≠ actual). Deflate is fast (the driver just reclaims the
+    /// ballooned pages), so the confirm loop is normally one or two
+    /// polls; a guest that cannot deflate within the deadline is a
+    /// guest we must not run a warm hook in, surfaced as an error.
+    async fn balloon_release(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let socket = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .state
+            .firecracker_socket
+            .clone();
+        let api = FirecrackerClient::new(&socket);
+        api.patch_balloon(0).await.map_err(|e| {
+            if client::is_balloon_device_missing(&e) {
+                SandboxError::InvalidSpec(format!("no balloon device in this VM: {e}"))
+            } else {
+                e
+            }
+        })?;
+        const DEFLATE_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+        let started = std::time::Instant::now();
+        loop {
+            let stats = api.get_balloon_statistics().await?;
+            if stats.actual_mib == 0 {
+                tracing::debug!(
+                    sandbox_id = %id,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "balloon deflate confirmed (actual_mib=0)",
+                );
+                return Ok(());
+            }
+            if started.elapsed() >= DEFLATE_DEADLINE {
+                return Err(SandboxError::Snapshot(format!(
+                    "balloon deflate did not complete within {DEFLATE_DEADLINE:?} \
+                     (actual_mib={} still ballooned)",
+                    stats.actual_mib,
+                )));
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        }
+    }
+
     /// ADR 0018 commit 12m: symmetric companion to `pause`. Resume
     /// the VM via PATCH /vm {state: Resumed}. Idempotent on FC's
     /// side. Not currently invoked by PooledBackend (the
@@ -6008,7 +6194,9 @@ mod tests {
             uffd_handler_bin: PathBuf::from("/nonexistent/engram-uffd-handler"),
             uffd_base_dir: None,
             restore_mode: RestoreMode::File,
+            fresh_restore_override: None,
             track_dirty_pages: false,
+            balloon: false,
             net_pool: None,
             egress_proxy_port: None,
             egress_dns_port: None,
@@ -6672,6 +6860,29 @@ mod tests {
         be.config.uffd_base_dir = Some(std::path::PathBuf::from("/dev/shm/engram"));
         assert_eq!(be.effective_restore_mode(true), RestoreMode::Uffd);
         assert_eq!(be.effective_restore_mode(false), RestoreMode::Uffd);
+
+        // ADR 0092: the fresh-create override beats the derivation — a
+        // substrate host restores fresh creates from the per-image
+        // memfile (reclaimable page-cache residency) while resumes keep
+        // the substrate.
+        be.config.fresh_restore_override = Some(RestoreMode::File);
+        assert_eq!(
+            be.effective_restore_mode(true),
+            RestoreMode::File,
+            "explicit file override wins for fresh creates on a substrate host",
+        );
+        assert_eq!(
+            be.effective_restore_mode(false),
+            RestoreMode::Uffd,
+            "the override never touches resumes",
+        );
+        be.config.fresh_restore_override = Some(RestoreMode::Uffd);
+        be.config.uffd_base_dir = None;
+        assert_eq!(
+            be.effective_restore_mode(true),
+            RestoreMode::Uffd,
+            "explicit uffd override wins over the substrate-off derivation",
+        );
     }
 
     #[test]

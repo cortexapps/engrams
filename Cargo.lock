@@ -726,6 +726,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "crossbeam-channel"
+version = "0.5.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d85363c37faeca707aef026efa9f3b34d077bce547e48f770770625c6013679e"
+dependencies = [
+ "crossbeam-utils",
+]
+
+[[package]]
 name = "crossbeam-epoch"
 version = "0.9.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1009,6 +1018,7 @@ dependencies = [
  "engram-telemetry",
  "engram-transport",
  "nix 0.29.0",
+ "rustix",
  "serde",
  "tempfile",
  "tokio",
@@ -1528,15 +1538,16 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "crossbeam-channel",
  "engram-chunk-store",
  "engram-core",
  "engram-oci",
  "engram-storage-local",
  "filetime",
  "flate2",
+ "futures",
  "http",
  "parking_lot",
- "ruzstd",
  "serde",
  "serde_json",
  "sha2",
@@ -1912,6 +1923,7 @@ checksum = "843fba2746e448b37e26a819579957415c8cef339bf08564fe8b7ddbd959573c"
 dependencies = [
  "crc32fast",
  "miniz_oxide",
+ "zlib-rs",
 ]
 
 [[package]]
@@ -4506,15 +4518,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 
 [[package]]
-name = "ruzstd"
-version = "0.8.3"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a7c1c839d570d835527c9a5e4db7cb2198683a988cb9d7293fc8674e6bd58fc8"
-dependencies = [
- "twox-hash",
-]
-
-[[package]]
 name = "ryu"
 version = "1.0.23"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -6560,6 +6563,7 @@ dependencies = [
  "indexmap 2.14.0",
  "lazy_static",
  "libc",
+ "linux-raw-sys",
  "log",
  "memchr",
  "nix 0.31.2",
@@ -6610,7 +6614,6 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-core",
- "twox-hash",
  "uuid",
  "winnow",
  "zeroize",
@@ -6778,6 +6781,12 @@ dependencies = [
  "thiserror 2.0.18",
  "zopfli",
 ]
+
+[[package]]
+name = "zlib-rs"
+version = "0.6.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b142a20ec14a91d5bc708c1dc21b080c550113d8aa77afa29635673a65dd02c5"
 
 [[package]]
 name = "zmij"

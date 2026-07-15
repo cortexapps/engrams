@@ -17,7 +17,7 @@
 //!   turn and nobody followed up. (An interleaving event replaces
 //!   `harness_idle` as newest, which is the hub's clear-on-any-event
 //!   rule by construction.)
-//! - **hard TTL** (default 1800s, `ENGRAM_IDLE_HARD_TTL_SECS`):
+//! - **hard TTL** (default 28800s = 8h, `ENGRAM_IDLE_HARD_TTL_SECS`):
 //!   any-event silence — the backstop for adapters that never emit
 //!   `Idle`.
 //! - **shell pin**: sessions with `shell_pinned_until > now()` are
@@ -57,7 +57,7 @@ use crate::state::{SessionEvent, SharedState};
 /// `DEFAULT_IDLE_TTL_SECS` (ADR 0039 follow-up #20 rationale).
 pub const DEFAULT_SOFT_TTL_SECS: u64 = 300;
 /// Hard TTL default — the never-emits-Idle backstop.
-pub const DEFAULT_HARD_TTL_SECS: u64 = 1800;
+pub const DEFAULT_HARD_TTL_SECS: u64 = 28_800;
 /// Scan cadence — the retired host tick's cadence, so detection
 /// latency is unchanged.
 pub const DEFAULT_POLL_INTERVAL: Duration = Duration::from_secs(10);
@@ -340,8 +340,8 @@ mod tests {
             sandbox_id: Some(SandboxId::new()),
             image: "test/repo:idle-detector".into(),
             mode: engram_core::types::session::SessionMode::Agent,
-            created_at: Utc::now() - chrono::Duration::seconds(7200),
-            last_active_at: Utc::now() - chrono::Duration::seconds(7200),
+            created_at: Utc::now() - chrono::Duration::seconds(30_000),
+            last_active_at: Utc::now() - chrono::Duration::seconds(30_000),
             live_disk_manifest: None,
             park_rung: 0,
             parked_at: None,
@@ -349,7 +349,7 @@ mod tests {
         };
         let (state, mini, _local) = build_state_for_session(session);
         // No events at all → last_event_at falls back to created_at
-        // (2h ago) → hard TTL (30min) crossed.
+        // (8h20m ago) → hard TTL (8h) crossed.
         run_once(&IdleDetectorConfig::default(), &state)
             .await
             .expect("run_once");
@@ -379,6 +379,17 @@ mod tests {
     fn cfg() -> IdleDetectorConfig {
         IdleDetectorConfig::default()
     }
+
+    /// ADR 0039 follow-up #20 (moved here from the host-side module the
+    /// ADR 0074 addendum retired): the soft TTL must never revert to an
+    /// aggressive value that evicts interactive sessions during normal
+    /// think-pauses, and must stay strictly below the hard ceiling so the
+    /// soft path fires first for a genuinely abandoned session. Enforced
+    /// at compile time.
+    const _SOFT_TTL_NOT_AGGRESSIVE: () = {
+        assert!(DEFAULT_SOFT_TTL_SECS >= 120);
+        assert!(DEFAULT_SOFT_TTL_SECS < DEFAULT_HARD_TTL_SECS);
+    };
 
     #[test]
     fn soft_fires_only_on_idle_kind_past_soft_ttl() {
@@ -413,11 +424,11 @@ mod tests {
     #[test]
     fn hard_fires_on_any_kind_past_hard_ttl() {
         assert_eq!(
-            classify(&cfg(), &cand(1801, Some("agent_message"), None)),
+            classify(&cfg(), &cand(28_801, Some("agent_message"), None)),
             Some(IdleKind::Hard)
         );
         assert_eq!(
-            classify(&cfg(), &cand(1801, None, None)),
+            classify(&cfg(), &cand(28_801, None, None)),
             Some(IdleKind::Hard)
         );
     }
@@ -446,11 +457,11 @@ mod tests {
             classify(&cfg(), &cand(301, Some("harness_idle"), Some(60))),
             None
         );
-        assert_eq!(classify(&cfg(), &cand(9999, None, Some(60))), None);
+        assert_eq!(classify(&cfg(), &cand(30_000, None, Some(60))), None);
         // An EXPIRED pin suppresses nothing — the bridge died and the
         // pin lapsed, exactly the issue #219 leak this design deletes.
         assert_eq!(
-            classify(&cfg(), &cand(9999, None, Some(-60))),
+            classify(&cfg(), &cand(30_000, None, Some(-60))),
             Some(IdleKind::Hard)
         );
     }

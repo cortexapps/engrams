@@ -369,6 +369,7 @@ jobs:
             --test host_status_transition_live_pg \
             --test queue_scanner_live_pg \
             --test binding_cas_live_pg \
+            --test sandbox_owner_live_pg \
             --test outbox_live_pg \
             --test session_ops_live_pg \
             --test mount_catalog_live_pg \
@@ -390,8 +391,8 @@ jobs:
     # the host-agent musl build with CFLAGS=None and it failed the same
     # way uffd-handler used to.
     env:
-      CFLAGS_x86_64_unknown_linux_musl: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
-      BINDGEN_EXTRA_CLANG_ARGS: "-I/usr/include -I/usr/include/x86_64-linux-gnu"
+      CFLAGS_x86_64_unknown_linux_musl: "-idirafter /opt/uapi"
+      BINDGEN_EXTRA_CLANG_ARGS: "-idirafter /opt/uapi"
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
@@ -413,7 +414,18 @@ jobs:
         # linux-libc-dev: uffd-handler's transitive userfaultfd-sys build
         # script compiles a C shim that #includes <linux/types.h>, absent
         # from the musl cross-gcc sysroot.
-        run: sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev
+        run: |
+          sudo apt-get update && sudo apt-get install -y musl-tools linux-libc-dev
+          # Adversarial finding from the #663 rollout: injecting ALL of
+          # /usr/include poisons any real vendored-C build (zstd-sys) with
+          # glibc headers under a musl target. The shim only needs the
+          # KERNEL UAPI headers, which are libc-agnostic — stage exactly
+          # those in a scoped dir and reference it with -idirafter, so the
+          # musl sysroot's own headers always win and only genuinely
+          # missing ones (linux/*, asm*/*) fall through.
+          sudo mkdir -p /opt/uapi
+          sudo cp -r /usr/include/linux /usr/include/asm-generic /opt/uapi/
+          sudo cp -r /usr/include/x86_64-linux-gnu/asm /opt/uapi/asm
 
       # Mirrors what `just bake-demo` produces on Linux. If any of these
       # stop building the demo bake
@@ -925,6 +937,7 @@ jobs:
             --test two_host_drain_wave \
             --test pagemap_scanner \
             --test eviction_finalize_redrive \
+            --test chain_rehydrate \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1

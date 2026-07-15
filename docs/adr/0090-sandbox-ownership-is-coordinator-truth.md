@@ -1,7 +1,13 @@
 # ADR 0090: Sandbox ownership is coordinator truth — rolls and recoveries must not kill owned VMs
 
-- Status: Proposed
+- Status: Accepted (2026-07-13)
 - Date: 2026-07-13
+- Commit chain: PR #653 (`4ee65faa`) — the whole decision landed in one
+  change: the reconciler's coordinator-ask (+ `session_owning_sandbox` /
+  `/hosts/:id/sandboxes/:sid/owner`), quarantined-survivor heartbeat
+  advert driving `evict_local`, the `start_agent` retry budget →
+  terminal `Failed` + `harness_start_failed`, bundle-coverage placement
+  preference, and the loud heartbeat-failure mode.
 - Issues: 2026-07-11 reliability campaign (`scratch/devbrain-campaign-2026-07-11/REPORT.md` §2-4); memory note `teardown-reconcile-kills-reattached-vms` (2026-07-10, live-repro'd 2026-07-12 on session dd8d8f1f)
 
 ## Context
@@ -83,3 +89,25 @@ in-flight work the coordinator still owns*. This ADR extends it to sessions.
   wire-version bump discipline applies).
 - `parse_session_state` and friends are untouched — no new session states here
   (the `Unreachable` state is ADR 0091's concern, WS3).
+
+## Outcome (2026-07-13)
+
+Deployed. The prod fleet rolled onto it without incident. Divergences
+from the Decision above, both recorded during implementation:
+
+1. **`SandboxManifest.session_id` was NOT added** (Decision §2 proposed it
+   as a reattach-time fast path). The coordinator's ownership answer
+   repairs the local binding table directly (`record_session_binding`),
+   which makes the schema change redundant — the unknown-binding arm is
+   rare (post-roll, failed-rehydrate only), so an RPC there is cheap.
+
+2. The `start_agent` failure was not "no backoff, then give up" as the
+   campaign reported: `CreatedHarnessFailed` mapped to `OpOutcome::Done`,
+   so the Deliver verb enqueued a *fresh* Resume op each round — an
+   unbounded, backoff-free loop where the existing `RESUME_MAX_ATTEMPTS`
+   machinery was simply unreachable. Propagating it as `Retry` re-engaged
+   the budget that was already there.
+
+The teardown-reconcile kill (the memory note this ADR closes) has not
+recurred; the next fleet roll over an active session is its acceptance
+test.
