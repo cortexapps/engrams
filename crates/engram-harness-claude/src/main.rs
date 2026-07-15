@@ -23,7 +23,7 @@
 //! sandbox is the safety boundary, not Claude's per-tool consent.
 //!
 //! Each turn's `system`/`init` line carries Claude's session id, which
-//! we stash in `/workspace/.engram/claude-session-id` so a respawn
+//! we stash in `/workspace/.engrams/claude-session-id` so a respawn
 //! (idle-resume or crash recovery) can `--resume` into the same
 //! conversation. Lost on cold death (Dead status); a forked session
 //! gets a fresh Claude conversation.
@@ -65,18 +65,18 @@ mod adapter {
     use tokio::sync::{mpsc, Notify};
     use tokio::time::{timeout, Instant};
 
-    pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engram/claude-session-id";
+    pub const CLAUDE_SESSION_ID_FILE: &str = "/workspace/.engrams/claude-session-id";
 
     /// ADR 0054 Flavor B: the per-session hook↔harness unix socket and the
-    /// generated `--settings` file. Both live under `/workspace/.engram`
+    /// generated `--settings` file. Both live under `/workspace/.engrams`
     /// (already per-session, like the claude session-id file), so the names
     /// are fixed yet collision-free across sessions and correct on every
     /// backend (FC / VZ / Process). The harness binds the socket
     /// before spawning claude; the hook reaches it via `ENGRAM_HOOK_SOCK`.
-    pub const HOOK_SOCK_FILE: &str = "/workspace/.engram/hook.sock";
-    pub const HOOK_SETTINGS_FILE: &str = "/workspace/.engram/claude-settings.json";
-    pub const MCP_CONFIG_FILE: &str = "/workspace/.engram/mcp-config.json";
-    pub const MCP_SOCK_FILE: &str = "/workspace/.engram/mcp.sock";
+    pub const HOOK_SOCK_FILE: &str = "/workspace/.engrams/hook.sock";
+    pub const HOOK_SETTINGS_FILE: &str = "/workspace/.engrams/claude-settings.json";
+    pub const MCP_CONFIG_FILE: &str = "/workspace/.engrams/mcp-config.json";
+    pub const MCP_SOCK_FILE: &str = "/workspace/.engrams/mcp.sock";
 
     /// ADR 0089 P2: the orchestrator's model-facing tool manifest. The main
     /// harness parses `ENGRAM_TOOLS` once at startup and carries this typed
@@ -1351,7 +1351,7 @@ mod adapter {
                 }]
             }
         });
-        let _ = tokio::fs::create_dir_all("/workspace/.engram").await;
+        let _ = tokio::fs::create_dir_all("/workspace/.engrams").await;
         if let Err(e) = tokio::fs::write(HOOK_SETTINGS_FILE, settings.to_string()).await {
             tracing::warn!(error = %e, "couldn't write claude hook settings");
         }

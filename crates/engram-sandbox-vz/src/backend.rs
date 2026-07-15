@@ -858,7 +858,7 @@ impl SandboxBackend for VzBackend {
         // to a fresh per-sandbox file and cold-boots a new VM.
         // agentd's harness supervisor pattern + Claude's
         // `--resume <session-id>` (persisted on the rootfs at
-        // /workspace/.engram/claude-session-id) recover
+        // /workspace/.engrams/claude-session-id) recover
         // conversation continuity across the cold boot.
         vm.pause().await?;
         let snapshot_rootfs = dest.join(SNAPSHOT_ROOTFS_FILENAME);
