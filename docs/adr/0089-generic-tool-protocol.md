@@ -15,6 +15,20 @@ deliberately NOT built here — the tool roadmap is its own decision. Codex live
 gates (scenario A analog + snapshot-park) remain open pending a codex profile in
 dev; the codex frontend is fully covered by the fake-seam suite.
 
+Post-acceptance correctness hardening (2026-07-15): review of the complete
+stacked change found and fixed several assumptions that were safe only in a
+single-session or single-consumer deployment. Tool-call identity is now scoped
+by session in the orchestrator ledger, DBOS workflow ids, and coordinator
+outbox ids. `tool_result_submitted` and its durable outbox obligation commit in
+one Postgres transaction. Task, Slack-thread binding, and listener registration
+also commit in one orchestrator transaction. Listener overflow recovery is
+per-consumer so one stalled surface cannot block the others. External session
+completions must satisfy the declared output schema; only orchestrator-handled
+failures may use the internal `{ "error": ... }` envelope. Finally, a failed
+Claude hook bridge now visibly denies the tool instead of silently deferring
+an unrecorded call, and native-question deduplication is scoped to the current
+run. Regression coverage pins each failure mode.
+
 ## Context
 
 The orchestrator has no way to hand a tool to the agent running inside a session.

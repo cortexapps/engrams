@@ -29,7 +29,7 @@ function recordingDb(actions: DbAction[]): PendingToolCallDb {
 }
 
 describe("PendingToolCallStore", () => {
-  test("request insert is idempotent on tool_call_id", async () => {
+  test("request insert is idempotent on session-scoped tool_call_id", async () => {
     const actions: DbAction[] = [];
     const store = makePendingToolCallStore(recordingDb(actions));
     const requestedAt = new Date("2026-07-13T12:00:00.000Z");
@@ -63,8 +63,8 @@ describe("PendingToolCallStore", () => {
     const submittedAt = new Date("2026-07-13T12:01:00.000Z");
     const completedAt = new Date("2026-07-13T12:02:00.000Z");
 
-    await store.markSubmitted("call-1", submittedAt);
-    await store.markCompleted("call-1", completedAt);
+    await store.markSubmitted("session-1", "call-1", submittedAt);
+    await store.markCompleted("session-1", "call-1", completedAt);
 
     expect(actions).toEqual([
       { kind: "update", values: { submittedAt } },

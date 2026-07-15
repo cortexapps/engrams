@@ -1,0 +1,2 @@
+DROP INDEX "pending_tool_calls_tool_call_id_unique";--> statement-breakpoint
+CREATE UNIQUE INDEX "pending_tool_calls_session_tool_call_unique" ON "pending_tool_calls" USING btree ("session_id","tool_call_id");

@@ -102,9 +102,9 @@ export async function bookkeepToolEvent(
       requestedAt: at,
     });
   } else if (event.kind === "tool_result_submitted") {
-    await deps.pendingCalls.markSubmitted(toolCallId, at);
+    await deps.pendingCalls.markSubmitted(sessionId, toolCallId, at);
   } else {
-    await deps.pendingCalls.markCompleted(toolCallId, at);
+    await deps.pendingCalls.markCompleted(sessionId, toolCallId, at);
   }
 }
 
@@ -132,7 +132,10 @@ export function makeToolConsumer(deps: ToolConsumerDeps): SessionConsumer {
           : {}),
       };
       try {
-        await deps.startWorkflow(input, `toolexec:${requested.toolCallId}`);
+        await deps.startWorkflow(
+          input,
+          `toolexec:${ctx.sessionId}:${requested.toolCallId}`,
+        );
       } catch (err) {
         log.error(
           {

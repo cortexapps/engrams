@@ -907,7 +907,7 @@ impl AppState {
         // defensive catch for any confirming event authored/replayed straight
         // through `emit`; a confirming event terminally retires the matching
         // outbox row, and unknown / already-acked ids are no-ops (at-least-once).
-        if let Some(ack_id) = outbox_ack_id(&event) {
+        if let Some(ack_id) = outbox_ack_id(session, &event) {
             match self.services.meta.outbox_ack(&ack_id).await {
                 Ok(true) => {
                     ::metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
@@ -918,6 +918,33 @@ impl AppState {
                 }
             }
         }
+        self.events.publish(
+            session,
+            IndexedEvent {
+                idx,
+                event,
+                ephemeral: false,
+            },
+        );
+        Ok(idx)
+    }
+
+    /// Persist an event and the durable command it announces in one metadata
+    /// transaction, then publish the committed event on the live bus.
+    pub async fn emit_with_outbox(
+        &self,
+        session: SessionId,
+        event: SessionEvent,
+        outbox: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<i64, crate::error::ApiError> {
+        let kind = event.kind();
+        let payload = serde_json::to_value(&event)
+            .map_err(|e| crate::error::ApiError::Internal(format!("event serialize: {e}")))?;
+        let idx = self
+            .services
+            .meta
+            .append_session_event_and_outbox(session, kind, payload, outbox)
+            .await?;
         self.events.publish(
             session,
             IndexedEvent {
@@ -961,7 +988,7 @@ impl AppState {
                 return Ok(None);
             }
         };
-        if let Some(ack_id) = outbox_ack_id(&event) {
+        if let Some(ack_id) = outbox_ack_id(session, &event) {
             match self.services.meta.outbox_ack(&ack_id).await {
                 Ok(true) => {
                     ::metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
@@ -991,7 +1018,7 @@ impl AppState {
 ///   harness itself does, and an edit/dequeue of a queued prompt keeps
 ///   its own confirmations).
 /// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
-fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
+fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {
             prompt_id: Some(pid),
@@ -999,9 +1026,9 @@ fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
         } => Some(pid.clone()),
         SessionEvent::HarnessPromptQueued { prompt_id, .. } => Some(prompt_id.clone()),
         SessionEvent::HarnessPromptSteered { prompt_id, .. } => Some(prompt_id.clone()),
-        SessionEvent::HarnessToolCallCompleted { tool_call_id, .. } => {
-            Some(format!("tool_result:{tool_call_id}"))
-        }
+        SessionEvent::HarnessToolCallCompleted { tool_call_id, .. } => Some(
+            engram_core::types::outbox::tool_result_outbox_id(session_id, tool_call_id),
+        ),
         _ => None,
     }
 }
@@ -1090,7 +1117,7 @@ fn harness_event_sink(
             // the web can't render). Capture the ack id here (before
             // `session_event` moves into the published frame) and retire the row
             // after the append. Unknown / already-acked ids are no-ops.
-            let ack_id = outbox_ack_id(&session_event);
+            let ack_id = outbox_ack_id(session_id, &session_event);
 
             // Session titles: a harness-suggested title is materialized onto
             // `sessions.suggested_title` (in real time, at ingestion) so the
@@ -1418,6 +1445,7 @@ pub(crate) mod tests {
 
     #[test]
     fn prompt_steered_maps_and_acks_by_prompt_id() {
+        let session_id = SessionId::new();
         let ev = SessionEvent::from_harness(
             HarnessEvent::PromptSteered {
                 prompt_id: "p-steer".into(),
@@ -1425,7 +1453,7 @@ pub(crate) mod tests {
             chrono::Utc::now(),
         );
         assert_eq!(ev.kind(), "prompt_steered");
-        assert_eq!(outbox_ack_id(&ev).as_deref(), Some("p-steer"));
+        assert_eq!(outbox_ack_id(session_id, &ev).as_deref(), Some("p-steer"));
     }
 
     #[test]
@@ -1523,6 +1551,7 @@ pub(crate) mod tests {
 
     #[test]
     fn tool_call_completed_acks_tool_result_outbox_row() {
+        let session_id = SessionId::new();
         let ev = SessionEvent::from_harness(
             HarnessEvent::ToolCallCompleted {
                 run_id: "r1".into(),
@@ -1534,7 +1563,11 @@ pub(crate) mod tests {
             },
             chrono::Utc::now(),
         );
-        assert_eq!(outbox_ack_id(&ev).as_deref(), Some("tool_result:call_1"));
+        let expected = format!("tool_result:{session_id}:call_1");
+        assert_eq!(
+            outbox_ack_id(session_id, &ev).as_deref(),
+            Some(expected.as_str())
+        );
     }
 
     #[test]

@@ -192,17 +192,18 @@ export async function submitToolExecution(
     );
   } catch (err) {
     if (!alreadyCompleted(err)) throw err;
-    await deps.pendingCalls.markSubmitted(input.toolCallId, deps.now());
+    await deps.pendingCalls.markSubmitted(input.sessionId, input.toolCallId, deps.now());
   }
 }
 
 const productionPendingCalls: PendingToolCallStore = {
   recordRequested: (input) => makePendingToolCallStore().recordRequested(input),
-  markSubmitted: (toolCallId, at) =>
-    makePendingToolCallStore().markSubmitted(toolCallId, at),
-  markCompleted: (toolCallId, at) =>
-    makePendingToolCallStore().markCompleted(toolCallId, at),
-  find: (toolCallId) => makePendingToolCallStore().find(toolCallId),
+  markSubmitted: (sessionId, toolCallId, at) =>
+    makePendingToolCallStore().markSubmitted(sessionId, toolCallId, at),
+  markCompleted: (sessionId, toolCallId, at) =>
+    makePendingToolCallStore().markCompleted(sessionId, toolCallId, at),
+  find: (sessionId, toolCallId) =>
+    makePendingToolCallStore().find(sessionId, toolCallId),
   listUnsubmittedSessionCallsBefore: (cutoff) =>
     makePendingToolCallStore().listUnsubmittedSessionCallsBefore(cutoff),
 };

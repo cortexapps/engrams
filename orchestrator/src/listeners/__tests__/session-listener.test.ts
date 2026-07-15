@@ -401,7 +401,7 @@ describe("SessionListener", () => {
     expect(rec.events).toEqual([]);
   });
 
-  test("a retrying consumer does not block another consumer's cursor", async () => {
+  test("a saturated retrying consumer does not block another consumer's cursor", async () => {
     const cursors = makeInMemoryCursorStore();
     const slow = recordingConsumer({
       name: "slow",
@@ -410,21 +410,22 @@ describe("SessionListener", () => {
       },
     });
     const fast = recordingConsumer({ name: "fast" });
-    let reads = 0;
     const subject = await listener({
       cursorStore: cursors,
       readPage: async (_sessionId, after) => {
-        reads++;
-        return reads === 1 ? page([event(0n), event(1n)], 1n) : page([], after);
+        const events = [event(0n), event(1n), event(2n), event(3n)]
+          .filter((candidate) => candidate.idx > after);
+        return page(events, events.length > 0 ? 3n : after);
       },
+      queueCapacity: 1,
       sleep: never,
       openStream: async () => opened([], { waitAtEnd: true }),
     }, [slow.consumer, fast.consumer], cursors);
 
     const running = subject.run();
-    await waitFor(async () => (await cursors.get("session-1", "fast")) === 1n);
+    await waitFor(async () => (await cursors.get("session-1", "fast")) === 3n);
     expect(await cursors.get("session-1", "slow")).toBe(-1n);
-    expect(fast.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
+    expect(fast.events.map((ev) => ev.idx)).toEqual([0n, 1n, 2n, 3n]);
 
     await subject.stop();
     await running;

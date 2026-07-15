@@ -672,7 +672,10 @@ mod adapter {
                         let mut calls = deferred_calls.lock().await;
                         if calls.contains_key(&req.tool_use_id) {
                             (false, false)
-                        } else if calls.values().any(|call| call.tool_name == tool_name) {
+                        } else if calls
+                            .values()
+                            .any(|call| call.run_id == run_id && call.tool_name == tool_name)
+                        {
                             (false, true)
                         } else {
                             calls.insert(
@@ -889,10 +892,12 @@ mod adapter {
                     println!("{out}");
                 }
                 Some(HookVerdict::Allow) => print_allow(),
-                // Defer verdict (incl. a no-card duplicate, ADR 0054), or any
-                // socket failure → defer. The turn ends `tool_deferred` and the
-                // VM can idle-evict.
-                Some(HookVerdict::Defer) | None => print_defer(),
+                // Only a verdict durably registered by the main harness may
+                // defer. A missing hook socket would otherwise strand an
+                // invisible call forever, so deny visibly and let Claude see
+                // a retryable tool error.
+                Some(HookVerdict::Defer) => print_defer(),
+                None => print_deny("engrams hook bridge unavailable; retry the tool call"),
             }
             std::process::ExitCode::SUCCESS
         }
@@ -906,6 +911,18 @@ mod adapter {
             println!(
                 r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"defer"}}}}"#
             );
+        }
+        pub(super) fn deny_output(reason: &str) -> serde_json::Value {
+            serde_json::json!({
+                "hookSpecificOutput": {
+                    "hookEventName": "PreToolUse",
+                    "permissionDecision": "deny",
+                    "permissionDecisionReason": reason,
+                }
+            })
+        }
+        fn print_deny(reason: &str) {
+            println!("{}", deny_output(reason));
         }
 
         async fn round_trip(
@@ -3640,7 +3657,7 @@ mod adapter {
                     results_in_hand: results.clone(),
                     parked_calls: parked.clone(),
                     deferred_calls: deferred,
-                    current_run_id: run_id,
+                    current_run_id: run_id.clone(),
                     evt_tx,
                 },
             ));
@@ -4705,6 +4722,7 @@ mod adapter {
             hook_server::DeferredCalls,
             mpsc::Receiver<HarnessEvent>,
             hook_server::DuplicateDeferredIds,
+            hook_server::CurrentRunId,
         ) {
             let sock = std::env::temp_dir()
                 .join(format!(
@@ -4726,7 +4744,7 @@ mod adapter {
             tokio::spawn(hook_server::serve(
                 listener,
                 hook_server::State {
-                    current_run_id: run_id,
+                    current_run_id: run_id.clone(),
                     evt_tx,
                     duplicate_deferred_ids: duplicates.clone(),
                     manifest: Arc::new(manifest),
@@ -4734,7 +4752,7 @@ mod adapter {
                     deferred_calls: pending.clone(),
                 },
             ));
-            (sock, results, pending, evt_rx, duplicates)
+            (sock, results, pending, evt_rx, duplicates, run_id)
         }
 
         async fn hook_fire_named(
@@ -4808,9 +4826,19 @@ mod adapter {
             ));
         }
 
+        #[test]
+        fn hook_socket_failure_is_a_visible_denial_not_a_defer() {
+            let output = hook_bridge::deny_output("bridge unavailable");
+            assert_eq!(output["hookSpecificOutput"]["permissionDecision"], "deny");
+            assert_eq!(
+                output["hookSpecificOutput"]["permissionDecisionReason"],
+                "bridge unavailable"
+            );
+        }
+
         #[tokio::test]
         async fn native_ask_user_question_uses_generic_request_and_result_frames() {
-            let (sock, results, pending, mut evt_rx, _duplicates) =
+            let (sock, results, pending, mut evt_rx, _duplicates, _run_id) =
                 spawn_manifest_hook_server(vec![native_question_tool()]).await;
             let input = serde_json::json!({
                 "questions": [{
@@ -4865,7 +4893,7 @@ mod adapter {
             for (tool_call_id, observed_name) in
                 [("toolu_named", "AskUserQuestion"), ("toolu_old", "")]
             {
-                let (sock, _results, pending, mut evt_rx, _duplicates) =
+                let (sock, _results, pending, mut evt_rx, _duplicates, _run_id) =
                     spawn_manifest_hook_server(Vec::new()).await;
                 let input = serde_json::json!({
                     "questions": [{
@@ -4900,7 +4928,7 @@ mod adapter {
 
         #[tokio::test]
         async fn native_ask_user_question_dedups_double_fire_via_generic_ledger() {
-            let (sock, _results, pending, mut evt_rx, duplicates) =
+            let (sock, _results, pending, mut evt_rx, duplicates, _run_id) =
                 spawn_manifest_hook_server(vec![native_question_tool()]).await;
             let input = serde_json::json!({"questions": []});
 
@@ -4929,9 +4957,40 @@ mod adapter {
         }
 
         #[tokio::test]
+        async fn native_questions_with_the_same_name_in_different_runs_are_distinct() {
+            let (sock, _results, pending, mut evt_rx, duplicates, run_id) =
+                spawn_manifest_hook_server(vec![native_question_tool()]).await;
+            let input = serde_json::json!({"questions": []});
+
+            assert!(matches!(
+                hook_fire_named(&sock, "toolu_first", "AskUserQuestion", input.clone()).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::ToolCallRequested { run_id, call_id, .. })
+                    if run_id == "run-x" && call_id == "toolu_first"
+            ));
+
+            *run_id.lock().await = Some("run-y".into());
+            assert!(matches!(
+                hook_fire_named(&sock, "toolu_second", "AskUserQuestion", input).await,
+                hook_server::HookVerdict::Defer
+            ));
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::ToolCallRequested { run_id, call_id, .. })
+                    if run_id == "run-y" && call_id == "toolu_second"
+            ));
+            assert!(duplicates.lock().await.is_empty());
+            assert_eq!(pending.lock().await.len(), 2);
+            let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        #[tokio::test]
         async fn hook_defers_manifest_deferred_tool_and_emits_request() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            let (sock, results, pending, mut evt_rx, _duplicates) =
+            let (sock, results, pending, mut evt_rx, _duplicates, _run_id) =
                 spawn_manifest_hook_server(manifest).await;
             assert!(matches!(
                 hook_fire_named(
@@ -4968,7 +5027,7 @@ mod adapter {
         #[tokio::test]
         async fn hook_dedups_duplicate_manifest_deferred_tool_in_same_turn() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            let (sock, _results, pending, mut evt_rx, duplicates) =
+            let (sock, _results, pending, mut evt_rx, duplicates, _run_id) =
                 spawn_manifest_hook_server(manifest).await;
 
             assert!(matches!(
@@ -5017,7 +5076,7 @@ mod adapter {
         #[tokio::test]
         async fn hook_allows_manifest_sync_tool_without_emitting() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Sync)];
-            let (sock, _results, pending, mut evt_rx, _duplicates) =
+            let (sock, _results, pending, mut evt_rx, _duplicates, _run_id) =
                 spawn_manifest_hook_server(manifest).await;
             assert!(matches!(
                 hook_fire_named(
@@ -5037,7 +5096,7 @@ mod adapter {
         #[tokio::test]
         async fn hook_never_defers_tool_search() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            let (sock, _results, pending, mut evt_rx, _duplicates) =
+            let (sock, _results, pending, mut evt_rx, _duplicates, _run_id) =
                 spawn_manifest_hook_server(manifest).await;
             assert!(matches!(
                 hook_fire_named(
@@ -5057,7 +5116,7 @@ mod adapter {
         #[tokio::test]
         async fn hook_allows_deferred_refire_with_result_in_hand() {
             let manifest = vec![generic_tool("save_memory", ToolExecution::Deferred)];
-            let (sock, results, pending, mut evt_rx, _duplicates) =
+            let (sock, results, pending, mut evt_rx, _duplicates, _run_id) =
                 spawn_manifest_hook_server(manifest).await;
             results
                 .lock()

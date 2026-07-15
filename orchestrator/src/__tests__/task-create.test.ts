@@ -366,13 +366,26 @@ function fakeSessions(): TaskSessionsClient & { createReqs: unknown[]; deletedId
   };
 }
 
-/** A fake DB that records each `.values()` payload in insert order (task first,
- *  task_session second), or throws from the transaction when `throwOnTx`. */
-function recordingDb(records: Record<string, unknown>[], throwOnTx = false): Db {
+/** A fake DB that records each `.values()` payload in insert order, or throws
+ * from the transaction / a selected insert to exercise compensation paths. */
+function recordingDb(
+  records: Record<string, unknown>[],
+  throwOnTx = false,
+  failInsertAt?: number,
+): Db {
   return {
     transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
       if (throwOnTx) throw new Error("db boom");
-      const tx = { insert: () => ({ values: async (v: Record<string, unknown>) => void records.push(v) }) };
+      let insertCount = 0;
+      const tx = {
+        insert: () => ({
+          values: async (v: Record<string, unknown>) => {
+            insertCount += 1;
+            if (insertCount === failInsertAt) throw new Error("insert boom");
+            records.push(v);
+          },
+        }),
+      };
       return fn(tx);
     },
   } as unknown as Db;
@@ -402,7 +415,6 @@ const createDeps = (
     profileOver?: Partial<ProfileRow>;
     portExposures?: PortExposureStore;
     users?: CreateTaskDeps["users"];
-    ensureListenerRow?: CreateTaskDeps["ensureListenerRow"];
   } = {},
 ): CreateTaskDeps => ({
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
@@ -415,24 +427,18 @@ const createDeps = (
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
   users: opts.users ?? fakeUsers(),
-  ensureListenerRow: opts.ensureListenerRow ?? (async () => {}),
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
 });
 
 describe("createTaskWithSession", () => {
-  test("writes the per-session listener row after creating the task", async () => {
-    const ensured: string[] = [];
-
+  test("writes the per-session listener row in the task transaction", async () => {
+    const records: Record<string, unknown>[] = [];
     await createTaskWithSession(
-      createDeps(fakeSessions(), recordingDb([]), {
-        ensureListenerRow: async (sessionId) => {
-          ensured.push(sessionId);
-        },
-      }),
+      createDeps(fakeSessions(), recordingDb(records)),
       { type: "chat", ownerUserId: "user-1", profileId: "p1" },
     );
 
-    expect(ensured).toEqual(["sess-1"]);
+    expect(records[2]).toEqual({ sessionId: "sess-1" });
   });
 
   test("persists task + primary task_session and folds extraHarnessEnv into the session", async () => {
@@ -445,6 +451,7 @@ describe("createTaskWithSession", () => {
       profileId: "p1",
       source: { provider: "slack", team: "T1" },
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },
+      slackThreadWorkflowId: "thread-wf-1",
     });
 
     expect(out.sessionId).toBe("sess-1");
@@ -460,6 +467,8 @@ describe("createTaskWithSession", () => {
       source: { provider: "slack", team: "T1" },
     });
     expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "p1" });
+    expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
+    expect(records[3]).toEqual({ sessionId: "sess-1" });
   });
 
   test("defaults source to {} and title to null", async () => {
@@ -494,6 +503,18 @@ describe("createTaskWithSession", () => {
         profileId: "p1",
       }),
     ).rejects.toThrow(/db boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
+  });
+
+  test("compensates when listener registration fails inside the task transaction", async () => {
+    const sessions = fakeSessions();
+    await expect(
+      createTaskWithSession(createDeps(sessions, recordingDb([], false, 3)), {
+        type: "chat",
+        ownerUserId: "u",
+        profileId: "p1",
+      }),
+    ).rejects.toThrow(/insert boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
@@ -590,7 +611,7 @@ describe("createTaskWithSession", () => {
 
     // Task still created + persisted despite the 3000 failure.
     expect(out.sessionId).toBe("sess-1");
-    expect(records).toHaveLength(2); // task + primary task_session
+    expect(records).toHaveLength(3); // task + primary task_session + listener
     // Both ports were attempted; 8080 succeeded after 3000 threw.
     expect(ports.calls.map((c) => c.port)).toEqual([3000, 8080]);
   });

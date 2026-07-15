@@ -35,7 +35,6 @@ import {
   type StartedSession,
 } from "./communication-policy.ts";
 import { THREAD_TOPIC, type ThreadInbox, type SourceMention } from "./thread-inbox.ts";
-import { bindSlackSession } from "../listeners/slack-session-store.ts";
 
 const log = rootLog.child({ component: "slack" });
 
@@ -49,6 +48,8 @@ export interface CreateTaskInput {
   appendSystemPrompt: string;
   /** The trigger ref recorded on the persisted task (operator-visible). */
   source: Record<string, unknown>;
+  /** Stable DBOS mailbox id, persisted atomically before listener discovery. */
+  threadWorkflowId: string;
 }
 
 export interface ThreadControlPlane {
@@ -119,21 +120,6 @@ const LEGACY_QUESTION_MSG =
  *  without a live DBOS engine (the engine integration is deferred — ADR 0060). */
 export type StepRunner = <T>(fn: () => Promise<T>, name: string) => Promise<T>;
 
-export type SlackSessionBinder = (
-  sessionId: string,
-  threadWfId: string,
-) => Promise<void>;
-
-/** Checkpoint the idempotent session→thread binding write at workflow start. */
-export async function bindThreadSession(
-  step: StepRunner,
-  sessionId: string,
-  threadWfId: string,
-  bind: SlackSessionBinder = bindSlackSession,
-): Promise<void> {
-  await step(() => bind(sessionId, threadWfId), "bindSlackSession");
-}
-
 async function slackThreadWorkflowImpl(): Promise<void> {
   const pol = requirePolicy();
   const cp = requireControlPlane();
@@ -144,6 +130,8 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   const m = first.mention;
 
   const step: StepRunner = (fn, name) => DBOS.runStep(fn, { name });
+  const threadWorkflowId = DBOS.workflowID;
+  if (!threadWorkflowId) throw new Error("Slack thread workflow ID is unavailable");
 
   await step(() => pol.onPickup(m), "onPickup");
 
@@ -178,6 +166,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
             channel: m.channel,
             threadRoot: m.threadRoot,
           },
+          threadWorkflowId,
         }),
       "createTask",
     );
@@ -191,14 +180,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
 
   await step(() => pol.onStarted(m, session), "onStarted");
 
-  // 2) Bind the session to this thread mailbox. The process listener discovers
-  // the session through session_listeners and applies the Slack consumer once
-  // this row exists.
-  const threadWfId = DBOS.workflowID;
-  if (!threadWfId) throw new Error("Slack thread workflow ID is unavailable");
-  await bindThreadSession(step, session.id, threadWfId);
-
-  // 3) Drain loop — one recv multiplexes session events ∪ trigger events.
+  // 2) Drain loop — one recv multiplexes session events ∪ trigger events.
   // `st` is plain workflow-local render state, rebuilt deterministically on
   // replay from the checkpointed recv'd messages + step outputs (the bubble ts
   // is a checkpointed `onAssistantMessage` output; the accumulated text is

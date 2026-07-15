@@ -522,7 +522,6 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   const fullDeps: TaskDeps = {
     harnessCatalog: fakeHarnessCatalog(),
     users: makeFakeUsers(),
-    ensureListenerRow: async () => {},
     ...deps,
   };
   const srv = buildServer(app, (router) => {

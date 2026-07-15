@@ -2486,6 +2486,108 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn append_session_event_and_outbox(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        payload: serde_json::Value,
+        outbox: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<i64, MetaError> {
+        if outbox.session_id != session_id {
+            return Err(MetaError::Serialization(
+                "event/outbox session ids do not match".into(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO session_outbox
+                (prompt_id, session_id, kind, payload, created_at, not_before)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (prompt_id) DO NOTHING
+            RETURNING prompt_id
+            "#,
+        )
+        .bind(&outbox.prompt_id)
+        .bind(session_id.as_uuid())
+        .bind(outbox.kind.as_str())
+        .bind(&outbox.payload)
+        .bind(outbox.created_at)
+        .bind(outbox.not_before)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .is_some();
+
+        if !inserted {
+            let existing = sqlx::query(
+                "SELECT session_id, kind, payload FROM session_outbox WHERE prompt_id = $1",
+            )
+            .bind(&outbox.prompt_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                MetaError::Conflict(format!(
+                    "outbox id {} disappeared during completion",
+                    outbox.prompt_id
+                ))
+            })?;
+            let existing_session: uuid::Uuid = existing.try_get("session_id").map_err(db_err)?;
+            let existing_kind: String = existing.try_get("kind").map_err(db_err)?;
+            let existing_payload: serde_json::Value =
+                existing.try_get("payload").map_err(db_err)?;
+            if existing_session != session_id.as_uuid()
+                || existing_kind != outbox.kind.as_str()
+                || existing_payload != outbox.payload
+            {
+                return Err(MetaError::Conflict(format!(
+                    "outbox id {} belongs to another command",
+                    outbox.prompt_id
+                )));
+            }
+        }
+
+        let event = sqlx::query(
+            r#"
+            WITH next AS (
+                UPDATE sessions
+                   SET next_event_idx = next_event_idx + 1,
+                       updated_at = NOW(),
+                       last_event_at = NOW()
+                 WHERE id = $1
+             RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
+            ),
+            inserted AS (
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch FROM next
+                RETURNING idx
+            )
+            SELECT idx FROM inserted
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind)
+        .bind(payload)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        let idx: i64 = event.try_get("idx").map_err(db_err)?;
+
+        sqlx::query("SELECT pg_notify('session_events', $1), pg_notify('session_outbox', $2)")
+            .bind(
+                serde_json::json!({ "session_id": session_id.to_string(), "idx": idx }).to_string(),
+            )
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(idx)
+    }
+
     async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
         let rows = sqlx::query(
             "SELECT DISTINCT session_id FROM session_outbox

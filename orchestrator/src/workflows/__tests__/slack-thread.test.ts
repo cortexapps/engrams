@@ -16,7 +16,6 @@
 
 import { expect, test, describe } from "bun:test";
 import {
-  bindThreadSession,
   closingSummary,
   handleInbound,
   type StepRunner,
@@ -368,22 +367,5 @@ describe("Slack thread ingest-v2 state", () => {
       lastMessage: "final answer",
       assets: [],
     });
-  });
-
-  test("session startup writes the Slack binding row", async () => {
-    const bindings: Array<{ sessionId: string; threadWfId: string }> = [];
-
-    await bindThreadSession(
-      STEP,
-      "session-1",
-      "thread-wf-1",
-      async (sessionId, threadWfId) => {
-        bindings.push({ sessionId, threadWfId });
-      },
-    );
-
-    expect(bindings).toEqual([
-      { sessionId: "session-1", threadWfId: "thread-wf-1" },
-    ]);
   });
 });
