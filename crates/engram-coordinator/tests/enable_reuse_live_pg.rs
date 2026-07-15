@@ -393,6 +393,7 @@ fn spawn_capture_job_simulator(
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 };
                 // ADR 0084 P3: `result_bincode` now encodes a
                 // `CaptureJobResult` (artifact + optional cold-base

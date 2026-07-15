@@ -1222,12 +1222,14 @@ pub(crate) fn attach_warm_peers(
             .iter()
             .filter(|h| {
                 h.id != recipient
-                    && crate::placement::host_is_schedulable(h, now, ttl)
                     && h.ready_images
                         .iter()
                         .any(|d| d == r.manifest_digest.as_str())
             })
-            .filter_map(|h| h.host_addr.as_deref().map(|a| (h.id, a)))
+            // `host_can_serve_chunks`, NOT `host_is_schedulable`: a
+            // cordoned host mid-drain still serves reads happily, and
+            // during a roll it's often the warmest seed available.
+            .filter_map(|h| crate::placement::host_can_serve_chunks(h, now, ttl).map(|a| (h.id, a)))
             .collect();
         if candidates.is_empty() {
             r.warm_peers = Vec::new();

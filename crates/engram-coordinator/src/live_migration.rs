@@ -358,6 +358,8 @@ pub async fn migrate_session_live(
         // Issue #529: restore-side reconstruction, not a fresh capture —
         // no pause instant to carry.
         paused_at: None,
+        // ADR 0095: peer-fill hints are for ordinary resumes; a teleport dest pulls via its migration export.
+        peer_hints: Vec::new(),
     };
     // ADR 0019 / telemetry restoration (#526): `dest.restore` makes a
     // gRPC call to the target host-agent; the `TraceparentInjector`

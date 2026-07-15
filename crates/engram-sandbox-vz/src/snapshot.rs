@@ -109,6 +109,9 @@ pub(crate) async fn build_metadata(
         // (it gates on `supports_diff_checkpoints`, InvalidSpec → composed
         // path); the composed path's `now` fallback covers VZ same as today.
         paused_at: None,
+        // ADR 0095: capture never stamps peer hints; the resume
+        // assembler does, coordinator-side.
+        peer_hints: Vec::new(),
     })
 }
 

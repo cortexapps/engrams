@@ -429,6 +429,9 @@ impl SandboxBackend for ProcessBackend {
             // `PooledBackend` (which stamps it from its own capture_phase);
             // dev-only backend, so the composed path's `now` fallback is fine.
             paused_at: None,
+            // ADR 0095: capture never stamps peer hints; the resume
+            // assembler does, coordinator-side.
+            peer_hints: Vec::new(),
         })
     }
 
@@ -1137,6 +1140,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         };
         let res = b.restore(meta).await;
         assert!(matches!(res, Err(SandboxError::Snapshot(_))));
