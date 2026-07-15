@@ -233,6 +233,25 @@ pub struct EnabledImageRef {
     /// memory image to warm. Nullable since migration 0049. No `serde(default)`
     /// — clean break, coord + hosts deploy together.
     pub base_snapshot_memory_manifest: Option<engram_core::types::manifest::ManifestRef>,
+    /// ADR 0095: fleet siblings currently advertising this digest in
+    /// `ready_images` — peer-fill seeds the prefetch supervisor pulls the
+    /// base chunk set from (LAN) before falling back to GCS. Assembled
+    /// fresh by the coordinator on every heartbeat ack (never persisted —
+    /// stored prestage refs deserialize to empty via the default); ≤2
+    /// entries, recipient excluded. Empty ⇒ no live seed ⇒ the pull is
+    /// pure GCS, byte-identical to pre-0095 behavior.
+    #[serde(default)]
+    pub warm_peers: Vec<PeerRef>,
+}
+
+/// ADR 0095: one peer-fill seed — a fleet sibling that holds the chunks.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PeerRef {
+    pub host_id: HostId,
+    /// The sibling's gRPC address, exactly as the coordinator dials it
+    /// (`hosts.host_addr`) — host pods share the coordinator's network
+    /// view of each other.
+    pub addr: String,
 }
 
 /// Newtype over the OCI manifest digest string (`sha256:<hex>`).
@@ -406,6 +425,10 @@ mod tests {
                     manifest_id: uuid::Uuid::nil(),
                     version: 1,
                 }),
+                warm_peers: vec![PeerRef {
+                    host_id: HostId::new(),
+                    addr: "http://10.0.0.7:9101".into(),
+                }],
             }],
             capture_assignments: Some(vec![CaptureJobAssignment {
                 job_id: CaptureJobId::new(),

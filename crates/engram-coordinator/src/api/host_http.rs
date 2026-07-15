@@ -722,7 +722,7 @@ pub async fn heartbeat(
     // ADR 0015 M5: ship the coord's authoritative enabled-images
     // set so the host's prefetch loop drives from heartbeat alone.
     // Best-effort: a PG hiccup degrades to no-images for this tick.
-    let enabled_images = match state.services.meta.list_enabled_images().await {
+    let mut enabled_images = match state.services.meta.list_enabled_images().await {
         Ok(rows) => enabled_image_refs_from_rows(rows),
         Err(e) => {
             tracing::debug!(host_id = %host_id, error = %e, "list_enabled_images failed");
@@ -738,22 +738,46 @@ pub async fn heartbeat(
     // for this tick; the scanner's poll loop just sees one more empty
     // heartbeat and keeps waiting. A row that fails to deserialize (wire
     // skew mid-roll) is skipped + logged rather than failing the whole ack.
-    let prestage_images = match state.services.meta.list_prestaging_refs().await {
-        Ok(raw) => raw
-            .into_iter()
-            .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
-                    None
-                }
-            })
-            .collect(),
-        Err(e) => {
-            tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
-            Vec::new()
+    let mut prestage_images: Vec<EnabledImageRef> =
+        match state.services.meta.list_prestaging_refs().await {
+            Ok(raw) => raw
+                .into_iter()
+                .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
+                        None
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
+                Vec::new()
+            }
+        };
+
+    // ADR 0095: stamp peer-fill seeds onto every image entry — fleet
+    // siblings whose `ready_images` already carry the digest, so the
+    // recipient's prefetch supervisor pulls the base chunk set over the
+    // LAN instead of N-hosts × GCS. Freshly assembled every ack (never
+    // persisted; seeds change as hosts warm/die). Best-effort, same
+    // posture as the lists themselves: a PG hiccup ⇒ no seeds ⇒ pure
+    // GCS, byte-identical to pre-0095. The capturing host of a fresh
+    // enable flips ready within one reconcile tick of the snapshot row
+    // landing (its prefetch is an all-local stat walk), so it becomes
+    // the prestage seed automatically, and hosts that finish warming
+    // join the seed set — a natural fan-out tree.
+    if !(enabled_images.is_empty() && prestage_images.is_empty()) {
+        match state.services.meta.list_active_hosts().await {
+            Ok(hosts) => {
+                attach_warm_peers(&mut enabled_images, &hosts, host_id);
+                attach_warm_peers(&mut prestage_images, &hosts, host_id);
+            }
+            Err(e) => {
+                tracing::debug!(host_id = %host_id, error = %e, "list_active_hosts failed; no warm peers this tick");
+            }
         }
-    };
+    }
 
     // ADR 0035 §5: the bundle pin set. NOT best-effort — an empty set
     // is an instruction to sweep, so a PG failure here must fail the
@@ -1166,7 +1190,63 @@ pub(crate) fn enabled_image_ref(row: &engram_core::types::EnabledImage) -> Optio
         base_snapshot_id,
         base_snapshot_disk_manifest,
         base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
+        warm_peers: Vec::new(),
     })
+}
+
+/// ADR 0095: how many peer-fill seeds ride each image entry. Two: one
+/// primary plus one alternate, so a requester's bounded second dial has
+/// somewhere to go without waiting a heartbeat tick.
+const WARM_PEER_SEEDS: usize = 2;
+
+/// ADR 0095: stamp `warm_peers` onto image entries — fleet siblings
+/// whose `ready_images` carry the digest, schedulable
+/// ([`crate::placement::host_is_schedulable`]: Ready, uncordoned,
+/// heartbeat-fresh, wire-compatible), with a dialable addr, excluding
+/// the recipient. Pure so it unit-tests without PG.
+///
+/// Seed spread: candidates rotate by a hash of (recipient, digest), so
+/// concurrent warmers fan out across the ready set instead of camping
+/// on one seed, and a given recipient keeps stable seeds across ticks
+/// (connection reuse) until the ready set changes.
+pub(crate) fn attach_warm_peers(
+    refs: &mut [EnabledImageRef],
+    hosts: &[engram_core::types::host::HostRecord],
+    recipient: engram_core::HostId,
+) {
+    use std::hash::{Hash, Hasher};
+    let now = chrono::Utc::now();
+    let ttl = crate::placement::placement_ttl();
+    for r in refs.iter_mut() {
+        let mut candidates: Vec<(engram_core::HostId, &str)> = hosts
+            .iter()
+            .filter(|h| {
+                h.id != recipient
+                    && crate::placement::host_is_schedulable(h, now, ttl)
+                    && h.ready_images
+                        .iter()
+                        .any(|d| d == r.manifest_digest.as_str())
+            })
+            .filter_map(|h| h.host_addr.as_deref().map(|a| (h.id, a)))
+            .collect();
+        if candidates.is_empty() {
+            r.warm_peers = Vec::new();
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        recipient.hash(&mut hasher);
+        r.manifest_digest.as_str().hash(&mut hasher);
+        let rot = (hasher.finish() as usize) % candidates.len();
+        candidates.rotate_left(rot);
+        r.warm_peers = candidates
+            .into_iter()
+            .take(WARM_PEER_SEEDS)
+            .map(|(host_id, addr)| engram_protocol::heartbeat::PeerRef {
+                host_id,
+                addr: addr.to_string(),
+            })
+            .collect();
+    }
 }
 
 // ---- POST /api/hosts/:id/auth/resolve-registry ----
