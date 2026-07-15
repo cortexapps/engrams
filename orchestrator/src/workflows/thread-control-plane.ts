@@ -27,7 +27,6 @@ import { makeConnectorStore } from "../db/connectors.ts";
 import {
   createTaskWithSession,
   type Db,
-  type EnsureListenerRow,
   type TaskSessionsClient,
   type HarnessCatalogClient,
 } from "../rpc/task-create.ts";
@@ -37,7 +36,6 @@ import type { ImagesClient } from "../rpc/profiles.ts";
 import { config } from "../config.ts";
 import type { ThreadControlPlane } from "./slack-thread.ts";
 import { tools as defaultToolRegistry, type ToolRegistry } from "../tools/registry.ts";
-import { ensureListenerRow as ensureProductionListenerRow } from "../listeners/lease-store.ts";
 
 /** The control-plane session ops the thread workflow drives. The create/delete
  *  half is the shared `TaskSessionsClient` (used by the create-task primitive);
@@ -55,7 +53,6 @@ export interface ThreadControlPlaneDeps {
   sessions?: ThreadSessionsClient;
   toolRegistry?: Pick<ToolRegistry, "complete">;
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;
-  ensureListenerRow?: EnsureListenerRow;
   /** The Drizzle DB the task-persist transaction runs on. Default = the pool. */
   db?: Db;
 }
@@ -71,8 +68,6 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
   const sessions = deps.sessions ?? (defaultSessions as unknown as ThreadSessionsClient);
   const toolRegistry = deps.toolRegistry ?? defaultToolRegistry;
   const resolveUser = deps.resolveUser ?? resolveEngramsUser;
-  const ensureListenerRow =
-    deps.ensureListenerRow ?? ensureProductionListenerRow;
   const db = deps.db ?? getDb();
 
   return {
@@ -87,7 +82,6 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
           connectors,
           harnessCatalog,
           sessions,
-          ensureListenerRow,
           secrets,
           db,
         },
@@ -96,6 +90,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
           ownerUserId: input.ownerUserId,
           profileId: input.profileId,
           source: input.source,
+          slackThreadWorkflowId: input.threadWorkflowId,
           ...(input.prompt ? { prompt: input.prompt } : {}),
           ...(input.appendSystemPrompt
             ? { extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: input.appendSystemPrompt } }

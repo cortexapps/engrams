@@ -82,11 +82,9 @@ import type { CustomConnectorSource } from "../connectors/registry.ts";
 import {
   createTaskWithSession,
   type Db,
-  type EnsureListenerRow,
   type HarnessCatalogClient,
 } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
-import { ensureListenerRow } from "../listeners/lease-store.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -153,7 +151,6 @@ export interface TaskDeps {
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
   /** Register a session for stream-listener scanner discovery. */
-  ensureListenerRow?: EnsureListenerRow;
   db?: Db;
 }
 
@@ -551,7 +548,6 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           connectors,
           harnessCatalog: harnessCatalogClient,
           sessions: sessionsClient,
-          ensureListenerRow: deps?.ensureListenerRow ?? ensureListenerRow,
           secrets: resolveSecrets(),
           portExposures: resolvePortExposures(),
           users: resolveUsers(),

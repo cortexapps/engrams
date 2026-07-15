@@ -155,8 +155,3 @@ export function makeInMemoryLeaseStore(
     },
   };
 }
-
-/** Production task-creation seam: register a session for scanner discovery. */
-export async function ensureListenerRow(sessionId: string): Promise<void> {
-  await makeLeaseStore().ensureRow(sessionId);
-}

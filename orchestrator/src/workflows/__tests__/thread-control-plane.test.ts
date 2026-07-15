@@ -76,7 +76,6 @@ describe("makeThreadControlPlane", () => {
   test("createTask injects ENGRAM_APPEND_SYSTEM_PROMPT + persists a slack_thread task", async () => {
     let createdReq: { harnessEnv?: Record<string, string> } | undefined;
     const records: Record<string, unknown>[] = [];
-    const ensured: string[] = [];
 
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
@@ -85,7 +84,6 @@ describe("makeThreadControlPlane", () => {
       harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null },
       resolveUser: async () => "user-1",
-      ensureListenerRow: async (sessionId) => void ensured.push(sessionId),
       db: recordingDb(records),
       sessions: {
         createSession: async (req) => {
@@ -103,6 +101,7 @@ describe("makeThreadControlPlane", () => {
       prompt: "hello",
       appendSystemPrompt: "You were triggered from Slack.",
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
+      threadWorkflowId: "thread-wf-1",
     });
 
     expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe("You were triggered from Slack.");
@@ -113,7 +112,8 @@ describe("makeThreadControlPlane", () => {
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
     });
     expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "default-profile" });
-    expect(ensured).toEqual(["sess-1"]);
+    expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
+    expect(records[3]).toEqual({ sessionId: "sess-1" });
     expect(started.id).toBe("sess-1");
     expect(started.webUrl).toContain("/sessions/sess-1");
   });

@@ -27,7 +27,12 @@ import { isServiceAccountEmail } from "./api-key.ts";
 import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
 import type { ImagesClient } from "./profiles.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
-import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
+import {
+  sessionListener as sessionListenerTable,
+  slackSession as slackSessionTable,
+  task as taskTable,
+  taskSession as taskSessionTable,
+} from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
 import {
   compileIntegrationPolicy,
@@ -273,16 +278,12 @@ export interface TaskSessionsClient {
   deleteSession(req: { sessionId: string }): Promise<unknown>;
 }
 
-/** Register a newly persisted session for listener scanner discovery. */
-export type EnsureListenerRow = (sessionId: string) => Promise<void>;
-
 export interface CreateTaskDeps {
   profiles: ProfileStore;
   images: ImagesClient;
   connectors: CustomConnectorSource;
   harnessCatalog: HarnessCatalogClient;
   sessions: TaskSessionsClient;
-  ensureListenerRow: EnsureListenerRow;
   /** Resolve `envVar` for the OWNER (e.g. the Claude OAuth token), or null. */
   secrets: { get(userId: string, envVar: string): Promise<string | null> };
   db: Db;
@@ -315,6 +316,8 @@ export interface CreateTaskParams {
   /** Extra harness env merged LAST — e.g. the trigger's
    *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
+  /** Slack workflow mailbox to bind before the listener becomes discoverable. */
+  slackThreadWorkflowId?: string;
 }
 
 export interface CreatedTask {
@@ -402,6 +405,17 @@ export async function createTaskWithSession(
         role: "primary",
         profileId: profile.id,
       });
+      if (params.slackThreadWorkflowId !== undefined) {
+        await tx.insert(slackSessionTable).values({
+          sessionId: created.sessionId,
+          threadWfId: params.slackThreadWorkflowId,
+        });
+      }
+      // Register last: once this transaction commits, every consumer-specific
+      // binding and the task/profile context are already visible.
+      await tx.insert(sessionListenerTable).values({
+        sessionId: created.sessionId,
+      });
     });
   } catch (err) {
     // Compensate: drop the orphan session so a retry starts clean.
@@ -415,10 +429,6 @@ export async function createTaskWithSession(
     }
     throw err;
   }
-
-  // The task/profile rows must be visible before a listener can resolve tool
-  // context. Every creation surface registers the session through this point.
-  await deps.ensureListenerRow(created.sessionId);
 
   // ADR 0064: auto-mint one private port-exposure per port the profile declares.
   // Best-effort — an exposure failure must NOT fail the task (the session is

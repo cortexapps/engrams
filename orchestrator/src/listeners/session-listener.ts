@@ -45,9 +45,11 @@ export interface SessionListenerDeps {
 interface ConsumerState {
   consumer: SessionConsumer;
   cursor: bigint;
+  highestSeen: bigint;
   highestOffered: bigint;
   queue: CuratedEvent[];
   drain: Promise<void> | null;
+  recovery: Promise<void> | null;
   spaceWaiters: Array<() => void>;
 }
 
@@ -104,7 +106,9 @@ export class SessionListener {
     } finally {
       this.#requestStop();
       await heartbeat;
-      await Promise.all(this.#states.map((state) => state.drain));
+      await Promise.all(
+        this.#states.flatMap((state) => [state.drain, state.recovery]),
+      );
       if (!this.#released) await this.#release();
     }
   }
@@ -119,9 +123,11 @@ export class SessionListener {
       this.#states.push({
         consumer,
         cursor,
+        highestSeen: cursor,
         highestOffered: cursor,
         queue: [],
         drain: null,
+        recovery: null,
         spaceWaiters: [],
       });
     }
@@ -294,20 +300,83 @@ export class SessionListener {
 
   async #offer(event: CuratedEvent): Promise<void> {
     for (const state of this.#states) {
+      if (event.idx > state.highestSeen) state.highestSeen = event.idx;
       if (event.idx <= state.highestOffered) continue;
-      while (
-        state.queue.length >= (this.#deps.queueCapacity ?? DEFAULT_QUEUE_CAPACITY) &&
-        !this.#stopRequested
+      if (
+        state.recovery !== null ||
+        state.queue.length >= (this.#deps.queueCapacity ?? DEFAULT_QUEUE_CAPACITY)
       ) {
-        await Promise.race([
-          new Promise<void>((resolve) => state.spaceWaiters.push(resolve)),
-          this.#stopped,
-        ]);
+        // Never hold the shared stream behind one full consumer. Its durable
+        // cursor lets an independent recovery task replay the skipped suffix.
+        this.#ensureRecovery(state);
+        continue;
       }
-      if (this.#stopRequested) return;
-      state.highestOffered = event.idx;
-      state.queue.push(event);
-      this.#ensureDrain(state);
+      this.#enqueue(state, event);
+    }
+  }
+
+  #enqueue(state: ConsumerState, event: CuratedEvent): void {
+    if (event.idx <= state.highestOffered) return;
+    state.highestOffered = event.idx;
+    state.queue.push(event);
+    this.#ensureDrain(state);
+  }
+
+  #ensureRecovery(state: ConsumerState): void {
+    if (state.recovery !== null || this.#stopRequested) return;
+    state.recovery = this.#recover(state).finally(() => {
+      state.recovery = null;
+      // An event can extend highestSeen while the previous recovery is
+      // completing. Re-check after clearing the in-flight marker.
+      if (state.highestOffered < state.highestSeen) this.#ensureRecovery(state);
+    });
+  }
+
+  async #recover(state: ConsumerState): Promise<void> {
+    let after = state.highestOffered;
+    let attempt = 0;
+    while (!this.#stopRequested && after < state.highestSeen) {
+      try {
+        const page = await this.#deps.readPage(this.#deps.sessionId, after);
+        attempt = 0;
+        for (const event of page.events) {
+          if (event.idx <= state.highestOffered) continue;
+          if (event.idx > state.highestSeen) state.highestSeen = event.idx;
+          while (
+            state.queue.length >= (this.#deps.queueCapacity ?? DEFAULT_QUEUE_CAPACITY) &&
+            !this.#stopRequested
+          ) {
+            await Promise.race([
+              new Promise<void>((resolve) => state.spaceWaiters.push(resolve)),
+              this.#stopped,
+            ]);
+          }
+          if (this.#stopRequested) return;
+          this.#enqueue(state, event);
+        }
+        if (page.nextAfter <= after) {
+          if (!(await this.#sleepOrStop(RETRY_INITIAL_MS))) return;
+        } else {
+          after = page.nextAfter;
+        }
+      } catch (err) {
+        attempt++;
+        const delayMs = Math.min(
+          RETRY_MAX_MS,
+          RETRY_INITIAL_MS * 2 ** Math.min(attempt - 1, 16),
+        );
+        log.warn(
+          {
+            sessionId: this.#deps.sessionId,
+            consumer: state.consumer.name,
+            after: String(after),
+            delayMs,
+            err,
+          },
+          "listener consumer catch-up retry",
+        );
+        if (!(await this.#sleepOrStop(delayMs))) return;
+      }
     }
   }
 
@@ -392,12 +461,15 @@ export class SessionListener {
     for (;;) {
       for (const state of this.#states) {
         if (state.queue.length > 0) this.#ensureDrain(state);
+        if (state.highestOffered < state.highestSeen) this.#ensureRecovery(state);
       }
-      const drains = this.#states.flatMap((state) =>
-        state.drain === null ? [] : [state.drain]
+      const work = this.#states.flatMap((state) =>
+        [state.drain, state.recovery].filter(
+          (pending): pending is Promise<void> => pending !== null,
+        )
       );
-      if (drains.length === 0) return;
-      await Promise.all(drains);
+      if (work.length === 0) return;
+      await Promise.all(work);
     }
   }
 
