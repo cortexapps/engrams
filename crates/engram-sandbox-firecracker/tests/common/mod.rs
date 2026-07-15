@@ -17,9 +17,7 @@ use std::time::Duration;
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::types::image::OciRuntimeDefaults;
 use engram_core::types::sandbox::ExecEvent;
-use engram_rootfs_materializer::{
-    inject_init, recommended_size, recursive_size, Ext4Packer, InitInjection, Mke2fsPacker,
-};
+use engram_rootfs_materializer::{inject_init, pack_tree, InitInjection};
 use futures::StreamExt;
 
 /// Successful preflight: paths to the cached vmlinux + ext4 rootfs.
@@ -35,7 +33,7 @@ pub struct FcEnv {
 /// `let env = match common::fc_preflight() { Some(e) => e, None => return };`
 /// without growing per-test boilerplate.
 ///
-/// Tests that need additional binaries (e.g. `docker`, `mke2fs`)
+/// Tests that need additional binaries (e.g. `docker`, `mksquashfs`)
 /// follow up with [`require_bin`].
 pub fn fc_preflight() -> Option<FcEnv> {
     let kernel = match std::env::var("FC_TEST_KERNEL") {
@@ -120,7 +118,7 @@ pub fn compat_preflight() -> Option<CompatEnv> {
 }
 
 /// Returns `false` (after printing `SKIP:`) if `bin` isn't on `$PATH`.
-/// Used by tests with extra binary requirements (docker, mke2fs).
+/// Used by tests with extra binary requirements (docker, mksquashfs).
 pub fn require_bin(bin: &str) -> bool {
     if which(bin).is_none() {
         eprintln!("SKIP: {bin} not on PATH");
@@ -387,7 +385,7 @@ pub fn stage_agentd_bundle(bundle_dir: &Path, agentd_binary: &Path) -> StagedAge
 // ---------------------------------------------------------------------------
 // ADR 0080 §D: docker-free fixture rootfs bake.
 //
-// Phase 4 retired the docker-based image bake (docker build + export + mke2fs).
+// Phase 4 retired the docker-based image bake (docker build + export + pack).
 // The FC integration tests only ever baked a minimal rootfs whose whole
 // userland is `/bin/sh` + coreutils (agentd is static musl, so the guest
 // needs no glibc), so we build that tree directly from a static busybox and
@@ -512,7 +510,7 @@ pub fn copy_host_tool_with_closure(
 /// extra files / [`copy_host_tool_with_closure`] tools), injects the stage-1
 /// init shim (`init`), `Mke2fsPacker`-packs it into `out_ext4`, and chunks it
 /// into `chunk_store` (content-derived manifest, like the retired bake).
-/// Gate callers with `require_bin("mke2fs")` + [`find_busybox`].
+/// Gate callers with [`find_busybox`] (pure-Rust pack — no mke2fs).
 pub async fn bake_fixture_ext4(
     out_ext4: &Path,
     chunk_store: &ChunkStore,
@@ -531,11 +529,17 @@ pub async fn bake_fixture_ext4(
     if let Some(parent) = out_ext4.parent() {
         std::fs::create_dir_all(parent).expect("out_ext4 parent");
     }
-    let dir_size = recursive_size(tree.path()).await.expect("recursive_size");
-    Mke2fsPacker::default()
-        .pack(tree.path(), out_ext4, recommended_size(dir_size))
-        .await
-        .expect("mke2fs pack (is a >=1.47.1 mke2fs on PATH / ENGRAM_MKE2FS?)");
+    // ADR 0093: pure-Rust deterministic pack — no mke2fs, no gate.
+    // spawn_blocking (not block_in_place): #[tokio::test] runtimes are
+    // current-thread, where block_in_place panics.
+    {
+        let tree_path = tree.path().to_path_buf();
+        let out = out_ext4.to_path_buf();
+        tokio::task::spawn_blocking(move || pack_tree(&tree_path, &out))
+            .await
+            .expect("pack_tree join")
+            .expect("pack_tree");
+    }
     // Chunk the ext4 into the content-addressed store, mirroring the retired
     // Builder's ext4 branch: content-derived ref, idempotent put.
     let manifest = chunk_store

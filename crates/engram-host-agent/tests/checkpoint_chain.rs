@@ -19,7 +19,7 @@
 //!      payload) and `delete_acked` clears them.
 //!
 //! Gating mirrors `exec_real_vm.rs` (Linux + KVM + firecracker +
-//! Docker + mke2fs + musl agentd) — the exec verification needs an
+//! Docker + musl agentd) — the exec verification needs an
 //! agentd-baked rootfs. Run on the dev-vm:
 //!
 //! ```sh
@@ -62,7 +62,7 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "mke2fs", "mksquashfs"] {
+    for bin in ["firecracker", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)

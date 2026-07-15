@@ -82,7 +82,7 @@ async fn agentd_rolls_via_bundle_without_recapture() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mksquashfs") {
         return;
     }
     let Some(busybox) = common::find_busybox() else {

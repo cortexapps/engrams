@@ -540,7 +540,7 @@ mod tests {
     // Exercises mksquashfs end to end. Runs wherever squashfs-tools is on PATH —
     // the nix dev shell (`just check`) + the `test-linux` CI lane (which apt-
     // installs it). Self-skips elsewhere (e.g. the macOS lane), mirroring the
-    // ext4-determinism test's mke2fs gate, so it still runs in CI but doesn't
+    // ext4-determinism test's environment gate, so it still runs in CI but doesn't
     // hard-fail a toolless environment.
     #[test]
     fn pack_is_deterministic_and_well_formed() {

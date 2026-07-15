@@ -15,7 +15,7 @@
 //!      returns `Err`, so the enable aborts rather than silently shipping
 //!      a "cold" base snapshot that the hook claimed to warm.
 //!
-//! Linux + KVM + firecracker + Docker + mke2fs + musl agentd only (the
+//! Linux + KVM + firecracker + Docker + musl agentd only (the
 //! exec verification needs an agentd-baked rootfs). Run on the dev-vm:
 //!
 //! ```sh
@@ -266,7 +266,7 @@ impl TestEnv {
             eprintln!("SKIP: /dev/kvm not present");
             return None;
         }
-        for bin in ["firecracker", "mke2fs", "mksquashfs"] {
+        for bin in ["firecracker", "mksquashfs"] {
             let missing = std::env::var_os("PATH")
                 .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
                 .unwrap_or(true);

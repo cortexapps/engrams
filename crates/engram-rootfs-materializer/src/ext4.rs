@@ -1,164 +1,7 @@
-//! Pack a directory tree into an ext4 disk image, ready for
-//! `FirecrackerBackend` to attach as a root drive.
-//!
-//! The default [`Mke2fsPacker`] shells out to `mke2fs -t ext4 -F -d`,
-//! which (since e2fsprogs 1.43) populates the freshly-formatted
-//! filesystem from a source directory in one shot — no loopback
-//! mount, no root needed. This is the same flow Firecracker's CI uses
-//! to bake their published `ubuntu-*.ext4` artifacts.
-//!
-//! ADR 0080: this module is the single home for tree → ext4 packing,
-//! whether the tree came from `docker export` (the retiring bake) or
-//! an OCI-layer flatten (this crate).
-//!
-//! [`Ext4Packer`] is a trait so unit tests can mock it; the real
-//! binary is exercised by the packer/determinism integration tests.
-
-use std::path::{Path, PathBuf};
-
-use async_trait::async_trait;
-
-#[async_trait]
-pub trait Ext4Packer: Send + Sync {
-    /// Create `dst_image` (overwriting any existing file) of size
-    /// `size_bytes`, format it as ext4, and copy the contents of
-    /// `src_dir` into the new filesystem. The image is left ready for
-    /// Firecracker to attach as a block device.
-    async fn pack(
-        &self,
-        src_dir: &Path,
-        dst_image: &Path,
-        size_bytes: u64,
-    ) -> Result<(), Ext4Error>;
-}
-
-#[derive(Debug)]
-pub enum Ext4Error {
-    Io(std::io::Error),
-    /// mke2fs returned a non-zero exit code. The string is its
-    /// captured stderr — verbose, but useful when the bake fails.
-    Mke2fs(String),
-    /// Could not find the mke2fs binary (PATH miss or stale config).
-    MissingBinary(String),
-}
-
-impl std::fmt::Display for Ext4Error {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Io(e) => write!(f, "io: {e}"),
-            Self::Mke2fs(s) => write!(f, "mke2fs: {s}"),
-            Self::MissingBinary(b) => write!(f, "binary not found: {b}"),
-        }
-    }
-}
-
-impl std::error::Error for Ext4Error {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(e) => Some(e),
-            _ => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for Ext4Error {
-    fn from(e: std::io::Error) -> Self {
-        Self::Io(e)
-    }
-}
-
-/// Production [`Ext4Packer`] backed by `mke2fs` from e2fsprogs.
-#[derive(Clone, Debug)]
-pub struct Mke2fsPacker {
-    bin: PathBuf,
-}
-
-impl Default for Mke2fsPacker {
-    fn default() -> Self {
-        Self {
-            bin: resolve_mke2fs(),
-        }
-    }
-}
-
-impl Mke2fsPacker {
-    pub fn with_binary(bin: impl Into<PathBuf>) -> Self {
-        Self { bin: bin.into() }
-    }
-}
-
-/// Resolve the `mke2fs` to shell out to, preferring a pinned one.
-///
-/// ADR 0036 byte-determinism requires an e2fsprogs that honors
-/// `SOURCE_DATE_EPOCH` (>= 1.47.1); most distros' system e2fsprogs is older and
-/// silently stamps wall-clock times, breaking cross-bake chunk dedup. So we
-/// don't rely on whatever `mke2fs` happens to be on `$PATH` — we ship a pinned
-/// static `mke2fs` *next to the current executable* (the `cli-tools` artifact
-/// for bakes; ADR 0080 moves the same pin into the host-agent image for
-/// enable-time materialization) and resolve it here, so the pack is
-/// deterministic by construction wherever it runs. Order:
-///
-/// 1. `$ENGRAM_MKE2FS` — explicit override (CI's packer test, debugging).
-/// 2. an `mke2fs` sibling of the current executable — the bundled pin.
-/// 3. `mke2fs` from `$PATH` — `nix develop` dev shells, and hosts whose
-///    distro e2fsprogs packs only content where determinism is immaterial
-///    (e.g. the empty stub harness).
-fn resolve_mke2fs() -> PathBuf {
-    if let Some(p) = std::env::var_os("ENGRAM_MKE2FS") {
-        return PathBuf::from(p);
-    }
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(sibling) = exe.parent().map(|d| d.join("mke2fs")) {
-            if sibling.is_file() {
-                return sibling;
-            }
-        }
-    }
-    PathBuf::from("mke2fs")
-}
-
-#[async_trait]
-impl Ext4Packer for Mke2fsPacker {
-    async fn pack(
-        &self,
-        src_dir: &Path,
-        dst_image: &Path,
-        size_bytes: u64,
-    ) -> Result<(), Ext4Error> {
-        // Atomic write: format into `<dst>.tmp` and rename on success.
-        // On any error path (missing binary, mke2fs failure, IO), the
-        // tmp file gets cleaned up so the next attempt starts fresh.
-        // Without this, a missing-binary failure leaves the
-        // preallocated zero-padded file at `dst_image`, which downstream
-        // cache-presence checks happily mistake for a built artifact —
-        // the VM then mounts a block of zeros as ext4 and the harness
-        // never appears.
-        let mut tmp = dst_image.to_path_buf();
-        tmp.as_mut_os_string().push(".tmp");
-
-        // 1. Truncate / preallocate. mke2fs reads the file's size to
-        //    decide how big to make the filesystem; we want exactly
-        //    `size_bytes`.
-        let f = tokio::fs::File::create(&tmp).await?;
-        f.set_len(size_bytes).await?;
-        drop(f);
-
-        // 2. Format + populate in one mke2fs call. Best-effort cleanup
-        //    of the tmp file on any failure path; ignore cleanup errors
-        //    since the original mke2fs error is what the caller cares
-        //    about.
-        let result = self.run_mke2fs(src_dir, &tmp).await;
-        if let Err(e) = result {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            return Err(e);
-        }
-
-        // 3. Atomic rename. Only after this returns Ok does the cache
-        //    presence check on `dst_image` start returning true.
-        tokio::fs::rename(&tmp, dst_image).await?;
-        Ok(())
-    }
-}
+//! Deterministic ext4 SIZING — the inputs the streaming packer feeds
+//! mkext4 (ADR 0093 retired the mke2fs shell-out; ADR 0036's
+//! determinism constants and the size/inode quantizers live on here).
+//! Tree → image packing for fixtures is `stream_pack::pack_tree`.
 
 /// ADR 0036: fixed inputs that make `mke2fs` output a pure function
 /// of the source tree, so a re-bake with unchanged content reproduces
@@ -173,81 +16,15 @@ impl Ext4Packer for Mke2fsPacker {
 /// guests mount the rootfs by virtio device path, never by UUID, and
 /// the images are block devices inside dedicated microVMs (no host
 /// blkid involvement).
-const DETERMINISTIC_FS_UUID: &str = "00000000-e9a4-4a11-8036-000000000036";
-const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000000036";
+pub(crate) const DETERMINISTIC_FS_UUID: &str = "00000000-e9a4-4a11-8036-000000000036";
+pub(crate) const DETERMINISTIC_HASH_SEED: &str = "00000000-5eed-4a11-8036-000000000036";
 /// 2024-01-01T00:00:00Z. e2fsprogs (≥1.45) reads `SOURCE_DATE_EPOCH`
 /// and (a) stamps superblock mkfs/write times from it instead of the
 /// wall clock, and (b) clamps inode timestamps newer than it — which
-/// covers files injected at materialize time (the init shim, whiteout
-/// side effects). [`clamp_mtimes`] performs the same clamp in the tree
-/// itself as belt-and-braces (the reproducible-bundle lesson: one path
-/// skipping the clamp produced sha mismatches).
-/// Verified empirically: same tree packed twice (and two
-/// separately-created identical trees) → byte-identical images.
+/// covers files injected at materialize time (the init shim). The
+/// streaming packer clamps at declare time (`stream_pack`); mkext4
+/// stamps superblock times from this same epoch.
 pub const DETERMINISTIC_EPOCH_SECS: u64 = 1_704_067_200;
-const DETERMINISTIC_EPOCH: &str = "1704067200";
-
-impl Mke2fsPacker {
-    /// Inner mke2fs invocation, factored out so the caller can wrap
-    /// the failure path in tmp-file cleanup without duplicating
-    /// argument construction.
-    async fn run_mke2fs(&self, src_dir: &Path, dst_image: &Path) -> Result<(), Ext4Error> {
-        // Provision the inode table from the actual entry count, not
-        // mke2fs's default (size / 16 KiB). A tree of many tiny files —
-        // node_modules, gradle/pnpm caches — exhausts the default inode
-        // count long before it runs out of blocks (`mke2fs: No space left
-        // on device while populating file system`, even with the 2x size
-        // headroom). See `recommended_inodes` — but cap it to what THIS
-        // filesystem can hold (the dst image is preallocated to its final
-        // size above): `recommended_inodes` floors at ~131072 for the
-        // multi-GiB image case, which a small fs (the 16 MiB host stub
-        // harness) can't fit, and mke2fs hard-rejects an oversized inode
-        // table ("inode_size * inodes_count too big for a filesystem with
-        // N blocks").
-        let fs_size_bytes = tokio::fs::metadata(dst_image)
-            .await
-            .map(|m| m.len())
-            .unwrap_or(0);
-        let num_inodes = inode_count_for(count_entries(src_dir).await, fs_size_bytes);
-        let output = tokio::process::Command::new(&self.bin)
-            .arg("-t")
-            .arg("ext4")
-            .arg("-F")
-            .arg("-q")
-            // ADR 0036 determinism: fixed FS UUID + directory-hash
-            // seed + epoch (see the consts above).
-            .arg("-U")
-            .arg(DETERMINISTIC_FS_UUID)
-            .arg("-E")
-            .arg(format!("hash_seed={DETERMINISTIC_HASH_SEED}"))
-            // Explicit inode count (deterministic: derived from the entry
-            // count, quantized — see recommended_inodes).
-            .arg("-N")
-            .arg(num_inodes.to_string())
-            .env("SOURCE_DATE_EPOCH", DETERMINISTIC_EPOCH)
-            .arg("-d")
-            .arg(src_dir)
-            .arg(dst_image)
-            .output()
-            .await
-            .map_err(|e| {
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    Ext4Error::MissingBinary(self.bin.to_string_lossy().into_owned())
-                } else {
-                    Ext4Error::Io(e)
-                }
-            })?;
-
-        if !output.status.success() {
-            let mut stderr = String::from_utf8_lossy(&output.stderr).into_owned();
-            if stderr.is_empty() {
-                stderr = format!("exit status {}", output.status);
-            }
-            return Err(Ext4Error::Mke2fs(stderr));
-        }
-        Ok(())
-    }
-}
 
 /// Pick a sensible image size for `dir_size_bytes` of source data:
 /// ext4 metadata (~3-5%), inode table, journal (~64 MiB by default),
@@ -291,33 +68,6 @@ pub fn recommended_size(dir_size_bytes: u64) -> u64 {
     raw.saturating_add(align - 1) & !(align - 1)
 }
 
-/// Count filesystem entries (regular files, dirs, symlinks — one inode
-/// each) under `dir`. Does NOT follow symlinks: `mke2fs -d` replicates a
-/// symlink as a symlink (one inode), and not following also avoids walking
-/// symlink farms (pnpm `node_modules`) or cycles. Used to size the inode
-/// table via [`recommended_inodes`].
-async fn count_entries(dir: &Path) -> u64 {
-    let mut n = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let mut rd = match tokio::fs::read_dir(&d).await {
-            Ok(r) => r,
-            Err(_) => continue,
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            n = n.saturating_add(1);
-            // `file_type()` reflects the entry itself (readdir d_type),
-            // NOT the symlink target — so we only descend into real dirs.
-            if let Ok(ft) = entry.file_type().await {
-                if ft.is_dir() {
-                    stack.push(entry.path());
-                }
-            }
-        }
-    }
-    n
-}
-
 /// Inodes to provision for a tree of `entry_count` entries. mke2fs's
 /// default inode count is `fs_size / 16 KiB`, which a tree of many tiny
 /// files (node_modules, gradle/pnpm caches) blows past — it runs out of
@@ -354,88 +104,6 @@ pub fn inode_count_for(entry_count: u64, fs_size_bytes: u64) -> u64 {
     }
     let cap = (fs_size_bytes / (INODE_SIZE_B * 4)).max(16);
     recommended.min(cap)
-}
-
-/// Sum the *actual disk usage* (allocated 512-byte blocks, à la `du`) of every
-/// entry under `dir`, without following symlinks.
-///
-/// We size from `st_blocks`, NOT apparent file length (`meta.len()`): the
-/// brain/gradle/pnpm caches baked into warm dev images are hundreds of
-/// thousands of tiny files, and ext4 rounds every file up to a 4 KiB block
-/// (plus a block per directory). Summing apparent lengths undercounts real
-/// block consumption by 2-4× for such trees, so `recommended_size`'s 2×
-/// headroom still undershot and `mke2fs -d` hit ENOSPC mid-populate (the
-/// dev-brain bake). Block usage captures the rounding, directory blocks, and
-/// xattr/inline overhead directly.
-///
-/// Counting is per-entry, so a hardlink (pnpm's content-addressed store links
-/// into `node_modules`) is counted once per link — an overcount, but in the
-/// safe direction (a slightly larger fs is fine; a too-small one is fatal).
-/// Not following symlinks matches `count_entries` and `mke2fs -d`, which
-/// replicates a symlink as a symlink: we count the link inode's own blocks and
-/// reach a target only if it lives in the real tree. `symlink_metadata`
-/// (lstat) also can't error on broken symlinks, unlike `metadata`.
-pub async fn recursive_size(dir: &Path) -> std::io::Result<u64> {
-    use std::os::unix::fs::MetadataExt;
-    let mut total = 0u64;
-    let mut stack = vec![dir.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        let mut entries = match tokio::fs::read_dir(&d).await {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(e) => return Err(e),
-        };
-        while let Some(entry) = entries.next_entry().await? {
-            // `file_type()` is readdir's d_type — it reflects the entry
-            // itself, not a symlink target, so we descend only real dirs.
-            let ft = entry.file_type().await?;
-            // lstat: count the entry's own allocated blocks (st_blocks is in
-            // 512-byte units), never the symlink target.
-            let meta = tokio::fs::symlink_metadata(entry.path()).await?;
-            total = total.saturating_add(meta.blocks().saturating_mul(512));
-            if ft.is_dir() {
-                stack.push(entry.path());
-            }
-        }
-    }
-    Ok(total)
-}
-
-/// Clamp every mtime under `root` (files, dirs, symlinks) to
-/// [`DETERMINISTIC_EPOCH_SECS`] — anything newer is set to the epoch;
-/// older (tar-carried, already deterministic) timestamps are left
-/// alone. Belt-and-braces for the pack's `SOURCE_DATE_EPOCH` clamp:
-/// e2fsprogs < 1.47.1 silently ignores the env var, and the
-/// reproducible-bundle incident taught us that any single path
-/// skipping the clamp shows up later as a sha-mismatch head-scratcher.
-/// Run right before [`Ext4Packer::pack`]. Blocking — call from
-/// `spawn_blocking`.
-pub fn clamp_mtimes(root: &Path) -> std::io::Result<()> {
-    let clamp = filetime::FileTime::from_unix_time(DETERMINISTIC_EPOCH_SECS as i64, 0);
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(d) = stack.pop() {
-        // Clamp the directory itself AFTER queueing (children writes
-        // won't touch it again — we only read below this point).
-        for entry in std::fs::read_dir(&d)? {
-            let entry = entry?;
-            let p = entry.path();
-            let meta = std::fs::symlink_metadata(&p)?;
-            if meta.is_dir() {
-                stack.push(p.clone());
-            }
-            let mtime = filetime::FileTime::from_last_modification_time(&meta);
-            if mtime > clamp {
-                // lutimes: never follow symlinks (the target may not
-                // even exist inside the tree).
-                filetime::set_symlink_file_times(&p, clamp, clamp)?;
-            }
-        }
-        let meta = std::fs::symlink_metadata(&d)?;
-        if filetime::FileTime::from_last_modification_time(&meta) > clamp {
-            filetime::set_symlink_file_times(&d, clamp, clamp)?;
-        }
-    }
-    Ok(())
 }
 
 #[cfg(test)]
@@ -551,35 +219,5 @@ mod tests {
                 "recommended_size({s}) must be 4 KiB aligned for VZ"
             );
         }
-    }
-
-    /// The determinism clamp: newer-than-epoch mtimes (freshly written
-    /// files) snap to the epoch; older, tar-carried mtimes survive.
-    /// Symlinks are clamped via lutimes (never following the target).
-    #[test]
-    fn clamp_mtimes_clamps_new_and_keeps_old() {
-        let dir = tempfile::tempdir().unwrap();
-        let root = dir.path();
-        std::fs::create_dir(root.join("sub")).unwrap();
-        std::fs::write(root.join("sub/fresh"), b"now").unwrap(); // wall clock, > epoch
-        std::fs::write(root.join("old"), b"then").unwrap();
-        let old = filetime::FileTime::from_unix_time(1_000_000, 0); // 1970s
-        filetime::set_file_mtime(root.join("old"), old).unwrap();
-        std::os::unix::fs::symlink("missing-target", root.join("dangling")).unwrap();
-
-        clamp_mtimes(root).unwrap();
-
-        let mt = |p: &str| {
-            let m = std::fs::symlink_metadata(root.join(p)).unwrap();
-            filetime::FileTime::from_last_modification_time(&m).unix_seconds()
-        };
-        assert_eq!(mt("sub/fresh"), DETERMINISTIC_EPOCH_SECS as i64);
-        assert_eq!(mt("sub"), DETERMINISTIC_EPOCH_SECS as i64);
-        assert_eq!(mt("old"), 1_000_000, "pre-epoch mtimes are preserved");
-        assert_eq!(
-            mt("dangling"),
-            DETERMINISTIC_EPOCH_SECS as i64,
-            "symlink itself is clamped without following its target"
-        );
     }
 }

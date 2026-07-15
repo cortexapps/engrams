@@ -181,7 +181,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mksquashfs") {
         return;
     }
     if !require_root() {

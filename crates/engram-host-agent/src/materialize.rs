@@ -2,7 +2,7 @@
 //!
 //! Turns a **standard** docker/OCI image into a chunked bootable ext4
 //! via `engram-rootfs-materializer` (pull → flatten → inject stage-1
-//! init → mke2fs pack → chunk). The chunks + content-derived manifest
+//! init → streaming pack+chunk, ADR 0093). Chunks + content-derived manifest
 //! land in the host's [`ChunkStore`], which is wired write-through:
 //! the durable tier is BlobStorage (`ChunkStore::new(blob)`) with the
 //! NVMe chunk cache as the local write-through layer (ADR 0078) — so
@@ -210,7 +210,7 @@ pub async fn run(
 
     // ---- keepalive: forward stage frames + re-send the last one ----
     // The materializer signals honest stage TRANSITIONS only; a long
-    // silent leg (a multi-GiB layer pull, a slow mke2fs) would starve
+    // silent leg (a multi-GiB layer pull, a long fill pass) would starve
     // the coordinator's lease renewal, so re-send the latest frame
     // every 20 s (comfortably under the ≤30 s contract) — the exact
     // shape of the capture path's `spawn_leg_keepalive`.
@@ -282,8 +282,7 @@ fn map_materialize_error(image_uri: &str, e: MaterializeError) -> SandboxError {
         // the same bytes for nothing.
         MaterializeError::Pull(PullError::UnsupportedLayerMediaType(_))
         | MaterializeError::Pull(PullError::Config(_))
-        | MaterializeError::Flatten(_)
-        | MaterializeError::Ext4(_) => MaterializeFailureKind::Image,
+        | MaterializeError::Flatten(_) => MaterializeFailureKind::Image,
         // Registry transport: transient blips dominate (the enqueue
         // probe already rejected bad URIs/auth).
         MaterializeError::Pull(PullError::Oci(_)) | MaterializeError::Pull(PullError::Io(_)) => {

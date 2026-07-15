@@ -253,10 +253,10 @@ nix develop      # drops you into a shell with everything pinned
 
 If you use [direnv](https://direnv.net), `direnv allow` once and the shell auto-activates whenever you `cd` in. Don't have Nix? The [Determinate Systems installer](https://install.determinate.systems) is one line and uninstalls cleanly.
 
-With Nix you get the **full** toolchain — including `e2fsprogs` (whose
-`mke2fs` the host-side rootfs materializer uses, ADR 0080) and the
+With Nix you get the **full** toolchain — including the
 `aarch64`/`x86_64` musl cross compilers for building/linting the
-Linux-target crates. Nothing else to install.
+Linux-target crates. Nothing else to install. (The rootfs ext4 pack is
+pure Rust since ADR 0093 — no e2fsprogs anywhere.)
 
 **Without Nix (macOS)** — on Apple Silicon `just dev` runs the
 Virtualization.framework (VZ) backend (ADR 0024 auto-detects it), and
@@ -271,7 +271,6 @@ brew install tilt-dev/tap/tilt                      # `just dev` orchestrator
 brew install jq                                     # smoke-test helpers
 brew install protobuf pkg-config openssl            # build deps (tonic / openssl-sys)
 brew install node pnpm                              # web SPA (skip with ENGRAM_SKIP_WEB=1)
-brew install e2fsprogs                              # mke2fs — host-side rootfs materializer (ADR 0080)
 brew install FiloSottile/musl-cross/musl-cross --with-aarch64   # aarch64-linux-musl-gcc
 # Docker Desktop (or colima): the registry/postgres/jaeger/fake-gcs containers
 # and the `docker build`/`docker push` behind `just bake` / `bake-demo`.
@@ -472,7 +471,7 @@ engram image update --uri localhost:5001/cortex/api:warm-1 --config ./image-conf
 SID=$(engram session create --image localhost:5001/cortex/api:warm-1)
 ```
 
-At enable (and on rebase) the coordinator materializes the OCI image into a chunked ext4 rootfs **host-side** via the `MaterializeImage` host RPC (`engram-rootfs-materializer`: pull → whiteout-aware flatten → inject the stage-1 `/sbin/engram-init` shim → deterministic `mke2fs` pack → chunk into `BlobStorage`). That init shim is the only engrams-owned file baked into the rootfs; per-session latency is zero (materialize is enable/rebase-time only). Harness-level credentials (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, …) live one layer above the image and are handled per-harness at session-create time — see `DESIGN.md` for the full image / config / secret model.
+At enable (and on rebase) the coordinator materializes the OCI image into a chunked ext4 rootfs **host-side** via the `MaterializeImage` host RPC (`engram-rootfs-materializer`, ADR 0093: pull-pipelined whiteout-aware declare → seal a deterministic pure-Rust ext4 layout (`mkext4`) with the stage-1 `/sbin/engram-init` shim declared in → stream-fill straight into chunked `BlobStorage` — no tree, no image file). That init shim is the only engrams-owned file baked into the rootfs; per-session latency is zero (materialize is enable/rebase-time only). Harness-level credentials (`CLAUDE_CODE_OAUTH_TOKEN`, `ANTHROPIC_API_KEY`, …) live one layer above the image and are handled per-harness at session-create time — see `DESIGN.md` for the full image / config / secret model.
 
 Building + pushing the image requires Docker (Docker Desktop, OrbStack, Colima, or Podman with the docker-compat shim).
 
