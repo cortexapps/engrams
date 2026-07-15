@@ -25,7 +25,7 @@ use std::time::{Duration, Instant};
 
 use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
-    read_msg, write_msg, Answers, AttachReject, CheckpointReason, HarnessAttach, HarnessAttachAck,
+    read_msg, write_msg, AttachReject, CheckpointReason, HarnessAttach, HarnessAttachAck,
     HarnessCommand, HarnessEvent, HarnessFrame,
 };
 use parking_lot::Mutex;
@@ -418,21 +418,19 @@ impl HarnessHub {
             .await
     }
 
-    /// ADR 0054: deliver a user's answer to a deferred `UserQuestion`.
-    /// ADR 0073: fail-fast like `send_prompt` — the coordinator's outbox
-    /// row (`answer:<tool_call_id>`) is the at-least-once machinery, and
-    /// redelivery is idempotent (one tool_result per deferred tool).
-    pub async fn answer_question(
+    /// ADR 0089: deliver an opaque result for an orchestrator-registered
+    /// tool. The coordinator outbox owns retry and confirmation semantics.
+    pub async fn tool_result(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
-        answers: Answers,
+        result_json: String,
     ) -> Result<(), HarnessError> {
         let cmd_tx = self.acquire_cmd_tx(sandbox_id)?;
         cmd_tx
-            .send(HarnessFrame::Command(HarnessCommand::AnswerQuestion {
-                tool_call_id,
-                answers,
+            .send(HarnessFrame::Command(HarnessCommand::ToolResult {
+                call_id: tool_call_id,
+                result_json,
             }))
             .await
             .map_err(|_| HarnessError::WriterClosed)?;
@@ -776,7 +774,7 @@ where
                 // event resets it — the same set/clear rule the old
                 // in-memory maps implemented). Confirming events
                 // (RunStarted{prompt_id} / PromptQueued /
-                // QuestionAnswered) also ack the outbox row at the
+                // ToolCallCompleted) also ack the outbox row at the
                 // coordinator's emit choke point.
                 let fut = (hub.event_sink)(session_id, sandbox_id, ev);
                 fut.await;
@@ -1236,10 +1234,8 @@ mod tests {
         assert!(matches!(err, HarnessError::NotAttached));
     }
 
-    // ADR 0054: answer_question delivers an AnswerQuestion frame and buffers
-    // it un-confirmed; a QuestionAnswered event from the harness retires it.
     #[tokio::test]
-    async fn answer_question_reaches_harness_and_retires_on_confirmation() {
+    async fn tool_result_reaches_harness_and_retires_on_confirmation() {
         let (sink, _) = collecting_sink();
         let hub = test_hub(sink);
         let sandbox_id = SandboxId::new();
@@ -1247,11 +1243,8 @@ mod tests {
         let (host_side, harness_side) = duplex_pair();
 
         hub.bind_session(session_id, sandbox_id, 1).expect("bind");
-
         hub.accept_connection(sandbox_id, Some(session_id), host_side);
 
-        // Harness: attach, read one AnswerQuestion, then emit
-        // QuestionAnswered (the coordinator-side ack signal).
         let harness_task = tokio::spawn(async move {
             let (mut hr, mut hw) = tokio::io::split(harness_side);
             write_msg(
@@ -1269,15 +1262,20 @@ mod tests {
             let frame: HarnessFrame = read_msg(&mut hr).await.unwrap();
             let ok = matches!(
                 &frame,
-                HarnessFrame::Command(HarnessCommand::AnswerQuestion { tool_call_id, .. })
-                    if tool_call_id == "toolu_1"
+                HarnessFrame::Command(HarnessCommand::ToolResult {
+                    call_id,
+                    result_json,
+                }) if call_id == "call_1" && result_json == r#"{"saved":true}"#
             );
             write_msg(
                 &mut hw,
-                &HarnessFrame::Event(HarnessEvent::QuestionAnswered {
+                &HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
                     run_id: "run-1".into(),
-                    tool_call_id: "toolu_1".into(),
-                    answers: Answers::new(),
+                    tool_call_id: "call_1".into(),
+                    tool_name: "save_memory".into(),
+                    ok: true,
+                    duration_ms: 1,
+                    result_summary: None,
                 }),
             )
             .await
@@ -1290,17 +1288,14 @@ mod tests {
             "harness should attach within the 1s deadline"
         );
 
-        let mut a = Answers::new();
-        a.insert("Q?".into(), vec!["A".into()]);
-        hub.answer_question(sandbox_id, "toolu_1".into(), a)
+        hub.tool_result(sandbox_id, "call_1".into(), r#"{"saved":true}"#.into())
             .await
-            .expect("answer_question");
+            .expect("tool_result");
 
-        let received = harness_task.await.unwrap();
-        assert!(received, "harness should receive an AnswerQuestion frame");
-        // ADR 0073: no host-side replay buffer to assert on — the
-        // QuestionAnswered event flows to the coordinator, whose emit
-        // path acks the `answer:<tool_call_id>` outbox row instead.
+        assert!(
+            harness_task.await.unwrap(),
+            "harness should receive a ToolResult frame and confirm the same call id"
+        );
     }
 
     #[tokio::test]

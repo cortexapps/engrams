@@ -74,8 +74,10 @@ test-pkg pkg *ARGS:
 # mounted so crates aren't re-downloaded, and a container-local
 # CARGO_TARGET_DIR keeps the macOS `target/` (a different target triple)
 # untouched. Uses `cargo test` (not nextest) so the container needs no extra
-# tooling. `rust:bookworm` tracks the latest stable, matching our pinned
-# `channel = "stable"`. Example: `just test-linux engram-harness-claude`.
+# cargo tooling; `jq` is installed on demand — the fake-codex test scripts
+# shell out to it, and `rust:bookworm` doesn't ship it. `rust:bookworm`
+# tracks the latest stable, matching our pinned `channel = "stable"`.
+# Example: `just test-linux engram-harness-claude`.
 test-linux pkg='engram-harness-claude' *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -99,7 +101,7 @@ test-linux pkg='engram-harness-claude' *ARGS:
                 -w /work \
                 -e CARGO_TARGET_DIR=/lxtarget \
                 rust:bookworm \
-                bash -c "cargo test -p {{pkg}} {{ARGS}}" ;;
+                bash -c "command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq); cargo test -p {{pkg}} {{ARGS}}" ;;
         *)
             echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
     esac
@@ -335,16 +337,19 @@ fc-colima-provision profile='fc-dev':
 # snapshot/chunk GC once their owning sessions are gone; the warm-pool base
 # snapshot an enabled image clones from is preserved (re-captured on re-enable).
 #
-# Use it to reclaim disk or get a clean slate before a re-bake. Talks to the
-# coordinator app-gRPC via ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKEN (dev
-# defaults below); the stack must be up.
+# Use it to reclaim disk or get a clean slate before a re-bake. Drives the
+# LOCAL orchestrator (:8787) via the `engrams` CLI (bun, cli/) with
+# ENGRAMS_API_KEY auth; the stack must be up.
 reap-sessions profile='' mac_docker_context='colima':
     #!/usr/bin/env bash
     set -euo pipefail
-    # The `engrams` CLI drives the orchestrator (the coordinator is internal);
-    # `just dev` seeds the admin credential into var/dev-api-key (Tilt's
-    # dev-api-key resource).
-    export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
+    # The `engrams` CLI drives the orchestrator (the coordinator is internal).
+    # The URL is HARDCODED to the local dev stack — the CLI's default host is
+    # prod, and a stray ENGRAMS_URL (or a stored prod login in hosts.json) must
+    # never point a reaper at it. Auth is ENGRAMS_API_KEY only: from the env,
+    # else var/dev-api-key (`just dev` seeds it via Tilt's dev-api-key
+    # resource); the env var also stops the CLI falling back to hosts.json.
+    export ENGRAMS_URL="http://localhost:8787"
     export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
     [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
     # fc-colima profile for the VM-side stages (3 bundles, 4 snapshots). The
@@ -502,7 +507,9 @@ reap-sessions profile='' mac_docker_context='colima':
 reap-bundles:
     #!/usr/bin/env bash
     set -euo pipefail
-    export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
+    # Hardcoded local orchestrator + ENGRAMS_API_KEY auth — same rationale as
+    # reap-sessions: never let env/hosts.json aim a GC pass at prod.
+    export ENGRAMS_URL="http://localhost:8787"
     export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
     [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
     (cd cli && bun install --silent)

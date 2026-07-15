@@ -10,7 +10,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/session.proto.
  */
 export const file_engram_app_v1_session: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Nlc3Npb24ucHJvdG8SDWVuZ3JhbS5hcHAudjEiFQoTTGlzdFNlc3Npb25zUmVxdWVzdCJIChRMaXN0U2Vzc2lvbnNSZXNwb25zZRIwCghzZXNzaW9ucxgBIAMoCzIeLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkxpc3RJdGVtIrQBCg9TZXNzaW9uTGlzdEl0ZW0SJwoHc2Vzc2lvbhgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbhIYCgtvd25lcl9lbWFpbBgCIAEoCUgAiAEBEhcKCm93bmVyX25hbWUYAyABKAlIAYgBARIXCgpvd25lcl9raW5kGAQgASgJSAKIAQFCDgoMX293bmVyX2VtYWlsQg0KC19vd25lcl9uYW1lQg0KC19vd25lcl9raW5kIuoBCgdTZXNzaW9uEgoKAmlkGAEgASgJEg4KBnN0YXR1cxgCIAEoCRIUCgdob3N0X2lkGAMgASgJSACIAQESFwoKc2FuZGJveF9pZBgEIAEoCUgBiAEBEg0KBWltYWdlGAUgASgJEgwKBG1vZGUYBiABKAkSEgoKY3JlYXRlZF9hdBgHIAEoCRIWCg5sYXN0X2FjdGl2ZV9hdBgIIAEoCRIcCg9zdWdnZXN0ZWRfdGl0bGUYCSABKAlIAogBAUIKCghfaG9zdF9pZEINCgtfc2FuZGJveF9pZEISChBfc3VnZ2VzdGVkX3RpdGxlIuUDChRDcmVhdGVTZXNzaW9uUmVxdWVzdBIRCglpbWFnZV91cmkYASABKAkSDAoEbW9kZRgCIAEoCRITCgZwcm9tcHQYAyABKAlIAIgBARIWCglwcm9tcHRfaWQYByABKAlIAYgBARJBCgdzZWNyZXRzGAUgAygLMjAuZW5ncmFtLmFwcC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdC5TZWNyZXRzRW50cnkSSAoLaGFybmVzc19lbnYYBiADKAsyMy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0Lkhhcm5lc3NFbnZFbnRyeRIXCg9zZWxlY3RlZF9za2lsbHMYCCADKAkSFAoMY2FwYWJpbGl0aWVzGAkgAygJEh8KF2ludGVncmF0aW9uX3BvbGljeV9qc29uGAogASgJEhQKB2hhcm5lc3MYCyABKAlIAogBARouCgxTZWNyZXRzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ARoxCg9IYXJuZXNzRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIJCgdfcHJvbXB0QgwKCl9wcm9tcHRfaWRCCgoIX2hhcm5lc3NKBAgEEAUiYAoVQ3JlYXRlU2Vzc2lvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDgoGc3RhdHVzGAIgASgJEhUKDWltYWdlX3ZlcnNpb24YAyABKAkSDAoEa2luZBgEIAEoCSInChFHZXRTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIj0KEkdldFNlc3Npb25SZXNwb25zZRInCgdzZXNzaW9uGAEgASgLMhYuZW5ncmFtLmFwcC52MS5TZXNzaW9uIioKFERlbGV0ZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFwoVRGVsZXRlU2Vzc2lvblJlc3BvbnNlIkgKEVNlbmRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDAoEdGV4dBgCIAEoCRIRCglwcm9tcHRfaWQYAyABKAkiNgoSU2VuZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSImChBJbnRlcnJ1cHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiNQoRSW50ZXJydXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJIk4KF0VkaXRRdWV1ZWRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEQoJcHJvbXB0X2lkGAIgASgJEgwKBHRleHQYAyABKAkiPAoYRWRpdFF1ZXVlZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSJDChpEZXF1ZXVlUXVldWVkUHJvbXB0UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhEKCXByb21wdF9pZBgCIAEoCSI/ChtEZXF1ZXVlUXVldWVkUHJvbXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJItABChVBbnN3ZXJRdWVzdGlvblJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIUCgx0b29sX2NhbGxfaWQYAiABKAkSQgoHYW5zd2VycxgDIAMoCzIxLmVuZ3JhbS5hcHAudjEuQW5zd2VyUXVlc3Rpb25SZXF1ZXN0LkFuc3dlcnNFbnRyeRpJCgxBbnN3ZXJzRW50cnkSCwoDa2V5GAEgASgJEigKBXZhbHVlGAIgASgLMhkuZW5ncmFtLmFwcC52MS5TdHJpbmdMaXN0OgI4ASIcCgpTdHJpbmdMaXN0Eg4KBnZhbHVlcxgBIAMoCSI6ChZBbnN3ZXJRdWVzdGlvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSJHChNTdHJlYW1FdmVudHNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEgoFc2luY2UYAiABKANIAIgBAUIICgZfc2luY2UiTAoMU2Vzc2lvbkV2ZW50EhAKA2lkeBgBIAEoA0gAiAEBEgwKBGtpbmQYAiABKAkSFAoMcGF5bG9hZF9qc29uGAMgASgJQgYKBF9pZHgicgoYTGlzdFNlc3Npb25FdmVudHNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFgoJYWZ0ZXJfaWR4GAIgASgDSACIAQESEgoFbGltaXQYAyABKANIAYgBAUIMCgpfYWZ0ZXJfaWR4QggKBl9saW1pdCJgChlMaXN0U2Vzc2lvbkV2ZW50c1Jlc3BvbnNlEisKBmV2ZW50cxgBIAMoCzIbLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkV2ZW50EhYKDm5leHRfYWZ0ZXJfaWR4GAIgASgDIv0BCgtFeGVjUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhQKB2NvbW1hbmQYAiABKAlIAIgBARIMCgRhcmd2GAMgAygJEjAKA2VudhgEIAMoCzIjLmVuZ3JhbS5hcHAudjEuRXhlY1JlcXVlc3QuRW52RW50cnkSFAoHd29ya2RpchgFIAEoCUgBiAEBEhkKDHRpbWVvdXRfc2VjcxgGIAEoBEgCiAEBGioKCEVudkVudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAFCCgoIX2NvbW1hbmRCCgoIX3dvcmtkaXJCDwoNX3RpbWVvdXRfc2VjcyKRAQoKRXhlY091dHB1dBItCgdzdGFydGVkGAEgASgLMhouZW5ncmFtLmFwcC52MS5FeGVjU3RhcnRlZEgAEhAKBnN0ZG91dBgCIAEoDEgAEhAKBnN0ZGVychgDIAEoDEgAEicKBGV4aXQYBCABKAsyFy5lbmdyYW0uYXBwLnYxLkV4ZWNFeGl0SABCBwoFZXZlbnQiHgoLRXhlY1N0YXJ0ZWQSDwoHZXhlY19pZBgBIAEoCSJfCghFeGVjRXhpdBIYCgtleGl0X3N0YXR1cxgBIAEoBUgAiAEBEikKBnJ1c2FnZRgCIAEoCzIZLmVuZ3JhbS5hcHAudjEuRXhlY1J1c2FnZUIOCgxfZXhpdF9zdGF0dXMimQEKCkV4ZWNSdXNhZ2USDwoHd2FsbF9tcxgBIAEoBBIYCgtwZWFrX3Jzc19rYhgCIAEoBEgAiAEBEhgKC3VzZXJfY3B1X21zGAMgASgESAGIAQESFwoKc3lzX2NwdV9tcxgEIAEoBEgCiAEBQg4KDF9wZWFrX3Jzc19rYkIOCgxfdXNlcl9jcHVfbXNCDQoLX3N5c19jcHVfbXMieQoNR2V0TG9nUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhEKBGtpbmQYAiABKAlIAIgBARISCgVsaW1pdBgDIAEoA0gBiAEBEhEKBHRhaWwYBCABKAhIAogBAUIHCgVfa2luZEIICgZfbGltaXRCBwoFX3RhaWwiZAoOR2V0TG9nUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRraW5kGAIgASgJEjAKBmV2ZW50cxgDIAMoCzIgLmVuZ3JhbS5hcHAudjEuQ29udmVyc2F0aW9uRW50cnkiUAoRQ29udmVyc2F0aW9uRW50cnkSCwoDaWR4GAEgASgDEgwKBGtpbmQYAiABKAkSCgoCYXQYAyABKAkSFAoMcGF5bG9hZF9qc29uGAQgASgJIiUKD1NuYXBzaG90UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIoYBChBTbmFwc2hvdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSGAoLc25hcHNob3RfaWQYAiABKAlIAIgBARIXCgpzaXplX2J5dGVzGAMgASgESAGIAQESDAoEbm90ZRgEIAEoCUIOCgxfc25hcHNob3RfaWRCDQoLX3NpemVfYnl0ZXMiKgoURW5zdXJlQnJvd3NlclJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSIlChVFbnN1cmVCcm93c2VyUmVzcG9uc2USDAoEcG9ydBgBIAEoDSImChBFbnN1cmVJZGVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiIQoRRW5zdXJlSWRlUmVzcG9uc2USDAoEcG9ydBgBIAEoDSIjCg1SZXN1bWVSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkihAEKDlJlc3VtZVJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSGAoLc25hcHNob3RfaWQYAiABKAlIAIgBARIXCgpzaXplX2J5dGVzGAMgASgESAGIAQESDAoEbm90ZRgEIAEoCUIOCgxfc25hcHNob3RfaWRCDQoLX3NpemVfYnl0ZXMiJwoRRXZpY3RMb2NhbFJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSIUChJFdmljdExvY2FsUmVzcG9uc2UiJgoQRXZpY3RJZGxlUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIjcKEUV2aWN0SWRsZVJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDgoGc3RhdHVzGAIgASgJIigKEkdldENvd1N0YXRlUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJImQKE0dldENvd1N0YXRlUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIvCgVzdGF0ZRgCIAEoCzIbLmVuZ3JhbS5hcHAudjEuQ293U3RhdGVWaWV3SACIAQFCCAoGX3N0YXRlIroDCgxDb3dTdGF0ZVZpZXcSEgoKc2FuZGJveF9pZBgBIAEoCRIXCgpzZXNzaW9uX2lkGAIgASgJSACIAQESGAoQZGlza19tYW5pZmVzdF9pZBgDIAEoCRIdChVkaXNrX21hbmlmZXN0X3ZlcnNpb24YBCABKAQSFAoMZGlydHlfY2h1bmtzGAUgASgNEhMKC2RpcnR5X2J5dGVzGAYgASgEEhoKDWxhc3RfZmx1c2hfYXQYByABKAlIAYgBARITCgtiYXNlX2NodW5rcxgIIAEoDRIZChFiYXNlX2NodW5rc19sb2NhbBgJIAEoDRIfChJtZW1vcnlfbWFuaWZlc3RfaWQYCiABKAlIAogBARIkChdtZW1vcnlfbWFuaWZlc3RfdmVyc2lvbhgLIAEoBEgDiAEBEh0KEGxhc3Rfc25hcHNob3RfYXQYDCABKAlIBIgBAUINCgtfc2Vzc2lvbl9pZEIQCg5fbGFzdF9mbHVzaF9hdEIVChNfbWVtb3J5X21hbmlmZXN0X2lkQhoKGF9tZW1vcnlfbWFuaWZlc3RfdmVyc2lvbkITChFfbGFzdF9zbmFwc2hvdF9hdCIsChZMaXN0Q2hlY2twb2ludHNSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiZAoXTGlzdENoZWNrcG9pbnRzUmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRI1CgtjaGVja3BvaW50cxgCIAMoCzIgLmVuZ3JhbS5hcHAudjEuQ2hlY2twb2ludFN1bW1hcnkipgEKEUNoZWNrcG9pbnRTdW1tYXJ5EhMKC3NuYXBzaG90X2lkGAEgASgJEhIKCmNyZWF0ZWRfYXQYAiABKAkSEgoKc2l6ZV9ieXRlcxgDIAEoBBIaCg1ldmVudHNfY3Vyc29yGAQgASgDSACIAQESEwoLcmVjb3ZlcmFibGUYBSABKAgSEQoJaXNfbGF0ZXN0GAYgASgIQhAKDl9ldmVudHNfY3Vyc29yIj0KEkdldEFydGlmYWN0UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhMKC2FydGlmYWN0X2lkGAIgASgJImIKE0dldEFydGlmYWN0UmVzcG9uc2USMwoIbWV0YWRhdGEYASABKAsyHy5lbmdyYW0uYXBwLnYxLkFydGlmYWN0TWV0YWRhdGFIABIPCgVjaHVuaxgCIAEoDEgAQgUKA21zZyJNChBBcnRpZmFjdE1ldGFkYXRhEhIKCm1lZGlhX3R5cGUYASABKAkSEgoKc2l6ZV9ieXRlcxgCIAEoBBIRCglmaWxlX25hbWUYAyABKAkiYwodQ3JlYXRlQXJ0aWZhY3RGcm9tUGF0aFJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRwYXRoGAIgASgJEhQKB2NhcHRpb24YAyABKAlIAIgBAUIKCghfY2FwdGlvbiJdCh5DcmVhdGVBcnRpZmFjdEZyb21QYXRoUmVzcG9uc2USEwoLYXJ0aWZhY3RfaWQYASABKAkSEgoKbWVkaWFfdHlwZRgCIAEoCRISCgpzaXplX2J5dGVzGAMgASgEIrQBChFSZWxheVNoZWxsUmVxdWVzdBIoCgRvcGVuGAEgASgLMhguZW5ncmFtLmFwcC52MS5TaGVsbE9wZW5IABIOCgR0ZXh0GAIgASgJSAASEAoGYmluYXJ5GAMgASgMSAASDgoEcGluZxgEIAEoDEgAEg4KBHBvbmcYBSABKAxIABIqCgVjbG9zZRgGIAEoCzIZLmVuZ3JhbS5hcHAudjEuU2hlbGxDbG9zZUgAQgcKBWZyYW1lIosBChJSZWxheVNoZWxsUmVzcG9uc2USDgoEdGV4dBgBIAEoCUgAEhAKBmJpbmFyeRgCIAEoDEgAEg4KBHBpbmcYAyABKAxIABIOCgRwb25nGAQgASgMSAASKgoFY2xvc2UYBSABKAsyGS5lbmdyYW0uYXBwLnYxLlNoZWxsQ2xvc2VIAEIHCgVmcmFtZSIfCglTaGVsbE9wZW4SEgoKc2Vzc2lvbl9pZBgBIAEoCSIqCgpTaGVsbENsb3NlEgwKBGNvZGUYASABKA0SDgoGcmVhc29uGAIgASgJIn8KEFJlbGF5UG9ydFJlcXVlc3QSJwoEb3BlbhgBIAEoCzIXLmVuZ3JhbS5hcHAudjEuUG9ydE9wZW5IABIOCgRkYXRhGAIgASgMSAASKQoFY2xvc2UYAyABKAsyGC5lbmdyYW0uYXBwLnYxLlBvcnRDbG9zZUgAQgcKBWZyYW1lIlcKEVJlbGF5UG9ydFJlc3BvbnNlEg4KBGRhdGEYASABKAxIABIpCgVjbG9zZRgCIAEoCzIYLmVuZ3JhbS5hcHAudjEuUG9ydENsb3NlSABCBwoFZnJhbWUiLAoIUG9ydE9wZW4SEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRwb3J0GAIgASgNIgsKCVBvcnRDbG9zZTL2DwoOU2Vzc2lvblNlcnZpY2USVwoMTGlzdFNlc3Npb25zEiIuZW5ncmFtLmFwcC52MS5MaXN0U2Vzc2lvbnNSZXF1ZXN0GiMuZW5ncmFtLmFwcC52MS5MaXN0U2Vzc2lvbnNSZXNwb25zZRJaCg1DcmVhdGVTZXNzaW9uEiMuZW5ncmFtLmFwcC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuQ3JlYXRlU2Vzc2lvblJlc3BvbnNlElEKCkdldFNlc3Npb24SIC5lbmdyYW0uYXBwLnYxLkdldFNlc3Npb25SZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5HZXRTZXNzaW9uUmVzcG9uc2USWgoNRGVsZXRlU2Vzc2lvbhIjLmVuZ3JhbS5hcHAudjEuRGVsZXRlU2Vzc2lvblJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkRlbGV0ZVNlc3Npb25SZXNwb25zZRJRCgpTZW5kUHJvbXB0EiAuZW5ncmFtLmFwcC52MS5TZW5kUHJvbXB0UmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuU2VuZFByb21wdFJlc3BvbnNlEk4KCUludGVycnVwdBIfLmVuZ3JhbS5hcHAudjEuSW50ZXJydXB0UmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuSW50ZXJydXB0UmVzcG9uc2USYwoQRWRpdFF1ZXVlZFByb21wdBImLmVuZ3JhbS5hcHAudjEuRWRpdFF1ZXVlZFByb21wdFJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLkVkaXRRdWV1ZWRQcm9tcHRSZXNwb25zZRJsChNEZXF1ZXVlUXVldWVkUHJvbXB0EikuZW5ncmFtLmFwcC52MS5EZXF1ZXVlUXVldWVkUHJvbXB0UmVxdWVzdBoqLmVuZ3JhbS5hcHAudjEuRGVxdWV1ZVF1ZXVlZFByb21wdFJlc3BvbnNlEl0KDkFuc3dlclF1ZXN0aW9uEiQuZW5ncmFtLmFwcC52MS5BbnN3ZXJRdWVzdGlvblJlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkFuc3dlclF1ZXN0aW9uUmVzcG9uc2USUQoMU3RyZWFtRXZlbnRzEiIuZW5ncmFtLmFwcC52MS5TdHJlYW1FdmVudHNSZXF1ZXN0GhsuZW5ncmFtLmFwcC52MS5TZXNzaW9uRXZlbnQwARJmChFMaXN0U2Vzc2lvbkV2ZW50cxInLmVuZ3JhbS5hcHAudjEuTGlzdFNlc3Npb25FdmVudHNSZXF1ZXN0GiguZW5ncmFtLmFwcC52MS5MaXN0U2Vzc2lvbkV2ZW50c1Jlc3BvbnNlEj8KBEV4ZWMSGi5lbmdyYW0uYXBwLnYxLkV4ZWNSZXF1ZXN0GhkuZW5ncmFtLmFwcC52MS5FeGVjT3V0cHV0MAESRQoGR2V0TG9nEhwuZW5ncmFtLmFwcC52MS5HZXRMb2dSZXF1ZXN0Gh0uZW5ncmFtLmFwcC52MS5HZXRMb2dSZXNwb25zZRJLCghTbmFwc2hvdBIeLmVuZ3JhbS5hcHAudjEuU25hcHNob3RSZXF1ZXN0Gh8uZW5ncmFtLmFwcC52MS5TbmFwc2hvdFJlc3BvbnNlEloKDUVuc3VyZUJyb3dzZXISIy5lbmdyYW0uYXBwLnYxLkVuc3VyZUJyb3dzZXJSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5FbnN1cmVCcm93c2VyUmVzcG9uc2USTgoJRW5zdXJlSWRlEh8uZW5ncmFtLmFwcC52MS5FbnN1cmVJZGVSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5FbnN1cmVJZGVSZXNwb25zZRJFCgZSZXN1bWUSHC5lbmdyYW0uYXBwLnYxLlJlc3VtZVJlcXVlc3QaHS5lbmdyYW0uYXBwLnYxLlJlc3VtZVJlc3BvbnNlElEKCkV2aWN0TG9jYWwSIC5lbmdyYW0uYXBwLnYxLkV2aWN0TG9jYWxSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5FdmljdExvY2FsUmVzcG9uc2USTgoJRXZpY3RJZGxlEh8uZW5ncmFtLmFwcC52MS5FdmljdElkbGVSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5FdmljdElkbGVSZXNwb25zZRJUCgtHZXRDb3dTdGF0ZRIhLmVuZ3JhbS5hcHAudjEuR2V0Q293U3RhdGVSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5HZXRDb3dTdGF0ZVJlc3BvbnNlEmAKD0xpc3RDaGVja3BvaW50cxIlLmVuZ3JhbS5hcHAudjEuTGlzdENoZWNrcG9pbnRzUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuTGlzdENoZWNrcG9pbnRzUmVzcG9uc2USVgoLR2V0QXJ0aWZhY3QSIS5lbmdyYW0uYXBwLnYxLkdldEFydGlmYWN0UmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuR2V0QXJ0aWZhY3RSZXNwb25zZTABEnUKFkNyZWF0ZUFydGlmYWN0RnJvbVBhdGgSLC5lbmdyYW0uYXBwLnYxLkNyZWF0ZUFydGlmYWN0RnJvbVBhdGhSZXF1ZXN0Gi0uZW5ncmFtLmFwcC52MS5DcmVhdGVBcnRpZmFjdEZyb21QYXRoUmVzcG9uc2UyZQoRU2hlbGxSZWxheVNlcnZpY2USUAoFUmVsYXkSIC5lbmdyYW0uYXBwLnYxLlJlbGF5U2hlbGxSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5SZWxheVNoZWxsUmVzcG9uc2UoATABMmIKEFBvcnRSZWxheVNlcnZpY2USTgoFUmVsYXkSHy5lbmdyYW0uYXBwLnYxLlJlbGF5UG9ydFJlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLlJlbGF5UG9ydFJlc3BvbnNlKAEwAWIGcHJvdG8z");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL3Nlc3Npb24ucHJvdG8SDWVuZ3JhbS5hcHAudjEiFQoTTGlzdFNlc3Npb25zUmVxdWVzdCJIChRMaXN0U2Vzc2lvbnNSZXNwb25zZRIwCghzZXNzaW9ucxgBIAMoCzIeLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkxpc3RJdGVtIrQBCg9TZXNzaW9uTGlzdEl0ZW0SJwoHc2Vzc2lvbhgBIAEoCzIWLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbhIYCgtvd25lcl9lbWFpbBgCIAEoCUgAiAEBEhcKCm93bmVyX25hbWUYAyABKAlIAYgBARIXCgpvd25lcl9raW5kGAQgASgJSAKIAQFCDgoMX293bmVyX2VtYWlsQg0KC19vd25lcl9uYW1lQg0KC19vd25lcl9raW5kIuoBCgdTZXNzaW9uEgoKAmlkGAEgASgJEg4KBnN0YXR1cxgCIAEoCRIUCgdob3N0X2lkGAMgASgJSACIAQESFwoKc2FuZGJveF9pZBgEIAEoCUgBiAEBEg0KBWltYWdlGAUgASgJEgwKBG1vZGUYBiABKAkSEgoKY3JlYXRlZF9hdBgHIAEoCRIWCg5sYXN0X2FjdGl2ZV9hdBgIIAEoCRIcCg9zdWdnZXN0ZWRfdGl0bGUYCSABKAlIAogBAUIKCghfaG9zdF9pZEINCgtfc2FuZGJveF9pZEISChBfc3VnZ2VzdGVkX3RpdGxlIuUDChRDcmVhdGVTZXNzaW9uUmVxdWVzdBIRCglpbWFnZV91cmkYASABKAkSDAoEbW9kZRgCIAEoCRITCgZwcm9tcHQYAyABKAlIAIgBARIWCglwcm9tcHRfaWQYByABKAlIAYgBARJBCgdzZWNyZXRzGAUgAygLMjAuZW5ncmFtLmFwcC52MS5DcmVhdGVTZXNzaW9uUmVxdWVzdC5TZWNyZXRzRW50cnkSSAoLaGFybmVzc19lbnYYBiADKAsyMy5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXF1ZXN0Lkhhcm5lc3NFbnZFbnRyeRIXCg9zZWxlY3RlZF9za2lsbHMYCCADKAkSFAoMY2FwYWJpbGl0aWVzGAkgAygJEh8KF2ludGVncmF0aW9uX3BvbGljeV9qc29uGAogASgJEhQKB2hhcm5lc3MYCyABKAlIAogBARouCgxTZWNyZXRzRW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4ARoxCg9IYXJuZXNzRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIJCgdfcHJvbXB0QgwKCl9wcm9tcHRfaWRCCgoIX2hhcm5lc3NKBAgEEAUiYAoVQ3JlYXRlU2Vzc2lvblJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDgoGc3RhdHVzGAIgASgJEhUKDWltYWdlX3ZlcnNpb24YAyABKAkSDAoEa2luZBgEIAEoCSInChFHZXRTZXNzaW9uUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIj0KEkdldFNlc3Npb25SZXNwb25zZRInCgdzZXNzaW9uGAEgASgLMhYuZW5ncmFtLmFwcC52MS5TZXNzaW9uIioKFERlbGV0ZVNlc3Npb25SZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFwoVRGVsZXRlU2Vzc2lvblJlc3BvbnNlIkgKEVNlbmRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDAoEdGV4dBgCIAEoCRIRCglwcm9tcHRfaWQYAyABKAkiNgoSU2VuZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSImChBJbnRlcnJ1cHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiNQoRSW50ZXJydXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJIk4KF0VkaXRRdWV1ZWRQcm9tcHRSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSEQoJcHJvbXB0X2lkGAIgASgJEgwKBHRleHQYAyABKAkiPAoYRWRpdFF1ZXVlZFByb21wdFJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEbm90ZRgCIAEoCSJDChpEZXF1ZXVlUXVldWVkUHJvbXB0UmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhEKCXByb21wdF9pZBgCIAEoCSI/ChtEZXF1ZXVlUXVldWVkUHJvbXB0UmVzcG9uc2USEgoKc2Vzc2lvbl9pZBgBIAEoCRIMCgRub3RlGAIgASgJIlgKF0NvbXBsZXRlVG9vbENhbGxSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFAoMdG9vbF9jYWxsX2lkGAIgASgJEhMKC3Jlc3VsdF9qc29uGAMgASgJIjwKGENvbXBsZXRlVG9vbENhbGxSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEgwKBG5vdGUYAiABKAkiRwoTU3RyZWFtRXZlbnRzUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhIKBXNpbmNlGAIgASgDSACIAQFCCAoGX3NpbmNlIkwKDFNlc3Npb25FdmVudBIQCgNpZHgYASABKANIAIgBARIMCgRraW5kGAIgASgJEhQKDHBheWxvYWRfanNvbhgDIAEoCUIGCgRfaWR4InIKGExpc3RTZXNzaW9uRXZlbnRzUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJEhYKCWFmdGVyX2lkeBgCIAEoA0gAiAEBEhIKBWxpbWl0GAMgASgDSAGIAQFCDAoKX2FmdGVyX2lkeEIICgZfbGltaXQiYAoZTGlzdFNlc3Npb25FdmVudHNSZXNwb25zZRIrCgZldmVudHMYASADKAsyGy5lbmdyYW0uYXBwLnYxLlNlc3Npb25FdmVudBIWCg5uZXh0X2FmdGVyX2lkeBgCIAEoAyL9AQoLRXhlY1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIUCgdjb21tYW5kGAIgASgJSACIAQESDAoEYXJndhgDIAMoCRIwCgNlbnYYBCADKAsyIy5lbmdyYW0uYXBwLnYxLkV4ZWNSZXF1ZXN0LkVudkVudHJ5EhQKB3dvcmtkaXIYBSABKAlIAYgBARIZCgx0aW1lb3V0X3NlY3MYBiABKARIAogBARoqCghFbnZFbnRyeRILCgNrZXkYASABKAkSDQoFdmFsdWUYAiABKAk6AjgBQgoKCF9jb21tYW5kQgoKCF93b3JrZGlyQg8KDV90aW1lb3V0X3NlY3MikQEKCkV4ZWNPdXRwdXQSLQoHc3RhcnRlZBgBIAEoCzIaLmVuZ3JhbS5hcHAudjEuRXhlY1N0YXJ0ZWRIABIQCgZzdGRvdXQYAiABKAxIABIQCgZzdGRlcnIYAyABKAxIABInCgRleGl0GAQgASgLMhcuZW5ncmFtLmFwcC52MS5FeGVjRXhpdEgAQgcKBWV2ZW50Ih4KC0V4ZWNTdGFydGVkEg8KB2V4ZWNfaWQYASABKAkiXwoIRXhlY0V4aXQSGAoLZXhpdF9zdGF0dXMYASABKAVIAIgBARIpCgZydXNhZ2UYAiABKAsyGS5lbmdyYW0uYXBwLnYxLkV4ZWNSdXNhZ2VCDgoMX2V4aXRfc3RhdHVzIpkBCgpFeGVjUnVzYWdlEg8KB3dhbGxfbXMYASABKAQSGAoLcGVha19yc3Nfa2IYAiABKARIAIgBARIYCgt1c2VyX2NwdV9tcxgDIAEoBEgBiAEBEhcKCnN5c19jcHVfbXMYBCABKARIAogBAUIOCgxfcGVha19yc3Nfa2JCDgoMX3VzZXJfY3B1X21zQg0KC19zeXNfY3B1X21zInkKDUdldExvZ1JlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRIRCgRraW5kGAIgASgJSACIAQESEgoFbGltaXQYAyABKANIAYgBARIRCgR0YWlsGAQgASgISAKIAQFCBwoFX2tpbmRCCAoGX2xpbWl0QgcKBV90YWlsImQKDkdldExvZ1Jlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSDAoEa2luZBgCIAEoCRIwCgZldmVudHMYAyADKAsyIC5lbmdyYW0uYXBwLnYxLkNvbnZlcnNhdGlvbkVudHJ5IlAKEUNvbnZlcnNhdGlvbkVudHJ5EgsKA2lkeBgBIAEoAxIMCgRraW5kGAIgASgJEgoKAmF0GAMgASgJEhQKDHBheWxvYWRfanNvbhgEIAEoCSIlCg9TbmFwc2hvdFJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSKGAQoQU25hcHNob3RSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEhgKC3NuYXBzaG90X2lkGAIgASgJSACIAQESFwoKc2l6ZV9ieXRlcxgDIAEoBEgBiAEBEgwKBG5vdGUYBCABKAlCDgoMX3NuYXBzaG90X2lkQg0KC19zaXplX2J5dGVzIioKFEVuc3VyZUJyb3dzZXJSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiJQoVRW5zdXJlQnJvd3NlclJlc3BvbnNlEgwKBHBvcnQYASABKA0iJgoQRW5zdXJlSWRlUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIiEKEUVuc3VyZUlkZVJlc3BvbnNlEgwKBHBvcnQYASABKA0iIwoNUmVzdW1lUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJIoQBCg5SZXN1bWVSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEhgKC3NuYXBzaG90X2lkGAIgASgJSACIAQESFwoKc2l6ZV9ieXRlcxgDIAEoBEgBiAEBEgwKBG5vdGUYBCABKAlCDgoMX3NuYXBzaG90X2lkQg0KC19zaXplX2J5dGVzIicKEUV2aWN0TG9jYWxSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkiFAoSRXZpY3RMb2NhbFJlc3BvbnNlIiYKEEV2aWN0SWRsZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSI3ChFFdmljdElkbGVSZXNwb25zZRISCgpzZXNzaW9uX2lkGAEgASgJEg4KBnN0YXR1cxgCIAEoCSIoChJHZXRDb3dTdGF0ZVJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCSJkChNHZXRDb3dTdGF0ZVJlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSLwoFc3RhdGUYAiABKAsyGy5lbmdyYW0uYXBwLnYxLkNvd1N0YXRlVmlld0gAiAEBQggKBl9zdGF0ZSK6AwoMQ293U3RhdGVWaWV3EhIKCnNhbmRib3hfaWQYASABKAkSFwoKc2Vzc2lvbl9pZBgCIAEoCUgAiAEBEhgKEGRpc2tfbWFuaWZlc3RfaWQYAyABKAkSHQoVZGlza19tYW5pZmVzdF92ZXJzaW9uGAQgASgEEhQKDGRpcnR5X2NodW5rcxgFIAEoDRITCgtkaXJ0eV9ieXRlcxgGIAEoBBIaCg1sYXN0X2ZsdXNoX2F0GAcgASgJSAGIAQESEwoLYmFzZV9jaHVua3MYCCABKA0SGQoRYmFzZV9jaHVua3NfbG9jYWwYCSABKA0SHwoSbWVtb3J5X21hbmlmZXN0X2lkGAogASgJSAKIAQESJAoXbWVtb3J5X21hbmlmZXN0X3ZlcnNpb24YCyABKARIA4gBARIdChBsYXN0X3NuYXBzaG90X2F0GAwgASgJSASIAQFCDQoLX3Nlc3Npb25faWRCEAoOX2xhc3RfZmx1c2hfYXRCFQoTX21lbW9yeV9tYW5pZmVzdF9pZEIaChhfbWVtb3J5X21hbmlmZXN0X3ZlcnNpb25CEwoRX2xhc3Rfc25hcHNob3RfYXQiLAoWTGlzdENoZWNrcG9pbnRzUmVxdWVzdBISCgpzZXNzaW9uX2lkGAEgASgJImQKF0xpc3RDaGVja3BvaW50c1Jlc3BvbnNlEhIKCnNlc3Npb25faWQYASABKAkSNQoLY2hlY2twb2ludHMYAiADKAsyIC5lbmdyYW0uYXBwLnYxLkNoZWNrcG9pbnRTdW1tYXJ5IqYBChFDaGVja3BvaW50U3VtbWFyeRITCgtzbmFwc2hvdF9pZBgBIAEoCRISCgpjcmVhdGVkX2F0GAIgASgJEhIKCnNpemVfYnl0ZXMYAyABKAQSGgoNZXZlbnRzX2N1cnNvchgEIAEoA0gAiAEBEhMKC3JlY292ZXJhYmxlGAUgASgIEhEKCWlzX2xhdGVzdBgGIAEoCEIQCg5fZXZlbnRzX2N1cnNvciI9ChJHZXRBcnRpZmFjdFJlcXVlc3QSEgoKc2Vzc2lvbl9pZBgBIAEoCRITCgthcnRpZmFjdF9pZBgCIAEoCSJiChNHZXRBcnRpZmFjdFJlc3BvbnNlEjMKCG1ldGFkYXRhGAEgASgLMh8uZW5ncmFtLmFwcC52MS5BcnRpZmFjdE1ldGFkYXRhSAASDwoFY2h1bmsYAiABKAxIAEIFCgNtc2ciTQoQQXJ0aWZhY3RNZXRhZGF0YRISCgptZWRpYV90eXBlGAEgASgJEhIKCnNpemVfYnl0ZXMYAiABKAQSEQoJZmlsZV9uYW1lGAMgASgJImMKHUNyZWF0ZUFydGlmYWN0RnJvbVBhdGhSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSDAoEcGF0aBgCIAEoCRIUCgdjYXB0aW9uGAMgASgJSACIAQFCCgoIX2NhcHRpb24iXQoeQ3JlYXRlQXJ0aWZhY3RGcm9tUGF0aFJlc3BvbnNlEhMKC2FydGlmYWN0X2lkGAEgASgJEhIKCm1lZGlhX3R5cGUYAiABKAkSEgoKc2l6ZV9ieXRlcxgDIAEoBCK0AQoRUmVsYXlTaGVsbFJlcXVlc3QSKAoEb3BlbhgBIAEoCzIYLmVuZ3JhbS5hcHAudjEuU2hlbGxPcGVuSAASDgoEdGV4dBgCIAEoCUgAEhAKBmJpbmFyeRgDIAEoDEgAEg4KBHBpbmcYBCABKAxIABIOCgRwb25nGAUgASgMSAASKgoFY2xvc2UYBiABKAsyGS5lbmdyYW0uYXBwLnYxLlNoZWxsQ2xvc2VIAEIHCgVmcmFtZSKLAQoSUmVsYXlTaGVsbFJlc3BvbnNlEg4KBHRleHQYASABKAlIABIQCgZiaW5hcnkYAiABKAxIABIOCgRwaW5nGAMgASgMSAASDgoEcG9uZxgEIAEoDEgAEioKBWNsb3NlGAUgASgLMhkuZW5ncmFtLmFwcC52MS5TaGVsbENsb3NlSABCBwoFZnJhbWUiHwoJU2hlbGxPcGVuEhIKCnNlc3Npb25faWQYASABKAkiKgoKU2hlbGxDbG9zZRIMCgRjb2RlGAEgASgNEg4KBnJlYXNvbhgCIAEoCSJ/ChBSZWxheVBvcnRSZXF1ZXN0EicKBG9wZW4YASABKAsyFy5lbmdyYW0uYXBwLnYxLlBvcnRPcGVuSAASDgoEZGF0YRgCIAEoDEgAEikKBWNsb3NlGAMgASgLMhguZW5ncmFtLmFwcC52MS5Qb3J0Q2xvc2VIAEIHCgVmcmFtZSJXChFSZWxheVBvcnRSZXNwb25zZRIOCgRkYXRhGAEgASgMSAASKQoFY2xvc2UYAiABKAsyGC5lbmdyYW0uYXBwLnYxLlBvcnRDbG9zZUgAQgcKBWZyYW1lIiwKCFBvcnRPcGVuEhIKCnNlc3Npb25faWQYASABKAkSDAoEcG9ydBgCIAEoDSILCglQb3J0Q2xvc2Uy/A8KDlNlc3Npb25TZXJ2aWNlElcKDExpc3RTZXNzaW9ucxIiLmVuZ3JhbS5hcHAudjEuTGlzdFNlc3Npb25zUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuTGlzdFNlc3Npb25zUmVzcG9uc2USWgoNQ3JlYXRlU2Vzc2lvbhIjLmVuZ3JhbS5hcHAudjEuQ3JlYXRlU2Vzc2lvblJlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkNyZWF0ZVNlc3Npb25SZXNwb25zZRJRCgpHZXRTZXNzaW9uEiAuZW5ncmFtLmFwcC52MS5HZXRTZXNzaW9uUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuR2V0U2Vzc2lvblJlc3BvbnNlEloKDURlbGV0ZVNlc3Npb24SIy5lbmdyYW0uYXBwLnYxLkRlbGV0ZVNlc3Npb25SZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5EZWxldGVTZXNzaW9uUmVzcG9uc2USUQoKU2VuZFByb21wdBIgLmVuZ3JhbS5hcHAudjEuU2VuZFByb21wdFJlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLlNlbmRQcm9tcHRSZXNwb25zZRJOCglJbnRlcnJ1cHQSHy5lbmdyYW0uYXBwLnYxLkludGVycnVwdFJlcXVlc3QaIC5lbmdyYW0uYXBwLnYxLkludGVycnVwdFJlc3BvbnNlEmMKEEVkaXRRdWV1ZWRQcm9tcHQSJi5lbmdyYW0uYXBwLnYxLkVkaXRRdWV1ZWRQcm9tcHRSZXF1ZXN0GicuZW5ncmFtLmFwcC52MS5FZGl0UXVldWVkUHJvbXB0UmVzcG9uc2USbAoTRGVxdWV1ZVF1ZXVlZFByb21wdBIpLmVuZ3JhbS5hcHAudjEuRGVxdWV1ZVF1ZXVlZFByb21wdFJlcXVlc3QaKi5lbmdyYW0uYXBwLnYxLkRlcXVldWVRdWV1ZWRQcm9tcHRSZXNwb25zZRJjChBDb21wbGV0ZVRvb2xDYWxsEiYuZW5ncmFtLmFwcC52MS5Db21wbGV0ZVRvb2xDYWxsUmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuQ29tcGxldGVUb29sQ2FsbFJlc3BvbnNlElEKDFN0cmVhbUV2ZW50cxIiLmVuZ3JhbS5hcHAudjEuU3RyZWFtRXZlbnRzUmVxdWVzdBobLmVuZ3JhbS5hcHAudjEuU2Vzc2lvbkV2ZW50MAESZgoRTGlzdFNlc3Npb25FdmVudHMSJy5lbmdyYW0uYXBwLnYxLkxpc3RTZXNzaW9uRXZlbnRzUmVxdWVzdBooLmVuZ3JhbS5hcHAudjEuTGlzdFNlc3Npb25FdmVudHNSZXNwb25zZRI/CgRFeGVjEhouZW5ncmFtLmFwcC52MS5FeGVjUmVxdWVzdBoZLmVuZ3JhbS5hcHAudjEuRXhlY091dHB1dDABEkUKBkdldExvZxIcLmVuZ3JhbS5hcHAudjEuR2V0TG9nUmVxdWVzdBodLmVuZ3JhbS5hcHAudjEuR2V0TG9nUmVzcG9uc2USSwoIU25hcHNob3QSHi5lbmdyYW0uYXBwLnYxLlNuYXBzaG90UmVxdWVzdBofLmVuZ3JhbS5hcHAudjEuU25hcHNob3RSZXNwb25zZRJaCg1FbnN1cmVCcm93c2VyEiMuZW5ncmFtLmFwcC52MS5FbnN1cmVCcm93c2VyUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuRW5zdXJlQnJvd3NlclJlc3BvbnNlEk4KCUVuc3VyZUlkZRIfLmVuZ3JhbS5hcHAudjEuRW5zdXJlSWRlUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuRW5zdXJlSWRlUmVzcG9uc2USRQoGUmVzdW1lEhwuZW5ncmFtLmFwcC52MS5SZXN1bWVSZXF1ZXN0Gh0uZW5ncmFtLmFwcC52MS5SZXN1bWVSZXNwb25zZRJRCgpFdmljdExvY2FsEiAuZW5ncmFtLmFwcC52MS5FdmljdExvY2FsUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuRXZpY3RMb2NhbFJlc3BvbnNlEk4KCUV2aWN0SWRsZRIfLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVxdWVzdBogLmVuZ3JhbS5hcHAudjEuRXZpY3RJZGxlUmVzcG9uc2USVAoLR2V0Q293U3RhdGUSIS5lbmdyYW0uYXBwLnYxLkdldENvd1N0YXRlUmVxdWVzdBoiLmVuZ3JhbS5hcHAudjEuR2V0Q293U3RhdGVSZXNwb25zZRJgCg9MaXN0Q2hlY2twb2ludHMSJS5lbmdyYW0uYXBwLnYxLkxpc3RDaGVja3BvaW50c1JlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLkxpc3RDaGVja3BvaW50c1Jlc3BvbnNlElYKC0dldEFydGlmYWN0EiEuZW5ncmFtLmFwcC52MS5HZXRBcnRpZmFjdFJlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkdldEFydGlmYWN0UmVzcG9uc2UwARJ1ChZDcmVhdGVBcnRpZmFjdEZyb21QYXRoEiwuZW5ncmFtLmFwcC52MS5DcmVhdGVBcnRpZmFjdEZyb21QYXRoUmVxdWVzdBotLmVuZ3JhbS5hcHAudjEuQ3JlYXRlQXJ0aWZhY3RGcm9tUGF0aFJlc3BvbnNlMmUKEVNoZWxsUmVsYXlTZXJ2aWNlElAKBVJlbGF5EiAuZW5ncmFtLmFwcC52MS5SZWxheVNoZWxsUmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuUmVsYXlTaGVsbFJlc3BvbnNlKAEwATJiChBQb3J0UmVsYXlTZXJ2aWNlEk4KBVJlbGF5Eh8uZW5ncmFtLmFwcC52MS5SZWxheVBvcnRSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5SZWxheVBvcnRSZXNwb25zZSgBMAFiBnByb3RvMw");
 
 /**
  * @generated from message engram.app.v1.ListSessionsRequest
@@ -555,63 +555,42 @@ export const DequeueQueuedPromptResponseSchema: GenMessage<DequeueQueuedPromptRe
   messageDesc(file_engram_app_v1_session, 17);
 
 /**
- * @generated from message engram.app.v1.AnswerQuestionRequest
+ * @generated from message engram.app.v1.CompleteToolCallRequest
  */
-export type AnswerQuestionRequest = Message<"engram.app.v1.AnswerQuestionRequest"> & {
+export type CompleteToolCallRequest = Message<"engram.app.v1.CompleteToolCallRequest"> & {
   /**
    * @generated from field: string session_id = 1;
    */
   sessionId: string;
 
   /**
-   * Claude's tool_use_id of the deferred AskUserQuestion — the correlation
-   * token carried on the `user_question` event.
+   * The call_id carried on the `tool_call_requested` event — the
+   * correlation token the harness minted for this call.
    *
    * @generated from field: string tool_call_id = 2;
    */
   toolCallId: string;
 
   /**
-   * Selected labels keyed by question text. The value is ALWAYS a list
-   * (1 element for single-select, N for multi-select) — proto3 maps can't
-   * hold a `repeated` value directly, so it's wrapped in StringList.
+   * Opaque JSON result. Validated upstream (orchestrator) against the
+   * tool's output schema; the coordinator never inspects it.
    *
-   * @generated from field: map<string, engram.app.v1.StringList> answers = 3;
+   * @generated from field: string result_json = 3;
    */
-  answers: { [key: string]: StringList };
+  resultJson: string;
 };
 
 /**
- * Describes the message engram.app.v1.AnswerQuestionRequest.
- * Use `create(AnswerQuestionRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.CompleteToolCallRequest.
+ * Use `create(CompleteToolCallRequestSchema)` to create a new message.
  */
-export const AnswerQuestionRequestSchema: GenMessage<AnswerQuestionRequest> = /*@__PURE__*/
+export const CompleteToolCallRequestSchema: GenMessage<CompleteToolCallRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_session, 18);
 
 /**
- * A list of strings, for use as a proto3 map value (which cannot be
- * `repeated` directly).
- *
- * @generated from message engram.app.v1.StringList
+ * @generated from message engram.app.v1.CompleteToolCallResponse
  */
-export type StringList = Message<"engram.app.v1.StringList"> & {
-  /**
-   * @generated from field: repeated string values = 1;
-   */
-  values: string[];
-};
-
-/**
- * Describes the message engram.app.v1.StringList.
- * Use `create(StringListSchema)` to create a new message.
- */
-export const StringListSchema: GenMessage<StringList> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 19);
-
-/**
- * @generated from message engram.app.v1.AnswerQuestionResponse
- */
-export type AnswerQuestionResponse = Message<"engram.app.v1.AnswerQuestionResponse"> & {
+export type CompleteToolCallResponse = Message<"engram.app.v1.CompleteToolCallResponse"> & {
   /**
    * @generated from field: string session_id = 1;
    */
@@ -624,11 +603,11 @@ export type AnswerQuestionResponse = Message<"engram.app.v1.AnswerQuestionRespon
 };
 
 /**
- * Describes the message engram.app.v1.AnswerQuestionResponse.
- * Use `create(AnswerQuestionResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.CompleteToolCallResponse.
+ * Use `create(CompleteToolCallResponseSchema)` to create a new message.
  */
-export const AnswerQuestionResponseSchema: GenMessage<AnswerQuestionResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 20);
+export const CompleteToolCallResponseSchema: GenMessage<CompleteToolCallResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_session, 19);
 
 /**
  * @generated from message engram.app.v1.StreamEventsRequest
@@ -654,7 +633,7 @@ export type StreamEventsRequest = Message<"engram.app.v1.StreamEventsRequest"> &
  * Use `create(StreamEventsRequestSchema)` to create a new message.
  */
 export const StreamEventsRequestSchema: GenMessage<StreamEventsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 21);
+  messageDesc(file_engram_app_v1_session, 20);
 
 /**
  * The typed event ENVELOPE. payload_json is NORMATIVELY the JSON object
@@ -692,7 +671,7 @@ export type SessionEvent = Message<"engram.app.v1.SessionEvent"> & {
  * Use `create(SessionEventSchema)` to create a new message.
  */
 export const SessionEventSchema: GenMessage<SessionEvent> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 22);
+  messageDesc(file_engram_app_v1_session, 21);
 
 /**
  * @generated from message engram.app.v1.ListSessionEventsRequest
@@ -726,7 +705,7 @@ export type ListSessionEventsRequest = Message<"engram.app.v1.ListSessionEventsR
  * Use `create(ListSessionEventsRequestSchema)` to create a new message.
  */
 export const ListSessionEventsRequestSchema: GenMessage<ListSessionEventsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 23);
+  messageDesc(file_engram_app_v1_session, 22);
 
 /**
  * @generated from message engram.app.v1.ListSessionEventsResponse
@@ -755,7 +734,7 @@ export type ListSessionEventsResponse = Message<"engram.app.v1.ListSessionEvents
  * Use `create(ListSessionEventsResponseSchema)` to create a new message.
  */
 export const ListSessionEventsResponseSchema: GenMessage<ListSessionEventsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 24);
+  messageDesc(file_engram_app_v1_session, 23);
 
 /**
  * @generated from message engram.app.v1.ExecRequest
@@ -800,7 +779,7 @@ export type ExecRequest = Message<"engram.app.v1.ExecRequest"> & {
  * Use `create(ExecRequestSchema)` to create a new message.
  */
 export const ExecRequestSchema: GenMessage<ExecRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 25);
+  messageDesc(file_engram_app_v1_session, 24);
 
 /**
  * engram_core::types::ExecEvent is authoritative for the stream body:
@@ -852,7 +831,7 @@ export type ExecOutput = Message<"engram.app.v1.ExecOutput"> & {
  * Use `create(ExecOutputSchema)` to create a new message.
  */
 export const ExecOutputSchema: GenMessage<ExecOutput> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 26);
+  messageDesc(file_engram_app_v1_session, 25);
 
 /**
  * @generated from message engram.app.v1.ExecStarted
@@ -869,7 +848,7 @@ export type ExecStarted = Message<"engram.app.v1.ExecStarted"> & {
  * Use `create(ExecStartedSchema)` to create a new message.
  */
 export const ExecStartedSchema: GenMessage<ExecStarted> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 27);
+  messageDesc(file_engram_app_v1_session, 26);
 
 /**
  * @generated from message engram.app.v1.ExecExit
@@ -897,7 +876,7 @@ export type ExecExit = Message<"engram.app.v1.ExecExit"> & {
  * Use `create(ExecExitSchema)` to create a new message.
  */
 export const ExecExitSchema: GenMessage<ExecExit> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 28);
+  messageDesc(file_engram_app_v1_session, 27);
 
 /**
  * engram_core::types::ExecRusage. wall_ms is coordinator-measured wall
@@ -933,7 +912,7 @@ export type ExecRusage = Message<"engram.app.v1.ExecRusage"> & {
  * Use `create(ExecRusageSchema)` to create a new message.
  */
 export const ExecRusageSchema: GenMessage<ExecRusage> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 29);
+  messageDesc(file_engram_app_v1_session, 28);
 
 /**
  * @generated from message engram.app.v1.GetLogRequest
@@ -976,7 +955,7 @@ export type GetLogRequest = Message<"engram.app.v1.GetLogRequest"> & {
  * Use `create(GetLogRequestSchema)` to create a new message.
  */
 export const GetLogRequestSchema: GenMessage<GetLogRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 30);
+  messageDesc(file_engram_app_v1_session, 29);
 
 /**
  * @generated from message engram.app.v1.GetLogResponse
@@ -1003,7 +982,7 @@ export type GetLogResponse = Message<"engram.app.v1.GetLogResponse"> & {
  * Use `create(GetLogResponseSchema)` to create a new message.
  */
 export const GetLogResponseSchema: GenMessage<GetLogResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 31);
+  messageDesc(file_engram_app_v1_session, 30);
 
 /**
  * @generated from message engram.app.v1.ConversationEntry
@@ -1039,7 +1018,7 @@ export type ConversationEntry = Message<"engram.app.v1.ConversationEntry"> & {
  * Use `create(ConversationEntrySchema)` to create a new message.
  */
 export const ConversationEntrySchema: GenMessage<ConversationEntry> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 32);
+  messageDesc(file_engram_app_v1_session, 31);
 
 /**
  * @generated from message engram.app.v1.SnapshotRequest
@@ -1056,7 +1035,7 @@ export type SnapshotRequest = Message<"engram.app.v1.SnapshotRequest"> & {
  * Use `create(SnapshotRequestSchema)` to create a new message.
  */
 export const SnapshotRequestSchema: GenMessage<SnapshotRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 33);
+  messageDesc(file_engram_app_v1_session, 32);
 
 /**
  * @generated from message engram.app.v1.SnapshotResponse
@@ -1090,7 +1069,7 @@ export type SnapshotResponse = Message<"engram.app.v1.SnapshotResponse"> & {
  * Use `create(SnapshotResponseSchema)` to create a new message.
  */
 export const SnapshotResponseSchema: GenMessage<SnapshotResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 34);
+  messageDesc(file_engram_app_v1_session, 33);
 
 /**
  * @generated from message engram.app.v1.EnsureBrowserRequest
@@ -1107,7 +1086,7 @@ export type EnsureBrowserRequest = Message<"engram.app.v1.EnsureBrowserRequest">
  * Use `create(EnsureBrowserRequestSchema)` to create a new message.
  */
 export const EnsureBrowserRequestSchema: GenMessage<EnsureBrowserRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 35);
+  messageDesc(file_engram_app_v1_session, 34);
 
 /**
  * @generated from message engram.app.v1.EnsureBrowserResponse
@@ -1127,7 +1106,7 @@ export type EnsureBrowserResponse = Message<"engram.app.v1.EnsureBrowserResponse
  * Use `create(EnsureBrowserResponseSchema)` to create a new message.
  */
 export const EnsureBrowserResponseSchema: GenMessage<EnsureBrowserResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 36);
+  messageDesc(file_engram_app_v1_session, 35);
 
 /**
  * @generated from message engram.app.v1.EnsureIdeRequest
@@ -1144,7 +1123,7 @@ export type EnsureIdeRequest = Message<"engram.app.v1.EnsureIdeRequest"> & {
  * Use `create(EnsureIdeRequestSchema)` to create a new message.
  */
 export const EnsureIdeRequestSchema: GenMessage<EnsureIdeRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 37);
+  messageDesc(file_engram_app_v1_session, 36);
 
 /**
  * @generated from message engram.app.v1.EnsureIdeResponse
@@ -1164,7 +1143,7 @@ export type EnsureIdeResponse = Message<"engram.app.v1.EnsureIdeResponse"> & {
  * Use `create(EnsureIdeResponseSchema)` to create a new message.
  */
 export const EnsureIdeResponseSchema: GenMessage<EnsureIdeResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 38);
+  messageDesc(file_engram_app_v1_session, 37);
 
 /**
  * @generated from message engram.app.v1.ResumeRequest
@@ -1181,7 +1160,7 @@ export type ResumeRequest = Message<"engram.app.v1.ResumeRequest"> & {
  * Use `create(ResumeRequestSchema)` to create a new message.
  */
 export const ResumeRequestSchema: GenMessage<ResumeRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 39);
+  messageDesc(file_engram_app_v1_session, 38);
 
 /**
  * Same shape as SnapshotResponse (the HTTP resume handler reuses it);
@@ -1216,7 +1195,7 @@ export type ResumeResponse = Message<"engram.app.v1.ResumeResponse"> & {
  * Use `create(ResumeResponseSchema)` to create a new message.
  */
 export const ResumeResponseSchema: GenMessage<ResumeResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 40);
+  messageDesc(file_engram_app_v1_session, 39);
 
 /**
  * @generated from message engram.app.v1.EvictLocalRequest
@@ -1233,7 +1212,7 @@ export type EvictLocalRequest = Message<"engram.app.v1.EvictLocalRequest"> & {
  * Use `create(EvictLocalRequestSchema)` to create a new message.
  */
 export const EvictLocalRequestSchema: GenMessage<EvictLocalRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 41);
+  messageDesc(file_engram_app_v1_session, 40);
 
 /**
  * Today's HTTP handler returns 202 Accepted with no body.
@@ -1248,7 +1227,7 @@ export type EvictLocalResponse = Message<"engram.app.v1.EvictLocalResponse"> & {
  * Use `create(EvictLocalResponseSchema)` to create a new message.
  */
 export const EvictLocalResponseSchema: GenMessage<EvictLocalResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 42);
+  messageDesc(file_engram_app_v1_session, 41);
 
 /**
  * @generated from message engram.app.v1.EvictIdleRequest
@@ -1265,7 +1244,7 @@ export type EvictIdleRequest = Message<"engram.app.v1.EvictIdleRequest"> & {
  * Use `create(EvictIdleRequestSchema)` to create a new message.
  */
 export const EvictIdleRequestSchema: GenMessage<EvictIdleRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 43);
+  messageDesc(file_engram_app_v1_session, 42);
 
 /**
  * Mirrors api/admin.rs EvictIdleResponse. The synchronous pipeline has
@@ -1292,7 +1271,7 @@ export type EvictIdleResponse = Message<"engram.app.v1.EvictIdleResponse"> & {
  * Use `create(EvictIdleResponseSchema)` to create a new message.
  */
 export const EvictIdleResponseSchema: GenMessage<EvictIdleResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 44);
+  messageDesc(file_engram_app_v1_session, 43);
 
 /**
  * @generated from message engram.app.v1.GetCowStateRequest
@@ -1309,7 +1288,7 @@ export type GetCowStateRequest = Message<"engram.app.v1.GetCowStateRequest"> & {
  * Use `create(GetCowStateRequestSchema)` to create a new message.
  */
 export const GetCowStateRequestSchema: GenMessage<GetCowStateRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 45);
+  messageDesc(file_engram_app_v1_session, 44);
 
 /**
  * @generated from message engram.app.v1.GetCowStateResponse
@@ -1334,7 +1313,7 @@ export type GetCowStateResponse = Message<"engram.app.v1.GetCowStateResponse"> &
  * Use `create(GetCowStateResponseSchema)` to create a new message.
  */
 export const GetCowStateResponseSchema: GenMessage<GetCowStateResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 46);
+  messageDesc(file_engram_app_v1_session, 45);
 
 /**
  * Mirrors engram_coordinator::cow_state::CowStateView. One row per
@@ -1427,7 +1406,7 @@ export type CowStateView = Message<"engram.app.v1.CowStateView"> & {
  * Use `create(CowStateViewSchema)` to create a new message.
  */
 export const CowStateViewSchema: GenMessage<CowStateView> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 47);
+  messageDesc(file_engram_app_v1_session, 46);
 
 /**
  * @generated from message engram.app.v1.ListCheckpointsRequest
@@ -1444,7 +1423,7 @@ export type ListCheckpointsRequest = Message<"engram.app.v1.ListCheckpointsReque
  * Use `create(ListCheckpointsRequestSchema)` to create a new message.
  */
 export const ListCheckpointsRequestSchema: GenMessage<ListCheckpointsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 48);
+  messageDesc(file_engram_app_v1_session, 47);
 
 /**
  * @generated from message engram.app.v1.ListCheckpointsResponse
@@ -1469,7 +1448,7 @@ export type ListCheckpointsResponse = Message<"engram.app.v1.ListCheckpointsResp
  * Use `create(ListCheckpointsResponseSchema)` to create a new message.
  */
 export const ListCheckpointsResponseSchema: GenMessage<ListCheckpointsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 49);
+  messageDesc(file_engram_app_v1_session, 48);
 
 /**
  * ADR 0028 A.log: one checkpoint in a session's chain.
@@ -1521,7 +1500,7 @@ export type CheckpointSummary = Message<"engram.app.v1.CheckpointSummary"> & {
  * Use `create(CheckpointSummarySchema)` to create a new message.
  */
 export const CheckpointSummarySchema: GenMessage<CheckpointSummary> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 50);
+  messageDesc(file_engram_app_v1_session, 49);
 
 /**
  * @generated from message engram.app.v1.GetArtifactRequest
@@ -1543,7 +1522,7 @@ export type GetArtifactRequest = Message<"engram.app.v1.GetArtifactRequest"> & {
  * Use `create(GetArtifactRequestSchema)` to create a new message.
  */
 export const GetArtifactRequestSchema: GenMessage<GetArtifactRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 51);
+  messageDesc(file_engram_app_v1_session, 50);
 
 /**
  * @generated from message engram.app.v1.GetArtifactResponse
@@ -1574,7 +1553,7 @@ export type GetArtifactResponse = Message<"engram.app.v1.GetArtifactResponse"> &
  * Use `create(GetArtifactResponseSchema)` to create a new message.
  */
 export const GetArtifactResponseSchema: GenMessage<GetArtifactResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 52);
+  messageDesc(file_engram_app_v1_session, 51);
 
 /**
  * @generated from message engram.app.v1.ArtifactMetadata
@@ -1604,7 +1583,7 @@ export type ArtifactMetadata = Message<"engram.app.v1.ArtifactMetadata"> & {
  * Use `create(ArtifactMetadataSchema)` to create a new message.
  */
 export const ArtifactMetadataSchema: GenMessage<ArtifactMetadata> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 53);
+  messageDesc(file_engram_app_v1_session, 52);
 
 /**
  * ADR 0026 trusted operator file pull: capture ANY file in the session
@@ -1634,7 +1613,7 @@ export type CreateArtifactFromPathRequest = Message<"engram.app.v1.CreateArtifac
  * Use `create(CreateArtifactFromPathRequestSchema)` to create a new message.
  */
 export const CreateArtifactFromPathRequestSchema: GenMessage<CreateArtifactFromPathRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 54);
+  messageDesc(file_engram_app_v1_session, 53);
 
 /**
  * @generated from message engram.app.v1.CreateArtifactFromPathResponse
@@ -1661,7 +1640,7 @@ export type CreateArtifactFromPathResponse = Message<"engram.app.v1.CreateArtifa
  * Use `create(CreateArtifactFromPathResponseSchema)` to create a new message.
  */
 export const CreateArtifactFromPathResponseSchema: GenMessage<CreateArtifactFromPathResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 55);
+  messageDesc(file_engram_app_v1_session, 54);
 
 /**
  * Frame kinds mirror the WS frames / host ProxyShellMessage 1:1. Request
@@ -1720,7 +1699,7 @@ export type RelayShellRequest = Message<"engram.app.v1.RelayShellRequest"> & {
  * Use `create(RelayShellRequestSchema)` to create a new message.
  */
 export const RelayShellRequestSchema: GenMessage<RelayShellRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 56);
+  messageDesc(file_engram_app_v1_session, 55);
 
 /**
  * @generated from message engram.app.v1.RelayShellResponse
@@ -1767,7 +1746,7 @@ export type RelayShellResponse = Message<"engram.app.v1.RelayShellResponse"> & {
  * Use `create(RelayShellResponseSchema)` to create a new message.
  */
 export const RelayShellResponseSchema: GenMessage<RelayShellResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 57);
+  messageDesc(file_engram_app_v1_session, 56);
 
 /**
  * @generated from message engram.app.v1.ShellOpen
@@ -1784,7 +1763,7 @@ export type ShellOpen = Message<"engram.app.v1.ShellOpen"> & {
  * Use `create(ShellOpenSchema)` to create a new message.
  */
 export const ShellOpenSchema: GenMessage<ShellOpen> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 58);
+  messageDesc(file_engram_app_v1_session, 57);
 
 /**
  * @generated from message engram.app.v1.ShellClose
@@ -1806,7 +1785,7 @@ export type ShellClose = Message<"engram.app.v1.ShellClose"> & {
  * Use `create(ShellCloseSchema)` to create a new message.
  */
 export const ShellCloseSchema: GenMessage<ShellClose> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 59);
+  messageDesc(file_engram_app_v1_session, 58);
 
 /**
  * Raw opaque bytes; no frame-kind taxonomy (cf. RelayShell*). Request
@@ -1847,7 +1826,7 @@ export type RelayPortRequest = Message<"engram.app.v1.RelayPortRequest"> & {
  * Use `create(RelayPortRequestSchema)` to create a new message.
  */
 export const RelayPortRequestSchema: GenMessage<RelayPortRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 60);
+  messageDesc(file_engram_app_v1_session, 59);
 
 /**
  * @generated from message engram.app.v1.RelayPortResponse
@@ -1876,7 +1855,7 @@ export type RelayPortResponse = Message<"engram.app.v1.RelayPortResponse"> & {
  * Use `create(RelayPortResponseSchema)` to create a new message.
  */
 export const RelayPortResponseSchema: GenMessage<RelayPortResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 61);
+  messageDesc(file_engram_app_v1_session, 60);
 
 /**
  * @generated from message engram.app.v1.PortOpen
@@ -1900,7 +1879,7 @@ export type PortOpen = Message<"engram.app.v1.PortOpen"> & {
  * Use `create(PortOpenSchema)` to create a new message.
  */
 export const PortOpenSchema: GenMessage<PortOpen> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 62);
+  messageDesc(file_engram_app_v1_session, 61);
 
 /**
  * Clean teardown sentinel (see ProxyPortClose in host_service.proto).
@@ -1915,7 +1894,7 @@ export type PortClose = Message<"engram.app.v1.PortClose"> & {
  * Use `create(PortCloseSchema)` to create a new message.
  */
 export const PortCloseSchema: GenMessage<PortClose> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_session, 63);
+  messageDesc(file_engram_app_v1_session, 62);
 
 /**
  * The orchestrator-facing app contract (ADR 0051 §2.3, rev 2026-06-10).
@@ -1996,16 +1975,17 @@ export const SessionService: GenService<{
     output: typeof DequeueQueuedPromptResponseSchema;
   },
   /**
-   * ADR 0054: answer a deferred AskUserQuestion (the `user_question` event).
-   * Resumes an idle session exactly as SendPrompt does, then feeds the
-   * answer back to the agent via a `--resume` re-fire.
+   * ADR 0089: complete an outstanding tool call (the `tool_call_requested`
+   * event) with its result. Appends a
+   * `tool_result_submitted` event at RPC time, enqueues a durable ToolResult
+   * outbox row, and resumes an idle session exactly as SendPrompt does.
    *
-   * @generated from rpc engram.app.v1.SessionService.AnswerQuestion
+   * @generated from rpc engram.app.v1.SessionService.CompleteToolCall
    */
-  answerQuestion: {
+  completeToolCall: {
     methodKind: "unary";
-    input: typeof AnswerQuestionRequestSchema;
-    output: typeof AnswerQuestionResponseSchema;
+    input: typeof CompleteToolCallRequestSchema;
+    output: typeof CompleteToolCallResponseSchema;
   },
   /**
    * Streams the event envelope itself, not a wrapped Response message.

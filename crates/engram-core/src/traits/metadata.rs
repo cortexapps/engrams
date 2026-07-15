@@ -1004,6 +1004,22 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// Atomically append a visible lifecycle event and create the durable
+    /// command that event announces. Production stores must commit both or
+    /// neither so `tool_result_submitted` can never exist without a delivery
+    /// obligation. The default preserves simple mock-store behavior.
+    async fn append_session_event_and_outbox(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        payload: serde_json::Value,
+        row: &crate::types::outbox::OutboxRow,
+    ) -> Result<i64, MetaError> {
+        let idx = self.append_session_event(session_id, kind, payload).await?;
+        self.outbox_enqueue(row).await?;
+        Ok(idx)
+    }
+
     /// Sessions with at least one due, un-acked row (`acked_at IS NULL
     /// AND not_before <= now()`). The delivery driver fans out from
     /// this set. Default (mocks): empty.

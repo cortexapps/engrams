@@ -14,6 +14,7 @@
  */
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
+import { AnswersSchema, QuestionsSchema } from "../tools/builtin.ts";
 import type { SourceMention } from "./thread-inbox.ts";
 
 /** A started session, as the thread workflow needs to reference it. */
@@ -94,8 +95,8 @@ export interface CommunicationPolicy {
 /** The effect a curated session event maps to — the framework's per-event
  *  classification, consumed by the thread workflow's dispatch. */
 export type SessionEffect =
-  | { kind: "question"; toolCallId: string | undefined }
-  | { kind: "answered"; toolCallId: string | undefined }
+  | { kind: "question"; toolCallId: string | undefined; via: QuestionProtocol }
+  | { kind: "answered"; toolCallId: string | undefined; via: QuestionProtocol }
   | { kind: "asset" }
   /** Assistant text — coalesced into the turn's running thread message. */
   | { kind: "message"; text: string }
@@ -104,18 +105,37 @@ export type SessionEffect =
   | { kind: "idle" }
   | { kind: "ignore" };
 
+/** Which durable question protocol produced a card. Historical events use the
+ * bespoke question RPC; ADR 0089 generic events complete through the tool RPC. */
+export type QuestionProtocol = "generic" | "legacy";
+
 /**
  * Decide which policy method a curated session event drives. Pure. Curated
  * kinds that render no thread effect (`run_started`/`run_completed`) map to
  * `ignore` — `run_completed` is NOT terminal (Invariant 2); the closing
  * summary is driven by `session_terminal`, not here.
  */
-export function routeSessionEvent(ev: CuratedEvent): SessionEffect {
+export function routeSessionEvent(
+  ev: CuratedEvent,
+  questionProtocols: ReadonlyMap<string, QuestionProtocol> = new Map(),
+): SessionEffect {
   switch (ev.kind) {
     case "user_question":
-      return { kind: "question", toolCallId: parseToolCallId(ev.payloadJson) };
+      return { kind: "question", toolCallId: parseToolCallId(ev.payloadJson), via: "legacy" };
     case "question_answered":
-      return { kind: "answered", toolCallId: parseToolCallId(ev.payloadJson) };
+      return { kind: "answered", toolCallId: parseToolCallId(ev.payloadJson), via: "legacy" };
+    case "tool_call_requested": {
+      const toolCallId = parseGenericQuestionRequest(ev.payloadJson);
+      return toolCallId
+        ? { kind: "question", toolCallId, via: "generic" }
+        : { kind: "ignore" };
+    }
+    case "tool_result_submitted": {
+      const toolCallId = parseGenericQuestionResult(ev.payloadJson);
+      return toolCallId && questionProtocols.get(toolCallId) === "generic"
+        ? { kind: "answered", toolCallId, via: "generic" }
+        : { kind: "ignore" };
+    }
     case "integration_asset":
     case "file_shared":
       return { kind: "asset" };
@@ -127,6 +147,51 @@ export function routeSessionEvent(ev: CuratedEvent): SessionEffect {
       return { kind: "idle" };
     default:
       return { kind: "ignore" };
+  }
+}
+
+/** Match and validate the one session-handled generic tool Slack presents. */
+function parseGenericQuestionRequest(payloadJson: string): string | undefined {
+  try {
+    const payload = JSON.parse(payloadJson) as {
+      tool_call_id?: unknown;
+      name?: unknown;
+      args_json?: unknown;
+    };
+    if (
+      typeof payload.tool_call_id !== "string" ||
+      !payload.tool_call_id ||
+      payload.name !== "ask_user_question" ||
+      typeof payload.args_json !== "string"
+    ) {
+      return undefined;
+    }
+    const args: unknown = JSON.parse(payload.args_json);
+    return QuestionsSchema.safeParse(args).success ? payload.tool_call_id : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** A submitted result locks a card only when both its outer envelope and nested
+ * canonical answer map are valid. The workflow supplies its known-card map. */
+function parseGenericQuestionResult(payloadJson: string): string | undefined {
+  try {
+    const payload = JSON.parse(payloadJson) as {
+      tool_call_id?: unknown;
+      result_json?: unknown;
+    };
+    if (
+      typeof payload.tool_call_id !== "string" ||
+      !payload.tool_call_id ||
+      typeof payload.result_json !== "string"
+    ) {
+      return undefined;
+    }
+    const result: unknown = JSON.parse(payload.result_json);
+    return AnswersSchema.safeParse(result).success ? payload.tool_call_id : undefined;
+  } catch {
+    return undefined;
   }
 }
 

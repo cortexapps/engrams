@@ -35,6 +35,7 @@ use engram_core::types::{
 };
 use engram_core::{HostId, MetaError, SessionId};
 use engram_protocol::app;
+use engram_protocol::app::session_service_server::SessionService as _;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
 use parking_lot::Mutex;
@@ -54,6 +55,7 @@ struct MockMetadataStore {
     enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
     events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
     next_event_idx: Mutex<HashMap<SessionId, i64>>,
+    outbox: Mutex<HashMap<String, engram_core::types::outbox::OutboxRow>>,
     live_disk_manifests: Mutex<HashMap<SessionId, engram_core::types::manifest::ManifestRef>>,
     chunk_generation: std::sync::atomic::AtomicU64,
     hosts: Mutex<HashMap<HostId, HostRecord>>,
@@ -479,6 +481,17 @@ impl MetadataStore for MockMetadataStore {
             .flat_map(|v| v.iter().filter(|e| e.idx > since).cloned())
             .take(limit.max(0) as usize)
             .collect())
+    }
+
+    async fn outbox_enqueue(
+        &self,
+        row: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<(), MetaError> {
+        self.outbox
+            .lock()
+            .entry(row.prompt_id.clone())
+            .or_insert_with(|| row.clone());
+        Ok(())
     }
 
     async fn insert_artifact(
@@ -943,6 +956,198 @@ async fn session_get_list_delete_round_trip() {
     );
 
     server.abort();
+}
+
+fn complete_tool_call_service(state: Arc<AppState>) -> grpc_app::AppSessionService {
+    grpc_app::AppSessionService {
+        state,
+        auth: Arc::new(grpc_app::auth::BearerAuth::new(vec![TEST_TOKEN.into()])),
+    }
+}
+
+fn complete_tool_call_request(
+    message: app::CompleteToolCallRequest,
+) -> tonic::Request<app::CompleteToolCallRequest> {
+    let mut req = tonic::Request::new(message);
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TEST_TOKEN}")
+            .parse()
+            .expect("ascii header"),
+    );
+    req
+}
+
+#[tokio::test]
+async fn complete_tool_call_appends_submitted_event_and_enqueues_outbox() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    let service = complete_tool_call_service(state);
+
+    service
+        .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            session_id: session_id.to_string(),
+            tool_call_id: "call_1".into(),
+            result_json: r#" { "saved": true } "#.into(),
+        }))
+        .await
+        .expect("CompleteToolCall must succeed");
+
+    let events = meta.events.lock();
+    let submitted = events
+        .get(&session_id)
+        .and_then(|rows| rows.iter().find(|row| row.kind == "tool_result_submitted"))
+        .expect("tool_result_submitted event");
+    assert_eq!(submitted.payload["tool_call_id"], "call_1");
+    assert_eq!(submitted.payload["result_json"], r#" { "saved": true } "#);
+    drop(events);
+
+    let outbox = meta.outbox.lock();
+    let outbox_id = engram_core::types::outbox::tool_result_outbox_id(session_id, "call_1");
+    let row = outbox.get(&outbox_id).expect("tool result outbox row");
+    assert_eq!(row.kind, engram_core::types::outbox::OutboxKind::ToolResult);
+    assert_eq!(row.payload["tool_call_id"], "call_1");
+    assert_eq!(row.payload["result_json"], r#" { "saved": true } "#);
+}
+
+#[tokio::test]
+async fn complete_tool_call_rejects_empty_tool_call_id() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    let service = complete_tool_call_service(state);
+
+    let err = service
+        .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            session_id: session_id.to_string(),
+            tool_call_id: String::new(),
+            result_json: "{}".into(),
+        }))
+        .await
+        .expect_err("empty tool_call_id must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert!(meta.outbox.lock().is_empty());
+}
+
+#[tokio::test]
+async fn complete_tool_call_rejects_terminal_session() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    for target in [
+        SessionState::Created,
+        SessionState::Active,
+        SessionState::Completed,
+    ] {
+        meta.transition_session(session_id, target)
+            .await
+            .expect("transition session");
+    }
+    let service = complete_tool_call_service(state);
+
+    let err = service
+        .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            session_id: session_id.to_string(),
+            tool_call_id: "call_1".into(),
+            result_json: "{}".into(),
+        }))
+        .await
+        .expect_err("terminal session must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(meta.outbox.lock().is_empty());
+}
+
+#[tokio::test]
+async fn complete_tool_call_is_idempotent_on_tool_call_id() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    let service = complete_tool_call_service(state);
+
+    for result_json in [r#"{"saved":true}"#, r#"{"saved":false}"#] {
+        service
+            .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+                session_id: session_id.to_string(),
+                tool_call_id: "call_1".into(),
+                result_json: result_json.into(),
+            }))
+            .await
+            .expect("duplicate CompleteToolCall must succeed");
+    }
+
+    let outbox = meta.outbox.lock();
+    assert_eq!(outbox.len(), 1, "prompt_id uniqueness must dedupe retries");
+    let outbox_id = engram_core::types::outbox::tool_result_outbox_id(session_id, "call_1");
+    assert_eq!(
+        outbox[&outbox_id].payload["result_json"], r#"{"saved":true}"#,
+        "the first accepted row wins"
+    );
+}
+
+#[tokio::test]
+async fn complete_tool_call_namespaces_outbox_identity_by_session() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let first = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed first session");
+    let second = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed second session");
+    let service = complete_tool_call_service(state);
+
+    for session_id in [first, second] {
+        service
+            .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+                session_id: session_id.to_string(),
+                tool_call_id: "shared-call".into(),
+                result_json: r#"{"saved":true}"#.into(),
+            }))
+            .await
+            .expect("same call id in another session must succeed");
+    }
+
+    let outbox = meta.outbox.lock();
+    assert!(
+        outbox.contains_key(&engram_core::types::outbox::tool_result_outbox_id(
+            first,
+            "shared-call"
+        ))
+    );
+    assert!(
+        outbox.contains_key(&engram_core::types::outbox::tool_result_outbox_id(
+            second,
+            "shared-call"
+        ))
+    );
 }
 
 /// GetSession with a malformed (non-UUID) session id maps to

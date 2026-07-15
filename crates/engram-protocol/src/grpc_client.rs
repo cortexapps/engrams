@@ -34,14 +34,14 @@ use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_port_message::Body as ProxyPortBody;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
-    AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
-    CreateSandboxRequest, DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty,
-    ExecStartRequest, FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest,
-    MaterializeImageRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
-    PeerChunkFrame, PeerChunkGetRequest, ProxyPortData, ProxyPortMessage, ProxyPortOpen,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest,
-    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, StringList,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest,
+    DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty, ExecStartRequest,
+    FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest, MaterializeImageRequest,
+    MigrationExportRef, MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest,
+    ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
+    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
+    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SendHarnessToolResultRequest, StartAgentRequest,
     UnbindHarnessSessionRequest,
 };
 
@@ -842,24 +842,20 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    pub async fn answer_harness_question(
+    pub async fn send_harness_tool_result(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
-        answers: std::collections::BTreeMap<String, Vec<String>>,
+        result_json: String,
     ) -> Result<(), SandboxError> {
-        let req = AnswerHarnessQuestionRequest {
+        let req = SendHarnessToolResultRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             tool_call_id,
-            // Canonical Answers → proto map<string, StringList>.
-            answers: answers
-                .into_iter()
-                .map(|(question, values)| (question, StringList { values }))
-                .collect(),
+            result_json,
         };
         self.inner
             .clone()
-            .answer_harness_question(req)
+            .send_harness_tool_result(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -1652,13 +1648,13 @@ impl HostClient for GrpcHostClient {
             .await
     }
 
-    async fn answer_question(
+    async fn tool_result(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
-        answers: std::collections::BTreeMap<String, Vec<String>>,
+        result_json: String,
     ) -> Result<(), SandboxError> {
-        self.answer_harness_question(sandbox_id, tool_call_id, answers)
+        self.send_harness_tool_result(sandbox_id, tool_call_id, result_json)
             .await
     }
 

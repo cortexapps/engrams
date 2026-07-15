@@ -26,6 +26,9 @@ import { makePreviewProxyMiddleware } from "./routes/preview-proxy.ts";
 import { makePreviewUpgradeHandler } from "./routes/preview-ws.ts";
 import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
+import { makeExternalToolCompletionGuard } from "./rpc/tool-completion-guard.ts";
+import { registerBuiltinTools } from "./tools/builtin.ts";
+import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
@@ -38,12 +41,13 @@ import { controlPlaneTransport } from "./control-plane/transport.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
 // ADR 0060: embedded DBOS engine. Workflow modules (P1+) must be imported
 // ABOVE the initDbos() call below so their workflows/steps are registered
-// before DBOS.launch(). Importing slack-thread.ts registers both the thread
-// workflow and (transitively) the per-session ingest pump.
+// before DBOS.launch(). Imports below register the finite Slack-thread and
+// tool-execution workflows.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
+import { makeProductionListenerManager } from "./listeners/manager.ts";
 
 const app = new Hono();
 
@@ -158,6 +162,7 @@ const server = buildServer(
     // any active profile still references (the coordinator only knows sessions).
     registerPassthrough(router, SURFACE, controlPlaneTransport, undefined, undefined, {
       "ImageService.DisableImage": makeDisableImageGuard(),
+      "SessionService.CompleteToolCall": makeExternalToolCompletionGuard(),
     });
   },
   // Pass the full NodeWebSocket handle so buildServer can install the
@@ -178,7 +183,13 @@ const server = buildServer(
 // bind can start a workflow.
 setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
+// ADR 0089: production built-ins and optional dev smoke tools are registered
+// before DBOS launches so manifest compilation and tool execution see them.
+registerBuiltinTools();
+if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
+const listenerManager = makeProductionListenerManager();
+await listenerManager.start();
 
 server.listen(config.port, "0.0.0.0", () => {
   log.info({ port: config.port }, "orchestrator listening");
@@ -190,6 +201,7 @@ process.on("SIGTERM", () => {
   server.close(async (err) => {
     // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
     // after the HTTP server stops accepting connections.
+    await listenerManager.stop();
     await shutdownDbos();
     if (err) {
       log.error({ err }, "orchestrator: error during shutdown");

@@ -535,7 +535,9 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
 /// coordinator's own eviction/resume lifecycle events — `evicted`,
 /// `status_changed`, `snapshot_taken`, `resumed`,
 /// `recovered_from_checkpoint`. A clean evict→resume cycle appends
-/// exactly this family past the cursor; tombstoning them is what made
+/// exactly this family past the cursor. ADR 0091 also excludes the clean
+/// harness state markers (`harness_idle` and ADR 0089's `harness_parked`);
+/// tombstoning any of them is what made
 /// every resume look like a rewind even when nothing guest-derived was
 /// lost.
 #[tokio::test]
@@ -570,6 +572,8 @@ async fn rewind_is_kind_scoped_to_guest_derived_events() {
             "status_changed",
             serde_json::json!({"from": "idle", "to": "created"}),
         ),
+        ("harness_idle", serde_json::json!({})),
+        ("harness_parked", serde_json::json!({})),
     ] {
         meta.append_session_event(session_id, kind, payload)
             .await
@@ -622,7 +626,11 @@ async fn rewind_is_kind_scoped_to_guest_derived_events() {
             e.idx > cursor
                 && matches!(
                     e.kind.as_str(),
-                    "evicted" | "status_changed" | "snapshot_taken"
+                    "evicted"
+                        | "status_changed"
+                        | "snapshot_taken"
+                        | "harness_idle"
+                        | "harness_parked"
                 )
         })
         .any(|e| e.rewound_at.is_some());

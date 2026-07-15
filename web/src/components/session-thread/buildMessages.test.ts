@@ -230,7 +230,8 @@ describe("buildMessages — message/part shaping", () => {
     );
     const a = real(messages)[0]!;
     expect(a.status).toEqual({ type: "incomplete", reason: "cancelled" });
-    expect((a.metadata?.custom?.run as RunFooter).interrupted).toBe(true);
+    const run = a.metadata?.custom?.run as RunFooter | undefined;
+    expect(run?.interrupted).toBe(true);
   });
 
   test("an open run on an inactive session (idle-evicted mid-run) is not running", () => {
@@ -907,7 +908,12 @@ describe("buildMessages — ADR 0054 interactive AskUserQuestion", () => {
     const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
     expect(card.role).toBe("system");
     const marker = customMarker(card) as Extract<SystemMarker, { kind: "user_question" }>;
-    expect(marker).toMatchObject({ kind: "user_question", toolCallId: "t1", answers: null });
+    expect(marker).toMatchObject({
+      kind: "user_question",
+      toolCallId: "t1",
+      answers: null,
+      via: "legacy",
+    });
     expect(marker.questions).toEqual([Q]);
     // Awaiting input is NOT "working" — the composer must not show a spinner.
     expect(isRunning).toBe(false);
@@ -1048,6 +1054,225 @@ describe("buildMessages — ADR 0054 interactive AskUserQuestion", () => {
     expect(toolParts(messages).some((p) => p.toolCallId === "t1")).toBe(false);
     // The resume run's own assistant reply still renders.
     expect(real(messages).some((m) => m.role === "assistant")).toBe(true);
+  });
+
+  test("a generic ask_user_question request renders the same unanswered card", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-generic",
+          name: "ask_user_question",
+          args_json: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    expect(customMarker(card)).toMatchObject({
+      kind: "user_question",
+      toolCallId: "t-generic",
+      questions: [Q],
+      answers: null,
+      via: "generic",
+    });
+    expect(toolParts(messages)).toHaveLength(0);
+    expect(isRunning).toBe(false);
+  });
+
+  test("tool_result_submitted folds canonical answers onto the generic card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-generic",
+          name: "ask_user_question",
+          args_json: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "t-generic",
+          result_json: JSON.stringify({ "Which database?": ["Postgres"] }),
+          at: AT2,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    expect(customMarker(card)).toMatchObject({
+      toolCallId: "t-generic",
+      answers: { "Which database?": ["Postgres"] },
+      via: "generic",
+    });
+  });
+
+  test("#64389 multi-fire suppresses phantom AskUserQuestion starts but keeps the one real card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "phantom-1",
+          tool_name: "AskUserQuestion",
+          args_summary: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "phantom-2",
+          tool_name: "AskUserQuestion",
+          args_summary: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "real-call",
+          tool_name: "AskUserQuestion",
+          args_summary: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "real-call",
+          name: "ask_user_question",
+          args_json: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+
+    expect(toolParts(messages)).toHaveLength(0);
+    expect(real(messages).filter((m) => customMarker(m)?.kind === "user_question")).toHaveLength(1);
+  });
+
+  test("phantom suppression does not hide a legitimate in-flight ordinary tool", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "read-live",
+          tool_name: "Read",
+          args_summary: JSON.stringify({ file_path: "README.md" }),
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+
+    expect(toolParts(messages)).toEqual([
+      expect.objectContaining({ toolCallId: "read-live", toolName: "Read" }),
+    ]);
+  });
+
+  test("a prior generic request of the same name does not hide a later in-flight sync start", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "echo-old",
+          tool_name: "dev_echo",
+          args_summary: JSON.stringify({ text: "old" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "echo-old",
+          name: "dev_echo",
+          args_json: JSON.stringify({ text: "old" }),
+          at: AT,
+        },
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "echo-old",
+          result_json: JSON.stringify({ text: "old" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "echo-old",
+          tool_name: "dev_echo",
+          ok: true,
+          duration_ms: 1,
+          result_summary: "old",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT },
+        { type: "run_started", run_id: "r2", prompt_summary: null, at: AT2 },
+        {
+          type: "tool_call_started",
+          run_id: "r2",
+          tool_call_id: "echo-live",
+          tool_name: "dev_echo",
+          args_summary: JSON.stringify({ text: "live" }),
+          at: AT2,
+        },
+      ]),
+      SID,
+      "active",
+    );
+
+    expect(toolParts(messages)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ toolCallId: "echo-live", toolName: "dev_echo" }),
+      ]),
+    );
+  });
+});
+
+describe("buildMessages — generic deferred tool waiting state", () => {
+  test("an unsubmitted generic call renders a pending tool row", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "approval-1",
+          name: "approve_deploy",
+          args_json: JSON.stringify({ environment: "production" }),
+          at: AT,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const parts = real(messages).flatMap((message) =>
+      typeof message.content === "string"
+        ? []
+        : message.content.filter((part) => part.type === "tool-call"),
+    );
+    expect(parts).toEqual([
+      expect.objectContaining({
+        type: "tool-call",
+        toolCallId: "approval-1",
+        toolName: "approve_deploy",
+        args: { environment: "production" },
+      }),
+    ]);
+    expect(parts[0]).not.toHaveProperty("result");
   });
 });
 

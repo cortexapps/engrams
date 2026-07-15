@@ -1336,6 +1336,8 @@ dependencies = [
  "engram-core",
  "engram-harness-proto",
  "engram-transport",
+ "serde",
+ "serde_json",
  "tokio",
  "tracing",
  "workspace-hack",

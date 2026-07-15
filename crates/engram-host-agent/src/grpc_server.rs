@@ -24,19 +24,19 @@ use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer}
 use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
-    AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
-    BrowserPortResponse, CowStateAllResponse, CowStateResponse, CreateSandboxRequest,
-    CreateSandboxResponse, DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse,
-    EditHarnessQueuedPromptRequest, Empty, ExecExit, ExecFrame, ExecStartRequest,
-    FencedSandboxRequest, GuestIpResponse, IdePortResponse, InterruptHarnessRequest,
-    ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent, MaterializeImageFailed,
-    MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse, MigrationExportRef,
-    MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse, PeerChunkFrame,
-    PeerChunkGetRequest, PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData,
-    ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing,
-    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SnapshotBeginResponse, SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BrowserPortResponse, CowStateAllResponse,
+    CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
+    DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
+    ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse, IdePortResponse,
+    InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
+    MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse,
+    MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
+    PeerChunkFrame, PeerChunkGetRequest, PostCopyCaptureResponse, ProbeSandboxResponse,
+    ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -926,20 +926,14 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Empty {}))
     }
 
-    async fn answer_harness_question(
+    async fn send_harness_tool_result(
         &self,
-        req: Request<AnswerHarnessQuestionRequest>,
+        req: Request<SendHarnessToolResultRequest>,
     ) -> Result<Response<Empty>, Status> {
         let r = req.into_inner();
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
-        // Unwrap the proto StringList map → canonical Answers.
-        let answers: engram_harness_proto::Answers = r
-            .answers
-            .into_iter()
-            .map(|(question, list)| (question, list.values))
-            .collect();
         self.inner
-            .answer_question(sandbox_id, r.tool_call_id, answers)
+            .tool_result(sandbox_id, r.tool_call_id, r.result_json)
             .await
             .map_err(sandbox_to_status)?;
         Ok(Response::new(Empty {}))
