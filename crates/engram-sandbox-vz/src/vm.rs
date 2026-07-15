@@ -10,7 +10,8 @@
 //! `Retained<VZVirtualMachine>` carries.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -191,6 +192,62 @@ impl<T: Clone> Clone for Sendable<T> {
     }
 }
 
+// ---- VZVirtualMachineDelegate (crash detection, ADR 0096) ------------
+
+use vm_delegate::VmStopDelegate;
+
+mod vm_delegate {
+    use super::*;
+    use objc2::define_class;
+    use objc2::runtime::NSObjectProtocol;
+    use objc2::DefinedClass;
+    use objc2_foundation::NSObject;
+    use objc2_virtualization::VZVirtualMachineDelegate;
+
+    /// State held inside the delegate instance — the shared dead flag
+    /// the owning `VzVm` (and through it the backend's `list()` /
+    /// `probe_sandbox`) reads.
+    pub(crate) struct DelegateIvars {
+        pub(crate) dead: Arc<AtomicBool>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[name = "EngramVZVmStopDelegate"]
+        #[ivars = DelegateIvars]
+        pub(crate) struct VmStopDelegate;
+
+        unsafe impl NSObjectProtocol for VmStopDelegate {}
+
+        unsafe impl VZVirtualMachineDelegate for VmStopDelegate {
+            #[unsafe(method(guestDidStopVirtualMachine:))]
+            fn guest_did_stop(&self, _vm: &VZVirtualMachine) {
+                self.ivars().dead.store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    "vz: guest stopped the VM (guestDidStopVirtualMachine) — marking dead"
+                );
+            }
+
+            #[unsafe(method(virtualMachine:didStopWithError:))]
+            fn did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
+                self.ivars().dead.store(true, Ordering::SeqCst);
+                tracing::error!(
+                    error = %ns_error_message(error),
+                    "vz: VM stopped with error — marking dead"
+                );
+            }
+        }
+    );
+
+    impl VmStopDelegate {
+        pub(crate) fn new(dead: Arc<AtomicBool>) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(DelegateIvars { dead });
+            // SAFETY: `init` returns a fully-initialised retained instance.
+            unsafe { objc2::msg_send![super(this), init] }
+        }
+    }
+}
+
 /// Owned VZ virtual machine.
 ///
 /// Holds the `Retained<VZVirtualMachine>` plus the per-VM
@@ -200,6 +257,15 @@ impl<T: Clone> Clone for Sendable<T> {
 pub(crate) struct VzVm {
     vm: Retained<VZVirtualMachine>,
     queue: DispatchRetained<DispatchQueue>,
+    /// ADR 0096 crash detection: set by the [`VmStopDelegate`] when the
+    /// guest stops the VM or VZ stops it with an error. `list()` filters
+    /// dead sandboxes so the ADR 0009 heartbeat reflects ground truth.
+    dead: Arc<AtomicBool>,
+    /// Kept retained for the VM's lifetime — `VZVirtualMachine.delegate`
+    /// is a WEAK ObjC property (the same trap as the vsock listener
+    /// delegates): dropping this deallocates the delegate and the stop
+    /// callbacks silently never fire.
+    _delegate: Retained<VmStopDelegate>,
 }
 
 // SAFETY: see `SendableVm` for the full argument. The `VzVm` itself
@@ -273,7 +339,42 @@ impl VzVm {
             )
         };
 
-        Ok(Self { vm, queue })
+        // ADR 0096 crash detection: attach a stop delegate BEFORE the
+        // caller starts the VM. `setDelegate:` must run on the VM's
+        // queue (Apple's threading contract); the serial queue orders
+        // this ahead of the later `start()` dispatch. The delegate does
+        // nothing but flip the dead flag + log — callbacks arrive on
+        // the VM queue and must never block.
+        let dead = Arc::new(AtomicBool::new(false));
+        let delegate = VmStopDelegate::new(dead.clone());
+        {
+            let vm = Sendable(vm.clone());
+            let delegate = Sendable(delegate.clone());
+            queue.exec_async(move || {
+                // Move the WHOLE wrappers in (edition-2021 disjoint
+                // capture would otherwise grab the bare Retained fields).
+                let (vm, delegate) = (vm, delegate);
+                // SAFETY: on the VM's queue; delegate outlives the VM
+                // (kept retained in `_delegate` — the property is weak).
+                unsafe {
+                    vm.0.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate.0)));
+                }
+            });
+        }
+
+        Ok(Self {
+            vm,
+            queue,
+            dead,
+            _delegate: delegate,
+        })
+    }
+
+    /// ADR 0096: true once the stop delegate has fired — the guest
+    /// stopped the VM or VZ stopped it with an error. The backend's
+    /// `list()`/`probe_sandbox` key off this.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 
     /// Start the VM. Resolves once VZ's `startWithCompletionHandler`

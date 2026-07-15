@@ -22,6 +22,7 @@ use engram_core::traits::sandbox::{
 };
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
+use engram_core::types::sandbox::SandboxProbe;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
 };
@@ -122,33 +123,23 @@ struct VzSandboxState {
     guest_endpoints: Mutex<Option<GuestEndpoints>>,
 }
 
-// ADR 0009 §4 (host-side VM supervision) is FC-only by design. The
-// rationale for skipping VZ here:
+// ADR 0009 §4 (host-side VM supervision), VZ edition — ADR 0096
+// superseded the earlier "FC-only by design" posture here. VZ VMs run
+// in-process as `VZVirtualMachine` ObjC objects, so there is no VM pid
+// to poll the way FC does; instead a `VZVirtualMachineDelegate` shim
+// (`vm::VmStopDelegate`) flips a per-VM dead flag on
+// `guestDidStopVirtualMachine:` / `virtualMachine:didStopWithError:`.
 //
-//   - VZ VMs run **in-process** as `VZVirtualMachine` ObjC objects
-//     hosted by Apple's `Virtualization.framework`. There is no
-//     separate VM process whose pid we could poll the way the FC
-//     backend does. The VM's lifecycle is the `VzVm` Rust struct's
-//     Drop lifecycle.
-//   - The way a VZ VM dies "out from under" the host-agent is via
-//     internal state transitions surfaced through
-//     `VZVirtualMachineDelegate` callbacks
-//     (`virtualMachine:didStopWithError:` etc.). Wiring those
-//     properly requires creating an ObjC class that conforms to the
-//     delegate protocol and threading it through
-//     `objc2-virtualization` — significantly more work than the
-//     FC poll-based supervisor, and VZ is dev-only.
-//   - The bug case §4 is meant to catch (host-agent alive, VM dies
-//     unexpectedly) is significantly rarer for VZ. In dev the user
-//     restarting `just dev` kills the host-agent and the VM
-//     together; in that scenario reconcile's clean-slate startup
-//     path handles things correctly via the empty `running_sandboxes`
-//     heartbeat.
-//
-// If/when VZ VM crash detection becomes important (i.e. a sandbox
-// goes wedged-but-not-killed and we want eager pruning), the right
-// path is a `VZVirtualMachineDelegate` shim. Tracked in
-// `docs/state-reconciliation-rollout.md` as a future enhancement.
+//   - `list()` filters dead sandboxes, so the ADR 0009 §2 heartbeat's
+//     `running_sandboxes` reflects ground truth and the coordinator's
+//     3-strike divergence flip works unmodified.
+//   - `probe_sandbox` reports `process_alive` from the dead flag plus
+//     a live queue-dispatched `VZVirtualMachine.state()` read — an
+//     independent ground-truth check (ADR 0068), not map membership.
+//   - Detection is eager; CLEANUP stays coordinator-driven (the FC
+//     posture) — the delegate callbacks arrive on the VM's dispatch
+//     queue and only store the flag + log, never touch the sandboxes
+//     map or block.
 pub struct VzBackend {
     work_dir: PathBuf,
     cfg: VzConfig,
@@ -1063,7 +1054,47 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-        Ok(self.sandboxes.iter().map(|kv| *kv.key()).collect())
+        // ADR 0096: exclude sandboxes whose stop delegate fired — the
+        // heartbeat's `running_sandboxes` must reflect ground truth so
+        // the coordinator's ADR 0009 divergence detection can flip a
+        // session whose VM died out from under us. The map entry stays
+        // (cleanup is coordinator-driven via destroy).
+        Ok(self
+            .sandboxes
+            .iter()
+            .filter(|kv| !kv.value().vm.is_dead())
+            .map(|kv| *kv.key())
+            .collect())
+    }
+
+    /// ADR 0068/0096: ground-truth liveness, not map membership. A VZ
+    /// VM has no host pid; "the process is alive" means the delegate
+    /// hasn't declared it dead AND the live `state()` read says the
+    /// machine is in a running-family state (Running/Paused + the
+    /// transitional states around them). Stopped/Error ⇒ dead.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        let vm = match self.sandboxes.get(&id) {
+            Some(live) => live.vm.clone(),
+            None => {
+                return Ok(SandboxProbe {
+                    known_to_backend: false,
+                    process_alive: false,
+                    control_alive: None,
+                })
+            }
+        };
+        use objc2_virtualization::VZVirtualMachineState as S;
+        let state = vm.state().await;
+        let alive = !vm.is_dead()
+            && matches!(
+                state,
+                S::Running | S::Paused | S::Starting | S::Pausing | S::Resuming
+            );
+        Ok(SandboxProbe {
+            known_to_backend: true,
+            process_alive: alive,
+            control_alive: None,
+        })
     }
 
     /// Ensure the in-guest `ttyd` is running, returning the port it

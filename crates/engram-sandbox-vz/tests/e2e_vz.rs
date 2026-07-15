@@ -428,6 +428,60 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     backend.destroy(id).await.expect("destroy");
 }
 
+/// ADR 0096 (ADR 0009 §4, VZ edition): crash detection. A guest that
+/// stops its VM out from under the host-agent must be noticed eagerly:
+/// the `VZVirtualMachineDelegate` shim flips the dead flag,
+/// `probe_sandbox` reports `process_alive=false` from the flag + a live
+/// `state()` read, and `list()` drops the sandbox so the heartbeat's
+/// `running_sandboxes` reflects ground truth (the coordinator's 3-strike
+/// divergence flip then fires unmodified). Cleanup stays coordinator-
+/// driven — the map entry survives until `destroy`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
+async fn e2e_vz_crash_detection_marks_dead() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let backend = backend(&env, work.path(), false);
+
+    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    await_agent(&backend, id).await;
+    let probe = backend.probe_sandbox(id).await.expect("probe");
+    assert!(
+        probe.known_to_backend && probe.process_alive,
+        "healthy VM must probe alive: {probe:?}"
+    );
+
+    // Guest-initiated stop. The exec stream dies mid-flight with the VM;
+    // ignore its outcome — the assertion is what the backend REPORTS.
+    let _ = tokio::time::timeout(Duration::from_secs(5), exec(&backend, id, "poweroff -f")).await;
+
+    // The stop delegate fires on the VM's dispatch queue; poll the probe.
+    let deadline = std::time::Instant::now() + Duration::from_secs(15);
+    loop {
+        let p = backend.probe_sandbox(id).await.expect("probe");
+        if p.known_to_backend && !p.process_alive {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "VM never probed dead after guest poweroff: {p:?}",
+        );
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        !backend.list().await.expect("list").contains(&id),
+        "dead sandbox must drop out of list() (the heartbeat's running_sandboxes)",
+    );
+
+    backend
+        .destroy(id)
+        .await
+        .expect("destroy tolerates an already-stopped VM");
+}
+
 /// ADR 0096: external pause/resume — the coordinator's rung-2 park.
 /// Until ADR 0096 `VzBackend` inherited the trait-default no-ops, so a
 /// park "succeeded" while the guest kept running. Pins:
