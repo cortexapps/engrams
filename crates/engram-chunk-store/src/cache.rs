@@ -552,6 +552,14 @@ struct CacheInner {
     /// Debounce for the populate-path eviction sweep (unix millis of
     /// the last sweep). See `write_local`.
     last_sweep_ms: std::sync::atomic::AtomicI64,
+    /// ADR 0092: allocated bytes co-tenant consumers currently hold on
+    /// the cache's filesystem that the sweeper cannot evict (today: the
+    /// per-image base memfiles File restores read, maintained by the
+    /// image-prefetch supervisor via [`ChunkCache::set_co_tenant_reserved`]).
+    /// Subtracted from the absolute ceiling every sweep so the cache
+    /// never aims to fill space a co-tenant needs. 0 (the default) ⇒
+    /// today's behavior.
+    co_tenant_reserved: std::sync::atomic::AtomicU64,
 }
 
 impl ChunkCache {
@@ -565,6 +573,7 @@ impl ChunkCache {
                 pinned: Mutex::new(HashMap::new()),
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
+                co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -586,8 +595,31 @@ impl ChunkCache {
                 pinned: Mutex::new(HashMap::new()),
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
+                co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
             }),
         }
+    }
+
+    /// ADR 0092: record how many allocated bytes co-tenant consumers
+    /// (files on this cache's filesystem the sweeper cannot evict — the
+    /// per-image base memfiles) currently hold. The next sweep subtracts
+    /// this from the absolute ceiling, so growth in a co-tenant converts
+    /// into cache eviction pressure instead of disk overshoot. Callers
+    /// re-publish their current total whenever it changes (the
+    /// image-prefetch supervisor does so every reconcile tick);
+    /// last-write-wins, single logical writer.
+    pub fn set_co_tenant_reserved(&self, bytes: u64) {
+        self.inner
+            .co_tenant_reserved
+            .store(bytes, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// The co-tenant reserve currently in force (see
+    /// [`Self::set_co_tenant_reserved`]).
+    pub fn co_tenant_reserved(&self) -> u64 {
+        self.inner
+            .co_tenant_reserved
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     fn path_for(&self, hash: ChunkHash) -> PathBuf {
@@ -1266,6 +1298,21 @@ impl ChunkCache {
             c => Some(c),
         };
 
+        // ADR 0092: co-tenants share the cache's filesystem with bytes the
+        // sweeper can't evict (today: the per-image base memfiles that File
+        // restores read). The static ceiling was derived assuming the cache
+        // owns its disk fraction outright, so an unbudgeted 40 GB co-tenant
+        // silently authorizes overshooting the kubelet eviction line (the
+        // 2026-07-14 w8wq DiskPressure incident). Subtract whatever the
+        // co-tenants currently claim so the cache *aims* below it — the
+        // statvfs floor stays the independent backstop.
+        let reserved = self
+            .inner
+            .co_tenant_reserved
+            .load(std::sync::atomic::Ordering::Relaxed);
+        metrics::gauge!("engram_chunk_cache_co_tenant_reserved_bytes").set(reserved as f64);
+        let ceiling = ceiling.map(|c| c.saturating_sub(reserved));
+
         // ADR 0070: pins are a floor, not a bug. Compute what's
         // unevictable BEFORE deciding how much to free, and gauge it
         // regardless of whether a sweep is otherwise a no-op — dashboards
@@ -1281,6 +1328,9 @@ impl ChunkCache {
         // 0 is the "no ceiling configured" sentinel here (u64::MAX would
         // render as a meaningless huge gauge value) — mirrors the "0 =
         // disabled" convention other env knobs in this codebase use.
+        // Reports the EFFECTIVE ceiling (configured minus the co-tenant
+        // reserve) — the value enforcement actually uses; the reserve
+        // itself is the engram_chunk_cache_co_tenant_reserved_bytes gauge.
         metrics::gauge!("engram_chunk_cache_budget_bytes").set(ceiling.unwrap_or(0) as f64);
         let pins_over_budget = matches!(ceiling, Some(c) if pinned_bytes > c);
         metrics::gauge!("engram_chunk_cache_pins_over_budget").set(if pins_over_budget {
@@ -1297,10 +1347,12 @@ impl ChunkCache {
             tracing::error!(
                 pinned_bytes,
                 budget_bytes = ceiling.unwrap_or(0),
-                "chunk cache: pinned (unevictable) bytes exceed the configured budget — the \
-                 enabled-image set does not fit this host's disk. Pins are never auto-released; \
-                 fix is more disk, fewer/graded enabled images, or a smaller working set — never \
-                 raising the budget above the kubelet eviction line",
+                co_tenant_reserved_bytes = reserved,
+                "chunk cache: pinned (unevictable) bytes exceed the effective budget (configured \
+                 ceiling minus the co-tenant reserve, e.g. base memfiles) — the enabled-image set \
+                 does not fit this host's disk. Pins are never auto-released; fix is more disk, \
+                 fewer/graded enabled images, or a smaller working set — never raising the budget \
+                 above the kubelet eviction line",
             );
         }
 
@@ -1870,6 +1922,68 @@ mod tests {
         assert!(cache.contains(hb).await);
         assert!(cache.contains(hc).await);
         assert!(cache.contains(hd).await);
+    }
+
+    #[tokio::test]
+    async fn co_tenant_reserve_tightens_the_ceiling() {
+        // ADR 0092: a co-tenant (base memfile) claiming bytes on the
+        // cache's filesystem shrinks the effective ceiling — a cache
+        // that is happily within its configured budget must yield when
+        // the reserve appears, and must NOT keep evicting once the
+        // reserve is released.
+        let (cache, _store, _b, _c) = setup(30).await;
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let c = b"cccccccccc";
+        let ha = ChunkHash::of(a);
+        let hb = ChunkHash::of(b);
+        let hc = ChunkHash::of(c);
+        cache.put(ha, a).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache.put(hb, b).await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache.put(hc, c).await.unwrap();
+        cache.sweep().await.unwrap();
+        assert!(
+            cache.contains(ha).await && cache.contains(hb).await && cache.contains(hc).await,
+            "30/30 with no reserve: at boundary, nothing evicts",
+        );
+
+        // A 10-byte co-tenant reserve → effective ceiling 20 → the LRU
+        // chunk goes.
+        cache.set_co_tenant_reserved(10);
+        cache.sweep().await.unwrap();
+        assert!(!cache.contains(ha).await, "a must yield to the reserve");
+        assert!(cache.contains(hb).await && cache.contains(hc).await);
+
+        // Reserve released → 20/30 → no further eviction pressure.
+        cache.set_co_tenant_reserved(0);
+        cache.sweep().await.unwrap();
+        assert!(cache.contains(hb).await && cache.contains(hc).await);
+    }
+
+    #[tokio::test]
+    async fn co_tenant_reserve_larger_than_budget_empties_but_never_panics() {
+        // Reserve ≥ configured budget ⇒ effective ceiling saturates at 0:
+        // everything unpinned evicts, pinned chunks still survive (pins
+        // are a floor the reserve can't override), no underflow.
+        let (cache, _store, _b, _c) = setup(30).await;
+        let a = b"aaaaaaaaaa";
+        let b = b"bbbbbbbbbb";
+        let ha = ChunkHash::of(a);
+        let hb = ChunkHash::of(b);
+        cache.put(ha, a).await.unwrap();
+        cache.pin(ha);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        cache.put(hb, b).await.unwrap();
+
+        cache.set_co_tenant_reserved(1_000_000);
+        cache.sweep().await.unwrap();
+        assert!(
+            cache.contains(ha).await,
+            "pinned chunk survives even a saturating reserve",
+        );
+        assert!(!cache.contains(hb).await, "unpinned chunk evicts to 0");
     }
 
     #[tokio::test]
