@@ -309,6 +309,17 @@ const RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30)
 /// chunks. No ImageCache: the prefetch warms the base snapshot's
 /// chunks from the GCS chunk store and never reads the source OCI
 /// image (see [`prefetch_one`]).
+/// Digests with a prefetch task currently running — the reconcile
+/// loop's spawn guard. Without it, a not-ready image (first warm, or a
+/// recheck flip) got a NEW prefetch task every tick while the previous
+/// ones still ran; at dev-brain scale (24 GiB memfile, 44k chunks) the
+/// concurrent re-materializations chewed fs headroom until the cache's
+/// free-space floor started evicting freshly-landed chunks, which kept
+/// the recheck's still-warm probe false — the 2026-07-15 redo-loop
+/// storm (77k evictions / +15k GCS refetches in 11 min on an otherwise
+/// idle host).
+type InflightPrefetches = Arc<parking_lot::Mutex<HashSet<ManifestDigest>>>;
+
 pub fn spawn_supervisor(
     chunk_store: ChunkStore,
     chunk_cache: ChunkCache,
@@ -340,6 +351,7 @@ pub fn spawn_supervisor(
     // prefetch task so one dead seed is skipped fleet-wide on this host
     // for the lost-window instead of once per image.
     let peer_health = crate::peer_fill::PeerHealth::new();
+    let inflight: InflightPrefetches = Arc::new(parking_lot::Mutex::new(HashSet::new()));
     tracing::info!(
         permits,
         recheck_secs = RECHECK_INTERVAL.as_secs(),
@@ -387,6 +399,7 @@ pub fn spawn_supervisor(
                 ram_ledger.clone(),
                 tracked_base_shm.clone(),
                 headroom_skipped.clone(),
+                inflight.clone(),
             )
             .await;
 
@@ -440,6 +453,7 @@ async fn reconcile(
     ram_ledger: Arc<crate::ram_ledger::RamLedger>,
     tracked_base_shm: TrackedBaseShm,
     headroom_skipped: HeadroomSkipped,
+    inflight: InflightPrefetches,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -604,10 +618,18 @@ async fn reconcile(
                     pin: None,
                 });
         }
+        // Spawn guard: one prefetch task per digest at a time. The
+        // reconcile tick fires every 30 s (and on every ack), while a
+        // large image's prefetch runs for minutes — unguarded, each
+        // tick stacked another full prefetch (see `InflightPrefetches`).
+        if !inflight.lock().insert(image.manifest_digest.clone()) {
+            continue;
+        }
         // Clone the whole ref into the task — it carries everything
         // prefetch_one needs (uri, digest, base-snapshot disk + memory
         // manifests). Two Strings + two Copy refs; cheap per reconcile.
         let image = image.clone();
+        let inflight = inflight.clone();
         let readiness = readiness.clone();
         let chunk_store = chunk_store.clone();
         let chunk_cache = chunk_cache.clone();
@@ -685,6 +707,10 @@ async fn reconcile(
                     );
                 }
             }
+            // Release the spawn guard on BOTH arms — the next tick may
+            // spawn a fresh attempt (Err), or the recheck may flip and
+            // legitimately re-prefetch later (Ok).
+            inflight.lock().remove(&image.manifest_digest);
         });
     }
 
@@ -1631,6 +1657,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1664,6 +1691,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(!readiness.contains(&img.manifest_digest), "now unready");
@@ -1702,6 +1730,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1743,6 +1772,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -1785,6 +1815,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1814,6 +1845,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -1839,6 +1871,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -2024,6 +2057,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -2051,6 +2085,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -2074,6 +2109,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -2118,6 +2154,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -2151,6 +2188,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -2173,6 +2211,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -2218,6 +2257,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -2260,6 +2300,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert_eq!(
@@ -2282,6 +2323,7 @@ mod tests {
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert_eq!(
