@@ -1907,10 +1907,13 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: Install entitlements (verify file is well-formed plist)
         run: plutil -lint crates/engram-sandbox-vz/entitlements.plist
-      - name: Build coord + sandbox-vz tests
-        # cargo build --tests produces the binaries under target/debug/deps/
-        # that vz-codesign signs.
-        run: cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+      - name: Build sandbox-vz test binaries (nextest shape)
+        # MUST be `cargo nextest run --no-run` — the same invocation shape the
+        # run steps use, so they reuse these exact binaries and the signatures
+        # below survive. A plain `cargo build -p a -p b --tests` resolves
+        # features differently and nextest would recompile fresh UNSIGNED
+        # binaries after codesign (ADR 0096).
+        run: cargo nextest run -p engram-sandbox-vz --no-run
       - name: Codesign with virtualization entitlement
         run: bash crates/engram-sandbox-vz/scripts/codesign.sh debug
       # `if: always()` from here so one VZ-test step's failure doesn't hide the

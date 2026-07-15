@@ -1020,14 +1020,23 @@ bake repo dir='.':
 # cover every host now.
 # ------------------------------------------------------------------
 
-# Ad-hoc codesign the coordinator + the engram-sandbox-vz test
-# binaries with the com.apple.security.virtualization entitlement.
-# Without this, every VZ API call returns NSError "process doesn't
-# have the com.apple.security.virtualization entitlement" — see the
-# smoke test in crates/engram-sandbox-vz/src/vm.rs.
+# Ad-hoc codesign the engram-sandbox-vz test binaries with the
+# com.apple.security.virtualization entitlement. Without this, every
+# VZ API call returns NSError "process doesn't have the
+# com.apple.security.virtualization entitlement" — see the smoke test
+# in crates/engram-sandbox-vz/src/vm.rs.
+#
+# The build MUST be `cargo nextest run --no-run` — the exact
+# invocation shape `vz-test` runs with. A plain `cargo build -p a -p b
+# --tests` resolves features differently (AGENTS.md: `-p X -p Y`
+# invalidates the cache), so nextest would silently RECOMPILE fresh,
+# unsigned test binaries after we signed the stale ones — the live VZ
+# tests then die on the missing entitlement (ADR 0096).
 #
 # Idempotent: re-running on an already-signed binary is a no-op
-# beyond a few ms of cycle. `dev-vz` and `vz-test` depend on it.
+# beyond a few ms of cycle. `vz-test` and the Tiltfile depend on it
+# (the Tiltfile builds + signs `engram-host-agent` itself, atomically
+# with its own build — not here).
 #
 # We sign with the ad-hoc identity (`-`), which is enough for
 # locally-built dev binaries on Apple Silicon. CI does the same.
@@ -1037,15 +1046,17 @@ vz-codesign:
     @if [ "$(uname -s)" != "Darwin" ]; then \
         echo "vz-codesign is macOS-only; skipping" >&2; exit 0; \
     fi
-    cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+    cargo nextest run -p engram-sandbox-vz --no-run
     bash crates/engram-sandbox-vz/scripts/codesign.sh debug
 
-# Run the engram-sandbox-vz crate's unit tests, including the live
-# VZ smoke test gated behind --ignored. Codesigns first so the
-# entitlement check passes when the test reaches into VZ.
+# Run the engram-sandbox-vz crate's unit tests, then the live VZ
+# tests gated behind #[ignore]. Codesigns first so the entitlement
+# check passes when the test reaches into VZ. (`--run-ignored
+# ignored-only` is nextest's native spelling; the old `-- --ignored`
+# worked only via libtest-compat emulation — CI already uses this.)
 vz-test: vz-codesign
     cargo nextest run -p engram-sandbox-vz
-    cargo nextest run -p engram-sandbox-vz -- --ignored
+    cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only
 
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
