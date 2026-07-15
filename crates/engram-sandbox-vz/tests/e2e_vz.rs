@@ -27,7 +27,7 @@
 //!   - `ENGRAM_VZ_ROOTFS` — a bootable arm64 ext4 whose init is the ADR 0080
 //!     stage-1 shim (`make-test-rootfs.sh`, or any materialized session
 //!     image); agentd itself must NOT be baked in,
-//!   - `ENGRAM_VZ_BUNDLE_DIR` — a staged bundle dir (`<sha>.erofs` files +
+//!   - `ENGRAM_VZ_BUNDLE_DIR` — a staged bundle dir (`<sha>.squashfs` files +
 //!     `current.json` carrying at least the `agentd` and `guest-tools`
 //!     keys; `just vz-test-bundles` produces the minimal set),
 //!   - `ENGRAM_VZ_REQUIRE=1` (optional) — turn every preflight SKIP into a
@@ -37,7 +37,7 @@
 //! Missing kernel/rootfs/bundles otherwise skip cleanly (prints `SKIP:` and
 //! returns), mirroring `fc_preflight`.
 //!
-//! The skill/browser variants additionally need `ENGRAM_VZ_SKILL_EROFS`
+//! The skill/browser variants additionally need `ENGRAM_VZ_SKILL_SQUASHFS`
 //! (a Docker-built bundle staged into the SAME dir as
 //! `ENGRAM_VZ_BUNDLE_DIR`) and a glibc rootfs for the browser stack — they
 //! stay soft-skips even under `ENGRAM_VZ_REQUIRE`.
@@ -171,31 +171,32 @@ fn spec(rootfs: &Path) -> SandboxSpec {
     }
 }
 
-/// ADR 0061: resolve a staged skill erofs (`ENGRAM_VZ_SKILL_EROFS`,
-/// pointing at a `<bundle_dir>/<sha>.erofs` produced by `just bundles-vz`)
-/// into its sha. Always a soft skip when unset/missing — the skill/browser
-/// bundles are Docker-built, which the CI runner can't produce.
-fn skill_erofs_preflight(env: &VzEnv) -> Option<String> {
-    let path = match std::env::var("ENGRAM_VZ_SKILL_EROFS") {
+/// ADR 0061/0096: resolve a staged skill bundle (`ENGRAM_VZ_SKILL_SQUASHFS`,
+/// pointing at a `<bundle_dir>/<sha>.squashfs` produced by
+/// `just bundles-squashfs`) into its sha. Always a soft skip when
+/// unset/missing — the skill/browser bundles are Docker-built, which the
+/// CI runner can't produce.
+fn skill_bundle_preflight(env: &VzEnv) -> Option<String> {
+    let path = match std::env::var("ENGRAM_VZ_SKILL_SQUASHFS") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
             eprintln!(
-                "SKIP: ENGRAM_VZ_SKILL_EROFS unset (run `just bundles-vz`, then point \
-                 it at a <sha>.erofs staged in ENGRAM_VZ_BUNDLE_DIR)"
+                "SKIP: ENGRAM_VZ_SKILL_SQUASHFS unset (run `just bundles-squashfs`, then \
+                 point it at a <sha>.squashfs staged in ENGRAM_VZ_BUNDLE_DIR)"
             );
             return None;
         }
     };
     if !path.exists() {
         eprintln!(
-            "SKIP: ENGRAM_VZ_SKILL_EROFS={} doesn't exist",
+            "SKIP: ENGRAM_VZ_SKILL_SQUASHFS={} doesn't exist",
             path.display()
         );
         return None;
     }
     if path.parent() != Some(env.bundle_dir.as_path()) {
         eprintln!(
-            "SKIP: ENGRAM_VZ_SKILL_EROFS={} is not staged inside ENGRAM_VZ_BUNDLE_DIR={} \
+            "SKIP: ENGRAM_VZ_SKILL_SQUASHFS={} is not staged inside ENGRAM_VZ_BUNDLE_DIR={} \
              (the backend resolves every drive against ONE bundle dir)",
             path.display(),
             env.bundle_dir.display(),
@@ -204,7 +205,7 @@ fn skill_erofs_preflight(env: &VzEnv) -> Option<String> {
     }
     Some(
         path.file_stem()
-            .expect("erofs has a file stem")
+            .expect("squashfs has a file stem")
             .to_string_lossy()
             .into_owned(),
     )
@@ -216,7 +217,7 @@ fn spec_with_skill(rootfs: &Path, sha: &str) -> SandboxSpec {
         .push(engram_core::types::sandbox::AuxRoDrive {
             drive_id: "dyn_0".into(),
             guest_mount: PathBuf::from("/opt/engram/dyn/0"),
-            fs_type: "erofs".into(),
+            fs_type: "squashfs".into(),
             sha256: Some(sha.to_string()),
         });
     s
@@ -312,13 +313,13 @@ async fn e2e_vz_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "live VZ boot + a Docker-built skill bundle (ENGRAM_VZ_SKILL_EROFS)"]
-async fn e2e_vz_skill_erofs_attaches() {
+#[ignore = "live VZ boot + a Docker-built skill bundle (ENGRAM_VZ_SKILL_SQUASHFS)"]
+async fn e2e_vz_skill_bundle_attaches() {
     let env = match vz_preflight() {
         Some(e) => e,
         None => return,
     };
-    let sha = match skill_erofs_preflight(&env) {
+    let sha = match skill_bundle_preflight(&env) {
         Some(x) => x,
         None => return,
     };
@@ -334,18 +335,18 @@ async fn e2e_vz_skill_erofs_attaches() {
     // Attach order is slot-ascending (ADR 0062), so the skill (slot 0)
     // is the FIRST aux drive: /dev/vdb (after the /dev/vda rootfs).
     // RO-mount it and read the bundle's mount.json to prove the attach +
-    // the kernel's erofs driver work end to end (a second RO mount of an
-    // already-init-shim-mounted device shares the superblock — fine).
+    // the kernel's squashfs driver work end to end (a second RO mount of
+    // an already-init-shim-mounted device shares the superblock — fine).
     let (out, code) = exec(
         &backend,
         id,
-        "mkdir -p /mnt/e && mount -t erofs -o ro /dev/vdb /mnt/e && cat /mnt/e/mount.json",
+        "mkdir -p /mnt/e && mount -t squashfs -o ro /dev/vdb /mnt/e && cat /mnt/e/mount.json",
     )
     .await;
-    assert_eq!(code, Some(0), "mount erofs /dev/vdb failed; out={out}");
+    assert_eq!(code, Some(0), "mount squashfs /dev/vdb failed; out={out}");
     assert!(
         out.contains('{'),
-        "mount.json not readable from erofs; out={out}"
+        "mount.json not readable from squashfs; out={out}"
     );
 
     backend.destroy(id).await.expect("destroy");
@@ -664,16 +665,16 @@ async fn relay_connect(
 }
 
 /// ADR 0065 (P4.2): VZ parity for the in-guest browser. Boots a VZ guest with
-/// the **`browser`** erofs bundle attached (`Xvfb` + `openbox` + `chromium` +
+/// the **`browser`** bundle attached (`Xvfb` + `openbox` + `chromium` +
 /// `x11vnc` + the `engram-browser` launcher), then calls
 /// [`SandboxBackend::start_browser`] and asserts the bound VNC port — the same
 /// lazy-spawn path the host's `proxy_vnc` drives before dialing the guest's
-/// raw-TCP `:5900`. This mirrors [`e2e_vz_skill_erofs_attaches`] (the ADR 0061
-/// erofs harness) but with the browser bundle and the `start_browser` lazy
+/// raw-TCP `:5900`. This mirrors [`e2e_vz_skill_bundle_attaches`] (the ADR 0061
+/// bundle harness) but with the browser bundle and the `start_browser` lazy
 /// spawn instead of a manual mount-and-read.
 ///
-/// Point `ENGRAM_VZ_SKILL_EROFS` at the **browser** bundle's
-/// `<bundle_dir>/<sha>.erofs` (built by `just bundles-vz`). NB: the browser
+/// Point `ENGRAM_VZ_SKILL_SQUASHFS` at the **browser** bundle's
+/// `<bundle_dir>/<sha>.squashfs` (built by `just bundles-squashfs`). NB: the browser
 /// bundle's binaries are Docker-built against glibc — this test needs a
 /// glibc rootfs (a materialized session image), not the Alpine test rootfs
 /// `just vz-e2e` stages.
@@ -693,7 +694,7 @@ async fn e2e_vz_browser_bundle_mounts_and_starts() {
         Some(e) => e,
         None => return,
     };
-    let sha = match skill_erofs_preflight(&env) {
+    let sha = match skill_bundle_preflight(&env) {
         Some(x) => x,
         None => return,
     };

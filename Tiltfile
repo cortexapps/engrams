@@ -266,7 +266,7 @@ dc_resource('jaeger',
 # runtime resource.)
 #
 # ADR 0062: the image bakes NO harness — the built-in `claude` rides the
-# fleet `current_bundles` stamp (`just bundles-squashfs` / `bundles-vz`) and
+# fleet `current_bundles` stamp (`just bundles-squashfs`, both backends) and
 # is selected per session. `just bake-demo` just bakes deploy/demo/.
 # ----------------------------------------------------------------
 
@@ -496,7 +496,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
         # ADR 0061/0055: where the host-agent reads the bundle generation
-        # stamp (current.json) + staged <sha>.{erofs,squashfs} files. The
+        # stamp (current.json) + staged <sha>.squashfs files. The
         # `bundles` resource below stages them here before this resource
         # starts (resource_deps). Without this, bundle_dir_from_env() falls
         # back to the Linux fleet path /var/lib/engram/shared (absent on
@@ -768,13 +768,16 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
 # a current.json stamp) under var/shared BEFORE the host-agent boots, so
 # it reports `current_bundles` and the coordinator can resolve enabled
 # skills (else `POST /sessions` 400s with "skill `skills` is unknown").
-# The fs format follows the backend: VZ's Kata kernel mounts erofs, FC
-# mounts squashfs. Re-running this (a skill edit under deploy/bundles)
+# One fs format for both backends since ADR 0096: squashfs (the owned VZ
+# kernel has CONFIG_SQUASHFS=y; the erofs fork is retired).
+# Re-running this (a skill edit under deploy/bundles)
 # rewrites current.json, which restarts the host-agent (its `deps` below)
 # so it re-reads the stamp — new sessions pick the edit up.
 _bundle_dir = os.path.abspath('var/shared')
 if dev_split:
-    _bundles_recipe = 'bundles-vz' if sandbox_backend == 'vz' else 'bundles-squashfs'
+    # ADR 0096: both backends stage squashfs — the owned VZ kernel has
+    # CONFIG_SQUASHFS=y, so the erofs fork (bundles-vz) is retired.
+    _bundles_recipe = 'bundles-squashfs'
     _bundles_cmd = 'just ' + _bundles_recipe
     # On the fc-colima path this resource auto-retriggered forever. The build
     # is content-deterministic and never modifies deploy/bundles (verified:

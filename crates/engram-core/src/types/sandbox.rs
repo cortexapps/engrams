@@ -133,7 +133,7 @@ pub struct AuxRoDrive {
     /// (`/opt/engram/dyn/<i>`); the mounted bundle's `mount.json` declares
     /// what to wire, so the path itself is generic (ADR 0055 §1/§7).
     pub guest_mount: PathBuf,
-    /// Filesystem type for the guest mount (`"squashfs"` | `"erofs"`).
+    /// Filesystem type for the guest mount (`"squashfs"` on both backends).
     pub fs_type: String,
     /// ADR 0035: content identity of the attached generation. `None` on the
     /// symbolic coord→host request ("attach whatever this host currently

@@ -61,10 +61,10 @@ pub struct VzConfig {
     /// zero or unset.
     pub default_vcpus: u32,
     /// ADR 0061: directory holding content-addressed skill bundles
-    /// (`<sha>.erofs`) + the `current.json` stamp — the VZ mirror of the
+    /// (`<sha>.squashfs`) + the `current.json` stamp — the VZ mirror of the
     /// FC host's `/var/lib/engram/shared`. Set from
     /// `bundles::bundle_dir_from_env()` by the host-agent. Drives whose
-    /// `sha256` is `Some` attach `bundle_dir/<sha>.erofs`.
+    /// `sha256` is `Some` attach `bundle_dir/<sha>.squashfs`.
     pub bundle_dir: PathBuf,
 }
 
@@ -260,7 +260,7 @@ impl VzBackend {
             let sha = stamp.get(AuxRoDrive::AGENTD_STAMP_KEY).ok_or_else(|| {
                 SandboxError::InvalidSpec(format!(
                     "bundle stamp {} carries no `{}` entry — restage bundles \
-                     (`just bundles-vz`)",
+                     (`just bundles-squashfs`)",
                     stamp_path.display(),
                     AuxRoDrive::AGENTD_STAMP_KEY,
                 ))
@@ -290,7 +290,7 @@ impl VzBackend {
                     stamp = %stamp_path.display(),
                     "bundle stamp carries no `{}` entry — the SHELL tab only \
                      works if the image bakes ttyd; restage bundles \
-                     (`just bundles-vz`)",
+                     (`just bundles-squashfs`)",
                     AuxRoDrive::GUEST_TOOLS_STAMP_KEY,
                 ),
             }
@@ -539,16 +539,13 @@ fn warn_vz_ignores_allow_hosts_once(network: &engram_core::types::NetworkPolicy)
 #[async_trait]
 impl SandboxBackend for VzBackend {
     fn bundle_dir(&self) -> &std::path::Path {
-        // Same dir VZ stages + attaches `<sha>.erofs` from, so the heartbeat
-        // reports exactly what restore will attach (ADR 0062).
+        // Same dir VZ stages + attaches `<sha>.squashfs` from, so the
+        // heartbeat reports exactly what restore will attach (ADR 0062).
+        // The `bundle_file_ext` erofs override is GONE (ADR 0096): VZ
+        // boots the owned ADR 0025 kernel (CONFIG_SQUASHFS=y), so both
+        // backends stage the shared squashfs default — the ADR 0061
+        // erofs fork existed only because the Kata kernel lacked it.
         &self.cfg.bundle_dir
-    }
-
-    fn bundle_file_ext(&self) -> &'static str {
-        // VZ stages + attaches erofs (see `staged_erofs_path`); the Kata guest
-        // kernel mounts erofs, not squashfs. The BundleStore must materialize/
-        // sweep `<sha>.erofs`, not the FC-default `<sha>.squashfs`.
-        "erofs"
     }
 
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {

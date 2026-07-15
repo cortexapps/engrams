@@ -12,9 +12,9 @@
 //! connection (an HMR WebSocket, a noVNC stream) would starve every
 //! other forwarded connection — head-of-line blocking. `VZVirtioSocketDevice`
 //! muxes any number of concurrent streams per port (like Firecracker's
-//! virtio-vsock), so each forwarded connection is independent. The Kata
-//! guest kernel VZ boots ships `CONFIG_VIRTIO_VSOCKETS=y` built-in, so
-//! the constraint that motivated the console swap no longer applies.
+//! virtio-vsock), so each forwarded connection is independent. The
+//! guest kernel ships `CONFIG_VIRTIO_VSOCKETS=y` built-in, so the
+//! constraint that motivated the console swap no longer applies.
 //!
 //! # Ports & directions
 //!

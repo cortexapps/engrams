@@ -4864,7 +4864,7 @@ pub(crate) struct SnapshotFinisher {
     chunk_store: Option<ChunkStore>,
     chunk_cache: Option<ChunkCache>,
     bundle_dir: PathBuf,
-    /// The backend's staged-bundle extension (squashfs/erofs), so `publish`
+    /// The backend's staged-bundle extension (squashfs on both backends), so `publish`
     /// opens the SAME staged filename the backend attaches. Copied from
     /// `SandboxBackend::bundle_file_ext` at construction (like `bundle_dir`).
     bundle_file_ext: &'static str,
@@ -5773,7 +5773,7 @@ impl SandboxBackend for PooledBackend {
 
     fn bundle_file_ext(&self) -> &'static str {
         // Delegates to the inner backend so the BundleStore materializes/sweeps
-        // the SAME filename the backend attaches (squashfs on FC, erofs on VZ).
+        // the SAME filename the backend attaches (squashfs, ADR 0096).
         self.inner.bundle_file_ext()
     }
 

@@ -41,11 +41,11 @@ pub(crate) struct VmConfig {
     /// Linux kernel command line. Default points root at /dev/vda
     /// (the first virtio-block device) and routes the console to hvc0.
     pub kernel_cmdline: String,
-    /// ADR 0061: skill bundles to attach as read-only erofs virtio-blk
+    /// ADR 0061: skill bundles to attach as read-only squashfs virtio-blk
     /// drives. Only entries with `sha256 = Some` attach (sentinels are
     /// skipped); attach order is `/dev/vdb`, `/dev/vdc`, …
     pub aux_ro_drives: Vec<AuxRoDrive>,
-    /// Directory the erofs payloads live in (`<sha>.erofs`).
+    /// Directory the bundle payloads live in (`<sha>.squashfs`).
     pub bundle_dir: std::path::PathBuf,
     /// ADR 0096 spike: pin the `VZGenericMachineIdentifier` (its
     /// `dataRepresentation` bytes). Apple's machine-state save/restore
@@ -90,8 +90,8 @@ impl VmConfig {
             //     bake injects this at /sbin/engram-init.
             //   - `ip=dhcp` — Linux's IP_PNP path: kernel itself
             //     brings up eth0 and DHCPs for an address against
-            //     VZ's NAT before userspace runs. The Kata kernel
-            //     ships with CONFIG_IP_PNP_DHCP=y so this is free.
+            //     VZ's NAT before userspace runs. The owned engram
+            //     kernel ships CONFIG_IP_PNP_DHCP=y so this is free.
             //     Without it the rootfs would need iproute2 +
             //     dhclient just to get on the network — `node:20-slim`
             //     and the demo bakes carry neither, so the guest
@@ -589,12 +589,13 @@ impl VzVm {
 }
 
 /// ADR 0061: host path of a resolved skill generation for the VZ backend.
-/// Content-keyed `<bundle_dir>/<sha>.erofs` — VZ stages erofs where FC
-/// stages squashfs (the Kata VZ kernel has no CONFIG_SQUASHFS). The sha
-/// comes from the host's `current.json` stamp via the coordinator's
-/// resolved `AuxRoDrive.sha256`, so path and content never disagree.
-pub(crate) fn staged_erofs_path(bundle_dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
-    bundle_dir.join(format!("{sha}.erofs"))
+/// Content-keyed `<bundle_dir>/<sha>.squashfs` — the shared
+/// `AuxRoDrive::staged_file_name` format both backends stage (ADR 0096
+/// retired VZ's erofs fork along with the Kata kernel). The sha comes
+/// from the host's `current.json` stamp via the coordinator's resolved
+/// `AuxRoDrive.sha256`, so path and content never disagree.
+pub(crate) fn staged_bundle_path(bundle_dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
+    bundle_dir.join(AuxRoDrive::staged_file_name(sha))
 }
 
 /// ADR 0062: order aux RO drives by ascending reserved slot for attach.
@@ -630,7 +631,7 @@ pub(crate) fn aux_drives_in_slot_order(drives: &[AuxRoDrive]) -> Vec<&AuxRoDrive
 /// virtio-console (single byte stream per port → head-of-line
 /// blocking when a persistent connection monopolises a port) back to
 /// virtio-vsock, which muxes any number of concurrent streams per
-/// port. The Kata guest kernel VZ boots (`just pull-kernel`) ships
+/// port. The guest kernel VZ boots (`just pull-kernel`) ships
 /// `CONFIG_VIRTIO_VSOCKETS=y` built-in, so the earlier "console is
 /// universally compiled in, vsock isn't" constraint no longer applies.
 /// The `vsock_bridge` attaches per-port listeners + dials after
@@ -709,7 +710,7 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         );
         storage.push(Retained::cast_unchecked(block_dev));
 
-        // ADR 0061/0062: attach each resolved bundle as a read-only erofs
+        // ADR 0061/0062: attach each resolved bundle as a read-only squashfs
         // virtio-blk image. Order by ascending reserved slot (NOT the
         // coordinator's slice order, which pushes the harness last) so the
         // harness (slot 0) is attached first and the guest init shim mounts it
@@ -725,10 +726,10 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
             let Some(sha) = drive.sha256.as_deref() else {
                 continue;
             };
-            let path = staged_erofs_path(&cfg.bundle_dir, sha);
+            let path = staged_bundle_path(&cfg.bundle_dir, sha);
             if !path.exists() {
                 return Err(VzError::AttachmentFailed(format!(
-                    "skill bundle {} not staged at {} — run `just bundles-vz`",
+                    "skill bundle {} not staged at {} — run `just bundles-squashfs`",
                     drive.drive_id,
                     path.display()
                 )));
@@ -736,7 +737,7 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
             tracing::info!(
                 drive_id = %drive.drive_id,
                 path = %path.display(),
-                "vz: attaching aux erofs drive"
+                "vz: attaching aux bundle drive"
             );
             let url = nsurl_for_path(&path);
             let att = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
@@ -935,9 +936,9 @@ mod tests {
     }
 
     #[test]
-    fn staged_erofs_path_is_content_keyed() {
-        let p = super::staged_erofs_path(std::path::Path::new("/var/shared"), "abc123");
-        assert_eq!(p, std::path::PathBuf::from("/var/shared/abc123.erofs"));
+    fn staged_bundle_path_is_content_keyed() {
+        let p = super::staged_bundle_path(std::path::Path::new("/var/shared"), "abc123");
+        assert_eq!(p, std::path::PathBuf::from("/var/shared/abc123.squashfs"));
     }
 
     /// ADR 0062 regression: the coordinator builds `selected_mounts` as

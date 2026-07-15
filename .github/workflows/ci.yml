@@ -1958,10 +1958,10 @@ jobs:
           hv="$(sysctl -n kern.hv_support 2>/dev/null || echo 0)"
           echo "hv=${hv}" >> "$GITHUB_OUTPUT"
           echo "kern.hv_support=${hv}"
-      - name: Install live-e2e staging deps (just, erofs-utils, musl cross cc)
+      - name: Install live-e2e staging deps (just, squashfs-tools, musl cross cc)
         if: always() && steps.hv.outputs.hv == '1'
         run: |
-          brew install just erofs-utils messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+          brew install just squashfs messense/macos-cross-toolchains/aarch64-unknown-linux-musl
           rustup target add aarch64-unknown-linux-musl
       - name: Live VZ e2e (just vz-e2e — boots real VMs)
         if: always() && steps.hv.outputs.hv == '1'
