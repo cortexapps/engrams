@@ -1,6 +1,6 @@
 # ADR 0093: Streaming packer — fuse flatten/pack/chunk via mkext4
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -115,9 +115,29 @@ report as `pack` then `chunk` by fill progress.
 
 ## Close (2026-07-15)
 
-All gates green; flips to Accepted after the first prod re-enable on
-this build (the honest-lifecycle pattern: code-complete ≠
-prod-validated).
+All gates green. **Accepted 2026-07-15**: the first prod re-enable on
+this build (enable job `ce067a91`, dev-brain) ran end to end:
+
+| leg | pre-0093 baseline | prod on 0093 |
+|---|---|---|
+| pull | 2 s | 1.7 s |
+| flatten → declare | 2m56s | 2m41s (GHCR-bound; ~15 s compute) |
+| pack → seal | 1m48s | **1.3 s** |
+| chunk → fill+upload | 2m09s | **1m26s** (full 14.2 GiB, zero dedup — the cutover run) |
+| **materialize** | **6m55s** | **4m10s** |
+| capture boot | 4 s | 3.0 s (NBD against the write-through-seeded NVMe cache) |
+| seed dump | 1m48s | 1m47s |
+| warm hook | 20m34s → **exit 1** | **9m05s → exit 0** |
+| cold-base upload join | (open at failure) | 62 ms — fully hidden |
+| final snapshot | — | 4m18s |
+
+The two-bake-old "unfixable" warm-hook failure did not reproduce: with
+capture co-located and every guest page-in served from the local NVMe
+cache the streaming pack seeded, the in-guest brain stack boots inside
+its own timeout. The hook bug was a starved guest wearing a script
+error's clothes. First successful dev-brain enable since 2026-07-11;
+enable-to-ready 41 min total, of which ~22 min is the post-capture
+chunk prestage fan-out — the next latency lever, out of scope here.
 
 **Measured — local dev-brain** (551,775 entries, 37 layers, 30 GiB
 image, Apple Silicon; mat-profile driver, local blob store):
