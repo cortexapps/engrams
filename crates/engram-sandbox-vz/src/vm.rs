@@ -57,6 +57,14 @@ pub(crate) struct VmConfig {
     /// Produce fresh bytes with [`fresh_machine_identifier`], persist
     /// them beside the saved state, and pass them back at restore.
     pub machine_identifier: Option<Vec<u8>>,
+    /// ADR 0096 spike round 2: pin the virtio-net MAC address
+    /// (`"aa:bb:cc:dd:ee:ff"`). The framework default mints a RANDOM
+    /// `VZMACAddress` per configuration — a restore whose MAC differs
+    /// from the saved VM's fails with the same generic
+    /// VZErrorRestore=12 (documented on Apple's forums; the saved
+    /// state pins the whole effective device config, not just the
+    /// machine identifier). `None` keeps the random default.
+    pub mac_address: Option<String>,
 }
 
 impl VmConfig {
@@ -104,6 +112,7 @@ impl VmConfig {
             aux_ro_drives: Vec::new(),
             bundle_dir: std::path::PathBuf::new(),
             machine_identifier: None,
+            mac_address: None,
         }
     }
 
@@ -112,6 +121,14 @@ impl VmConfig {
     #[allow(dead_code)] // spike-only until machine-state snapshots productize
     pub fn with_machine_identifier(mut self, bytes: Vec<u8>) -> Self {
         self.machine_identifier = Some(bytes);
+        self
+    }
+
+    /// ADR 0096 spike round 2: pin the virtio-net MAC (see the field
+    /// docs).
+    #[allow(dead_code)] // spike-only until machine-state snapshots productize
+    pub fn with_mac_address(mut self, mac: impl Into<String>) -> Self {
+        self.mac_address = Some(mac.into());
         self
     }
 
@@ -782,6 +799,19 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         let nat_super: Retained<objc2_virtualization::VZNetworkDeviceAttachment> =
             Retained::cast_unchecked(nat);
         net_dev.setAttachment(Some(&nat_super));
+        // ADR 0096 spike round 2: pin the MAC when asked — the default
+        // is a fresh random VZMACAddress per configuration, and a
+        // machine-state restore requires the restoring config's MAC to
+        // MATCH the saved VM's (mismatch = generic VZErrorRestore=12).
+        if let Some(mac) = &cfg.mac_address {
+            let mac_ns = NSString::from_str(mac);
+            let mac_addr = objc2_virtualization::VZMACAddress::initWithString(
+                objc2_virtualization::VZMACAddress::alloc(),
+                &mac_ns,
+            )
+            .ok_or_else(|| VzError::ConfigInvalid(format!("mac_address {mac:?} did not parse")))?;
+            net_dev.setMACAddress(&mac_addr);
+        }
         let net_dev_super: Retained<objc2_virtualization::VZNetworkDeviceConfiguration> =
             Retained::cast_unchecked(net_dev);
         let network_array: Retained<NSArray<objc2_virtualization::VZNetworkDeviceConfiguration>> =
@@ -1085,8 +1115,13 @@ mod tests {
         let mid = fresh_machine_identifier();
 
         let mk_cfg = || {
-            let mut c =
-                VmConfig::new(&kernel, &rootfs_copy, 1024, 2).with_machine_identifier(mid.clone());
+            let mut c = VmConfig::new(&kernel, &rootfs_copy, 1024, 2)
+                .with_machine_identifier(mid.clone())
+                // Round 2: the saved state pins the WHOLE effective
+                // device config — a fresh random MAC on the restoring
+                // config is a documented VZErrorRestore=12 cause.
+                // Locally-administered, unicast.
+                .with_mac_address("0a:e2:96:00:00:01");
             // Idle PID 1 — the ADR 0080 init shim would panic without
             // its agentd bundle; the spike only probes VM mechanics.
             c.kernel_cmdline =
@@ -1127,14 +1162,15 @@ mod tests {
                 );
                 eprintln!(
                     "SPIKE RESULT: machine-state save/restore WORKS on this macOS with a \
-                     pinned VZGenericMachineIdentifier — productization unlocked (ADR 0096 D7)"
+                     pinned VZGenericMachineIdentifier + pinned MAC address — \
+                     productization unlocked (ADR 0096 D7)"
                 );
                 vm2.stop().await.ok();
             }
             Err(e) => {
                 panic!(
                     "SPIKE RESULT: restoreMachineStateFromURL still fails on this macOS \
-                     (pinned machine id did not fix it): {e}"
+                     (pinned machine id + MAC did not fix it): {e}"
                 );
             }
         }

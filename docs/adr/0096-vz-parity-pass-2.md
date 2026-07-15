@@ -7,9 +7,15 @@ machine, on the owned kernel). See § Commit chain. Two follow-ups remain
 open: (1) the arm64 kernel release asset must be published by dispatching
 `build-fc-kernel.yml` once (a locally-built binary was deliberately NOT
 uploaded to the shared release); until then `just pull-kernel` 404s on
-machines without a cached kernel. (2) The D7 spike answered NO — Apple's
-machine-state restore is still broken on macOS 26 (see snapshot.rs) — so
-the D7 productization path stays closed.
+machines without a cached kernel. (2) The D7 spike answered **YES** on the
+second round: machine-state save/restore WORKS on macOS 26 once BOTH the
+`VZGenericMachineIdentifier` AND the virtio-net MAC are pinned across the
+boundary (the framework's per-config random MAC was the config-identity
+mismatch behind the historical VZError 12). Same-user/same-host only (the
+save file is keychain-protected; headless runners need an unlocked login
+keychain) — productization (warm restore, memory manifests, honest park
+residency) is its own follow-up ADR; clone+cold-boot remains the shipping
+semantics in this pass.
 
 Builds on ADR 0003 (the VZ backend), ADR 0024 (unified dev orchestration), and
 ADR 0032 (parity pass 1, June 2026). Supersedes ADR 0061's "a custom VZ kernel is
@@ -149,13 +155,20 @@ narrows to a soft-enforcement note. Requires D5 (netfilter config).
 
 ADR 0003 chose clone+cold-boot because Apple's
 `saveMachineStateToURL`/`restoreMachineStateFromURL` failed for arm64 Linux
-guests (VZError 12, macOS-14 era). The plumbing still exists (`VzVm::save`/
-`restore`, dead-code). On macOS 26 we re-validate once, sweeping the two
-never-ruled-out causes: no explicit `VZGenericPlatformConfiguration` with a
-persisted `VZGenericMachineIdentifier`, and per-device save/restore support
-(console/NAT attachments). Either outcome is recorded in `snapshot.rs`'s header
-with the macOS version. If green, productization (memory manifest, warm restore,
-honest park, two-phase-eviction eligibility) is a *future* ADR — not this pass.
+guests (VZError 12, macOS-14 era). Re-validated on macOS 26: **it works** —
+the failure was a config-identity mismatch, not a Linux-guest limitation.
+Two identities must be pinned across the save→restore boundary: an explicit
+`VZGenericPlatformConfiguration` with a persisted `VZGenericMachineIdentifier`,
+AND the virtio-net `VZMACAddress` (the framework default mints a random MAC
+per configuration; the MAC mismatch alone reproduces the generic code-12 —
+credit to the pinned-MAC lead from Apple-forum prior art). Round 1 with only
+the machine identifier pinned still failed; round 2 with both pinned restores
+and resumes to Running. Recorded in `snapshot.rs`'s header with caveats: the
+save file is keychain-protected, so restore is same-user/same-host only
+(headless runners need an unlocked login keychain; cross-host stays cold-boot
+via disk chunks), and the whole effective device config must be reconstructed
+byte-equivalently. Productization (memory manifest, warm restore, honest park,
+two-phase-eviction eligibility) is a *future* ADR — not this pass.
 
 ## Out of scope (permanent divergences, not regressions)
 
@@ -204,9 +217,9 @@ One PR, in landing order:
    state(); parked snapshot neither flushes nor un-parks).
 10. `vz: crash detection via a VZVirtualMachineDelegate shim` — D4
     (dead flag; list() ground truth; probe_sandbox override).
-11. `vz: machine-state save/restore spike` — D7 outcome: STILL broken on
-    macOS 26 with a pinned machine identifier and a validator-approved
-    config; probe stays in-tree.
+11. `vz: machine-state save/restore spike` — D7 round 1: still broken
+    with only the machine identifier pinned (+ a follow-up commit for
+    round 2: pinning the MAC too makes it WORK — see the Accepted note).
 12. `vz: own the guest kernel; retire the erofs bundle fork` — D5
     (Image-engram arm64 boots VZ as-is; bundles-vz deleted; squashfs
     everywhere; build-fc-kernel.yml arch matrix).
