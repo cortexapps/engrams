@@ -29,7 +29,7 @@
 //! capture. No long sleeps — the gate is a `Notify`, not a timeout.
 //!
 //! Gating mirrors `checkpoint_chain.rs` (Linux + KVM + firecracker +
-//! Docker + mke2fs + musl agentd). Run on the dev-vm:
+//! Docker + musl agentd). Run on the dev-vm:
 //!
 //! ```sh
 //! cargo build -p engram-agentd --target x86_64-unknown-linux-musl --release
@@ -116,7 +116,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         eprintln!("SKIP: /dev/kvm not present");
         return;
     }
-    for bin in ["firecracker", "mke2fs", "mksquashfs"] {
+    for bin in ["firecracker", "mksquashfs"] {
         if std::env::var_os("PATH")
             .map(|p| !std::env::split_paths(&p).any(|d| d.join(bin).is_file()))
             .unwrap_or(true)

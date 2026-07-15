@@ -33,7 +33,7 @@ async fn exec_runs_inside_baked_microvm() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mksquashfs") {
         return;
     }
     let Some(busybox) = common::find_busybox() else {

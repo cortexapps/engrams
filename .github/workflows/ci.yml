@@ -309,18 +309,11 @@ jobs:
       - name: Seed GCS test bucket
         run: bash deploy/dev/seed-buckets.sh
 
-      # ADR 0036: put the flake-pinned e2fsprogs (>= 1.47.1) mke2fs ahead of the
-      # runner's apt <= 1.47.0 one, so `ext4_pack_is_deterministic_across_rebuilds`
-      # actually runs (and prod bakes dedup) instead of self-skipping. The
-      # install-Nix + build-mke2fs incantation lives in one composite action that
-      # engrams-internal's bakes also consume; here we use the local copy
-      # (default `.` flake-ref = this checkout).
-      - name: Reproducible mke2fs (e2fsprogs >= 1.47.1, pinned via flake)
-        uses: ./.github/actions/setup-reproducible-mke2fs
-
       # ADR 0055 P2: mksquashfs for the engram-coordinator `skill_pack`
-      # determinism test (it self-skips without the tool, like the ext4 test's
-      # mke2fs gate — install it so the test actually RUNS in this lane).
+      # determinism test (it self-skips without the tool — install it so
+      # the test actually RUNS in this lane). ADR 0093 retired the
+      # mke2fs/e2fsprogs setup that used to sit here: ext4 packing is
+      # pure Rust (mkext4).
       - name: Install squashfs-tools
         run: sudo apt-get install -y -qq --no-install-recommends squashfs-tools
 
@@ -724,19 +717,18 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           sudo chmod 0666 /dev/userfaultfd
 
-      # `mke2fs` (e2fsprogs) is needed by the exec_real_vm +
-      # materialize_boot tests for ext4 packing. `musl-tools` is for the
-      # static agentd build that the same tests bake into the rootfs.
-      # `squashfs-tools` (mksquashfs) is for `just bundles-squashfs`,
-      # which stages the `browser` bundle the e2e_vnc test mounts (ADR
-      # 0064), and for the agentd-bundle staging in
+      # `musl-tools` is for the static agentd build the FC tests bake
+      # into the rootfs. `squashfs-tools` (mksquashfs) is for `just
+      # bundles-squashfs`, which stages the `browser` bundle the e2e_vnc
+      # test mounts (ADR 0064), and for the agentd-bundle staging in
       # agentd_bundle_reexec/materialize_boot. `busybox-static` is the
-      # materialize_boot guest's entire userland (ADR 0080 phase 3b —
-      # the synthetic docker image's one real binary).
-      - name: Install build deps (musl-tools, e2fsprogs, squashfs-tools, busybox-static)
+      # materialize_boot guest's entire userland (ADR 0080 phase 3b).
+      # ADR 0093: ext4 packing is pure Rust — no e2fsprogs. (debugfs for
+      # the nbd_chunked_disk inspection comes with the runner's distro.)
+      - name: Install build deps (musl-tools, squashfs-tools, busybox-static)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools e2fsprogs squashfs-tools busybox-static
+          sudo apt-get install -y -qq musl-tools squashfs-tools busybox-static
 
       # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
       # so the existing FC suite + the stock<->fork compat test exercise the
@@ -1643,11 +1635,11 @@ jobs:
           sudo sysctl -w vm.unprivileged_userfaultfd=1
           sudo chmod 0666 /dev/userfaultfd
 
-      - name: Install build deps (musl-tools, e2fsprogs)
+      - name: Install build deps (musl-tools)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq --no-install-recommends \
-              musl-tools e2fsprogs jq bc python3
+              musl-tools jq bc python3
 
       - name: Install firecracker (v1.16.0)
         run: |

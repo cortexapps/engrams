@@ -49,7 +49,7 @@ async fn share_file_round_trips_over_vsock() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mksquashfs") {
         return;
     }
     let Some(busybox) = common::find_busybox() else {

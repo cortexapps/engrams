@@ -1,7 +1,7 @@
 //! ADR 0080 §C phase 3b end-to-end: `materialize_and_boot` — a tiny
 //! synthetic STANDARD docker image (mock loopback registry, ~1 MB of
 //! layers) goes through the REAL materializer pipeline (pull →
-//! whiteout-aware flatten → stage-1 init inject → mke2fs pack → chunk
+//! streaming declare/seal/fill pack → chunk (ADR 0093)
 //! into a chunk store), the chunked ext4 is reassembled from the store
 //! (the host's materialize-to-file path), and a real FC microVM boots
 //! it — the injected shim mounts the agentd bundle slot, execs agentd
@@ -234,13 +234,13 @@ async fn exec_ok(
 }
 
 #[tokio::test]
-#[ignore = "requires Linux + KVM + firecracker + mke2fs + mksquashfs + static busybox"]
+#[ignore = "requires Linux + KVM + firecracker + mksquashfs + static busybox"]
 async fn materialize_and_boot() {
     let env = match fc_preflight() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mksquashfs") {
         return;
     }
     let Some(busybox) = find_busybox() else {
@@ -328,7 +328,7 @@ async fn materialize_and_boot() {
     reg.add_manifest("boot-1", serde_json::to_vec(&manifest_json).unwrap());
     let uri = format!("127.0.0.1:{}/mat-boot:boot-1", addr.port());
 
-    // ---- 2. Materialize: the REAL pipeline, real mke2fs ----
+    // ---- 2. Materialize: the REAL pipeline (streaming pack) ----
     let store_dir = tempfile::tempdir().expect("store dir");
     let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
         engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),

@@ -10,7 +10,6 @@
 # justfile `dev-fc` path depends on these exact paths):
 #   /usr/local/bin/firecracker        - upstream FC binary, version pinned below
 #   /opt/engram-dev/Image             - the aarch64 guest kernel (ADR 0025 recipe)
-#   /opt/engram-dev/bin/mke2fs        - e2fsprogs packer for enable materialize
 #   /opt/engram-dev/{bin,shared,var}  - working dirs for the host-agent
 #
 # Usage: deploy/dev/fc-colima-provision.sh [profile] [--rebuild-kernel]
@@ -125,7 +124,7 @@ FC_VERSION="$1"
 VM_USER="$2"
 
 # --- apt packages ---
-PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools e2fsprogs"
+PKGS="build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools"
 MISSING=""
 for p in $PKGS; do
     dpkg -s "$p" >/dev/null 2>&1 || MISSING="$MISSING $p"
@@ -138,24 +137,6 @@ if [ -n "$MISSING" ]; then
 else
     echo "==> all apt packages already present"
 fi
-
-# --- mke2fs: enable-time image materialization runs in the VM-side
-# host-agent, so give it a stable contract path independent of sudo's PATH.
-# The binary still comes from the VM's e2fsprogs package; /etc/mke2fs.conf and
-# the rest of the e2fsprogs chain stay package-owned.
-MKE2FS_BIN="$(command -v mke2fs || true)"
-if [ -z "$MKE2FS_BIN" ]; then
-    echo "fc-colima-provision: e2fsprogs installed but mke2fs is not on PATH" >&2
-    exit 1
-fi
-mkdir -p /opt/engram-dev/bin
-ln -sf "$MKE2FS_BIN" /opt/engram-dev/bin/mke2fs
-MKE2FS_VER="$("/opt/engram-dev/bin/mke2fs" -V 2>&1 | sed -n 's/^mke2fs \([0-9][0-9.]*\).*/\1/p' | head -1 || true)"
-if [ -n "$MKE2FS_VER" ] && [ "$(printf '%s\n%s\n' "1.47.1" "$MKE2FS_VER" | sort -V | head -1)" != "1.47.1" ]; then
-    echo "WARNING: mke2fs $MKE2FS_VER is older than 1.47.1; enable still works, but ext4 packs are not byte-stable (ADR 0036)." >&2
-fi
-echo "==> mke2fs: /opt/engram-dev/bin/mke2fs -> $MKE2FS_BIN"
-/opt/engram-dev/bin/mke2fs -V
 
 # --- firecracker binary (upstream aarch64 release, CI's pinned version) ---
 NEED_FC=1
@@ -310,8 +291,7 @@ cat <<EOF
 ==> fc-colima-provision done for profile '$PROFILE'
 
 Provisioned inside the VM:
-  - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools e2fsprogs
-  - /opt/engram-dev/bin/mke2fs (stable contract path for enable-time materialize)
+  - packages: build-essential flex bison bc libssl-dev libelf-dev dwarves curl git file iptables squashfs-tools
   - /usr/local/bin/firecracker ($FC_VERSION)
   - nbd loaded (nbds_max=16), vm.unprivileged_userfaultfd=1, /dev/kvm mode 0666 (persisted)
   - engram-dev-fwd.service (DNAT localhost:{5001,4443,4317} -> 192.168.5.2, no

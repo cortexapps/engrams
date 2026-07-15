@@ -509,40 +509,30 @@ async fn materialize_scrubs_scratch_on_error() {
 // Pull/flatten pipeline (ADR 0088 addendum).
 // ---------------------------------------------------------------
 
-/// Fake packer that records the flattened tree (rel → bytes for
-/// regular files, plus a tombstone check by omission) instead of
-/// running mke2fs — lets pipeline tests assert layer-ordering
-/// semantics without ext4 tooling.
-#[derive(Clone, Default)]
-struct TreeProbePacker {
-    tree: Arc<Mutex<HashMap<String, Vec<u8>>>>,
+/// Reassemble the materialized image from the chunk store (manifest
+/// gaps are zero-fill) and open it with the mkext4 verification
+/// reader — the streaming pack produces no image file, so the store
+/// IS the artifact (ADR 0093). Checksum-verifies before returning.
+async fn image_from_store(
+    chunk_store: &engram_chunk_store::ChunkStore,
+    manifest_ref: engram_chunk_store::ManifestRef,
+) -> Vec<u8> {
+    let manifest = chunk_store.get_manifest(manifest_ref).await.unwrap();
+    let mut image = vec![0u8; manifest.total_bytes as usize];
+    for c in &manifest.chunks {
+        let bytes = chunk_store.get_chunk(c.hash).await.unwrap();
+        image[c.offset as usize..c.offset as usize + bytes.len()].copy_from_slice(&bytes);
+    }
+    let fs = mkext4::reader::Fs::open(&image[..]).unwrap();
+    let issues = fs.verify().unwrap();
+    assert!(issues.is_empty(), "image must verify clean: {issues:?}");
+    image
 }
 
-#[async_trait::async_trait]
-impl engram_rootfs_materializer::Ext4Packer for TreeProbePacker {
-    async fn pack(
-        &self,
-        src_dir: &std::path::Path,
-        dst_image: &std::path::Path,
-        _size_bytes: u64,
-    ) -> Result<(), engram_rootfs_materializer::Ext4Error> {
-        fn walk(root: &std::path::Path, dir: &std::path::Path, out: &mut HashMap<String, Vec<u8>>) {
-            for e in std::fs::read_dir(dir).unwrap() {
-                let p = e.unwrap().path();
-                let m = std::fs::symlink_metadata(&p).unwrap();
-                if m.is_dir() {
-                    walk(root, &p, out);
-                } else if m.is_file() {
-                    let rel = p.strip_prefix(root).unwrap().to_string_lossy().into_owned();
-                    out.insert(rel, std::fs::read(&p).unwrap());
-                }
-            }
-        }
-        let mut tree = HashMap::new();
-        walk(src_dir, src_dir, &mut tree);
-        *self.tree.lock() = tree;
-        std::fs::write(dst_image, b"probe-ext4").map_err(engram_rootfs_materializer::Ext4Error::Io)
-    }
+fn read_path(image: &[u8], path: &str) -> Option<Vec<u8>> {
+    let fs = mkext4::reader::Fs::open(image).unwrap();
+    let ino = fs.resolve(path).ok()?;
+    fs.read_file(ino).ok()
 }
 
 /// Publish an arm64-only image whose layers are the given raw tars
@@ -587,18 +577,6 @@ async fn publish_gzip_layers(layer_tars: Vec<Vec<u8>>) -> Fixture {
     }
 }
 
-fn probe_materializer(probe: &TreeProbePacker) -> Materializer {
-    Materializer::with_packer(
-        oci_client(),
-        InitInjection {
-            vsock_port: 1024,
-            transport: Transport::Vsock,
-            init_script: None,
-        },
-        Arc::new(probe.clone()),
-    )
-}
-
 /// Three layers whose semantics only hold under IN-ORDER apply
 /// (layer 2 whiteouts layer 1's file; layer 3 overwrites layer 2's):
 /// the buffered download pipeline must deliver in manifest order even
@@ -628,9 +606,7 @@ async fn pipelined_layers_apply_in_order() {
         engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
     ));
     let scratch = tempfile::tempdir().unwrap();
-    let probe = TreeProbePacker::default();
-
-    probe_materializer(&probe)
+    let out = materializer()
         .materialize(
             &fx.uri,
             Platform::LinuxArm64,
@@ -641,14 +617,14 @@ async fn pipelined_layers_apply_in_order() {
         .await
         .expect("pipelined materialize");
 
-    let tree = probe.tree.lock().clone();
+    let image = image_from_store(&chunk_store, out.disk_manifest).await;
     assert!(
-        !tree.contains_key("a"),
+        read_path(&image, "/a").is_none(),
         "layer-2 whiteout must remove layer-1's file"
     );
-    assert_eq!(tree.get("keep").map(Vec::as_slice), Some(&b"k"[..]));
+    assert_eq!(read_path(&image, "/keep").as_deref(), Some(&b"k"[..]));
     assert_eq!(
-        tree.get("b").map(Vec::as_slice),
+        read_path(&image, "/b").as_deref(),
         Some(&b"v3-longer"[..]),
         "layer 3 must overwrite layer 2 (in-order apply)"
     );
@@ -693,9 +669,8 @@ async fn mid_pull_failure_fails_and_scrubs() {
         engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
     ));
     let scratch = tempfile::tempdir().unwrap();
-    let probe = TreeProbePacker::default();
 
-    let err = probe_materializer(&probe)
+    let err = materializer()
         .materialize(
             &fx.uri,
             Platform::LinuxArm64,
@@ -730,9 +705,8 @@ async fn single_layer_small_image_fast_path() {
         engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
     ));
     let scratch = tempfile::tempdir().unwrap();
-    let probe = TreeProbePacker::default();
 
-    let out = probe_materializer(&probe)
+    let out = materializer()
         .materialize(
             &fx.uri,
             Platform::LinuxArm64,
@@ -742,10 +716,10 @@ async fn single_layer_small_image_fast_path() {
         )
         .await
         .expect("single-layer materialize");
-    assert_eq!(
-        probe.tree.lock().get("hello").map(Vec::as_slice),
-        Some(&b"world"[..])
-    );
+    let image = image_from_store(&chunk_store, out.disk_manifest).await;
+    assert_eq!(read_path(&image, "/hello").as_deref(), Some(&b"world"[..]));
+    // The init shim rides in every image (declared, not tree-written).
+    assert!(read_path(&image, "/sbin/engram-init").is_some());
     assert!(out.manifest_digest.starts_with("sha256:"));
     assert!(
         std::fs::read_dir(scratch.path()).unwrap().next().is_none(),

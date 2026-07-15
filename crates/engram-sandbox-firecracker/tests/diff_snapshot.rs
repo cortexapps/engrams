@@ -24,7 +24,7 @@
 //! 0028's "Status / phase chain" P1 numbers.
 //!
 //! Same gating as `exec_real_vm.rs` (Linux + KVM + firecracker + Docker
-//! + mke2fs + musl agentd). Run via:
+//! + musl agentd). Run via:
 //!
 //! ```sh
 //! bash crates/engram-sandbox-firecracker/scripts/run-boot-test.sh diff_snapshot
@@ -62,7 +62,7 @@ async fn diff_snapshot_chain_rebases_and_restores_faithfully() {
         Some(e) => e,
         None => return,
     };
-    if !require_bin("mke2fs") || !require_bin("mksquashfs") {
+    if !require_bin("mksquashfs") {
         return;
     }
     let Some(busybox) = common::find_busybox() else {

@@ -298,7 +298,7 @@ pub trait HostClient: Send + Sync {
 
     /// ADR 0080 §C: materialize a STANDARD docker/OCI image into a
     /// chunked bootable ext4 on this host — pull, whiteout-aware
-    /// flatten, stage-1 init injection, deterministic mke2fs pack,
+    /// declare, stage-1 init injection, deterministic streaming pack,
     /// chunk into the host's chunk store (which writes through to
     /// BlobStorage, so the returned manifest is durable and readable
     /// coordinator-side). The enable scanner calls this on a picked
