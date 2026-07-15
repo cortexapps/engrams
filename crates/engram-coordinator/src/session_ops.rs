@@ -646,27 +646,35 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
                 .await
         }
     };
-    // ADR 0079 latency fix: a `for_delivery` resume the DELIVER verb
-    // enqueued (on an Idle session) leaves the deliver op requeued with a
-    // failure backoff — but the resume SUCCEEDING is not a failure, and
-    // the backed-off deliver would otherwise wait out the 5 s poll after
-    // the session is already Active (prod: prompt-after-idle ~10 s →
-    // ~21 s). Wake the sibling deliver so the loop's next claim forwards
-    // the prompt in <100 ms.
+    // ADR 0079 + ADR 0094: the initial-prompt DELIVER op is deferred
+    // while the session is still booting ("session is pending — not
+    // deliverable") and requeued on a growing backoff. Nothing else makes
+    // it ready when the boot completes, so the prompt would wait out the
+    // accumulated backoff (fresh create: ~36 s — the dominant TTFM cost,
+    // measured on the dev VM; claude answers in ~2 s once it has the
+    // prompt). The op that drives the row to Active wakes the sibling
+    // DELIVER on success, so the loop's next claim forwards the prompt in
+    // <100 ms. Two boot ops enqueue a sibling deliver:
+    //   - `Resume{flavor=for_delivery}` — prompt-after-idle (ADR 0079).
+    //   - `CreateBoot` — the fresh-create boot (ADR 0094; the original
+    //     "40 s = guest stampede" reading was wrong — it was this backoff).
     //
-    // Gated on Done-or-session-terminal (re-review): a resume that fails
-    // terminally while the session stays RESUMABLE (a deterministic
+    // Gated on Done-or-session-terminal (re-review): a boot/resume that
+    // fails terminally while the session stays RESUMABLE (a deterministic
     // non-`gone:` failure, e.g. a corrupt disk-only manifest) must NOT
-    // wake the deliver — the woken deliver would instantly enqueue a
-    // fresh resume, whose failure wakes it again, resetting the deliver's
+    // wake the deliver — the woken deliver would instantly enqueue a fresh
+    // boot/resume, whose failure wakes it again, resetting the deliver's
     // growing backoff every cycle into an unpaced failure loop. The
-    // session-terminal arm keeps the `gone:` path fast (session flipped
-    // Dead → the woken deliver drops its rows and completes). Never fired
-    // while the resume merely retries — the deliver stays backed off.
-    if terminal
-        && op.kind == OpKind::Resume
-        && op.payload.get("flavor").and_then(|f| f.as_str()) == Some("for_delivery")
-    {
+    // session-terminal arm keeps the `gone:`/failed path fast (session
+    // flipped terminal → the woken deliver drops its rows and completes).
+    // Never fired while the boot merely retries — the deliver stays
+    // backed off.
+    let wakes_sibling_deliver = match op.kind {
+        OpKind::CreateBoot => true,
+        OpKind::Resume => op.payload.get("flavor").and_then(|f| f.as_str()) == Some("for_delivery"),
+        _ => false,
+    };
+    if terminal && wakes_sibling_deliver {
         let wake = if finished_done {
             true
         } else {
@@ -680,7 +688,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
                 .op_wake_queued_kind(op.session_id, OpKind::Deliver)
                 .await
             {
-                tracing::debug!(session_id = %op.session_id, error = %e, "deliver wake after for_delivery resume failed (5s poll backstops)");
+                tracing::debug!(session_id = %op.session_id, kind = op.kind.as_str(), error = %e, "sibling deliver wake after boot failed (5s poll backstops)");
             }
         }
     }
