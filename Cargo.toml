@@ -178,6 +178,11 @@ tracing-opentelemetry = "0.29"
 # cli
 clap = { version = "4", features = ["derive", "env"] }
 
+# ADR 0095: hardware CRC32C (Castagnoli, SSE4.2/ARMv8) on peer-chunk
+# transport frames — the landing-path integrity check that replaces
+# sha256 there.
+crc32c = "0.6"
+
 # misc
 tar = "0.4"
 # ADR 0088 addendum: the zlib-rs backend is pure Rust with zlib-ng-class

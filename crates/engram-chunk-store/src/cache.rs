@@ -98,20 +98,56 @@ pub const DEFAULT_SWEEP_DEBOUNCE_MS: i64 = 5_000;
 /// policy" claim, so both fill sources must agree on the exact metric
 /// name — a typo in either literal would silently fork the series.
 ///
-/// - `source="gcs"`: incremented here, in [`ChunkCache::get`]'s
-///   leader-persist arm, only when `write_local` actually landed the
-///   fetched bytes on disk (a `write_local` failure means the fetch
-///   happened but the cache did NOT fill — see the `write_local`
+/// - `source="gcs"` / `source="peer"`: incremented in
+///   [`ChunkCache::get_with_source`]'s leader-persist arm with the label
+///   the fetch closure reported (ADR 0095: the closure seam is the one
+///   place that knows the backend), only when `write_local` actually
+///   landed the fetched bytes on disk (a `write_local` failure means the
+///   fetch happened but the cache did NOT fill — see the `write_local`
 ///   error-handling comment just above the increment site).
-/// - `source="peer"`: incremented by `engram-host-agent::pooled_backend`
-///   at the two loops that land migration-sourced chunks into this same
-///   cache via [`ChunkCache::put_no_evict`] (the prestage loop and the
-///   `pull_chunks_from_source` divergence pull).
+/// - `source="peer"` is ALSO incremented by
+///   `engram-host-agent::pooled_backend` at the loops that land
+///   migration-sourced chunks via [`ChunkCache::put_no_evict`], and by
+///   `engram-host-agent::peer_fill` at the bulk
+///   [`ChunkCache::put_unverified_no_evict`] landings (ADR 0095).
 pub const CHUNK_FILL_TOTAL: &str = "engram_chunk_fill_total";
 
 /// Byte-counted companion to [`CHUNK_FILL_TOTAL`]. Same `source` label,
-/// same two call sites (one here, one in `engram-host-agent`).
+/// same call sites.
 pub const CHUNK_FILL_BYTES_TOTAL: &str = "engram_chunk_fill_bytes_total";
+
+/// Where a populate's bytes came from — the `source` label on
+/// [`CHUNK_FILL_TOTAL`] / [`CHUNK_FILL_BYTES_TOTAL`] and the `tier` on
+/// the fetch histogram (ADR 0095).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FillSource {
+    /// The cold tier. `BlobStorage` is GCS in every deployed
+    /// configuration; a non-GCS impl would still be the correct label
+    /// for "the cold tier", not a peer.
+    BlobStorage,
+    /// A fleet sibling's NVMe over `PeerChunkGet` (ADR 0095).
+    Peer,
+}
+
+impl FillSource {
+    /// The `source` label value on the fill counters.
+    pub fn label(self) -> &'static str {
+        match self {
+            FillSource::BlobStorage => "gcs",
+            FillSource::Peer => "peer",
+        }
+    }
+
+    /// The `tier` label value on `engram_chunk_fetch_seconds` /
+    /// `engram_chunk_cache_{hits,bytes}_total` (the third tier next to
+    /// `nvme`).
+    pub fn fetch_tier(self) -> &'static str {
+        match self {
+            FillSource::BlobStorage => "blobstorage",
+            FillSource::Peer => "peer",
+        }
+    }
+}
 
 /// Configuration for the on-disk cache.
 ///
@@ -560,6 +596,12 @@ struct CacheInner {
     /// never aims to fill space a co-tenant needs. 0 (the default) ⇒
     /// today's behavior.
     co_tenant_reserved: std::sync::atomic::AtomicU64,
+    /// ADR 0095: live feed from [`ChunkCache::put_unverified_no_evict`]
+    /// to the background scrubber. `None` until
+    /// [`ChunkCache::spawn_scrubber`] runs (a cache without a scrubber
+    /// still lands unverified chunks correctly — the markers are
+    /// durable and a later scrubber's boot scan picks them up).
+    scrub_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<ChunkHash>>>,
 }
 
 impl ChunkCache {
@@ -574,6 +616,7 @@ impl ChunkCache {
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
+                scrub_tx: Mutex::new(None),
             }),
         }
     }
@@ -596,6 +639,7 @@ impl ChunkCache {
                 evicted_ring: Mutex::new(EvictedRing::with_capacity(EVICTED_RING_CAP)),
                 last_sweep_ms: std::sync::atomic::AtomicI64::new(0),
                 co_tenant_reserved: std::sync::atomic::AtomicU64::new(0),
+                scrub_tx: Mutex::new(None),
             }),
         }
     }
@@ -698,6 +742,29 @@ impl ChunkCache {
     where
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<Bytes>>,
+    {
+        // Plain closures are the cold tier by definition — the
+        // source-aware sibling below is for tiered (peer-capable)
+        // fetchers (ADR 0095).
+        self.get_with_source(hash, || async move {
+            fetch().await.map(|b| (b, FillSource::BlobStorage))
+        })
+        .await
+    }
+
+    /// [`Self::get`] with a source-aware fetcher: the closure reports
+    /// where the bytes actually came from, so the
+    /// [`CHUNK_FILL_TOTAL`]/[`CHUNK_FILL_BYTES_TOTAL`] `source` label
+    /// and the fetch histogram's `tier` stay honest when a call site
+    /// composes a peer tier ahead of BlobStorage (ADR 0095). Populate
+    /// semantics are identical — singleflight, sha256
+    /// verify-on-populate (a fault-time peer chunk IS verified; only
+    /// the bulk `put_unverified_no_evict` path defers hashing to the
+    /// scrubber), atomic write-through.
+    pub async fn get_with_source<F, Fut>(&self, hash: ChunkHash, fetch: F) -> Result<Bytes>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(Bytes, FillSource)>>,
     {
         // Fast path: local hit. The cache is content-addressed and every
         // populate path verifies `bytes == hash` before the atomic write
@@ -816,9 +883,14 @@ impl ChunkCache {
                 // blob page-in" without per-read trace spam.
                 let fetch_start = std::time::Instant::now();
                 let fetched = fetch().await;
+                let source = fetched
+                    .as_ref()
+                    .map(|(_, s)| *s)
+                    .unwrap_or(FillSource::BlobStorage);
+                let fetched = fetched.map(|(b, _)| b);
                 metrics::histogram!(
                     "engram_chunk_fetch_seconds",
-                    "tier" => "blobstorage",
+                    "tier" => source.fetch_tier(),
                 )
                 .record(fetch_start.elapsed().as_secs_f64());
                 // Verify-on-populate. This is the ONE place a chunk is hashed:
@@ -882,32 +954,30 @@ impl ChunkCache {
                     // even when write_local below fails.
                     metrics::counter!(
                         "engram_chunk_cache_bytes_total",
-                        "tier" => "blobstorage",
+                        "tier" => source.fetch_tier(),
                     )
                     .increment(bytes.len() as u64);
                     // ADR 0019 / telemetry restoration (#526), review finding
                     // 4: the baseline meter for epic-gcs-free-resume's
-                    // "GCS-free by policy" claim — every chunk that fills the
-                    // local cache from BlobStorage (as opposed to a
-                    // peer-fill, recorded at the host-agent's MigrationFetch
-                    // destination pull loops) counts here. `source="gcs"`
-                    // names the fetch backend this closure resolves to in
-                    // practice (BlobStorage is GCS in every deployed
-                    // configuration); a non-GCS BlobStorage impl would still
-                    // be the correct label for "the cold tier", not a peer.
-                    // Gated on `write_local_ok`: a fetch whose local persist
-                    // failed did NOT fill the cache — counting it here would
-                    // mask exactly the "warming ran but reads still miss"
-                    // state the write_local warning above exists to catch.
+                    // "GCS-free by policy" claim. ADR 0095 moved the label to
+                    // the closure seam: the fetcher reports its actual source
+                    // (`gcs` = the cold BlobStorage tier in every deployed
+                    // configuration; `peer` = a fleet sibling's NVMe), so a
+                    // tiered fetcher can't launder a peer fill as GCS or vice
+                    // versa. Gated on `write_local_ok`: a fetch whose local
+                    // persist failed did NOT fill the cache — counting it
+                    // here would mask exactly the "warming ran but reads
+                    // still miss" state the write_local warning above exists
+                    // to catch.
                     if write_local_ok {
                         metrics::counter!(
                             CHUNK_FILL_TOTAL,
-                            "source" => "gcs",
+                            "source" => source.label(),
                         )
                         .increment(1);
                         metrics::counter!(
                             CHUNK_FILL_BYTES_TOTAL,
-                            "source" => "gcs",
+                            "source" => source.label(),
                         )
                         .increment(bytes.len() as u64);
                     }
@@ -924,15 +994,16 @@ impl ChunkCache {
                 for waiter in waiters {
                     let _ = waiter.send(clone_result(&result));
                 }
-                // ADR 0014 M1.15: count the leader's fetch as a
-                // blobstorage hit (we went to the underlying store).
+                // ADR 0014 M1.15: count the leader's fetch as a remote-tier
+                // hit (we went past local NVMe — `blobstorage`, or `peer`
+                // when a tiered fetcher resolved there, ADR 0095).
                 // Singleflight FOLLOWERS are not counted here at all — the
                 // rx-await arm increments no metric; a follower surfaces as
                 // an nvme hit only on its own later `get` call that finds
                 // the now-cached chunk.
                 metrics::counter!(
                     "engram_chunk_cache_hits_total",
-                    "tier" => "blobstorage",
+                    "tier" => source.fetch_tier(),
                 )
                 .increment(1);
                 return result;
@@ -1134,6 +1205,208 @@ impl ChunkCache {
     /// [`Self::put_no_evict`].
     pub async fn sweep(&self) -> Result<()> {
         self.evict_to_budget().await
+    }
+
+    /// ADR 0095: land peer-pulled bytes WITHOUT the sha256
+    /// verify-on-populate — the bulk peer-fill landing path, where
+    /// hashing at line rate would cost cores the co-tenant guests need
+    /// (no SHA-NI on this fleet). Integrity contract: the transport
+    /// already CRC32C-checked every frame; this call marks the chunk
+    /// **unverified-origin** (a `.unverified` sidecar, written BEFORE
+    /// the chunk becomes visible) and enqueues it for the background
+    /// scrubber ([`Self::spawn_scrubber`]), which sha256s it off the
+    /// critical path — a mismatch deletes the file (next read refetches
+    /// from GCS) and counts `engram_chunk_scrub_total{outcome="corrupt"}`.
+    /// Until the scrub clears the marker the chunk is readable LOCALLY
+    /// (CRC-checked bytes; trust-on-read as usual) but is NOT served
+    /// onward to peers ([`Self::read_verified_for_serve`]) — corruption
+    /// can travel at most one hop.
+    ///
+    /// Like [`Self::put_no_evict`], skips the per-write budget sweep:
+    /// bulk callers MUST call [`Self::sweep`] once after the batch.
+    pub async fn put_unverified_no_evict(&self, hash: ChunkHash, bytes: &[u8]) -> Result<()> {
+        let target = self.path_for(hash);
+        if let Some(parent) = target.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        // Marker FIRST: a crash between the two writes must leave
+        // either (marker, no chunk) — a stale marker the scrubber
+        // reaps — or nothing. The bad state (unverified chunk with no
+        // marker) must be unreachable. Markers are never removed
+        // outside the scrubber (racing a verified writer on the same
+        // hash then converges to "marked, scrub verifies" instead of
+        // leaving unhashed bytes unmarked).
+        write_atomic(&self.marker_path_for(hash), b"").await?;
+        write_atomic(&target, bytes).await?;
+        if let Some(tx) = self.inner.scrub_tx.lock().as_ref() {
+            let _ = tx.send(hash);
+        }
+        Ok(())
+    }
+
+    /// `.unverified` sidecar path for a chunk. Lives next to the chunk
+    /// file; invisible to the LRU walk ([`Self::list_entries`] only
+    /// matches 62-hex names), so eviction can never strip a marker out
+    /// from under its chunk.
+    fn marker_path_for(&self, hash: ChunkHash) -> PathBuf {
+        let mut p = self.path_for(hash).into_os_string();
+        p.push(".unverified");
+        PathBuf::from(p)
+    }
+
+    /// ADR 0095 serve-onward gate: the chunk's bytes IF it is resident
+    /// AND verified-origin (sha256'd at populate, or scrubbed since a
+    /// bulk peer landing). `None` ⇒ the peer-serve path streams a
+    /// `missing` marker and the requester sources it from GCS — an
+    /// unverified chunk is never re-served, so a corrupt source can
+    /// poison at most its direct pullers, and only until the scrub.
+    pub async fn read_verified_for_serve(&self, hash: ChunkHash) -> Result<Option<Bytes>> {
+        if fs::try_exists(self.marker_path_for(hash))
+            .await
+            .unwrap_or(false)
+        {
+            return Ok(None);
+        }
+        read_if_present(&self.path_for(hash)).await
+    }
+
+    /// ADR 0095: spawn the background scrubber that drains the
+    /// unverified-origin backlog. Rate-limited to `bytes_per_sec`
+    /// (sha256 on no-SHA-NI hosts is ~0.5-1 GB/s/core — the limit keeps
+    /// the drain to a fraction of a core next to live guests). On boot
+    /// it scans for leftover markers (crash recovery), then drains the
+    /// live queue fed by [`Self::put_unverified_no_evict`].
+    ///
+    /// Outcomes (`engram_chunk_scrub_total{outcome}`):
+    /// - `ok`: content matches its hash — marker removed, chunk becomes
+    ///   servable onward.
+    /// - `corrupt`: mismatch — chunk + marker deleted (next read
+    ///   refetches from GCS), logged at ERROR.
+    /// - `missing`: marker with no chunk (evicted mid-queue, or a
+    ///   crashed landing) — marker reaped.
+    ///
+    /// The caller keeps the returned handle alive for the process
+    /// lifetime (same held-handle pattern as [`Self::spawn_sweeper`]).
+    pub fn spawn_scrubber(&self, bytes_per_sec: u64) -> tokio::task::JoinHandle<()> {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<ChunkHash>();
+        *self.inner.scrub_tx.lock() = Some(tx);
+        let cache = self.clone();
+        tokio::spawn(async move {
+            // Crash recovery: enqueue every marker already on disk.
+            let leftover = cache.scan_unverified_markers().await;
+            if !leftover.is_empty() {
+                tracing::info!(
+                    count = leftover.len(),
+                    "chunk scrubber: found unverified-origin markers from a prior life",
+                );
+            }
+            let mut backlog: std::collections::VecDeque<ChunkHash> = leftover.into();
+            loop {
+                let hash = match backlog.pop_front() {
+                    Some(h) => h,
+                    None => match rx.recv().await {
+                        Some(h) => h,
+                        None => return, // cache dropped
+                    },
+                };
+                let started = std::time::Instant::now();
+                let scrubbed = cache.scrub_one(hash).await;
+                // Rate limit: sleep so that (bytes hashed) / (elapsed +
+                // sleep) ≤ bytes_per_sec. Zero-byte outcomes (missing)
+                // pace on a nominal floor so a marker storm can't spin.
+                let bytes = scrubbed.max(64 * 1024) as f64;
+                let budget =
+                    std::time::Duration::from_secs_f64(bytes / (bytes_per_sec.max(1) as f64));
+                if let Some(sleep) = budget.checked_sub(started.elapsed()) {
+                    tokio::time::sleep(sleep).await;
+                }
+            }
+        })
+    }
+
+    /// Scrub one unverified-origin chunk; returns the byte count hashed
+    /// (0 for `missing`). See [`Self::spawn_scrubber`].
+    async fn scrub_one(&self, hash: ChunkHash) -> usize {
+        let marker = self.marker_path_for(hash);
+        if !fs::try_exists(&marker).await.unwrap_or(false) {
+            // Already scrubbed (duplicate queue entry) — not an outcome.
+            return 0;
+        }
+        let bytes = match read_if_present(&self.path_for(hash)).await {
+            Ok(Some(b)) => b,
+            _ => {
+                let _ = fs::remove_file(&marker).await;
+                metrics::counter!("engram_chunk_scrub_total", "outcome" => "missing").increment(1);
+                return 0;
+            }
+        };
+        if ChunkHash::of(&bytes) == hash {
+            let _ = fs::remove_file(&marker).await;
+            metrics::counter!("engram_chunk_scrub_total", "outcome" => "ok").increment(1);
+        } else {
+            // Delete chunk BEFORE marker (the crash-safe order: the bad
+            // bytes must never linger unmarked). Next read misses and
+            // refetches from GCS through the verifying populate.
+            let _ = fs::remove_file(self.path_for(hash)).await;
+            let _ = fs::remove_file(&marker).await;
+            metrics::counter!("engram_chunk_scrub_total", "outcome" => "corrupt").increment(1);
+            tracing::error!(
+                hash = %hash,
+                "chunk scrubber: peer-landed chunk FAILED sha256 — deleted (will refetch \
+                 from GCS); if this fires repeatedly the sourcing peer has disk rot or a \
+                 serve bug (ADR 0095 §Integrity)",
+            );
+        }
+        bytes.len()
+    }
+
+    /// Walk the cache for `.unverified` sidecars (boot-time crash
+    /// recovery for the scrubber). Same two-level layout as
+    /// [`Self::list_entries`].
+    async fn scan_unverified_markers(&self) -> Vec<ChunkHash> {
+        let mut out = Vec::new();
+        let Ok(mut top) = fs::read_dir(&self.inner.config.root).await else {
+            return out;
+        };
+        while let Ok(Some(prefix_entry)) = top.next_entry().await {
+            let prefix_path = prefix_entry.path();
+            if !prefix_entry
+                .file_type()
+                .await
+                .map(|t| t.is_dir())
+                .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(prefix) = prefix_path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_owned)
+            else {
+                continue;
+            };
+            if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
+                continue;
+            }
+            let Ok(mut inner) = fs::read_dir(&prefix_path).await else {
+                continue;
+            };
+            while let Ok(Some(file)) = inner.next_entry().await {
+                let Some(name) = file.file_name().to_str().map(str::to_owned) else {
+                    continue;
+                };
+                let Some(rest) = name.strip_suffix(".unverified") else {
+                    continue;
+                };
+                if rest.len() != 62 || !rest.chars().all(|c| c.is_ascii_hexdigit()) {
+                    continue;
+                }
+                if let Ok(hash) = ChunkHash::from_hex(&format!("{prefix}{rest}")) {
+                    out.push(hash);
+                }
+            }
+        }
+        out
     }
 
     /// Spawn the periodic sweeper (ADR 0070): calls [`Self::sweep`] every

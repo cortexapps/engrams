@@ -241,6 +241,21 @@ service HostService {
   // RPC latency budget intact.
   rpc Ping(Empty) returns (Empty);
 
+  // ADR 0095: the standing peer-chunk tier. Host-to-host: any host-agent
+  // serves cache-RESIDENT content-addressed chunks by sha256 to any fleet
+  // peer, batch-streamed back-to-back (zero per-object round trips). This
+  // is NOT MigrationFetch: no export registry, no StateBin/seal artifacts,
+  // no allowlist — durable chunks are hash-capability inside the fleet
+  // boundary (every host already holds GCS creds for all of them; the ADR
+  // argues the posture). A locally-missing hash streams a `missing`
+  // marker and the requester falls to GCS — a peer can never induce a
+  // GCS read on the serving host. Backpressure: RESOURCE_EXHAUSTED when
+  // the serve semaphore is full (requester sends that batch to GCS
+  // without marking the peer lost). Frames carry CRC32C; the requester
+  // lands bulk pulls unverified-origin and a background scrubber
+  // re-hashes them off the critical path (ADR 0095 §Integrity).
+  rpc PeerChunkGet(PeerChunkGetRequest) returns (stream PeerChunkFrame);
+
   // ADR 0068 probe-before-host_lost: ground-truth sandbox liveness,
   // for `reconcile::flip_missing` to check BEFORE flipping a session to
   // `host_lost` on nothing but absence from the host's self-reported
@@ -457,6 +472,45 @@ message MigrationFrame {
   bytes data = 3;
   // Last frame for this item.
   bool last = 4;
+}
+
+// --- ADR 0095: PeerChunkGet ---
+
+message PeerChunkGetRequest {
+  // 32-byte raw sha256 chunk hashes, in the order frames refer to them
+  // by index. Batch semantics: thousands per request is the intended
+  // shape (one request per pull window per stream).
+  repeated bytes hashes = 1;
+  // Why the requester wants these — observability + serve-side rate
+  // class, not authorization (hash-capability + resident-only is the
+  // gate). BaseImage is validated against the serving host's
+  // ready∪prestaging digests and rejected on mismatch; Snapshot is
+  // counted as-is (the serving host has no authoritative local index
+  // of snapshot ids — the coordinator only hints requesters at the
+  // host that captured it).
+  oneof scope {
+    // "sha256:<hex>" manifest digest of an enabled image.
+    string base_image_digest = 2;
+    // 16-byte snapshot UUID (divergence fill for a resume).
+    bytes snapshot_id = 3;
+  }
+}
+
+message PeerChunkFrame {
+  // Index into PeerChunkGetRequest.hashes.
+  uint32 item_idx = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  // Last frame for this item.
+  bool last = 4;
+  // Terminal single-frame marker: this hash is not cache-resident (or
+  // not yet verified for onward serving) on this host. The requester
+  // sources it from GCS; an honest miss never marks the peer lost.
+  bool missing = 5;
+  // CRC32C (Castagnoli) of `data`. Hardware-accelerated on both ends;
+  // catches wire/framing corruption without paying sha256 on the
+  // landing path (ADR 0095 §Integrity).
+  uint32 crc32c = 6;
 }
 
 message SnapshotBeginResponse {

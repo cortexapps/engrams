@@ -113,7 +113,7 @@ impl GrpcHostPool {
         // TCP+H2 handshake. We follow up with `ping` below to force
         // the handshake before the first real RPC.
         let channel = endpoint.connect_lazy();
-        let client = GrpcHostClient::new(channel).with_reap_decode_cap();
+        let client = GrpcHostClient::new(channel);
 
         self.entries.insert(
             host_id,
