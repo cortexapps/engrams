@@ -1175,4 +1175,226 @@ mod tests {
             }
         }
     }
+
+    /// Shared preflight for the round-3 spikes: kernel + rootfs or skip.
+    fn spike_artifacts() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let kernel = std::env::var("ENGRAM_VZ_KERNEL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(home).join(".cache/engram-vz-test/vmlinux-arm64")
+            });
+        let rootfs = match std::env::var("ENGRAM_VZ_ROOTFS") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                eprintln!("SKIP: ENGRAM_VZ_ROOTFS unset (run `just vz-e2e` once to stage it)");
+                return None;
+            }
+        };
+        if !kernel.exists() || !rootfs.exists() {
+            eprintln!("SKIP: kernel/rootfs artifacts missing");
+            return None;
+        }
+        Some((kernel, rootfs))
+    }
+
+    fn spike_cfg(
+        kernel: &std::path::Path,
+        rootfs: &std::path::Path,
+        mid: Vec<u8>,
+        mac: &str,
+        memory_mib: u32,
+    ) -> VmConfig {
+        let mut c = VmConfig::new(kernel, rootfs, memory_mib, 2)
+            .with_machine_identifier(mid)
+            .with_mac_address(mac);
+        // Idle PID 1 — no bundles needed; the spikes probe VM mechanics.
+        c.kernel_cmdline =
+            "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw quiet init=/bin/sh".into();
+        c
+    }
+
+    /// ADR 0096 D7 spike round 3, probes (a)+(c)+(d) — the design gates
+    /// for warm-restore productization:
+    ///   (a) does restore tolerate the rootfs living at a DIFFERENT path
+    ///       than at save time? (restore_impl clones to a fresh
+    ///       per-sandbox path, so this decides whether the manifest must
+    ///       carry the saved attachment path)
+    ///   (c) save duration + state-file size at a 1 GiB guest (bounds
+    ///       the snapshot() pause-window growth)
+    ///   (d) does the vsock bridge attach to a restored-but-still-PAUSED
+    ///       machine? (decides restore→bridge→resume vs
+    ///       restore→resume→bridge ordering)
+    ///
+    /// FINDINGS (2026-07-15, macOS 26 / Darwin 25.2) — recorded by
+    /// running this probe; see the SPIKE3 eprintln lines:
+    ///   (a) PASS — the rootfs path is NOT part of save/restore config
+    ///       identity; a clone at a different path restores fine.
+    ///   (c) see log line (sub-second expected on NVMe at 1 GiB).
+    ///   (d) PASS — listeners register on a paused machine, so the warm
+    ///       path orders restore → bridge → resume (no redial window).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ADR 0096 D7 spike r3: live probes — run via `just vz-e2e` artifacts"]
+    async fn machine_state_spike_round3_path_timing_ordering() {
+        let Some((kernel, rootfs)) = spike_artifacts() else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("scratch");
+        let rootfs_a = scratch.path().join("a.rootfs.ext4");
+        crate::disk::clone_or_copy(&rootfs, &rootfs_a)
+            .await
+            .expect("clone rootfs");
+        let state = scratch.path().join("machine.vzs");
+        let mid = fresh_machine_identifier();
+        const MAC: &str = "0a:e2:96:00:00:02";
+
+        let vm1 = match VzVm::new(spike_cfg(&kernel, &rootfs_a, mid.clone(), MAC, 1024)) {
+            Ok(vm) => vm,
+            Err(VzError::ConfigInvalid(msg)) => {
+                eprintln!("SKIP: unsigned test binary / config invalid: {msg}");
+                return;
+            }
+            Err(other) => panic!("VzVm::new: {other}"),
+        };
+        vm1.start().await.expect("start");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        vm1.pause().await.expect("pause");
+
+        // (c) timing + size at 1 GiB.
+        let t0 = std::time::Instant::now();
+        vm1.save(&state).await.expect("save");
+        let save_elapsed = t0.elapsed();
+        let size = std::fs::metadata(&state).expect("state file").len();
+        eprintln!(
+            "SPIKE3(c): save of a 1 GiB guest took {save_elapsed:?}, machine.vzs = {} MiB",
+            size / (1024 * 1024)
+        );
+        vm1.stop().await.ok();
+        drop(vm1);
+
+        // (a) restore with the rootfs at a DIFFERENT path.
+        let rootfs_b = scratch.path().join("b.rootfs.ext4");
+        crate::disk::clone_or_copy(&rootfs_a, &rootfs_b)
+            .await
+            .expect("clone to different path");
+        let vm2 = VzVm::new(spike_cfg(&kernel, &rootfs_b, mid.clone(), MAC, 1024))
+            .expect("rebuild VM at different rootfs path");
+        match vm2.restore(&state).await {
+            Ok(()) => eprintln!(
+                "SPIKE3(a): PASS — restore tolerates a rootfs at a different path \
+                 (no saved-attachment-path field needed in the manifest)"
+            ),
+            Err(e) => panic!(
+                "SPIKE3(a): FAIL — restore rejects a moved rootfs; the manifest must \
+                 pin the saved attachment path: {e}"
+            ),
+        }
+
+        // (d) bridge attach while still PAUSED (before resume).
+        let uds_base = scratch.path().join("spike3.vsock");
+        let bridge_paused = crate::vsock_bridge::VsockBridge::start(
+            vm2.raw_clone(),
+            vm2.queue_clone(),
+            uds_base,
+            None,
+            None,
+            None,
+        )
+        .await;
+        match &bridge_paused {
+            Ok(_) => eprintln!(
+                "SPIKE3(d): PASS — vsock listeners register on a restored-but-paused \
+                 machine; warm restore orders restore → bridge → resume"
+            ),
+            Err(e) => eprintln!(
+                "SPIKE3(d): listeners on a paused machine FAILED ({e}) — warm restore \
+                 must order restore → resume → bridge (self-healing redial window)"
+            ),
+        }
+
+        vm2.resume().await.expect("resume");
+        assert_eq!(vm2.state().await, VZVirtualMachineState::Running);
+        if let Ok((mut bridge, _conn)) = bridge_paused {
+            bridge.stop().await;
+        }
+        vm2.stop().await.ok();
+    }
+
+    /// ADR 0096 D7 spike round 3, probe (b): CROSS-PROCESS restore — the
+    /// real resume shape (save in one host-agent process, restore in the
+    /// next). Two-phase via env:
+    ///
+    /// ```sh
+    /// dir=$(mktemp -d)
+    /// ENGRAM_VZ_SPIKE_PHASE=save    ENGRAM_VZ_SPIKE_DIR=$dir cargo nextest run ... -E 'test(machine_state_spike_cross_process)' --run-ignored ignored-only
+    /// ENGRAM_VZ_SPIKE_PHASE=restore ENGRAM_VZ_SPIKE_DIR=$dir cargo nextest run ... -E 'test(machine_state_spike_cross_process)' --run-ignored ignored-only
+    /// ```
+    ///
+    /// Skips (never fails) when the phase env is unset, so it's inert in
+    /// the normal `--run-ignored` sweep. FINDING (2026-07-15, macOS 26):
+    /// PASS — same-user cross-process restore works (the keychain
+    /// protection is per-user, not per-process).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ADR 0096 D7 spike r3(b): two-phase cross-process probe (env-driven)"]
+    async fn machine_state_spike_cross_process() {
+        let phase = match std::env::var("ENGRAM_VZ_SPIKE_PHASE") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("SKIP: ENGRAM_VZ_SPIKE_PHASE unset (two-phase probe; see doc)");
+                return;
+            }
+        };
+        let dir = std::path::PathBuf::from(
+            std::env::var("ENGRAM_VZ_SPIKE_DIR").expect("ENGRAM_VZ_SPIKE_DIR"),
+        );
+        let Some((kernel, rootfs)) = spike_artifacts() else {
+            return;
+        };
+        const MAC: &str = "0a:e2:96:00:00:03";
+        let rootfs_copy = dir.join("rootfs.ext4");
+        let state = dir.join("machine.vzs");
+        let mid_file = dir.join("machine-id.bin");
+
+        match phase.as_str() {
+            "save" => {
+                std::fs::create_dir_all(&dir).expect("spike dir");
+                crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+                    .await
+                    .expect("clone rootfs");
+                let mid = fresh_machine_identifier();
+                std::fs::write(&mid_file, &mid).expect("persist machine id");
+                let vm = match VzVm::new(spike_cfg(&kernel, &rootfs_copy, mid, MAC, 512)) {
+                    Ok(vm) => vm,
+                    Err(VzError::ConfigInvalid(msg)) => {
+                        eprintln!("SKIP: unsigned/config invalid: {msg}");
+                        return;
+                    }
+                    Err(other) => panic!("VzVm::new: {other}"),
+                };
+                vm.start().await.expect("start");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                vm.pause().await.expect("pause");
+                vm.save(&state).await.expect("save");
+                vm.stop().await.ok();
+                eprintln!(
+                    "SPIKE3(b): save phase complete; run the restore phase in a fresh process"
+                );
+            }
+            "restore" => {
+                let mid = std::fs::read(&mid_file).expect("saved machine id");
+                let vm = VzVm::new(spike_cfg(&kernel, &rootfs_copy, mid, MAC, 512))
+                    .expect("rebuild VM in fresh process");
+                match vm.restore(&state).await {
+                    Ok(()) => {
+                        vm.resume().await.expect("resume");
+                        assert_eq!(vm.state().await, VZVirtualMachineState::Running);
+                        eprintln!("SPIKE3(b): PASS — cross-process (same-user) restore works");
+                        vm.stop().await.ok();
+                    }
+                    Err(e) => panic!("SPIKE3(b): FAIL — cross-process restore rejected: {e}"),
+                }
+            }
+            other => panic!("ENGRAM_VZ_SPIKE_PHASE must be save|restore, got {other}"),
+        }
+    }
 }
