@@ -1,6 +1,19 @@
 # 0089 — Generic tool protocol: orchestrator-registered tools for every harness
 
-Status: Proposed
+Status: Accepted (2026-07-15)
+
+Implemented on `adr-0089-generic-tool-protocol`: P1 spine → P2 claude frontend →
+P3 codex frontend (commits through `e8687a18`, live gates in the P2 notes), then
+`b9ac69d6` (P4 parked eviction + the codex drain EOF fix), `61e45f8a`/`b2a9dab0`/
+`0b65d113`/`f52ed34d` (P5 AUQ convergence a–d, ending in the sanctioned wire
+break). Live-proven on the dev stack 2026-07-15: web and Slack question
+round-trips both ran purely on the generic frames
+(`tool_call_requested(ask_user_question)` → `harness_parked` →
+`tool_result_submitted` → `tool_call_completed` on the re-fire run; 588ms
+answer→completed; zero legacy events). P6's originally-planned first tools were
+deliberately NOT built here — the tool roadmap is its own decision. Codex live
+gates (scenario A analog + snapshot-park) remain open pending a codex profile in
+dev; the codex frontend is fully covered by the fake-seam suite.
 
 ## Context
 
