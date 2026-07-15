@@ -127,6 +127,7 @@ fn spawn_harness() -> SpawnHarnessRequest {
         env: HashMap::from([("ENGRAM_HARNESS_CWD".into(), "/workspace".into())]),
         session_env: HashMap::new(),
         host_ca_pem: Some("-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----\n".into()),
+        post_restore: true,
     }
 }
 

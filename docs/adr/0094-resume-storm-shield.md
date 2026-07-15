@@ -47,39 +47,44 @@ harness the quiet guest first, let the stampede run after.
 agentd (guest PID 1) freezes the resumed workload for the few seconds
 the harness needs to cold-start, then thaws it:
 
-1. **Resume detection = the clock step, made durable.** The only guest
-   signal that a restore happened is the CLOCK_REALTIME step agentd
-   already performs against the KVM PTP device. A step larger than a
-   resume-scale threshold (60 s) writes a marker file
-   (`/run/engram/resume-step`). A file, not process state, because
-   fresh creates re-exec agentd (ADR 0080 RefreshAgent) and either
-   generation — pre- or post-re-exec — may be the one that steps
-   (the periodic tick is 10 s).
+1. **Trigger = a host signal on the SpawnHarness frame.** The host adds
+   `post_restore: bool` to `SpawnHarnessRequest` and sets it on every
+   restore-based `start_agent` (FC always — every FC session is a
+   base-snapshot restore; VZ matches for parity; Process leaves it
+   `false`). agentd shields when it's set. **A guest-side clock-step
+   marker was tried first and DISPROVEN on the dev VM (2026-07-15): on
+   a fresh create the *captured* agentd corrects the clock during its
+   own boot, before the ADR 0080 RefreshAgent re-exec swaps in the new
+   (shield-capable) agentd — so the new agentd sees an already-correct
+   clock, never steps, never writes a marker, and never shields. The
+   host is the only party that reliably knows a spawn is post-restore
+   AND always runs current code (works for old + new bases).** The
+   trailing `serde(default)` field is wire-safe; an old host that omits
+   it simply never shields.
 2. **Shield window on the cold-spawn path only.** In the harness
    supervisor's spawn arm (the reattach arm returns earlier — a warm
-   harness has no cold start to protect), if the marker is fresh
-   (< 120 s): SIGSTOP every userspace process except PID 1 and kernel
-   threads, spawn the harness, and SIGCONT everything after a fixed
-   grace (default 8 s — cold start is 2.7 s quiet; the margin covers
-   spawn + init + the first API send). The stampede still happens, but
+   harness has no cold start to protect), when `post_restore` is set:
+   SIGSTOP every userspace process except PID 1 and kernel threads,
+   spawn the harness, and SIGCONT everything after a fixed grace
+   (default 8 s — cold start is 2.7 s quiet; the margin covers spawn +
+   init + the first API send). The stampede still happens, but
    overlapped with model latency instead of ahead of the first token.
-   A Track-A live `start_agent` re-issue, VZ/dev backends (no PTP →
-   no marker), and plain harness restarts see no marker and never
-   shield.
+   A Track-A live `start_agent` re-issue reattaches (returns before the
+   shield); Process/dev backends leave `post_restore` unset.
 3. **Fail-open everywhere.** Freeze/thaw are best-effort per-pid
    (EPERM/ESRCH skipped); the thaw runs from a spawned timer AND from
    guard drop (spawn failure), is idempotent, and only CONTs the pids
-   it stopped. Two backstops heal the pathological captures:
-   - on agentd startup, and
-   - whenever a resume-scale clock step occurs with no shield active,
-   agentd sweeps `/proc` for state-`T` processes and SIGCONTs them
-   (logged loudly). This covers "captured mid-shield" (a snapshot taken
-   inside the window would otherwise resume with the workload frozen
-   forever) and "re-exec'd away the thaw timer".
-4. **No knob, no proto change.** The shield keys purely on local
-   evidence (cold spawn + fresh resume marker), which is exactly the
-   storm case and nothing else. Rollback = roll back the agentd bundle
-   (ADR 0080 makes that a re-point).
+   it stopped. A startup backstop heals the pathological captures: on
+   agentd startup, agentd sweeps `/proc` for state-`T` processes no
+   active shield owns and SIGCONTs them (logged loudly) — covering
+   "captured mid-shield" (a snapshot taken inside the window would
+   otherwise resume with the workload frozen forever) and "RefreshAgent
+   re-exec'd away the thaw timer" (the successor agentd's startup sweep
+   thaws the orphaned freeze).
+4. **One small wire field, no per-session knob.** `post_restore` is set
+   by the backend, not an operator toggle — it's exactly the storm case
+   and nothing else. Rollback = roll back the agentd bundle (ADR 0080
+   makes that a re-point); an un-upgraded host simply omits the field.
 
 ## What could go wrong (and why it's bounded)
 
@@ -88,8 +93,8 @@ the harness needs to cold-start, then thaws it:
   round-trip usually absorbs it.
 - **Frozen processes' TCP peers time out**: the window is seconds;
   in-guest peers are also frozen, external peers retry.
-- **Eviction snapshots the frozen set**: the startup + clock-step
-  sweeps CONT stragglers on the other side; and no evictor acts within
+- **Eviction snapshots the frozen set**: the startup sweep CONTs
+  stragglers on the other side; and no evictor acts within
   seconds of a create in practice.
 - **Someone's deliberate SIGSTOP gets CONT'd** by the backstop sweep:
   accepted in a single-workload guest; the sweep logs each pid.

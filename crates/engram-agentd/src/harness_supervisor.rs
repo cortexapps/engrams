@@ -190,15 +190,15 @@ impl HarnessSupervisor {
         // correct clock right after a resume. The periodic tick keeps a
         // long-running harness corrected across later resumes.
         crate::clock::sync_now();
-        // ADR 0094: a cold spawn right after a resume races the guest's
-        // wake-up stampede (measured 40 s to first reply vs 2.7 s quiet;
-        // nice and the memory substrate both measured ineffective). Freeze
-        // the resumed workload for the cold-start window — a detached
-        // timer thaws it; the guard thaws early if the spawn fails. The
-        // reattach arm above never reaches this (a warm harness has no
-        // cold start to protect), and without a fresh resume marker
-        // (VZ/dev, live re-issues, plain restarts) this is a no-op.
-        let storm_shield = if crate::storm_shield::resumed_recently() {
+        // ADR 0094: a cold spawn right after a snapshot restore races the
+        // guest's wake-up stampede (measured 40 s to first reply vs 2.7 s
+        // quiet; nice and the memory substrate both measured ineffective).
+        // Freeze the resumed workload for the cold-start window — a
+        // detached timer thaws it; the guard thaws early if the spawn
+        // fails. The host sets `post_restore` only on restore-based spawns
+        // (FC always; VZ/Process never); the reattach arm above returns
+        // before this, so a live re-issue never freezes.
+        let storm_shield = if req.post_restore {
             crate::storm_shield::engage()
         } else {
             None
@@ -409,6 +409,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: session_env.clone(),
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap();
@@ -423,6 +424,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap();
@@ -442,6 +444,7 @@ mod tests {
             env: HashMap::new(),
             session_env: HashMap::new(),
             host_ca_pem: None,
+            post_restore: false,
         };
         let pid1 = sup.spawn(long.clone()).await.unwrap().expect("pid");
         // The teleport-handshake shape: SpawnHarness while running.
@@ -463,6 +466,7 @@ mod tests {
             env: HashMap::new(),
             session_env: HashMap::new(),
             host_ca_pem: None,
+            post_restore: false,
         };
         let sup2 = HarnessSupervisor::new();
         let pid3 = sup2.spawn(short.clone()).await.unwrap().expect("pid");
@@ -485,6 +489,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap()
@@ -519,6 +524,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap();
@@ -540,6 +546,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap();
@@ -549,6 +556,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap();
@@ -581,6 +589,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap();
@@ -624,6 +633,7 @@ mod tests {
                 env,
                 session_env,
                 host_ca_pem: None,
+                post_restore: false,
             })
             .await
             .unwrap();

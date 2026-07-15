@@ -377,6 +377,21 @@ pub struct SpawnHarnessRequest {
     /// core-ops fold of the former standalone CA-install verb.
     #[serde(default)]
     pub host_ca_pem: Option<String>,
+    /// ADR 0094: this harness spawn follows a snapshot restore, so the
+    /// guest's resumed workload is stampeding (JVM GC catch-up, timer
+    /// floods) and a cold harness cold-start races it (~40 s vs 2.7 s on
+    /// a quiet guest). When `true`, agentd storm-shields the spawn:
+    /// SIGSTOP the resumed workload, spawn the harness onto the quiet
+    /// guest, SIGCONT after a short grace. The host is the only party
+    /// that reliably knows a spawn is post-restore — the guest-side
+    /// clock-step heuristic doesn't survive the ADR 0080 agentd re-exec
+    /// (the captured agentd corrects the clock before the new agentd
+    /// loads; dev-VM-proven 2026-07-15). The FC backend sets this on
+    /// every restore-based `start_agent`; VZ/Process leave it `false`.
+    /// Trailing field — wire-safe evolution, `serde(default)` = `false`
+    /// so an old host that omits it simply never shields.
+    #[serde(default)]
+    pub post_restore: bool,
 }
 
 /// Single-shot response for non-streaming [`WireRequest`] verbs.

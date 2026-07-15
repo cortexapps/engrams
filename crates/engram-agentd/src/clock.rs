@@ -29,11 +29,6 @@ const PTP_DEVICE: &str = "/dev/ptp0";
 /// stepping needlessly in steady state.
 const STEP_THRESHOLD_NANOS: i128 = 2 * NANOS_PER_SEC;
 
-/// ADR 0094: a step this large means "we just resumed from a snapshot"
-/// (idle windows are minutes-to-days), not drift. Drives the resume
-/// marker the storm shield keys on.
-const RESUME_SCALE_NANOS: i128 = 60 * NANOS_PER_SEC;
-
 /// Background re-check cadence. Covers re-resumes (each restore re-freezes
 /// the clock) and slow drift for long-lived children (the harness); the
 /// pre-spawn sync is what makes fresh execs window-free.
@@ -99,20 +94,10 @@ impl ClockSync {
             return;
         }
         match UnixClock::CLOCK_REALTIME.step_clock(to_time_offset(diff)) {
-            Ok(_) => {
-                tracing::info!(
-                    offset_secs = (diff / NANOS_PER_SEC) as i64,
-                    "stepped guest clock to host PTP"
-                );
-                // ADR 0094: a resume-scale step is the only guest-visible
-                // signal that a restore just happened — record it durably
-                // (fresh creates re-exec agentd, so process state won't
-                // survive) so the harness supervisor's cold-spawn arm can
-                // shield against the wake-up stampede.
-                if diff.abs() > RESUME_SCALE_NANOS {
-                    crate::storm_shield::note_resume_step();
-                }
-            }
+            Ok(_) => tracing::info!(
+                offset_secs = (diff / NANOS_PER_SEC) as i64,
+                "stepped guest clock to host PTP"
+            ),
             Err(e) => tracing::warn!(
                 error = ?e,
                 "step guest clock failed (need CAP_SYS_TIME?)"

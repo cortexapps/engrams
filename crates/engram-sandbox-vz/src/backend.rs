@@ -726,6 +726,9 @@ impl SandboxBackend for VzBackend {
             env: agent.env.into_iter().collect(),
             session_env: agent.session_env.into_iter().collect(),
             host_ca_pem: agent.host_ca_pem,
+            // ADR 0094: VZ restores from a base snapshot like FC (parity),
+            // so a fresh harness spawn follows a restore — shield it.
+            post_restore: true,
         });
         engram_agentd::write_msg(&mut conn, &req)
             .await

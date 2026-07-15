@@ -1416,6 +1416,7 @@ mod tests {
                 host_ca_pem: Some(
                     "-----BEGIN CERTIFICATE-----\nAAAA\n-----END CERTIFICATE-----".into(),
                 ),
+                post_restore: false,
             }),
             cacerts,
         )
@@ -1461,6 +1462,7 @@ mod tests {
                 host_ca_pem: Some(
                     "-----BEGIN CERTIFICATE-----\nBBBB\n-----END CERTIFICATE-----".into(),
                 ),
+                post_restore: false,
             }),
             cacerts,
         )
@@ -1513,6 +1515,7 @@ mod tests {
                 host_ca_pem: Some(
                     "-----BEGIN CERTIFICATE-----\nCCCC\n-----END CERTIFICATE-----".into(),
                 ),
+                post_restore: false,
             }),
             cacerts,
         )
@@ -1546,6 +1549,7 @@ mod tests {
                 env: HashMap::new(),
                 session_env: HashMap::new(),
                 host_ca_pem: Some(pem.clone()),
+                post_restore: false,
             })
         };
         let first = round_trip_with_cacerts(req(), cacerts.clone()).await;

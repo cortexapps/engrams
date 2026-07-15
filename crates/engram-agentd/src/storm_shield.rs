@@ -11,40 +11,26 @@
 //! later. The stampede still happens — overlapped with model latency
 //! instead of ahead of the first token.
 //!
-//! Trigger discipline (no knob, no proto change — keyed on local
-//! evidence that is exactly the storm case and nothing else):
+//! Trigger: the harness supervisor's cold-spawn arm calls [`engage`]
+//! when the host set `post_restore` on the `SpawnHarness` frame. The
+//! host is the only party that reliably knows a spawn follows a restore
+//! — a guest-side clock-step heuristic was tried and **fails on fresh
+//! creates** (dev-VM-proven 2026-07-15): the captured agentd corrects
+//! the clock during ITS boot, before the ADR 0080 RefreshAgent re-exec
+//! loads the new agentd, so the new agentd never observes the skew. The
+//! reattach arm returns before [`engage`], so a live re-issue of a
+//! still-running harness never freezes.
 //!
-//! - [`note_resume_step`] — called by `clock` when it steps
-//!   CLOCK_REALTIME by a resume-scale amount (the only guest-visible
-//!   restore signal). Durable as a *file* marker because fresh creates
-//!   re-exec agentd (ADR 0080) and either generation may be the one
-//!   that steps.
-//! - [`resumed_recently`] — the harness supervisor's cold-spawn arm
-//!   engages the shield only when the marker is fresh. Track-A live
-//!   re-issues, VZ/dev backends (no PTP device → no step → no marker)
-//!   and plain harness restarts never shield.
-//!
-//! Fail-open everywhere: freeze/thaw are best-effort per pid, the thaw
-//! runs from a detached timer AND from guard drop (spawn failure), and
-//! two backstop sweeps ([`startup_audit`], plus one on every resume-
-//! scale step) SIGCONT any state-`T` process no active shield owns —
-//! healing "captured mid-shield" and "re-exec'd away the thaw timer".
+//! Fail-open: freeze/thaw are best-effort per pid, the thaw runs from a
+//! detached timer AND from guard drop (spawn failure), and a startup
+//! backstop ([`startup_audit`]) SIGCONTs any state-`T` process no active
+//! shield owns — healing a freeze that outlived its agentd (captured
+//! mid-shield, or a RefreshAgent re-exec between freeze and thaw).
 
-use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
-
-/// Written on every resume-scale clock step; freshness gates the shield.
-/// Lives in the ADR 0080 tmpfs dir so it survives the RefreshAgent
-/// re-exec (and, being tmpfs, never a reboot).
-pub const RESUME_MARKER: &str = "/run/engram/resume-step";
-
-/// How long after a resume a cold spawn is considered storm-racing. The
-/// fresh-create flow (restore → RefreshAgent → SpawnHarness) completes
-/// in seconds; 120 s absorbs slow paths without shielding spawns on a
-/// long-live guest.
-const MARKER_FRESH: Duration = Duration::from_secs(120);
+#[cfg(target_os = "linux")]
+use std::time::Duration;
 
 /// How long the workload stays frozen after the spawn. Cold start on a
 /// quiet guest is 2.7 s (measured); 8 s covers spawn + init + the first
@@ -52,7 +38,7 @@ const MARKER_FRESH: Duration = Duration::from_secs(120);
 #[cfg(target_os = "linux")]
 const SHIELD_GRACE: Duration = Duration::from_secs(8);
 
-/// The currently-armed shield, so the backstop sweeps can tell "pids we
+/// The currently-armed shield, so the startup backstop can tell "pids we
 /// froze on purpose" from orphaned freezes.
 static ACTIVE: Mutex<Option<Arc<ShieldState>>> = Mutex::new(None);
 
@@ -101,40 +87,10 @@ impl Drop for ShieldGuard {
     }
 }
 
-/// Record that a resume-scale clock step just happened, and heal any
-/// orphaned freezes from a previous shield that never got to thaw
-/// (captured mid-window, or the thaw timer died with a re-exec'd agentd).
-pub fn note_resume_step() {
-    let _ = std::fs::create_dir_all(Path::new(RESUME_MARKER).parent().unwrap());
-    if let Err(e) = std::fs::write(RESUME_MARKER, b"") {
-        tracing::warn!(error = %e, marker = RESUME_MARKER, "resume marker write failed");
-    }
-    audit_orphaned_freezes("resume-step");
-}
-
-/// Fresh-marker check the spawn path keys on.
-pub fn resumed_recently() -> bool {
-    marker_is_fresh(Path::new(RESUME_MARKER), MARKER_FRESH, SystemTime::now())
-}
-
-fn marker_is_fresh(path: &Path, window: Duration, now: SystemTime) -> bool {
-    let Ok(meta) = std::fs::metadata(path) else {
-        return false;
-    };
-    let Ok(mtime) = meta.modified() else {
-        return false;
-    };
-    match now.duration_since(mtime) {
-        Ok(age) => age <= window,
-        // mtime in the future = clock stepped backwards past the write;
-        // treat as fresh (we clearly just messed with the clock).
-        Err(_) => true,
-    }
-}
-
 /// Startup backstop: a just-(re)started agentd owns no shield, so any
 /// state-`T` process is an orphaned freeze — SIGCONT it. Cheap no-op on
-/// a normal boot.
+/// a normal boot. Covers a freeze captured into a snapshot and a
+/// RefreshAgent re-exec that dropped the thaw timer.
 pub fn startup_audit() {
     audit_orphaned_freezes("agentd-startup");
 }
@@ -239,7 +195,7 @@ fn cont_pids(pids: &[i32]) {
 }
 
 /// SIGCONT any state-`T` process the active shield doesn't own. Heals a
-/// frozen set that outlived its thaw (captured mid-shield; agentd
+/// frozen set that outlived its shield (captured mid-shield; agentd
 /// re-exec'd between freeze and timer). Deliberate in-guest SIGSTOPs are
 /// sacrificed — acceptable in a single-workload guest, and each CONT is
 /// logged.
@@ -289,44 +245,14 @@ fn proc_state(pid: i32) -> Option<char> {
     stat.rsplit(')').next()?.trim_start().chars().next()
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn absent_marker_is_not_fresh() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("resume-step");
-        assert!(!marker_is_fresh(&p, MARKER_FRESH, SystemTime::now()));
-    }
-
-    #[test]
-    fn fresh_marker_is_fresh_and_zero_window_is_stale() {
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("resume-step");
-        std::fs::write(&p, b"").unwrap();
-        assert!(marker_is_fresh(&p, MARKER_FRESH, SystemTime::now()));
-        // A zero window makes any real mtime stale — the aging path,
-        // without needing to forge mtimes.
-        let later = SystemTime::now() + Duration::from_secs(1);
-        assert!(!marker_is_fresh(&p, Duration::ZERO, later));
-    }
-
-    #[test]
-    fn future_mtime_reads_fresh() {
-        // Clock stepped backwards past the write ⇒ duration_since errs ⇒
-        // treat as fresh.
-        let dir = tempfile::tempdir().unwrap();
-        let p = dir.path().join("resume-step");
-        std::fs::write(&p, b"").unwrap();
-        let past = SystemTime::UNIX_EPOCH;
-        assert!(marker_is_fresh(&p, MARKER_FRESH, past));
-    }
+    use std::time::Duration;
 
     /// Freeze/thaw round-trip on a real child. Unprivileged-safe: we own
     /// the child. Exercises stop_pids/cont_pids/proc_state — NOT the
     /// full engage() sweep, which would freeze the test host.
-    #[cfg(target_os = "linux")]
     #[test]
     fn stop_and_cont_roundtrip_on_own_child() {
         let mut child = std::process::Command::new("sleep")

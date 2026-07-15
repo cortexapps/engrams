@@ -5354,6 +5354,12 @@ impl SandboxBackend for FirecrackerBackend {
             env: agent.env.into_iter().collect(),
             session_env: agent.session_env.into_iter().collect(),
             host_ca_pem: agent.host_ca_pem,
+            // ADR 0094: every FC session is a base-snapshot restore, so a
+            // fresh (non-reattach) harness spawn always races the resumed
+            // workload's wake-up stampede. Signal it so agentd storm-
+            // shields the cold start; the reattach arm in agentd returns
+            // before the shield, so a live re-issue never freezes.
+            post_restore: true,
         });
 
         // Harness spawn: connect to agentd-1024 and round-trip SpawnHarness.
