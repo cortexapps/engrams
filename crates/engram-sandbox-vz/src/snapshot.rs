@@ -8,6 +8,18 @@
 //! Apple's own `containerization` framework avoids the API
 //! entirely for Linux. So we don't use it.
 //!
+//! Re-validated 2026-07-15 on macOS 26 (Darwin 25.2), ADR 0096 D7:
+//! STILL BROKEN. With an explicit `VZGenericPlatformConfiguration` +
+//! a pinned `VZGenericMachineIdentifier` persisted across the
+//! save→restore boundary (the never-previously-ruled-out cause), and
+//! `validateSaveRestoreSupportWithError` PASSING the exact config,
+//! restore of a saved arm64 Linux guest still fails with the same
+//! opaque code-12. The standing probe is
+//! `vm::tests::machine_state_save_restore_spike` (`--ignored`; needs
+//! the `just vz-e2e` artifacts) — re-run it on future macOS majors;
+//! if it ever goes green, memory snapshots / warm restore / honest
+//! park productize as their own ADR.
+//!
 //! Instead, snapshot semantics are clone-based:
 //!   `snapshot` — pause VM → APFS-clone the per-sandbox rootfs
 //!                into the snapshot dir → resume → write manifest.

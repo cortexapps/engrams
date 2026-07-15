@@ -47,6 +47,16 @@ pub(crate) struct VmConfig {
     pub aux_ro_drives: Vec<AuxRoDrive>,
     /// Directory the erofs payloads live in (`<sha>.erofs`).
     pub bundle_dir: std::path::PathBuf,
+    /// ADR 0096 spike: pin the `VZGenericMachineIdentifier` (its
+    /// `dataRepresentation` bytes). Apple's machine-state save/restore
+    /// contract requires the restoring VM's identifier to MATCH the
+    /// saved one — and with no explicit platform (the `None` default,
+    /// today's behavior) every process gets a fresh random identifier,
+    /// which is the never-ruled-out cause of the historical
+    /// VZErrorRestore=12 that pushed VZ to clone+cold-boot (ADR 0003).
+    /// Produce fresh bytes with [`fresh_machine_identifier`], persist
+    /// them beside the saved state, and pass them back at restore.
+    pub machine_identifier: Option<Vec<u8>>,
 }
 
 impl VmConfig {
@@ -93,7 +103,16 @@ impl VmConfig {
                 .into(),
             aux_ro_drives: Vec::new(),
             bundle_dir: std::path::PathBuf::new(),
+            machine_identifier: None,
         }
+    }
+
+    /// ADR 0096 spike: pin the platform machine identifier (see the
+    /// field docs).
+    #[allow(dead_code)] // spike-only until machine-state snapshots productize
+    pub fn with_machine_identifier(mut self, bytes: Vec<u8>) -> Self {
+        self.machine_identifier = Some(bytes);
+        self
     }
 
     /// ADR 0061: attach these skill bundles (resolved `AuxRoDrive`s) from
@@ -106,6 +125,19 @@ impl VmConfig {
         self.aux_ro_drives = drives;
         self.bundle_dir = bundle_dir;
         self
+    }
+}
+
+/// ADR 0096 spike: mint fresh `VZGenericMachineIdentifier` bytes
+/// (its `dataRepresentation`). Persist beside a saved machine state
+/// and hand back via [`VmConfig::with_machine_identifier`] at restore.
+#[allow(dead_code)] // spike-only until machine-state snapshots productize
+pub(crate) fn fresh_machine_identifier() -> Vec<u8> {
+    use objc2_virtualization::VZGenericMachineIdentifier;
+    // SAFETY: plain data object; no VM/queue involvement.
+    unsafe {
+        let mid = VZGenericMachineIdentifier::new();
+        mid.dataRepresentation().to_vec()
     }
 }
 
@@ -626,6 +658,32 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         vz_cfg.setCPUCount(cfg.vcpus as objc2_foundation::NSUInteger);
         vz_cfg.setMemorySize((cfg.memory_mib as u64) * 1024 * 1024);
 
+        // ADR 0096 spike: pinned machine identifier. Save/restore
+        // requires the restoring VM's identifier to match the saved
+        // one; the implicit default platform mints a fresh random one
+        // per process. Only set when the caller opts in — `None`
+        // keeps today's behavior byte-for-byte.
+        if let Some(bytes) = &cfg.machine_identifier {
+            use objc2_virtualization::{
+                VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
+            };
+            let data = objc2_foundation::NSData::with_bytes(bytes);
+            let mid = VZGenericMachineIdentifier::initWithDataRepresentation(
+                VZGenericMachineIdentifier::alloc(),
+                &data,
+            )
+            .ok_or_else(|| {
+                VzError::ConfigInvalid(
+                    "machine_identifier bytes did not parse as a VZGenericMachineIdentifier".into(),
+                )
+            })?;
+            let platform = VZGenericPlatformConfiguration::new();
+            platform.setMachineIdentifier(&mid);
+            let platform_super: Retained<objc2_virtualization::VZPlatformConfiguration> =
+                Retained::cast_unchecked(platform);
+            vz_cfg.setPlatform(&platform_super);
+        }
+
         // Storage devices, in attach order so `/dev/vda` is the
         // rootfs and (when present) `/dev/vdb` is the harness
         // substrate:
@@ -956,6 +1014,114 @@ mod tests {
                 assert!(!msg.is_empty(), "AttachmentFailed must carry a message");
             }
             Err(other) => panic!("unexpected error from VzVm::new: {other}"),
+        }
+    }
+
+    /// ADR 0096 D7 spike: re-validate Apple's machine-state
+    /// save/restore for arm64 Linux guests on current macOS. ADR 0003
+    /// abandoned the API when restore returned an opaque
+    /// VZErrorRestore=12 (macOS-14 era, UTM #6654) and VZ has
+    /// clone+cold-boot snapshots since. The never-ruled-out cause: no
+    /// explicit platform config → a fresh random
+    /// `VZGenericMachineIdentifier` per process, which the restore
+    /// contract requires to MATCH the saved VM's.
+    ///
+    /// Boots the staged test rootfs with `init=/bin/sh` (an idle PID 1
+    /// — no bundles needed), pauses, saves, tears the VM down, rebuilds
+    /// an identical config with the SAME pinned identifier, restores,
+    /// resumes, and asserts the machine reports Running. Prints a loud
+    /// `SPIKE RESULT:` line either way — the outcome (with the macOS
+    /// version) belongs in snapshot.rs's header. If green, memory
+    /// snapshots / warm restore / honest park productize as their own
+    /// future ADR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ADR 0096 spike: live save/restore probe — run via `just vz-e2e` artifacts \
+                (macOS + codesigned + kernel + ENGRAM_VZ_ROOTFS)"]
+    async fn machine_state_save_restore_spike() {
+        // Surface VzVm::new's validateSaveRestoreSupportWithError
+        // verdict (it names the offending device when unsupported).
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let kernel = std::env::var("ENGRAM_VZ_KERNEL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(home).join(".cache/engram-vz-test/vmlinux-arm64")
+            });
+        let rootfs = match std::env::var("ENGRAM_VZ_ROOTFS") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                eprintln!("SKIP: ENGRAM_VZ_ROOTFS unset (run `just vz-e2e` once to stage it)");
+                return;
+            }
+        };
+        if !kernel.exists() || !rootfs.exists() {
+            eprintln!("SKIP: kernel/rootfs artifacts missing");
+            return;
+        }
+
+        let scratch = tempfile::tempdir().expect("scratch");
+        let rootfs_copy = scratch.path().join("rootfs.ext4");
+        crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+            .await
+            .expect("clone rootfs");
+        let state = scratch.path().join("machine.vzs");
+        let mid = fresh_machine_identifier();
+
+        let mk_cfg = || {
+            let mut c =
+                VmConfig::new(&kernel, &rootfs_copy, 1024, 2).with_machine_identifier(mid.clone());
+            // Idle PID 1 — the ADR 0080 init shim would panic without
+            // its agentd bundle; the spike only probes VM mechanics.
+            c.kernel_cmdline =
+                "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw quiet init=/bin/sh".into();
+            c
+        };
+
+        let vm1 = match VzVm::new(mk_cfg()) {
+            Ok(vm) => vm,
+            Err(VzError::ConfigInvalid(msg)) => {
+                eprintln!("SKIP: unsigned test binary / config invalid: {msg}");
+                return;
+            }
+            Err(other) => panic!("VzVm::new: {other}"),
+        };
+        vm1.start().await.expect("start");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await; // let the kernel settle
+        assert_eq!(
+            vm1.state().await,
+            VZVirtualMachineState::Running,
+            "guest must be running before pause+save"
+        );
+        vm1.pause().await.expect("pause");
+        if let Err(e) = vm1.save(&state).await {
+            panic!("SPIKE RESULT: saveMachineStateToURL FAILED on this macOS: {e}");
+        }
+        vm1.stop().await.ok();
+        drop(vm1);
+
+        let vm2 = VzVm::new(mk_cfg()).expect("rebuild identical VM");
+        match vm2.restore(&state).await {
+            Ok(()) => {
+                vm2.resume().await.expect("resume restored VM");
+                assert_eq!(
+                    vm2.state().await,
+                    VZVirtualMachineState::Running,
+                    "restored VM must report Running after resume"
+                );
+                eprintln!(
+                    "SPIKE RESULT: machine-state save/restore WORKS on this macOS with a \
+                     pinned VZGenericMachineIdentifier — productization unlocked (ADR 0096 D7)"
+                );
+                vm2.stop().await.ok();
+            }
+            Err(e) => {
+                panic!(
+                    "SPIKE RESULT: restoreMachineStateFromURL still fails on this macOS \
+                     (pinned machine id did not fix it): {e}"
+                );
+            }
         }
     }
 }
