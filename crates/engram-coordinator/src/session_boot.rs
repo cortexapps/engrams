@@ -434,8 +434,32 @@ pub(crate) async fn boot_on_reserved_host(
     // ADR 0073 (completion): the create-time prompt's user echo + outbox row
     // are written by `send_prompt_core` in `create_session_core` when the
     // session is first created (the same path every follow-up uses), so the
-    // boot finalize records nothing prompt-related here. The delivery driver
-    // forwards the enqueued prompt once this boot brings the harness up.
+    // boot finalize records nothing prompt-related here.
+    //
+    // ADR 0094: wake the sibling DELIVER op now that the boot is done. The
+    // create-time DELIVER was enqueued while the session was still `pending`,
+    // so it deferred ("not deliverable yet") and requeued on a growing linear
+    // backoff (`(attempts+1)×2 s`). `start_agent` above already attached the
+    // harness, so the prompt is deliverable the instant we flip to `Active` —
+    // but nothing made the backed-off DELIVER *ready*, so it would wait out
+    // its backoff (+ the 5 s fallback poll): the dominant fresh-create TTFM
+    // cost (measured ~5 s locally, ~36 s on the dev VM). Pulling its
+    // `not_before` to now + a NOTIFY lets the executor forward the prompt in
+    // <100 ms. This is the SAME wake ADR 0079 established for resumes and
+    // PR #676 wired onto the `CreateBoot` op — but #676 only covered the
+    // queued (no-capacity) path; the capacity-available create is out-of-op
+    // and boots straight through here, so it never fired for the common case.
+    // Idempotent: a no-op if the op executor's completion re-drive already
+    // claimed the DELIVER, and harmless when there is no create-time prompt
+    // (0 rows matched). The 5 s fallback poll still backstops a missed NOTIFY.
+    if let Err(e) = state
+        .services
+        .meta
+        .op_wake_queued_kind(session_id, engram_core::types::session_op::OpKind::Deliver)
+        .await
+    {
+        tracing::debug!(%session_id, error = %e, "sibling deliver wake after boot failed (5s poll backstops)");
+    }
 
     Ok(())
 }
