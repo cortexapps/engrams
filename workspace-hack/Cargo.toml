@@ -156,11 +156,10 @@ zeroize = { version = "1" }
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
 nix = { version = "0.31", features = ["ioctl", "socket"] }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
@@ -168,20 +167,18 @@ tower-http = { version = "0.6", default-features = false, features = ["follow-re
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs"] }
 
 [target.x86_64-unknown-linux-musl.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
 hyper-rustls = { version = "0.27", default-features = false, features = ["webpki-tokio"] }
 hyper-util = { version = "0.1", default-features = false, features = ["client-proxy"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
 nix = { version = "0.31", features = ["ioctl", "socket"] }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs"] }
 tower = { version = "0.5", default-features = false, features = ["retry", "timeout"] }
 tower-http = { version = "0.6", default-features = false, features = ["follow-redirect"] }
 
@@ -189,10 +186,9 @@ tower-http = { version = "0.6", default-features = false, features = ["follow-re
 bitflags = { version = "2", default-features = false, features = ["std"] }
 lazy_static = { version = "1", default-features = false, features = ["spin_no_std"] }
 libc = { version = "0.2", features = ["extra_traits"] }
-linux-raw-sys = { version = "0.12", default-features = false, features = ["auxvec", "elf", "errno", "general", "ioctl", "no_std", "prctl"] }
 nom = { version = "7" }
 ring = { version = "0.17", features = ["std"] }
-rustix = { version = "1", features = ["fs", "process"] }
+rustix = { version = "1", features = ["fs"] }
 
 [target.x86_64-apple-darwin.dependencies]
 bitflags = { version = "2", default-features = false, features = ["std"] }
