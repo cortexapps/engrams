@@ -35,6 +35,7 @@ import { abilityFor } from "../authz/ability.ts";
 import { buildServer } from "../server.ts";
 import { registerPassthrough } from "../rpc/passthrough.ts";
 import type { GetSession, ResolveOwner } from "../rpc/passthrough.ts";
+import { makeExternalToolCompletionGuard } from "../rpc/tool-completion-guard.ts";
 import { SURFACE } from "../rpc/surface.ts";
 import { POLICY } from "../authz/policy-map.ts";
 import { clearOwnerCache } from "../authz/resolve.ts";
@@ -43,9 +44,16 @@ import { SessionService } from "../gen/engram/app/v1/session_pb.ts";
 import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 import { ImageService } from "../gen/engram/app/v1/image_pb.ts";
 import {
+  CompleteToolCallResponseSchema,
   GetSessionResponseSchema,
   ListSessionsResponseSchema,
 } from "../gen/engram/app/v1/session_pb.ts";
+import type {
+  PendingToolCallRow,
+  PendingToolCallStore,
+} from "../tools/pending-tool-calls.ts";
+import { createToolRegistry } from "../tools/registry.ts";
+import { registerBuiltinTools } from "../tools/builtin.ts";
 import {
   ListHostsResponseSchema,
 } from "../gen/engram/app/v1/fleet_pb.ts";
@@ -159,6 +167,72 @@ function makeTransport(serverUrl: string): Transport {
   });
 }
 
+function fakePendingCalls(rows: PendingToolCallRow[]): PendingToolCallStore {
+  const key = (sessionId: string, toolCallId: string) => `${sessionId}\0${toolCallId}`;
+  const byId = new Map(rows.map((row) => [key(row.sessionId, row.toolCallId), row]));
+  return {
+    recordRequested: async () => {},
+    markSubmitted: async () => {},
+    markCompleted: async () => {},
+    find: async (sessionId, toolCallId) => byId.get(key(sessionId, toolCallId)) ?? null,
+    listUnsubmittedSessionCallsBefore: async () => [],
+  };
+}
+
+function pendingRow(
+  toolCallId: string,
+  handling: "handled" | "session",
+): PendingToolCallRow {
+  return {
+    sessionId: SESSION_OF_A,
+    toolCallId,
+    toolName: handling === "session" ? "ask_user_question" : "save_memory",
+    handling,
+    requestedAt: new Date(0),
+    submittedAt: null,
+    completedAt: null,
+  };
+}
+
+/** In-process Connect transport for the new CompleteToolCall matrix cases.
+ *  It exercises the same registered passthrough handler/gate/preflight without
+ *  requiring a loopback listener (the filesystem sandbox forbids bind(2)). */
+function completeToolCallTransport(
+  getSession: GetSession,
+  pendingCalls: PendingToolCallStore,
+): { transport: Transport; upstreamCallCount: { value: number } } {
+  const upstreamCallCount = { value: 0 };
+  const registry = createToolRegistry();
+  registerBuiltinTools(registry);
+  const upstream = createRouterTransport((router: ConnectRouter) => {
+    router.service(SessionService, {
+      completeToolCall: (req: { sessionId: string }) => {
+        upstreamCallCount.value++;
+        return create(CompleteToolCallResponseSchema, {
+          sessionId: req.sessionId,
+          note: "queued",
+        });
+      },
+    } as never);
+  });
+  const transport = createRouterTransport((router: ConnectRouter) => {
+    registerPassthrough(
+      router,
+      SURFACE,
+      upstream,
+      getSession,
+      fakeResolveOwner,
+      {
+        "SessionService.CompleteToolCall": makeExternalToolCompletionGuard({
+          pendingCalls,
+          registry,
+        }),
+      },
+    );
+  });
+  return { transport, upstreamCallCount };
+}
+
 /** Expect a Connect call to throw with a specific error code. */
 async function expectCode(
   call: () => Promise<unknown>,
@@ -228,6 +302,21 @@ describe("authz.matrix — member accessing own session", () => {
       await orch.close();
     }
   });
+
+  test("member A completes a session-handled call on their own session → allowed", async () => {
+    const orch = completeToolCallTransport(
+      makeGetSession(MEMBER_A, "user"),
+      fakePendingCalls([pendingRow("session-call", "session")]),
+    );
+    const client = createClient(SessionService, orch.transport);
+    const result = await client.completeToolCall({
+      sessionId: SESSION_OF_A,
+      toolCallId: "session-call",
+      resultJson: JSON.stringify({ "Deploy now?": ["Yes"] }),
+    });
+    expect(result.sessionId).toBe(SESSION_OF_A);
+    expect(orch.upstreamCallCount.value).toBe(1);
+  });
 });
 
 describe("authz.matrix — member cross-session access (anti-enumeration)", () => {
@@ -248,6 +337,23 @@ describe("authz.matrix — member cross-session access (anti-enumeration)", () =
     }
   });
 
+  test("member B completing owner A's tool call → NotFound", async () => {
+    const orch = completeToolCallTransport(
+      makeGetSession(MEMBER_B, "user"),
+      fakePendingCalls([pendingRow("session-call", "session")]),
+    );
+    const client = createClient(SessionService, orch.transport);
+    await expectCode(
+      () => client.completeToolCall({
+        sessionId: SESSION_OF_A,
+        toolCallId: "session-call",
+        resultJson: JSON.stringify({ "Deploy now?": ["Yes"] }),
+      }),
+      Code.NotFound,
+    );
+    expect(orch.upstreamCallCount.value).toBe(0);
+  });
+
   test("member calling GetSession on unknown session → NotFound", async () => {
     // fakeResolveOwner returns null for unknown sessions.
     // null owner means no task row exists; notFound.
@@ -262,6 +368,76 @@ describe("authz.matrix — member cross-session access (anti-enumeration)", () =
     } finally {
       await orch.close();
     }
+  });
+});
+
+describe("CompleteToolCall external handling guard", () => {
+  test("owner cannot externally complete an orchestrator-handled call", async () => {
+    const orch = completeToolCallTransport(
+      makeGetSession(MEMBER_A, "user"),
+      fakePendingCalls([pendingRow("handled-call", "handled")]),
+    );
+    const client = createClient(SessionService, orch.transport);
+    await expectCode(
+      () => client.completeToolCall({
+        sessionId: SESSION_OF_A,
+        toolCallId: "handled-call",
+        resultJson: JSON.stringify({ saved: true }),
+      }),
+      Code.PermissionDenied,
+    );
+    expect(orch.upstreamCallCount.value).toBe(0);
+  });
+
+  test("unknown tool_call_id is NotFound and never reaches upstream", async () => {
+    const orch = completeToolCallTransport(
+      makeGetSession(MEMBER_A, "user"),
+      fakePendingCalls([]),
+    );
+    const client = createClient(SessionService, orch.transport);
+    await expectCode(
+      () => client.completeToolCall({
+        sessionId: SESSION_OF_A,
+        toolCallId: "missing-call",
+        resultJson: "{}",
+      }),
+      Code.NotFound,
+    );
+    expect(orch.upstreamCallCount.value).toBe(0);
+  });
+
+  test("invalid session-tool output is rejected before upstream", async () => {
+    const orch = completeToolCallTransport(
+      makeGetSession(MEMBER_A, "user"),
+      fakePendingCalls([pendingRow("session-call", "session")]),
+    );
+    const client = createClient(SessionService, orch.transport);
+    await expectCode(
+      () => client.completeToolCall({
+        sessionId: SESSION_OF_A,
+        toolCallId: "session-call",
+        resultJson: JSON.stringify({ "Deploy now?": 42 }),
+      }),
+      Code.InvalidArgument,
+    );
+    expect(orch.upstreamCallCount.value).toBe(0);
+  });
+
+  test("protocol error envelope cannot bypass a session tool output schema", async () => {
+    const orch = completeToolCallTransport(
+      makeGetSession(MEMBER_A, "user"),
+      fakePendingCalls([pendingRow("session-call", "session")]),
+    );
+    const client = createClient(SessionService, orch.transport);
+    await expectCode(
+      () => client.completeToolCall({
+        sessionId: SESSION_OF_A,
+        toolCallId: "session-call",
+        resultJson: JSON.stringify({ error: "pretend this was answered" }),
+      }),
+      Code.InvalidArgument,
+    );
+    expect(orch.upstreamCallCount.value).toBe(0);
   });
 });
 

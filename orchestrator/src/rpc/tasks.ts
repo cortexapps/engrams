@@ -150,6 +150,7 @@ export interface TaskDeps {
   portExposures?: PortExposureStore;
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
+  /** Register a session for stream-listener scanner discovery. */
   db?: Db;
 }
 

@@ -1,6 +1,33 @@
 # 0089 — Generic tool protocol: orchestrator-registered tools for every harness
 
-Status: Proposed
+Status: Accepted (2026-07-15)
+
+Implemented on `adr-0089-generic-tool-protocol`: P1 spine → P2 claude frontend →
+P3 codex frontend (commits through `e8687a18`, live gates in the P2 notes), then
+`b9ac69d6` (P4 parked eviction + the codex drain EOF fix), `61e45f8a`/`b2a9dab0`/
+`0b65d113`/`f52ed34d` (P5 AUQ convergence a–d, ending in the sanctioned wire
+break). Live-proven on the dev stack 2026-07-15: web and Slack question
+round-trips both ran purely on the generic frames
+(`tool_call_requested(ask_user_question)` → `harness_parked` →
+`tool_result_submitted` → `tool_call_completed` on the re-fire run; 588ms
+answer→completed; zero legacy events). P6's originally-planned first tools were
+deliberately NOT built here — the tool roadmap is its own decision. Codex live
+gates (scenario A analog + snapshot-park) remain open pending a codex profile in
+dev; the codex frontend is fully covered by the fake-seam suite.
+
+Post-acceptance correctness hardening (2026-07-15): review of the complete
+stacked change found and fixed several assumptions that were safe only in a
+single-session or single-consumer deployment. Tool-call identity is now scoped
+by session in the orchestrator ledger, DBOS workflow ids, and coordinator
+outbox ids. `tool_result_submitted` and its durable outbox obligation commit in
+one Postgres transaction. Task, Slack-thread binding, and listener registration
+also commit in one orchestrator transaction. Listener overflow recovery is
+per-consumer so one stalled surface cannot block the others. External session
+completions must satisfy the declared output schema; only orchestrator-handled
+failures may use the internal `{ "error": ... }` envelope. Finally, a failed
+Claude hook bridge now visibly denies the tool instead of silently deferring
+an unrecorded call, and native-question deduplication is scoped to the current
+run. Regression coverage pins each failure mode.
 
 ## Context
 
@@ -284,8 +311,9 @@ construction.
 ### 7. What gets retired (clean break)
 
 `HarnessEvent::UserQuestion`/`QuestionAnswered`, `HarnessCommand::AnswerQuestion`,
-`OutboxKind::Answer`, the `AnswerQuestion` app-gRPC RPC, and the harness-side
-question special-casing all collapse into the generic frames. The Slack
+the `AnswerQuestion` app-gRPC RPC, and the harness-side question special-casing
+all collapse into the generic frames. `OutboxKind::Answer` remains only as a
+parse tombstone for real pre-flag-day rows; it has no producer or relay. The Slack
 workflow's structure, idempotency keys, and `toolCallId` bookkeeping survive
 with renamed inputs — AUQ was already shaped like a session-handled tool; the
 protocol is that shape, generalized.
@@ -303,8 +331,8 @@ running arbitrary model output, not internal traffic. Accordingly:
 
 - Every handled-tool dispatch authz-checks the session's `capabilities`
   (already on `CreateSessionRequest`) before the handler runs.
-- `CompleteToolCall` requires a principal with access to the session (same
-  gate as today's `AnswerQuestion`), and only session-handled calls may be
+- `CompleteToolCall` requires a principal with access to the session (the
+  owner-scoped prompt gate), and only session-handled calls may be
   completed externally — handled tools complete exclusively from orchestrator
   code.
 - zod validation runs in both directions: args before any handler/presenter,
@@ -473,19 +501,91 @@ interaction (P4).
   `OutboxKind::ToolResult`; orchestrator registry (zod), manifest compilation
   into `harness_env`, handled-tool dispatch, `CompleteToolCall` RPC, the
   presenter-coverage test; latency measurement.
+
+  *As built (2026-07-13):* landed test-first, red→green. Divergences and
+  notes: (1) applied migration 0084's `CHECK (kind IN ('prompt','answer'))`
+  required the new migration `0105_outbox_tool_result_kind.sql`; (2)
+  `tool_call_completed` joined the curated ingest set too, so the
+  orchestrator's `pending_tool_calls` ledger (new drizzle table — powers the
+  §8 session-handled-only external gate and the §1 watchdog) can stamp
+  consumption; (3) the ToolResult outbox row is retired by the existing
+  `ToolCallCompleted` harness event (`tool_result:<call_id>` ack id); (4)
+  handled-tool failures complete with the protocol error envelope
+  `{"error":"<message>"}` — the one exception to a tool's output schema; (5)
+  unknown tool names in the ledger default to `handling:"handled"` (fail
+  closed for external completion), which also means a call naming a tool
+  since deleted from the registry is never completed — acceptable while
+  manifest and registry ship together, revisit if registry becomes dynamic;
+  (6) both harnesses carry a loud-warn placeholder arm for
+  `HarnessCommand::ToolResult` until their P2/P3 frontends land; (7) sync
+  latency measurement deferred to the P2 live smoke (needs a real session).
 - **P2 — claude frontend.** `mcp-bridge` subcommand + config generation +
   `--strict-mcp-config`; hook manifest matching (prefix filter, ToolSearch
   exemption); deferred delivery via the AUQ machinery; scrub broadening.
   Rebundle-only. Exit gate: scenario A + C live on a VZ session.
+
+  *As built (2026-07-13):* landed as designed (ToolSearch/built-ins
+  short-circuit in the hook client — only AUQ + `mcp__engrams__` names
+  round-trip the socket), plus three live-smoke-driven fixes: (1) the
+  narrate-past double-fire (#64389) reproduced for manifest deferred tools —
+  `duplicate_auq_ids` generalized to `duplicate_deferred_ids` so a same-turn
+  duplicate defers without a second `ToolCallRequested` and is scrubbed;
+  (2) **idle eviction drains the harness before the snapshot** ("claude-free"
+  snapshots), so resume always presents a *fresh* harness — the
+  "CLI survived in the snapshot" fast path never occurs post-eviction, and an
+  unknown `ToolResult` now mirrors AnswerQuestion (stash → SIGINT →
+  `ResumeForDeferred` → id-stable re-fire served from stash); (3) dispatch
+  had been wired into the Slack-only ingest pump — web tasks had no pump at
+  all — so bookkeeping/dispatch moved to a per-session
+  `toolDispatchWorkflow` started from `createTaskWithSession`, the funnel all
+  creation surfaces share. Scenario A measured sub-4s submit→reply through
+  the 1s ingest poll — the §3 latency escalation (live `StreamEvents`) is
+  not needed.
 - **P3 — codex frontend.** `experimentalApi: true`; `dynamicTools`
   declaration on start/resume; parked-call table in `engram-harness-sdk`
   (fixes the answer-drop gap); sync + deferred + crash degrade; schema-check
   additions. Exit gate: scenario A analog live, **and the snapshot-park
   spike** (park → evict → restore → respond, same callId).
+
+  *As built (2026-07-13):* implemented against a fake-codex stdio seam
+  (shell script speaking the app-server newline-JSON protocol, mirroring the
+  claude crate's fake-CLI pattern) — 22 red→green tests including the
+  answer-drop regression (post-respawn answer delivered as a follow-up user
+  message, unknown ids logged loudly) and the crash degrade.
+  `check-app-server-schema.sh` pins `DynamicToolCallParams`/`Response` + the
+  `experimentalApi` capability against the pinned 0.144.1 binary. NOTE: the
+  P2 finding that idle eviction produces harness-free snapshots applies here
+  too — the §5 "whole-VM snapshot captures the parked await" assumption does
+  not hold for *idle-evicted* sessions; the durable parked-call table +
+  crash-degrade path (already built) are the actual delivery mechanism after
+  eviction. Exit gates (scenario A analog + snapshot-park) still open: the
+  dev stack has no codex profile yet.
 - **P4 — parked eviction.** The parked signal (`Parked` event vs `Idle`
   reuse), ADR 0034 state-machine integration, wake-on-result.
+
+  *As built (2026-07-14):* added the trailing `Parked` wire variant (kind
+  `harness_parked`). Codex emits it for deferred dynamic tools and
+  `requestUserInput`; claude emits it when a turn ends `tool_deferred`. The
+  coordinator classifies it like `harness_idle` for the soft TTL, and the ADR
+  0091 resume-rewind excludes it for the same reason. Wake-on-result is
+  unchanged (`ToolResult` outbox → `Resume`); after idle eviction, codex uses
+  the existing crash-degrade delivery path because snapshots are harness-free.
 - **P5 — AUQ convergence.** Native bindings both harnesses; policy/web/Slack
   switch to generic kinds (legacy kinds still render for old sessions);
-  delete the bespoke question wire types, RPC, and outbox kind.
+  delete the bespoke question wire types, RPC, and outbox write path.
+
+  *As built (2026-07-14):* convergence landed as four deliberately ordered
+  steps: (a) registry and session-handled plumbing (`61e45f8a`), (b) native
+  bindings in both harnesses (`b2a9dab0`), (c) web and Slack cutover
+  (`0b65d113`), then (d) this atomic positional-bincode wire break. Step (d)
+  deletes the bespoke question events/command, both answer RPCs and their
+  host/coordinator relays, all legacy answer producers, and the Claude/Codex
+  legacy question branches. It is a flag-day deployment: the guest image
+  containing **both** harnesses and the host-agent/coordinator fleet must be
+  baked and deployed together. `OutboxKind::Answer` stays as a parse tombstone;
+  an unacked pre-flag-day `answer` row is retired with a loud warning before
+  any resume or host delivery, so it cannot retry-loop. Historical
+  `user_question` and `question_answered` rows remain curated and renderable
+  forever; only their write/answer paths were removed.
 - **P6 — first real tools.** `save_memory`, `add_review_comment`; flip this
   ADR to Accepted with the commit chain and as-built divergences.

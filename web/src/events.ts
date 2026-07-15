@@ -141,17 +141,33 @@ export type SessionEvent =
       result_summary: string | null;
       at: string;
     }
+  // ADR 0089: an orchestrator-registered tool was invoked. `args_json` is
+  // deliberately opaque JSON text; tool-specific presenters parse it.
+  | {
+      type: "tool_call_requested";
+      run_id: string;
+      tool_call_id: string;
+      name: string;
+      args_json: string;
+      at: string;
+    }
+  // ADR 0089: the coordinator synchronously accepted a result for delivery.
+  // Surfaces resolve pending UI from this event without waiting for the harness.
+  | {
+      type: "tool_result_submitted";
+      tool_call_id: string;
+      result_json: string;
+      at: string;
+    }
   | { type: "run_completed"; run_id: string; ok: boolean; at: string }
   // ADR 0030: the in-flight run was stopped by an operator interrupt
   // (`POST /sessions/:id/interrupt`). The session stays alive; the
   // transcript renders an "interrupted" receipt and the run closes.
   | { type: "run_interrupted"; run_id: string; at: string }
   | { type: "harness_idle"; at: string }
-  // ADR 0054: the agent called `AskUserQuestion`; the harness deferred it
-  // (the turn ends so the VM can idle-evict) and emitted this durable
-  // "awaiting input" card. The web renders an interactive question form and
-  // POSTs the answer back via `SessionService.AnswerQuestion`, keyed on
-  // `tool_call_id` (Claude's tool_use_id). Survives eviction — it's in the log.
+  // ADR 0054 legacy read shape: pre-upgrade sessions may contain this durable
+  // question card. Unanswered cards are read-only after ADR 0089 P5d; answered
+  // cards still fold in their historical `question_answered` receipt.
   | {
       type: "user_question";
       run_id: string;
@@ -159,7 +175,7 @@ export type SessionEvent =
       questions: UserQuestion[];
       at: string;
     }
-  // ADR 0054: the deferred question was answered — the harness holds the
+  // ADR 0054 legacy read shape: the deferred question was answered — the harness held the
   // answer and is feeding it back on the `--resume` re-fire. Resolves the
   // card (same `tool_call_id`); `answers` is keyed by question text, values
   // are the selected option labels (1 for single-select, N for multi).

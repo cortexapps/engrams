@@ -189,29 +189,7 @@ describe("SessionThread", () => {
     await waitFor(() => expect(screen.getByText(/read 1/)).toBeTruthy());
   });
 
-  // ADR 0054: the interactive AskUserQuestion card — the deferred question
-  // renders a form; submitting POSTs answers keyed by question text (StringList
-  // values) and flips to an optimistic receipt.
-  test("a deferred question renders an interactive card; submitting POSTs the answer", async () => {
-    let captured: {
-      sessionId: string;
-      toolCallId: string;
-      answers: Record<string, string[]>;
-    } | null = null;
-    const transport = createRouterTransport((router) => {
-      router.service(SessionService, {
-        answerQuestion: (req) => {
-          captured = {
-            sessionId: req.sessionId,
-            toolCallId: req.toolCallId,
-            answers: Object.fromEntries(Object.entries(req.answers).map(([k, v]) => [k, v.values])),
-          };
-          return { sessionId: req.sessionId, note: "ok" };
-        },
-      });
-    });
-
-    const user = userEvent.setup();
+  test("an unanswered legacy question is read-only after the protocol upgrade", async () => {
     renderWithProviders(
       <SessionThread
         sessionId="s1"
@@ -246,29 +224,95 @@ describe("SessionThread", () => {
           { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
         ])}
       />,
-      { transport },
     );
 
     await waitFor(() => expect(screen.getByText("Which database?")).toBeTruthy());
     // The generic AskUserQuestion tool part is suppressed — only the card shows.
     expect(screen.queryByText("AskUserQuestion")).toBeNull();
 
-    // Submit is gated until a selection is made.
     const submit = screen.getByRole("button", { name: "Submit answer" });
     expect((submit as HTMLButtonElement).disabled).toBe(true);
+    expect((screen.getByRole("radio", { name: /Postgres/ }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
+    expect(screen.getByText(/predates an upgrade/i)).toBeTruthy();
+  });
 
-    await user.click(screen.getByText("Postgres"));
-    expect((submit as HTMLButtonElement).disabled).toBe(false);
-    await user.click(submit);
-
-    await waitFor(() => expect(captured).not.toBeNull());
-    expect(captured!).toEqual({
-      sessionId: "s1",
-      toolCallId: "t1",
-      answers: { "Which database?": ["Postgres"] },
+  test("a generic question submits canonical answers through CompleteToolCall only", async () => {
+    let completed: { sessionId: string; toolCallId: string; resultJson: string } | null = null;
+    const transport = createRouterTransport((router) => {
+      router.service(SessionService, {
+        completeToolCall: (req) => {
+          completed = {
+            sessionId: req.sessionId,
+            toolCallId: req.toolCallId,
+            resultJson: req.resultJson,
+          };
+          return { sessionId: req.sessionId, note: "ok" };
+        },
+      });
     });
-    // Optimistic receipt: the form is replaced while the answer round-trips.
-    await waitFor(() => expect(screen.getByText("saving…")).toBeTruthy());
+    const user = userEvent.setup();
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "tool_call_requested",
+            run_id: "r1",
+            tool_call_id: "t-generic",
+            name: "ask_user_question",
+            args_json: JSON.stringify({
+              questions: [
+                {
+                  question: "Which database?",
+                  header: "Database",
+                  multiSelect: false,
+                  options: [{ label: "Postgres", description: "Relational, default" }],
+                },
+              ],
+            }),
+            at: AT,
+          },
+        ])}
+      />,
+      { transport },
+    );
+
+    await user.click(await screen.findByText("Postgres"));
+    await user.click(screen.getByRole("button", { name: "Submit answer" }));
+
+    await waitFor(() => expect(completed).not.toBeNull());
+    expect(completed).toEqual({
+      sessionId: "s1",
+      toolCallId: "t-generic",
+      resultJson: JSON.stringify({ "Which database?": ["Postgres"] }),
+    });
+    expect(await screen.findByText("saving…")).toBeTruthy();
+  });
+
+  test("an unanswered non-question generic call shows a waiting tool affordance", async () => {
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "tool_call_requested",
+            run_id: "r1",
+            tool_call_id: "approval-1",
+            name: "approve_deploy",
+            args_json: JSON.stringify({ environment: "production" }),
+            at: AT,
+          },
+        ])}
+      />,
+    );
+
+    await waitFor(() =>
+      expect(screen.getByRole("button", { name: "Waiting for tool: approve_deploy" })).toBeTruthy(),
+    );
   });
 
   // Regression: an idle send to session A must not bleed its optimistic bubble

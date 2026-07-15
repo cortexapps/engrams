@@ -5,9 +5,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use engram_core::{SandboxId, SessionId};
-use engram_harness_proto::{
-    AgentRole, FileChange, HarnessCommand, HarnessEvent, Question, QuestionOption,
-};
+use engram_harness_proto::{AgentRole, FileChange, HarnessCommand, HarnessEvent};
+use engram_harness_sdk::parked::{ParkedCall, ParkedCallKind, ParkedCallStore};
+use engram_harness_sdk::questions::{Answers, Question, QuestionOption};
 use engram_harness_sdk::{emit, Channels, ConnectionConfig, QueuedPrompt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
@@ -16,7 +16,102 @@ use tokio::sync::{mpsc, Notify};
 
 const DEFAULT_CODEX_HOME: &str = "/workspace/.engram/codex";
 const THREAD_ID_FILE: &str = "/workspace/.engram/codex-thread-id";
+const PARKED_CALLS_FILE: &str = "/workspace/.engram/codex-parked-calls.json";
 const MAX_SUMMARY: usize = 4096;
+
+type ToolManifest = Vec<ManifestTool>;
+
+#[derive(Clone, Debug)]
+struct ManifestTool {
+    name: String,
+    description: String,
+    input_schema: Value,
+    execution: ToolExecution,
+    codex_native_binding: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ToolExecution {
+    Sync,
+    Deferred,
+}
+
+fn parse_tool_manifest(raw: &str) -> Result<ToolManifest, String> {
+    let value: Value = serde_json::from_str(raw).map_err(|error| error.to_string())?;
+    let entries = value
+        .as_array()
+        .ok_or("ENGRAM_TOOLS must be a JSON array")?;
+    entries
+        .iter()
+        .map(|entry| {
+            let object = entry
+                .as_object()
+                .ok_or("ENGRAM_TOOLS entries must be objects")?;
+            let required_string = |field: &str| {
+                object
+                    .get(field)
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .ok_or_else(|| format!("ENGRAM_TOOLS entry missing string {field}"))
+            };
+            let execution = match required_string("execution")?.as_str() {
+                "sync" => ToolExecution::Sync,
+                "deferred" => ToolExecution::Deferred,
+                other => return Err(format!("invalid ENGRAM_TOOLS execution {other}")),
+            };
+            let codex_native_binding = match object.get("nativeBindings") {
+                None => None,
+                Some(Value::Object(bindings)) => match bindings.get("codex") {
+                    None | Some(Value::Null) => None,
+                    Some(Value::String(binding)) => Some(binding.clone()),
+                    Some(_) => {
+                        return Err("ENGRAM_TOOLS nativeBindings.codex must be a string".to_string())
+                    }
+                },
+                Some(_) => return Err("ENGRAM_TOOLS nativeBindings must be an object".to_string()),
+            };
+            Ok(ManifestTool {
+                name: required_string("name")?,
+                description: required_string("description")?,
+                input_schema: object
+                    .get("inputSchema")
+                    .cloned()
+                    .ok_or("ENGRAM_TOOLS entry missing inputSchema")?,
+                execution,
+                codex_native_binding,
+            })
+        })
+        .collect()
+}
+
+fn manifest_from_env() -> ToolManifest {
+    match std::env::var("ENGRAM_TOOLS") {
+        Ok(raw) if !raw.trim().is_empty() => match parse_tool_manifest(&raw) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                tracing::error!(%error, "invalid ENGRAM_TOOLS manifest; exposing no dynamic tools");
+                Vec::new()
+            }
+        },
+        _ => Vec::new(),
+    }
+}
+
+fn dynamic_tools(manifest: &ToolManifest) -> Value {
+    Value::Array(
+        manifest
+            .iter()
+            .filter(|tool| tool.codex_native_binding.is_none())
+            .map(|tool| {
+                json!({
+                    "name": tool.name,
+                    "description": tool.description,
+                    "inputSchema": tool.input_schema,
+                })
+            })
+            .collect(),
+    )
+}
 
 #[derive(Parser, Clone, Debug)]
 #[command(name = "engram-harness-codex")]
@@ -35,6 +130,29 @@ struct Cli {
     codex_bin: Option<PathBuf>,
     #[arg(long, env = "ENGRAM_CODEX_HOME", default_value = DEFAULT_CODEX_HOME)]
     codex_home: PathBuf,
+    /// Test seam for per-session state. Production uses THREAD_ID_FILE.
+    #[arg(skip)]
+    thread_id_file: Option<PathBuf>,
+    /// Parsed once from ENGRAM_TOOLS by the harness entrypoint.
+    #[arg(skip)]
+    tool_manifest: ToolManifest,
+    /// Test seam for the durable correlation table.
+    #[arg(skip)]
+    parked_calls_file: Option<PathBuf>,
+}
+
+impl Cli {
+    fn thread_id_file(&self) -> &Path {
+        self.thread_id_file
+            .as_deref()
+            .unwrap_or_else(|| Path::new(THREAD_ID_FILE))
+    }
+
+    fn parked_calls_file(&self) -> &Path {
+        self.parked_calls_file
+            .as_deref()
+            .unwrap_or_else(|| Path::new(PARKED_CALLS_FILE))
+    }
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -45,7 +163,8 @@ async fn main() -> ExitCode {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
         )
         .init();
-    let cli = Cli::parse();
+    let mut cli = Cli::parse();
+    cli.tool_manifest = manifest_from_env();
     if !((cli.connect.is_some()) ^ (cli.port.is_some())) {
         tracing::error!("provide exactly one of --connect or --port");
         return ExitCode::from(2);
@@ -89,6 +208,7 @@ struct AppServer {
     persisted_prompts: HashMap<String, PersistedTurn>,
     buffered: VecDeque<Value>,
     stderr_task: Option<tokio::task::JoinHandle<Vec<String>>>,
+    generation: u64,
 }
 
 #[derive(Clone, Debug)]
@@ -103,11 +223,23 @@ enum Pending {
     Start(QueuedPrompt),
     Steer(QueuedPrompt),
     Interrupt,
+    FollowUp {
+        call_id: String,
+        completion: FollowUpCompletion,
+    },
 }
 
-struct OutstandingQuestion {
-    request_id: Value,
-    ids_by_text: HashMap<String, String>,
+#[derive(Debug)]
+enum FollowUpCompletion {
+    Tool {
+        name: String,
+        result_summary: String,
+    },
+}
+
+struct ToolContext<'a> {
+    parked: &'a mut ParkedCallStore,
+    manifest: &'a ToolManifest,
 }
 
 async fn run_engine(
@@ -119,8 +251,21 @@ async fn run_engine(
     let mut queued = VecDeque::<QueuedPrompt>::new();
     let mut seen = HashSet::<String>::new();
     let mut failures = 0u32;
+    let mut generation = 0u64;
+    let mut parked = match ParkedCallStore::open(cli.parked_calls_file()) {
+        Ok(store) => store,
+        Err(error) => {
+            tracing::error!(%error, path = %cli.parked_calls_file().display(), "could not open Codex parked-call table");
+            return ExitCode::from(1);
+        }
+    };
+    if let Err(error) = parked.mark_requests_stale() {
+        tracing::error!(%error, "could not mark restored Codex request IDs stale");
+        return ExitCode::from(1);
+    }
     loop {
-        match AppServer::spawn(&cli).await {
+        generation = generation.saturating_add(1);
+        match AppServer::spawn(&cli, generation).await {
             Ok(mut server) => {
                 failures = 0;
                 seen.extend(server.persisted_prompts.keys().cloned());
@@ -131,24 +276,37 @@ async fn run_engine(
                     &events,
                     &mut queued,
                     &mut seen,
+                    &mut parked,
+                    &cli.tool_manifest,
                 )
                 .await;
                 if matches!(
                     outcome,
                     DriveOutcome::Shutdown | DriveOutcome::ChannelClosed
                 ) {
-                    let _ = server.stdin.shutdown().await;
-                    if tokio::time::timeout(std::time::Duration::from_secs(5), server.child.wait())
+                    // ChildStdin::shutdown() only flushes — dropping the
+                    // handle is what closes the pipe and delivers the EOF
+                    // the app-server exits on. Without it every drain ate
+                    // the full 5s timeout and ended in SIGKILL.
+                    let AppServer {
+                        mut child, stdin, ..
+                    } = server;
+                    drop(stdin);
+                    if tokio::time::timeout(std::time::Duration::from_secs(5), child.wait())
                         .await
                         .is_err()
                     {
-                        let _ = server.child.start_kill();
-                        let _ = server.child.wait().await;
+                        let _ = child.start_kill();
+                        let _ = child.wait().await;
                     }
                     return ExitCode::SUCCESS;
                 }
                 let _ = server.child.start_kill();
                 let _ = server.child.wait().await;
+                if let Err(error) = parked.mark_requests_stale() {
+                    tracing::error!(%error, "could not stale Codex requests after app-server crash");
+                    return ExitCode::from(1);
+                }
             }
             Err(error) => tracing::error!(%error, "failed to start Codex app-server"),
         }
@@ -164,7 +322,7 @@ async fn run_engine(
 }
 
 impl AppServer {
-    async fn spawn(cli: &Cli) -> Result<Self, String> {
+    async fn spawn(cli: &Cli, generation: u64) -> Result<Self, String> {
         tokio::fs::create_dir_all(&cli.codex_home)
             .await
             .map_err(|e| format!("create CODEX_HOME: {e}"))?;
@@ -192,11 +350,12 @@ impl AppServer {
             persisted_prompts: HashMap::new(),
             buffered: VecDeque::new(),
             stderr_task: Some(engram_harness_sdk::spawn_stderr_tail(stderr, 64, true)),
+            generation,
         };
         server
             .request_wait(
                 "initialize",
-                json!({"clientInfo":{"name":"engrams","title":"Engrams","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":false}}),
+                json!({"clientInfo":{"name":"engrams","title":"Engrams","version":env!("CARGO_PKG_VERSION")},"capabilities":{"experimentalApi":true}}),
             )
             .await?;
         server.notify("initialized", json!({})).await?;
@@ -217,7 +376,7 @@ impl AppServer {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => tracing::warn!(%error, "could not remove Codex credential cache"),
         }
-        let prior = tokio::fs::read_to_string(THREAD_ID_FILE)
+        let prior = tokio::fs::read_to_string(cli.thread_id_file())
             .await
             .ok()
             .map(|s| s.trim().to_owned())
@@ -228,6 +387,7 @@ impl AppServer {
             "thread/start"
         };
         let mut params = thread_params();
+        params["dynamicTools"] = dynamic_tools(&cli.tool_manifest);
         if let Some(thread_id) = prior {
             params["threadId"] = json!(thread_id);
         }
@@ -238,7 +398,7 @@ impl AppServer {
             .ok_or("thread response missing result.thread.id")?
             .to_owned();
         server.persisted_prompts = persisted_prompts(&response);
-        persist_thread_id(&server.thread_id).await?;
+        persist_thread_id(cli.thread_id_file(), &server.thread_id).await?;
         Ok(server)
     }
 
@@ -306,10 +466,11 @@ async fn drive(
     events: &mpsc::Sender<HarnessEvent>,
     queued: &mut VecDeque<QueuedPrompt>,
     seen: &mut HashSet<String>,
+    parked: &mut ParkedCallStore,
+    manifest: &ToolManifest,
 ) -> DriveOutcome {
     let mut active: Option<String> = None;
     let mut pending = HashMap::<i64, Pending>::new();
-    let mut questions = HashMap::<String, OutstandingQuestion>::new();
     let mut interrupt_deadline: Option<tokio::time::Instant> = None;
     let mut interrupt_requested = false;
     emit(events, HarnessEvent::Idle).await;
@@ -380,7 +541,7 @@ async fn drive(
                 &mut active,
                 &mut pending,
                 queued,
-                &mut questions,
+                ToolContext { parked, manifest },
             )
             .await;
             if completed {
@@ -458,17 +619,17 @@ async fn drive(
                         interrupt_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
                     }
                 },
-                Some(HarnessCommand::AnswerQuestion { tool_call_id, answers }) => {
-                    if let Some(outstanding) = questions.remove(&tool_call_id) {
-                        let codex_answers: serde_json::Map<String, Value> = answers.iter().map(|(text,v)| {
-                            let id = outstanding.ids_by_text.get(text).cloned().unwrap_or_else(|| text.clone());
-                            (id, json!({"answers":v}))
-                        }).collect();
-                        let _ = server.respond(outstanding.request_id, json!({"answers":codex_answers})).await;
-                        if let Some(run_id) = active.clone() {
-                            emit(events, HarnessEvent::QuestionAnswered { run_id, tool_call_id, answers }).await;
-                        }
-                    }
+                Some(HarnessCommand::ToolResult { call_id, result_json }) => {
+                    route_tool_result(
+                        server,
+                        parked,
+                        &mut pending,
+                        &active,
+                        events,
+                        &call_id,
+                        result_json,
+                    )
+                    .await;
                 }
                 Some(HarnessCommand::Shutdown { .. }) => return DriveOutcome::Shutdown,
                 Some(HarnessCommand::Checkpoint { .. }) => {}
@@ -488,7 +649,15 @@ async fn drive(
             message = server.read() => match message {
                 Ok(Some(value)) => {
                     let completed = value.get("method").and_then(Value::as_str) == Some("turn/completed");
-                    handle_message(server, value, events, &mut active, &mut pending, queued, &mut questions).await;
+                    handle_message(
+                        server,
+                        value,
+                        events,
+                        &mut active,
+                        &mut pending,
+                        queued,
+                        ToolContext { parked, manifest },
+                    ).await;
                     if completed {
                         interrupt_deadline = None;
                         interrupt_requested = false;
@@ -496,8 +665,9 @@ async fn drive(
                 },
                 Ok(None) | Err(_) => {
                     for request in pending.drain().map(|(_, request)| request) {
-                        if let Pending::Start(prompt) | Pending::Steer(prompt) = request {
-                            queued.push_back(prompt);
+                        match request {
+                            Pending::Start(prompt) | Pending::Steer(prompt) => queued.push_back(prompt),
+                            Pending::Interrupt | Pending::FollowUp { .. } => {}
                         }
                     }
                     if let Some(run_id) = active.take() {
@@ -545,6 +715,236 @@ async fn start_turn(server: &mut AppServer, prompt: &QueuedPrompt) -> Result<i64
     server.send_request("turn/start", params).await
 }
 
+async fn handle_dynamic_tool_call(
+    server: &mut AppServer,
+    value: Value,
+    events: &mpsc::Sender<HarnessEvent>,
+    active: &Option<String>,
+    parked: &mut ParkedCallStore,
+    manifest: &ToolManifest,
+) {
+    let params = value.get("params").cloned().unwrap_or(Value::Null);
+    let Some(request_id) = value.get("id").cloned() else {
+        tracing::error!("item/tool/call request missing JSON-RPC id");
+        return;
+    };
+    let Some(call_id) = params.get("callId").and_then(Value::as_str) else {
+        tracing::error!(request_id = %request_id, "item/tool/call missing callId");
+        return;
+    };
+    let Some(tool_name) = params.get("tool").and_then(Value::as_str) else {
+        tracing::error!(%call_id, "item/tool/call missing tool name");
+        return;
+    };
+    let Some(tool) = manifest
+        .iter()
+        .find(|tool| tool.name == tool_name && tool.codex_native_binding.is_none())
+    else {
+        tracing::error!(%call_id, %tool_name, "Codex requested an undeclared dynamic tool");
+        let _ = server
+            .respond(
+                request_id,
+                json!({
+                    "success":false,
+                    "contentItems":[{
+                        "type":"inputText",
+                        "text":format!("undeclared dynamic tool: {tool_name}")
+                    }]
+                }),
+            )
+            .await;
+        return;
+    };
+    let execution = match tool.execution {
+        ToolExecution::Sync => "sync",
+        ToolExecution::Deferred => "deferred",
+    };
+    let call = ParkedCall::new(
+        call_id,
+        ParkedCallKind::DynamicTool,
+        request_id,
+        tool_name,
+        server.generation,
+        json!({"execution":execution}),
+    );
+    if let Err(error) = parked.record(call) {
+        tracing::error!(%error, %call_id, "could not durably park Codex dynamic tool call");
+        return;
+    }
+    let run_id = params
+        .get("turnId")
+        .and_then(Value::as_str)
+        .or(active.as_deref())
+        .unwrap_or("")
+        .to_owned();
+    emit(
+        events,
+        HarnessEvent::ToolCallRequested {
+            run_id,
+            call_id: call_id.to_owned(),
+            name: tool_name.to_owned(),
+            args_json: params
+                .get("arguments")
+                .cloned()
+                .unwrap_or_else(|| json!({}))
+                .to_string(),
+        },
+    )
+    .await;
+    if tool.execution == ToolExecution::Deferred {
+        emit(events, HarnessEvent::Parked).await;
+    }
+}
+
+async fn route_tool_result(
+    server: &mut AppServer,
+    parked: &mut ParkedCallStore,
+    pending: &mut HashMap<i64, Pending>,
+    active: &Option<String>,
+    events: &mpsc::Sender<HarnessEvent>,
+    call_id: &str,
+    result_json: String,
+) {
+    let Some(call) = parked.get(call_id).cloned() else {
+        tracing::error!(%call_id, "ToolResult has no parked Codex call");
+        return;
+    };
+    if call.kind != ParkedCallKind::DynamicTool {
+        tracing::error!(%call_id, kind = ?call.kind, "ToolResult does not match a dynamic tool call");
+        return;
+    }
+    let native_question =
+        call.context.get("nativeBinding").and_then(Value::as_str) == Some("requestUserInput");
+    let answers = if native_question {
+        match serde_json::from_str::<Answers>(&result_json) {
+            Ok(answers) => Some(answers),
+            Err(error) => {
+                tracing::error!(%error, %call_id, "ToolResult for ask_user_question is not a canonical answer map");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+    if call.request_generation != server.generation || call.request_id.is_null() {
+        let message = if native_question {
+            format!(
+                "Answer to the earlier question ({call_id}) after Codex restarted: {result_json}"
+            )
+        } else {
+            format!(
+                "The earlier `{}` tool call ({call_id}) completed after Codex restarted. Result: {result_json}",
+                call.tool_name
+            )
+        };
+        let completion = FollowUpCompletion::Tool {
+            name: call.tool_name.clone(),
+            result_summary: result_json,
+        };
+        if let Err(error) =
+            send_follow_up(server, active, pending, call_id, message, completion).await
+        {
+            tracing::error!(%error, %call_id, "could not deliver late ToolResult as user message");
+        }
+        return;
+    }
+    if native_question {
+        let codex_answers = codex_answers(&call, answers.as_ref().expect("parsed above"));
+        if let Err(error) = server
+            .respond(call.request_id, json!({"answers":codex_answers}))
+            .await
+        {
+            tracing::error!(%error, %call_id, "could not answer Codex requestUserInput");
+            return;
+        }
+    } else if let Err(error) = server
+        .respond(
+            call.request_id,
+            json!({
+                "success":true,
+                "contentItems":[{"type":"inputText","text":result_json}]
+            }),
+        )
+        .await
+    {
+        tracing::error!(%error, %call_id, "could not answer Codex dynamic tool call");
+        return;
+    }
+    if let Err(error) = parked.take(call_id) {
+        tracing::error!(%error, %call_id, "could not retire answered Codex dynamic tool call");
+    }
+    if native_question {
+        emit(
+            events,
+            HarnessEvent::ToolCallCompleted {
+                run_id: active.clone().unwrap_or_default(),
+                tool_call_id: call_id.to_owned(),
+                tool_name: call.tool_name,
+                ok: true,
+                duration_ms: 0,
+                result_summary: Some(engram_harness_sdk::truncate_utf8(&result_json, MAX_SUMMARY)),
+            },
+        )
+        .await;
+    }
+}
+
+fn codex_answers(call: &ParkedCall, answers: &Answers) -> serde_json::Map<String, Value> {
+    let ids_by_text = call.context.get("idsByText").and_then(Value::as_object);
+    answers
+        .iter()
+        .map(|(text, selections)| {
+            let id = ids_by_text
+                .and_then(|ids| ids.get(text))
+                .and_then(Value::as_str)
+                .unwrap_or(text)
+                .to_owned();
+            (id, json!({"answers":selections}))
+        })
+        .collect()
+}
+
+async fn send_follow_up(
+    server: &mut AppServer,
+    active: &Option<String>,
+    pending: &mut HashMap<i64, Pending>,
+    call_id: &str,
+    text: String,
+    completion: FollowUpCompletion,
+) -> Result<(), String> {
+    let client_id = format!("codex-follow-up-{}", uuid::Uuid::new_v4());
+    let request_id = if let Some(turn_id) = active.as_deref() {
+        server
+            .send_request(
+                "turn/steer",
+                json!({
+                    "threadId":server.thread_id,
+                    "expectedTurnId":turn_id,
+                    "clientUserMessageId":client_id,
+                    "input":[{"type":"text","text":text}],
+                }),
+            )
+            .await?
+    } else {
+        start_turn(
+            server,
+            &QueuedPrompt {
+                prompt_id: client_id,
+                text,
+            },
+        )
+        .await?
+    };
+    pending.insert(
+        request_id,
+        Pending::FollowUp {
+            call_id: call_id.to_owned(),
+            completion,
+        },
+    );
+    Ok(())
+}
+
 async fn handle_message(
     server: &mut AppServer,
     value: Value,
@@ -552,8 +952,12 @@ async fn handle_message(
     active: &mut Option<String>,
     pending: &mut HashMap<i64, Pending>,
     queued: &mut VecDeque<QueuedPrompt>,
-    questions: &mut HashMap<String, OutstandingQuestion>,
+    tools: ToolContext<'_>,
 ) {
+    if value.get("method").and_then(Value::as_str) == Some("item/tool/call") {
+        handle_dynamic_tool_call(server, value, events, active, tools.parked, tools.manifest).await;
+        return;
+    }
     if value.get("method").and_then(Value::as_str) == Some("item/tool/requestUserInput") {
         let params = value.get("params").cloned().unwrap_or(Value::Null);
         let run_id = params
@@ -568,7 +972,7 @@ async fn handle_message(
             .unwrap_or("request-user-input")
             .to_owned();
         let qs = parse_questions(params.get("questions"));
-        let ids_by_text = params
+        let ids_by_text: serde_json::Map<String, Value> = params
             .get("questions")
             .and_then(Value::as_array)
             .into_iter()
@@ -576,28 +980,52 @@ async fn handle_message(
             .filter_map(|q| {
                 Some((
                     q.get("question")?.as_str()?.to_owned(),
-                    q.get("id")?.as_str()?.to_owned(),
+                    Value::String(q.get("id")?.as_str()?.to_owned()),
                 ))
             })
             .collect();
-        if let Some(request_id) = value.get("id").cloned() {
-            questions.insert(
-                item_id.clone(),
-                OutstandingQuestion {
-                    request_id,
-                    ids_by_text,
-                },
+        let Some(request_id) = value.get("id").cloned() else {
+            tracing::error!(%item_id, "requestUserInput missing JSON-RPC id");
+            return;
+        };
+        let native_tool = tools
+            .manifest
+            .iter()
+            .find(|tool| tool.codex_native_binding.as_deref() == Some("requestUserInput"))
+            .map(|tool| tool.name.clone());
+        let tool_name = native_tool.unwrap_or_else(|| {
+            tracing::warn!(
+                %item_id,
+                "requestUserInput has no manifest native binding; falling back to deferred ask_user_question"
             );
+            "ask_user_question".to_string()
+        });
+        let call = ParkedCall::new(
+            &item_id,
+            ParkedCallKind::DynamicTool,
+            request_id,
+            &tool_name,
+            server.generation,
+            json!({
+                "nativeBinding":"requestUserInput",
+                "idsByText":ids_by_text
+            }),
+        );
+        if let Err(error) = tools.parked.record(call) {
+            tracing::error!(%error, %item_id, "could not durably park Codex requestUserInput");
+            return;
         }
         emit(
             events,
-            HarnessEvent::UserQuestion {
+            HarnessEvent::ToolCallRequested {
                 run_id,
-                tool_call_id: item_id,
-                questions: qs,
+                call_id: item_id,
+                name: tool_name,
+                args_json: json!({"questions":qs}).to_string(),
             },
         )
         .await;
+        emit(events, HarnessEvent::Parked).await;
         return;
     }
     if let Some(id) = value.get("id").and_then(Value::as_i64) {
@@ -639,6 +1067,52 @@ async fn handle_message(
                     queued.push_back(prompt);
                 }
                 Pending::Interrupt => {}
+                Pending::FollowUp {
+                    call_id,
+                    completion,
+                } if value.get("error").is_none() => {
+                    if let Some(turn_id) = value.pointer("/result/turn/id").and_then(Value::as_str)
+                    {
+                        *active = Some(turn_id.to_owned());
+                        emit(
+                            events,
+                            HarnessEvent::RunStarted {
+                                run_id: turn_id.to_owned(),
+                                prompt_summary: None,
+                                prompt_id: None,
+                            },
+                        )
+                        .await;
+                    }
+                    if let Err(error) = tools.parked.take(&call_id) {
+                        tracing::error!(%error, %call_id, "could not retire crash-degraded Codex call");
+                    }
+                    match completion {
+                        FollowUpCompletion::Tool {
+                            name,
+                            result_summary,
+                        } => {
+                            emit(
+                                events,
+                                HarnessEvent::ToolCallCompleted {
+                                    run_id: active.clone().unwrap_or_default(),
+                                    tool_call_id: call_id,
+                                    tool_name: name,
+                                    ok: true,
+                                    duration_ms: 0,
+                                    result_summary: Some(engram_harness_sdk::truncate_utf8(
+                                        &result_summary,
+                                        MAX_SUMMARY,
+                                    )),
+                                },
+                            )
+                            .await;
+                        }
+                    }
+                }
+                Pending::FollowUp { call_id, .. } => {
+                    tracing::error!(%call_id, error = ?value.get("error"), "Codex rejected crash-degrade follow-up");
+                }
             }
         }
         return;
@@ -1049,13 +1523,13 @@ fn thread_params() -> Value {
     params
 }
 
-async fn persist_thread_id(id: &str) -> Result<(), String> {
-    if let Some(parent) = Path::new(THREAD_ID_FILE).parent() {
+async fn persist_thread_id(path: &Path, id: &str) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
         tokio::fs::create_dir_all(parent)
             .await
             .map_err(|e| e.to_string())?;
     }
-    tokio::fs::write(THREAD_ID_FILE, format!("{id}\n"))
+    tokio::fs::write(path, format!("{id}\n"))
         .await
         .map_err(|e| e.to_string())
 }
@@ -1071,6 +1545,909 @@ async fn ensure_skills_link(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn write_fake_codex(scripted_after_turn_start: &[&str]) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("fake-codex-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let script = base.join("codex");
+        let record = base.join("requests.jsonl");
+        let mut body = String::from("#!/bin/sh\n");
+        body.push_str(&format!("record='{}'\n", record.display()));
+        body.push_str(
+            r#"while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$record"
+  id=$(printf '%s\n' "$line" | jq -r '.id // empty')
+  method=$(printf '%s\n' "$line" | jq -r '.method // empty')
+  case "$method" in
+    initialize|account/login/start)
+      printf '{"id":%s,"result":{}}\n' "$id"
+      ;;
+    thread/start|thread/resume)
+      printf '{"id":%s,"result":{"thread":{"id":"t1","turns":[]}}}\n' "$id"
+      ;;
+    turn/start)
+      printf '{"id":%s,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}\n' "$id"
+"#,
+        );
+        for line in scripted_after_turn_start {
+            body.push_str(&format!("      printf '%s\\n' '{line}'\n"));
+        }
+        body.push_str(
+            r#"      ;;
+  esac
+done
+"#,
+        );
+        tokio::fs::write(&script, body).await.unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        (script, record)
+    }
+
+    async fn write_crashing_question_fake() -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("fake-codex-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let script = base.join("codex");
+        let record = base.join("requests.jsonl");
+        let generation = base.join("generation");
+        let mut body = String::from("#!/bin/sh\n");
+        body.push_str(&format!("record='{}'\n", record.display()));
+        body.push_str(&format!("generation_file='{}'\n", generation.display()));
+        body.push_str(
+            r#"generation=0
+if [ -f "$generation_file" ]; then
+  generation=$(cat "$generation_file")
+fi
+generation=$((generation + 1))
+printf '%s\n' "$generation" > "$generation_file"
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$record"
+  id=$(printf '%s\n' "$line" | jq -r '.id // empty')
+  method=$(printf '%s\n' "$line" | jq -r '.method // empty')
+  case "$method" in
+    initialize|account/login/start)
+      printf '{"id":%s,"result":{}}\n' "$id"
+      ;;
+    thread/start)
+      printf '{"id":%s,"result":{"thread":{"id":"t1","turns":[]}}}\n' "$id"
+      ;;
+    thread/resume)
+      printf '{"id":%s,"result":{"thread":{"id":"t1","turns":[{"id":"turn-1","status":"interrupted","items":[]}]}}}\n' "$id"
+      ;;
+    turn/start)
+      if [ "$generation" -eq 1 ]; then
+        printf '{"id":%s,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}\n' "$id"
+        printf '%s\n' '{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"question-1","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}'
+        exit 91
+      else
+        printf '{"id":%s,"result":{"turn":{"id":"turn-follow-up","status":"inProgress"}}}\n' "$id"
+      fi
+      ;;
+  esac
+done
+"#,
+        );
+        tokio::fs::write(&script, body).await.unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        (script, record)
+    }
+
+    fn test_cli(codex_bin: PathBuf, codex_home: PathBuf) -> Cli {
+        let parked_calls_file = codex_home
+            .parent()
+            .unwrap_or(&codex_home)
+            .join("parked-calls.json");
+        Cli {
+            connect: None,
+            port: Some(1),
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            binding_epoch: 1,
+            codex_bin: Some(codex_bin),
+            codex_home,
+            thread_id_file: None,
+            tool_manifest: manifest_from_env(),
+            parked_calls_file: Some(parked_calls_file),
+        }
+    }
+
+    fn native_question_manifest() -> ToolManifest {
+        parse_tool_manifest(
+            r#"[{"name":"ask_user_question","description":"Ask the user one or more structured questions.","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{"codex":"requestUserInput"}}]"#,
+        )
+        .unwrap()
+    }
+
+    async fn recorded_requests(path: &Path) -> Vec<Value> {
+        tokio::fs::read_to_string(path)
+            .await
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn fake_app_server_completes_one_prompt_turn() {
+        let completed = r#"{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn-1","status":"completed"}}}"#;
+        let (script, _) = write_fake_codex(&[completed]).await;
+        let base = script.parent().unwrap();
+        let mut cli = test_cli(script.clone(), base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "hello".into(),
+            })
+            .await
+            .unwrap();
+        let completed = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            let mut started = false;
+            while let Some(event) = event_rx.recv().await {
+                match event {
+                    HarnessEvent::RunStarted { run_id, .. } => {
+                        assert_eq!(run_id, "turn-1");
+                        started = true;
+                    }
+                    HarnessEvent::RunCompleted { run_id, ok } => {
+                        assert!(started);
+                        assert_eq!(run_id, "turn-1");
+                        assert!(ok);
+                        break;
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await;
+        if completed.is_err() {
+            engine.abort();
+        }
+        completed.expect("fake app-server prompt turn timed out");
+
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn initialize_enables_experimental_api() {
+        let (script, record) = write_fake_codex(&[]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        let mut server = AppServer::spawn(&cli, 1).await.unwrap();
+
+        let requests = recorded_requests(&record).await;
+        let initialize = requests
+            .iter()
+            .find(|request| request.get("method") == Some(&json!("initialize")))
+            .unwrap();
+        assert_eq!(
+            initialize.pointer("/params/capabilities/experimentalApi"),
+            Some(&json!(true))
+        );
+        let _ = server.child.start_kill();
+        let _ = server.child.wait().await;
+    }
+
+    async fn assert_manifest_declared_on_thread(method: &str, resume: bool) {
+        let manifest = r#"[
+            {"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object","properties":{"text":{"type":"string"}}},"execution":"sync","nativeBindings":{}},
+            {"name":"ask_user_question","description":"Ask the user","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{"codex":"requestUserInput"}},
+            {"name":"claude_native","description":"Only native on Claude","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{"claude":"Example"}}
+        ]"#;
+        std::env::set_var("ENGRAM_TOOLS", manifest);
+        let (script, record) = write_fake_codex(&[]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        if resume {
+            tokio::fs::write(cli.thread_id_file.as_ref().unwrap(), "existing-thread\n")
+                .await
+                .unwrap();
+        }
+        let mut server = AppServer::spawn(&cli, 1).await.unwrap();
+
+        let requests = recorded_requests(&record).await;
+        let thread = requests
+            .iter()
+            .find(|request| request.get("method") == Some(&json!(method)))
+            .unwrap();
+        assert_eq!(
+            thread.pointer("/params/dynamicTools"),
+            Some(&json!([
+                {
+                    "name":"save_memory",
+                    "description":"Save a memory",
+                    "inputSchema":{
+                        "type":"object",
+                        "properties":{"text":{"type":"string"}}
+                    }
+                },
+                {
+                    "name":"claude_native",
+                    "description":"Only native on Claude",
+                    "inputSchema":{"type":"object"}
+                }
+            ]))
+        );
+        let _ = server.child.start_kill();
+        let _ = server.child.wait().await;
+        std::env::remove_var("ENGRAM_TOOLS");
+    }
+
+    #[tokio::test]
+    async fn thread_start_declares_manifest_dynamic_tools() {
+        assert_manifest_declared_on_thread("thread/start", false).await;
+    }
+
+    #[tokio::test]
+    async fn thread_resume_redeclares_manifest_dynamic_tools() {
+        assert_manifest_declared_on_thread("thread/resume", true).await;
+    }
+
+    #[tokio::test]
+    async fn deferred_dynamic_tool_call_emits_requested_then_parked_without_idle() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, _) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "remember".into(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await,
+                    Some(HarnessEvent::ToolCallRequested { ref call_id, .. })
+                        if call_id == "call-1"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("deferred dynamic tool request timed out");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("deferred call did not emit a parked marker"),
+            Some(HarnessEvent::Parked)
+        ));
+        let idle = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::Idle)) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(idle.is_err(), "a parked open turn must not emit Idle");
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn sync_dynamic_tool_call_emits_request_and_routes_result() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, record) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"sync","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "remember".into(),
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(HarnessEvent::ToolCallRequested {
+                    run_id,
+                    call_id,
+                    name,
+                    args_json,
+                }) = event_rx.recv().await
+                {
+                    break (run_id, call_id, name, args_json);
+                }
+            }
+        })
+        .await
+        .expect("dynamic tool request timed out");
+        assert_eq!(
+            event,
+            (
+                "turn-1".into(),
+                "call-1".into(),
+                "save_memory".into(),
+                r#"{"text":"remember this"}"#.into(),
+            )
+        );
+        let parked = tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::Parked)) {
+                    break;
+                }
+            }
+        })
+        .await;
+        assert!(parked.is_err(), "sync dynamic tools must not emit Parked");
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "call-1".into(),
+                result_json: r#"{"saved":true}"#.into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let requests = recorded_requests(&record).await;
+                if requests.iter().any(|request| {
+                    request
+                        == &json!({
+                            "id":77,
+                            "result":{
+                                "success":true,
+                                "contentItems":[{
+                                    "type":"inputText",
+                                    "text":r#"{"saved":true}"#
+                                }]
+                            }
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("dynamic tool result response timed out");
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn native_request_user_input_uses_generic_frames_and_is_parked_durably() {
+        let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"question-1","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
+        let (script, record) = write_fake_codex(&[question]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = native_question_manifest();
+        let parked_path = cli.parked_calls_file().to_path_buf();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "deploy".into(),
+            })
+            .await
+            .unwrap();
+
+        let event = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(HarnessEvent::ToolCallRequested {
+                    run_id,
+                    call_id,
+                    name,
+                    args_json,
+                }) = event_rx.recv().await
+                {
+                    break (run_id, call_id, name, args_json);
+                }
+            }
+        })
+        .await
+        .expect("requestUserInput event timed out");
+        assert_eq!(event.0, "turn-1");
+        assert_eq!(event.1, "question-1");
+        assert_eq!(event.2, "ask_user_question");
+        assert_eq!(
+            serde_json::from_str::<Value>(&event.3).unwrap(),
+            json!({"questions":[{
+                "question":"Deploy now?",
+                "header":"Deploy",
+                "multiSelect":false,
+                "options":[{"label":"Yes","description":"Deploy it"}]
+            }]})
+        );
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), event_rx.recv())
+                .await
+                .expect("requestUserInput did not emit a parked marker"),
+            Some(HarnessEvent::Parked)
+        ));
+        let parked = ParkedCallStore::open(parked_path).unwrap().all();
+        assert_eq!(parked.len(), 1);
+        assert_eq!(parked[0].tool_call_id, "question-1");
+        assert_eq!(parked[0].kind, ParkedCallKind::DynamicTool);
+        assert_eq!(parked[0].tool_name, "ask_user_question");
+        assert_eq!(parked[0].request_id, json!(88));
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "question-1".into(),
+                result_json: json!({"Deploy now?":["Yes"]}).to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if recorded_requests(&record).await.iter().any(|request| {
+                    request
+                        == &json!({
+                            "id":88,
+                            "result":{"answers":{"q1":{"answers":["Yes"]}}}
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("native question result response timed out");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(HarnessEvent::ToolCallCompleted {
+                        tool_call_id,
+                        tool_name,
+                        ok,
+                        ..
+                    }) = event_rx.recv().await
+                    {
+                        break (tool_call_id, tool_name, ok);
+                    }
+                }
+            })
+            .await,
+            Ok((call_id, name, true))
+                if call_id == "question-1" && name == "ask_user_question"
+        ));
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn unbound_request_user_input_falls_back_to_generic_question_protocol() {
+        let question = r#"{"id":88,"method":"item/tool/requestUserInput","params":{"itemId":"legacy-question","threadId":"t1","turnId":"turn-1","questions":[{"id":"q1","question":"Deploy now?","header":"Deploy","multiSelect":false,"options":[{"label":"Yes","description":"Deploy it"}]}]}}"#;
+        let (script, record) = write_fake_codex(&[question]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = Vec::new();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-legacy".into(),
+                text: "deploy".into(),
+            })
+            .await
+            .unwrap();
+        let requested = tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if let Some(HarnessEvent::ToolCallRequested {
+                    call_id,
+                    name,
+                    args_json,
+                    ..
+                }) = event_rx.recv().await
+                {
+                    break (call_id, name, args_json);
+                }
+            }
+        })
+        .await
+        .expect("fallback requestUserInput event timed out");
+        assert_eq!(requested.0, "legacy-question");
+        assert_eq!(requested.1, "ask_user_question");
+        assert_eq!(
+            serde_json::from_str::<Value>(&requested.2).unwrap(),
+            json!({"questions":[{
+                "question":"Deploy now?",
+                "header":"Deploy",
+                "multiSelect":false,
+                "options":[{"label":"Yes","description":"Deploy it"}]
+            }]})
+        );
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "legacy-question".into(),
+                result_json: json!({"Deploy now?":["Yes"]}).to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if recorded_requests(&record).await.iter().any(|request| {
+                    request
+                        == &json!({
+                            "id":88,
+                            "result":{"answers":{"q1":{"answers":["Yes"]}}}
+                        })
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("fallback ToolResult response timed out");
+        assert!(matches!(
+            tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                loop {
+                    if let Some(HarnessEvent::ToolCallCompleted {
+                        tool_call_id,
+                        tool_name,
+                        ok,
+                        ..
+                    }) = event_rx.recv().await
+                    {
+                        break (tool_call_id, tool_name, ok);
+                    }
+                }
+            })
+            .await,
+            Ok((call_id, name, true))
+                if call_id == "legacy-question"
+                    && name == "ask_user_question"
+        ));
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn shutdown_returns_promptly_while_dynamic_tool_call_is_parked() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, _) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"save_memory","description":"Save a memory","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "remember".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::Parked)) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("deferred call did not park");
+
+        command_tx
+            .send(HarnessCommand::Shutdown { grace_secs: 1 })
+            .await
+            .unwrap();
+        let exit = tokio::time::timeout(std::time::Duration::from_secs(2), engine)
+            .await
+            .expect("shutdown waited on the open JSON-RPC tool call")
+            .expect("engine task panicked");
+        assert_eq!(exit, ExitCode::SUCCESS);
+    }
+
+    #[tokio::test]
+    async fn native_question_result_after_app_server_crash_becomes_follow_up_user_message() {
+        let (script, record) = write_crashing_question_fake().await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = native_question_manifest();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(32);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "deploy".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await,
+                    Some(HarnessEvent::ToolCallRequested { ref call_id, ref name, .. })
+                        if call_id == "question-1" && name == "ask_user_question"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("pre-crash question event timed out");
+        tokio::time::timeout(std::time::Duration::from_secs(6), async {
+            loop {
+                if recorded_requests(&record)
+                    .await
+                    .iter()
+                    .any(|request| request.get("method") == Some(&json!("thread/resume")))
+                {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("fake app-server did not respawn");
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "question-1".into(),
+                result_json: json!({"Deploy now?":["Yes"]}).to_string(),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                let requests = recorded_requests(&record).await;
+                if requests.iter().any(|request| {
+                    request.get("method") == Some(&json!("turn/start"))
+                        && request
+                            .pointer("/params/input/0/text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| text.contains("question-1") && text.contains("Yes"))
+                }) {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("late answer was not delivered as a follow-up user message");
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await,
+                    Some(HarnessEvent::ToolCallCompleted {
+                        ref tool_call_id,
+                        ref tool_name,
+                        ok: true,
+                        ..
+                    }) if tool_call_id == "question-1" && tool_name == "ask_user_question"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("late result was not confirmed after the follow-up was accepted");
+        engine.abort();
+    }
+
+    #[tokio::test]
+    async fn unknown_result_logs_an_error_without_panicking() {
+        use std::io::Write;
+        use std::sync::Mutex;
+
+        #[derive(Clone)]
+        struct LogWriter(Arc<Mutex<Vec<u8>>>);
+        impl Write for LogWriter {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(bytes);
+                Ok(bytes.len())
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let logs = Arc::new(Mutex::new(Vec::new()));
+        let make_writer = {
+            let logs = logs.clone();
+            move || LogWriter(logs.clone())
+        };
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_max_level(tracing::Level::ERROR)
+            .with_writer(make_writer)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+        let (script, _) = write_fake_codex(&[]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        // This test launches a shell + jq-backed fake app-server alongside the
+        // rest of the nextest process set. Two seconds flaked under ordinary
+        // parallel load even though the same test completed in 350ms alone.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while !matches!(event_rx.recv().await, Some(HarnessEvent::Idle)) {}
+        })
+        .await
+        .unwrap();
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "missing-tool".into(),
+                result_json: "null".into(),
+            })
+            .await
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let output = String::from_utf8(logs.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("missing-tool"), "logs were: {output}");
+        assert!(!engine.is_finished(), "unknown correlation must not panic");
+        engine.abort();
+    }
+
+    async fn write_fake_schema_codex(include_malformed_dynamic: bool) -> PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+
+        let base = std::env::temp_dir().join(format!("fake-codex-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let script = base.join("codex");
+        let mut body =
+            String::from("#!/bin/sh\nfor out do :; done\nmkdir -p \"$out/v1\" \"$out/v2\"\n");
+        let schemas = [
+            ("v2/ThreadStartParams.json", r#"{}"#),
+            ("v2/ThreadResumeParams.json", r#"{}"#),
+            ("v2/TurnStartParams.json", r#"{}"#),
+            (
+                "v2/TurnSteerParams.json",
+                r#"{"properties":{"clientUserMessageId":{},"expectedTurnId":{}}}"#,
+            ),
+            (
+                "v2/TurnInterruptParams.json",
+                r#"{"properties":{"turnId":{},"threadId":{}}}"#,
+            ),
+            ("v2/TurnCompletedNotification.json", r#"{}"#),
+            (
+                "v2/AgentMessageDeltaNotification.json",
+                r#"{"properties":{"delta":{},"itemId":{}}}"#,
+            ),
+            ("v2/FileChangePatchUpdatedNotification.json", r#"{}"#),
+            (
+                "v2/ThreadNameUpdatedNotification.json",
+                r#"{"properties":{"threadId":{},"threadName":{}}}"#,
+            ),
+            ("ToolRequestUserInputParams.json", r#"{}"#),
+            (
+                "ServerNotification.json",
+                r#"{"definitions":{"TurnStatus":{"enum":["completed","failed","interrupted","inProgress"]}}}"#,
+            ),
+        ];
+        for (path, schema) in schemas {
+            body.push_str(&format!("printf '%s\\n' '{schema}' > \"$out/{path}\"\n"));
+        }
+        if include_malformed_dynamic {
+            for path in [
+                "v1/InitializeParams.json",
+                "DynamicToolCallParams.json",
+                "DynamicToolCallResponse.json",
+            ] {
+                body.push_str(&format!("printf '%s\\n' '{{}}' > \"$out/{path}\"\n"));
+            }
+        }
+        tokio::fs::write(&script, body).await.unwrap();
+        let mut permissions = std::fs::metadata(&script).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(&script, permissions).unwrap();
+        script
+    }
+
+    async fn run_schema_checker(fake_codex: &Path) -> std::process::Output {
+        let checker = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../deploy/harness-codex/check-app-server-schema.sh");
+        tokio::process::Command::new("bash")
+            .arg(checker)
+            .arg(fake_codex)
+            .output()
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn schema_checker_rejects_missing_dynamic_tool_contract() {
+        let fake = write_fake_schema_codex(false).await;
+        let output = run_schema_checker(&fake).await;
+        assert!(
+            !output.status.success(),
+            "checker accepted schemas with no dynamic-tool contract"
+        );
+    }
+
+    #[tokio::test]
+    async fn schema_checker_rejects_malformed_dynamic_tool_contract() {
+        let fake = write_fake_schema_codex(true).await;
+        let output = run_schema_checker(&fake).await;
+        assert!(
+            !output.status.success(),
+            "checker accepted malformed dynamic-tool schemas"
+        );
+    }
 
     #[test]
     fn parses_request_user_input_shape() {

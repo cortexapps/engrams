@@ -12,6 +12,7 @@ import { expect, test, describe } from "bun:test";
 import {
   parseInteractivity,
   parseUserQuestion,
+  parseQuestionAnswers,
   buildAnswerModal,
   buildQuestionBlocks,
   buildAnsweredBlocks,
@@ -142,9 +143,50 @@ describe("parseUserQuestion()", () => {
     });
   });
 
+  test("maps canonical questions nested in a tool_call_requested args_json", () => {
+    const payload = JSON.stringify({
+      run_id: "r",
+      tool_call_id: "tc-generic",
+      name: "ask_user_question",
+      args_json: JSON.stringify({
+        questions: [
+          {
+            question: "Pick one",
+            header: "Pick",
+            multiSelect: false,
+            options: [{ label: "A", description: "first option" }],
+          },
+        ],
+      }),
+    });
+    expect(parseUserQuestion(payload)).toEqual({
+      toolCallId: "tc-generic",
+      questions: [{ question: "Pick one", header: "Pick", multiSelect: false, options: ["A"] }],
+    });
+  });
+
   test("malformed payload → null (never throws)", () => {
     expect(parseUserQuestion("not json")).toBeNull();
     expect(parseUserQuestion(JSON.stringify({ tool_call_id: "tc" }))).toBeNull();
+  });
+});
+
+describe("parseQuestionAnswers()", () => {
+  test("reads legacy question_answered answers", () => {
+    expect(
+      parseQuestionAnswers(JSON.stringify({ tool_call_id: "tc", answers: { "Ship?": ["Yes"] } })),
+    ).toEqual({ "Ship?": ["Yes"] });
+  });
+
+  test("reads canonical answers nested in tool_result_submitted result_json", () => {
+    expect(
+      parseQuestionAnswers(
+        JSON.stringify({
+          tool_call_id: "tc-generic",
+          result_json: JSON.stringify({ "Ship?": ["Yes"] }),
+        }),
+      ),
+    ).toEqual({ "Ship?": ["Yes"] });
   });
 });
 

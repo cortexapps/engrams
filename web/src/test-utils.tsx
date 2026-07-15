@@ -131,7 +131,6 @@ export const testTransport: Transport = createRouterTransport((router) => {
     deleteSession: () => ({}),
     sendPrompt: () => ({ sessionId: "", note: "" }),
     interrupt: () => ({ sessionId: "", note: "" }),
-    answerQuestion: () => ({ sessionId: "", note: "" }),
     getLog: () => ({ sessionId: "", kind: "", events: [] }),
     snapshot: () => ({ sessionId: "", snapshotId: undefined, sizeBytes: undefined, note: "" }),
     resume: () => ({ sessionId: "", snapshotId: undefined, sizeBytes: undefined, note: "" }),

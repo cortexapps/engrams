@@ -35,22 +35,13 @@ import type { CustomConnectorSource } from "../connectors/registry.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import { config } from "../config.ts";
 import type { ThreadControlPlane } from "./slack-thread.ts";
-
-/** A StringList map value (proto3 maps can't hold `repeated` directly). */
-interface StringList {
-  values: string[];
-}
+import { tools as defaultToolRegistry, type ToolRegistry } from "../tools/registry.ts";
 
 /** The control-plane session ops the thread workflow drives. The create/delete
  *  half is the shared `TaskSessionsClient` (used by the create-task primitive);
- *  send/answer are the per-turn ops only the thread workflow needs. */
+ *  send is the per-turn op only the thread workflow needs. */
 export interface ThreadSessionsClient extends TaskSessionsClient {
   sendPrompt(req: { sessionId: string; promptId?: string; text: string }): Promise<unknown>;
-  answerQuestion(req: {
-    sessionId: string;
-    toolCallId: string;
-    answers: Record<string, StringList>;
-  }): Promise<unknown>;
 }
 
 export interface ThreadControlPlaneDeps {
@@ -60,6 +51,7 @@ export interface ThreadControlPlaneDeps {
   harnessCatalog?: HarnessCatalogClient;
   secrets?: { get(userId: string, envVar: string): Promise<string | null> };
   sessions?: ThreadSessionsClient;
+  toolRegistry?: Pick<ToolRegistry, "complete">;
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;
   /** The Drizzle DB the task-persist transaction runs on. Default = the pool. */
   db?: Db;
@@ -74,6 +66,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
     deps.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogClient);
   const secrets = deps.secrets ?? makeUserSecretStore(getDb());
   const sessions = deps.sessions ?? (defaultSessions as unknown as ThreadSessionsClient);
+  const toolRegistry = deps.toolRegistry ?? defaultToolRegistry;
   const resolveUser = deps.resolveUser ?? resolveEngramsUser;
   const db = deps.db ?? getDb();
 
@@ -83,12 +76,21 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
 
     async createTask(input) {
       const { sessionId } = await createTaskWithSession(
-        { profiles, images, connectors, harnessCatalog, sessions, secrets, db },
+        {
+          profiles,
+          images,
+          connectors,
+          harnessCatalog,
+          sessions,
+          secrets,
+          db,
+        },
         {
           type: "slack_thread",
           ownerUserId: input.ownerUserId,
           profileId: input.profileId,
           source: input.source,
+          slackThreadWorkflowId: input.threadWorkflowId,
           ...(input.prompt ? { prompt: input.prompt } : {}),
           ...(input.appendSystemPrompt
             ? { extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: input.appendSystemPrompt } }
@@ -102,10 +104,7 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
       await sessions.sendPrompt({ sessionId, promptId, text: prompt });
     },
 
-    answerQuestion: async (sessionId, toolCallId, answers) => {
-      const wire: Record<string, StringList> = {};
-      for (const [k, v] of Object.entries(answers)) wire[k] = { values: v };
-      await sessions.answerQuestion({ sessionId, toolCallId, answers: wire });
-    },
+    completeToolCall: (sessionId, toolCallId, result) =>
+      toolRegistry.complete(sessionId, toolCallId, result),
   };
 }

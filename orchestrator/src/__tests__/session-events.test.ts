@@ -49,6 +49,19 @@ describe("curated()", () => {
       expect(curated(k)).toBe(false);
     }
   });
+
+  test("forwards generic tool request and submitted-result events", async () => {
+    const page: WireEvent[] = [
+      { idx: 7n, kind: "tool_call_requested", payloadJson: '{"tool_call_id":"tc-1"}' },
+      { idx: 8n, kind: "tool_result_submitted", payloadJson: '{"tool_call_id":"tc-1"}' },
+    ];
+
+    const out = await readSessionEventsBounded("sess", 6n, fakeList(page, 8n));
+    expect(out.events.map((event) => event.kind)).toEqual([
+      "tool_call_requested",
+      "tool_result_submitted",
+    ]);
+  });
 });
 
 describe("readSessionEventsBounded()", () => {

@@ -91,7 +91,6 @@ describe("makeThreadControlPlane", () => {
           return { sessionId: "sess-1" };
         },
         sendPrompt: async () => {},
-        answerQuestion: async () => {},
         deleteSession: async () => {},
       },
     });
@@ -102,6 +101,7 @@ describe("makeThreadControlPlane", () => {
       prompt: "hello",
       appendSystemPrompt: "You were triggered from Slack.",
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
+      threadWorkflowId: "thread-wf-1",
     });
 
     expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe("You were triggered from Slack.");
@@ -112,11 +112,14 @@ describe("makeThreadControlPlane", () => {
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
     });
     expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "default-profile" });
+    expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
+    expect(records[3]).toEqual({ sessionId: "sess-1" });
     expect(started.id).toBe("sess-1");
     expect(started.webUrl).toContain("/sessions/sess-1");
   });
 
   test("getDefaultProfile + resolveUser delegate to their seams", async () => {
+    const completed: unknown[][] = [];
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
       images: fakeImages(),
@@ -124,16 +127,20 @@ describe("makeThreadControlPlane", () => {
       harnessCatalog: fakeHarnessCatalog(),
       secrets: { get: async () => null },
       resolveUser: async (provider, ext) => (provider === "slack" && ext === "U1" ? "user-7" : null),
+      toolRegistry: {
+        complete: async (...args) => void completed.push(args),
+      },
       db: recordingDb([]),
       sessions: {
         createSession: async () => ({ sessionId: "s" }),
         sendPrompt: async () => {},
-        answerQuestion: async () => {},
         deleteSession: async () => {},
       },
     });
 
     expect((await cp.getDefaultProfile())?.id).toBe("default-profile");
     expect(await cp.resolveUser("slack", "U1")).toBe("user-7");
+    await cp.completeToolCall("s", "tc", { "Ship?": ["Yes"] });
+    expect(completed).toEqual([["s", "tc", { "Ship?": ["Yes"] }]]);
   });
 });

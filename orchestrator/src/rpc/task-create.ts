@@ -27,7 +27,12 @@ import { isServiceAccountEmail } from "./api-key.ts";
 import { makePortExposureStore, type PortExposureStore } from "../db/port-exposures.ts";
 import type { ImagesClient } from "./profiles.ts";
 import { evictOwnerCacheEntry } from "../authz/resolve.ts";
-import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
+import {
+  sessionListener as sessionListenerTable,
+  slackSession as slackSessionTable,
+  task as taskTable,
+  taskSession as taskSessionTable,
+} from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
 import {
   compileIntegrationPolicy,
@@ -36,6 +41,8 @@ import {
   loadRegistry,
   type CustomConnectorSource,
 } from "../connectors/registry.ts";
+import { compileToolManifest } from "../tools/manifest.ts";
+import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -101,6 +108,9 @@ export interface SessionCompileDeps {
   images: ImagesClient;
   connectors: CustomConnectorSource;
   harnessCatalog: HarnessCatalogClient;
+  /** Tool registry to compile into the harness manifest. Production uses the
+   *  process-wide registry; tests may inject a focused registry. */
+  toolRegistry?: ToolRegistry;
   /** Resolve the owner's harness token for `envVar` (e.g. CLAUDE_CODE_OAUTH_TOKEN),
    *  or null. Only called when the profile sets includeUserTokens. */
   resolveUserToken: (envVar: string) => Promise<string | null>;
@@ -112,11 +122,10 @@ export interface SessionCompileOpts {
    *  e.g. "slack_thread"). Drives the strict-by-run-type credential pick (ADR
    *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
    *  its `org_env` (org secret, resolved host-side). Default "chat". */
-  type?: string;
   /** The creator is a service-account principal (an ADR 0086 API key — e.g. a
-   *  `ci-<repo>` CI key). Forces the PROGRAMMATIC credential pick regardless
-   *  of task type: a service account has no per-user harness token, so a
-   *  "chat" task it creates must still ride `org_env`. */
+   *  `ci-<repo>` CI key). Picks the PROGRAMMATIC credential (`org_env`): a
+   *  service account has no per-user harness token. Human-owned tasks get the
+   *  owner's token regardless of surface (chat UI, Slack, …). */
   programmatic?: boolean;
   /** ADR 0063 B2: per-session override of the profile's default harness / model /
    *  effort. Unset = use the profile's default. */
@@ -162,12 +171,14 @@ export async function compileSessionCreateInput(
   const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
 
-  // Strict-by-run-type credentials (ADR 0063 B4): a human (chat) task carries
-  // the user's per-user token; a programmatic task carries the org secret. They
-  // are mutually exclusive — never both. Run type is the task type AND the
-  // principal type: a service-account creator (API key) is programmatic even
-  // for a "chat" task — it has no per-user token to inject.
-  const isHuman = (opts.type ?? "chat") === "chat" && !opts.programmatic;
+  // Strict-by-principal credentials (ADR 0063 B4, amended): a human-owned task
+  // carries the owner's per-user token; a service-account-created task carries
+  // the org secret. They are mutually exclusive — never both. The PRINCIPAL
+  // decides, never the task type/surface: a Slack mention email-matched to a
+  // real user is that user (the old `type === "chat"` gate booted Slack
+  // sessions credential-less — "Not logged in", session e721311e), while an
+  // API-key creator is programmatic even for a "chat" task.
+  const isHuman = !opts.programmatic;
 
   // Harness env, lowest → highest precedence: user token < CLI dummy env <
   // profile env_vars < model env < effort env < git attribution < trigger
@@ -189,6 +200,8 @@ export async function compileSessionCreateInput(
   const cliPlan = compileCliIntegrations(profile.capabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
+  const toolManifest = compileToolManifest(deps.toolRegistry ?? productionTools, profile.capabilities);
+  if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
   for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
   // ADR 0063: the selected model/effort map to env vars via the harness
   // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in env_vars).
@@ -303,6 +316,8 @@ export interface CreateTaskParams {
   /** Extra harness env merged LAST — e.g. the trigger's
    *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
   extraHarnessEnv?: Record<string, string>;
+  /** Slack workflow mailbox to bind before the listener becomes discoverable. */
+  slackThreadWorkflowId?: string;
 }
 
 export interface CreatedTask {
@@ -356,7 +371,6 @@ export async function createTaskWithSession(
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
     },
     {
-      type: params.type,
       ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.harness != null ? { harness: params.harness } : {}),
@@ -390,6 +404,17 @@ export async function createTaskWithSession(
         sessionId: created.sessionId,
         role: "primary",
         profileId: profile.id,
+      });
+      if (params.slackThreadWorkflowId !== undefined) {
+        await tx.insert(slackSessionTable).values({
+          sessionId: created.sessionId,
+          threadWfId: params.slackThreadWorkflowId,
+        });
+      }
+      // Register last: once this transaction commits, every consumer-specific
+      // binding and the task/profile context are already visible.
+      await tx.insert(sessionListenerTable).values({
+        sessionId: created.sessionId,
       });
     });
   } catch (err) {

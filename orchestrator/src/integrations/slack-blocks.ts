@@ -18,6 +18,7 @@
 import type { ModalView, KnownBlock } from "@slack/types";
 
 import type { SourceAnswer } from "../workflows/thread-inbox.ts";
+import { AnswersSchema, QuestionsSchema } from "../tools/builtin.ts";
 import type {
   AssetSummary,
   ClosingSummary,
@@ -244,14 +245,34 @@ interface RawUserQuestion {
   }[];
 }
 
-/** Parse a `user_question` event payload into the rendering shape, or null if
- *  it lacks a tool_call_id or any question. Pure; never throws. */
+interface RawToolQuestionRequest {
+  tool_call_id?: unknown;
+  name?: unknown;
+  args_json?: unknown;
+}
+
+/** Parse either question protocol's event payload into the rendering shape, or
+ *  null if it lacks a tool_call_id or any question. Pure; never throws. */
 export function parseUserQuestion(payloadJson: string): ParsedUserQuestion | null {
-  let p: RawUserQuestion;
+  let decoded: unknown;
   try {
-    p = JSON.parse(payloadJson) as RawUserQuestion;
+    decoded = JSON.parse(payloadJson);
   } catch {
     return null;
+  }
+  if (typeof decoded !== "object" || decoded === null || Array.isArray(decoded)) return null;
+
+  let p = decoded as RawUserQuestion;
+  const generic = decoded as RawToolQuestionRequest;
+  if (typeof generic.args_json === "string") {
+    if (generic.name !== "ask_user_question") return null;
+    try {
+      const canonical = QuestionsSchema.safeParse(JSON.parse(generic.args_json));
+      if (!canonical.success) return null;
+      p = { tool_call_id: generic.tool_call_id, questions: canonical.data.questions };
+    } catch {
+      return null;
+    }
   }
   if (typeof p.tool_call_id !== "string" || !Array.isArray(p.questions) || p.questions.length === 0) {
     return null;
@@ -265,6 +286,25 @@ export function parseUserQuestion(payloadJson: string): ParsedUserQuestion | nul
       : [],
   }));
   return { toolCallId: p.tool_call_id, questions };
+}
+
+/** Parse the resolved answer map from either the historical question event or
+ * ADR 0089's nested opaque result JSON. Invalid payloads render as Answered. */
+export function parseQuestionAnswers(payloadJson: string): Record<string, string[]> {
+  try {
+    const payload = JSON.parse(payloadJson) as {
+      answers?: unknown;
+      result_json?: unknown;
+    };
+    const raw =
+      typeof payload.result_json === "string"
+        ? (JSON.parse(payload.result_json) as unknown)
+        : payload.answers;
+    const parsed = AnswersSchema.safeParse(raw);
+    return parsed.success ? parsed.data : {};
+  } catch {
+    return {};
+  }
 }
 
 const section = (text: string): KnownBlock => ({ type: "section", text: { type: "mrkdwn", text } });

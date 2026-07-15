@@ -3,11 +3,9 @@
  *
  * The coordinator's append-only session event log is the durable, ordered,
  * replayable inbox for the reverse channel (ADR 0060 Decision 1). The
- * SessionIngestWorkflow pump walks it forward in bounded pages via the unary
- * `ListSessionEvents` RPC, forwarding only the events an external surface
- * (Slack, …) cares about and detecting the terminal status_changed that ends
- * the loop. Curation + terminal detection live here so they are unit-testable
- * in isolation; the workflow just drives the loop.
+ * Session listeners walk it forward in bounded pages via the unary
+ * `ListSessionEvents` RPC before tailing the server stream. Curation + terminal
+ * detection live here so catch-up and stream delivery see identical events.
  */
 
 import { sessions } from "./client.ts";
@@ -25,6 +23,9 @@ export const CURATED_KINDS: ReadonlySet<string> = new Set([
   "run_completed",
   "user_question",
   "question_answered",
+  "tool_call_requested",
+  "tool_result_submitted",
+  "tool_call_completed",
   "integration_asset",
   "file_shared",
 ]);
@@ -78,9 +79,8 @@ export interface BoundedRead {
   terminal?: { outcome: TerminalOutcome };
   /** Text of the LAST assistant `agent_message` in this page, if any. Drives the
    *  closing-summary enrichment (ADR 0060, onComplete): agent_message is not a
-   *  curated content kind, but the pump already walks every page, so we surface
-   *  the last assistant text here and the pump tracks the most-recent across
-   *  pages — no extra coordinator round-trip. */
+   *  curated content kind, but bounded readers already walk every page, so this
+   *  remains available without an extra coordinator round-trip. */
   lastAssistantText?: string;
 }
 
@@ -95,6 +95,19 @@ export interface WireEvent {
   payloadJson: string;
 }
 
+/** Apply the exact reverse-channel curation rules to one streamed frame. */
+export function curateWireEvent(ev: WireEvent): CuratedEvent | undefined {
+  if (ev.idx === undefined) return undefined;
+  if (ev.kind === "agent_message") {
+    return parseAssistantText(ev.payloadJson) === undefined
+      ? undefined
+      : { idx: ev.idx, kind: ev.kind, payloadJson: ev.payloadJson };
+  }
+  return curated(ev.kind)
+    ? { idx: ev.idx, kind: ev.kind, payloadJson: ev.payloadJson }
+    : undefined;
+}
+
 /** The injectable list seam: one bounded read of the log. */
 export type ListEventsFn = (
   sessionId: string,
@@ -102,8 +115,7 @@ export type ListEventsFn = (
   limit: bigint,
 ) => Promise<{ events: WireEvent[]; nextAfterIdx: bigint }>;
 
-/** Page size per bounded read — keeps the pump's step count proportional to
- *  event activity (ADR 0060 §DBOS adoption, `operation_outputs` growth). */
+/** Page size per bounded read. */
 const PAGE_LIMIT = 200n;
 
 /** Production list fn: the coordinator's unary `ListSessionEvents` RPC. */
@@ -116,7 +128,7 @@ const defaultList: ListEventsFn = async (sessionId, after, limit) => {
  * Read one bounded page of a session's log starting strictly after `after`,
  * curated for the reverse channel. Returns the forwarded content events, the
  * next cursor, and — if the page crossed into a terminal session state — a
- * `terminal` marker the pump uses to send its closing signal and stop.
+ * `terminal` marker the listener uses to send its closing signal and stop.
  *
  * `list` is injectable for tests; production uses the coordinator RPC.
  */
@@ -142,15 +154,13 @@ export async function readSessionEventsBounded(
         // Forward the assistant's text to the thread as content (the workflow
         // coalesces consecutive ones into one per-turn message). Only the
         // assistant role — the prompt echo (`user`) and system notes never post.
-        if (ev.idx !== undefined) {
-          events.push({ idx: ev.idx, kind: "agent_message", payloadJson: ev.payloadJson });
-        }
+        const curatedEvent = curateWireEvent(ev);
+        if (curatedEvent) events.push(curatedEvent);
       }
       continue;
     }
-    if (curated(ev.kind) && ev.idx !== undefined) {
-      events.push({ idx: ev.idx, kind: ev.kind, payloadJson: ev.payloadJson });
-    }
+    const curatedEvent = curateWireEvent(ev);
+    if (curatedEvent) events.push(curatedEvent);
   }
   return { events, nextAfter: nextAfterIdx, terminal, lastAssistantText };
 }
@@ -166,9 +176,15 @@ function parseAssistantText(payloadJson: string): string | undefined {
   }
 }
 
+/** Map a session's CURRENT status (GetSession) to its terminal outcome, or
+ *  undefined while non-terminal. Same vocabulary as the event-log transition. */
+export function terminalOutcomeForStatus(status: string): TerminalOutcome | undefined {
+  return TERMINAL_OUTCOME[status];
+}
+
 /** Map a `status_changed` payload's `to` state to its terminal outcome, or
  *  undefined if `to` is not a terminal state. */
-function parseTerminalOutcome(payloadJson: string): TerminalOutcome | undefined {
+export function parseTerminalOutcome(payloadJson: string): TerminalOutcome | undefined {
   try {
     const to: unknown = (JSON.parse(payloadJson) as { to?: unknown })?.to;
     return typeof to === "string" ? TERMINAL_OUTCOME[to] : undefined;

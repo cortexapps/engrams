@@ -106,6 +106,7 @@ export type SystemMarker =
       toolCallId: string;
       questions: UserQuestion[];
       answers: Record<string, string[]> | null;
+      via: QuestionProtocol;
       at: string;
     }
   // ADR 0028 A.log: a rung-1 recovery rewound the live transcript to a
@@ -132,6 +133,9 @@ export interface RunFooter {
   interrupted: boolean;
   endAt: string;
 }
+
+/** The completion wire a question card must use. */
+export type QuestionProtocol = "generic" | "legacy";
 
 /** A prompt the harness has queued (type-ahead) and not yet consumed. */
 export interface QueuedPrompt {
@@ -201,6 +205,77 @@ function parseArgs(argsSummary: string | null): Record<string, unknown> {
   } catch {
     return {};
   }
+}
+
+function parseCanonicalQuestions(argsJson: string): UserQuestion[] | null {
+  try {
+    const raw = JSON.parse(argsJson) as { questions?: unknown };
+    if (!Array.isArray(raw.questions)) return null;
+    const questions: UserQuestion[] = [];
+    for (const value of raw.questions) {
+      if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+      const question = value as {
+        question?: unknown;
+        header?: unknown;
+        multiSelect?: unknown;
+        options?: unknown;
+      };
+      if (
+        typeof question.question !== "string" ||
+        typeof question.header !== "string" ||
+        typeof question.multiSelect !== "boolean" ||
+        !Array.isArray(question.options)
+      ) {
+        return null;
+      }
+      const options: UserQuestion["options"] = [];
+      for (const value of question.options) {
+        if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+        const option = value as { label?: unknown; description?: unknown };
+        if (typeof option.label !== "string" || typeof option.description !== "string") return null;
+        options.push({ label: option.label, description: option.description });
+      }
+      questions.push({
+        question: question.question,
+        header: question.header,
+        multiSelect: question.multiSelect,
+        options,
+      });
+    }
+    return questions;
+  } catch {
+    return null;
+  }
+}
+
+function parseCanonicalAnswers(resultJson: string): Record<string, string[]> | null {
+  try {
+    const raw: unknown = JSON.parse(resultJson);
+    if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return null;
+    const answers: Record<string, string[]> = {};
+    for (const [question, value] of Object.entries(raw)) {
+      if (!Array.isArray(value) || !value.every((label) => typeof label === "string")) return null;
+      answers[question] = value;
+    }
+    return answers;
+  } catch {
+    return null;
+  }
+}
+
+function parseJsonValue(json: string): { ok: true; value: unknown } | { ok: false } {
+  try {
+    return { ok: true, value: JSON.parse(json) as unknown };
+  } catch {
+    return { ok: false };
+  }
+}
+
+/** Claude exposes registered tools as `mcp__engrams__<name>` while generic
+ * request events carry the canonical registry name. */
+function canonicalToolName(name: string): string {
+  const prefix = "mcp__engrams__";
+  return name.startsWith(prefix) ? name.slice(prefix.length) : name;
 }
 
 export function buildMessages(
@@ -298,18 +373,24 @@ export function buildMessages(
   // an event touched, so the rolled-back span renders greyed. Preserves any
   // existing custom payload (run footer, marker).
   const markRewound = (d: Draft) => {
-    d.metadata = { custom: { ...(d.metadata?.custom ?? {}), rewound: true } };
+    d.metadata = { custom: { ...d.metadata?.custom, rewound: true } };
   };
 
-  // ADR 0054: AskUserQuestion is observed TWICE on the wire — as a generic
-  // `tool_call_started` (the harness translates every `tool_use` block) AND
-  // as the dedicated `user_question`/`question_answered` pair. Pre-scan so we
-  // can (a) suppress the generic tool part for those tool_call_ids — the
-  // interactive card is the canonical render — and (b) fold the answer onto
-  // the card even though it arrives in a LATER run (the deferred tool re-fires
-  // on `--resume`, so `question_answered` lands after a fresh run_started).
+  // Question cards span two durable protocols forever: historical
+  // user_question/question_answered and ADR 0089's generic request/result pair.
+  // Pre-scan makes folding order-independent and lets #64389 phantom starts be
+  // distinguished from real tool rows.
   const questionToolCallIds = new Set<string>();
   const answersByToolCallId = new Map<string, Record<string, string[]>>();
+  const genericRequests = new Map<
+    string,
+    Extract<IndexedEvent["event"], { type: "tool_call_requested" }>
+  >();
+  const submittedResults = new Map<string, unknown>();
+  const startedToolCallIds = new Set<string>();
+  const completedToolCallIds = new Set<string>();
+  const endedRunIds = new Set<string>();
+  const requestedToolNames = new Set<string>();
   // ADR 0054 Flavor A: a Write/Edit/MultiEdit tool call emits a generic
   // tool_call_started AND (on success) a `file_changed` carrying the diff. We
   // pre-scan so the generic card is re-rendered as a rich diff in place; a
@@ -327,15 +408,37 @@ export function buildMessages(
   const userEchoByPromptId = new Map<string, string>();
   for (const { event } of events) {
     if (event.type === "user_question") questionToolCallIds.add(event.tool_call_id);
-    else if (event.type === "question_answered")
-      answersByToolCallId.set(event.tool_call_id, event.answers);
-    else if (event.type === "file_changed")
+    else if (event.type === "tool_call_requested") {
+      genericRequests.set(event.tool_call_id, event);
+      requestedToolNames.add(event.name);
+      if (event.name === "ask_user_question" && parseCanonicalQuestions(event.args_json) !== null) {
+        questionToolCallIds.add(event.tool_call_id);
+      }
+    } else if (event.type === "tool_call_started") {
+      startedToolCallIds.add(event.tool_call_id);
+    } else if (event.type === "tool_call_completed") {
+      completedToolCallIds.add(event.tool_call_id);
+    } else if (event.type === "run_completed" || event.type === "run_interrupted") {
+      endedRunIds.add(event.run_id);
+    } else if (event.type === "file_changed")
       fileChangesByToolCallId.set(event.tool_call_id, {
         path: event.path,
         change: event.change,
       });
     else if (event.type === "agent_message" && event.role === "user" && event.prompt_id)
       userEchoByPromptId.set(event.prompt_id, event.text);
+  }
+  for (const { event } of events) {
+    if (event.type === "question_answered") {
+      answersByToolCallId.set(event.tool_call_id, event.answers);
+    } else if (event.type === "tool_result_submitted") {
+      const parsed = parseJsonValue(event.result_json);
+      if (parsed.ok) submittedResults.set(event.tool_call_id, parsed.value);
+      if (questionToolCallIds.has(event.tool_call_id)) {
+        const answers = parseCanonicalAnswers(event.result_json);
+        if (answers) answersByToolCallId.set(event.tool_call_id, answers);
+      }
+    }
   }
 
   for (const indexed of events) {
@@ -417,10 +520,19 @@ export function buildMessages(
       }
 
       case "tool_call_started": {
-        // ADR 0054: the AskUserQuestion call renders as the interactive
-        // `user_question` card, not a generic tool part — drop the duplicate
-        // (and don't tally it as a tool run).
-        if (ev.tool_name === "AskUserQuestion" || questionToolCallIds.has(ev.tool_call_id)) break;
+        // #64389: Claude may narrate multiple AskUserQuestion tool_use rows for
+        // one real deferred request. A start is phantom only when its tool maps
+        // to a deferred request seen in this transcript (or the native binding),
+        // and its own id has neither a request nor a completion. Ordinary
+        // in-flight sync tools remain visible.
+        const nativeQuestion = ev.tool_name === "AskUserQuestion";
+        const mapsToObservedDeferred =
+          requestedToolNames.has(canonicalToolName(ev.tool_name)) && endedRunIds.has(ev.run_id);
+        const phantom =
+          (nativeQuestion || mapsToObservedDeferred) &&
+          !genericRequests.has(ev.tool_call_id) &&
+          !completedToolCallIds.has(ev.tool_call_id);
+        if (questionToolCallIds.has(ev.tool_call_id) || phantom) break;
         bump(classifyTool(ev.tool_name));
         const a = ensureAssistant(ev.at);
         // ADR 0054 Flavor A: a Write/Edit/MultiEdit that produced a successful
@@ -445,9 +557,50 @@ export function buildMessages(
               argsText: ev.args_summary ?? "",
             };
         a.content.push(part);
+        if (submittedResults.has(ev.tool_call_id)) {
+          part.result = submittedResults.get(ev.tool_call_id);
+        }
         openTools.set(ev.tool_call_id, part);
         break;
       }
+
+      case "tool_call_requested": {
+        if (ev.name === "ask_user_question") {
+          const questions = parseCanonicalQuestions(ev.args_json);
+          if (questions) {
+            pushSystem(`tcr:${idx}`, "the agent asked a question", {
+              kind: "user_question",
+              toolCallId: ev.tool_call_id,
+              questions,
+              answers: answersByToolCallId.get(ev.tool_call_id) ?? null,
+              via: "generic",
+              at: ev.at,
+            });
+          }
+          break;
+        }
+        // The harness may also emit a native tool_call_started with this same
+        // id. That row owns the render when present; otherwise the durable
+        // request itself becomes the pending fallback row.
+        if (startedToolCallIds.has(ev.tool_call_id)) break;
+        const part: ToolPart = {
+          type: "tool-call",
+          toolCallId: ev.tool_call_id,
+          toolName: ev.name,
+          args: parseArgs(ev.args_json),
+          argsText: ev.args_json,
+        };
+        if (submittedResults.has(ev.tool_call_id)) {
+          part.result = submittedResults.get(ev.tool_call_id);
+        }
+        ensureAssistant(ev.at).content.push(part);
+        openTools.set(ev.tool_call_id, part);
+        break;
+      }
+
+      // Folded onto its generic request row/card by the pre-scan.
+      case "tool_result_submitted":
+        break;
 
       case "tool_call_completed": {
         // ADR 0054: the answered AskUserQuestion's tool_result (it re-fired on
@@ -533,7 +686,7 @@ export function buildMessages(
           a.status = ok
             ? { type: "complete", reason: "stop" }
             : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
-          a.metadata = { custom: { ...(a.metadata?.custom ?? {}), run: footer } };
+          a.metadata = { custom: { ...a.metadata?.custom, run: footer } };
         }
         active = null;
         runOpen = false;
@@ -626,6 +779,7 @@ export function buildMessages(
           toolCallId: ev.tool_call_id,
           questions: ev.questions,
           answers: answersByToolCallId.get(ev.tool_call_id) ?? null,
+          via: "legacy",
           at: ev.at,
         });
         break;

@@ -1,6 +1,6 @@
 //! `POST /sessions/:id/prompt` — durably enqueue a prompt for a session.
 //!
-//! ADR 0073 phase 2: `SendPrompt`/`AnswerQuestion` no longer deliver
+//! ADR 0073 phase 2: `SendPrompt` no longer delivers
 //! synchronously. The core emits the durable receipts (prompt_received
 //! and the user echo), INSERTs one `session_outbox` row, and returns
 //! 202-shaped success immediately — the outbox delivery driver
@@ -9,7 +9,7 @@
 //! until the confirming harness event acks the row. A caller therefore
 //! never waits on a 12-89s resume, and a connection bounce can no
 //! longer eat the command (the e35ed1fa class): the row survives until
-//! `run_started{prompt_id}` / `question_answered{tool_call_id}` lands.
+//! `run_started{prompt_id}` lands.
 //!
 //! Dead sessions return 410 Gone — the only affordance there is
 //! `engram session fork <id>`.
@@ -162,20 +162,14 @@ pub(crate) async fn send_prompt_core(
     Ok("prompt queued")
 }
 
-/// ADR 0054: transport-agnostic answer core (gRPC `AnswerQuestion`).
-/// Answering a deferred `UserQuestion` delivers exactly as a prompt does
-/// — one outbox row + a Deliver op (the deliver verb auto-resumes behind
-/// the enqueue) — forwarding `HarnessCommand::AnswerQuestion`. Unlike a
-/// prompt it emits **no user-echo**: the harness's own `QuestionAnswered`
-/// event is the durable "answered" record, and a synthetic user turn would
-/// pollute the transcript. Idempotent end to end (the deferred tool yields
-/// exactly one tool_result), so a duplicate answer is at worst a no-op
-/// resume.
-pub(crate) async fn answer_question_core(
+/// ADR 0089: accept an opaque result for an orchestrator-registered tool.
+/// The submitted event and durable outbox row commit atomically so surfaces
+/// never lock a pending call that has no delivery obligation.
+pub(crate) async fn complete_tool_call_core(
     state: &SharedState,
     id: SessionId,
     tool_call_id: String,
-    answers: engram_harness_proto::Answers,
+    result_json: String,
 ) -> Result<&'static str, ApiError> {
     if tool_call_id.is_empty() {
         return Err(ApiError::BadRequest("`tool_call_id` is required".into()));
@@ -187,11 +181,15 @@ pub(crate) async fn answer_question_core(
             session.status.as_str()
         )));
     }
+
     let row = engram_core::types::outbox::OutboxRow {
-        prompt_id: format!("answer:{tool_call_id}"),
+        prompt_id: engram_core::types::outbox::tool_result_outbox_id(id, &tool_call_id),
         session_id: id,
-        kind: engram_core::types::outbox::OutboxKind::Answer,
-        payload: serde_json::json!({ "tool_call_id": tool_call_id, "answers": answers }),
+        kind: engram_core::types::outbox::OutboxKind::ToolResult,
+        payload: serde_json::json!({
+            "tool_call_id": tool_call_id.clone(),
+            "result_json": result_json.clone(),
+        }),
         created_at: chrono::Utc::now(),
         attempts: 0,
         not_before: chrono::Utc::now(),
@@ -199,14 +197,19 @@ pub(crate) async fn answer_question_core(
         acked_at: None,
     };
     state
-        .services
-        .meta
-        .outbox_enqueue(&row)
-        .await
-        .map_err(|e| ApiError::Internal(format!("enqueue answer: {e}")))?;
+        .emit_with_outbox(
+            id,
+            SessionEvent::ToolResultSubmitted {
+                tool_call_id,
+                result_json,
+                at: chrono::Utc::now(),
+            },
+            &row,
+        )
+        .await?;
     crate::outbox_delivery::enqueue_deliver_op(state, id).await;
     state.outbox_wake.notify_one();
-    Ok("answer queued")
+    Ok("tool result queued")
 }
 
 /// Phase 1b: edit a still-queued type-ahead prompt by its `prompt_id`,

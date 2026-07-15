@@ -27,6 +27,7 @@ import {
   index,
   uniqueIndex,
   customType,
+  bigint,
 } from "drizzle-orm/pg-core";
 
 /** Raw binary column (Postgres `bytea`). node-postgres maps `bytea` ⇄ Buffer. */
@@ -79,6 +80,66 @@ export const taskSession = pgTable(
     index("task_session_session_idx").on(t.sessionId), // the authz join (ADR §6) hits this
   ],
 );
+
+// ---------------------------------------------------------------------------
+// Generic tool protocol pending-call ledger (ADR 0089 P1)
+// ---------------------------------------------------------------------------
+
+/** Durable lifecycle bookkeeping for generic tool calls. The coordinator event
+ *  log remains the wire source of truth; this orchestrator-owned projection
+ *  supports external-completion policy and stale session-call watchdogs. */
+export const pendingToolCall = pgTable(
+  "pending_tool_calls",
+  {
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    toolName: text("tool_name").notNull(),
+    handling: text("handling").notNull(),
+    requestedAt: timestamp("requested_at", { withTimezone: true }).notNull(),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("pending_tool_calls_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
+    index("pending_tool_calls_session_idx").on(t.sessionId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Stream-fed session listeners (ingest v2)
+// ---------------------------------------------------------------------------
+
+/** Desired listener rows also serve as cross-process leases. Terminal rows are
+ * retained so a completed session is never accidentally listened to again. */
+export const sessionListener = pgTable("session_listeners", {
+  sessionId: text("session_id").primaryKey(),
+  owner: text("owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  terminalAt: timestamp("terminal_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Durable progress is independent for each consumer of a session event log. */
+export const consumerCursor = pgTable(
+  "consumer_cursors",
+  {
+    sessionId: text("session_id").notNull(),
+    consumer: text("consumer").notNull(),
+    lastIdx: bigint("last_idx", { mode: "bigint" }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.sessionId, t.consumer] })],
+);
+
+/** Slack-backed sessions route listener output into their owning thread
+ * workflow mailbox. Absence means the Slack consumer does not apply. */
+export const slackSession = pgTable("slack_session", {
+  sessionId: text("session_id").primaryKey(),
+  threadWfId: text("thread_wf_id").notNull(),
+});
 
 // ---------------------------------------------------------------------------
 // Session profiles (ADR 0053)

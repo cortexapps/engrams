@@ -2486,6 +2486,108 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn append_session_event_and_outbox(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        payload: serde_json::Value,
+        outbox: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<i64, MetaError> {
+        if outbox.session_id != session_id {
+            return Err(MetaError::Serialization(
+                "event/outbox session ids do not match".into(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO session_outbox
+                (prompt_id, session_id, kind, payload, created_at, not_before)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (prompt_id) DO NOTHING
+            RETURNING prompt_id
+            "#,
+        )
+        .bind(&outbox.prompt_id)
+        .bind(session_id.as_uuid())
+        .bind(outbox.kind.as_str())
+        .bind(&outbox.payload)
+        .bind(outbox.created_at)
+        .bind(outbox.not_before)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .is_some();
+
+        if !inserted {
+            let existing = sqlx::query(
+                "SELECT session_id, kind, payload FROM session_outbox WHERE prompt_id = $1",
+            )
+            .bind(&outbox.prompt_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                MetaError::Conflict(format!(
+                    "outbox id {} disappeared during completion",
+                    outbox.prompt_id
+                ))
+            })?;
+            let existing_session: uuid::Uuid = existing.try_get("session_id").map_err(db_err)?;
+            let existing_kind: String = existing.try_get("kind").map_err(db_err)?;
+            let existing_payload: serde_json::Value =
+                existing.try_get("payload").map_err(db_err)?;
+            if existing_session != session_id.as_uuid()
+                || existing_kind != outbox.kind.as_str()
+                || existing_payload != outbox.payload
+            {
+                return Err(MetaError::Conflict(format!(
+                    "outbox id {} belongs to another command",
+                    outbox.prompt_id
+                )));
+            }
+        }
+
+        let event = sqlx::query(
+            r#"
+            WITH next AS (
+                UPDATE sessions
+                   SET next_event_idx = next_event_idx + 1,
+                       updated_at = NOW(),
+                       last_event_at = NOW()
+                 WHERE id = $1
+             RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
+            ),
+            inserted AS (
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch FROM next
+                RETURNING idx
+            )
+            SELECT idx FROM inserted
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind)
+        .bind(payload)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        let idx: i64 = event.try_get("idx").map_err(db_err)?;
+
+        sqlx::query("SELECT pg_notify('session_events', $1), pg_notify('session_outbox', $2)")
+            .bind(
+                serde_json::json!({ "session_id": session_id.to_string(), "idx": idx }).to_string(),
+            )
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(idx)
+    }
+
     async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
         let rows = sqlx::query(
             "SELECT DISTINCT session_id FROM session_outbox
@@ -3887,15 +3989,17 @@ impl MetadataStore for PostgresStore {
         // user_question, question_answered, file_changed, file_shared,
         // integration_asset, …) still rewinds.
         //
-        // ADR 0091: `harness_idle` joins the exclusion list. It is the
-        // idle detector's nomination input — "the harness finished its
-        // turn and is waiting" — a fact that stays true across a clean
-        // evict/resume (the resumed harness IS idle until the next
-        // prompt), and it lands after the eviction checkpoint's cursor
-        // by construction (idle → 5 min TTL → capture cut at pause
-        // time). Rewinding it made EVERY clean cycle report
+        // ADR 0091: `harness_idle` and ADR 0089's `harness_parked` join
+        // the exclusion list. They are the idle detector's nomination
+        // inputs — either "the harness finished its turn and is waiting"
+        // or "the open turn is waiting only on deferred external work" —
+        // facts that stay true across a clean evict/resume (the resumed
+        // session remains idle or parked until the next prompt/result),
+        // and they land after the eviction checkpoint's cursor by
+        // construction (waiting marker → 5 min TTL → capture cut at pause
+        // time). Rewinding them made EVERY clean cycle report
         // `rolled_back: 1` under a `host_failure_recovery` banner
-        // (2026-07-11 campaign, every observed resume). With it
+        // (2026-07-11 campaign, every observed resume). With them
         // excluded, a clean resume tombstones nothing and
         // `apply_rung1_rewind`'s zero-rows early-return emits no
         // recovery event at all — the honest outcome.
@@ -3919,7 +4023,7 @@ impl MetadataStore for PostgresStore {
                AND kind NOT IN (
                    'status_changed', 'snapshot_taken', 'evicted',
                    'resumed', 'recovered_from_checkpoint', 'prompt_received',
-                   'harness_idle'
+                   'harness_idle', 'harness_parked'
                )
             "#,
         )

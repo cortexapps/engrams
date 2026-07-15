@@ -16,6 +16,7 @@ import { log as rootLog } from "../log.ts";
 import { getSlackClient } from "./slack.ts";
 import {
   parseUserQuestion,
+  parseQuestionAnswers,
   buildQuestionBlocks,
   buildAnsweredBlocks,
   buildAssetLine,
@@ -296,7 +297,7 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
     },
 
     async onAnswered(m, ev, ref) {
-      const answers = parseAnswers(ev.payloadJson);
+      const answers = parseQuestionAnswers(ev.payloadJson);
       const blocks = buildAnsweredBlocks(answers);
       const text = "Answered";
       if (ref) {
@@ -392,13 +393,4 @@ export function makeSlackPolicy(deps: SlackPolicyDeps = {}): CommunicationPolicy
       return foldReplies(res.messages ?? [], since, botUserId, m.ts);
     },
   };
-
-  function parseAnswers(payloadJson: string): Record<string, string[]> {
-    try {
-      const a = (JSON.parse(payloadJson) as { answers?: unknown }).answers;
-      return a && typeof a === "object" ? (a as Record<string, string[]>) : {};
-    } catch {
-      return {};
-    }
-  }
 }

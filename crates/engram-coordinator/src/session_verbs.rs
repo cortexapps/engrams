@@ -9,7 +9,7 @@ use engram_core::types::SessionState;
 
 use crate::error::ApiError;
 use crate::session_ops::{OpCtx, OpOutcome};
-use crate::state::SessionEvent;
+use crate::state::{SessionEvent, SharedState};
 
 pub async fn dispatch(ctx: &OpCtx<'_>) -> OpOutcome {
     match ctx.op.kind {
@@ -554,6 +554,11 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
             Ok(None) => return OpOutcome::Done,
             Err(e) => return OpOutcome::Retry(format!("outbox next-due fetch: {e}")),
         };
+        match retire_legacy_answer_row(state, &row).await {
+            Ok(true) => continue,
+            Ok(false) => {}
+            Err(reason) => return OpOutcome::Retry(reason),
+        }
         let session = match state.services.meta.get_session(id).await {
             Ok(s) => s,
             // Row gone (FK CASCADE already reaped the outbox too).
@@ -722,6 +727,9 @@ async fn forward_outbox_row(
     use engram_core::types::outbox::OutboxKind;
     use engram_core::SandboxError;
     let state = ctx.state;
+    if retire_legacy_answer_row(state, row).await? {
+        return Ok(());
+    }
     let Some(sandbox_id) = state.resolve_sandbox(row.session_id).await else {
         return Err("no live sandbox on an Active session".into());
     };
@@ -741,25 +749,24 @@ async fn forward_outbox_row(
                     .send_prompt(sandbox_id, row.prompt_id.clone(), text)
                     .await
             }
-            OutboxKind::Answer => {
+            OutboxKind::Answer => unreachable!("legacy answer rows retire before forwarding"),
+            OutboxKind::ToolResult => {
                 let tool_call_id = row
                     .payload
                     .get("tool_call_id")
-                    .and_then(|t| t.as_str())
+                    .and_then(|value| value.as_str())
                     .unwrap_or_default()
                     .to_string();
-                let answers: engram_harness_proto::Answers = row
+                let result_json = row
                     .payload
-                    .get("answers")
-                    .cloned()
-                    .map(serde_json::from_value)
-                    .transpose()
-                    .map_err(|e| SandboxError::InvalidSpec(format!("outbox answers: {e}")))?
-                    .unwrap_or_default();
+                    .get("result_json")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or_default()
+                    .to_string();
                 state
                     .services
                     .host
-                    .answer_question(sandbox_id, tool_call_id, answers)
+                    .tool_result(sandbox_id, tool_call_id, result_json)
                     .await
             }
         }
@@ -792,6 +799,31 @@ async fn forward_outbox_row(
         }
         Err(e) => Err(format!("forward: {e}")),
     }
+}
+
+/// ADR 0089 P5d parse tombstone: real databases can contain an unacked
+/// pre-flag-day `answer` row, but the guest wire no longer has an answer
+/// command. Terminally acknowledge it before any resume or host lookup so it
+/// cannot wedge the outbox head in a permanent retry loop.
+async fn retire_legacy_answer_row(
+    state: &SharedState,
+    row: &engram_core::types::outbox::OutboxRow,
+) -> Result<bool, String> {
+    if row.kind != engram_core::types::outbox::OutboxKind::Answer {
+        return Ok(false);
+    }
+    tracing::warn!(
+        session_id = %row.session_id,
+        prompt_id = %row.prompt_id,
+        "dropping pre-flag-day answer outbox row after the ADR 0089 wire break"
+    );
+    state
+        .services
+        .meta
+        .outbox_ack(&row.prompt_id)
+        .await
+        .map_err(|error| format!("retire legacy answer row: {error}"))?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------
@@ -1142,6 +1174,77 @@ mod tests {
         }
     }
 
+    fn outbox_tool_result(
+        id: SessionId,
+        tool_call_id: &str,
+    ) -> engram_core::types::outbox::OutboxRow {
+        engram_core::types::outbox::OutboxRow {
+            prompt_id: engram_core::types::outbox::tool_result_outbox_id(id, tool_call_id),
+            session_id: id,
+            kind: engram_core::types::outbox::OutboxKind::ToolResult,
+            payload: serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "result_json": r#"{"saved":true}"#,
+            }),
+            created_at: chrono::Utc::now(),
+            attempts: 0,
+            not_before: chrono::Utc::now(),
+            delivered_at: None,
+            acked_at: None,
+        }
+    }
+
+    fn outbox_legacy_answer(
+        id: SessionId,
+        tool_call_id: &str,
+    ) -> engram_core::types::outbox::OutboxRow {
+        engram_core::types::outbox::OutboxRow {
+            prompt_id: format!("answer:{tool_call_id}"),
+            session_id: id,
+            kind: engram_core::types::outbox::OutboxKind::Answer,
+            payload: serde_json::json!({
+                "tool_call_id": tool_call_id,
+                "answers": { "Ship?": ["Yes"] },
+            }),
+            created_at: chrono::Utc::now(),
+            attempts: 0,
+            not_before: chrono::Utc::now(),
+            delivered_at: None,
+            acked_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_answer_outbox_row_is_retired_without_host_delivery() {
+        let id = SessionId::new();
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        let row = outbox_legacy_answer(id, "legacy-call");
+        state.services.meta.outbox_enqueue(&row).await.unwrap();
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Deliver, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue deliver")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            epoch: op.epoch.unwrap(),
+            op: &op,
+        };
+
+        assert!(forward_outbox_row(&ctx, &row).await.is_ok());
+        assert!(
+            mini.acked_outbox
+                .lock()
+                .contains(&"answer:legacy-call".to_string()),
+            "a pre-flag-day answer row must be terminally retired"
+        );
+    }
+
     /// ADR 0079 pass 2, the headline ordering property: a Deliver op on
     /// a non-Active (Idle) session enqueues a RESUME op and requeues
     /// itself with backoff — the resume (higher id, due) becomes the
@@ -1227,6 +1330,56 @@ mod tests {
         assert!(
             mini.acked_outbox.lock().contains(&"p-1".to_string()),
             "the terminal session's row is acked (dropped), not redelivered forever"
+        );
+    }
+
+    #[tokio::test]
+    async fn tool_result_delivery_on_idle_enqueues_resume_before_completion() {
+        let id = SessionId::new();
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(idle_session(id));
+        state
+            .services
+            .meta
+            .outbox_enqueue(&outbox_tool_result(id, "call_1"))
+            .await
+            .unwrap();
+
+        let deliver = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Deliver, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue deliver")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        let deliver_id = deliver.id;
+        crate::session_ops::drive_claimed(&state, deliver).await;
+
+        let ops = mini.ops.all();
+        let resume = ops
+            .iter()
+            .find(|op| op.kind == OpKind::Resume)
+            .expect("ToolResult delivery on Idle must enqueue Resume");
+        assert!(resume.id > deliver_id, "Resume is queued behind Deliver");
+        assert_eq!(
+            resume.state,
+            OpState::Failed,
+            "the resume runs before the delivery retry"
+        );
+        assert_eq!(
+            mini.ops.get(deliver_id).expect("deliver row").state,
+            OpState::Done,
+            "delivery completes after the session settles terminal"
+        );
+        assert!(
+            mini.acked_outbox
+                .lock()
+                .contains(&engram_core::types::outbox::tool_result_outbox_id(
+                    id, "call_1",
+                )),
+            "the completed delivery lane retires the ToolResult row"
         );
     }
 

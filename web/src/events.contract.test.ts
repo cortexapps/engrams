@@ -18,6 +18,7 @@
 
 import { describe, expect, test } from "vitest";
 import { parseOrchestratorFrame, type IndexedEvent, type SessionEvent } from "./events";
+import { SESSION_EVENT_KINDS } from "./sse";
 
 // ---------------------------------------------------------------------------
 // LIVE fixtures — captured from the orchestrator, session 0c0929d3
@@ -149,6 +150,47 @@ describe("parseOrchestratorFrame — LIVE fixtures", () => {
 });
 
 describe("parseOrchestratorFrame — SYNTH fixtures", () => {
+  test("generic tool request/result payload fields survive the two-level SSE parse", () => {
+    const requestPayload = {
+      type: "tool_call_requested",
+      run_id: "r1",
+      tool_call_id: "call-1",
+      name: "ask_user_question",
+      args_json: JSON.stringify({ questions: [] }),
+      at: "2026-07-14T00:00:00Z",
+    };
+    const requested = parseOrchestratorFrame(
+      JSON.stringify({
+        idx: 10,
+        kind: "tool_call_requested",
+        payload_json: JSON.stringify(requestPayload),
+      }),
+      "tool_call_requested",
+    );
+    expect(requested?.event).toEqual(requestPayload);
+
+    const resultPayload = {
+      type: "tool_result_submitted",
+      tool_call_id: "call-1",
+      result_json: JSON.stringify({ "Ship?": ["Yes"] }),
+      at: "2026-07-14T00:00:01Z",
+    };
+    const submitted = parseOrchestratorFrame(
+      JSON.stringify({
+        idx: 11,
+        kind: "tool_result_submitted",
+        payload_json: JSON.stringify(resultPayload),
+      }),
+      "tool_result_submitted",
+    );
+    expect(submitted?.event).toEqual(resultPayload);
+  });
+
+  test("the EventSource allowlist includes both generic lifecycle kinds", () => {
+    expect(SESSION_EVENT_KINDS).toContain("tool_call_requested");
+    expect(SESSION_EVENT_KINDS).toContain("tool_result_submitted");
+  });
+
   test("lagged returns null (not an IndexedEvent)", () => {
     expect(parse(SYNTH_LAGGED)).toBeNull();
   });

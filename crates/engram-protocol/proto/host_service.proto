@@ -131,10 +131,8 @@ service HostService {
   // consumed it (single writer).
   rpc EditHarnessQueuedPrompt(EditHarnessQueuedPromptRequest) returns (Empty);
   rpc DequeueHarnessQueuedPrompt(DequeueHarnessQueuedPromptRequest) returns (Empty);
-  // ADR 0054: deliver a user's answer to a deferred AskUserQuestion to the
-  // attached harness (which stashes it and re-fires the deferred tool via
-  // `--resume`).
-  rpc AnswerHarnessQuestion(AnswerHarnessQuestionRequest) returns (Empty);
+  // ADR 0089: deliver an opaque result for an orchestrator-registered tool.
+  rpc SendHarnessToolResult(SendHarnessToolResultRequest) returns (Empty);
   // ADR 0030: operator interrupt. Stop the in-flight run on the
   // attached harness (it SIGINTs its current `claude` child and
   // returns to Idle); the session stays alive and resumable.
@@ -668,19 +666,10 @@ message DequeueHarnessQueuedPromptRequest {
   string prompt_id = 2;
 }
 
-message AnswerHarnessQuestionRequest {
+message SendHarnessToolResultRequest {
   bytes sandbox_id = 1; // 16-byte UUID
-  // Claude's tool_use_id of the deferred AskUserQuestion.
   string tool_call_id = 2;
-  // Selected labels keyed by question text. Always a list (1 for
-  // single-select, N for multi-select); proto3 map values can't be
-  // `repeated`, so each is wrapped in StringList.
-  map<string, StringList> answers = 3;
-}
-
-// A list of strings, for use as a proto3 map value.
-message StringList {
-  repeated string values = 1;
+  string result_json = 3;
 }
 
 message InterruptHarnessRequest {
@@ -883,4 +872,3 @@ message FlushSandboxResponse {
   // non-empty encodes `Some(ManifestRef { manifest_id, version })`.
   bytes manifest_ref_bincode = 1;
 }
-
