@@ -31,6 +31,7 @@ import { registerBuiltinTools } from "./tools/builtin.ts";
 import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
+import { registerPapercuts } from "./rpc/papercuts.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
@@ -131,6 +132,9 @@ const server = buildServer(
     // Native TaskService: orchestrator-owned task model (ADR 0051 §3, Task 19).
     // Registered BEFORE the passthrough so it wins the /rpc/engram.app.v1.TaskService/* prefix.
     registerTasks(router);
+
+    // Native PapercutService: orchestrator-owned friction inbox + fix-task launch.
+    registerPapercuts(router);
 
     // Native ProfileService: orchestrator-owned session profiles (ADR 0053).
     registerProfiles(router);
