@@ -1,6 +1,6 @@
 //! ADR 0073 phase 2 → ADR 0079 pass 2: the outbox delivery SHIM.
 //!
-//! `SendPrompt`/`AnswerQuestion` durably enqueue (`session_outbox`) and
+//! `SendPrompt`/`CompleteToolCall` durably enqueue (`session_outbox`) and
 //! return 202 immediately. The delivery body — auto-resume ordering, the
 //! forward to the host relay, the in-place harness reattach on the
 //! unbound desync, redelivery until the confirming harness event acks

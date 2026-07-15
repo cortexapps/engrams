@@ -93,7 +93,6 @@ describe("makeThreadControlPlane", () => {
           return { sessionId: "sess-1" };
         },
         sendPrompt: async () => {},
-        answerQuestion: async () => {},
         deleteSession: async () => {},
       },
     });
@@ -135,7 +134,6 @@ describe("makeThreadControlPlane", () => {
       sessions: {
         createSession: async () => ({ sessionId: "s" }),
         sendPrompt: async () => {},
-        answerQuestion: async () => {},
         deleteSession: async () => {},
       },
     });

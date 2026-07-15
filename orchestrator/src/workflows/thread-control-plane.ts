@@ -39,21 +39,11 @@ import type { ThreadControlPlane } from "./slack-thread.ts";
 import { tools as defaultToolRegistry, type ToolRegistry } from "../tools/registry.ts";
 import { ensureListenerRow as ensureProductionListenerRow } from "../listeners/lease-store.ts";
 
-/** A StringList map value (proto3 maps can't hold `repeated` directly). */
-interface StringList {
-  values: string[];
-}
-
 /** The control-plane session ops the thread workflow drives. The create/delete
  *  half is the shared `TaskSessionsClient` (used by the create-task primitive);
- *  send/answer are the per-turn ops only the thread workflow needs. */
+ *  send is the per-turn op only the thread workflow needs. */
 export interface ThreadSessionsClient extends TaskSessionsClient {
   sendPrompt(req: { sessionId: string; promptId?: string; text: string }): Promise<unknown>;
-  answerQuestion(req: {
-    sessionId: string;
-    toolCallId: string;
-    answers: Record<string, StringList>;
-  }): Promise<unknown>;
 }
 
 export interface ThreadControlPlaneDeps {
@@ -117,12 +107,6 @@ export function makeThreadControlPlane(deps: ThreadControlPlaneDeps = {}): Threa
 
     sendPrompt: async (sessionId, prompt, promptId) => {
       await sessions.sendPrompt({ sessionId, promptId, text: prompt });
-    },
-
-    answerQuestion: async (sessionId, toolCallId, answers) => {
-      const wire: Record<string, StringList> = {};
-      for (const [k, v] of Object.entries(answers)) wire[k] = { values: v };
-      await sessions.answerQuestion({ sessionId, toolCallId, answers: wire });
     },
 
     completeToolCall: (sessionId, toolCallId, result) =>

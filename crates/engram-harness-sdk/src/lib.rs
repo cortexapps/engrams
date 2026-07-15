@@ -5,6 +5,7 @@
 //! snapshot restores and host rolls, and at-least-once event delivery.
 
 pub mod parked;
+pub mod questions;
 
 use std::collections::{HashSet, VecDeque};
 use std::process::ExitCode;

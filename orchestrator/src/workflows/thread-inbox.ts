@@ -30,7 +30,7 @@ export interface SourceMention {
 /**
  * A human answer to a deferred `AskUserQuestion`, arriving via the source's
  * interactivity surface (P2). `answers` is keyed by question text → selected
- * labels, matching `AnswerQuestionRequest.answers` (ADR 0054).
+ * labels, matching the canonical question tool result (ADR 0089).
  */
 export interface SourceAnswer {
   toolCallId: string;

@@ -16,7 +16,7 @@
  *   - session_event   → route to the policy (question/answer-update/asset)
  *   - session_terminal → closing summary (ok) or failure, then exit
  *   - trigger_mention  → gather NEW context, SendPrompt (idempotent prompt_id)
- *   - trigger_answer   → CompleteToolCall (generic) or AnswerQuestion (legacy)
+ *   - trigger_answer   → CompleteToolCall (generic); legacy cards get an upgrade notice
  *
  * `questionTs` (tool_call_id → posted-question ref) is plain workflow-local
  * state: it is rebuilt deterministically on replay from the checkpointed
@@ -61,11 +61,6 @@ export interface ThreadControlPlane {
   createTask(input: CreateTaskInput): Promise<StartedSession>;
   /** Deliver a follow-up prompt; `promptId` is the dedupe key (Decision 9). */
   sendPrompt(sessionId: string, prompt: string, promptId: string): Promise<void>;
-  answerQuestion(
-    sessionId: string,
-    toolCallId: string,
-    answers: Record<string, string[]>,
-  ): Promise<void>;
   /** Complete an ADR 0089 session-handled tool through its registered schema. */
   completeToolCall(
     sessionId: string,
@@ -109,13 +104,15 @@ const SESSION_FAILED_MSG = "The session ended in failure.";
 // continue. See `TerminalOutcome` in session-events.ts.
 const SESSION_CLOSED_MSG = "This session is complete. Start a new session if you'd like to continue.";
 // Non-fatal: the thread stays alive after these so the user can retry.
-// ADR 0067: SendPrompt, AnswerQuestion, and CompleteToolCall now durably
+// ADR 0067: SendPrompt and CompleteToolCall durably
 // ENQUEUE on the coordinator (202) — a resuming/idle session is no longer a
 // delivery failure, so there is no "mention me again" apology arm. These fire
 // only for hard enqueue failures (session gone / coord unreachable).
 const DELIVER_FAIL_MSG =
   "I couldn't queue that for your session (it may have ended). Start a new session to continue.";
 const ANSWER_FAIL_MSG = "I couldn't record that answer — the session may have ended.";
+const LEGACY_QUESTION_MSG =
+  "This question predates an upgrade and can no longer be answered.";
 
 /** Run an effect as a checkpointed step. The workflow passes `DBOS.runStep`; a
  *  test passes a plain runner so the drain-loop control flow is unit-testable
@@ -253,7 +250,7 @@ type InboundTurn = Exclude<ThreadInbox, { kind: "session_terminal" }>;
  * Handle one non-terminal inbound message; return the (possibly advanced)
  * `lastTs` cursor. **Never throws** — that is the whole point:
  *
- * - An ENQUEUE failure (`sendPrompt` / `answerQuestion` — ADR 0067: these
+ * - An ENQUEUE failure (`sendPrompt` / `completeToolCall` — ADR 0067: these
  *   202-enqueue on the coordinator's durable outbox, so a resuming/idle
  *   session is never an error; only hard failures like a terminated
  *   session or an unreachable coord land here) is caught and surfaced via
@@ -309,19 +306,19 @@ export async function handleInbound(
       }
     }
     case "trigger_answer": {
+      const via = st.questionProtocols.get(msg.answer.toolCallId) ?? "legacy";
+      if (via === "legacy") {
+        await step(
+          () => pol.onDeliveryError(st.currentMention, LEGACY_QUESTION_MSG),
+          "onDeliveryError",
+        ).catch(() => {});
+        return lastTs;
+      }
       try {
-        const via = st.questionProtocols.get(msg.answer.toolCallId) ?? "legacy";
-        if (via === "generic") {
-          await step(
-            () => cp.completeToolCall(session.id, msg.answer.toolCallId, msg.answer.answers),
-            "completeToolCall",
-          );
-        } else {
-          await step(
-            () => cp.answerQuestion(session.id, msg.answer.toolCallId, msg.answer.answers),
-            "answerQuestion",
-          );
-        }
+        await step(
+          () => cp.completeToolCall(session.id, msg.answer.toolCallId, msg.answer.answers),
+          "completeToolCall",
+        );
       } catch (err) {
         log.error({ sessionId: session.id, err }, "slack: failed to enqueue answer — keeping the thread alive");
         await step(() => pol.onDeliveryError(st.currentMention, ANSWER_FAIL_MSG), "onDeliveryError").catch(() => {});

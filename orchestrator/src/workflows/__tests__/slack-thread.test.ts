@@ -93,9 +93,8 @@ function recordingPolicy() {
 
 /** A control plane whose delivery methods are scriptable per test. */
 function recordingControlPlane() {
-  const calls: { sendPrompt: unknown[][]; answerQuestion: unknown[][]; completeToolCall: unknown[][] } = {
+  const calls: { sendPrompt: unknown[][]; completeToolCall: unknown[][] } = {
     sendPrompt: [],
-    answerQuestion: [],
     completeToolCall: [],
   };
   const cp: ThreadControlPlane & { sendPromptImpl: () => Promise<void>; answerImpl: () => Promise<void> } = {
@@ -105,10 +104,6 @@ function recordingControlPlane() {
     sendPrompt: async (sessionId, prompt, promptId) => {
       calls.sendPrompt.push([sessionId, prompt, promptId]);
       await cp.sendPromptImpl();
-    },
-    answerQuestion: async (sessionId, toolCallId, answers) => {
-      calls.answerQuestion.push([sessionId, toolCallId, answers]);
-      await cp.answerImpl();
     },
     completeToolCall: async (sessionId, toolCallId, answers) => {
       calls.completeToolCall.push([sessionId, toolCallId, answers]);
@@ -192,20 +187,21 @@ describe("handleInbound() — answer", () => {
     answer: { toolCallId: "tc", answers: { "Ship?": ["Yes"] } },
   };
 
-  test("happy path: answerQuestion is delivered, cursor unchanged", async () => {
+  test("a pre-upgrade question cannot be answered and posts a graceful notice", async () => {
     const { pol, calls } = recordingPolicy();
     const { cp, calls: cpCalls } = recordingControlPlane();
     const st = freshState(mention("100.0", "Ev0"));
 
     const next = await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
 
-    expect(cpCalls.answerQuestion).toEqual([["s1", "tc", { "Ship?": ["Yes"] }]]);
     expect(cpCalls.completeToolCall).toHaveLength(0);
-    expect(calls.onDeliveryError).toHaveLength(0);
+    expect(calls.onDeliveryError).toEqual([
+      [st.currentMention, "This question predates an upgrade and can no longer be answered."],
+    ]);
     expect(next).toBe("180.0");
   });
 
-  test("a generic question answer uses CompleteToolCall and never AnswerQuestion", async () => {
+  test("a generic question answer uses CompleteToolCall", async () => {
     const { pol } = recordingPolicy();
     const { cp, calls: cpCalls } = recordingControlPlane();
     const st = freshState(mention("100.0", "Ev0"));
@@ -235,25 +231,8 @@ describe("handleInbound() — answer", () => {
     await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
 
     expect(cpCalls.completeToolCall).toEqual([["s1", "tc", { "Ship?": ["Yes"] }]]);
-    expect(cpCalls.answerQuestion).toHaveLength(0);
   });
 
-  test("answerQuestion failure is NON-FATAL: ⚠️ onDeliveryError, no throw", async () => {
-    const { pol, calls } = recordingPolicy();
-    const { cp } = recordingControlPlane();
-    cp.answerImpl = async () => {
-      throw new Error("sandbox not found");
-    };
-    const cur = mention("160.0", "Ev2");
-    const st = freshState(cur);
-
-    const next = await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
-
-    expect(calls.onDeliveryError).toHaveLength(1);
-    expect(calls.onDeliveryError[0][0]).toBe(cur); // reacts on the current turn's mention
-    expect(String(calls.onDeliveryError[0][1])).toContain("session");
-    expect(next).toBe("180.0");
-  });
 });
 
 describe("handleInbound() — session event", () => {

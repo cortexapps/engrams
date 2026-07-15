@@ -54,6 +54,7 @@ mod adapter {
     use engram_harness_proto::{
         AgentRole, EditHunk, FileChange, HarnessCommand, HarnessEvent, MAX_FILE_CHANGE_BYTES,
     };
+    use engram_harness_sdk::questions::{Answers, Question};
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
     use serde_json::Value;
@@ -492,35 +493,19 @@ mod adapter {
     /// held open.
     pub mod hook_server {
         use super::{
-            emit, injected_tools, mcp_server, BufReader, HarnessEvent, ToolExecution, ToolManifest,
+            emit, injected_tools, mcp_server, Answers, BufReader, HarnessEvent, Question,
+            ToolExecution, ToolManifest,
         };
-        use engram_harness_proto::{Answers, Question};
         use std::collections::{HashMap, HashSet};
         use std::sync::Arc;
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         use tokio::net::{UnixListener, UnixStream};
         use tokio::sync::{mpsc, Mutex};
 
-        /// `tool_use_id → canonical Answers`, owned by `run_engine` so it
-        /// survives a claude respawn: an answer is stashed by the live
-        /// process's `AnswerQuestion` arm and consumed by the hook of the
-        /// *next*, resumed process (findings #11/#12 — the answer can only
-        /// land on the resumed re-fire). `tokio::sync::Mutex` (not std)
-        /// because the accept handler holds it across an `.await`, and it is
-        /// touched concurrently by the accept task and the `cmd_rx` arm.
-        pub type AnswersInHand = Arc<Mutex<HashMap<String, Answers>>>;
         /// The most-recently-started turn's `run_id`, so a hook (which only
-        /// ever fires inside an in-flight turn) can tag its
-        /// `UserQuestion`/`QuestionAnswered` events. Set by
-        /// `start_turn`/`start_continuation_turn`.
+        /// ever fires inside an in-flight turn) can tag its generic tool
+        /// lifecycle events. Set by `start_turn`/`start_continuation_turn`.
         pub type CurrentRunId = Arc<Mutex<Option<String>>>;
-        /// ADR 0054: SESSION-level "an AskUserQuestion card is awaiting an
-        /// answer right now." Set true when the hook cards the first AUQ;
-        /// cleared when that answer is delivered. While true, EVERY further AUQ
-        /// — same run or a later one (the #64389 double-fire fires both ways) —
-        /// is a duplicate: no card, recorded in `DuplicateDeferredIds` for the scrub.
-        /// Session-scoped (not per-run) so a cross-run sibling is still caught.
-        pub type QuestionOutstanding = Arc<Mutex<bool>>;
         /// ADR 0054 / 0089: `tool_use_id`s of duplicate deferred calls the hook
         /// suppressed (AUQ or manifest tool).
         /// Drained at the answer-resume and handed to `scrub_transcript`, which
@@ -544,10 +529,8 @@ mod adapter {
         /// tool state grows alongside the older AUQ state.
         #[derive(Clone)]
         pub struct State {
-            pub answers_in_hand: AnswersInHand,
             pub current_run_id: CurrentRunId,
             pub evt_tx: mpsc::Sender<HarnessEvent>,
-            pub question_outstanding: QuestionOutstanding,
             pub duplicate_deferred_ids: DuplicateDeferredIds,
             pub manifest: Arc<ToolManifest>,
             pub results_in_hand: mcp_server::ResultsInHand,
@@ -595,10 +578,8 @@ mod adapter {
 
         async fn handle_one(stream: UnixStream, state: State) {
             let State {
-                answers_in_hand,
                 current_run_id,
                 evt_tx,
-                question_outstanding,
                 duplicate_deferred_ids,
                 manifest,
                 results_in_hand,
@@ -620,18 +601,43 @@ mod adapter {
             let run_id = current_run_id.lock().await.clone().unwrap_or_default();
 
             // A native binding adapts a Claude built-in onto the same generic
-            // deferred-call ledger used by injected MCP tools. Its result is
-            // consumed here (rather than by the MCP bridge) because Claude's
-            // own AskUserQuestion implementation produces the tool_result once
-            // the hook allows it with updatedInput.answers.
-            if let Some(tool) = manifest
+            // deferred-call ledger used by injected MCP tools. Old hook payloads
+            // omitted `tool_name`; resolve those to the production AUQ binding
+            // by canonical name. If the manifest is misconfigured and has no
+            // binding at all, fail safe onto deferred `ask_user_question`: never
+            // silently swallow the question and never resurrect the bespoke wire.
+            let native_tool = manifest
                 .iter()
                 .find(|tool| tool.native_bindings.claude.as_deref() == Some(req.tool_name.as_str()))
-            {
+                .or_else(|| {
+                    if req.tool_name.is_empty() {
+                        manifest.iter().find(|tool| {
+                            tool.name == "ask_user_question"
+                                && tool.native_bindings.claude.as_deref() == Some("AskUserQuestion")
+                        })
+                    } else {
+                        None
+                    }
+                });
+            let needs_question_fallback =
+                req.tool_name.is_empty() || req.tool_name == "AskUserQuestion";
+            let native_binding = native_tool
+                .map(|tool| (tool.name.clone(), tool.execution))
+                .or_else(|| {
+                    needs_question_fallback.then(|| {
+                        tracing::warn!(
+                            tool_use_id = %req.tool_use_id,
+                            observed_tool_name = %req.tool_name,
+                            "AskUserQuestion has no manifest native binding; falling back to deferred ask_user_question"
+                        );
+                        ("ask_user_question".to_string(), ToolExecution::Deferred)
+                    })
+                });
+            if let Some((tool_name, execution)) = native_binding {
                 let mut event = None;
-                let verdict = if tool.execution == ToolExecution::Sync {
+                let verdict = if execution == ToolExecution::Sync {
                     tracing::warn!(
-                        tool_name = %tool.name,
+                        tool_name = %tool_name,
                         native_binding = %req.tool_name,
                         "sync native binding is unsupported; allowing the built-in"
                     );
@@ -648,7 +654,7 @@ mod adapter {
                             tracing::error!(
                                 %error,
                                 tool_use_id = %req.tool_use_id,
-                                tool_name = %tool.name,
+                                tool_name = %tool_name,
                                 "native tool result is not a canonical answer map"
                             );
                             results_in_hand
@@ -659,22 +665,21 @@ mod adapter {
                         }
                     }
                 } else {
-                    // Questions are session-scoped: while one native AUQ is
-                    // outstanding, a second same-name call in any run is the
-                    // #64389 double-fire. Exact-id re-fires remain ordinary
-                    // idempotency and are never scrubbed.
+                    // A second same-name native call while the first remains in
+                    // the deferred ledger is Claude #64389's double-fire.
+                    // Exact-id re-fires remain ordinary idempotency.
                     let (first_request, duplicate) = {
                         let mut calls = deferred_calls.lock().await;
                         if calls.contains_key(&req.tool_use_id) {
                             (false, false)
-                        } else if calls.values().any(|call| call.tool_name == tool.name) {
+                        } else if calls.values().any(|call| call.tool_name == tool_name) {
                             (false, true)
                         } else {
                             calls.insert(
                                 req.tool_use_id.clone(),
                                 DeferredCall {
                                     run_id: run_id.clone(),
-                                    tool_name: tool.name.clone(),
+                                    tool_name: tool_name.clone(),
                                 },
                             );
                             (true, false)
@@ -688,7 +693,7 @@ mod adapter {
                         tracing::warn!(
                             %run_id,
                             tool_use_id = %req.tool_use_id,
-                            tool_name = %tool.name,
+                            tool_name = %tool_name,
                             "ADR 0089: duplicate deferred native tool (#64389 double-fire); \
                              deferring with no request (scrubbed before resume)"
                         );
@@ -697,7 +702,7 @@ mod adapter {
                         event = Some(HarnessEvent::ToolCallRequested {
                             run_id,
                             call_id: req.tool_use_id.clone(),
-                            name: tool.name.clone(),
+                            name: tool_name,
                             args_json: serde_json::json!({"questions": req.questions}).to_string(),
                         });
                     }
@@ -710,134 +715,44 @@ mod adapter {
                 return;
             }
 
-            // Before ADR 0089 only AUQ reached this socket, so old requests
-            // omitted `tool_name`. Treat an empty name as legacy AUQ to keep that
-            // one-line protocol byte-compatible while new prefixed MCP tools
-            // carry their full hook payload.
-            let is_auq = req.tool_name.is_empty() || req.tool_name == "AskUserQuestion";
-            if !is_auq {
-                let mut event = None;
-                let verdict = if req.tool_name == "ToolSearch" {
-                    // Claude lazily loads MCP tools through ToolSearch; parking
-                    // this built-in would prevent the real tool from ever
-                    // being proposed (ADR 0089 spike).
-                    HookVerdict::Allow
-                } else if let Some(name) = req.tool_name.strip_prefix("mcp__engrams__") {
-                    match injected_tools(&manifest).find(|tool| tool.name == name) {
-                        Some(tool) if tool.execution == ToolExecution::Sync => HookVerdict::Allow,
-                        Some(_) if results_in_hand.lock().await.contains_key(&req.tool_use_id) => {
-                            // The hook must leave the stash intact: after allow,
-                            // Claude invokes the MCP bridge, which consumes it.
-                            HookVerdict::Allow
-                        }
-                        Some(_) => {
-                            // Claude #64389 can issue the same logical deferred
-                            // call twice with distinct ids in one turn. Decide
-                            // and insert under one lock so concurrent hook
-                            // connections cannot both become host-visible.
-                            // An exact-id re-fire remains ordinary idempotency:
-                            // never scrub the original id.
-                            let (first_request, duplicate) = {
-                                let mut calls = deferred_calls.lock().await;
-                                if calls.contains_key(&req.tool_use_id) {
-                                    (false, false)
-                                } else if calls
-                                    .values()
-                                    .any(|call| call.run_id == run_id && call.tool_name == name)
-                                {
-                                    (false, true)
-                                } else {
-                                    calls.insert(
-                                        req.tool_use_id.clone(),
-                                        DeferredCall {
-                                            run_id: run_id.clone(),
-                                            tool_name: name.to_string(),
-                                        },
-                                    );
-                                    (true, false)
-                                }
-                            };
-                            if duplicate {
-                                duplicate_deferred_ids
-                                    .lock()
-                                    .await
-                                    .insert(req.tool_use_id.clone());
-                                tracing::warn!(
-                                    %run_id,
-                                    tool_use_id = %req.tool_use_id,
-                                    tool_name = %name,
-                                    "ADR 0089: duplicate deferred manifest tool in one turn \
-                                     (#64389 double-fire); deferring with no request \
-                                     (scrubbed before resume)"
+            let mut event = None;
+            let verdict = if req.tool_name == "ToolSearch" {
+                // Claude lazily loads MCP tools through ToolSearch; parking
+                // this built-in would prevent the real tool from ever being
+                // proposed (ADR 0089 spike).
+                HookVerdict::Allow
+            } else if let Some(name) = req.tool_name.strip_prefix("mcp__engrams__") {
+                match injected_tools(&manifest).find(|tool| tool.name == name) {
+                    Some(tool) if tool.execution == ToolExecution::Sync => HookVerdict::Allow,
+                    Some(_) if results_in_hand.lock().await.contains_key(&req.tool_use_id) => {
+                        // The hook must leave the stash intact: after allow,
+                        // Claude invokes the MCP bridge, which consumes it.
+                        HookVerdict::Allow
+                    }
+                    Some(_) => {
+                        // Claude #64389 can issue the same logical deferred
+                        // call twice with distinct ids in one turn. Decide and
+                        // insert under one lock so concurrent hook connections
+                        // cannot both become host-visible.
+                        let (first_request, duplicate) = {
+                            let mut calls = deferred_calls.lock().await;
+                            if calls.contains_key(&req.tool_use_id) {
+                                (false, false)
+                            } else if calls
+                                .values()
+                                .any(|call| call.run_id == run_id && call.tool_name == name)
+                            {
+                                (false, true)
+                            } else {
+                                calls.insert(
+                                    req.tool_use_id.clone(),
+                                    DeferredCall {
+                                        run_id: run_id.clone(),
+                                        tool_name: name.to_string(),
+                                    },
                                 );
+                                (true, false)
                             }
-                            if first_request {
-                                event = Some(HarnessEvent::ToolCallRequested {
-                                    run_id,
-                                    call_id: req.tool_use_id.clone(),
-                                    name: name.to_string(),
-                                    args_json: req.tool_input.to_string(),
-                                });
-                            }
-                            HookVerdict::Defer
-                        }
-                        None => HookVerdict::Allow,
-                    }
-                } else {
-                    HookVerdict::Allow
-                };
-                if let Some(event) = event {
-                    emit(&evt_tx, event).await;
-                }
-                write_verdict(&mut w, &verdict).await;
-                return;
-            }
-
-            // Verdict (+ optional event):
-            //   answer-in-hand → answer + QuestionAnswered (consume with
-            //     `remove`, so a re-fire of the SAME id after consumption
-            //     defers — one tool_result, structural idempotency, ADR 0054).
-            //     Clear `question_outstanding`: this card is now answered, so
-            //     the NEXT genuine question is carded afresh.
-            //   else, no question outstanding → defer + UserQuestion (card),
-            //     mark a question outstanding.
-            //   else (a question is ALREADY outstanding) → defer with NO card —
-            //     the #64389 stdin double-fire, WITHIN this run or a LATER one
-            //     (claude, held open on stdin, re-asks either way). We DEFER
-            //     rather than deny: a deny leaves a "stop and wait" tool_result
-            //     in claude's transcript that the model retries after the real
-            //     answer lands (re-ask + a second card). The duplicate stays a
-            //     parked tool; its id goes to `duplicate_deferred_ids` so the
-            //     answer-resume scrub drops it, leaving exactly one question.
-            // The answers-map lock is a temporary (dropped before the
-            // outstanding lock — no lock-order coupling), and the event is
-            // emitted AFTER the locks drop (`emit` can block on host-link
-            // backpressure).
-            let (verdict, event): (HookVerdict, Option<HarnessEvent>) = {
-                let answer = answers_in_hand.lock().await.remove(&req.tool_use_id);
-                match answer {
-                    Some(answers) => {
-                        *question_outstanding.lock().await = false;
-                        (
-                            HookVerdict::Answer {
-                                answers: answers.clone(),
-                            },
-                            Some(HarnessEvent::QuestionAnswered {
-                                run_id,
-                                tool_call_id: req.tool_use_id,
-                                answers,
-                            }),
-                        )
-                    }
-                    None => {
-                        // Atomic check-and-set under one lock: the first AUQ
-                        // since the last answer flips the flag and is carded;
-                        // any AUQ while it is already set is the duplicate.
-                        let duplicate = {
-                            let mut outstanding = question_outstanding.lock().await;
-                            let was_set = *outstanding;
-                            *outstanding = true;
-                            was_set
                         };
                         if duplicate {
                             duplicate_deferred_ids
@@ -847,23 +762,26 @@ mod adapter {
                             tracing::warn!(
                                 %run_id,
                                 tool_use_id = %req.tool_use_id,
-                                "ADR 0054: duplicate AskUserQuestion while one is outstanding \
-                                 (#64389 double-fire); deferring with no card (scrubbed before resume)"
+                                tool_name = %name,
+                                "ADR 0089: duplicate deferred manifest tool in one turn \
+                                 (#64389 double-fire); deferring with no request \
+                                 (scrubbed before resume)"
                             );
-                            // Defer (keep it parked) but emit no card.
-                            (HookVerdict::Defer, None)
-                        } else {
-                            (
-                                HookVerdict::Defer,
-                                Some(HarnessEvent::UserQuestion {
-                                    run_id,
-                                    tool_call_id: req.tool_use_id,
-                                    questions: req.questions,
-                                }),
-                            )
                         }
+                        if first_request {
+                            event = Some(HarnessEvent::ToolCallRequested {
+                                run_id,
+                                call_id: req.tool_use_id.clone(),
+                                name: name.to_string(),
+                                args_json: req.tool_input.to_string(),
+                            });
+                        }
+                        HookVerdict::Defer
                     }
+                    None => HookVerdict::Allow,
                 }
+            } else {
+                HookVerdict::Allow
             };
             if let Some(event) = event {
                 emit(&evt_tx, event).await;
@@ -894,8 +812,7 @@ mod adapter {
     /// stdout.
     pub mod hook_bridge {
         use super::hook_server::HookVerdict;
-        use super::BufReader;
-        use engram_harness_proto::{Answers, Question};
+        use super::{Answers, BufReader, Question};
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
 
@@ -1508,15 +1425,11 @@ mod adapter {
         const MAX_RESPAWN_BACKOFF_SECS: u64 = 10;
         let mut fast_crashes: u32 = 0;
 
-        // ADR 0054 / 0089: the answer + generic result bridges. Their stashes
-        // and `current_run_id` are owned here so they survive a claude respawn
-        // (the answer is stashed by one process and consumed by the hook of
-        // the next, resumed one — findings #11/#12). The hook socket is
+        // ADR 0089: the generic result bridge stash and `current_run_id` are
+        // owned here so they survive a claude respawn. The hook socket is
         // bound ONCE, before the first spawn (bind-before-spawn → no hook
         // can fire before the listener exists), and shared across respawns;
         // the accept task outlives any single claude process.
-        let answers_in_hand: hook_server::AnswersInHand =
-            Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let results_in_hand: mcp_server::ResultsInHand =
             Arc::new(tokio::sync::Mutex::new(HashMap::new()));
         let parked_mcp_calls: mcp_server::ParkedCalls =
@@ -1531,16 +1444,9 @@ mod adapter {
         // ResumeForDeferred).
         let scrub_msg_ids: Arc<tokio::sync::Mutex<HashSet<String>>> =
             Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-        // ADR 0054: session-level AskUserQuestion dedup of the #64389 double-fire
-        // (within- OR cross-run). `question_outstanding` is set when the hook
-        // cards a question and cleared when its answer is delivered; while set,
-        // every further AUQ is a duplicate with no card. Manifest deferred
-        // tools use the same set for same-name double-fires within one turn.
-        // `duplicate_deferred_ids` collects every suppressed duplicate's
+        // `duplicate_deferred_ids` collects every suppressed #64389 duplicate's
         // tool_use id so the deferred-delivery scrub deletes it from the
         // transcript. Owned here so all deferred paths span respawns.
-        let question_outstanding: hook_server::QuestionOutstanding =
-            Arc::new(tokio::sync::Mutex::new(false));
         let duplicate_deferred_ids: hook_server::DuplicateDeferredIds =
             Arc::new(tokio::sync::Mutex::new(HashSet::new()));
         write_hook_settings().await;
@@ -1571,10 +1477,8 @@ mod adapter {
                 let task = tokio::spawn(hook_server::serve(
                     listener,
                     hook_server::State {
-                        answers_in_hand: answers_in_hand.clone(),
                         current_run_id: current_run_id.clone(),
                         evt_tx: evt_tx.clone(),
-                        question_outstanding: question_outstanding.clone(),
                         duplicate_deferred_ids: duplicate_deferred_ids.clone(),
                         manifest: tool_manifest.clone(),
                         results_in_hand: results_in_hand.clone(),
@@ -1630,13 +1534,12 @@ mod adapter {
                 &evt_tx,
                 &mut pending,
                 &mut seen_prompt_ids,
-                &answers_in_hand,
                 &results_in_hand,
                 &parked_mcp_calls,
                 &deferred_calls,
                 &current_run_id,
                 &scrub_msg_ids,
-                &question_outstanding,
+                &duplicate_deferred_ids,
                 mcp_config_path,
             )
             .await
@@ -1834,7 +1737,7 @@ mod adapter {
         /// (both shipped hardcoded-empty/zero before — 2026-07-11 campaign
         /// papercut: every timing consumer read 0).
         tool_call_starts: HashMap<String, (String, std::time::Instant)>,
-        /// Deferred AUQ + manifest tool_use_ids seen this turn that have not
+        /// Deferred native + manifest tool_use_ids seen this turn that have not
         /// received a `tool_result`. While non-empty, assistant text/chunks are
         /// the narrate-past hallucination (Claude talking past a parked tool)
         /// and are suppressed; delivery clears the id and re-enables output.
@@ -1843,12 +1746,9 @@ mod adapter {
         /// hooks park the turn. Kept with the turn so transcript translation
         /// can classify generic tool_use blocks without global/env lookups.
         deferred_tool_names: HashSet<String>,
-        /// ADR 0054 Part B: set for a `start_continuation_turn` (answer-resume).
-        /// If such a turn ENDS with an answer still in `answers_in_hand`, the
-        /// deferred tool was never re-fired — claude narrate-past'd and
-        /// abandoned it (a `--resume` does not re-present an abandoned tool).
-        /// The engine then delivers the answer as a fresh user message rather
-        /// than leaving the question hanging.
+        /// Set for a continuation turn created to deliver a deferred result.
+        /// If the result remains stashed at turn end, Claude abandoned the
+        /// re-fire and the engine degrades to a fresh user message.
         is_delivery_resume: bool,
         /// ADR 0054 Part C: message-ids of the narrate-past assistant messages
         /// suppressed THIS turn (Part A hid them from the UI). Copied into the
@@ -1913,7 +1813,6 @@ mod adapter {
         evt_tx: &mpsc::Sender<HarnessEvent>,
         pending: &mut VecDeque<QueuedPrompt>,
         seen_prompt_ids: &mut HashSet<String>,
-        answers_in_hand: &hook_server::AnswersInHand,
         results_in_hand: &mcp_server::ResultsInHand,
         parked_mcp_calls: &mcp_server::ParkedCalls,
         deferred_calls: &hook_server::DeferredCalls,
@@ -1922,11 +1821,7 @@ mod adapter {
         // scrub from the transcript before the next answer-resume. Owned by
         // `run_engine` so it survives a respawn; populated at turn-end here.
         scrub_msg_ids: &Arc<tokio::sync::Mutex<HashSet<String>>>,
-        // ADR 0054: set true while an AskUserQuestion card is awaiting an
-        // answer (the hook owns it). While set, a further AUQ is the #64389
-        // duplicate — its card is already suppressed at the hook, so we also
-        // drop its `ToolCallStarted` here (no phantom tool-call in the UI).
-        question_outstanding: &hook_server::QuestionOutstanding,
+        duplicate_deferred_ids: &hook_server::DuplicateDeferredIds,
         mcp_config_path: Option<&str>,
     ) -> SessionOutcome {
         // A socket call outside a turn must carry the wire-mandated empty
@@ -2041,7 +1936,7 @@ mod adapter {
         // the abort's `result` lands.
         let mut interrupt_deadline: Option<Instant> = None;
 
-        // ADR 0054 / 0089: if an answer or deferred result is stashed, claude
+        // ADR 0089: if a deferred result is stashed, claude
         // WILL re-fire the tool on this `--resume` startup (id-stable, no
         // stdin — findings #9/#12). Establish a CONTINUATION turn (fresh
         // run_id, `RunStarted` with no `prompt_id`, no user-echo, no
@@ -2053,7 +1948,7 @@ mod adapter {
         // with no matching pending tool leaves a continuation turn with no
         // output until `max_run_secs` or the next command; rare, and the
         // session stays command-responsive.)
-        if !answers_in_hand.lock().await.is_empty() || !results_in_hand.lock().await.is_empty() {
+        if !results_in_hand.lock().await.is_empty() {
             turn = Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
         } else {
             // Kick off the first queued prompt (an initial prompt, or a
@@ -2070,8 +1965,7 @@ mod adapter {
                     }
                 }
                 None => {
-                    let parked = *question_outstanding.lock().await
-                        || !deferred_calls.lock().await.is_empty();
+                    let parked = !deferred_calls.lock().await.is_empty();
                     emit(
                         evt_tx,
                         if parked {
@@ -2132,10 +2026,9 @@ mod adapter {
                                     // is a narrate-past — claude abandoned the
                                     // deferred question instead of suspending. The
                                     // hallucinated reply was already suppressed in
-                                    // `translate_jsonl`; surface the event for
-                                    // observability. The UserQuestion card the hook
-                                    // emitted stands, so the session stays
-                                    // awaiting-answer.
+                                    // `translate_jsonl`. The generic deferred-tool
+                                    // request the hook emitted stands, so the
+                                    // session stays awaiting its tool result.
                                     let narrated_past = marker.terminal_reason.as_deref()
                                         != Some("tool_deferred")
                                         && !t.deferred_pending.is_empty();
@@ -2184,22 +2077,9 @@ mod adapter {
                                         )
                                         .await;
                                     }
-                                    // ADR 0054 Part B: an answer-resume that ends
-                                    // with the answer STILL in hand means the
-                                    // deferred tool was never re-fired — claude
-                                    // narrate-past'd and abandoned it (a `--resume`
-                                    // does NOT re-present an abandoned tool, verified
-                                    // empirically). The stash→resume→re-fire path is
-                                    // a dead end here, so deliver the answer as a
-                                    // fresh user message (claude asked for it
-                                    // conversationally) and mark the card answered —
-                                    // never leave the question hanging.
-                                    let stale: Vec<(String, engram_harness_proto::Answers)> =
-                                        if is_delivery_resume {
-                                            answers_in_hand.lock().await.drain().collect()
-                                        } else {
-                                            Vec::new()
-                                        };
+                                    // If Claude narrate-past'd and abandoned the
+                                    // deferred re-fire, deliver the still-stashed
+                                    // generic result as a fresh user message.
                                     let stale_results: Vec<(String, String)> =
                                         if is_delivery_resume {
                                             results_in_hand.lock().await.drain().collect()
@@ -2222,45 +2102,13 @@ mod adapter {
                                                 })
                                                 .collect()
                                         };
-                                    if !stale.is_empty() || !stale_results.is_empty() {
-                                        // ADR 0054: this is an answer-delivery
-                                        // path the hook never reaches (claude
-                                        // narrate-past'd and abandoned the
-                                        // deferred tool, so its re-fire — and
-                                        // the hook's `question_outstanding`
-                                        // clear at the answer verdict — never
-                                        // happen). Clear the flag HERE, before
-                                        // the fallback turn starts, or it stays
-                                        // set for the rest of the session and
-                                        // every later genuine AUQ is wrongly
-                                        // deduped as a #64389 duplicate (no
-                                        // card, scrubbed → silently swallowed).
-                                        // Invariant: the flag is cleared on
-                                        // EVERY answer-delivery path, not just
-                                        // the hook's.
-                                        if !stale.is_empty() {
-                                            *question_outstanding.lock().await = false;
-                                        }
+                                    if !stale_results.is_empty() {
                                         if let Some(s) = stdin.as_mut() {
-                                            let text = fallback_delivery_message(
-                                                &stale,
-                                                &stale_results,
-                                            );
+                                            let text = fallback_delivery_message(&stale_results);
                                             let ft = start_turn(
                                                 evt_tx, s, cli, None, &text, current_run_id,
                                             )
                                             .await;
-                                            for (tool_call_id, answers) in stale {
-                                                emit(
-                                                    evt_tx,
-                                                    HarnessEvent::QuestionAnswered {
-                                                        run_id: ft.run_id.clone(),
-                                                        tool_call_id,
-                                                        answers,
-                                                    },
-                                                )
-                                                .await;
-                                            }
                                             // The normal id-stable re-fire
                                             // produces ToolCallCompleted when
                                             // Claude streams its tool_result.
@@ -2335,21 +2183,17 @@ mod adapter {
                                     &mut t.suppressed_msg_ids,
                                 ) {
                                     for mut ev in translated {
-                                        // ADR 0054: drop a duplicate AUQ's
-                                        // tool-log entry (the #64389 double-fire,
-                                        // within- or cross-run). A question is
-                                        // already outstanding, so the hook gave
-                                        // this AUQ no card; suppress its
-                                        // ToolCallStarted too so no phantom tool
-                                        // call flickers in the UI. (The first,
-                                        // carded question's card stands regardless
-                                        // — the UI renders that, not this entry.)
+                                        // The hook gave #64389 duplicates no
+                                        // request; suppress their tool-log entry
+                                        // too so no phantom call flickers.
                                         if let HarnessEvent::ToolCallStarted {
-                                            tool_name, ..
+                                            tool_call_id, ..
                                         } = &ev
                                         {
-                                            if tool_name == "AskUserQuestion"
-                                                && *question_outstanding.lock().await
+                                            if duplicate_deferred_ids
+                                                .lock()
+                                                .await
+                                                .contains(tool_call_id)
                                             {
                                                 continue;
                                             }
@@ -2437,34 +2281,6 @@ mod adapter {
                                     text,
                                 });
                             }
-                        }
-                        Some(HarnessCommand::AnswerQuestion { tool_call_id, answers }) => {
-                            tracing::warn!(
-                                %tool_call_id,
-                                "received legacy AnswerQuestion command; use ToolResult for native ask_user_question"
-                            );
-                            // ADR 0054: stash the answer for the hook of the
-                            // NEXT (resumed) process — it can ONLY land on the
-                            // resumed re-fire, never on this live process
-                            // (feeding the live stream re-infers a new
-                            // tool_use_id, finding #11). Then end THIS claude
-                            // and re-enter via `--resume`.
-                            tracing::info!(
-                                %tool_call_id,
-                                "answer received; resuming claude to re-fire the deferred AUQ"
-                            );
-                            answers_in_hand.lock().await.insert(tool_call_id, answers);
-                            resuming_for_deferred = true;
-                            // claude flushes its transcript per-message, so the
-                            // session stays cleanly `--resume`-able after SIGINT.
-                            sigint_child(&child);
-                            // `break` (NOT `return`): the existing `None =>
-                            // return ChannelClosed` arm skips the reap block,
-                            // but we MUST reap (wait the child, drain stderr,
-                            // close any defensively-in-flight turn). Breaking
-                            // the loop runs the reap, which returns
-                            // `ResumeForDeferred`.
-                            break;
                         }
                         Some(HarnessCommand::ToolResult { call_id, result_json }) => {
                             let known_deferred =
@@ -2683,8 +2499,8 @@ mod adapter {
                 // Grace expired mid-turn before claude could drain.
                 emit(evt_tx, HarnessEvent::RunCompleted { run_id, ok: false }).await;
             } else if resuming_for_deferred {
-                // ADR 0054: an `AnswerQuestion` tore down a turn that was
-                // (defensively) still in flight — the deferred-question turn
+                // ADR 0089: a generic deferred result tore down a turn that was
+                // (defensively) still in flight — the deferred-tool turn
                 // normally already ended `tool_deferred` (so `turn` is
                 // None), but a racing answer is handled here. This is NOT a
                 // crash: close the run quietly (no abnormal-exit System
@@ -2743,8 +2559,8 @@ mod adapter {
         current_run_id: &hook_server::CurrentRunId,
     ) -> TurnState {
         let run_id = format!("run-{}", uuid::Uuid::new_v4());
-        // ADR 0054: publish the run_id so a hook firing within this turn
-        // tags its UserQuestion/QuestionAnswered with the right run.
+        // ADR 0054 / 0089: publish the run_id so a hook firing within this
+        // turn tags its generic tool lifecycle events with the right run.
         *current_run_id.lock().await = Some(run_id.clone());
         // `RunStarted{prompt_id}` is the "queued prompt consumed" signal:
         // a UI that drew a greyed type-ahead item with this id moves it
@@ -2825,26 +2641,10 @@ mod adapter {
         }
     }
 
-    /// ADR 0054 Part B: render the canonical answer map(s) as a plain user
-    /// message — used when a narrate-past abandoned the deferred tool, so the
-    /// answer can't ride a re-fired `tool_result`. claude asked the question
-    /// conversationally, so an ordinary message is exactly what it awaits.
-    fn fallback_delivery_message(
-        stale_answers: &[(String, engram_harness_proto::Answers)],
-        stale_results: &[(String, String)],
-    ) -> String {
-        let mut lines = Vec::new();
-        if !stale_answers.is_empty() {
-            lines.push("Here are my answers to the question(s) you just asked:".to_string());
-        }
-        for (_tool_call_id, answers) in stale_answers {
-            for (question, labels) in answers {
-                lines.push(format!("- {}: {}", question, labels.join(", ")));
-            }
-        }
-        if !stale_results.is_empty() {
-            lines.push("Results for the deferred tool call(s) you made earlier:".to_string());
-        }
+    /// Render results as a plain user message when Claude abandons an id-stable
+    /// deferred re-fire. The explicit completion event still retires each row.
+    fn fallback_delivery_message(stale_results: &[(String, String)]) -> String {
+        let mut lines = vec!["Results for the deferred tool call(s) you made earlier:".to_string()];
         for (call_id, result_json) in stale_results {
             lines.push(format!("- {call_id}: {result_json}"));
         }
@@ -3592,7 +3392,7 @@ mod adapter {
     #[cfg(test)]
     mod engine_tests {
         use super::*;
-        use engram_harness_proto::{Answers, Question, QuestionOption};
+        use engram_harness_sdk::questions::{Answers, Question, QuestionOption};
         use std::pin::Pin;
         use std::task::{Context, Poll};
 
@@ -4897,50 +4697,6 @@ mod adapter {
             }
         }
 
-        /// Spin up `hook_server::serve` on a fresh, isolated temp socket (NOT
-        /// the production `/workspace` path — tests run in parallel). Returns
-        /// the path plus the shared state and the event receiver.
-        async fn spawn_hook_server() -> (
-            String,
-            hook_server::AnswersInHand,
-            hook_server::CurrentRunId,
-            mpsc::Receiver<HarnessEvent>,
-            hook_server::DuplicateDeferredIds,
-        ) {
-            let sock = std::env::temp_dir()
-                .join(format!("engram-hooktest-{}.sock", uuid::Uuid::new_v4()))
-                .to_string_lossy()
-                .into_owned();
-            let answers: hook_server::AnswersInHand =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let run_id: hook_server::CurrentRunId =
-                Arc::new(tokio::sync::Mutex::new(Some("run-x".into())));
-            let outstanding: hook_server::QuestionOutstanding =
-                Arc::new(tokio::sync::Mutex::new(false));
-            let dup_ids: hook_server::DuplicateDeferredIds =
-                Arc::new(tokio::sync::Mutex::new(HashSet::new()));
-            let results: mcp_server::ResultsInHand =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let deferred: hook_server::DeferredCalls =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
-            let (evt_tx, evt_rx) = mpsc::channel::<HarnessEvent>(16);
-            let listener = tokio::net::UnixListener::bind(&sock).unwrap();
-            tokio::spawn(hook_server::serve(
-                listener,
-                hook_server::State {
-                    answers_in_hand: answers.clone(),
-                    current_run_id: run_id.clone(),
-                    evt_tx,
-                    question_outstanding: outstanding,
-                    duplicate_deferred_ids: dup_ids.clone(),
-                    manifest: Arc::new(Vec::new()),
-                    results_in_hand: results,
-                    deferred_calls: deferred,
-                },
-            ));
-            (sock, answers, run_id, evt_rx, dup_ids)
-        }
-
         async fn spawn_manifest_hook_server(
             manifest: ToolManifest,
         ) -> (
@@ -4957,16 +4713,12 @@ mod adapter {
                 ))
                 .to_string_lossy()
                 .into_owned();
-            let answers: hook_server::AnswersInHand =
-                Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let results: mcp_server::ResultsInHand =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let pending: hook_server::DeferredCalls =
                 Arc::new(tokio::sync::Mutex::new(HashMap::new()));
             let run_id: hook_server::CurrentRunId =
                 Arc::new(tokio::sync::Mutex::new(Some("run-x".into())));
-            let outstanding: hook_server::QuestionOutstanding =
-                Arc::new(tokio::sync::Mutex::new(false));
             let duplicates: hook_server::DuplicateDeferredIds =
                 Arc::new(tokio::sync::Mutex::new(HashSet::new()));
             let (evt_tx, evt_rx) = mpsc::channel(16);
@@ -4974,10 +4726,8 @@ mod adapter {
             tokio::spawn(hook_server::serve(
                 listener,
                 hook_server::State {
-                    answers_in_hand: answers,
                     current_run_id: run_id,
                     evt_tx,
-                    question_outstanding: outstanding,
                     duplicate_deferred_ids: duplicates.clone(),
                     manifest: Arc::new(manifest),
                     results_in_hand: results.clone(),
@@ -4985,24 +4735,6 @@ mod adapter {
                 },
             ));
             (sock, results, pending, evt_rx, duplicates)
-        }
-
-        /// A fake `PreToolUse` hook client: one request line, one verdict.
-        async fn hook_fire(
-            sock: &str,
-            tool_use_id: &str,
-            questions: &[Question],
-        ) -> hook_server::HookVerdict {
-            let stream = tokio::net::UnixStream::connect(sock).await.unwrap();
-            let (r, mut w) = stream.into_split();
-            let req = serde_json::json!({ "tool_use_id": tool_use_id, "questions": questions });
-            let mut line = serde_json::to_string(&req).unwrap();
-            line.push('\n');
-            w.write_all(line.as_bytes()).await.unwrap();
-            w.flush().await.unwrap();
-            let mut lines = BufReader::new(r).lines();
-            let resp = lines.next_line().await.unwrap().unwrap();
-            serde_json::from_str(&resp).unwrap()
         }
 
         async fn hook_fire_named(
@@ -5123,9 +4855,47 @@ mod adapter {
             assert!(pending.lock().await.is_empty());
             assert!(
                 evt_rx.try_recv().is_err(),
-                "native delivery must not emit QuestionAnswered"
+                "native delivery must not emit a second completion event"
             );
             let _ = tokio::fs::remove_file(sock).await;
+        }
+
+        #[tokio::test]
+        async fn unbound_native_question_falls_back_to_generic_deferred_tool() {
+            for (tool_call_id, observed_name) in
+                [("toolu_named", "AskUserQuestion"), ("toolu_old", "")]
+            {
+                let (sock, _results, pending, mut evt_rx, _duplicates) =
+                    spawn_manifest_hook_server(Vec::new()).await;
+                let input = serde_json::json!({
+                    "questions": [{
+                        "question": "Continue?",
+                        "header": "Confirm",
+                        "multiSelect": false,
+                        "options": [{"label": "Yes", "description": "Continue"}]
+                    }]
+                });
+
+                assert!(matches!(
+                    hook_fire_named(&sock, tool_call_id, observed_name, input.clone()).await,
+                    hook_server::HookVerdict::Defer
+                ));
+                match evt_rx.recv().await {
+                    Some(HarnessEvent::ToolCallRequested {
+                        call_id,
+                        name,
+                        args_json,
+                        ..
+                    }) => {
+                        assert_eq!(call_id, tool_call_id);
+                        assert_eq!(name, "ask_user_question");
+                        assert_eq!(serde_json::from_str::<Value>(&args_json).unwrap(), input);
+                    }
+                    other => panic!("expected generic question request, got {other:?}"),
+                }
+                assert!(pending.lock().await.contains_key(tool_call_id));
+                let _ = tokio::fs::remove_file(sock).await;
+            }
         }
 
         #[tokio::test]
@@ -5310,193 +5080,6 @@ mod adapter {
             assert!(pending.lock().await.is_empty());
             assert!(evt_rx.try_recv().is_err());
             let _ = tokio::fs::remove_file(sock).await;
-        }
-
-        // No answer in hand → defer + UserQuestion. After an answer is
-        // stashed, a re-fire of the SAME tool_use_id → answer +
-        // QuestionAnswered.
-        #[tokio::test]
-        async fn hook_defers_then_answers_after_stash() {
-            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
-            let questions = vec![sample_q("Pick one?", false)];
-
-            let v = hook_fire(&sock, "toolu_1", &questions).await;
-            assert!(matches!(v, hook_server::HookVerdict::Defer));
-            match evt_rx.recv().await {
-                Some(HarnessEvent::UserQuestion {
-                    run_id,
-                    tool_call_id,
-                    questions: qs,
-                }) => {
-                    assert_eq!(run_id, "run-x");
-                    assert_eq!(tool_call_id, "toolu_1");
-                    assert_eq!(qs.len(), 1);
-                }
-                other => panic!("expected UserQuestion, got {other:?}"),
-            }
-
-            {
-                let mut m = answers.lock().await;
-                let mut a = Answers::new();
-                a.insert("Pick one?".into(), vec!["A".into()]);
-                m.insert("toolu_1".into(), a);
-            }
-            let v = hook_fire(&sock, "toolu_1", &questions).await;
-            match v {
-                hook_server::HookVerdict::Answer { answers } => {
-                    assert_eq!(answers.get("Pick one?"), Some(&vec!["A".to_string()]));
-                }
-                _ => panic!("expected answer after stash"),
-            }
-            match evt_rx.recv().await {
-                Some(HarnessEvent::QuestionAnswered {
-                    tool_call_id,
-                    answers,
-                    ..
-                }) => {
-                    assert_eq!(tool_call_id, "toolu_1");
-                    assert_eq!(answers.get("Pick one?"), Some(&vec!["A".to_string()]));
-                }
-                other => panic!("expected QuestionAnswered, got {other:?}"),
-            }
-        }
-
-        // One AUQ call carrying TWO questions (one multi, one single) → one
-        // request, one answers map keyed by question text (finding #8).
-        #[tokio::test]
-        async fn hook_multi_question_one_roundtrip() {
-            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
-            let questions = vec![sample_q("Languages?", true), sample_q("Editor?", false)];
-            {
-                let mut m = answers.lock().await;
-                let mut a = Answers::new();
-                a.insert("Languages?".into(), vec!["Python".into(), "Rust".into()]);
-                a.insert("Editor?".into(), vec!["VS Code".into()]);
-                m.insert("toolu_multi".into(), a);
-            }
-            match hook_fire(&sock, "toolu_multi", &questions).await {
-                hook_server::HookVerdict::Answer { answers } => {
-                    assert_eq!(answers.len(), 2, "one answers map for N questions");
-                    assert_eq!(answers.get("Languages?").unwrap().len(), 2);
-                    assert_eq!(
-                        answers.get("Editor?").unwrap(),
-                        &vec!["VS Code".to_string()]
-                    );
-                }
-                _ => panic!("expected answer"),
-            }
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::QuestionAnswered { .. })
-            ));
-        }
-
-        // Idempotency: the deferred tool yields exactly one tool_result, so
-        // a duplicate re-fire after consumption DEFERS (consumed once).
-        #[tokio::test]
-        async fn hook_duplicate_refire_defers_after_consumption() {
-            let (sock, answers, _rid, mut evt_rx, _dup_ids) = spawn_hook_server().await;
-            let questions = vec![sample_q("One?", false)];
-            {
-                let mut m = answers.lock().await;
-                let mut a = Answers::new();
-                a.insert("One?".into(), vec!["A".into()]);
-                m.insert("toolu_dup".into(), a);
-            }
-            assert!(matches!(
-                hook_fire(&sock, "toolu_dup", &questions).await,
-                hook_server::HookVerdict::Answer { .. }
-            ));
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::QuestionAnswered { .. })
-            ));
-            assert!(matches!(
-                hook_fire(&sock, "toolu_dup", &questions).await,
-                hook_server::HookVerdict::Defer
-            ));
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::UserQuestion { .. })
-            ));
-            assert!(
-                answers.lock().await.is_empty(),
-                "the answer was consumed exactly once"
-            );
-        }
-
-        // ADR 0054: SESSION-level dedup of the #64389 double-fire. The first
-        // AUQ defers + cards and marks a question outstanding; any further AUQ
-        // while one is outstanding — INCLUDING one in a different run (the
-        // cross-run double-fire) — still DEFERS (parked, no deny poison) but
-        // emits NO card and is recorded for the scrub. Once the outstanding
-        // question is ANSWERED, the next genuine question is carded afresh.
-        #[tokio::test]
-        async fn hook_dedups_duplicate_auq_session_wide() {
-            let (sock, answers, run_id, mut evt_rx, dup_ids) = spawn_hook_server().await;
-            let questions = vec![sample_q("Color?", false)];
-
-            // First AUQ in run-x → defer + card.
-            assert!(matches!(
-                hook_fire(&sock, "toolu_a", &questions).await,
-                hook_server::HookVerdict::Defer
-            ));
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::UserQuestion { .. })
-            ));
-
-            // Second, distinct AUQ in the SAME run → defer (parked), NO card,
-            // and its id is recorded for the scrub.
-            assert!(matches!(
-                hook_fire(&sock, "toolu_b", &questions).await,
-                hook_server::HookVerdict::Defer
-            ));
-            assert!(
-                evt_rx.try_recv().is_err(),
-                "the same-run duplicate emits no card"
-            );
-
-            // A duplicate in a DIFFERENT run (the cross-run double-fire) is
-            // STILL deduped — the invariant is session-wide, not per-run.
-            *run_id.lock().await = Some("run-y".into());
-            assert!(matches!(
-                hook_fire(&sock, "toolu_c", &questions).await,
-                hook_server::HookVerdict::Defer
-            ));
-            assert!(
-                evt_rx.try_recv().is_err(),
-                "the cross-run duplicate emits no card either"
-            );
-            assert_eq!(
-                *dup_ids.lock().await,
-                HashSet::from(["toolu_b".to_string(), "toolu_c".to_string()]),
-                "both duplicates (same- and cross-run) are recorded for the scrub"
-            );
-
-            // Answer the outstanding question (its id is the carded toolu_a) →
-            // clears `question_outstanding`, so the NEXT genuine question cards.
-            {
-                let mut a = Answers::new();
-                a.insert("Color?".into(), vec!["A".into()]);
-                answers.lock().await.insert("toolu_a".to_string(), a);
-            }
-            assert!(matches!(
-                hook_fire(&sock, "toolu_a", &questions).await,
-                hook_server::HookVerdict::Answer { .. }
-            ));
-            assert!(matches!(
-                evt_rx.recv().await,
-                Some(HarnessEvent::QuestionAnswered { .. })
-            ));
-            assert!(matches!(
-                hook_fire(&sock, "toolu_d", &questions).await,
-                hook_server::HookVerdict::Defer
-            ));
-            assert!(
-                matches!(evt_rx.recv().await, Some(HarnessEvent::UserQuestion { .. })),
-                "after the answer, a fresh question is carded again"
-            );
         }
 
         // The hook-bridge's claude-specific denormalization (finding #6): a
@@ -6110,233 +5693,6 @@ mod adapter {
             let _ = tokio::fs::remove_file(counter).await;
             let _ = tokio::fs::remove_file(captured).await;
         }
-
-        /// A fake claude for the answer-resume + Part B fallback cycle. The
-        /// first turn it emits (init + "resumed" + `result`) models the
-        /// NARRATE-PAST: on the `--resume` it does NOT re-fire the deferred
-        /// tool — it just recaps and ends — so the stashed answer is left
-        /// UNCONSUMED in `answers_in_hand`. Then (unlike the old fake) it
-        /// RESPONDS to each stdin line with "got your answer" + `result`, so
-        /// the harness's fallback delivery (a fresh user message) produces a
-        /// completing turn. On the first (idle) spawn there's no in-flight
-        /// turn so the recap is dropped and only the startup `Idle` surfaces;
-        /// the continuation turn after `AnswerQuestion` captures the recap.
-        async fn write_answer_fallback_fake_claude() -> String {
-            use std::os::unix::fs::PermissionsExt;
-            let path =
-                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
-            let body = "#!/bin/sh\n\
-                printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n\
-                printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m2\",\"content\":[{\"type\":\"text\",\"text\":\"resumed\"}]}}'\n\
-                printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
-                while IFS= read -r _l; do\n\
-                  printf '%s\\n' '{\"type\":\"assistant\",\"message\":{\"id\":\"m3\",\"content\":[{\"type\":\"text\",\"text\":\"got your answer\"}]}}'\n\
-                  printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false}'\n\
-                done\n";
-            tokio::fs::write(&path, body).await.unwrap();
-            let mut perms = std::fs::metadata(&path).unwrap().permissions();
-            perms.set_mode(0o755);
-            std::fs::set_permissions(&path, perms).unwrap();
-            path.to_string_lossy().into_owned()
-        }
-
-        // ADR 0054 Part B: an `AnswerQuestion` stashes the answer, SIGINTs
-        // claude, and respawns `--resume` into a CONTINUATION turn (RunStarted
-        // with NO prompt_id). When claude NARRATE-PASTs, it does NOT re-fire
-        // the deferred tool on resume (verified: an abandoned tool is not
-        // re-presented), so the answer is left UNCONSUMED in `answers_in_hand`
-        // after the continuation turn. The engine must then DELIVER the answer
-        // as a fresh user message (a new no-prompt_id turn) and mark the card
-        // answered (`QuestionAnswered`), instead of going idle with the
-        // question hanging. (The fake never consumes the answer, exactly like
-        // the abandoned-tool case; the first idle spawn's recap is dropped.)
-        #[tokio::test]
-        async fn answer_resume_unconsumed_falls_back_to_user_message() {
-            let script = write_answer_fallback_fake_claude().await;
-            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
-            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
-            let reattach = Arc::new(Notify::new());
-            let engine = tokio::spawn(run_engine(
-                test_cli(script.clone()),
-                cmd_rx,
-                reattach.clone(),
-                evt_tx,
-            ));
-
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            let mut a = Answers::new();
-            a.insert("Q?".into(), vec!["A".into()]);
-            cmd_tx
-                .send(HarnessCommand::AnswerQuestion {
-                    tool_call_id: "toolu_1".into(),
-                    answers: a,
-                })
-                .await
-                .unwrap();
-
-            // 1) the answer-resume continuation turn — claude recaps ("resumed")
-            //    and ends WITHOUT re-firing the deferred tool: answer unconsumed.
-            let (_rid, pid) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(pid, None, "continuation turn carries no prompt_id");
-            expect_agent_message(&mut evt_rx, "resumed").await;
-            let _ = expect_run_completed(&mut evt_rx).await;
-
-            // 2) Part B fallback: a fresh turn (no prompt_id) delivers the answer
-            //    as a user message, and the card is marked answered.
-            let (_fid, fpid) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(
-                fpid, None,
-                "the fallback answer delivery is not a user prompt"
-            );
-            match evt_rx.recv().await {
-                Some(HarnessEvent::QuestionAnswered {
-                    tool_call_id,
-                    answers,
-                    ..
-                }) => {
-                    assert_eq!(tool_call_id, "toolu_1");
-                    assert_eq!(answers.get("Q?"), Some(&vec!["A".to_string()]));
-                }
-                other => panic!("expected QuestionAnswered, got {other:?}"),
-            }
-            expect_agent_message(&mut evt_rx, "got your answer").await;
-            let _ = expect_run_completed(&mut evt_rx).await;
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            cmd_tx
-                .send(HarnessCommand::Shutdown { grace_secs: 5 })
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
-            let _ = tokio::fs::remove_file(&script).await;
-        }
-
-        /// ADR 0054 regression — the exact failure mode of session
-        /// `3b9b9dc5`: a narrate-past on the ANSWER-RESUME turn drops into the
-        /// Part B fallback, which delivers the answer as a fresh user message
-        /// but (before the fix) never cleared `question_outstanding` — the
-        /// hook's clear at the answer verdict (`HookVerdict::Answer`) is
-        /// unreachable on this path because the deferred tool was never
-        /// re-fired. The leaked flag then makes the NEXT genuine
-        /// AskUserQuestion look like a #64389 duplicate: deferred with NO
-        /// card, scrubbed, silently swallowed — re-introducing the very bug
-        /// this ADR fixed. In the live session that surfaced as a first
-        /// "red or green" card answered via the fallback (no
-        /// `tool_call_completed`), then a "cats or dogs" prompt that produced
-        /// `run_started`/`run_completed` with no `user_question` at all.
-        ///
-        /// This drives the real seam end to end — the engine's fallback and
-        /// the real hook server share ONE `question_outstanding` over an
-        /// isolated socket — so the assertion exercises the actual coupling,
-        /// not a stand-in: Q1 is carded, answered, narrate-past'd into the
-        /// fallback; then a distinct Q2 must STILL be carded.
-        #[tokio::test]
-        async fn fallback_clears_outstanding_so_later_question_still_cards() {
-            let script = write_answer_fallback_fake_claude().await;
-            // An isolated hook socket: this test FIRES real hooks, so it can't
-            // share the fixed production path the other `run_engine` tests bind
-            // (they never fire, so they tolerate the collision; we can't).
-            let sock = std::env::temp_dir()
-                .join(format!("engram-regr-{}.sock", uuid::Uuid::new_v4()))
-                .to_string_lossy()
-                .into_owned();
-            let mut cli = test_cli(script.clone());
-            cli.hook_sock_path = Some(sock.clone());
-
-            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
-            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
-            let reattach = Arc::new(Notify::new());
-            let engine = tokio::spawn(run_engine(cli, cmd_rx, reattach.clone(), evt_tx));
-
-            // Startup idle. The socket is bound before the first run, so once
-            // Idle lands a hook fire can connect.
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            // Q1: the hook cards it and sets `question_outstanding` true.
-            let q1 = vec![sample_q("Q?", false)];
-            assert!(matches!(
-                hook_fire(&sock, "toolu_1", &q1).await,
-                hook_server::HookVerdict::Defer
-            ));
-            match evt_rx.recv().await {
-                Some(HarnessEvent::UserQuestion { tool_call_id, .. }) => {
-                    assert_eq!(tool_call_id, "toolu_1", "Q1 is carded");
-                }
-                other => panic!("expected UserQuestion for Q1, got {other:?}"),
-            }
-
-            // Answer Q1. Claude narrate-past's on the resume (never re-fires
-            // the deferred tool → the hook never consumes the answer, so its
-            // flag-clear never runs), and the engine drops into the fallback.
-            let mut a = Answers::new();
-            a.insert("Q?".into(), vec!["A".into()]);
-            cmd_tx
-                .send(HarnessCommand::AnswerQuestion {
-                    tool_call_id: "toolu_1".into(),
-                    answers: a,
-                })
-                .await
-                .unwrap();
-
-            // The narrate-past resume turn: recap, no tool re-fire.
-            let (_rid, pid) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(pid, None, "continuation turn carries no prompt_id");
-            expect_agent_message(&mut evt_rx, "resumed").await;
-            let _ = expect_run_completed(&mut evt_rx).await;
-
-            // The Part B fallback delivers the answer as a fresh user message.
-            let (_fid, fpid) = expect_run_started_id(&mut evt_rx).await;
-            assert_eq!(fpid, None, "the fallback answer delivery is not a prompt");
-            match evt_rx.recv().await {
-                Some(HarnessEvent::QuestionAnswered { tool_call_id, .. }) => {
-                    assert_eq!(tool_call_id, "toolu_1");
-                }
-                other => panic!("expected QuestionAnswered, got {other:?}"),
-            }
-            expect_agent_message(&mut evt_rx, "got your answer").await;
-            let _ = expect_run_completed(&mut evt_rx).await;
-            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
-
-            // The regression: a brand-new, DISTINCT question. With the flag
-            // leaked it is deduped (Defer, no card) and swallowed; with the
-            // fallback's clear it cards again. Both outcomes return Defer, so
-            // only the EMITTED card distinguishes them — and on the buggy path
-            // no event is ever emitted, so we bound the wait to fail loudly
-            // instead of hanging.
-            let q2 = vec![sample_q("Q2?", false)];
-            assert!(matches!(
-                hook_fire(&sock, "toolu_2", &q2).await,
-                hook_server::HookVerdict::Defer
-            ));
-            match tokio::time::timeout(Duration::from_secs(5), evt_rx.recv()).await {
-                Ok(Some(HarnessEvent::UserQuestion { tool_call_id, .. })) => {
-                    assert_eq!(
-                        tool_call_id, "toolu_2",
-                        "the later genuine question must still be carded"
-                    );
-                }
-                Ok(other) => panic!("expected UserQuestion for Q2, got {other:?}"),
-                Err(_) => panic!(
-                    "Q2 was silently swallowed: no card emitted — \
-                     `question_outstanding` leaked across the Part B fallback"
-                ),
-            }
-
-            cmd_tx
-                .send(HarnessCommand::Shutdown { grace_secs: 5 })
-                .await
-                .unwrap();
-            tokio::time::timeout(Duration::from_secs(5), engine)
-                .await
-                .expect("engine should exit on shutdown")
-                .expect("engine task should not panic");
-            let _ = tokio::fs::remove_file(&script).await;
-            let _ = tokio::fs::remove_file(&sock).await;
-        }
     }
 }
 
@@ -6770,8 +6126,9 @@ mod tests {
         // tool_result follows), claude sometimes narrates a bogus "internal
         // error retrieving your answer" in a LATER assistant message and ends
         // the turn `completed` instead of `tool_deferred`. That hallucination
-        // must NOT reach the UI — the UserQuestion card (emitted by the hook)
-        // is the source of truth and the session stays awaiting-answer.
+        // must NOT reach the UI — the generic deferred-tool request emitted
+        // by the hook is the source of truth and the session stays awaiting
+        // its tool result.
         let mut tc = 0u32;
         let mut auq = std::collections::HashSet::new();
 
@@ -6792,7 +6149,7 @@ mod tests {
         assert!(
             evs.iter()
                 .any(|e| matches!(e, HarnessEvent::ToolCallStarted { .. })),
-            "the AUQ tool call still surfaces (the UI dedups it against UserQuestion)"
+            "the AUQ tool call still surfaces for the generic question card"
         );
 
         // 2) the narrate-past: a NEW assistant message with bogus error text.

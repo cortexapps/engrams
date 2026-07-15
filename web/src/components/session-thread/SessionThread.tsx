@@ -12,7 +12,6 @@ import {
   sendPrompt as sendPromptMethod,
   interrupt as interruptMethod,
   dequeueQueuedPrompt as dequeueQueuedPromptMethod,
-  answerQuestion as answerQuestionMethod,
   completeToolCall as completeToolCallMethod,
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
 import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
@@ -196,51 +195,34 @@ export function SessionThread({
   const sendPromptMutation = useMutation(sendPromptMethod);
   const interruptMutation = useMutation(interruptMethod);
   const dequeueQueuedMutation = useMutation(dequeueQueuedPromptMethod);
-  const answerQuestionMutation = useMutation(answerQuestionMethod);
   const completeToolCallMutation = useMutation(completeToolCallMethod);
 
   // Optimistic answered-question state. CompleteToolCall appends
   // tool_result_submitted synchronously, but the browser can still observe the
-  // mutation response before SSE delivery; legacy question_answered can take
-  // longer while the harness resumes. On failure the card returns to its form.
+  // mutation response before SSE delivery. On failure the card returns to its form.
   const [answeredToolCallIds, setAnsweredToolCallIds] = useState<Set<string>>(new Set());
 
   const sendBlocked = status ? SEND_BLOCKED.has(status) : false;
 
   const submitAnswer = useCallback(
-    (via: "generic" | "legacy", toolCallId: string, answers: Record<string, string[]>) => {
+    (toolCallId: string, answers: Record<string, string[]>) => {
       if (sendBlocked) return;
       setAnsweredToolCallIds((prev) => new Set(prev).add(toolCallId));
-      const completion =
-        via === "generic"
-          ? completeToolCallMutation.mutateAsync({
-              sessionId,
-              toolCallId,
-              resultJson: JSON.stringify(answers),
-            })
-          : (() => {
-              // proto3 maps can't hold a `repeated` value, so each legacy answer
-              // is wrapped in a StringList (the init shape is `{ values }`).
-              const answersInit: Record<string, { values: string[] }> = {};
-              for (const [question, labels] of Object.entries(answers)) {
-                answersInit[question] = { values: labels };
-              }
-              return answerQuestionMutation.mutateAsync({
-                sessionId,
-                toolCallId,
-                answers: answersInit,
-              });
-            })();
+      const completion = completeToolCallMutation.mutateAsync({
+        sessionId,
+        toolCallId,
+        resultJson: JSON.stringify(answers),
+      });
       completion.catch((err) => {
         setAnsweredToolCallIds((prev) => {
           const next = new Set(prev);
           next.delete(toolCallId);
           return next;
         });
-        console.warn(`${via === "generic" ? "completeToolCall" : "answerQuestion"} failed`, err);
+        console.warn("completeToolCall failed", err);
       });
     },
-    [sessionId, sendBlocked, answerQuestionMutation, completeToolCallMutation],
+    [sessionId, sendBlocked, completeToolCallMutation],
   );
 
   // ADR 0052: ↑-in-empty-composer recall. Pull the most-recent still-queued

@@ -1,11 +1,11 @@
 //! ADR 0073 phase 2: the coordinator-durable command outbox.
 //!
-//! Every command down to the guest (a user prompt, an interactive
-//! answer) is a `session_outbox` row from the moment the API accepts
+//! Every command down to the guest (a user prompt or generic tool result)
+//! is a `session_outbox` row from the moment the API accepts
 //! it until the confirming harness event acks it. The delivery driver
 //! (`engram-coordinator::outbox_delivery`) forwards rows oldest-first
 //! per session and redelivers on a backoff schedule; the harness's
-//! prompt_id dedup (ADR 0052) and idempotent answers (ADR 0054) make
+//! prompt_id and tool-call dedup make
 //! redelivery a no-op, so the pipeline is at-least-once end to end
 //! with exactly-once effect.
 
@@ -20,6 +20,9 @@ use super::ids::SessionId;
 #[serde(rename_all = "snake_case")]
 pub enum OutboxKind {
     Prompt,
+    /// ADR 0089 P5d parse tombstone only. Applied migrations and real
+    /// databases still admit pre-flag-day rows; the coordinator retires
+    /// them with a warning and never forwards them to the guest.
     Answer,
     ToolResult,
 }
@@ -48,12 +51,13 @@ impl OutboxKind {
 /// the other way); the coordinator's delivery driver deserializes it
 /// into the typed shape at the host-RPC boundary:
 /// - kind=prompt: `{"text": String}`
-/// - kind=answer: `{"tool_call_id": String, "answers": Answers}`
+/// - kind=answer: legacy parse tombstone; never forwarded
 /// - kind=tool_result: `{"tool_call_id": String, "result_json": String}`
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OutboxRow {
-    /// Client-minted for prompts (ADR 0052); `answer:<tool_call_id>`
-    /// for answers; `tool_result:<tool_call_id>` for generic tool results.
+    /// Client-minted for prompts (ADR 0052); legacy rows may contain
+    /// `answer:<tool_call_id>`; `tool_result:<tool_call_id>` identifies
+    /// generic tool results.
     /// PRIMARY KEY — a retried enqueue is a no-op.
     pub prompt_id: String,
     pub session_id: SessionId,

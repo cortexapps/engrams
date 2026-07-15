@@ -9,7 +9,6 @@ use serde_json::Value;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ParkedCallKind {
     DynamicTool,
-    UserQuestion,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -142,7 +141,6 @@ fn encode_call(call: &ParkedCall) -> Value {
         "tool_call_id": call.tool_call_id,
         "kind": match call.kind {
             ParkedCallKind::DynamicTool => "dynamic_tool",
-            ParkedCallKind::UserQuestion => "user_question",
         },
         "request_id": call.request_id,
         "tool_name": call.tool_name,
@@ -165,15 +163,23 @@ fn decode_calls(bytes: &[u8]) -> io::Result<BTreeMap<String, ParkedCall>> {
         let string = |field: &str| {
             object
                 .get(field)
-                .and_then(Value::as_str)
+                .and_then(|value| value.as_str())
                 .map(str::to_owned)
                 .ok_or_else(|| invalid_data(format!("parked-call entry missing {field}")))
         };
-        let kind = match string("kind")?.as_str() {
-            "dynamic_tool" => ParkedCallKind::DynamicTool,
-            "user_question" => ParkedCallKind::UserQuestion,
-            other => return Err(invalid_data(format!("unknown parked-call kind {other}"))),
-        };
+        let encoded_kind = string("kind")?;
+        if encoded_kind != "dynamic_tool" {
+            tracing::warn!(
+                kind = %encoded_kind,
+                tool_call_id = object
+                    .get("tool_call_id")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("<missing>"),
+                "dropping unsupported parked-call entry during store open"
+            );
+            continue;
+        }
+        let kind = ParkedCallKind::DynamicTool;
         let tool_call_id = string("tool_call_id")?;
         let call = ParkedCall {
             tool_call_id: tool_call_id.clone(),
@@ -264,6 +270,57 @@ mod tests {
                 .take("missing")
                 .unwrap(),
             None
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn legacy_and_unknown_kinds_are_dropped_without_blocking_store_open() {
+        let path = test_path("legacy-kind");
+        let _ = std::fs::remove_file(&path);
+        std::fs::write(
+            &path,
+            serde_json::to_vec(&json!([
+                {
+                    "tool_call_id":"legacy-question",
+                    "kind":"user_question",
+                    "request_id":41,
+                    "tool_name":"requestUserInput",
+                    "requested_at":1,
+                    "request_generation":1,
+                    "context":{}
+                },
+                {
+                    "tool_call_id":"future-call",
+                    "kind":"future_kind",
+                    "request_id":42,
+                    "tool_name":"future_tool",
+                    "requested_at":2,
+                    "request_generation":1,
+                    "context":{}
+                },
+                {
+                    "tool_call_id":"dynamic-call",
+                    "kind":"dynamic_tool",
+                    "request_id":43,
+                    "tool_name":"save_memory",
+                    "requested_at":3,
+                    "request_generation":1,
+                    "context":{"execution":"deferred"}
+                }
+            ]))
+            .unwrap(),
+        )
+        .unwrap();
+
+        let store = ParkedCallStore::open(&path).expect("legacy rows must not poison store open");
+        assert_eq!(
+            store
+                .all()
+                .into_iter()
+                .map(|call| call.tool_call_id)
+                .collect::<Vec<_>>(),
+            vec!["dynamic-call"]
         );
         let _ = std::fs::remove_file(path);
     }

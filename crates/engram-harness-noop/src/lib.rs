@@ -163,10 +163,6 @@ where
                     // Phase 1b queue mutations. Noop has a fixed run shape
                     // and never queues, so there's nothing to edit/cancel.
                 }
-                Ok(HarnessFrame::Command(HarnessCommand::AnswerQuestion { .. })) => {
-                    // ADR 0054: noop never calls AskUserQuestion, so it never
-                    // receives an answer to feed back. Nothing to do.
-                }
                 Ok(HarnessFrame::Command(HarnessCommand::ToolResult { .. })) => {
                     // ADR 0089: noop never requests a registered tool, so it
                     // has no pending call that could consume this result.

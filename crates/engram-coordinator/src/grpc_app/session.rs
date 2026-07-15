@@ -145,30 +145,6 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
-    async fn answer_question(
-        &self,
-        req: Request<app::AnswerQuestionRequest>,
-    ) -> Result<Response<app::AnswerQuestionResponse>, Status> {
-        self.auth.check(&req)?;
-        let r = req.into_inner();
-        let id = parse_session_id(&r.session_id)?;
-        // ADR 0054: unwrap the proto StringList map back into the canonical
-        // Answers (BTreeMap<String, Vec<String>>).
-        let answers: engram_harness_proto::Answers = r
-            .answers
-            .into_iter()
-            .map(|(question, list)| (question, list.values))
-            .collect();
-        let note =
-            crate::api::prompt::answer_question_core(&self.state, id, r.tool_call_id, answers)
-                .await
-                .map_err(into_status)?;
-        Ok(Response::new(app::AnswerQuestionResponse {
-            session_id: id.to_string(),
-            note: note.to_string(),
-        }))
-    }
-
     async fn complete_tool_call(
         &self,
         req: Request<app::CompleteToolCallRequest>,

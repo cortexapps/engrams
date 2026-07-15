@@ -70,13 +70,6 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
-  // ADR 0054: answering a deferred AskUserQuestion is the same owner-scoped
-  // "prompt" capability as sending one — both drive a session you own.
-  "SessionService.AnswerQuestion": {
-    action: "prompt",
-    subject: "Session",
-    sessionIdField: "sessionId",
-  },
   "SessionService.CompleteToolCall": {
     action: "prompt",
     subject: "Session",

@@ -284,8 +284,9 @@ construction.
 ### 7. What gets retired (clean break)
 
 `HarnessEvent::UserQuestion`/`QuestionAnswered`, `HarnessCommand::AnswerQuestion`,
-`OutboxKind::Answer`, the `AnswerQuestion` app-gRPC RPC, and the harness-side
-question special-casing all collapse into the generic frames. The Slack
+the `AnswerQuestion` app-gRPC RPC, and the harness-side question special-casing
+all collapse into the generic frames. `OutboxKind::Answer` remains only as a
+parse tombstone for real pre-flag-day rows; it has no producer or relay. The Slack
 workflow's structure, idempotency keys, and `toolCallId` bookkeeping survive
 with renamed inputs — AUQ was already shaped like a session-handled tool; the
 protocol is that shape, generalized.
@@ -303,8 +304,8 @@ running arbitrary model output, not internal traffic. Accordingly:
 
 - Every handled-tool dispatch authz-checks the session's `capabilities`
   (already on `CreateSessionRequest`) before the handler runs.
-- `CompleteToolCall` requires a principal with access to the session (same
-  gate as today's `AnswerQuestion`), and only session-handled calls may be
+- `CompleteToolCall` requires a principal with access to the session (the
+  owner-scoped prompt gate), and only session-handled calls may be
   completed externally — handled tools complete exclusively from orchestrator
   code.
 - zod validation runs in both directions: args before any handler/presenter,
@@ -544,6 +545,20 @@ interaction (P4).
   the existing crash-degrade delivery path because snapshots are harness-free.
 - **P5 — AUQ convergence.** Native bindings both harnesses; policy/web/Slack
   switch to generic kinds (legacy kinds still render for old sessions);
-  delete the bespoke question wire types, RPC, and outbox kind.
+  delete the bespoke question wire types, RPC, and outbox write path.
+
+  *As built (2026-07-14):* convergence landed as four deliberately ordered
+  steps: (a) registry and session-handled plumbing (`61e45f8a`), (b) native
+  bindings in both harnesses (`b2a9dab0`), (c) web and Slack cutover
+  (`0b65d113`), then (d) this atomic positional-bincode wire break. Step (d)
+  deletes the bespoke question events/command, both answer RPCs and their
+  host/coordinator relays, all legacy answer producers, and the Claude/Codex
+  legacy question branches. It is a flag-day deployment: the guest image
+  containing **both** harnesses and the host-agent/coordinator fleet must be
+  baked and deployed together. `OutboxKind::Answer` stays as a parse tombstone;
+  an unacked pre-flag-day `answer` row is retired with a loud warning before
+  any resume or host delivery, so it cannot retry-loop. Historical
+  `user_question` and `question_answered` rows remain curated and renderable
+  forever; only their write/answer paths were removed.
 - **P6 — first real tools.** `save_memory`, `add_review_comment`; flip this
   ADR to Accepted with the commit chain and as-built divergences.

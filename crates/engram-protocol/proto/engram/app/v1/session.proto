@@ -18,12 +18,8 @@ service SessionService {
   // consumed (the harness is the single writer).
   rpc EditQueuedPrompt(EditQueuedPromptRequest) returns (EditQueuedPromptResponse);
   rpc DequeueQueuedPrompt(DequeueQueuedPromptRequest) returns (DequeueQueuedPromptResponse);
-  // ADR 0054: answer a deferred AskUserQuestion (the `user_question` event).
-  // Resumes an idle session exactly as SendPrompt does, then feeds the
-  // answer back to the agent via a `--resume` re-fire.
-  rpc AnswerQuestion(AnswerQuestionRequest) returns (AnswerQuestionResponse);
   // ADR 0089: complete an outstanding tool call (the `tool_call_requested`
-  // event) with its result. Generalizes AnswerQuestion: appends a
+  // event) with its result. Appends a
   // `tool_result_submitted` event at RPC time, enqueues a durable ToolResult
   // outbox row, and resumes an idle session exactly as SendPrompt does.
   rpc CompleteToolCall(CompleteToolCallRequest) returns (CompleteToolCallResponse);
@@ -251,28 +247,6 @@ message DequeueQueuedPromptRequest {
 }
 
 message DequeueQueuedPromptResponse {
-  string session_id = 1;
-  string note = 2;
-}
-
-message AnswerQuestionRequest {
-  string session_id = 1;
-  // Claude's tool_use_id of the deferred AskUserQuestion — the correlation
-  // token carried on the `user_question` event.
-  string tool_call_id = 2;
-  // Selected labels keyed by question text. The value is ALWAYS a list
-  // (1 element for single-select, N for multi-select) — proto3 maps can't
-  // hold a `repeated` value directly, so it's wrapped in StringList.
-  map<string, StringList> answers = 3;
-}
-
-// A list of strings, for use as a proto3 map value (which cannot be
-// `repeated` directly).
-message StringList {
-  repeated string values = 1;
-}
-
-message AnswerQuestionResponse {
   string session_id = 1;
   string note = 2;
 }

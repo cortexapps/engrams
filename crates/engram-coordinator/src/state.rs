@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::types::{ExecRusage, SessionState};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
-use engram_harness_proto::{Answers, FileChange, HarnessEvent, Question};
+use engram_harness_proto::{FileChange, HarnessEvent};
 use engram_host_agent::harness::{EventSink, HarnessHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -216,27 +216,6 @@ pub enum SessionEvent {
         chunk: String,
         at: DateTime<Utc>,
     },
-    /// ADR 0054: the agent called `AskUserQuestion` and the harness
-    /// deferred it — the durable "awaiting input" signal. The web renders
-    /// an interactive card and marks the session awaiting-input; it
-    /// survives eviction because it's in the log. `tool_call_id` correlates
-    /// defer → answer; the answer rides `AnswerQuestion` →
-    /// `HarnessQuestionAnswered` with the same id.
-    HarnessUserQuestion {
-        run_id: String,
-        tool_call_id: String,
-        questions: Vec<Question>,
-        at: DateTime<Utc>,
-    },
-    /// ADR 0054: the deferred question was answered — the harness holds the
-    /// answer and is feeding it back to the agent on the `--resume`
-    /// re-fire. Resolves the card and moves it out of awaiting-input.
-    HarnessQuestionAnswered {
-        run_id: String,
-        tool_call_id: String,
-        answers: Answers,
-        at: DateTime<Utc>,
-    },
     /// ADR 0054 Flavor A: the agent successfully changed a file via a
     /// `Write`/`Edit`/`MultiEdit` tool. The web renders a rich diff (red/green
     /// hunks for an edit, all-green for a write) in place of the generic tool
@@ -419,8 +398,6 @@ impl SessionEvent {
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
             Self::HarnessPromptSteered { .. } => "prompt_steered",
             Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
-            Self::HarnessUserQuestion { .. } => "user_question",
-            Self::HarnessQuestionAnswered { .. } => "question_answered",
             Self::HarnessFileChanged { .. } => "file_changed",
             Self::HarnessTitleSuggested { .. } => "title_suggested",
             Self::IntegrationAsset { .. } => "integration_asset",
@@ -529,26 +506,6 @@ impl SessionEvent {
                 run_id,
                 message_id,
                 chunk,
-                at,
-            },
-            HarnessEvent::UserQuestion {
-                run_id,
-                tool_call_id,
-                questions,
-            } => Self::HarnessUserQuestion {
-                run_id,
-                tool_call_id,
-                questions,
-                at,
-            },
-            HarnessEvent::QuestionAnswered {
-                run_id,
-                tool_call_id,
-                answers,
-            } => Self::HarnessQuestionAnswered {
-                run_id,
-                tool_call_id,
-                answers,
                 at,
             },
             HarnessEvent::FileChanged {
@@ -944,7 +901,7 @@ impl AppState {
             .await?;
         // ADR 0073: ack any outbox row a DIRECTLY-EMITTED confirming event
         // retires. NOTE: the confirming events (`run_started`/`prompt_queued`/
-        // `question_answered`) are HARNESS events, and those ingest via
+        // `tool_call_completed`) are HARNESS events, and those ingest via
         // `harness_event_sink` → `append_session_event`, NOT this `emit` — so
         // they ack THERE (see the ack in `harness_event_sink`). This arm is the
         // defensive catch for any confirming event authored/replayed straight
@@ -1033,7 +990,6 @@ impl AppState {
 ///   its type-ahead queue; the queue survives via the replay the
 ///   harness itself does, and an edit/dequeue of a queued prompt keeps
 ///   its own confirmations).
-/// - `question_answered{tool_call_id}` — the answer landed.
 /// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
 fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
     match event {
@@ -1043,9 +999,6 @@ fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
         } => Some(pid.clone()),
         SessionEvent::HarnessPromptQueued { prompt_id, .. } => Some(prompt_id.clone()),
         SessionEvent::HarnessPromptSteered { prompt_id, .. } => Some(prompt_id.clone()),
-        SessionEvent::HarnessQuestionAnswered { tool_call_id, .. } => {
-            Some(format!("answer:{tool_call_id}"))
-        }
         SessionEvent::HarnessToolCallCompleted { tool_call_id, .. } => {
             Some(format!("tool_result:{tool_call_id}"))
         }
@@ -1128,7 +1081,7 @@ fn harness_event_sink(
 
             // ADR 0073 fix: harness events are the CONFIRMING events that retire
             // the durable outbox row (`run_started{prompt_id}` /
-            // `prompt_queued{prompt_id}` / `question_answered{tool_call_id}`),
+            // `prompt_queued{prompt_id}` / `tool_call_completed{tool_call_id}`),
             // but they ingest through THIS sink — NOT `AppState::emit`, where the
             // ack lived — so the ack never fired. An un-acked row is redelivered
             // forever: the delivery driver re-resumes the session and re-runs the
@@ -1524,51 +1477,6 @@ pub(crate) mod tests {
             SessionEvent::PromptReceived { prompt_id, .. } => assert_eq!(prompt_id, "p-1"),
             other => panic!("expected PromptReceived, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn user_question_and_answer_map_from_harness_with_stable_kinds() {
-        // ADR 0054: the interactive question/answer harness events map to
-        // coord SessionEvents under the stable `user_question` /
-        // `question_answered` kinds the SSE stream + web card key on.
-        let q = SessionEvent::from_harness(
-            HarnessEvent::UserQuestion {
-                run_id: "r1".into(),
-                tool_call_id: "toolu_1".into(),
-                questions: vec![],
-            },
-            chrono::Utc::now(),
-        );
-        match &q {
-            SessionEvent::HarnessUserQuestion { tool_call_id, .. } => {
-                assert_eq!(tool_call_id, "toolu_1")
-            }
-            other => panic!("expected HarnessUserQuestion, got {other:?}"),
-        }
-        assert_eq!(q.kind(), "user_question");
-
-        let mut answers = Answers::new();
-        answers.insert("Q?".into(), vec!["A".into()]);
-        let a = SessionEvent::from_harness(
-            HarnessEvent::QuestionAnswered {
-                run_id: "r1".into(),
-                tool_call_id: "toolu_1".into(),
-                answers,
-            },
-            chrono::Utc::now(),
-        );
-        match &a {
-            SessionEvent::HarnessQuestionAnswered {
-                tool_call_id,
-                answers,
-                ..
-            } => {
-                assert_eq!(tool_call_id, "toolu_1");
-                assert_eq!(answers.get("Q?"), Some(&vec!["A".to_string()]));
-            }
-            other => panic!("expected HarnessQuestionAnswered, got {other:?}"),
-        }
-        assert_eq!(a.kind(), "question_answered");
     }
 
     #[test]
