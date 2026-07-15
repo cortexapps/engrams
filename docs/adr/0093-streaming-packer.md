@@ -87,12 +87,11 @@ report as `pack` then `chunk` by fill progress.
   revert`, not an env var — the determinism cutover already forces
   re-capture either way, so a runtime toggle would buy nothing and
   cost a second maintained path.
-- **mkext4 0.0.2 caveat**: declaration is O(N²) in single-directory
-  entry count (linear duplicate scan). Nested trees (node_modules
-  shape) are unaffected; a pathological flat directory would regress
-  declare. 0.0.3 fixes this (indexed lookup, in review); we bump the
-  pin — accepting the byte-layout consequences if any golden churns —
-  before enabling by default in prod.
+- **mkext4 pinned `=0.0.3`**: 0.0.2's O(N²) flat-directory declare
+  (linear duplicate scan) is fixed by 0.0.3's indexed lookup. The
+  bump landed inside this PR so the determinism domain is minted
+  once: 0.0.2→0.0.3 verified byte-identical on the full dev-brain
+  image (same `ManifestRef`) before pinning.
 
 ## Gates
 
@@ -161,7 +160,7 @@ unprivileged-run artifacts (sidecar ownership, macOS symlink umask).
 
 **Cross-repo follow-ups:** engrams-internal references the deleted
 `setup-reproducible-mke2fs` composite action (companion cleanup
-needed); mkext4 0.0.3 pin bump once the flat-dir fix ships.
+needed).
 
 ## Commit chain
 

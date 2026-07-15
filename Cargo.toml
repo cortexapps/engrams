@@ -206,8 +206,9 @@ zstd = { version = "0.13", default-features = false }
 # ADR 0093: the streaming packer. Pinned EXACT: mkext4's byte layout is
 # stable per crate version only, and our chunk dedup + cold-base reuse
 # keys hang off byte-identical images — a version bump is a deliberate
-# fleet-wide chunk-cache invalidation event, never a float.
-mkext4 = "=0.0.2"
+# fleet-wide chunk-cache invalidation event, never a float. (0.0.2→0.0.3
+# verified byte-identical on dev-brain before landing: same ManifestRef.)
+mkext4 = "=0.0.3"
 once_cell = "1"
 # ADR 0088 addendum round 2: the flatten write pool's job dequeue. A
 # `Mutex<mpsc::Receiver>` shared by 16 workers burned 38s of CPU in
