@@ -2340,7 +2340,10 @@ done
             Arc::new(Notify::new()),
             event_tx,
         ));
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+        // This test launches a shell + jq-backed fake app-server alongside the
+        // rest of the nextest process set. Two seconds flaked under ordinary
+        // parallel load even though the same test completed in 350ms alone.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !matches!(event_rx.recv().await, Some(HarnessEvent::Idle)) {}
         })
         .await
