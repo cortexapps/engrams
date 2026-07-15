@@ -296,6 +296,7 @@ async fn hit_with_a_verified_present_candidate() {
         working_set_blob_key: None,
         aux_bundles: vec![],
         paused_at: None,
+        peer_hints: Vec::new(),
     };
     meta.upsert_cold_base(ColdBaseRow {
         content_key: content_key.clone(),

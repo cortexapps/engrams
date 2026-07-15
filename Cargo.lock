@@ -1352,6 +1352,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc32c",
  "dashmap",
  "engram-chunk-store",
  "engram-cloud-static",

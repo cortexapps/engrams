@@ -62,31 +62,60 @@ spec:
               echo "[node-prep] sysctl {{ $k }}={{ $v }}"
               ( echo {{ $v | quote }} > /proc/sys/{{ $k | replace "." "/" }} ) 2>&1 || echo "[node-prep] {{ $k }} skipped"
               {{- end }}
-              {{- with .Values.storage.dedicatedDevice }}
+              {{- with .Values.storage.dedicatedDevices }}
               # ADR 0070: format (only if unformatted) + mount the dedicated
               # volume at workDirHostPath, moving the chunk cache /
               # snapshots / memfiles off the node boot disk (the budget in
               # ChunkCacheConfig is the real disk-headroom mechanism; this
-              # is defense-in-depth accounting, not bytes). Idempotent
-              # across pod restarts: `blkid` detects an existing filesystem
+              # is defense-in-depth accounting, not bytes). With MULTIPLE
+              # devices (GKE local-NVMe raw block), they're striped into a
+              # RAID0 md array first — GKE's own documented raw-block
+              # pattern (gke-daemonset-raid-disks.yaml), and like the rest
+              # of this step `mdadm` resolves from the HOST's PATH.
+              # Idempotent across pod restarts AND node reboots: an
+              # already-active array is left alone (`-e` on the md node),
+              # surviving superblocks are re-`--assemble`d rather than
+              # re-`--create`d, `blkid` detects an existing filesystem
               # (never reformats a device with live data — that would
               # destroy a prior life's chunk cache on every pod restart),
-              # `mountpoint -q` skips a redundant mount. Runs BEFORE the
+              # `mountpoint -q` skips a redundant mount. `-E nodiscard`
+              # skips the full-device discard at mkfs (fresh local NVMe is
+              # already trimmed; a discard pass adds minutes per node for
+              # nothing). Runs BEFORE the
               # base-shm tmpfs step below so, when both are set, the tmpfs
               # mounts INSIDE this filesystem's tree (uffdBaseDir normally
               # lives under workDirHostPath). Same nsenter-into-host-mount-ns
               # shape as the tmpfs step: `mkfs.ext4`/`blkid`/`mount` resolve
               # from the HOST's PATH, not this busybox image's.
-              echo "[node-prep] dedicated volume {{ . }} -> {{ $.Values.storage.workDirHostPath }}"
+              {{- if eq (len .) 1 }}
+              {{- $dev := first . }}
+              echo "[node-prep] dedicated volume {{ $dev }} -> {{ $.Values.storage.workDirHostPath }}"
               nsenter -t 1 -m -- sh -c \
                 'set -e; \
                  mkdir -p {{ $.Values.storage.workDirHostPath }}; \
-                 if ! blkid {{ . }} >/dev/null 2>&1; then \
-                   echo "[node-prep] {{ . }} has no filesystem; mkfs.ext4"; \
-                   mkfs.ext4 -F {{ . }}; \
+                 if ! blkid {{ $dev }} >/dev/null 2>&1; then \
+                   echo "[node-prep] {{ $dev }} has no filesystem; mkfs.ext4"; \
+                   mkfs.ext4 -F -E nodiscard {{ $dev }}; \
                  fi; \
-                 mountpoint -q {{ $.Values.storage.workDirHostPath }} || mount {{ . }} {{ $.Values.storage.workDirHostPath }}' \
+                 mountpoint -q {{ $.Values.storage.workDirHostPath }} || mount {{ $dev }} {{ $.Values.storage.workDirHostPath }}' \
                 2>&1 || echo "[node-prep] dedicated volume mount FAILED (host-agent will refuse to start: ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true)"
+              {{- else }}
+              {{- $md := "/dev/md/engram-work" }}
+              echo "[node-prep] dedicated volumes {{ join " " . }} -> RAID0 {{ $md }} -> {{ $.Values.storage.workDirHostPath }}"
+              nsenter -t 1 -m -- sh -c \
+                'set -e; \
+                 mkdir -p {{ $.Values.storage.workDirHostPath }}; \
+                 if [ ! -e {{ $md }} ]; then \
+                   mdadm --assemble {{ $md }} {{ join " " . }} 2>/dev/null || \
+                     mdadm --create {{ $md }} --level=0 --force --run --raid-devices={{ len . }} {{ join " " . }}; \
+                 fi; \
+                 if ! blkid {{ $md }} >/dev/null 2>&1; then \
+                   echo "[node-prep] {{ $md }} has no filesystem; mkfs.ext4"; \
+                   mkfs.ext4 -F -E nodiscard {{ $md }}; \
+                 fi; \
+                 mountpoint -q {{ $.Values.storage.workDirHostPath }} || mount {{ $md }} {{ $.Values.storage.workDirHostPath }}' \
+                2>&1 || echo "[node-prep] dedicated volume mount FAILED (host-agent will refuse to start: ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true)"
+              {{- end }}
               {{- end }}
               {{- with .Values.firecracker.uffdBaseDir }}
               # ADR 0045 D3: tmpfs for the per-template base shm files

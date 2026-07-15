@@ -245,6 +245,8 @@ pub(crate) async fn boot_on_reserved_host(
         aux_bundles: record.aux_bundles,
         // Issue #529: restore-side reconstruction, not a fresh capture.
         paused_at: None,
+        // ADR 0095: fresh create from the image base: ready_images-gated placement means the chunks are already pinned local.
+        peer_hints: Vec::new(),
     };
     let restore_leg = state.host_registry.restore_base_on_host(
         host_id,

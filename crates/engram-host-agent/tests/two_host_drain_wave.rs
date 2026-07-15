@@ -106,6 +106,7 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
             inner,
             None,
             engram_host_agent::session_epochs::ephemeral(),
+            None,
         )
         .await;
     });

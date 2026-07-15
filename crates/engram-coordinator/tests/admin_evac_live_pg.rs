@@ -165,6 +165,7 @@ impl HostClient for FakeBackend {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         })
     }
     async fn commit_snapshot(

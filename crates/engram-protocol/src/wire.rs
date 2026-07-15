@@ -96,7 +96,14 @@ use serde::{Deserialize, Serialize};
 // `Heartbeat.capture_job_reports`, `HeartbeatAck.capture_assignments`/
 // `acked_capture_jobs`. BuildBaseSnapshot RPC deletion rides this bump
 // (removed in the cutover commit).
-pub const WIRE_VERSION: u32 = 15;
+// v16 (ADR 0095): `SnapshotMetadata.peer_hints` — peer-fill seed addrs
+// for the restore destination (bincode field addition). The standing
+// `PeerChunkGet` RPC + the heartbeat-ack `warm_peers` field ride this
+// bump too (both are independently mixed-roll-safe — proto addition /
+// serde-default JSON — but the bump makes the deploy posture explicit:
+// a v16 coord never dispatches a peer-hinted restore to a v15 host,
+// whose bincode decode would fail loudly). Lockstep coord+host roll.
+pub const WIRE_VERSION: u32 = 16;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -205,6 +205,7 @@ fn snapshot_metadata() -> SnapshotMetadata {
         }],
         // v9: trailing field — the host's exact pause instant (issue #529).
         paused_at: Some(DateTime::from_timestamp(1_770_000_100, 0).unwrap()),
+        peer_hints: Vec::new(),
     }
 }
 
@@ -421,8 +422,14 @@ fn wire_version_pinned() {
     // JSON heartbeat/ack, NOT the gRPC bincode `bytes` payloads this
     // corpus pins — no new golden entries here. BuildBaseSnapshot RPC
     // deletion rides this bump too (removed in the cutover commit).
+    // 15 -> 16: ADR 0095 — `SnapshotMetadata` gains the TRAILING
+    // `peer_hints` field (peer-fill seed addrs for the restore
+    // destination). Goldens regenerated. The `PeerChunkGet` RPC and the
+    // JSON-ack `warm_peers` field ride this bump too (both are
+    // independently roll-safe; the bump pins the deploy posture — a v16
+    // coord never dispatches a peer-hinted restore to a v15 host).
     assert_eq!(
-        WIRE_VERSION, 15,
+        WIRE_VERSION, 16,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

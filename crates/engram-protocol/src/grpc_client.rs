@@ -38,13 +38,26 @@ use crate::grpc::{
     CreateSandboxRequest, DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty,
     ExecStartRequest, FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest,
     MaterializeImageRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
-    ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
-    ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
-    ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
+    PeerChunkFrame, PeerChunkGetRequest, ProxyPortData, ProxyPortMessage, ProxyPortOpen,
+    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellOpen, ProxyShellPing,
+    ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest, RestoreBaseForSessionRequest,
+    RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest, StartAgentRequest, StringList,
+    UnbindHarnessSessionRequest,
 };
 
 use crate::wire::{WireExecRequest, WireReapStats};
+
+/// ADR 0095: why a peer-chunk pull wants its hashes — the wire `scope`
+/// oneof on [`PeerChunkGetRequest`]. Observability + serve-side rate
+/// class, not authorization (see the proto comment).
+#[derive(Debug, Clone)]
+pub enum PeerChunkScope {
+    /// `"sha256:<hex>"` manifest digest of an enabled image (warmup /
+    /// prestage pulls).
+    BaseImage(String),
+    /// Divergence fill for a resume of this snapshot.
+    Snapshot(engram_core::types::ids::SnapshotId),
+}
 
 /// Per-request interceptor that injects coord-side request metadata on
 /// every outbound coord→host gRPC call:
@@ -131,23 +144,17 @@ impl GrpcHostClient {
     ///
     /// Every RPC carries the caller's `traceparent` via
     /// [`TraceparentInjector`] (ADR 0019 distributed tracing).
+    ///
+    /// The inbound decode cap is 32 MiB on every client (was an opt-in
+    /// for `ReapMaterializeDir`'s 16 MiB reply; ADR 0095's
+    /// `PeerChunkGet` frames — 4 MiB data + overhead — need past
+    /// tonic's 4 MiB default too, and the cap is just a limit check,
+    /// no allocation change).
     pub fn new(channel: Channel) -> Self {
         Self {
-            inner: HostServiceClient::with_interceptor(channel, TraceparentInjector),
+            inner: HostServiceClient::with_interceptor(channel, TraceparentInjector)
+                .max_decoding_message_size(32 * 1024 * 1024),
         }
-    }
-
-    /// Bump the inbound decode cap for `ReapMaterializeDir` (1M live
-    /// disk-manifest UUIDs ≈ 16 MiB on the wire). Other methods stay
-    /// at tonic's 4 MiB default; SandboxSpec / SnapshotMetadata are
-    /// well under that.
-    pub fn with_reap_decode_cap(mut self) -> Self {
-        // `max_decoding_message_size` is set per-client; tonic v0.12
-        // applies the cap to every response. We only need it for the
-        // `Reap` reply path, but the cost of raising it globally on
-        // this client is just a header value — no allocation change.
-        self.inner = self.inner.max_decoding_message_size(32 * 1024 * 1024);
-        self
     }
 
     /// Fire a no-op `Ping` to force TCP+H2 handshake on a freshly
@@ -424,6 +431,39 @@ impl GrpcHostClient {
                 detail: resp.detail,
             }
         })
+    }
+
+    /// ADR 0095: standing peer-chunk tier — batch-stream cache-resident
+    /// content-addressed chunks from a fleet peer. Host-to-host (the
+    /// host-agent's peer-fill client dials a sibling host-agent); the
+    /// coordinator never calls this. Frames come back in request order
+    /// per item with per-frame CRC32C; a `missing` frame is terminal for
+    /// its item and means "source it from GCS", never a peer fault.
+    pub async fn peer_chunk_get(
+        &self,
+        hashes: Vec<[u8; 32]>,
+        scope: PeerChunkScope,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<PeerChunkFrame, SandboxError>>,
+        SandboxError,
+    > {
+        use crate::grpc::peer_chunk_get_request::Scope;
+        let req = PeerChunkGetRequest {
+            hashes: hashes.into_iter().map(|h| h.to_vec()).collect(),
+            scope: Some(match scope {
+                PeerChunkScope::BaseImage(digest) => Scope::BaseImageDigest(digest),
+                PeerChunkScope::Snapshot(id) => Scope::SnapshotId(id.as_uuid().as_bytes().to_vec()),
+            }),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .peer_chunk_get(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        use futures::StreamExt;
+        Ok(resp.map(|frame| frame.map_err(grpc_to_sandbox_err)).boxed())
     }
 
     /// ADR 0045 C1: pull an export's artifacts (destination host → source host).

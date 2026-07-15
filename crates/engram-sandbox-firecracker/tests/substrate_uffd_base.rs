@@ -185,6 +185,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
         working_set_blob_key: metadata.working_set_blob_key.clone(),
         aux_bundles: metadata.aux_bundles.clone(),
         paused_at: metadata.paused_at,
+        peer_hints: Vec::new(),
     };
 
     let dump_logs_and_panic = |what: &str, e: String, work_path: &Path| -> ! {

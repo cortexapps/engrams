@@ -295,6 +295,7 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
         working_set_blob_key: None,
         aux_bundles: vec![],
         paused_at: None,
+        peer_hints: Vec::new(),
     };
 
     // Resume: installs the NBD data plane in `nbd_sandboxes`.

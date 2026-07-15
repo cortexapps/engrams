@@ -6052,6 +6052,9 @@ impl FirecrackerBackend {
             // stamps it from `SnapshotCapture::paused_at` after this
             // returns (same layering as `memory_manifest` above).
             paused_at: None,
+            // ADR 0095: capture never stamps peer hints; the resume
+            // assembler does, coordinator-side.
+            peer_hints: Vec::new(),
         })
     }
 }
@@ -6439,6 +6442,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
@@ -6555,6 +6559,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
