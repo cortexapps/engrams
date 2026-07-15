@@ -52,7 +52,7 @@ use engram_core::types::SessionId;
 use engram_core::types::{HostCapacity, HostMetadata, HostStatus};
 use engram_core::{HostId, SandboxId, SnapshotId};
 use engram_oci::{AnonymousResolver, OciClient};
-use engram_rootfs_materializer::{Ext4Error, Ext4Packer, InitInjection, Materializer, Transport};
+use engram_rootfs_materializer::{InitInjection, Materializer, Transport};
 use parking_lot::Mutex;
 use sha2::Digest as _;
 use tokio::sync::oneshot;
@@ -172,52 +172,6 @@ fn gzip_layer(entries: &[(&str, &[u8])]) -> Vec<u8> {
 }
 
 // ---------------------------------------------------------------
-// Deterministic fake ext4 packer: serializes the flattened tree
-// (sorted walk of paths + bytes) instead of running mke2fs, so
-// "identical tree ⇒ identical packed bytes ⇒ identical content_ref"
-// holds without pinning e2fsprogs in the live-PG lane. Everything
-// upstream of the pack (pull, flatten, init inject, chunking) is the
-// REAL pipeline.
-// ---------------------------------------------------------------
-
-struct FakeTreePacker;
-
-#[async_trait]
-impl Ext4Packer for FakeTreePacker {
-    async fn pack(
-        &self,
-        src_dir: &Path,
-        dst_image: &Path,
-        _size_bytes: u64,
-    ) -> Result<(), Ext4Error> {
-        fn walk(dir: &Path, root: &Path, out: &mut Vec<u8>) -> std::io::Result<()> {
-            let mut entries: Vec<_> = std::fs::read_dir(dir)?.collect::<Result<_, _>>()?;
-            entries.sort_by_key(|e| e.file_name());
-            for e in entries {
-                let path = e.path();
-                let rel = path.strip_prefix(root).unwrap().to_path_buf();
-                let meta = std::fs::symlink_metadata(&path)?;
-                out.extend_from_slice(rel.to_string_lossy().as_bytes());
-                out.push(0);
-                if meta.file_type().is_symlink() {
-                    out.extend_from_slice(std::fs::read_link(&path)?.to_string_lossy().as_bytes());
-                } else if meta.is_dir() {
-                    walk(&path, root, out)?;
-                } else {
-                    out.extend_from_slice(&std::fs::read(&path)?);
-                }
-                out.push(0);
-            }
-            Ok(())
-        }
-        let mut out = Vec::new();
-        walk(src_dir, src_dir, &mut out)?;
-        std::fs::write(dst_image, out)?;
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------
 // Fake host: `materialize_image` runs the REAL materializer (fake
 // packer) into the SHARED test chunk store; `build_base_snapshot`
 // counts calls and returns a fixed synthetic snapshot whose (empty)
@@ -329,14 +283,15 @@ impl HostClient for FakeCaptureHost {
             "arm64" => engram_rootfs_materializer::Platform::LinuxArm64,
             _ => engram_rootfs_materializer::Platform::LinuxAmd64,
         };
-        let materializer = Materializer::with_packer(
+        // ADR 0093: no packer seam — the streaming pack runs for real
+        // (pure Rust, no mke2fs needed in the test env).
+        let materializer = Materializer::new(
             OciClient::new(Arc::new(AnonymousResolver)),
             InitInjection {
                 vsock_port: 1024,
                 transport: Transport::Vsock,
                 init_script: None,
             },
-            Arc::new(FakeTreePacker),
         );
         let out = materializer
             .materialize(

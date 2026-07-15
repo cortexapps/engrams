@@ -222,7 +222,7 @@ impl ChunkStore {
     /// deduped, and zero-elided alike) so callers get the same
     /// monotone fraction `chunk_file_into` reports.
     pub fn region_chunker(
-        self: &Arc<Self>,
+        &self,
         kind: ManifestKind,
         total_bytes: u64,
         progress: Option<Arc<dyn Fn(u64, u64) + Send + Sync>>,
@@ -242,7 +242,7 @@ impl ChunkStore {
             covered_total: 0,
             tx,
         };
-        let store = Arc::clone(self);
+        let store = self.clone();
         let total_chunks = total_bytes.div_ceil(chunk_size).max(1);
         let uploader = tokio::spawn(async move {
             let mut stats = RegionChunkStats::default();
@@ -270,7 +270,7 @@ impl ChunkStore {
                             Some(Completed::Chunk { offset, body }) => {
                                 stats.chunks_uploaded += 1;
                                 stats.bytes_uploaded += body.len() as u64;
-                                let store = Arc::clone(&store);
+                                let store = store.clone();
                                 inflight.push(async move {
                                     let hash = store.put_chunk(&body).await?;
                                     crate::Result::Ok((offset, hash))
@@ -308,10 +308,10 @@ mod tests {
     use engram_core::traits::BlobStorage;
     use engram_storage_local::LocalBlobStorage;
 
-    fn store() -> (Arc<ChunkStore>, tempfile::TempDir) {
+    fn store() -> (ChunkStore, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
-        (Arc::new(ChunkStore::new(blob)), dir)
+        (ChunkStore::new(blob), dir)
     }
 
     /// Deterministic pseudo-random bytes (no RNG in tests).

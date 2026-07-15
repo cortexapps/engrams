@@ -1,23 +1,26 @@
-//! ADR 0080 §C — host-side materialization of a **standard**
-//! OCI/Docker image into a bootable engram rootfs.
+//! ADR 0080 §C / ADR 0093 — host-side materialization of a
+//! **standard** OCI/Docker image into a bootable engram rootfs.
 //!
-//! Pipeline (each stage its own module, each a clean seam):
+//! Pipeline (ADR 0093, the streaming pack — no intermediate tree, no
+//! image file):
 //!
 //! 1. [`pull`] — resolve the manifest for a platform (manifest lists /
 //!    OCI indexes handled), extract the config blob's `ENV`/`WORKDIR`
 //!    as [`OciRuntimeDefaults`], stream layer blobs to scratch. Fails
 //!    loud on unknown layer mediaTypes before downloading bytes.
-//! 2. [`flatten`] — whiteout-aware layer application into one tree
-//!    (`.wh.`, opaque dirs, hardlinks, symlinks, setuid, xattrs, the
-//!    unprivileged-ownership sidecar, zip-slip rejection).
-//! 3. [`inject`] — write the stage-1 init shim (the ONE engrams file
-//!    in the rootfs).
-//! 4. [`ext4`] — deterministic mke2fs pack (fixed UUID/hash-seed +
-//!    `SOURCE_DATE_EPOCH` + a tree-side mtime clamp).
-//! 5. chunk — `chunk_file` into the content-addressed store; the
-//!    manifest ref is **content-derived** ([`Manifest::content_ref`]),
-//!    so re-materializing unchanged content reproduces the same ref
-//!    and base-snapshot reuse keeps working (ADR 0036).
+//! 2. [`stream_pack`] declare — whiteout-aware layer semantics
+//!    (`.wh.`, opaque dirs, hardlinks, symlinks, setuid, xattrs,
+//!    zip-slip rejection) applied to an in-memory namespace, pipelined
+//!    with the downloads; the init shim is declared alongside
+//!    ([`inject`] renders it).
+//! 3. seal — replay survivors into `mkext4`, freeze the deterministic
+//!    layout (fixed UUID/hash-seed/epoch), emit every metadata byte.
+//! 4. fill + chunk — re-decode layers, stream file bytes to final
+//!    offsets; each 16 MiB chunk hashes+PUTs the moment its range
+//!    completes ([`engram_chunk_store::region`]). The manifest ref is
+//!    **content-derived** ([`Manifest::content_ref`]), so
+//!    re-materializing unchanged content reproduces the same ref and
+//!    base-snapshot reuse keeps working (ADR 0036).
 //!
 //! Everything transient lives under one caller-supplied scratch dir
 //! and is scrubbed on success AND error (drop guard). Phase 3b wraps
@@ -34,7 +37,6 @@ pub mod pull;
 pub mod stream_pack;
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};
 use engram_core::types::image::OciRuntimeDefaults;
@@ -59,14 +61,38 @@ pub use pull::{
 const PULL_LOOKAHEAD: usize = 3;
 
 /// Scratch headroom to budget for one materialize, as a multiple of
-/// the image's compressed size: compressed layers (~1×) + the
-/// flattened tree + the packed ext4 overlap at the peak. The ~2.5×
-/// figure is the ADR's planning hint for 3b's disk-veto/budget
-/// integration — an estimate, not a guarantee (a highly-compressed
-/// image can expand further; the enable-time size cap bounds the
-/// blast radius).
+/// the image's compressed size. ADR 0093: the streaming pack holds
+/// only the COMPRESSED layers on scratch (retained through the fill
+/// pass) — the tree and the image file no longer exist — so the
+/// budget collapses from ~2.5× to ~1.25× (framing + in-flight
+/// download temp). An estimate for the disk-veto/budget integration,
+/// not a guarantee.
 pub fn estimated_peak_scratch_bytes(compressed_image_bytes: u64) -> u64 {
-    compressed_image_bytes.saturating_mul(5) / 2
+    // ADR 0093: scratch holds the COMPRESSED layers only (kept through
+    // the fill pass) — no tree, no image file. 1.25x for tar framing +
+    // in-flight download temp.
+    compressed_image_bytes.saturating_add(compressed_image_bytes / 4)
+}
+
+/// Decompress a pulled layer on its own thread (ChannelReader), so
+/// inflate overlaps the consuming pass's work. Shared by the declare
+/// and fill passes.
+fn decode_layer(
+    path: &std::path::Path,
+    compression: LayerCompression,
+) -> Result<flatten::ChannelReader, std::io::Error> {
+    let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let decoder: Box<dyn std::io::Read + Send> = match compression {
+        LayerCompression::Gzip => Box::new(flate2::read::GzDecoder::new(reader)),
+        // C-backed zstd (ADR 0088 addendum): ruzstd's single-threaded
+        // decode was the historical flatten bottleneck for
+        // zstd-layered images.
+        LayerCompression::Zstd => Box::new(
+            zstd::stream::read::Decoder::with_buffer(reader).map_err(std::io::Error::other)?,
+        ),
+        LayerCompression::None => Box::new(reader),
+    };
+    flatten::ChannelReader::spawn(decoder)
 }
 
 /// Result of one materialize: everything phase 3b's RPC reply needs.
@@ -165,32 +191,17 @@ impl Drop for ScratchGuard {
 }
 
 /// The materializer: OCI client (auth resolved by the caller's
-/// [`engram_oci::RegistryAuthResolver`]) + an ext4 packer + the init
-/// injection to stamp into every produced rootfs.
+/// [`engram_oci::RegistryAuthResolver`]) + the init injection to
+/// stamp into every produced rootfs. ADR 0093: the ext4 packer seam
+/// is gone — packing is the in-process streaming replay.
 pub struct Materializer {
     oci: engram_oci::OciClient,
-    packer: Arc<dyn Ext4Packer>,
     init: InitInjection,
 }
 
 impl Materializer {
-    /// Production constructor: real `mke2fs` packer.
     pub fn new(oci: engram_oci::OciClient, init: InitInjection) -> Self {
-        Self {
-            oci,
-            packer: Arc::new(Mke2fsPacker::default()),
-            init,
-        }
-    }
-
-    /// Custom packer — tests record / inject failures instead of
-    /// running real mke2fs.
-    pub fn with_packer(
-        oci: engram_oci::OciClient,
-        init: InitInjection,
-        packer: Arc<dyn Ext4Packer>,
-    ) -> Self {
-        Self { oci, packer, init }
+        Self { oci, init }
     }
 
     /// Run the full pipeline for `image_uri` on `platform`. All
@@ -244,8 +255,6 @@ impl Materializer {
         let compressed_bytes = resolved.compressed_bytes;
         let layers_dir = work.join("layers");
         tokio::fs::create_dir_all(&layers_dir).await?;
-        let rootfs = work.join("rootfs");
-        tokio::fs::create_dir_all(&rootfs).await?;
 
         // Bounded handoff: the driver blocks once the flattener is
         // 2 layers behind (plus lookahead in flight).
@@ -289,23 +298,20 @@ impl Materializer {
                 })
             };
 
-        let flatten_consumer = {
-            let rootfs = rootfs.clone();
+        let declare_consumer = {
             let progress = progress.clone();
             tokio::task::spawn_blocking(
-                move || -> Result<(TreeMetadata, FlattenStats, u64), MaterializeError> {
-                    let mut meta = TreeMetadata::default();
-                    // One engine across all layers: the fd-scoped write pool
-                    // and the memoized resolve cache are reused layer to layer.
-                    let mut flattener =
-                        flatten::Flattener::new(&rootfs, flatten::default_write_concurrency())?;
+                move || -> Result<(stream_pack::NamespaceBuilder, Vec<PulledLayer>, u64), MaterializeError> {
+                    let mut ns = stream_pack::NamespaceBuilder::new();
+                    let mut kept: Vec<PulledLayer> = Vec::new();
                     let mut layer_result: Result<(), MaterializeError> = Ok(());
-                    let mut applied = 0usize;
-                    let mut flatten_busy_ms = 0u64;
+                    let mut declare_busy_ms = 0u64;
                     while let Some(layer) = layer_rx.blocking_recv() {
-                        applied += 1;
+                        let applied = kept.len() + 1;
                         // Frame per layer (keepalive-coalesced coord-side;
-                        // never re-emits Pull after the first Flatten).
+                        // never re-emits Pull after the first Flatten). The
+                        // wire stage stays `Flatten` (4-stage vocabulary —
+                        // mid-roll skew drops unknown stages).
                         if let Some(tx) = &progress {
                             let _ = tx.try_send(engram_core::types::MaterializeProgress {
                                 stage: MaterializeStage::Flatten,
@@ -316,202 +322,137 @@ impl Materializer {
                                 chunks_total: None,
                             });
                         }
-                        // Per-layer timing + entry delta: a slow layer with a
-                        // huge entry delta is syscall-bound tiny-file creation;
-                        // slow with a small delta is decompression.
                         let layer_started = std::time::Instant::now();
-                        let entries_before = meta.len();
-                        let file = match std::fs::File::open(&layer.path) {
-                            Ok(f) => f,
-                            Err(e) => {
-                                layer_result = Err(e.into());
-                                break;
-                            }
-                        };
-                        let reader = std::io::BufReader::new(file);
-                        // Decompression runs on its own thread (ChannelReader)
-                        // so inflate overlaps the reader's syscall work.
-                        let decode = || -> Result<flatten::ChannelReader, std::io::Error> {
-                            let decoder: Box<dyn std::io::Read + Send> = match layer.compression {
-                                LayerCompression::Gzip => {
-                                    Box::new(flate2::read::GzDecoder::new(reader))
-                                }
-                                // C-backed zstd (ADR 0088 addendum rollout
-                                // fix): ruzstd's single-threaded pure-Rust
-                                // decode WAS the flatten bottleneck for
-                                // zstd-layered images — dev-brain's 3.5 GB
-                                // compressed layer held the fd-worker pool
-                                // idle behind it for tens of minutes.
-                                LayerCompression::Zstd => Box::new(
-                                    zstd::stream::read::Decoder::with_buffer(reader)
-                                        .map_err(std::io::Error::other)?,
-                                ),
-                                LayerCompression::None => Box::new(reader),
-                            };
-                            flatten::ChannelReader::spawn(decoder)
-                        };
-                        let piped = match decode() {
+                        let piped = match decode_layer(&layer.path, layer.compression) {
                             Ok(p) => p,
                             Err(e) => {
                                 layer_result = Err(e.into());
                                 break;
                             }
                         };
-                        if let Err(e) = flattener.apply_layer(&mut meta, piped) {
+                        // Headers only — bodies are skipped; the layer FILE
+                        // stays on scratch for the fill pass.
+                        if let Err(e) = ns.declare_layer(piped) {
                             layer_result = Err(e.into());
                             break;
                         }
-                        tracing::debug!(
-                            digest = %layer.digest,
-                            compression = ?layer.compression,
-                            entries = meta.len() - entries_before,
-                            elapsed_ms = layer_started.elapsed().as_millis() as u64,
-                            "layer applied to tree"
-                        );
-                        flatten_busy_ms += layer_started.elapsed().as_millis() as u64;
-                        let _ = std::fs::remove_file(&layer.path);
+                        declare_busy_ms += layer_started.elapsed().as_millis() as u64;
+                        kept.push(layer);
                     }
-                    // Drain-close so a mid-flatten abort unblocks the driver's
-                    // bounded send promptly.
+                    // Drain-close so a mid-declare abort unblocks the
+                    // driver's bounded send promptly.
                     layer_rx.close();
-                    // Join the write pool BEFORE anything consumes the tree.
-                    // finish() also stamps dir mtimes/ownership and returns
-                    // the entry/byte hints that retired the pack stage's
-                    // full-tree walks. On a mid-layer abort, finish()'s
-                    // error is the root cause (a worker failure echoes into
-                    // the reader as a generic abort).
-                    match (layer_result, flattener.finish(&mut meta)) {
-                        (_, Err(e)) => Err(e.into()),
-                        (Err(e), Ok(_)) => Err(e),
-                        (Ok(()), Ok(stats)) => Ok((meta, stats, flatten_busy_ms)),
-                    }
+                    layer_result.map(|()| (ns, kept, declare_busy_ms))
                 },
             )
         };
 
-        let (pull_join, flatten_join) = tokio::join!(pull_driver, flatten_consumer);
-        let flatten_result = flatten_join.map_err(|e| {
-            MaterializeError::Io(std::io::Error::other(format!("flatten task: {e}")))
+        let (pull_join, declare_join) = tokio::join!(pull_driver, declare_consumer);
+        let declare_result = declare_join.map_err(|e| {
+            MaterializeError::Io(std::io::Error::other(format!("declare task: {e}")))
         })?;
         // Error precedence: a pull failure truncates the layer stream,
-        // which the flattener sees as a short (but well-formed) apply —
+        // which the declare pass sees as a short (but well-formed) tar —
         // the pull error is the root cause and wins.
         let pull_ms = pull_join.map_err(|e| {
             MaterializeError::Io(std::io::Error::other(format!("pull task: {e}")))
         })??;
-        let (tree_meta, flatten_stats, flatten_busy_ms) = flatten_result?;
+        let (mut ns, layers, declare_ms) = declare_result?;
         let pipeline_ms = pipeline_started.elapsed().as_millis() as u64;
-        let (pulled, flatten_ms) = (resolved, flatten_busy_ms);
+
+        // 3. The stage-1 init shim: declared like any other file (no
+        // tree exists to write it into); filled from memory in pass 2.
+        let (shim_rel, shim_mode, shim_body) = inject::rendered_init_shim(&self.init).await?;
+        ns.declare_synthetic(&shim_rel, shim_mode, shim_body)?;
+
+        // 4. Seal: replay survivors into mkext4, freeze the layout.
+        // Reported as `Pack` on the wire (4-stage vocabulary).
+        report(MaterializeStage::Pack, None);
+        let seal_started = std::time::Instant::now();
+        let sealed = tokio::task::spawn_blocking(move || ns.seal())
+            .await
+            .map_err(|e| {
+                MaterializeError::Io(std::io::Error::other(format!("seal task: {e}")))
+            })??;
+        let seal_ms = seal_started.elapsed().as_millis() as u64;
+        let image_len = sealed.image_len();
+        if !sealed.skipped_xattrs.is_empty() {
+            tracing::warn!(
+                count = sealed.skipped_xattrs.len(),
+                first = ?sealed.skipped_xattrs.first(),
+                "some layer xattrs could not be carried into the image"
+            );
+        }
         tracing::info!(
             image = %image_uri,
             layers = layer_count,
-            entries = tree_meta.len(),
+            entries = sealed.entry_count,
             pipeline_ms,
             pull_ms,
-            flatten_busy_ms,
-            entry_count_hint = flatten_stats.entry_count_hint,
-            tree_bytes_hint = flatten_stats.tree_bytes_hint,
-            "flattened layers into tree (pipelined with pull)"
+            declare_ms,
+            seal_ms,
+            ext4_size_bytes = image_len,
+            "namespace declared + layout sealed (pipelined with pull)"
         );
-        if !tree_meta.skipped_xattrs.is_empty() {
-            tracing::warn!(
-                count = tree_meta.skipped_xattrs.len(),
-                first = ?tree_meta.skipped_xattrs.first(),
-                "some layer xattrs could not be applied to the tree"
-            );
-        }
-        if !tree_meta.skipped_specials.is_empty() {
-            tracing::warn!(
-                paths = ?tree_meta.skipped_specials,
-                "special files (dev nodes/fifos) skipped — mknod requires root; the guest's \
-                 devtmpfs provides /dev at boot"
-            );
-        }
 
-        // 3. Inject the stage-1 init shim. Ownership + mtime clamping
-        // happened AT WRITE TIME inside the flatten (ADR 0088 addendum
-        // round 2: the old apply_ownership/clamp_mtimes full-tree walks
-        // — 44s + a per-entry lchown pass on a dev-brain profile — are
-        // folded into the write path; inject stamps its own file).
-        inject::inject_init(&rootfs, &self.init).await?;
-
-        // 4. Deterministic pack. The size input comes from the
-        // flatten's byte accounting (the old `recursive_size` walk —
-        // ~27s of readdir+lstat on a dev-brain tree — retired);
-        // `recommended_size`'s 2x + 256 MiB banding absorbs the
-        // rounded-length approximation.
-        report(MaterializeStage::Pack, None);
-        let dir_size = flatten_stats.tree_bytes_hint;
-        let ext4_path = work.join("rootfs.ext4");
-        let fs_size = ext4::recommended_size(dir_size);
-        tracing::info!(
-            image = %image_uri,
-            dir_size_bytes = dir_size,
-            entry_count_hint = flatten_stats.entry_count_hint,
-            ext4_size_bytes = fs_size,
-            "packing flattened tree to ext4"
-        );
-        let pack_started = std::time::Instant::now();
-        self.packer.pack(&rootfs, &ext4_path, fs_size).await?;
-        let pack_ms = pack_started.elapsed().as_millis() as u64;
-        // The tree served its purpose. Deleting 500k+ files cost ~40s
-        // ON the critical path — rename it aside (instant) and reap it
-        // in the background, joined after the chunk stage so scratch
-        // hygiene stays deterministic before return.
-        let doomed = work.join(format!("rootfs.doomed-{}", uuid::Uuid::new_v4().simple()));
-        let tree_reaper = match tokio::fs::rename(&rootfs, &doomed).await {
-            Ok(()) => {
-                let doomed = doomed.clone();
-                Some(tokio::task::spawn_blocking(move || {
-                    let _ = std::fs::remove_dir_all(&doomed);
-                }))
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, "rootfs rename-aside failed; deleting inline");
-                let _ = tokio::fs::remove_dir_all(&rootfs).await;
-                None
-            }
-        };
-        let ext4_size_bytes = tokio::fs::metadata(&ext4_path).await?.len();
+        // 5. Fill + fused chunk upload (ADR 0093): metadata bytes and
+        // zero runs stream out of `begin()` immediately; data follows
+        // at ascending offsets as layers re-decode. Every 16 MiB chunk
+        // hashes+PUTs the moment its range completes — there is no
+        // image file and no separate chunk stage. Identity stays
+        // content-derived (ADR 0036): a deterministic re-materialize
+        // reproduces the SAME ManifestRef.
         report(
             MaterializeStage::Chunk,
-            Some(format!("{ext4_size_bytes} ext4 bytes")),
+            Some(format!("{image_len} ext4 bytes")),
         );
-
-        // 5. Chunk into the content-addressed store. Identity is
-        // content-derived (ADR 0036): a deterministic re-materialize
-        // reproduces the SAME ManifestRef, so the enable pipeline can
-        // recognize "already captured this exact rootfs" and reuse the
-        // base snapshot. An already-present manifest is success.
         let chunk_started = std::time::Instant::now();
-        // Window-count frames feed the enable UI's chunk progress bar —
-        // one per flushed upload window (~every 512 MiB), so a dev-brain
-        // ext4 emits ~dozens, not thousands.
-        let chunk_progress = |done: u64, total: u64| {
-            if let Some(tx) = &progress {
-                let _ = tx.try_send(MaterializeProgress {
-                    stage: MaterializeStage::Chunk,
-                    detail: Some(format!("{ext4_size_bytes} ext4 bytes")),
-                    chunks_done: Some(done),
-                    chunks_total: Some(total),
-                });
-            }
-        };
-        let (manifest, chunk_stats) = chunk_store
-            .chunk_file_into(
-                &ext4_path,
-                ManifestKind::Disk,
-                None,
-                None,
-                Some(&chunk_progress),
-            )
-            .await?;
+        let chunk_progress: Option<std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>> =
+            progress.clone().map(|tx| {
+                let detail = format!("{image_len} ext4 bytes");
+                std::sync::Arc::new(move |done: u64, total: u64| {
+                    let _ = tx.try_send(MaterializeProgress {
+                        stage: MaterializeStage::Chunk,
+                        detail: Some(detail.clone()),
+                        chunks_done: Some(done),
+                        chunks_total: Some(total),
+                    });
+                }) as std::sync::Arc<dyn Fn(u64, u64) + Send + Sync>
+            });
+        let (mut rc, uploader) =
+            chunk_store.region_chunker(ManifestKind::Disk, image_len, chunk_progress);
+        let fill_task =
+            tokio::task::spawn_blocking(move || -> Result<(u64, u64), MaterializeError> {
+                let mut sink = stream_pack::ChunkerSink(&mut rc);
+                let mut w = sealed.begin(&mut sink)?;
+                let mut fill_busy_ms = 0u64;
+                for (i, layer) in layers.iter().enumerate() {
+                    if sealed.layer_fill_count(i) > 0 {
+                        let piped = decode_layer(&layer.path, layer.compression)?;
+                        let started = std::time::Instant::now();
+                        sealed.fill_layer(&mut w, i, piped)?;
+                        fill_busy_ms += started.elapsed().as_millis() as u64;
+                    }
+                    let _ = std::fs::remove_file(&layer.path);
+                }
+                sealed.fill_synthetic(&mut w)?;
+                stream_pack::SealedImage::finish_writer(w)?;
+                let high_water = rc.finish()?;
+                Ok((fill_busy_ms, high_water))
+            });
+        let fill_join = fill_task.await;
+        let upload_join = uploader.await;
+        // The uploader's error is the root cause when both fail (a PUT
+        // failure closes the channel, which the fill pass surfaces as a
+        // generic "uploader terminated").
+        let (manifest, chunk_stats) = upload_join
+            .map_err(|e| MaterializeError::Io(std::io::Error::other(format!("uploader: {e}"))))??;
+        let (fill_ms, partial_high_water) = fill_join.map_err(|e| {
+            MaterializeError::Io(std::io::Error::other(format!("fill task: {e}")))
+        })??;
         let chunk_ms = chunk_started.elapsed().as_millis() as u64;
-        // Background tree deletion overlapped the chunk stage; join it
-        // so the scratch guard's final scrub never races a live reaper.
-        if let Some(reaper) = tree_reaper {
-            let _ = reaper.await;
-        }
+        let ext4_size_bytes = image_len;
+
         let disk_manifest = manifest.content_ref();
         match chunk_store.get_manifest(disk_manifest).await {
             Ok(_) => {
@@ -533,19 +474,21 @@ impl Materializer {
             chunks = manifest.chunks.len(),
             ext4_size_bytes,
             pull_ms,
-            flatten_ms,
-            pack_ms,
+            declare_ms,
+            seal_ms,
+            fill_ms,
             chunk_ms,
-            chunk_scan_ms = (chunk_stats.scan_seconds * 1000.0) as u64,
-            chunk_flush_ms = (chunk_stats.flush_seconds * 1000.0) as u64,
+            chunks_uploaded = chunk_stats.chunks_uploaded,
+            chunks_elided = chunk_stats.chunks_elided,
             chunk_bytes_uploaded = chunk_stats.bytes_uploaded,
-            "materialized image into chunk store"
+            partial_high_water,
+            "materialized image into chunk store (streaming pack, no image file)"
         );
 
         Ok(Materialized {
             disk_manifest,
-            oci_defaults: pulled.oci_defaults,
-            manifest_digest: pulled.manifest_digest,
+            oci_defaults: resolved.oci_defaults,
+            manifest_digest: resolved.manifest_digest,
             ext4_size_bytes,
         })
         // _guard drops here → scratch subdir scrubbed.
@@ -558,7 +501,8 @@ mod tests {
 
     #[test]
     fn peak_estimate_is_the_adr_hint() {
-        assert_eq!(estimated_peak_scratch_bytes(1000), 2500);
+        // ADR 0093: compressed layers only — no tree, no image file.
+        assert_eq!(estimated_peak_scratch_bytes(1000), 1250);
         assert_eq!(estimated_peak_scratch_bytes(0), 0);
         // No overflow on adversarial input.
         assert!(estimated_peak_scratch_bytes(u64::MAX) > 0);

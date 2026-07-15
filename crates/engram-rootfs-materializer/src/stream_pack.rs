@@ -783,6 +783,22 @@ impl SealedImage {
         self.layout.image_len()
     }
 
+    /// Open the image writer: every metadata byte and zero run is
+    /// emitted to `sink` before this returns.
+    pub fn begin<S: mkext4::sink::RegionSink>(
+        &self,
+        sink: S,
+    ) -> Result<mkext4::build::ImageWriter<'_, S>, FlattenError> {
+        self.layout.writer(sink).map_err(mk_err)
+    }
+
+    /// Finish the writer (asserts every declared file was filled).
+    pub fn finish_writer<S: mkext4::sink::RegionSink>(
+        w: mkext4::build::ImageWriter<'_, S>,
+    ) -> Result<(), FlattenError> {
+        w.finish().map(|_| ()).map_err(mk_err)
+    }
+
     /// Number of surviving entries a given layer must fill (for
     /// progress accounting).
     pub fn layer_fill_count(&self, layer: usize) -> usize {

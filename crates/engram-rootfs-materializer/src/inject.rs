@@ -411,6 +411,25 @@ pub async fn inject_init(
     Ok(())
 }
 
+/// ADR 0093: the rendered shim as `(rel path, mode, bytes)` for the
+/// streaming packer's synthetic declaration — no tree involved. The
+/// epoch stamping that `inject_init` does on a real tree is the
+/// declaring side's job there (`declare_synthetic` stamps AT epoch).
+pub async fn rendered_init_shim(
+    injection: &InitInjection,
+) -> Result<(String, u16, Vec<u8>), std::io::Error> {
+    let body = match &injection.init_script {
+        Some(src) => tokio::fs::read(src).await.map_err(|e| {
+            std::io::Error::new(e.kind(), format!("read init {}: {e}", src.display()))
+        })?,
+        None => DEFAULT_INIT_SHIM
+            .replace(VSOCK_PORT_PLACEHOLDER, &injection.vsock_port.to_string())
+            .replace(TRANSPORT_PLACEHOLDER, injection.transport.env_value())
+            .into_bytes(),
+    };
+    Ok((INIT_PATH.to_string(), 0o755, body))
+}
+
 /// Copy `src` to `dst` and chmod 0755. `label` is a short tag ("agent",
 /// "init") used in the error message so a copy failure points at the
 /// caller's intent.
