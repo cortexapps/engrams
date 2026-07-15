@@ -1,6 +1,10 @@
 # 0095 — Peer fill of disk chunks: one fleet transport for resume, warmup, and prestage
 
-Status: Proposed (2026-07-14)
+Status: Accepted (2026-07-15) — prod-validated same day; see §Prod
+validation. Commit chain: #677 (ADR + tier + wirings + chart striping,
+WIRE 16), engrams-internal#74 (2×375 GB local-NVMe RAID0 kvm pool),
+#679 (fresh-node init/mount-race fix), #680 (bundle-supervisor retry +
+prefetch in-flight guard). Validation record: issue #678.
 
 Issue: successor to #548 (GCS-free resume, ADR 0078 — phases 1+2 landed
 via #587/#601; this ADR absorbs the unbuilt remainder and broadens it).
@@ -284,7 +288,42 @@ would add a second listener + protocol surface.
    deleted, refetched, counted; serve-onward never streams an
    unverified chunk; backlog drains within ~10 min of a bulk pull.
 
+## Prod validation (2026-07-15, 2-host NVMe fleet — the Accepted basis)
+
+Measured the day the stack deployed (#677 → internal#74 → #679 → #680);
+full log-line evidence on issue #678.
+
+| Acceptance criterion | Result |
+|---|---|
+| 1. Prestage ≤3 min, GCS ≤1.1× unique | **~3.2 min** (vs 22.1 min = ~7×, and BOTH hosts vs one); GCS ≈1× + a ~200-chunk upload-race tail. Enable total 41.5→20.5 min. |
+| 2. Warmup GCS ≈ only-unheld chunks | Organic window: 15.1 GiB @ 523 MiB/s, `missing_on_peer=0`. A no-live-seed bringup (both nodes fresh simultaneously) correctly ran GCS-parallel — the contract's degenerate case, observed. |
+| 3. Resume p50 ≤1.5 s with live source | Affinity-local full resume AND rung-2 ascent: **<1 s** incl. an md5 integrity check over the divergence; data intact across 4 park/resume cycles. The isolated CROSS-HOST wall-clock stayed unmeasured — every controlled attempt was absorbed by a faster designed path (ascent, affinity) — see divergence log. |
+| 4. Dead/absent peer bounded | Exercised organically: readiness-flip scope rejects, upload-tail misses, and backpressure all degraded to GCS per contract, no session impact. |
+| 5. VZ serves / Process unavailable | CI lanes (loopback suite runs on all platforms; e2e Process = the no-hint arm). |
+| 6. Transport ≥ NVMe write rate | Superseded by prod: **28.7 GiB @ 692 MiB/s** and 21,870×512 KiB @ 283 MiB/s through real fleet NICs/NVMe (loopback bench: 1,112 MiB/s release, macOS). No raw-TCP plane needed. |
+| 7. Scrub catches corruption, serve-gate holds | Unit/integration-pinned; prod counters during the (unrelated) prefetch storm: `ok=8,731, missing=1,023, corrupt=0` — `missing` = chunks LRU-evicted before their scrub under storm pressure, the safe direction. |
+
+Incidental finds fixed forward during validation: the fresh-node
+init/mount race (#679), the bundle-supervisor retry wedge (#680), and
+the **prefetch redo-loop storm** (#680) — no per-digest in-flight guard
+let one false `still_warm` flip stack unbounded concurrent 24 GiB
+memfile re-materializations, whose fs-headroom churn evicted
+freshly-landed unpinned chunks and kept the recheck false (77k
+evictions, ~1 TB/hr NVMe reads, idle fleet). Very likely the true
+mechanism behind the historical "dev-brain re-prefetch churn".
+
 ## Divergence log
+
+- **Cross-host resume wall-clock: measure on the next organic
+  occurrence.** Three deliberate attempts all landed on faster designed
+  paths (placement-race → affinity local; rung-2 ascent under cordon —
+  correct: cordons don't kill parked VMs; the D5 async destroy leg —
+  Idle ≠ VM-gone), and the pressure reaper rightly holds rung-2 parks
+  on a headroomed fleet. The mechanism is prod-proven by the prestage /
+  warmup windows (same hints → dial → CRC landing → GCS floor); any
+  host roll or evacuation with idle sessions will emit
+  `peer resume pre-pass window complete` on the destination — fold that
+  wall-clock in here when it lands.
 
 - **Fault-time peer tier: built but not wired.** The plan called for a
   fault-time peer binding in the populate closures as the resume tail's
