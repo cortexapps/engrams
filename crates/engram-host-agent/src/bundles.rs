@@ -76,17 +76,46 @@ pub fn spawn_supervisor(
     store: BundleStore,
     current: Vec<AuxBundleRef>,
 ) -> tokio::sync::watch::Sender<Vec<AuxBundleRef>> {
+    /// After a failed materialize, retry on this cadence instead of
+    /// waiting for the next `live_bundles` CHANGE — the pin set is
+    /// near-static, so "retry on next ack change" was a wedge: a
+    /// transient staging failure (the 2026-07-15 fresh-NVMe bringup's
+    /// mount race mid-write, a GCS blip) left the host bundle-less
+    /// with a healthy agent until a pod restart. Success returns the
+    /// loop to pure change-driven waits — no steady-state polling.
+    const FAILED_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
     let (tx, mut rx) = tokio::sync::watch::channel(Vec::<AuxBundleRef>::new());
     tokio::spawn(async move {
+        let mut failed = false;
         loop {
-            if rx.changed().await.is_err() {
+            if failed {
+                tokio::select! {
+                    changed = rx.changed() => {
+                        if changed.is_err() {
+                            tracing::debug!(
+                                "bundle supervisor: live_bundles sender dropped; exiting"
+                            );
+                            return;
+                        }
+                    }
+                    _ = tokio::time::sleep(FAILED_RETRY) => {}
+                }
+            } else if rx.changed().await.is_err() {
                 tracing::debug!("bundle supervisor: live_bundles sender dropped; exiting");
                 return;
             }
             let live = rx.borrow_and_update().clone();
-            if let Err(e) = store.materialize_if_missing(&live).await {
-                tracing::warn!(error = %e, "bundle prefetch failed; retrying on next ack change");
-            }
+            failed = match store.materialize_if_missing(&live).await {
+                Ok(()) => false,
+                Err(e) => {
+                    tracing::warn!(
+                        error = %e,
+                        retry_secs = FAILED_RETRY.as_secs(),
+                        "bundle prefetch failed; will retry",
+                    );
+                    true
+                }
+            };
             store.sweep_unpinned(&live, &current).await;
         }
     });
@@ -474,5 +503,52 @@ mod tests {
         // Sorted by drive_id for deterministic heartbeats.
         assert_eq!(refs[0].drive_id, "browser");
         assert_eq!(refs[1].drive_id, "skills");
+    }
+
+    /// A failed materialize self-heals on the retry timer WITHOUT an
+    /// ack change (prod 2026-07-15: the near-static pin set meant
+    /// "retry on next ack change" never fired and the host sat
+    /// bundle-less until a pod restart). `start_paused` auto-advances
+    /// the 60 s retry sleep, so the test runs in milliseconds.
+    #[tokio::test(start_paused = true)]
+    async fn failed_materialize_retries_on_timer_not_just_ack_change() {
+        let _ = tracing_subscriber::fmt().with_test_writer().try_init();
+        let blob_dir = tempfile::tempdir().unwrap();
+        let staged_dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(blob_dir.path().to_path_buf()),
+        );
+        let store = BundleStore::new(blob.clone(), staged_dir.path().to_path_buf(), "squashfs");
+        // Content-addressed: the pin sha must be the real digest of the
+        // bytes the blob will hold (materialize verifies on stage).
+        let body = bytes::Bytes::from_static(b"squashfs bytes");
+        let sha = {
+            use sha2::Digest;
+            let mut h = sha2::Sha256::new();
+            h.update(&body);
+            format!("{:x}", h.finalize())
+        };
+        let staged = staged_dir.path().join(format!("{sha}.squashfs"));
+        let pin = vec![AuxBundleRef {
+            drive_id: "skills".into(),
+            sha256: sha.clone(),
+        }];
+
+        let tx = spawn_supervisor(store, Vec::new());
+        // First attempt: the blob doesn't exist yet — materialize fails.
+        tx.send(pin.clone()).unwrap();
+        tokio::task::yield_now().await;
+        assert!(!tokio::fs::try_exists(&staged).await.unwrap());
+
+        // Publish the blob; do NOT touch the watch channel. The retry
+        // timer alone must stage it.
+        blob.put(&AuxRoDrive::blob_key(&sha), body).await.unwrap();
+        for _ in 0..200 {
+            if tokio::fs::try_exists(&staged).await.unwrap() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        }
+        panic!("retry timer never staged the bundle (still wedged on ack change)");
     }
 }
