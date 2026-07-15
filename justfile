@@ -1058,6 +1058,78 @@ vz-test: vz-codesign
     cargo nextest run -p engram-sandbox-vz
     cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only
 
+# ADR 0096: stage the MINIMAL bundle set the live VZ e2e boots with —
+# agentd (hard: the init shim execs it out of its slot, ADR 0080),
+# guest-tools (the SHELL-tab ttyd the lifecycle e2e asserts), and the
+# sentinel — into var/vz-e2e/shared/ (content-addressed erofs +
+# current.json, the exact layout `resolve_agentd_slot` reads). A
+# stripped-down `bundles-vz` (no harnesses, no Docker bundles) so the
+# e2e stages in seconds; the pack helpers mirror bundles-vz's — keep
+# the two in lockstep.
+vz-test-bundles:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v mkfs.erofs >/dev/null || {
+        echo "mkfs.erofs not found — 'brew install erofs-utils' or use 'nix develop'" >&2
+        exit 1
+    }
+    sha256_of() {
+        if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
+        else shasum -a 256 "$1" | cut -d' ' -f1; fi
+    }
+    # Reproducible pack — same pins as bundles-vz (UUID/time/uid/gid,
+    # 4K blocks for the 4K guest page size).
+    pack_erofs() {  # pack_erofs <out.erofs> <tree-dir>
+        mkfs.erofs -b 4096 -T 0 -U 00000000-0000-0000-0000-000000000000 \
+            --force-uid=0 --force-gid=0 "$1" "$2" >/dev/null
+    }
+    out=var/vz-e2e/shared
+    mkdir -p "$out"
+    stamp="{"
+    sep=""
+    for name in sentinel guest-tools; do
+        tree="$PWD/$out/.$name.stage"
+        rm -rf "$tree"; mkdir -p "$tree"
+        "deploy/bundles/$name/build.sh" --stage "$tree"
+        img="$out/.$name.build.erofs"
+        rm -f "$img"
+        pack_erofs "$img" "$tree"
+        rm -rf "$tree"
+        sha="$(sha256_of "$img")"
+        mv "$img" "$out/$sha.erofs"
+        stamp="$stamp$sep\"$name\": \"$sha\""
+        sep=", "
+    done
+    # agentd — always the arm64 musl build (the VZ guest is arm64 Linux).
+    cargo build --release --target aarch64-unknown-linux-musl -p engram-agentd
+    agentd_bin="target/aarch64-unknown-linux-musl/release/engram-agentd"
+    tree="$PWD/$out/.agentd.stage"
+    rm -rf "$tree"; mkdir -p "$tree"
+    install -m 0755 "$agentd_bin" "$tree/engram-agentd"
+    sha256_of "$tree/engram-agentd" > "$tree/agentd.sha256"
+    img="$out/.agentd.build.erofs"
+    rm -f "$img"
+    pack_erofs "$img" "$tree"
+    rm -rf "$tree"
+    sha="$(sha256_of "$img")"
+    mv "$img" "$out/$sha.erofs"
+    stamp="$stamp$sep\"agentd\": \"$sha\""
+    echo "$stamp}" > "$out/current.json"
+    cat "$out/current.json"
+
+# ADR 0096: the ONE-COMMAND live VZ e2e. Stages everything from HEAD —
+# kernel, bundles, a fresh Docker-free rootfs (real init shim + mkext4),
+# codesigned test binaries — then boots real VMs through the whole
+# suite. Rebuilt every run, so the live loop can't silently rot the way
+# the old "point ENGRAM_VZ_ROOTFS at a stale bake" flow did.
+# ENGRAM_VZ_REQUIRE=1 turns any leftover preflight SKIP into a failure.
+vz-e2e: pull-kernel vz-test-bundles vz-codesign
+    bash crates/engram-sandbox-vz/scripts/make-test-rootfs.sh var/vz-e2e/rootfs.ext4
+    ENGRAM_VZ_ROOTFS="$PWD/var/vz-e2e/rootfs.ext4" \
+    ENGRAM_VZ_BUNDLE_DIR="$PWD/var/vz-e2e/shared" \
+    ENGRAM_VZ_REQUIRE=1 \
+        cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only -E 'test(e2e_vz)'
+
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
 watch:

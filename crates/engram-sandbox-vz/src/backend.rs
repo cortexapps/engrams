@@ -564,8 +564,9 @@ impl SandboxBackend for VzBackend {
         warn_vz_ignores_allow_hosts_once(&spec.network);
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
-                "VzBackend requires SandboxSpec.rootfs_source — point it at the ext4 \
-                 rootfs produced by `just bake-demo`"
+                "VzBackend requires SandboxSpec.rootfs_source — an ext4 with the \
+                 ADR 0080 init shim (a materialized session image, or the \
+                 `make-test-rootfs.sh` test image `just vz-e2e` stages)"
                     .into(),
             )
         })?;
@@ -573,8 +574,9 @@ impl SandboxBackend for VzBackend {
         // specific NSError later.
         if !bake_rootfs.exists() {
             return Err(SandboxError::InvalidSpec(format!(
-                "vz rootfs not found at {} — bake an image with `just bake-demo` and \
-                 point SandboxSpec.rootfs_source at it",
+                "vz rootfs not found at {} — materialize an image (enable flow) or \
+                 stage the test rootfs (`just vz-e2e`) and point \
+                 SandboxSpec.rootfs_source at it",
                 bake_rootfs.display()
             )));
         }

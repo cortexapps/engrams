@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Fetch the arm64 Linux kernel that VZ uses to boot Linux guests.
 #
-# Source: Kata Containers static-kernel release (Linux 6.18.15-186
+# Source: Kata Containers static-kernel release (Linux 6.12.28-153
 # with a VZ-tuned kconfig). Same kernel `apple/container` uses by
 # default — strips PCI/ACPI/USB/sound/graphics, ships
 # VIRTIO_BLK/NET/CONSOLE built in. Cold boot is sub-second on

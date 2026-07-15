@@ -1,39 +1,46 @@
 //! Live end-to-end lifecycle test for the VZ (Virtualization.framework)
 //! backend. Exercises the real prod-shape path through `VzBackend` on an
-//! actual booting microVM and locks in the parity fixes from ADR 0032:
+//! actual booting microVM and locks in the parity fixes from ADR 0032 +
+//! ADR 0096:
 //!
 //!   - agentd exec over the real vsock transport (ADR 0066 Phase 2),
+//!   - the ADR 0080 boot contract — agentd is NOT baked into the rootfs;
+//!     the stage-1 init shim execs it out of its reserved bundle slot,
+//!     resolved from the staged `current.json` exactly like real sessions,
 //!   - durable snapshots — a guest write with NO explicit `sync` survives a
 //!     snapshot → cold-boot restore (the `flush_guest_fs` / agentd `Sync` RPC),
 //!   - cold-boot restore from a clone-snapshot,
 //!   - the SHELL tab — `start_shell` forwards to agentd's `StartShell` so ttyd
-//!     is actually spawned (no more `connection refused`).
+//!     (from the guest-tools bundle slot) is actually spawned,
+//!   - the vsock port relay reaching guest loopback without head-of-line
+//!     blocking (ADR 0066).
 //!
 //! # Gating
 //!
-//! macOS-only (`cfg`) and `#[ignore]` by default. It needs two artifacts:
+//! macOS-only (`cfg`) and `#[ignore]` by default. **`just vz-e2e` stages
+//! everything from HEAD and runs this in one command** (ADR 0096) — kernel,
+//! bundles, a fresh Docker-free rootfs (Alpine minirootfs + the real init
+//! shim, packed by mkext4/ADR 0093), codesigned binaries. The env contract:
+//!
 //!   - `ENGRAM_VZ_KERNEL_PATH` (or `~/.cache/engram-vz-test/vmlinux-arm64`,
 //!     populated by `just pull-kernel`),
-//!   - `ENGRAM_VZ_ROOTFS` — a bootable arm64 ext4 with `engram-agentd` +
-//!     `ttyd` baked in and `ENGRAM_TRANSPORT=vsock` in its env, i.e. the
-//!     output of `just bake-demo` (point the var at the materialized
-//!     `var/host-sandboxes/chunked-rootfs/<manifest>.ext4`). NB: a rootfs
-//!     baked before ADR 0066 Phase 2 carries `ENGRAM_TRANSPORT=console`
-//!     and will NOT boot against this vsock-only backend — re-bake it.
+//!   - `ENGRAM_VZ_ROOTFS` — a bootable arm64 ext4 whose init is the ADR 0080
+//!     stage-1 shim (`make-test-rootfs.sh`, or any materialized session
+//!     image); agentd itself must NOT be baked in,
+//!   - `ENGRAM_VZ_BUNDLE_DIR` — a staged bundle dir (`<sha>.erofs` files +
+//!     `current.json` carrying at least the `agentd` and `guest-tools`
+//!     keys; `just vz-test-bundles` produces the minimal set),
+//!   - `ENGRAM_VZ_REQUIRE=1` (optional) — turn every preflight SKIP into a
+//!     hard failure. CI sets this so the lane can never silently regress
+//!     back to skip-and-green (ADR 0096).
 //!
-//! Run locally:
-//! ```sh
-//! just vz-codesign           # codesign the test binary (entitlement)
-//! ENGRAM_VZ_ROOTFS=/path/to/rootfs.ext4 \
-//!   cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only -E 'test(e2e_vz)'
-//! ```
+//! Missing kernel/rootfs/bundles otherwise skip cleanly (prints `SKIP:` and
+//! returns), mirroring `fc_preflight`.
 //!
-//! In CI the existing `vz` job's `--run-ignored` step invokes this test; it
-//! skips cleanly (prints `SKIP:` and returns) when `ENGRAM_VZ_ROOTFS` is
-//! absent. The macOS Blacksmith runner has no Docker, so it can't bake a
-//! rootfs — wiring a Docker-free prebuilt-rootfs asset (mirroring
-//! `pull-kernel.sh`) so CI exercises the full boot is the tracked follow-up
-//! in ADR 0032.
+//! The skill/browser variants additionally need `ENGRAM_VZ_SKILL_EROFS`
+//! (a Docker-built bundle staged into the SAME dir as
+//! `ENGRAM_VZ_BUNDLE_DIR`) and a glibc rootfs for the browser stack — they
+//! stay soft-skips even under `ENGRAM_VZ_REQUIRE`.
 
 #![cfg(target_os = "macos")]
 
@@ -44,10 +51,13 @@ use std::time::Duration;
 
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::sandbox::{
-    CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec,
+    AuxRoDrive, CpuLimit, DiskLimit, ExecEvent, ExecRequest, MemoryLimit, SandboxSpec,
 };
 use engram_core::SandboxId;
-use engram_harness_proto::{read_msg, write_msg, RelayAck, RelayConnect, PROXY_PORT_VSOCK_PORT};
+use engram_harness_proto::{
+    read_msg, write_msg, ForgeOp, ForgeRequest, ForgeResponse, RelayAck, RelayConnect,
+    PROXY_PORT_VSOCK_PORT,
+};
 use engram_sandbox_vz::{VzBackend, VzConfig};
 use futures::StreamExt;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -55,11 +65,21 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 struct VzEnv {
     kernel: PathBuf,
     rootfs: PathBuf,
+    bundle_dir: PathBuf,
 }
 
-/// Resolve the kernel + rootfs the live test needs, or `None` (skip) when
-/// either is missing — mirrors `fc_preflight` / the vm.rs smoke convention so
-/// a CI runner without artifacts no-ops instead of failing.
+/// ADR 0096: a failed preflight is a clean SKIP locally, a hard failure
+/// under `ENGRAM_VZ_REQUIRE=1` (CI) — the exact mechanism that let the
+/// live suite pass vacuously for weeks is gone.
+fn skip(msg: &str) {
+    if std::env::var("ENGRAM_VZ_REQUIRE").as_deref() == Ok("1") {
+        panic!("ENGRAM_VZ_REQUIRE=1: {msg}");
+    }
+    eprintln!("SKIP: {msg}");
+}
+
+/// Resolve the kernel + rootfs + bundle dir the live test needs, or `None`
+/// (skip; panic under `ENGRAM_VZ_REQUIRE=1`).
 fn vz_preflight() -> Option<VzEnv> {
     let kernel = std::env::var("ENGRAM_VZ_KERNEL_PATH")
         .map(PathBuf::from)
@@ -68,26 +88,69 @@ fn vz_preflight() -> Option<VzEnv> {
             PathBuf::from(home).join(".cache/engram-vz-test/vmlinux-arm64")
         });
     if !kernel.exists() {
-        eprintln!(
-            "SKIP: VZ kernel not found at {} (run `just pull-kernel`)",
+        skip(&format!(
+            "VZ kernel not found at {} (run `just pull-kernel`)",
             kernel.display()
-        );
+        ));
         return None;
     }
     let rootfs = match std::env::var("ENGRAM_VZ_ROOTFS") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
-            eprintln!("SKIP: ENGRAM_VZ_ROOTFS unset (point it at a `just bake-demo` ext4)");
+            skip("ENGRAM_VZ_ROOTFS unset (run `just vz-e2e`, which stages a fresh one)");
             return None;
         }
     };
     if !rootfs.exists() {
-        eprintln!("SKIP: ENGRAM_VZ_ROOTFS={} doesn't exist", rootfs.display());
+        skip(&format!(
+            "ENGRAM_VZ_ROOTFS={} doesn't exist",
+            rootfs.display()
+        ));
         return None;
     }
-    Some(VzEnv { kernel, rootfs })
+    let bundle_dir = match std::env::var("ENGRAM_VZ_BUNDLE_DIR") {
+        Ok(p) => PathBuf::from(p),
+        Err(_) => {
+            skip("ENGRAM_VZ_BUNDLE_DIR unset (run `just vz-test-bundles`)");
+            return None;
+        }
+    };
+    if !bundle_dir.join(AuxRoDrive::CURRENT_STAMP).exists() {
+        skip(&format!(
+            "no {} in ENGRAM_VZ_BUNDLE_DIR={} (run `just vz-test-bundles`)",
+            AuxRoDrive::CURRENT_STAMP,
+            bundle_dir.display()
+        ));
+        return None;
+    }
+    Some(VzEnv {
+        kernel,
+        rootfs,
+        bundle_dir,
+    })
 }
 
+fn backend(env: &VzEnv, work: &Path, with_chunks: bool) -> VzBackend {
+    let b = VzBackend::new(
+        work.join("sb"),
+        VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(env.bundle_dir.clone()),
+    )
+    .expect("VzBackend::new");
+    if with_chunks {
+        let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
+            work.join("blob"),
+        ));
+        b.with_chunk_store(engram_chunk_store::ChunkStore::new(blob))
+    } else {
+        b
+    }
+}
+
+/// ADR 0080/0096: every live spec carries the symbolic agentd +
+/// guest-tools reserved slots — `resolve_agentd_slot` resolves them
+/// against the staged `current.json`, the same path real sessions take.
+/// There is no other way to boot: the init shim panics the kernel when
+/// no agentd bundle is mounted.
 fn spec(rootfs: &Path) -> SandboxSpec {
     SandboxSpec {
         image: "engram-e2e-vz".into(),
@@ -101,21 +164,24 @@ fn spec(rootfs: &Path) -> SandboxSpec {
         env: HashMap::new(),
         workdir: None,
         network: Default::default(),
-        aux_ro_drives: Vec::new(),
+        aux_ro_drives: vec![
+            AuxRoDrive::reserved_slot(AuxRoDrive::AGENTD_SLOT_INDEX),
+            AuxRoDrive::reserved_slot(AuxRoDrive::GUEST_TOOLS_SLOT_INDEX),
+        ],
     }
 }
 
 /// ADR 0061: resolve a staged skill erofs (`ENGRAM_VZ_SKILL_EROFS`,
-/// pointing at a `var/shared/<sha>.erofs` produced by `just bundles-vz`)
-/// into (bundle_dir, sha). `None` (skip) when unset/missing — CI stages
-/// no bundle, exactly like the rootfs guard, so the test no-ops there.
-fn skill_erofs_preflight() -> Option<(PathBuf, String)> {
+/// pointing at a `<bundle_dir>/<sha>.erofs` produced by `just bundles-vz`)
+/// into its sha. Always a soft skip when unset/missing — the skill/browser
+/// bundles are Docker-built, which the CI runner can't produce.
+fn skill_erofs_preflight(env: &VzEnv) -> Option<String> {
     let path = match std::env::var("ENGRAM_VZ_SKILL_EROFS") {
         Ok(p) => PathBuf::from(p),
         Err(_) => {
             eprintln!(
                 "SKIP: ENGRAM_VZ_SKILL_EROFS unset (run `just bundles-vz`, then point \
-                 it at var/shared/<sha>.erofs)"
+                 it at a <sha>.erofs staged in ENGRAM_VZ_BUNDLE_DIR)"
             );
             return None;
         }
@@ -127,23 +193,32 @@ fn skill_erofs_preflight() -> Option<(PathBuf, String)> {
         );
         return None;
     }
-    let dir = path.parent().expect("erofs has a parent dir").to_path_buf();
-    let sha = path
-        .file_stem()
-        .expect("erofs has a file stem")
-        .to_string_lossy()
-        .into_owned();
-    Some((dir, sha))
+    if path.parent() != Some(env.bundle_dir.as_path()) {
+        eprintln!(
+            "SKIP: ENGRAM_VZ_SKILL_EROFS={} is not staged inside ENGRAM_VZ_BUNDLE_DIR={} \
+             (the backend resolves every drive against ONE bundle dir)",
+            path.display(),
+            env.bundle_dir.display(),
+        );
+        return None;
+    }
+    Some(
+        path.file_stem()
+            .expect("erofs has a file stem")
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 fn spec_with_skill(rootfs: &Path, sha: &str) -> SandboxSpec {
     let mut s = spec(rootfs);
-    s.aux_ro_drives = vec![engram_core::types::sandbox::AuxRoDrive {
-        drive_id: "dyn_0".into(),
-        guest_mount: PathBuf::from("/opt/engram/dyn/0"),
-        fs_type: "erofs".into(),
-        sha256: Some(sha.to_string()),
-    }];
+    s.aux_ro_drives
+        .push(engram_core::types::sandbox::AuxRoDrive {
+            drive_id: "dyn_0".into(),
+            guest_mount: PathBuf::from("/opt/engram/dyn/0"),
+            fs_type: "erofs".into(),
+            sha256: Some(sha.to_string()),
+        });
     s
 }
 
@@ -185,35 +260,29 @@ async fn await_agent(backend: &VzBackend, id: SandboxId) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires macOS + a codesigned binary + a VZ kernel + ENGRAM_VZ_ROOTFS"]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_lifecycle() {
     let env = match vz_preflight() {
         Some(e) => e,
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
-        work.path().join("blob"),
-    ));
-    let cs = engram_chunk_store::ChunkStore::new(blob);
-    let backend = VzBackend::new(
-        work.path().join("sb"),
-        VzConfig::with_kernel(env.kernel.clone()),
-    )
-    .expect("VzBackend::new")
-    .with_chunk_store(cs);
+    let backend = backend(&env, work.path(), true);
 
     // 1. Boot + exec over the real vsock transport (ADR 0066 Phase 2; ADR
     //    0032 #3: exec must answer promptly, not 90s later — the ready-port
-    //    drain listener keeps the guest handshake from stalling).
+    //    drain listener keeps the guest handshake from stalling). The boot
+    //    itself proves the ADR 0080 contract: agentd came out of its
+    //    bundle slot, resolved from current.json.
     let id = backend.create(spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
     let (out, code) = exec(&backend, id, "echo hello-vz && uname -m").await;
     assert_eq!(code, Some(0), "exec exit; out={out}");
     assert!(out.contains("hello-vz"), "exec stdout: {out}");
 
-    // 2. SHELL tab (ADR 0032 #5): start_shell must spawn ttyd and return its
-    //    port, not the trait-default-7681-without-a-listener.
+    // 2. SHELL tab (ADR 0032 #5): start_shell must spawn ttyd (from the
+    //    guest-tools bundle slot — the rootfs bakes no ttyd) and return
+    //    its port, not the trait-default-7681-without-a-listener.
     let port = backend
         .start_shell(id)
         .await
@@ -243,27 +312,18 @@ async fn e2e_vz_lifecycle() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires macOS + codesigned binary + VZ kernel + ENGRAM_VZ_ROOTFS + ENGRAM_VZ_SKILL_EROFS"]
+#[ignore = "live VZ boot + a Docker-built skill bundle (ENGRAM_VZ_SKILL_EROFS)"]
 async fn e2e_vz_skill_erofs_attaches() {
     let env = match vz_preflight() {
         Some(e) => e,
         None => return,
     };
-    let (bundle_dir, sha) = match skill_erofs_preflight() {
+    let sha = match skill_erofs_preflight(&env) {
         Some(x) => x,
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
-        work.path().join("blob"),
-    ));
-    let cs = engram_chunk_store::ChunkStore::new(blob);
-    let backend = VzBackend::new(
-        work.path().join("sb"),
-        VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(bundle_dir),
-    )
-    .expect("VzBackend::new")
-    .with_chunk_store(cs);
+    let backend = backend(&env, work.path(), true);
 
     let id = backend
         .create(spec_with_skill(&env.rootfs, &sha))
@@ -271,10 +331,11 @@ async fn e2e_vz_skill_erofs_attaches() {
         .expect("create");
     await_agent(&backend, id).await;
 
-    // The erofs skill is attached as /dev/vdb (first aux drive after the
-    // /dev/vda rootfs). RO-mount it and read the bundle's mount.json to
-    // prove the attach + the kernel's erofs driver work end to end. This
-    // does not rely on the init-shim auto-mount (Part 3 / a re-bake).
+    // Attach order is slot-ascending (ADR 0062), so the skill (slot 0)
+    // is the FIRST aux drive: /dev/vdb (after the /dev/vda rootfs).
+    // RO-mount it and read the bundle's mount.json to prove the attach +
+    // the kernel's erofs driver work end to end (a second RO mount of an
+    // already-init-shim-mounted device shares the superblock — fine).
     let (out, code) = exec(
         &backend,
         id,
@@ -296,48 +357,47 @@ async fn e2e_vz_skill_erofs_attaches() {
 /// one — the property real virtio-vsock gives us that the retired
 /// single-stream-per-port console bridge couldn't.
 ///
-/// Uses `node` (present in the demo `node:20-slim` base) for the loopback
-/// servers, detached via `setsid` so they survive the exec returning.
+/// Uses the cross-built `vz-e2e-echo` helper `make-test-rootfs.sh` bakes
+/// at /usr/bin (std-only echo + hold-open sink on guest loopback),
+/// detached via `setsid` so it survives the exec returning.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "requires macOS + a codesigned binary + a VZ kernel + a vsock ENGRAM_VZ_ROOTFS"]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
 async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     let env = match vz_preflight() {
         Some(e) => e,
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let backend = VzBackend::new(
-        work.path().join("sb"),
-        VzConfig::with_kernel(env.kernel.clone()),
-    )
-    .expect("VzBackend::new");
+    let backend = backend(&env, work.path(), false);
 
     let id = backend.create(spec(&env.rootfs)).await.expect("create");
     await_agent(&backend, id).await;
 
     // Bring loopback up (the relay dials 127.0.0.1; a minimal guest may leave
-    // `lo` down), then start a concurrent echo server on 127.0.0.1:ECHO and a
-    // black-hole on 127.0.0.1:SINK that accepts but never replies (stands in for
-    // a persistent HMR WebSocket / noVNC stream). socat `fork` gives each
-    // connection its own handler, so any HOL we observe is the relay's, not the
-    // server's. `setsid … &` detaches both so the exec returns while they keep
-    // running (reparented to agentd).
+    // `lo` down), then start the echo server on 127.0.0.1:ECHO and the
+    // black-hole sink on 127.0.0.1:SINK (accepts but never replies — stands
+    // in for a persistent HMR WebSocket / noVNC stream). Each echo
+    // connection gets its own thread, so any HOL we observe is the relay's,
+    // not the server's. `setsid … &` detaches it so the exec returns while
+    // it keeps running (reparented to agentd).
     const ECHO: u16 = 3111;
     const SINK: u16 = 3112;
-    let (_, code) = exec(
+    let (out, code) = exec(
         &backend,
         id,
         &format!(
             "ip link set lo up 2>/dev/null; \
-             setsid socat TCP-LISTEN:{ECHO},bind=127.0.0.1,fork,reuseaddr EXEC:cat \
-               </dev/null >/dev/null 2>&1 & \
-             setsid socat TCP-LISTEN:{SINK},bind=127.0.0.1,fork,reuseaddr EXEC:'sleep 3600' \
-               </dev/null >/dev/null 2>&1 & \
+             command -v vz-e2e-echo || echo MISSING-HELPER; \
+             setsid vz-e2e-echo {ECHO} {SINK} </dev/null >/dev/null 2>&1 & \
              sleep 1"
         ),
     )
     .await;
-    assert_eq!(code, Some(0), "starting loopback servers");
+    assert_eq!(code, Some(0), "starting loopback servers; out={out}");
+    assert!(
+        !out.contains("MISSING-HELPER"),
+        "vz-e2e-echo not in the rootfs — stage it via make-test-rootfs.sh; out={out}"
+    );
 
     // 1. Loopback reach (the ADR 0066 regression): round-trip bytes through
     //    the relay to the 127.0.0.1 echo server.
@@ -364,6 +424,102 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     .await
     .expect("second relay stream must not be HOL-blocked by the stalled one");
     assert_eq!(&round_trip, b"second", "second echo while first is stalled");
+
+    backend.destroy(id).await.expect("destroy");
+}
+
+/// ADR 0023/0096: the in-guest forge credential broker over vsock 1028 —
+/// the VZ mirror of FC's `forge_loopback.rs`. Registers a `ForgeSink`
+/// that echoes the broker token back inside the minted password, runs
+/// `engram-agentd forge-credential` inside the guest (the exact helper
+/// git invokes in real sessions), and asserts the round-trip:
+///
+///   guest `engram-agentd forge-credential`
+///     → dials AF_VSOCK host:1028
+///     → VZ vsock bridge listener → our ForgeSink
+///     → sink reads the `ForgeRequest`, writes a `ForgeResponse`
+///     → agentd prints the credential password to stdout
+///
+/// Until ADR 0096 the bridge had no 1028 listener and `set_forge_sink`
+/// was the trait-default no-op — this dial died on connection-refused,
+/// silently breaking git-credential brokering on every VZ session.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
+async fn e2e_vz_forge_credential_round_trips() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let backend = backend(&env, work.path(), false);
+
+    // Echo the broker token back inside the password so the assertion
+    // proves the in-guest env → ForgeRequest plumbing is intact
+    // (mirrors the FC test's sink).
+    let sink: engram_core::traits::sandbox::ForgeSink = Arc::new(move |mut stream| {
+        tokio::spawn(async move {
+            let req: ForgeRequest = match read_msg(&mut stream).await {
+                Ok(r) => r,
+                Err(e) => {
+                    eprintln!("forge sink: read failed: {e}");
+                    return;
+                }
+            };
+            let resp = match req.op {
+                ForgeOp::FetchCredential { .. } => ForgeResponse::Credential {
+                    username: "x-access-token".into(),
+                    password: format!("ghs_canned_{}", req.broker_token),
+                },
+            };
+            let _ = write_msg(&mut stream, &resp).await;
+        });
+    });
+    backend.set_forge_sink(sink);
+
+    let id = backend.create(spec(&env.rootfs)).await.expect("create");
+    await_agent(&backend, id).await;
+
+    // The exec'd helper needs the session env the harness normally
+    // carries: the session id, the broker token, and the transport pin.
+    let mut exec_env = HashMap::new();
+    exec_env.insert(
+        "ENGRAM_SESSION_ID".to_string(),
+        engram_core::types::ids::SessionId::new().to_string(),
+    );
+    exec_env.insert("ENGRAM_FORGE_TOKEN".to_string(), "tok-abc123".to_string());
+    exec_env.insert("ENGRAM_TRANSPORT".to_string(), "vsock".to_string());
+    let req = ExecRequest {
+        command: vec![
+            "/run/engram/engram-agentd".into(),
+            "forge-credential".into(),
+            "--host".into(),
+            "github.com".into(),
+        ],
+        stdin: None,
+        env: exec_env,
+        workdir: None,
+        timeout: Some(Duration::from_secs(15)),
+    };
+    let mut stream = backend.exec_stream(id, req).await.expect("exec_stream");
+    let mut out = String::new();
+    let mut err = String::new();
+    let mut code = None;
+    while let Some(ev) = stream.events.next().await {
+        match ev {
+            ExecEvent::Stdout(b) => out.push_str(&String::from_utf8_lossy(&b)),
+            ExecEvent::Stderr(b) => err.push_str(&String::from_utf8_lossy(&b)),
+            ExecEvent::Exit(c) => {
+                code = c;
+                break;
+            }
+        }
+    }
+    assert_eq!(code, Some(0), "forge-credential exit (stderr: {err})");
+    assert_eq!(
+        out, "ghs_canned_tok-abc123",
+        "guest forge-credential should print the credential the sink minted \
+         (stderr: {err})",
+    );
 
     backend.destroy(id).await.expect("destroy");
 }
@@ -399,10 +555,10 @@ async fn relay_connect(
 /// spawn instead of a manual mount-and-read.
 ///
 /// Point `ENGRAM_VZ_SKILL_EROFS` at the **browser** bundle's
-/// `var/shared/<sha>.erofs` (built by `just bundles-vz` for the `browser`
-/// bundle); the guest mounts it at `/opt/engram/dyn/0` (auto-mount via the
-/// init shim, or the same `mount -t erofs /dev/vdb` fallback the sibling test
-/// uses) so `engram-browser` lands on `PATH`.
+/// `<bundle_dir>/<sha>.erofs` (built by `just bundles-vz`). NB: the browser
+/// bundle's binaries are Docker-built against glibc — this test needs a
+/// glibc rootfs (a materialized session image), not the Alpine test rootfs
+/// `just vz-e2e` stages.
 ///
 /// # Scope
 ///
@@ -413,27 +569,18 @@ async fn relay_connect(
 /// host-agent `proxy_vnc` wiring this `SandboxBackend`-only harness lacks
 /// (there is no `HostClient`/relay here to open a `proxy_vnc` tunnel against).
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-#[ignore = "VZ live: macOS + codesigned binary + VZ kernel + ENGRAM_VZ_ROOTFS + the browser ENGRAM_VZ_SKILL_EROFS"]
+#[ignore = "live VZ boot + the Docker-built browser bundle + a glibc rootfs"]
 async fn e2e_vz_browser_bundle_mounts_and_starts() {
     let env = match vz_preflight() {
         Some(e) => e,
         None => return,
     };
-    let (bundle_dir, sha) = match skill_erofs_preflight() {
+    let sha = match skill_erofs_preflight(&env) {
         Some(x) => x,
         None => return,
     };
     let work = tempfile::tempdir().expect("workdir");
-    let blob = Arc::new(engram_storage_local::LocalBlobStorage::new(
-        work.path().join("blob"),
-    ));
-    let cs = engram_chunk_store::ChunkStore::new(blob);
-    let backend = VzBackend::new(
-        work.path().join("sb"),
-        VzConfig::with_kernel(env.kernel.clone()).with_bundle_dir(bundle_dir),
-    )
-    .expect("VzBackend::new")
-    .with_chunk_store(cs);
+    let backend = backend(&env, work.path(), true);
 
     let id = backend
         .create(spec_with_skill(&env.rootfs, &sha))

@@ -708,9 +708,9 @@ mod tests {
     /// run = the plumbing works end-to-end *until* the entitlement
     /// check.
     #[test]
-    #[ignore = "requires a kernel + rootfs file present on disk; \
-                ignored by default. Run with --ignored on a host that \
-                has `just pull-kernel` + `just bake-demo` artifacts."]
+    #[ignore = "requires a kernel + rootfs FILE present on disk (any bytes — \
+                CI touches an empty /tmp/engram-vz-rootfs.ext4); run with \
+                --ignored after `just pull-kernel`."]
     fn config_validation_surfaces_clear_error_without_entitlement() {
         let kernel =
             std::path::PathBuf::from(std::env::var("ENGRAM_VZ_KERNEL_PATH").unwrap_or_else(|_| {
