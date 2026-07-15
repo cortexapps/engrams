@@ -1672,6 +1672,33 @@ async fn resume_from_fc_snapshot(
     // ADR 0045 D4: hand the host the image's base manifest so resumed
     // sessions share the per-image base shm with fresh creates.
     let base_memory_manifest = base_memory_manifest_for_image(state, &session.image).await;
+    // ADR 0095: peer-fill hint — if the snapshot host is alive and
+    // wire-compatible, tell the destination where the chunks are
+    // resident. Stamped unconditionally BEFORE placement (the pick
+    // happens inside restore_for_session): an affinity-host landing
+    // makes the destination's pre-pass a no-op stat walk, a cross-host
+    // landing pulls the divergent set over the LAN, and a dead/absent
+    // source leaves the hint empty ⇒ the pure-GCS path, unchanged.
+    // Best-effort by contract: any lookup failure degrades to no hint.
+    let peer_hints = match record.host_id {
+        Some(source) => match state.services.meta.list_active_hosts().await {
+            Ok(hosts) => {
+                let now = Utc::now();
+                let ttl = crate::placement::placement_ttl();
+                hosts
+                    .iter()
+                    .find(|h| h.id == source)
+                    .and_then(|h| crate::placement::host_can_serve_chunks(h, now, ttl))
+                    .map(|addr| vec![addr.to_string()])
+                    .unwrap_or_default()
+            }
+            Err(e) => {
+                tracing::debug!(%id, error = %e, "resume: host lookup for peer hint failed; no hint");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
     let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
         id: record.id,
         size_bytes: record.size_bytes,
@@ -1703,6 +1730,8 @@ async fn resume_from_fc_snapshot(
         aux_bundles: record.aux_bundles.clone(),
         // Issue #529: restore-side reconstruction, not a fresh capture.
         paused_at: None,
+        // ADR 0095: assembled above — the live snapshot host, or empty.
+        peer_hints,
     };
     // ADR 0079: the restore step boundary — a live VM exists from here.
     if !op_ctx.step("restore").await {

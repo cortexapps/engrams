@@ -409,6 +409,28 @@ pub async fn evacuate_dead_source(
                 },
                 _ => None,
             };
+            // ADR 0095: the snapshot-rehome leg of an evacuation is
+            // exactly the peer-fill case — the capturing host is
+            // draining (cordoned) but ALIVE, one LAN hop away, with the
+            // whole divergent set on its NVMe. Hint it
+            // (`host_can_serve_chunks` deliberately ignores the
+            // cordon); a dead source degrades to the GCS path.
+            let peer_hints = match s.host_id {
+                Some(src) => match meta.list_active_hosts().await {
+                    Ok(hosts) => {
+                        let now = chrono::Utc::now();
+                        let ttl = crate::placement::placement_ttl();
+                        hosts
+                            .iter()
+                            .find(|h| h.id == src)
+                            .and_then(|h| crate::placement::host_can_serve_chunks(h, now, ttl))
+                            .map(|addr| vec![addr.to_string()])
+                            .unwrap_or_default()
+                    }
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            };
             let metadata = SnapshotMetadata {
                 migration_source: None,
                 id: s.id,
@@ -428,6 +450,8 @@ pub async fn evacuate_dead_source(
                 aux_bundles: s.aux_bundles.clone(),
                 // Issue #529: restore-side reconstruction, not a fresh capture.
                 paused_at: None,
+                // ADR 0095: assembled above — the draining source, or empty.
+                peer_hints,
             };
             target_backend
                 .restore(metadata, fence)
@@ -568,6 +592,7 @@ mod tests {
                 working_set_blob_key: None,
                 aux_bundles: vec![],
                 paused_at: None,
+                peer_hints: Vec::new(),
             })
         }
         async fn commit_snapshot(

@@ -31,12 +31,12 @@ use engram_protocol::grpc::{
     InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
     MaterializeImageFailed, MaterializeImageRequest, MaterializeProgress, MigrationCaptureResponse,
     MigrationExportRef, MigrationFetchRequest, MigrationFrame, MigrationPresetupResponse,
-    PostCopyCaptureResponse, ProbeSandboxResponse, ProxyPortData, ProxyPortMessage,
-    ProxyShellBinary, ProxyShellClose, ProxyShellMessage, ProxyShellPing, ProxyShellPong,
-    ProxyShellText, ReapMaterializeDirRequest, ReapMaterializeDirResponse,
-    RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage, SendHarnessPromptRequest,
-    SendHarnessToolResultRequest, SnapshotBeginResponse, SnapshotResponse, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    PeerChunkFrame, PeerChunkGetRequest, PostCopyCaptureResponse, ProbeSandboxResponse,
+    ProxyPortData, ProxyPortMessage, ProxyShellBinary, ProxyShellClose, ProxyShellMessage,
+    ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
+    ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
+    SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
 };
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use futures::Stream;
@@ -71,6 +71,11 @@ pub struct HostServiceImpl {
     /// ADR 0079: per-session fencing-epoch high-water, durable under
     /// work_dir. Gates every session-scoped lifecycle RPC.
     epochs: SessionEpochStore,
+    /// ADR 0095: the standing peer-chunk serve state (cache + readiness
+    /// view + stream semaphore). `None` on cache-less hosts (Process
+    /// backend), which answer `unavailable` — host infrastructure, not
+    /// sandbox lifecycle, so it lives here rather than on `HostClient`.
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
 }
 
 impl HostServiceImpl {
@@ -79,11 +84,17 @@ impl HostServiceImpl {
             inner,
             admin: None,
             epochs,
+            peer: None,
         }
     }
 
     pub fn with_admin_handler(mut self, admin: Arc<dyn HostAdminHandler>) -> Self {
         self.admin = Some(admin);
+        self
+    }
+
+    pub fn with_peer_serve(mut self, peer: Arc<crate::peer_fill::PeerServe>) -> Self {
+        self.peer = Some(peer);
         self
     }
 
@@ -163,10 +174,14 @@ pub async fn boot(
     inner: Arc<dyn HostClient>,
     admin: Option<Arc<dyn HostAdminHandler>>,
     epochs: SessionEpochStore,
+    peer: Option<Arc<crate::peer_fill::PeerServe>>,
 ) -> Result<(), tonic::transport::Error> {
     let mut svc = HostServiceImpl::new(inner, epochs);
     if let Some(a) = admin {
         svc = svc.with_admin_handler(a);
+    }
+    if let Some(p) = peer {
+        svc = svc.with_peer_serve(p);
     }
     tracing::info!(addr = %listen_addr, "gRPC HostService listening");
     tonic::transport::Server::builder()
@@ -174,7 +189,16 @@ pub async fn boot(
         // one TCP connection per coord pod. 256 is well above the
         // running_sandboxes ceiling — we don't expect to hit it.
         .concurrency_limit_per_connection(256)
-        .add_service(HostServiceServer::new(svc))
+        // ADR 0095: peer-chunk pulls move MiB-scale frames between
+        // hosts; tonic's default 64 KiB stream / 1 MiB connection
+        // windows cap a stream at ~20 MB/s (the teleport transport's
+        // measured artifact). Large static windows + adaptive flow
+        // control lift the serve side to NIC/NVMe rate; coord-side
+        // control RPCs are unaffected (windows are ceilings).
+        .initial_stream_window_size(Some(16 * 1024 * 1024))
+        .initial_connection_window_size(Some(32 * 1024 * 1024))
+        .http2_adaptive_window(Some(true))
+        .add_service(HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024))
         .serve(listen_addr)
         .await
 }
@@ -422,6 +446,63 @@ impl HostService for HostServiceImpl {
                 .map_err(sandbox_to_status)
         });
         Ok(Response::new(Box::pin(mapped)))
+    }
+
+    type PeerChunkGetStream =
+        Pin<Box<dyn Stream<Item = Result<PeerChunkFrame, Status>> + Send + 'static>>;
+
+    /// ADR 0095: the standing peer-chunk tier's serve arm. Streams
+    /// cache-resident, verified-origin chunks by hash; see the proto
+    /// comment for the full contract. Deliberately NOT fenced and NOT
+    /// wire-version gated at the session level — host-to-host, no
+    /// session writes, pure content-addressed reads.
+    async fn peer_chunk_get(
+        &self,
+        req: Request<PeerChunkGetRequest>,
+    ) -> Result<Response<Self::PeerChunkGetStream>, Status> {
+        use engram_protocol::grpc::peer_chunk_get_request::Scope;
+        let Some(peer) = self.peer.clone() else {
+            return Err(Status::unavailable(
+                "peer-chunk tier disabled: no chunk cache on this host",
+            ));
+        };
+        let req = req.into_inner();
+        // Scope: BaseImage is validated against this host's ready set
+        // (reject ⇒ the coordinator's hint was stale — requester falls
+        // to GCS); Snapshot is counted as-is (no authoritative local
+        // snapshot index; hash-capability + resident-only is the gate).
+        match &req.scope {
+            Some(Scope::BaseImageDigest(digest)) => {
+                let digest = engram_protocol::heartbeat::ManifestDigest(digest.clone());
+                if !peer.ready.contains(&digest) {
+                    metrics::counter!(
+                        "engram_peer_serve_total",
+                        "outcome" => "scope_reject",
+                    )
+                    .increment(1);
+                    return Err(Status::failed_precondition(format!(
+                        "image {} not ready on this host",
+                        digest.0
+                    )));
+                }
+            }
+            Some(Scope::SnapshotId(_)) | None => {}
+        }
+        let hashes =
+            crate::peer_fill::parse_request_hashes(&req).map_err(Status::invalid_argument)?;
+        let Some(permit) = peer.try_claim_stream() else {
+            return Err(Status::resource_exhausted(
+                "peer serve streams saturated (backpressure — source this batch from GCS)",
+            ));
+        };
+        // Channel depth 4 ≈ 16 MiB in flight per stream at 4 MiB
+        // frames — enough to keep the socket busy without buffering
+        // whole chunks per item.
+        let (tx, rx) = mpsc::channel(4);
+        tokio::spawn(peer.stream_frames(hashes, tx, permit));
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(rx),
+        )))
     }
 
     async fn migration_commit(

@@ -254,6 +254,7 @@ async fn cancelled_restore_keeps_the_daemon_and_slot() {
         working_set_blob_key: None,
         aux_bundles: vec![],
         paused_at: None,
+        peer_hints: Vec::new(),
     };
 
     // Run `restore` in a task and CANCEL it (abort) once the NBD attach has

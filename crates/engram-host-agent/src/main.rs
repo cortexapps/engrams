@@ -218,7 +218,7 @@ async fn main() -> Result<(), HostAgentError> {
     let cli = Cli::parse();
 
     // ADR 0070: dedicated-volume mountpoint gate. When the chart pairs
-    // `storage.dedicatedDevice` with `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT
+    // `storage.dedicatedDevices` with `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT
     // =true`, `work_dir` MUST resolve to a distinct filesystem from the
     // boot-disk reference path (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`
     // — bare metal only; the chart points this at a read-only hostPath
@@ -813,7 +813,7 @@ const HOST_ROOT_REF_PATH_ENV_VAR: &str = "ENGRAM_HOST_ROOT_REF_PATH";
 /// (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`) — i.e. a dedicated volume
 /// is actually mounted there, not just a directory on the boot disk.
 /// The chart sets `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` only when
-/// `storage.dedicatedDevice` is configured, so this is a paired guard:
+/// `storage.dedicatedDevices` is configured, so this is a paired guard:
 /// "you told me to expect a dedicated volume; prove it's mounted before
 /// I start writing to it."
 ///
@@ -870,7 +870,7 @@ fn require_work_dir_mountpoint_or_exit(work_dir: &std::path::Path) -> Result<(),
         return Err(HostAgentError::Config(format!(
             "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but {} is on the SAME filesystem as the \
              boot-disk reference path {} (st_dev {work_dev} == {root_dev}) — the dedicated \
-             volume isn't mounted there yet (or storage.dedicatedDevice is misconfigured). \
+             volume isn't mounted there yet (or storage.dedicatedDevices is misconfigured). \
              Refusing to start: coming up on the boot disk here would silently defeat the whole \
              point of the dedicated volume — cache/snapshot/memfile writes would count against \
              the SAME kubelet nodefs signal ADR 0070's headroom gauge and budget exist to keep \

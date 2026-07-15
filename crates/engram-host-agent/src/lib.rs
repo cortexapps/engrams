@@ -39,6 +39,7 @@ pub mod harness;
 pub mod host_client;
 pub mod migrate_peer;
 pub mod migration;
+pub mod peer_fill;
 pub mod session_epochs;
 pub mod substrate_server;
 pub use host_client::LocalHostClient;
@@ -1038,6 +1039,30 @@ impl HostAgent {
                 }));
             }
 
+            // ADR 0095: shared "which images is this host ready to
+            // serve" view — written by the prefetch supervisor (spawned
+            // below), read by the heartbeat builder AND the peer-chunk
+            // serve arm's BaseImage scope check. Created here because
+            // the gRPC server needs it before the supervisor exists.
+            let readiness = image_prefetch::ImageReadiness::new();
+
+            // ADR 0095: the standing peer-chunk tier — serve state for
+            // the gRPC arm (cache-less hosts serve nothing and answer
+            // `unavailable`), plus the background scrubber that drains
+            // the unverified-origin backlog bulk peer pulls create.
+            let peer_serve = self
+                .chunk_cache
+                .clone()
+                .map(|cache| peer_fill::PeerServe::new(cache, readiness.clone()));
+            let _scrubber_task = self.chunk_cache.as_ref().map(|cache| {
+                let bps = std::env::var("ENGRAM_CHUNK_SCRUB_BPS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or(256 * 1024 * 1024);
+                cache.spawn_scrubber(bps)
+            });
+
             // ADR 0013: boot the gRPC HostService server. The
             // coord's GrpcHostPool dials this address (populated
             // via /api/hosts/register) to dispatch coord→host
@@ -1046,6 +1071,7 @@ impl HostAgent {
             let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
                 let local_for_grpc = local_host.clone();
                 let admin_for_grpc = admin_handler.clone();
+                let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
                 // durable under work_dir like the binding records.
                 let epochs = session_epochs::SessionEpochStore::open(
@@ -1053,8 +1079,14 @@ impl HostAgent {
                 )
                 .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        grpc_server::boot(addr, local_for_grpc, admin_for_grpc, epochs).await
+                    if let Err(e) = grpc_server::boot(
+                        addr,
+                        local_for_grpc,
+                        admin_for_grpc,
+                        epochs,
+                        peer_for_grpc,
+                    )
+                    .await
                     {
                         tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
                     }
@@ -1097,12 +1129,12 @@ impl HostAgent {
             // ADR 0015 M5: image-prefetch supervisor. Watches the
             // heartbeat-ack's `enabled_images` set and pulls the
             // chunked rootfs for any image not yet local on this
-            // host. Updates the shared `ImageReadiness` which the
-            // heartbeat builder reads to populate `ready_images`.
-            // Spawned only when chunk_store + image_cache are wired
-            // (production hosts; dev-process backend lacks both and
-            // simply never reports ready).
-            let readiness = image_prefetch::ImageReadiness::new();
+            // host. Updates the shared `ImageReadiness` (created above
+            // with the peer-serve state) which the heartbeat builder
+            // reads to populate `ready_images`. Spawned only when
+            // chunk_store + image_cache are wired (production hosts;
+            // dev-process backend lacks both and simply never reports
+            // ready).
             // The heartbeat's `stages_images` field (below) must exactly
             // track whether the supervisor spawn below actually happens —
             // derive both from the same pure gate rather than letting

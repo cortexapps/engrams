@@ -348,6 +348,25 @@ pub fn host_is_schedulable(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) ->
             )
 }
 
+/// ADR 0095: a host that may SERVE chunks to a fleet peer — alive
+/// (Ready + heartbeat-fresh), wire-compatible, with a dialable addr.
+/// Deliberately NOT [`host_is_schedulable`]: a coordinator-cordoned
+/// host mid-drain is often the one host that HOLDS the bytes (the
+/// evacuation source; the resume source during a roll) and serving
+/// reads costs it nothing schedulability protects. Returns the addr on
+/// success so call sites can't forget the addr-present check.
+pub fn host_can_serve_chunks(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> Option<&str> {
+    let fresh = now
+        .signed_duration_since(h.last_heartbeat_at)
+        .to_std()
+        .map_or(true, |age| age <= ttl);
+    if h.status == HostStatus::Ready && fresh && host_wire_version_ok(h) {
+        h.host_addr.as_deref()
+    } else {
+        None
+    }
+}
+
 fn host_passes_filters(
     h: &HostRecord,
     ctx: &ScheduleContext<'_>,

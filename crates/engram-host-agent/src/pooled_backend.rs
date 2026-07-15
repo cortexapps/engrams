@@ -460,6 +460,10 @@ pub struct PooledBackend {
     /// to the OCI-pulled `rootfs.ext4` (transitional path; retired
     /// in Phase 6).
     chunk_store: Option<ChunkStore>,
+    /// ADR 0095: requester-side peer health for the resume peer-fill
+    /// arm — one per backend so a lost peer is skipped across every
+    /// resume on this host for the lost-window.
+    peer_health: std::sync::Arc<crate::peer_fill::PeerHealth>,
     /// Per-host directory where chunked manifests are materialized.
     /// `Some` iff `chunk_store` is. Files inside are named by
     /// `manifest_id`-`version` so two sessions hitting the same
@@ -1705,6 +1709,7 @@ impl PooledBackend {
             quarantined_survivors: Arc::new(DashMap::new()),
             unreachable_guests: Arc::new(DashMap::new()),
             chunk_store: None,
+            peer_health: crate::peer_fill::PeerHealth::new(),
             materialize_dir: None,
             bundle_dir,
             chunk_cache: None,
@@ -2350,6 +2355,84 @@ impl PooledBackend {
         // Stable: non-hot chunks keep their relative manifest order.
         remaining.sort_by_key(|h| rank.get(h.as_bytes()).copied().unwrap_or(usize::MAX));
         remaining
+    }
+
+    /// ADR 0095: the peer-hinted resume pre-pass — land this snapshot's
+    /// locally-missing chunk set (memory + disk session manifests,
+    /// `contains_on_disk`-filtered, which also elides the pinned image
+    /// base) from the hinted sibling before the guest resumes. Wholly
+    /// best-effort: any shortfall simply leaves those chunks to the
+    /// fault path, which resolves local → GCS exactly as before this
+    /// ADR. No hot-first rider here — the coordinator has no
+    /// working-set trace for an ordinary resume (the per-host traces
+    /// are dest-local and this dest never ran the session), so
+    /// manifest order stands, memory first (the wake-up set lives
+    /// there).
+    async fn peer_resume_prepass(&self, metadata: &SnapshotMetadata) {
+        use engram_protocol::grpc_client::PeerChunkScope;
+        let (Some(store), Some(cache)) = (self.chunk_store.clone(), self.chunk_cache.clone())
+        else {
+            return;
+        };
+        let mut want: Vec<engram_chunk_store::manifest::ChunkHash> = Vec::new();
+        for manifest_ref in [metadata.memory_manifest, metadata.disk_manifest]
+            .into_iter()
+            .flatten()
+        {
+            match store.get_manifest(manifest_ref).await {
+                Ok(m) => want.extend(m.chunks.iter().map(|c| c.hash)),
+                Err(e) => {
+                    tracing::warn!(
+                        ?manifest_ref,
+                        error = %e,
+                        "peer resume pre-pass: manifest load failed; skipping tier",
+                    );
+                    return;
+                }
+            }
+        }
+        let mut missing = Vec::with_capacity(want.len());
+        let mut seen = std::collections::HashSet::with_capacity(want.len());
+        for h in want {
+            if seen.insert(h) && !cache.contains_on_disk(h) {
+                missing.push(h);
+            }
+        }
+        if missing.is_empty() {
+            return; // affinity-host resume: everything already local
+        }
+        let scope = PeerChunkScope::Snapshot(metadata.id);
+        let total = missing.len();
+        let started = std::time::Instant::now();
+        for addr in metadata.peer_hints.iter().take(2) {
+            let stats = crate::peer_fill::pull_chunks_from_peer(
+                addr,
+                scope.clone(),
+                &missing,
+                &cache,
+                &self.peer_health,
+            )
+            .await;
+            tracing::info!(
+                snapshot_id = %metadata.id,
+                peer = %addr,
+                landed = stats.landed,
+                landed_bytes = stats.landed_bytes,
+                missing_on_peer = stats.missing,
+                failed = stats.failed,
+                backpressure = stats.backpressure,
+                of = total,
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                "peer resume pre-pass window complete (ADR 0095)",
+            );
+            if !stats.failed {
+                return;
+            }
+            missing.retain(|h| !cache.contains_on_disk(*h));
+            if missing.is_empty() {
+                return;
+            }
+        }
     }
 
     /// ADR 0045 C1: pull a chunk set from a live migration export over
@@ -7381,6 +7464,19 @@ impl SandboxBackend for PooledBackend {
                     }
                 }
             }
+        } else if !metadata.peer_hints.is_empty() {
+            // ADR 0095: peer-hinted ordinary resume — the coordinator
+            // says a live sibling (the snapshot host) holds this
+            // session's chunks on NVMe. Land the locally-missing set
+            // BEFORE the guest resumes, synchronously, for exactly the
+            // reason the C1 migration arm above does: the background
+            // version loses the race and the wake-up working set then
+            // faults at GCS round-trip speed. On the affinity host the
+            // missing set is empty (everything resident) and this arm
+            // is a stat walk; on a dead/saturated peer the pull
+            // degrades per the bounded-dial contract and the remainder
+            // faults via GCS — today's path, unchanged.
+            self.peer_resume_prepass(&metadata).await;
         }
         let memory_ref = metadata.memory_manifest;
         let row_template = migration.as_ref().map(|_| metadata.clone());
@@ -9118,6 +9214,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -9592,6 +9689,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -9729,6 +9827,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -9908,6 +10007,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -9956,6 +10056,7 @@ mod tests {
                 working_set_blob_key: None,
                 aux_bundles: vec![],
                 paused_at: None,
+                peer_hints: Vec::new(),
             }
         }
 
@@ -10953,6 +11054,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -11093,6 +11195,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -11233,6 +11336,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -11469,6 +11573,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         };
         pooled.restore(metadata.clone()).await.unwrap();
 
@@ -11599,6 +11704,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         };
         let _ = pooled.restore(metadata).await;
         let after = tokio::fs::read(snap_dir.join("memory.bin")).await.unwrap();
@@ -12397,6 +12503,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 })
             }
             fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
@@ -12667,6 +12774,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: Vec::new(),
             paused_at: None,
+            peer_hints: Vec::new(),
         }
     }
 
@@ -12973,6 +13081,7 @@ mod tests {
                 working_set_blob_key: None,
                 aux_bundles: vec![],
                 paused_at: None,
+                peer_hints: Vec::new(),
             })
         }
         fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {

@@ -57,6 +57,7 @@ rustls.workspace = true
 sha2.workspace = true
 chrono.workspace = true
 clap.workspace = true
+crc32c.workspace = true
 dashmap.workspace = true
 futures.workspace = true
 futures-util.workspace = true

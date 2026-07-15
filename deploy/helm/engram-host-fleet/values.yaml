@@ -151,12 +151,17 @@ storage:
   # Confirm and adjust here before treating the headroom gauge's alarm
   # threshold as trustworthy.
   kubeletEvictPct: 10
-  # ADR 0070: mount workDirHostPath on its own block device instead of
-  # sharing the node boot disk. "" (default) = today's behavior — a
-  # hostPath directory on the root filesystem. When set to a device path
-  # (e.g. /dev/nvme1n1, a GKE local-SSD raw-block device), node-prep
-  # formats it (idempotent — only if unformatted) and mounts it at
-  # workDirHostPath, and the host-agent DaemonSet gets
+  # ADR 0070: mount workDirHostPath on its own block device(s) instead of
+  # sharing the node boot disk. [] (default) = today's behavior — a
+  # hostPath directory on the root filesystem. With ONE device path
+  # (e.g. a GKE local-SSD raw-block device,
+  # /dev/disk/by-id/google-local-ssd-block0), node-prep formats it
+  # (idempotent — only if unformatted) and mounts it at workDirHostPath.
+  # With SEVERAL, node-prep first stripes them into a RAID0 md array
+  # (/dev/md/engram-work, mdadm from the HOST's PATH — GKE COS ships it;
+  # this is GKE's own documented raw-block pattern,
+  # gke-daemonset-raid-disks.yaml) and formats + mounts the array
+  # instead. Either way the host-agent DaemonSet gets
   # ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT=true + a read-only hostPath mount
   # of the NODE's `/` at /mnt/host-root (ENGRAM_HOST_ROOT_REF_PATH) —
   # refuses to start unless workDirHostPath is actually a distinct
@@ -168,9 +173,14 @@ storage:
   # boot disk. This moves ACCOUNTING, not
   # bytes: the dedicated disk still fills, and the budget above (not
   # this) is the mechanism that keeps the fleet off the kubelet's
-  # eviction line. Nodepool provisioning of the device itself (e.g. a
-  # Terraform local-SSD flag) is out of scope for this chart.
-  dedicatedDevice: ""
+  # eviction line. Nodepool provisioning of the devices themselves (e.g.
+  # a Terraform local-SSD flag) is out of scope for this chart. NOTE:
+  # local-SSD data does NOT survive node deletion/recreation — everything
+  # under workDirHostPath must be (and is) reconstructible: the chunk
+  # cache refills from the blob store, bundles are re-staged by the
+  # stage-node-assets init container on every pod start, and the HostId
+  # is re-seeded deterministically from the node name.
+  dedicatedDevices: []
 
 nbd:
   # ADR 0049: warm-pool slot allocator. node-prep loads the nbd module

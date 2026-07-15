@@ -108,6 +108,19 @@ pub struct SnapshotMetadata {
     /// path falls back to `now`, unchanged from today).
     #[serde(default)]
     pub paused_at: Option<DateTime<Utc>>,
+    /// ADR 0095 (wire v16): fleet siblings believed to hold this
+    /// snapshot's chunks on NVMe — peer-fill hints for the restore
+    /// DESTINATION (≤2 gRPC addrs; `[0]` is the snapshot host).
+    /// Stamped by the coordinator's resume assembler only when the
+    /// restore lands cross-host with a live, wire-compatible source;
+    /// empty ⇒ pure-GCS restore, byte-identical to pre-0095. The
+    /// destination bulk-pulls the divergent set hot-first before the
+    /// VM starts and arms the fault-time peer tier for the tail; every
+    /// peer failure degrades to GCS within the bounded-dial contract.
+    /// Deliberately NOT `MigrationSourceInfo` — no export, no seal, no
+    /// registry: the chunks are already durable and hash-addressed.
+    #[serde(default)]
+    pub peer_hints: Vec<String>,
 }
 
 /// Persisted row in the `snapshots` table.

@@ -314,6 +314,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         working_set_blob_key: None,
         aux_bundles: checkpoint.aux_bundles.clone(),
         paused_at: Some(checkpoint.paused_at),
+        peer_hints: Vec::new(),
     };
     let restored = pooled_b
         .restore(metadata)

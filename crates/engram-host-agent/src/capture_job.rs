@@ -769,6 +769,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 },
                 cold_base: None,
             })
