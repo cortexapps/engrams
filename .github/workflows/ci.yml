@@ -1944,6 +1944,10 @@ jobs:
           key: vz-test-artifacts-${{ hashFiles('crates/engram-sandbox-vz/scripts/pull-kernel.sh', 'crates/engram-sandbox-vz/scripts/make-test-rootfs.sh') }}
       - name: Pull VZ kernel (engram arm64 Image, ADR 0096)
         if: always()
+        # GH_TOKEN: the kernel is a private release asset fetched via `gh`
+        # (same as the FC lane's fetch-fc-test-artifacts step).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
       - name: Stage rootfs placeholder (for the non-booting config-validation test)
         if: always()
@@ -1970,6 +1974,9 @@ jobs:
           # the brew tap installs aarch64-unknown-linux-musl-gcc. Env overrides
           # the config linker for this step only.
           CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-unknown-linux-musl-gcc
+          # vz-e2e depends on pull-kernel (a no-op when the step above
+          # cached it, but `gh` still needs the token on a cache miss).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: just vz-e2e
       - name: Workspace check (catches downstream-of-VZ regressions)
         if: always()
