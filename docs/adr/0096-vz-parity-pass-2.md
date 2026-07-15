@@ -1,6 +1,15 @@
 # ADR 0096: VZ ↔ FC parity, pass 2 — close the drift, harden the loop
 
-Status: 2026-07-15 — **Proposed.**
+Status: 2026-07-15 — **Accepted.** Landed as one PR (single-PR by explicit
+choice for this pass); every decision below shipped and is pinned by the
+live `just vz-e2e` suite (8/8 booting-VM tests green on an M-series dev
+machine, on the owned kernel). See § Commit chain. Two follow-ups remain
+open: (1) the arm64 kernel release asset must be published by dispatching
+`build-fc-kernel.yml` once (a locally-built binary was deliberately NOT
+uploaded to the shared release); until then `just pull-kernel` 404s on
+machines without a cached kernel. (2) The D7 spike answered NO — Apple's
+machine-state restore is still broken on macOS 26 (see snapshot.rs) — so
+the D7 productization path stays closed.
 
 Builds on ADR 0003 (the VZ backend), ADR 0024 (unified dev orchestration), and
 ADR 0032 (parity pass 1, June 2026). Supersedes ADR 0061's "a custom VZ kernel is
@@ -172,4 +181,35 @@ guest-internal usage) is specced in the survey if ever wanted.
 
 ## Commit chain
 
-(Filled in as the work lands; flipped to Accepted at the end.)
+One PR, in landing order:
+
+1. `dev: capability-probe the backend fallback` — D1 (detect-backend.sh
+   probes `/dev/kvm` rw + `kern.hv_support`; degrade → process/mode=all).
+2. `vz: fix the codesign/run contract` — the nextest-shape build, the nix
+   `file(1)` word-order bug that signed NOTHING in the dev shell, native
+   `--run-ignored`.
+3. `vz: re-resolve symbolic bundle slots on restore` — the resume
+   cold-boot booted bundle-less and panicked init.
+4. `vz: serve the forge broker on vsock 1028` — D4; forge_delivery
+   mirrors upload byte-for-byte.
+5. `vz: self-staging live e2e — 'just vz-e2e'` — D3 (mk-test-rootfs via
+   mkext4 + Alpine minirootfs, vz-test-bundles, ENGRAM_VZ_REQUIRE,
+   doc-rot sweep).
+6. `host-agent: real memory capacity on macOS via hw.memsize` — D4
+   (unblocks the rung-2 headroom gate).
+7. `host-agent: substrate populate server only on FC` — hygiene.
+8. `ci: live VZ e2e in the vz lane when the runner has a hypervisor` —
+   D3 (kern.hv_support probe; loud skip otherwise).
+9. `vz: real external pause/resume` — D4 (idempotent VzVm pause/resume +
+   state(); parked snapshot neither flushes nor un-parks).
+10. `vz: crash detection via a VZVirtualMachineDelegate shim` — D4
+    (dead flag; list() ground truth; probe_sandbox override).
+11. `vz: machine-state save/restore spike` — D7 outcome: STILL broken on
+    macOS 26 with a pinned machine identifier and a validator-approved
+    config; probe stays in-tree.
+12. `vz: own the guest kernel; retire the erofs bundle fork` — D5
+    (Image-engram arm64 boots VZ as-is; bundles-vz deleted; squashfs
+    everywhere; build-fc-kernel.yml arch matrix).
+13. `vz: soft egress steering` — D6 (ENGRAM_EGRESS cmdline → init-shim
+    DNAT to the proxy at the NAT gateway; SNI-dial compatible; soft by
+    design and said so).
