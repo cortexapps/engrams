@@ -50,13 +50,16 @@ export function splitHosts(text: string): string[] {
 export function secretRowsToWire(rows: SecretRow[]): ProfileSecretValue[] {
   return rows
     .filter((r) => r.ref.trim())
-    .map((r) => ({
-      ref: r.ref.trim(),
-      envVar: r.envVar.trim(),
-      mode: r.mode,
-      allowHosts: r.mode === "broker" ? splitHosts(r.allowHostsText) : [],
-      allowHostPatterns: [],
-    }));
+    .map((r) => {
+      const entries = r.mode === "broker" ? splitHosts(r.allowHostsText) : [];
+      return {
+        ref: r.ref.trim(),
+        envVar: r.envVar.trim(),
+        mode: r.mode,
+        allowHosts: entries.filter((h) => !h.startsWith("*.")),
+        allowHostPatterns: entries.filter((h) => h.startsWith("*.")),
+      };
+    });
 }
 
 /** Wire ProfileSecret[] → editor rows (hydrate on edit). */
@@ -66,6 +69,7 @@ export function wireToSecretRows(
     envVar: string;
     mode: string;
     allowHosts: string[];
+    allowHostPatterns?: string[];
   }>,
 ): SecretRow[] {
   return secrets.map((s) => ({
@@ -73,7 +77,7 @@ export function wireToSecretRows(
     ref: s.ref,
     envVar: s.envVar,
     mode: s.mode === "literal" ? "literal" : "broker",
-    allowHostsText: (s.allowHosts ?? []).join(", "),
+    allowHostsText: [...(s.allowHosts ?? []), ...(s.allowHostPatterns ?? [])].join(", "),
   }));
 }
 

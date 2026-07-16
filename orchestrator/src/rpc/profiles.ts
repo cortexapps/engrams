@@ -255,6 +255,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     return harness;
   }
 
+  /** Optional proto strings may arrive as ""; normalize catalog selections before validation. */
+  function catalogOptionId(value: string | undefined): string | null {
+    return value?.trim() || null;
+  }
+
   /**
    * ADR 0055 P2: validate selected skills against builtins ∪ the live upload
    * catalog (like image_id). The coordinator re-checks at session-create, but
@@ -331,7 +336,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
-      const harness = await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
+      const model = catalogOptionId(req.model);
+      const effort = catalogOptionId(req.effort);
+      const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
@@ -351,8 +358,8 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         secrets,
         isDefault: req.isDefault,
         harness,
-        model: req.model ?? null,
-        effort: req.effort ?? null,
+        model,
+        effort,
         portExposures: req.portExposures ?? [],
       });
       return { profile: toProto(row, true) };
@@ -364,7 +371,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
       if (!req.name.trim()) throw new ConnectError("name is required", Code.InvalidArgument);
       await assertImageEnabled(req.imageId);
-      const harness = await assertHarnessValid(req.harness ?? null, req.model ?? null, req.effort ?? null);
+      const model = catalogOptionId(req.model);
+      const effort = catalogOptionId(req.effort);
+      const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
       assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
       const network = normalizeNetwork(req.network);
@@ -384,8 +393,8 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         secrets,
         isDefault: req.isDefault,
         harness,
-        model: req.model ?? null,
-        effort: req.effort ?? null,
+        model,
+        effort,
         portExposures: req.portExposures ?? [],
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
