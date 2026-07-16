@@ -271,7 +271,7 @@ async fn advance_one_claimed(
                         SessionEvent::StatusChanged {
                             from: prev,
                             to: SessionState::Idle,
-                            at: Utc::now(),
+                            at: state.services.clock.now_utc(),
                         },
                     )
                     .await;
@@ -352,7 +352,7 @@ async fn run_resume_pipeline(
     // pin so this evacuation degrades to default capacity-ranked placement.
     let require_host = match state.services.meta.get_teleport_target(session_id).await {
         Ok(Some((host, set_at))) => {
-            if teleport_pin_aged(set_at, Utc::now()) {
+            if teleport_pin_aged(set_at, state.services.clock.now_utc()) {
                 tracing::warn!(
                     %session_id,
                     stale_target = %host,
@@ -390,6 +390,7 @@ async fn run_resume_pipeline(
         // host, migration parachute) is moving AWAY from the source.
         None,
         fence,
+        state.services.clock.now_utc(),
     )
     .await
     {
@@ -425,7 +426,7 @@ async fn run_resume_pipeline(
                             SessionEvent::StatusChanged {
                                 from: prev,
                                 to: target,
-                                at: Utc::now(),
+                                at: state.services.clock.now_utc(),
                             },
                         )
                         .await;
@@ -473,7 +474,7 @@ async fn run_resume_pipeline(
             SessionEvent::StatusChanged {
                 from: SessionState::Evacuating,
                 to: SessionState::Created,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await;
@@ -539,6 +540,8 @@ async fn run_resume_pipeline(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     // The scanner's full loop exercises Postgres + HostRegistry +
     // finish_resume_to_active; the per-step plumbing is unit-tested
@@ -612,6 +615,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: tmp,

@@ -8,9 +8,8 @@
 //! see it too.
 
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use chrono::Utc;
 use engram_core::types::{ExecEvent, ExecRequest as SandboxExecRequest, ExecRusage};
 use engram_core::SessionId;
 use futures::stream::{Stream, StreamExt};
@@ -188,14 +187,14 @@ pub(crate) async fn exec_stream_core(
             SessionEvent::ExecStarted {
                 exec_id: exec_id.clone(),
                 command: argv.clone(),
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await?;
 
     let state_for_stream = state.clone();
     let exec_id_for_stream = exec_id.clone();
-    let started_at = Instant::now();
+    let started_at = state.services.clock.now_mono();
     let body = async_stream::stream! {
         let mut events = backend_stream.events;
         let mut exit_status = None;
@@ -230,7 +229,12 @@ pub(crate) async fn exec_stream_core(
             }
         }
         let rusage = ExecRusage {
-            wall_ms: started_at.elapsed().as_millis() as u64,
+            wall_ms: state_for_stream
+                .services
+                .clock
+                .now_mono()
+                .saturating_sub(started_at)
+                .as_millis() as u64,
             ..ExecRusage::default()
         };
         let _ = state_for_stream
@@ -238,7 +242,7 @@ pub(crate) async fn exec_stream_core(
                 exec_id: exec_id_for_stream.clone(),
                 exit_status,
                 rusage,
-                at: Utc::now(),
+                at: state_for_stream.services.clock.now_utc(),
             })
             .await
             .map_err(|e| tracing::warn!(error = %e, "exec_completed event persistence failed"));

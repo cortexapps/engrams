@@ -54,6 +54,12 @@ rust-version = "1.80"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+# ADR 0098 D1: crates that carry a clippy.toml `disallowed-methods` list
+# (coordinator, postgres) get direct time/uuid calls denied; crates
+# without one have an empty list, so this is a no-op for them.
+disallowed_methods = "deny"
+
 [workspace.dependencies]
 # kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
 # rustls (not openssl) to match reqwest's TLS choice; "latest" k8s-openapi

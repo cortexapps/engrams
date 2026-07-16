@@ -12,6 +12,9 @@
 //!     cargo test -p engram-coordinator --test snapshot_disk_manifest_persistence -- --ignored
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use chrono::Utc;

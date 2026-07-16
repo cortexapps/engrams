@@ -22,6 +22,9 @@
 //! in-memory `HashMap`s, so create/get/list/delete actually persist and
 //! the round-trip assertions are real.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -650,6 +653,8 @@ fn test_state(app_grpc_tokens: Vec<String>) -> (Arc<AppState>, Arc<MockMetadataS
         chunk_store: engram_chunk_store::ChunkStore::new(blob()),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),

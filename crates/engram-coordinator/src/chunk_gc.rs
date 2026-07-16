@@ -28,7 +28,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use engram_chunk_store::{ChunkHash, ChunkStore, GcError, PinSet};
 use engram_core::traits::{BlobStorage, MetadataStore};
 
@@ -167,6 +166,7 @@ pub async fn run_one_sweep(
         &state.services.chunk_store,
         cfg,
         mode,
+        &state.services.clock,
     )
     .await
 }
@@ -175,12 +175,21 @@ pub async fn run_one_sweep(
 /// SharedState-taking [`run_one_sweep`] above wraps this for the
 /// production callers; tests bypass the wrapper to build the
 /// services they need from a real PG pool + LocalBlobStorage.
+///
+/// `clock` is the sweep's time source (ADR 0098 D1: time is an
+/// injected input). The promote pass reads it FRESH, after the mark
+/// pass: candidates are stamped `first_seen_at DEFAULT now()` by PG
+/// during this same call, so a cutoff captured at sweep start would
+/// never see a same-sweep candidate as expired under zero grace.
+/// (The host-vs-PG cross-clock comparison predates this seam; D3's
+/// bind-param `now()` unifies it.)
 pub async fn run_one_sweep_inner(
     meta: Arc<dyn MetadataStore>,
     blob: Arc<dyn BlobStorage>,
     chunk_store: &ChunkStore,
     cfg: &ChunkGcConfig,
     mode: SweepMode,
+    clock: &Arc<dyn engram_core::traits::Clock>,
 ) -> Result<SweepReport, GcError> {
     let mut report = SweepReport::default();
 
@@ -253,8 +262,14 @@ pub async fn run_one_sweep_inner(
 
     // -------- promote pass (Full only) --------
     if mode == SweepMode::Full {
-        let (deletes, repinned, errors) =
-            promote_expired(meta.as_ref(), blob.as_ref(), chunk_store, cfg).await?;
+        let (deletes, repinned, errors) = promote_expired(
+            meta.as_ref(),
+            blob.as_ref(),
+            chunk_store,
+            cfg,
+            clock.now_utc(),
+        )
+        .await?;
         report.promoted_deletes = deletes;
         report.promote_repinned_skips = repinned;
         report.promote_delete_errors = errors;
@@ -273,8 +288,9 @@ async fn promote_expired(
     blob: &dyn BlobStorage,
     chunk_store: &ChunkStore,
     cfg: &ChunkGcConfig,
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<(usize, usize, usize), GcError> {
-    let cutoff = Utc::now()
+    let cutoff = now
         - chrono::Duration::from_std(cfg.grace_period)
             .unwrap_or_else(|_| chrono::Duration::seconds(86_400));
 
@@ -391,6 +407,7 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
             state.services.blob.clone(),
             &cfg,
             SweepMode::Full,
+            &state.services.clock,
         )
         .await
         {
@@ -419,6 +436,7 @@ pub async fn gc_sweep_loop(state: SharedState, cfg: ChunkGcConfig) {
             state.services.blob.clone(),
             &cfg,
             SweepMode::Full,
+            &state.services.clock,
         )
         .await
         {

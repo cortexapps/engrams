@@ -796,18 +796,25 @@ impl AppState {
         let bindings = engram_host_agent::bindings::BindingStore::open(bindings_dir)
             .expect("open coordinator binding store");
         let harness_hub = Arc::new(HarnessHub::new(
-            harness_event_sink(events.clone(), services.meta.clone()),
+            harness_event_sink(
+                events.clone(),
+                services.meta.clone(),
+                services.clock.clone(),
+            ),
             bindings,
         ));
         let reconciler =
             crate::reconcile::Reconciler::new(crate::reconcile::grace_ticks_from_env());
+        let boot_bundles = Arc::new(crate::boot_bundle::BootBundleCache::new(
+            services.clock.clone(),
+        ));
         Self {
             cfg,
             services,
             events,
             host_registry,
             harness_hub,
-            boot_bundles: Arc::new(crate::boot_bundle::BootBundleCache::new()),
+            boot_bundles,
             // ADR 0073: local fast-path wake for the outbox delivery
             // driver (the PG NOTIFY covers cross-pod).
             outbox_wake: Arc::new(tokio::sync::Notify::new()),
@@ -1045,7 +1052,8 @@ pub type SharedState = Arc<AppState>;
 /// `at` is the host's wall-clock at observation time, captured at
 /// the source and round-tripped through the WS. We forward it for
 /// future use (per-event timestamps on the persisted row); today the
-/// sink's `SessionEvent::from_harness` stamps its own `Utc::now()`
+/// sink's `SessionEvent::from_harness` stamps its own coordinator
+/// clock read (ADR 0098 D1: the injected `Clock`, not `Utc::now()`)
 /// because the persisted event row already has a `created_at`.
 pub async fn emit_harness_event(
     state: &SharedState,
@@ -1069,6 +1077,7 @@ pub async fn emit_harness_event(
 fn harness_event_sink(
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
+    clock: Arc<dyn engram_core::traits::Clock>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
     // to drop a `harness_idle` or `harness_parked` that would land
@@ -1079,6 +1088,7 @@ fn harness_event_sink(
     Arc::new(move |session_id, _sandbox_id, ev| {
         let events = events.clone();
         let meta = meta.clone();
+        let clock = clock.clone();
         let last_kind = last_kind.clone();
         Box::new(Box::pin(async move {
             // Forward every harness event into session_events for live
@@ -1086,7 +1096,7 @@ fn harness_event_sink(
             // auto-checkpoint branch this used to trigger on Idle /
             // RunCompleted; durability moved to hot+cold snapshots,
             // not git checkpoints.
-            let session_event = SessionEvent::from_harness(ev, Utc::now());
+            let session_event = SessionEvent::from_harness(ev, clock.now_utc());
             let kind = session_event.kind();
 
             // Issue #527 Phase 1: a run-started with a client prompt_id is
@@ -1349,6 +1359,8 @@ fn strip_jsonb_nul(v: &mut serde_json::Value) -> bool {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod tests {
     use super::*;
 
@@ -1936,6 +1948,8 @@ pub(crate) mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),
@@ -2777,7 +2791,11 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus.clone(), meta.clone());
+        let sink = super::harness_event_sink(
+            bus.clone(),
+            meta.clone(),
+            Arc::new(engram_core::traits::SystemClock::new()),
+        );
 
         // Three back-to-back idles: only the first should land.
         for _ in 0..3 {
@@ -2876,7 +2894,8 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus, meta);
+        let sink =
+            super::harness_event_sink(bus, meta, Arc::new(engram_core::traits::SystemClock::new()));
 
         sink(
             session_id,
@@ -2950,7 +2969,11 @@ pub(crate) mod tests {
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
         let events = Arc::new(SessionEventBus::new(8));
-        let sink = harness_event_sink(events, meta);
+        let sink = harness_event_sink(
+            events,
+            meta,
+            Arc::new(engram_core::traits::SystemClock::new()),
+        );
         let sandbox_id = engram_core::SandboxId::new();
 
         // A run_started carrying the outbox row's prompt_id retires that row.

@@ -153,7 +153,7 @@ pub async fn register(
         // first heartbeat.
         utilization: Default::default(),
         status: HostStatus::Ready,
-        last_heartbeat_at: Utc::now(),
+        last_heartbeat_at: state.services.clock.now_utc(),
         host_addr: Some(req.host_addr.clone()),
         // ADR 0047: scheduling state arrives with the first heartbeat.
         // NOTE: `upsert_host` deliberately does not write `cordoned` —
@@ -377,7 +377,7 @@ pub async fn register(
     );
 
     Ok(Json(RegisterResponse {
-        server_time: Utc::now(),
+        server_time: state.services.clock.now_utc(),
         coord_wire_version: engram_protocol::WIRE_VERSION,
         enabled_images,
         rehydrate_sandboxes,
@@ -770,8 +770,9 @@ pub async fn heartbeat(
     if !(enabled_images.is_empty() && prestage_images.is_empty()) {
         match state.services.meta.list_active_hosts().await {
             Ok(hosts) => {
-                attach_warm_peers(&mut enabled_images, &hosts, host_id);
-                attach_warm_peers(&mut prestage_images, &hosts, host_id);
+                let now = state.services.clock.now_utc();
+                attach_warm_peers(&mut enabled_images, &hosts, host_id, now);
+                attach_warm_peers(&mut prestage_images, &hosts, host_id, now);
             }
             Err(e) => {
                 tracing::debug!(host_id = %host_id, error = %e, "list_active_hosts failed; no warm peers this tick");
@@ -817,7 +818,7 @@ pub async fn heartbeat(
             image_version: adv.image_version.clone(),
             size_bytes: adv.size_bytes,
             created_at: adv.captured_at,
-            last_accessed_at: Utc::now(),
+            last_accessed_at: state.services.clock.now_utc(),
             disk_manifest: adv.disk_manifest,
             memory_manifest: adv.memory_manifest,
             recoverable,
@@ -847,7 +848,7 @@ pub async fn heartbeat(
                             SessionEvent::SnapshotTaken {
                                 snapshot_id: adv.snapshot_id,
                                 size_bytes: adv.size_bytes,
-                                at: Utc::now(),
+                                at: state.services.clock.now_utc(),
                             },
                         )
                         .await;
@@ -963,7 +964,7 @@ pub async fn heartbeat(
                                 crate::state::SessionEvent::StatusChanged {
                                     from: prev,
                                     to: engram_core::types::SessionState::Unreachable,
-                                    at: chrono::Utc::now(),
+                                    at: state.services.clock.now_utc(),
                                 },
                             )
                             .await;
@@ -1080,7 +1081,7 @@ pub async fn heartbeat(
     };
 
     Ok(Json(HeartbeatResponse {
-        server_time: Utc::now(),
+        server_time: state.services.clock.now_utc(),
         revoked_sessions: Vec::new(),
         enabled_images,
         prestage_images,
@@ -1213,9 +1214,9 @@ pub(crate) fn attach_warm_peers(
     refs: &mut [EnabledImageRef],
     hosts: &[engram_core::types::host::HostRecord],
     recipient: engram_core::HostId,
+    now: chrono::DateTime<chrono::Utc>,
 ) {
     use std::hash::{Hash, Hasher};
-    let now = chrono::Utc::now();
     let ttl = crate::placement::placement_ttl();
     for r in refs.iter_mut() {
         let mut candidates: Vec<(engram_core::HostId, &str)> = hosts
@@ -1739,6 +1740,8 @@ pub struct SandboxOwnerResponse {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -1790,6 +1793,8 @@ mod tests {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),
@@ -2142,7 +2147,7 @@ mod tests {
                 host(4, &["sha256:other"]),
             ];
             let mut refs = vec![image_ref(D)];
-            attach_warm_peers(&mut refs, &hosts, hid(1));
+            attach_warm_peers(&mut refs, &hosts, hid(1), Utc::now());
             let peers = &refs[0].warm_peers;
             assert_eq!(peers.len(), 2, "capped at {WARM_PEER_SEEDS}");
             assert!(
@@ -2167,7 +2172,7 @@ mod tests {
             addrless.host_addr = None;
             let hosts = vec![cordoned, dead, skewed, addrless];
             let mut refs = vec![image_ref(D)];
-            attach_warm_peers(&mut refs, &hosts, hid(1));
+            attach_warm_peers(&mut refs, &hosts, hid(1), Utc::now());
             let peers = &refs[0].warm_peers;
             assert_eq!(
                 peers.iter().map(|p| p.host_id).collect::<Vec<_>>(),
@@ -2180,7 +2185,7 @@ mod tests {
         fn no_candidates_means_empty_hints_never_self() {
             let hosts = vec![host(1, &[D])]; // only the recipient itself
             let mut refs = vec![image_ref(D)];
-            attach_warm_peers(&mut refs, &hosts, hid(1));
+            attach_warm_peers(&mut refs, &hosts, hid(1), Utc::now());
             assert!(refs[0].warm_peers.is_empty());
         }
 
@@ -2194,7 +2199,7 @@ mod tests {
             let primaries: std::collections::HashSet<_> = (10u128..30)
                 .map(|r| {
                     let mut refs = vec![image_ref(D)];
-                    attach_warm_peers(&mut refs, &hosts, hid(r));
+                    attach_warm_peers(&mut refs, &hosts, hid(r), Utc::now());
                     refs[0].warm_peers[0].host_id
                 })
                 .collect();

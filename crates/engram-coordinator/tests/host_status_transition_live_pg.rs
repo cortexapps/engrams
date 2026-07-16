@@ -18,6 +18,9 @@
 //!     cargo test -p engram-coordinator --test host_status_transition_live_pg -- --ignored
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::host::{

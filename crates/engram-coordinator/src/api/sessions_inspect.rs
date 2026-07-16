@@ -163,6 +163,8 @@ pub(crate) async fn checkpoints_core(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -214,6 +216,8 @@ mod tests {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),

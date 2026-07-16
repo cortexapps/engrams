@@ -107,6 +107,10 @@ pub struct HostRegistry {
     /// the dead-host detector's 30s threshold, so the TTL only fires
     /// when *detection itself* is broken or paused.
     ttl: Duration,
+    /// ADR 0098 D1: wall clock for heartbeat-freshness decisions.
+    /// Defaults to `SystemClock` at construction; the simulation
+    /// harness swaps it when it builds the registry.
+    clock: Arc<dyn engram_core::traits::Clock>,
 }
 
 impl HostRegistry {
@@ -120,6 +124,7 @@ impl HostRegistry {
             meta,
             dialer: parking_lot::RwLock::new(None),
             ttl: crate::placement::placement_ttl(),
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
     }
 
@@ -140,6 +145,7 @@ impl HostRegistry {
             meta,
             dialer: parking_lot::RwLock::new(None),
             ttl,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
     }
 
@@ -290,7 +296,9 @@ impl HostRegistry {
         let Some(row) = rows.into_iter().find(|r| r.id == host_id) else {
             return Err(SandboxError::HostLost);
         };
-        let fresh = chrono::Utc::now()
+        let fresh = self
+            .clock
+            .now_utc()
             .signed_duration_since(row.last_heartbeat_at)
             .to_std()
             .map_or(true, |age| age <= self.ttl);
@@ -449,7 +457,9 @@ impl HostRegistry {
         let Some(row) = rows.into_iter().find(|r| r.id == host_id) else {
             return Err(SandboxError::HostLost);
         };
-        let fresh = chrono::Utc::now()
+        let fresh = self
+            .clock
+            .now_utc()
             .signed_duration_since(row.last_heartbeat_at)
             .to_std()
             .map_or(true, |age| age <= self.ttl);

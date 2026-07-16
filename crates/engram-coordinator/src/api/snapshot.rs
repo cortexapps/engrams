@@ -17,7 +17,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use engram_core::traits::storage::BlobStorage;
 use engram_core::traits::SessionFence;
 use engram_core::types::manifest::ManifestRef;
@@ -280,7 +279,7 @@ pub(crate) async fn snapshot_core(
                 let _ = st.services.host.stop_ide(sandbox_id).await;
                 let metadata = st.services.host.snapshot(sandbox_id, fence).await?;
 
-                let now = Utc::now();
+                let now = st.services.clock.now_utc();
                 // Record the host that wrote this snapshot to its local disk so
                 // the resume path's snapshot-affinity scheduler can route back to
                 // it (zero-cost hot-tier hit). ADR 0007: durability lives in the
@@ -543,7 +542,7 @@ async fn observe_resume_op(
     timeout: Duration,
 ) -> Result<ObservedResume, ApiError> {
     use engram_core::types::session_op::OpState;
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = state.services.clock.now_mono() + timeout;
     loop {
         if let Some(op_id) = op_id {
             if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
@@ -582,7 +581,7 @@ async fn observe_resume_op(
                 return Ok(ObservedResume::Active);
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if state.services.clock.now_mono() >= deadline {
             return Err(ApiError::Conflict(
                 "resume in flight (op enqueued); retry shortly".into(),
             ));
@@ -849,7 +848,7 @@ pub(crate) async fn ascend_evicting_to_active(
                         crate::state::SessionEvent::StatusChanged {
                             from: prev,
                             to: SessionState::Active,
-                            at: chrono::Utc::now(),
+                            at: state.services.clock.now_utc(),
                         },
                     )
                     .await;
@@ -1046,6 +1045,7 @@ async fn resume_disk_only_cold_boot(
         // never strands the resume.
         origin,
         ctx.fence(),
+        state.services.clock.now_utc(),
     )
     .await
     .map_err(|e| match &e {
@@ -1069,7 +1069,7 @@ async fn resume_disk_only_cold_boot(
             SessionEvent::StatusChanged {
                 from: SessionState::Idle,
                 to: SessionState::Created,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await;
@@ -1136,7 +1136,7 @@ async fn transition_to_dead_if_no_snapshot(
                     SessionEvent::StatusChanged {
                         from: prev,
                         to: SessionState::Dead,
-                        at: Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await;
@@ -1304,7 +1304,7 @@ pub async fn apply_rung1_rewind(
                 rolled_back: summary.rolled_back,
                 surviving_side_effects: summary.surviving_side_effects,
                 cause,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await;
@@ -1415,7 +1415,7 @@ pub async fn finish_resume_to_active(
                     SessionEvent::StatusChanged {
                         from: SessionState::Idle,
                         to: SessionState::Created,
-                        at: Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await;
@@ -1425,7 +1425,7 @@ pub async fn finish_resume_to_active(
     let prev_for_active =
         crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active).await?;
     if emit_status {
-        let now = Utc::now();
+        let now = state.services.clock.now_utc();
         // Review finding #6: fenced. Ok(None) (a successor re-claimed) is
         // not an error — the transition above committed under our epoch.
         state
@@ -1568,7 +1568,13 @@ async fn resume_from_fc_snapshot(
     // empty candidate set — a present-but-full fleet still soft-picks
     // (the pre-existing ADR 0046 resume-isn't-reserved posture).
     if matches!(session.status, SessionState::Idle) {
-        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
+        match crate::placement::candidates_for(
+            state.services.meta.as_ref(),
+            &ctx,
+            state.services.clock.now_utc(),
+        )
+        .await
+        {
             Ok(c) if c.hosts.is_empty() => {
                 // ADR 0079 (0078 re-review finding #4): fenced, like every
                 // sibling write in this pipeline — an unfenced Idle→Queued
@@ -1593,7 +1599,7 @@ async fn resume_from_fc_snapshot(
                         SessionEvent::StatusChanged {
                             from: SessionState::Idle,
                             to: SessionState::Queued,
-                            at: Utc::now(),
+                            at: state.services.clock.now_utc(),
                         },
                     )
                     .await;
@@ -1683,7 +1689,7 @@ async fn resume_from_fc_snapshot(
     let peer_hints = match record.host_id {
         Some(source) => match state.services.meta.list_active_hosts().await {
             Ok(hosts) => {
-                let now = Utc::now();
+                let now = state.services.clock.now_utc();
                 let ttl = crate::placement::placement_ttl();
                 hosts
                     .iter()
@@ -1743,6 +1749,7 @@ async fn resume_from_fc_snapshot(
         &ctx,
         restore_metadata,
         op_ctx.fence(),
+        state.services.clock.now_utc(),
     )
     .await
     {
@@ -1838,7 +1845,7 @@ async fn resume_from_fc_snapshot(
                     id,
                     SessionEvent::Resumed {
                         snapshot_id: record.id,
-                        at: Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await?;
@@ -2070,7 +2077,7 @@ pub(crate) async fn enqueue_and_observe_evict(
         EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
         EnqueueOutcome::Duplicate => None,
     };
-    let deadline = std::time::Instant::now() + OP_OBSERVE_TIMEOUT;
+    let deadline = state.services.clock.now_mono() + OP_OBSERVE_TIMEOUT;
     loop {
         // Status settles first (mark_idle / the park bookkeeping land
         // before the op row finishes).
@@ -2109,7 +2116,7 @@ pub(crate) async fn enqueue_and_observe_evict(
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if state.services.clock.now_mono() >= deadline {
             return Err(ApiError::Conflict(
                 "eviction in flight (op enqueued); retry shortly".into(),
             ));
@@ -2217,6 +2224,8 @@ async fn snapshot_artifacts_present(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod recoverable_tests {
     use super::*;
     use engram_storage_local::LocalBlobStorage;
@@ -2417,6 +2426,8 @@ mod recoverable_tests {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod effective_resume_disk_manifest_tests {
     use super::*;
     use engram_core::types::manifest::ManifestRef;
@@ -2558,8 +2569,11 @@ mod resume_placement_label_tests {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod evicting_gate_tests {
     use super::*;
+    use chrono::Utc;
     use engram_core::types::session::SessionMode;
     use tempfile::TempDir;
 
@@ -3017,8 +3031,11 @@ mod evicting_gate_tests {
 /// pipeline — a reclaimed-away zombie executor must not fork the state
 /// machine or land a stale StatusChanged event.
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod resume_queue_fence_tests {
     use super::*;
+    use chrono::Utc;
     use engram_core::types::session::SessionMode;
     use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
 

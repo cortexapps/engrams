@@ -108,6 +108,15 @@ pub struct Services {
     /// real `--mode=all` materialize-dir producer would plug back in
     /// here without a wire change.
     pub materialize_dir: Option<std::path::PathBuf>,
+    /// ADR 0098 D1: wall-clock/monotonic time as a world input. All
+    /// decision-feeding `now` reads in this crate go through here
+    /// (enforced by clippy `disallowed-methods`); the DST harness
+    /// substitutes a scheduler-driven `SimClock`.
+    pub clock: Arc<dyn engram_core::traits::Clock>,
+    /// ADR 0098 D1: randomness as a world input — UUID minting and
+    /// backoff jitter. The DST harness substitutes a seeded stream so
+    /// ids replay from a seed.
+    pub entropy: Arc<dyn engram_core::traits::Entropy>,
 }
 
 /// Bootstrap the axum server. Returns once the bind future yields.
@@ -555,9 +564,8 @@ async fn repopulate_routing(state: &AppState) -> Result<(), engram_core::MetaErr
 /// dead_host's detector do its job. Their `host_addr` row will be
 /// reused if they restart and re-register.
 async fn prewarm_host_registry(state: &AppState) -> Result<(), engram_core::MetaError> {
-    use chrono::Utc;
     let rows = state.services.meta.list_active_hosts().await?;
-    let cutoff = Utc::now() - chrono::Duration::seconds(60);
+    let cutoff = state.services.clock.now_utc() - chrono::Duration::seconds(60);
     let mut warmed = 0usize;
     for row in rows {
         let Some(host_addr) = row.host_addr.clone() else {

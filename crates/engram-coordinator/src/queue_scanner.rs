@@ -270,7 +270,7 @@ pub async fn run_once(
         for q in class {
             // Timeouts are checked first so a stuck head is failed out
             // rather than blocking its class forever.
-            let now = Utc::now();
+            let now = state.services.clock.now_utc();
             if now
                 .signed_duration_since(q.queued_at)
                 .to_std()
@@ -301,7 +301,7 @@ pub async fn run_once(
                                 "origin" => "create",
                                 "outcome" => "placed",
                             )
-                            .record(wait_duration(&q).as_secs_f64());
+                            .record(wait_duration(now, &q).as_secs_f64());
                             summary.placed += 1;
                             enqueue_boot_op(state, &q, host_id).await;
                         }
@@ -389,10 +389,10 @@ async fn enqueue_boot_op(state: &SharedState, q: &QueuedSession, host_id: engram
     }
 }
 
-/// Wall-clock elapsed since `q` was queued (never negative).
-fn wait_duration(q: &QueuedSession) -> Duration {
-    Utc::now()
-        .signed_duration_since(q.queued_at)
+/// Wall-clock elapsed since `q` was queued (never negative). `now` is
+/// hoisted from the caller's injected clock (ADR 0098 D1).
+fn wait_duration(now: chrono::DateTime<Utc>, q: &QueuedSession) -> Duration {
+    now.signed_duration_since(q.queued_at)
         .to_std()
         .unwrap_or_default()
 }
@@ -489,21 +489,31 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
         // current stamp, so there is no pinned generation to prefer.
         prefer_bundles: &[],
     };
-    let candidates =
-        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(session_id = %q.session.id, error = ?e,
+    let candidates = match crate::placement::candidates_for(
+        state.services.meta.as_ref(),
+        &ctx,
+        state.services.clock.now_utc(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(session_id = %q.session.id, error = ?e,
                 "queue-scanner: candidates_for failed");
-                return PlaceOutcome::Error;
-            }
-        };
+            return PlaceOutcome::Error;
+        }
+    };
     // ADR 0068 (core-ops-batch correction pass): an empty candidate set
     // here falls into `PlaceOutcome::NoCapacity` below with no visibility
     // into why — mirror the create/resume paths' exclusion-reason logging.
     if candidates.hosts.is_empty() {
-        crate::placement::log_empty_candidates(state.services.meta.as_ref(), &ctx, "queue_create")
-            .await;
+        crate::placement::log_empty_candidates(
+            state.services.meta.as_ref(),
+            &ctx,
+            "queue_create",
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
     match state
         .services
@@ -533,6 +543,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
                     &candidates.hosts,
                     q.mem_budget_mib,
                     q.cpu_budget_vcpus,
+                    state.services.clock.now_utc(),
                 )
                 .await;
             }
@@ -593,7 +604,13 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
         // real pins); ordering is irrelevant to an emptiness test.
         prefer_bundles: &[],
     };
-    match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
+    match crate::placement::candidates_for(
+        state.services.meta.as_ref(),
+        &ctx,
+        state.services.clock.now_utc(),
+    )
+    .await
+    {
         Ok(c) => {
             let has_capacity = !c.hosts.is_empty();
             // ADR 0068 (core-ops-batch correction pass): `Some(false)` is
@@ -605,6 +622,7 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
                     state.services.meta.as_ref(),
                     &ctx,
                     "queue_resume_precheck",
+                    state.services.clock.now_utc(),
                 )
                 .await;
             }
@@ -637,7 +655,7 @@ async fn dequeue_resume(state: &SharedState, q: &QueuedSession) {
                 "origin" => "resume",
                 "outcome" => "placed",
             )
-            .record(wait_duration(q).as_secs_f64());
+            .record(wait_duration(state.services.clock.now_utc(), q).as_secs_f64());
         }
         Err(e) => {
             tracing::warn!(%session_id, error = %e,
@@ -704,7 +722,10 @@ async fn fail_queued_create_image_gone(state: &SharedState, q: &QueuedSession) -
 /// `queue_timeout` event; resume → back to `Idle` (durable, retryable).
 async fn time_out_session(state: &SharedState, q: &QueuedSession) {
     let session_id = q.session.id;
-    let waited = Utc::now()
+    let waited = state
+        .services
+        .clock
+        .now_utc()
         .signed_duration_since(q.queued_at)
         .num_seconds()
         .max(0);
@@ -740,7 +761,12 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
                 "waited_secs": waited,
                 "reason": "no host capacity became available in time",
             });
-            if let Ok(m) = crate::placement::fleet_snapshot(state.services.meta.as_ref()).await {
+            if let Ok(m) = crate::placement::fleet_snapshot(
+                state.services.meta.as_ref(),
+                state.services.clock.now_utc(),
+            )
+            .await
+            {
                 payload["fleet"] = serde_json::json!({
                     "schedulable_hosts": m.schedulable_hosts,
                     "free_mib": m.free_mib,
@@ -809,9 +835,10 @@ async fn sample_queue_metrics(state: &SharedState, queued: &[QueuedSession]) {
     // Age of the oldest queued row this tick — 0 when the queue is empty.
     // `queued` is already `queued_at ASC` (list_queued_sessions_fifo), so
     // the head is `queued[0]`.
+    let now = state.services.clock.now_utc();
     let head_age = queued
         .first()
-        .map(|q| wait_duration(q).as_secs_f64())
+        .map(|q| wait_duration(now, q).as_secs_f64())
         .unwrap_or(0.0);
     ::metrics::gauge!(crate::metrics::QUEUE_HEAD_AGE_SECONDS).set(head_age);
 }
@@ -823,7 +850,7 @@ async fn emit_from(state: &SharedState, id: SessionId, from: SessionState, to: S
             SessionEvent::StatusChanged {
                 from,
                 to,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await
@@ -834,6 +861,8 @@ async fn emit_from(state: &SharedState, id: SessionId, from: SessionState, to: S
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_core::types::session::{Session, SessionMode};

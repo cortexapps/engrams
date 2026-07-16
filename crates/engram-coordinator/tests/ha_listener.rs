@@ -18,6 +18,9 @@
 //!     cargo test -p engram-coordinator --test ha_listener -- --ignored --nocapture
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -138,6 +141,8 @@ async fn build_app_state(
         )),
         host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         database_url: database_url.to_string(),
@@ -337,17 +342,19 @@ async fn cross_replica_scheduling_pins_and_tokens() {
         caps: Default::default(),
         prefer_bundles: &[],
     };
-    let (picked, _) = placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx)
-        .await
-        .expect("B schedules onto a host whose heartbeats landed on A");
+    let (picked, _) =
+        placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx, chrono::Utc::now())
+            .await
+            .expect("B schedules onto a host whose heartbeats landed on A");
     assert!(picked == h1 || picked == h2);
 
     // --- 2. cordon via A ⇒ B's picker excludes it ---------------------
     meta_a.set_host_cordoned(h1, true).await.expect("cordon");
     for _ in 0..10 {
-        let (picked, _) = placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx)
-            .await
-            .expect("pick");
+        let (picked, _) =
+            placement::pick_for_session(meta_b.as_ref(), &registry_b, &ctx, chrono::Utc::now())
+                .await
+                .expect("pick");
         assert_eq!(picked, h2, "A's cordon must bind B's picker");
     }
 

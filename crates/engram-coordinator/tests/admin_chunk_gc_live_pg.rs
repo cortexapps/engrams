@@ -32,6 +32,9 @@
 //!   via the enabled_images row independent of the base snapshot
 //!   row's `recoverable` flag.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -44,6 +47,12 @@ use engram_core::types::session::SessionMode;
 use engram_core::types::{SandboxId, SessionSpec, SnapshotId, SnapshotRecord};
 use engram_storage_local::LocalBlobStorage;
 use uuid::Uuid;
+
+/// ADR 0098 D1: the GC sweeps take an injected clock; live tests run on
+/// the real one.
+fn system_clock() -> std::sync::Arc<dyn engram_core::traits::Clock> {
+    std::sync::Arc::new(engram_core::traits::SystemClock::new())
+}
 
 struct TestRig {
     meta: Arc<dyn MetadataStore>,
@@ -231,6 +240,7 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         &rig.chunk_store,
         &cfg,
         SweepMode::DryRun,
+        &system_clock(),
     )
     .await
     .expect("dry-run sweep");
@@ -355,6 +365,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
         &rig.chunk_store,
         &cfg,
         SweepMode::Full,
+        &system_clock(),
     )
     .await
     .expect("full sweep");
@@ -397,6 +408,7 @@ async fn full_sweep_with_zero_grace_promotes_orphan_and_keeps_pinned() {
         &rig.chunk_store,
         &cfg,
         SweepMode::Full,
+        &system_clock(),
     )
     .await
     .expect("second sweep");
@@ -491,6 +503,7 @@ async fn promote_skips_candidate_that_became_repinned() {
         &rig.chunk_store,
         &cfg,
         SweepMode::Full,
+        &system_clock(),
     )
     .await
     .expect("sweep");
@@ -547,6 +560,7 @@ async fn nonzero_grace_protects_recent_candidates() {
         &rig.chunk_store,
         &cfg,
         SweepMode::Full,
+        &system_clock(),
     )
     .await
     .expect("full sweep");
@@ -589,6 +603,7 @@ async fn nonzero_grace_protects_recent_candidates() {
         &rig.chunk_store,
         &cfg_zero,
         SweepMode::Full,
+        &system_clock(),
     )
     .await
     .expect("second sweep zero-grace");
@@ -660,6 +675,7 @@ async fn non_recoverable_snapshots_do_not_pin() {
         &rig.chunk_store,
         &cfg,
         SweepMode::Full,
+        &system_clock(),
     )
     .await
     .expect("sweep");
@@ -770,6 +786,7 @@ async fn base_snapshot_memfile_pinned_even_when_snapshot_not_recoverable() {
         &rig.chunk_store,
         &cfg,
         SweepMode::Full,
+        &system_clock(),
     )
     .await
     .expect("sweep");
