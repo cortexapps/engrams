@@ -156,7 +156,9 @@ async fn wait_for_file(path: &str) -> Result<std::fs::Metadata, String> {
             Err(error) => return Err(format!("{path}: stat: {error}")),
         }
         if tokio::time::Instant::now() >= deadline {
-            return Err(format!("{path}: file did not become ready within 2 seconds"));
+            return Err(format!(
+                "{path}: file did not become ready within 2 seconds"
+            ));
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
