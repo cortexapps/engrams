@@ -36,6 +36,7 @@ import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
 // create path seals + injects the user token under this name (ADR 0063 B3).
 const USER_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
 import { makeProfileStore } from "../db/profiles.ts";
+import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 import { checkDb, getDb } from "../db/client.ts";
@@ -1698,6 +1699,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       expect(fakeSessions.createReqs[0]?.harnessEnv).toEqual({
         CLAUDE_CODE_OAUTH_TOKEN: "admin-token",
         ANTHROPIC_MODEL: "claude-opus-4-8",
+        ENGRAM_APPEND_SYSTEM_PROMPT: PAPERCUT_SYSTEM_PROMPT,
       });
     } finally {
       await srv.close();

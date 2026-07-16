@@ -31,6 +31,7 @@ import { registerBuiltinTools } from "./tools/builtin.ts";
 import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
+import { registerPapercuts } from "./rpc/papercuts.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
@@ -48,6 +49,9 @@ import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
+import { getDb } from "./db/client.ts";
+import { makePapercutStore } from "./db/papercuts.ts";
+import { tools } from "./tools/registry.ts";
 
 const app = new Hono();
 
@@ -129,6 +133,9 @@ const server = buildServer(
     // Registered BEFORE the passthrough so it wins the /rpc/engram.app.v1.TaskService/* prefix.
     registerTasks(router);
 
+    // Native PapercutService: orchestrator-owned friction inbox.
+    registerPapercuts(router);
+
     // Native ProfileService: orchestrator-owned session profiles (ADR 0053).
     registerProfiles(router);
 
@@ -185,7 +192,7 @@ setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
-registerBuiltinTools();
+registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 const listenerManager = makeProductionListenerManager();

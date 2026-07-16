@@ -1,5 +1,5 @@
 // Code-based TanStack Router tree for engrams-web. The shell is RootLayout (the
-// primary destinations rail + inset). `/sessions`, `/operator`, and `/settings`
+// primary destinations rail + inset). `/sessions`, `/kaizen`, `/operator`, and `/settings`
 // are nested LAYOUT routes that each render their own second sidebar + <Outlet/>.
 // `/operator` is the admin hat: one section gathers fleet, storage, images, and
 // registries behind a single rail, landing on a read-only Overview cockpit.
@@ -32,6 +32,8 @@ import { AllSessions } from "./pages/sessions/AllSessions";
 import { SessionDetail } from "./pages/SessionDetail";
 import { OperatorLayout } from "./pages/operator/OperatorLayout";
 import { Overview } from "./pages/operator/Overview";
+import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
+import { Papercuts } from "./pages/kaizen/Papercuts";
 import { Fleet } from "./pages/Fleet";
 import { Storage } from "./pages/Storage";
 import { SettingsLayout } from "./pages/settings/SettingsLayout";
@@ -196,6 +198,26 @@ const operatorRegistriesRoute = createRoute({
   component: RegistriesPanel,
 });
 
+// /kaizen layout route (second sidebar) ----------------------------------
+const kaizenLayoutRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/kaizen",
+  beforeLoad: requireAuth,
+  component: KaizenLayout,
+});
+const kaizenIndexRoute = createRoute({
+  getParentRoute: () => kaizenLayoutRoute,
+  path: "/",
+  beforeLoad: () => {
+    throw redirect({ to: "/kaizen/papercuts" });
+  },
+});
+const papercutsRoute = createRoute({
+  getParentRoute: () => kaizenLayoutRoute,
+  path: "papercuts",
+  component: Papercuts,
+});
+
 // /settings layout route (second sidebar) ----------------------------------
 const settingsLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
@@ -294,6 +316,7 @@ export const routeTree = rootRoute.addChildren([
       operatorImagesRoute,
       operatorRegistriesRoute,
     ]),
+    kaizenLayoutRoute.addChildren([kaizenIndexRoute, papercutsRoute]),
     settingsLayoutRoute.addChildren([
       settingsIndexRoute,
       profileRoute,
