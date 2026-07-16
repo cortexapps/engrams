@@ -43,5 +43,8 @@ settings.local.json
 .playwright-mcp/
 scratch/
 node_modules
+__pycache__/
 docs/superpowers/**
 .impeccable
+# On-demand live-model browser evaluation artifacts (ADR 0097).
+/artifacts/browser-eval/

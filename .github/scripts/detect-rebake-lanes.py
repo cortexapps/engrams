@@ -178,6 +178,7 @@ CI_SELF_PATHS = [".github/workflows/ci.yml",
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/"]
 ORCH_PATHS = ["orchestrator/"]
+BROWSER_EVAL_PATHS = ["evals/browser/"]
 # A lockfile/manifest/toolchain bump recompiles the whole workspace.
 RUST_COMMON = ["Cargo.lock", "Cargo.toml", "rust-toolchain.toml"]
 
@@ -345,6 +346,7 @@ def main():
         or bool(cc)
         or any_path(changed, RUST_COMMON)
         or any_path(changed, HARNESS_PATHS)
+        or any_path(changed, BROWSER_EVAL_PATHS)
     )
     # musl cross-compile of the FC host binaries — same closure as host_binaries.
     test_cross = ci_self or host_binaries

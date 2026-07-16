@@ -6,7 +6,8 @@ name: CI
 # Surfaces this workflow exercises:
 #   - lint:             cargo fmt --check, cargo clippy -D warnings,
 #                       cargo check workspace
-#   - test-linux:       cargo nextest workspace tests, plus
+#   - test-linux:       cargo nextest workspace tests, the deterministic
+#                       browser-evaluation smoke, plus
 #                       Postgres-gated ignored tests (ha_listener,
 #                       snapshot_disk_manifest_persistence) against
 #                       the postgres service container, plus the
@@ -316,6 +317,17 @@ jobs:
       # pure Rust (mkext4).
       - name: Install squashfs-tools
         run: sudo apt-get install -y -qq --no-install-recommends squashfs-tools
+
+      # ADR 0097: no model credentials or browser install. This locks the four
+      # seeded Incident Console contracts, exact grader, protocol isolation,
+      # intent variants, bounded MiniWoB driver reads, and the no-model smoke.
+      # `detect-rebake-lanes.py` maps evals/browser/ changes to this lane so an
+      # eval-only PR cannot skip its tests.
+      - name: Deterministic browser evaluation smoke
+        if: always()
+        run: |
+          python3 -m unittest discover -s evals/browser -p 'test_*.py'
+          python3 evals/browser/browser_eval.py smoke
 
       # Default (non-ignored) tests across the entire workspace. Mirrors
       # `just check`'s nextest pass — same speedup, same coverage. The

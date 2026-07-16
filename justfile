@@ -61,6 +61,16 @@ gen-proto:
 test *ARGS:
     cargo nextest run --workspace {{ARGS}}
 
+# Deterministic, no-model browser task/grader smoke (ADR 0097).
+browser-eval-smoke:
+    python3 -m unittest discover -s evals/browser -p 'test_*.py'
+    python3 evals/browser/browser_eval.py smoke
+
+# Full bounded Codex + Claude browser matrix. This invokes authenticated model
+# CLIs and writes an untracked report under artifacts/browser-eval/.
+browser-eval *ARGS:
+    python3 evals/browser/browser_eval.py matrix {{ARGS}}
+
 # Run a single crate's tests with output. Stays on `cargo test` so
 # `--nocapture` works the way you expect.
 test-pkg pkg *ARGS:
