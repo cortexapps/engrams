@@ -1,0 +1,17 @@
+[package]
+name = "engram-testkit"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Dev-only test support: per-test template-cloned Postgres databases (ADR 0099). Never a production dependency."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-postgres.workspace = true
+sha2.workspace = true
+sqlx.workspace = true
+uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
