@@ -145,6 +145,15 @@ pub enum SessionEvent {
         result_summary: Option<String>,
         at: DateTime<Utc>,
     },
+    /// A native shell tool is driving the shared browser. Correlates to the
+    /// generic tool start/completion via `tool_call_id`; web clients replace
+    /// the raw shell card with a browser presenter.
+    HarnessBrowserActivity {
+        run_id: String,
+        tool_call_id: String,
+        intent: String,
+        at: DateTime<Utc>,
+    },
     /// ADR 0089: an orchestrator-registered tool was invoked. The
     /// coordinator preserves the JSON arguments verbatim and never parses
     /// their tool-specific shape.
@@ -388,6 +397,7 @@ impl SessionEvent {
             Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
+            Self::HarnessBrowserActivity { .. } => "browser_activity",
             Self::HarnessToolCallRequested { .. } => "tool_call_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
@@ -462,6 +472,16 @@ impl SessionEvent {
                 ok,
                 duration_ms,
                 result_summary,
+                at,
+            },
+            HarnessEvent::BrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+            } => Self::HarnessBrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
                 at,
             },
             HarnessEvent::ToolCallRequested {
@@ -1568,6 +1588,30 @@ pub(crate) mod tests {
             outbox_ack_id(session_id, &ev).as_deref(),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn browser_activity_maps_from_harness_with_correlation() {
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::BrowserActivity {
+                run_id: "r1".into(),
+                tool_call_id: "tool-browser".into(),
+                intent: "Clicking Sign in".into(),
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(ev.kind(), "browser_activity");
+        assert!(matches!(
+            ev,
+            SessionEvent::HarnessBrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+                ..
+            } if run_id == "r1"
+                && tool_call_id == "tool-browser"
+                && intent == "Clicking Sign in"
+        ));
     }
 
     #[test]

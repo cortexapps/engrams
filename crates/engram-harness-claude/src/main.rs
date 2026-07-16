@@ -496,9 +496,7 @@ mod adapter {
     /// connection reattaches. Errors only if the receiver is gone,
     /// i.e. the process is tearing down; treat as a debug no-op.
     async fn emit(evt_tx: &mpsc::Sender<HarnessEvent>, ev: HarnessEvent) {
-        if evt_tx.send(ev).await.is_err() {
-            tracing::debug!("event channel closed; dropping event");
-        }
+        engram_harness_sdk::emit(evt_tx, ev).await;
     }
 
     /// ADR 0054 Flavor B: the hook↔harness socket server and its shared

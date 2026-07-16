@@ -358,6 +358,17 @@ pub enum HarnessEvent {
     /// for eviction (the coordinator's soft TTL treats this like `Idle`), but
     /// unlike `Idle` the agent's turn remains open awaiting an external result.
     Parked,
+    /// A shell tool call is driving the shared browser. Emitted immediately
+    /// before its generic [`HarnessEvent::ToolCallStarted`] with the same id,
+    /// so clients can replace the raw Bash/Shell card with a browser-specific
+    /// presenter while continuing to use `ToolCallCompleted` for outcome.
+    /// `intent` is concise agent-authored display text, sanitized and bounded
+    /// by the shared harness SDK.
+    BrowserActivity {
+        run_id: String,
+        tool_call_id: String,
+        intent: String,
+    },
 }
 
 /// Who emitted an [`HarnessEvent::AgentMessage`].
@@ -395,6 +406,7 @@ impl HarnessEvent {
             Self::ToolCallRequested { .. } => "tool_call_requested",
             Self::Idle => "harness_idle",
             Self::Parked => "harness_parked",
+            Self::BrowserActivity { .. } => "browser_activity",
         }
     }
 
@@ -405,7 +417,8 @@ impl HarnessEvent {
         match self {
             Self::ToolCallStarted { tool_call_id, .. }
             | Self::ToolCallCompleted { tool_call_id, .. }
-            | Self::FileChanged { tool_call_id, .. } => Some(tool_call_id.as_str()),
+            | Self::FileChanged { tool_call_id, .. }
+            | Self::BrowserActivity { tool_call_id, .. } => Some(tool_call_id.as_str()),
             Self::ToolCallRequested { call_id, .. } => Some(call_id.as_str()),
             _ => None,
         }
@@ -775,6 +788,11 @@ mod tests {
             tool_name: "Bash".into(),
             args_summary: Some("cargo test".into()),
         }));
+        round_trip(HarnessFrame::Event(HarnessEvent::BrowserActivity {
+            run_id: "r".into(),
+            tool_call_id: "t".into(),
+            intent: "Clicking Sign in".into(),
+        }));
         round_trip(HarnessFrame::Event(HarnessEvent::AgentMessage {
             run_id: "r1".into(),
             message_id: "m1".into(),
@@ -992,6 +1010,15 @@ mod tests {
         assert_eq!(HarnessEvent::Idle.kind(), "harness_idle");
         assert_eq!(HarnessEvent::Parked.kind(), "harness_parked");
         assert_eq!(
+            HarnessEvent::BrowserActivity {
+                run_id: "r".into(),
+                tool_call_id: "t".into(),
+                intent: "Clicking Sign in".into(),
+            }
+            .kind(),
+            "browser_activity"
+        );
+        assert_eq!(
             HarnessEvent::TitleSuggested { title: "t".into() }.kind(),
             "title_suggested"
         );
@@ -1036,6 +1063,15 @@ mod tests {
                 call_id: id.into(),
                 name: "save_memory".into(),
                 args_json: "{}".into(),
+            }
+            .tool_call_id(),
+            Some(id)
+        );
+        assert_eq!(
+            HarnessEvent::BrowserActivity {
+                run_id: "x".into(),
+                tool_call_id: id.into(),
+                intent: "Inspecting page".into(),
             }
             .tool_call_id(),
             Some(id)

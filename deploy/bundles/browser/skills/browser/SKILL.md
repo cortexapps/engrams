@@ -14,12 +14,17 @@ snapshot when navigation or a rerender makes the current references stale, or
 when an action did not produce its expected postcondition. Do not repeat an
 unchanged action against unchanged state more than twice.
 
+Prefix each `playwright-cli` invocation with a short, outcome-neutral intent.
+This names the live browser event in the conversation; the harness records the
+actual success or failure. Use present-progressive wording, omit secrets and
+entered values, and run one browser action per shell invocation.
+
 ```sh
-playwright-cli open http://localhost:3000
-playwright-cli snapshot
-playwright-cli click e7
-playwright-cli fill e8 "search term"
-playwright-cli select e9 value
+ENGRAM_BROWSER_INTENT="Navigating to the local app" playwright-cli open http://localhost:3000
+ENGRAM_BROWSER_INTENT="Inspecting the page" playwright-cli snapshot
+ENGRAM_BROWSER_INTENT="Clicking Sign in" playwright-cli click e7
+ENGRAM_BROWSER_INTENT="Filling the search field" playwright-cli fill e8 "search term"
+ENGRAM_BROWSER_INTENT="Selecting the account" playwright-cli select e9 value
 ```
 
 Use Playwright's testing, tracing, mocking, PDF, and cross-browser commands
@@ -36,7 +41,7 @@ absolute path. Screenshot command output confirms only that a file exists; it
 does not contain the pixels.
 
 ```sh
-playwright-cli screenshot --filename /tmp/engram-browser-observations/page.png
+ENGRAM_BROWSER_INTENT="Inspecting the rendered page" playwright-cli screenshot --filename /tmp/engram-browser-observations/page.png
 ```
 
 The browser wrapper blocks further browser commands until `browser_view`
@@ -52,7 +57,7 @@ evidence or the requested deliverable is itself an image or video. Complete
 and verify the work first, then share one final screenshot by default:
 
 ```sh
-playwright-cli screenshot --filename /workspace/final-state.png
+ENGRAM_BROWSER_INTENT="Capturing the verified final state" playwright-cli screenshot --filename /workspace/final-state.png
 engram-share --file /workspace/final-state.png --caption "Verified final state"
 ```
 

@@ -37,6 +37,15 @@ experimental implementation and raw iteration history are preserved on the
   for explicit evidence or an inherently visual deliverable. Use video only
   for explicit requests or temporal bugs.
 - Keep artifact creation/inspection separate from delivery in `share-file`.
+- Prefix browser CLI calls with a concise, outcome-neutral
+  `ENGRAM_BROWSER_INTENT`. The shared harness SDK recognizes supported browser
+  invocations in native Shell/Bash calls and emits a typed `browser_activity`
+  immediately before the generic tool start, carrying the same
+  `tool_call_id`. It derives a safe fallback when the annotation is omitted.
+- Use `browser_activity` to open the Browser pane once on first agent activity
+  and to replace the raw shell card with a browser-specific presenter. Keep
+  the correlated generic `tool_call_completed` event as the source of truth
+  for success/failure, and never reopen after the user collapses the pane.
 
 ## Evaluation findings
 
@@ -68,6 +77,13 @@ bundles useful post-action state into fewer agent round trips. Agent-browser is
 not shipped by this decision; the preserved lab branch can support future
 comparison on broader standardized tasks without expanding this PR.
 
+Browser activity follows ADR 0089's correlation and presentation principles
+without entering its registered-tool dispatch protocol: this is enrichment of
+an already-running native shell call, not a new model-facing tool awaiting a
+result. Detecting framebuffer changes was rejected as the trigger because it
+would miss read-only inspection, fire for animations or human input, and
+require mounting the VNC viewer before the pane knows it should open.
+
 The browser/VNC production test must prove that the CLI observes semantic state,
 that an annotated screenshot is created, and that the same page is painted in
 the real framebuffer.
@@ -75,8 +91,9 @@ the real framebuffer.
 ## Validation
 
 The implementation passed the full Rust repository gate (format, clippy with
-warnings denied, Hakari verification, and 1,684 nextest cases), targeted
-orchestrator and browser-pane tests, web lint and production build, bundle
+warnings denied, Hakari verification, and 1,690 nextest cases), targeted
+harness enrichment, event-correlation, coordinator mapping, orchestrator, and
+browser-pane tests, all 215 web tests, web lint and production build, bundle
 activation coverage, and compilation of the ignored Firecracker browser/VNC
 test. The latter remains assigned to the existing Linux+KVM CI lane, where the
 browser bundle is staged before execution.

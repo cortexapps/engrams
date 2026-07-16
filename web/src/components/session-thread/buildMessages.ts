@@ -67,6 +67,15 @@ export interface FileChangeArgs {
   change: FileChange;
 }
 
+/** Synthetic presenter for a browser-enriched Shell/Bash call. The matching
+ * browser_activity event carries display intent; generic completion still
+ * owns success/failure correlation. */
+export const BROWSER_ACTIVITY_TOOL = "engram.browserActivity";
+
+export interface BrowserActivityArgs {
+  intent: string;
+}
+
 /** Payload carried in a system message's `metadata.custom.marker` — the
  *  harness-register events that aren't agent messages. */
 export type SystemMarker =
@@ -396,6 +405,7 @@ export function buildMessages(
   // pre-scan so the generic card is re-rendered as a rich diff in place; a
   // failed edit emits NO file_changed and keeps its generic (error) card.
   const fileChangesByToolCallId = new Map<string, FileChangeArgs>();
+  const browserActivityByToolCallId = new Map<string, BrowserActivityArgs>();
   // prod session 68c70a65: a `prompt_id` user echo is HELD and rendered at its
   // consuming `run_started{prompt_id}` (below). That relies on the echo being
   // seen BEFORE its run_started — true when the coordinator appends the echo
@@ -425,6 +435,8 @@ export function buildMessages(
         path: event.path,
         change: event.change,
       });
+    else if (event.type === "browser_activity")
+      browserActivityByToolCallId.set(event.tool_call_id, { intent: event.intent });
     else if (event.type === "agent_message" && event.role === "user" && event.prompt_id)
       userEchoByPromptId.set(event.prompt_id, event.text);
   }
@@ -541,6 +553,7 @@ export function buildMessages(
         // tool (an edit), and the part keeps its real id so the completion
         // correlates as usual. No file_changed (e.g. a failed edit) → generic.
         const fc = fileChangesByToolCallId.get(ev.tool_call_id);
+        const browserActivity = browserActivityByToolCallId.get(ev.tool_call_id);
         const part: ToolPart = fc
           ? {
               type: "tool-call",
@@ -549,13 +562,21 @@ export function buildMessages(
               args: fc as unknown as Record<string, unknown>,
               argsText: fc.path,
             }
-          : {
-              type: "tool-call",
-              toolCallId: ev.tool_call_id,
-              toolName: ev.tool_name,
-              args: parseArgs(ev.args_summary),
-              argsText: ev.args_summary ?? "",
-            };
+          : browserActivity
+            ? {
+                type: "tool-call",
+                toolCallId: ev.tool_call_id,
+                toolName: BROWSER_ACTIVITY_TOOL,
+                args: browserActivity as unknown as Record<string, unknown>,
+                argsText: browserActivity.intent,
+              }
+            : {
+                type: "tool-call",
+                toolCallId: ev.tool_call_id,
+                toolName: ev.tool_name,
+                args: parseArgs(ev.args_summary),
+                argsText: ev.args_summary ?? "",
+              };
         a.content.push(part);
         if (submittedResults.has(ev.tool_call_id)) {
           part.result = submittedResults.get(ev.tool_call_id);
@@ -793,6 +814,7 @@ export function buildMessages(
       // FILE_CHANGE_TOOL swap in `tool_call_started`) via the pre-scan — no
       // standalone render.
       case "file_changed":
+      case "browser_activity":
         break;
 
       // ADR 0052: the harness-owned queue, reflected up. A mid-turn prompt is
