@@ -10,8 +10,15 @@ description = "Dev-only test support: per-test template-cloned Postgres database
 workspace = true
 
 [dependencies]
+engram-core.workspace = true
 engram-postgres.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
 sha2.workspace = true
 sqlx.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["rt", "macros"] }
