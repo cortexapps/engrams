@@ -462,7 +462,9 @@ jobs:
 
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Keep release builds on the same reproducible toolchain as CI and
+          # avoid setup-bun's GitHub tags API lookup for the `latest` alias.
+          bun-version: 1.3.14
 
       - name: Build engrams (bun compile, per-target)
         working-directory: cli
