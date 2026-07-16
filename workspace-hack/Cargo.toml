@@ -55,8 +55,11 @@ once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 phf_shared = { version = "0.11" }
 pkcs8 = { version = "0.10", default-features = false, features = ["pem", "std"] }
+ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 prost = { version = "0.13", features = ["prost-derive"] }
-rand = { version = "0.8", features = ["small_rng"] }
+rand-274715c4dabd11b0 = { package = "rand", version = "0.9", default-features = false, features = ["thread_rng"] }
+rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
+rand_chacha = { version = "0.9", default-features = false, features = ["std"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }
@@ -120,10 +123,11 @@ num-traits = { version = "0.2", features = ["i128", "libm"] }
 once_cell = { version = "1" }
 percent-encoding = { version = "2" }
 phf_shared = { version = "0.11" }
+ppv-lite86 = { version = "0.2", default-features = false, features = ["simd", "std"] }
 proc-macro2 = { version = "1" }
 prost = { version = "0.13", features = ["prost-derive"] }
 quote = { version = "1" }
-rand = { version = "0.8", features = ["small_rng"] }
+rand-c38e5c1d305a1b54 = { package = "rand", version = "0.8", features = ["small_rng"] }
 rand_core = { version = "0.6", default-features = false, features = ["std"] }
 regex = { version = "1" }
 regex-automata = { version = "0.4", default-features = false, features = ["dfa-build", "dfa-onepass", "hybrid", "meta", "nfa-backtrack", "perf-inline", "perf-literal", "std", "unicode"] }

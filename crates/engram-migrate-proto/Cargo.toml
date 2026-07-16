@@ -20,3 +20,5 @@ serde.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+# ADR 0099 H4: decode-never-panics property suites (tests/decode_never_panics.rs).
+proptest.workspace = true

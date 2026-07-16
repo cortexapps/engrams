@@ -229,6 +229,11 @@ async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 sha2 = "0.10"
 
+# property-based testing (ADR 0099 H3/H4). Dev-dependency only; the
+# persisted `proptest-regressions/` seeds turn every counterexample into a
+# checked-in deterministic regression test.
+proptest = "1"
+
 # tls + cert mint (host-side egress proxy)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["tls12", "ring"] }
