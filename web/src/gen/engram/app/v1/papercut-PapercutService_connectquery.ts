@@ -18,8 +18,3 @@ export const archivePapercut = PapercutService.method.archivePapercut;
  * @generated from rpc engram.app.v1.PapercutService.UnarchivePapercut
  */
 export const unarchivePapercut = PapercutService.method.unarchivePapercut;
-
-/**
- * @generated from rpc engram.app.v1.PapercutService.StartFixTask
- */
-export const startFixTask = PapercutService.method.startFixTask;

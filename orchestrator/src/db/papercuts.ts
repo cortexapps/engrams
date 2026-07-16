@@ -1,6 +1,6 @@
 /** Papercut data-access seam. Drizzle-backed by default and injectable in tests. */
 
-import { desc, eq, isNull } from "drizzle-orm";
+import { and, desc, eq, isNull } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import {
@@ -15,6 +15,7 @@ export interface PapercutInput {
   severity: string | null;
   tags: string[];
   sessionId: string;
+  toolCallId: string | null;
   taskId: string | null;
   profileId: string | null;
   userId: string | null;
@@ -22,7 +23,6 @@ export interface PapercutInput {
 
 export interface PapercutRow extends PapercutInput {
   id: string;
-  fixTaskId: string | null;
   archivedAt: Date | null;
   createdAt: Date;
 }
@@ -37,7 +37,6 @@ export interface PapercutStore {
   list(opts: { includeArchived: boolean; limit: number }): Promise<PapercutListRow[]>;
   get(id: string): Promise<PapercutRow | null>;
   setArchived(id: string, archived: boolean): Promise<void>;
-  setFixTask(id: string, taskId: string): Promise<void>;
 }
 
 function toRow(row: typeof papercutTable.$inferSelect): PapercutRow {
@@ -49,10 +48,10 @@ function toRow(row: typeof papercutTable.$inferSelect): PapercutRow {
     severity: row.severity ?? null,
     tags: row.tags ?? [],
     sessionId: row.sessionId,
+    toolCallId: row.toolCallId ?? null,
     taskId: row.taskId ?? null,
     profileId: row.profileId ?? null,
     userId: row.userId ?? null,
-    fixTaskId: row.fixTaskId ?? null,
     archivedAt: row.archivedAt ?? null,
     createdAt: row.createdAt,
   };
@@ -66,10 +65,10 @@ const listSelection = {
   severity: papercutTable.severity,
   tags: papercutTable.tags,
   sessionId: papercutTable.sessionId,
+  toolCallId: papercutTable.toolCallId,
   taskId: papercutTable.taskId,
   profileId: papercutTable.profileId,
   userId: papercutTable.userId,
-  fixTaskId: papercutTable.fixTaskId,
   archivedAt: papercutTable.archivedAt,
   createdAt: papercutTable.createdAt,
   profileName: profileTable.name,
@@ -82,8 +81,32 @@ export function makePapercutStore(
   return {
     async insert(row) {
       const id = crypto.randomUUID();
-      await db.insert(papercutTable).values({ id, ...row });
-      return id;
+      const inserted = await db
+        .insert(papercutTable)
+        .values({ id, ...row })
+        .onConflictDoNothing({
+          target: [papercutTable.sessionId, papercutTable.toolCallId],
+        })
+        .returning({ id: papercutTable.id });
+      if (inserted[0]) return inserted[0].id;
+
+      if (row.toolCallId == null) {
+        throw new Error("papercut insert unexpectedly conflicted without a tool call id");
+      }
+      const existing = await db
+        .select({ id: papercutTable.id })
+        .from(papercutTable)
+        .where(
+          and(
+            eq(papercutTable.sessionId, row.sessionId),
+            eq(papercutTable.toolCallId, row.toolCallId),
+          ),
+        )
+        .limit(1);
+      if (!existing[0]) {
+        throw new Error("conflicting papercut row was not found after insert replay");
+      }
+      return existing[0].id;
     },
 
     async list({ includeArchived, limit }) {
@@ -121,13 +144,6 @@ export function makePapercutStore(
       await db
         .update(papercutTable)
         .set({ archivedAt: archived ? new Date() : null })
-        .where(eq(papercutTable.id, id));
-    },
-
-    async setFixTask(id, taskId) {
-      await db
-        .update(papercutTable)
-        .set({ fixTaskId: taskId })
         .where(eq(papercutTable.id, id));
     },
   };

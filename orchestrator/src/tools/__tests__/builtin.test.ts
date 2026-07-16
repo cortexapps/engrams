@@ -10,10 +10,19 @@ import { createToolRegistry } from "../registry.ts";
 
 function papercutRecorder(): { store: PapercutStore; inserted: PapercutInput[] } {
   const inserted: PapercutInput[] = [];
+  const idsByToolCall = new Map<string, string>();
   const store: PapercutStore = {
     async insert(row) {
+      const key = row.toolCallId == null
+        ? null
+        : `${row.sessionId}:${row.toolCallId}`;
+      const existing = key == null ? undefined : idsByToolCall.get(key);
+      if (existing) return existing;
+
+      const id = `papercut-${inserted.length + 1}`;
       inserted.push(row);
-      return "papercut-1";
+      if (key != null) idsByToolCall.set(key, id);
+      return id;
     },
     async list() {
       return [];
@@ -22,7 +31,6 @@ function papercutRecorder(): { store: PapercutStore; inserted: PapercutInput[] }
       return null;
     },
     async setArchived() {},
-    async setFixTask() {},
   };
   return { store, inserted };
 }
@@ -134,33 +142,34 @@ describe("built-in tools", () => {
     });
   });
 
-  test("papercut handler persists the tool arguments and session context", async () => {
+  test("papercut handler persists once and returns the same id on step replay", async () => {
     const registry = createToolRegistry();
     const papercuts = papercutRecorder();
     registerBuiltinTools(registry, { papercuts: papercuts.store });
 
     const tool = registry.get("papercut");
     if (!tool || tool.handling !== "handled") throw new Error("papercut tool not registered");
-    const output = await tool.handler(
-      {
-        sessionId: "session-1",
-        taskId: "task-1",
-        profileId: "profile-1",
-        userId: "user-1",
-        capabilities: [],
-        toolCallId: "call-1",
-        toolName: "papercut",
-      },
-      tool.input.parse({
-        summary: "Command output was unclear",
-        description: "The error omitted the failing file; a path would have helped.",
-        category: "tooling",
-        severity: "medium",
-        tags: ["errors", "cli"],
-      }),
-    );
+    const ctx = {
+      sessionId: "session-1",
+      taskId: "task-1",
+      profileId: "profile-1",
+      userId: "user-1",
+      capabilities: [],
+      toolCallId: "call-1",
+      toolName: "papercut",
+    };
+    const args = tool.input.parse({
+      summary: "Command output was unclear",
+      description: "The error omitted the failing file; a path would have helped.",
+      category: "tooling",
+      severity: "medium",
+      tags: ["errors", "cli"],
+    });
+    const first = await tool.handler(ctx, args);
+    const replay = await tool.handler(ctx, args);
 
-    expect(output).toEqual({ logged: true, id: "papercut-1" });
+    expect(first).toEqual({ logged: true, id: "papercut-1" });
+    expect(replay).toEqual(first);
     expect(papercuts.inserted).toEqual([{
       summary: "Command output was unclear",
       description: "The error omitted the failing file; a path would have helped.",
@@ -168,6 +177,7 @@ describe("built-in tools", () => {
       severity: "medium",
       tags: ["errors", "cli"],
       sessionId: "session-1",
+      toolCallId: "call-1",
       taskId: "task-1",
       profileId: "profile-1",
       userId: "user-1",

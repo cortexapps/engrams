@@ -3,7 +3,6 @@ import { useQueryClient } from "@tanstack/react-query";
 import {
   archivePapercut,
   listPapercuts,
-  startFixTask,
   unarchivePapercut,
 } from "../gen/engram/app/v1/papercut-PapercutService_connectquery";
 
@@ -27,9 +26,4 @@ export function useArchivePapercut() {
 export function useUnarchivePapercut() {
   const invalidate = useInvalidatePapercuts();
   return useMutation(unarchivePapercut, { onSuccess: invalidate });
-}
-
-export function useStartFixTask() {
-  const invalidate = useInvalidatePapercuts();
-  return useMutation(startFixTask, { onSuccess: invalidate });
 }

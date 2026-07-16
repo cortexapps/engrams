@@ -9,7 +9,6 @@ service PapercutService {
   rpc ListPapercuts(ListPapercutsRequest) returns (ListPapercutsResponse);
   rpc ArchivePapercut(ArchivePapercutRequest) returns (ArchivePapercutResponse);
   rpc UnarchivePapercut(UnarchivePapercutRequest) returns (UnarchivePapercutResponse);
-  rpc StartFixTask(StartFixTaskRequest) returns (StartFixTaskResponse);
 }
 
 message Papercut {
@@ -22,11 +21,9 @@ message Papercut {
   repeated string tags = 6;
   string session_id = 7;
   string task_id = 8;
-  // Empty means no fix task.
-  string fix_task_id = 9;
-  bool archived = 10;
-  google.protobuf.Timestamp created_at = 11;
-  ProfileSnapshot profile = 12;
+  bool archived = 9;
+  google.protobuf.Timestamp created_at = 10;
+  ProfileSnapshot profile = 11;
 }
 
 message ListPapercutsRequest {
@@ -51,13 +48,4 @@ message UnarchivePapercutRequest {
 
 message UnarchivePapercutResponse {
   Papercut papercut = 1;
-}
-
-message StartFixTaskRequest {
-  string id = 1;
-}
-
-message StartFixTaskResponse {
-  string task_id = 1;
-  string session_id = 2;
 }

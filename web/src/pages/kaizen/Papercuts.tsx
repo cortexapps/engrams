@@ -1,18 +1,12 @@
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { timestampDate } from "@bufbuild/protobuf/wkt";
-import { Link, useNavigate } from "@tanstack/react-router";
-import { ArchiveIcon, ArchiveRestoreIcon, HammerIcon, WrenchIcon } from "lucide-react";
+import { Link } from "@tanstack/react-router";
+import { ArchiveIcon, ArchiveRestoreIcon, CopyIcon } from "lucide-react";
 import { toast } from "sonner";
 
 import { PageHeading } from "../../components/page-heading";
 import { ProfileChip } from "../../components/profiles/ProfileChip";
-import {
-  useArchivePapercut,
-  usePapercuts,
-  useStartFixTask,
-  useUnarchivePapercut,
-} from "../../hooks/usePapercuts";
-import { useTasks } from "../../hooks/useTasks";
+import { useArchivePapercut, usePapercuts, useUnarchivePapercut } from "../../hooks/usePapercuts";
 import { useNow } from "../../hooks/useNow";
 import { errorMessage } from "../../lib/errors";
 import type { Papercut } from "../../gen/engram/app/v1/papercut_pb";
@@ -47,24 +41,43 @@ function CreatedAt({ papercut, now }: { papercut: Papercut; now: number }) {
   );
 }
 
+function papercutDetails(papercut: Papercut): string {
+  if (!papercut.createdAt) throw new Error("Papercut is missing its logged date.");
+
+  const lines = [`Papercut: ${papercut.summary}`, `Category: ${papercut.category}`];
+  const severity = papercut.severity.trim();
+  if (severity) lines.push(`Severity: ${severity}`);
+  const tags = papercut.tags.map((tag) => tag.trim()).filter(Boolean);
+  if (tags.length > 0) lines.push(`Tags: ${tags.join(", ")}`);
+  lines.push(
+    `Logged: ${timestampDate(papercut.createdAt).toISOString()} from session ${papercut.sessionId}`,
+  );
+  return `${lines.join("\n")}\n\n${papercut.description}`;
+}
+
 function PapercutRow({
   papercut,
-  fixSessionId,
   now,
   busy,
-  onStartFix,
   onArchive,
   onUnarchive,
 }: {
   papercut: Papercut;
-  fixSessionId?: string;
   now: number;
   busy: boolean;
-  onStartFix: (id: string) => Promise<void>;
   onArchive: (id: string) => Promise<void>;
   onUnarchive: (id: string) => Promise<void>;
 }) {
   const [descriptionExpanded, setDescriptionExpanded] = useState(false);
+
+  const onCopy = async () => {
+    try {
+      await navigator.clipboard.writeText(papercutDetails(papercut));
+      toast.success("Papercut copied");
+    } catch (err) {
+      toast.error(errorMessage(err));
+    }
+  };
 
   return (
     <article
@@ -92,24 +105,6 @@ function PapercutRow({
                 from session
               </Link>
             )}
-            {papercut.fixTaskId &&
-              (fixSessionId ? (
-                <Badge asChild variant="secondary">
-                  <Link
-                    to="/sessions/$id"
-                    params={{ id: fixSessionId }}
-                    title={`Fix task ${papercut.fixTaskId}`}
-                  >
-                    <WrenchIcon />
-                    fix task
-                  </Link>
-                </Badge>
-              ) : (
-                <Badge variant="secondary" title={`Fix task ${papercut.fixTaskId}`}>
-                  <WrenchIcon />
-                  fix task
-                </Badge>
-              ))}
           </div>
 
           {papercut.tags.length > 0 && (
@@ -141,12 +136,10 @@ function PapercutRow({
         </div>
 
         <div className="flex shrink-0 flex-wrap items-center gap-1 lg:justify-end">
-          {!papercut.archived && (
-            <Button size="sm" disabled={busy} onClick={() => void onStartFix(papercut.id)}>
-              <HammerIcon />
-              Start fix task
-            </Button>
-          )}
+          <Button variant="ghost" size="sm" onClick={() => void onCopy()}>
+            <CopyIcon />
+            Copy papercut details
+          </Button>
 
           {papercut.archived ? (
             <Button
@@ -192,34 +185,9 @@ function PapercutRow({
 export function Papercuts() {
   const [showArchived, setShowArchived] = useState(false);
   const { data, error, isPending } = usePapercuts(showArchived);
-  const { data: taskData } = useTasks({ scope: "mine" });
   const archivePapercut = useArchivePapercut();
   const unarchivePapercut = useUnarchivePapercut();
-  const startFixTask = useStartFixTask();
-  const navigate = useNavigate();
   const now = useNow();
-
-  const fixSessions = useMemo(
-    () =>
-      new Map(
-        (taskData?.tasks ?? []).flatMap((task) => {
-          const sessionId = task.sessions[0]?.sessionId;
-          return sessionId ? [[task.id, sessionId] as const] : [];
-        }),
-      ),
-    [taskData],
-  );
-
-  const onStartFix = async (id: string) => {
-    try {
-      const response = await startFixTask.mutateAsync({ id });
-      if (!response.sessionId) throw new Error("Fix task started, but no session was returned.");
-      toast.success("Fix task started");
-      navigate({ to: "/sessions/$id", params: { id: response.sessionId } });
-    } catch (err) {
-      toast.error(errorMessage(err));
-    }
-  };
 
   const onArchive = async (id: string) => {
     try {
@@ -240,7 +208,7 @@ export function Papercuts() {
   };
 
   const papercuts = data?.papercuts ?? [];
-  const busy = archivePapercut.isPending || unarchivePapercut.isPending || startFixTask.isPending;
+  const busy = archivePapercut.isPending || unarchivePapercut.isPending;
 
   return (
     <div className="flex flex-col gap-6">
@@ -281,10 +249,8 @@ export function Papercuts() {
           <PapercutRow
             key={papercut.id}
             papercut={papercut}
-            fixSessionId={fixSessions.get(papercut.fixTaskId)}
             now={now}
             busy={busy}
-            onStartFix={onStartFix}
             onArchive={onArchive}
             onUnarchive={onUnarchive}
           />

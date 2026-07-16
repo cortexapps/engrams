@@ -155,6 +155,13 @@
       "when": 1784157439243,
       "tag": "0021_chilly_starhawk",
       "breakpoints": true
+    },
+    {
+      "idx": 22,
+      "version": "7",
+      "when": 1784161433276,
+      "tag": "0022_fast_chronomancer",
+      "breakpoints": true
     }
   ]
 }

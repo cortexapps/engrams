@@ -73,6 +73,7 @@ export function registerBuiltinTools(
         severity: args.severity ?? null,
         tags: args.tags ?? [],
         sessionId: ctx.sessionId,
+        toolCallId: ctx.toolCallId,
         taskId: ctx.taskId ?? null,
         profileId: ctx.profileId ?? null,
         userId: ctx.userId ?? null,

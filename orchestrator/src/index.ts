@@ -133,7 +133,7 @@ const server = buildServer(
     // Registered BEFORE the passthrough so it wins the /rpc/engram.app.v1.TaskService/* prefix.
     registerTasks(router);
 
-    // Native PapercutService: orchestrator-owned friction inbox + fix-task launch.
+    // Native PapercutService: orchestrator-owned friction inbox.
     registerPapercuts(router);
 
     // Native ProfileService: orchestrator-owned session profiles (ADR 0053).

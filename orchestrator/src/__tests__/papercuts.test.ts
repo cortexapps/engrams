@@ -13,7 +13,6 @@ import type {
   ProfileRow,
   ProfileStore,
 } from "../db/profiles.ts";
-import type { CreateTaskParams } from "../rpc/task-create.ts";
 
 const USER_ID = "papercut-user";
 const CREATED_AT = new Date("2026-07-14T18:19:20.123Z");
@@ -27,10 +26,10 @@ function papercutRow(overrides: Partial<PapercutListRow> = {}): PapercutListRow 
     severity: null,
     tags: ["developer-experience", "docs"],
     sessionId: "source-session",
+    toolCallId: "tool-call-1",
     taskId: null,
     profileId: "profile-1",
     userId: USER_ID,
-    fixTaskId: null,
     archivedAt: null,
     createdAt: CREATED_AT,
     profileName: "Development",
@@ -66,10 +65,6 @@ function makePapercuts(seed: PapercutListRow[]): FakePapercutStore {
     async setArchived(id, archived) {
       const row = rows.get(id);
       if (row) rows.set(id, { ...row, archivedAt: archived ? new Date() : null });
-    },
-    async setFixTask(id, taskId) {
-      const row = rows.get(id);
-      if (row) rows.set(id, { ...row, fixTaskId: taskId });
     },
   };
 }
@@ -177,7 +172,6 @@ describe("PapercutService", () => {
         archivedAt: new Date("2026-07-15T00:00:00Z"),
         severity: null,
         taskId: null,
-        fixTaskId: null,
       }),
     ]);
     const server = await spawn({
@@ -192,7 +186,6 @@ describe("PapercutService", () => {
       expect(papercut.archived).toBe(true);
       expect(papercut.severity).toBe("");
       expect(papercut.taskId).toBe("");
-      expect(papercut.fixTaskId).toBe("");
       expect(papercut.profile).toMatchObject({
         id: "profile-1",
         name: "Development",
@@ -247,98 +240,4 @@ describe("PapercutService", () => {
     }
   });
 
-  test("StartFixTask creates and links a normal caller-owned chat task", async () => {
-    const store = makePapercuts([
-      papercutRow({ severity: "high", tags: ["tooling", "docs"] }),
-    ]);
-    let createParams: CreateTaskParams | undefined;
-    const server = await spawn({
-      papercuts: store,
-      profiles: makeProfiles([profileRow()]),
-      async createTask(params) {
-        createParams = params;
-        return { taskId: "fix-task", sessionId: "fix-session" };
-      },
-    });
-    try {
-      const response = await server.client.startFixTask({ id: "pc-1" });
-      expect(response.sessionId).toBe("fix-session");
-      expect(response.taskId).not.toBe("");
-      expect(store.rows.get("pc-1")?.fixTaskId).toBe(response.taskId);
-      expect(createParams).toMatchObject({
-        type: "chat",
-        title: "Fix papercut: The formatter is hard to discover",
-        ownerUserId: USER_ID,
-        profileId: "profile-1",
-      });
-
-      const prompt = createParams?.prompt ?? "";
-      expect(prompt).toContain("Summary: The formatter is hard to discover");
-      expect(prompt).toContain(
-        "I had to search the repository to find the formatting command.",
-      );
-      expect(prompt).toContain("Severity: high");
-      expect(prompt).toContain("Tags: tooling, docs");
-      expect(prompt).toContain(
-        `(logged ${CREATED_AT.toISOString()} from session source-session)`,
-      );
-    } finally {
-      await server.close();
-    }
-  });
-
-  test("StartFixTask rejects an archived papercut", async () => {
-    const server = await spawn({
-      papercuts: makePapercuts([papercutRow({ archivedAt: new Date() })]),
-      profiles: makeProfiles([profileRow()]),
-    });
-    try {
-      await expectConnectError(
-        server.client.startFixTask({ id: "pc-1" }),
-        Code.FailedPrecondition,
-        "papercut is archived",
-      );
-    } finally {
-      await server.close();
-    }
-  });
-
-  test("StartFixTask rejects a papercut without a profile", async () => {
-    const server = await spawn({
-      papercuts: makePapercuts([
-        papercutRow({ profileId: null, profileName: null, profileIcon: null }),
-      ]),
-      profiles: makeProfiles([]),
-    });
-    try {
-      await expectConnectError(
-        server.client.startFixTask({ id: "pc-1" }),
-        Code.FailedPrecondition,
-        "papercut has no profile",
-      );
-    } finally {
-      await server.close();
-    }
-  });
-
-  for (const [label, profiles] of [
-    ["missing", makeProfiles([])],
-    ["archived", makeProfiles([profileRow({ deletedAt: new Date() })])],
-  ] as const) {
-    test(`StartFixTask rejects a ${label} profile`, async () => {
-      const server = await spawn({
-        papercuts: makePapercuts([papercutRow()]),
-        profiles,
-      });
-      try {
-        await expectConnectError(
-          server.client.startFixTask({ id: "pc-1" }),
-          Code.FailedPrecondition,
-          "the papercut's profile is archived or gone — cannot start a fix task",
-        );
-      } finally {
-        await server.close();
-      }
-    });
-  }
 });

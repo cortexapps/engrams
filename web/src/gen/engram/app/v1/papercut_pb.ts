@@ -14,7 +14,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/papercut.proto.
  */
 export const file_engram_app_v1_papercut: GenFile = /*@__PURE__*/
-  fileDesc("ChxlbmdyYW0vYXBwL3YxL3BhcGVyY3V0LnByb3RvEg1lbmdyYW0uYXBwLnYxIpsCCghQYXBlcmN1dBIKCgJpZBgBIAEoCRIPCgdzdW1tYXJ5GAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEhAKCGNhdGVnb3J5GAQgASgJEhAKCHNldmVyaXR5GAUgASgJEgwKBHRhZ3MYBiADKAkSEgoKc2Vzc2lvbl9pZBgHIAEoCRIPCgd0YXNrX2lkGAggASgJEhMKC2ZpeF90YXNrX2lkGAkgASgJEhAKCGFyY2hpdmVkGAogASgIEi4KCmNyZWF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi8KB3Byb2ZpbGUYDCABKAsyHi5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTbmFwc2hvdCIwChRMaXN0UGFwZXJjdXRzUmVxdWVzdBIYChBpbmNsdWRlX2FyY2hpdmVkGAEgASgIIkMKFUxpc3RQYXBlcmN1dHNSZXNwb25zZRIqCglwYXBlcmN1dHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLlBhcGVyY3V0IiQKFkFyY2hpdmVQYXBlcmN1dFJlcXVlc3QSCgoCaWQYASABKAkiRAoXQXJjaGl2ZVBhcGVyY3V0UmVzcG9uc2USKQoIcGFwZXJjdXQYASABKAsyFy5lbmdyYW0uYXBwLnYxLlBhcGVyY3V0IiYKGFVuYXJjaGl2ZVBhcGVyY3V0UmVxdWVzdBIKCgJpZBgBIAEoCSJGChlVbmFyY2hpdmVQYXBlcmN1dFJlc3BvbnNlEikKCHBhcGVyY3V0GAEgASgLMhcuZW5ncmFtLmFwcC52MS5QYXBlcmN1dCIhChNTdGFydEZpeFRhc2tSZXF1ZXN0EgoKAmlkGAEgASgJIjsKFFN0YXJ0Rml4VGFza1Jlc3BvbnNlEg8KB3Rhc2tfaWQYASABKAkSEgoKc2Vzc2lvbl9pZBgCIAEoCTKQAwoPUGFwZXJjdXRTZXJ2aWNlEloKDUxpc3RQYXBlcmN1dHMSIy5lbmdyYW0uYXBwLnYxLkxpc3RQYXBlcmN1dHNSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5MaXN0UGFwZXJjdXRzUmVzcG9uc2USYAoPQXJjaGl2ZVBhcGVyY3V0EiUuZW5ncmFtLmFwcC52MS5BcmNoaXZlUGFwZXJjdXRSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5BcmNoaXZlUGFwZXJjdXRSZXNwb25zZRJmChFVbmFyY2hpdmVQYXBlcmN1dBInLmVuZ3JhbS5hcHAudjEuVW5hcmNoaXZlUGFwZXJjdXRSZXF1ZXN0GiguZW5ncmFtLmFwcC52MS5VbmFyY2hpdmVQYXBlcmN1dFJlc3BvbnNlElcKDFN0YXJ0Rml4VGFzaxIiLmVuZ3JhbS5hcHAudjEuU3RhcnRGaXhUYXNrUmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuU3RhcnRGaXhUYXNrUmVzcG9uc2ViBnByb3RvMw", [file_engram_app_v1_profile, file_google_protobuf_timestamp]);
+  fileDesc("ChxlbmdyYW0vYXBwL3YxL3BhcGVyY3V0LnByb3RvEg1lbmdyYW0uYXBwLnYxIoYCCghQYXBlcmN1dBIKCgJpZBgBIAEoCRIPCgdzdW1tYXJ5GAIgASgJEhMKC2Rlc2NyaXB0aW9uGAMgASgJEhAKCGNhdGVnb3J5GAQgASgJEhAKCHNldmVyaXR5GAUgASgJEgwKBHRhZ3MYBiADKAkSEgoKc2Vzc2lvbl9pZBgHIAEoCRIPCgd0YXNrX2lkGAggASgJEhAKCGFyY2hpdmVkGAkgASgIEi4KCmNyZWF0ZWRfYXQYCiABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi8KB3Byb2ZpbGUYCyABKAsyHi5lbmdyYW0uYXBwLnYxLlByb2ZpbGVTbmFwc2hvdCIwChRMaXN0UGFwZXJjdXRzUmVxdWVzdBIYChBpbmNsdWRlX2FyY2hpdmVkGAEgASgIIkMKFUxpc3RQYXBlcmN1dHNSZXNwb25zZRIqCglwYXBlcmN1dHMYASADKAsyFy5lbmdyYW0uYXBwLnYxLlBhcGVyY3V0IiQKFkFyY2hpdmVQYXBlcmN1dFJlcXVlc3QSCgoCaWQYASABKAkiRAoXQXJjaGl2ZVBhcGVyY3V0UmVzcG9uc2USKQoIcGFwZXJjdXQYASABKAsyFy5lbmdyYW0uYXBwLnYxLlBhcGVyY3V0IiYKGFVuYXJjaGl2ZVBhcGVyY3V0UmVxdWVzdBIKCgJpZBgBIAEoCSJGChlVbmFyY2hpdmVQYXBlcmN1dFJlc3BvbnNlEikKCHBhcGVyY3V0GAEgASgLMhcuZW5ncmFtLmFwcC52MS5QYXBlcmN1dDK3AgoPUGFwZXJjdXRTZXJ2aWNlEloKDUxpc3RQYXBlcmN1dHMSIy5lbmdyYW0uYXBwLnYxLkxpc3RQYXBlcmN1dHNSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5MaXN0UGFwZXJjdXRzUmVzcG9uc2USYAoPQXJjaGl2ZVBhcGVyY3V0EiUuZW5ncmFtLmFwcC52MS5BcmNoaXZlUGFwZXJjdXRSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5BcmNoaXZlUGFwZXJjdXRSZXNwb25zZRJmChFVbmFyY2hpdmVQYXBlcmN1dBInLmVuZ3JhbS5hcHAudjEuVW5hcmNoaXZlUGFwZXJjdXRSZXF1ZXN0GiguZW5ncmFtLmFwcC52MS5VbmFyY2hpdmVQYXBlcmN1dFJlc3BvbnNlYgZwcm90bzM", [file_engram_app_v1_profile, file_google_protobuf_timestamp]);
 
 /**
  * @generated from message engram.app.v1.Papercut
@@ -63,24 +63,17 @@ export type Papercut = Message<"engram.app.v1.Papercut"> & {
   taskId: string;
 
   /**
-   * Empty means no fix task.
-   *
-   * @generated from field: string fix_task_id = 9;
-   */
-  fixTaskId: string;
-
-  /**
-   * @generated from field: bool archived = 10;
+   * @generated from field: bool archived = 9;
    */
   archived: boolean;
 
   /**
-   * @generated from field: google.protobuf.Timestamp created_at = 11;
+   * @generated from field: google.protobuf.Timestamp created_at = 10;
    */
   createdAt?: Timestamp;
 
   /**
-   * @generated from field: engram.app.v1.ProfileSnapshot profile = 12;
+   * @generated from field: engram.app.v1.ProfileSnapshot profile = 11;
    */
   profile?: ProfileSnapshot;
 };
@@ -195,45 +188,6 @@ export const UnarchivePapercutResponseSchema: GenMessage<UnarchivePapercutRespon
   messageDesc(file_engram_app_v1_papercut, 6);
 
 /**
- * @generated from message engram.app.v1.StartFixTaskRequest
- */
-export type StartFixTaskRequest = Message<"engram.app.v1.StartFixTaskRequest"> & {
-  /**
-   * @generated from field: string id = 1;
-   */
-  id: string;
-};
-
-/**
- * Describes the message engram.app.v1.StartFixTaskRequest.
- * Use `create(StartFixTaskRequestSchema)` to create a new message.
- */
-export const StartFixTaskRequestSchema: GenMessage<StartFixTaskRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_papercut, 7);
-
-/**
- * @generated from message engram.app.v1.StartFixTaskResponse
- */
-export type StartFixTaskResponse = Message<"engram.app.v1.StartFixTaskResponse"> & {
-  /**
-   * @generated from field: string task_id = 1;
-   */
-  taskId: string;
-
-  /**
-   * @generated from field: string session_id = 2;
-   */
-  sessionId: string;
-};
-
-/**
- * Describes the message engram.app.v1.StartFixTaskResponse.
- * Use `create(StartFixTaskResponseSchema)` to create a new message.
- */
-export const StartFixTaskResponseSchema: GenMessage<StartFixTaskResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_papercut, 8);
-
-/**
  * @generated from service engram.app.v1.PapercutService
  */
 export const PapercutService: GenService<{
@@ -260,14 +214,6 @@ export const PapercutService: GenService<{
     methodKind: "unary";
     input: typeof UnarchivePapercutRequestSchema;
     output: typeof UnarchivePapercutResponseSchema;
-  },
-  /**
-   * @generated from rpc engram.app.v1.PapercutService.StartFixTask
-   */
-  startFixTask: {
-    methodKind: "unary";
-    input: typeof StartFixTaskRequestSchema;
-    output: typeof StartFixTaskResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_papercut, 0);
