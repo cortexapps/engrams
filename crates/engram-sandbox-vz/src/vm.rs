@@ -118,7 +118,6 @@ impl VmConfig {
 
     /// ADR 0096 spike: pin the platform machine identifier (see the
     /// field docs).
-    #[allow(dead_code)] // spike-only until machine-state snapshots productize
     pub fn with_machine_identifier(mut self, bytes: Vec<u8>) -> Self {
         self.machine_identifier = Some(bytes);
         self
@@ -126,7 +125,6 @@ impl VmConfig {
 
     /// ADR 0096 spike round 2: pin the virtio-net MAC (see the field
     /// docs).
-    #[allow(dead_code)] // spike-only until machine-state snapshots productize
     pub fn with_mac_address(mut self, mac: impl Into<String>) -> Self {
         self.mac_address = Some(mac.into());
         self
@@ -159,10 +157,9 @@ impl VmConfig {
     }
 }
 
-/// ADR 0096 spike: mint fresh `VZGenericMachineIdentifier` bytes
+/// ADR 0096: mint fresh `VZGenericMachineIdentifier` bytes
 /// (its `dataRepresentation`). Persist beside a saved machine state
 /// and hand back via [`VmConfig::with_machine_identifier`] at restore.
-#[allow(dead_code)] // spike-only until machine-state snapshots productize
 pub(crate) fn fresh_machine_identifier() -> Vec<u8> {
     use objc2_virtualization::VZGenericMachineIdentifier;
     // SAFETY: plain data object; no VM/queue involvement.

@@ -105,6 +105,18 @@ impl VzConfig {
 struct VzSandboxState {
     #[allow(dead_code)]
     spec: SandboxSpec,
+    /// ADR 0096 D7: the pinned platform machine identifier + virtio-net
+    /// MAC this VM was built with. Persisted into the snapshot manifest's
+    /// warm block so a machine-state restore can rebuild the identical
+    /// config (Apple's save/restore contract). Minted fresh at `create()`
+    /// and on cold restores; inherited from the manifest on warm restores.
+    machine_identifier: Vec<u8>,
+    mac_address: String,
+    /// The RESOLVED aux drives actually attached to the live VM (the
+    /// spec's symbolic slots after stamp resolution) — what a warm
+    /// restore must re-attach byte-for-byte. The `spec` above keeps the
+    /// symbolic form for the cold path's fresh re-resolution.
+    resolved_aux_ro_drives: Vec<AuxRoDrive>,
     /// Live VM. Dropping this releases the underlying ObjC objects
     /// (config, devices, queue) once any in-flight dispatched work
     /// completes.
@@ -421,6 +433,10 @@ impl VzBackend {
             "vz: cloned snapshot rootfs to fresh per-sandbox path for cold-resume"
         );
 
+        // ADR 0096 D7: cold restores mint a FRESH identity — the new VM
+        // is a new machine (and fresh MACs keep the many-sessions-from-
+        // one-base case collision-free). Warm restores inherit instead.
+        let (machine_identifier, mac_address) = mint_vm_identity();
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
@@ -428,7 +444,9 @@ impl VzBackend {
             vcpus,
         )
         .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone())
-        .with_egress_ports(self.cfg.egress_ports);
+        .with_egress_ports(self.cfg.egress_ports)
+        .with_machine_identifier(machine_identifier.clone())
+        .with_mac_address(mac_address.clone());
         let vm = VzVm::new(vm_cfg)?;
         if let Err(e) = vm.start().await {
             let _ = tokio::fs::remove_file(&rootfs_path).await;
@@ -455,7 +473,10 @@ impl VzBackend {
         self.sandboxes.insert(
             new_id,
             VzSandboxState {
+                resolved_aux_ro_drives: spec.aux_ro_drives.clone(),
                 spec,
+                machine_identifier,
+                mac_address,
                 vm,
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 connector,
@@ -534,6 +555,23 @@ where
 
 /// Logged at-most-once per backend instance when a session asks for
 /// egress filtering VZ can't enforce. Apple's
+/// ADR 0096 D7: mint a fresh per-VM identity — a platform machine
+/// identifier plus a random locally-administered unicast MAC
+/// (`0a:xx:xx:xx:xx:xx`). Every VM-CREATING path must mint one: a VM
+/// built without an explicit identity gets a random one VZ never
+/// exposes, so its machine-state save could never be restored. Warm
+/// restores inherit the manifest's saved identity instead (and the
+/// dup-MAC gate keeps two live VMs from sharing a MAC on the NAT).
+fn mint_vm_identity() -> (Vec<u8>, String) {
+    let mid = crate::vm::fresh_machine_identifier();
+    let b = uuid::Uuid::new_v4().into_bytes();
+    let mac = format!(
+        "0a:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
+        b[0], b[1], b[2], b[3], b[4]
+    );
+    (mid, mac)
+}
+
 /// `VZNATNetworkDeviceAttachment` is opaque: no host-side insertable
 /// filter exists, so VZ cannot HARD-enforce `manifest.network.allow_hosts`
 /// the way FC's netns iptables do. ADR 0096 D6 added SOFT steering — the
@@ -648,6 +686,9 @@ impl SandboxBackend for VzBackend {
             "vz: aux drives after agentd-slot resolution"
         );
 
+        // ADR 0096 D7: fresh pinned identity for this VM.
+        let (machine_identifier, mac_address) = mint_vm_identity();
+        let resolved_aux_ro_drives = aux_ro_drives.clone();
         let vm_cfg = VmConfig::new(
             self.cfg.kernel_path.clone(),
             rootfs_path.clone(),
@@ -659,7 +700,9 @@ impl SandboxBackend for VzBackend {
         // nothing (except the agentd slot, resolved above); a plain
         // cold-create with resolved drives attaches them.
         .with_aux_ro_drives(aux_ro_drives, self.cfg.bundle_dir.clone())
-        .with_egress_ports(self.cfg.egress_ports);
+        .with_egress_ports(self.cfg.egress_ports)
+        .with_machine_identifier(machine_identifier.clone())
+        .with_mac_address(mac_address.clone());
         let vm = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
@@ -706,6 +749,9 @@ impl SandboxBackend for VzBackend {
             id,
             VzSandboxState {
                 spec,
+                machine_identifier,
+                mac_address,
+                resolved_aux_ro_drives,
                 vm,
                 bridge: parking_lot::Mutex::new(Some(bridge)),
                 connector,
