@@ -324,7 +324,15 @@ for arg in "$@"; do
         --filename=*) filename="${arg#--filename=}" ;;
     esac
 done
-"$here/node/bin/playwright-cli" "$@"
+# Invoke the JavaScript entrypoint through the bundled Node explicitly. The
+# npm-generated playwright-cli shim starts with `#!/usr/bin/env node`; minimal
+# guest images (including the production-shaped Firecracker fixture) need not
+# carry /usr/bin/env, even though this bundle already carries Node itself.
+# Executing the shim directly therefore reports the misleading ENOENT
+# "playwright-cli: not found". Node accepts the shim path (and ignores its
+# shebang), preserving npm symlink/module resolution without depending on any
+# base-image utility.
+"$here/node/bin/node" "$here/node/bin/playwright-cli" "$@"
 status=$?
 if [ "$status" -eq 0 ] && [ "${1:-}" = screenshot ] && [ -f "$filename" ]; then
     canonical="$(readlink -f -- "$filename")"
