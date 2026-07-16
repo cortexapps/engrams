@@ -20,7 +20,7 @@ describe("ProfileSecretsEditor helpers (ADR 0057)", () => {
         ref: " datadog-api-key ",
         envVar: " DD_API_KEY ",
         mode: "broker",
-        allowHostsText: "api.datadoghq.com",
+        allowHostsText: "api.datadoghq.com, *.datadoghq.com",
       },
       { id: "2", ref: "", envVar: "IGNORED", mode: "literal", allowHostsText: "" }, // no ref → dropped
       {
@@ -37,7 +37,7 @@ describe("ProfileSecretsEditor helpers (ADR 0057)", () => {
         envVar: "DD_API_KEY",
         mode: "broker",
         allowHosts: ["api.datadoghq.com"],
-        allowHostPatterns: [],
+        allowHostPatterns: ["*.datadoghq.com"],
       },
       // literal mode drops allowHosts (only broker substitutes at the proxy)
       {
@@ -52,14 +52,20 @@ describe("ProfileSecretsEditor helpers (ADR 0057)", () => {
 
   it("wireToSecretRows hydrates rows, coercing an unknown mode to broker", () => {
     const rows = wireToSecretRows([
-      { ref: "k", envVar: "K", mode: "weird", allowHosts: ["h1.com", "h2.com"] },
+      {
+        ref: "k",
+        envVar: "K",
+        mode: "weird",
+        allowHosts: ["h1.com", "h2.com"],
+        allowHostPatterns: ["*.h3.com"],
+      },
     ]);
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({
       ref: "k",
       envVar: "K",
       mode: "broker",
-      allowHostsText: "h1.com, h2.com",
+      allowHostsText: "h1.com, h2.com, *.h3.com",
     });
     expect(rows[0].id).toBeTruthy();
   });

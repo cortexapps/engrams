@@ -429,6 +429,143 @@ async fn e2e_vz_port_relay_reaches_loopback_without_hol() {
     backend.destroy(id).await.expect("destroy");
 }
 
+/// ADR 0096 D7: WARM restore — a snapshot→restore round-trip preserves
+/// guest MEMORY, not just disk. The tmpfs marker (/dev/shm — never
+/// touches the virtio-blk disk) is the memory proof: a cold boot loses
+/// it, only a machine-state resume carries it. Also pins the StepClock
+/// path: the resumed guest's frozen CLOCK_REALTIME is host-pushed back
+/// within the threshold.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
+async fn e2e_vz_warm_restore_preserves_memory_and_clock() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let b = backend(&env, work.path(), true);
+
+    let id = b.create(spec(&env.rootfs)).await.expect("create");
+    await_agent(&b, id).await;
+    let (_, code) = exec(
+        &b,
+        id,
+        "echo disk-marker > /root/warm.txt && echo mem-marker > /dev/shm/warm.txt",
+    )
+    .await;
+    assert_eq!(code, Some(0), "write markers");
+
+    let meta = b.snapshot(id).await.expect("snapshot");
+    let machine_state = work
+        .path()
+        .join("sb/snapshots")
+        .join(meta.id.to_string())
+        .join("machine.vzs");
+    if !machine_state.exists() {
+        // Best-effort save failed (locked keychain on a headless host).
+        // The cold path is covered by the fallback test; nothing warm
+        // to assert here.
+        eprintln!(
+            "SKIP: machine.vzs was not saved (locked login keychain?) — warm restore \
+             untestable on this host"
+        );
+        b.destroy(id).await.expect("destroy");
+        return;
+    }
+    b.destroy(id).await.expect("destroy");
+
+    // Let real time run ahead of the frozen guest clock so the
+    // StepClock assertion below is meaningful (the guest steps only
+    // past a 2s threshold).
+    tokio::time::sleep(Duration::from_secs(4)).await;
+
+    let id2 = b.restore(meta).await.expect("restore");
+    await_agent(&b, id2).await;
+    let (out, code) = exec(&b, id2, "cat /root/warm.txt /dev/shm/warm.txt").await;
+    assert_eq!(code, Some(0), "post-restore read; out={out}");
+    assert!(out.contains("disk-marker"), "disk marker survives: {out}");
+    assert!(
+        out.contains("mem-marker"),
+        "tmpfs marker must survive a WARM restore (memory proof — a cold boot would \
+         lose it): {out}",
+    );
+
+    // Clock: the resumed guest was frozen for ≥4s; StepClock must have
+    // pushed it back to within a few seconds of the host.
+    let host_now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let (out, code) = exec(&b, id2, "date +%s").await;
+    assert_eq!(code, Some(0), "guest date; out={out}");
+    let guest_now: i64 = out.trim().parse().expect("guest epoch seconds");
+    let skew = (guest_now - host_now).abs();
+    assert!(
+        skew <= 3,
+        "warm-restored guest clock must be host-stepped (StepClock); skew was {skew}s",
+    );
+
+    b.destroy(id2).await.expect("destroy 2");
+}
+
+/// ADR 0096 D7: the cold-boot FALLBACK. Deleting machine.vzs fails the
+/// warm gate; the restore must cold-boot exactly like pre-D7 — the
+/// un-synced disk write survives (the pre-clone flush property), the
+/// tmpfs marker is gone (fresh memory), and the session is functional.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "live VZ boot: run via `just vz-e2e` (macOS + codesigned + staged artifacts)"]
+async fn e2e_vz_warm_restore_falls_back_to_cold() {
+    let env = match vz_preflight() {
+        Some(e) => e,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("workdir");
+    let b = backend(&env, work.path(), true);
+
+    let id = b.create(spec(&env.rootfs)).await.expect("create");
+    await_agent(&b, id).await;
+    // NO explicit sync — the disk marker's survival across the COLD
+    // path is the flush_guest_fs property this test now carries
+    // (lifecycle's restore leg went warm).
+    let (_, code) = exec(
+        &b,
+        id,
+        "echo disk-marker > /root/cold.txt && echo mem-marker > /dev/shm/cold.txt",
+    )
+    .await;
+    assert_eq!(code, Some(0), "write markers");
+    let meta = b.snapshot(id).await.expect("snapshot");
+    b.destroy(id).await.expect("destroy");
+
+    // Fail the warm gate: remove the machine state.
+    let machine_state = work
+        .path()
+        .join("sb/snapshots")
+        .join(meta.id.to_string())
+        .join("machine.vzs");
+    let _ = std::fs::remove_file(&machine_state);
+
+    let id2 = b.restore(meta).await.expect("restore (cold fallback)");
+    await_agent(&b, id2).await;
+    let (out, code) = exec(
+        &b,
+        id2,
+        "cat /root/cold.txt; ls /dev/shm/cold.txt 2>/dev/null || echo TMPFS-GONE",
+    )
+    .await;
+    assert_eq!(code, Some(0), "post-fallback read; out={out}");
+    assert!(
+        out.contains("disk-marker"),
+        "un-synced disk write must survive the cold fallback (flush property): {out}",
+    );
+    assert!(
+        out.contains("TMPFS-GONE"),
+        "tmpfs must be fresh on a cold boot (memory NOT restored): {out}",
+    );
+
+    b.destroy(id2).await.expect("destroy 2");
+}
+
 /// ADR 0096 D6: soft egress steering. The backend passes
 /// `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline; the init shim
 /// derives the NAT gateway from the guest's default route and installs

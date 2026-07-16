@@ -80,6 +80,8 @@ const linesOf = (text: string) =>
     .map((s) => s.trim())
     .filter(Boolean);
 
+const optionId = (value: string | null | undefined): string | null => value?.trim() || null;
+
 const schema = z.object({
   name: z.string().trim().min(1, "Name the profile first"),
   description: z.string(),
@@ -95,6 +97,7 @@ const schema = z.object({
   skills: z.array(z.string()),
   capabilities: z.array(z.string()),
   envRows: z.array(z.custom<EnvRow>()),
+  networkDefault: z.enum(["deny", "allow"]),
   allowHostsText: z.string(),
   allowPatternsText: z.string(),
   secretRows: z.array(z.custom<SecretRow>()),
@@ -117,6 +120,7 @@ const EMPTY: ProfileFormValues = {
   skills: [],
   capabilities: [],
   envRows: [],
+  networkDefault: "deny",
   allowHostsText: "",
   allowPatternsText: "",
   secretRows: [],
@@ -138,6 +142,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
 
   const [netOpen, setNetOpen] = useState(false);
   const [advanced, setAdvanced] = useState(false);
+  const [hydratedProfileId, setHydratedProfileId] = useState<string | null>(null);
 
   const form = useForm<ProfileFormValues>({
     resolver: zodResolver(schema),
@@ -157,6 +162,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const envRows = watch("envRows");
   const secretRows = watch("secretRows");
   const portExposures = watch("portExposures");
+  const networkDefault = watch("networkDefault");
   const allowHostsText = watch("allowHostsText");
   const allowPatternsText = watch("allowPatternsText");
 
@@ -173,19 +179,21 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       // harness/model/effort = "" (inherit), and `?? null` wouldn't catch "" —
       // leaving the form to submit "" (→ `harness "" is not in the catalog`).
       // The default-harness effect below then fills a concrete harness to edit.
-      harness: p.harness || null,
-      model: p.model || null,
-      effort: p.effort || null,
+      harness: optionId(p.harness),
+      model: optionId(p.model),
+      effort: optionId(p.effort),
       isDefault: p.isDefault,
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
       capabilities: p.capabilities ?? [],
       envRows: mapToEnvRows(p.envVars),
+      networkDefault: p.network?.default === "allow" ? "allow" : "deny",
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
       allowPatternsText: (p.network?.allowHostPatterns ?? []).join("\n"),
       secretRows: wireToSecretRows(p.secrets ?? []),
       portExposures: p.portExposures ?? [],
     });
+    setHydratedProfileId(p.id);
     if ((p.network?.allowHosts ?? []).length || (p.network?.allowHostPatterns ?? []).length)
       setNetOpen(true);
   }, [existing, reset]);
@@ -211,23 +219,23 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   }, [mode, images, form, setValue]);
 
   // ADR 0063: a profile always names a CONCRETE harness (no "inherit deployment
-  // default"). Default to the first registered harness whenever none is set —
-  // in create mode, AND when editing a legacy (pre-0063) profile whose harness
-  // is empty, so save doesn't fail with `harness "" is not in the catalog`. Runs
-  // after the edit hydrate (deps include `existing`); it won't clobber a concrete
-  // hydrated harness.
+  // default"). Default new profiles immediately. For an edit, wait until the
+  // existing profile has hydrated before repairing a legacy empty harness; a
+  // temporary default while the profile query is loading can leave the three
+  // coupled Select controls out of sync with the saved selection.
   useEffect(() => {
-    if (!form.getValues("harness") && harnesses && harnesses.length > 0)
-      setValue("harness", harnesses[0]!.name);
+    if (!harnesses?.length) return;
+    if (mode === "edit" && !existing?.profile) return;
+    if (!form.getValues("harness")) setValue("harness", harnesses[0]!.name);
   }, [mode, harnesses, form, setValue, existing]);
 
   const network = useMemo(
     () => ({
-      default: "deny" as const,
+      default: networkDefault,
       allowHosts: linesOf(allowHostsText),
       allowHostPatterns: linesOf(allowPatternsText),
     }),
-    [allowHostsText, allowPatternsText],
+    [networkDefault, allowHostsText, allowPatternsText],
   );
   const policy = useMemo(
     () =>
@@ -271,16 +279,16 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       description: vals.description,
       icon: vals.icon,
       imageId: vals.imageId,
-      harness: vals.harness ?? undefined,
-      model: vals.model ?? undefined,
-      effort: vals.effort ?? undefined,
+      harness: optionId(vals.harness) ?? undefined,
+      model: optionId(vals.model) ?? undefined,
+      effort: optionId(vals.effort) ?? undefined,
       isDefault: vals.isDefault,
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
       capabilities: vals.capabilities,
       envVars: envRowsToMap(vals.envRows),
       network: {
-        default: "deny" as const,
+        default: vals.networkDefault,
         allowHosts: linesOf(vals.allowHostsText),
         allowHostPatterns: linesOf(vals.allowPatternsText),
       },
@@ -302,6 +310,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   };
 
   const busy = create.isPending || update.isPending;
+
+  // Mount the controlled selectors only after reset() has installed the
+  // fetched profile. Otherwise they first mount with EMPTY and Radix notifies
+  // their change handlers as the saved values arrive, clearing model/effort.
+  if (mode === "edit" && hydratedProfileId !== editingId) {
+    return <Text tone="muted">Loading profile…</Text>;
+  }
 
   return (
     <form onSubmit={handleSubmit(onSubmit)} className="mx-auto w-full max-w-5xl pb-4">
@@ -432,9 +447,17 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 <Field>
                   <FieldLabel htmlFor="harness-select">Harness</FieldLabel>
                   <Select
-                    value={field.value ?? undefined}
+                    // Keep Radix controlled before the async profile hydrate.
+                    // An undefined→value transition invokes this coupled
+                    // control's change path and clears the saved model/effort.
+                    value={field.value ?? ""}
                     onValueChange={(v) => {
-                      field.onChange(v);
+                      const next = optionId(v);
+                      // Radix can notify when reset() hydrates the controlled
+                      // value. Only a real user-visible harness change should
+                      // invalidate the dependent selections.
+                      if (next === form.getValues("harness")) return;
+                      field.onChange(next);
                       // model/effort are enums on the harness — reset them when
                       // the harness changes so a stale option can't survive.
                       setValue("model", null);
@@ -473,10 +496,16 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                     <FieldLabel htmlFor="model-select">Model</FieldLabel>
                     <Select
                       value={field.value ?? "__inherit__"}
-                      onValueChange={(v) => field.onChange(v === "__inherit__" ? null : v)}
+                      onValueChange={(v) =>
+                        field.onChange(v === "__inherit__" ? null : optionId(v))
+                      }
                       disabled={!harnessDescriptor || harnessDescriptor.models.length === 0}
                     >
-                      <SelectTrigger id="model-select" className="w-full">
+                      <SelectTrigger
+                        id="model-select"
+                        data-testid="model-select"
+                        className="w-full"
+                      >
                         <SelectValue placeholder="Default" />
                       </SelectTrigger>
                       <SelectContent>
@@ -500,10 +529,16 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                     <FieldLabel htmlFor="effort-select">Effort</FieldLabel>
                     <Select
                       value={field.value ?? "__inherit__"}
-                      onValueChange={(v) => field.onChange(v === "__inherit__" ? null : v)}
+                      onValueChange={(v) =>
+                        field.onChange(v === "__inherit__" ? null : optionId(v))
+                      }
                       disabled={!harnessDescriptor || harnessDescriptor.effort.length === 0}
                     >
-                      <SelectTrigger id="effort-select" className="w-full">
+                      <SelectTrigger
+                        id="effort-select"
+                        data-testid="effort-select"
+                        className="w-full"
+                      >
                         <SelectValue placeholder="Default" />
                       </SelectTrigger>
                       <SelectContent>
@@ -614,16 +649,18 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
           <Section
             icon={<LockIcon className="size-4" />}
             title="Network"
-            sub="Deny by default. Sessions reach only what their powers open — add extra hosts only if a power can't."
+            sub="Session egress policy. New profiles deny by default; add extra hosts only if a power can't."
           >
             <div className="flex items-center gap-2.5 rounded-md border bg-background px-3.5 py-2.5">
               <LockIcon className="size-4 shrink-0 text-instrument-nominal" />
               <div className="flex-1 text-[0.82rem]">
-                <strong>Automatic egress.</strong>{" "}
+                <strong>{networkDefault === "allow" ? "Open egress." : "Automatic egress."}</strong>{" "}
                 <span className="text-muted-foreground">
-                  {policy.derivedHosts.length === 0
-                    ? "No powers granted — sessions are fully sandboxed."
-                    : `${policy.derivedHosts.length} host${policy.derivedHosts.length === 1 ? "" : "s"} opened by granted powers.`}
+                  {networkDefault === "allow"
+                    ? "Hosts not matched below remain reachable."
+                    : policy.derivedHosts.length === 0
+                      ? "No powers granted — sessions are fully sandboxed."
+                      : `${policy.derivedHosts.length} host${policy.derivedHosts.length === 1 ? "" : "s"} opened by granted powers.`}
                 </span>
               </div>
             </div>

@@ -269,6 +269,7 @@ image to the local registry (ADR 0080 — no local ext4 bake). You need:
 brew install just                                   # task runner
 brew install tilt-dev/tap/tilt                      # `just dev` orchestrator
 brew install jq                                     # smoke-test helpers
+brew install squashfs                               # mksquashfs for `just dev` bundles
 brew install protobuf pkg-config openssl            # build deps (tonic / openssl-sys)
 brew install node pnpm                              # web SPA (skip with ENGRAM_SKIP_WEB=1)
 brew install FiloSottile/musl-cross/musl-cross --with-aarch64   # aarch64-linux-musl-gcc

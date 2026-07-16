@@ -170,6 +170,65 @@ via disk chunks), and the whole effective device config must be reconstructed
 byte-equivalently. Productization (memory manifest, warm restore, honest park,
 two-phase-eviction eligibility) is a *future* ADR — not this pass.
 
+## Addendum (2026-07-15): D7 productized — warm restore
+
+Landed as a stacked PR on this ADR's branch. The spike's round-2 finding
+(pin the machine identifier AND the MAC) was productized after a round-3
+spike closed the remaining design gates — all favorably: the rootfs path is
+NOT part of save/restore config identity; cross-process same-user restore
+works (the real resume shape); a 1 GiB idle guest saves in ~390ms to a
+~16 MiB file (VZ writes the touched working set, not RAM size); and vsock
+listeners register on a restored-but-paused machine, so the warm path
+orders restore → bridge → resume with no guest-redial window.
+
+**Semantics.** `snapshot()` best-effort-saves `machine.vzs` in the pause
+window and records a `WarmMachineState` block (pinned identity, RESOLVED
+drives, resolved sizing, exact boot cmdline) in the manifest. `restore`
+(resume flavor only) warm-restores when the gate passes; `restore_fresh`
+(base fan-out) is always cold. The gate — all pure checks, any miss
+info-logs and cold-boots: warm block + machine.vzs present; saved cmdline
+equals today's (an ENGRAM_EGRESS drift means the resumed guest's in-memory
+DNAT rules would be stale — only a cold reboot re-runs the init shim);
+every saved staged bundle still on disk; no live sandbox already carries
+the saved MAC (double-restore guard). Warm inherits the saved identity and
+keeps the RUNNING captured agentd (FC resume semantics — no slot
+re-resolution); every other VM-creating path mints a fresh identity (an
+unknowable identity is an unrestorable save). Any warm FAILURE warns
+loudly, re-clones the possibly-dirtied rootfs, and falls back cold.
+
+**Clock.** VZ guests have no KVM-PTP device, so agentd's self-driven sync
+is a permanent no-op there and a resumed guest wakes frozen at save time.
+New `WireRequest::StepClock { unix_nanos }` (bincode tail-append) —
+host-pushed right after resume, same 2s threshold as the PTP path. Old
+baked agentds fail the decode and the step degrades to a logged
+best-effort miss, the `Sync` posture.
+
+**Guest side needed no new code**: the harness supervisor already
+live-reattaches and SIGUSR1-nudges a still-alive harness whose vsock
+connection went dead (built for FC live-move; a VZ warm restore is the
+same shape from inside the guest), and the coordinator re-issues
+`start_agent` after `restore()` returns.
+
+**Constraints + costs (by design).** `machine.vzs` is keychain-protected:
+same-user/same-host restore only — headless hosts with a locked login
+keychain simply never produce warm blocks and stay cold; the file is never
+chunked (cross-host restore stays cold via disk chunks). Each snapshot dir
+gains a working-set-sized file (16 MiB idle → up to RAM under load); the
+follow-up knob if it bites is `VzConfig::warm_snapshots` plus the available
+base-capture discriminator (specs carrying unresolved sentinel slots). The
+resumed guest keeps its save-time DHCP lease — MAC pinning keeps it
+consistent; `guest_endpoints` re-queries live. Pre-existing, unchanged:
+PooledBackend's cross-host disk materialize writes `{mref}-v{ver}.ext4`
+while VZ's restore reads `rootfs.ext4` — the cross-host VZ story remains
+aspirational and cold.
+
+**Verification.** 10/10 live e2e (`just vz-e2e`): a `/dev/shm` marker —
+which never touches the disk — survives snapshot→destroy→restore (the
+memory proof), the frozen clock is stepped back within 3s, the cold
+fallback (machine.vzs deleted) keeps the un-synced disk write and loses
+tmpfs, parked snapshots stay parked, and pre-D7 manifests parse
+(`warm: None`) by unit test.
+
 ## Out of scope (permanent divergences, not regressions)
 
 UFFD lazy restore, base-shm density, dirty-page diff snapshots, the NBD chunked

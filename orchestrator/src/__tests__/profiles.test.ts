@@ -281,4 +281,20 @@ describe("ProfileService — auth + field filtering", () => {
       expect(updated.profile!.portExposures).toEqual([5173]);
     } finally { await s.close(); }
   });
+
+  test("admin UpdateProfile treats blank optional model and effort as unset", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore([active]),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+    });
+    try {
+      const updated = await s.client.updateProfile({
+        id: active.id, name: active.name, description: "", icon: "Bot", imageId: "img-1",
+        harness: "claude", model: "", effort: "", includeUserTokens: false, envVars: {},
+      });
+      expect(updated.profile!.harness).toBe("claude");
+      expect(updated.profile!.model).toBeUndefined();
+      expect(updated.profile!.effort).toBeUndefined();
+    } finally { await s.close(); }
+  });
 });

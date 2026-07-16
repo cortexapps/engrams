@@ -159,6 +159,51 @@ pub fn sync_now() {
     }
 }
 
+/// ADR 0096 D7: step `CLOCK_REALTIME` to a host-supplied wall clock —
+/// the host-pushed analogue of [`sync_now`] for guests with NO PTP
+/// device (VZ). A warm-restored VZ guest wakes with its clock frozen at
+/// save time; the host sends `WireRequest::StepClock` with its own
+/// `CLOCK_REALTIME` right after resume. Same policy as the PTP path:
+/// step only past [`STEP_THRESHOLD_NANOS`]. Returns the applied offset
+/// in nanos, `None` when under threshold (or on non-Linux, where
+/// there's no clock to step). Orthogonal to the periodic PTP tick —
+/// this is a one-shot push, nothing to re-arm.
+pub fn step_to(host_unix_nanos: i64) -> Option<i64> {
+    #[cfg(target_os = "linux")]
+    {
+        let sys = match UnixClock::CLOCK_REALTIME.now() {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::debug!(error = ?e, "read system clock failed");
+                return None;
+            }
+        };
+        let diff =
+            host_unix_nanos as i128 - (sys.seconds as i128 * NANOS_PER_SEC + sys.nanos as i128);
+        if diff.abs() <= STEP_THRESHOLD_NANOS {
+            return None;
+        }
+        match UnixClock::CLOCK_REALTIME.step_clock(to_time_offset(diff)) {
+            Ok(_) => {
+                tracing::info!(
+                    offset_secs = (diff / NANOS_PER_SEC) as i64,
+                    "stepped guest clock to host-supplied time (StepClock)"
+                );
+                Some(diff as i64)
+            }
+            Err(e) => {
+                tracing::warn!(error = ?e, "StepClock step failed (need CAP_SYS_TIME?)");
+                None
+            }
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = host_unix_nanos;
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
