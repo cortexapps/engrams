@@ -249,6 +249,13 @@ async-graphql-parser = "7"
 # resolver.
 hickory-proto = { version = "0.24", default-features = false, features = ["tokio-runtime"] }
 
+# testing (dev-only)
+# ADR 0099 H3: property-based testing. proptest over quickcheck for the
+# composable `Strategy` API, integrated shrinking, and — decisive —
+# persisted regression seeds (`proptest-regressions/`, committed to git):
+# every counterexample becomes a permanent deterministic regression test.
+proptest = "1"
+
 [profile.release]
 lto = "thin"
 codegen-units = 1
