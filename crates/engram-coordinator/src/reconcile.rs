@@ -295,6 +295,21 @@ async fn flip_missing(
     let sandbox_id = sandbox_id.or(session.sandbox_id);
     if let Some(sb) = sandbox_id {
         if let Some(prev_host) = host_registry.invalidate_sandbox(sb) {
+            // ADR 0099 H6 (site 4): sandbox-ownership uniqueness. This
+            // sandbox came from `host_id`'s own PG assignments, so its
+            // cached owner must be `host_id`. A different `prev_host`
+            // means the routing cache attributes this sandbox to a second
+            // host — the "same sandbox reported on two hosts" anomaly.
+            // soft_invariant (not a panic): the reconciler's job is to
+            // repair, and dropping the cache row (which we just did) + the
+            // CAS-guarded flip below IS the repair — panicking here would
+            // prevent it. The log line (stable `soft-invariant violated:`
+            // prefix + `name` field) is the alerting seam.
+            engram_core::soft_invariant!(
+                prev_host == host_id,
+                "sandbox {sb} (session {session_id}) reconciled by host {host_id} \
+                 but routing cache owned it under host {prev_host}",
+            );
             tracing::debug!(
                 session_id = %session_id,
                 sandbox_id = %sb,
