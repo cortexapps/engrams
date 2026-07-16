@@ -47,7 +47,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use engram_core::types::SessionState;
 use engram_core::HostId;
 
@@ -188,8 +188,9 @@ pub async fn run_once(
         }
     }
 
+    let now = state.services.clock.now_utc();
     for c in candidates {
-        let kind = match classify(cfg, &c) {
+        let kind = match classify(cfg, &c, now) {
             Some(k) => k,
             None => continue,
         };
@@ -222,12 +223,13 @@ pub async fn run_once(
 fn classify(
     cfg: &IdleDetectorConfig,
     c: &engram_core::traits::metadata::IdleScanCandidate,
+    now: DateTime<Utc>,
 ) -> Option<IdleKind> {
-    if c.shell_pinned_until.is_some_and(|t| t > Utc::now()) {
+    if c.shell_pinned_until.is_some_and(|t| t > now) {
         return None;
     }
     let last = c.last_event_at;
-    let age = Utc::now().signed_duration_since(last).to_std().ok()?;
+    let age = now.signed_duration_since(last).to_std().ok()?;
     if age >= cfg.hard_ttl {
         return Some(IdleKind::Hard);
     }
@@ -255,13 +257,14 @@ async fn nominate(
         .await
     {
         Ok(prev) => {
+            let now = state.services.clock.now_utc();
             // ADR 0074 rung 1: the nomination is rung 1 — VM untouched,
             // cancellable (queued-op cancel + one CAS) until the evict
             // op's pipeline claims the session.
             if let Err(e) = state
                 .services
                 .meta
-                .set_session_park_rung(c.session_id, 1, Some(Utc::now()))
+                .set_session_park_rung(c.session_id, 1, Some(now))
                 .await
             {
                 tracing::warn!(session_id = %c.session_id, error = %e, "park_rung stamp failed");
@@ -301,7 +304,7 @@ async fn nominate(
                     SessionEvent::StatusChanged {
                         from: prev,
                         to: SessionState::Evicting,
-                        at: Utc::now(),
+                        at: now,
                     },
                 )
                 .await;
@@ -320,6 +323,8 @@ async fn nominate(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_core::traits::metadata::IdleScanCandidate;
@@ -365,14 +370,19 @@ mod tests {
         );
     }
 
-    fn cand(age_secs: i64, kind: Option<&str>, pinned_in: Option<i64>) -> IdleScanCandidate {
+    fn cand(
+        now: DateTime<Utc>,
+        age_secs: i64,
+        kind: Option<&str>,
+        pinned_in: Option<i64>,
+    ) -> IdleScanCandidate {
         IdleScanCandidate {
             session_id: SessionId::new(),
             sandbox_id: Some(SandboxId::new()),
             host_id: None,
-            last_event_at: Utc::now() - chrono::Duration::seconds(age_secs),
+            last_event_at: now - chrono::Duration::seconds(age_secs),
             last_event_kind: kind.map(String::from),
-            shell_pinned_until: pinned_in.map(|s| Utc::now() + chrono::Duration::seconds(s)),
+            shell_pinned_until: pinned_in.map(|s| now + chrono::Duration::seconds(s)),
         }
     }
 
@@ -393,42 +403,45 @@ mod tests {
 
     #[test]
     fn soft_fires_only_on_idle_kind_past_soft_ttl() {
+        let now = Utc::now();
         assert_eq!(
-            classify(&cfg(), &cand(301, Some("harness_idle"), None)),
+            classify(&cfg(), &cand(now, 301, Some("harness_idle"), None), now),
             Some(IdleKind::Soft)
         );
         // Recent idle: not yet.
         assert_eq!(
-            classify(&cfg(), &cand(299, Some("harness_idle"), None)),
+            classify(&cfg(), &cand(now, 299, Some("harness_idle"), None), now),
             None
         );
         // A non-idle newest event = the hub's clear-on-any-event rule.
         assert_eq!(
-            classify(&cfg(), &cand(301, Some("agent_message"), None)),
+            classify(&cfg(), &cand(now, 301, Some("agent_message"), None), now),
             None
         );
     }
 
     #[test]
     fn parked_soft_fires_only_past_soft_ttl() {
+        let now = Utc::now();
         assert_eq!(
-            classify(&cfg(), &cand(301, Some("harness_parked"), None)),
+            classify(&cfg(), &cand(now, 301, Some("harness_parked"), None), now),
             Some(IdleKind::Soft)
         );
         assert_eq!(
-            classify(&cfg(), &cand(299, Some("harness_parked"), None)),
+            classify(&cfg(), &cand(now, 299, Some("harness_parked"), None), now),
             None
         );
     }
 
     #[test]
     fn hard_fires_on_any_kind_past_hard_ttl() {
+        let now = Utc::now();
         assert_eq!(
-            classify(&cfg(), &cand(28_801, Some("agent_message"), None)),
+            classify(&cfg(), &cand(now, 28_801, Some("agent_message"), None), now),
             Some(IdleKind::Hard)
         );
         assert_eq!(
-            classify(&cfg(), &cand(28_801, None, None)),
+            classify(&cfg(), &cand(now, 28_801, None, None), now),
             Some(IdleKind::Hard)
         );
     }
@@ -453,15 +466,19 @@ mod tests {
 
     #[test]
     fn live_shell_pin_suppresses_both_ttls() {
+        let now = Utc::now();
         assert_eq!(
-            classify(&cfg(), &cand(301, Some("harness_idle"), Some(60))),
+            classify(&cfg(), &cand(now, 301, Some("harness_idle"), Some(60)), now),
             None
         );
-        assert_eq!(classify(&cfg(), &cand(30_000, None, Some(60))), None);
+        assert_eq!(
+            classify(&cfg(), &cand(now, 30_000, None, Some(60)), now),
+            None
+        );
         // An EXPIRED pin suppresses nothing — the bridge died and the
         // pin lapsed, exactly the issue #219 leak this design deletes.
         assert_eq!(
-            classify(&cfg(), &cand(30_000, None, Some(-60))),
+            classify(&cfg(), &cand(now, 30_000, None, Some(-60)), now),
             Some(IdleKind::Hard)
         );
     }

@@ -56,7 +56,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use engram_core::traits::MetadataStore;
 use engram_core::types::SessionState;
 use engram_core::HostId;
@@ -77,12 +77,9 @@ async fn emit_status_changed(
     session_id: SessionId,
     from: SessionState,
     to: SessionState,
+    now: DateTime<Utc>,
 ) {
-    let event = SessionEvent::StatusChanged {
-        from,
-        to,
-        at: Utc::now(),
-    };
+    let event = SessionEvent::StatusChanged { from, to, at: now };
     let kind = event.kind();
     let payload = match serde_json::to_value(&event) {
         Ok(p) => p,
@@ -161,8 +158,10 @@ struct ProbeMemory {
     /// Consecutive failed probes, one per detector tick. Reset by any
     /// answered probe.
     consecutive_failures: u32,
-    /// When this host last answered a probe while its row was stale.
-    last_rescue: Option<std::time::Instant>,
+    /// When this host last answered a probe while its row was stale, as
+    /// a `Clock::now_mono()` mark (ADR 0098 D1: monotonic marks are
+    /// stored as `Duration`, not opaque `Instant`s).
+    last_rescue: Option<Duration>,
 }
 
 /// Pure verdict for the probe-failure path: is this failure enough
@@ -173,7 +172,7 @@ struct ProbeMemory {
 /// otherwise for the grace duration).
 fn probe_failure_permits_eviction(
     mem: &ProbeMemory,
-    now: std::time::Instant,
+    now: Duration,
     min_probe_failures: u32,
     probe_rescue_grace: Duration,
 ) -> bool {
@@ -181,7 +180,7 @@ fn probe_failure_permits_eviction(
         return false;
     }
     match mem.last_rescue {
-        Some(rescued_at) => now.duration_since(rescued_at) >= probe_rescue_grace,
+        Some(rescued_at) => now.saturating_sub(rescued_at) >= probe_rescue_grace,
         None => true,
     }
 }
@@ -372,7 +371,7 @@ async fn evict_host(
                 host_id,
                 ProbeMemory {
                     consecutive_failures: 0,
-                    last_rescue: Some(std::time::Instant::now()),
+                    last_rescue: Some(state.services.clock.now_mono()),
                 },
             );
             tracing::warn!(
@@ -393,7 +392,7 @@ async fn evict_host(
             // host rides it out.
             let mem = probe_memory.entry(host_id).or_default();
             mem.consecutive_failures = mem.consecutive_failures.saturating_add(1);
-            let now = std::time::Instant::now();
+            let now = state.services.clock.now_mono();
             if !probe_failure_permits_eviction(
                 mem,
                 now,
@@ -406,7 +405,7 @@ async fn evict_host(
                     min_strikes = cfg.min_probe_failures,
                     recently_rescued = mem
                         .last_rescue
-                        .is_some_and(|t| now.duration_since(t) < cfg.probe_rescue_grace),
+                        .is_some_and(|t| now.saturating_sub(t) < cfg.probe_rescue_grace),
                     "stale row + failed probe, but not enough evidence to orphan its sessions yet; deferring eviction to a later tick",
                 );
                 sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
@@ -434,7 +433,15 @@ async fn evict_host(
     // `from` is honest (not a hand-encoded `Active` that would lie if
     // the session had been Idle).
     for (session_id, prev) in &affected {
-        emit_status_changed(meta, events, *session_id, *prev, SessionState::HostLost).await;
+        emit_status_changed(
+            meta,
+            events,
+            *session_id,
+            *prev,
+            SessionState::HostLost,
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
 
     // Stage 2: per-session recoverability-aware second transition.
@@ -489,7 +496,15 @@ async fn evict_host(
 
         match meta.transition_session(*session_id, target).await {
             Ok(prev) => {
-                emit_status_changed(meta, events, *session_id, prev, target).await;
+                emit_status_changed(
+                    meta,
+                    events,
+                    *session_id,
+                    prev,
+                    target,
+                    state.services.clock.now_utc(),
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -688,15 +703,14 @@ mod tests {
     // is the gate that makes that impossible: a failed probe evicts
     // only with `min_probe_failures` consecutive strikes AND no rescue
     // within `probe_rescue_grace`.
-    use std::time::Instant;
-
     const MIN: u32 = 3;
     const GRACE: Duration = Duration::from_secs(120);
 
-    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Instant) {
-        // Anchor `now` far enough from the ProbeMemory's rescue instant
-        // that subtraction can't underflow.
-        let now = Instant::now() + GRACE * 10;
+    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Duration) {
+        // `now` is a monotonic mark (ADR 0098 D1: `Clock::now_mono()`
+        // returns a `Duration`). Anchor it far enough from the
+        // ProbeMemory's rescue mark that subtraction can't underflow.
+        let now = GRACE * 10;
         let m = ProbeMemory {
             consecutive_failures: failures,
             last_rescue: rescued_ago.map(|ago| now - ago),

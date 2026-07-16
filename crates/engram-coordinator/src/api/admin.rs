@@ -599,6 +599,7 @@ pub(crate) async fn admin_drain_host_core(
                     &fit_ctx,
                     mem_budget,
                     cpu_budget as i64,
+                    st.services.clock.now_utc(),
                 )
                 .await
                 {
@@ -634,6 +635,7 @@ pub(crate) async fn admin_drain_host_core(
                         st.services.meta.as_ref(),
                         &st.host_registry,
                         &ctx,
+                        st.services.clock.now_utc(),
                     )
                     .await
                     .ok()
@@ -879,6 +881,7 @@ async fn bundle_gc_run(
         state.services.blob.clone(),
         &cfg,
         mode,
+        &state.services.clock,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("bundle-gc: {e}")))?;
@@ -901,6 +904,7 @@ async fn snapshot_blob_gc_run(
         state.services.blob.clone(),
         &cfg,
         mode,
+        &state.services.clock,
     )
     .await
     .map_err(|e| ApiError::Internal(format!("snapshot-blob-gc: {e}")))?;
@@ -941,9 +945,12 @@ pub struct FleetDemandResponse {
 /// "no pressure" (free = total) so scale-down hysteresis rides out a single
 /// tick rather than surfacing a 5xx to the autoscaler.
 pub(crate) async fn fleet_demand_core(state: &SharedState) -> FleetDemandResponse {
-    let m = crate::placement::fleet_snapshot(state.services.meta.as_ref())
-        .await
-        .unwrap_or_default();
+    let m = crate::placement::fleet_snapshot(
+        state.services.meta.as_ref(),
+        state.services.clock.now_utc(),
+    )
+    .await
+    .unwrap_or_default();
     // free_mib rides the snapshot now: same capability/TTL-gated host set
     // as schedulable_hosts, so the autoscaler can't see capacity placement
     // won't use (the retired SQL `fleet_free_mib` did — the 2026-07-11

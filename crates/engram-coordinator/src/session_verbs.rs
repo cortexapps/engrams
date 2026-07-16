@@ -140,7 +140,7 @@ async fn fail_wedged_created_session(ctx: &OpCtx<'_>, reason: &str) {
                     SessionEvent::StatusChanged {
                         from: prev,
                         to: SessionState::Failed,
-                        at: chrono::Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await;
@@ -267,7 +267,7 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
                             SessionEvent::StatusChanged {
                                 from: prev,
                                 to: SessionState::Idle,
-                                at: chrono::Utc::now(),
+                                at: state.services.clock.now_utc(),
                             },
                         )
                         .await;
@@ -378,14 +378,20 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
-    let started = std::time::Instant::now();
+    let started = ctx.state.services.clock.now_mono();
     match crate::idle_evictor::run_evict_pipeline(ctx, target, allow_park, nominated).await {
         Ok(crate::idle_evictor::EvictOutcome::Evacuated) => {
             // Only completed captures are recorded — the pre-0034 bug
             // shape would reappear as nominations without completions,
             // not as a latency shift.
-            ::metrics::histogram!(crate::metrics::EVICTION_PIPELINE_SECONDS)
-                .record(started.elapsed().as_secs_f64());
+            ::metrics::histogram!(crate::metrics::EVICTION_PIPELINE_SECONDS).record(
+                ctx.state
+                    .services
+                    .clock
+                    .now_mono()
+                    .saturating_sub(started)
+                    .as_secs_f64(),
+            );
             OpOutcome::Done
         }
         // Park: the op completes early at parked (session Evicting,
@@ -491,7 +497,7 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
                                     crate::state::SessionEvent::StatusChanged {
                                         from: prev,
                                         to: SessionState::HostLost,
-                                        at: chrono::Utc::now(),
+                                        at: ctx.state.services.clock.now_utc(),
                                     },
                                 )
                                 .await;
@@ -967,7 +973,7 @@ async fn create_boot_retry_or_fail(ctx: &OpCtx<'_>, reason: String) -> OpOutcome
                     crate::state::SessionEvent::StatusChanged {
                         from: prev,
                         to: SessionState::Failed,
-                        at: chrono::Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await;
@@ -1029,7 +1035,7 @@ async fn destroy(ctx: &OpCtx<'_>) -> OpOutcome {
                         crate::state::SessionEvent::StatusChanged {
                             from: prev,
                             to: target,
-                            at: chrono::Utc::now(),
+                            at: state.services.clock.now_utc(),
                         },
                     )
                     .await;
@@ -1102,6 +1108,8 @@ async fn destroy(ctx: &OpCtx<'_>) -> OpOutcome {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_core::types::session::{Session, SessionMode};

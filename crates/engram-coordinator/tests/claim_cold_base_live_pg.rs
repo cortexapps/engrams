@@ -13,6 +13,9 @@
 //! `#[ignore]`'d by default; requires Postgres at
 //! `ENGRAM_TEST_DATABASE_URL`.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use axum::extract::{Path as AxPath, State};
@@ -73,6 +76,8 @@ async fn build_state(
         chunk_store: chunk_store.clone(),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let host_registry = Arc::new(engram_coordinator::host_registry::HostRegistry::new(
         meta.clone(),

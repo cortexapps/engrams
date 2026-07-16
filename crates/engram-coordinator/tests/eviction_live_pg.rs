@@ -11,6 +11,9 @@
 //! `ENGRAM_TEST_DATABASE_URL`. CI wires this into the
 //! Postgres-gated-ignored lane alongside `admin_evac_live_pg`.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use engram_core::traits::MetadataStore;

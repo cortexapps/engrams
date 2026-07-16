@@ -20,6 +20,9 @@
 //! ADR 0051 Drip E: the coordinator's REST surface is gone — `StreamEvents`
 //! gRPC is the sole events surface; there is no SSE feed to compare against.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use engram_protocol::app;
 use engram_protocol::app::image_service_client::ImageServiceClient;
 use engram_protocol::app::session_service_client::SessionServiceClient;

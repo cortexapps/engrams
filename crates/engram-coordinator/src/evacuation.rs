@@ -242,6 +242,9 @@ pub async fn evacuate_dead_source(
     // ADR 0079: the caller's op/claim epoch, stamped into the restore
     // RPC (the evac-resumer claim, the resume verb's disk-only path).
     fence: SessionFence,
+    // ADR 0098 D1: the caller's injected wall clock, used for the
+    // peer-hint heartbeat-staleness gate (`host_can_serve_chunks`).
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<EvacReceipt, EvacError> {
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
@@ -345,12 +348,16 @@ pub async fn evacuate_dead_source(
     // exact host (still excluding the source); a bad pin retries then
     // falls back to Idle rather than silently landing elsewhere.
     let (target_host, target_backend) = match require_host {
-        Some(host) => {
-            crate::placement::pick_specific_host(meta.as_ref(), registry, host, session.host_id)
-                .await
-                .map_err(EvacError::NoTargetAvailable)?
-        }
-        None => crate::placement::pick_for_session(meta.as_ref(), registry, &ctx)
+        Some(host) => crate::placement::pick_specific_host(
+            meta.as_ref(),
+            registry,
+            host,
+            session.host_id,
+            now,
+        )
+        .await
+        .map_err(EvacError::NoTargetAvailable)?,
+        None => crate::placement::pick_for_session(meta.as_ref(), registry, &ctx, now)
             .await
             .map_err(EvacError::NoTargetAvailable)?,
     };
@@ -418,7 +425,6 @@ pub async fn evacuate_dead_source(
             let peer_hints = match s.host_id {
                 Some(src) => match meta.list_active_hosts().await {
                     Ok(hosts) => {
-                        let now = chrono::Utc::now();
                         let ttl = crate::placement::placement_ttl();
                         hosts
                             .iter()
@@ -491,6 +497,8 @@ pub async fn evacuate_dead_source(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -1070,6 +1078,7 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            chrono::Utc::now(),
         )
         .await
         .expect("rung-1 happy path");
@@ -1128,6 +1137,7 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            chrono::Utc::now(),
         )
         .await
         .expect("snapshot-only happy path");
@@ -1177,6 +1187,7 @@ mod tests {
             None,
             Some(origin),
             SessionFence::unfenced(),
+            chrono::Utc::now(),
         )
         .await
         .expect("origin-affinity happy path");
@@ -1231,6 +1242,7 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            chrono::Utc::now(),
         )
         .await
         .expect("disk-only cold-boot happy path");
@@ -1277,6 +1289,7 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            chrono::Utc::now(),
         )
         .await;
         match &result {
@@ -1307,6 +1320,7 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            chrono::Utc::now(),
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoRecoverableState)));
@@ -1337,6 +1351,7 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            chrono::Utc::now(),
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoTargetAvailable(_))));

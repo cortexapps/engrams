@@ -19,6 +19,9 @@
 //!
 //! `#[ignore]`'d by default; requires Postgres at `ENGRAM_TEST_DATABASE_URL`.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -503,6 +506,8 @@ async fn build_app_state(
         )),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         database_url: database_url.to_string(),

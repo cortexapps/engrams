@@ -14,6 +14,7 @@
 //!   Reintroduced in Phase 6 / ADR 0005 as the disk-pressure flush
 //!   target — see `docs/adr/0005-disk-pressure-blob-tier.md`.
 
+pub mod clock;
 pub mod cloud;
 pub mod host_client;
 pub mod integration;
@@ -22,6 +23,7 @@ pub mod sandbox;
 pub mod secrets;
 pub mod storage;
 
+pub use clock::{Clock, Entropy, OsEntropy, SystemClock};
 pub use cloud::{CloudBackend, PreemptionStream};
 pub use host_client::{HostClient, SessionFence};
 pub use integration::{

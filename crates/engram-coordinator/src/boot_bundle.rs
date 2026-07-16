@@ -19,9 +19,9 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
-use engram_core::traits::MetadataStore;
+use engram_core::traits::{Clock, MetadataStore};
 use engram_core::types::image::ImageConfig;
 use engram_core::types::{EnabledImage, SnapshotRecord};
 
@@ -52,12 +52,14 @@ pub(crate) struct BootBundle {
 }
 
 struct FleetCatalogEntry {
-    filled_at: Instant,
+    /// Monotonic mark (`Clock::now_mono`) of the fill (ADR 0098 D1).
+    filled_at: Duration,
     catalog: Arc<HashMap<String, String>>,
 }
 
 struct BundleEntry {
-    filled_at: Instant,
+    /// Monotonic mark (`Clock::now_mono`) of the fill (ADR 0098 D1).
+    filled_at: Duration,
     bundle: Arc<BootBundle>,
 }
 
@@ -65,15 +67,20 @@ struct BundleEntry {
 /// `pg_listener`-driven invalidation (see module docs). Cheap to clone
 /// (`Arc`-wrapped by the caller, like `harness_hub`/`cow_state_cache` on
 /// `AppState`).
-#[derive(Default)]
 pub struct BootBundleCache {
+    /// Injected time source for TTL freshness checks (ADR 0098 D1).
+    clock: Arc<dyn Clock>,
     bundles: parking_lot::Mutex<HashMap<String, BundleEntry>>,
     fleet_catalog: parking_lot::Mutex<Option<FleetCatalogEntry>>,
 }
 
 impl BootBundleCache {
-    pub fn new() -> Self {
-        Self::default()
+    pub fn new(clock: Arc<dyn Clock>) -> Self {
+        Self {
+            clock,
+            bundles: Default::default(),
+            fleet_catalog: Default::default(),
+        }
     }
 
     /// Fill (or serve fresh) the bundle for `image_uri`. Always resolves the
@@ -127,7 +134,7 @@ impl BootBundleCache {
         self.bundles.lock().insert(
             image_uri.to_string(),
             BundleEntry {
-                filled_at: Instant::now(),
+                filled_at: self.clock.now_mono(),
                 bundle: bundle.clone(),
             },
         );
@@ -137,7 +144,7 @@ impl BootBundleCache {
     fn fresh_bundle(&self, image_uri: &str) -> Option<Arc<BootBundle>> {
         let g = self.bundles.lock();
         let e = g.get(image_uri)?;
-        (e.filled_at.elapsed() < CACHE_TTL).then(|| e.bundle.clone())
+        (self.clock.now_mono().saturating_sub(e.filled_at) < CACHE_TTL).then(|| e.bundle.clone())
     }
 
     /// `pg_listener` invalidation on `enabled_image_changed <image_uri>`.
@@ -171,7 +178,7 @@ impl BootBundleCache {
             .unwrap_or_default();
         let catalog = Arc::new(catalog);
         *self.fleet_catalog.lock() = Some(FleetCatalogEntry {
-            filled_at: Instant::now(),
+            filled_at: self.clock.now_mono(),
             catalog: catalog.clone(),
         });
         Ok(catalog)
@@ -180,7 +187,7 @@ impl BootBundleCache {
     fn fresh_fleet_catalog(&self) -> Option<Arc<HashMap<String, String>>> {
         let g = self.fleet_catalog.lock();
         let e = g.as_ref()?;
-        (e.filled_at.elapsed() < CACHE_TTL).then(|| e.catalog.clone())
+        (self.clock.now_mono().saturating_sub(e.filled_at) < CACHE_TTL).then(|| e.catalog.clone())
     }
 
     /// `pg_listener` invalidation on `fleet_catalog_changed <host_id>`. Any
@@ -196,6 +203,8 @@ impl BootBundleCache {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
 
@@ -489,7 +498,7 @@ mod tests {
     #[tokio::test]
     async fn bundle_for_caches_across_calls() {
         let meta = CountingMeta::default();
-        let cache = BootBundleCache::new();
+        let cache = BootBundleCache::new(Arc::new(engram_core::traits::SystemClock::new()));
         let a = cache.bundle_for(&meta, "img:1").await.unwrap();
         let b = cache.bundle_for(&meta, "img:1").await.unwrap();
         assert_eq!(a.enabled.image_uri, b.enabled.image_uri);
@@ -500,7 +509,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_image_forces_refill() {
         let meta = CountingMeta::default();
-        let cache = BootBundleCache::new();
+        let cache = BootBundleCache::new(Arc::new(engram_core::traits::SystemClock::new()));
         cache.bundle_for(&meta, "img:1").await.unwrap();
         cache.invalidate_image("img:1");
         cache.bundle_for(&meta, "img:1").await.unwrap();
@@ -510,7 +519,7 @@ mod tests {
     #[tokio::test]
     async fn fleet_catalog_caches_across_calls() {
         let meta = CountingMeta::default();
-        let cache = BootBundleCache::new();
+        let cache = BootBundleCache::new(Arc::new(engram_core::traits::SystemClock::new()));
         let a = cache.fleet_catalog(&meta).await.unwrap();
         let b = cache.fleet_catalog(&meta).await.unwrap();
         assert_eq!(a, b);
@@ -520,7 +529,7 @@ mod tests {
     #[tokio::test]
     async fn invalidate_fleet_catalog_forces_refill() {
         let meta = CountingMeta::default();
-        let cache = BootBundleCache::new();
+        let cache = BootBundleCache::new(Arc::new(engram_core::traits::SystemClock::new()));
         cache.fleet_catalog(&meta).await.unwrap();
         cache.invalidate_fleet_catalog();
         cache.fleet_catalog(&meta).await.unwrap();
