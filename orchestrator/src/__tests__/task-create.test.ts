@@ -127,6 +127,17 @@ describe("compileSessionCreateInput", () => {
     expect(inp.mode).toBe("agent");
   });
 
+  test("enables private browser image observations only with the browser skill", async () => {
+    const withBrowser = await compileSessionCreateInput(profile({ skills: ["browser"] }), deps());
+    expect(withBrowser.selectedSkills).toEqual(["browser"]);
+    expect(withBrowser.harnessEnv?.ENGRAM_BROWSER_VIEW_ENABLED).toBe("1");
+
+    const withoutBrowser = await compileSessionCreateInput(profile(), deps(), {
+      extraHarnessEnv: { ENGRAM_BROWSER_VIEW_ENABLED: "1" },
+    });
+    expect(withoutBrowser.harnessEnv?.ENGRAM_BROWSER_VIEW_ENABLED).toBeUndefined();
+  });
+
   test("merges extraHarnessEnv last (e.g. ENGRAM_APPEND_SYSTEM_PROMPT)", async () => {
     const inp = await compileSessionCreateInput(profile({ envVars: { FOO: "bar" } }), deps(), {
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },

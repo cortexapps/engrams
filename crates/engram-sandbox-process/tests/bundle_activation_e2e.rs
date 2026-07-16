@@ -4,9 +4,9 @@
 //! Drives the real session-generation path on the dev `ProcessBackend`
 //! (`create` → `start_agent`) with the RO bundles staged, and asserts the
 //! produced session directory contains everything a harness discovers:
-//! the `~/.claude/skills` tree (share-file always; show-your-work when the
-//! browser bundle is present), and the `engram-share`/`playwright-cli` wrappers on
-//! PATH + `/etc/gitconfig`. This is the cross-cutting check that the engine
+//! the `~/.claude/skills` tree (share-file always; browser when its bundle is
+//! present), and the browser/share wrappers on PATH + `/etc/gitconfig`. This is
+//! the cross-cutting check that the engine
 //! actually lands skills in sessions — the per-unit behavior is covered by
 //! `engram-session-bundles` tests.
 //!
@@ -45,11 +45,11 @@ fn stage_fake_bundles(skills: &Path, browser: &Path) {
     .unwrap();
 
     write_exec(&browser.join("bin/playwright-cli"), "#!/bin/sh\n");
-    std::fs::create_dir_all(browser.join("skills/show-your-work")).unwrap();
-    std::fs::write(browser.join("skills/show-your-work/SKILL.md"), "---\n").unwrap();
+    std::fs::create_dir_all(browser.join("skills/browser")).unwrap();
+    std::fs::write(browser.join("skills/browser/SKILL.md"), "---\n").unwrap();
     std::fs::write(
         browser.join("mount.json"),
-        r#"{"kind":"skill","skills":[{"name":"show-your-work","bins":["bin/playwright-cli"]}]}"#,
+        r#"{"kind":"skill","skills":[{"name":"browser","bins":["bin/playwright-cli"]}]}"#,
     )
     .unwrap();
 }
@@ -111,8 +111,8 @@ async fn generated_session_has_skills_and_browser_tooling() {
         "share-file skill not wired (should always be present)",
     );
     assert!(
-        cwd.join("root/.agents/skills/show-your-work").is_symlink(),
-        "show-your-work not wired despite browser bundle present",
+        cwd.join("root/.agents/skills/browser").is_symlink(),
+        "browser skill not wired despite browser bundle present",
     );
 
     // Wrappers on PATH + git wiring. The forge token still wires the askpass +
@@ -125,11 +125,15 @@ async fn generated_session_has_skills_and_browser_tooling() {
         "gitconfig must point core.askPass at the bundle git-askpass; got {gitconfig:?}",
     );
 
-    // Browser: the playwright-cli wrapper is on PATH (no MCP config) so the
-    // agent drives the browser with plain `playwright-cli`.
+    // The browser CLI wrapper is on PATH; the capability's local image tool
+    // is injected by the harness, not through a session-level MCP config.
     assert!(
         cwd.join("usr/local/bin/playwright-cli").is_symlink(),
         "playwright-cli wrapper not symlinked onto PATH",
+    );
+    assert!(
+        !cwd.join("usr/local/bin/agent-browser").exists(),
+        "evaluation-only agent-browser must not enter the production bundle",
     );
     assert!(
         !cwd.join("root/.mcp.json").exists(),
