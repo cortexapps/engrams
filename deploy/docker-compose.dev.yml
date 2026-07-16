@@ -16,6 +16,11 @@ services:
   postgres:
     image: postgres:16
     restart: unless-stopped
+    # ADR 0099 H2: the live-PG test lane runs deeply parallel with a
+    # per-test database each (engram-testkit) — each test's store holds
+    # up to an 8-connection pool, so give headroom over the stock
+    # max_connections=100. Mirrors the CI `Start postgres` step.
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: engram
       POSTGRES_PASSWORD: engram

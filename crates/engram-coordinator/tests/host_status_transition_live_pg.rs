@@ -27,18 +27,8 @@ use engram_core::types::HostId;
 use engram_postgres::PostgresStore;
 
 async fn connect() -> Option<PostgresStore> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set (run `just db-up`)");
-            return None;
-        }
-    };
-    let store = PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(store)
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(db.store)
 }
 
 fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {

@@ -26,12 +26,8 @@ use engram_core::types::session::{SessionMode, SessionSpec};
 use engram_core::SessionId;
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
-    let url = std::env::var("ENGRAM_TEST_DATABASE_URL").ok()?;
-    let store = engram_postgres::PostgresStore::connect(&url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 async fn seed_session(meta: &Arc<dyn MetadataStore>) -> SessionId {

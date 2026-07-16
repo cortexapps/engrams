@@ -34,13 +34,15 @@ use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{EnabledImage, HostId, SessionId};
 use uuid::Uuid;
 
-async fn connect() -> Option<Arc<dyn MetadataStore>> {
-    let url = std::env::var("ENGRAM_TEST_DATABASE_URL").ok()?;
-    let store = engram_postgres::PostgresStore::connect(&url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+/// Connect to this test's own template-cloned database (ADR 0099 H1).
+/// Returns the per-test URL alongside the store so tests that open
+/// additional connections (raw pools, `PgListener`s, `AppState`) point at
+/// the SAME database — never the admin `ENGRAM_TEST_DATABASE_URL`, which
+/// is no longer migrated.
+async fn connect() -> Option<(Arc<dyn MetadataStore>, String)> {
+    let db = engram_testkit::pg::fresh_db().await?;
+    let url = db.url;
+    Some((Arc::new(db.store), url))
 }
 
 fn spec() -> SessionSpec {
@@ -255,7 +257,9 @@ async fn seed_enabled_image(meta: &Arc<dyn MetadataStore>, image_uri: &str) -> S
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn enqueue_list_demand_and_fifo_order() {
-    let Some(meta) = connect().await else { return };
+    let Some((meta, _)) = connect().await else {
+        return;
+    };
 
     let s1 = SessionId::new();
     let s2 = SessionId::new();
@@ -264,7 +268,7 @@ async fn enqueue_list_demand_and_fifo_order() {
     tokio::time::sleep(Duration::from_millis(10)).await;
     enqueue(&meta, s2, spec(), 8192, 4).await;
 
-    // demand reflects both (Σ over ALL queued in the shared DB ≥ ours).
+    // demand reflects both (Σ over ALL queued in this test's own DB ≥ ours).
     let demand = meta.queued_demand().await.expect("demand");
     assert!(demand.sessions >= 2);
     assert!(demand.mem_mib >= 4096 + 8192);
@@ -291,7 +295,9 @@ async fn enqueue_list_demand_and_fifo_order() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn place_queued_flips_to_pending_on_a_fitting_host() {
-    let Some(meta) = connect().await else { return };
+    let Some((meta, _)) = connect().await else {
+        return;
+    };
     let host = seed_ready_host(&meta, 16_384, 8, &[]).await;
     let sid = SessionId::new();
     enqueue(&meta, sid, spec(), 4096, 2).await;
@@ -317,7 +323,9 @@ async fn place_queued_flips_to_pending_on_a_fitting_host() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn place_queued_returns_none_when_no_host_fits() {
-    let Some(meta) = connect().await else { return };
+    let Some((meta, _)) = connect().await else {
+        return;
+    };
     // Host with only 2 GiB allocatable; a 4 GiB session can't fit.
     let host = seed_ready_host(&meta, 2048, 8, &[]).await;
     let sid = SessionId::new();
@@ -403,7 +411,9 @@ async fn placement_enqueues_create_boot_op_with_stable_key() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn resume_origin_enqueue_requires_idle() {
-    let Some(meta) = connect().await else { return };
+    let Some((meta, _)) = connect().await else {
+        return;
+    };
     // A non-idle session is a no-op for the resume enqueue (gated on
     // status='idle'); we just assert it doesn't error and doesn't queue.
     let sid = SessionId::new();
@@ -424,25 +434,19 @@ async fn resume_origin_enqueue_requires_idle() {
 // ─── queue-fairness follow-up: per-fit-class scanner sweeps + the
 // ─── `placement_changed` NOTIFY wake ───────────────────────────────────
 //
-// These tests share ONE live Postgres with every other live-pg test in
-// this crate, and `run_once`'s placement path reads the FULL `hosts` /
-// `sessions` tables (`candidates_for` → `list_active_hosts`, and the
-// queue sweep itself, are both unscoped by test). nextest's DEFAULT is to
-// run each `#[ignore]`'d test as its own process, in parallel — but this
-// file is NOT safe under that default: `ci.yml`'s "Postgres-gated ignored
-// tests" step runs the whole live-pg group with `--test-threads=1`, and
-// this file's tests actually require that serialization to be correct,
-// not just fast. In particular, `create_origin_timeout_fails_session_and_records_wait`
-// / `resume_origin_timeout_returns_to_idle` run `run_once` with a 1ms
-// timeout, which times out (Failed / Idle) EVERY queued row in the shared
-// database, not just their own — running them concurrently with any other
-// live-pg test that has an in-flight `queued` row would brick it. Sessions
-// that must NOT fit anywhere use a budget (1 TiB / 1000 vcpus) no other
-// test in this suite could accidentally satisfy; sessions that DO need
-// to fit are only asserted by "left `queued`", never by which host they
-// landed on, so accidentally fitting a concurrently-seeded foreign host
-// is harmless — but the destructive timeout sweeps above are not, and
-// depend on `--test-threads=1` for correctness, not merely determinism.
+// `run_once`'s placement path reads the FULL `hosts` / `sessions` tables
+// (`candidates_for` → `list_active_hosts`, and the queue sweep itself, are
+// both unscoped by test). These tests used to share ONE live Postgres with
+// every other live-pg test in this crate, which made that a hazard — the
+// 1ms-timeout sweeps in `create_origin_timeout_fails_session_and_records_wait`
+// / `resume_origin_timeout_returns_to_idle` time out (Failed / Idle) EVERY
+// queued row in the database, and the suite needed `--test-threads=1` for
+// correctness. ADR 0099 H1 retired that: each test now runs against its
+// own template-cloned database, so full-table reads and destructive
+// timeout sweeps only ever see the test's own rows. The defensive fixture
+// design below (unfittable budgets, per-class disjoint budget sub-ranges,
+// `cordon_unmeasured_hosts`) predates that isolation and is kept as cheap
+// belt-and-suspenders hygiene.
 
 /// A budget no live-pg test in this suite seeds a host large enough to
 /// satisfy — the "doesn't fit anywhere, ever" budget. Must stay LARGER
@@ -576,11 +580,11 @@ async fn has_status_change_to(
 /// `binding_cas_live_pg`, `enable_reuse_live_pg`, `admin_evac_live_pg`)
 /// call `upsert_host` without a follow-up `touch_host_heartbeat` and
 /// never clean up, leaving exactly such a host behind — a real
-/// nondeterminism risk for this file's "never fits anywhere" assertions,
-/// since the whole live-pg suite runs against ONE shared Postgres in one
-/// `--test-threads=1` nextest invocation (`ci.yml`'s "Postgres-gated
-/// ignored tests" step). Cordon any such host up front so a test's
-/// deliberately-unfittable session can't land on it via that fallback.
+/// nondeterminism risk for this file's "never fits anywhere" assertions
+/// back when the whole live-pg suite shared ONE Postgres. ADR 0099 H1's
+/// per-test databases make foreign hosts impossible, but the cordon is
+/// kept as cheap hygiene against unmeasured hosts seeded by the test's
+/// own fixtures.
 async fn cordon_unmeasured_hosts(meta: &Arc<dyn MetadataStore>) {
     if let Ok(hosts) = meta.list_active_hosts().await {
         for h in hosts {
@@ -607,11 +611,10 @@ async fn setup(
     Arc<engram_coordinator::AppState>,
     String,
 )> {
-    let meta = connect().await?;
+    let (meta, database_url) = connect().await?;
     if cordon {
         cordon_unmeasured_hosts(&meta).await;
     }
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
     let state = build_app_state(meta.clone(), &database_url).await;
     Some((meta, state, database_url))
 }
@@ -865,8 +868,9 @@ async fn resume_origin_timeout_returns_to_idle() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn notify_placement_changed_fires_at_every_site() {
-    let Some(meta) = connect().await else { return };
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
+    let Some((meta, database_url)) = connect().await else {
+        return;
+    };
     let store = engram_postgres::PostgresStore::connect(&database_url)
         .await
         .expect("connect raw store");
@@ -883,13 +887,12 @@ async fn notify_placement_changed_fires_at_every_site() {
     // `ha_listener.rs`).
     tokio::time::sleep(Duration::from_millis(150)).await;
 
-    // `placement_changed` is a GLOBAL channel: other live-pg tests running
-    // concurrently in this same nextest invocation (each its own process,
-    // sharing this one dev Postgres) also write to the 5 notify sites and
-    // land noise on this listener. Loop past anything that isn't the
-    // reason we're expecting instead of asserting strict message-N
-    // ordering, so this test only fails if OUR expected reason never
-    // shows up within the deadline.
+    // NOTIFY is per-database, and this test now owns its database (ADR
+    // 0099 H1), so no foreign test can land noise on this listener. Still
+    // loop past anything that isn't the reason we're expecting instead of
+    // asserting strict message-N ordering — a single call under test may
+    // legitimately fire more than one site — so this test only fails if
+    // OUR expected reason never shows up within the deadline.
     async fn wait_for_reason(listener: &mut sqlx::postgres::PgListener, expected: &str) {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
@@ -903,7 +906,7 @@ async fn notify_placement_changed_fires_at_every_site() {
             if notification.payload() == expected {
                 return;
             }
-            // Noise from a concurrently-running test on the shared channel.
+            // A different reason from this test's own earlier writes.
         }
     }
 
@@ -966,18 +969,17 @@ async fn notify_placement_changed_fires_at_every_site() {
 /// wakes into a full fleet sweep for a resume that changed nothing.
 ///
 /// Same LISTEN harness as the positive test, but a bounded NEGATIVE wait
-/// instead of waiting for an expected payload. Like every other test in
-/// this file that shares the global `placement_changed` channel, this
-/// depends on the suite running with `--test-threads=1` (ci.yml's
-/// "Postgres-gated ignored tests" step, and this file's own module
-/// comment above) for correctness, not just determinism — a concurrently
-/// running sibling test's own legitimate NOTIFY could otherwise land in
-/// the window and produce a false failure.
+/// instead of waiting for an expected payload. This used to depend on the
+/// suite running with `--test-threads=1` (the `placement_changed` channel
+/// was shared across every live-pg test on the one dev Postgres); ADR
+/// 0099 H1's per-test databases make the channel private, so the only
+/// NOTIFYs that can land here are this test's own.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn enqueue_session_resume_noop_does_not_notify_placement_changed() {
-    let Some(meta) = connect().await else { return };
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
+    let Some((meta, database_url)) = connect().await else {
+        return;
+    };
 
     let mut listener = sqlx::postgres::PgListener::connect(&database_url)
         .await
