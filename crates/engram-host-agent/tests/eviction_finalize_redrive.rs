@@ -390,7 +390,14 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
 }
 
 async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
-    for _ in 0..400 {
+    // 120s budget. This poll exits the moment the condition holds, so a
+    // generous deadline costs nothing on green runs — but the
+    // "checkpoint record after re-drive" wait races a REAL re-driven
+    // chunk+upload of the guest's memory, which blew a 20s budget twice
+    // in one day on contended 4-vcpu CI runners (2026-07-15, runs
+    // 29458713634 + 29461273841; both green on retry). Deadline sized
+    // to the slowest observed CI I/O, not the property.
+    for _ in 0..2400 {
         if f() {
             return;
         }
