@@ -1,14 +1,14 @@
 # ADR 0065: pinned versions for the opt-in `browser` RO bundle. It ships
 # the shared browser stack (Xvfb + chromium full-UI + x11vnc + openbox,
-# glibc-linked, self-contained) AND the Microsoft playwright-cli pointed at that
-# chromium over CDP — so one selection gives the human a browser to drive over
-# VNC and the agent the SAME browser to drive programmatically. build.sh reads
+# glibc-linked, self-contained) and Microsoft playwright-cli,
+# all pointed at that chromium over CDP — so one selection gives the human a
+# browser over VNC and the agent the SAME browser programmatically. build.sh reads
 # the apt package versions at build time; this file records intent + the pinned
 # Node/CLI versions (keep in lockstep with build.sh) + the bundle name the
 # coordinator resolves (a profile selects "browser").
 name = "browser"
-description = "Shared live browser: chromium (full UI) + Xvfb + x11vnc + openbox + playwright-cli, glibc-linked, self-contained. The human drives it over VNC; the agent drives the same Chrome over CDP (ADR 0065)."
+description = "Shared live browser: Chromium + VNC for the human and Playwright CLI 0.1.17 with intent-aware visual fallback against the same Chrome (ADR 0065/0097)."
 
 # Keep in lockstep with build.sh.
 node_version = "20.18.1"
-playwright_cli_version = "0.1.13"
+playwright_cli_version = "0.1.17"
