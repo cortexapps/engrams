@@ -8,6 +8,28 @@
 //! Apple's own `containerization` framework avoids the API
 //! entirely for Linux. So we don't use it.
 //!
+//! Re-validated 2026-07-15 on macOS 26 (Darwin 25.2), ADR 0096 D7:
+//! **IT WORKS** — when BOTH identities are pinned across the
+//! save→restore boundary:
+//!   1. an explicit `VZGenericPlatformConfiguration` with a persisted
+//!      `VZGenericMachineIdentifier`, AND
+//!   2. a pinned virtio-net `VZMACAddress` (the framework default
+//!      mints a random MAC per configuration — the restoring config
+//!      must byte-match the saved VM's effective device config, and
+//!      the MAC mismatch alone reproduces the generic code-12).
+//! The historical VZError 12 was (at least on this macOS) that
+//! config-identity mismatch, not a Linux-guest limitation. Caveats
+//! for productization (its own future ADR — warm restore, memory
+//! manifests, honest park residency): the save file is protected via
+//! the user's keychain, so restore is SAME-USER, SAME-HOST only
+//! (headless runners need an unlocked login keychain; cross-host
+//! restore stays cold-boot via disk chunks by design), and the whole
+//! effective config (devices, order, sizes) must be reconstructed
+//! exactly. Until that ADR lands, clone+cold-boot remains the
+//! shipping snapshot semantics below. The standing probe is
+//! `vm::tests::machine_state_save_restore_spike` (`--ignored`; run
+//! via the `just vz-e2e` artifacts).
+//!
 //! Instead, snapshot semantics are clone-based:
 //!   `snapshot` — pause VM → APFS-clone the per-sandbox rootfs
 //!                into the snapshot dir → resume → write manifest.

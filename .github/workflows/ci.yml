@@ -1907,10 +1907,13 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: Install entitlements (verify file is well-formed plist)
         run: plutil -lint crates/engram-sandbox-vz/entitlements.plist
-      - name: Build coord + sandbox-vz tests
-        # cargo build --tests produces the binaries under target/debug/deps/
-        # that vz-codesign signs.
-        run: cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+      - name: Build sandbox-vz test binaries (nextest shape)
+        # MUST be `cargo nextest run --no-run` — the same invocation shape the
+        # run steps use, so they reuse these exact binaries and the signatures
+        # below survive. A plain `cargo build -p a -p b --tests` resolves
+        # features differently and nextest would recompile fresh UNSIGNED
+        # binaries after codesign (ADR 0096).
+        run: cargo nextest run -p engram-sandbox-vz --no-run
       - name: Codesign with virtualization entitlement
         run: bash crates/engram-sandbox-vz/scripts/codesign.sh debug
       # `if: always()` from here so one VZ-test step's failure doesn't hide the
@@ -1924,19 +1927,57 @@ jobs:
       #    never boots a VM, but it *does* stat a kernel + rootfs file, skipping
       #    if either is missing — so the pulled kernel + the empty placeholder
       #    below let it actually run.
-      #  - the `e2e_vz_*` smokes DO boot a real VM, so they skip in CI: they need
-      #    a Docker-baked vsock rootfs passed via ENGRAM_VZ_ROOTFS (unset here),
-      #    which the macOS runner can't produce (ADR 0032). Those run locally as
-      #    a `just vz-test` pre-merge gate.
-      - name: Pull VZ kernel (Kata arm64)
+      #  - the `e2e_vz_*` smokes DO boot real VMs. ADR 0096 made them
+      #    self-staging (Docker-free rootfs via mkext4 + `just vz-e2e`), so
+      #    they run HERE whenever the runner's hypervisor is available —
+      #    probed explicitly below, since a hosted macOS runner may itself be
+      #    a VM without nested virtualization. When the probe passes,
+      #    ENGRAM_VZ_REQUIRE=1 turns any leftover preflight SKIP into a hard
+      #    failure (no more skip-and-green); when it fails, the skip is loud
+      #    in the log and `just vz-e2e` is the documented local pre-merge
+      #    gate (ADR 0096 D3).
+      - name: Cache VZ test artifacts (kernel + Alpine minirootfs)
         if: always()
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/engram-vz-test
+          key: vz-test-artifacts-${{ hashFiles('crates/engram-sandbox-vz/scripts/pull-kernel.sh', 'crates/engram-sandbox-vz/scripts/make-test-rootfs.sh') }}
+      - name: Pull VZ kernel (engram arm64 Image, ADR 0096)
+        if: always()
+        # GH_TOKEN: the kernel is a private release asset fetched via `gh`
+        # (same as the FC lane's fetch-fc-test-artifacts step).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
       - name: Stage rootfs placeholder (for the non-booting config-validation test)
         if: always()
         run: touch /tmp/engram-vz-rootfs.ext4
-      - name: Run ignored VZ tests (config validation runs; e2e_vz smokes skip)
+      - name: Run ignored VZ tests (config validation; e2e_vz runs live below)
         if: always()
-        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast
+        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz)'
+      - name: Probe nested virtualization
+        id: hv
+        if: always()
+        run: |
+          hv="$(sysctl -n kern.hv_support 2>/dev/null || echo 0)"
+          echo "hv=${hv}" >> "$GITHUB_OUTPUT"
+          echo "kern.hv_support=${hv}"
+      - name: Install live-e2e staging deps (just, squashfs-tools, musl cross cc)
+        if: always() && steps.hv.outputs.hv == '1'
+        run: |
+          brew install just squashfs messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+      - name: Live VZ e2e (just vz-e2e — boots real VMs)
+        if: always() && steps.hv.outputs.hv == '1'
+        env:
+          # .cargo/config.toml names the nix devshell's aarch64-linux-musl-gcc;
+          # the brew tap installs aarch64-unknown-linux-musl-gcc. Env overrides
+          # the config linker for this step only.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-unknown-linux-musl-gcc
+          # vz-e2e depends on pull-kernel (a no-op when the step above
+          # cached it, but `gh` still needs the token on a cache miss).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: just vz-e2e
       - name: Workspace check (catches downstream-of-VZ regressions)
         if: always()
         run: cargo check --workspace --all-targets

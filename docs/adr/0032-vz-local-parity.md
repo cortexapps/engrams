@@ -96,8 +96,10 @@ On a running `just dev` (VZ): `POST /api/v1/enabled-images` → 201; `POST
 /api/v1/sessions` → active; `exec` returns `uname` + a populated
 `ENGRAM_SESSION_ID`; the SHELL WS upgrades and ttyd streams its title frame; a
 write with **no** explicit `sync` → snapshot → evict-local → resume reads back
-intact. A macOS-only e2e test (`crates/engram-host-agent/tests/e2e_vz.rs`) locks
-this lifecycle in.
+intact. A macOS-only e2e test (`crates/engram-sandbox-vz/tests/e2e_vz.rs`) locks
+this lifecycle in. (The "Docker-free prebuilt-rootfs asset" follow-up this test's
+CI skip pointed at landed in ADR 0096: `just vz-e2e` stages a fresh rootfs via
+mkext4 and the suite runs non-vacuously.)
 
 **Commit chain.** PR #67 (`vz-local-parity`): host-agent chunk-store wiring →
 memory-manifest optional (migration 0049) → ready-port skip on console → VZ

@@ -17,9 +17,12 @@ use dashmap::DashMap;
 use engram_agentd::{
     read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
 };
-use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink, SandboxBackend, UploadSink};
+use engram_core::traits::sandbox::{
+    ForgeSink, HarnessByteStream, HarnessSink, SandboxBackend, UploadSink,
+};
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
+use engram_core::types::sandbox::SandboxProbe;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
 };
@@ -48,9 +51,16 @@ pub struct VzConfig {
     /// `CONFIG_VIRTIO_BLK=y`, `CONFIG_VIRTIO_NET=y`,
     /// `CONFIG_VIRTIO_CONSOLE=y`. Cached at
     /// `~/.cache/engram-vz-test/vmlinux-arm64` by default. The
-    /// canonical source is `just pull-kernel`, which fetches
-    /// the Kata Containers static kernel.
+    /// canonical source is `just pull-kernel`, which fetches the
+    /// engram arm64 kernel Image (ADR 0025/0096 — the same owned
+    /// config prod's FC guests boot).
     pub kernel_path: PathBuf,
+    /// ADR 0096 D6: host egress proxy + DNS-proxy ports, passed to the
+    /// guest as `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline so
+    /// the init shim installs the in-guest DNAT redirect (SOFT
+    /// enforcement — see the shim). `None` (tests, ad-hoc) boots with
+    /// open egress and no cmdline token.
+    pub egress_ports: Option<(u16, u16)>,
     /// Default RAM in MiB applied when `SandboxSpec::memory.max_mib`
     /// is zero or unset. VZ minimum is 128 MiB.
     pub default_memory_mib: u32,
@@ -58,10 +68,10 @@ pub struct VzConfig {
     /// zero or unset.
     pub default_vcpus: u32,
     /// ADR 0061: directory holding content-addressed skill bundles
-    /// (`<sha>.erofs`) + the `current.json` stamp — the VZ mirror of the
+    /// (`<sha>.squashfs`) + the `current.json` stamp — the VZ mirror of the
     /// FC host's `/var/lib/engram/shared`. Set from
     /// `bundles::bundle_dir_from_env()` by the host-agent. Drives whose
-    /// `sha256` is `Some` attach `bundle_dir/<sha>.erofs`.
+    /// `sha256` is `Some` attach `bundle_dir/<sha>.squashfs`.
     pub bundle_dir: PathBuf,
 }
 
@@ -69,6 +79,7 @@ impl VzConfig {
     pub fn with_kernel(kernel_path: impl Into<PathBuf>) -> Self {
         Self {
             kernel_path: kernel_path.into(),
+            egress_ports: None,
             default_memory_mib: 512,
             default_vcpus: 1,
             bundle_dir: PathBuf::from(AuxRoDrive::SHARED_DIR),
@@ -79,6 +90,13 @@ impl VzConfig {
     /// (`ENGRAM_BUNDLE_DIR` in dev, `/var/lib/engram/shared` in prod).
     pub fn with_bundle_dir(mut self, dir: impl Into<PathBuf>) -> Self {
         self.bundle_dir = dir.into();
+        self
+    }
+
+    /// ADR 0096 D6: pass the host egress proxy + DNS-proxy ports into
+    /// every guest (in-guest soft steering).
+    pub fn with_egress_ports(mut self, proxy: u16, dns: u16) -> Self {
+        self.egress_ports = Some((proxy, dns));
         self
     }
 }
@@ -120,33 +138,23 @@ struct VzSandboxState {
     guest_endpoints: Mutex<Option<GuestEndpoints>>,
 }
 
-// ADR 0009 §4 (host-side VM supervision) is FC-only by design. The
-// rationale for skipping VZ here:
+// ADR 0009 §4 (host-side VM supervision), VZ edition — ADR 0096
+// superseded the earlier "FC-only by design" posture here. VZ VMs run
+// in-process as `VZVirtualMachine` ObjC objects, so there is no VM pid
+// to poll the way FC does; instead a `VZVirtualMachineDelegate` shim
+// (`vm::VmStopDelegate`) flips a per-VM dead flag on
+// `guestDidStopVirtualMachine:` / `virtualMachine:didStopWithError:`.
 //
-//   - VZ VMs run **in-process** as `VZVirtualMachine` ObjC objects
-//     hosted by Apple's `Virtualization.framework`. There is no
-//     separate VM process whose pid we could poll the way the FC
-//     backend does. The VM's lifecycle is the `VzVm` Rust struct's
-//     Drop lifecycle.
-//   - The way a VZ VM dies "out from under" the host-agent is via
-//     internal state transitions surfaced through
-//     `VZVirtualMachineDelegate` callbacks
-//     (`virtualMachine:didStopWithError:` etc.). Wiring those
-//     properly requires creating an ObjC class that conforms to the
-//     delegate protocol and threading it through
-//     `objc2-virtualization` — significantly more work than the
-//     FC poll-based supervisor, and VZ is dev-only.
-//   - The bug case §4 is meant to catch (host-agent alive, VM dies
-//     unexpectedly) is significantly rarer for VZ. In dev the user
-//     restarting `just dev` kills the host-agent and the VM
-//     together; in that scenario reconcile's clean-slate startup
-//     path handles things correctly via the empty `running_sandboxes`
-//     heartbeat.
-//
-// If/when VZ VM crash detection becomes important (i.e. a sandbox
-// goes wedged-but-not-killed and we want eager pruning), the right
-// path is a `VZVirtualMachineDelegate` shim. Tracked in
-// `docs/state-reconciliation-rollout.md` as a future enhancement.
+//   - `list()` filters dead sandboxes, so the ADR 0009 §2 heartbeat's
+//     `running_sandboxes` reflects ground truth and the coordinator's
+//     3-strike divergence flip works unmodified.
+//   - `probe_sandbox` reports `process_alive` from the dead flag plus
+//     a live queue-dispatched `VZVirtualMachine.state()` read — an
+//     independent ground-truth check (ADR 0068), not map membership.
+//   - Detection is eager; CLEANUP stays coordinator-driven (the FC
+//     posture) — the delegate callbacks arrive on the VM's dispatch
+//     queue and only store the flag + log, never touch the sandboxes
+//     map or block.
 pub struct VzBackend {
     work_dir: PathBuf,
     cfg: VzConfig,
@@ -155,6 +163,14 @@ pub struct VzBackend {
     /// bridge passes guest-initiated 1026 connections to this sink
     /// in the same way `engram-sandbox-firecracker` does.
     harness_sink: Mutex<Option<HarnessSink>>,
+    /// ADR 0023/0096: latest forge-credential sink (set by
+    /// `set_forge_sink`). The vsock bridge hands each guest-initiated
+    /// port-1028 connection to it — one vsock stream per credential
+    /// exchange, exactly as `engram-sandbox-firecracker` serves over
+    /// vsock. Until ADR 0096 this was the one FC channel VZ didn't
+    /// serve: the trait-default no-op ate the sink and in-guest
+    /// `forge-credential` dials were refused.
+    forge_sink: Mutex<Option<ForgeSink>>,
     /// ADR 0026: latest artifact-upload sink (set by `set_upload_sink`).
     /// The vsock bridge hands each guest-initiated port-1029 connection to
     /// it — one vsock stream per upload, exactly as
@@ -185,6 +201,7 @@ impl VzBackend {
             cfg,
             sandboxes: DashMap::new(),
             harness_sink: Mutex::new(None),
+            forge_sink: Mutex::new(None),
             upload_sink: Mutex::new(None),
             chunk_store: None,
         })
@@ -258,7 +275,7 @@ impl VzBackend {
             let sha = stamp.get(AuxRoDrive::AGENTD_STAMP_KEY).ok_or_else(|| {
                 SandboxError::InvalidSpec(format!(
                     "bundle stamp {} carries no `{}` entry — restage bundles \
-                     (`just bundles-vz`)",
+                     (`just bundles-squashfs`)",
                     stamp_path.display(),
                     AuxRoDrive::AGENTD_STAMP_KEY,
                 ))
@@ -288,7 +305,7 @@ impl VzBackend {
                     stamp = %stamp_path.display(),
                     "bundle stamp carries no `{}` entry — the SHELL tab only \
                      works if the image bakes ttyd; restage bundles \
-                     (`just bundles-vz`)",
+                     (`just bundles-squashfs`)",
                     AuxRoDrive::GUEST_TOOLS_STAMP_KEY,
                 ),
             }
@@ -353,6 +370,17 @@ impl VzBackend {
         if let Some(mounts) = mounts_override {
             spec.aux_ro_drives = mounts;
         }
+        // ADR 0080/0096: re-resolve symbolic stamped slots against this
+        // host's CURRENT stamp, exactly like create() — the manifest may
+        // carry `sha256 = None` slots (a backend-level spec resolves at
+        // attach, and create() never writes the resolution back), and an
+        // unresolved slot is skipped at attach, which cold-boots a guest
+        // with no agentd bundle → the init shim panics the kernel. A
+        // no-op for coordinator-resolved specs (sha already pinned); for
+        // symbolic ones this is also the honest resume semantic — VZ's
+        // cold boot picks up the host's current agentd generation, the
+        // cold-boot analogue of FC's post-resume RefreshAgent.
+        self.resolve_agentd_slot(&mut spec.aux_ro_drives)?;
         let snapshot_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::Snapshot(
                 "snapshot manifest missing rootfs_source — cannot restore without a \
@@ -399,7 +427,8 @@ impl VzBackend {
             memory_mib,
             vcpus,
         )
-        .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone());
+        .with_aux_ro_drives(spec.aux_ro_drives.clone(), self.cfg.bundle_dir.clone())
+        .with_egress_ports(self.cfg.egress_ports);
         let vm = VzVm::new(vm_cfg)?;
         if let Err(e) = vm.start().await {
             let _ = tokio::fs::remove_file(&rootfs_path).await;
@@ -410,12 +439,14 @@ impl VzBackend {
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
 
         let harness_sink = self.harness_sink.lock().clone();
+        let forge_sink = self.forge_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
         let (bridge, connector) = VsockBridge::start(
             vm.raw_clone(),
             vm.queue_clone(),
             vsock_uds_path.clone(),
             harness_sink,
+            forge_sink,
             upload_sink,
         )
         .await
@@ -503,20 +534,26 @@ where
 
 /// Logged at-most-once per backend instance when a session asks for
 /// egress filtering VZ can't enforce. Apple's
-/// `VZNATNetworkDeviceAttachment` is opaque: the host shares its
-/// networking stack with the guest with no insertable filter, so a
-/// non-empty `manifest.network.allow_hosts` is unenforceable here.
-/// Production isolation lives on FC; VZ stays "open egress, warn".
-fn warn_vz_ignores_allow_hosts_once(network: &engram_core::types::NetworkPolicy) {
+/// `VZNATNetworkDeviceAttachment` is opaque: no host-side insertable
+/// filter exists, so VZ cannot HARD-enforce `manifest.network.allow_hosts`
+/// the way FC's netns iptables do. ADR 0096 D6 added SOFT steering — the
+/// init shim DNATs guest 443/53 to the egress proxy when the host passes
+/// `ENGRAM_EGRESS`, so the proxy plane (SNI dial, allow_hosts filtering,
+/// CA, inject/observe) IS exercised on dev — but a root guest can flush
+/// its own rules, and images without iptables stay open. Warn once so
+/// nobody mistakes dev steering for isolation; production hard isolation
+/// lives on FC.
+fn warn_vz_soft_egress_once(network: &engram_core::types::NetworkPolicy) {
     use std::sync::atomic::{AtomicBool, Ordering};
     static WARNED: AtomicBool = AtomicBool::new(false);
     let restrictive = matches!(network.default, engram_core::types::NetworkDefault::Deny)
         && !network.allow_hosts.is_empty();
     if restrictive && !WARNED.swap(true, Ordering::Relaxed) {
         tracing::warn!(
-            "VZ does not enforce manifest.network.allow_hosts; macOS's NAT path is \
-             opaque. Sessions on this backend get open egress. Use the Firecracker \
-             backend on Linux for production hard-isolation networking."
+            "VZ enforces manifest.network.allow_hosts only via SOFT in-guest \
+             steering (ADR 0096 D6) — a root guest can bypass it, and images \
+             without iptables get open egress. Use the Firecracker backend on \
+             Linux for production hard-isolation networking."
         );
     }
 }
@@ -524,24 +561,22 @@ fn warn_vz_ignores_allow_hosts_once(network: &engram_core::types::NetworkPolicy)
 #[async_trait]
 impl SandboxBackend for VzBackend {
     fn bundle_dir(&self) -> &std::path::Path {
-        // Same dir VZ stages + attaches `<sha>.erofs` from, so the heartbeat
-        // reports exactly what restore will attach (ADR 0062).
+        // Same dir VZ stages + attaches `<sha>.squashfs` from, so the
+        // heartbeat reports exactly what restore will attach (ADR 0062).
+        // The `bundle_file_ext` erofs override is GONE (ADR 0096): VZ
+        // boots the owned ADR 0025 kernel (CONFIG_SQUASHFS=y), so both
+        // backends stage the shared squashfs default — the ADR 0061
+        // erofs fork existed only because the Kata kernel lacked it.
         &self.cfg.bundle_dir
     }
 
-    fn bundle_file_ext(&self) -> &'static str {
-        // VZ stages + attaches erofs (see `staged_erofs_path`); the Kata guest
-        // kernel mounts erofs, not squashfs. The BundleStore must materialize/
-        // sweep `<sha>.erofs`, not the FC-default `<sha>.squashfs`.
-        "erofs"
-    }
-
     async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
-        warn_vz_ignores_allow_hosts_once(&spec.network);
+        warn_vz_soft_egress_once(&spec.network);
         let bake_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::InvalidSpec(
-                "VzBackend requires SandboxSpec.rootfs_source — point it at the ext4 \
-                 rootfs produced by `just bake-demo`"
+                "VzBackend requires SandboxSpec.rootfs_source — an ext4 with the \
+                 ADR 0080 init shim (a materialized session image, or the \
+                 `make-test-rootfs.sh` test image `just vz-e2e` stages)"
                     .into(),
             )
         })?;
@@ -549,8 +584,9 @@ impl SandboxBackend for VzBackend {
         // specific NSError later.
         if !bake_rootfs.exists() {
             return Err(SandboxError::InvalidSpec(format!(
-                "vz rootfs not found at {} — bake an image with `just bake-demo` and \
-                 point SandboxSpec.rootfs_source at it",
+                "vz rootfs not found at {} — materialize an image (enable flow) or \
+                 stage the test rootfs (`just vz-e2e`) and point \
+                 SandboxSpec.rootfs_source at it",
                 bake_rootfs.display()
             )));
         }
@@ -622,7 +658,8 @@ impl SandboxBackend for VzBackend {
         // capture these are sentinel placeholders (sha = None) and attach
         // nothing (except the agentd slot, resolved above); a plain
         // cold-create with resolved drives attaches them.
-        .with_aux_ro_drives(aux_ro_drives, self.cfg.bundle_dir.clone());
+        .with_aux_ro_drives(aux_ro_drives, self.cfg.bundle_dir.clone())
+        .with_egress_ports(self.cfg.egress_ports);
         let vm = VzVm::new(vm_cfg)?;
 
         // Start the VM; if start fails, drop the VM via the early
@@ -640,15 +677,18 @@ impl SandboxBackend for VzBackend {
         // <vsock_uds>_1024 agentd UDS immediately so a subsequent
         // start_agent / exec_stream dial can't race a not-yet-bound
         // window, and registers the guest-initiated listeners (harness
-        // 1026, upload 1029, ready 1027). The returned connector serves
-        // the port relay (guest vsock 1030) via `open_guest_stream`.
+        // 1026, forge 1028, upload 1029, ready 1027). The returned
+        // connector serves the port relay (guest vsock 1030) via
+        // `open_guest_stream`.
         let harness_sink = self.harness_sink.lock().clone();
+        let forge_sink = self.forge_sink.lock().clone();
         let upload_sink = self.upload_sink.lock().clone();
         let (bridge, connector) = VsockBridge::start(
             vm.raw_clone(),
             vm.queue_clone(),
             vsock_uds_path.clone(),
             harness_sink,
+            forge_sink,
             upload_sink,
         )
         .await
@@ -752,6 +792,10 @@ impl SandboxBackend for VzBackend {
         }
     }
 
+    fn set_forge_sink(&self, sink: ForgeSink) {
+        *self.forge_sink.lock() = Some(sink);
+    }
+
     fn set_harness_sink(&self, sink: HarnessSink) {
         *self.harness_sink.lock() = Some(sink);
     }
@@ -814,6 +858,28 @@ impl SandboxBackend for VzBackend {
         Ok(Some(stream))
     }
 
+    /// ADR 0096: external pause — the coordinator's rung-2 park.
+    /// Forwards to the (idempotent) queue-dispatched `VzVm::pause`.
+    /// Until this override, VZ inherited the trait-default no-op and a
+    /// park "succeeded" while the guest kept running.
+    async fn pause(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vm = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vm.clone()
+        };
+        vm.pause().await.map_err(SandboxError::from)
+    }
+
+    /// Symmetric un-park companion to [`Self::pause`] (idempotent on a
+    /// running VM).
+    async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let vm = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vm.clone()
+        };
+        vm.resume().await.map_err(SandboxError::from)
+    }
+
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
         let (vm, spec, rootfs_path, vsock_uds_path) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
@@ -834,7 +900,20 @@ impl SandboxBackend for VzBackend {
         // clone is about to copy. Best-effort: a flush failure (agent not
         // up, slow boot) shouldn't abort the snapshot — we fall back to the
         // last ext4 commit, same as before this call existed.
-        self.flush_guest_fs(id, &vsock_uds_path).await;
+        //
+        // ADR 0096: skip it when the VM is already externally paused
+        // (park→snapshot descent) — a frozen guest can't answer the
+        // Sync RPC, and burning the 5s timeout against it stalls every
+        // rung-2→3 descent. A parked guest also can't be dirtying new
+        // pages, so the clone reflects whatever the pre-park state
+        // flushed (the evictor pairs park with a prior snapshot).
+        let already_paused =
+            vm.state().await == objc2_virtualization::VZVirtualMachineState::Paused;
+        if already_paused {
+            tracing::debug!(sandbox_id = %id, "vz: snapshot of a parked VM — skipping guest fs flush");
+        } else {
+            self.flush_guest_fs(id, &vsock_uds_path).await;
+        }
 
         // ADR 0007 Phase 6: allocate snapshot id + derive staging
         // dir from it. Coord no longer dictates layout.
@@ -863,7 +942,16 @@ impl SandboxBackend for VzBackend {
         vm.pause().await?;
         let snapshot_rootfs = dest.join(SNAPSHOT_ROOTFS_FILENAME);
         let clone_result = clone_or_copy(&rootfs_path, &snapshot_rootfs).await;
-        let resume_result = vm.resume().await;
+        // ADR 0096: snapshot must not have the side effect of
+        // UN-parking — if the VM was externally paused (rung-2 park)
+        // before we got here, leave it paused; the evictor owns the
+        // park state and this is usually the rung-2→3 descent right
+        // before destroy.
+        let resume_result = if already_paused {
+            Ok(())
+        } else {
+            vm.resume().await
+        };
         clone_result.map_err(SandboxError::from)?;
         // If clone succeeded but resume failed, the VM is stuck
         // paused — surface the resume error so the caller can
@@ -986,7 +1074,47 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
-        Ok(self.sandboxes.iter().map(|kv| *kv.key()).collect())
+        // ADR 0096: exclude sandboxes whose stop delegate fired — the
+        // heartbeat's `running_sandboxes` must reflect ground truth so
+        // the coordinator's ADR 0009 divergence detection can flip a
+        // session whose VM died out from under us. The map entry stays
+        // (cleanup is coordinator-driven via destroy).
+        Ok(self
+            .sandboxes
+            .iter()
+            .filter(|kv| !kv.value().vm.is_dead())
+            .map(|kv| *kv.key())
+            .collect())
+    }
+
+    /// ADR 0068/0096: ground-truth liveness, not map membership. A VZ
+    /// VM has no host pid; "the process is alive" means the delegate
+    /// hasn't declared it dead AND the live `state()` read says the
+    /// machine is in a running-family state (Running/Paused + the
+    /// transitional states around them). Stopped/Error ⇒ dead.
+    async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        let vm = match self.sandboxes.get(&id) {
+            Some(live) => live.vm.clone(),
+            None => {
+                return Ok(SandboxProbe {
+                    known_to_backend: false,
+                    process_alive: false,
+                    control_alive: None,
+                })
+            }
+        };
+        use objc2_virtualization::VZVirtualMachineState as S;
+        let state = vm.state().await;
+        let alive = !vm.is_dead()
+            && matches!(
+                state,
+                S::Running | S::Paused | S::Starting | S::Pausing | S::Resuming
+            );
+        Ok(SandboxProbe {
+            known_to_backend: true,
+            process_alive: alive,
+            control_alive: None,
+        })
     }
 
     /// Ensure the in-guest `ttyd` is running, returning the port it

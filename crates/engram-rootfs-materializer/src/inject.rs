@@ -157,8 +157,10 @@ mark fs_mounts_done
 # vz-backend kernel cmdline); IP_PNP doesn't write resolv.conf, so
 # we do it here. Backend-aware by the guest's OWN address: VZ guests
 # get 192.168.64.x from Apple's DHCP and the NAT gateway
-# (192.168.64.1) answers DNS, so it goes first (VZ dev has no egress
-# proxy). FC guests live in the 10.200/16 netns pool behind the
+# (192.168.64.1) answers DNS, so it goes first. (When the host passes
+# ENGRAM_EGRESS, the redirect below DNATs :53 to the filtering DNS
+# proxy regardless of this entry — ADR 0096 D6.) FC guests live in
+# the 10.200/16 netns pool behind the
 # MANDATORY egress proxy (issue #240): the host iptables REDIRECTs
 # guest {udp,tcp}/53 to the filtering DNS proxy regardless of the
 # destination IP, and that proxy NXDOMAINs anything outside
@@ -258,7 +260,7 @@ mark ca_staged
 # extra read-only virtio-blk drive. Slots carry a sentinel at base-snapshot
 # capture; a per-session create patch_drives the profile-selected skills into
 # the slots' devices in the paused restore window. We mount every read-only
-# bundle device (squashfs on FC, erofs on VZ — the ext4 CA drive is never
+# bundle device (squashfs on both backends since ADR 0096 — the ext4 CA drive is never
 # matched) at a sequential /opt/engram/dyn/<i> — the index tracks the host's
 # slot order (FC preserves attach order). The mounts freeze into the base
 # snapshot's VFS; on a fresh-create restore the host has swapped some slots'
@@ -271,14 +273,59 @@ for dev in /dev/vd*; do
     [ -b "$dev" ] || continue
     [ "$dev" = "/dev/vda" ] && continue  # rootfs
     mkdir -p "/opt/engram/dyn/$i" 2>/dev/null || true
-    if mount -t squashfs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null || \
-       mount -t erofs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null; then
+    if mount -t squashfs -o ro "$dev" "/opt/engram/dyn/$i" 2>/dev/null; then
         i=$((i + 1))
     else
         rmdir "/opt/engram/dyn/$i" 2>/dev/null || true  # not a bundle device (e.g. CA ext4)
     fi
 done
 mark bundles_mounted
+# ADR 0096 D6: SOFT egress steering on VZ. The VZ backend passes
+# ENGRAM_EGRESS=<proxy_port>:<dns_port> on the kernel cmdline (env
+# form, so the kernel hands it to PID 1); FC never sets it — its
+# REDIRECT lives host-side in the netns. When present, DNAT guest
+# tcp/443 and {udp,tcp}/53 to the egress proxy on the NAT gateway,
+# so the ADR 0006/0056 proxy plane (SNI dial, CA, inject/observe,
+# allow_hosts) is exercised on macOS dev too. SOFT enforcement by
+# design: the guest is root and can flush these rules; macOS NAT
+# stays open underneath (isolation remains FC-only). The gateway is
+# derived from the default route, not hardcoded — Apple assigns it.
+# An image without iptables logs and stays open-egress.
+if [ -n "${ENGRAM_EGRESS:-}" ]; then
+    # PID 1 has no PATH yet (the full export happens below, before
+    # exec) — set it here so `command -v` and the tool itself resolve.
+    PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+    export PATH
+    egress_ok=""
+    if command -v iptables >/dev/null 2>&1; then
+        gw_hex=""
+        if [ -r /proc/net/route ]; then
+            while read -r _rt_if rt_dest rt_gw _rt_rest; do
+                if [ "$rt_dest" = "00000000" ]; then
+                    gw_hex="$rt_gw"
+                    break
+                fi
+            done < /proc/net/route
+        fi
+        if [ -n "$gw_hex" ]; then
+            # Gateway hex is the network-order address printed
+            # little-endian: "0140A8C0" -> 192.168.64.1.
+            gw="$((0x$(echo "$gw_hex" | cut -c7-8))).$((0x$(echo "$gw_hex" | cut -c5-6))).$((0x$(echo "$gw_hex" | cut -c3-4))).$((0x$(echo "$gw_hex" | cut -c1-2)))"
+            ep="${ENGRAM_EGRESS%%:*}"
+            ed="${ENGRAM_EGRESS##*:}"
+            if iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination "$gw:$ep" 2>/dev/null \
+               && iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null \
+               && iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null; then
+                egress_ok=1
+                echo "engram-init: egress steering active -> $gw:$ep (443) / $gw:$ed (53)" >&2
+            fi
+        fi
+    fi
+    if [ -z "$egress_ok" ]; then
+        echo "engram-init: WARN: ENGRAM_EGRESS set but steering not installed (no iptables in image, or no default route) — open egress" >&2
+    fi
+fi
+mark egress_steered
 export ENGRAM_TRANSPORT=__TRANSPORT__
 # Diagnostic: dump virtio-port + hvc device layout so a misconfig is
 # obvious from the kernel boot log. Cheap (one-shot, only at init).
@@ -481,22 +528,23 @@ mod tests {
         );
     }
 
-    /// ADR 0061: the dyn-mount loop must try squashfs first (FC path) then
-    /// erofs (VZ's Kata kernel has no CONFIG_SQUASHFS). The ext4 CA drive
-    /// must never be matched because only read-only bundle formats are
-    /// attempted.
+    /// ADR 0096: both backends mount squashfs bundles (the ADR 0061 erofs
+    /// fallback is retired with the Kata kernel — the owned VZ kernel has
+    /// CONFIG_SQUASHFS=y). The ext4 CA drive must never be matched because
+    /// only the read-only bundle format is attempted.
     #[test]
-    fn init_shim_dyn_mount_tries_squashfs_then_erofs() {
+    fn init_shim_dyn_mount_is_squashfs_only() {
         assert!(
             DEFAULT_INIT_SHIM.contains("mount -t squashfs -o ro"),
-            "dyn-mount loop must try squashfs first (FC path)",
+            "dyn-mount loop must mount squashfs",
         );
         assert!(
-            DEFAULT_INIT_SHIM.contains("mount -t erofs -o ro"),
-            "dyn-mount loop must try erofs as fallback (VZ / Kata path)",
+            !DEFAULT_INIT_SHIM.contains("mount -t erofs"),
+            "the erofs fallback is retired (ADR 0096) — a lingering mount \
+             attempt would mask a wrongly-staged bundle",
         );
         // The dyn-mount loop iterates /dev/vd* and skips /dev/vda (rootfs).
-        // It must only attempt read-only bundle formats (squashfs, erofs), never
+        // It must only attempt the read-only bundle format (squashfs), never
         // ext4 — otherwise the CA ext4 drive on /dev/vdb would be double-mounted.
         // We verify the dyn-mount loop section (between "for dev in /dev/vd*" and
         // "mark bundles_mounted") contains no "mount -t ext4" invocation.

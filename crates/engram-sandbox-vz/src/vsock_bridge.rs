@@ -12,9 +12,9 @@
 //! connection (an HMR WebSocket, a noVNC stream) would starve every
 //! other forwarded connection — head-of-line blocking. `VZVirtioSocketDevice`
 //! muxes any number of concurrent streams per port (like Firecracker's
-//! virtio-vsock), so each forwarded connection is independent. The Kata
-//! guest kernel VZ boots ships `CONFIG_VIRTIO_VSOCKETS=y` built-in, so
-//! the constraint that motivated the console swap no longer applies.
+//! virtio-vsock), so each forwarded connection is independent. The
+//! guest kernel ships `CONFIG_VIRTIO_VSOCKETS=y` built-in, so the
+//! constraint that motivated the console swap no longer applies.
 //!
 //! # Ports & directions
 //!
@@ -22,6 +22,7 @@
 //!   port 1024 (host → guest, agentd):  UDS at <base>_1024 ←→ connectToPort(1024)
 //!   port 1026 (guest → host, harness): VZVirtioSocketListener → harness_sink
 //!   port 1027 (guest → host, ready):   VZVirtioSocketListener → drained
+//!   port 1028 (guest → host, forge):   VZVirtioSocketListener → forge_sink
 //!   port 1029 (guest → host, upload):  VZVirtioSocketListener → upload_sink
 //!   port 1030 (host → guest, relay):   connectToPort(1030) via open_guest_stream
 //! ```
@@ -32,12 +33,15 @@
 //!   backend's `start_agent` / `exec_stream` / `start_shell` / `guest_endpoints`
 //!   already use. Each UDS accept is its own vsock stream, so concurrent
 //!   control RPCs no longer serialise (unlike the console bridge).
-//! - **Harness (1026) / upload (1029), guest→host:** register a
-//!   `VZVirtioSocketListener` per port; each guest dial becomes its own
-//!   `VZVirtioSocketConnection`, whose fd we hand straight to the sink as
-//!   a `HarnessByteStream`. Upload is now one vsock connection per
-//!   upload — exactly like FC — so the console bridge's per-stream
-//!   `upload_pump` serialisation is retired.
+//! - **Harness (1026) / forge (1028) / upload (1029), guest→host:**
+//!   register a `VZVirtioSocketListener` per port; each guest dial
+//!   becomes its own `VZVirtioSocketConnection`, whose fd we hand
+//!   straight to the sink as a `HarnessByteStream`. Upload is one vsock
+//!   connection per upload and forge one per credential exchange —
+//!   exactly like FC. (Forge was the one FC channel this bridge lacked
+//!   until ADR 0096: in-guest `engram-agentd forge-credential` dials
+//!   died on connection-refused, silently breaking git-credential
+//!   brokering on every VZ session.)
 //! - **Ready (1027), guest→host:** agentd (on the vsock transport) dials
 //!   the readiness port at startup and writes one `AgentReady` frame
 //!   (fire-and-forget). We register a listener that drains and drops it,
@@ -62,7 +66,7 @@ use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
-use engram_core::traits::sandbox::{HarnessByteStream, HarnessSink, UploadSink};
+use engram_core::traits::sandbox::{ForgeSink, HarnessByteStream, HarnessSink, UploadSink};
 use objc2::rc::Retained;
 use objc2::AnyThread;
 use objc2_foundation::NSError;
@@ -85,6 +89,8 @@ const VSOCK_PORT_HARNESS: u32 = 1026;
 /// Readiness handshake port (guest→host). agentd on the vsock transport
 /// dials this once at startup (`engram_agentd::ENGRAM_AGENTD_READY_PORT`).
 const VSOCK_PORT_READY: u32 = 1027;
+/// ADR 0023 forge credential broker (`engram_harness_proto::FORGE_VSOCK_PORT`).
+const VSOCK_PORT_FORGE: u32 = 1028;
 /// ADR 0026 artifact upload (`engram_harness_proto::UPLOAD_VSOCK_PORT`).
 const VSOCK_PORT_UPLOAD: u32 = 1029;
 
@@ -281,9 +287,10 @@ pub(crate) struct VsockBridge {
 impl VsockBridge {
     /// Look up the VM's `VZVirtioSocketDevice`, bind the agentd UDS
     /// (1024) host→guest pump, and register the guest→host listeners
-    /// (harness 1026 → `harness_sink`, upload 1029 → `upload_sink`, ready
-    /// 1027 → drain). The VM must already be `start()`ed — VZ socket-device
-    /// APIs only operate on a running machine.
+    /// (harness 1026 → `harness_sink`, forge 1028 → `forge_sink`, upload
+    /// 1029 → `upload_sink`, ready 1027 → drain). The VM must already be
+    /// `start()`ed — VZ socket-device APIs only operate on a running
+    /// machine.
     ///
     /// Returns the bridge alongside a [`VsockConnector`] the backend keeps
     /// for `open_guest_stream` (the port relay, 1030).
@@ -292,6 +299,7 @@ impl VsockBridge {
         queue: DispatchRetained<DispatchQueue>,
         base_path: PathBuf,
         harness_sink: Option<HarnessSink>,
+        forge_sink: Option<ForgeSink>,
         upload_sink: Option<UploadSink>,
     ) -> Result<(Self, VsockConnector), BridgeError> {
         let socket_device = lookup_socket_device(&queue, &vm)
@@ -330,11 +338,13 @@ impl VsockBridge {
         // handed straight to the port's sink as a HarnessByteStream — no
         // duplex hop, no per-connection serialisation.
         let harness_delivery: Option<ConnDelivery> = harness_sink.map(harness_delivery);
+        let forge_delivery: Option<ConnDelivery> = forge_sink.map(forge_delivery);
         let upload_delivery: Option<ConnDelivery> = upload_sink.map(upload_delivery);
         let ready_delivery: Option<ConnDelivery> = Some(ready_drain_delivery());
 
         for (port, delivery) in [
             (VSOCK_PORT_HARNESS, harness_delivery),
+            (VSOCK_PORT_FORGE, forge_delivery),
             (VSOCK_PORT_UPLOAD, upload_delivery),
             (VSOCK_PORT_READY, ready_delivery),
         ] {
@@ -543,6 +553,17 @@ fn harness_delivery(sink: HarnessSink) -> ConnDelivery {
     Arc::new(move |fd: OwnedFd| match AsyncRawFdStream::new(fd) {
         Ok(s) => sink(Box::pin(s)),
         Err(e) => tracing::warn!(error = %e, "vz harness conn: AsyncRawFdStream::new failed"),
+    })
+}
+
+/// ADR 0023/0096: deliver each guest forge dial straight to the forge
+/// sink. One vsock connection per credential exchange (like FC) — the
+/// sink reads the `ForgeRequest`, validates the broker token, and
+/// replies over this stream.
+fn forge_delivery(sink: ForgeSink) -> ConnDelivery {
+    Arc::new(move |fd: OwnedFd| match AsyncRawFdStream::new(fd) {
+        Ok(s) => sink(Box::pin(s)),
+        Err(e) => tracing::warn!(error = %e, "vz forge conn: AsyncRawFdStream::new failed"),
     })
 }
 

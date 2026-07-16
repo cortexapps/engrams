@@ -129,9 +129,9 @@ pub struct BundleStore {
     blob: Arc<dyn BlobStorage>,
     dir: PathBuf,
     /// The staged-bundle file extension for THIS host's backend
-    /// (`SandboxBackend::bundle_file_ext`): `squashfs` on FC, `erofs` on VZ.
+    /// (`SandboxBackend::bundle_file_ext`): `squashfs` on both backends (ADR 0096).
     /// The staged filename (`<sha>.<ext>`) must match what the backend attaches
-    /// (`staged_erofs_path` on VZ), or `materialize_if_missing` misses the
+    /// (`staged_bundle_path` on VZ), or `materialize_if_missing` misses the
     /// locally-staged file and faults to BlobStorage.
     ext: String,
 }
@@ -228,7 +228,7 @@ impl BundleStore {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
             // Only files matching the staged-generation shape for this backend's
-            // pack format (<sha>.squashfs on FC, <sha>.erofs on VZ); the stamp
+            // pack format (<sha>.squashfs on both backends, ADR 0096); the stamp
             // itself and any temp files stay.
             if !name.ends_with(&suffix) || keep.contains(name) {
                 continue;

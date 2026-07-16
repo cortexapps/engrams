@@ -101,12 +101,13 @@ not change. Production is unaffected: Helm sets the backend explicitly and never
 runs the probe.
 
 Detection lives in one place — `deploy/dev/detect-backend.sh` — using a single
-rule:
+rule (ADR 0096 hardened each arm into a *capability* probe — a host that looks
+the part but can't actually run the VMM degrades to `process`):
 
 ```
-/dev/kvm present & readable   -> firecracker
-else macOS && arm64           -> vz
-else                          -> process
+/dev/kvm present & read-writable            -> firecracker
+else macOS && arm64 && kern.hv_support = 1  -> vz
+else                                        -> process
 ```
 
 The `Tiltfile` calls that probe once and uses its result for **both** coupled

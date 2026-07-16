@@ -460,8 +460,13 @@ async fn main() -> Result<(), HostAgentError> {
                     })?;
                 // ADR 0061: VZ reads skill bundles from the same staged
                 // dir the host-agent reports its `current_bundles` from.
+                // ADR 0096 D6: pass the egress proxy/DNS ports into every
+                // guest — the init shim installs the in-guest DNAT
+                // redirect (soft steering; the proxy already binds
+                // 0.0.0.0, reachable at the VZ NAT gateway).
                 let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel)
-                    .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env());
+                    .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env())
+                    .with_egress_ports(cli.egress_proxy_port, cli.egress_dns_port);
                 fc_for_reattach = None;
                 // ADR 0007: attach the chunk store so `snapshot()` chunks
                 // the rootfs clone and reports the manifest ref. Without
@@ -533,15 +538,23 @@ async fn main() -> Result<(), HostAgentError> {
     // ADR 0075: spawn the substrate populate server now both halves
     // exist. The uffd base dir mirrors the FC config default (env
     // override first) so the tmpfs probe answers for the dir handlers
-    // actually use.
-    let _substrate_server = engram_host_agent::substrate_server::SubstrateServer::new(
-        chunk_cache.clone(),
-        std::sync::Arc::new(chunk_store.clone()),
-        engram_sandbox_firecracker::uffd_base_dir_from_env()
-            .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
-    )
-    .spawn(cli.work_dir.join("substrate.sock"))
-    .map_err(HostAgentError::Io)?;
+    // actually use. FC-only (ADR 0096): its sole client is the UFFD
+    // handler, which exists only on the Firecracker backend — on VZ the
+    // server just sat on a Linux-shaped `/dev/shm/engram` default that
+    // doesn't exist on macOS.
+    let _substrate_server = match cli.sandbox_backend {
+        BackendChoice::Firecracker => Some(
+            engram_host_agent::substrate_server::SubstrateServer::new(
+                chunk_cache.clone(),
+                std::sync::Arc::new(chunk_store.clone()),
+                engram_sandbox_firecracker::uffd_base_dir_from_env()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
+            )
+            .spawn(cli.work_dir.join("substrate.sock"))
+            .map_err(HostAgentError::Io)?,
+        ),
+        BackendChoice::Vz => None,
+    };
     let materialize_dir = cli.work_dir.join("chunked-rootfs");
 
     // OCI auth resolver. The standalone host-agent doesn't have

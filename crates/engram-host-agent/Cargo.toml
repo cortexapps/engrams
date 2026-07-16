@@ -46,12 +46,10 @@ async-trait.workspace = true
 base64.workspace = true
 bincode.workspace = true
 bytes.workspace = true
-# Linux-only: raw libc bindings for the NBD ioctl orchestration
-# in `disk_daemon::runtime`. Gated by `target_os = "linux"` on the
-# call sites; the dep is unconditional because Cargo's
-# target-cfg deps machinery doesn't gate workspace-style deps and
-# `libc` is platform-portable (it just compiles to a no-op crate
-# on non-Linux).
+# Raw libc bindings: the NBD ioctl orchestration in
+# `disk_daemon::runtime` (Linux) and the `hw.memsize` capacity
+# sysctl in `resource` (macOS). Call sites are target_os-gated;
+# the dep is unconditional because `libc` is platform-portable.
 libc = "0.2"
 rustls.workspace = true
 sha2.workspace = true
