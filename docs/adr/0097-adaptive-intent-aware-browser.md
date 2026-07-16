@@ -1,6 +1,6 @@
 # ADR 0097: Adaptive, intent-aware shared browser
 
-Status: Proposed
+Status: Accepted
 
 ## Context
 
@@ -71,3 +71,12 @@ comparison on broader standardized tasks without expanding this PR.
 The browser/VNC production test must prove that the CLI observes semantic state,
 that an annotated screenshot is created, and that the same page is painted in
 the real framebuffer.
+
+## Validation
+
+The implementation passed the full Rust repository gate (format, clippy with
+warnings denied, Hakari verification, and 1,684 nextest cases), targeted
+orchestrator and browser-pane tests, web lint and production build, bundle
+activation coverage, and compilation of the ignored Firecracker browser/VNC
+test. The latter remains assigned to the existing Linux+KVM CI lane, where the
+browser bundle is staged before execution.
