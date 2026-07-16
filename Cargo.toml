@@ -33,6 +33,7 @@ members = [
     "crates/engram-git-dev",
     "crates/engram-git-github",
     "crates/engram-postgres",
+    "crates/engram-testkit",
     "crates/engram-egress-proxy",
     "crates/engram-crypto",
     "crates/engram-oci",
@@ -72,6 +73,7 @@ schemars = "0.8"
 engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
+engram-testkit = { path = "crates/engram-testkit" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
 engram-sandbox-vz = { path = "crates/engram-sandbox-vz" }
 engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }

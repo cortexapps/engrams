@@ -1139,6 +1139,7 @@ dependencies = [
  "engram-storage-gcs",
  "engram-storage-local",
  "engram-telemetry",
+ "engram-testkit",
  "flate2",
  "futures",
  "http-body-util",
@@ -1775,6 +1776,17 @@ dependencies = [
  "tracing",
  "tracing-opentelemetry",
  "tracing-subscriber",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-testkit"
+version = "0.1.0"
+dependencies = [
+ "engram-postgres",
+ "sha2",
+ "sqlx",
+ "uuid",
  "workspace-hack",
 ]
 

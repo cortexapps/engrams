@@ -46,43 +46,19 @@ use parking_lot::Mutex;
 struct TestRig {
     meta: Arc<dyn MetadataStore>,
     chunk_store: ChunkStore,
+    /// URL of this rig's private database, for tests that need a raw pool.
+    db_url: String,
     _blob_dir: tempfile::TempDir,
 }
 
 async fn rig() -> Option<TestRig> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return None;
-        }
-    };
-    // ADR 0047: placement reads the GLOBAL hosts table now, so tests in
-    // this binary can no longer share a database — a sibling test's
-    // fresh host row would be a legal pick. Give each rig its own
-    // database, created off the configured URL. (Leaked test databases
-    // are fine: CI's Postgres is ephemeral, and local dev reuses names
-    // rarely enough to not matter.)
-    let admin = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("connect postgres (admin)");
-    let db_name = format!("engram_test_{}", uuid::Uuid::new_v4().simple());
-    sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
-        .execute(&admin)
-        .await
-        .expect("create per-test database");
-    let base = database_url
-        .rsplit_once('/')
-        .map(|(b, _)| b)
-        .expect("database url has a path");
-    let test_url = format!("{base}/{db_name}");
-    let store = engram_postgres::PostgresStore::connect(&test_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
+    // ADR 0047: placement reads the GLOBAL hosts table, so tests in this
+    // binary cannot share a database — a sibling test's fresh host row
+    // would be a legal pick. ADR 0099 H1: each rig clones its own
+    // database from the migrated template.
+    let db = engram_testkit::pg::fresh_db().await?;
+    let db_url = db.url;
+    let store = db.store;
 
     let blob_dir = tempfile::tempdir().expect("tempdir");
     let blob: Arc<dyn engram_core::traits::BlobStorage> =
@@ -93,6 +69,7 @@ async fn rig() -> Option<TestRig> {
     Some(TestRig {
         meta: pg as Arc<dyn MetadataStore>,
         chunk_store,
+        db_url,
         _blob_dir: blob_dir,
     })
 }
@@ -564,8 +541,10 @@ async fn evacuate_dead_source_no_state_returns_no_recoverable() {
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn migration_0037_landed_evac_attempts_column_and_index() {
     let Some(rig) = rig().await else { return };
-    let database_url = std::env::var("ENGRAM_TEST_DATABASE_URL").unwrap();
-    let pool = sqlx::PgPool::connect(&database_url).await.unwrap();
+    // Inspect the rig's OWN database — the schema assertions must run
+    // against what the template migration chain produced, not whatever
+    // state the shared admin database happens to be in.
+    let pool = sqlx::PgPool::connect(&rig.db_url).await.unwrap();
 
     let row: Option<(String, String, Option<String>)> = sqlx::query_as(
         "SELECT column_name, data_type, column_default \

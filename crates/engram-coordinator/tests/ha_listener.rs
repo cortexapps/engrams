@@ -27,23 +27,15 @@ use engram_core::types::SessionSpec;
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn cross_replica_event_fan_out() {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Bring up the dev DB with \
-                 `docker compose -f deploy/docker-compose.dev.yml up -d postgres` and re-run with \
-                 ENGRAM_TEST_DATABASE_URL=postgres://engram:engram@localhost:5435/engram"
-            );
-            return;
-        }
+    // ADR 0099 H1: private template-cloned database — this binary's two
+    // tests both LISTEN/NOTIFY, and NOTIFY is per-database, so a shared
+    // database means cross-talk (the reason the CI PG lane used to run
+    // `--test-threads=1`).
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
     };
-
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    let meta: Arc<dyn MetadataStore> = Arc::new(store);
+    let database_url = db.url.clone();
+    let meta: Arc<dyn MetadataStore> = Arc::new(db.store);
 
     // Seed a session row both AppStates can refer to. The producer
     // (coord-B) appends an event against this id; the subscriber on
@@ -180,15 +172,11 @@ async fn append_session_event_fires_pg_notify() {
     // Targeted check that the SQL change in `append_session_event`
     // actually emits a NOTIFY (and not, say, a silent INSERT).
     // Subscribes a raw PgListener and counts notifications.
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => return,
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
     };
-
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect");
-    store.migrate().await.expect("migrate");
+    let database_url = db.url;
+    let store = db.store;
 
     let mut listener = sqlx::postgres::PgListener::connect(&database_url)
         .await
@@ -260,17 +248,13 @@ async fn cross_replica_scheduling_pins_and_tokens() {
     use engram_core::types::host::{HostCapacity, HostHeartbeat, HostRecord, HostStatus};
     use engram_core::HostId;
 
-    let Ok(database_url) = std::env::var("ENGRAM_TEST_DATABASE_URL") else {
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
         return;
     };
-    let store_a = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect A");
-    store_a.migrate().await.expect("migrate");
-    let store_b = engram_postgres::PostgresStore::connect(&database_url)
+    let store_b = engram_postgres::PostgresStore::connect(&db.url)
         .await
         .expect("connect B");
-    let meta_a: Arc<dyn MetadataStore> = Arc::new(store_a);
+    let meta_a: Arc<dyn MetadataStore> = Arc::new(db.store);
     let meta_b: Arc<dyn MetadataStore> = Arc::new(store_b);
 
     // --- 1. heartbeat through A ⇒ schedulable from B -----------------
@@ -470,15 +454,10 @@ async fn cross_replica_scheduling_pins_and_tokens() {
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn broker_token_insert_requires_session_row() {
-    let Ok(database_url) = std::env::var("ENGRAM_TEST_DATABASE_URL") else {
-        eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set");
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
         return;
     };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    let meta: Arc<dyn MetadataStore> = Arc::new(store);
+    let meta: Arc<dyn MetadataStore> = Arc::new(db.store);
 
     // A broker token for a session whose row doesn't exist yet.
     let orphan = engram_core::types::SessionId::new();
