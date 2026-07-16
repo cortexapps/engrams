@@ -518,7 +518,6 @@ impl VzVm {
 
     /// Save the paused VM's full state (memory + device state) to
     /// `dest`. VM must be in `.paused`. Used by snapshot in task 29.
-    #[allow(dead_code)]
     pub async fn save(&self, dest: &Path) -> Result<(), VzError> {
         let url = Sendable(nsurl_for_path(dest));
         self.dispatch_op_save_restore("save", move |vm, completion| {
@@ -533,7 +532,6 @@ impl VzVm {
     /// Restore from a save file. Must be called on a freshly-built
     /// VM with a configuration that matches the source. Used by
     /// snapshot in task 29.
-    #[allow(dead_code)]
     pub async fn restore(&self, src: &Path) -> Result<(), VzError> {
         let url = Sendable(nsurl_for_path(src));
         self.dispatch_op_save_restore("restore", move |vm, completion| {
@@ -556,7 +554,6 @@ impl VzVm {
     /// Same shape as `dispatch_op`, but tags the error variant as
     /// `SaveRestore` so the caller can distinguish snapshot failures
     /// from lifecycle failures. Used by snapshot in task 29.
-    #[allow(dead_code)]
     async fn dispatch_op_save_restore<F>(
         &self,
         op: &'static str,

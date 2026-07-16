@@ -385,10 +385,195 @@ impl VzBackend {
         }
     }
 
-    /// ADR 0061: shared cold-resume path. `mounts_override = Some` (fresh
-    /// create) replaces the snapshot's reserved/sentinel slots with this
-    /// session's resolved skills; `None` (resume) keeps the snapshot's
-    /// pinned `spec.aux_ro_drives`.
+    /// ADR 0096 D7: push the host's wall clock into a warm-restored
+    /// guest. VZ exposes no KVM-PTP device, so the guest wakes with
+    /// `CLOCK_REALTIME` frozen at save time and its self-driven PTP sync
+    /// is a permanent no-op — the host steps it instead, right after
+    /// resume (before the coordinator's start_agent re-delivery, since
+    /// that only happens after `restore()` returns). Best-effort +
+    /// bounded, mirroring `flush_guest_fs`; the guest applies the same
+    /// 2s threshold the FC PTP path uses.
+    async fn step_guest_clock(&self, id: SandboxId, vsock_uds_path: &Path) {
+        let agent_uds = port_uds_path(vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let unix_nanos = match std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH) {
+            Ok(d) => d.as_nanos() as i64,
+            Err(_) => return,
+        };
+        let fut = async {
+            let conn = UnixStream::connect(&agent_uds).await.ok()?;
+            let (mut reader, mut writer) = tokio::io::split(conn);
+            write_msg(&mut writer, &WireRequest::StepClock { unix_nanos })
+                .await
+                .ok()?;
+            let resp: WireResponse = read_msg(&mut reader).await.ok()?;
+            Some(resp)
+        };
+        match tokio::time::timeout(Duration::from_secs(5), fut).await {
+            Ok(Some(WireResponse::ClockStepped {
+                applied_offset_nanos,
+            })) => {
+                tracing::info!(
+                    sandbox_id = %id,
+                    applied_offset_secs = applied_offset_nanos.map(|n| n / 1_000_000_000),
+                    "vz: warm-restored guest clock stepped (None = under threshold)"
+                );
+            }
+            Ok(Some(other)) => {
+                tracing::warn!(sandbox_id = %id, ?other, "vz: unexpected reply to StepClock");
+            }
+            Ok(None) => {
+                tracing::warn!(
+                    sandbox_id = %id,
+                    "vz: StepClock dial failed (old agentd generation?) — guest clock stays stale"
+                );
+            }
+            Err(_) => {
+                tracing::warn!(sandbox_id = %id, "vz: StepClock timed out after 5s");
+            }
+        }
+    }
+
+    /// Start the vsock bridge for `vm` with the currently-registered
+    /// sinks. Shared by the warm and cold restore paths (create() keeps
+    /// its inline copy with its own teardown semantics).
+    async fn attach_bridge(
+        &self,
+        vm: &Arc<VzVm>,
+        vsock_uds_path: &Path,
+    ) -> Result<(VsockBridge, VsockConnector), SandboxError> {
+        let harness_sink = self.harness_sink.lock().clone();
+        let forge_sink = self.forge_sink.lock().clone();
+        let upload_sink = self.upload_sink.lock().clone();
+        VsockBridge::start(
+            vm.raw_clone(),
+            vm.queue_clone(),
+            vsock_uds_path.to_path_buf(),
+            harness_sink,
+            forge_sink,
+            upload_sink,
+        )
+        .await
+        .map_err(SandboxError::from)
+    }
+
+    /// ADR 0096 D7: the warm-restore eligibility gate — pure checks, no
+    /// side effects, so a `Err(reason)` costs nothing and cold-boots.
+    fn warm_gate(
+        &self,
+        manifest: &crate::snapshot::VzSnapshotManifest,
+        src: &Path,
+    ) -> Result<crate::snapshot::WarmMachineState, String> {
+        let Some(w) = manifest.warm.clone() else {
+            return Err("manifest has no warm block (pre-D7 snapshot, or the save failed)".into());
+        };
+        if !src.join(crate::snapshot::MACHINE_STATE_FILENAME).exists() {
+            return Err("machine.vzs missing from the snapshot dir".into());
+        }
+        // Cmdline equality — never blind reuse: the resumed guest's
+        // in-memory state (e.g. its ENGRAM_EGRESS DNAT rules) reflects
+        // the SAVED cmdline, and only a cold reboot re-runs the init
+        // shim against today's.
+        let current = self.current_kernel_cmdline();
+        if w.kernel_cmdline != current {
+            return Err(format!(
+                "kernel cmdline drift since save (saved {:?}, current {:?}) — cold reboot \
+                 re-runs the init shim",
+                w.kernel_cmdline, current
+            ));
+        }
+        for d in &w.aux_ro_drives {
+            if let Some(sha) = d.sha256.as_deref() {
+                let p = crate::vm::staged_bundle_path(&self.cfg.bundle_dir, sha);
+                if !p.exists() {
+                    return Err(format!(
+                        "staged bundle {} ({}) is gone — the saved device config can't be \
+                         rebuilt",
+                        p.display(),
+                        d.drive_id
+                    ));
+                }
+            }
+        }
+        // Dup-MAC guard: two live VMs on the shared NAT must never carry
+        // the same MAC (double restore of one snapshot, or restoring
+        // while the source sandbox still runs). Cold mints fresh.
+        if self
+            .sandboxes
+            .iter()
+            .any(|kv| kv.value().mac_address == w.mac_address)
+        {
+            return Err(
+                "saved MAC is already live on this host (double restore / source still \
+                 running)"
+                    .into(),
+            );
+        }
+        Ok(w)
+    }
+
+    /// ADR 0096 D7: boot the saved machine state. Rebuilds the
+    /// byte-equivalent config from the warm block (pinned identity +
+    /// resolved drives + resolved sizing), restores, attaches the vsock
+    /// bridge while still PAUSED (spike r3(d): listener registration
+    /// works pre-resume, closing the guest-redial window), resumes, and
+    /// steps the guest clock. Any error falls back to cold in the
+    /// caller.
+    async fn try_warm_restore(
+        &self,
+        new_id: SandboxId,
+        src: &Path,
+        w: &crate::snapshot::WarmMachineState,
+        rootfs_path: &Path,
+        spec: &SandboxSpec,
+    ) -> Result<SandboxId, SandboxError> {
+        let vm_cfg = VmConfig::new(
+            self.cfg.kernel_path.clone(),
+            rootfs_path.to_path_buf(),
+            w.memory_mib,
+            w.vcpus,
+        )
+        .with_aux_ro_drives(w.aux_ro_drives.clone(), self.cfg.bundle_dir.clone())
+        // Gate-checked equal to the saved cmdline.
+        .with_egress_ports(self.cfg.egress_ports)
+        .with_machine_identifier(w.machine_identifier.clone())
+        .with_mac_address(w.mac_address.clone());
+        let vm = Arc::new(VzVm::new(vm_cfg)?);
+        vm.restore(&src.join(crate::snapshot::MACHINE_STATE_FILENAME))
+            .await?;
+        let vsock_uds_path = self.vsock_uds_path_for(new_id);
+        // Bridge BEFORE resume — no window where a live guest redials
+        // unregistered listeners.
+        let (bridge, connector) = self.attach_bridge(&vm, &vsock_uds_path).await?;
+        vm.resume().await?;
+        self.step_guest_clock(new_id, &vsock_uds_path).await;
+        self.sandboxes.insert(
+            new_id,
+            VzSandboxState {
+                spec: spec.clone(),
+                machine_identifier: w.machine_identifier.clone(),
+                mac_address: w.mac_address.clone(),
+                resolved_aux_ro_drives: w.aux_ro_drives.clone(),
+                vm,
+                bridge: parking_lot::Mutex::new(Some(bridge)),
+                connector,
+                vsock_uds_path,
+                rootfs_path: rootfs_path.to_path_buf(),
+                guest_endpoints: Mutex::new(None),
+            },
+        );
+        tracing::info!(
+            sandbox_id = %new_id,
+            "vz: WARM restore — saved machine state resumed (memory intact, no cold boot)"
+        );
+        Ok(new_id)
+    }
+
+    /// ADR 0061/0096: shared resume path — WARM (machine-state resume,
+    /// memory intact) when the gate passes, cold-boot otherwise.
+    /// `mounts_override = Some` (fresh create) replaces the snapshot's
+    /// reserved/sentinel slots with this session's resolved skills and
+    /// is ALWAYS cold (different device config than the saved VM);
+    /// `None` (resume) keeps the snapshot's pinned drives.
     async fn restore_impl(
         &self,
         metadata: SnapshotMetadata,
@@ -396,21 +581,11 @@ impl VzBackend {
     ) -> Result<SandboxId, SandboxError> {
         let src = self.snapshot_dir_for(metadata.id);
         let manifest = crate::snapshot::read_manifest(&src).await?;
-        let mut spec = manifest.spec;
+        let warm_requested = mounts_override.is_none();
+        let mut spec = manifest.spec.clone();
         if let Some(mounts) = mounts_override {
             spec.aux_ro_drives = mounts;
         }
-        // ADR 0080/0096: re-resolve symbolic stamped slots against this
-        // host's CURRENT stamp, exactly like create() — the manifest may
-        // carry `sha256 = None` slots (a backend-level spec resolves at
-        // attach, and create() never writes the resolution back), and an
-        // unresolved slot is skipped at attach, which cold-boots a guest
-        // with no agentd bundle → the init shim panics the kernel. A
-        // no-op for coordinator-resolved specs (sha already pinned); for
-        // symbolic ones this is also the honest resume semantic — VZ's
-        // cold boot picks up the host's current agentd generation, the
-        // cold-boot analogue of FC's post-resume RefreshAgent.
-        self.resolve_agentd_slot(&mut spec.aux_ro_drives)?;
         let snapshot_rootfs = spec.rootfs_source.clone().ok_or_else(|| {
             SandboxError::Snapshot(
                 "snapshot manifest missing rootfs_source — cannot restore without a \
@@ -424,6 +599,74 @@ impl VzBackend {
                 snapshot_rootfs.display()
             )));
         }
+
+        let new_id = SandboxId::new();
+        tokio::fs::create_dir_all(&self.work_dir).await?;
+        let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, new_id);
+
+        // Clone the snapshot's rootfs into a fresh per-sandbox file. The
+        // snapshot's clone stays intact (so a forked session or a re-resume
+        // after this one can clone it again); the new sandbox writes only to
+        // its own clone. Shared by the warm and cold paths (spike r3(a):
+        // the rootfs path is NOT part of save/restore config identity).
+        clone_or_copy(&snapshot_rootfs, &rootfs_path).await?;
+        tracing::debug!(
+            sandbox_id = %new_id,
+            src = %snapshot_rootfs.display(),
+            dst = %rootfs_path.display(),
+            "vz: cloned snapshot rootfs to fresh per-sandbox path"
+        );
+
+        // ADR 0096 D7: WARM restore — resume the saved machine state
+        // (memory intact) when the gate passes; ANY failure warns and
+        // falls through to the cold boot below.
+        if warm_requested {
+            match self.warm_gate(&manifest, &src) {
+                Err(reason) => {
+                    tracing::info!(
+                        snapshot_id = %metadata.id,
+                        reason,
+                        "vz: warm restore unavailable — cold-booting"
+                    );
+                }
+                Ok(w) => {
+                    match self
+                        .try_warm_restore(new_id, &src, &w, &rootfs_path, &spec)
+                        .await
+                    {
+                        Ok(id) => return Ok(id),
+                        Err(e) => {
+                            tracing::warn!(
+                                snapshot_id = %metadata.id,
+                                error = %e,
+                                "vz: WARM restore failed — falling back to cold boot \
+                                 (watch for a silent fleet-wide regression to cold)"
+                            );
+                            // A briefly-resumed guest may have dirtied
+                            // the clone — re-clone for a pristine cold
+                            // boot.
+                            let _ = tokio::fs::remove_file(&rootfs_path).await;
+                            clone_or_copy(&snapshot_rootfs, &rootfs_path).await?;
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- cold boot ----
+        // ADR 0080/0096: re-resolve symbolic stamped slots against this
+        // host's CURRENT stamp, exactly like create() — the manifest may
+        // carry `sha256 = None` slots (a backend-level spec resolves at
+        // attach, and create() never writes the resolution back), and an
+        // unresolved slot is skipped at attach, which cold-boots a guest
+        // with no agentd bundle → the init shim panics the kernel. A
+        // no-op for coordinator-resolved specs (sha already pinned); for
+        // symbolic ones this is also the honest resume semantic — VZ's
+        // cold boot picks up the host's current agentd generation, the
+        // cold-boot analogue of FC's post-resume RefreshAgent. (The warm
+        // path above deliberately does NOT re-resolve: it keeps the
+        // RUNNING captured agentd, FC's resume semantics.)
+        self.resolve_agentd_slot(&mut spec.aux_ro_drives)?;
         let memory_mib = if spec.memory.max_mib > 0 {
             spec.memory.max_mib
         } else {
@@ -434,22 +677,6 @@ impl VzBackend {
         } else {
             self.cfg.default_vcpus
         };
-
-        let new_id = SandboxId::new();
-        tokio::fs::create_dir_all(&self.work_dir).await?;
-        let rootfs_path = per_sandbox_rootfs_path(&self.work_dir, new_id);
-
-        // Clone the snapshot's rootfs into a fresh per-sandbox file. The
-        // snapshot's clone stays intact (so a forked session or a re-resume
-        // after this one can clone it again); the new sandbox writes only to
-        // its own clone.
-        clone_or_copy(&snapshot_rootfs, &rootfs_path).await?;
-        tracing::debug!(
-            sandbox_id = %new_id,
-            src = %snapshot_rootfs.display(),
-            dst = %rootfs_path.display(),
-            "vz: cloned snapshot rootfs to fresh per-sandbox path for cold-resume"
-        );
 
         // ADR 0096 D7: cold restores mint a FRESH identity — the new VM
         // is a new machine (and fresh MACs keep the many-sessions-from-
@@ -474,19 +701,14 @@ impl VzBackend {
 
         let vsock_uds_path = self.vsock_uds_path_for(new_id);
 
-        let harness_sink = self.harness_sink.lock().clone();
-        let forge_sink = self.forge_sink.lock().clone();
-        let upload_sink = self.upload_sink.lock().clone();
-        let (bridge, connector) = VsockBridge::start(
-            vm.raw_clone(),
-            vm.queue_clone(),
-            vsock_uds_path.clone(),
-            harness_sink,
-            forge_sink,
-            upload_sink,
-        )
-        .await
-        .map_err(SandboxError::from)?;
+        let (bridge, connector) = match self.attach_bridge(&vm, &vsock_uds_path).await {
+            Ok(x) => x,
+            Err(e) => {
+                // Don't leak the per-sandbox clone on the error path.
+                let _ = tokio::fs::remove_file(&rootfs_path).await;
+                return Err(e);
+            }
+        };
 
         self.sandboxes.insert(
             new_id,

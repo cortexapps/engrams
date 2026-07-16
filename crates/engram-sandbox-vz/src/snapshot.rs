@@ -1,44 +1,42 @@
-//! Clone-based snapshot manifest for `engram-sandbox-vz`.
+//! Snapshot manifest for `engram-sandbox-vz` — warm machine-state
+//! restore when possible, clone+cold-boot always available (ADR 0096
+//! D7 productized what the spike proved).
 //!
-//! VZ's `saveMachineStateToURL` / `restoreMachineStateFromURL`
-//! pair is broken upstream for arm64 Linux guests on macOS:
-//! save succeeds but restore returns generic VZErrorRestore=12
-//! "invalid argument" with no NSUnderlyingError. See UTM #6654,
-//! Apple Developer Forum thread 745168, and the fact that
-//! Apple's own `containerization` framework avoids the API
-//! entirely for Linux. So we don't use it.
+//! History: VZ originally used clone+cold-boot ONLY, because
+//! `restoreMachineStateFromURL` returned an opaque VZErrorRestore=12
+//! for arm64 Linux guests (ADR 0003 era; UTM #6654, Apple forum
+//! 745168). Re-validated 2026-07-15 on macOS 26: the failure was a
+//! CONFIG-IDENTITY mismatch, not a Linux-guest limitation — restore
+//! works when both the `VZGenericMachineIdentifier` AND the
+//! virtio-net MAC are pinned across the boundary (the framework mints
+//! a fresh random MAC per configuration otherwise). The standing
+//! probes are `vm::tests::machine_state_save_restore_spike` and the
+//! round-3 siblings.
 //!
-//! Re-validated 2026-07-15 on macOS 26 (Darwin 25.2), ADR 0096 D7:
-//! **IT WORKS** — when BOTH identities are pinned across the
-//! save→restore boundary:
-//!   1. an explicit `VZGenericPlatformConfiguration` with a persisted
-//!      `VZGenericMachineIdentifier`, AND
-//!   2. a pinned virtio-net `VZMACAddress` (the framework default
-//!      mints a random MAC per configuration — the restoring config
-//!      must byte-match the saved VM's effective device config, and
-//!      the MAC mismatch alone reproduces the generic code-12).
-//! The historical VZError 12 was (at least on this macOS) that
-//! config-identity mismatch, not a Linux-guest limitation. Caveats
-//! for productization (its own future ADR — warm restore, memory
-//! manifests, honest park residency): the save file is protected via
-//! the user's keychain, so restore is SAME-USER, SAME-HOST only
-//! (headless runners need an unlocked login keychain; cross-host
-//! restore stays cold-boot via disk chunks by design), and the whole
-//! effective config (devices, order, sizes) must be reconstructed
-//! exactly. Until that ADR lands, clone+cold-boot remains the
-//! shipping snapshot semantics below. The standing probe is
-//! `vm::tests::machine_state_save_restore_spike` (`--ignored`; run
-//! via the `just vz-e2e` artifacts).
+//! Snapshot semantics:
+//!   `snapshot` — flush guest fs (unless parked) → pause → APFS-clone
+//!                the rootfs → BEST-EFFORT `saveMachineStateToURL` to
+//!                `machine.vzs` (~working-set-sized; a failure just
+//!                omits the warm block) → resume-unless-parked →
+//!                manifest (with [`WarmMachineState`] iff saved).
+//!   `restore`  — WARM when the gate passes (resume flavor only; warm
+//!                block + machine.vzs present; saved cmdline equals
+//!                today's; saved staged bundles still exist; saved MAC
+//!                not already live): rebuild the byte-equivalent
+//!                config, `restoreMachineStateFromURL`, attach the
+//!                bridge while paused, resume, host-push the clock
+//!                (StepClock). Memory intact — no cold boot, no
+//!                Claude `--resume` crutch.
+//!                COLD otherwise (and on ANY warm failure, after
+//!                re-cloning the rootfs): fresh per-sandbox clone,
+//!                re-resolve the agentd slot, cold-boot — exactly the
+//!                pre-D7 behavior.
 //!
-//! Instead, snapshot semantics are clone-based:
-//!   `snapshot` — pause VM → APFS-clone the per-sandbox rootfs
-//!                into the snapshot dir → resume → write manifest.
-//!                The clone IS the snapshot.
-//!   `restore`  — read manifest → APFS-clone snapshot rootfs into
-//!                a fresh per-sandbox file → cold-boot a fresh VM.
-//!                Bootstrap supervisor + Claude `--resume <id>`
-//!                handle conversation continuity across the
-//!                cold boot.
+//! Constraints (by Apple's design): `machine.vzs` is protected via
+//! the user's keychain — SAME-USER, SAME-HOST restore only (headless
+//! runners with a locked login keychain simply never produce warm
+//! blocks); it is NEVER chunked to BlobStorage, and cross-host
+//! restore stays cold-boot via disk chunks.
 //!
 //! See `disk.rs` for the clone primitives.
 
