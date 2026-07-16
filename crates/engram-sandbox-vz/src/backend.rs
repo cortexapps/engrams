@@ -335,6 +335,24 @@ impl VzBackend {
             .join(snapshot_id.to_string())
     }
 
+    /// ADR 0096 D7: the kernel cmdline a VM built by THIS backend today
+    /// would boot with (`VmConfig::new` default + the egress token).
+    /// snapshot() persists it into the warm block; restore compares the
+    /// saved value against this as an equality gate (a difference means
+    /// the resumed guest's in-memory state — e.g. its egress DNAT rules —
+    /// would be stale, so the restore goes cold and re-runs the init
+    /// shim). Pure string assembly, no ObjC.
+    fn current_kernel_cmdline(&self) -> String {
+        VmConfig::new(
+            self.cfg.kernel_path.clone(),
+            std::path::PathBuf::new(),
+            0,
+            0,
+        )
+        .with_egress_ports(self.cfg.egress_ports)
+        .kernel_cmdline
+    }
+
     /// Ask the in-guest agentd to `sync(2)` so dirty page-cache writes
     /// land in the virtio-blk-backed rootfs file before `snapshot()`
     /// clones it. Best-effort + bounded: a 5 s cap keeps a wedged guest
@@ -927,14 +945,30 @@ impl SandboxBackend for VzBackend {
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
-        let (vm, spec, rootfs_path, vsock_uds_path) = {
+        let (vm, spec, rootfs_path, vsock_uds_path, machine_identifier, mac_address, resolved_aux) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             (
                 live.vm.clone(),
                 live.spec.clone(),
                 live.rootfs_path.clone(),
                 live.vsock_uds_path.clone(),
+                live.machine_identifier.clone(),
+                live.mac_address.clone(),
+                live.resolved_aux_ro_drives.clone(),
             )
+        };
+        // Resolved sizing, same computation the VM was built with (same
+        // process, same VzConfig defaults) — persisted into the warm
+        // block so restore never recomputes against changed defaults.
+        let memory_mib = if spec.memory.max_mib > 0 {
+            spec.memory.max_mib
+        } else {
+            self.cfg.default_memory_mib
+        };
+        let vcpus = if spec.cpu.vcpus > 0 {
+            spec.cpu.vcpus
+        } else {
+            self.cfg.default_vcpus
         };
 
         // Flush the guest filesystem BEFORE pausing + cloning. The clone
@@ -988,6 +1022,42 @@ impl SandboxBackend for VzBackend {
         vm.pause().await?;
         let snapshot_rootfs = dest.join(SNAPSHOT_ROOTFS_FILENAME);
         let clone_result = clone_or_copy(&rootfs_path, &snapshot_rootfs).await;
+        // ADR 0096 D7: save the machine state (memory + device state)
+        // while still paused, beside the clone. BEST-EFFORT: a failure
+        // (locked keychain on a headless host, an unsupported config)
+        // logs and omits the warm block — the snapshot stays cold-boot
+        // restorable exactly as before. Cheap: VZ writes the touched
+        // working set, not the full RAM size (~390ms / 16 MiB for an
+        // idle 1 GiB guest, spike round 3).
+        let warm = if clone_result.is_ok() {
+            let state_path = dest.join(crate::snapshot::MACHINE_STATE_FILENAME);
+            match vm.save(&state_path).await {
+                Ok(()) => Some(crate::snapshot::WarmMachineState {
+                    machine_identifier: machine_identifier.clone(),
+                    mac_address: mac_address.clone(),
+                    // The cmdline the saved VM booted with — recomputed
+                    // the same way create()/restore built it (same
+                    // process, same VzConfig). Restore uses it as an
+                    // equality gate.
+                    kernel_cmdline: self.current_kernel_cmdline(),
+                    aux_ro_drives: resolved_aux.clone(),
+                    memory_mib,
+                    vcpus,
+                }),
+                Err(e) => {
+                    tracing::warn!(
+                        sandbox_id = %id,
+                        error = %e,
+                        "vz: machine-state save failed — snapshot will be cold-boot only \
+                         (locked keychain on a headless host?)"
+                    );
+                    let _ = tokio::fs::remove_file(&state_path).await;
+                    None
+                }
+            }
+        } else {
+            None
+        };
         // ADR 0096: snapshot must not have the side effect of
         // UN-parking — if the VM was externally paused (rung-2 park)
         // before we got here, leave it paused; the evictor owns the
@@ -1010,7 +1080,7 @@ impl SandboxBackend for VzBackend {
         // in `spec.image` for audit purposes.
         let mut snapshot_spec = spec.clone();
         snapshot_spec.rootfs_source = Some(snapshot_rootfs.clone());
-        let manifest = crate::snapshot::VzSnapshotManifest::new(id, snapshot_spec);
+        let manifest = crate::snapshot::VzSnapshotManifest::new(id, snapshot_spec, warm);
         let manifest_path = dest.join(crate::snapshot::MANIFEST_FILENAME);
         let bytes = serde_json::to_vec_pretty(&manifest)
             .map_err(|e| SandboxError::Snapshot(format!("manifest serialize: {e}")))?;
