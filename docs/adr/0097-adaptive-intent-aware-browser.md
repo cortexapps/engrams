@@ -1,6 +1,15 @@
 # ADR 0097 — Adaptive, intent-aware browser control
 
-Status: Accepted
+Status: Proposed
+
+> **Evaluation reopened (2026-07-16).** The first 64-episode result is retained
+> below as an implementation record but is not valid evidence for choosing the
+> production actuator. A post-run fairness audit found that the agent-browser
+> arm received a too-long session/socket name and a misleading literal `URL`
+> command example, the visual interlock was enforced mechanically only for
+> agent-browser, and the 800×600 headless viewport did not match production's
+> 1440×1080 framebuffer. ADR acceptance and actuator selection are suspended
+> until a factored, symmetric rerun replaces that result.
 
 ## Context
 
@@ -174,12 +183,17 @@ Incident Console gate or its predeclared Playwright fallback. Its uniformly
 poor result is retained as a limitation of this local model/task calibration,
 not presented as a product-performance claim.
 
-### Selection and implementation
+### Superseded first-run selection and implementation
 
-The hybrid is not shipped. This is the fallback specified before the run:
+The first run selected the fallback specified before the run:
 Playwright CLI 0.1.17 plus the unified intent-aware browser and sharing policy.
 agent-browser stays in `evals/browser` so the comparison can be repeated when
 its behavior or the model harness changes.
+
+That actuator conclusion is now suspended by the fairness findings above. The
+closed-loop policy, private visual-observation bridge, and intent-gated sharing
+remain independently justified and implemented while the repaired comparison
+is in progress.
 
 The implementation replaces `show-your-work`, narrows `share-file`, adds the
 private `browser_view` bridge to both harnesses, recognizes both evaluated CLIs

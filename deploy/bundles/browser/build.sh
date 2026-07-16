@@ -329,7 +329,10 @@ status=$?
 if [ "$status" -eq 0 ] && [ "${1:-}" = screenshot ] && [ -f "$filename" ]; then
     canonical="$(readlink -f -- "$filename")"
     case "$canonical" in
-        "$observation_dir"/*) printf "%s\n" "$canonical" > "$pending" ;;
+        "$observation_dir"/*)
+            printf "%s\n" "$canonical" > "$pending"
+            echo "playwright-cli: private screenshot ready at $canonical. Call browser_view with this exact path now; browser commands are blocked until it returns the pixels."
+            ;;
     esac
 fi
 exit "$status"

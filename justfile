@@ -69,6 +69,8 @@ browser-eval-smoke:
 # Full bounded Codex + Claude browser matrix. This invokes authenticated model
 # CLIs and writes an untracked report under artifacts/browser-eval/.
 browser-eval *ARGS:
+    python3 evals/browser/browser_eval.py prepare --cli pw017 --cli agent032
+    python3 evals/browser/browser_eval.py preflight --cli pw017 --cli agent032
     python3 evals/browser/browser_eval.py matrix {{ARGS}}
 
 # Run a single crate's tests with output. Stays on `cargo test` so

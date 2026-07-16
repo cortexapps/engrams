@@ -8,10 +8,12 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 import html
+import hashlib
 import json
 import os
 from pathlib import Path
-import select
+import platform
+import re
 import shlex
 import shutil
 import signal
@@ -19,77 +21,65 @@ import subprocess
 import sys
 import tempfile
 import time
-from typing import Iterable, TextIO
+from typing import Iterable
 from urllib.request import Request, urlopen
 
 from incident_console import SEEDS, start_server, task_prompt
+from image_mcp import handle as handle_image_request
+from skill_matrix import (
+    CLIS,
+    CLI_SPECS,
+    POLICIES,
+    TASK_MODES,
+    VISIONS,
+    config_id,
+    render_skill,
+    skill_hash,
+)
 
 
 ROOT = Path(__file__).resolve().parents[2]
 PROXY = Path(__file__).with_name("tool_proxy.py")
 IMAGE_MCP = Path(__file__).with_name("image_mcp.py")
-MINIWOB_DRIVER = Path(__file__).with_name("miniwob_driver.py")
-ARMS = ("prod", "pw-latest", "agent-dom", "hybrid")
+TOOL_ROOT = ROOT / "artifacts" / "browser-eval" / ".tools"
 HARNESSES = ("codex", "claude")
-MINIWOB_TASKS = (
-    "click-button",
-    "choose-list",
-    "enter-text",
-    "click-checkboxes",
-    "click-menu-2",
-    "use-autocomplete",
-)
 CODEX_MODEL = os.environ.get("ENGRAM_EVAL_CODEX_MODEL", "gpt-5.4")
 CLAUDE_MODEL = os.environ.get("ENGRAM_EVAL_CLAUDE_MODEL", "sonnet")
 
 
-BASELINE_INSTRUCTIONS = """Use playwright-cli to drive the live browser. Start with open, inspect the page with snapshot, interact using element references, and verify the final state. Use screenshots or recordings to show visual work and publish them with engram-share. Use only browser observations and rendered pixels: do not inspect page JavaScript, HTML source, network traffic, runtime variables, or task APIs, and do not use shell HTTP clients."""
-
-POLICY_INSTRUCTIONS = """You have one shared live browser. Use playwright-cli for this task. Follow OBSERVE -> ACT ONCE -> WAIT -> OBSERVE -> VERIFY. Start with a compact snapshot and search/read before acting. After any mutation take a fresh snapshot; never reuse stale references. If canvas, occlusion, or layout makes semantic state insufficient, capture one screenshot with boxes. Immediately call the browser_view MCP tool with its absolute path: after taking a decision screenshot, you MUST NOT take another browser action or screenshot until browser_view has returned the pixels. Then act once and verify. Do not repeat an action against unchanged page state more than twice. Screenshots are internal observations unless the user explicitly requests evidence. Publish exactly one final screenshot only when requested; otherwise never call engram-share. Record video only when explicitly requested or when demonstrating a temporal bug. Use only browser observations and rendered pixels: do not inspect page JavaScript, HTML source, network traffic, runtime variables, or task APIs, and do not use shell HTTP clients."""
-
-AGENT_DOM_INSTRUCTIONS = """You have one shared live browser. Use agent-browser for this task. Follow OBSERVE -> ACT ONCE -> WAIT -> OBSERVE -> VERIFY. Start with `agent-browser open URL`, then compact interactive snapshots (`agent-browser snapshot -i`). Search/read before acting, refresh the snapshot after every mutation, and never reuse stale @e refs. Do not repeat an action against unchanged page state more than twice. This arm forbids screenshots for deciding browser actions: if semantic state is insufficient, report the blocker. If and only if the user explicitly requests final evidence after a successful task, take and share exactly one final screenshot; otherwise never call engram-share. Use only browser observations: do not inspect page JavaScript, HTML source, network traffic, runtime variables, or task APIs, and do not use shell HTTP clients. The canvas decision must come from pixels; because this arm has no visual tool, report that blocker rather than bypassing it."""
-
-HYBRID_INSTRUCTIONS = """You have one shared live browser. Use agent-browser for normal interaction. Follow OBSERVE -> ACT ONCE -> WAIT -> OBSERVE -> VERIFY. Start with `agent-browser open URL`, then compact interactive snapshots (`agent-browser snapshot -i`). Search/read before acting and refresh after every mutation; never reuse stale @e refs. If the target is canvas-based, occluded, unlabeled, visually ambiguous, or one fresh semantic recovery made no progress, capture one `agent-browser screenshot --annotate <absolute-file>`. Immediately call the browser_view MCP tool with that absolute path: after taking a decision screenshot, you MUST NOT take another browser action or screenshot until browser_view has returned the pixels. Then act once and verify. Never repeat an action against unchanged page state more than twice. Screenshots are internal observations unless the user explicitly requests evidence. Publish exactly one final screenshot with engram-share only when requested; otherwise never share. Record video only when explicitly requested or for a temporal bug. Use only browser observations and rendered pixels: do not inspect page JavaScript, HTML source, network traffic, runtime variables, or task APIs, and do not use shell HTTP clients."""
-
-
 @dataclass(frozen=True)
 class Episode:
-    arm: str
+    cli: str
+    policy: str
+    vision: str
+    task_mode: str
     harness: str
     seed: int
     evidence: bool
 
 
-@dataclass(frozen=True)
-class MiniwobEpisode:
-    arm: str
-    harness: str
-    task: str
-    seed: int = 0
-
-
 def matrix() -> Iterable[Episode]:
-    for arm in ARMS:
-        for harness in HARNESSES:
-            for seed in range(len(SEEDS)):
-                for evidence in (False, True):
-                    yield Episode(arm, harness, seed, evidence)
+    for cli in CLIS:
+        for policy in POLICIES:
+            for vision in VISIONS:
+                for task_mode in TASK_MODES:
+                    for harness in HARNESSES:
+                        for seed in range(len(SEEDS)):
+                            for evidence in (False, True):
+                                yield Episode(
+                                    cli, policy, vision, task_mode, harness, seed, evidence
+                                )
 
 
-def episode_key(result: dict[str, object]) -> tuple[int, int, int, bool]:
+def episode_key(result: dict[str, object]) -> tuple[int, int, int, int, int, int, bool]:
     return (
-        ARMS.index(str(result["arm"])),
+        CLIS.index(str(result["cli"])),
+        POLICIES.index(str(result["policy"])),
+        VISIONS.index(str(result["vision"])),
+        TASK_MODES.index(str(result["task_mode"])),
         HARNESSES.index(str(result["harness"])),
         int(result["seed"]),
         bool(result["evidence"]),
-    )
-
-
-def miniwob_key(result: dict[str, object]) -> tuple[int, int, int]:
-    return (
-        ARMS.index(str(result["arm"])),
-        HARNESSES.index(str(result["harness"])),
-        MINIWOB_TASKS.index(str(result["task"])),
     )
 
 
@@ -121,17 +111,21 @@ def chrome_command(profile: Path, cdp_port: int) -> list[str]:
     chrome = next((p for p in candidates if p and Path(p).exists()), None)
     if not chrome:
         raise RuntimeError("Chrome/Chromium not found; set ENGRAM_EVAL_CHROME")
-    return [
+    command = [
         chrome,
-        "--headless=new",
         "--disable-gpu",
         "--no-first-run",
         "--no-default-browser-check",
         f"--remote-debugging-port={cdp_port}",
         "--remote-allow-origins=*",
         f"--user-data-dir={profile}",
+        "--window-position=0,0",
+        "--window-size=1440,1080",
         "about:blank",
     ]
+    if os.environ.get("ENGRAM_EVAL_HEADFUL") != "1":
+        command.insert(1, "--headless=new")
+    return command
 
 
 def free_port() -> int:
@@ -140,6 +134,13 @@ def free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
         return int(sock.getsockname()[1])
+
+
+def png_dimensions(path: Path) -> tuple[int, int]:
+    header = path.read_bytes()[:24]
+    if len(header) != 24 or not header.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise RuntimeError(f"{path} is not a PNG screenshot")
+    return int.from_bytes(header[16:20], "big"), int.from_bytes(header[20:24], "big")
 
 
 def wait_cdp(port: int) -> None:
@@ -153,9 +154,9 @@ def wait_cdp(port: int) -> None:
     raise RuntimeError(f"Chrome CDP :{port} did not become ready")
 
 
-def write_proxies(bin_dir: Path, arm: str) -> None:
+def write_proxies(bin_dir: Path, cli: str) -> None:
     bin_dir.mkdir(parents=True)
-    browser_tool = "playwright-cli" if arm in {"prod", "pw-latest"} else "agent-browser"
+    browser_tool = CLI_SPECS[cli].tool
     for name in (browser_tool, "engram-share"):
         path = bin_dir / name
         path.write_text(
@@ -167,23 +168,6 @@ def write_proxies(bin_dir: Path, arm: str) -> None:
             encoding="utf-8",
         )
         path.chmod(0o755)
-
-
-def arm_instructions(arm: str) -> str:
-    instructions = {
-        "prod": BASELINE_INSTRUCTIONS,
-        "pw-latest": POLICY_INSTRUCTIONS,
-        "agent-dom": AGENT_DOM_INSTRUCTIONS,
-        "hybrid": HYBRID_INSTRUCTIONS,
-    }[arm]
-    browser_tool = "playwright-cli" if arm in {"prod", "pw-latest"} else "agent-browser"
-    return (
-        instructions
-        + f"\n\nThe measured `{browser_tool}` wrapper is already first on PATH. Invoke it only "
-        f"as `{browser_tool}`; do not search for browser binaries or evaluation config, use an "
-        "absolute CLI path, override its session/CDP target, or call an unwrapped browser CLI. "
-        "Doing so invalidates the episode."
-    )
 
 
 def harness_command(
@@ -229,22 +213,89 @@ def harness_command(
         "--verbose",
         "--model",
         CLAUDE_MODEL,
+        "--setting-sources",
+        "project,local",
     ]
     command += ["--mcp-config", str(mcp_config), "--strict-mcp-config"]
     return [*command, prompt]
 
 
-def command_for_arm(arm: str) -> tuple[str, str]:
-    agent = os.environ.get(
-        "ENGRAM_EVAL_AGENT_BROWSER_COMMAND", "npx --yes agent-browser@0.32.0"
+def command_for_cli(cli: str) -> str:
+    spec = CLI_SPECS[cli]
+    env_key = {
+        "pw013": "ENGRAM_EVAL_PLAYWRIGHT_013_COMMAND",
+        "pw017": "ENGRAM_EVAL_PLAYWRIGHT_017_COMMAND",
+        "agent032": "ENGRAM_EVAL_AGENT_BROWSER_COMMAND",
+    }[cli]
+    override = os.environ.get(env_key)
+    if override:
+        return override
+    executable = prepared_executable(cli)
+    if not executable.is_file():
+        raise RuntimeError(
+            f"{cli} is not prepared at {executable}; run "
+            f"`python3 evals/browser/browser_eval.py prepare --cli {cli}`"
+        )
+    return str(executable)
+
+
+def prepared_executable(cli: str) -> Path:
+    if cli != "agent032":
+        return TOOL_ROOT / cli / "node_modules" / ".bin" / CLI_SPECS[cli].executable
+    system = {"Darwin": "darwin", "Linux": "linux"}.get(platform.system())
+    machine = {"arm64": "arm64", "aarch64": "arm64", "x86_64": "x64"}.get(
+        platform.machine()
     )
-    version = "0.1.13" if arm == "prod" else "0.1.17"
-    version_key = "013" if version == "0.1.13" else "017"
-    playwright = os.environ.get(
-        f"ENGRAM_EVAL_PLAYWRIGHT_{version_key}_COMMAND",
-        f"npx --yes @playwright/cli@{version}",
+    if not system or not machine:
+        raise RuntimeError(
+            f"agent-browser has no measured native binary for "
+            f"{platform.system()} {platform.machine()}"
+        )
+    if system == "linux" and platform.libc_ver()[0].lower() == "musl":
+        system = "linux-musl"
+    return (
+        TOOL_ROOT
+        / cli
+        / "node_modules"
+        / "agent-browser"
+        / "bin"
+        / f"agent-browser-{system}-{machine}"
     )
-    return agent, playwright
+
+
+def prepare_tools(clis: list[str]) -> None:
+    for cli in clis:
+        spec = CLI_SPECS[cli]
+        destination = TOOL_ROOT / cli
+        executable = prepared_executable(cli)
+        package_json = (
+            destination / "node_modules" / "agent-browser" / "package.json"
+            if cli == "agent032"
+            else destination / "node_modules" / "@playwright" / "cli" / "package.json"
+        )
+        if executable.is_file() and package_json.is_file():
+            installed = json.loads(package_json.read_text(encoding="utf-8"))
+            if installed.get("version") == spec.version:
+                print(f"{cli}: prepared {executable}")
+                continue
+        destination.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "npm",
+                "install",
+                "--prefix",
+                str(destination),
+                "--no-save",
+                "--no-audit",
+                "--no-fund",
+                "--ignore-scripts",
+                spec.package,
+            ],
+            check=True,
+        )
+        if not executable.is_file():
+            raise RuntimeError(f"npm did not install {spec.executable} at {executable}")
+        print(f"{cli}: prepared {executable}")
 
 
 def command_version(command: str) -> str:
@@ -294,6 +345,94 @@ def expected_model(harness: str) -> str:
     return CODEX_MODEL if harness == "codex" else CLAUDE_MODEL
 
 
+def install_candidate_skills(workspace: Path, instructions: str) -> Path:
+    """Mirror engrams' harness-agnostic skill discovery layout."""
+    skill_dir = workspace / ".agents" / "skills" / "browser"
+    skill_dir.mkdir(parents=True)
+    skill_path = skill_dir / "SKILL.md"
+    skill_path.write_text(instructions, encoding="utf-8")
+    share_dir = workspace / ".agents" / "skills" / "share-file"
+    share_dir.mkdir()
+    shutil.copyfile(
+        ROOT / "deploy" / "bundles" / "skills" / "skills" / "share-file" / "SKILL.md",
+        share_dir / "SKILL.md",
+    )
+    claude_root = workspace / ".claude"
+    claude_root.mkdir()
+    (claude_root / "skills").symlink_to(Path("..") / ".agents" / "skills")
+    return skill_path
+
+
+def isolate_harness_home(
+    harness: str, workspace: Path, env: dict[str, str]
+) -> None:
+    """Keep host skills and settings out while retaining Codex's login."""
+    if harness == "claude":
+        # Claude's local subscription login is brokered through its normal
+        # config/daemon path. `--setting-sources project,local` excludes user
+        # settings and plugins while keeping that authentication path intact.
+        env.pop("CLAUDE_CONFIG_DIR", None)
+        env.pop("CLAUDE_SECURESTORAGE_CONFIG_DIR", None)
+        return
+    home = workspace / ".home"
+    codex_home = home / ".codex"
+    codex_home.mkdir(parents=True)
+    source_codex_home = Path(
+        os.environ.get("CODEX_HOME", str(Path.home() / ".codex"))
+    )
+    source_auth = source_codex_home / "auth.json"
+    if source_auth.is_file():
+        (codex_home / "auth.json").symlink_to(source_auth)
+    env.update(
+        {
+            "HOME": str(home),
+            "CODEX_HOME": str(codex_home),
+        }
+    )
+
+
+def skill_loaded(log: Path, skill_path: Path) -> bool:
+    if not log.exists():
+        return False
+    raw = log.read_text(encoding="utf-8", errors="replace")
+    if str(skill_path) in raw or ("SKILL.md" in raw and "browser" in raw.lower()):
+        return True
+    for line in raw.splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        def visit(item: object) -> bool:
+            if isinstance(item, dict):
+                name = str(item.get("name", item.get("tool_name", ""))).lower()
+                if name == "skill" and "browser" in json.dumps(item).lower():
+                    return True
+                return any(visit(child) for child in item.values())
+            if isinstance(item, list):
+                return any(visit(child) for child in item)
+            return False
+
+        if visit(value):
+            return True
+    return False
+
+
+def episode_prompt(task_url: str, seed: int, evidence: bool, task_mode: str) -> str:
+    return f"Task URL: {task_url}\n\n{task_prompt(seed, evidence, mode=task_mode)}"
+
+
+def normalized_skill_hash(
+    instructions: str, task_url: str, observation_dir: Path, deliverable_dir: Path
+) -> str:
+    normalized = (
+        instructions.replace(task_url, "TASK_URL")
+        .replace(str(observation_dir), "OBSERVATION_DIR")
+        .replace(str(deliverable_dir), "DELIVERABLE_DIR")
+    )
+    return skill_hash(normalized)
+
+
 def executed_shell_commands(log: Path) -> list[str]:
     commands: list[str] = []
     if not log.exists():
@@ -310,6 +449,12 @@ def executed_shell_commands(log: Path) -> list[str]:
                     item.get("command"), str
                 ):
                     commands.append(str(item["command"]))
+                if item.get("type") == "tool_use" and item.get("name") == "Bash":
+                    tool_input = item.get("input")
+                    if isinstance(tool_input, dict) and isinstance(
+                        tool_input.get("command"), str
+                    ):
+                        commands.append(str(tool_input["command"]))
                 for child in item.values():
                     visit(child)
             elif isinstance(item, list):
@@ -320,14 +465,28 @@ def executed_shell_commands(log: Path) -> list[str]:
     return commands
 
 
-def protocol_violation(log: Path, raw_browser_command: str, task_url: str) -> bool:
+def protocol_violation(
+    log: Path,
+    raw_browser_command: str,
+    task_url: str,
+    observation_root: Path | None = None,
+) -> bool:
     raw_executable = shlex.split(raw_browser_command)[0]
     task_host = task_url.removeprefix("http://").split("/", 1)[0]
     for command in executed_shell_commands(log):
         lowered = command.lower()
-        if raw_executable in command or "engram_eval_driver_config" in lowered:
+        if raw_executable in command or "engram_eval_" in lowered:
             return True
-        if "driver.json" in lowered and any(name in lowered for name in ("cat", "jq", "rg")):
+        if any(
+            private_name in lowered
+            for private_name in (
+                "driver.json",
+                "events.jsonl",
+                "action-count",
+                "pending-view",
+                "evals/browser",
+            )
+        ):
             return True
         if task_host in command and any(
             marker in lowered
@@ -336,7 +495,61 @@ def protocol_violation(log: Path, raw_browser_command: str, task_url: str) -> bo
             return True
         if "/api/" in lowered:
             return True
+        if observation_root and str(observation_root) in command and any(
+            marker in lowered for marker in ("cat ", "sed ", "base64 ", "open ")
+        ):
+            return True
+    if observation_root and log.exists():
+        observation = str(observation_root)
+        for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+            try:
+                value = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+
+            def has_direct_image_read(item: object) -> bool:
+                if isinstance(item, dict):
+                    if item.get("type") == "tool_use" and str(
+                        item.get("name", "")
+                    ).lower() in {"read", "view_image"}:
+                        return observation in json.dumps(item)
+                    return any(has_direct_image_read(child) for child in item.values())
+                if isinstance(item, list):
+                    return any(has_direct_image_read(child) for child in item)
+                return False
+
+            if has_direct_image_read(value):
+                return True
     return False
+
+
+def harness_tool_calls(log: Path) -> int:
+    if not log.exists():
+        return 0
+    count = 0
+    for line in log.read_text(encoding="utf-8", errors="replace").splitlines():
+        try:
+            value = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        def visit(item: object) -> None:
+            nonlocal count
+            if isinstance(item, dict):
+                if item.get("type") == "command_execution" and item.get(
+                    "status"
+                ) == "completed":
+                    count += 1
+                elif item.get("type") == "tool_use":
+                    count += 1
+                for child in item.values():
+                    visit(child)
+            elif isinstance(item, list):
+                for child in item:
+                    visit(child)
+
+        visit(value)
+    return count
 
 
 def read_events(path: Path) -> list[dict[str, object]]:
@@ -356,70 +569,175 @@ def count_shared_artifacts(events: list[dict[str, object]]) -> int:
     )
 
 
-def no_progress_repeats(events: list[dict[str, object]]) -> int:
+def count_valid_shared_artifacts(events: list[dict[str, object]]) -> int:
+    return sum(
+        1
+        for event in events
+        if event.get("type") == "share" and bool(event.get("valid"))
+    )
+
+
+def count_screenshots(events: list[dict[str, object]]) -> int:
+    """Count attempted screenshots, excluding capability-discovery probes."""
+    probes = {"-h", "--help", "-V", "--version"}
+    return sum(
+        1
+        for event in events
+        if event.get("type") == "browser_start"
+        and [str(arg) for arg in event.get("argv", [])][:1] == ["screenshot"]
+        and not probes.intersection(str(arg) for arg in event.get("argv", []))
+    )
+
+
+def count_screenshot_roles(events: list[dict[str, object]]) -> dict[str, int]:
+    roles = {"internal": 0, "deliverable": 0, "unclassified": 0}
+    probes = {"-h", "--help", "-V", "--version"}
+    for event in events:
+        argv = [str(arg) for arg in event.get("argv", [])]
+        if (
+            event.get("type") != "browser_start"
+            or argv[:1] != ["screenshot"]
+            or probes.intersection(argv)
+        ):
+            continue
+        role = str(event.get("screenshotRole") or "unclassified")
+        roles[role if role in roles else "unclassified"] += 1
+    return roles
+
+
+MUTATING_BROWSER_COMMANDS = {
+    "open",
+    "goto",
+    "click",
+    "dblclick",
+    "fill",
+    "type",
+    "select",
+    "check",
+    "uncheck",
+    "press",
+    "hover",
+    "drag",
+    "upload",
+}
+
+
+def max_identical_failed_attempts(events: list[dict[str, object]]) -> int:
+    """Return the longest run of identical failed mutation attempts.
+
+    Observations are deliberately excluded: taking two fresh snapshots while
+    verifying a stable page is not a failed action. A mutation is failed only
+    when the sanitized page state is unchanged across that command.
+    """
     starts = [e for e in events if e.get("type") == "browser_start"]
     ends = {e.get("action"): e for e in events if e.get("type") == "browser_end"}
-    repeats = 0
+    longest = 0
     previous: tuple[object, object, object] | None = None
     run = 0
     for event in starts:
+        argv = [str(arg) for arg in event.get("argv", [])]
+        if not argv or argv[0] not in MUTATING_BROWSER_COMMANDS:
+            previous = None
+            run = 0
+            continue
         end = ends.get(event.get("action"), {})
+        before = event.get("before", {})
         after = end.get("after", {}) if isinstance(end, dict) else {}
+        before_hash = before.get("stateHash") if isinstance(before, dict) else None
         state_hash = after.get("stateHash") if isinstance(after, dict) else None
-        current = (event.get("tool"), event.get("argv"), state_hash)
+        if before_hash is None or state_hash is None or before_hash != state_hash:
+            previous = None
+            run = 0
+            continue
+        current = (event.get("tool"), argv, before_hash)
         if current == previous:
             run += 1
-            repeats = max(repeats, run)
         else:
-            run = 0
+            run = 1
+        longest = max(longest, run)
         previous = current
-    return repeats
+    previous_gate: tuple[object, object, object] | None = None
+    gate_run = 0
+    for event in events:
+        if event.get("type") != "visual_gate":
+            continue
+        current_gate = (
+            event.get("tool"),
+            event.get("argv"),
+            event.get("requiredPath"),
+        )
+        gate_run = gate_run + 1 if current_gate == previous_gate else 1
+        longest = max(longest, gate_run)
+        previous_gate = current_gate
+    return longest
 
 
 def run_episode(episode: Episode, out_root: Path) -> dict[str, object]:
-    episode_id = f"{episode.arm}-{episode.harness}-s{episode.seed}-{'evidence' if episode.evidence else 'plain'}"
+    started = time.monotonic()
+    wall_clock_limit_seconds = 180
+    configuration = config_id(episode.cli, episode.policy, episode.vision)
+    episode_id = (
+        f"{configuration}-{episode.task_mode}-{episode.harness}-s{episode.seed}-"
+        f"{'evidence' if episode.evidence else 'plain'}"
+    )
+    session_name = "be-" + hashlib.sha256(episode_id.encode()).hexdigest()[:12]
     out = out_root / episode_id
     out.mkdir(parents=True, exist_ok=True)
     workspace = Path(tempfile.mkdtemp(prefix=f"engrams-{episode_id}-"))
+    agent_socket_dir = Path(tempfile.mkdtemp(prefix="abe-", dir="/tmp"))
+    path_alias = Path(tempfile.mkdtemp(prefix="be-ep-", dir="/tmp"))
+    path_alias.rmdir()
+    path_alias.symlink_to(out, target_is_directory=True)
     server, thread = start_server()
-    post_json(f"{server.url}/api/reset", {"seed": episode.seed})
+    post_json(
+        f"{server.url}/api/reset", {"seed": episode.seed, "mode": episode.task_mode}
+    )
     cdp_port = free_port()
     profile = out / "chrome-profile"
     chrome_log = (out / "chrome.log").open("wb")
-    chrome = subprocess.Popen(chrome_command(profile, cdp_port), stdout=chrome_log, stderr=subprocess.STDOUT)
-    started = time.monotonic()
+    chrome = subprocess.Popen(
+        chrome_command(profile, cdp_port), stdout=chrome_log, stderr=subprocess.STDOUT
+    )
     try:
         wait_cdp(cdp_port)
-        observation_dir = out / "observations"
+        observation_dir = path_alias / "observations"
         observation_dir.mkdir()
-        instructions = arm_instructions(episode.arm)
-        (workspace / "AGENTS.md").write_text(instructions + "\n", encoding="utf-8")
-        (workspace / "CLAUDE.md").write_text(instructions + "\n", encoding="utf-8")
+        deliverable_dir = path_alias / "deliverables"
+        deliverable_dir.mkdir()
+        instructions = render_skill(
+            episode.cli,
+            episode.policy,
+            episode.vision,
+            server.url,
+            str(observation_dir),
+            str(deliverable_dir),
+        )
+        (out / "SKILL.md").write_text(instructions, encoding="utf-8")
+        skill_path = install_candidate_skills(workspace, instructions)
         bin_dir = out / "bin"
-        write_proxies(bin_dir, episode.arm)
+        write_proxies(bin_dir, episode.cli)
         events = out / "events.jsonl"
         action_count = out / "action-count"
         pending_view = out / "pending-view"
-        agent_command, playwright_command = command_for_arm(episode.arm)
-        browser_tool = "playwright-cli" if episode.arm in {"prod", "pw-latest"} else "agent-browser"
+        browser_command = command_for_cli(episode.cli)
+        browser_tool = CLI_SPECS[episode.cli].tool
         driver_config = out / "driver.json"
         driver_config.write_text(
             json.dumps(
                 {
                     "cdpPort": cdp_port,
-                    "commands": {
-                        browser_tool: playwright_command
-                        if browser_tool == "playwright-cli"
-                        else agent_command
-                    },
+                    "sessionName": session_name,
+                    "commands": {browser_tool: browser_command},
                 }
             ),
             encoding="utf-8",
         )
         config = out / "playwright.config.json"
-        config.write_text(json.dumps({"browser": {"cdpEndpoint": f"http://127.0.0.1:{cdp_port}"}}))
+        config.write_text(
+            json.dumps({"browser": {"cdpEndpoint": f"http://127.0.0.1:{cdp_port}"}})
+        )
         mcp_config = out / "mcp.json"
-        visual = episode.arm in {"pw-latest", "hybrid"}
+        visual = episode.vision == "on"
         mcp_config.write_text(
             json.dumps(
                 {
@@ -436,18 +754,24 @@ def run_episode(episode: Episode, out_root: Path) -> dict[str, object]:
             )
         )
         env = os.environ.copy()
+        isolate_harness_home(episode.harness, workspace, env)
         env.update(
             {
                 "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
                 "ENGRAM_EVAL_EVENTS": str(events),
                 "ENGRAM_EVAL_ACTION_COUNT": str(action_count),
-                "ENGRAM_EVAL_BROWSER_LOCK": str(out / "browser.lock"),
                 "ENGRAM_EVAL_ACTION_LIMIT": "30",
-                "ENGRAM_EVAL_VISUAL_GATE": "1" if episode.arm in {"hybrid", "pw-latest"} else "0",
+                "ENGRAM_EVAL_VISUAL_GATE": "1" if visual else "0",
                 "ENGRAM_EVAL_PENDING_VIEW": str(pending_view),
+                "ENGRAM_EVAL_OBSERVATION_ROOT": str(observation_dir),
+                "ENGRAM_EVAL_DELIVERABLE_ROOT": str(deliverable_dir),
+                "ENGRAM_EVAL_EVIDENCE_REQUESTED": "1" if episode.evidence else "0",
                 "ENGRAM_EVAL_CDP_PORT": str(cdp_port),
+                "ENGRAM_EVAL_STATE_URL": f"{server.url}/api/observable",
+                "ENGRAM_EVAL_GRADE_URL": f"{server.url}/api/grade",
                 "ENGRAM_EVAL_DRIVER_CONFIG": str(driver_config),
                 "ENGRAM_EVAL_SESSION_ID": episode_id,
+                "AGENT_BROWSER_SOCKET_DIR": str(agent_socket_dir),
                 "PLAYWRIGHT_MCP_CONFIG": str(config),
             }
         )
@@ -458,14 +782,25 @@ def run_episode(episode: Episode, out_root: Path) -> dict[str, object]:
             "ENGRAM_EVAL_PLAYWRIGHT_017_COMMAND",
         ):
             env.pop(key, None)
-        prompt = (
-            f"Task URL: {server.url}\n"
-            f"Internal screenshot directory: {observation_dir}\n\n"
-            f"{task_prompt(episode.seed, episode.evidence)}"
+        prompt = episode_prompt(
+            server.url, episode.seed, episode.evidence, episode.task_mode
         )
         agent_log_path = out / "agent.jsonl"
         with agent_log_path.open("wb") as agent_log:
             try:
+                remaining = wall_clock_limit_seconds - (time.monotonic() - started)
+                if remaining <= 0:
+                    raise subprocess.TimeoutExpired(
+                        harness_command(
+                            episode.harness,
+                            workspace,
+                            prompt,
+                            mcp_config,
+                            visual,
+                            out,
+                        ),
+                        wall_clock_limit_seconds,
+                    )
                 result = subprocess.run(
                     harness_command(
                         episode.harness,
@@ -479,7 +814,7 @@ def run_episode(episode: Episode, out_root: Path) -> dict[str, object]:
                     env=env,
                     stdout=agent_log,
                     stderr=subprocess.STDOUT,
-                    timeout=180,
+                    timeout=remaining,
                     check=False,
                 )
                 exit_code = result.returncode
@@ -488,49 +823,96 @@ def run_episode(episode: Episode, out_root: Path) -> dict[str, object]:
                 exit_code = 124
                 timed_out = True
         grade = get_json(f"{server.url}/api/grade")
-        selected_browser_command = (
-            playwright_command if browser_tool == "playwright-cli" else agent_command
-        )
         violated_protocol = protocol_violation(
-            agent_log_path, selected_browser_command, server.url
+            agent_log_path, browser_command, server.url, observation_dir
         )
         recorded = read_events(events)
         shares = count_shared_artifacts(recorded)
-        screenshots = sum(
-            1
-            for e in recorded
-            if e.get("type") == "browser_start"
-            and "screenshot" in [str(a) for a in e.get("argv", [])]
-        )
+        valid_shares = count_valid_shared_artifacts(recorded)
+        screenshots = count_screenshots(recorded)
+        screenshot_roles = count_screenshot_roles(recorded)
         expected_shares = 1 if episode.evidence and grade["success"] else 0
+        share_intent_success = shares == expected_shares and valid_shares == expected_shares
         actions = int(action_count.read_text() if action_count.exists() else "0")
-        max_repeat = no_progress_repeats(recorded)
-        bounded = not timed_out and not violated_protocol and 0 < actions <= 30 and max_repeat <= 2
+        max_failed_attempts = max_identical_failed_attempts(recorded)
+        loaded_skill = skill_loaded(agent_log_path, skill_path)
+        screenshot_policy_success = not any(
+            event.get("type") == "screenshot_policy" for event in recorded
+        )
+        expected_internal_screenshots = (
+            1
+            if visual and episode.task_mode == "visual" and bool(grade["success"])
+            else 0
+        )
+        expected_deliverable_screenshots = expected_shares
+        visual_intent_success = (
+            screenshot_roles["internal"] == expected_internal_screenshots
+            and screenshot_roles["deliverable"] == expected_deliverable_screenshots
+            and screenshot_roles["unclassified"] == 0
+            and not pending_view.exists()
+        )
+        visual_gate_blocks = sum(
+            event.get("type") == "visual_gate" for event in recorded
+        )
+        duration_ms = round((time.monotonic() - started) * 1000)
+        bounded = (
+            not timed_out
+            and not violated_protocol
+            and 0 < actions <= 30
+            and max_failed_attempts <= 2
+            and duration_ms <= wall_clock_limit_seconds * 1000
+        )
         return {
             **asdict(episode),
             "id": episode_id,
-            "success": bool(grade["success"]) and shares == expected_shares and bounded,
+            "configuration": configuration,
+            "success": (
+                bool(grade["success"])
+                and share_intent_success
+                and bounded
+                and loaded_skill
+                and screenshot_policy_success
+                and visual_intent_success
+            ),
             "taskSuccess": bool(grade["success"]),
-            "shareIntentSuccess": shares == expected_shares,
+            "shareIntentSuccess": share_intent_success,
             "shares": shares,
+            "validShares": valid_shares,
             "screenshots": screenshots,
+            "internalScreenshots": screenshot_roles["internal"],
+            "deliverableScreenshots": screenshot_roles["deliverable"],
+            "screenshotPolicySuccess": screenshot_policy_success,
+            "visualIntentSuccess": visual_intent_success,
+            "visualGateBlocks": visual_gate_blocks,
             "actions": actions,
-            "maxIdenticalRepeat": max_repeat,
+            "harnessToolCalls": harness_tool_calls(agent_log_path),
+            "maxIdenticalFailedAttempts": max_failed_attempts,
             "exitCode": exit_code,
             "timedOut": timed_out,
             "protocolViolation": violated_protocol,
-            "durationMs": round((time.monotonic() - started) * 1000),
-            "harnessVersion": command_version(episode.harness),
-            "resolvedModel": resolved_model(agent_log_path)
-            if episode.harness == "claude"
-            else expected_model(episode.harness),
-            "browserVersion": "playwright-cli@0.1.13"
-            if episode.arm == "prod"
-            else (
-                "playwright-cli@0.1.17"
-                if episode.arm == "pw-latest"
-                else "agent-browser@0.32.0"
+            "durationMs": duration_ms,
+            "skillHash": skill_hash(instructions),
+            "skillTemplateHash": normalized_skill_hash(
+                instructions, server.url, observation_dir, deliverable_dir
             ),
+            "skillLoaded": loaded_skill,
+            "sessionName": session_name,
+            "chromeMode": (
+                "headful" if os.environ.get("ENGRAM_EVAL_HEADFUL") == "1" else "headless-new"
+            ),
+            "windowGeometry": "1440x1080",
+            "emulationTier": (
+                "production-geometry-headful"
+                if os.environ.get("ENGRAM_EVAL_HEADFUL") == "1"
+                else "diagnostic-headless"
+            ),
+            "harnessVersion": command_version(episode.harness),
+            "resolvedModel": (
+                resolved_model(agent_log_path)
+                if episode.harness == "claude"
+                else expected_model(episode.harness)
+            ),
+            "browserVersion": f"{browser_tool}@{CLI_SPECS[episode.cli].version}",
             "grade": grade,
         }
     finally:
@@ -544,6 +926,8 @@ def run_episode(episode: Episode, out_root: Path) -> dict[str, object]:
         server.server_close()
         thread.join(timeout=2)
         shutil.rmtree(workspace, ignore_errors=True)
+        shutil.rmtree(agent_socket_dir, ignore_errors=True)
+        path_alias.unlink(missing_ok=True)
 
 
 def median(values: list[int]) -> int | float | None:
@@ -554,19 +938,31 @@ def median(values: list[int]) -> int | float | None:
     return values[middle] if len(values) % 2 else (values[middle - 1] + values[middle]) / 2
 
 
-def arm_summary(results: list[dict[str, object]]) -> dict[str, dict[str, object]]:
+def configuration_summary(results: list[dict[str, object]]) -> dict[str, dict[str, object]]:
     summary: dict[str, dict[str, object]] = {}
-    for arm in ARMS:
-        selected = [result for result in results if result["arm"] == arm]
-        if not selected:
-            continue
-        summary[arm] = {
+    for configuration in sorted({str(result["configuration"]) for result in results}):
+        selected = [
+            result for result in results if result["configuration"] == configuration
+        ]
+        summary[configuration] = {
             "episodes": len(selected),
             "passes": sum(bool(result["success"]) for result in selected),
             "taskPasses": sum(bool(result["taskSuccess"]) for result in selected),
+            "skillLoads": sum(bool(result["skillLoaded"]) for result in selected),
+            "screenshotPolicyPasses": sum(
+                bool(result["screenshotPolicySuccess"]) for result in selected
+            ),
+            "visualIntentPasses": sum(
+                bool(result["visualIntentSuccess"]) for result in selected
+            ),
+            "visualGateBlocks": sum(
+                int(result["visualGateBlocks"]) for result in selected
+            ),
             "sharePasses": sum(bool(result["shareIntentSuccess"]) for result in selected),
             "timeouts": sum(bool(result["timedOut"]) for result in selected),
-            "maxIdenticalRepeat": max(int(result["maxIdenticalRepeat"]) for result in selected),
+            "maxIdenticalFailedAttempts": max(
+                int(result["maxIdenticalFailedAttempts"]) for result in selected
+            ),
             "medianSuccessfulCommands": median(
                 [int(result["actions"]) for result in selected if bool(result["taskSuccess"])]
             ),
@@ -578,37 +974,54 @@ def arm_summary(results: list[dict[str, object]]) -> dict[str, dict[str, object]
                 )
                 for harness in HARNESSES
             },
+            "byTaskMode": {
+                mode: sum(
+                    bool(result["success"])
+                    for result in selected
+                    if result["task_mode"] == mode
+                )
+                for mode in TASK_MODES
+            },
         }
     return summary
 
 
 def incident_gate(results: list[dict[str, object]]) -> dict[str, object]:
-    summary = arm_summary(results)
-    complete = len(results) == len(ARMS) * len(HARNESSES) * len(SEEDS) * 2
-    if not complete or "prod" not in summary or "hybrid" not in summary:
-        return {"evaluated": False, "reason": "requires the complete 64-episode matrix"}
-    prod = summary["prod"]
-    hybrid = summary["hybrid"]
-    hybrid_results = [result for result in results if result["arm"] == "hybrid"]
-    checks = {
-        "pooledPassDeltaAtLeastThree": int(hybrid["passes"]) - int(prod["passes"]) >= 3,
-        "codexLosesAtMostOne": int(hybrid["byHarness"]["codex"])
-        >= int(prod["byHarness"]["codex"]) - 1,
-        "claudeLosesAtMostOne": int(hybrid["byHarness"]["claude"])
-        >= int(prod["byHarness"]["claude"]) - 1,
-        "allWithinBounds": all(
-            not bool(result["timedOut"]) and 0 < int(result["actions"]) <= 30
-            for result in hybrid_results
-        ),
-        "noProtocolViolations": all(
-            not bool(result.get("protocolViolation")) for result in hybrid_results
-        ),
-        "noMoreThanTwoIdenticalFailures": all(
-            int(result["maxIdenticalRepeat"]) <= 2 for result in hybrid_results
-        ),
-        "sharingExact": all(bool(result["shareIntentSuccess"]) for result in hybrid_results),
+    if not results:
+        return {"evaluated": False, "reason": "no episodes"}
+    configurations: dict[str, dict[str, bool]] = {}
+    for configuration in sorted({str(result["configuration"]) for result in results}):
+        selected = [
+            result for result in results if result["configuration"] == configuration
+        ]
+        configurations[configuration] = {
+            "allWithinBounds": all(
+                not bool(result["timedOut"])
+                and int(result.get("durationMs", 0)) <= 180_000
+                and 0 < int(result["actions"]) <= 30
+                for result in selected
+            ),
+            "noProtocolViolations": all(
+                not bool(result.get("protocolViolation")) for result in selected
+            ),
+            "skillDiscovered": all(bool(result.get("skillLoaded")) for result in selected),
+            "screenshotPolicyExact": all(
+                bool(result.get("screenshotPolicySuccess")) for result in selected
+            ),
+            "visualIntentExact": all(
+                bool(result.get("visualIntentSuccess")) for result in selected
+            ),
+            "noMoreThanTwoIdenticalFailures": all(
+                int(result["maxIdenticalFailedAttempts"]) <= 2 for result in selected
+            ),
+            "sharingExact": all(bool(result["shareIntentSuccess"]) for result in selected),
+        }
+    return {
+        "evaluated": True,
+        "passed": all(all(checks.values()) for checks in configurations.values()),
+        "configurations": configurations,
+        "selection": "none; a factorial sweep diagnoses factors but does not select an actuator",
     }
-    return {"evaluated": True, "passed": all(checks.values()), "checks": checks}
 
 
 def write_report(results: list[dict[str, object]], out: Path) -> None:
@@ -618,12 +1031,43 @@ def write_report(results: list[dict[str, object]], out: Path) -> None:
     for result in results:
         events = out / str(result["id"]) / "events.jsonl"
         if events.exists():
-            shares = count_shared_artifacts(read_events(events))
+            recorded = read_events(events)
+            shares = count_shared_artifacts(recorded)
+            valid_shares = count_valid_shared_artifacts(recorded)
             result["shares"] = shares
+            result["validShares"] = valid_shares
+            result["screenshots"] = count_screenshots(recorded)
+            screenshot_roles = count_screenshot_roles(recorded)
+            result["internalScreenshots"] = screenshot_roles["internal"]
+            result["deliverableScreenshots"] = screenshot_roles["deliverable"]
+            result["maxIdenticalFailedAttempts"] = max_identical_failed_attempts(
+                recorded
+            )
+            result["visualGateBlocks"] = sum(
+                event.get("type") == "visual_gate" for event in recorded
+            )
+            result["screenshotPolicySuccess"] = not any(
+                event.get("type") == "screenshot_policy" for event in recorded
+            )
             expected_shares = (
                 1 if bool(result.get("evidence")) and bool(result["taskSuccess"]) else 0
             )
-            result["shareIntentSuccess"] = shares == expected_shares
+            result["shareIntentSuccess"] = (
+                shares == expected_shares and valid_shares == expected_shares
+            )
+            expected_internal = (
+                1
+                if result.get("vision") == "on"
+                and result.get("task_mode") == "visual"
+                and bool(result["taskSuccess"])
+                else 0
+            )
+            result["visualIntentSuccess"] = (
+                screenshot_roles["internal"] == expected_internal
+                and screenshot_roles["deliverable"] == expected_shares
+                and screenshot_roles["unclassified"] == 0
+                and not (out / str(result["id"]) / "pending-view").exists()
+            )
     # A timed-out or command-limit episode is a failed episode even if it
     # happened to mutate the task into the right state before being killed.
     for result in results:
@@ -631,12 +1075,18 @@ def write_report(results: list[dict[str, object]], out: Path) -> None:
             result["shareIntentSuccess"]
         ) and not bool(result["timedOut"]) and not bool(
             result.get("protocolViolation")
-        ) and 0 < int(result["actions"]) <= 30 and int(result["maxIdenticalRepeat"]) <= 2
+        ) and bool(result.get("skillLoaded")) and bool(
+            result.get("screenshotPolicySuccess")
+        ) and bool(
+            result.get("visualIntentSuccess")
+        ) and int(result.get("durationMs", 0)) <= 180_000 and 0 < int(
+            result["actions"]
+        ) <= 30 and int(result["maxIdenticalFailedAttempts"]) <= 2
     (out / "results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
     summary = {
         "generatedAt": datetime.now(timezone.utc).isoformat(),
         "models": {"codex": CODEX_MODEL, "claudeRequested": CLAUDE_MODEL},
-        "arms": arm_summary(results),
+        "configurations": configuration_summary(results),
         "incidentGate": incident_gate(results),
     }
     (out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
@@ -657,324 +1107,6 @@ def write_report(results: list[dict[str, object]], out: Path) -> None:
     (out / "report.html").write_text(report, encoding="utf-8")
 
 
-def miniwob_paths() -> tuple[str, Path]:
-    python = os.environ.get("ENGRAM_BROWSERGYM_PYTHON")
-    root_value = os.environ.get("ENGRAM_MINIWOB_ROOT")
-    root = Path(root_value) if root_value else None
-    if not python or not Path(python).is_file() or root is None or not root.is_dir():
-        raise RuntimeError(
-            "MiniWoB calibration requires ENGRAM_BROWSERGYM_PYTHON and ENGRAM_MINIWOB_ROOT; "
-            "see evals/browser/README.md"
-        )
-    return python, root
-
-
-def read_line_with_timeout(stream: TextIO, timeout: float, context: str) -> str:
-    ready, _, _ = select.select([stream], [], [], timeout)
-    if not ready:
-        raise TimeoutError(f"timed out waiting for {context}")
-    line = stream.readline()
-    if not line:
-        raise RuntimeError(f"process exited before replying to {context}")
-    return line
-
-
-def driver_request(
-    driver: subprocess.Popen[str], body: dict[str, object], timeout: float = 5
-) -> dict[str, object]:
-    assert driver.stdin is not None and driver.stdout is not None
-    driver.stdin.write(json.dumps(body) + "\n")
-    driver.stdin.flush()
-    line = read_line_with_timeout(driver.stdout, timeout, "MiniWoB driver response")
-    return json.loads(line)
-
-
-def run_miniwob_episode(episode: MiniwobEpisode, out_root: Path) -> dict[str, object]:
-    episode_id = f"miniwob-{episode.arm}-{episode.harness}-{episode.task}-s{episode.seed}"
-    out = out_root / episode_id
-    out.mkdir(parents=True, exist_ok=True)
-    workspace = Path(tempfile.mkdtemp(prefix=f"engrams-{episode_id}-"))
-    cdp_port = free_port()
-    profile = out / "chrome-profile"
-    chrome_log = (out / "chrome.log").open("wb")
-    chrome = subprocess.Popen(
-        chrome_command(profile, cdp_port), stdout=chrome_log, stderr=subprocess.STDOUT
-    )
-    driver: subprocess.Popen[str] | None = None
-    driver_log = None
-    started = time.monotonic()
-    try:
-        wait_cdp(cdp_port)
-        browsergym_python, miniwob_root = miniwob_paths()
-        base_url = (miniwob_root / "miniwob/html/miniwob").resolve().as_uri() + "/"
-        driver_log = (out / "driver.log").open("w", encoding="utf-8")
-        driver = subprocess.Popen(
-            [
-                browsergym_python,
-                str(MINIWOB_DRIVER),
-                "--cdp",
-                f"http://127.0.0.1:{cdp_port}",
-                "--task",
-                episode.task,
-                "--seed",
-                str(episode.seed),
-                "--base-url",
-                base_url,
-            ],
-            stdin=subprocess.PIPE,
-            stdout=subprocess.PIPE,
-            stderr=driver_log,
-            text=True,
-        )
-        assert driver.stdout is not None
-        setup_line = read_line_with_timeout(driver.stdout, 15, "MiniWoB driver setup")
-        setup = json.loads(setup_line)
-
-        instructions = arm_instructions(episode.arm)
-        (workspace / "AGENTS.md").write_text(instructions + "\n", encoding="utf-8")
-        (workspace / "CLAUDE.md").write_text(instructions + "\n", encoding="utf-8")
-        bin_dir = out / "bin"
-        write_proxies(bin_dir, episode.arm)
-        events = out / "events.jsonl"
-        action_count = out / "action-count"
-        pending_view = out / "pending-view"
-        agent_command, playwright_command = command_for_arm(episode.arm)
-        browser_tool = "playwright-cli" if episode.arm in {"prod", "pw-latest"} else "agent-browser"
-        driver_config = out / "driver.json"
-        driver_config.write_text(
-            json.dumps(
-                {
-                    "cdpPort": cdp_port,
-                    "commands": {
-                        browser_tool: playwright_command
-                        if browser_tool == "playwright-cli"
-                        else agent_command
-                    },
-                }
-            ),
-            encoding="utf-8",
-        )
-        config = out / "playwright.config.json"
-        config.write_text(json.dumps({"browser": {"cdpEndpoint": f"http://127.0.0.1:{cdp_port}"}}))
-        mcp_config = out / "mcp.json"
-        visual = episode.arm in {"pw-latest", "hybrid"}
-        mcp_config.write_text(
-            json.dumps(
-                {
-                    "mcpServers": {
-                        "browser_view": {
-                            "type": "stdio",
-                            "command": "python3",
-                            "args": [str(IMAGE_MCP), str(workspace), str(out)],
-                        }
-                    }
-                    if visual
-                    else {}
-                }
-            )
-        )
-        env = os.environ.copy()
-        env.update(
-            {
-                "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
-                "ENGRAM_EVAL_EVENTS": str(events),
-                "ENGRAM_EVAL_ACTION_COUNT": str(action_count),
-                "ENGRAM_EVAL_BROWSER_LOCK": str(out / "browser.lock"),
-                "ENGRAM_EVAL_ACTION_LIMIT": "30",
-                "ENGRAM_EVAL_VISUAL_GATE": "1"
-                if episode.arm in {"hybrid", "pw-latest"}
-                else "0",
-                "ENGRAM_EVAL_PENDING_VIEW": str(pending_view),
-                "ENGRAM_EVAL_CDP_PORT": str(cdp_port),
-                "ENGRAM_EVAL_DRIVER_CONFIG": str(driver_config),
-                "ENGRAM_EVAL_SESSION_ID": episode_id,
-                "PLAYWRIGHT_MCP_CONFIG": str(config),
-            }
-        )
-        for key in (
-            "ENGRAM_EVAL_AGENT_BROWSER_COMMAND",
-            "ENGRAM_EVAL_PLAYWRIGHT_COMMAND",
-            "ENGRAM_EVAL_PLAYWRIGHT_013_COMMAND",
-            "ENGRAM_EVAL_PLAYWRIGHT_017_COMMAND",
-        ):
-            env.pop(key, None)
-        prompt = (
-            "Complete the MiniWoB++ task already open in the shared browser. "
-            f"The BrowserGym-generated goal is: {setup['goal']}\n"
-            "Verify completion. Do not share any screenshot or recording."
-        )
-        agent_log_path = out / "agent.jsonl"
-        with agent_log_path.open("wb") as agent_log:
-            try:
-                result = subprocess.run(
-                    harness_command(
-                        episode.harness,
-                        workspace,
-                        prompt,
-                        mcp_config,
-                        visual,
-                        out,
-                    ),
-                    cwd=workspace,
-                    env=env,
-                    stdout=agent_log,
-                    stderr=subprocess.STDOUT,
-                    timeout=180,
-                    check=False,
-                )
-                exit_code = result.returncode
-                timed_out = False
-            except subprocess.TimeoutExpired:
-                exit_code = 124
-                timed_out = True
-        try:
-            grade = driver_request(driver, {"command": "validate"})
-        except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError) as error:
-            grade = {
-                "type": "grade",
-                "success": False,
-                "reward": 0,
-                "done": False,
-                "message": f"BrowserGym validation failed: {error}",
-            }
-        selected_browser_command = (
-            playwright_command if browser_tool == "playwright-cli" else agent_command
-        )
-        violated_protocol = protocol_violation(agent_log_path, selected_browser_command, base_url)
-        recorded = read_events(events)
-        shares = count_shared_artifacts(recorded)
-        actions = int(action_count.read_text() if action_count.exists() else "0")
-        max_repeat = no_progress_repeats(recorded)
-        bounded = not timed_out and not violated_protocol and 0 < actions <= 30 and max_repeat <= 2
-        return {
-            **asdict(episode),
-            "id": episode_id,
-            "success": bool(grade["success"]) and shares == 0 and bounded,
-            "taskSuccess": bool(grade["success"]),
-            "shares": shares,
-            "actions": actions,
-            "maxIdenticalRepeat": max_repeat,
-            "exitCode": exit_code,
-            "timedOut": timed_out,
-            "protocolViolation": violated_protocol,
-            "durationMs": round((time.monotonic() - started) * 1000),
-            "harnessVersion": command_version(episode.harness),
-            "resolvedModel": resolved_model(agent_log_path)
-            if episode.harness == "claude"
-            else expected_model(episode.harness),
-            "browserVersion": "playwright-cli@0.1.17"
-            if episode.arm == "pw-latest"
-            else "agent-browser@0.32.0",
-            "goal": setup["goal"],
-            "grade": grade,
-        }
-    finally:
-        if driver is not None and driver.poll() is None:
-            try:
-                driver_request(driver, {"command": "close"}, timeout=2)
-            except (OSError, RuntimeError, TimeoutError, json.JSONDecodeError):
-                driver.kill()
-            try:
-                driver.wait(timeout=5)
-            except subprocess.TimeoutExpired:
-                driver.kill()
-        if driver_log is not None:
-            driver_log.close()
-        chrome.send_signal(signal.SIGTERM)
-        try:
-            chrome.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            chrome.kill()
-        chrome_log.close()
-        shutil.rmtree(workspace, ignore_errors=True)
-
-
-def run_miniwob_episode_safe(episode: MiniwobEpisode, out_root: Path) -> dict[str, object]:
-    started = time.monotonic()
-    try:
-        return run_miniwob_episode(episode, out_root)
-    except Exception as error:
-        return {
-            **asdict(episode),
-            "id": f"miniwob-{episode.arm}-{episode.harness}-{episode.task}-s{episode.seed}",
-            "success": False,
-            "taskSuccess": False,
-            "shares": 0,
-            "actions": 0,
-            "maxIdenticalRepeat": 0,
-            "exitCode": 1,
-            "timedOut": isinstance(error, TimeoutError),
-            "protocolViolation": False,
-            "durationMs": round((time.monotonic() - started) * 1000),
-            "harnessVersion": command_version(episode.harness),
-            "resolvedModel": expected_model(episode.harness),
-            "browserVersion": (
-                "playwright-cli@0.1.17"
-                if episode.arm == "pw-latest"
-                else "agent-browser@0.32.0"
-            ),
-            "goal": None,
-            "grade": {
-                "type": "grade",
-                "success": False,
-                "message": f"evaluation infrastructure failed: {error}",
-            },
-        }
-
-
-def miniwob_gate(results: list[dict[str, object]], arms: list[str]) -> dict[str, object]:
-    stats: dict[str, dict[str, object]] = {}
-    for arm in arms:
-        selected = [result for result in results if result["arm"] == arm]
-        passed = sum(bool(result["success"]) for result in selected)
-        stats[arm] = {
-            "passes": passed,
-            "failures": len(selected) - passed,
-            "medianSuccessfulCommands": median(
-                [int(result["actions"]) for result in selected if result["success"]]
-            ),
-        }
-    best_failures = min(int(stat["failures"]) for stat in stats.values())
-    medians = [
-        float(stat["medianSuccessfulCommands"])
-        for stat in stats.values()
-        if stat["medianSuccessfulCommands"] is not None
-    ]
-    best_median = min(medians) if medians else None
-    hybrid = stats.get("hybrid")
-    passed = bool(
-        hybrid
-        and int(hybrid["failures"]) <= best_failures + 1
-        and hybrid["medianSuccessfulCommands"] is not None
-        and best_median is not None
-        and float(hybrid["medianSuccessfulCommands"]) <= best_median * 1.10
-    )
-    return {
-        "passed": passed,
-        "arms": stats,
-        "bestFailures": best_failures,
-        "bestMedian": best_median,
-    }
-
-
-def write_miniwob_report(results: list[dict[str, object]], arms: list[str], out: Path) -> None:
-    (out / "miniwob-results.json").write_text(json.dumps(results, indent=2) + "\n", encoding="utf-8")
-    (out / "miniwob-summary.json").write_text(
-        json.dumps(
-            {
-                "benchmark": {
-                    "browsergym": "browsergym-miniwob==0.14.3",
-                    "miniwobRevision": "7fd85d71a4b60325c6585396ec4f48377d049838",
-                },
-                "gate": miniwob_gate(results, arms),
-            },
-            indent=2,
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-
-
 def smoke() -> int:
     server, thread = start_server()
     try:
@@ -983,6 +1115,10 @@ def smoke() -> int:
             assert get_json(f"{server.url}/api/config")["incident"] == cfg["incident"]
             initial = get_json(f"{server.url}/api/grade")
             assert initial["success"] is False
+            post_json(
+                f"{server.url}/api/observe",
+                {"filter": cfg["incident"]},
+            )
             post_json(f"{server.url}/api/select", {"incident": cfg["incident"]})
             submitted = post_json(
                 f"{server.url}/api/submit", {"service": cfg["source"], "policy": cfg["policy"]}
@@ -997,83 +1133,212 @@ def smoke() -> int:
         thread.join(timeout=2)
 
 
+def preflight_cli(cli: str) -> None:
+    """Exercise the real pinned CLI and symmetric visual gate without a model."""
+    root = Path(tempfile.mkdtemp(prefix=f"browser-eval-preflight-{cli}-"))
+    socket_dir = Path(tempfile.mkdtemp(prefix="abe-pre-", dir="/tmp"))
+    server, thread = start_server()
+    post_json(f"{server.url}/api/reset", {"seed": 0, "mode": "visual"})
+    cdp_port = free_port()
+    profile = root / "chrome-profile"
+    chrome_log = (root / "chrome.log").open("wb")
+    chrome = subprocess.Popen(
+        chrome_command(profile, cdp_port), stdout=chrome_log, stderr=subprocess.STDOUT
+    )
+    try:
+        wait_cdp(cdp_port)
+        bin_dir = root / "bin"
+        write_proxies(bin_dir, cli)
+        observation_dir = root / "observations"
+        observation_dir.mkdir()
+        pending_view = root / "pending-view"
+        events = root / "events.jsonl"
+        action_count = root / "action-count"
+        spec = CLI_SPECS[cli]
+        browser_command = command_for_cli(cli)
+        session_name = "be-preflight"
+        driver_config = root / "driver.json"
+        driver_config.write_text(
+            json.dumps(
+                {
+                    "cdpPort": cdp_port,
+                    "sessionName": session_name,
+                    "commands": {spec.tool: browser_command},
+                }
+            ),
+            encoding="utf-8",
+        )
+        playwright_config = root / "playwright.config.json"
+        playwright_config.write_text(
+            json.dumps({"browser": {"cdpEndpoint": f"http://127.0.0.1:{cdp_port}"}}),
+            encoding="utf-8",
+        )
+        env = os.environ.copy()
+        env.update(
+            {
+                "PATH": f"{bin_dir}{os.pathsep}{env['PATH']}",
+                "ENGRAM_EVAL_EVENTS": str(events),
+                "ENGRAM_EVAL_ACTION_COUNT": str(action_count),
+                "ENGRAM_EVAL_ACTION_LIMIT": "10",
+                "ENGRAM_EVAL_VISUAL_GATE": "1",
+                "ENGRAM_EVAL_PENDING_VIEW": str(pending_view),
+                "ENGRAM_EVAL_OBSERVATION_ROOT": str(observation_dir),
+                "ENGRAM_EVAL_CDP_PORT": str(cdp_port),
+                "ENGRAM_EVAL_STATE_URL": f"{server.url}/api/observable",
+                "ENGRAM_EVAL_DRIVER_CONFIG": str(driver_config),
+                "AGENT_BROWSER_SOCKET_DIR": str(socket_dir),
+                "PLAYWRIGHT_MCP_CONFIG": str(playwright_config),
+            }
+        )
+
+        def invoke(*args: str, expected: int = 0) -> subprocess.CompletedProcess[str]:
+            result = subprocess.run(
+                [spec.tool, *args],
+                cwd=root,
+                env=env,
+                capture_output=True,
+                text=True,
+                timeout=40,
+            )
+            if result.returncode != expected:
+                raise RuntimeError(
+                    f"{spec.tool} {' '.join(args)} exited {result.returncode}: "
+                    f"{result.stdout}{result.stderr}"
+                )
+            return result
+
+        invoke("open", server.url)
+        snapshot_args = (
+            ("snapshot",) if spec.tool == "playwright-cli" else ("snapshot", "-i")
+        )
+        snapshot_result = invoke(*snapshot_args)
+        if "acknowledge" not in snapshot_result.stdout.lower():
+            raise RuntimeError(f"{cli} snapshot did not expose the shared page semantics")
+        screenshot = observation_dir / f"{cli}.png"
+        if spec.tool == "playwright-cli":
+            invoke("screenshot", "--filename", str(screenshot))
+        else:
+            invoke("screenshot", "--annotate", str(screenshot))
+        width, height = png_dimensions(screenshot)
+        if width < 1200 or height < 900:
+            raise RuntimeError(
+                f"{cli} screenshot was {width}x{height}, below production geometry"
+            )
+        if pending_view.read_text(encoding="utf-8").strip() != str(screenshot.resolve()):
+            raise RuntimeError(f"{cli} did not create the symmetric visual interlock")
+        invoke(*snapshot_args, expected=125)
+        response = handle_image_request(
+            {
+                "jsonrpc": "2.0",
+                "id": 1,
+                "method": "tools/call",
+                "params": {"name": "browser_view", "arguments": {"path": str(screenshot)}},
+            },
+            [root],
+        )
+        if response is None or response.get("result", {}).get("isError"):
+            raise RuntimeError(f"browser_view rejected {cli} screenshot: {response}")
+        if pending_view.exists():
+            raise RuntimeError(f"browser_view did not clear {cli} visual interlock")
+        post_view = invoke(*snapshot_args)
+        ref_prefix = "" if spec.tool == "playwright-cli" else "@"
+
+        def ref_for(output: str, label: str) -> str:
+            match = re.search(
+                rf'[^\n]*{re.escape(label)}[^\n]*\[ref=(e\d+)\]', output
+            )
+            if not match:
+                raise RuntimeError(f"{cli} snapshot did not expose {label!r}")
+            return ref_prefix + match.group(1)
+
+        invoke("click", ref_for(post_view.stdout, "Acknowledge and continue"))
+        after_ack = invoke(*snapshot_args)
+        invoke("fill", ref_for(after_ack.stdout, "Filter incidents"), SEEDS[0]["incident"])
+        observable = get_json(f"{server.url}/api/observable")
+        if observable.get("filter") != SEEDS[0]["incident"]:
+            raise RuntimeError(f"{cli} did not mutate the shared semantic filter state")
+        print(
+            f"{cli}: CLI/CDP/snapshot/filter/{width}x{height} screenshot/browser_view "
+            "preflight passed"
+        )
+    finally:
+        chrome.send_signal(signal.SIGTERM)
+        try:
+            chrome.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            chrome.kill()
+        chrome_log.close()
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2)
+        shutil.rmtree(root, ignore_errors=True)
+        shutil.rmtree(socket_dir, ignore_errors=True)
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("smoke")
+    prepare_parser = sub.add_parser("prepare")
+    prepare_parser.add_argument("--cli", choices=CLIS, action="append")
+    preflight_parser = sub.add_parser("preflight")
+    preflight_parser.add_argument("--cli", choices=CLIS, action="append")
     matrix_parser = sub.add_parser("matrix")
     matrix_parser.add_argument("--dry-run", action="store_true")
-    matrix_parser.add_argument("--arm", choices=ARMS, action="append")
+    matrix_parser.add_argument("--cli", choices=CLIS, action="append")
+    matrix_parser.add_argument("--policy", choices=POLICIES, action="append")
+    matrix_parser.add_argument("--vision", choices=VISIONS, action="append")
+    matrix_parser.add_argument("--task-mode", choices=TASK_MODES, action="append")
+    matrix_parser.add_argument(
+        "--matched-capability",
+        action="store_true",
+        help="pair semantic-only capability with DOM tasks and adaptive vision with visual tasks",
+    )
     matrix_parser.add_argument("--harness", choices=HARNESSES, action="append")
     matrix_parser.add_argument("--seed", type=int, choices=range(len(SEEDS)), action="append")
     matrix_parser.add_argument("--evidence", choices=("plain", "requested", "both"), default="both")
     matrix_parser.add_argument("--jobs", type=int, choices=range(1, 5), default=1)
-    miniwob_parser = sub.add_parser("miniwob")
-    miniwob_parser.add_argument(
-        "--arm",
-        choices=("pw-latest", "agent-dom", "hybrid"),
-        action="append",
-        required=True,
+    matrix_parser.add_argument(
+        "--headful",
+        action="store_true",
+        help="run local Chrome headfully at the production 1440x1080 geometry",
     )
-    miniwob_parser.add_argument("--harness", choices=HARNESSES, action="append")
-    miniwob_parser.add_argument("--task", choices=MINIWOB_TASKS, action="append")
-    miniwob_parser.add_argument("--seed", type=int, default=0)
-    miniwob_parser.add_argument("--jobs", type=int, choices=range(1, 5), default=1)
     args = parser.parse_args()
     if args.command == "smoke":
         return smoke()
-    if args.command == "miniwob":
-        arms = list(dict.fromkeys(args.arm))
-        harnesses = args.harness or list(HARNESSES)
-        tasks = args.task or list(MINIWOB_TASKS)
-        selected_miniwob = [
-            MiniwobEpisode(arm, harness, task, args.seed)
-            for arm in arms
-            for harness in harnesses
-            for task in tasks
-        ]
-        run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-        out = ROOT / "artifacts" / "browser-eval" / f"{run_id}-miniwob"
-        out.mkdir(parents=True)
-        miniwob_results: list[dict[str, object]] = []
-        if args.jobs == 1:
-            for index, episode in enumerate(selected_miniwob, 1):
-                print(f"[{index}/{len(selected_miniwob)}] {episode}", flush=True)
-                miniwob_results.append(run_miniwob_episode_safe(episode, out))
-                write_miniwob_report(miniwob_results, arms, out)
-        else:
-            print(
-                f"running {len(selected_miniwob)} MiniWoB episodes with {args.jobs} isolated workers",
-                flush=True,
-            )
-            with ThreadPoolExecutor(max_workers=args.jobs) as executor:
-                futures = {
-                    executor.submit(run_miniwob_episode_safe, episode, out): episode
-                    for episode in selected_miniwob
-                }
-                for index, future in enumerate(as_completed(futures), 1):
-                    result = future.result()
-                    miniwob_results.append(result)
-                    miniwob_results.sort(key=miniwob_key)
-                    print(
-                        f"[{index}/{len(selected_miniwob)}] {result['id']}: "
-                        f"{'PASS' if result['success'] else 'FAIL'} ({result['durationMs']} ms)",
-                        flush=True,
-                    )
-                    write_miniwob_report(miniwob_results, arms, out)
-        print(out / "miniwob-summary.json")
-        return 0 if all(bool(result["success"]) for result in miniwob_results) else 1
+    if args.command == "prepare":
+        prepare_tools(args.cli or list(CLIS))
+        return 0
+    if args.command == "preflight":
+        for cli in args.cli or ["pw017", "agent032"]:
+            preflight_cli(cli)
+        return 0
+    selected_clis = args.cli or ["pw017", "agent032"]
+    selected_policies = args.policy or list(POLICIES)
+    selected_visions = args.vision or list(VISIONS)
+    selected_modes = args.task_mode or list(TASK_MODES)
+    selected_harnesses = args.harness or list(HARNESSES)
+    selected_seeds = args.seed or [0]
     selected = [
         e
         for e in matrix()
-        if (not args.arm or e.arm in args.arm)
-        and (not args.harness or e.harness in args.harness)
-        and (not args.seed or e.seed in args.seed)
+        if e.cli in selected_clis
+        and e.policy in selected_policies
+        and e.vision in selected_visions
+        and e.task_mode in selected_modes
+        and (
+            not args.matched_capability
+            or e.vision == ("on" if e.task_mode == "visual" else "off")
+        )
+        and e.harness in selected_harnesses
+        and e.seed in selected_seeds
         and (args.evidence == "both" or e.evidence == (args.evidence == "requested"))
     ]
     if args.dry_run:
         print(json.dumps([asdict(e) for e in selected], indent=2))
         return 0
+    if args.headful:
+        os.environ["ENGRAM_EVAL_HEADFUL"] = "1"
     run_id = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
     out = ROOT / "artifacts" / "browser-eval" / run_id
     out.mkdir(parents=True)
