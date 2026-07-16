@@ -338,8 +338,24 @@ pub enum WireRequest {
     /// process group so code-server and its helpers all reap together.
     /// Idempotent — a no-op when nothing is running. Replies
     /// [`WireResponse::IdeStopped`].
-    /// Appended last: see the APPEND-ONLY note above.
     StopIde,
+    /// ADR 0096 D7: step the guest's `CLOCK_REALTIME` to the host's
+    /// wall clock. Replies [`WireResponse::ClockStepped`].
+    ///
+    /// A VZ warm-restored guest wakes with its clock frozen at
+    /// save time and has NO `/dev/ptp0` (KVM-PTP is a KVM paravirt
+    /// device), so agentd's self-driven PTP sync is a permanent no-op
+    /// there — the host pushes the time instead, right after resume.
+    /// FC never sends this (its guests re-step from the PHC on the
+    /// periodic tick + pre-spawn sync). The guest steps only when the
+    /// offset exceeds the same 2s threshold the PTP path uses. (Sent
+    /// to an older baked agentd, the decode fails and the host's step
+    /// degrades to best-effort/logged — same posture as `Sync`.)
+    /// Appended last: see the APPEND-ONLY note above.
+    StepClock {
+        /// Host `CLOCK_REALTIME` at send, in Unix nanoseconds.
+        unix_nanos: i64,
+    },
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -483,8 +499,15 @@ pub enum WireResponse {
     },
     /// Reply to [`WireRequest::StopIde`] — the IDE has been torn down
     /// (or there was nothing running).
-    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
     IdeStopped,
+    /// Reply to [`WireRequest::StepClock`]. `applied_offset_nanos` is
+    /// the step the guest actually applied, `None` when the offset was
+    /// under the step threshold (no change) — surfaced so the host's
+    /// log line says what happened.
+    /// Appended last: see the APPEND-ONLY note on [`WireRequest`].
+    ClockStepped {
+        applied_offset_nanos: Option<i64>,
+    },
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -572,6 +595,45 @@ mod tests {
         let mut cur = Cursor::new(buf);
         let got: WireExecRequest = read_msg(&mut cur).await.unwrap();
         assert_eq!(got, req());
+    }
+
+    /// ADR 0096 D7: the tail-appended StepClock/ClockStepped variants
+    /// round-trip. (bincode encodes by variant INDEX — appending is the
+    /// only safe evolution; this pins the wire shape.)
+    #[tokio::test]
+    async fn step_clock_variants_round_trip() {
+        let mut buf = Vec::new();
+        write_msg(
+            &mut buf,
+            &WireRequest::StepClock {
+                unix_nanos: 1_752_614_400_000_000_000,
+            },
+        )
+        .await
+        .unwrap();
+        let mut cur = Cursor::new(buf);
+        let got: WireRequest = read_msg(&mut cur).await.unwrap();
+        assert!(matches!(
+            got,
+            WireRequest::StepClock {
+                unix_nanos: 1_752_614_400_000_000_000
+            }
+        ));
+
+        for resp in [
+            WireResponse::ClockStepped {
+                applied_offset_nanos: Some(-3_000_000_000),
+            },
+            WireResponse::ClockStepped {
+                applied_offset_nanos: None,
+            },
+        ] {
+            let mut buf = Vec::new();
+            write_msg(&mut buf, &resp).await.unwrap();
+            let mut cur = Cursor::new(buf);
+            let got: WireResponse = read_msg(&mut cur).await.unwrap();
+            assert_eq!(got, resp);
+        }
     }
 
     #[tokio::test]
