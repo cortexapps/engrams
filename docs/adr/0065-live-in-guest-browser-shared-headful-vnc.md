@@ -1,5 +1,11 @@
 # ADR 0065 — Live in-guest browser: one shared headful Chrome + VNC (unified)
 
+> **Agent-control amendment:** ADR 0097 replaces the original
+> `show-your-work`/Playwright-first agent surface with one intent-aware browser
+> skill and upgrades Playwright CLI to 0.1.17. The evaluated hybrid did not pass
+> its shipping gate, so agent-browser remains evaluation-only. The shared
+> Chrome/VNC architecture in this ADR is unchanged.
+
 Status: **Proposed**
 
 > **Renumbered 0064 → 0065.** This began as PR #498's `0064-in-guest-browser-vnc.md`, but `0064`

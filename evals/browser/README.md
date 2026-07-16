@@ -21,6 +21,11 @@ just browser-eval-smoke
 just browser-eval
 ```
 
+CI runs only `just browser-eval-smoke`: deterministic Python contract tests and
+the no-model grader smoke. It never launches Codex, Claude, Chrome, or a browser
+CLI and requires no model credentials. The live matrix and MiniWoB calibration
+are explicit, on-demand runs.
+
 The full matrix invokes authenticated model CLIs and may consume quota. Use
 `--dry-run` to print its 64 episodes without invoking a model. Results go to
 `artifacts/browser-eval/<run-id>/`, which is intentionally untracked.
