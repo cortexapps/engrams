@@ -46,7 +46,6 @@ use engram_storage_local::LocalBlobStorage;
 use uuid::Uuid;
 
 struct TestRig {
-    pg: Arc<engram_postgres::PostgresStore>,
     meta: Arc<dyn MetadataStore>,
     blob: Arc<dyn BlobStorage>,
     chunk_store: ChunkStore,
@@ -54,91 +53,21 @@ struct TestRig {
 }
 
 async fn rig() -> Option<TestRig> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
+    // Each test gets its own template-cloned database (ADR 0099 H1), so
+    // there is no leaked pin-set state from prior runs or sibling tests
+    // to wipe — the rig starts from a freshly-migrated empty schema.
+    let db = engram_testkit::pg::fresh_db().await?;
 
     let blob_dir = tempfile::tempdir().expect("tempdir");
     let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(blob_dir.path().to_path_buf()));
     let chunk_store = ChunkStore::new(blob.clone());
 
-    let pg = Arc::new(store);
-    let rig = TestRig {
-        pg: pg.clone(),
-        meta: pg as Arc<dyn MetadataStore>,
+    Some(TestRig {
+        meta: Arc::new(db.store),
         blob,
         chunk_store,
         _blob_dir: blob_dir,
-    };
-
-    // Defensive: wipe pin-set state from any prior test run that
-    // may have panicked + leaked rows pointing at a now-gone
-    // tempdir. Without this, `PinSet::collect` in the first
-    // sweep fails with `ChunkStore(Blob(NotFound))` on the leaked
-    // manifest_id. The wipe is broad (every enabled_image, every
-    // snapshot) but it's a test DB — no concurrent state to
-    // preserve, and CI's --test-threads=1 serializes tests.
-    wipe_pin_set_state(&rig.pg).await;
-
-    Some(rig)
-}
-
-/// Nuclear cleanup: remove every row that could pin a chunk in
-/// `PinSet::collect`. Called at the start of every test so any
-/// leaked state from a prior panicking run is cleared before this
-/// test seeds its known state.
-///
-/// - `enabled_images`: all rows deleted (pin-set source #1).
-/// - `sessions`: live_disk_manifest_* cleared so pin-set source
-///   #2 returns empty. Session rows themselves stay (FK from
-///   snapshots).
-/// - `snapshots`: all rows deleted (pin-set sources #3 + #4).
-/// - `chunk_gc_candidates`: cleared so stale candidate rows don't
-///   leak into this test's promote-pass assertions.
-/// - `chunk_generation`: bumped to mark the new state.
-async fn wipe_pin_set_state(pg: &engram_postgres::PostgresStore) {
-    let pool = pg.pool();
-    sqlx::query("DELETE FROM chunk_gc_candidates")
-        .execute(pool)
-        .await
-        .expect("wipe chunk_gc_candidates");
-    // ADR 0020 P1: `enabled_images.base_snapshot_id` is a NOT NULL FK
-    // into `snapshots`, so clear the referencing table FIRST or the
-    // snapshots delete trips the FK constraint.
-    sqlx::query("DELETE FROM enabled_images")
-        .execute(pool)
-        .await
-        .expect("wipe enabled_images");
-    sqlx::query("DELETE FROM snapshots")
-        .execute(pool)
-        .await
-        .expect("wipe snapshots");
-    sqlx::query(
-        "UPDATE sessions
-            SET sandbox_id                 = NULL,
-                live_disk_manifest_id      = NULL,
-                live_disk_manifest_version = NULL,
-                live_disk_manifest_at      = NULL
-          WHERE live_disk_manifest_id IS NOT NULL OR sandbox_id IS NOT NULL",
-    )
-    .execute(pool)
-    .await
-    .expect("clear sessions.live_disk_manifest_*");
-    sqlx::query("UPDATE chunk_generation SET generation = generation + 1 WHERE id = TRUE")
-        .execute(pool)
-        .await
-        .expect("bump chunk_generation");
+    })
 }
 
 /// Write a manifest of `chunks_bytes` to BlobStorage and return
@@ -736,8 +665,6 @@ async fn non_recoverable_snapshots_do_not_pin() {
     .expect("sweep");
 
     // Pin set excludes the non-recoverable snapshot's chunks.
-    // candidates_marked includes both the unrec chunk and any other
-    // orphans this DB happens to have (other tests share the DB).
     // The targeted assertion: the unrec chunk WAS deleted.
     assert!(
         report.candidates_marked >= 1,

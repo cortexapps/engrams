@@ -24,26 +24,13 @@ use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::{HostId, SandboxId};
 
 async fn pg() -> Option<Arc<dyn MetadataStore>> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 /// Insert a `hosts` row so `sessions_host_id_fkey` is satisfied.
 /// Hostname carries the host_id suffix to dodge `ON CONFLICT (hostname)`
-/// collisions with other suites.
+/// collisions when a test seeds more than one host.
 async fn ensure_host(meta: &Arc<dyn MetadataStore>, host_id: HostId) {
     use engram_core::types::host::HostRecord;
     use engram_core::types::{HostCapacity, HostMetadata, HostStatus};

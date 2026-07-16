@@ -27,21 +27,8 @@ use engram_core::types::SnapshotId;
 use uuid::Uuid;
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 /// Unique-per-run fake sha256 hex so concurrent CI runs don't trample.
