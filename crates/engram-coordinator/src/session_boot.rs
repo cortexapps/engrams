@@ -343,6 +343,22 @@ pub(crate) async fn boot_on_reserved_host(
             ))));
         }
     };
+    // ADR 0099 H6 (site 1): a freshly minted epoch is threaded into BOTH
+    // the AgentSpec stamp and the durable bind RPC below, and every fence
+    // downstream compares against it. It must clear the floor: the column
+    // defaults to 0 and `mint_binding_epoch` is an atomic `+1 RETURNING`,
+    // so a mint yields >= 1 by construction. A 0 here would mean the
+    // counter never advanced — the spawned harness would lose every
+    // fence and never validate. (Strict pairwise monotonicity is enforced
+    // fail-closed one layer down, at the host-agent binding record's
+    // `bindings::bind`, which refuses an `existing > presented` write; the
+    // coordinator's fresh-spawn mint sites don't co-locate a prior epoch,
+    // so this floor check is the assertion available without an added DB
+    // read.)
+    engram_core::invariant!(
+        binding_epoch >= 1,
+        "minted binding epoch must be positive for session {session_id}, got {binding_epoch}",
+    );
     state
         .services
         .host
