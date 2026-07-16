@@ -14,7 +14,7 @@
 //! video. We fail fast client-side on a non-media extension, but the
 //! coord is the authority — it never trusts a guest-supplied type.
 
-use std::process::ExitCode;
+use std::{io::ErrorKind, process::ExitCode, time::Duration};
 
 use engram_core::SessionId;
 use engram_harness_proto::{
@@ -78,9 +78,7 @@ async fn run_inner(rest: &[String]) -> Result<String, String> {
         ));
     }
 
-    let meta = tokio::fs::metadata(&path)
-        .await
-        .map_err(|e| format!("{path}: stat: {e}"))?;
+    let meta = wait_for_file(&path).await?;
     if !meta.is_file() {
         return Err(format!("{path}: not a regular file"));
     }
@@ -144,6 +142,26 @@ async fn run_inner(rest: &[String]) -> Result<String, String> {
     }
 }
 
+/// A model harness can dispatch screenshot creation and sharing concurrently.
+/// Give the producer a short bounded window to publish a non-empty file so one
+/// explicit share intent does not turn into a spurious retry or duplicate.
+async fn wait_for_file(path: &str) -> Result<std::fs::Metadata, String> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        match tokio::fs::metadata(path).await {
+            Ok(meta) if !meta.is_file() => return Err(format!("{path}: not a regular file")),
+            Ok(meta) if meta.len() > 0 => return Ok(meta),
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => return Err(format!("{path}: stat: {error}")),
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(format!("{path}: file did not become ready within 2 seconds"));
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+}
+
 fn env_session_id() -> Result<SessionId, String> {
     let s = std::env::var("ENGRAM_SESSION_ID")
         .map_err(|_| "ENGRAM_SESSION_ID not set in the guest env".to_string())?;
@@ -186,5 +204,19 @@ mod tests {
         assert!(ALLOWED_EXTS.contains(&"mp4"));
         assert!(!ALLOWED_EXTS.contains(&"svg"));
         assert!(!ALLOWED_EXTS.contains(&"html"));
+    }
+
+    #[tokio::test]
+    async fn waits_for_a_concurrently_created_share_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("evidence.png");
+        let producer_path = path.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(30)).await;
+            tokio::fs::write(producer_path, b"png").await.unwrap();
+        });
+
+        let meta = wait_for_file(path.to_str().unwrap()).await.unwrap();
+        assert_eq!(meta.len(), 3);
     }
 }
