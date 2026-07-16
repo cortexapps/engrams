@@ -35,12 +35,11 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
     // ADR 0065: the single browser capability (mirror of the orchestrator's
     // BUILTIN_SKILLS — keep the two in sync). One shared Chromium: the human
     // drives it over VNC in the BROWSER tab, the agent drives the SAME browser
-    // via playwright-cli + show-your-work. (The old headless-only `playwright`
-    // skill is retired into this.)
+    // via the intent-aware playwright-cli 0.1.17 wrapper.
     name: "browser",
     label: "Browser",
     description:
-      "One shared Chromium the human drives over VNC (BROWSER tab) and the agent drives programmatically — same browser, so the human watches the agent live. Use an image sized for a browser (≥1 GiB).",
+      "One shared Chromium: the human watches or takes over through VNC while the agent uses semantic browser control with visual fallback. Evidence is shared only on request. Use an image sized for a browser (≥1 GiB).",
   },
   {
     // ADR 0085: code-server as a trusted, human-only IDE surface over the

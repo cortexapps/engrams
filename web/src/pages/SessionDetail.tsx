@@ -23,6 +23,7 @@ import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
 import { Button } from "@/components/ui/button";
 import { Separator } from "@/components/ui/separator";
 import type { Session, ProfileSnapshotView } from "../lib/types";
+import { isSharedBrowserCommand } from "../lib/browserCommand";
 
 // The session workspace (ADR 0065 follow-up). The transcript is the primary
 // left column; the live shell + browser live in a resizable companion pane on
@@ -174,8 +175,8 @@ export function SessionDetail() {
   };
 
   // ADR 0065: when the AGENT boots the shared browser, surface it. The agent
-  // runs `playwright-cli` (whose wrapper brings the stack up via
-  // `engram-browser --ensure`), so the first such exec is our signal to open the
+  // runs a supported browser CLI (whose wrapper brings the stack up), so the
+  // first such exec is our signal to open the
   // pane on the BROWSER tab — the human then watches the agent drive the same
   // Chrome live. Fires once (ref guard) and only when the browser capability is
   // present; we don't reopen if the human subsequently collapses the pane.
@@ -183,8 +184,7 @@ export function SessionDetail() {
   useEffect(() => {
     if (!browserEnabled || autoOpenedBrowserRef.current) return;
     const agentBootedBrowser = events.some(
-      (ie) =>
-        ie.event.type === "exec_started" && ie.event.command.join(" ").includes("playwright-cli"),
+      (ie) => ie.event.type === "exec_started" && isSharedBrowserCommand(ie.event.command),
     );
     if (agentBootedBrowser) {
       autoOpenedBrowserRef.current = true;

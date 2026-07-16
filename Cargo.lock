@@ -1338,6 +1338,7 @@ dependencies = [
  "engram-transport",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "workspace-hack",

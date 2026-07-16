@@ -55,7 +55,7 @@ build_tree() {
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        # curl + xz-utils fetch the pinned Node for playwright-cli (ADR 0065);
+        # curl + xz-utils fetch pinned Node for playwright-cli (ADR 0065/0097);
         # util-linux carries setpriv AND flock (the launcher --ensure lock);
         # patchelf rewrites PT_INTERP/DT_RPATH on every bundled ELF (issue
         # #569) so the bundle carries its own loader instead of depending on
@@ -225,7 +225,7 @@ build_tree() {
 </fontconfig>
 FONTS
 
-        # --- playwright-cli driving the SHARED headful chrome (ADR 0065) ------
+        # --- playwright-cli driving shared chrome (ADR 0097) -----------------
         # The browser skill is the shared browser: the human drives it over VNC
         # and the AGENT drives the SAME chromium over CDP. So this bundle also
         # ships the Microsoft playwright-cli, configured to CONNECT to the
@@ -236,7 +236,7 @@ FONTS
         # [NB: single-quoted docker -c block below — NO raw apostrophes anywhere,
         # including inside the heredocs (a raw quote still ends the outer string).]
         NODE_VERSION=20.18.1
-        PLAYWRIGHT_CLI_VERSION=0.1.13
+        PLAYWRIGHT_CLI_VERSION=0.1.17
         ARCH="$(dpkg --print-architecture)"
         case "$ARCH" in
             amd64) NODE_ARCH=x64 ;;
@@ -303,13 +303,42 @@ here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 # resolves through actually exists before this ever runs.
 export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
 export PATH="$here/node/bin:$PATH"
-exec "$here/node/bin/playwright-cli" "$@"
+observation_dir=/tmp/engram-browser-observations
+pending="$observation_dir/.pending-view"
+mkdir -p "$observation_dir"
+if [ -s "$pending" ]; then
+    required="$(cat "$pending")"
+    echo "playwright-cli: call browser_view on $required before another browser command" >&2
+    exit 125
+fi
+filename=""
+want_filename=0
+for arg in "$@"; do
+    if [ "$want_filename" -eq 1 ]; then
+        filename="$arg"
+        want_filename=0
+        continue
+    fi
+    case "$arg" in
+        --filename) want_filename=1 ;;
+        --filename=*) filename="${arg#--filename=}" ;;
+    esac
+done
+"$here/node/bin/playwright-cli" "$@"
+status=$?
+if [ "$status" -eq 0 ] && [ "${1:-}" = screenshot ] && [ -f "$filename" ]; then
+    canonical="$(readlink -f -- "$filename")"
+    case "$canonical" in
+        "$observation_dir"/*) printf "%s\n" "$canonical" > "$pending" ;;
+    esac
+fi
+exit "$status"
 WRAP
         chmod 0755 /out/bin/playwright-cli
 
-        # show-your-work skill (moved here from the retired playwright bundle).
+        # One intent-aware browser skill (ADR 0097).
         mkdir -p /out/skills
-        cp -R /skills-src/show-your-work /out/skills/
+        cp -R /skills-src/browser /out/skills/
 
         # --- patchelf: bake the bundle loader + rpath into every bundled ----
         # ELF EXECUTABLE (issue #569; see the header comment above for

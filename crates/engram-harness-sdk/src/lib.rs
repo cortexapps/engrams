@@ -4,6 +4,7 @@
 //! owns the failure-prone Engram-facing half: dial/attach, reconnect across
 //! snapshot restores and host rolls, and at-least-once event delivery.
 
+pub mod browser_view;
 pub mod parked;
 pub mod questions;
 
