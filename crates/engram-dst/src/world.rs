@@ -24,9 +24,15 @@ pub struct SimHostState {
     /// heartbeats never land (the dead-host detector's hardest case —
     /// the issue-#231 probe exists exactly for this).
     pub heartbeats_partitioned: bool,
-    /// The inverse: heartbeats land but RPCs fail (a half-open
-    /// connection / one-way network fault).
-    pub rpc_partitioned: bool,
+    /// The inverse of the heartbeat partition: heartbeats land but RPC
+    /// verbs STALL (ADR 0098 coverage-gap G1, the #743 op-wedge class).
+    /// `Some(d)` = every RPC on this host sleeps `d` of virtual time
+    /// before answering — above the verb's `op_deadline` this is the
+    /// 03e6535e wedge (the within-step heartbeat keeps the op row fresh
+    /// while the dispatch never returns; only the tokio-timer deadline
+    /// unwedges it), below it a plain delay. Replaces the fail-fast
+    /// `rpc_partitioned` flag that was toggled but never read.
+    pub rpc_hang: Option<std::time::Duration>,
     /// sandbox -> owning session (as told to us via create's spec).
     pub sandboxes: BTreeMap<SandboxId, Option<SessionId>>,
 }
@@ -63,9 +69,30 @@ pub struct SimHostClient {
     pub entropy: Arc<SimEntropy>,
 }
 
+impl SimHostClient {
+    /// The G1 RPC hang/delay fault: stall this verb by the host's
+    /// configured `rpc_hang` before touching the world. The lock is
+    /// released BEFORE the sleep; on the paused clock the sleep resolves
+    /// deterministically — either auto-advance reaches it (a delay) or
+    /// the caller's `op_deadline` timeout fires first and drops this
+    /// future mid-sleep (the wedge). Never `future::pending()` — an
+    /// un-timed caller would deadlock the run-step-to-completion
+    /// scheduler.
+    async fn maybe_hang(&self) {
+        let hang = {
+            let hosts = self.world.hosts.lock();
+            hosts.get(&self.host_id).and_then(|h| h.rpc_hang)
+        };
+        if let Some(d) = hang {
+            tokio::time::sleep(d).await;
+        }
+    }
+}
+
 #[async_trait]
 impl HostClient for SimHostClient {
     async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+        self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
         self.world.with_host(self.host_id, |h| {
             // Ownership is learned at bind_session time (the spec is a
@@ -76,6 +103,7 @@ impl HostClient for SimHostClient {
     }
 
     async fn destroy(&self, id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
+        self.maybe_hang().await;
         self.world.with_host(self.host_id, |h| {
             h.sandboxes.remove(&id);
             Ok(())
@@ -83,11 +111,13 @@ impl HostClient for SimHostClient {
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+        self.maybe_hang().await;
         self.world
             .with_host(self.host_id, |h| Ok(h.sandboxes.keys().copied().collect()))
     }
 
     async fn probe_sandbox(&self, id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+        self.maybe_hang().await;
         self.world.with_host(self.host_id, |h| {
             let known = h.sandboxes.contains_key(&id);
             Ok(SandboxProbe {
@@ -103,6 +133,7 @@ impl HostClient for SimHostClient {
         _id: SandboxId,
         _cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        self.maybe_hang().await;
         // The D5 workload never execs; guest behavior is out of scope
         // (ADR 0098 non-goal). Fail loudly if a driver starts doing it.
         Err(SandboxError::Unsupported(
@@ -115,6 +146,7 @@ impl HostClient for SimHostClient {
         id: SandboxId,
         _fence: SessionFence,
     ) -> Result<SnapshotMetadata, SandboxError> {
+        self.maybe_hang().await;
         let entropy = self.entropy.clone();
         self.world.with_host(self.host_id, |h| {
             if !h.sandboxes.contains_key(&id) {
@@ -139,6 +171,7 @@ impl HostClient for SimHostClient {
         _metadata: SnapshotMetadata,
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
         self.world.with_host(self.host_id, |h| {
             h.sandboxes.insert(id, None);
@@ -153,6 +186,7 @@ impl HostClient for SimHostClient {
         _policy: SessionEgressPolicy,
         _fence: SessionFence,
     ) -> Result<(), SandboxError> {
+        self.maybe_hang().await;
         self.world.with_host(self.host_id, |h| {
             if h.sandboxes.contains_key(&id) {
                 Ok(())
@@ -173,6 +207,7 @@ impl HostClient for SimHostClient {
         _selected_mounts: Vec<engram_core::types::sandbox::AuxRoDrive>,
         _fence: SessionFence,
     ) -> Result<SandboxId, SandboxError> {
+        self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
         self.world.with_host(self.host_id, |h| {
             h.sandboxes.insert(id, None);
@@ -181,6 +216,7 @@ impl HostClient for SimHostClient {
     }
 
     async fn apply_egress_policy(&self, _policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+        self.maybe_hang().await;
         Ok(())
     }
 
@@ -194,6 +230,7 @@ impl HostClient for SimHostClient {
         sandbox_id: SandboxId,
         _binding_epoch: u64,
     ) {
+        self.maybe_hang().await;
         let _ = self.world.with_host(self.host_id, |h| {
             if let Some(owner) = h.sandboxes.get_mut(&sandbox_id) {
                 *owner = Some(session_id);
@@ -203,6 +240,7 @@ impl HostClient for SimHostClient {
     }
 
     async fn unbind_session(&self, session_id: SessionId) {
+        self.maybe_hang().await;
         let _ = self.world.with_host(self.host_id, |h| {
             for owner in h.sandboxes.values_mut() {
                 if *owner == Some(session_id) {
@@ -219,6 +257,7 @@ impl HostClient for SimHostClient {
         _prompt_id: String,
         _text: String,
     ) -> Result<(), SandboxError> {
+        self.maybe_hang().await;
         self.world.with_host(self.host_id, |_| Ok(()))
     }
 }

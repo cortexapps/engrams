@@ -13,5 +13,5 @@ pub mod invariants;
 pub mod scheduler;
 pub mod world;
 
-pub use scheduler::{Profile, Sim, SimReport};
+pub use scheduler::{DriverKind, Profile, Sim, SimReport, Step};
 pub use world::SimWorld;
