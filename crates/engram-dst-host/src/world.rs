@@ -43,6 +43,7 @@ use engram_storage_local::LocalBlobStorage;
 
 use crate::coord_stub::SimCoordClient;
 use crate::effects::{sim_effects, SeamLog};
+use crate::reconcile::SimReconcileBackend;
 use crate::simfs::SimFs;
 
 /// Disk geometry every sim sandbox uses. Small on purpose — the oracle
@@ -158,6 +159,12 @@ pub struct SimHost {
     pub effects: HostEffects,
     pub seam_log: Arc<SeamLog>,
     pub sandboxes: Vec<SandboxSlot>,
+    /// Flow C (ADR 0098 P3): the teardown-reconcile world the REAL
+    /// `reconcile_once` drives. Seeded in lockstep with `sandboxes` (same
+    /// ids, same coord ownership) but a SEPARATE concern — reconcile reaps
+    /// bindings, the disk model serves chunks; a reconcile destroy does not
+    /// touch a `SandboxSlot`.
+    pub reconcile: Arc<SimReconcileBackend>,
     pub ledger: AckedWriteLedger,
     /// Monotonic content-tag source. Advances only on writes, so the id a
     /// given step mints is a pure function of the step sequence (seed).
@@ -177,6 +184,7 @@ impl SimHost {
             Arc::new(LocalBlobStorage::new(fs.chunks_dir().to_path_buf()));
         let store = Arc::new(ChunkStore::new(blob));
         let coord = Arc::new(SimCoordClient::new());
+        let reconcile = Arc::new(SimReconcileBackend::new());
         let (effects, seam_log) = sim_effects(clock.clone(), entropy.clone(), coord.clone());
         // Deterministic, readable host id.
         let host_id = HostId::from(uuid::Uuid::from_u128(0x0A57_0000));
@@ -202,6 +210,9 @@ impl SimHost {
                 .expect("seed base manifest");
             let backend = build_backend(&store, fs.cache_dir(), i, base_ref).await;
             coord.set_owner(sandbox_id, session_id);
+            // Flow C steady state: the sandbox is live, coord-owned, and
+            // locally bound — reconcile is a no-op until something perturbs it.
+            reconcile.seed_sandbox(sandbox_id, session_id);
             sandboxes.push(SandboxSlot {
                 sandbox_id,
                 session_id,
@@ -221,8 +232,62 @@ impl SimHost {
             effects,
             seam_log,
             sandboxes,
+            reconcile,
             ledger: AckedWriteLedger::default(),
             next_tag: 0,
+        }
+    }
+
+    /// The number of sandboxes seeded into the reconcile world (== the disk
+    /// sandbox count). A stable index space `0..num` for the perturbation
+    /// steps.
+    pub fn num_sandboxes(&self) -> usize {
+        self.sandboxes.len()
+    }
+
+    /// The sandbox/session ids for reconcile-world slot `idx` (the same ids
+    /// seeded at construction).
+    fn reconcile_ids(&self, idx: usize) -> Option<(SandboxId, SessionId)> {
+        self.sandboxes
+            .get(idx)
+            .map(|s| (s.sandbox_id, s.session_id))
+    }
+
+    /// Drive one REAL `reconcile_once` tick against the sim world, over the
+    /// caller-owned `strikes` ledger. Flow C's end-to-end path: list →
+    /// classify (pure core + a coord call per sandbox) → strike-debounce →
+    /// destroy/repair. Returns the list()-failure error verbatim (benign in
+    /// the sim — `list()` never fails).
+    pub async fn reconcile_tick(
+        &self,
+        strikes: &mut std::collections::HashMap<SandboxId, u32>,
+    ) -> Result<(), String> {
+        engram_host_agent::teardown_reconcile::reconcile_once(
+            &*self.reconcile,
+            &*self.coord,
+            self.host_id,
+            strikes,
+        )
+        .await
+        .map_err(|e| format!("reconcile_once: {e}"))
+    }
+
+    /// Perturbation: drop the LOCAL binding for reconcile slot `idx` (the ADR
+    /// 0090 survivor — coord still owns it). Next reconcile must REPAIR, not
+    /// reap.
+    pub fn drop_local_binding(&self, idx: usize) {
+        if let Some((sandbox_id, _)) = self.reconcile_ids(idx) {
+            self.reconcile.drop_local_binding(sandbox_id);
+        }
+    }
+
+    /// Perturbation: revoke coordinator ownership of reconcile slot `idx` (a
+    /// terminal/idle/rebound session). Reconcile SHOULD reap it after the
+    /// strike debounce — and Oracle #9 confirms the coord genuinely no longer
+    /// owns it, so the reap is correct.
+    pub fn revoke_ownership(&self, idx: usize) {
+        if let Some((sandbox_id, _)) = self.reconcile_ids(idx) {
+            self.coord.revoke_owner(sandbox_id);
         }
     }
 
@@ -377,6 +442,11 @@ impl SimHost {
         for slot in &mut self.sandboxes {
             slot.backend = None; // RAM dies
         }
+        // Flow C: the pooled/capture in-RAM tables (local bindings, migration
+        // roles, live captures) die with the process; the live FC set and the
+        // coordinator (a separate process) survive. The successor's reconcile
+        // loop rebuilds the bindings from the coordinator — the None-arm path.
+        self.reconcile.crash_ram();
         Ok(())
     }
 

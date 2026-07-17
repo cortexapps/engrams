@@ -24,16 +24,28 @@
 //! [`Restart`](Step::Restart), [`AdvanceTime`](Step::AdvanceTime). The single
 //! oracle is acked-write durability (see [`invariants`]).
 //!
-//! # Deferred to P3+
+//! # P3 (Flow C — reconcile)
 //!
-//! Faults (the coord stub's adversarial [`ScriptedResponse`] queue is wired
-//! but never fired), the lifecycle-flow extractions (Flow A–E), and
-//! scheduler-driven crash-point INJECTION (the [`CrashPoint`] boundaries are
-//! named + coverage-tested here, but cutting the process at one is P4).
+//! P3 adds [`ReconcileTick`](Step::ReconcileTick) (+ the
+//! [`DropLocalBinding`](Step::DropLocalBinding) /
+//! [`RevokeOwnership`](Step::RevokeOwnership) perturbations), driving the REAL
+//! [`reconcile_once`](engram_host_agent::teardown_reconcile::reconcile_once)
+//! against a modelled reconcile world ([`reconcile`]) and the now-live
+//! adversarial [`ScriptedResponse`] queue. Oracle #9 (the None-arm mis-reap
+//! stays fixed) joins the invariant suite. See [`reconcile`].
+//!
+//! # Deferred to P4+
+//!
+//! The remaining lifecycle-flow extractions (Flow A/B/D/E), scheduler-driven
+//! crash-point INJECTION (the [`CrashPoint`] boundaries are named +
+//! coverage-tested here, but cutting the process at one is P4), and the #224
+//! insert-after-sweep gate (it lives in the `abandon_nbd_data_planes_for_shutdown`
+//! SIGTERM path, which is not extracted until P4's Flow A).
 
 pub mod coord_stub;
 pub mod effects;
 pub mod invariants;
+pub mod reconcile;
 pub mod scheduler;
 pub mod simfs;
 pub mod world;
@@ -41,6 +53,7 @@ pub mod world;
 pub use coord_stub::{RecordedPublish, ScriptedResponse, SimCoordClient};
 pub use effects::{sim_effects, SeamEvent, SeamLog, SimDeviceSync, SimNbd};
 pub use invariants::Violation;
+pub use reconcile::{DestroyRecord, SimReconcileBackend};
 pub use scheduler::{Profile, Sim, SimReport, Step, NUM_SANDBOXES};
 pub use simfs::{CrashPoint, SimFs};
 pub use world::{AckedWriteLedger, LedgerEntry, SandboxSlot, SimHost, CHUNK_SIZE, NUM_CHUNKS};

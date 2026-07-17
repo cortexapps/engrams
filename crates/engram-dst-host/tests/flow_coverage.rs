@@ -26,6 +26,9 @@ fn all_step_representatives() -> Vec<Step> {
         Step::CrashProcess,
         Step::Restart,
         Step::AdvanceTime(Duration::from_secs(1)),
+        Step::ReconcileTick,
+        Step::DropLocalBinding(0),
+        Step::RevokeOwnership(0),
     ]
 }
 
@@ -40,6 +43,9 @@ const EXPECTED: &[&str] = &[
     "CrashProcess",
     "Restart",
     "AdvanceTime",
+    "ReconcileTick",
+    "DropLocalBinding",
+    "RevokeOwnership",
 ];
 
 #[test]
