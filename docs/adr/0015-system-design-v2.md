@@ -492,6 +492,21 @@ transitions surface as `MetaError::Conflict` carrying the rendered
 bodies show the actual collision instead of a generic "couldn't
 update."
 
+**The one sanctioned exemption (2026-07-17, from the ADR 0099 H6
+audit + the ADR 0098 oracle design):**
+`MetadataStore::mark_host_dead_and_orphan_sessions` bulk-flips every
+non-terminal session on a dead host to `HostLost` in one transaction,
+including from states the table gives no `HostLost` edge
+(`Pending`/`Queued`/`Idle`/…) — host death really can strike any of
+them. This is DELIBERATELY an exemption rather than a table widening:
+adding `* → HostLost` edges would let ANY caller legally flip ANY
+session to `HostLost`, stripping both the production legality check
+and the DST transition-legality oracle of their power to catch a
+buggy path doing exactly that. The privilege stays localized to this
+one method (the oracle's exemption is likewise scoped: that method,
+`HostLost`-only); no second exempt site may be added without a matching
+entry here and in the engram-dst oracle."
+
 **Persistence + transition helper.** `MetadataStore::transition_session(id,
 target)` replaces every direct `UPDATE sessions SET status = ...`
 call site. The Postgres impl does `SELECT ... FOR UPDATE` →
