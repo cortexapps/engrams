@@ -40,6 +40,18 @@ const STAGE_ASSETS_CONTAINER: &str = "stage-node-assets";
 /// carrying this marker; an admin cordon (no marker) stays sticky.
 pub const ROLL_CORDON_ANNOTATION: &str = "fleet.engram.io/roll-cordon";
 
+/// Marks a node whose image-roll successor failed to become Ready within the
+/// roll gate. The value identifies the managed node pool (or DaemonSet when
+/// autoscaling is disabled), so a restarted operator can distinguish its own
+/// unavailable-capacity debt from another fleet's node.
+///
+/// Unlike [`ROLL_CORDON_ANNOTATION`], this marker is not merely convergence
+/// bookkeeping: autoscaling treats it as one unit of unavailable capacity,
+/// surges a replacement under demand, then drain-gates removal of the named
+/// node. It is written only after the bounded successor gate expires, so a
+/// normally-joining node never causes repeated growth.
+pub const ROLL_STUCK_ANNOTATION: &str = "fleet.engram.io/roll-stuck";
+
 /// Context shared across reconciles.
 pub struct Ctx {
     pub client: Client,
@@ -138,6 +150,14 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
         tracing::warn!(error = %e, "roll-cordon convergence failed; continuing");
     }
 
+    // A successor-gate timeout is durable node state, not an invitation to
+    // delete the same already-terminating pod every reconcile. Feed the
+    // marked nodes to autoscaling so it can surge replacement capacity and
+    // drain/remove them safely. With autoscaling disabled, the marker still
+    // blocks the destructive retry loop and leaves a crisp operator signal.
+    let recovery_key = roll_recovery_key(spec);
+    let stuck_rolls = list_roll_stuck_nodes(client, recovery_key).await?;
+
     // 3. Plan.
     let decision = plan_roll(
         &pods,
@@ -150,20 +170,21 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
     // ADR 0044 K4 + ADR 0048: autoscale the node pool from coordinator demand
     // (scale-up via set_size; scale-down via the teleport-packed wave). A fresh
     // wave only starts when the image roll is quiescent (`roll_idle`); an
-    // in-flight wave blocks new rolls (returned in `wave_in_flight`). Best-
-    // effort — a coord hiccup shouldn't wedge the controller.
+    // in-flight wave, queue/grow pressure, or stuck-roll repair blocks new
+    // rolls (returned in `blocks_roll`). Best-effort — a coord hiccup
+    // shouldn't wedge the controller.
     let roll_idle = matches!(decision, RollDecision::UpToDate { .. });
-    let wave_in_flight = match run_autoscale(spec, &ctx, &pods, roll_idle).await {
-        Ok(status) => status.wave_in_flight,
+    let blocks_roll = match run_autoscale(spec, &ctx, &pods, roll_idle, &stuck_rolls).await {
+        Ok(status) => status.blocks_roll,
         Err(e) => {
             tracing::warn!(error = %e, "autoscale step failed; continuing");
-            false
+            !stuck_rolls.is_empty()
         }
     };
 
     // 4. Act. An in-flight scale-down wave takes precedence over image rolls
     //    (the wave's drains are consuming receiving capacity) — requeue soon.
-    if wave_in_flight {
+    if blocks_roll {
         return Ok(Action::requeue(Duration::from_secs(10)));
     }
     match decision {
@@ -180,7 +201,7 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
             Ok(Action::requeue(Duration::from_secs(30)))
         }
         RollDecision::RollNode { node, pod } => {
-            roll_node(client, spec, &node, &pod).await?;
+            roll_node(client, spec, &node, &pod, recovery_key).await?;
             Ok(Action::requeue(Duration::from_secs(5)))
         }
     }
@@ -194,9 +215,18 @@ async fn run_autoscale(
     ctx: &Ctx,
     pods: &[PodInfo],
     roll_idle: bool,
+    stuck_rolls: &[String],
 ) -> Result<crate::autoscale::AutoscaleStatus, OperatorError> {
     if spec.autoscaling.is_none() {
-        return Ok(crate::autoscale::AutoscaleStatus::default());
+        if !stuck_rolls.is_empty() {
+            tracing::warn!(
+                nodes = ?stuck_rolls,
+                "image roll is stuck but autoscaling is disabled; blocking further rolls"
+            );
+        }
+        return Ok(crate::autoscale::AutoscaleStatus {
+            blocks_roll: !stuck_rolls.is_empty(),
+        });
     }
     let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
     let nodes = crate::autoscale::K8sNodeOps {
@@ -208,8 +238,11 @@ async fn run_autoscale(
         &ctx.scaledown_ticks,
         &coord,
         &nodes,
-        pods,
-        roll_idle,
+        crate::autoscale::FleetObservation {
+            pods,
+            roll_idle,
+            stuck_rolls,
+        },
     )
     .await
 }
@@ -237,6 +270,7 @@ async fn roll_node(
     spec: &HostFleetSpec,
     node: &str,
     pod: &str,
+    recovery_key: &str,
 ) -> Result<(), OperatorError> {
     let host_id = HostId::from_node_name(node);
     let coord = CoordClient::new(spec.coordinator_url.clone(), coord_token());
@@ -274,20 +308,31 @@ async fn roll_node(
     // Gate on the successor being Ready on the target image BEFORE uncordoning
     // — keeping the host `draining` (dead-host-detector-exempt) through the
     // swap so the reattaching sessions are never struck out.
-    gate_successor_ready(
+    let successor = gate_successor_ready(
         client,
         spec,
         node,
         Duration::from_secs(spec.drain_timeout_seconds),
     )
-    .await?;
+    .await;
+    if let Err(e @ OperatorError::RollTimeout { .. }) = successor {
+        set_node_roll_stuck(client, node, Some(recovery_key)).await?;
+        tracing::warn!(
+            %node,
+            %host_id,
+            %recovery_key,
+            "successor gate timed out; marked roll stuck for surge + safe replacement"
+        );
+        return Err(e);
+    }
+    successor?;
 
     // The successor re-registered under the same stable HostId (GAP 1) and is
     // Ready; resume scheduling. Coordinator first — it's the load-bearing
     // cordon, and a crash between the two leaves a marked node convergence
     // re-releases (both calls are idempotent).
     coord.uncordon(host_id).await?;
-    set_node_roll_cordon(client, node, false).await?;
+    clear_node_roll_markers(client, node).await?;
     tracing::info!(%node, %host_id, "successor Ready + reattached; uncordoned");
     Ok(())
 }
@@ -540,6 +585,67 @@ async fn set_node_roll_cordon(client: &Client, node: &str, on: bool) -> Result<(
     Ok(())
 }
 
+fn roll_recovery_key(spec: &HostFleetSpec) -> &str {
+    spec.autoscaling
+        .as_ref()
+        .map(|a| a.node_pool.as_str())
+        .unwrap_or(spec.daemon_set.name.as_str())
+}
+
+async fn set_node_roll_stuck(
+    client: &Client,
+    node: &str,
+    recovery_key: Option<&str>,
+) -> Result<(), OperatorError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+    let value = recovery_key
+        .map(|key| serde_json::Value::String(key.to_string()))
+        .unwrap_or(serde_json::Value::Null);
+    let patch = serde_json::json!({
+        "metadata": { "annotations": { ROLL_STUCK_ANNOTATION: value } }
+    });
+    nodes
+        .patch(node, &PatchParams::default(), &Patch::Merge(patch))
+        .await?;
+    Ok(())
+}
+
+async fn list_roll_stuck_nodes(
+    client: &Client,
+    recovery_key: &str,
+) -> Result<Vec<String>, OperatorError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+    Ok(nodes
+        .list(&ListParams::default())
+        .await?
+        .into_iter()
+        .filter(|node| {
+            node.annotations()
+                .get(ROLL_STUCK_ANNOTATION)
+                .is_some_and(|value| value == recovery_key)
+        })
+        .map(|node| node.name_any())
+        .collect())
+}
+
+/// Release both durable image-roll markers and the K8s cordon in one patch.
+/// A recovered successor and a safely removed stuck node converge through the
+/// same cleanup, so neither can leave phantom unavailable-capacity debt.
+async fn clear_node_roll_markers(client: &Client, node: &str) -> Result<(), OperatorError> {
+    let nodes: Api<Node> = Api::all(client.clone());
+    let patch = serde_json::json!({
+        "metadata": { "annotations": {
+            ROLL_CORDON_ANNOTATION: serde_json::Value::Null,
+            ROLL_STUCK_ANNOTATION: serde_json::Value::Null,
+        }},
+        "spec": { "unschedulable": false },
+    });
+    nodes
+        .patch(node, &PatchParams::default(), &Patch::Merge(patch))
+        .await?;
+    Ok(())
+}
+
 /// The convergence rule (pure, unit-tested): a roll-cordoned node whose pod
 /// is Ready on BOTH target images has a *completed* roll — whoever cordoned
 /// it never uncordoned (the operator was replaced mid-roll, or the successor
@@ -593,7 +699,7 @@ async fn converge_roll_cordons(
             "releasing leaked roll-cordon: roll completed but its owner never uncordoned"
         );
         coord.uncordon(host_id).await?;
-        set_node_roll_cordon(client, node, false).await?;
+        clear_node_roll_markers(client, node).await?;
     }
     Ok(())
 }
