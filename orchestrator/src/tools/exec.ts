@@ -7,6 +7,7 @@ import { profile, task, taskSession } from "../db/schema.ts";
 import { log as rootLog } from "../log.ts";
 import {
   completeRegisteredToolCall,
+  isProtocolErrorResult,
   type ToolCallCompleter,
 } from "./complete.ts";
 import {
@@ -145,7 +146,9 @@ export async function executeToolCall(
     const parsedResult = tool.output.safeParse(rawResult);
     return {
       kind: "submit",
-      result: parsedResult.success
+      result: isProtocolErrorResult(rawResult)
+        ? rawResult
+        : parsedResult.success
         ? parsedResult.data
         : { error: `invalid result for tool ${tool.name}` },
     };

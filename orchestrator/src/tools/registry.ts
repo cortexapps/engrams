@@ -32,13 +32,22 @@ export interface ToolContext extends SessionToolContext {
   toolName: string;
 }
 
+/** The sole protocol-level exception to a handled tool's output schema. */
+export interface ToolProtocolError {
+  error: string;
+}
+
 export type ToolHandler<
   TInput extends z.ZodType = z.ZodType,
   TOutput extends z.ZodType = z.ZodType,
 > = (
   ctx: ToolContext,
   args: z.output<TInput>,
-) => Promise<z.input<TOutput> | void> | z.input<TOutput> | void;
+) =>
+  | Promise<z.input<TOutput> | ToolProtocolError | void>
+  | z.input<TOutput>
+  | ToolProtocolError
+  | void;
 
 interface ToolDefinitionBase<
   TInput extends z.ZodType,
