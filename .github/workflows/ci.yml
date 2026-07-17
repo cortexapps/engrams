@@ -2042,8 +2042,8 @@ jobs:
   # succeeded or was skipped, and fails on any `failure`/`cancelled`.
   # ADR 0098 D7: the deterministic-simulation swarm. Fixed seed ranges
   # (a CI failure is always locally reproducible: `just sim SEED=<n>`);
-  # the nightly/long-run variant comes later. Runs whenever the Rust
-  # lanes run — the sim's dep closure is the coordinator itself.
+  # the deep-horizon exploration arm is nightly-sim.yml. Runs whenever
+  # the Rust lanes run — the sim's dep closure is the coordinator itself.
   test-sim:
     name: simulation swarm (engram-dst)
     needs: detect
