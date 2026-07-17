@@ -164,6 +164,35 @@ fn snapshot(
     }
 }
 
+fn enabled_image(
+    uri: &str,
+    name: &str,
+    at: chrono::DateTime<chrono::Utc>,
+) -> engram_core::types::registry::EnabledImage {
+    engram_core::types::registry::EnabledImage {
+        id: uuid::Uuid::nil(),
+        image_uri: uri.to_string(),
+        image_config: engram_core::types::image::ImageConfig {
+            name: name.to_string(),
+            resources: engram_core::types::image::ResourceHints {
+                suggested_vcpus: Some(1),
+                ..Default::default()
+            },
+            ..Default::default()
+        },
+        oci_defaults: Default::default(),
+        manifest_digest: "sha256:conf".to_string(),
+        disk_manifest: None,
+        base_snapshot_id: None,
+        base_snapshot_disk_manifest: None,
+        base_snapshot_memory_manifest: None,
+        last_refreshed_at: at,
+        created_at: at,
+        updated_at: None,
+        soft_deleted_at: None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
@@ -587,9 +616,15 @@ async fn snapshot_durable_head(ctx: &Ctx) {
 async fn gc_candidates(ctx: &Ctx) {
     let meta = &ctx.meta;
     let h = [7u8; 32];
+    assert_eq!(meta.count_gc_candidates().await.unwrap(), 0);
     meta.upsert_chunk_gc_candidate(h).await.unwrap();
     ctx.clock.advance(Duration::from_secs(100));
     meta.upsert_chunk_gc_candidate(h).await.unwrap(); // sticky first_seen
+    assert_eq!(
+        meta.count_gc_candidates().await.unwrap(),
+        1,
+        "re-upsert of the same hash does not double-count"
+    );
 
     let now = ctx.clock.now_utc();
     // Cutoff after first_seen: expired (proves last_seen didn't reset it).
@@ -610,6 +645,11 @@ async fn gc_candidates(ctx: &Ctx) {
         .await
         .unwrap()
         .is_empty());
+    assert_eq!(
+        meta.count_gc_candidates().await.unwrap(),
+        0,
+        "delete drops the candidate from the count"
+    );
 }
 
 /// Host staleness: cordoned hosts get the 10x-lenient bar; dead is
@@ -835,7 +875,129 @@ async fn stale_pending_reservation(ctx: &Ctx) {
     );
 }
 
+/// ADR 0080 cheap-edit path (`update_enabled_image_config`): an in-place
+/// config replace on a LIVE row is visible via `get_enabled_image`;
+/// `updated_at` is stamped; an unknown uri and a soft-deleted row both
+/// surface `NotFound` (the `soft_deleted_at IS NULL` guard — editing a
+/// disabled image is a re-enable's job).
+async fn enabled_image_config_update(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let uri = "conf.local/img:warm";
+    let at = ctx.clock.now_utc();
+    meta.upsert_enabled_image(enabled_image(uri, "before", at))
+        .await
+        .unwrap();
+
+    // Unknown uri → NotFound.
+    let edited = enabled_image(uri, "after", at).image_config;
+    let err = meta
+        .update_enabled_image_config("conf.local/nope:warm", &edited)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::NotFound), "got {err:?}");
+
+    // Live row → in-place replace, visible through the live-only read.
+    ctx.clock.advance(Duration::from_secs(10));
+    meta.update_enabled_image_config(uri, &edited)
+        .await
+        .unwrap();
+    let row = meta
+        .get_enabled_image(uri)
+        .await
+        .unwrap()
+        .expect("row still enabled");
+    assert_eq!(row.image_config.name, "after", "config replaced in place");
+    assert!(row.updated_at.is_some(), "updated_at stamped on cheap edit");
+
+    // Soft-deleted row → NotFound (the UPDATE's soft_deleted_at guard
+    // matches 0 rows).
+    meta.soft_delete_enabled_image(uri).await.unwrap();
+    let err = meta
+        .update_enabled_image_config(uri, &edited)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, MetaError::NotFound),
+        "editing a disabled image must be NotFound: {err:?}"
+    );
+}
+
+/// The enable/capture read surface over a store with no such jobs:
+/// `live_enable_work_by_host` is the empty map, while `list_prestaging_refs`
+/// and `capture_assignments_for_host` are empty — and registering or
+/// heartbeating a host fabricates none of them. (The sim models no
+/// enable_jobs/capture_jobs table; a fresh PG DB has no such rows — both
+/// stores agree on the empty case, the only one conformance exercises.)
+async fn live_enable_work_empty(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    assert!(meta
+        .live_enable_work_by_host(Duration::from_secs(45))
+        .await
+        .unwrap()
+        .is_empty());
+    assert!(meta.list_prestaging_refs().await.unwrap().is_empty());
+    let host = HostId::new();
+    let now = ctx.clock.now_utc();
+    assert!(meta
+        .capture_assignments_for_host(host)
+        .await
+        .unwrap()
+        .is_empty());
+    meta.upsert_host(host_record(host, "conf-lew", now))
+        .await
+        .unwrap();
+    meta.touch_host_heartbeat(host, heartbeat_fixture())
+        .await
+        .unwrap();
+    assert!(
+        meta.live_enable_work_by_host(Duration::from_secs(45))
+            .await
+            .unwrap()
+            .is_empty(),
+        "a registered+heartbeating host with no jobs still has no live work"
+    );
+    assert!(
+        meta.list_prestaging_refs().await.unwrap().is_empty(),
+        "no enable jobs → nothing to prestage"
+    );
+    assert!(
+        meta.capture_assignments_for_host(host)
+            .await
+            .unwrap()
+            .is_empty(),
+        "no capture jobs → nothing assigned to the host"
+    );
+}
+
+/// `snapshot_totals`: fleet-wide count + Σ size_bytes over all snapshot
+/// rows. Empty store → zeros; recording rows advances both aggregates.
+async fn snapshot_totals_aggregate(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    assert_eq!(
+        meta.snapshot_totals().await.unwrap(),
+        engram_core::traits::SnapshotTotals::default(),
+        "empty store has zero snapshots"
+    );
+    let sid = meta.create_session(spec("conf:totals")).await.unwrap();
+    let now = ctx.clock.now_utc();
+    let mut s1 = snapshot(SnapshotId::new(), sid, now, true);
+    s1.size_bytes = 1000;
+    let mut s2 = snapshot(SnapshotId::new(), sid, now, true);
+    s2.size_bytes = 2500;
+    meta.record_snapshot(s1).await.unwrap();
+    meta.record_snapshot(s2).await.unwrap();
+    let totals = meta.snapshot_totals().await.unwrap();
+    assert_eq!(totals.count, 2);
+    assert_eq!(totals.total_bytes, 3500);
+}
+
 conformance!(t_placement_no_fit, super::placement_no_fit);
+conformance!(
+    t_enabled_image_config_update,
+    super::enabled_image_config_update
+);
+conformance!(t_live_enable_work_empty, super::live_enable_work_empty);
+conformance!(t_snapshot_totals, super::snapshot_totals_aggregate);
 conformance!(
     t_stale_pending_reservation,
     super::stale_pending_reservation
