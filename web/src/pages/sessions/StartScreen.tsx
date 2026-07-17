@@ -45,7 +45,7 @@ import {
 import { useAuth } from "../../auth/AuthProvider";
 import { useKeyboardUi } from "../../keyboard/store";
 import { MOD_LABEL } from "../../keyboard/platform";
-import { useEnterToSend } from "../../hooks/useEnterToSend";
+import { isSubmitKey, useEnterToSend } from "../../hooks/useEnterToSend";
 import { catalogToViews } from "../../components/integrations/useConnectorViews";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
 import { ProfileIcon } from "../../components/profiles/ProfileIcon";
@@ -224,14 +224,7 @@ export function StartScreen() {
   }, [windowHeight, profilesPending, profiles.length, recent.length]);
 
   const onComposerKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    const plainEnter =
-      e.key === "Enter" &&
-      !e.shiftKey &&
-      !e.metaKey &&
-      !e.ctrlKey &&
-      !e.altKey &&
-      !e.nativeEvent.isComposing;
-    if ((e.key === "Enter" && (e.metaKey || e.ctrlKey)) || (enterToSend && plainEnter)) {
+    if (isSubmitKey(e, enterToSend)) {
       e.preventDefault();
       void launch();
     }
