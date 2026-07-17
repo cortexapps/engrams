@@ -248,7 +248,9 @@ describe("SessionProfileEditor (edit)", () => {
     expect(screen.getByText("db-password")).toBeTruthy();
     expect(screen.getByDisplayValue("DB_PASSWORD")).toBeTruthy();
     expect(
-      screen.getByLabelText(/include the launching user's token/i).getAttribute("data-state"),
+      screen
+        .getByLabelText(/include the launching user's other saved tokens/i)
+        .getAttribute("data-state"),
     ).toBe("checked");
     fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
     await waitFor(() => expect(update).toHaveBeenCalledOnce());

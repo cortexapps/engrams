@@ -1075,12 +1075,13 @@ function Advanced({
         <Switch
           checked={includeUserTokens}
           onCheckedChange={setIncludeUserTokens}
-          aria-label="Include the launching user's token"
+          aria-label="Include the launching user's other saved tokens"
         />
         <div className="flex-1">
-          <div className="text-[0.84rem]">Include the launching user's token</div>
+          <div className="text-[0.84rem]">Include the launching user's other tokens</div>
           <div className="text-[0.74rem] text-muted-foreground">
-            Carries the developer's Claude token into the sandbox. Leave off for untrusted images.
+            The harness's own credential always rides along. This additionally carries the
+            developer's other saved tokens into the sandbox. Leave off for untrusted images.
           </div>
         </div>
       </div>

@@ -49,7 +49,10 @@ export interface ThreadControlPlaneDeps {
   images?: ImagesClient;
   connectors?: CustomConnectorSource;
   harnessCatalog?: HarnessCatalogClient;
-  secrets?: { get(userId: string, envVar: string): Promise<string | null> };
+  secrets?: {
+    get(userId: string, envVar: string): Promise<string | null>;
+    getAll(userId: string): Promise<Record<string, string>>;
+  };
   sessions?: ThreadSessionsClient;
   toolRegistry?: Pick<ToolRegistry, "complete">;
   resolveUser?: (provider: string, externalUserId: string) => Promise<string | null>;

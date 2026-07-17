@@ -1,6 +1,6 @@
 # ADR 0063: harness.toml descriptor + harness-derived env wiring
 
-Status: 2026-06-30 — **Accepted** (control-plane half shipped; see the commit chain in §Phasing).
+Status: 2026-06-30 — **Accepted** (amended 2026-07-17; see §4 and the commit chain in §Phasing).
 Builds on **ADR 0062** (per-session harness selection — the infra half + the harness catalog
 this ADR consumes), **ADR 0051** (the TypeScript orchestration tier — the coordinator stays
 harness-agnostic; the orchestrator owns harness-specific naming), **ADR 0053** (session
@@ -116,14 +116,15 @@ descriptor.default_*` for model/effort), validates against the catalog, and sets
 the "Claude Code for planning, OpenCode + small model for execution" UX: same profile, per-launch
 override.
 
-### 4. Credential injection — strict by run type
+### 4. Credential injection — strict by principal
 
 The descriptor's two credential slots map to engrams' two credential tiers, chosen **strictly by
-run type** (mutually exclusive, no cross-fallback):
+principal** (mutually exclusive, no cross-fallback):
 
-- **Human / interactive** (chat UI, `task.type === "chat"`): inject the user's token under
-  `user_env`. The user-token store (`user_session_secrets`) is **already keyed by `(userId,
-  envVarName)`** — multi-harness user tokens (a Claude OAuth token *and*, say, an OpenAI key) need
+- **Human principal** (chat UI or an external trigger resolved to a real user): require and inject
+  the user's token under `user_env`. The user-token store (`user_session_secrets`) is **already
+  keyed by `(userId, envVarName)`** — multi-harness user tokens (a Claude OAuth token *and*, say,
+  an OpenAI key) need
   **no new table**, only a non-hardcoded env-var name. Storage routes generalize from
   `/me/claude-token` to `/me/harness-tokens[/:harness]` (resolving `user_env` from the
   descriptor), with a thin `/me/claude-token` shim kept for one release so
@@ -149,15 +150,31 @@ on every surface (chat UI, Slack thread, …); only service-account creators
 (`ownerIsServiceAccount` → `programmatic`) take the `org_env` path. Cron remains programmatic by
 construction (service-account principal), so the original cron/CI behavior is unchanged.
 
+*Amended 2026-07-17*: declaring `user_env` makes that credential mandatory for a human run. The
+create is rejected before boot when the owner has not saved it; `include_user_tokens` now means
+"also carry my other saved credentials" and never gates the selected harness's own credential.
+The admin trust decision lives at harness registration/enablement: enabling a descriptor opts
+human sessions using that harness into automatic injection of its declared `user_env`.
+
+Harness auth names are principal-authoritative, not profile configuration. After all configurable
+env layers are merged, a human's per-user `user_env` is applied last and the selected harness's
+`org_env` is removed. For a programmatic principal, both auth names are removed from
+orchestrator-provided `harness_env`; `org_env` comes exclusively from the host-side org-secret
+policy. Thus profile/model/trigger env cannot supply or override either selected-harness
+credential, and the two credential tiers remain mutually exclusive.
+
 ### 5. Model + effort → env mapping
 
 After resolving the effective harness descriptor + model/effort ids, the compile path
 dict-merges `descriptor.model(id).env` and `descriptor.effort(id).env` into the harness-env map.
-**Precedence:** user-token / org-inject < CLI dummy < `profile.envVars` < **model env < effort
-env** < trigger extras — the explicit picker wins over any stale `ANTHROPIC_MODEL` left in a
-profile's `env_vars` (the migration intent; `EnvVarsEditor`'s "set the model here" hint is
-removed, since there is a model field now). The coordinator stays agnostic: one flat
-`harness_env`, injected verbatim and persisted for resume.
+**General-env precedence:** other carried user tokens < CLI dummy < `profile.envVars` < **model
+env < effort env** < git attribution < trigger extras — the explicit picker wins over any stale
+`ANTHROPIC_MODEL` left in a profile's `env_vars` (the migration intent; `EnvVarsEditor`'s "set the
+model here" hint is removed, since there is a model field now). The selected harness's auth names
+then follow §4's separate principal-authoritative rule: human `user_env` is applied last;
+programmatic `org_env` is resolved host-side and neither auth name may come from configurable
+`harness_env`. The coordinator stays harness-agnostic: it receives the resulting flat env plus the
+org-secret policy, and persists/resolves them through their existing paths.
 
 ### 6. Admin Harnesses tab
 

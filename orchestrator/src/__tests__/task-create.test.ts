@@ -81,11 +81,19 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
   }),
 });
 
-const deps = (token: string | null = null, images = [{ id: "img-1", imageUri: "uri-1" }]): SessionCompileDeps => ({
+// Default the user token to present ("tok") — a human (chat) run now BLOCKS when
+// the harness's declared user_env is unset, so tests exercising other
+// seams must have a token unless they specifically test the block.
+const deps = (
+  token: string | null = "tok",
+  images = [{ id: "img-1", imageUri: "uri-1" }],
+  allTokens: Record<string, string> = {},
+): SessionCompileDeps => ({
   images: { listEnabledImages: async () => ({ images }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
   harnessCatalog: fakeHarnessCatalog(),
   resolveUserToken: async () => token,
+  resolveAllUserTokens: async () => allTokens,
 });
 
 describe("truncatePrompt — default title from the prompt", () => {
@@ -154,11 +162,50 @@ describe("compileSessionCreateInput", () => {
     });
   });
 
-  test("user token injected only when includeUserTokens", async () => {
+  // The harness's declared user credential is MANDATORY for a human
+  // run — always injected, independent of includeUserTokens.
+  test("always injects the harness user_env for a human run, regardless of includeUserTokens", async () => {
     const off = await compileSessionCreateInput(profile({ includeUserTokens: false }), deps("tok"));
-    expect(off.harnessEnv?.[USER_ENV]).toBeUndefined();
+    expect(off.harnessEnv?.[USER_ENV]).toBe("tok");
     const on = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"));
     expect(on.harnessEnv?.[USER_ENV]).toBe("tok");
+  });
+
+  test("human auth is principal-authoritative over profile and trigger env values", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ envVars: { [USER_ENV]: "profile-token", [ORG_ENV]: "profile-org-token" } }),
+      deps("user-token"),
+      { extraHarnessEnv: { [USER_ENV]: "trigger-token", [ORG_ENV]: "trigger-org-token" } },
+    );
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("user-token");
+    expect(inp.harnessEnv?.[ORG_ENV]).toBeUndefined();
+  });
+
+  // Don't silently boot un-authed — block the create with the env-var
+  // name in the message (the client renders the descriptor's setup hint).
+  test("blocks a human run when the harness user credential is not set", async () => {
+    await expect(compileSessionCreateInput(profile(), deps(null))).rejects.toThrow(
+      /CLAUDE_CODE_OAUTH_TOKEN.*isn't set/s,
+    );
+  });
+
+  // includeUserTokens now means "also carry my OTHER saved tokens".
+  test("includeUserTokens additionally injects the user's OTHER saved tokens", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ includeUserTokens: true }),
+      deps("tok", undefined, { GH_TOKEN: "ghp", [USER_ENV]: "tok" }),
+    );
+    expect(inp.harnessEnv?.GH_TOKEN).toBe("ghp");
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
+  });
+
+  test("without includeUserTokens, other saved tokens are NOT injected (only the harness user_env)", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ includeUserTokens: false }),
+      deps("tok", undefined, { GH_TOKEN: "ghp" }),
+    );
+    expect(inp.harnessEnv?.GH_TOKEN).toBeUndefined();
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
   });
 
   test("injects the user token under the harness's declared user_env, not a hardcoded name", async () => {
@@ -175,6 +222,7 @@ describe("compileSessionCreateInput", () => {
         }),
       },
       resolveUserToken: async (envVar) => (envVar === "OPENCODE_TOKEN" ? "tok-123" : null),
+      resolveAllUserTokens: async () => ({}),
     };
     const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), customDeps);
     expect(inp.harnessEnv?.OPENCODE_TOKEN).toBe("tok-123");
@@ -199,10 +247,19 @@ describe("compileSessionCreateInput", () => {
     // A `ci-<repo>` API key has no per-user harness token — the programmatic
     // flag must pick the org-credential path or the harness boots
     // credential-less ("not logged in", session 47723225).
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      programmatic: true,
-    });
+    const inp = await compileSessionCreateInput(
+      profile({
+        includeUserTokens: true,
+        envVars: { [USER_ENV]: "profile-user-token", [ORG_ENV]: "profile-org-token" },
+      }),
+      deps("tok"),
+      {
+        programmatic: true,
+        extraHarnessEnv: { [USER_ENV]: "trigger-user-token", [ORG_ENV]: "trigger-org-token" },
+      },
+    );
     expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
+    expect(inp.harnessEnv?.[ORG_ENV]).toBeUndefined();
     const policy = JSON.parse(inp.integrationPolicyJson!) as {
       secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
     };
@@ -442,7 +499,8 @@ const createDeps = (
   connectors: { list: async () => [] },
   harnessCatalog: fakeHarnessCatalog(),
   sessions,
-  secrets: { get: async () => null },
+  // Token present by default so human (chat) creates don't hit the block.
+  secrets: { get: async () => "tok", getAll: async () => ({}) },
   db,
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
@@ -511,6 +569,20 @@ describe("createTaskWithSession", () => {
         profileId: "p1",
       }),
     ).rejects.toThrow(/not found or archived/);
+    expect(sessions.createReqs).toHaveLength(0);
+  });
+
+  // A human chat task with no user credential is blocked BEFORE any
+  // session is created (the block is in the compile step).
+  test("blocks a human chat task when the harness user credential is unset, creating no session", async () => {
+    const sessions = fakeSessions();
+    const deps: CreateTaskDeps = {
+      ...createDeps(sessions, recordingDb([])),
+      secrets: { get: async () => null, getAll: async () => ({}) },
+    };
+    await expect(
+      createTaskWithSession(deps, { type: "chat", ownerUserId: "u", profileId: "p1" }),
+    ).rejects.toThrow(/CLAUDE_CODE_OAUTH_TOKEN/);
     expect(sessions.createReqs).toHaveLength(0);
   });
 
