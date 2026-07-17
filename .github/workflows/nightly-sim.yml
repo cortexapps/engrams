@@ -25,6 +25,7 @@ on:
 
 permissions:
   contents: read
+  issues: write # failure auto-filing (the step below)
 
 concurrency:
   group: nightly-sim
@@ -67,6 +68,47 @@ jobs:
           echo "calm=${calm_start}..${calm_end}" >> "$GITHUB_OUTPUT"
           echo "UTC day ${day}: chaos seeds ${chaos_start}..${chaos_end}, calm seeds ${calm_start}..${calm_end}, 5000 steps"
       - name: chaos swarm (1200 seeds x 5000 steps)
-        run: cargo run -p engram-dst --release --bin sim -- --seeds ${{ steps.seeds.outputs.chaos }} --steps 5000 --profile chaos
+        run: cargo run -p engram-dst --release --bin sim -- --seeds ${{ steps.seeds.outputs.chaos }} --steps 5000 --profile chaos --failure-report "$RUNNER_TEMP/chaos-report.md"
       - name: calm swarm (400 seeds x 5000 steps)
-        run: cargo run -p engram-dst --release --bin sim -- --seeds ${{ steps.seeds.outputs.calm }} --steps 5000 --profile calm
+        # always() (minus cancellation): a chaos failure shouldn't hide
+        # whatever the calm window would have found the same night.
+        if: ${{ !cancelled() }}
+        run: cargo run -p engram-dst --release --bin sim -- --seeds ${{ steps.seeds.outputs.calm }} --steps 5000 --profile calm --failure-report "$RUNNER_TEMP/calm-report.md"
+      - name: File a failure issue with repro steps
+        # Turns the sim's --failure-report artifact (violation, pinned
+        # replay command, trace tail per failed seed) into a GitHub
+        # issue. Dedup: one open issue per invariant slug — repeat
+        # failures of the same invariant become comments on it, so a
+        # recurring bug accumulates seeds instead of spamming issues.
+        # A job failure WITHOUT a report file is an infra error (build
+        # break, runner death) — no issue; the workflow failure itself
+        # is the signal there.
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reports=""
+          for f in "$RUNNER_TEMP/chaos-report.md" "$RUNNER_TEMP/calm-report.md"; do
+            if [ -s "$f" ]; then
+              reports="${reports}$(cat "$f")"$'\n'
+            fi
+          done
+          if [ -z "$reports" ]; then
+            echo "job failed with no failure report — infra error, not filing an issue"
+            exit 0
+          fi
+          slug=$(printf '%s' "$reports" | sed -n 's/^<!-- sim-failure-slug: \(.*\) -->$/\1/p' | head -1)
+          slug=${slug:-invariant-violation}
+          title="nightly sim: \`${slug}\` violated"
+          body=$(printf '%s\n\n%s\n\n---\n_Run: %s • commit %s • fix flow: replay locally at this commit, fix, then pin the seed in `crates/engram-dst/tests/regression_seeds.rs` (ADR 0098)._\n' \
+            "**Commit:** \`${GITHUB_SHA}\` — replay commands below assume \`git checkout ${GITHUB_SHA}\`." \
+            "$reports" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "${GITHUB_SHA}")
+          existing=$(gh issue list --state open --label sim-failure --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "commenting on existing issue #$existing"
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label sim-failure --body "$body"
+          fi
