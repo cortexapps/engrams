@@ -1561,13 +1561,14 @@ jobs:
           - variant: suite
             two_hosts: ""
             expect_two_hosts: ""
-            # Excludes the two-host evacuation test (the `teleport` variant runs it).
-            # `e2e_claude_with_bogus_key…` is UN-quarantined (#403): the failure
-            # window began exactly when the floating `latest` CLI crossed to
-            # 2.1.187 (the release that broke headless behaviors, ADR 0054 /
-            # #431); the bake has since pinned 2.1.185 — the version the test
-            # was last green on — so the quarantine's cause is gone.
-            nextest_filter: "test(/e2e_/) - test(e2e_two_host_evacuate_preserves_sentinel)"
+            # Excludes the two-host evacuation test (the `teleport` variant runs it)
+            # and `e2e_claude_with_bogus_key…` — quarantined per #403. The
+            # CLI-version hypothesis is now RULED OUT: an un-quarantine attempt
+            # (2026-07-17, run 29557516643) timed out identically at 180s on the
+            # PINNED 2.1.185 — run_started never arrives after prompt delivery,
+            # so the fault is in the harness spawn/auth path, not a CLI message-
+            # shape drift. Fresh evidence on #403; re-add when actually fixed.
+            nextest_filter: "test(/e2e_/) - test(e2e_two_host_evacuate_preserves_sentinel) - test(e2e_claude_with_bogus_key_surfaces_anthropic_auth_error)"
           - variant: teleport
             two_hosts: "1"
             expect_two_hosts: "1"
