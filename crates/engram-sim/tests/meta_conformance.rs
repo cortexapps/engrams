@@ -236,6 +236,26 @@ async fn queue_fifo(ctx: &Ctx) {
     assert!(q
         .iter()
         .all(|r| matches!(r.origin, engram_core::types::session::QueueOrigin::Create)));
+
+    // The D4 finding, now guarded: a BARE transition_session(_, Queued)
+    // (FSM-legal from Pending) stamps the queue columns, so the fifo
+    // list decodes it instead of erroring on NULL queue_origin.
+    ctx.clock.advance(Duration::from_secs(5));
+    let c = meta.create_session(spec("conf:q")).await.unwrap();
+    meta.transition_session(c, SessionState::Queued)
+        .await
+        .unwrap();
+    let q = meta.list_queued_sessions_fifo().await.unwrap();
+    let ids: Vec<SessionId> = q.iter().map(|r| r.session.id).collect();
+    assert_eq!(ids, vec![a, b, c], "bare-transitioned session joins FIFO");
+    assert!(matches!(
+        q[2].origin,
+        engram_core::types::session::QueueOrigin::Create
+    ));
+    assert!(
+        q[1].queued_at < q[2].queued_at,
+        "queued_at stamped at flip time"
+    );
 }
 
 /// Dead-host lease: acquire, contest, claimant-guarded release, stale

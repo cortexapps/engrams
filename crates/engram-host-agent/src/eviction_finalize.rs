@@ -163,62 +163,25 @@ pub struct EvictionFinalizeRecord {
 }
 
 impl EvictionFinalizeRecord {
-    fn path_in(dir: &Path, id: SnapshotId) -> PathBuf {
-        dir.join(format!("{id}.json"))
-    }
-
-    /// Durably persist (write + fsync via rename) into `dir`.
+    /// Durably persist into `dir` via the shared [`crate::durable_record`]
+    /// engine (write `.partial` → fsync → rename → **fsync parent dir**).
+    /// This used to be a hand-rolled copy that OMITTED the parent-dir
+    /// fsync — a crash right after the rename could lose the directory
+    /// entry and silently drop a pending finalize (flagged in #707;
+    /// retired here per simplify-via-abstractions).
     pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        tokio::fs::create_dir_all(dir).await?;
-        let dest = Self::path_in(dir, self.snapshot_id);
-        let tmp = dest.with_extension("json.partial");
-        let bytes = serde_json::to_vec_pretty(self)
-            .map_err(|e| std::io::Error::other(format!("serialize finalize record: {e}")))?;
-        tokio::fs::write(&tmp, &bytes).await?;
-        let f = tokio::fs::OpenOptions::new().read(true).open(&tmp).await?;
-        f.sync_all().await?;
-        tokio::fs::rename(&tmp, &dest).await?;
-        Ok(())
+        crate::durable_record::persist(dir, self.snapshot_id, self, "eviction finalize record")
+            .await
     }
 
     /// All pending finalize records in `dir` — the host-agent startup
-    /// re-drive set. Unreadable/partial files are skipped with a warn —
-    /// a torn write must not wedge startup.
+    /// re-drive set. Torn-write tolerant via the shared engine.
     pub async fn load_all(dir: &Path) -> Vec<Self> {
-        let mut out = Vec::new();
-        let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
-            return out;
-        };
-        while let Ok(Some(entry)) = rd.next_entry().await {
-            let p = entry.path();
-            if !p.is_file() || p.extension().and_then(|e| e.to_str()) != Some("json") {
-                continue;
-            }
-            match tokio::fs::read(&p).await {
-                Ok(bytes) => match serde_json::from_slice::<Self>(&bytes) {
-                    Ok(r) => out.push(r),
-                    Err(e) => {
-                        tracing::warn!(path = %p.display(), error = %e,
-                            "unparseable eviction finalize record; skipping");
-                    }
-                },
-                Err(e) => {
-                    tracing::warn!(path = %p.display(), error = %e,
-                        "unreadable eviction finalize record; skipping");
-                }
-            }
-        }
-        out
+        crate::durable_record::load_all(dir, "eviction finalize record").await
     }
 
     async fn delete(dir: &Path, id: SnapshotId) {
-        let p = Self::path_in(dir, id);
-        if let Err(e) = tokio::fs::remove_file(&p).await {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(path = %p.display(), error = %e,
-                    "failed to delete completed eviction finalize record");
-            }
-        }
+        crate::durable_record::delete_acked(dir, [id], "eviction finalize record").await;
     }
 
     /// Terminal give-up: move the record to `finalize/failed/` (kept for

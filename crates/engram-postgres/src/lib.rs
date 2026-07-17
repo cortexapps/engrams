@@ -2164,6 +2164,15 @@ impl MetadataStore for PostgresStore {
         // clean. ADR 0034 mirrors this for Evicting/`evict_attempts`.
         // Folded into the same UPDATE that commits the state flip so
         // the counters and the state are always consistent.
+        //
+        // Entering Queued stamps the queue columns (ADR 0098 D4
+        // conformance finding): a bare `transition_session(_, Queued)`
+        // is FSM-legal but used to leave `queued_at`/`queue_origin`
+        // NULL, and `list_queued_sessions_fifo` then failed to DECODE
+        // the row — a scanner-breaking landmine for any future caller.
+        // `queued_at` re-stamps (a fresh enqueue moment is what FIFO
+        // wants); `queue_origin` keeps an existing origin and defaults
+        // to 'create' otherwise.
         sqlx::query(
             r#"
             UPDATE sessions
@@ -2171,7 +2180,11 @@ impl MetadataStore for PostgresStore {
                    last_active_at = $3,
                    updated_at = $3,
                    evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
-                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
+                   queued_at = CASE WHEN $2 = 'queued' THEN $3 ELSE queued_at END,
+                   queue_origin = CASE WHEN $2 = 'queued'
+                                  THEN COALESCE(queue_origin, 'create')
+                                  ELSE queue_origin END
              WHERE id = $1
             "#,
         )
@@ -6732,7 +6745,11 @@ impl MetadataStore for PostgresStore {
                    last_active_at = $4,
                    updated_at = $4,
                    evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
-                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
+                   queued_at = CASE WHEN $2 = 'queued' THEN $4 ELSE queued_at END,
+                   queue_origin = CASE WHEN $2 = 'queued'
+                                  THEN COALESCE(queue_origin, 'create')
+                                  ELSE queue_origin END
              WHERE id = $1 AND current_epoch = $3
             "#,
         )
