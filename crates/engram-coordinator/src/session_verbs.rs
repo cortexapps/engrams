@@ -939,6 +939,17 @@ async fn create_boot(ctx: &OpCtx<'_>) -> OpOutcome {
 /// the Failed flip frees the `pending` reservation).
 async fn create_boot_retry_or_fail(ctx: &OpCtx<'_>, reason: String) -> OpOutcome {
     if ctx.op.attempts < CREATE_BOOT_MAX_ATTEMPTS {
+        // Issue #722: an actively-retried pending must stay FRESH in
+        // placement's eyes — the crash-orphan exclusion writes a stale
+        // pending's reservation off the books, and if it later boots
+        // anyway the host is over-packed. Best-effort: a failed touch
+        // just means this attempt didn't refresh.
+        let _ = ctx
+            .state
+            .services
+            .meta
+            .touch_session_activity(ctx.op.session_id)
+            .await;
         return OpOutcome::Retry(reason);
     }
     let state = ctx.state;

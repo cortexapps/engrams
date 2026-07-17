@@ -257,6 +257,26 @@ impl Sim {
                             .await
                             .unwrap_or_default();
                         for sid in orphans {
+                            // Issue #722 mirror of the sweep: stale
+                            // orphans fail; only fresh ones revive.
+                            let stale = match state.services.meta.get_session(sid).await {
+                                Ok(s) => {
+                                    state.services.clock.now_utc() - s.last_active_at
+                                        > chrono::Duration::minutes(10)
+                                }
+                                Err(_) => false,
+                            };
+                            if stale {
+                                let _ = state
+                                    .services
+                                    .meta
+                                    .transition_session(
+                                        sid,
+                                        engram_core::types::session::SessionState::Failed,
+                                    )
+                                    .await;
+                                continue;
+                            }
                             let key = format!("boot-recover:{sid}");
                             let _ = engram_coordinator::session_ops::enqueue(
                                 &state,

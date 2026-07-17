@@ -2037,6 +2037,32 @@ jobs:
   # the merge queue. Instead this gate ALWAYS runs, depends on EVERY lane (Linux +
   # macOS + the e2e stack), and is the one required check: it passes iff each lane
   # succeeded or was skipped, and fails on any `failure`/`cancelled`.
+  # ADR 0098 D7: the deterministic-simulation swarm. Fixed seed ranges
+  # (a CI failure is always locally reproducible: `just sim SEED=<n>`);
+  # the nightly/long-run variant comes later. Runs whenever the Rust
+  # lanes run — the sim's dep closure is the coordinator itself.
+  test-sim:
+    name: simulation swarm (engram-dst)
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release-sim
+      - name: chaos swarm (200 seeds x 1500 steps)
+        run: cargo run -p engram-dst --release --bin sim -- --seeds 0..200 --steps 1500 --profile chaos
+      - name: calm swarm (100 seeds x 1500 steps)
+        run: cargo run -p engram-dst --release --bin sim -- --seeds 0..100 --steps 1500 --profile calm
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -2052,6 +2078,7 @@ jobs:
       - test-firecracker
       - vz
       - test-macos
+      - test-sim
       # The end-to-end coord lane + its upstream bake/artifact deps. Previously
       # omitted (e2e was non-required), which let a red e2e merge — now gated.
       - bake-harness-claude-artifact
