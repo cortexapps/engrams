@@ -4,7 +4,8 @@
 //!   - `codec_roundtrip.rs` (ADR 0099 §H3) — asserts encode→decode identity.
 //!
 //! Each consumer links a subset, so the module carries a narrow
-//! `allow(dead_code)`.
+//! `allow(dead_code)`. The `_exhaustiveness_*` guards below make a new enum
+//! variant a COMPILE error until a generator arm is added. NO wildcard arms.
 #![allow(dead_code)]
 
 use engram_migrate_proto::{ConnPurpose, FromSource, HandlerControl, SealBitmap, ToSource};
@@ -145,4 +146,47 @@ pub fn handler_control() -> impl Strategy<Value = HandlerControl> {
         (any::<u64>(), s())
             .prop_map(|(remaining, detail)| HandlerControl::PeerLost { remaining, detail }),
     ]
+}
+
+// ---- exhaustiveness guards ---------------------------------------------
+//
+// Never called; compiled only so the `match` is checked. A new enum variant
+// makes the match non-exhaustive → compile error → land here and add its arm
+// AND a generator arm to the matching strategy above. NO wildcard arms.
+
+fn _exhaustiveness_conn_purpose(p: &ConnPurpose) {
+    match p {
+        ConnPurpose::Fault => {}
+        ConnPurpose::Drain => {}
+    }
+}
+
+fn _exhaustiveness_to_source(m: &ToSource) {
+    match m {
+        ToSource::Hello { .. } => {}
+        ToSource::NeedAt { .. } => {}
+        ToSource::GetChunk { .. } => {}
+        ToSource::DrainDone { .. } => {}
+    }
+}
+
+fn _exhaustiveness_from_source(m: &FromSource) {
+    match m {
+        FromSource::HelloAck { .. } => {}
+        FromSource::Seal { .. } => {}
+        FromSource::Page { .. } => {}
+        FromSource::ZeroChunk { .. } => {}
+        FromSource::AltSource { .. } => {}
+        FromSource::ChunkBytes { .. } => {}
+        FromSource::Error { .. } => {}
+    }
+}
+
+fn _exhaustiveness_handler_control(m: &HandlerControl) {
+    match m {
+        HandlerControl::Sealed { .. } => {}
+        HandlerControl::DrainProgress { .. } => {}
+        HandlerControl::DrainDone { .. } => {}
+        HandlerControl::PeerLost { .. } => {}
+    }
 }

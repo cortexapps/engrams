@@ -6,6 +6,12 @@
 //! A single source of truth for "what a valid frame looks like" so the two
 //! suites never drift. Each consumer links a subset, so the module carries a
 //! narrow `allow(dead_code)` — this is a strategy *library*, not dead code.
+//!
+//! **New wire variant?** The `_exhaustiveness_*` guards below `match` over
+//! every enum with NO wildcard arm, so adding a variant is a COMPILE error
+//! here until you add a generator arm to the matching strategy. Do not add a
+//! `_ =>` arm to silence it — that reintroduces the silent-gap class this
+//! guards against (the BrowserActivity gap that motivated ADR 0099 H3 PR 2).
 #![allow(dead_code)]
 
 use engram_core::{SandboxId, SessionId};
@@ -129,6 +135,16 @@ pub fn harness_event() -> impl Strategy<Value = HarnessEvent> {
             }
         }),
         Just(HarnessEvent::Parked),
+        // PR #693: browser-driving shell tool call. Added here (and thereby to
+        // both the decode-mutation corpus and the round-trip identity suite)
+        // by ADR 0099 H3 PR 2 — the variant that motivated the guard below.
+        (s(), s(), s()).prop_map(|(run_id, tool_call_id, intent)| {
+            HarnessEvent::BrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+            }
+        }),
     ]
 }
 
@@ -250,4 +266,110 @@ pub fn relay_connect() -> impl Strategy<Value = RelayConnect> {
 
 pub fn relay_ack() -> impl Strategy<Value = RelayAck> {
     (any::<bool>(), opt_s()).prop_map(|(ok, error)| RelayAck { ok, error })
+}
+
+// ---- exhaustiveness guards ---------------------------------------------
+//
+// Never called; compiled only so the `match` is checked. A new enum variant
+// makes the match non-exhaustive → compile error → you land here and add the
+// corresponding generator arm above. NO wildcard arms.
+
+fn _exhaustiveness_harness_event(e: &HarnessEvent) {
+    match e {
+        HarnessEvent::RunStarted { .. } => {}
+        HarnessEvent::AgentMessage { .. } => {}
+        HarnessEvent::ToolCallStarted { .. } => {}
+        HarnessEvent::ToolCallCompleted { .. } => {}
+        HarnessEvent::RunCompleted { .. } => {}
+        HarnessEvent::RunInterrupted { .. } => {}
+        HarnessEvent::Idle => {}
+        HarnessEvent::PromptQueued { .. } => {}
+        HarnessEvent::PromptEdited { .. } => {}
+        HarnessEvent::PromptDequeued { .. } => {}
+        HarnessEvent::AgentMessageChunk { .. } => {}
+        HarnessEvent::FileChanged { .. } => {}
+        HarnessEvent::TitleSuggested { .. } => {}
+        HarnessEvent::PromptSteered { .. } => {}
+        HarnessEvent::ToolCallRequested { .. } => {}
+        HarnessEvent::Parked => {}
+        HarnessEvent::BrowserActivity { .. } => {}
+    }
+}
+
+fn _exhaustiveness_harness_command(c: &HarnessCommand) {
+    match c {
+        HarnessCommand::Checkpoint { .. } => {}
+        HarnessCommand::Shutdown { .. } => {}
+        HarnessCommand::Prompt { .. } => {}
+        HarnessCommand::Interrupt => {}
+        HarnessCommand::EditQueued { .. } => {}
+        HarnessCommand::DequeueQueued { .. } => {}
+        HarnessCommand::ToolResult { .. } => {}
+    }
+}
+
+fn _exhaustiveness_harness_frame(f: &HarnessFrame) {
+    match f {
+        HarnessFrame::Event(_) => {}
+        HarnessFrame::Command(_) => {}
+    }
+}
+
+fn _exhaustiveness_file_change(c: &FileChange) {
+    match c {
+        FileChange::Write { .. } => {}
+        FileChange::Edit { .. } => {}
+        FileChange::Patch { .. } => {}
+    }
+}
+
+fn _exhaustiveness_agent_role(r: &AgentRole) {
+    match r {
+        AgentRole::Assistant => {}
+        AgentRole::User => {}
+        AgentRole::System => {}
+    }
+}
+
+fn _exhaustiveness_checkpoint_reason(r: &CheckpointReason) {
+    match r {
+        CheckpointReason::Idle => {}
+        CheckpointReason::Preempt => {}
+        CheckpointReason::Manual => {}
+        CheckpointReason::RunCompleted => {}
+    }
+}
+
+fn _exhaustiveness_attach_reject(r: &AttachReject) {
+    match r {
+        AttachReject::UnknownBinding => {}
+        AttachReject::Superseded => {}
+        AttachReject::SessionMismatch => {}
+    }
+}
+
+fn _exhaustiveness_forge_op(o: &ForgeOp) {
+    match o {
+        ForgeOp::FetchCredential { .. } => {}
+    }
+}
+
+fn _exhaustiveness_forge_response(r: &ForgeResponse) {
+    match r {
+        ForgeResponse::Credential { .. } => {}
+        ForgeResponse::Error { .. } => {}
+    }
+}
+
+fn _exhaustiveness_upload_op(o: &UploadOp) {
+    match o {
+        UploadOp::ShareFile { .. } => {}
+    }
+}
+
+fn _exhaustiveness_upload_response(r: &UploadResponse) {
+    match r {
+        UploadResponse::Shared { .. } => {}
+        UploadResponse::Error { .. } => {}
+    }
 }

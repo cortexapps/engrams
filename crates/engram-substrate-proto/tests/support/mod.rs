@@ -4,7 +4,8 @@
 //!   - `codec_roundtrip.rs` (ADR 0099 §H3) — asserts encode→decode identity.
 //!
 //! Each consumer links a subset, so the module carries a narrow
-//! `allow(dead_code)`.
+//! `allow(dead_code)`. The `_exhaustiveness_*` guards below make a new enum
+//! variant a COMPILE error until a generator arm is added. NO wildcard arms.
 #![allow(dead_code)]
 
 use engram_core::types::manifest::ManifestRef;
@@ -48,4 +49,25 @@ pub fn from_writer() -> impl Strategy<Value = FromWriter> {
         any::<u64>().prop_map(|len| FromWriter::Populated { len }),
         "[ -~]{0,16}".prop_map(|msg| FromWriter::PopulateErr { msg }),
     ]
+}
+
+// ---- exhaustiveness guards ---------------------------------------------
+//
+// Never called; compiled only so the `match` is checked. A new enum variant
+// makes the match non-exhaustive → compile error → land here and add its arm
+// AND a generator arm to the matching strategy above. NO wildcard arms.
+
+fn _exhaustiveness_to_writer(m: &ToWriter) {
+    match m {
+        ToWriter::Hello { .. } => {}
+        ToWriter::Populate { .. } => {}
+    }
+}
+
+fn _exhaustiveness_from_writer(m: &FromWriter) {
+    match m {
+        FromWriter::HelloAck { .. } => {}
+        FromWriter::Populated { .. } => {}
+        FromWriter::PopulateErr { .. } => {}
+    }
 }

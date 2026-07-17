@@ -5,6 +5,12 @@
 //!
 //! Each consumer links a subset, so the module carries a narrow
 //! `allow(dead_code)` — this is a strategy *library*, not dead code.
+//!
+//! **New wire variant?** The `_exhaustiveness_*` guards below `match` over
+//! every enum with NO wildcard arm, so adding a variant is a COMPILE error
+//! here until you add a generator arm to the matching strategy. Both
+//! `WireRequest`/`WireResponse` are documented APPEND-ONLY — the guard makes
+//! "appended but not generated" fail the build rather than silently skip.
 #![allow(dead_code)]
 
 use std::collections::HashMap;
@@ -176,4 +182,60 @@ pub fn wire_stat_response() -> impl Strategy<Value = WireStatResponse> {
 
 pub fn wire_download_response() -> impl Strategy<Value = WireDownloadResponse> {
     small_bytes().prop_map(|bytes| WireDownloadResponse { bytes })
+}
+
+// ---- exhaustiveness guards ---------------------------------------------
+//
+// Never called; compiled only so the `match` is checked. A new enum variant
+// makes the match non-exhaustive → compile error → add the matching generator
+// arm above. NO wildcard arms.
+
+fn _exhaustiveness_wire_request(r: &WireRequest) {
+    match r {
+        WireRequest::Exec(_) => {}
+        WireRequest::Stat { .. } => {}
+        WireRequest::Upload { .. } => {}
+        WireRequest::Download { .. } => {}
+        WireRequest::Ping => {}
+        WireRequest::Shutdown => {}
+        WireRequest::GuestIp => {}
+        WireRequest::StartShell { .. } => {}
+        WireRequest::SpawnHarness(_) => {}
+        WireRequest::Sync => {}
+        WireRequest::StartBrowser { .. } => {}
+        WireRequest::StopBrowser => {}
+        WireRequest::RefreshAgent => {}
+        WireRequest::StartIde { .. } => {}
+        WireRequest::StopIde => {}
+        WireRequest::StepClock { .. } => {}
+    }
+}
+
+fn _exhaustiveness_wire_response(r: &WireResponse) {
+    match r {
+        WireResponse::Stat(_) => {}
+        WireResponse::UploadOk => {}
+        WireResponse::Download(_) => {}
+        WireResponse::Pong => {}
+        WireResponse::ShutdownAck => {}
+        WireResponse::GuestIp(_) => {}
+        WireResponse::ShellReady { .. } => {}
+        WireResponse::HarnessSpawned { .. } => {}
+        WireResponse::Error { .. } => {}
+        WireResponse::Synced => {}
+        WireResponse::BrowserReady { .. } => {}
+        WireResponse::BrowserStopped => {}
+        WireResponse::AgentRefreshed { .. } => {}
+        WireResponse::IdeReady { .. } => {}
+        WireResponse::IdeStopped => {}
+        WireResponse::ClockStepped { .. } => {}
+    }
+}
+
+fn _exhaustiveness_wire_exec_event(e: &WireExecEvent) {
+    match e {
+        WireExecEvent::Stdout(_) => {}
+        WireExecEvent::Stderr(_) => {}
+        WireExecEvent::Exit(_) => {}
+    }
 }
