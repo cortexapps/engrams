@@ -189,6 +189,75 @@ fn device_is_free(slot: u32) -> bool {
 /// tests so the allocator is exercisable off-Linux).
 type FreeCheck = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 
+/// The explicit lifecycle of one `/dev/nbdN` slot (ADR 0098 Phase 2, P7).
+///
+/// The allocator tracks a slot's state IMPLICITLY across three
+/// representations — the `reserved` bitset, the `warm` queue, and possession
+/// of an [`NbdSlot`] handle (+ its `quarantined` flag). The allocator is
+/// already portable and tested, so this enum + transition table do NOT rewire
+/// it; they make the implicit FSM auditable (the slot-accounting oracle in the
+/// host-internal simulator asserts against these states):
+///
+/// | State | Implicit representation |
+/// |---|---|
+/// | [`Free`](SlotState::Free) | `reserved == false`, not in the warm queue |
+/// | [`Warm`](SlotState::Warm) | `reserved == true`, present in the warm queue (validated, ready) |
+/// | [`Claimed`](SlotState::Claimed) | `reserved == true`, not warm, a live [`NbdSlot`] handle exists |
+/// | [`Parked`](SlotState::Parked) | `reserved == true`, not warm, a `quarantine()`d handle dropped (bit never cleared) |
+///
+/// The populator's transient validation window — `reserved == true` but
+/// neither warm nor leased, between `Inner::reserve_next` and `unreserve` — is
+/// deliberately NOT a distinct state: it is a `Free` slot mid-transition to
+/// `Warm` (or back to `Free`), and [`NbdSlotAllocator::claim`]'s retry loop
+/// exists solely to survive it (a survivor grab treats
+/// "reserved-but-not-warm-and-no-lease" as retryable, never terminal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SlotState {
+    /// Not reserved, not warm — available for the populator or a direct claim.
+    Free,
+    /// Reserved and validated, waiting in the warm queue for an `acquire`.
+    Warm,
+    /// Reserved and leased out (a live `NbdSlot` handle is serving a sandbox).
+    Claimed,
+    /// Reserved and quarantined (a survivor whose rehydrate failed) — held out
+    /// of circulation until the evict_local → resume ladder recovers it.
+    Parked,
+}
+
+impl SlotState {
+    /// Every state (exhaustiveness guard: a new variant is a compile error at
+    /// the array literal and forces a decision in [`Self::can_transition_to`]).
+    pub const ALL: [SlotState; 4] = [
+        SlotState::Free,
+        SlotState::Warm,
+        SlotState::Claimed,
+        SlotState::Parked,
+    ];
+
+    /// Whether the allocator can move a slot `self → to`. The legal edges,
+    /// each mapped to the concrete allocator action:
+    ///
+    /// - `Free → Warm` — the populator validates a free slot and warms it.
+    /// - `Free → Claimed` — `claim`/`try_claim` reserves a free device
+    ///   directly (survivor grab / sweep), skipping the warm queue.
+    /// - `Warm → Claimed` — `acquire`/`claim` pulls a validated slot out of
+    ///   the warm queue.
+    /// - `Claimed → Free` — the lease drops normally (`release` clears the
+    ///   reserved bit).
+    /// - `Claimed → Parked` — the lease is `quarantine()`d (bit stays set).
+    ///
+    /// [`Parked`](SlotState::Parked) is terminal: only a process restart
+    /// clears the reserved bit. `Warm → Free` never happens (the populator
+    /// never un-warms a validated slot; it only advances to `Claimed`).
+    pub fn can_transition_to(self, to: SlotState) -> bool {
+        use SlotState::{Claimed, Free, Parked, Warm};
+        matches!(
+            (self, to),
+            (Free, Warm) | (Free, Claimed) | (Warm, Claimed) | (Claimed, Free) | (Claimed, Parked)
+        )
+    }
+}
+
 /// Lease handle for one `/dev/nbdN` slot. Auto-returns the slot to the
 /// allocator on `Drop` — a sandbox holds one for the lifetime of its
 /// NBD daemon, and the lease's drop releases the slot back into the
@@ -700,6 +769,43 @@ mod tests {
     use super::*;
     use std::collections::HashSet;
     use std::time::Duration;
+
+    /// ADR 0098 P7: the auditable slot FSM. The legal edges match the
+    /// allocator's concrete actions; `Parked` is terminal, and `Warm → Free`
+    /// (a populator un-warming a validated slot) is never legal.
+    #[test]
+    fn slot_state_transition_table_matches_the_allocator() {
+        use SlotState::{Claimed, Free, Parked, Warm};
+        let legal = [
+            (Free, Warm),      // populator warms
+            (Free, Claimed),   // direct claim / try_claim on a free device
+            (Warm, Claimed),   // acquire pulls from the warm queue
+            (Claimed, Free),   // normal lease drop → release
+            (Claimed, Parked), // quarantine() a survivor's device
+        ];
+        for from in SlotState::ALL {
+            for to in SlotState::ALL {
+                let expect = legal.contains(&(from, to));
+                assert_eq!(
+                    from.can_transition_to(to),
+                    expect,
+                    "unexpected verdict for {from:?} → {to:?}",
+                );
+            }
+        }
+        // Parked is terminal — no out-edge (only a process restart clears it).
+        assert!(
+            SlotState::ALL
+                .iter()
+                .all(|to| !Parked.can_transition_to(*to)),
+            "Parked must be terminal",
+        );
+        // A warm slot never regresses to Free.
+        assert!(
+            !Warm.can_transition_to(Free),
+            "the populator never un-warms"
+        );
+    }
 
     /// Build a test pool over `0..n` with an injectable busy-set so the
     /// allocator is exercisable off-Linux (no real `/sys`).

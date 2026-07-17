@@ -50,9 +50,12 @@ use tokio::net::UnixStream as TokioUnixStream;
 use tokio::sync::{mpsc, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinHandle as TokioJoinHandle;
 
+use engram_host_core::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
+
 use super::backend::{ChunkedDiskBackend, DiskBackendError, InFlightGuard};
 use super::nbd::{NbdCommand, NbdReply, NbdRequest, REPLY_HEADER_LEN, REQUEST_HEADER_LEN};
-use super::nbd_netlink::{self, NbdNetlinkParams};
+use super::nbd_kernel::HostNbdKernel;
+use super::nbd_netlink;
 use super::slot::{NbdSlot, NbdSlotAllocator};
 
 /// Block size the daemon hard-pins. 4096 matches the kernel's
@@ -387,26 +390,29 @@ fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOut
     //     free-paths snapshot; pre-this-fix the sweep killed its rootfs).
     //   - pid alive but not ours → some other live owner; not stale.
     // Only a dead pid (kill(pid,0) == ESRCH) is a genuine stale binding.
-    if let Ok(pid) = bound_pid.parse::<i32>() {
-        let self_pid = std::process::id() as i32;
-        if pid == self_pid {
+    // The verdict itself is the pure `sweep_verdict` (ADR 0098 P7,
+    // `engram_host_core::reattach`) — the simulator drives the same core in
+    // the 731df805 scenario (a live parked survivor must never be swept). A
+    // non-empty-but-unparseable pid is treated as `Dead` (stale), preserving
+    // the pre-extraction fall-through.
+    let self_pid = std::process::id() as i32;
+    let liveness = match bound_pid.parse::<i32>() {
+        Ok(pid) if pid == self_pid => engram_host_core::PidLiveness::SelfPid,
+        Ok(pid) if pid_is_alive(pid) => engram_host_core::PidLiveness::Alive,
+        Ok(_) | Err(_) => engram_host_core::PidLiveness::Dead,
+    };
+    match engram_host_core::sweep_verdict(liveness) {
+        engram_host_core::SweepAction::NotStuck => {
             tracing::info!(
                 device = %path.display(),
                 bound_pid = %bound_pid,
-                "NBD recovery: skipping — device is bound by THIS host-agent process \
-                 (a live session that claimed it after the sweep snapshot); not stale",
+                ?liveness,
+                "NBD recovery: skipping — the device's owner is live (or this very \
+                 generation); not a stale binding (would be wrong to disconnect)",
             );
             return Ok(NbdRecoveryOutcome::NotStuck);
         }
-        if pid_is_alive(pid) {
-            tracing::info!(
-                device = %path.display(),
-                bound_pid = %bound_pid,
-                "NBD recovery: skipping — bound pid is still a live process; not a \
-                 stale binding (would be wrong to disconnect a live owner)",
-            );
-            return Ok(NbdRecoveryOutcome::NotStuck);
-        }
+        engram_host_core::SweepAction::Disconnect => {}
     }
 
     tracing::warn!(
@@ -659,23 +665,40 @@ pub async fn reattach_manifest(
     // informational. Fall back to the ref's manifest id only when sysfs
     // has no record (never netlink-configured — the RECONFIGURE will fail
     // regardless, with the right error).
-    let backend_id = match kernel_backend_identifier(slot.path()) {
-        Some(kernel_id) => kernel_id,
-        None => {
-            tracing::warn!(
-                device = %slot.path().display(),
-                "no kernel-recorded NBD backend identifier; falling back to the \
-                 rehydrate ref's manifest id",
-            );
-            disk_manifest_ref.manifest_id.to_string()
-        }
-    };
+    // The pure Flow B plan (ADR 0098 P7, `engram_host_core::reattach`):
+    // resolve the RECONFIGURE backend identifier (echo the kernel's own
+    // recorded value via the seam, else fall back to the ref's manifest id)
+    // and lay out the seed-then-RECONFIGURE ordering as explicit steps.
+    let kernel = HostNbdKernel;
+    let plan = engram_host_core::plan_reattach(
+        disk_manifest_ref.manifest_id,
+        kernel.backend_identifier(slot.path()),
+        seed_dirty.is_some(),
+    );
+    if plan.used_identifier_fallback {
+        tracing::warn!(
+            device = %slot.path().display(),
+            "no kernel-recorded NBD backend identifier; falling back to the \
+             rehydrate ref's manifest id",
+        );
+    }
+    // The adopt-before-RECONFIGURE ordering is a plan property; assert it so a
+    // future reorder trips loudly rather than reintroducing the 2026-07-16
+    // rolled-back-base read window.
+    debug_assert!(plan.seed_precedes_reconfigure());
     let backend =
         match ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await
         {
             Ok(b) => Arc::new(b),
             Err(e) => return Err((slot, e.into())),
         };
+    // Verify-on-read probe target (ADR 0098 P7 rider): the first seeded chunk,
+    // captured BEFORE `adopt_unflushed` consumes the seed vec. `None` unless a
+    // spool was adopted, so a clean rehydrate pays nothing.
+    let probe: Option<(usize, Vec<u8>)> = seed_dirty
+        .as_deref()
+        .and_then(engram_host_core::first_seeded_probe)
+        .map(|(idx, bytes)| (idx, bytes.to_vec()));
     if let Some(chunks) = seed_dirty {
         let count = chunks.len();
         let bytes = backend.adopt_unflushed(chunks).await;
@@ -687,26 +710,49 @@ pub async fn reattach_manifest(
              ahead of RECONFIGURE",
         );
     }
-    let handle = match reattach(backend.clone(), slot.path(), &backend_id).await {
+    let handle = match reattach(backend.clone(), slot.path(), &plan.backend_id).await {
         Ok(h) => h,
         Err(e) => return Err((slot, e)),
     };
+    // Verify-on-read rider (ADR 0098 P7): only when a spool was adopted, prove
+    // the seeded acked bytes are readable at their offset after RECONFIGURE —
+    // a single-chunk probe through the backend (an in-RAM dirty-tier read),
+    // NOT a full-disk scan (latency is non-negotiable). A mismatch/read-error
+    // means the rehydrate would serve the wrong bytes; return the slot for
+    // park rather than hand FC a silently-corrupt disk. The device-plane
+    // O_DIRECT check is the FC regression lane's job.
+    if let Some((idx, expected)) = probe {
+        let chunk_size = backend.chunk_size();
+        let offset = idx as u64 * chunk_size;
+        match backend.read(offset, chunk_size).await {
+            Ok(bytes) if engram_host_core::probe_matches(&bytes, &expected) => {}
+            Ok(_) => {
+                let device = slot.path().display().to_string();
+                return Err((
+                    slot,
+                    NbdRuntimeError::Io(io::Error::other(format!(
+                        "verify-on-read: {device} served chunk {idx} did not match the seeded \
+                         acked bytes after RECONFIGURE (rolled-back base?)"
+                    ))),
+                ));
+            }
+            Err(e) => {
+                let device = slot.path().display().to_string();
+                return Err((
+                    slot,
+                    NbdRuntimeError::Io(io::Error::other(format!(
+                        "verify-on-read: {device} chunk {idx} readback failed after RECONFIGURE: {e}"
+                    ))),
+                ));
+            }
+        }
+    }
     Ok(NbdSandboxState {
         scheduler: None,
         backend,
         handle,
         slot,
     })
-}
-
-/// The identifier the kernel recorded at CONNECT time —
-/// `/sys/block/nbdN/backend`. `None` when the attr is missing/unreadable
-/// (device never netlink-configured, or pre-identifier kernel).
-fn kernel_backend_identifier(nbd_device: &Path) -> Option<String> {
-    let name = nbd_device.file_name()?.to_str()?;
-    let raw = std::fs::read_to_string(format!("/sys/block/{name}/backend")).ok()?;
-    let id = raw.trim();
-    (!id.is_empty()).then(|| id.to_string())
 }
 
 async fn attach_backend(
@@ -781,7 +827,14 @@ pub async fn spawn(
     nbd_device: &Path,
     backend_id: &str,
 ) -> Result<NbdHandle, NbdRuntimeError> {
-    serve_at(backend, nbd_device, backend_id, ConnectMode::Connect).await
+    serve_at(
+        backend,
+        nbd_device,
+        backend_id,
+        ConnectMode::Connect,
+        &HostNbdKernel,
+    )
+    .await
 }
 
 /// Hand the kernel a NEW serve socket for a device it already has
@@ -817,6 +870,7 @@ pub async fn reattach(
             nbd_device,
             backend_id,
             ConnectMode::Reconfigure,
+            &HostNbdKernel,
         )
         .await?;
         // An adopted socket stays open (the kernel holds its dup); a
@@ -885,6 +939,11 @@ async fn serve_at(
     nbd_device: &Path,
     backend_id: &str,
     mode: ConnectMode,
+    // ADR 0098 P7 (Flow B): the kernel control plane behind the seam. Prod
+    // passes `&HostNbdKernel`; the CONNECT/RECONFIGURE genl round-trips run on
+    // `spawn_blocking` inside the impl. serve_at owns the socketpair lifetime
+    // (below), so it stays the choke point for the serve loop.
+    kernel: &dyn NbdKernel,
 ) -> Result<NbdHandle, NbdRuntimeError> {
     let total_bytes = backend.total_bytes();
     if !total_bytes.is_multiple_of(NBD_BLOCK_SIZE) {
@@ -901,33 +960,39 @@ async fn serve_at(
     //    stays in-process as a Tokio stream.
     let (kernel_side, server_side) = unix_socketpair()?;
 
-    // 2. Configure (or re-arm) the device via netlink. The kernel
-    //    dups the socket fd, runs its own receive machinery (no
-    //    NBD_DO_IT thread), and parks guest I/O for
-    //    `dead_conn_timeout` whenever the connection dies — the
-    //    pod-roll survival contract. The genl round-trips are
-    //    blocking syscalls with a bounded recv timeout; run them off
-    //    the async workers.
-    let params_fd = kernel_side.as_raw_fd();
-    let backend_id_owned = backend_id.to_string();
-    let connect = tokio::task::spawn_blocking(move || {
-        let params = NbdNetlinkParams {
-            index,
-            sock_fd: params_fd,
-            timeout_secs: nbd_kernel_timeout_secs(),
-            dead_conn_timeout_secs: nbd_dead_conn_timeout_secs(),
-            backend_identifier: &backend_id_owned,
-        };
-        match mode {
-            ConnectMode::Connect => {
-                nbd_netlink::connect_device(&params, total_bytes, NBD_BLOCK_SIZE)
-            }
-            ConnectMode::Reconfigure => nbd_netlink::reconfigure_device(&params),
+    // 2. Configure (or re-arm) the device through the kernel seam. The
+    //    kernel dups the socket fd, runs its own receive machinery (no
+    //    NBD_DO_IT thread), and parks guest I/O for `dead_conn_timeout`
+    //    whenever the connection dies — the pod-roll survival contract. The
+    //    serve fd is the kernel-side half, alive across the await because
+    //    serve_at owns it until `drop(kernel_side)` below.
+    let serve_fd = kernel_side.as_raw_fd();
+    match mode {
+        ConnectMode::Connect => {
+            kernel
+                .connect(NbdConnectRequest {
+                    device: nbd_device,
+                    serve_fd,
+                    size_bytes: total_bytes,
+                    block_size: NBD_BLOCK_SIZE,
+                    timeout_secs: nbd_kernel_timeout_secs(),
+                    dead_conn_timeout_secs: nbd_dead_conn_timeout_secs(),
+                    backend_identifier: backend_id,
+                })
+                .await?;
         }
-    })
-    .await
-    .map_err(io::Error::other)?;
-    connect?;
+        ConnectMode::Reconfigure => {
+            kernel
+                .reconfigure(NbdReconfigureRequest {
+                    device: nbd_device,
+                    serve_fd,
+                    timeout_secs: nbd_kernel_timeout_secs(),
+                    dead_conn_timeout_secs: nbd_dead_conn_timeout_secs(),
+                    backend_identifier: backend_id,
+                })
+                .await?;
+        }
+    }
     // The kernel holds its own reference now.
     drop(kernel_side);
 

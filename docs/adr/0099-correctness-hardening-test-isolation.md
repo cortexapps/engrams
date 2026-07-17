@@ -280,6 +280,15 @@ the `soft_invariant` field). Per-site dispositions:
 6. **Added** — `SessionState::terminal_target`'s debug-assert upgraded to
    `invariant!` (cold forced-termination path; now `#[track_caller]` and fires
    in prod).
+7. **Added** (`soft_invariant!`, ADR 0098 P7) — `PooledBackend::resume` (the
+   un-pause data-plane gate) fires when a rung-cancel resume would un-pause a
+   guest onto a rootfs NBD device this host-agent generation does not serve
+   (`rootfs_device().is_some()` yet the sandbox is absent from `nbd_sandboxes`).
+   The 731df805 dead-plane class: a rung-parked survivor's device was
+   disconnected by the stale-binding sweep and an un-pause landed on it. The
+   handler proceeds to route the caller into the `evict_local → resume` ladder
+   (an explicit early-return; the macro only adds the alertable line), so a
+   future listing-bug recurrence can never serve dead-plane reads.
 
 ### H7 / H8 — Dispositions for the known flaky tests
 
