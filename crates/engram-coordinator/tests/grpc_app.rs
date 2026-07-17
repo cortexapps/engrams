@@ -163,6 +163,37 @@ fn bearer(
 /// `suggested_vcpus` is set because `ImageConfig::validate` requires it
 /// (ADR 0048), so an UpdateImage that round-trips this config validates
 /// AND diffs clean against the row (no phantom `resources` change).
+/// Stage `enabled_image(uri)` faithfully: `enabled_images.base_snapshot_id`
+/// is NOT NULL + FK to `snapshots` in PG (migration 0038) and SimMeta
+/// asserts it — record the session-less template base snapshot first
+/// (migration 0028), exactly as the enable pipeline does.
+async fn stage_enabled_image(meta: &dyn MetadataStore, uri: &str) {
+    let now = Utc::now();
+    let base_id = engram_core::SnapshotId::new();
+    meta.record_snapshot(engram_core::types::snapshot::SnapshotRecord {
+        id: base_id,
+        session_id: None,
+        host_id: None,
+        image_version: format!("{uri}#base"),
+        size_bytes: 0,
+        created_at: now,
+        last_accessed_at: now,
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable: true,
+        aux_bundles: Vec::new(),
+        events_cursor: None,
+        fc_snapshot_version: None,
+    })
+    .await
+    .expect("stage template base snapshot");
+    let mut img = enabled_image(uri);
+    img.base_snapshot_id = Some(base_id);
+    meta.upsert_enabled_image(img)
+        .await
+        .expect("seed enabled image");
+}
+
 fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
     let now = Utc::now();
     engram_core::types::EnabledImage {
@@ -759,9 +790,7 @@ async fn image_list_enabled_images_reflects_store() {
     }
 
     // Seed an enabled image and assert it surfaces over gRPC.
-    meta.upsert_enabled_image(enabled_image("localhost:5001/demo:warm"))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), "localhost:5001/demo:warm").await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;
@@ -824,9 +853,7 @@ fn update_request(config: app::ImageConfig, allow_recapture: bool) -> app::Updat
 #[tokio::test]
 async fn image_update_cheap_edit_applies_in_place_without_job() {
     let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
-    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), UPDATE_URI).await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;
@@ -877,9 +904,7 @@ async fn image_update_cheap_edit_applies_in_place_without_job() {
 #[tokio::test]
 async fn image_update_capture_affecting_diff_requires_allow_recapture() {
     let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
-    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), UPDATE_URI).await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;
@@ -971,9 +996,7 @@ async fn image_update_unknown_uri_is_not_found() {
 #[tokio::test]
 async fn image_update_invalid_config_is_invalid_argument() {
     let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
-    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), UPDATE_URI).await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;
