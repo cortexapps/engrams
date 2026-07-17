@@ -230,6 +230,12 @@ pub struct SandboxSlot {
     /// Rung-2 parked (evicting-shaped: FC paused, VM resident). The 731df805
     /// class was a parked survivor whose device the sweep disconnected.
     pub parked: bool,
+    /// ADR 0098 G2: the slot's last completed finalize published NO disk
+    /// manifest — a poisoned lineage (only reachable via the pre-#743
+    /// silent-skip capture the G2 seeds reproduce). A resume of this
+    /// snapshot has no manifest to attach; the sidecar still names the
+    /// capture-time literal device.
+    pub poisoned_snapshot: bool,
 }
 
 impl SandboxSlot {
@@ -237,6 +243,37 @@ impl SandboxSlot {
     pub fn rebuild_ref(&self) -> ManifestRef {
         self.published_ref.unwrap_or(self.base_ref)
     }
+}
+
+/// [`SimHost::snapshot_begin`]'s outcome — the G2 capture-leg verdicts
+/// made observable for the seeds (the swarm treats every variant as a
+/// benign step).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CaptureOutcome {
+    /// A finalize began.
+    Began(SnapshotId),
+    /// Idempotent re-observation of the pending finalize (the
+    /// capture-lock lockout's observable contract).
+    AlreadyPending(SnapshotId),
+    /// The G2 refusal: an untracked RESIDENT survivor — capturing would
+    /// record a manifestless snapshot and drop its acked writes.
+    RefusedUntracked,
+    /// Nothing capturable at this slot (no VM at all).
+    NotCapturable,
+}
+
+/// [`SimHost::resume_finalized`]'s outcome — the G2 resume-leg verdicts.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ResumeOutcome {
+    /// The chunked attach path took; the sandbox rebuilt from its
+    /// snapshot's disk manifest.
+    Attached,
+    /// The G2 refusal: a poisoned (manifestless) snapshot on a
+    /// data-plane host — no boot onto the stale literal device.
+    RefusedStaleLiteral,
+    /// PRE-#743 only (seed-driven): FC booted onto the capture-time
+    /// literal device's current content.
+    BootedStaleLiteral,
 }
 
 /// The sim's [`EvictionSandbox`] — records every terminal-destroy the REAL
@@ -396,6 +433,7 @@ impl SimHost {
                 served_by: Some(generation),
                 kernel_owner: Some(generation),
                 parked: false,
+                poisoned_snapshot: false,
             });
         }
 
@@ -1178,16 +1216,36 @@ impl SimHost {
     /// re-observes the SAME snapshot id (the capture-lock lockout's
     /// observable contract — no second finalize, no concurrent chain
     /// mutation).
-    pub async fn snapshot_begin(&mut self, idx: usize) -> Result<Option<SnapshotId>, String> {
+    pub async fn snapshot_begin(&mut self, idx: usize) -> Result<CaptureOutcome, String> {
         if idx >= self.sandboxes.len() {
-            return Ok(None);
+            return Ok(CaptureOutcome::NotCapturable);
         }
         let sandbox_id = self.sandboxes[idx].sandbox_id;
         if let Some(existing) = self.pending_finalizes.get(&sandbox_id) {
-            return Ok(Some(*existing));
+            return Ok(CaptureOutcome::AlreadyPending(*existing));
+        }
+        // ADR 0098 G2 — the survivor-invisibility family's CAPTURE leg,
+        // decided by the REAL pure verdict. `tracked` = a live backend
+        // (the `nbd_sandboxes` entry analog: rebuild == rehydrate). An
+        // untracked RESIDENT survivor (the VM is there, its disk server
+        // was never rehydrated — the 03e6535e pre-condition) is REFUSED,
+        // never silently skipped into a manifestless snapshot.
+        let tracked = self.sandboxes[idx].backend.is_some();
+        match engram_host_core::plan_capture_disk_drain(tracked, true, true) {
+            engram_host_core::CaptureDrainPlan::Drain => {}
+            engram_host_core::CaptureDrainPlan::RefuseUntracked => {
+                return if self.is_resident_survivor(idx) {
+                    Ok(CaptureOutcome::RefusedUntracked)
+                } else {
+                    Ok(CaptureOutcome::NotCapturable)
+                };
+            }
+            engram_host_core::CaptureDrainPlan::NoNbdDisk => {
+                unreachable!("every sim sandbox is NBD-backed on a data-plane host")
+            }
         }
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
-            return Ok(None);
+            return Ok(CaptureOutcome::NotCapturable);
         };
         let snapshot_id = SnapshotId::from(self.entropy.uuid());
         let dest = self.fs.root().join("staging").join(snapshot_id.to_string());
@@ -1247,7 +1305,111 @@ impl SimHost {
         // The VM is paused for the whole finalize (and destroyed at its
         // terminal); the guest can no longer reach the data plane.
         self.sandboxes[idx].backend = None;
-        Ok(Some(snapshot_id))
+        Ok(CaptureOutcome::Began(snapshot_id))
+    }
+
+    /// The PRE-#743 capture on an untracked resident survivor — the G2
+    /// seeds' bug reproduction, never driven by the swarm. The missing
+    /// `nbd_sandboxes` entry was a SILENT skip: the snapshot records
+    /// `disk_pending: None` (no drain — the acked disk writes are simply
+    /// not in it) and the finalize completes with `disk_manifest=None`,
+    /// poisoning the lineage the resume leg then boots.
+    pub async fn snapshot_begin_pre743(&mut self, idx: usize) -> Result<SnapshotId, String> {
+        let sandbox_id = self.sandboxes[idx].sandbox_id;
+        assert!(
+            self.sandboxes[idx].backend.is_none() && self.is_resident_survivor(idx),
+            "the pre-743 silent skip is only reachable for an untracked resident survivor",
+        );
+        let snapshot_id = SnapshotId::from(self.entropy.uuid());
+        let dest = self.fs.root().join("staging").join(snapshot_id.to_string());
+        tokio::fs::create_dir_all(&dest)
+            .await
+            .map_err(|e| format!("pre743 staging dir: {e}"))?;
+        tokio::fs::write(dest.join("state.bin"), b"sim fc state")
+            .await
+            .map_err(|e| format!("pre743 state.bin: {e}"))?;
+        tokio::fs::write(dest.join("manifest.json"), b"{}")
+            .await
+            .map_err(|e| format!("pre743 manifest.json: {e}"))?;
+        let now = self.effects.clock.now_utc();
+        let record = EvictionFinalizeRecord {
+            snapshot_id,
+            session_id: self.sandboxes[idx].session_id,
+            sandbox_id,
+            image_version: "sim".to_string(),
+            size_bytes: 0,
+            paused_at: now,
+            captured_at: now,
+            dest,
+            chain_prev_ref: None,
+            // THE BUG: no drain happened, so the record carries no disk
+            // tier at all — indistinguishable from a legitimately
+            // disk-less capture.
+            disk_pending: None,
+            aux_bundles: Vec::new(),
+            stage: FinalizeStage::Captured,
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        let finalizer = self.finalizer(self.effects.fs.clone());
+        record
+            .persist(self.effects.fs.as_ref(), &finalizer.finalize_dir())
+            .await
+            .map_err(|e| format!("pre743 record persist: {e}"))?;
+        self.pending_finalizes.insert(sandbox_id, snapshot_id);
+        self.in_flight.insert(idx, record);
+        self.finalize_started.insert(snapshot_id);
+        Ok(snapshot_id)
+    }
+
+    /// Resume a finalized (destroyed) sandbox from its snapshot — the G2
+    /// RESUME leg, decided by the REAL `plan_resume_attach`. `gated` =
+    /// the #743 guard active. A poisoned snapshot (no disk manifest — the
+    /// sidecar still names the capture-time literal device) is REFUSED
+    /// when gated; ungated it boots FC onto the stale literal, modeled as
+    /// the base image's content — the acked-write oracle then catches the
+    /// below-floor reads (the corruption #743 shipped).
+    pub async fn resume_finalized(
+        &mut self,
+        idx: usize,
+        gated: bool,
+    ) -> Result<ResumeOutcome, String> {
+        assert!(
+            self.sandboxes[idx].backend.is_none() && !self.finalize_pending(idx),
+            "resume targets a finalized (destroyed, non-pending) sandbox",
+        );
+        let poisoned = self.sandboxes[idx].poisoned_snapshot;
+        let plan = engram_host_core::plan_resume_attach(!poisoned, true, poisoned);
+        match plan {
+            engram_host_core::ResumeAttachPlan::Attach => {
+                self.rebuild(idx).await?;
+                Ok(ResumeOutcome::Attached)
+            }
+            engram_host_core::ResumeAttachPlan::RefuseStaleLiteral if gated => {
+                // The resume op requeues; the poisoned lineage surfaces
+                // loudly. No boot, no corruption.
+                Ok(ResumeOutcome::RefusedStaleLiteral)
+            }
+            engram_host_core::ResumeAttachPlan::RefuseStaleLiteral => {
+                // PRE-#743: FC restores against the capture-time literal
+                // /dev/nbdN — dead or foreign. The guest sees whatever
+                // that device serves now: the base image's bytes, never
+                // the session's acked writes.
+                let backend = build_backend(
+                    &self.store,
+                    self.fs.cache_dir(),
+                    idx,
+                    self.sandboxes[idx].base_ref,
+                )
+                .await;
+                self.sandboxes[idx].backend = Some(Arc::new(backend));
+                Ok(ResumeOutcome::BootedStaleLiteral)
+            }
+            engram_host_core::ResumeAttachPlan::Materialize => {
+                unreachable!("every sim resume is on a data-plane host")
+            }
+        }
     }
 
     /// One finalize redrive attempt for slot `idx` — the REAL production
@@ -1271,6 +1433,10 @@ impl SimHost {
                 // The terminal leg published the disk manifest — the same
                 // durability class as a flush publish: it raises the
                 // published floor and becomes the durable rebuild pointer.
+                // A completed finalize WITHOUT one (only reachable via the
+                // pre-#743 silent-skip capture) is a poisoned lineage the
+                // resume leg must reckon with.
+                self.sandboxes[idx].poisoned_snapshot = record.disk_manifest.is_none();
                 if let Some(published) = record.disk_manifest {
                     self.sandboxes[idx].published_ref = Some(published);
                     self.mark_flush_published(idx, published).await?;

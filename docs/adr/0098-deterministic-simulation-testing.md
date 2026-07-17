@@ -589,26 +589,31 @@ answer is a plan, not a hope:
   (attempts advanced, never finished, never booted), and the healed
   quiescence pass converges it — `no_op_dropped` +
   `quiescence-no-stragglers` are the standing catch.
-- **G2 — the disk-corruption belongs to the host sim (`engram-dst-host`)
-  and is a recurring class.** Two silent-fallback paths keyed disk
-  durability on `nbd_sandboxes.get(id)` and skipped for a post-roll
+- **G2 — CLOSED (the decision seams + the four-leg family; full resume
+  flow extraction stays P8-adjacent).** Two silent-fallback paths keyed
+  disk durability on `nbd_sandboxes.get(id)` and skipped for a post-roll
   survivor never rehydrated: capture recorded a `recoverable` snapshot
-  with `disk_manifest=None` (dropping acked writes), and resume then booted
-  onto the stale literal `/dev/nbdN`. The **acked-write durability oracle**
-  is precisely the catch (a lost published-floor write / a boot onto the
-  wrong device is a below-floor read), but the host world model drives
-  `ChunkedDiskBackend` directly and does not yet model `PooledBackend`'s
-  `nbd_sandboxes` tracking, the capture/snapshot orchestration, or the
-  resume NBD-attach decision — those flows are extracted only past P7.
-  **The recurring shape:** this is the *second* incident in two days
-  (after 731df805/#739, register/sweep) whose mechanism is identical —
-  **a lookup keyed on a tracking map that a post-roll survivor isn't in,
-  causing a silent skip that corrupts.** #739 is register/sweep; #743 is
-  capture/resume. **To close G2:** generalize P7's 731df805 scenario into a
-  **survivor-invisibility family** spanning register, sweep, *capture*, and
-  *resume*, each asserted by the acked-write oracle — landing as the
-  capture (P5-adjacent) and resume-attach flows are extracted behind the
-  host-core seam.
+  with `disk_manifest=None` (dropping acked writes), and resume then
+  booted onto the stale literal `/dev/nbdN`. **The recurring shape** — a
+  lookup keyed on a tracking map that a post-roll survivor isn't in,
+  causing a silent skip that corrupts — now has all four legs pinned as
+  the **survivor-invisibility family**: register + sweep cores in
+  `engram-host-core::reattach` (P7, the 731df805 pair), capture + resume
+  cores in **`engram-host-core::survivor`** (`plan_capture_disk_drain` →
+  `Drain|RefuseUntracked|NoNbdDisk`, `plan_resume_attach` →
+  `Attach|RefuseStaleLiteral|Materialize`), with the #743 prod guards in
+  `PooledBackend::snapshot`/`restore` rewired through them (extraction,
+  not behavior change — the #743 unit tests pin both refusals). The sim's
+  `snapshot_begin` consults the real capture verdict (an untracked
+  resident survivor is `RefusedUntracked`, exercised by every swarm
+  `SnapshotBegin` on a post-roll slot), and `resume_finalized` the resume
+  verdict over the poisoned-lineage marker a manifestless finalize
+  leaves. Three seeds: the FIXED capture refusal (+ rehydrate-then-drain
+  remediation), the **ungated capture+resume double failure where the
+  acked-write oracle FIRES the below-floor violation** — the direct
+  "would DST have caught #743" proof — and the gated resume as the last
+  line (poisoned snapshot already manufactured, refusal, no corruption),
+  mirroring the 731df805 un-pause-gate seed's defense-in-depth shape.
 
 **The program already shapes fixes ahead of catching bugs:** #743 followed
 the D4 conformance rule (implemented `SimMetadataStore::rewind_session_to_cursor`

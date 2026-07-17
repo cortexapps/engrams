@@ -504,7 +504,10 @@ async fn finalize_completes_publishes_the_floor_and_destroys() {
     host.guest_write(0, 1).await.unwrap();
     host.guest_write(0, 6).await.unwrap();
 
-    let snapshot_id = host.snapshot_begin(0).await.unwrap().expect("began");
+    let engram_dst_host::CaptureOutcome::Began(snapshot_id) = host.snapshot_begin(0).await.unwrap()
+    else {
+        panic!("expected a fresh finalize to begin");
+    };
     assert!(
         host.sandboxes[0].backend.is_none(),
         "the captured VM is paused for the whole finalize",
@@ -555,8 +558,10 @@ async fn finalize_crash_at_every_op_resumes_and_completes() {
         host.guest_write(0, 2).await.unwrap();
         host.guest_write(0, 7).await.unwrap();
 
-        let began = host.snapshot_begin(0).await.unwrap();
-        assert!(began.is_some());
+        assert!(matches!(
+            host.snapshot_begin(0).await.unwrap(),
+            engram_dst_host::CaptureOutcome::Began(_)
+        ));
         host.finalize_crash_at(0, op_index)
             .await
             .unwrap_or_else(|e| panic!("finalize_crash_at({op_index}): {e}"));
@@ -607,7 +612,10 @@ async fn finalize_quarantine_after_max_attempts_is_convergent() {
     // A newer acked write that will ride the (doomed) finalize.
     host.guest_write(0, 3).await.unwrap();
 
-    let snapshot_id = host.snapshot_begin(0).await.unwrap().expect("began");
+    let engram_dst_host::CaptureOutcome::Began(snapshot_id) = host.snapshot_begin(0).await.unwrap()
+    else {
+        panic!("expected a fresh finalize to begin");
+    };
     // The staging inputs vanish out from under the record.
     let pending_dir = host
         .fs
@@ -665,8 +673,15 @@ async fn snapshot_begin_idempotent_under_pending_finalize() {
     let mut host = scenario_host(0, 2).await;
     host.guest_write(0, 4).await.unwrap();
 
-    let first = host.snapshot_begin(0).await.unwrap().expect("began");
-    let second = host.snapshot_begin(0).await.unwrap().expect("re-observed");
+    let engram_dst_host::CaptureOutcome::Began(first) = host.snapshot_begin(0).await.unwrap()
+    else {
+        panic!("expected a fresh finalize to begin");
+    };
+    let engram_dst_host::CaptureOutcome::AlreadyPending(second) =
+        host.snapshot_begin(0).await.unwrap()
+    else {
+        panic!("expected the pending finalize to be re-observed");
+    };
     assert_eq!(first, second, "a pending finalize re-observes the same id");
     assert_eq!(
         host.finalize_started.len(),
@@ -679,7 +694,10 @@ async fn snapshot_begin_idempotent_under_pending_finalize() {
     host.finalize_tick(0).await.unwrap();
     host.restart().await.unwrap();
     host.guest_write(0, 4).await.unwrap();
-    let third = host.snapshot_begin(0).await.unwrap().expect("fresh begin");
+    let engram_dst_host::CaptureOutcome::Began(third) = host.snapshot_begin(0).await.unwrap()
+    else {
+        panic!("expected a fresh begin after completion");
+    };
     assert_ne!(third, first, "a completed finalize does not pin the id");
     // Drain to keep the scenario convergent.
     host.finalize_tick(0).await.unwrap();
@@ -963,4 +981,127 @@ async fn pinned_chaos_seeds_hold_all_oracles() {
     for seed in [0u64, 7, 13] {
         run_pinned(seed, Profile::Chaos, 200).await;
     }
+}
+
+// ───────── G2: the survivor-invisibility family — capture + resume ─────────
+//
+// Two incidents in two days shared one mechanism: a lookup keyed on a
+// tracking map a post-roll survivor isn't in, causing a silent skip that
+// corrupts. 731df805 (#739) was register/sweep — pinned above. 03e6535e
+// (#743) was capture (`nbd_sandboxes` missing → recoverable snapshot with
+// disk_manifest=None) and resume (boot onto the capture-time literal
+// /dev/nbdN). These seeds pin all four legs' shared shape through the pure
+// verdicts (`plan_capture_disk_drain` / `plan_resume_attach`) the prod
+// guards and the sim both drive.
+
+/// FIXED capture leg: a post-roll resident survivor (VM there, disk server
+/// never rehydrated) is REFUSED — never silently skipped into a
+/// manifestless snapshot. Rehydrating it (the error message's remediation)
+/// makes the capture drain normally.
+#[tokio::test(start_paused = true)]
+async fn untracked_survivor_capture_refuses_never_a_manifestless_snapshot() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 1).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+    host.guest_write(0, 1).await.unwrap(); // newer, un-published ack
+
+    // The roll: RAM dies, the VM stays resident, nothing rehydrates it.
+    host.abrupt_crash().await.unwrap();
+    assert!(host.sandboxes[0].backend.is_none());
+
+    let outcome = host.snapshot_begin(0).await.unwrap();
+    assert_eq!(
+        outcome,
+        engram_dst_host::CaptureOutcome::RefusedUntracked,
+        "an untracked resident survivor must be refused, not skipped",
+    );
+    assert!(
+        host.pending_finalizes.is_empty() && host.finalize_started.is_empty(),
+        "a refusal records nothing",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+
+    // Remediation: rehydrate (restart rebuilds = the nbd_sandboxes entry
+    // returns), then the capture drains normally.
+    host.restart().await.unwrap();
+    assert!(matches!(
+        host.snapshot_begin(0).await.unwrap(),
+        engram_dst_host::CaptureOutcome::Began(_)
+    ));
+    host.finalize_tick(0).await.unwrap();
+    invariants::check_finalize_convergence(&host)
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// UNGATED capture + UNGATED resume — the literal #743 double failure, and
+/// the proof the acked-write oracle CATCHES it: the pre-#743 silent-skip
+/// capture completes a finalize with disk_manifest=None (poisoned lineage;
+/// the floor stays where the last real flush put it), and the pre-#743
+/// resume boots FC onto the capture-time literal device (base content).
+/// The published-floor writes are gone from what the guest reads — the
+/// oracle MUST fire the 85e0298a/03e6535e below-floor violation.
+#[tokio::test(start_paused = true)]
+async fn ungated_capture_and_resume_poison_the_lineage_and_the_oracle_catches_it() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 2).await.unwrap();
+    host.flush_tick(0).await.unwrap(); // floor raised over the acked write
+
+    host.abrupt_crash().await.unwrap();
+
+    // Pre-#743 capture: the silent skip records a disk-less finalize.
+    let _poisoned = host.snapshot_begin_pre743(0).await.unwrap();
+    host.finalize_tick(0).await.unwrap();
+    assert!(host.pending_finalizes.is_empty(), "the finalize completed");
+    assert!(
+        host.sandboxes[0].poisoned_snapshot,
+        "a completed finalize without a disk manifest is the poisoned lineage",
+    );
+
+    // Pre-#743 resume: boots onto the stale literal device.
+    let outcome = host.resume_finalized(0, /*gated=*/ false).await.unwrap();
+    assert_eq!(outcome, engram_dst_host::ResumeOutcome::BootedStaleLiteral);
+
+    // The oracle catches the corruption: the flushed (published-floor)
+    // write is below-floor gone from what the stale device serves.
+    let violation = invariants::check(&host)
+        .await
+        .expect_err("the acked-write oracle must catch the stale-literal boot");
+    assert_eq!(violation.invariant, "acked-write-durability");
+    assert!(
+        violation.detail.contains("rolled back below the floor"),
+        "the 03e6535e corruption is the below-floor class: {}",
+        violation.detail,
+    );
+}
+
+/// GATED resume as the last line: even with the poisoned snapshot already
+/// manufactured (the capture gate bypassed), the resume gate refuses the
+/// stale literal — no boot, no corruption, oracles clean. The exact
+/// defense-in-depth shape of the 731df805 un-pause-gate seed.
+#[tokio::test(start_paused = true)]
+async fn poisoned_snapshot_resume_gate_refuses_the_stale_literal() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 3).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+    host.abrupt_crash().await.unwrap();
+
+    let _poisoned = host.snapshot_begin_pre743(0).await.unwrap();
+    host.finalize_tick(0).await.unwrap();
+    assert!(host.sandboxes[0].poisoned_snapshot);
+
+    let outcome = host.resume_finalized(0, /*gated=*/ true).await.unwrap();
+    assert_eq!(
+        outcome,
+        engram_dst_host::ResumeOutcome::RefusedStaleLiteral,
+        "the resume gate must refuse the stale literal device",
+    );
+    assert!(
+        host.sandboxes[0].backend.is_none(),
+        "no boot happened — the guest never lands on the dead plane",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
