@@ -7,10 +7,58 @@ import "google/protobuf/timestamp.proto";
 // PR code review record (ADR 0100). Reviews are org-visible: a team
 // dashboard, not a personal list. Writes happen through review tool calls
 // and the review workflow, never through this service.
+//
+// Repo enrollment is org configuration: which repos engrams reviews, how
+// reviews trigger, and the autofix posture. Enrollment mutations are
+// admin-only; listing is org-visible like the reviews themselves.
 service ReviewService {
   rpc ListReviews(ListReviewsRequest) returns (ListReviewsResponse);
   rpc GetReview(GetReviewRequest) returns (GetReviewResponse);
+
+  rpc ListEnrollments(ListEnrollmentsRequest) returns (ListEnrollmentsResponse);
+  rpc UpsertEnrollment(UpsertEnrollmentRequest) returns (UpsertEnrollmentResponse);
+  rpc DeleteEnrollment(DeleteEnrollmentRequest) returns (DeleteEnrollmentResponse);
 }
+
+// A repo enrolled for PR review.
+message RepoEnrollment {
+  // "owner/name".
+  string repo = 1;
+  // auto | manual — whether pull_request.opened auto-triggers a review, or a
+  // review must be asked for (@engrams review / dispatch).
+  string trigger_mode = 2;
+  // auto | manual | off — whether posted findings route back to the authoring
+  // session for fixes.
+  string autofix = 3;
+  // Profile the review sessions run on; empty = the designated pr_reviewer
+  // profile.
+  optional string profile_id = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message ListEnrollmentsRequest {}
+
+message ListEnrollmentsResponse {
+  repeated RepoEnrollment enrollments = 1;
+}
+
+message UpsertEnrollmentRequest {
+  string repo = 1;
+  string trigger_mode = 2;
+  string autofix = 3;
+  optional string profile_id = 4;
+}
+
+message UpsertEnrollmentResponse {
+  RepoEnrollment enrollment = 1;
+}
+
+message DeleteEnrollmentRequest {
+  string repo = 1;
+}
+
+message DeleteEnrollmentResponse {}
 
 // One review pass over a PR at a pinned head_sha.
 message Review {
