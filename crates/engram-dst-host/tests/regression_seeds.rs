@@ -11,7 +11,9 @@
 
 use std::collections::HashMap;
 
-use engram_dst_host::{invariants, CrashPoint, Profile, ScriptedResponse, Sim, SimHost};
+use engram_dst_host::{
+    decode_tag, invariants, CrashPoint, Profile, ScriptedResponse, Sim, SimHost, CHUNK_SIZE,
+};
 use engram_host_agent::disk_daemon::spool;
 
 /// Drive one deterministic scenario host with `num` sandboxes.
@@ -460,6 +462,95 @@ async fn every_crash_point_injection_recovers_every_acked_write() {
             .await
             .unwrap_or_else(|v| panic!("crash point {cp:?}: {} — {}", v.invariant, v.detail));
     }
+}
+
+// ─────────────── P4.5: oracle honesty — the honest-loss boundary ───────────
+//
+// The adversarial-review finding: the old oracle demanded EVERY restarted
+// acked write recover, which either never exercised the post-ack/pre-handoff
+// hard-crash window or would falsely demand recovery of a write prod genuinely
+// loses. The oracle now verifies the durability PIPELINE — a write is
+// required-recoverable IFF it had a durable handoff (flush published OR spool
+// captured) before the crash. These two seeds pin BOTH directions of that
+// boundary.
+
+/// The honest-loss direction: a guest write acked from the RAM dirty tier, then
+/// ABRUPT process death (SIGKILL / power loss) BEFORE any flush or spool. The
+/// write never had a durable handoff, so the successor's manifest legitimately
+/// rolls the chunk back to base — an accepted, bounded loss (ADR 0028). The
+/// honest oracle keys on the durable-handoff floor, so it recovers the floor
+/// (here: base) and does NOT cry wolf demanding the un-handed-off acked tag.
+#[tokio::test(start_paused = true)]
+async fn post_ack_pre_handoff_crash_is_honest_loss() {
+    // Deterministic pinned seed (only the entropy for ids; the scenario is
+    // hand-driven, not pick-driven).
+    let mut host = scenario_host(0xA55E_7717, 1).await;
+
+    // A single acked write with a distinctive tag — NO FlushTick, NO SpoolExport.
+    host.guest_write(0, 3).await.unwrap();
+    let acked = host
+        .ledger
+        .latest_by_chunk()
+        .get(&(0, 3))
+        .expect("the write is acked in the ledger")
+        .content_tag;
+    assert!(acked > 0, "a real, distinctive acked tag");
+    assert!(
+        host.ledger.handed_off_tag(0, 3).is_none(),
+        "no flush and no spool ⇒ the write never had a durable handoff",
+    );
+
+    // Abrupt death: the RAM dirty tier evaporates with NO shutdown spool.
+    host.abrupt_crash().await.unwrap();
+    // The successor rebuilds through the REAL recovery path (from_blob at the
+    // durable pointer + tolerant spool adopt — here no spool, pointer = base).
+    host.restart().await.unwrap();
+
+    // The chunk legitimately reads BASE — the acked (un-handed-off) write is
+    // gone, exactly as production loses it.
+    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let got = decode_tag(&backend.read(3 * CHUNK_SIZE, CHUNK_SIZE).await.unwrap());
+    assert_eq!(
+        got, 0,
+        "the manifest rolled back to base — the write is lost"
+    );
+    assert_ne!(
+        got, acked,
+        "prod loses this write; the oracle must not fake recovery"
+    );
+
+    // The honest oracle reports NO violation on this accepted loss.
+    invariants::check(&host).await.unwrap_or_else(|v| {
+        panic!(
+            "the oracle cried wolf on an accepted loss: {} — {}",
+            v.invariant, v.detail
+        )
+    });
+
+    // The recoverable direction, in the SAME crash shape: a write that DID get a
+    // durable handoff (a flush) then abrupt-crashed MUST recover — the pipeline
+    // took responsibility for it.
+    host.guest_write(0, 4).await.unwrap();
+    let handed = host
+        .ledger
+        .latest_by_chunk()
+        .get(&(0, 4))
+        .unwrap()
+        .content_tag;
+    host.flush_tick(0).await.unwrap();
+    assert_eq!(
+        host.ledger.handed_off_tag(0, 4),
+        Some(handed),
+        "the flush published the write → its durable-handoff floor is recorded",
+    );
+    host.abrupt_crash().await.unwrap();
+    host.restart().await.unwrap();
+    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let got = decode_tag(&backend.read(4 * CHUNK_SIZE, CHUNK_SIZE).await.unwrap());
+    assert_eq!(got, handed, "a handed-off write survives even abrupt death");
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
 
 // ────────────── Flow B: the 731df805 scenario (ADR 0098 P7) ──────────────

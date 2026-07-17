@@ -49,6 +49,10 @@ pub enum Step {
     SpoolAdopt(usize),
     /// Orderly process crash: spool live sandboxes, then drop RAM backends.
     CrashProcess,
+    /// ABRUPT process death (P4.5): drop RAM backends with NO shutdown spool —
+    /// the post-ack / pre-handoff loss window. An un-handed-off acked write is
+    /// legitimately lost; the honest oracle tolerates exactly that.
+    AbruptCrash,
     /// Restart: rebuild backends from the surviving store + adopt spools.
     Restart,
     /// Advance virtual time (fires due tokio timers).
@@ -106,6 +110,7 @@ impl Step {
             Step::SpoolExport(..) => "SpoolExport",
             Step::SpoolAdopt(..) => "SpoolAdopt",
             Step::CrashProcess => "CrashProcess",
+            Step::AbruptCrash => "AbruptCrash",
             Step::Restart => "Restart",
             Step::AdvanceTime(..) => "AdvanceTime",
             Step::ReconcileTick => "ReconcileTick",
@@ -250,22 +255,27 @@ impl Sim {
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                23..=34 => Step::GuestRead(
+                23..=32 => Step::GuestRead(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                35..=43 => Step::FlushTick(self.rng.random_range(0..n)),
-                44..=50 => Step::SpoolExport(self.rng.random_range(0..n)),
-                51..=57 => Step::SpoolAdopt(self.rng.random_range(0..n)),
-                58..=64 => Step::ReconcileTick,
-                65..=67 => Step::DropLocalBinding(self.rng.random_range(0..n)),
-                68..=69 => Step::RevokeOwnership(self.rng.random_range(0..n)),
-                70..=74 => Step::CrashProcess,
-                75..=79 => Step::Restart,
+                33..=41 => Step::FlushTick(self.rng.random_range(0..n)),
+                42..=48 => Step::SpoolExport(self.rng.random_range(0..n)),
+                49..=55 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                56..=62 => Step::ReconcileTick,
+                63..=65 => Step::DropLocalBinding(self.rng.random_range(0..n)),
+                66..=67 => Step::RevokeOwnership(self.rng.random_range(0..n)),
+                68..=72 => Step::CrashProcess,
+                // P4.5: abrupt death exercises the post-ack/pre-handoff loss
+                // window — the honest oracle must TOLERATE the resulting rolled-
+                // back un-handed-off writes (and still catch a lost handed-off
+                // one). Without this the hard-crash window is never explored.
+                73..=76 => Step::AbruptCrash,
+                77..=79 => Step::Restart,
                 80..=82 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
                 83..=85 => Step::CrashAt(pick_crashpoint(&mut self.rng)),
                 // Flow B (P7): park → roll → rehydrate → sweep → un-pause. The
-                // roll comes from CrashProcess/Sigterm/CrashAt above.
+                // roll comes from CrashProcess/AbruptCrash/Sigterm/CrashAt above.
                 86..=88 => Step::SlotClaim(self.rng.random_range(0..n)),
                 89..=90 => Step::SlotPopulateTick,
                 91..=92 => Step::Park(self.rng.random_range(0..n)),
@@ -295,6 +305,13 @@ impl Sim {
                 self.host.crash_process().await?;
                 // A fresh host-agent process starts with an empty strike
                 // ledger (the real wrapper's local `HashMap`).
+                self.reconcile_strikes.clear();
+                self.crashed = true;
+            }
+            Step::AbruptCrash => {
+                self.host.abrupt_crash().await?;
+                // Same successor-process reset as any roll; RAM died, so bias
+                // toward Restart next.
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }

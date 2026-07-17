@@ -1,29 +1,59 @@
 //! Oracle #1 — the acked-write durability oracle (ADR 0098 Phase 2,
-//! invariant #1; the session-85e0298a corruption RCA, PR #712).
+//! invariant #1; the session-85e0298a corruption RCA, PR #712; oracle-honesty
+//! pass P4.5).
 //!
-//! **Property:** *every guest-acked write is recoverable from (the rebuilt
-//! backend's tier resolution ∪ the shutdown spool ∪ the published/uploaded
-//! chunks in the store) — at every crash point.*
+//! **Property (the honest, bidirectional form):** *every guest-acked write
+//! that had a durable HANDOFF before a crash — a flush published it, OR the
+//! shutdown spool captured it — is recoverable after restart, read back
+//! through the REAL recovery path (`from_blob(published_ref)` + spool
+//! `adopt_unflushed`). A write acked from the RAM dirty tier and lost to
+//! abrupt process death BEFORE any flush or spool is an accepted, bounded loss
+//! (bounded by the flush cadence + the periodic checkpoint, ADR 0028), NOT a
+//! violation.* The oracle verifies the durability PIPELINE
+//! (flush→publish→spool→adopt) never loses a write it took responsibility for
+//! — it does not claim omniscient recovery of every RAM-only ack.
 //!
-//! The ledger ([`AckedWriteLedger`]) is the oracle's memory: the LATEST
-//! acked `content_tag` per `(sandbox, chunk_idx)`. The check reads each such
-//! chunk back through the sandbox's **live** backend and asserts the decoded
-//! tag equals the acked tag. Reading through the live backend IS the union:
-//! `from_blob(published_ref)` resolves the uploaded/published tier, and
-//! spool adoption seeds the dirty tier — so a post-restart backend that
-//! reads the acked tag proves recoverability across all three sources.
+//! The ledger ([`AckedWriteLedger`]) is the oracle's memory. Per
+//! `(sandbox, chunk_idx)` it holds the LATEST acked tag AND the published-tier
+//! FLOOR (the highest tag a flush published to the durable/uploaded tier,
+//! observed from the REAL published manifest — see [`crate::world`]). For each
+//! chunk with a live backend, the check reads the chunk back and requires the
+//! decoded tag to fall in the honest RANGE `[published_floor, latest_ack]` (by
+//! tag order). Everything in that range is legitimate:
+//!
+//! * `== latest_ack` — a live backend that never crashed still holds the newest
+//!   write; and a rebuild where the latest write WAS itself published has
+//!   floor == latest.
+//! * `== published_floor` — a rebuild that dropped newer, un-published writes;
+//!   those newer writes are an ACCEPTED, bounded loss (flush cadence + periodic
+//!   checkpoint), never demanded back.
+//! * strictly between — a transiently-durable intermediate that a STANDING
+//!   shutdown spool adopted at recovery (the spool preserves an un-published
+//!   write across one roll; it is not a permanent floor).
+//!
+//! Only two reads are violations: OLDER than the published floor (a durable
+//! published write rolled back — the 85e0298a corruption class) or NEWER than
+//! the latest ack (a never-acked tag). The published floor is the ONLY
+//! permanent durability promise; spool RECOVERY is asserted separately by the
+//! regression seeds that crash with a STANDING spool. Reading through the live
+//! backend IS the recovery path: `from_blob(published_ref)` resolves the
+//! uploaded/published tier and spool adoption seeds the dirty tier — never a
+//! raw blob-existence check.
 //!
 //! When a sandbox has NO live backend (crashed, not yet restarted), its
-//! chunks are SKIPPED — the property is about recoverability *after*
-//! recovery, so it becomes checkable only once the successor rebuilds. Run
-//! after every step, the check is therefore meaningful exactly at the
-//! moments that matter (post-write, post-flush, post-adopt, and — the
-//! headline case — post `CrashProcess → Restart`).
+//! chunks are SKIPPED — the property is about recoverability *after* recovery,
+//! so it becomes checkable only once the successor rebuilds. Run after every
+//! step, the check is meaningful exactly at the moments that matter
+//! (post-write, post-flush, post-adopt, and the headline cases:
+//! `CrashProcess → Restart`, and — P4.5 — `AbruptCrash → Restart`, where a
+//! post-ack/pre-handoff write is correctly TOLERATED as lost).
 //!
-//! In P2 this **passes by construction**: `CrashProcess` completes the
-//! shutdown spool before dropping RAM, so `Restart`'s rebuild+adopt recovers
-//! every acked write. A FAILURE here is a real finding in the shipped
-//! flush/spool/adopt machinery — pin the seed, do not weaken the oracle.
+//! A FAILURE here is a real finding in the shipped flush/spool/adopt machinery
+//! — a write the pipeline DID hand off but cannot recover. Pin the seed, do
+//! not weaken the oracle. The regression seed
+//! `post_ack_pre_handoff_crash_is_honest_loss` pins the honest boundary from
+//! the other side: an un-handed-off write is lost and the oracle does NOT cry
+//! wolf.
 //!
 //! # Oracle #9 — the reconcile None-arm stays fixed (ADR 0098 P3)
 //!
@@ -150,9 +180,10 @@ fn reconcile_none_arm_fixed(host: &SimHost) -> Result<(), Violation> {
 }
 
 async fn acked_writes_recoverable(host: &SimHost) -> Result<(), Violation> {
-    // Snapshot the recoverable set (latest tag per chunk) under a
-    // deterministic BTreeMap order, then read each back through its live
-    // backend.
+    // Snapshot the latest-acked set under a deterministic BTreeMap order, then
+    // read each chunk back through its live backend and check it against BOTH
+    // the durable-handoff floor and the latest ack (the honest, bidirectional
+    // form — ADR 0098 P4.5).
     for ((idx, chunk_idx), entry) in host.ledger.latest_by_chunk() {
         let Some(slot) = host.sandboxes.get(idx) else {
             continue;
@@ -170,18 +201,36 @@ async fn acked_writes_recoverable(host: &SimHost) -> Result<(), Violation> {
                 detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
             })?;
         let got = decode_tag(&bytes);
-        if got != entry.content_tag {
-            return Err(Violation {
-                invariant: "acked-write-durability",
-                detail: format!(
-                    "sandbox {idx} chunk {chunk_idx}: acked tag {} not recoverable (read {got}); \
-                     lineage-at-ack {}v{}",
-                    entry.content_tag,
-                    entry.lineage_at_ack.manifest_id,
-                    entry.lineage_at_ack.version
-                ),
-            });
+        let latest = entry.content_tag;
+        // The published-tier floor: `0` (base) if this chunk was never flushed
+        // to the durable tier — its acked writes are all RAM-only or
+        // spool-transient, droppable by abrupt death.
+        let floor = host.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
+        // Honest range (ADR 0098 P4.5): a legitimate read is anywhere in
+        // `[published_floor, latest_ack]` by tag order — the live newest write
+        // (== latest), the permanent published floor (a rebuild that dropped
+        // newer un-published writes — an accepted, bounded loss), or a
+        // transiently-durable intermediate a standing spool adopted. Only two
+        // things are violations:
+        //   * a read OLDER than the published floor — a DURABLE published write
+        //     rolled back (the 85e0298a corruption class); or
+        //   * a read NEWER than the latest ack — a never-acked future tag.
+        if floor <= got && got <= latest {
+            continue;
         }
+        let why = if got < floor {
+            "a durable published write rolled back below the floor"
+        } else {
+            "a read newer than the latest ack (a never-acked tag)"
+        };
+        return Err(Violation {
+            invariant: "acked-write-durability",
+            detail: format!(
+                "sandbox {idx} chunk {chunk_idx}: read {got} outside [published_floor {floor}, \
+                 latest_ack {latest}] — {why}; lineage-at-ack {}v{}",
+                entry.lineage_at_ack.manifest_id, entry.lineage_at_ack.version
+            ),
+        });
     }
     Ok(())
 }
