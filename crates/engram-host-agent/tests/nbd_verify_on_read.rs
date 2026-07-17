@@ -49,6 +49,22 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     {
         let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
     }
+    // The kernel processes NBD_CMD_DISCONNECT asynchronously; the shared
+    // /dev/nbd0 stays configured for a beat after `disconnect_device` returns.
+    // A preceding FC test in this serial device sequence leaves it bound, so a
+    // bare disconnect-then-CONNECT races into EBUSY. Wait on the same
+    // /sys/block/nbdN/pid free signal `recover_stuck_nbd_devices` uses (bounded
+    // — a genuinely stuck device still surfaces as the CONNECT error).
+    if let Some(name) = nbd_path.file_name().and_then(|s| s.to_str()) {
+        let pid_path = format!("/sys/block/{name}/pid");
+        for _ in 0..100 {
+            match std::fs::read_to_string(&pid_path) {
+                Ok(s) if s.trim().is_empty() => break,
+                Err(_) => break, // absent ⇒ device not bound
+                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
+            }
+        }
+    }
 }
 
 fn preflight() -> Option<PathBuf> {
