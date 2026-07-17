@@ -29,7 +29,7 @@ on:
       kernel_rev:
         description: 'Engram build revision (bump when engram-docker.fragment changes)'
         required: false
-        default: '1'
+        default: '2'
 
 permissions:
   contents: write   # create the release + upload the asset
@@ -50,7 +50,7 @@ jobs:
             asset_prefix: Image-engram
     env:
       LINUX_VERSION: ${{ github.event.inputs.linux_version || '6.1.102' }}
-      KERNEL_REV: ${{ github.event.inputs.kernel_rev || '1' }}
+      KERNEL_REV: ${{ github.event.inputs.kernel_rev || '2' }}
       ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v6

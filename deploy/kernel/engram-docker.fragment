@@ -57,3 +57,9 @@ CONFIG_VXLAN=y
 CONFIG_OVERLAY_FS=y
 CONFIG_BRIDGE=y
 CONFIG_VETH=y
+
+# --- userspace checkpoint/restore (CRIU, including JDK CRaC) ---
+# Firecracker's base configs disable this for both x86_64 and arm64. CRIU
+# requires the kernel checkpoint/restore APIs even when every application
+# socket is quiesced before capture.
+CONFIG_CHECKPOINT_RESTORE=y
