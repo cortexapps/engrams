@@ -1,6 +1,6 @@
 # ADR 0100: Bundle the Playwright video runtime
 
-Status: 2026-07-16 — **Proposed.**
+Status: 2026-07-16 — **Accepted.**
 
 ## Context
 
@@ -43,3 +43,26 @@ package, avoiding an independently versioned system FFmpeg dependency. Active
 sessions mounted from an older bundle generation are unchanged; the repair is
 available to sessions launched after the fixed bundle is published.
 
+## Implementation and validation
+
+The decision landed in `baf6d918` after the proposed ADR in `631ff0b6`.
+Validation built a fresh arm64 browser bundle from the production build script;
+the pinned Playwright package resolved FFmpeg revision 1011 and placed its
+target-native executable under the bundle-owned browser path. The fresh bundle
+then ran in a disposable Debian container with Docker networking disabled.
+`video-start`, a chapter marker, and `video-stop` produced a non-empty 30,664
+byte WebM without any writable Playwright cache or network access.
+
+The bundle activation e2e passed, the ignored production-shaped
+Firecracker/VNC test compiled, and that test now asserts a real WebM before its
+existing semantic, annotated-screenshot, and framebuffer checks. The full
+repository gate passed format, Clippy with warnings denied, Hakari, and all
+1,747 nextest cases. The live Linux+KVM execution remains in the existing
+Firecracker CI lane, where the browser bundle is built and mounted exactly as
+production mounts it.
+
+The full gate also found two independently merged ADR 0099 integration defects
+already present on `main`: a duplicate workspace `proptest` dependency and a
+property test that violated the concurrently added aligned-offset contract.
+They are repaired separately in `fe30c900` and `cd22884d`; neither changes this
+ADR's browser-runtime decision.
