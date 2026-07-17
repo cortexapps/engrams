@@ -1510,6 +1510,37 @@ impl PooledBackend {
             took_nbd_path = false;
         }
         if !took_nbd_path {
+            // The 2026-07-17 corruption path (session 03e6535e): a chunked
+            // snapshot whose `disk_manifest` is None (manufactured by the D5
+            // silent-skip one hop upstream, or a torn checkpoint) takes NO
+            // NBD attach and NO sidecar patch — so FC restores against the
+            // capture-time LITERAL `/dev/nbdN` still named in the sidecar's
+            // `spec.rootfs_source`. On the receiving host that device is at
+            // best dead (every vda read → EIO → the guest SIGBUSes on its
+            // first mmap page-in) and at worst ANOTHER session's live disk
+            // (the cross-session hazard `prepare_resume_nbd_attach`'s
+            // migration arm already documents). On a host that runs the NBD
+            // data plane, refuse the restore rather than boot onto a
+            // stale/foreign literal device: the resume op requeues, and the
+            // poisoned lineage surfaces loudly for operator remediation
+            // instead of silently corrupting. (The materialize-to-file
+            // fallback below is only legitimate when the rootfs is NOT a
+            // block device — a flat-file rootfs, macOS/dev — which the
+            // sidecar reports as a non-`/dev/nbd` `rootfs_source`.)
+            if self.host_runs_nbd_data_plane() {
+                if let Some(dev) = read_sidecar_rootfs_source(&src).await {
+                    if dev.starts_with("/dev/nbd") {
+                        return Err(SandboxError::Snapshot(format!(
+                            "resume of {} would reopen the capture-time literal rootfs device {dev} \
+                             (sidecar spec.rootfs_source) because no NBD attach happened \
+                             (disk_manifest={:?}) — that device is dead or owned by another \
+                             session on this host. Refusing to boot onto a stale/foreign \
+                             /dev/nbdN; the snapshot's disk lineage must be repaired.",
+                            metadata.id, metadata.disk_manifest,
+                        )));
+                    }
+                }
+            }
             if let Some(chunk_store) = self.chunk_store.as_ref() {
                 if let Err(e) = materialize_disk_if_missing(
                     chunk_store,
@@ -1755,6 +1786,18 @@ impl PooledBackend {
             shutdown_manifest_publish: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
+    }
+
+    /// Whether this host runs the chunked-disk NBD data plane — the same
+    /// `(nbd_pool, chunk_store, chunk_cache)` triple `prepare_resume_nbd_attach`
+    /// gates the NBD attach path on. When true, a sandbox with a `/dev/nbd*`
+    /// rootfs is EXPECTED to have live NBD state (an `nbd_sandboxes` entry on
+    /// Linux); its absence is the post-roll-survivor corruption class the D4/D5
+    /// guards refuse to snapshot/resume through. When false (macOS/dev, or a
+    /// Linux host before `nbds_max` is wired) the materialize-to-file fallback
+    /// is the legitimate path and a missing entry is expected.
+    fn host_runs_nbd_data_plane(&self) -> bool {
+        self.nbd_pool.is_some() && self.chunk_store.is_some() && self.chunk_cache.is_some()
     }
 
     /// ADR 0045 C2: install the page server handle (startup wiring; a
@@ -2265,6 +2308,36 @@ impl PooledBackend {
                 // never raises the migration fence.
                 unwind.disk_backend = Some(backend);
                 unwind.disk_pending = Some(pending);
+            } else if self.host_runs_nbd_data_plane() {
+                // The 2026-07-17 corruption path (session 03e6535e): a
+                // sandbox with an NBD-backed rootfs but NO `nbd_sandboxes`
+                // entry is a post-pod-roll survivor whose in-pod NBD server
+                // died with the old host-agent and was never rehydrated
+                // (the #739 family). Silently skipping the drain here
+                // records a snapshot with `disk_manifest=None` +
+                // `recoverable=true` — dropping EVERY acked disk write of
+                // the session and poisoning its lineage (the next resume
+                // then boots onto a literal /dev/nbdN — see
+                // `prepare_resume_nbd_attach`'s D4 guard). Refuse to
+                // snapshot instead: an error requeues the eviction op
+                // (redrive-safe), and on a dead device the host-cache
+                // `sync_all` above already fails loudly rather than
+                // recording a "recoverable" poisoned snapshot. The skip is
+                // still correct for a legitimately non-NBD rootfs
+                // (macOS/dev/flat-file), which `rootfs_device` reports as
+                // `None`.
+                if let Some(dev) = self.inner.rootfs_device(id) {
+                    if dev.to_string_lossy().starts_with("/dev/nbd") {
+                        return Err(SandboxError::Snapshot(format!(
+                            "sandbox {id} has an NBD-backed rootfs ({}) but no nbd_sandboxes \
+                             entry — a post-roll survivor whose disk server is gone. Refusing to \
+                             snapshot with disk_manifest=None (would drop the session's acked \
+                             disk writes and poison its lineage); the session must be rehydrated \
+                             or evicted-locally first.",
+                            dev.display(),
+                        )));
+                    }
+                }
             }
         }
 
@@ -4782,6 +4855,24 @@ async fn patch_sidecar_rootfs_source(
         ))
     })?;
     Ok(())
+}
+
+/// Read the FC sidecar's `spec.rootfs_source` back off disk — the inverse
+/// of [`patch_sidecar_rootfs_source`]'s write, reading the SAME
+/// `<src>/manifest.json`. Used by the resume path's D4 guard to detect a
+/// snapshot whose sidecar still names a capture-time literal `/dev/nbdN`
+/// device that no NBD attach replaced. Best-effort: a missing/unparseable
+/// sidecar or an absent field returns `None` (the guard then does not
+/// fire, and the normal restore proceeds — a malformed sidecar fails later
+/// in FC's own restore with its own error).
+async fn read_sidecar_rootfs_source(src: &std::path::Path) -> Option<String> {
+    let bytes = fs::read(src.join("manifest.json")).await.ok()?;
+    let value: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    value
+        .get("spec")
+        .and_then(|s| s.get("rootfs_source"))
+        .and_then(|r| r.as_str())
+        .map(str::to_owned)
 }
 
 /// ADR 0008 Phase 5 final piece: ensure the disk `Manifest`
@@ -11774,6 +11865,239 @@ mod tests {
         let seen_sidecar = inner.saw_sidecar.lock().clone().expect("inner.restore ran");
         let parsed: serde_json::Value = serde_json::from_slice(&seen_sidecar).unwrap();
         assert_eq!(parsed["format"], "fc");
+    }
+
+    /// D4 (2026-07-17 corruption path, session 03e6535e): a chunked
+    /// snapshot whose `disk_manifest` is None takes no NBD attach and no
+    /// sidecar patch, so FC would reopen the capture-time LITERAL
+    /// `/dev/nbdN` still named in the sidecar — a dead or FOREIGN device on
+    /// the receiving host. On a host that runs the NBD data plane, the
+    /// resume must REFUSE rather than boot onto it. (Runs on macOS: the
+    /// guard sits at the platform-neutral `!took_nbd_path` join.)
+    #[tokio::test]
+    async fn resume_refuses_a_stale_literal_nbd_rootfs_when_no_attach_happened() {
+        use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore};
+        use engram_storage_local::LocalBlobStorage;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Inner whose snapshot writes a sidecar naming a literal /dev/nbd7
+        // rootfs with disk_manifest=None (the corruption shape), and whose
+        // `restore` must never be reached.
+        struct LiteralNbdSidecarInner {
+            staging_root: PathBuf,
+            restored: Arc<AtomicBool>,
+        }
+        impl LiteralNbdSidecarInner {
+            fn dir_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.staging_root.join(id.to_string())
+            }
+        }
+        #[async_trait]
+        impl SandboxBackend for LiteralNbdSidecarInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                let snapshot_id = engram_core::SnapshotId::new();
+                let dest = self.dir_for(snapshot_id);
+                tokio::fs::create_dir_all(&dest).await.unwrap();
+                tokio::fs::write(dest.join("memory.bin"), b"mem")
+                    .await
+                    .unwrap();
+                tokio::fs::write(dest.join("state.bin"), b"state")
+                    .await
+                    .unwrap();
+                // The load-bearing bit: a sidecar that names a literal NBD
+                // device as the rootfs source.
+                let sidecar = serde_json::json!({
+                    "sandbox_id": uuid::Uuid::new_v4(),
+                    "created_at": chrono::Utc::now(),
+                    "spec": {
+                        "image": "t", "rootfs_source": "/dev/nbd7", "image_uri": null,
+                        "harness_pack_uri": null, "cpu": {"vcpus": 1},
+                        "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
+                        "ttl": null, "env": {}, "workdir": null,
+                        "harness_substrate": null, "network": {}
+                    },
+                    "format": "fc"
+                });
+                tokio::fs::write(
+                    dest.join("manifest.json"),
+                    serde_json::to_vec_pretty(&sidecar).unwrap(),
+                )
+                .await
+                .unwrap();
+                Ok(SnapshotMetadata {
+                    id: snapshot_id,
+                    size_bytes: 3,
+                    created_at: chrono::Utc::now(),
+                    image_version: "t".into(),
+                    disk_manifest: None,
+                    memory_manifest: None,
+                    base_memory_manifest: None,
+                    migration_source: None,
+                    source_sandbox_id: None,
+                    state_blob_key: None,
+                    sidecar_blob_key: None,
+                    rootfs_blob_key: None,
+                    working_set_blob_key: None,
+                    aux_bundles: vec![],
+                    paused_at: None,
+                    peer_hints: Vec::new(),
+                })
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                self.dir_for(id)
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                self.restored.store(true, Ordering::SeqCst);
+                Err(SandboxError::InvalidSpec(
+                    "inner.restore must not be reached".into(),
+                ))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let blob: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let cs = ChunkStore::new(blob);
+        let cache = ChunkCache::new(ChunkCacheConfig::new(tmp.path().join("cache")));
+        // A fake `/dev/nbd7` path — the allocator only validates the string,
+        // never opens the device (the guard fires before any slot claim).
+        let pool =
+            crate::disk_daemon::NbdSlotAllocator::from_paths(vec![PathBuf::from("/dev/nbd7")])
+                .unwrap();
+        let restored = Arc::new(AtomicBool::new(false));
+        let inner: Arc<dyn SandboxBackend> = Arc::new(LiteralNbdSidecarInner {
+            staging_root: tmp.path().join("fc-snaps"),
+            restored: restored.clone(),
+        });
+        // The full NBD-data-plane triple → `host_runs_nbd_data_plane()` true.
+        let pooled = PooledBackend::new(inner)
+            .with_chunk_store(cs, tmp.path().join("mat"))
+            .with_chunk_cache(cache)
+            .with_nbd_pool(pool);
+
+        let md = pooled.snapshot(SandboxId::new()).await.unwrap();
+        assert!(md.disk_manifest.is_none(), "fixture precondition");
+
+        let err = pooled.restore(md).await.expect_err("restore must refuse");
+        assert!(
+            matches!(err, SandboxError::Snapshot(_)),
+            "expected a Snapshot refusal, got {err:?}",
+        );
+        assert!(
+            format!("{err}").contains("/dev/nbd7"),
+            "the refusal names the stale literal device: {err}",
+        );
+        assert!(
+            !restored.load(Ordering::SeqCst),
+            "inner.restore must never run for a refused resume",
+        );
+    }
+
+    /// D5 (2026-07-17 corruption path, session 03e6535e): a sandbox with an
+    /// NBD-backed rootfs but NO `nbd_sandboxes` entry is a post-pod-roll
+    /// survivor whose disk server is gone. Snapshotting it would silently
+    /// skip the disk drain and record `disk_manifest=None` — dropping the
+    /// session's acked disk writes. The capture must REFUSE. Linux-only:
+    /// the guard + `nbd_sandboxes` are `cfg(target_os = "linux")`.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn capture_refuses_an_untracked_nbd_rootfs_survivor() {
+        use engram_chunk_store::{ChunkCache, ChunkCacheConfig, ChunkStore};
+        use engram_storage_local::LocalBlobStorage;
+
+        let tmp = tempfile::tempdir().unwrap();
+
+        // Inner reporting an NBD-backed rootfs device (the survivor's live
+        // spec). `snapshot` is never reached — the guard fires first.
+        struct NbdRootfsInner;
+        #[async_trait]
+        impl SandboxBackend for NbdRootfsInner {
+            async fn create(&self, _: SandboxSpec) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn exec_stream(
+                &self,
+                _: SandboxId,
+                _: ExecRequest,
+            ) -> Result<ExecStream, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            fn supports_diff_checkpoints(&self) -> bool {
+                true
+            }
+            fn rootfs_device(&self, _id: SandboxId) -> Option<PathBuf> {
+                Some(PathBuf::from("/dev/nbd7"))
+            }
+            async fn snapshot(&self, _: SandboxId) -> Result<SnapshotMetadata, SandboxError> {
+                panic!("inner.snapshot must not be reached — the guard fires first")
+            }
+            fn snapshot_path_for(&self, id: engram_core::SnapshotId) -> PathBuf {
+                std::env::temp_dir().join(id.to_string())
+            }
+            async fn restore(&self, _: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
+                Err(SandboxError::InvalidSpec("unused".into()))
+            }
+            async fn destroy(&self, _: SandboxId) -> Result<(), SandboxError> {
+                Ok(())
+            }
+            async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+                Ok(Vec::new())
+            }
+            async fn start_agent(&self, _: SandboxId, _: AgentSpec) -> Result<(), SandboxError> {
+                Ok(())
+            }
+        }
+
+        let blob: Arc<dyn engram_core::traits::BlobStorage> =
+            Arc::new(LocalBlobStorage::new(tmp.path().join("blob")));
+        let cs = ChunkStore::new(blob);
+        let cache = ChunkCache::new(ChunkCacheConfig::new(tmp.path().join("cache")));
+        let pool =
+            crate::disk_daemon::NbdSlotAllocator::from_paths(vec![PathBuf::from("/dev/nbd7")])
+                .unwrap();
+        let pooled = PooledBackend::new(Arc::new(NbdRootfsInner))
+            .with_chunk_store(cs, tmp.path().join("mat"))
+            .with_chunk_cache(cache)
+            .with_nbd_pool(pool)
+            .with_checkpoint_dir(tmp.path().join("ckpt"));
+
+        let sandbox_id = SandboxId::new();
+        pooled.session_bindings.insert(sandbox_id, SessionId::new());
+        // Deliberately do NOT insert into `nbd_sandboxes` — the survivor
+        // whose disk server died with the rolled pod.
+
+        let err = pooled
+            .snapshot(sandbox_id)
+            .await
+            .expect_err("capture must refuse an untracked NBD-rootfs sandbox");
+        assert!(
+            matches!(err, SandboxError::Snapshot(_)),
+            "expected a Snapshot refusal, got {err:?}",
+        );
+        assert!(
+            format!("{err}").contains("nbd_sandboxes"),
+            "the refusal explains the missing NBD tracking: {err}",
+        );
     }
 
     /// Snapshot wrap is a no-op when no chunk store is wired —
