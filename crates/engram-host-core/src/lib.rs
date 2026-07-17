@@ -38,6 +38,7 @@ pub mod device;
 pub mod effects;
 pub mod fs;
 pub mod nbd;
+pub mod reattach;
 pub mod shutdown;
 
 pub use coord::{
@@ -48,6 +49,10 @@ pub use device::DeviceSync;
 pub use effects::HostEffects;
 pub use fs::{HostFs, TokioFs};
 pub use nbd::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
+pub use reattach::{
+    first_seeded_probe, is_local_survivor_candidate, plan_reattach, probe_matches,
+    resume_data_plane_served, sweep_verdict, PidLiveness, ReattachPlan, ReattachStep, SweepAction,
+};
 pub use shutdown::{
     admits_new_plane, classify_survivor, flush_budget, is_straggler, plan_shutdown, FlushProbe,
     ShutdownPlan, ShutdownStage, SurvivorAction, DEFAULT_FLUSH_BUDGET_SECS,

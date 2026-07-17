@@ -50,7 +50,85 @@ pub struct Violation {
 /// (in-memory tier resolution — microseconds).
 pub async fn check(host: &SimHost) -> Result<(), Violation> {
     acked_writes_recoverable(host).await?;
-    reconcile_none_arm_fixed(host)
+    reconcile_none_arm_fixed(host)?;
+    slot_accounting(host).await?;
+    device_serving(host)
+}
+
+/// Oracle #3 — slot accounting (ADR 0098 P7, Flow B). The allocator's device
+/// universe partitions cleanly at every step: `free + warm + held == capacity`,
+/// with no slot handed to two owners (the reserved-bit protocol enforces the
+/// latter synchronously; this identity catches a leak/double-count).
+///
+/// `yield_now` FIRST so any in-flight async `release` — a dropped lease's
+/// `Drop`-spawned task — has drained before we read the pool counters. The sim
+/// is single-threaded, so one yield runs every ready task to completion, which
+/// keeps the accounting deterministic across replays.
+async fn slot_accounting(host: &SimHost) -> Result<(), Violation> {
+    tokio::task::yield_now().await;
+    let free = host.nbd_pool.free_count().await;
+    let warm = host.nbd_pool.warm_count().await;
+    let held = host.leases_held();
+    let capacity = host.nbd_capacity as usize;
+    if free + warm + held != capacity {
+        return Err(Violation {
+            invariant: "slot-accounting",
+            detail: format!(
+                "free {free} + warm {warm} + held {held} != capacity {capacity} \
+                 (a slot leaked or was double-counted)"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Oracle #5 + the 731df805 property (ADR 0098 P7, Flow B): **single-device
+/// ownership** and **no resident VM's served device is ever left dead**. These
+/// are structural consistency invariants the Flow B methods maintain; the
+/// 731df805 corruption broke the last one — a rung-parked survivor's live
+/// served device was stale-swept/disconnected, then an un-pause landed on the
+/// dead plane. A FAILURE here is that class recurring, not a test to update.
+fn device_serving(host: &SimHost) -> Result<(), Violation> {
+    let gen = host.generation;
+    let mut seen = std::collections::BTreeSet::new();
+    for (idx, s) in host.sandboxes.iter().enumerate() {
+        // No two sandboxes claim the same `/dev/nbdN`.
+        if !seen.insert(s.nbd_device.clone()) {
+            return Err(Violation {
+                invariant: "single-device-ownership",
+                detail: format!(
+                    "device {} is owned by more than one sandbox (idx {idx})",
+                    s.nbd_device.display()
+                ),
+            });
+        }
+        // "served by THIS generation" ⟺ a lease is held (we actually serve it).
+        let served = s.served_by == Some(gen);
+        if served != s.lease.is_some() {
+            return Err(Violation {
+                invariant: "single-device-ownership",
+                detail: format!(
+                    "sandbox {idx}: served_by_current={served} but lease_held={} — \
+                     serving state and the slot lease disagree",
+                    s.lease.is_some()
+                ),
+            });
+        }
+        // A device we serve must have the kernel record US as its owner. If a
+        // served device's `kernel_owner` is cleared/another gen, its plane was
+        // torn down under a live serve — the 731df805 dead-plane class.
+        if served && s.kernel_owner != Some(gen) {
+            return Err(Violation {
+                invariant: "served-device-never-dead",
+                detail: format!(
+                    "sandbox {idx} is served by generation {gen} but kernel_owner={:?} — \
+                     a live served device was disconnected (the 731df805 dead-plane class)",
+                    s.kernel_owner
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Oracle #9: no sandbox reconcile ever destroyed is still coord-owned. Reads

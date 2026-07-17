@@ -7591,7 +7591,41 @@ impl SandboxBackend for PooledBackend {
     }
 
     /// ADR 0018 commit 12m: forward resume. Symmetric with pause.
+    ///
+    /// ADR 0098 P7 (#739 follow-up): the **un-pause data-plane gate**. A
+    /// rung-cancel resume must never un-pause a guest onto a rootfs NBD device
+    /// that THIS host-agent generation does not serve — the 731df805 outcome
+    /// (a coord-list gap left a rung-parked survivor's device unclaimed, the
+    /// stale-binding sweep disconnected its live rootfs, and the un-pause
+    /// landed on a dead data plane → EIO/garbage on the live guest, even
+    /// though the guest never left `paused`). The local-survivor rehydrate
+    /// pass is the primary fix; this gate is the last line — even if some
+    /// future listing bug recurs, we fail fast into the `evict_local → resume`
+    /// ladder rather than serving dead-plane reads.
     async fn resume(&self, id: SandboxId) -> Result<(), SandboxError> {
+        #[cfg(target_os = "linux")]
+        {
+            let is_nbd_backed = self.inner.rootfs_device(id).is_some();
+            let served = self.nbd_sandboxes.contains_key(&id);
+            let ok = engram_host_core::resume_data_plane_served(is_nbd_backed, served);
+            // Soft-invariant (ADR 0099 H6): logs the alertable line but never
+            // diverts control — the explicit early-return below is what routes
+            // the caller into recovery.
+            engram_core::soft_invariant!(
+                ok,
+                "resume {id}: rootfs NBD device is not served by this host-agent \
+                 generation; refusing to un-pause onto a dead data plane"
+            );
+            if !ok {
+                return Err(SandboxError::Vm(
+                    format!(
+                        "resume {id}: rootfs NBD data plane not served by this generation; \
+                         routing to evict_local → resume"
+                    )
+                    .into(),
+                ));
+            }
+        }
         self.inner.resume(id).await
     }
 
@@ -9226,16 +9260,27 @@ fn local_survivor_candidates(
 )> {
     records
         .into_iter()
-        .filter(|r| live.contains(&r.sandbox_id) && !served.contains(&r.sandbox_id))
         .filter_map(|r| {
-            let Some(session_id) = r.session_id else {
-                tracing::debug!(
-                    sandbox_id = %r.sandbox_id,
-                    "local survivor rehydrate: chain-head record has no session \
-                     binding; leaving this sandbox to the coordinator list",
-                );
+            // The pure predicate (ADR 0098 P7, `engram_host_core::reattach`):
+            // live ∧ unserved ∧ session-bound. Extracted so the host-internal
+            // simulator drives the #739 park→roll→register scenario over the
+            // same decision core.
+            let has_session = r.session_id.is_some();
+            if !engram_host_core::is_local_survivor_candidate(
+                live.contains(&r.sandbox_id),
+                served.contains(&r.sandbox_id),
+                has_session,
+            ) {
+                if live.contains(&r.sandbox_id) && !served.contains(&r.sandbox_id) && !has_session {
+                    tracing::debug!(
+                        sandbox_id = %r.sandbox_id,
+                        "local survivor rehydrate: chain-head record has no session \
+                         binding; leaving this sandbox to the coordinator list",
+                    );
+                }
                 return None;
-            };
+            }
+            let session_id = r.session_id.expect("candidate implies a bound session");
             Some((session_id, r.sandbox_id, r.manifest_ref))
         })
         .collect()

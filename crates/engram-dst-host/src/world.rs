@@ -36,7 +36,7 @@ use engram_core::traits::{BlobStorage, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_host_agent::disk_daemon::backend::ChunkedDiskBackend;
-use engram_host_agent::disk_daemon::spool;
+use engram_host_agent::disk_daemon::{spool, NbdSlot, NbdSlotAllocator};
 use engram_host_core::{HostEffects, LiveManifestPublishRequest};
 use engram_sim::{SimClock, SimEntropy};
 use engram_storage_local::LocalBlobStorage;
@@ -150,6 +150,26 @@ pub struct SandboxSlot {
     /// The live backend — `None` after a crash, until a restart/adopt
     /// rebuilds it.
     pub backend: Option<Arc<ChunkedDiskBackend>>,
+
+    // ── Flow B: the NBD slot/reattach device-serving model (ADR 0098 P7) ──
+    /// The `/dev/nbdN` this sandbox's rootfs is served over.
+    pub nbd_device: std::path::PathBuf,
+    /// The current generation's real slot lease from [`SimHost::nbd_pool`].
+    /// `Some` while this generation serves the device; forgotten (not
+    /// released) on a roll, exactly like `abandon_for_shutdown`.
+    pub lease: Option<NbdSlot>,
+    /// The host-agent generation whose serve socket the kernel currently
+    /// serves this device with (`RECONFIGURE`d). `None` = unserved (post-roll,
+    /// pre-rehydrate, or after a stale-sweep DISCONNECT). "served by THIS
+    /// generation" (the un-pause gate) is `served_by == Some(host.generation)`.
+    pub served_by: Option<u32>,
+    /// The generation the kernel records as the device's configuring owner
+    /// (`/sys/block/nbdN/pid` stand-in). SURVIVES a roll — only a DISCONNECT
+    /// clears it — so the stale-binding sweep probes it against liveness.
+    pub kernel_owner: Option<u32>,
+    /// Rung-2 parked (evicting-shaped: FC paused, VM resident). The 731df805
+    /// class was a parked survivor whose device the sweep disconnected.
+    pub parked: bool,
 }
 
 impl SandboxSlot {
@@ -180,6 +200,25 @@ pub struct SimHost {
     /// Monotonic content-tag source. Advances only on writes, so the id a
     /// given step mints is a pure function of the step sequence (seed).
     next_tag: u64,
+
+    // ── Flow B: the NBD slot allocator + generation (ADR 0098 P7) ──
+    /// The current process generation (a pid stand-in). Bumped on every roll
+    /// ([`crash_process`](SimHost::crash_process)); the successor's rehydrate
+    /// re-serves under the new generation while the kernel devices retain the
+    /// old (now dead) owner until re-served or swept.
+    pub generation: u32,
+    /// The REAL portable slot allocator for THIS generation. A roll replaces
+    /// it (a fresh host-agent process builds a fresh pool; the kernel device
+    /// bindings survive in `SandboxSlot::kernel_owner`). Devices
+    /// `0..num_sandboxes` are the sandbox rootfs devices; `num_sandboxes..cap`
+    /// are spares the populator warms + `SlotClaim`/`SlotPopulateTick` exercise.
+    pub nbd_pool: Arc<NbdSlotAllocator>,
+    /// The pool's device universe size (constant across generations).
+    pub nbd_capacity: u32,
+    /// Spare-device leases held for the slot-accounting exercise (dropped on a
+    /// roll). Separate from per-sandbox `lease`s so the accounting oracle sees
+    /// every held slot.
+    spare_leases: Vec<NbdSlot>,
 }
 
 impl SimHost {
@@ -199,6 +238,14 @@ impl SimHost {
         let (effects, seam_log) = sim_effects(clock.clone(), entropy.clone(), coord.clone());
         // Deterministic, readable host id.
         let host_id = HostId::from(uuid::Uuid::from_u128(0x0A57_0000));
+
+        // Flow B: the generation-1 slot allocator. `num_sandboxes` rootfs
+        // devices + 2 spares (for the warm/validation-window/`SlotClaim`
+        // exercise); `warm_target = 1` so the populator warms exactly one
+        // spare when time advances. Each sandbox claims its own `/dev/nbdN`.
+        let nbd_capacity = num_sandboxes as u32 + 2;
+        let generation = 1u32;
+        let nbd_pool = NbdSlotAllocator::with_capacity(nbd_capacity, 0);
 
         let mut sandboxes = Vec::with_capacity(num_sandboxes);
         for i in 0..num_sandboxes {
@@ -224,12 +271,23 @@ impl SimHost {
             // Flow C steady state: the sandbox is live, coord-owned, and
             // locally bound — reconcile is a no-op until something perturbs it.
             reconcile.seed_sandbox(sandbox_id, session_id);
+            // Flow B: claim this sandbox's rootfs device on the gen-1 pool.
+            let nbd_device = Self::device_path(i);
+            let lease = nbd_pool
+                .claim(&nbd_device)
+                .await
+                .expect("gen-1 claim of a free sandbox device");
             sandboxes.push(SandboxSlot {
                 sandbox_id,
                 session_id,
                 base_ref,
                 published_ref: None,
                 backend: Some(Arc::new(backend)),
+                nbd_device,
+                lease: Some(lease),
+                served_by: Some(generation),
+                kernel_owner: Some(generation),
+                parked: false,
             });
         }
 
@@ -246,6 +304,10 @@ impl SimHost {
             reconcile,
             ledger: AckedWriteLedger::default(),
             next_tag: 0,
+            generation,
+            nbd_pool,
+            nbd_capacity,
+            spare_leases: Vec::new(),
         }
     }
 
@@ -458,7 +520,235 @@ impl SimHost {
         // coordinator (a separate process) survive. The successor's reconcile
         // loop rebuilds the bindings from the coordinator — the None-arm path.
         self.reconcile.crash_ram();
+        // Flow B: a process death is a ROLL.
+        self.roll_generation();
         Ok(())
+    }
+
+    /// Flow B (ADR 0098 P7): a host-agent process death is a ROLL — the
+    /// successor comes up as a fresh GENERATION with a fresh slot pool. The
+    /// kernel `/dev/nbdN` devices, and the OWNER pid the kernel recorded for
+    /// them, SURVIVE (the pod-roll survival contract); only the in-process
+    /// serve sockets and slot leases die. So `served_by` clears (no current-gen
+    /// serve socket) while `kernel_owner` persists at the now-DEAD generation
+    /// until the successor re-serves the device (RECONFIGURE) or the
+    /// stale-binding sweep disconnects it. `parked` persists — the FC VM stays
+    /// resident across the roll.
+    fn roll_generation(&mut self) {
+        self.generation += 1;
+        for slot in &mut self.sandboxes {
+            // Drop the dead generation's lease (the old pool is discarded; its
+            // async release is unobservable). served_by clears; kernel_owner +
+            // parked persist.
+            slot.lease = None;
+            slot.served_by = None;
+        }
+        self.spare_leases.clear();
+        // The successor builds a fresh pool (all devices free — it discovers
+        // the surviving kernel bindings via rehydrate + the sweep).
+        self.nbd_pool = NbdSlotAllocator::with_capacity(self.nbd_capacity, 0);
+    }
+
+    // ─────────────────────── Flow B lifecycle (ADR 0098 P7) ───────────────────
+
+    /// Is sandbox `idx` a resident survivor whose device is bound to a DEAD
+    /// (prior) generation — i.e. it needs rehydrating? (The reattach pass found
+    /// the FC config; the kernel device is still configured under the old pid.)
+    fn is_resident_survivor(&self, idx: usize) -> bool {
+        self.sandboxes[idx]
+            .kernel_owner
+            .is_some_and(|g| g < self.generation)
+    }
+
+    /// Rung-2 PARK sandbox `idx`: the FC VM pauses but stays RESIDENT and its
+    /// NBD device keeps being served by the current generation (status
+    /// `evicting`-shaped). Models the coordinator parking a session at eviction
+    /// rung 2 — the exact pre-condition of the 731df805 incident. A no-op on a
+    /// sandbox this generation is not currently serving.
+    pub fn park(&mut self, idx: usize) {
+        if let Some(slot) = self.sandboxes.get_mut(idx) {
+            if slot.served_by == Some(self.generation) {
+                slot.parked = true;
+            }
+        }
+    }
+
+    /// Claim + serve sandbox `idx`'s device on the CURRENT generation
+    /// (RECONFIGURE), rebuilding its backend if the RAM died. Idempotent: a
+    /// device already served this generation is skipped (mirrors
+    /// `rehydrate_sandbox`'s `nbd_sandboxes` presence check). The device is
+    /// FREE in the fresh post-roll pool, so `claim`'s fast path takes it with
+    /// no retry (safe under paused tokio).
+    async fn reserve_and_serve(&mut self, idx: usize) -> Result<(), String> {
+        if self.sandboxes[idx].served_by == Some(self.generation) {
+            return Ok(());
+        }
+        let device = self.sandboxes[idx].nbd_device.clone();
+        let pool = self.nbd_pool.clone();
+        let Some(lease) = pool.claim(&device).await else {
+            return Err(format!(
+                "register rehydrate: claim of {} failed (not free?)",
+                device.display()
+            ));
+        };
+        // Rebuild the backend from the durable ref + adopt any spool (the
+        // seed-before-RECONFIGURE recovery leg). This is the recovery ARM the
+        // local-rehydrate pass adds to oracle #1's closure.
+        if self.sandboxes[idx].backend.is_none() {
+            self.rebuild(idx).await?;
+        }
+        let g = self.generation;
+        let s = &mut self.sandboxes[idx];
+        s.lease = Some(lease);
+        s.served_by = Some(g);
+        s.kernel_owner = Some(g);
+        Ok(())
+    }
+
+    /// The register-time rehydrate sequence (ADR 0098 P7): **coord-list pass →
+    /// local ChainHeadRecord pass (#739) → stale-binding sweep**, driven over
+    /// the pure verdicts. This is the callable sequence the 731df805 scenario
+    /// pins.
+    ///
+    /// * `coord_includes_parked` — the ADVERSARIAL knob: the pre-#739 buggy
+    ///   coordinator list filtered on `status='active'`, so it OMITTED
+    ///   rung-parked (`evicting`) survivors. `false` replays that bug.
+    /// * `local_pass_enabled` — whether the #739 defense-in-depth
+    ///   ChainHeadRecord pass runs. `false` is the ungated variant (proving the
+    ///   un-pause gate is the last line).
+    pub async fn register_rehydrate(
+        &mut self,
+        coord_includes_parked: bool,
+        local_pass_enabled: bool,
+    ) -> Result<(), String> {
+        let n = self.sandboxes.len();
+        // 1. Coord-list pass: re-serve every LISTED survivor. The buggy list
+        //    omits parked survivors.
+        for idx in 0..n {
+            if !self.is_resident_survivor(idx) {
+                continue;
+            }
+            let listed = coord_includes_parked || !self.sandboxes[idx].parked;
+            if listed {
+                self.reserve_and_serve(idx).await?;
+            }
+        }
+        // 2. Local ChainHeadRecord pass (#739 defense): re-serve any live
+        //    survivor the coord list missed, via the pure candidate predicate
+        //    (live ∧ unserved ∧ session-bound). Every sim sandbox's record
+        //    carries a bound session.
+        if local_pass_enabled {
+            for idx in 0..n {
+                let live = self.is_resident_survivor(idx);
+                let served = self.sandboxes[idx].served_by == Some(self.generation);
+                if engram_host_core::is_local_survivor_candidate(live, served, true) {
+                    self.reserve_and_serve(idx).await?;
+                }
+            }
+        }
+        // 3. Stale-binding sweep.
+        self.stale_sweep_tick();
+        Ok(())
+    }
+
+    /// The stale-binding sweep (ADR 0098 P7): DISCONNECT devices whose recorded
+    /// owner is a genuinely-dead generation, driven over the pure
+    /// [`sweep_verdict`](engram_host_core::sweep_verdict). Only devices FREE in
+    /// the pool are reached — the `served_by == current` (claimed) gate mirrors
+    /// the driver's `try_claim` free-in-pool gate, so a device THIS generation
+    /// serves (a re-served survivor) is NEVER swept (the 731df805 protection).
+    pub fn stale_sweep_tick(&mut self) {
+        let gen = self.generation;
+        for slot in &mut self.sandboxes {
+            // Served this generation ⇒ claimed ⇒ not free in the pool ⇒ the
+            // sweep skips it (try_claim would return None).
+            if slot.served_by == Some(gen) {
+                continue;
+            }
+            let liveness = match slot.kernel_owner {
+                None => engram_host_core::PidLiveness::NoPid,
+                Some(g) if g == gen => engram_host_core::PidLiveness::SelfPid,
+                // An older generation is a dead process.
+                Some(_) => engram_host_core::PidLiveness::Dead,
+            };
+            if matches!(
+                engram_host_core::sweep_verdict(liveness),
+                engram_host_core::SweepAction::Disconnect
+            ) {
+                // NBD_CMD_DISCONNECT: the kernel binding is torn down.
+                slot.kernel_owner = None;
+            }
+        }
+    }
+
+    /// Un-pause sandbox `idx` (rung-cancel resume). The **un-pause data-plane
+    /// gate** (ADR 0098 P7): the guest is un-paused only when its rootfs device
+    /// is served by THIS generation; otherwise the gate fires and the guest
+    /// stays parked, routed to `evict_local → resume` — it NEVER lands on a
+    /// dead data plane. Returns `true` if un-paused, `false` if the gate fired
+    /// (or there was nothing to un-pause).
+    pub fn unpause(&mut self, idx: usize) -> bool {
+        let Some(slot) = self.sandboxes.get(idx) else {
+            return false;
+        };
+        if !slot.parked {
+            return false;
+        }
+        let served = slot.served_by == Some(self.generation);
+        if engram_host_core::resume_data_plane_served(true, served) {
+            self.sandboxes[idx].parked = false;
+            true
+        } else {
+            // The gate fires — stay parked; the coordinator drives recovery.
+            false
+        }
+    }
+
+    /// The spare devices (`num_sandboxes..capacity`) the slot-allocator
+    /// exercise uses. A `usize` ordinal maps into them.
+    fn spare_device(&self, ordinal: usize) -> Option<std::path::PathBuf> {
+        let n = self.sandboxes.len();
+        let num_spares = (self.nbd_capacity as usize).saturating_sub(n);
+        if num_spares == 0 {
+            return None;
+        }
+        Some(Self::device_path(n + ordinal % num_spares))
+    }
+
+    /// Exercise the REAL slot allocator: `try_claim` a spare device (Free →
+    /// Claimed), holding the lease. `try_claim` is single-shot (no retry), so
+    /// it is hang-free under paused tokio and its synchronous reserved-bit
+    /// protocol guarantees NO double-claim — a device a prior `SlotClaim`
+    /// already holds returns `None` (benign). Held leases feed the
+    /// slot-accounting oracle.
+    pub async fn slot_claim(&mut self, ordinal: usize) {
+        let Some(device) = self.spare_device(ordinal) else {
+            return;
+        };
+        let pool = self.nbd_pool.clone();
+        if let Some(lease) = pool.try_claim(&device).await {
+            self.spare_leases.push(lease);
+        }
+    }
+
+    /// Release the oldest held spare lease (Claimed → Free), exercising the
+    /// allocator's `Drop`/`release` path. The async release is drained by the
+    /// slot-accounting oracle's `yield_now` before it reads the pool counters,
+    /// keeping the accounting deterministic.
+    pub fn slot_populate_tick(&mut self) {
+        // Drop the oldest spare so the populator/release path is exercised (the
+        // freed slot returns to the pool for a future SlotClaim).
+        if !self.spare_leases.is_empty() {
+            let _ = self.spare_leases.remove(0);
+        }
+    }
+
+    /// The count of slot leases this generation holds (per-sandbox served
+    /// devices + spare leases) — the "claimed + parked" term of the
+    /// slot-accounting identity `free + warm + held == capacity`.
+    pub fn leases_held(&self) -> usize {
+        let sandbox_leases = self.sandboxes.iter().filter(|s| s.lease.is_some()).count();
+        sandbox_leases + self.spare_leases.len()
     }
 
     /// Restart the process: bring up the sandboxes whose backend DIED — for
@@ -602,6 +892,8 @@ impl SimHost {
             slot.backend = None;
         }
         self.reconcile.crash_ram();
+        // Flow B: SIGTERM is a roll (the successor pidfd-reattaches).
+        self.roll_generation();
         Ok(())
     }
 
@@ -641,6 +933,8 @@ impl SimHost {
             slot.backend = None;
         }
         self.reconcile.crash_ram();
+        // Flow B: the injected crash is a roll.
+        self.roll_generation();
         Ok(())
     }
 
