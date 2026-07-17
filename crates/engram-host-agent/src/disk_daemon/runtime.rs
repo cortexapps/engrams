@@ -695,10 +695,9 @@ pub async fn reattach_manifest(
     // Verify-on-read probe target (ADR 0098 P7 rider): the first seeded chunk,
     // captured BEFORE `adopt_unflushed` consumes the seed vec. `None` unless a
     // spool was adopted, so a clean rehydrate pays nothing.
-    let probe: Option<(usize, Vec<u8>)> = seed_dirty
-        .as_deref()
-        .and_then(engram_host_core::first_seeded_probe)
-        .map(|(idx, bytes)| (idx, bytes.to_vec()));
+    let probe: Option<(usize, Vec<u8>)> =
+        engram_host_core::first_seeded_probe(seed_dirty.as_deref())
+            .map(|(idx, bytes)| (idx, bytes.to_vec()));
     if let Some(chunks) = seed_dirty {
         let count = chunks.len();
         let bytes = backend.adopt_unflushed(chunks).await;
