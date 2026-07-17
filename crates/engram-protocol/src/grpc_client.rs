@@ -19,6 +19,7 @@ use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -42,10 +43,10 @@ use crate::grpc::{
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
     ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
     SendHarnessPromptRequest, SendHarnessToolResultRequest, StartAgentRequest,
-    UnbindHarnessSessionRequest,
+    UnbindHarnessSessionRequest, WriteFilesRequest,
 };
 
-use crate::wire::{WireExecRequest, WireReapStats};
+use crate::wire::{WireExecRequest, WireReapStats, WireWriteFilesRequest, WireWriteFilesResponse};
 
 /// ADR 0095: why a peer-chunk pull wants its hashes — the wire `scope`
 /// oneof on [`PeerChunkGetRequest`]. Observability + serve-side rate
@@ -1174,6 +1175,30 @@ impl GrpcHostClient {
         })
     }
 
+    /// Unary batched file write. The opaque bincode payload keeps the
+    /// coord↔host schema pinned independently of the in-process types.
+    pub async fn write_files(
+        &self,
+        sandbox_id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let wire = WireWriteFilesRequest::from_engine(files);
+        let req = WriteFilesRequest {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            request_bincode: encode_bincode(&wire, "WireWriteFilesRequest")?,
+        };
+        let resp = self
+            .inner
+            .clone()
+            .write_files(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let wire: WireWriteFilesResponse =
+            decode_bincode(&resp.response_bincode, "WireWriteFilesResponse")?;
+        Ok(wire.into_engine())
+    }
+
     /// ADR 0014 issue #6: open a bidi ProxyShell stream to the host.
     /// Sends the initial frame carrying `sandbox_id`, then returns a
     /// `ShellTunnel` whose channels the caller bridges to the
@@ -1447,6 +1472,14 @@ impl HostClient for GrpcHostClient {
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
         self.exec_start(id, cmd).await
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        Self::write_files(self, id, files).await
     }
 
     async fn snapshot(

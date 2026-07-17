@@ -78,12 +78,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
+use engram_agentd::{
+    read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
+};
 use engram_core::traits::sandbox::{AgentRefresh, HarnessByteStream, SandboxBackend};
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -1528,6 +1531,30 @@ impl FirecrackerBackend {
         drive_exec_protocol(sandbox_id, reader, writer, cmd).await
     }
 
+    /// Drive agentd's existing `Upload` verb over a direct UDS. Public for
+    /// the protocol integration test; production uses the FC-vsock variant.
+    pub async fn write_files_via_agent_socket(
+        sandbox_id: SandboxId,
+        agent_socket: &Path,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let mut results = Vec::with_capacity(files.len());
+        for file in files {
+            let result = match UnixStream::connect(agent_socket).await {
+                Ok(conn) => upload_file_over_stream(conn, file).await,
+                Err(error) => write_file_failure(
+                    file.path,
+                    format!(
+                        "sandbox {sandbox_id}: connect to agent at {}: {error}",
+                        agent_socket.display()
+                    ),
+                ),
+            };
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     /// Connect to the in-guest agent over Firecracker's vsock proxy.
     /// The host UDS at `vsock_uds_path` is multiplexed: every host→
     /// guest connection sends `CONNECT <port>\n` first and reads back
@@ -1543,6 +1570,26 @@ impl FirecrackerBackend {
         let conn = Self::connect_fc_vsock(vsock_uds_path, port).await?;
         let (reader, writer) = tokio::io::split(conn);
         drive_exec_protocol(sandbox_id, reader, writer, cmd).await
+    }
+
+    async fn write_files_via_fc_vsock(
+        sandbox_id: SandboxId,
+        vsock_uds_path: &Path,
+        port: u32,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let mut results = Vec::with_capacity(files.len());
+        for file in files {
+            let result = match Self::connect_fc_vsock(vsock_uds_path, port).await {
+                Ok(conn) => upload_file_over_stream(conn, file).await,
+                Err(error) => write_file_failure(
+                    file.path,
+                    format!("sandbox {sandbox_id}: connect to agentd vsock: {error}"),
+                ),
+            };
+            results.push(result);
+        }
+        Ok(results)
     }
 
     /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`,
@@ -4183,6 +4230,41 @@ where
     })
 }
 
+async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let path = file.path.clone();
+    let request = WireRequest::Upload {
+        path: file.path,
+        bytes: file.content,
+        mode: file.mode,
+    };
+    if let Err(error) = write_msg(&mut stream, &request).await {
+        return write_file_failure(path, format!("send Upload request: {error}"));
+    }
+    match read_msg::<_, WireResponse>(&mut stream).await {
+        Ok(WireResponse::UploadOk) => WriteFileResult {
+            path,
+            ok: true,
+            error: None,
+        },
+        Ok(WireResponse::Error { kind, message }) => {
+            write_file_failure(path, format!("agentd rejected Upload ({kind}): {message}"))
+        }
+        Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
+        Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
+    }
+}
+
+fn write_file_failure(path: String, error: String) -> WriteFileResult {
+    WriteFileResult {
+        path,
+        ok: false,
+        error: Some(error),
+    }
+}
+
 /// Wait until either:
 ///   - the API socket appears (success), OR
 ///   - the firecracker process exits (failure — surface its exit
@@ -4292,6 +4374,18 @@ impl SandboxBackend for FirecrackerBackend {
         // here, agentd genuinely went away after readiness signal —
         // surface the error rather than masking with retries.
         Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        Self::write_files_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, files).await
     }
 
     /// ADR 0066: connect to the in-guest agentd relay listener on `port`

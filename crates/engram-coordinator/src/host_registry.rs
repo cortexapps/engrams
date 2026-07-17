@@ -19,7 +19,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use engram_core::traits::{HarnessDial, HostClient, MetadataStore, SessionFence};
-use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{
+    AgentSpec, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+};
 use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SessionId};
@@ -545,6 +547,31 @@ impl HostClient for HostRegistry {
                     tracing::debug!(
                         sandbox_id = %id, attempt, error = %msg,
                         "exec_stream transient Unavailable; retrying",
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        // Unlike exec, WriteFiles is idempotent: retrying the whole batch after
+        // an Unavailable response merely replaces each file with the same bytes.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (_, backend) = self.resolve_owner(id).await?;
+            match backend.write_files(id, files.clone()).await {
+                Err(SandboxError::Unavailable(msg)) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        sandbox_id = %id, attempt, error = %msg,
+                        "write_files transient Unavailable; retrying",
                     );
                     tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
                 }

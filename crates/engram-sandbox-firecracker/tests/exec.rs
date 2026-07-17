@@ -20,7 +20,7 @@ use std::time::Duration;
 
 use engram_agentd::{serve_connection, HarnessSupervisor};
 use engram_core::types::ids::SandboxId;
-use engram_core::types::sandbox::ExecRequest;
+use engram_core::types::sandbox::{ExecRequest, WriteFileSpec};
 use engram_sandbox_firecracker::FirecrackerBackend;
 use tokio::net::UnixListener;
 use tokio::task::JoinHandle;
@@ -78,6 +78,43 @@ async fn exec_stream_via_agent_socket_round_trips_stdout_and_exit() {
     assert_eq!(stdout, b"hello");
     assert!(stderr.is_empty(), "unexpected stderr: {stderr:?}");
     assert_eq!(exit, Some(0));
+
+    agent.abort();
+}
+
+#[tokio::test]
+async fn write_files_via_agent_socket_reports_each_file_result() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let socket = dir.path().join("agent.sock");
+    let agent = spawn_test_agent(socket.clone()).await;
+    let written = dir.path().join("written.txt");
+
+    let results = FirecrackerBackend::write_files_via_agent_socket(
+        SandboxId::new(),
+        &socket,
+        vec![
+            // Writing over an existing directory fails inside agentd, proving
+            // a per-file failure does not abort the rest of the batch.
+            WriteFileSpec {
+                path: dir.path().to_string_lossy().into_owned(),
+                content: b"cannot replace a directory".to_vec(),
+                mode: None,
+            },
+            WriteFileSpec {
+                path: written.to_string_lossy().into_owned(),
+                content: b"staged".to_vec(),
+                mode: Some(0o600),
+            },
+        ],
+    )
+    .await
+    .expect("write_files_via_agent_socket");
+
+    assert_eq!(results.len(), 2);
+    assert!(!results[0].ok, "directory write should fail");
+    assert!(results[0].error.is_some());
+    assert!(results[1].ok, "second write failed: {:?}", results[1]);
+    assert_eq!(tokio::fs::read(&written).await.unwrap(), b"staged");
 
     agent.abort();
 }

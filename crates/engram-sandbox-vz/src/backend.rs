@@ -24,7 +24,8 @@ use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::SandboxProbe;
 use engram_core::types::sandbox::{
-    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec,
+    AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxSpec, WriteFileResult,
+    WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -793,6 +794,41 @@ where
     })
 }
 
+async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let path = file.path.clone();
+    let request = WireRequest::Upload {
+        path: file.path,
+        bytes: file.content,
+        mode: file.mode,
+    };
+    if let Err(error) = write_msg(&mut stream, &request).await {
+        return write_file_failure(path, format!("send Upload request: {error}"));
+    }
+    match read_msg::<_, WireResponse>(&mut stream).await {
+        Ok(WireResponse::UploadOk) => WriteFileResult {
+            path,
+            ok: true,
+            error: None,
+        },
+        Ok(WireResponse::Error { kind, message }) => {
+            write_file_failure(path, format!("agentd rejected Upload ({kind}): {message}"))
+        }
+        Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
+        Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
+    }
+}
+
+fn write_file_failure(path: String, error: String) -> WriteFileResult {
+    WriteFileResult {
+        path,
+        ok: false,
+        error: Some(error),
+    }
+}
+
 /// Logged at-most-once per backend instance when a session asks for
 /// egress filtering VZ can't enforce. Apple's
 /// ADR 0096 D7: mint a fresh per-VM identity — a platform machine
@@ -1115,6 +1151,33 @@ impl SandboxBackend for VzBackend {
         })?;
         let (reader, writer) = tokio::io::split(conn);
         drive_exec_protocol(id, reader, writer, cmd).await
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let mut results = Vec::with_capacity(files.len());
+        for file in files {
+            let result = match UnixStream::connect(&agent_uds).await {
+                Ok(conn) => upload_file_over_stream(conn, file).await,
+                Err(error) => write_file_failure(
+                    file.path,
+                    format!(
+                        "sandbox {id}: connect engram-agentd UDS {}: {error}",
+                        agent_uds.display()
+                    ),
+                ),
+            };
+            results.push(result);
+        }
+        Ok(results)
     }
 
     /// ADR 0066 Phase 2: dial the in-guest agentd relay on `port` (the

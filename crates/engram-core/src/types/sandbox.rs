@@ -399,6 +399,25 @@ pub struct ExecRequest {
     pub timeout: Option<Duration>,
 }
 
+/// One file to write into a running sandbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteFileSpec {
+    pub path: String,
+    pub content: Vec<u8>,
+    /// Unix permission bits applied after writing. `None` leaves the
+    /// platform-created permissions unchanged.
+    pub mode: Option<u32>,
+}
+
+/// Per-file outcome from a batched [`SandboxBackend::write_files`](
+/// crate::traits::SandboxBackend::write_files) operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteFileResult {
+    pub path: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
 /// Output event from a streaming `exec`. The stream is terminated by
 /// exactly one `Exit` event (or an error).
 ///

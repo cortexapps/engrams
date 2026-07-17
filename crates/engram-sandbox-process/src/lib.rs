@@ -42,7 +42,9 @@ use dashmap::DashMap;
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
-use engram_core::types::sandbox::{AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{
+    AgentSpec, ExecEvent, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
 use serde::{Deserialize, Serialize};
@@ -358,6 +360,58 @@ impl SandboxBackend for ProcessBackend {
             exec_id: SandboxId::new().to_string(),
             events: Box::pin(ReceiverStream::new(rx)),
         })
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let state = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .clone();
+        let mut results = Vec::with_capacity(files.len());
+        for file in files {
+            // Match exec's workdir resolution: relative paths are rooted in
+            // the per-sandbox cwd; absolute paths remain absolute.
+            let resolved = state.cwd.join(&file.path);
+            let outcome: std::io::Result<()> = async {
+                if let Some(parent) = resolved.parent() {
+                    if !parent.as_os_str().is_empty() {
+                        tokio::fs::create_dir_all(parent).await?;
+                    }
+                }
+                tokio::fs::write(&resolved, &file.content).await?;
+                if let Some(mode) = file.mode {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        tokio::fs::set_permissions(
+                            &resolved,
+                            std::fs::Permissions::from_mode(mode),
+                        )
+                        .await?;
+                    }
+                }
+                Ok(())
+            }
+            .await;
+            results.push(match outcome {
+                Ok(()) => WriteFileResult {
+                    path: file.path,
+                    ok: true,
+                    error: None,
+                },
+                Err(error) => WriteFileResult {
+                    path: file.path,
+                    ok: false,
+                    error: Some(error.to_string()),
+                },
+            });
+        }
+        Ok(results)
     }
 
     async fn snapshot(&self, id: SandboxId) -> Result<SnapshotMetadata, SandboxError> {

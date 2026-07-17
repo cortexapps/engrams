@@ -28,7 +28,8 @@ use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::port::PortTunnel;
 use crate::types::sandbox::{
-    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec, WriteFileResult,
+    WriteFileSpec,
 };
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -130,6 +131,19 @@ pub trait HostClient: Send + Sync {
             stderr,
             exit_status,
         })
+    }
+
+    /// Write a batch of files into a running sandbox. Implementations report
+    /// file-level failures in the returned vector and reserve the outer error
+    /// for sandbox-level failures such as an unknown sandbox.
+    async fn write_files(
+        &self,
+        _id: SandboxId,
+        _files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this host doesn't support `write_files` yet".into(),
+        ))
     }
 
     async fn snapshot(

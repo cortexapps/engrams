@@ -347,6 +347,22 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(Box::pin(started.chain(body))))
     }
 
+    async fn write_files(
+        &self,
+        req: Request<app::WriteFilesRequest>,
+    ) -> Result<Response<app::WriteFilesResponse>, Status> {
+        self.auth.check(&req)?;
+        let r = req.into_inner();
+        let id = parse_session_id(&r.session_id)?;
+        let files = super::convert::write_files_request_from_proto(r);
+        let results = crate::api::write_files::write_files_core(&self.state, id, files)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(
+            super::convert::write_files_response_to_proto(results),
+        ))
+    }
+
     async fn get_log(
         &self,
         req: Request<app::GetLogRequest>,

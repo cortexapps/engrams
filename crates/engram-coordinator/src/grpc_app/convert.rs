@@ -20,6 +20,7 @@ use crate::api::exec::ExecRequest as ApiExecRequest;
 use crate::api::sessions::{CreateSessionRequest, ListSessionsResponse, SessionListItem};
 use crate::cow_state::CowStateView;
 use crate::error::ApiError;
+use engram_core::types::sandbox::{WriteFileResult, WriteFileSpec};
 use engram_core::types::session::SessionMode;
 
 /// `engram_core::types::Session` → proto `Session`. Drops `user_id`
@@ -195,6 +196,47 @@ pub(crate) fn exec_request_from_proto(r: app::ExecRequest) -> ApiExecRequest {
         env,
         workdir,
         timeout_secs,
+    }
+}
+
+/// proto `WriteFilesRequest` → engine file specs.
+///
+/// The routing `session_id` is consumed by the RPC handler. Exhaustive
+/// destructuring of both request levels keeps the converter total.
+pub(crate) fn write_files_request_from_proto(r: app::WriteFilesRequest) -> Vec<WriteFileSpec> {
+    let app::WriteFilesRequest {
+        session_id: _,
+        files,
+    } = r;
+    files
+        .into_iter()
+        .map(|file| {
+            let app::WriteFileSpec {
+                path,
+                content,
+                mode,
+            } = file;
+            WriteFileSpec {
+                path,
+                content,
+                mode,
+            }
+        })
+        .collect()
+}
+
+/// Engine per-file results → proto `WriteFilesResponse`.
+pub(crate) fn write_files_response_to_proto(
+    results: Vec<WriteFileResult>,
+) -> app::WriteFilesResponse {
+    app::WriteFilesResponse {
+        results: results
+            .into_iter()
+            .map(|result| {
+                let WriteFileResult { path, ok, error } = result;
+                app::WriteFileResult { path, ok, error }
+            })
+            .collect(),
     }
 }
 

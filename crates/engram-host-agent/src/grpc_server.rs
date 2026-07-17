@@ -36,9 +36,12 @@ use engram_protocol::grpc::{
     ProxyShellPing, ProxyShellPong, ProxyShellText, ReapMaterializeDirRequest,
     ReapMaterializeDirResponse, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
     SendHarnessPromptRequest, SendHarnessToolResultRequest, SnapshotBeginResponse,
-    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest,
+    SnapshotResponse, StartAgentRequest, UnbindHarnessSessionRequest, WriteFilesRequest,
+    WriteFilesResponse,
 };
-use engram_protocol::wire::{WireExecRequest, WireReapStats};
+use engram_protocol::wire::{
+    WireExecRequest, WireReapStats, WireWriteFilesRequest, WireWriteFilesResponse,
+};
 use futures::Stream;
 use std::pin::Pin;
 use tokio::sync::mpsc;
@@ -1239,6 +1242,28 @@ impl HostService for HostServiceImpl {
 
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream) as Self::ExecStartStream))
+    }
+
+    /// ADR 0097: unary batch file staging. The backend owns the guest
+    /// transport loop and returns one result for every requested file.
+    async fn write_files(
+        &self,
+        req: Request<WriteFilesRequest>,
+    ) -> Result<Response<WriteFilesResponse>, Status> {
+        check_wire_version(&req)?;
+        let r = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
+        let wire: WireWriteFilesRequest =
+            decode_bincode(&r.request_bincode, "WireWriteFilesRequest")?;
+        let results = self
+            .inner
+            .write_files(sandbox_id, wire.into_engine())
+            .await
+            .map_err(sandbox_to_status)?;
+        let response = WireWriteFilesResponse::from_engine(results);
+        Ok(Response::new(WriteFilesResponse {
+            response_bincode: encode_bincode(&response, "WireWriteFilesResponse")?,
+        }))
     }
 
     /// ADR 0014 issue #6: bidi WS-frame tunnel.
