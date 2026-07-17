@@ -308,4 +308,189 @@ mod tests {
         discard_spool(tmp.path(), sid).await.unwrap();
         assert!(read_spool(tmp.path(), sid).await.unwrap().is_none());
     }
+
+    // ── ADR 0099 H5: the post-crash on-disk state space, exhaustively.
+    //
+    // A shutdown spool is plain files in a directory, so every partial /
+    // corrupt state a crash (or bit-rot, or a lying fsync) can leave is
+    // externally constructible — no fault-injection trait needed. Each
+    // test below builds one such state on disk and asserts read_spool's
+    // SAFE behavior: return the FULL verified set, or fail/skip loudly —
+    // NEVER hand back a torn or subset view the caller would adopt as
+    // acked data. (The caller's Err/None arms discard + roll back; the
+    // sin the spool exists to prevent is a *silent* regression.)
+
+    fn chunk_path(root: &Path, sid: SandboxId, idx: usize) -> PathBuf {
+        spool_dir(root, sid).join(format!("chunk-{idx}.bin"))
+    }
+
+    /// State 1: a chunk file torn/short under a COMPLETE marker. The
+    /// write-ordering (chunk fsync before the marker) forbids this from
+    /// an orderly crash, but storage corruption can produce it — and
+    /// adopting the short bytes would serve a corrupt disk to the guest.
+    /// Sweep every truncation offset over a small chunk (durable_record's
+    /// exhaustive-truncation approach) plus an in-place bit-flip that
+    /// keeps the length: read_spool must reject every one, and must never
+    /// silently adopt the valid sibling as a subset.
+    #[tokio::test]
+    async fn torn_chunk_under_valid_marker_is_rejected_at_every_offset() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        // Chunk 0 is the one we corrupt; chunk 1 is the valid sibling.
+        let full: Vec<u8> = (0..24u8).collect();
+        let sibling = vec![0xEEu8; 8];
+        let good = vec![(0usize, full.clone()), (1usize, sibling.clone())];
+
+        // The pristine spool reads back whole (the sweep's control).
+        write_spool(tmp.path(), sid, refv(7), &good).await.unwrap();
+        let (_m, back) = read_spool(tmp.path(), sid).await.unwrap().unwrap();
+        assert_eq!(back, good, "pristine spool must round-trip");
+
+        // Truncate chunk 0 to every length shorter than full → digest
+        // mismatch → Err. A zero-length truncation is included.
+        for trunc in 0..full.len() {
+            std::fs::write(chunk_path(tmp.path(), sid, 0), &full[..trunc]).unwrap();
+            let err = read_spool(tmp.path(), sid)
+                .await
+                .expect_err("torn chunk must never read back as a complete spool");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        }
+
+        // A same-length mangle (one flipped byte) must also fail — the
+        // marker pins content, not just length.
+        let mut flipped = full.clone();
+        flipped[0] ^= 0xFF;
+        std::fs::write(chunk_path(tmp.path(), sid, 0), &flipped).unwrap();
+        assert!(read_spool(tmp.path(), sid).await.is_err());
+
+        // Restoring the exact bytes makes the spool whole again — the
+        // rejection was about content, not a wedged directory.
+        std::fs::write(chunk_path(tmp.path(), sid, 0), &full).unwrap();
+        let (_m, back) = read_spool(tmp.path(), sid).await.unwrap().unwrap();
+        assert_eq!(back, good, "restoring the bytes re-validates the spool");
+    }
+
+    /// State 2: crash mid-export leaves chunk files but no marker. The
+    /// marker is written + fsync'd LAST, so its absence means "not
+    /// complete" → read as absent (None); the successor serves the last
+    /// published manifest and the incomplete spool is inert until
+    /// discard_spool sweeps it.
+    #[tokio::test]
+    async fn missing_completeness_marker_reads_as_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        write_spool(
+            tmp.path(),
+            sid,
+            refv(3),
+            &[(0, vec![1u8; 16]), (1, vec![2u8; 16])],
+        )
+        .await
+        .unwrap();
+        // Crash between the chunk writes and the marker fsync.
+        std::fs::remove_file(spool_dir(tmp.path(), sid).join("meta.json")).unwrap();
+        assert!(
+            read_spool(tmp.path(), sid).await.unwrap().is_none(),
+            "no marker = incomplete spool = absent, never a partial adopt",
+        );
+        // And it is cleanable (the successor's discard path).
+        discard_spool(tmp.path(), sid).await.unwrap();
+        assert!(read_spool(tmp.path(), sid).await.unwrap().is_none());
+    }
+
+    /// State 3: a complete marker that lists a chunk whose file is gone.
+    /// The valid sibling must NOT be adopted as a subset — a spool is
+    /// all-or-nothing, so this is a loud Err, not a silent partial view.
+    #[tokio::test]
+    async fn marker_lists_a_chunk_whose_file_is_missing_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        write_spool(
+            tmp.path(),
+            sid,
+            refv(9),
+            &[(0, vec![1u8; 8]), (4, vec![2u8; 8])],
+        )
+        .await
+        .unwrap();
+        std::fs::remove_file(chunk_path(tmp.path(), sid, 4)).unwrap();
+        let err = read_spool(tmp.path(), sid)
+            .await
+            .expect_err("a marker referencing a missing chunk file must fail");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// State 4: foreign / garbage files beside the valid chunks. Stray
+    /// tmpfiles or unparsable names must be tolerated (the marker, not
+    /// the directory listing, defines the spool) — the valid siblings
+    /// still adopt. But an EXTRA well-named chunk the marker does NOT
+    /// list is a splice from another divergence point → Err.
+    #[tokio::test]
+    async fn garbage_files_tolerated_but_unlisted_extra_chunk_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        let good = vec![(0usize, vec![1u8; 8]), (2usize, vec![2u8; 8])];
+        write_spool(tmp.path(), sid, refv(5), &good).await.unwrap();
+        let dir = spool_dir(tmp.path(), sid);
+        // Foreign siblings: an unparsable name, a bad-index name, a
+        // leftover .partial tmpfile, a hidden file.
+        std::fs::write(dir.join("README"), b"operator scratch").unwrap();
+        std::fs::write(dir.join("chunk-.bin"), b"no index").unwrap();
+        std::fs::write(dir.join("chunk-abc.bin"), b"not a number").unwrap();
+        std::fs::write(dir.join("chunk-0.bin.partial"), b"torn tmp").unwrap();
+        std::fs::write(dir.join(".nfs0001"), b"stale nfs handle").unwrap();
+        let (_m, back) = read_spool(tmp.path(), sid).await.unwrap().unwrap();
+        assert_eq!(back, good, "garbage siblings must not block valid chunks");
+
+        // Now an unlisted but well-named extra chunk → reject (splice).
+        std::fs::write(dir.join("chunk-9.bin"), vec![9u8; 8]).unwrap();
+        let err = read_spool(tmp.path(), sid)
+            .await
+            .expect_err("an unlisted chunk-*.bin is an unaccounted splice");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+    }
+
+    /// State 5: corrupt lineage metadata — the marker file itself is
+    /// unparsable (torn mid-write, or garbage). read_spool must reject
+    /// it (InvalidData), never guess a lineage. This is the corrupted-
+    /// ref-file extension of the lineage-mismatch case whose semantic
+    /// half lives at the call site.
+    #[tokio::test]
+    async fn unparsable_marker_is_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        write_spool(tmp.path(), sid, refv(2), &[(0, vec![1u8; 8])])
+            .await
+            .unwrap();
+        let meta = spool_dir(tmp.path(), sid).join("meta.json");
+        // Truncated JSON (crash mid-marker-write).
+        std::fs::write(&meta, b"{\"manifest_id\":\"abcd").unwrap();
+        assert_eq!(
+            read_spool(tmp.path(), sid).await.unwrap_err().kind(),
+            io::ErrorKind::InvalidData,
+        );
+        // Outright garbage.
+        std::fs::write(&meta, b"\x00\xff not json at all").unwrap();
+        assert!(read_spool(tmp.path(), sid).await.is_err());
+    }
+
+    /// State 6: a zero-chunk, ref-only spool — the "flush+manifest
+    /// uploaded but the coord publish was lost" class. It carries the
+    /// store-ahead ManifestRef and adopts as an empty chunk set. Extend
+    /// with the torn-ref variant: a zero-chunk spool whose marker is
+    /// truncated must fail, not be treated as a valid empty spool.
+    #[tokio::test]
+    async fn zero_chunk_ref_only_spool_roundtrips_and_torn_ref_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        let bytes = write_spool(tmp.path(), sid, refv(88), &[]).await.unwrap();
+        assert_eq!(bytes, 0);
+        let (meta, back) = read_spool(tmp.path(), sid).await.unwrap().unwrap();
+        assert_eq!(meta.manifest_ref(), refv(88), "store-ahead ref preserved");
+        assert!(back.is_empty(), "zero-chunk spool adopts an empty set");
+
+        // Torn ref file on a zero-chunk spool → Err, not a phantom empty.
+        std::fs::write(spool_dir(tmp.path(), sid).join("meta.json"), b"{").unwrap();
+        assert!(read_spool(tmp.path(), sid).await.is_err());
+    }
 }
