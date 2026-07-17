@@ -30,6 +30,9 @@ Deviations still open, tracked:
 retiring the coordinator's per-test mocks onto SimMetadataStore;
 Agent-mode workload (needs the harness-catalog surface in SimMeta);
 capture-job reservations in SimMeta placement.
+**Phase 2 (host-agent, the P-series) opened 2026-07-17** — the "future,
+own ADR" sketch is superseded; the full design and P0–P9 chain live in
+§"Phase 2: host-agent simulation" below.
 
 Companion to ADR 0099 (correctness hardening & test isolation — the weeks-scale
 arc; this ADR is the months-scale one). Builds on ADR 0011 (the
@@ -145,7 +148,8 @@ clippy with `-D warnings`, so a new raw call is a hard failure. The only
 impls themselves (the one honest caller — consistent with the never-launder-
 lints rule) plus an explicitly-listed metrics helper if profiling shows one is
 needed. The gate initially covers coordinator + core + postgres + sim + dst;
-host-agent joins when its phase starts.
+host-agent joins in Phase 2 P1 (per-crate clippy.toml, decision-feeding
+scope + the `metrics_now()` carve-out — see §Phase 2).
 
 `SimClock` keeps **one time source, not two**: it is a thin view over tokio's
 paused clock (`base_utc + skew + (paused Instant − birth)`). The simulator
@@ -365,14 +369,90 @@ ADR 0079: hammer the pre-0079 lease ecosystem first and capture its bugs as
 regression seeds, then verify the op-log kernel retires them — an unusually
 strong migration-safety story for both ADRs.
 
-**Phase 2 (future, own ADR)**: the host-agent's NBD/teardown/migration
-ordering logic — the top real-world flake source — extracted into pure state
-machines (the `SessionState` pattern: explicit typed states +
-`can_transition_to`) with side effects behind a `HostEffects` trait, plus a
-`SimFs` with crash-point injection at every write/rename boundary of
-`durable_record.rs`'s fsync-rename-fsync-parent contract. Real-kernel
-behavior (netlink, actual NBD devices, KVM) stays in the Firecracker CI lane
-forever.
+## Phase 2: host-agent simulation (the P-series)
+
+**Status 2026-07-17: active.** The original sketch here said "future, own
+ADR" — superseded: Phase 2 extends THIS ADR in place as the P-series,
+mirroring the D-series (decision recorded the day the D-chain merged; the
+incidents this phase targets — 85e0298a acked-write loss, torn
+base-capture, the NBD teardown flake family, the teardown mis-reap — all
+lived in host-agent paths the coordinator sim cannot see).
+
+**Scope**: the host-agent's six multi-step lifecycle flows, extracted into
+pure typed state machines (the `SessionState` pattern) with side effects
+behind focused trait seams, plus a host-internal simulator. Real-kernel
+behavior (netlink, actual NBD devices, KVM, the block data plane, page
+cache — incl. BLKFLSBUF/cross-tenant invalidation) stays in the
+Firecracker CI lane forever; the sim owns ordering and crash logic, and
+runs on macOS.
+
+**Seams — `HostEffects` is a bundle STRUCT, not a mega-trait** (the
+`Services` analog; a god trait would recreate the mock-zoo D4 retired):
+`clock`/`entropy` (existing engram-core traits) + four new focused traits —
+`CoordControlPlane` (the 3 coordinator calls the flows make:
+`sandbox_ownership`, `sandbox_owner`, `publish_live_manifest`; the concrete
+reqwest `CoordClient` renames to `HttpCoordClient` and implements it),
+`HostFs` (granular write/sync_file/rename/sync_dir — the SimFs boundary
+under `durable_record` + the spool), `DeviceSync` (`/dev/nbdN` sync +
+abandon-in-place), `NbdKernel` (connect/reconfigure/disconnect/
+backend-identifier; Linux impl wraps `disk_daemon::runtime`). Trait defs +
+extracted state machines live in a new portable crate
+**`engram-host-core`** (deps: engram-core only — this is what makes the
+logic macOS-runnable); prod impls stay in `engram-host-agent`. Traits sit
+only at orchestration boundaries (30 s reconcile tick, once-per-death
+shutdown, backoff-paced redrive, attach/reattach) — the NBD serve loop,
+`read_chunk`/`write_chunk`, the migrate_peer page server, and the flush
+lock ladder stay concrete: **the flush pipeline is deliberately NOT
+extracted** (data plane; wrapping the #199/#204 lock ladder would add
+hot-path cost). Its `#[cfg(test)]` `flush_local_handoff_seam` generalizes
+instead into a 3-point `SchedulerSeam` (dirty→pending handoff,
+post-upload/pre-publish, pre-rebase) giving the sim deterministic control
+of both documented flush hazards at zero prod cost.
+
+**Clock/entropy sweep**: decision-feeding sites only (~57 `Utc::now`, ~23
+`Uuid::new_v4`, the budget/TTL/backoff `Instant::now`s and driven sleeps) —
+NOT the data-plane latency metric timers, which go through one documented
+`metrics_now()` helper carrying the single scoped `#[allow]` (a `Box::pin`
+per page-serve op would trade latency for nothing: the data plane is never
+simulated). Enforcement joins the shipped per-crate pattern:
+`clippy.toml` for engram-host-agent + engram-host-core (the D1 "root
+clippy.toml" wording was aspirational; per-crate is what shipped).
+
+**The simulator — new crate `engram-dst-host`**, sibling of `engram-dst`,
+NOT an enrichment of it: deps engram-sim (SimClock/SimEntropy, the
+paused-tokio + ChaCha8-forked-streams + BTreeMap discipline) +
+engram-host-agent + engram-host-core; **no engram-coordinator dep** — the
+two sims' dep closures (and their `detect-rebake-lanes.py` triggers) stay
+disjoint, and coordinator×host-internal state-space product is avoided.
+The coordinator here is a deliberately ADVERSARIAL scripted stub
+(`SimCoordClient`: ownership flips mid-export, lost publish acks,
+vanishing coordinator) — the real handlers would be cooperative and drag
+the wrong closure in. Sim impls of the effect traits live inside this
+crate.
+
+**World model**: `SimHost` = RAM state (dirty/pending tiers, scheduler
+timers, warm pool, export registry, bindings — dies on `CrashProcess`) +
+disk state (a real per-run tempdir behind `SimFs`: records/finalize/spool/
+L1 cache, plus a shared `LocalBlobStorage` chunk store standing in for
+GCS — survives). Restart rebuilds over the same tempdir through the REAL
+recovery entry points (`reattach_pass`, `reattach_manifest` +
+`adopt_unflushed`, `resume_pending_finalizes`, the stale-binding sweep,
+`load_all`). Guest writes are `(sandbox, chunk_idx, content_tag)` through
+the real `write_chunk`, appended to an acked-write ledger at the ack
+instant; reads resolve the tier ladder and return the tag.
+
+**SimFs + the H5 composition contract**: crashes inject at
+durable-OPERATION boundaries (the scheduler crashes between real fs ops;
+`durable_record`/`spool` keep calling tokio::fs unchanged). Intra-op
+byte-level torn states remain ADR 0099 H5's exhaustively-constructed
+static tests; a `crashpoint_coverage` meta-test asserts every SimFs
+boundary maps onto an H5-constructed state (8 enumerated boundaries across
+persist's write-partial/fsync/rename/fsync-parent and the spool's
+chunks/marker/dir sequence) — SimFs owns reachability at operation
+granularity, H5 owns exhaustiveness at byte granularity. If a future flow
+exposes a boundary static construction cannot reach, the escalation is an
+in-memory `Fs` seam in durable_record/spool — a deliberate deferral, noted
+here so it reads as a decision, not an oversight.
 
 **Phase 2 invariant #1 — the acked-write durability oracle** (added
 2026-07-16 from the session-85e0298a corruption RCA, PR #712): *every
@@ -383,14 +463,47 @@ were kernel page-cache behavior (permanently the FC lane's job — see
 non-goals), but the third — the SIGTERM flush-deadline overrun dropping the
 RAM dirty tier — was a pure shutdown-pipeline ordering bug, exactly what
 this phase's seeded crash-point injection explores systematically. The
-Phase 2 world model tracks acked writes explicitly and asserts the oracle
-after every injected crash/restart, so the *class* is covered rather than
-one bespoke regression per incident. Interim coverage until Phase 2 lands:
-the spool's post-crash on-disk states are exhaustively tested at the file
-level (the ADR 0099 H5 pattern — every state externally constructible), and
-the "checkpoint driver retries forever against a dead data plane" follow-up
-is a D6 convergence-invariant customer (retry-forever reads as
-non-convergence at quiescence).
+world model's ledger asserts the oracle after every injected
+crash/restart, so the *class* is covered rather than one bespoke
+regression per incident. The full oracle suite: (1) acked-write
+durability; (2) no-plane-leak (every claimed slot serving or
+parked/quarantined; no dirty tier abandoned without a spool export); (3)
+slot accounting (warm+in_use+parked+free == universe, no double-claim);
+(4) spool never silently dropped while holding the only copy of an acked
+write; (5) single-device ownership; (6) `FinalizeStage` monotonicity +
+resume-at-persisted-stage; (7) the migration decision table
+(`state_served` ⇒ never abort-unpause — the #216 split-brain guard); (8)
+convergence at quiescence for every redrive loop (the "checkpoint driver
+retries forever against a dead data plane" follow-up reads as
+non-convergence); (9) the reconcile session=None arm stays fixed (the
+2026-07-11 mis-reap — already fixed in code; the oracle pins it).
+
+**Known bugs ride the arc** (user decision): O_DIRECT for the NBD device
+sync rides P4 (fall back to verify-on-read if block alignment vs FC's
+drive assumptions proves fragile); verify-on-read (post-RECONFIGURE read
+observes the seeded acked bytes) rides P7; the None-arm mis-reap needs
+only its oracle (P3). Regression seeds double as the migration-safety
+proof: each historical hazard (#224 insert-after-sweep, #225
+deadline-overrun, #204 tier-less window, #199 flush reorder, #216 family,
+the slot validation-window race, the stale-binding TOCTOU, 85e0298a
+store-ahead recovery, the None-arm, checkpoint tail-cancellation) is
+reproduced where possible against pre-extraction logic, then pinned as
+proof the extraction retires it.
+
+**The P-series**:
+
+| PR | Content | Size |
+|---|---|---|
+| P0 | This section (bookend open) | S |
+| P1 | engram-host-core; the four traits + HostEffects bundle; HttpCoordClient rename; decision-feeding clock/entropy sweep + `metrics_now()`; per-crate clippy gates. Zero behavior change; full FC lane runs on it despite the mechanical label | XL |
+| P2 | engram-dst-host scaffold: SimFs + SimHost RAM/disk split + acked-write ledger + coord stub + SimNbd + scheduler skeleton + determinism audit + flow_coverage & crashpoint_coverage meta-tests | L |
+| P3 | Flow C (reconcile): `reconcile_once` extraction; the lib.rs inline loop collapses to a thin spawn wrapper; ReconcileTick + None-arm oracle + #224 abandoning + stale-binding TOCTOU scenarios | M |
+| P4 | Flow A (SIGTERM ladder): `ShutdownStage`/`plan_shutdown`/`classify_survivor` extraction (the `abandoning` SeqCst flag + drain-twice stays in the driver byte-identical — concurrency gate, not a decision); Sigterm/SpoolExport/SpoolAdopt/CrashProcess/Restart steps; **the acked-write oracle**; #225 + 85e0298a seeds; O_DIRECT rider; new minimal FC regression in ci.yml's --test list | L |
+| P5 | Flow D (eviction finalize): route through HostEffects; EvictionFinalizeLeg + crash-between-legs; FinalizeStage + convergence oracles; checkpoint tail-cancellation | M |
+| P6 | Flow F seam: SchedulerSeam generalization; #204/#199 as seeded interleavings | M |
+| P7 | Flow B (NBD slot): NbdKernel seam; typed SlotState; pure plan_reattach (seed-dirty-before-RECONFIGURE ordering); validation-window + slot-accounting sim; verify-on-read rider; new minimal FC reattach regression | L |
+| P8 | Flow E (migration): TTL clock → `now_mono`; #216 decision-table oracle; no-plane-leak/single-device tightening; #582/#598/#629 seeds | M |
+| P9 | CI: `test-host-sim` lane (fixed seeds, <5 min, own rust-cache key, replay-twice self-check) in `CI Gate.needs:` + a host-sim detector flag keyed on engram-dst-host's dep closure; nightly job with `--failure-report` issue auto-filing (the shipped nightly-sim pattern); regression_seeds populated; this section closed with the commit chain | S |
 
 ## Non-goals
 
