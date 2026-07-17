@@ -298,8 +298,8 @@ impl RfbPixelFormat {
     }
 }
 
-/// Complete the no-auth RFB 3.8 handshake, request RAW encoding, and return a
-/// tiny rectangle from the framebuffer center. This proves Chrome painted the
+/// Complete the no-auth RFB 3.8 handshake, request RAW encoding, and sample a
+/// tiny rectangle at the framebuffer center. This proves Chrome painted the
 /// page behind x11vnc; the protocol banner alone only proves x11vnc is alive.
 async fn read_center_rgb(stream: &mut HarnessByteStream) -> (u8, u8, u8) {
     stream
@@ -366,28 +366,72 @@ async fn read_center_rgb(stream: &mut HarnessByteStream) -> (u8, u8, u8) {
         .await
         .expect("request center framebuffer");
 
-    assert_eq!(stream.read_u8().await.expect("read server message type"), 0);
-    let _padding = stream.read_u8().await.expect("read framebuffer padding");
-    let rectangles = stream.read_u16().await.expect("read rectangle count");
-    assert!(rectangles > 0, "empty framebuffer update");
-    for _ in 0..rectangles {
-        let _rect_x = stream.read_u16().await.expect("read rect x");
-        let _rect_y = stream.read_u16().await.expect("read rect y");
-        let w = stream.read_u16().await.expect("read rect width");
-        let h = stream.read_u16().await.expect("read rect height");
-        let encoding = stream.read_i32().await.expect("read rect encoding");
-        assert_eq!(encoding, 0, "server ignored requested raw encoding");
-        let bytes_per_pixel = usize::from(format.bits_per_pixel / 8);
-        let mut pixels = vec![0; usize::from(w) * usize::from(h) * bytes_per_pixel];
-        stream
-            .read_exact(&mut pixels)
+    // x11vnc can queue RAW updates (notably the 18x18 software cursor tile)
+    // before it answers our explicit center request. The old decoder returned
+    // the first pixel of the first queued rectangle and therefore graded the
+    // top-left Chrome UI as though it were the page center. Read complete
+    // server messages until a rectangle actually covers our probe point.
+    //
+    // Probe the upper-left corner of the centered 32x32 request rather than
+    // its exact center: Xvfb starts the mouse cursor at screen center, and the
+    // cursor's white pixels would otherwise obscure the fixture beneath it.
+    let sample_x = x;
+    let sample_y = y;
+    let bytes_per_pixel = usize::from(format.bits_per_pixel / 8);
+    loop {
+        match stream
+            .read_u8()
             .await
-            .expect("read raw framebuffer pixels");
-        if !pixels.is_empty() {
-            return format.rgb(&pixels);
+            .expect("read RFB server message type")
+        {
+            0 => {
+                let _padding = stream.read_u8().await.expect("read framebuffer padding");
+                let rectangles = stream.read_u16().await.expect("read rectangle count");
+                assert!(rectangles > 0, "empty framebuffer update");
+                for _ in 0..rectangles {
+                    let rect_x = stream.read_u16().await.expect("read rect x");
+                    let rect_y = stream.read_u16().await.expect("read rect y");
+                    let w = stream.read_u16().await.expect("read rect width");
+                    let h = stream.read_u16().await.expect("read rect height");
+                    let encoding = stream.read_i32().await.expect("read rect encoding");
+                    assert_eq!(encoding, 0, "server ignored requested raw encoding");
+                    let mut pixels = vec![0; usize::from(w) * usize::from(h) * bytes_per_pixel];
+                    stream
+                        .read_exact(&mut pixels)
+                        .await
+                        .expect("read raw framebuffer pixels");
+
+                    if sample_x >= rect_x
+                        && sample_x < rect_x.saturating_add(w)
+                        && sample_y >= rect_y
+                        && sample_y < rect_y.saturating_add(h)
+                    {
+                        let pixel_x = usize::from(sample_x - rect_x);
+                        let pixel_y = usize::from(sample_y - rect_y);
+                        let offset = (pixel_y * usize::from(w) + pixel_x) * bytes_per_pixel;
+                        return format.rgb(&pixels[offset..]);
+                    }
+                }
+            }
+            2 => {} // Bell has no payload.
+            3 => {
+                // ServerCutText may be emitted independently of framebuffer
+                // updates. Consume it so the next byte is another message.
+                let mut padding = [0u8; 3];
+                stream
+                    .read_exact(&mut padding)
+                    .await
+                    .expect("read ServerCutText padding");
+                let len = stream.read_u32().await.expect("read ServerCutText length");
+                let mut text = vec![0; len as usize];
+                stream
+                    .read_exact(&mut text)
+                    .await
+                    .expect("read ServerCutText payload");
+            }
+            message_type => panic!("unsupported RFB server message type: {message_type}"),
         }
     }
-    panic!("RFB update contained no pixel data")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
