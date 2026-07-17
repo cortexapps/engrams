@@ -1,0 +1,31 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "google/protobuf/timestamp.proto";
+
+service PrRefService {
+  rpc ListPrRefs(ListPrRefsRequest) returns (ListPrRefsResponse);
+}
+
+message PrRef {
+  string id = 1;
+  string repo = 2;
+  int32 pr_number = 3;
+  optional string authoring_task_id = 4;
+  string session_id = 5;
+  string title = 6;
+  string url = 7;
+  string head_branch = 8;
+  string base_branch = 9;
+  google.protobuf.Timestamp observed_at = 10;
+}
+
+message ListPrRefsRequest {
+  optional string task_id = 1;
+  optional string session_id = 2;
+}
+
+message ListPrRefsResponse {
+  repeated PrRef pr_refs = 1;
+}
