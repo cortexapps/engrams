@@ -602,7 +602,14 @@ async fn pick_host_2d(
               -- last_active_at), and an old created_at would make that
               -- fresh reservation look crash-orphaned and leak
               -- (overcommit). reserve_and_persist_create sets both to NOW().
-              AND (status <> 'pending' OR last_active_at > $2 - INTERVAL '10 minutes')
+              -- Issue #722: live-op pendings always count (see the
+              -- companion predicate below).
+              AND (status <> 'pending'
+                   OR last_active_at > $2 - INTERVAL '10 minutes'
+                       OR EXISTS (SELECT 1 FROM session_ops o
+                                   WHERE o.session_id = sessions.id
+                                     AND o.kind = 'create_boot'
+                                     AND o.state IN ('queued','running')))
             UNION ALL
             -- ADR 0084 (c): a capture VM reserves like a session. The
             -- reservation lives on `capture_jobs` now (moved off
@@ -1700,7 +1707,13 @@ impl MetadataStore for PostgresStore {
                   -- flips it to `pending` (bumping last_active_at), and an old
                   -- created_at would make that fresh reservation look crash-orphaned
                   -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
-                  AND (status <> 'pending' OR last_active_at > $1 - INTERVAL '10 minutes')
+                  -- Issue #722: live-op pendings always count.
+                  AND (status <> 'pending'
+                       OR last_active_at > $1 - INTERVAL '10 minutes'
+                       OR EXISTS (SELECT 1 FROM session_ops o
+                                   WHERE o.session_id = sessions.id
+                                     AND o.kind = 'create_boot'
+                                     AND o.state IN ('queued','running')))
                 UNION ALL
                 -- ADR 0084 (c): capturing VMs reserve on `capture_jobs`.
                 SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
@@ -1840,7 +1853,18 @@ impl MetadataStore for PostgresStore {
                 WHERE host_id = ANY($1)
                   AND status IN ('pending','created','active','unreachable',
                                  'evacuating','evicting')
-                  AND (status <> 'pending' OR last_active_at > $2 - INTERVAL '10 minutes')
+                  -- Issue #722: a pending is written off ONLY when it is
+                  -- both stale AND has no live create_boot op — an
+                  -- actively-booting session (however slow its backoff)
+                  -- always holds its reservation; op-less orphans are
+                  -- failed by the reclaim sweep, so an excluded pending
+                  -- can never boot later and over-pack the host.
+                  AND (status <> 'pending'
+                       OR last_active_at > $2 - INTERVAL '10 minutes'
+                       OR EXISTS (SELECT 1 FROM session_ops o
+                                   WHERE o.session_id = sessions.id
+                                     AND o.kind = 'create_boot'
+                                     AND o.state IN ('queued','running')))
                 UNION ALL
                 SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
                 FROM capture_jobs
@@ -3439,6 +3463,16 @@ impl MetadataStore for PostgresStore {
                 Ok((SessionId::from(uuid), prev))
             })
             .collect::<Result<Vec<_>, MetaError>>()
+    }
+
+    async fn touch_session_activity(&self, session_id: SessionId) -> Result<(), MetaError> {
+        sqlx::query("UPDATE sessions SET last_active_at = $2 WHERE id = $1")
+            .bind(session_id.as_uuid())
+            .bind(self.clock.now_utc())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
     }
 
     async fn host_status(&self, host_id: HostId) -> Result<Option<HostStatus>, MetaError> {

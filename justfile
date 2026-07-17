@@ -965,6 +965,20 @@ clean-var:
     rm -rf ./var
 
 # ------------------------------------------------------------------
+# Deterministic simulation (ADR 0098). One seed replays one exact
+# interleaving; the swarm explores many. A failure prints the seed +
+# trace tail — replay it with `just sim SEED=<n>`.
+# ------------------------------------------------------------------
+
+# Replay a single seed (default profile: chaos).
+sim SEED STEPS='1500' PROFILE='chaos':
+    cargo run -p engram-dst --release --bin sim -- --seed {{SEED}} --steps {{STEPS}} --profile {{PROFILE}}
+
+# Seeded swarm over a range (`just sim-swarm 0..500`).
+sim-swarm SEEDS='0..200' STEPS='1500' PROFILE='chaos':
+    cargo run -p engram-dst --release --bin sim -- --seeds {{SEEDS}} --steps {{STEPS}} --profile {{PROFILE}}
+
+# ------------------------------------------------------------------
 # Web dashboard — read-only live view of the running coordinator.
 # `just dev` already runs the web SPA; this recipe is for running it
 # standalone against a coordinator on 127.0.0.1:8090. Vite proxies

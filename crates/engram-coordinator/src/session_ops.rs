@@ -499,6 +499,34 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
                 {
                     Ok(ids) => {
                         for session_id in ids {
+                            // Issue #722: past placement's crash-orphan
+                            // horizon the reservation is already written
+                            // off — reviving the boot would over-pack the
+                            // host. Fail it honestly instead (frees the
+                            // row's budget for everyone's arithmetic).
+                            let stale = match state.services.meta.get_session(session_id).await {
+                                Ok(s) => {
+                                    state.services.clock.now_utc() - s.last_active_at
+                                        > chrono::Duration::minutes(10)
+                                }
+                                Err(_) => false,
+                            };
+                            if stale {
+                                tracing::warn!(
+                                    %session_id,
+                                    "reclaim sweep: orphaned Pending past the placement \
+                                     horizon; failing instead of reviving (issue #722)",
+                                );
+                                let _ = state
+                                    .services
+                                    .meta
+                                    .transition_session(
+                                        session_id,
+                                        engram_core::types::SessionState::Failed,
+                                    )
+                                    .await;
+                                continue;
+                            }
                             ::metrics::counter!(
                                 crate::metrics::SESSION_OP_PENDING_ORPHANS_RECOVERED_TOTAL
                             )

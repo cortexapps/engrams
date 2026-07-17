@@ -752,4 +752,91 @@ conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
 conformance!(t_host_lifecycle, super::host_lifecycle);
+
+/// Issue #722: the reservation predicate. A stale `pending` WITH a live
+/// create_boot op still holds its budget (visible through
+/// placement_no_fit_details' free_mib); a stale op-less pending is
+/// written off — and the reclaim sweep fails those, so they can never
+/// boot later and over-pack the host.
+async fn stale_pending_reservation(ctx: &Ctx) {
+    use engram_core::types::session_op::{EnqueueOutcome, OpKind};
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    meta.upsert_host(host_record(host, "conf-722", now))
+        .await
+        .unwrap();
+    let mut hb = heartbeat_fixture();
+    hb.utilization =
+        serde_json::from_value(serde_json::json!({"allocatable_mib": 8192})).expect("utilization");
+    meta.touch_host_heartbeat(host, hb).await.unwrap();
+
+    // A placed pending with a queued create_boot op.
+    let with_op = SessionId::new();
+    let ws = |sid: SessionId| engram_core::traits::metadata::SessionCreateWriteSet {
+        session_id: sid,
+        spec: spec("conf:722"),
+        mem_budget_mib: 2048,
+        cpu_budget_vcpus: 1,
+        sealed_secrets: None,
+        capabilities: Vec::new(),
+        integration_policy_json: None,
+        runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+    };
+    let d = meta
+        .reserve_and_persist_create(ws(with_op), &[host], 0)
+        .await
+        .unwrap();
+    assert!(matches!(
+        d,
+        engram_core::traits::metadata::CreateDisposition::Placed(_)
+    ));
+    let outcome = meta
+        .op_enqueue_and_claim(
+            with_op,
+            OpKind::CreateBoot,
+            serde_json::json!({}),
+            None,
+            "pod",
+        )
+        .await
+        .unwrap();
+    let EnqueueOutcome::Claimed(op) = outcome else {
+        panic!("claimed")
+    };
+    // Requeue it (a retrying boot) so the op is live-but-queued.
+    assert!(meta
+        .op_requeue_with_backoff(op.id, op.epoch.unwrap(), Duration::from_secs(600), "slow")
+        .await
+        .unwrap());
+
+    // A placed pending with NO op (the orphan).
+    let orphan = SessionId::new();
+    let d = meta
+        .reserve_and_persist_create(ws(orphan), &[host], 0)
+        .await
+        .unwrap();
+    assert!(matches!(
+        d,
+        engram_core::traits::metadata::CreateDisposition::Placed(_)
+    ));
+
+    // Fresh: both reserve — 8192 - 2*2048 = 4096 free.
+    let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
+    assert_eq!(details[0].free_mib, 4096);
+
+    // Cross the 10-minute horizon: the live-op pending still counts,
+    // the op-less orphan is written off — 8192 - 2048 = 6144 free.
+    ctx.clock.advance(Duration::from_secs(11 * 60));
+    let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
+    assert_eq!(
+        details[0].free_mib, 6144,
+        "stale live-op pending must keep its reservation; op-less orphan must not"
+    );
+}
+
 conformance!(t_placement_no_fit, super::placement_no_fit);
+conformance!(
+    t_stale_pending_reservation,
+    super::stale_pending_reservation
+);

@@ -32,6 +32,25 @@ use engram_core::{HostId, MetaError, SessionId, SnapshotId};
 
 use super::{SessRow, SimDb, SimMetadataStore};
 
+/// Issue #722 reservation predicate, shared by pick/reserved/no-fit:
+/// a `pending` counts while fresh OR while a live create_boot op
+/// exists — a written-off pending can then never boot (the reclaim
+/// sweep fails stale op-less orphans).
+fn pending_counts(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
+    if row.session.status != SessionState::Pending {
+        return true;
+    }
+    if row.session.last_active_at > now - chrono::Duration::minutes(10) {
+        return true;
+    }
+    use engram_core::types::session_op::{OpKind, OpState};
+    db.session_ops.values().any(|o| {
+        o.session_id == row.session.id
+            && o.kind == OpKind::CreateBoot
+            && matches!(o.state, OpState::Queued | OpState::Running)
+    })
+}
+
 /// States that hold a host-memory reservation — mirrors
 /// `PostgresStore::host_memory_reserving_states()` /
 /// `SessionState::reserves_host_memory`.
@@ -40,6 +59,10 @@ fn reserves(state: SessionState) -> bool {
 }
 
 impl SimMetadataStore {
+    fn pending_counts_row(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
+        pending_counts(db, row, now)
+    }
+
     /// Mirror of `pick_host_2d` + `choose_placement_host`: candidates
     /// filtered to ready|draining and not cordoned; reservations summed
     /// over reserving-state sessions (a `pending` older than 10 minutes
@@ -75,9 +98,7 @@ impl SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = reserves(st)
-                && (st != SessionState::Pending
-                    || row.session.last_active_at > now - chrono::Duration::minutes(10));
+            let counts = reserves(st) && Self::pending_counts_row(db, row, now);
             if counts {
                 let e = reserved.entry(host).or_default();
                 e.0 += row.mem_budget_mib;
@@ -521,9 +542,7 @@ impl MetadataStore for SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = reserves(st)
-                && (st != SessionState::Pending
-                    || row.session.last_active_at > now - chrono::Duration::minutes(10));
+            let counts = reserves(st) && Self::pending_counts_row(&db, row, now);
             if counts {
                 let e = out.entry(host).or_default();
                 e.mem_mib += row.mem_budget_mib;
@@ -694,6 +713,16 @@ impl MetadataStore for SimMetadataStore {
         self.gate()?;
         let db = self.db.lock();
         Ok(db.hosts.get(&host_id).map(|h| h.status))
+    }
+
+    /// Issue #722: activity refresh without a transition.
+    async fn touch_session_activity(&self, session_id: SessionId) -> Result<(), MetaError> {
+        self.gate()?;
+        let now = self.now();
+        if let Some(r) = self.db.lock().sessions.get_mut(&session_id) {
+            r.session.last_active_at = now;
+        }
+        Ok(())
     }
 
     /// Insert-or-stale-takeover, exactly the 0106 SQL.
@@ -3014,9 +3043,7 @@ impl MetadataStore for SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = st.reserves_host_memory()
-                && (st != SessionState::Pending
-                    || row.session.last_active_at > now - chrono::Duration::minutes(10));
+            let counts = st.reserves_host_memory() && Self::pending_counts_row(&db, row, now);
             if counts {
                 let e = reserved.entry(host).or_default();
                 e.0 += row.mem_budget_mib;

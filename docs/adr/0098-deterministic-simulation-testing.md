@@ -1,6 +1,32 @@
 # ADR 0098: Deterministic simulation testing for the control plane
 
-Status: 2026-07-16 — **Proposed.**
+Status: 2026-07-17 — **Accepted.** Landed as the D1–D7 chain: #697 (D1
+clock/entropy seam + clippy gate), #700 (D3 bind-param now()), #714 (D4
+engram-sim + SimMetadataStore + the conformance suite + the dead_host
+leasing-row preamble), #715 (the Phase-2 acked-write oracle, from the
+#712 RCA), then the D5–D7 stack (#720 the simulator + first sims, #723
+the full fault menu + driver inventory + oracle suite, and the D7 PR:
+CLI + `just sim`/`sim-swarm` + regression seeds + the CI swarm lane).
+ADR 0099's H1/H2 (#695/#696) supplied the per-test-database substrate
+the conformance suite runs on.
+
+**The thesis held before the harness was even finished.** The
+conformance suite's FIRST run caught a latent scanner-breaking decode
+bug (bare transition-to-Queued leaves NULL queue columns; guarded in
+the follow-ups PR). Building D5 caught two SimMeta fidelity divergences
+(registration writing heartbeat-only host columns; raw-vcpu CPU budgets
+missing the overcommit factor) — each now pinned by a conformance case.
+And D6's unconditional placement-accounting oracle found a REAL
+production over-reservation hole (issue #722: the crash-orphan
+exclusion vs the ADR 0079 pending-revival backstop), deterministically
+reproducible from a seed; the fix (live-op pendings always reserve;
+the backstop fails stale orphans instead of reviving them; boot
+retries refresh freshness) landed in the D7 chain WITH conformance
+coverage, and the oracle tightened back to the unconditional form.
+Deviations still open, tracked: the nightly long-run swarm variant;
+retiring the coordinator's per-test mocks onto SimMetadataStore;
+Agent-mode workload (needs the harness-catalog surface in SimMeta);
+capture-job reservations in SimMeta placement.
 
 Companion to ADR 0099 (correctness hardening & test isolation — the weeks-scale
 arc; this ADR is the months-scale one). Builds on ADR 0011 (the
