@@ -13,6 +13,7 @@ import { expect, test, describe } from "bun:test";
 import { z } from "zod";
 import {
   compileSessionCreateInput,
+  createSessionForExistingTask,
   createTaskWithSession,
   truncatePrompt,
   type SessionCompileDeps,
@@ -383,6 +384,45 @@ describe("compileSessionCreateInput", () => {
     const inp = await compileSessionCreateInput(profile(), { ...deps(), toolRegistry });
     expect(inp.harnessEnv?.ENGRAM_TOOLS).toBeUndefined();
   });
+
+  test("extra capabilities widen integration grants but never the tool manifest", async () => {
+    const cloneCapability = "github:contents:read@openai/engrams";
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "review_tool",
+      description: "Profile-granted review tool.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "engram:pr_review",
+      handler: async () => ({ ok: true }),
+    });
+    toolRegistry.register({
+      name: "must_not_leak",
+      description: "A tool gated only by the per-session integration grant.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: cloneCapability,
+      handler: async () => ({ ok: true }),
+    });
+
+    const inp = await compileSessionCreateInput(
+      profile({ capabilities: ["engram:pr_review"] }),
+      { ...deps(), toolRegistry },
+      { extraCapabilities: [cloneCapability, cloneCapability] },
+    );
+
+    expect(inp.capabilities).toEqual(["engram:pr_review", cloneCapability]);
+    const policy = JSON.parse(inp.integrationPolicyJson!) as {
+      injects?: Array<{ mint_provider: string }>;
+    };
+    expect(policy.injects?.some((entry) => entry.mint_provider === "github")).toBe(true);
+    const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
+    expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -707,5 +747,50 @@ describe("createTaskWithSession", () => {
     expect(records).toHaveLength(3); // task + primary task_session + listener
     // Both ports were attempted; 8080 succeeded after 3000 threw.
     expect(ports.calls.map((c) => c.port)).toEqual([3000, 8080]);
+  });
+});
+
+describe("createSessionForExistingTask", () => {
+  test("creates promptlessly and inserts only the finder task_session row", async () => {
+    const records: Record<string, unknown>[] = [];
+    const sessions = fakeSessions();
+
+    const out = await createSessionForExistingTask(
+      createDeps(sessions, recordingDb(records)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "finder",
+        extraCapabilities: ["github:contents:read@openai/engrams"],
+        appendSystemPrompt: "finder system prompt",
+      },
+    );
+
+    expect(out).toEqual({ sessionId: "sess-1" });
+    expect(records).toEqual([{
+      taskId: "task-existing",
+      sessionId: "sess-1",
+      role: "finder",
+      profileId: "p1",
+    }]);
+    const request = sessions.createReqs[0] as {
+      prompt?: string;
+      capabilities?: string[];
+      harnessEnv?: Record<string, string>;
+    };
+    expect(request.prompt).toBeUndefined();
+    expect(request.capabilities).toEqual(["github:contents:read@openai/engrams"]);
+    expect(request.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
+      `finder system prompt\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+    );
+  });
+
+  test("deletes the orphan session when task_session persistence fails", async () => {
+    const sessions = fakeSessions();
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], true)),
+      { taskId: "task-existing", profileId: "p1", role: "finder" },
+    )).rejects.toThrow(/db boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 });

@@ -128,6 +128,10 @@ export interface SessionCompileDeps {
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** Per-session integration grants layered on top of the profile. These may
+   *  affect the bound capabilities and integration policy, but never the tool
+   *  manifest (for example, a review session's scoped clone credential). */
+  extraCapabilities?: readonly string[];
   /** The task type ("chat" = human/interactive; anything else = programmatic,
    *  e.g. "slack_thread"). Drives the strict-by-run-type credential pick (ADR
    *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
@@ -279,9 +283,17 @@ export async function compileSessionCreateInput(
   }
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
+  // Extra capabilities are per-session integration grants (such as the review
+  // clone token). They intentionally never widen the profile-owned tool
+  // manifest compiled above.
+  const capabilities = [...new Set([
+    ...profile.capabilities,
+    ...(opts.extraCapabilities ?? []),
+  ])];
+
   // Per-session integration policy (caps + network + secrets), shipped only
   // when it carries content.
-  const policy = compileIntegrationPolicy(profile.capabilities, registry, {
+  const policy = compileIntegrationPolicy(capabilities, registry, {
     network: profile.network,
     secrets: profile.secrets,
   });
@@ -311,7 +323,7 @@ export async function compileSessionCreateInput(
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
-    ...(profile.capabilities.length > 0 ? { capabilities: profile.capabilities } : {}),
+    ...(capabilities.length > 0 ? { capabilities } : {}),
     ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
   };
 }
@@ -375,9 +387,110 @@ export interface CreateTaskParams {
   slackThreadWorkflowId?: string;
 }
 
+export interface CreateSessionForExistingTaskParams {
+  taskId: string;
+  profileId: string;
+  role: string;
+  ownerUserId?: string;
+  prompt?: string;
+  extraCapabilities?: readonly string[];
+  appendSystemPrompt?: string;
+  /** Optional caller context; the existing task already owns its durable
+   *  source metadata, so this path does not insert or update it. */
+  source?: Record<string, unknown>;
+}
+
+export interface CreateSessionForExistingTaskDeps extends Omit<CreateTaskDeps, "profiles"> {
+  profiles: Pick<ProfileStore, "getActive">;
+}
+
 export interface CreatedTask {
   taskId: string;
   sessionId: string;
+}
+
+/**
+ * Create a session and attach it to an already-persisted task. Review phases
+ * use this path because their automation-owned `pr_review` task is created
+ * before any worker session exists. No listener is registered yet: this slice
+ * deliberately does not await terminal session state.
+ */
+export async function createSessionForExistingTask(
+  deps: CreateSessionForExistingTaskDeps,
+  params: CreateSessionForExistingTaskParams,
+): Promise<{ sessionId: string }> {
+  const profile = await deps.profiles.getActive(params.profileId);
+  if (!profile) {
+    throw new ConnectError("profile not found or archived", Code.NotFound);
+  }
+
+  let owner: { name: string; email: string } | undefined;
+  if (params.ownerUserId !== undefined) {
+    try {
+      const identity = await (deps.users ?? makeUserIdentityStore(deps.db)).getIdentity(
+        params.ownerUserId,
+      );
+      if (identity && !isServiceAccountEmail(identity.email)) owner = identity;
+    } catch (err) {
+      log.warn(
+        { userId: params.ownerUserId, err },
+        "task-create: owner identity lookup failed — booting without git attribution",
+      );
+    }
+  }
+
+  const sessionInput = await compileSessionCreateInput(
+    profile,
+    {
+      images: deps.images,
+      connectors: deps.connectors,
+      harnessCatalog: deps.harnessCatalog,
+      resolveUserToken: (envVar) =>
+        params.ownerUserId === undefined
+          ? Promise.resolve(null)
+          : deps.secrets.get(params.ownerUserId, envVar),
+    },
+    {
+      // An automation-owned review task has no human token; use the harness's
+      // programmatic credential while still creating the session promptless.
+      ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
+      ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
+      ...(params.appendSystemPrompt
+        ? { extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: params.appendSystemPrompt } }
+        : {}),
+      ...(owner ? { owner } : {}),
+    },
+  );
+
+  // When prompt is omitted (as it is for the finder), the session boots idle so
+  // deterministic bootstrap can finish before the separately checkpointed
+  // SendPrompt wakes it.
+  const created = await deps.sessions.createSession(sessionInput);
+  try {
+    await deps.db.transaction(async (tx) => {
+      await tx.insert(taskSessionTable).values({
+        taskId: params.taskId,
+        sessionId: created.sessionId,
+        role: params.role,
+        profileId: profile.id,
+      });
+      // No session_listeners row: terminal awaiting is a later ADR 0100 slice.
+    });
+  } catch (err) {
+    try {
+      await deps.sessions.deleteSession({ sessionId: created.sessionId });
+    } catch (delErr) {
+      log.error(
+        { sessionId: created.sessionId, err: delErr },
+        "task-create: failed to delete orphan session after task-session persist failure",
+      );
+    }
+    throw err;
+  }
+
+  evictOwnerCacheEntry(created.sessionId);
+  return { sessionId: created.sessionId };
 }
 
 /**
