@@ -516,9 +516,17 @@ pub trait MetadataStore: Send + Sync {
     }
 
     /// ADR 0016 Phase B commit 7 — restart-time rehydration source.
-    /// Returns one record per Active session bound to a sandbox on
-    /// `host_id`, including the effective disk manifest the host
-    /// should rebuild `ChunkedDiskBackend` from: the newer of
+    /// Returns one record per session with a VM resident on
+    /// `host_id` (any [`SessionState::reserves_host_memory`] state
+    /// with `sandbox_id` bound — NOT just `Active`: a rung-parked
+    /// `Evicting` session's paused VM survives a host-agent pod roll
+    /// exactly like an active one, and session 731df805 (2026-07-17)
+    /// showed what excluding it does — the successor pod's rehydrate
+    /// pass never re-claims the parked survivor's NBD device, the
+    /// stale-binding sweep then disconnects the live rootfs, and the
+    /// un-pause resumes the guest onto a dead data plane), including
+    /// the effective disk manifest the host should rebuild
+    /// `ChunkedDiskBackend` from: the newer of
     /// `sessions.live_disk_manifest_*` (last FlushScheduler publish)
     /// and the latest recoverable snapshot's `disk_manifest`.
     /// Same resolver semantic as `effective_resume_disk_manifest`
@@ -536,14 +544,14 @@ pub trait MetadataStore: Send + Sync {
     ///   chunked-disk tracking. Host skips rehydration (no
     ///   `attach_chunked_disk` to call).
     /// - The session's status changed mid-query (defensive).
-    async fn list_active_sandboxes_on_host_with_disk_manifest(
+    async fn list_resident_sandboxes_on_host_with_disk_manifest(
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SandboxId, Option<ManifestRef>)>, MetaError> {
         let all = self.list_active_sessions().await?;
         let mut out = Vec::new();
         for s in all {
-            if !matches!(s.status, SessionState::Active) {
+            if !s.status.reserves_host_memory() {
                 continue;
             }
             let (Some(h), Some(sb)) = (s.host_id, s.sandbox_id) else {

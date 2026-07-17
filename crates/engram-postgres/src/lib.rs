@@ -1931,7 +1931,7 @@ impl MetadataStore for PostgresStore {
     /// manifest server-side (newer of live + latest recoverable
     /// snapshot). Avoids the N+1 query the trait default would
     /// produce.
-    async fn list_active_sandboxes_on_host_with_disk_manifest(
+    async fn list_resident_sandboxes_on_host_with_disk_manifest(
         &self,
         host_id: HostId,
     ) -> Result<
@@ -1944,11 +1944,21 @@ impl MetadataStore for PostgresStore {
     > {
         // CTE picks the LATEST recoverable snapshot per session
         // (one row per session_id, ordered by created_at DESC).
-        // The outer SELECT joins it with the active-on-host
-        // sessions and picks max(live, snapshot) version when both
-        // share the same manifest_id; if they differ, snapshot
+        // The outer SELECT joins it with the VM-resident sessions
+        // on this host and picks max(live, snapshot) version when
+        // both share the same manifest_id; if they differ, snapshot
         // wins (mirrors `effective_resume_disk_manifest`'s
         // defensive branch).
+        //
+        // The status list is the SQL twin of
+        // `SessionState::host_memory_reserving_states()`: every
+        // state whose VM is resident on the host, not just
+        // 'active'. A rung-parked 'evicting' session's paused VM
+        // survives a host-agent pod roll like any other survivor;
+        // filtering it out here left its NBD device unclaimed after
+        // the roll — the successor's stale-binding sweep shot the
+        // live rootfs and the un-pause resumed the guest onto a
+        // dead data plane (session 731df805, 2026-07-17).
         let rows = sqlx::query(
             r#"
             WITH latest_snap AS (
@@ -1971,7 +1981,8 @@ impl MetadataStore for PostgresStore {
             FROM sessions s
             LEFT JOIN latest_snap ls ON ls.session_id = s.id
             WHERE s.host_id    = $1
-              AND s.status     = 'active'
+              AND s.status IN ('pending','created','active','unreachable',
+                               'evacuating','evicting')
               AND s.sandbox_id IS NOT NULL
             "#,
         )

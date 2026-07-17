@@ -782,6 +782,156 @@ async fn placement_no_fit(ctx: &Ctx) {
     assert_eq!(details[0].reason, "cpu_full");
 }
 
+/// Register-time rehydrate list (`list_resident_sandboxes_on_host_
+/// with_disk_manifest`): every VM-resident state with a bound sandbox
+/// is returned — a rung-parked `Evicting` session included (session
+/// 731df805, 2026-07-17: filtering on `status = 'active'` orphaned the
+/// parked survivor's NBD device across a host-agent pod roll) — with
+/// the effective disk manifest resolved as newer-of(live, latest
+/// recoverable snapshot): same manifest_id → max(version), different
+/// id → snapshot wins, non-recoverable snapshots invisible.
+async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
+    use engram_core::types::manifest::ManifestRef;
+
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    let other_host = HostId::new();
+    meta.upsert_host(host_record(host, "conf-rehydrate-h1", now))
+        .await
+        .unwrap();
+    meta.upsert_host(host_record(other_host, "conf-rehydrate-h2", now))
+        .await
+        .unwrap();
+
+    let mref = |manifest_id: uuid::Uuid, version: u64| ManifestRef {
+        manifest_id,
+        version,
+    };
+    let snap_with = |sid, at, recoverable, manifest: Option<ManifestRef>| {
+        let mut s = snapshot(SnapshotId::new(), sid, at, recoverable);
+        s.disk_manifest = manifest;
+        s
+    };
+    let bind = |sid, h| async move {
+        meta.assign_session_host(sid, Some(h)).await.unwrap();
+        let sb = engram_core::SandboxId::new();
+        meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
+        meta.transition_session(sid, SessionState::Created)
+            .await
+            .unwrap();
+        sb
+    };
+
+    let m_a = uuid::Uuid::from_u128(0xA);
+    let m_b = uuid::Uuid::from_u128(0xB);
+    let m_c = uuid::Uuid::from_u128(0xC);
+    let m_d = uuid::Uuid::from_u128(0xD);
+    let m_e = uuid::Uuid::from_u128(0xE);
+    let m_f = uuid::Uuid::from_u128(0xF);
+
+    // Active + sandbox: live A@5 vs recoverable snap A@3 → same id,
+    // live is newer → A@5.
+    let s_active = meta
+        .create_session(spec("conf:rehydrate-active"))
+        .await
+        .unwrap();
+    let sb_active = bind(s_active, host).await;
+    meta.transition_session(s_active, SessionState::Active)
+        .await
+        .unwrap();
+    meta.update_live_disk_manifest(s_active, sb_active, mref(m_a, 5))
+        .await
+        .unwrap();
+    assert!(meta
+        .record_snapshot(snap_with(s_active, now, true, Some(mref(m_a, 3))))
+        .await
+        .unwrap());
+
+    // THE regression case — rung-parked survivor: Evicting + sandbox
+    // still bound. Live B@2; two recoverable snapshots, the NEWEST
+    // (D@1) must win over both the older snap (C@9) and the live ref
+    // (different manifest_id → snapshot wins).
+    let s_parked = meta
+        .create_session(spec("conf:rehydrate-parked"))
+        .await
+        .unwrap();
+    let sb_parked = bind(s_parked, host).await;
+    meta.transition_session(s_parked, SessionState::Active)
+        .await
+        .unwrap();
+    meta.update_live_disk_manifest(s_parked, sb_parked, mref(m_b, 2))
+        .await
+        .unwrap();
+    assert!(meta
+        .record_snapshot(snap_with(s_parked, now, true, Some(mref(m_c, 9))))
+        .await
+        .unwrap());
+    ctx.clock.advance(Duration::from_secs(10));
+    let later = ctx.clock.now_utc();
+    assert!(meta
+        .record_snapshot(snap_with(s_parked, later, true, Some(mref(m_d, 1))))
+        .await
+        .unwrap());
+    meta.transition_session(s_parked, SessionState::Evicting)
+        .await
+        .unwrap();
+
+    // Created + sandbox (VM resident, agent not yet started): no live
+    // manifest; one recoverable snap E@1; a NEWER but non-recoverable
+    // F@7 must be invisible → E@1.
+    let s_created = meta
+        .create_session(spec("conf:rehydrate-created"))
+        .await
+        .unwrap();
+    let sb_created = bind(s_created, host).await;
+    assert!(meta
+        .record_snapshot(snap_with(s_created, now, true, Some(mref(m_e, 1))))
+        .await
+        .unwrap());
+    assert!(meta
+        .record_snapshot(snap_with(s_created, later, false, Some(mref(m_f, 7))))
+        .await
+        .unwrap());
+
+    // Idle (evicted; sandbox unbound) → excluded.
+    let s_idle = meta
+        .create_session(spec("conf:rehydrate-idle"))
+        .await
+        .unwrap();
+    bind(s_idle, host).await;
+    meta.transition_session(s_idle, SessionState::Active)
+        .await
+        .unwrap();
+    meta.transition_session(s_idle, SessionState::Idle)
+        .await
+        .unwrap();
+    meta.assign_session_sandbox(s_idle, None).await.unwrap();
+
+    // Active on ANOTHER host → excluded from this host's list.
+    let s_elsewhere = meta
+        .create_session(spec("conf:rehydrate-elsewhere"))
+        .await
+        .unwrap();
+    bind(s_elsewhere, other_host).await;
+    meta.transition_session(s_elsewhere, SessionState::Active)
+        .await
+        .unwrap();
+
+    let mut rows = meta
+        .list_resident_sandboxes_on_host_with_disk_manifest(host)
+        .await
+        .unwrap();
+    rows.sort_by_key(|(sid, _, _)| *sid);
+    let mut expected = vec![
+        (s_active, sb_active, Some(mref(m_a, 5))),
+        (s_parked, sb_parked, Some(mref(m_d, 1))),
+        (s_created, sb_created, Some(mref(m_e, 1))),
+    ];
+    expected.sort_by_key(|(sid, _, _)| *sid);
+    assert_eq!(rows, expected);
+}
+
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
@@ -792,6 +942,10 @@ conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
 conformance!(t_host_lifecycle, super::host_lifecycle);
+conformance!(
+    t_resident_sandboxes_rehydrate_list,
+    super::resident_sandboxes_rehydrate_list
+);
 
 /// Issue #722: the reservation predicate. A stale `pending` WITH a live
 /// create_boot op still holds its budget (visible through

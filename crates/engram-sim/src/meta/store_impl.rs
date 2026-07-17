@@ -2935,11 +2935,56 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
-    async fn list_active_sandboxes_on_host_with_disk_manifest(
+    async fn list_resident_sandboxes_on_host_with_disk_manifest(
         &self,
-        _host_id: HostId,
+        host_id: HostId,
     ) -> Result<Vec<(SessionId, SandboxId, Option<ManifestRef>)>, MetaError> {
-        panic!("SimMeta: list_active_sandboxes_on_host_with_disk_manifest not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // PG twin: sessions in any `reserves_host_memory` state with a
+        // sandbox bound on this host (a rung-parked `Evicting` VM is
+        // as resident as an `Active` one — session 731df805), each
+        // resolved to the effective disk manifest: newer of the live
+        // manifest and the latest recoverable snapshot's, same-id →
+        // max(version), different id → snapshot wins.
+        self.gate()?;
+        let db = self.db.lock();
+        let mut out = Vec::new();
+        for row in db.sessions.values() {
+            let s = &row.session;
+            if !s.status.reserves_host_memory() {
+                continue;
+            }
+            let (Some(h), Some(sb)) = (s.host_id, s.sandbox_id) else {
+                continue;
+            };
+            if h != host_id {
+                continue;
+            }
+            // Latest recoverable snapshot with a disk manifest
+            // (PG: DISTINCT ON (session_id) … ORDER BY created_at DESC).
+            let snap = db
+                .snapshots
+                .values()
+                .filter(|snap| {
+                    snap.session_id == Some(s.id)
+                        && snap.recoverable
+                        && snap.disk_manifest.is_some()
+                })
+                .max_by_key(|snap| snap.created_at)
+                .and_then(|snap| snap.disk_manifest);
+            let effective = match (s.live_disk_manifest, snap) {
+                (None, snap) => snap,
+                (Some(l), None) => Some(l),
+                (Some(l), Some(sn)) => {
+                    if l.manifest_id == sn.manifest_id && l.version > sn.version {
+                        Some(l)
+                    } else {
+                        Some(sn)
+                    }
+                }
+            };
+            out.push((s.id, sb, effective));
+        }
+        Ok(out)
     }
 
     async fn list_enable_jobs(&self, _limit: u32) -> Result<Vec<EnableJob>, MetaError> {
