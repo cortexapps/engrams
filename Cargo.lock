@@ -1061,6 +1061,7 @@ dependencies = [
  "engram-core",
  "engram-storage-gcs",
  "engram-storage-local",
+ "engram-testkit",
  "futures",
  "metrics",
  "nix 0.31.2",
@@ -1805,9 +1806,14 @@ dependencies = [
 name = "engram-testkit"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "bytes",
+ "engram-core",
  "engram-postgres",
+ "futures",
  "sha2",
  "sqlx",
+ "tokio",
  "uuid",
  "workspace-hack",
 ]

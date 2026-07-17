@@ -35,8 +35,9 @@ uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+engram-testkit.workspace = true
 engram-storage-local.workspace = true
 engram-storage-gcs.workspace = true
 proptest.workspace = true
 tempfile = "3"
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }

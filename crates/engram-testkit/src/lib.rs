@@ -5,3 +5,4 @@
 //! have one home instead of being copy-pasted between test binaries.
 
 pub mod pg;
+pub mod storage;
