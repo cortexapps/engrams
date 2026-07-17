@@ -71,6 +71,14 @@ export const completeToolCall = SessionService.method.completeToolCall;
 export const listSessionEvents = SessionService.method.listSessionEvents;
 
 /**
+ * ADR 0097: stage a batch of files inside a running session without
+ * embedding content in a shell command. Each file reports its own result.
+ *
+ * @generated from rpc engram.app.v1.SessionService.WriteFiles
+ */
+export const writeFiles = SessionService.method.writeFiles;
+
+/**
  * @generated from rpc engram.app.v1.SessionService.GetLog
  */
 export const getLog = SessionService.method.getLog;
