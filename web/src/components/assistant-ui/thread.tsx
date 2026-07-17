@@ -350,12 +350,11 @@ const Composer: FC = () => {
       <QueuedRail items={queued} onRemove={removeQueued} />
       <div className="flex w-full items-end gap-2 rounded-2xl border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
         <ComposerPrimitive.Input
-          // Default: Enter inserts a newline, ⌘/Ctrl+Enter submits — a writing
-          // surface (multi-line prompts to a coding agent), not a chat
-          // one-liner, so newline is the cheap key. With the Enter-to-send
-          // preference on, that flips to Slack's model: plain ↵ submits, ⇧↵ is
-          // the newline. submitMode="none" leaves submit entirely to our
-          // keydown so it isn't run-gated.
+          // Default (Enter-to-send on, like Claude desktop): plain ↵ submits,
+          // ⇧↵ is the newline. With the preference off it reverts to the
+          // writing-surface model — Enter inserts a newline and ⌘/Ctrl+Enter
+          // submits. submitMode="none" leaves submit entirely to our keydown so
+          // it isn't run-gated.
           submitMode="none"
           placeholder={
             enterToSend

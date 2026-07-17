@@ -99,8 +99,8 @@ function ComposerPreferences() {
           <div className="space-y-1">
             <Label htmlFor="enter-to-send">Press Enter to send</Label>
             <p className="text-sm text-muted-foreground">
-              Send with Enter and use Shift+Enter for a newline (Slack-style). Off by default: Enter
-              inserts a newline and ⌘/Ctrl+Enter sends.
+              Send with Enter and use Shift+Enter for a newline, like the Claude desktop app. On by
+              default; turn off to make Enter insert a newline and send with ⌘/Ctrl+Enter.
             </p>
           </div>
           <Switch

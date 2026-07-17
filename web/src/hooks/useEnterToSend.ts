@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useState } from "react";
 
-// Slack-style composer preference. When ON, plain Enter sends the message and
-// Shift+Enter inserts a newline; when OFF (the default), the composer keeps its
-// writing-surface behaviour — Enter is a newline and ⌘/Ctrl+Enter sends.
+// Slack-style composer preference. When ON (the default, matching the Claude
+// desktop app), plain Enter sends the message and Shift+Enter inserts a newline;
+// when OFF, the composer reverts to Enter = newline and ⌘/Ctrl+Enter sends.
 //
 // This is a personal, per-browser UI preference (not server state), so it lives
 // in localStorage exactly like the theme preference. Both consumers — the
@@ -10,10 +10,13 @@ import { useCallback, useEffect, useState } from "react";
 // live via a custom event (same tab) and the native `storage` event (other tabs).
 const STORAGE_KEY = "engrams-enter-to-send";
 const CHANGE_EVENT = "engrams-enter-to-send-change";
+const DEFAULT_ENABLED = true;
 
 function read(): boolean {
-  if (typeof localStorage === "undefined") return false;
-  return localStorage.getItem(STORAGE_KEY) === "true";
+  if (typeof localStorage === "undefined") return DEFAULT_ENABLED;
+  const stored = localStorage.getItem(STORAGE_KEY);
+  // Only an explicit opt-out turns it off; absence means the default.
+  return stored === null ? DEFAULT_ENABLED : stored === "true";
 }
 
 /** Reactive accessor for the Enter-to-send preference: `[enabled, setEnabled]`. */
