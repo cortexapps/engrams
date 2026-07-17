@@ -1105,3 +1105,114 @@ async fn poisoned_snapshot_resume_gate_refuses_the_stale_literal() {
         .await
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
+
+// ───────────── Flow F: the flush-pipeline interleavings (ADR 0098 P6) ─────
+
+/// #204 through the sim + ledger: a REAL flush parked at the dirty→pending
+/// handoff races a guest read AND a guest write of the drained chunk. The
+/// step's internal assertion pins the read to {drained, racing} — never
+/// pre-drain stale base — and the standing oracle then proves the racing
+/// write survives the published floor (the pre-fix code silently shadowed
+/// the drained bytes via a stale-base RMW).
+#[tokio::test(start_paused = true)]
+async fn flush_handoff_race_serves_drained_truth_and_loses_no_write() {
+    let mut host = scenario_host(0, 2).await;
+    host.flush_handoff_race(0).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    // The racing write is now the latest ack; a follow-up flush publishes
+    // it and the floor pins it forever.
+    host.flush_tick(0).await.unwrap();
+    host.guest_read(0, 0).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// #199's fence leg: the migration fence rises while a REAL flush is
+/// parked post-upload/pre-publish. The publish must abort (manifest
+/// unmoved, chunks_flushed 0, dirty re-queued — asserted inside the step),
+/// the ledger floor never moves on the aborted attempt, and the post-heal
+/// flush publishes the re-queued writes.
+#[tokio::test(start_paused = true)]
+async fn fence_raised_mid_upload_aborts_publish_and_requeues() {
+    let mut host = scenario_host(0, 2).await;
+    host.flush_fence_abort(0).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    // The step's healing tail already re-flushed; the write is on the floor.
+    host.guest_read(0, 1).await.unwrap();
+}
+
+/// #199's ordering leg: a SECOND flush launched while an earlier one is
+/// parked mid-pipeline must serialize behind it (the flush-pipeline
+/// guard), never publish out of order. The final published content is the
+/// NEWER write — an old-over-new overwrite would put the floor above what
+/// the device serves and the oracle would fire.
+#[tokio::test(start_paused = true)]
+async fn concurrent_flushes_serialize_never_reorder_publishes() {
+    use engram_host_agent::disk_daemon::backend::FlushSeamPoint;
+    let mut host = scenario_host(0, 1).await;
+    host.guest_write(0, 3).await.unwrap();
+    let backend = host.sandboxes[0].backend.clone().unwrap();
+
+    // Flush A drains the first write and parks post-upload/pre-publish.
+    let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
+    let a_backend = backend.clone();
+    let flush_a = tokio::spawn(async move { a_backend.flush().await });
+    arrived.notified().await;
+
+    // A NEWER guest write lands, and flush B starts — it must block on the
+    // pipeline guard until A completes (drain order == publish order).
+    host.guest_write(0, 3).await.unwrap();
+    let b_backend = backend.clone();
+    let flush_b = tokio::spawn(async move { b_backend.flush().await });
+    tokio::task::yield_now().await;
+
+    proceed.notify_one();
+    flush_a.await.unwrap().unwrap();
+    flush_b.await.unwrap().unwrap();
+    host.note_flush_published(0).await.unwrap();
+
+    // The floor and the served content are the NEWER tag; the standing
+    // oracle would flag an old-over-new publish as a below-floor read.
+    host.guest_read(0, 3).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// The pre-rebase store-ahead crash window: the process dies with a REAL
+/// flush parked between `put_manifest` and the rebase. The store holds a
+/// manifest nothing references; the floor never rose, so the successor's
+/// rollback is HONEST — and its next flush recovers through the REAL
+/// version-conflict retry (attempts the stale next-version, hits the
+/// conflict, re-targets latest+1).
+#[tokio::test(start_paused = true)]
+async fn pre_rebase_crash_is_honest_and_the_conflict_retry_recovers() {
+    let mut host = scenario_host(0, 2).await;
+    // An earlier real flush establishes a floor the crash must not breach.
+    host.guest_write(0, 4).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+
+    // The crash: a newer write's flush dies published-but-unrebased.
+    host.flush_pre_rebase_crash(0).await.unwrap();
+    host.restart().await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 4).await.unwrap();
+    host.guest_read(0, 2).await.unwrap();
+
+    // Recovery: the successor's next flush hits the store-ahead version
+    // conflict (the orphaned manifest occupies next-version) and the REAL
+    // retry loop re-targets past it.
+    host.guest_write(0, 5).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+    host.guest_read(0, 5).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
