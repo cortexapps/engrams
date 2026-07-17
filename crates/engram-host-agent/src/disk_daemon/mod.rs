@@ -40,6 +40,7 @@ pub mod flush_scheduler;
 pub mod live_manifest_publisher;
 pub mod nbd;
 pub mod slot;
+pub mod spool;
 
 #[cfg(target_os = "linux")]
 pub mod nbd_netlink;
@@ -62,6 +63,7 @@ pub use slot::{build_from_kernel as build_nbd_pool_from_kernel, NbdSlot, NbdSlot
 
 #[cfg(target_os = "linux")]
 pub use runtime::{
-    attach_manifest, attach_manifest_content, reattach, reattach_manifest,
-    recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError, NbdSandboxState, NBD_BLOCK_SIZE,
+    attach_manifest, attach_manifest_content, flush_block_device_cache, reattach,
+    reattach_manifest, recover_stuck_nbd_devices, spawn, NbdHandle, NbdRuntimeError,
+    NbdSandboxState, NBD_BLOCK_SIZE,
 };

@@ -301,7 +301,7 @@ async fn abandon_during_in_flight_restore_does_not_disconnect_survivor() {
     // SIGTERM: the abandon sweep runs while the restore body is in-flight.
     // The state has NOT been inserted yet (the barrier holds inner.restore),
     // so the sweep drains 0 entries — but it MUST raise the terminal flag.
-    let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
+    let abandoned = pooled.abandon_nbd_data_planes_for_shutdown().await;
     assert_eq!(
         abandoned, 0,
         "the in-flight state is not in the map yet; the sweep drains nothing"
