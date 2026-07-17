@@ -25,10 +25,13 @@ import {
   CopyIcon,
   CornerDownLeftIcon,
   Loader2Icon,
+  MicIcon,
+  MicOffIcon,
   SquareIcon,
   XIcon,
 } from "lucide-react";
 import type { FC } from "react";
+import { useCallback, useRef } from "react";
 import { ShellToolPart } from "@/components/session-thread/ShellToolPart";
 import { FileChangePart } from "@/components/session-thread/FileChangePart";
 import { BrowserActivityPart } from "@/components/session-thread/BrowserActivityPart";
@@ -42,6 +45,7 @@ import {
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
 import { useEnterToSend } from "@/hooks/useEnterToSend";
+import { appendDictation, useDictation } from "@/hooks/useDictation";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -421,10 +425,45 @@ const Composer: FC = () => {
             }
           }}
         />
+        <DictationButton />
         <ComposerAction />
       </div>
       {hintLine && <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">{hintLine}</p>}
     </ComposerPrimitive.Root>
+  );
+};
+
+// Voice dictation, on the browser-native Web Speech API (no backend, no key —
+// see useDictation). Finalized speech segments are appended into the composer
+// textarea; while listening the mic pulses. Hidden entirely where the browser
+// has no SpeechRecognition (e.g. Firefox), so it never shows a dead control.
+const DictationButton: FC = () => {
+  const composer = useComposerRuntime();
+  const text = useComposer((c) => c.text);
+  // Read the freshest text at append-time (not the closure snapshot) so several
+  // segments in one session stack up instead of clobbering each other.
+  const textRef = useRef(text);
+  textRef.current = text;
+  const appendChunk = useCallback(
+    (chunk: string) => composer.setText(appendDictation(textRef.current, chunk)),
+    [composer],
+  );
+  const { supported, listening, toggle } = useDictation(appendChunk);
+  if (!supported) return null;
+  return (
+    <TooltipIconButton
+      tooltip={listening ? "Stop dictation" : "Dictate"}
+      side="bottom"
+      type="button"
+      variant={listening ? "default" : "ghost"}
+      size="icon"
+      className={`size-8 rounded-full${listening ? " animate-pulse" : ""}`}
+      aria-label={listening ? "Stop voice dictation" : "Start voice dictation"}
+      aria-pressed={listening}
+      onClick={() => toggle()}
+    >
+      {listening ? <MicOffIcon className="size-4" /> : <MicIcon className="size-4" />}
+    </TooltipIconButton>
   );
 };
 
