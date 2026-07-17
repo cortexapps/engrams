@@ -239,16 +239,22 @@ schema, writes the row, and returns — replay-safe on
   The orchestrator posts the reply; free text from a session never reaches
   GitHub.
 
-### WriteFile / WriteFiles (new primitives, small)
+### WriteFiles (new primitive, small)
 
 `SessionService.Exec` exists today but has no stdin field, so pushing content
 into a guest means embedding it in a shell command string — quoting hazards
-and size limits. We add two RPCs (agentd verbs plumbed like Exec):
+and size limits. The as-built API adds one RPC, plumbed through the same
+coordinator → host → sandbox path as Exec:
 
-- `SessionService.WriteFile {session_id, path, content, mode?}` — one file.
 - `SessionService.WriteFiles {session_id, files: [{path, content, mode?}]}` —
-  a batch in one round trip; the response reports per-file success so a
-  partial failure is visible and retryable.
+  a batch in one round trip; a batch of one is the single-file case. The
+  response reports per-file success so a partial failure is visible and
+  retryable.
+
+The host-side backend opens one guest connection per file and reuses agentd's
+existing `Upload {path, bytes, mode}` verb. No new append-only agentd wire
+variant is added, so already-baked guest images support `WriteFiles` and no
+image rebake is required.
 
 The review workflow uses them, as a durable step, to stage a session before
 its first prompt:
@@ -709,7 +715,7 @@ service → generated connectquery client → hook → page):
 ## Phasing
 
 - **P0 — the review pass**: GitHub App + webhook route + enrollment,
-  `WriteFile`/`WriteFiles`, the seeded reviewer profile (designation marker),
+  `WriteFiles`, the seeded reviewer profile (designation marker),
   the `reviewers/` folder + renderer, the deterministic setup steps (Exec
   clone + WriteFiles), finder/verifier phases with `submit_finding` /
   `submit_verdict` / `finder_done`, the v1 policy gate, batched posting,
