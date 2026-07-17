@@ -41,29 +41,26 @@ use engram_storage_local::LocalBlobStorage;
 
 /// Clear any stale binding from a prior aborted run (idempotent).
 fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
-    if let Some(idx) = nbd_path
+    let Some(idx) = nbd_path
         .file_name()
         .and_then(|s| s.to_str())
         .and_then(|s| s.strip_prefix("nbd"))
         .and_then(|s| s.parse::<u32>().ok())
-    {
+    else {
+        return;
+    };
+    // A preceding FC test in this serial /dev/nbd0 sequence
+    // (`sigterm_overrun_...`) abandons a successor data plane at process
+    // exit, which leaves the device netlink-CONFIGURED under its
+    // dead_conn_timeout with NO serving pid. So /sys/block/nbdN/pid reads
+    // "free" while NBD_CMD_CONNECT still returns EBUSY, and a single
+    // disconnect at t=0 races the prior process's teardown (re-park after
+    // our disconnect). Re-issue NBD_CMD_DISCONNECT — which clears a
+    // dead-conn-parked config immediately — on a bounded settle loop so a
+    // late re-park is torn back down before this test's CONNECT.
+    for _ in 0..20 {
         let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
-    }
-    // The kernel processes NBD_CMD_DISCONNECT asynchronously; the shared
-    // /dev/nbd0 stays configured for a beat after `disconnect_device` returns.
-    // A preceding FC test in this serial device sequence leaves it bound, so a
-    // bare disconnect-then-CONNECT races into EBUSY. Wait on the same
-    // /sys/block/nbdN/pid free signal `recover_stuck_nbd_devices` uses (bounded
-    // — a genuinely stuck device still surfaces as the CONNECT error).
-    if let Some(name) = nbd_path.file_name().and_then(|s| s.to_str()) {
-        let pid_path = format!("/sys/block/{name}/pid");
-        for _ in 0..100 {
-            match std::fs::read_to_string(&pid_path) {
-                Ok(s) if s.trim().is_empty() => break,
-                Err(_) => break, // absent ⇒ device not bound
-                Ok(_) => std::thread::sleep(std::time::Duration::from_millis(50)),
-            }
-        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
 
