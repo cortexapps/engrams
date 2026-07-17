@@ -10,10 +10,14 @@
 //! — an O_DIRECT read of the seeded chunk returns the ACKED bytes, not the
 //! base, after RECONFIGURE.
 //!
-//! Sized to the property (AGENTS.md): a small image, ONE seeded chunk, two
-//! aligned device reads (the seeded chunk + an un-seeded chunk). No parked-I/O
-//! timing, no long sleeps — the assertion is "the served bytes are the seeded
-//! acked ones," which the least data demonstrates.
+//! Sized to the property (AGENTS.md): a small image, ONE seeded chunk. The
+//! device read is PARKED during the dead-connection window before the
+//! RECONFIGURE (mirroring `nbd_netlink_reconfigure`), so the RECONFIGURE
+//! adopts a genuinely-dead connection — without that ordering the fresh
+//! socket races the kernel's dead-marking, RECONFIGURE gets -ENOSPC, and the
+//! serve loop silently isn't wired to the kernel (the in-process probe reads
+//! only the dirty tier, so it can't catch that; the parked device read can).
+//! The assertion is "the served bytes are the seeded acked ones."
 //!
 //! Gating + run (mirrors `nbd_netlink_reconfigure.rs` — no FC needed):
 //!
@@ -231,8 +235,9 @@ async fn reattach_verify_on_read_serves_seeded_acked_bytes_not_base() {
         let deadline = std::time::Instant::now() + Duration::from_secs(20);
         loop {
             let device_for_parked = device.clone();
-            let probe =
-                tokio::task::spawn_blocking(move || pread_direct(&device_for_parked, seeded_off, 4096));
+            let probe = tokio::task::spawn_blocking(move || {
+                pread_direct(&device_for_parked, seeded_off, 4096)
+            });
             tokio::time::sleep(Duration::from_secs(2)).await;
             if !probe.is_finished() {
                 break probe; // parked under dead_conn_timeout — the state we want
@@ -255,9 +260,16 @@ async fn reattach_verify_on_read_serves_seeded_acked_bytes_not_base() {
     // mismatch would make this `Err`.
     let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
     let slot2 = pool2.claim(&device).await.expect("claim survivor device");
-    let state2 = reattach_manifest(manifest_ref, cache, store, slot2, u64::MAX, Some(seed_dirty))
-        .await
-        .expect("RECONFIGURE reattach with seeded acked chunk (verify-on-read passed)");
+    let state2 = reattach_manifest(
+        manifest_ref,
+        cache,
+        store,
+        slot2,
+        u64::MAX,
+        Some(seed_dirty),
+    )
+    .await
+    .expect("RECONFIGURE reattach with seeded acked chunk (verify-on-read passed)");
 
     // The DEVICE-plane proof: the parked read resumes and returns the ACKED
     // (seeded) bytes — the kernel serves the acked write, not the rolled-back
