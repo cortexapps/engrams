@@ -137,12 +137,24 @@ fn arb_valid_manifest_with_chunks(min_chunks: usize) -> impl Strategy<Value = Ma
 // ---------------------------------------------------------------------------
 
 proptest! {
-    #![proptest_config(ProptestConfig::with_cases(PROPTEST_CASES))]
+    #![proptest_config(ProptestConfig {
+        cases: PROPTEST_CASES,
+        // Integration-test targets can't use the default source-relative
+        // persistence (proptest can't find lib.rs from tests/); pin the
+        // regressions file explicitly so counterexamples become
+        // checked-in deterministic cases (ADR 0099 H3).
+        failure_persistence: Some(Box::new(
+            proptest::test_runner::FileFailurePersistence::Direct(
+                "proptest-regressions/manifest_props.txt",
+            ),
+        )),
+        ..ProptestConfig::default()
+    })]
 
     /// Chunking geometry: densely chunk an arbitrary buffer, then prove
     /// the resulting manifest (a) reports the right chunk count, (b) has
-    /// a `chunk_at` hit at every aligned offset and a miss everywhere
-    /// else, (c) tiles `[0, total_bytes)` with contiguous non-overlapping
+    /// a `chunk_at` hit at every aligned in-range offset and a miss at
+    /// the aligned past-end offset, (c) tiles `[0, total_bytes)` with contiguous non-overlapping
     /// ranges whose lengths follow `min(chunk_size, total_bytes-offset)`,
     /// and (d) reassembles byte-for-byte to the original buffer.
     #[test]
@@ -192,12 +204,11 @@ proptest! {
             prop_assert!(hit.is_some(), "aligned offset {} must resolve", aligned);
             prop_assert_eq!(hit.unwrap().offset, aligned);
         }
-        // A misaligned interior offset never resolves (cs>1 case).
-        if cs > 1 && total_bytes > 1 {
-            prop_assert!(m.chunk_at(1).is_none());
-        }
-        // An offset at/after the end never resolves.
-        prop_assert!(m.chunk_at(total_bytes).is_none());
+        // An aligned offset past the end never resolves. (Misaligned
+        // queries are a CONTRACT VIOLATION — chunk_at's doc requires
+        // exact alignment and ADR 0099 H6 site 2 enforces it with a
+        // debug_assert, so this suite only ever queries aligned
+        // offsets.)
         prop_assert!(m.chunk_at(expected * cs).is_none());
 
         // (c)+(d) tile and reassemble. Lengths follow the production
