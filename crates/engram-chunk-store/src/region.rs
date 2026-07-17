@@ -207,7 +207,23 @@ impl RegionChunker {
 
     fn chunk_len(&self, idx: u64) -> u64 {
         let start = idx * self.chunk_size;
-        self.chunk_size.min(self.total_bytes - start)
+        // ADR 0099 H6 (site 2): `idx` derives from a byte position bounded
+        // by `end <= total_bytes`, so `start < total_bytes` always holds
+        // and the subtraction below never underflows; the result is
+        // clamped to at most one chunk (the last-chunk bound). debug_assert
+        // documents + guards these against a future refactor of `cover`.
+        debug_assert!(
+            start < self.total_bytes,
+            "chunk {idx} start {start} is out of bounds for image length {}",
+            self.total_bytes,
+        );
+        let len = self.chunk_size.min(self.total_bytes - start);
+        debug_assert!(
+            len <= self.chunk_size,
+            "chunk {idx} length {len} exceeds chunk_size {}",
+            self.chunk_size,
+        );
+        len
     }
 }
 

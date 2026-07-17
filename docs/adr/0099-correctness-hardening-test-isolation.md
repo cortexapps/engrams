@@ -200,6 +200,53 @@ The deliberate site list (each addition gets a one-line entry here):
 6. `terminal_target` legality — upgrade the existing debug assertion to the
    shared macro for `#[track_caller]` diagnostics.
 
+**Landed (H6 macro PR).** The two macros live in `engram-core/src/invariant.rs`
+(the `tracing` facade — no subscriber, no I/O — is the only new dep; the no-I/O
+charter holds). `soft_invariant!` logs at `error!` with the stable, greppable
+prefix `soft-invariant violated:` and a `name` field; engram-core carries no
+metrics registry, so a counter rides the log pipeline (alert on that prefix /
+the `soft_invariant` field). Per-site dispositions:
+
+1. **Added** (always-on) — `session_boot.rs` asserts the freshly minted binding
+   epoch clears the floor (`>= 1`) at the dispatch site where it is stamped into
+   the AgentSpec + bind RPC. Strict pairwise monotonicity is already enforced
+   fail-closed one layer down at the host-agent binding record
+   (`bindings::bind` refuses `existing > presented`); the coordinator's
+   fresh-spawn mint sites don't co-locate a prior epoch, so the floor check is
+   the assertion available without an added DB read.
+2. **Added** (`debug_assert`) — `Manifest::chunk_at` (query offset aligned to
+   `chunk_size`) and `RegionChunker::chunk_len` (start in-bounds; length within
+   one chunk). Not covered by `validate()`, which guards manifest entries, not
+   the query offset.
+3. **No-op / consolidation** — both production resolver tiers already verify:
+   `BlobStorageResolver` re-hashes on read and `OciChunkResolver` re-verifies
+   against the bootstrap's expectation on top of `pull_chunk`'s digest check.
+   The `ChunkResolver` contract already documents "byte-correct or error", so
+   adding a re-hash at the `TieredChunkResolver` composition seam would be
+   redundant hashing on the hot page-in path. No code change; the invariant is
+   the existing per-tier verification.
+4. **Added** (`soft_invariant!`) — `reconcile::flip_missing` fires when a
+   sandbox drawn from `host_id`'s own PG assignments is cached under a different
+   host (same sandbox on two hosts). The reconciler proceeds to repair
+   (cache-row drop + the issue-#211 CAS-guarded flip is the existing
+   fail-closed behavior); the invariant only adds the alertable line.
+5. **Audited — no real bypass to close.** `transition_session` /
+   `fenced_transition_session` route through `try_transition_to`. The remaining
+   raw status writes each encode a single legal edge as a SQL CAS
+   (`pending → created`, `idle → queued`, `queued → pending`, all in the FSM
+   table). **One divergence to flag for follow-up:**
+   `mark_host_dead_and_orphan_sessions` bulk-flips every non-terminal session on
+   a dead host to `host_lost` via a `WHERE status NOT IN (terminal)` guard,
+   which is broader than the FSM's legal in-edges to `HostLost` (only
+   `Created/Active/Evicting/Unreachable`; `Pending/Queued/Idle/Evacuating` are
+   not in the table). Routing this per-row through `try_transition_to` would
+   risk stranding a session on a dead host, so it is deliberately left as a
+   bulk transition — recommend a separate change to either widen the FSM edges
+   or formally document host-death as an FSM-exempt mass orphan.
+6. **Added** — `SessionState::terminal_target`'s debug-assert upgraded to
+   `invariant!` (cold forced-termination path; now `#[track_caller]` and fires
+   in prod).
+
 ### H7 / H8 — Dispositions for the known flaky tests
 
 | Test | Disposition |
