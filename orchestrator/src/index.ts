@@ -32,6 +32,7 @@ import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerPapercuts } from "./rpc/papercuts.ts";
+import { registerPrRefs } from "./rpc/pr-refs.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
@@ -135,6 +136,9 @@ const server = buildServer(
 
     // Native PapercutService: orchestrator-owned friction inbox.
     registerPapercuts(router);
+
+    // Native PrRefService: durable task/session links to authored PRs (ADR 0097).
+    registerPrRefs(router);
 
     // Native ProfileService: orchestrator-owned session profiles (ADR 0053).
     registerProfiles(router);

@@ -6,6 +6,7 @@ import { makeCursorStore } from "./cursor-store.ts";
 import { makeLeaseStore } from "./lease-store.ts";
 import type { LeaseStore } from "./lease-store.ts";
 import { SessionListener } from "./session-listener.ts";
+import { makeProductionPrLinkConsumer } from "./pr-link-consumer.ts";
 import { makeProductionSlackConsumer } from "./slack-consumer.ts";
 import { makeProductionToolConsumer } from "./tool-consumer.ts";
 
@@ -136,7 +137,7 @@ export class ListenerManager {
 
 const PRODUCTION_LEASE_TTL_MS = 30_000;
 
-/** Build the process singleton with coordinator stream/catch-up and both
+/** Build the process singleton with coordinator stream/catch-up and all
  * production consumers wired for every acquired session. */
 export function makeProductionListenerManager(): ListenerManager {
   const owner = `${hostname()}:${process.pid}:${crypto.randomUUID()}`;
@@ -155,6 +156,7 @@ export function makeProductionListenerManager(): ListenerManager {
         cursorStore,
         consumers: [
           makeProductionToolConsumer(),
+          makeProductionPrLinkConsumer(),
           makeProductionSlackConsumer(),
         ],
         readPage: readSessionEventsBounded,

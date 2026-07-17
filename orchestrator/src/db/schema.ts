@@ -141,6 +141,34 @@ export const papercut = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Pull request references (ADR 0097)
+// ---------------------------------------------------------------------------
+
+/** Durable link from a PR observed in a session to the task that authored it. */
+export const prRef = pgTable(
+  "pr_ref",
+  {
+    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    repo: text("repo").notNull(),
+    prNumber: integer("pr_number").notNull(),
+    authoringTaskId: text("authoring_task_id").references(() => task.id, {
+      onDelete: "set null",
+    }),
+    sessionId: text("session_id").notNull(),
+    title: text("title").notNull(),
+    url: text("url").notNull(),
+    headBranch: text("head_branch").notNull(),
+    baseBranch: text("base_branch").notNull(),
+    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("pr_ref_repo_pr_number_unique").on(t.repo, t.prNumber),
+    index("pr_ref_authoring_task_idx").on(t.authoringTaskId),
+    index("pr_ref_session_idx").on(t.sessionId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Stream-fed session listeners (ingest v2)
 // ---------------------------------------------------------------------------
 
