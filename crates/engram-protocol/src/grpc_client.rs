@@ -95,8 +95,10 @@ impl Interceptor for TraceparentInjector {
 }
 
 /// Deadline applied (via the gRPC `grpc-timeout` header) to the
-/// snapshot-restore RPCs — `restore` (resume) and
-/// `restore_base_for_session` (cold-create-via-restore). Without it a
+/// snapshot-restore RPCs — `restore` (resume),
+/// `restore_base_for_session` (cold-create-via-restore), and
+/// `start_agent` (the harness (re)attach leg of the same resume
+/// pipeline, which shares the wedge modes). Without it a
 /// host that wedges mid-restore leaves the coord caller hung
 /// indefinitely (observed as a ~6-minute dead-host stall); the
 /// keepalive pings only catch a *silent* connection, not a peer that
@@ -914,13 +916,22 @@ impl GrpcHostClient {
         policy: SessionEgressPolicy,
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
-        let req = StartAgentRequest {
+        let mut req = tonic::Request::new(StartAgentRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             agent_bincode: encode_bincode(&agent, "AgentSpec")?,
             policy_bincode: encode_bincode(&policy, "SessionEgressPolicy")?,
             session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
             fencing_epoch: fence.epoch,
-        };
+        });
+        // Same deadline rationale as `restore` (see `restore_rpc_timeout`):
+        // the host-side SpawnHarness round-trip can wedge (guest page-in
+        // starvation, a dead rootfs device that never answers agentd), and
+        // without a `grpc-timeout` header the coordinator's resume `finish`
+        // step inherits the hang unbounded (prod 2026-07-17 session
+        // 03e6535e: a 34-minute stall ended only by a pod roll). The host
+        // reattach is idempotent, so a timed-out attempt that the op
+        // executor retries reconciles cleanly rather than double-spawning.
+        req.set_timeout(restore_rpc_timeout());
         self.inner
             .clone()
             .start_agent(req)

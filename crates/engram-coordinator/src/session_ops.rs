@@ -659,7 +659,39 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // (RAII abort) before `op_finish` so the beat never re-stamps a
     // just-finished row.
     let heartbeat = spawn_op_heartbeat(state, op.id, epoch);
-    let outcome = crate::session_verbs::dispatch(&ctx).await;
+    // ADR 0079 backstop / the 2026-07-17 resume-stall incident (session
+    // 03e6535e): the within-step liveness heartbeat above PROVES the
+    // executor is alive independently of step progress — by design, so a
+    // long-but-healthy host RPC is never reclaimed. Its failure mode is an
+    // executor that is alive but WEDGED: a verb `await` that never returns
+    // (there, `host.start_agent` on a resume `finish` step hung on a dead
+    // rootfs device) keeps the row heartbeating forever, so the 180s
+    // stale-op reclaim can never fire and the op is pinned until a deploy
+    // rolls the pod (34 minutes, in the incident). The per-RPC
+    // `grpc-timeout`s (restore/start_agent, 240s) are the first line; this
+    // is the backstop for a hang that is NOT a single bounded RPC (a lock,
+    // a channel wait, a future whose timeout isn't honoured). On expiry the
+    // dispatch future is DROPPED (cancelled) and the op requeues with
+    // backoff — equivalent to the executor crashing mid-step, which the
+    // reclaim-and-resume-at-recorded-step machinery already handles safely;
+    // the deadline just makes "alive but stuck" converge without waiting on
+    // a pod roll. Uses the tokio timer (not the injected clock) so it bounds
+    // REAL wall-clock hangs — and so the simulator's paused-clock advance
+    // fires it deterministically.
+    let outcome = match tokio::time::timeout(
+        op_deadline(op.kind),
+        crate::session_verbs::dispatch(&ctx),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => OpOutcome::Retry(format!(
+            "op exceeded wall-clock deadline {:?} at step {:?} (executor alive but wedged); \
+             requeued with backoff",
+            op_deadline(op.kind),
+            op.step.as_deref().unwrap_or("<start>"),
+        )),
+    };
     drop(heartbeat);
     let meta = &state.services.meta;
     let terminal = !matches!(outcome, OpOutcome::Retry(_));
@@ -732,6 +764,38 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
 fn backoff(attempts: i32) -> Duration {
     let secs = ((attempts.max(0) as u64) + 1) * 2;
     Duration::from_secs(secs.min(60))
+}
+
+/// Wall-clock backstop for a single op-dispatch attempt (see the deadline
+/// wrap in [`drive_one`]). NOT a pacing knob — sized generously ABOVE the
+/// sum of the per-RPC `grpc-timeout`s a healthy attempt can legitimately
+/// spend, so it only ever fires on a genuinely wedged executor. On expiry
+/// the attempt requeues with backoff; a fresh attempt gets a fresh
+/// deadline (this is per-attempt, never cumulative across retries).
+fn op_deadline(kind: OpKind) -> Duration {
+    // Operators can pin a single global backstop (and tests set a short
+    // one) via `ENGRAM_OP_DEADLINE_SECS`; unset uses the per-kind budgets
+    // below. Mirrors the `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` knob.
+    if let Some(secs) = std::env::var("ENGRAM_OP_DEADLINE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+    {
+        return Duration::from_secs(secs);
+    }
+    match kind {
+        // The worst legitimate case: restore (≤240s grpc) in the `restore`
+        // step THEN start_agent (≤240s grpc) in the `finish` step, plus
+        // secret/token minting and PG writes — up to ~500s. 600s clears it.
+        OpKind::Resume | OpKind::CreateBoot => Duration::from_secs(600),
+        // A live post-copy migration: capture + disk drain + dest restore.
+        OpKind::Teleport => Duration::from_secs(600),
+        // Park is fast; capture adds a multi-second GCS upload of the
+        // drained disk (~32s observed for ~1,936 chunks).
+        OpKind::Evict | OpKind::CheckpointFinalize => Duration::from_secs(300),
+        // Forward one outbox row (30s ACK budget) / tear down — fast.
+        OpKind::Deliver | OpKind::Destroy => Duration::from_secs(120),
+    }
 }
 
 /// This pod's identity — observability only, never authority (the epoch

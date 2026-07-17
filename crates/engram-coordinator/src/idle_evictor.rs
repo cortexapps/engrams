@@ -3698,4 +3698,254 @@ mod tests {
             "the in-flight host-side capture must be aborted on timeout",
         );
     }
+
+    /// The 2026-07-17 resume-stall incident (session 03e6535e): a verb
+    /// `await` that never returns (there, `host.start_agent` on a resume
+    /// `finish` step, on a dead rootfs device) keeps the op heartbeating
+    /// forever, so the stale-op reclaim can never fire and the op is pinned
+    /// until a deploy rolls the pod. `drive_one`'s wall-clock deadline
+    /// (`op_deadline`) is the backstop: a hung dispatch is cancelled and the
+    /// op REQUEUES with backoff — "executor alive but wedged" converges
+    /// without waiting on a pod roll. This drives the parked-paused (rung-2)
+    /// ascent, whose only host call is `resume`, and hangs it. Sibling of
+    /// `quarantine_evict_times_out_a_hanging_snapshot_begin` (which bounds a
+    /// DIFFERENT, capture-specific timeout); this one bounds the GENERAL op
+    /// executor.
+    #[tokio::test]
+    async fn resume_op_whose_host_call_wedges_is_requeued_by_the_op_deadline() {
+        // Process-local (nextest = process-per-test): a tiny global op
+        // deadline so the hang is bounded in ~1s of real time.
+        std::env::set_var("ENGRAM_OP_DEADLINE_SECS", "1");
+
+        // Forwards everything to a real inner host, but `resume` never
+        // returns — the wedged un-pause.
+        struct HangingResume {
+            inner: Arc<dyn engram_core::traits::HostClient>,
+        }
+        #[async_trait::async_trait]
+        impl engram_core::traits::HostClient for HangingResume {
+            async fn resume(
+                &self,
+                _sandbox_id: engram_core::SandboxId,
+                _fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                std::future::pending().await
+            }
+            async fn create(
+                &self,
+                spec: SandboxSpec,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.create(spec).await
+            }
+            async fn destroy(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.destroy(id, fence).await
+            }
+            async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
+                self.inner.list().await
+            }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
+            async fn exec_stream(
+                &self,
+                id: engram_core::SandboxId,
+                cmd: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                self.inner.exec_stream(id, cmd).await
+            }
+            async fn snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
+            {
+                self.inner.snapshot(id, fence).await
+            }
+            async fn snapshot_begin(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<engram_core::types::SnapshotId, engram_core::SandboxError> {
+                self.inner.snapshot_begin(id, fence).await
+            }
+            async fn abort_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.abort_snapshot(id, fence).await
+            }
+            async fn commit_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.commit_snapshot(id, fence).await
+            }
+            async fn restore(
+                &self,
+                metadata: engram_core::types::snapshot::SnapshotMetadata,
+                fence: SessionFence,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.restore(metadata, fence).await
+            }
+            async fn start_agent(
+                &self,
+                id: engram_core::SandboxId,
+                agent: engram_core::types::sandbox::AgentSpec,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.start_agent(id, agent, policy, fence).await
+            }
+            async fn apply_egress_policy(
+                &self,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.apply_egress_policy(policy).await
+            }
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
+                self.inner.guest_ip(id).await
+            }
+            async fn bind_session(
+                &self,
+                session_id: engram_core::SessionId,
+                sandbox_id: engram_core::SandboxId,
+                binding_epoch: u64,
+            ) {
+                self.inner
+                    .bind_session(session_id, sandbox_id, binding_epoch)
+                    .await
+            }
+            async fn unbind_session(&self, session_id: engram_core::SessionId) {
+                self.inner.unbind_session(session_id).await
+            }
+            async fn send_prompt(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+                prompt_id: String,
+                text: String,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+            }
+        }
+
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let local_path = sandbox_root.path().join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let meta = Arc::new(MiniMeta::new(evicting_session(session_id)));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
+        let hanging: Arc<dyn engram_core::traits::HostClient> = Arc::new(HangingResume {
+            inner: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+        });
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: hanging,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-op-deadline-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-op-deadline-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
+        };
+        let cfg = crate::config::CoordinatorConfig {
+            local_path,
+            ..crate::config::CoordinatorConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry,
+        ));
+
+        // Create + bind a real sandbox so the rung-2 ascent's `resume`
+        // routes to our hanging host, and stamp park_rung=2 so the ascent
+        // takes the un-pause path.
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        {
+            let mut s = meta.session.lock();
+            s.park_rung = 2;
+        }
+
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Resume,
+                serde_json::json!({}),
+                None,
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy at claim: {other:?}"),
+        };
+        let op_id = op.id;
+        crate::session_ops::drive_claimed(&state, op).await;
+
+        let row = state
+            .services
+            .meta
+            .op_get(op_id)
+            .await
+            .expect("op_get")
+            .expect("op row exists");
+        assert_eq!(
+            row.state,
+            OpState::Queued,
+            "a wedged resume attempt must requeue via the op deadline, not pin the op: {row:?}",
+        );
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("wall-clock deadline"),
+            "the op wall-clock deadline is what fired: {:?}",
+            row.error,
+        );
+    }
 }
