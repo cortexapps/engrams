@@ -154,6 +154,8 @@ describe("ReviewStore", () => {
           .where(eq(reviewTable.id, activeReviewId));
 
         expect((await store.getActiveReviewForTask(taskId))?.id).toBe(activeReviewId);
+        expect((await store.getActiveReviewForPr(repo, 102))?.id).toBe(activeReviewId);
+        expect(await store.getActiveReviewForPr(repo, 101)).toBeNull();
 
         const listed = await store.listReviews({ repo });
         expect(listed.map((row) => row.id).slice(0, 3)).toEqual([

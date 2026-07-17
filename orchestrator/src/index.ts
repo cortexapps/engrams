@@ -17,6 +17,8 @@ import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
 import slackEventsRoute from "./routes/slack-events.ts";
 import slackInteractivityRoute from "./routes/slack-interactivity.ts";
+import githubEventsRoute from "./routes/github-events.ts";
+import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -49,8 +51,10 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // tool-execution workflows.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
+import { setReviewControlPlane } from "./workflows/pr-review.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
+import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
@@ -110,6 +114,10 @@ app.route("/", integrationOauthRoute);
 // verify every request with the SDK against the slack.signing_secret org secret.
 app.route("/", slackEventsRoute);
 app.route("/", slackInteractivityRoute);
+// ADR 0100: GitHub's signed webhook and the bearer-authenticated CI trigger
+// converge on the same durable per-PR workflow.
+app.route("/", githubEventsRoute);
+app.route("/", reviewsDispatchRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();
@@ -202,6 +210,7 @@ const server = buildServer(
 // bind can start a workflow.
 setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
+setReviewControlPlane(makeReviewControlPlane());
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });

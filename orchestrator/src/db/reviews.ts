@@ -104,6 +104,7 @@ export interface ReviewStore {
   getReview(id: string): Promise<ReviewDetail | null>;
   listReviews(opts: { repo?: string }): Promise<ReviewListRow[]>;
   getActiveReviewForTask(taskId: string): Promise<ReviewRow | null>;
+  getActiveReviewForPr(repo: string, prNumber: number): Promise<ReviewRow | null>;
   insertFinding(input: ReviewFindingInput): Promise<{ id: string; replayed: boolean }>;
   insertVerdict(input: ReviewVerdictInput): Promise<{ id: string; replayed: boolean }>;
   setFinderSummary(reviewId: string, summaryMd: string): Promise<void>;
@@ -251,6 +252,22 @@ export function makeReviewStore(
         .where(
           and(
             eq(reviewTable.taskId, taskId),
+            inArray(reviewTable.status, ["queued", "finding", "verifying"]),
+          ),
+        )
+        .orderBy(desc(reviewTable.createdAt))
+        .limit(1);
+      return rows[0] ? toReviewRow(rows[0]) : null;
+    },
+
+    async getActiveReviewForPr(repo, prNumber) {
+      const rows = await db
+        .select()
+        .from(reviewTable)
+        .where(
+          and(
+            eq(reviewTable.repo, repo),
+            eq(reviewTable.prNumber, prNumber),
             inArray(reviewTable.status, ["queued", "finding", "verifying"]),
           ),
         )

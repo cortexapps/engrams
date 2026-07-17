@@ -84,6 +84,9 @@ function fakeReviewStore(options: {
     async getActiveReviewForTask() {
       return active;
     },
+    async getActiveReviewForPr() {
+      return null;
+    },
     async insertFinding(input) {
       findings.push(input);
       return { id: FINDING_ID, replayed: false };
