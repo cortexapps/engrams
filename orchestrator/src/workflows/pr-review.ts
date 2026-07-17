@@ -44,7 +44,7 @@ export async function prReviewWorkflowImpl(
   const first = await recv(REVIEW_TOPIC, RECV_TIMEOUT_S);
   if (first === null || first.kind !== "trigger") return;
 
-  await step(
+  const { reviewId, taskId } = await step(
     () => cp.ensureReviewRecord({
       repo: first.repo,
       prNumber: first.prNumber,
@@ -57,7 +57,45 @@ export async function prReviewWorkflowImpl(
     "ensureReviewRecord",
   );
 
-  // TODO(ADR 0100 execution PR): finder → verifier → policy gate → post
+  const headSha = first.headSha ?? "";
+  try {
+    const { sessionId } = await step(
+      () => cp.createFinderSession({
+        reviewId,
+        taskId,
+        repo: first.repo,
+        prNumber: first.prNumber,
+      }),
+      "createFinderSession",
+    );
+    await step(
+      () => cp.bootstrapFinderSession(sessionId, {
+        repo: first.repo,
+        headSha,
+      }),
+      "bootstrapFinderSession",
+    );
+    await step(
+      () => cp.sendFinderPrompt(sessionId, {
+        reviewId,
+        repo: first.repo,
+        prNumber: first.prNumber,
+        headSha,
+        baseSha: "",
+        ...(first.focus !== undefined ? { focus: first.focus } : {}),
+      }),
+      "sendFinderPrompt",
+    );
+  } catch (err) {
+    log.error(
+      { repo: first.repo, prNumber: first.prNumber, err },
+      "finder setup failed",
+    );
+    await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+    return;
+  }
+
+  // TODO(ADR 0100): await finder terminal → verifier → policy gate → post
   for (;;) {
     const message = await recv(REVIEW_TOPIC, RECV_TIMEOUT_S);
     if (message === null) continue;
@@ -70,7 +108,7 @@ export async function prReviewWorkflowImpl(
     }
     log.info(
       { repo: first.repo, prNumber: first.prNumber, kind: message.kind },
-      "github review queued; execution not yet implemented",
+      "github review finder running; later execution phases not yet implemented",
     );
   }
 }

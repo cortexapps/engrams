@@ -1,8 +1,29 @@
-/** Durable review-record operations behind the PrReviewWorkflow seam. */
+/** Durable review-record and finder-session operations behind the workflow seam. */
 
 import { getDb } from "../db/client.ts";
+import { makeConnectorStore } from "../db/connectors.ts";
+import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
+import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import { makeReviewStore, type ReviewStore } from "../db/reviews.ts";
 import { task as taskTable } from "../db/schema.ts";
+import {
+  harnessCatalog as defaultHarnessCatalog,
+  images as defaultImages,
+  sessions as defaultSessions,
+} from "../control-plane/client.ts";
+import {
+  createSessionForExistingTask,
+  type CreateSessionForExistingTaskParams,
+  type HarnessCatalogClient,
+  type TaskSessionsClient,
+} from "../rpc/task-create.ts";
+import type { ImagesClient } from "../rpc/profiles.ts";
+import {
+  renderReviewer as defaultRenderReviewer,
+  type RenderReviewerOptions,
+  type RenderedReviewerFile,
+  type ReviewCategory,
+} from "../reviewers/render.ts";
 
 export interface EnsureReviewRecordInput {
   repo: string;
@@ -16,6 +37,27 @@ export interface ReviewControlPlane {
   ensureReviewRecord(
     input: EnsureReviewRecordInput,
   ): Promise<{ reviewId: string; taskId: string }>;
+  createFinderSession(input: {
+    reviewId: string;
+    taskId: string;
+    repo: string;
+    prNumber: number;
+  }): Promise<{ sessionId: string }>;
+  bootstrapFinderSession(sessionId: string, input: {
+    repo: string;
+    headSha: string;
+    enabledCategories?: readonly ReviewCategory[];
+    orgInstructions?: string;
+  }): Promise<void>;
+  sendFinderPrompt(sessionId: string, input: {
+    reviewId: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    baseSha: string;
+    focus?: string;
+  }): Promise<void>;
+  markReviewFailed(reviewId: string): Promise<void>;
   markReviewHalted(repo: string, prNumber: number): Promise<void>;
 }
 
@@ -24,10 +66,96 @@ interface ReviewControlPlaneStore extends Pick<
   "createReview" | "getActiveReviewForPr" | "updateReviewStatus"
 > {}
 
+interface ReviewExecOutput {
+  event:
+    | { case: "started"; value: unknown }
+    | { case: "stdout"; value: Uint8Array }
+    | { case: "stderr"; value: Uint8Array }
+    | { case: "exit"; value: { exitStatus?: number } }
+    | { case: undefined; value?: undefined };
+}
+
+export interface ReviewSessionsClient extends TaskSessionsClient {
+  exec(req: { sessionId: string; command: string }): AsyncIterable<ReviewExecOutput>;
+  writeFiles(req: {
+    sessionId: string;
+    files: Array<{ path: string; content: Uint8Array; mode: number }>;
+  }): Promise<{ results: Array<{ path: string; ok: boolean; error?: string }> }>;
+  sendPrompt(req: { sessionId: string; promptId: string; text: string }): Promise<unknown>;
+}
+
+type RenderReviewer = (opts: RenderReviewerOptions) => RenderedReviewerFile[];
+type CreateExistingTaskSession = (
+  params: CreateSessionForExistingTaskParams,
+) => Promise<{ sessionId: string }>;
+
 export interface ReviewControlPlaneDeps {
   reviews?: ReviewControlPlaneStore;
   db?: ReturnType<typeof getDb>;
   insertTask?: (input: { repo: string; prNumber: number }) => Promise<string>;
+  sessions?: ReviewSessionsClient;
+  profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
+  enrollments?: Pick<EnrollmentStore, "get">;
+  renderReviewer?: RenderReviewer;
+  /** Focused test seam; production delegates to the shared task-create helper. */
+  createSessionForExistingTask?: CreateExistingTaskSession;
+}
+
+export class ReviewSetupError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ReviewSetupError";
+  }
+}
+
+const FINDER_SYSTEM_PROMPT = [
+  "You are the finder for an automated pull-request review.",
+  "Read /workspace/.review/finder.md and follow it. Never edit files, never push, and report findings only through the provided tools.",
+].join("\n");
+
+// GitHub's own charset limits (owner + repo are [A-Za-z0-9._-]); enforced here
+// so a repo/SHA can never carry shell metacharacters into the bootstrap `sh -c`
+// — defense in depth on top of the signature check + enrollment gate.
+const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+
+function assertSafeRepo(repo: string): void {
+  if (!REPO_RE.test(repo)) throw new ReviewSetupError(`invalid repository: ${repo}`);
+}
+
+function repoName(repo: string): string {
+  assertSafeRepo(repo);
+  const name = repo.split("/").at(-1);
+  if (!name) throw new ReviewSetupError(`invalid repository: ${repo}`);
+  return name;
+}
+
+function productionImagesClient(): ImagesClient {
+  return {
+    async listEnabledImages(req) {
+      const response = await defaultImages.listEnabledImages(req);
+      return {
+        images: response.images.map((image) => ({
+          id: image.id,
+          imageUri: image.imageUri,
+        })),
+      };
+    },
+  };
+}
+
+function productionHarnessCatalogClient(): HarnessCatalogClient {
+  return {
+    async listHarnesses(req) {
+      const response = await defaultHarnessCatalog.listHarnesses(req);
+      return {
+        harnesses: response.harnesses.map((harness) => ({
+          name: harness.name,
+          ...(harness.descriptor ? { descriptor: harness.descriptor } : {}),
+        })),
+      };
+    },
+  };
 }
 
 /** Insert only the automation-owned task row. Review phase sessions attach
@@ -55,13 +183,37 @@ export async function insertReviewTask(
 export function makeReviewControlPlane(
   deps: ReviewControlPlaneDeps = {},
 ): ReviewControlPlane {
-  const reviews = deps.reviews ?? makeReviewStore(deps.db ?? getDb());
+  let resolvedDb = deps.db;
+  const db = () => (resolvedDb ??= getDb());
+  let reviewStore = deps.reviews;
+  const reviews = () => (reviewStore ??= makeReviewStore(db()));
   const insertTask = deps.insertTask ?? ((input) =>
-    insertReviewTask(deps.db ?? getDb(), input));
+    insertReviewTask(db(), input));
+  const sessions = deps.sessions ?? defaultSessions;
+  let profileStore = deps.profiles;
+  const profiles = () => (profileStore ??= makeProfileStore(db()));
+  let enrollmentStore = deps.enrollments;
+  const enrollments = () => (enrollmentStore ??= makeEnrollmentStore(db()));
+  const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
+  const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
+    const database = db();
+    return createSessionForExistingTask(
+      {
+        profiles: profiles(),
+        images: productionImagesClient(),
+        connectors: { list: () => makeConnectorStore(database).list() },
+        harnessCatalog: productionHarnessCatalogClient(),
+        sessions,
+        secrets: { get: async () => null },
+        db: database,
+      },
+      params,
+    );
+  });
 
   return {
     async ensureReviewRecord(input) {
-      const active = await reviews.getActiveReviewForPr(
+      const active = await reviews().getActiveReviewForPr(
         input.repo,
         input.prNumber,
       );
@@ -71,7 +223,7 @@ export function makeReviewControlPlane(
         repo: input.repo,
         prNumber: input.prNumber,
       });
-      const reviewId = await reviews.createReview({
+      const reviewId = await reviews().createReview({
         ...input,
         taskId,
         status: "queued",
@@ -79,9 +231,107 @@ export function makeReviewControlPlane(
       return { reviewId, taskId };
     },
 
+    async createFinderSession(input) {
+      assertSafeRepo(input.repo);
+      const enrollment = await enrollments().get(input.repo);
+      const profileId = enrollment?.profileId
+        ?? (await profiles().getByDesignation("pr_reviewer"))?.id;
+      if (!profileId) {
+        throw new ReviewSetupError("no pr_reviewer profile configured");
+      }
+
+      return createExistingSession({
+        taskId: input.taskId,
+        profileId,
+        role: "finder",
+        extraCapabilities: [`github:contents:read@${input.repo}`],
+        appendSystemPrompt: FINDER_SYSTEM_PROMPT,
+        source: {
+          reviewId: input.reviewId,
+          repo: input.repo,
+          prNumber: input.prNumber,
+        },
+      });
+    },
+
+    async bootstrapFinderSession(sessionId, input) {
+      const name = repoName(input.repo);
+      if (input.headSha !== "" && !SHA_RE.test(input.headSha)) {
+        throw new ReviewSetupError(`invalid head SHA: ${input.headSha}`);
+      }
+      const workspace = `/workspace/${name}`;
+      // Removing the target first makes the coarse checkpoint safe even if an
+      // interrupted clone is retried outside DBOS result replay.
+      let command = `rm -rf ${workspace} && git clone https://github.com/${input.repo}.git ${workspace}`;
+      if (input.headSha !== "") {
+        command += ` && git -C ${workspace} checkout ${input.headSha}`;
+      }
+
+      const stderrDecoder = new TextDecoder();
+      let stderr = "";
+      let exitStatus: number | undefined;
+      for await (const message of sessions.exec({ sessionId, command })) {
+        if (message.event.case === "stderr") {
+          stderr += stderrDecoder.decode(message.event.value, { stream: true });
+        } else if (message.event.case === "exit") {
+          exitStatus = message.event.value.exitStatus;
+        }
+      }
+      stderr += stderrDecoder.decode();
+      if (exitStatus !== 0) {
+        const detail = stderr.trim() || "exec stream ended without a successful exit status";
+        throw new ReviewSetupError(`finder clone failed: ${detail}`);
+      }
+
+      const encoder = new TextEncoder();
+      const files = renderReviewer({
+        role: "finder",
+        ...(input.enabledCategories ? { enabledCategories: input.enabledCategories } : {}),
+        ...(input.orgInstructions !== undefined
+          ? { orgInstructions: input.orgInstructions }
+          : {}),
+      }).map((file) => ({
+        path: file.path,
+        content: encoder.encode(file.content),
+        mode: 0o644,
+      }));
+      const response = await sessions.writeFiles({ sessionId, files });
+      const failed = response.results.find((result) => !result.ok);
+      if (failed) {
+        throw new ReviewSetupError(
+          `failed to stage reviewer instructions at ${failed.path}: ${failed.error ?? "unknown error"}`,
+        );
+      }
+    },
+
+    async sendFinderPrompt(sessionId, input) {
+      const name = repoName(input.repo);
+      const range = input.baseSha !== "" && input.headSha !== ""
+        ? `${input.baseSha}..${input.headSha}`
+        : "the PR diff";
+      const prompt = [
+        `Review ${input.repo} pull request #${input.prNumber}.`,
+        `Analyze ${range} in /workspace/${name}.`,
+        "Read /workspace/.review/finder.md and follow its instructions before reviewing.",
+        ...(input.focus?.trim() ? [`Focus directive: ${input.focus.trim()}`] : []),
+        "Report findings only through the provided review tools; do not edit files or push changes.",
+      ].join("\n");
+
+      await sessions.sendPrompt({
+        sessionId,
+        promptId: `review:${input.reviewId}:finder`,
+        text: prompt,
+      });
+      await reviews().updateReviewStatus(input.reviewId, "finding");
+    },
+
+    async markReviewFailed(reviewId) {
+      await reviews().updateReviewStatus(reviewId, "failed");
+    },
+
     async markReviewHalted(repo, prNumber) {
-      const active = await reviews.getActiveReviewForPr(repo, prNumber);
-      if (active) await reviews.updateReviewStatus(active.id, "halted");
+      const active = await reviews().getActiveReviewForPr(repo, prNumber);
+      if (active) await reviews().updateReviewStatus(active.id, "halted");
     },
   };
 }

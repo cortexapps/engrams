@@ -44,6 +44,7 @@ import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
+import { sessions as controlPlaneSessions } from "./control-plane/client.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
 // ADR 0060: embedded DBOS engine. Workflow modules (P1+) must be imported
 // ABOVE the initDbos() call below so their workflows/steps are registered
@@ -59,8 +60,10 @@ import { makeProductionListenerManager } from "./listeners/manager.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
+import { makeEnrollmentStore } from "./db/enrollments.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { tools } from "./tools/registry.ts";
+import { renderReviewer } from "./reviewers/render.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 
 const app = new Hono();
@@ -210,7 +213,12 @@ const server = buildServer(
 // bind can start a workflow.
 setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
-setReviewControlPlane(makeReviewControlPlane());
+setReviewControlPlane(makeReviewControlPlane({
+  sessions: controlPlaneSessions,
+  profiles: makeProfileStore(getDb()),
+  enrollments: makeEnrollmentStore(getDb()),
+  renderReviewer,
+}));
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
