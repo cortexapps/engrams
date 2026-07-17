@@ -2348,6 +2348,149 @@ mod tests {
         assert_eq!(backend.dirty_chunks_count().await, 0);
     }
 
+    /// ADR 0099 H5 — the acked-write invariant across the whole
+    /// shutdown-spool crash-state space, end to end through the
+    /// export → spool → read → adopt seam (no NBD, no KVM: plain files
+    /// on a temp dir). Marks a set of chunk writes acked, exports+spools
+    /// them, then constructs each partial/corrupt on-disk state a crash
+    /// (or bit-rot) can leave and asserts the invariant:
+    ///
+    ///   every acked write is EITHER fully recoverable from an adopted
+    ///   spool OR the adoption fails/skips loudly — NO crash state makes
+    ///   read_spool hand back a torn chunk or a proper SUBSET while
+    ///   claiming completeness.
+    ///
+    /// That silent-subset/torn adopt is exactly the regression
+    /// session-85e0298a suffered (rolled-back acked writes → ext4
+    /// "Structure needs cleaning"); the whole spool exists to make it
+    /// impossible, so the oracle names it as the invariant.
+    #[tokio::test]
+    async fn acked_writes_never_silently_regress_across_spool_crash_states() {
+        use crate::disk_daemon::spool;
+
+        let chunk_size = 4096u64;
+        let total = 3 * chunk_size;
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let h0 = put_chunk(&store, 0xaa, chunk_size as usize).await;
+        let h1 = put_chunk(&store, 0xbb, chunk_size as usize).await;
+        let h2 = put_chunk(&store, 0xcc, chunk_size as usize).await;
+        let manifest = synth_manifest(
+            total,
+            chunk_size,
+            vec![(0, h0), (chunk_size, h1), (2 * chunk_size, h2)],
+        );
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let src = ChunkedDiskBackend::new(
+            manifest_ref,
+            &manifest,
+            cache.clone(),
+            store.clone(),
+            u64::MAX,
+        )
+        .unwrap();
+
+        // Two acked writes across both un-uploaded tiers: chunk 0 stays
+        // dirty; chunk 2 is drained into the pending tier (never
+        // uploaded) — both must survive the roll.
+        src.write(0, &[0x11; 4096]).await.unwrap();
+        src.write(2 * chunk_size, &[0x33; 4096]).await.unwrap();
+        let pending = src.flush_local().await.unwrap();
+        src.requeue_pending(pending).await;
+
+        let (exported_ref, acked) = src.export_unflushed().await;
+        assert_eq!(
+            acked.iter().map(|(i, _)| *i).collect::<Vec<_>>(),
+            vec![0, 2],
+            "export must union the dirty + pending tiers",
+        );
+
+        let sid = engram_core::SandboxId::new();
+        let spool_root = tempfile::tempdir().unwrap();
+        let root = spool_root.path();
+        let sdir = root.join(sid.to_string());
+
+        // Re-spool the pristine acked set (each case starts from it).
+        let respool = || spool::write_spool(root, sid, exported_ref, &acked);
+
+        // Adopt a read-back spool into a fresh backend and prove every
+        // acked write is served (dirty chunk 0 = 0x11, pending chunk 2 =
+        // 0x33) and the untouched chunk 1 falls through to the base.
+        let assert_full_recovery = |chunks: Vec<(usize, Vec<u8>)>| {
+            let cache = cache.clone();
+            let store = store.clone();
+            let manifest = manifest.clone();
+            let acked = acked.clone();
+            async move {
+                assert_eq!(chunks, acked, "adopted set must be the EXACT acked set");
+                let dst =
+                    ChunkedDiskBackend::new(ManifestRef::new(), &manifest, cache, store, u64::MAX)
+                        .unwrap();
+                dst.rebase_manifest_ref(exported_ref).await;
+                let adopted = dst.adopt_unflushed(chunks).await;
+                assert_eq!(adopted, 2 * chunk_size);
+                let b0 = dst.read(0, chunk_size).await.unwrap();
+                assert!(b0.iter().all(|b| *b == 0x11), "acked dirty chunk recovered");
+                let b1 = dst.read(chunk_size, chunk_size).await.unwrap();
+                assert!(b1.iter().all(|b| *b == 0xbb), "untouched chunk = base");
+                let b2 = dst.read(2 * chunk_size, chunk_size).await.unwrap();
+                assert!(
+                    b2.iter().all(|b| *b == 0x33),
+                    "acked pending chunk recovered"
+                );
+            }
+        };
+
+        // ── Case A: pristine spool → adopts the full set, all acked
+        // writes recoverable.
+        respool().await.unwrap();
+        let (_m, chunks) = spool::read_spool(root, sid).await.unwrap().unwrap();
+        assert_full_recovery(chunks).await;
+
+        // ── Case B: a chunk file torn under a complete marker → Err,
+        // never a torn/subset adopt.
+        respool().await.unwrap();
+        // Truncate chunk 0 to a short remnant under the intact marker.
+        // Ok(None) | Err = loud rollback; an Ok(Some) would be a torn adopt.
+        std::fs::write(sdir.join("chunk-0.bin"), [0x11; 100]).unwrap();
+        let torn = spool::read_spool(root, sid).await;
+        if let Ok(Some((_, c))) = torn {
+            panic!("adopted a torn spool as complete: {c:?}");
+        }
+
+        // ── Case C: crash mid-export, no marker → absent (never a
+        // partial adopt of the chunks that did land).
+        respool().await.unwrap();
+        std::fs::remove_file(sdir.join("meta.json")).unwrap();
+        assert!(spool::read_spool(root, sid).await.unwrap().is_none());
+
+        // ── Case D: marker lists a chunk whose file vanished → Err; the
+        // surviving sibling is NOT adopted as a subset.
+        respool().await.unwrap();
+        std::fs::remove_file(sdir.join("chunk-2.bin")).unwrap();
+        assert!(matches!(
+            spool::read_spool(root, sid).await,
+            Err(_) | Ok(None)
+        ));
+        assert!(
+            !matches!(spool::read_spool(root, sid).await, Ok(Some(_))),
+            "a missing acked chunk must never read back as a complete spool",
+        );
+
+        // ── Case E: foreign garbage beside the valid chunks → tolerated,
+        // full set still recovers.
+        respool().await.unwrap();
+        std::fs::write(sdir.join("chunk-tmp.swp"), b"editor droppings").unwrap();
+        std::fs::write(sdir.join("chunk-0.bin.partial"), b"torn tmp").unwrap();
+        let (_m, chunks) = spool::read_spool(root, sid).await.unwrap().unwrap();
+        assert_full_recovery(chunks).await;
+    }
+
     #[tokio::test]
     async fn read_within_a_single_base_chunk_returns_chunk_bytes() {
         let dir = tempfile::tempdir().unwrap();
