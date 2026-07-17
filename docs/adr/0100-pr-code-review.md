@@ -1,4 +1,4 @@
-# 0097 — PR code review: engrams as a code reviewer on GitHub pull requests
+# 0100 — PR code review: engrams as a code reviewer on GitHub pull requests
 
 Status: Proposed (2026-07-15)
 
