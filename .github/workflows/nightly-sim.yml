@@ -1,0 +1,114 @@
+# Nightly long-run simulation swarm (ADR 0098 D7 follow-up).
+#
+# The PR lane (ci.yml `test-sim`) runs a fixed window — seeds 0..200 chaos +
+# 0..100 calm at 1500 steps — so every PR replays the same territory. This
+# workflow is the exploration arm: each night it runs ~10x the PR-lane volume
+# at deeper horizons over a *fresh* date-derived seed window, so rare
+# interleavings (long recovery ladders, multi-fault pileups, quiescence
+# stragglers) keep getting new dice.
+#
+# On failure the sim binary prints the violated invariant, the trace tail, and
+# a ready-to-run replay command (`just sim SEED=<n> STEPS=<s> PROFILE=<p>`) —
+# reproduce locally from the job log, fix, then pin the seed in
+# crates/engram-dst/tests/regression_seeds.rs (the ADR 0098 rule: every fixed
+# failure becomes a pinned regression).
+#
+# Not a PR check: this never appears in ci.yml's `CI Gate` and must never be
+# made a required status (AGENTS.md — only the gate aggregator is required).
+
+name: Nightly sim swarm
+
+on:
+  schedule:
+    - cron: "17 9 * * *" # 09:17 UTC, after the US-evening merge tail
+  workflow_dispatch: {} # explicit admin trigger for ad-hoc long runs
+
+permissions:
+  contents: read
+  issues: write # failure auto-filing (the step below)
+
+concurrency:
+  group: nightly-sim
+  cancel-in-progress: false
+
+jobs:
+  swarm:
+    name: nightly swarm (engram-dst, deep horizon)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Same key as ci.yml's test-sim lane so the nightly reuses the PR
+          # lane's release build cache instead of maintaining its own.
+          shared-key: workspace-release-sim
+      - name: Pick tonight's seed window
+        id: seeds
+        # Day-derived, non-overlapping windows: each day advances the base by
+        # 1600 seeds (1200 chaos + 400 calm), so no night ever replays a prior
+        # night's seeds and the two profiles never overlap. The window is a
+        # pure function of the UTC date — logged here so any failure is
+        # reproducible even without the job's env.
+        run: |
+          day=$(( $(date -u +%s) / 86400 ))
+          base=$(( day * 1600 ))
+          chaos_start=$base
+          chaos_end=$(( base + 1200 ))
+          calm_start=$chaos_end
+          calm_end=$(( base + 1600 ))
+          echo "chaos=${chaos_start}..${chaos_end}" >> "$GITHUB_OUTPUT"
+          echo "calm=${calm_start}..${calm_end}" >> "$GITHUB_OUTPUT"
+          echo "UTC day ${day}: chaos seeds ${chaos_start}..${chaos_end}, calm seeds ${calm_start}..${calm_end}, 5000 steps"
+      - name: chaos swarm (1200 seeds x 5000 steps)
+        run: cargo run -p engram-dst --release --bin sim -- --seeds ${{ steps.seeds.outputs.chaos }} --steps 5000 --profile chaos --failure-report "$RUNNER_TEMP/chaos-report.md"
+      - name: calm swarm (400 seeds x 5000 steps)
+        # always() (minus cancellation): a chaos failure shouldn't hide
+        # whatever the calm window would have found the same night.
+        if: ${{ !cancelled() }}
+        run: cargo run -p engram-dst --release --bin sim -- --seeds ${{ steps.seeds.outputs.calm }} --steps 5000 --profile calm --failure-report "$RUNNER_TEMP/calm-report.md"
+      - name: File a failure issue with repro steps
+        # Turns the sim's --failure-report artifact (violation, pinned
+        # replay command, trace tail per failed seed) into a GitHub
+        # issue. Dedup: one open issue per invariant slug — repeat
+        # failures of the same invariant become comments on it, so a
+        # recurring bug accumulates seeds instead of spamming issues.
+        # A job failure WITHOUT a report file is an infra error (build
+        # break, runner death) — no issue; the workflow failure itself
+        # is the signal there.
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reports=""
+          for f in "$RUNNER_TEMP/chaos-report.md" "$RUNNER_TEMP/calm-report.md"; do
+            if [ -s "$f" ]; then
+              reports="${reports}$(cat "$f")"$'\n'
+            fi
+          done
+          if [ -z "$reports" ]; then
+            echo "job failed with no failure report — infra error, not filing an issue"
+            exit 0
+          fi
+          slug=$(printf '%s' "$reports" | sed -n 's/^<!-- sim-failure-slug: \(.*\) -->$/\1/p' | head -1)
+          slug=${slug:-invariant-violation}
+          title="nightly sim: \`${slug}\` violated"
+          body=$(printf '%s\n\n%s\n\n---\n_Run: %s • commit %s • fix flow: replay locally at this commit, fix, then pin the seed in `crates/engram-dst/tests/regression_seeds.rs` (ADR 0098)._\n' \
+            "**Commit:** \`${GITHUB_SHA}\` — replay commands below assume \`git checkout ${GITHUB_SHA}\`." \
+            "$reports" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "${GITHUB_SHA}")
+          existing=$(gh issue list --state open --label sim-failure --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "commenting on existing issue #$existing"
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label sim-failure --body "$body"
+          fi

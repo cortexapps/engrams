@@ -23,7 +23,10 @@ reproducible from a seed; the fix (live-op pendings always reserve;
 the backstop fails stale orphans instead of reviving them; boot
 retries refresh freshness) landed in the D7 chain WITH conformance
 coverage, and the oracle tightened back to the unconditional form.
-Deviations still open, tracked: the nightly long-run swarm variant;
+The nightly long-run swarm landed post-acceptance
+(`.github/workflows/nightly-sim.yml`: 1600 seeds × 5000 steps nightly
+over a date-derived, never-repeating seed window).
+Deviations still open, tracked:
 retiring the coordinator's per-test mocks onto SimMetadataStore;
 Agent-mode workload (needs the harness-catalog surface in SimMeta);
 capture-job reservations in SimMeta placement.
