@@ -345,6 +345,24 @@ machines (the `SessionState` pattern: explicit typed states +
 behavior (netlink, actual NBD devices, KVM) stays in the Firecracker CI lane
 forever.
 
+**Phase 2 invariant #1 — the acked-write durability oracle** (added
+2026-07-16 from the session-85e0298a corruption RCA, PR #712): *every
+guest-acked write is recoverable from (published manifest ∪ shutdown spool ∪
+uploaded chunks) after any crash, at every crash point.* The RCA found a
+class of guest-silent acked-write loss with three mechanisms in one day; two
+were kernel page-cache behavior (permanently the FC lane's job — see
+non-goals), but the third — the SIGTERM flush-deadline overrun dropping the
+RAM dirty tier — was a pure shutdown-pipeline ordering bug, exactly what
+this phase's seeded crash-point injection explores systematically. The
+Phase 2 world model tracks acked writes explicitly and asserts the oracle
+after every injected crash/restart, so the *class* is covered rather than
+one bespoke regression per incident. Interim coverage until Phase 2 lands:
+the spool's post-crash on-disk states are exhaustively tested at the file
+level (the ADR 0099 H5 pattern — every state externally constructible), and
+the "checkpoint driver retries forever against a dead data plane" follow-up
+is a D6 convergence-invariant customer (retry-forever reads as
+non-convergence at quiescence).
+
 ## Non-goals
 
 - No packet/socket-level network simulation — the trait seam is the boundary.
