@@ -944,15 +944,25 @@ pub(crate) async fn resume_from_idle(
     // resume-path event. Excluded from the ADR-0028 rewind tombstone (see
     // `rewind_session_to_cursor`) so a resume-with-rollback doesn't grey
     // it or inflate `rolled_back`.
-    let _ = state
-        .emit_fenced(
-            id,
-            ctx.fence(),
-            SessionEvent::ResumeStarted {
-                at: state.services.clock.now_utc(),
-            },
-        )
-        .await;
+    //
+    // Emit only on the op's FIRST attempt (adversarial-review finding):
+    // this function re-enters on every retry of the same Resume op, and
+    // since the event is rewind-excluded, re-emitting would append a fresh
+    // permanent "waking up" marker per retry. One per op is enough for the
+    // signal; the web additionally collapses repeats across ops into a
+    // single transient indicator. `claim_head` bumps `attempts` to 1 on the
+    // first claim, so `attempts <= 1` is the first dispatch.
+    if ctx.op.attempts <= 1 {
+        let _ = state
+            .emit_fenced(
+                id,
+                ctx.fence(),
+                SessionEvent::ResumeStarted {
+                    at: state.services.clock.now_utc(),
+                },
+            )
+            .await;
+    }
 
     // ADR 0079 note: the issue-#210 residual-sandbox destroy that lived
     // here is DELETED. A crash between the restore and the bind now

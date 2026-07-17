@@ -378,6 +378,21 @@ export function buildMessages(
     });
   };
 
+  // The "waking up" resume marker is TRANSIENT — it should read as live
+  // status while a session wakes, not accrete permanent history. The
+  // coordinator emits (rewind-excluded) ResumeStarted events, potentially
+  // one per resume op across retries; we render only the latest, and drop
+  // it entirely once the session actually produces something (resumed /
+  // run_started / an agent message). `wakingId` tracks the live marker so
+  // `clearWaking` can splice it back out of `out`.
+  let wakingId: string | null = null;
+  const clearWaking = () => {
+    if (wakingId == null) return;
+    const i = out.findIndex((d) => d.id === wakingId);
+    if (i !== -1) out.splice(i, 1);
+    wakingId = null;
+  };
+
   // ADR 0028 A.log: stamp `rewound` into the custom metadata of every draft
   // an event touched, so the rolled-back span renders greyed. Preserves any
   // existing custom payload (run footer, marker).
@@ -458,6 +473,10 @@ export function buildMessages(
     const lenBefore = out.length;
     switch (ev.type) {
       case "run_started": {
+        // The session is producing output — the transient "waking up" marker
+        // has served its purpose; drop it BEFORE capturing runStartLen so the
+        // splice can't shift the run's bounds.
+        clearWaking();
         tally = { reads: 0, edits: 0, ran: 0, other: 0 };
         runOpen = true;
         active = null;
@@ -725,6 +744,10 @@ export function buildMessages(
         break;
 
       case "resumed":
+        // Resume completed — the transient "waking up" marker is done.
+        // (run_started clears it too, for a resume that starts a run before
+        // the Resumed event lands.)
+        clearWaking();
         pushSystem(`res:${idx}`, "resumed", {
           kind: "durability",
           mark: "resumed",
@@ -732,16 +755,20 @@ export function buildMessages(
         });
         break;
 
-      // The coordinator started waking the session up. Rendered as a faint
-      // "waking up…" marker so a user who prompts an evicted session sees
-      // progress during the multi-second restore, instead of dead air until
-      // the later `resumed`/first run event lands.
+      // The coordinator started waking the session up. Rendered as a faint,
+      // TRANSIENT "waking up…" marker so a user who prompts an evicted
+      // session sees progress during the multi-second restore. Collapse to a
+      // single marker (drop any earlier one — a retrying resume emits
+      // several) and let the superseding events below remove it once the
+      // session is actually producing output.
       case "resume_started":
+        clearWaking();
         pushSystem(`wake:${idx}`, "waking up", {
           kind: "durability",
           mark: "waking",
           at: ev.at,
         });
+        wakingId = `wake:${idx}`;
         break;
 
       case "integration_asset": {
