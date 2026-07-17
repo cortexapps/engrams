@@ -5,6 +5,7 @@
 
 import { describe, expect, test } from "vitest";
 import {
+  BROWSER_ACTIVITY_TOOL,
   buildMessages,
   FILE_CHANGE_TOOL,
   SHELL_TOOL,
@@ -1334,6 +1335,50 @@ describe("buildMessages — ADR 0054 Flavor A file changes", () => {
     const footer = real(messages).find((m) => m.role === "assistant")!.metadata?.custom
       ?.run as RunFooter;
     expect(footer.edits).toBe(1);
+  });
+
+  test("browser activity replaces its correlated Shell card and keeps the real outcome", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "browser_activity",
+          run_id: "r1",
+          tool_call_id: "tb",
+          intent: "Clicking Sign in",
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tb",
+          tool_name: "Shell",
+          args_summary: 'ENGRAM_BROWSER_INTENT="Clicking Sign in" playwright-cli click e7',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tb",
+          tool_name: "Shell",
+          ok: false,
+          duration_ms: 5,
+          result_summary: "element not found",
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const tps = parts(messages);
+    expect(tps.some((p) => p.toolName === "Shell")).toBe(false);
+    const browser = tps.find((p) => p.toolName === BROWSER_ACTIVITY_TOOL)!;
+    expect(browser).toMatchObject({
+      toolCallId: "tb",
+      args: { intent: "Clicking Sign in" },
+      isError: true,
+    });
   });
 
   test("a write renders a file-change part carrying the content", () => {

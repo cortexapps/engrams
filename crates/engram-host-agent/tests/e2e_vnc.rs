@@ -16,12 +16,11 @@
 //!       in-guest and splices) →
 //!     raw RFB byte round-trip with x11vnc.
 //!
-//! The assertion is the RFB ProtocolVersion handshake: x11vnc speaks FIRST in
-//! RFB, sending the 12-byte `RFB 003.00x\n` banner the instant a viewer connects
-//! (RFC 6143 §7.1.1). So the first bytes off the relay stream must start with
-//! `RFB 003.` — proving the full chain ran: the browser bundle activated, the
-//! launcher brought x11vnc up on loopback, agentd's relay dialed it in-guest,
-//! and the bytes spliced back over vsock.
+//! The test first checks the RFB ProtocolVersion handshake, then drives a local
+//! fixture through Playwright CLI, verifies its semantic snapshot and annotated
+//! screenshot, completes the RFB handshake, requests a tiny RAW framebuffer
+//! rectangle, and decodes the fixture's high-contrast center pixel. This proves
+//! x11vnc and Chromium are alive and expose the same painted page.
 //!
 //! Coverage: `e2e_vnc_cold_via_pooled_backend` — cold-created FC sandbox. (The
 //! warm/netns path is gone with ADR 0066 — the relay reaches guest loopback
@@ -51,7 +50,7 @@ use engram_core::types::sandbox::{
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
-use tokio::io::AsyncReadExt;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
 // Shared FC e2e harness floor (preflight / root-check / host-state cleanup /
@@ -73,6 +72,16 @@ fn agentd_musl_bin() -> PathBuf {
 /// `browser` generation exactly as a prod host resolves it against
 /// `/var/lib/engram/shared`.
 const STAGED_BUNDLES_REL: &str = "var/shared";
+
+/// High-contrast fixture rendered by the shared Chrome. The center of the page
+/// is deliberately magenta so the RFB assertion can decode a tiny 32x32 raw
+/// rectangle rather than transfer a full 1440x1080 framebuffer through the
+/// 2-vCPU CI microVM.
+const BROWSER_E2E_HTML: &str = r#"<!doctype html>
+<html><head><meta charset="utf-8"><title>Engram browser paint fixture</title>
+<style>html,body{height:100%;margin:0}body{background:#d726ff;color:#101828;font:32px sans-serif}
+h1{margin:0;padding:48px;background:#fff}button{margin:48px;padding:16px;font:20px sans-serif}</style></head>
+<body><h1>ENGRAM_BROWSER_PAINTED</h1><button>Annotated target</button></body></html>"#;
 
 /// Resolve the repo-root-relative `var/shared/` staging dir + the `browser`
 /// bundle's content sha from `current.json`. Returns `None` (with a `SKIP:`
@@ -172,6 +181,8 @@ async fn bake_browser_rootfs(busybox: &Path) -> PathBuf {
         }),
         |tree| {
             std::fs::create_dir_all(tree.join("opt/engram/dyn"))?;
+            std::fs::create_dir_all(tree.join("workspace"))?;
+            std::fs::write(tree.join("workspace/browser-e2e.html"), BROWSER_E2E_HTML)?;
             Ok(())
         },
     )
@@ -234,6 +245,193 @@ async fn open_vnc_relay_stream(
         ack.error
     );
     stream
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RfbPixelFormat {
+    bits_per_pixel: u8,
+    big_endian: bool,
+    true_color: bool,
+    red_max: u16,
+    green_max: u16,
+    blue_max: u16,
+    red_shift: u8,
+    green_shift: u8,
+    blue_shift: u8,
+}
+
+impl RfbPixelFormat {
+    fn parse(bytes: [u8; 16]) -> Self {
+        Self {
+            bits_per_pixel: bytes[0],
+            big_endian: bytes[2] != 0,
+            true_color: bytes[3] != 0,
+            red_max: u16::from_be_bytes([bytes[4], bytes[5]]),
+            green_max: u16::from_be_bytes([bytes[6], bytes[7]]),
+            blue_max: u16::from_be_bytes([bytes[8], bytes[9]]),
+            red_shift: bytes[10],
+            green_shift: bytes[11],
+            blue_shift: bytes[12],
+        }
+    }
+
+    fn rgb(self, pixel: &[u8]) -> (u8, u8, u8) {
+        assert!(
+            self.true_color,
+            "x11vnc must advertise a true-color pixel format"
+        );
+        let raw = match (self.bits_per_pixel, self.big_endian) {
+            (32, false) => u32::from_le_bytes(pixel[..4].try_into().unwrap()),
+            (32, true) => u32::from_be_bytes(pixel[..4].try_into().unwrap()),
+            (16, false) => u16::from_le_bytes(pixel[..2].try_into().unwrap()) as u32,
+            (16, true) => u16::from_be_bytes(pixel[..2].try_into().unwrap()) as u32,
+            (bpp, _) => panic!("unsupported RFB bits-per-pixel: {bpp}"),
+        };
+        let channel = |shift: u8, max: u16| -> u8 {
+            (((raw >> shift) & u32::from(max)) * 255 / u32::from(max)) as u8
+        };
+        (
+            channel(self.red_shift, self.red_max),
+            channel(self.green_shift, self.green_max),
+            channel(self.blue_shift, self.blue_max),
+        )
+    }
+}
+
+/// Complete the no-auth RFB 3.8 handshake, request RAW encoding, and sample a
+/// tiny rectangle at the framebuffer center. This proves Chrome painted the
+/// page behind x11vnc; the protocol banner alone only proves x11vnc is alive.
+async fn read_center_rgb(stream: &mut HarnessByteStream) -> (u8, u8, u8) {
+    stream
+        .write_all(b"RFB 003.008\n")
+        .await
+        .expect("write RFB client version");
+    let security_count = stream.read_u8().await.expect("read security type count");
+    assert!(security_count > 0, "RFB server offered no security types");
+    let mut security_types = vec![0; usize::from(security_count)];
+    stream
+        .read_exact(&mut security_types)
+        .await
+        .expect("read RFB security types");
+    assert!(
+        security_types.contains(&1),
+        "x11vnc did not offer None security: {security_types:?}"
+    );
+    stream.write_all(&[1]).await.expect("select None security");
+    assert_eq!(
+        stream.read_u32().await.expect("read SecurityResult"),
+        0,
+        "RFB None security rejected"
+    );
+    stream
+        .write_all(&[1])
+        .await
+        .expect("write shared ClientInit");
+
+    let width = stream.read_u16().await.expect("read framebuffer width");
+    let height = stream.read_u16().await.expect("read framebuffer height");
+    let mut pixel_format = [0; 16];
+    stream
+        .read_exact(&mut pixel_format)
+        .await
+        .expect("read server pixel format");
+    let format = RfbPixelFormat::parse(pixel_format);
+    let name_len = stream.read_u32().await.expect("read desktop name length");
+    let mut name = vec![0; name_len as usize];
+    stream
+        .read_exact(&mut name)
+        .await
+        .expect("read desktop name");
+    assert!(
+        width >= 64 && height >= 64,
+        "unexpected framebuffer {width}x{height}"
+    );
+
+    // SetEncodings: request only raw pixels (encoding 0).
+    stream
+        .write_all(&[2, 0, 0, 1, 0, 0, 0, 0])
+        .await
+        .expect("request raw RFB encoding");
+    let rect_w = 32u16;
+    let rect_h = 32u16;
+    let x = width / 2 - rect_w / 2;
+    let y = height / 2 - rect_h / 2;
+    let mut request = vec![3, 0]; // FramebufferUpdateRequest, non-incremental
+    request.extend_from_slice(&x.to_be_bytes());
+    request.extend_from_slice(&y.to_be_bytes());
+    request.extend_from_slice(&rect_w.to_be_bytes());
+    request.extend_from_slice(&rect_h.to_be_bytes());
+    stream
+        .write_all(&request)
+        .await
+        .expect("request center framebuffer");
+
+    // x11vnc can queue RAW updates (notably the 18x18 software cursor tile)
+    // before it answers our explicit center request. The old decoder returned
+    // the first pixel of the first queued rectangle and therefore graded the
+    // top-left Chrome UI as though it were the page center. Read complete
+    // server messages until a rectangle actually covers our probe point.
+    //
+    // Probe the upper-left corner of the centered 32x32 request rather than
+    // its exact center: Xvfb starts the mouse cursor at screen center, and the
+    // cursor's white pixels would otherwise obscure the fixture beneath it.
+    let sample_x = x;
+    let sample_y = y;
+    let bytes_per_pixel = usize::from(format.bits_per_pixel / 8);
+    loop {
+        match stream
+            .read_u8()
+            .await
+            .expect("read RFB server message type")
+        {
+            0 => {
+                let _padding = stream.read_u8().await.expect("read framebuffer padding");
+                let rectangles = stream.read_u16().await.expect("read rectangle count");
+                assert!(rectangles > 0, "empty framebuffer update");
+                for _ in 0..rectangles {
+                    let rect_x = stream.read_u16().await.expect("read rect x");
+                    let rect_y = stream.read_u16().await.expect("read rect y");
+                    let w = stream.read_u16().await.expect("read rect width");
+                    let h = stream.read_u16().await.expect("read rect height");
+                    let encoding = stream.read_i32().await.expect("read rect encoding");
+                    assert_eq!(encoding, 0, "server ignored requested raw encoding");
+                    let mut pixels = vec![0; usize::from(w) * usize::from(h) * bytes_per_pixel];
+                    stream
+                        .read_exact(&mut pixels)
+                        .await
+                        .expect("read raw framebuffer pixels");
+
+                    if sample_x >= rect_x
+                        && sample_x < rect_x.saturating_add(w)
+                        && sample_y >= rect_y
+                        && sample_y < rect_y.saturating_add(h)
+                    {
+                        let pixel_x = usize::from(sample_x - rect_x);
+                        let pixel_y = usize::from(sample_y - rect_y);
+                        let offset = (pixel_y * usize::from(w) + pixel_x) * bytes_per_pixel;
+                        return format.rgb(&pixels[offset..]);
+                    }
+                }
+            }
+            2 => {} // Bell has no payload.
+            3 => {
+                // ServerCutText may be emitted independently of framebuffer
+                // updates. Consume it so the next byte is another message.
+                let mut padding = [0u8; 3];
+                stream
+                    .read_exact(&mut padding)
+                    .await
+                    .expect("read ServerCutText padding");
+                let len = stream.read_u32().await.expect("read ServerCutText length");
+                let mut text = vec![0; len as usize];
+                stream
+                    .read_exact(&mut text)
+                    .await
+                    .expect("read ServerCutText payload");
+            }
+            message_type => panic!("unsupported RFB server message type: {message_type}"),
+        }
+    }
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -356,7 +554,57 @@ async fn e2e_vnc_cold_via_pooled_backend() {
         "expected RFB ProtocolVersion banner (`RFB 003.`); got {banner:?}",
     );
 
-    // ---- 8. Teardown ----
+    // ---- 8. Drive the same Chrome semantically and produce an annotation ----
+    // Playwright CLI 0.1.17 rejects file:// navigation. Serve the fixture over
+    // guest loopback instead, which also matches how production browser work
+    // reaches pages. BusyBox httpd daemonizes only after successfully binding,
+    // so the following navigation cannot race server startup.
+    let driven = pooled
+        .exec(
+            sandbox_id,
+            engram_core::types::sandbox::ExecRequest {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "/bin/busybox httpd -p 127.0.0.1:18080 -h /workspace && \
+                     playwright-cli open http://127.0.0.1:18080/browser-e2e.html && \
+                     playwright-cli snapshot && \
+                     playwright-cli highlight button --style 'outline: 4px solid cyan' && \
+                     playwright-cli screenshot --filename /tmp/engram-browser-observations/browser-e2e.png && \
+                     test -s /tmp/engram-browser-observations/browser-e2e.png"
+                        .into(),
+                ],
+                stdin: None,
+                env: HashMap::new(),
+                workdir: Some("/workspace".into()),
+                timeout: Some(Duration::from_secs(45)),
+            },
+        )
+        .await
+        .expect("drive shared Chrome with Playwright CLI");
+    assert_eq!(
+        driven.exit_status,
+        Some(0),
+        "Playwright CLI failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&driven.stdout),
+        String::from_utf8_lossy(&driven.stderr),
+    );
+    assert!(
+        String::from_utf8_lossy(&driven.stdout).contains("ENGRAM_BROWSER_PAINTED"),
+        "semantic snapshot did not observe fixture: {:?}",
+        String::from_utf8_lossy(&driven.stdout),
+    );
+
+    // ---- 9. Decode a real framebuffer region from that same painted page ----
+    let (red, green, blue) = timeout(Duration::from_secs(15), read_center_rgb(&mut stream))
+        .await
+        .expect("raw RFB framebuffer within 15s");
+    assert!(
+        red > 180 && green < 100 && blue > 180,
+        "center framebuffer pixel was not fixture magenta: rgb({red}, {green}, {blue})"
+    );
+
+    // ---- 10. Teardown ----
     drop(stream);
     pooled
         .stop_browser(sandbox_id)

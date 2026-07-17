@@ -189,6 +189,13 @@ fn ev_tool_call_completed() -> HarnessEvent {
         result_summary: Some("done".into()),
     }
 }
+fn ev_browser_activity() -> HarnessEvent {
+    HarnessEvent::BrowserActivity {
+        run_id: "r1".into(),
+        tool_call_id: "t1".into(),
+        intent: "Clicking Sign in".into(),
+    }
+}
 fn ev_run_completed() -> HarnessEvent {
     HarnessEvent::RunCompleted {
         run_id: "r1".into(),
@@ -315,6 +322,7 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_prompt_steered", &ev_prompt_steered());
     assert_golden("event_tool_call_requested", &ev_tool_call_requested());
     assert_golden("event_parked", &HarnessEvent::Parked);
+    assert_golden("event_browser_activity", &ev_browser_activity());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -350,6 +358,7 @@ fn harness_event_golden_and_variant_indices() {
         "HarnessEvent::ToolCallRequested",
     );
     assert_variant_index(&HarnessEvent::Parked, 15, "HarnessEvent::Parked");
+    assert_variant_index(&ev_browser_activity(), 16, "HarnessEvent::BrowserActivity");
 }
 
 #[test]
@@ -544,6 +553,7 @@ fn regen_golden() {
     write("event_prompt_steered", &ev_prompt_steered());
     write("event_tool_call_requested", &ev_tool_call_requested());
     write("event_parked", &HarnessEvent::Parked);
+    write("event_browser_activity", &ev_browser_activity());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);

@@ -133,6 +133,17 @@ describe("compileSessionCreateInput", () => {
     expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(PAPERCUT_SYSTEM_PROMPT);
   });
 
+  test("enables private browser image observations only with the browser skill", async () => {
+    const withBrowser = await compileSessionCreateInput(profile({ skills: ["browser"] }), deps());
+    expect(withBrowser.selectedSkills).toEqual(["browser"]);
+    expect(withBrowser.harnessEnv?.ENGRAM_BROWSER_VIEW_ENABLED).toBe("1");
+
+    const withoutBrowser = await compileSessionCreateInput(profile(), deps(), {
+      extraHarnessEnv: { ENGRAM_BROWSER_VIEW_ENABLED: "1" },
+    });
+    expect(withoutBrowser.harnessEnv?.ENGRAM_BROWSER_VIEW_ENABLED).toBeUndefined();
+  });
+
   test("appends the papercut prompt after extraHarnessEnv's system prompt", async () => {
     const inp = await compileSessionCreateInput(profile({ envVars: { FOO: "bar" } }), deps(), {
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },

@@ -31,9 +31,14 @@ import {
 import type { FC } from "react";
 import { ShellToolPart } from "@/components/session-thread/ShellToolPart";
 import { FileChangePart } from "@/components/session-thread/FileChangePart";
+import { BrowserActivityPart } from "@/components/session-thread/BrowserActivityPart";
 import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
-import { FILE_CHANGE_TOOL, SHELL_TOOL } from "@/components/session-thread/buildMessages";
+import {
+  BROWSER_ACTIVITY_TOOL,
+  FILE_CHANGE_TOOL,
+  SHELL_TOOL,
+} from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
 import type { SessionState } from "@/lib/types";
@@ -192,9 +197,11 @@ const AssistantMessage: FC = () => {
                   const Tool: ToolCallMessagePartComponent =
                     part.toolName === SHELL_TOOL
                       ? ShellToolPart
-                      : part.toolName === FILE_CHANGE_TOOL
-                        ? FileChangePart
-                        : ToolFallback;
+                      : part.toolName === BROWSER_ACTIVITY_TOOL
+                        ? BrowserActivityPart
+                        : part.toolName === FILE_CHANGE_TOOL
+                          ? FileChangePart
+                          : ToolFallback;
                   return <Tool {...part} />;
                 }
                 case "indicator":

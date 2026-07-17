@@ -55,7 +55,7 @@ build_tree() {
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        # curl + xz-utils fetch the pinned Node for playwright-cli (ADR 0065);
+        # curl + xz-utils fetch pinned Node for playwright-cli (ADR 0065/0097);
         # util-linux carries setpriv AND flock (the launcher --ensure lock);
         # patchelf rewrites PT_INTERP/DT_RPATH on every bundled ELF (issue
         # #569) so the bundle carries its own loader instead of depending on
@@ -225,7 +225,7 @@ build_tree() {
 </fontconfig>
 FONTS
 
-        # --- playwright-cli driving the SHARED headful chrome (ADR 0065) ------
+        # --- playwright-cli driving shared chrome (ADR 0097) -----------------
         # The browser skill is the shared browser: the human drives it over VNC
         # and the AGENT drives the SAME chromium over CDP. So this bundle also
         # ships the Microsoft playwright-cli, configured to CONNECT to the
@@ -236,7 +236,7 @@ FONTS
         # [NB: single-quoted docker -c block below — NO raw apostrophes anywhere,
         # including inside the heredocs (a raw quote still ends the outer string).]
         NODE_VERSION=20.18.1
-        PLAYWRIGHT_CLI_VERSION=0.1.13
+        PLAYWRIGHT_CLI_VERSION=0.1.17
         ARCH="$(dpkg --print-architecture)"
         case "$ARCH" in
             amd64) NODE_ARCH=x64 ;;
@@ -302,14 +302,71 @@ here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 # call above is what guarantees the /tmp stable-symlink target DT_RPATH
 # resolves through actually exists before this ever runs.
 export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
+# The bundled version is deliberately pinned. Avoid the CLI making a best-effort
+# npm registry request on every short-lived invocation (including the private
+# foregrounding call below), which adds latency or noise in network-isolated
+# sessions without providing a useful upgrade path.
+export NO_UPDATE_NOTIFIER=1
 export PATH="$here/node/bin:$PATH"
-exec "$here/node/bin/playwright-cli" "$@"
+observation_dir=/tmp/engram-browser-observations
+pending="$observation_dir/.pending-view"
+mkdir -p "$observation_dir"
+if [ -s "$pending" ]; then
+    required="$(cat "$pending")"
+    echo "playwright-cli: call browser_view on $required before another browser command" >&2
+    exit 125
+fi
+filename=""
+want_filename=0
+for arg in "$@"; do
+    if [ "$want_filename" -eq 1 ]; then
+        filename="$arg"
+        want_filename=0
+        continue
+    fi
+    case "$arg" in
+        --filename) want_filename=1 ;;
+        --filename=*) filename="${arg#--filename=}" ;;
+    esac
+done
+# Invoke the JavaScript entrypoint through the bundled Node explicitly. The
+# npm-generated playwright-cli shim starts with `#!/usr/bin/env node`; minimal
+# guest images (including the production-shaped Firecracker fixture) need not
+# carry /usr/bin/env, even though this bundle already carries Node itself.
+# Executing the shim directly therefore reports the misleading ENOENT
+# "playwright-cli: not found". Node accepts the shim path (and ignores its
+# shebang), preserving npm symlink/module resolution without depending on any
+# base-image utility.
+"$here/node/bin/node" "$here/node/bin/playwright-cli" "$@"
+status=$?
+# A CDP-connected page can remain a background Chrome target even
+# after a successful navigation or interaction. Semantic commands would then
+# work while VNC still showed the previously active tab, violating the shared
+# headful-browser contract. Best-effort foreground the CLI session page after
+# every successful command. Invoke the real entrypoint directly so this
+# housekeeping action does not recurse through the wrapper or emit a second
+# browser-activity event; commands without a page (close, list, etc.) simply
+# fail here and retain their original successful status.
+if [ "$status" -eq 0 ]; then
+    "$here/node/bin/node" "$here/node/bin/playwright-cli" \
+        run-code "async page => await page.bringToFront()" >/dev/null 2>&1 || true
+fi
+if [ "$status" -eq 0 ] && [ "${1:-}" = screenshot ] && [ -f "$filename" ]; then
+    canonical="$(readlink -f -- "$filename")"
+    case "$canonical" in
+        "$observation_dir"/*)
+            printf "%s\n" "$canonical" > "$pending"
+            echo "playwright-cli: private screenshot ready at $canonical. Call browser_view with this exact path now; browser commands are blocked until it returns the pixels."
+            ;;
+    esac
+fi
+exit "$status"
 WRAP
         chmod 0755 /out/bin/playwright-cli
 
-        # show-your-work skill (moved here from the retired playwright bundle).
+        # One intent-aware browser skill (ADR 0097).
         mkdir -p /out/skills
-        cp -R /skills-src/show-your-work /out/skills/
+        cp -R /skills-src/browser /out/skills/
 
         # --- patchelf: bake the bundle loader + rpath into every bundled ----
         # ELF EXECUTABLE (issue #569; see the header comment above for
