@@ -1046,9 +1046,12 @@ impl MetadataStore for SimMetadataStore {
         // PG rejects (caught by the conformance suite's PG half,
         // 2026-07-17) — enforce loudly instead of diverging silently.
         assert!(
-            image.base_snapshot_id.is_some(),
-            "SimMeta fidelity: enabled_images.base_snapshot_id is NOT NULL in PG — \
-             record a base snapshot first and set base_snapshot_id"
+            image.base_snapshot_id.is_some()
+                && image.base_snapshot_disk_manifest.is_some()
+                && image.base_snapshot_memory_manifest.is_some(),
+            "SimMeta fidelity: enabled_images.base_snapshot_id (migration 0038) and \
+             the base_snapshot_{{disk,memory}}_manifest pair (migration 0043) are \
+             NOT NULL in PG — record a base snapshot first and set all three"
         );
         let uri = image.image_uri.clone();
         let mut db = self.db.lock();

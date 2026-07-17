@@ -189,6 +189,9 @@ async fn stage_enabled_image(meta: &dyn MetadataStore, uri: &str) {
     .expect("stage template base snapshot");
     let mut img = enabled_image(uri);
     img.base_snapshot_id = Some(base_id);
+    // Denormalized manifest pair: NOT NULL since migration 0043.
+    img.base_snapshot_disk_manifest = Some(engram_core::types::manifest::ManifestRef::new());
+    img.base_snapshot_memory_manifest = Some(engram_core::types::manifest::ManifestRef::new());
     meta.upsert_enabled_image(img)
         .await
         .expect("seed enabled image");
