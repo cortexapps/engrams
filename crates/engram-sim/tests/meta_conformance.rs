@@ -884,9 +884,17 @@ async fn enabled_image_config_update(ctx: &Ctx) {
     let meta = &ctx.meta;
     let uri = "conf.local/img:warm";
     let at = ctx.clock.now_utc();
-    meta.upsert_enabled_image(enabled_image(uri, "before", at))
-        .await
-        .unwrap();
+    // `enabled_images.base_snapshot_id` is NOT NULL + FK to `snapshots`
+    // in PG (migration 0038): stage the session-less template base
+    // snapshot first (migration 0028), exactly as the enable pipeline
+    // does before it upserts the row.
+    let base_id = SnapshotId::new();
+    let mut base_snap = snapshot(base_id, SessionId::new(), at, true);
+    base_snap.session_id = None;
+    meta.record_snapshot(base_snap).await.unwrap();
+    let mut img = enabled_image(uri, "before", at);
+    img.base_snapshot_id = Some(base_id);
+    meta.upsert_enabled_image(img).await.unwrap();
 
     // Unknown uri → NotFound.
     let edited = enabled_image(uri, "after", at).image_config;

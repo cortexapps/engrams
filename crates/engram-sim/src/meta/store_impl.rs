@@ -1041,6 +1041,15 @@ impl MetadataStore for SimMetadataStore {
     /// chunk_generation; notifies enabled_image_changed.
     async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError> {
         self.gate()?;
+        // Fidelity: `enabled_images.base_snapshot_id` is NOT NULL + FK in
+        // PG (migration 0038). Accepting `None` here green-lit a scenario
+        // PG rejects (caught by the conformance suite's PG half,
+        // 2026-07-17) — enforce loudly instead of diverging silently.
+        assert!(
+            image.base_snapshot_id.is_some(),
+            "SimMeta fidelity: enabled_images.base_snapshot_id is NOT NULL in PG — \
+             record a base snapshot first and set base_snapshot_id"
+        );
         let uri = image.image_uri.clone();
         let mut db = self.db.lock();
         db.enabled_images.insert(uri.clone(), (image, None));
