@@ -1154,6 +1154,7 @@ dependencies = [
  "engram-sandbox-process",
  "engram-secrets-dev",
  "engram-secrets-gcp",
+ "engram-sim",
  "engram-storage-gcs",
  "engram-storage-local",
  "engram-telemetry",

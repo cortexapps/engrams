@@ -88,6 +88,9 @@ engram-secrets-dev.workspace = true
 # ADR 0099 H1: per-test template-cloned Postgres databases for the
 # live-PG suite (kills shared-DB cross-talk; the lane runs in parallel).
 engram-testkit.workspace = true
+# ADR 0098 D4/D5: SimMetadataStore replaces the per-test partial mocks
+# (FakeMeta retired; more to follow).
+engram-sim.workspace = true
 engram-git-dev.workspace = true
 # ADR 0080 phase 3b: enable_reuse_live_pg's fake host runs the REAL
 # materializer (with a deterministic fake ext4 packer) against a mock
