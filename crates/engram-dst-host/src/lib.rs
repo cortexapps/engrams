@@ -51,6 +51,23 @@
 //! `abandon_nbd_data_planes_for_shutdown` DashMap race stays FC-lane residue.
 //! See [`crash_state`] and [`world`].
 //!
+//! # P4.5 (oracle honesty — the durability pipeline, not omniscient recovery)
+//!
+//! The acked-write oracle ([`invariants`]) is sharpened from "every acked write
+//! recovers" to the honest range `[published_floor, latest_ack]`. The ledger
+//! tracks the published-tier FLOOR per chunk (raised only by a real
+//! [`FlushTick`](Step::FlushTick) / the SIGTERM ladder's publish leg, observed
+//! from the durable manifest): a PUBLISHED write must never roll back, but a
+//! write lost to abrupt death before it is published is an accepted, bounded
+//! loss. A shutdown-spool capture is a TRANSIENT handoff (the successor adopts
+//! it back into the volatile tier), so it does NOT raise the floor; spool
+//! recovery is asserted by the regression seeds that crash with a standing
+//! spool. The new [`AbruptCrash`](Step::AbruptCrash) step drops RAM with NO
+//! spool to exercise the post-ack/pre-publish window every prior crash
+//! primitive (all spool first) never reached — which is what surfaced that a
+//! sticky spool floor over-claims. See the regression seed
+//! `post_ack_pre_handoff_crash_is_honest_loss`.
+//!
 //! # Deferred to P5+
 //!
 //! The remaining lifecycle-flow extractions (Flow B/D/E) and their oracles.
@@ -70,4 +87,6 @@ pub use invariants::Violation;
 pub use reconcile::{DestroyRecord, SimReconcileBackend};
 pub use scheduler::{Profile, Sim, SimReport, Step, NUM_SANDBOXES};
 pub use simfs::{CrashPoint, SimFs};
-pub use world::{AckedWriteLedger, LedgerEntry, SandboxSlot, SimHost, CHUNK_SIZE, NUM_CHUNKS};
+pub use world::{
+    decode_tag, AckedWriteLedger, LedgerEntry, SandboxSlot, SimHost, CHUNK_SIZE, NUM_CHUNKS,
+};

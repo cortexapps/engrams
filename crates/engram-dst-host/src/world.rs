@@ -104,9 +104,44 @@ pub struct LedgerEntry {
 /// survives a [`CrashProcess`](crate::Step::CrashProcess) (a real coordinator
 /// / an external observer remembers what the guest was told); the RAM
 /// backends do not.
+///
+/// It records two facts per chunk:
+/// * the **latest acked tag** (`log`) — what the guest was last told is
+///   written; and
+/// * the **durable-handoff floor** (`published_floor`) — the tag of the most
+///   recent write for that chunk that a flush PUBLISHED to the durable
+///   (uploaded) tier, i.e. that survives ANY subsequent crash, including
+///   abrupt process death.
+///
+/// The floor is the honest oracle's key (ADR 0098 P4.5). Two boundaries it
+/// makes precise:
+/// * A write acked from the RAM dirty tier but lost to abrupt process death
+///   BEFORE it is published is an accepted, bounded loss (bounded by the flush
+///   cadence + the periodic checkpoint, ADR 0028) — NOT a violation.
+/// * A **shutdown-spool capture is a TRANSIENT handoff, not a floor.** The
+///   spool preserves un-published writes across ONE orderly roll, but the
+///   successor's `rebuild` adopts the spool back into the *volatile* dirty tier
+///   and discards it — so the write is bounded by the next flush again. Baking
+///   a chunk-bearing spool into a sticky floor would falsely demand recovery of
+///   a write a later abrupt crash legitimately loses (the swarm found exactly
+///   this once `AbruptCrash` was added). The published tier is the ONLY
+///   permanent floor; spool RECOVERY is asserted by the dedicated regression
+///   seeds that crash with a STANDING spool, not by the standing-state oracle.
+///
+/// The oracle therefore tolerates any read in `[published_floor, latest_ack]`
+/// (by tag order) and flags only a read OLDER than the published floor (a
+/// published write rolled back) or NEWER than the latest ack.
 #[derive(Default)]
 pub struct AckedWriteLedger {
     log: Vec<LedgerEntry>,
+    /// The published-tier floor per `(sandbox, chunk_idx)`: the highest tag a
+    /// flush has published to the durable/uploaded tier. Observed from the REAL
+    /// published manifest (never optimistically flagged), monotonic per chunk
+    /// (the published lineage only advances), and NEVER lowered — the published
+    /// tier is permanently durable. A later un-published write mints a new tag
+    /// that starts BELOW the acked value but does not move the floor until it is
+    /// itself flushed.
+    published_floor: BTreeMap<(usize, u64), u64>,
 }
 
 impl AckedWriteLedger {
@@ -121,6 +156,26 @@ impl AckedWriteLedger {
 
     pub fn is_empty(&self) -> bool {
         self.log.is_empty()
+    }
+
+    /// Raise `(sandbox, chunk_idx)`'s published floor to `content_tag` — the tag
+    /// a flush was OBSERVED to publish in the real durable manifest. Monotonic
+    /// (takes the max): the published tier never loses a chunk, so the floor
+    /// never decreases. A base (tag-0) chunk in a published manifest leaves an
+    /// existing higher floor untouched.
+    pub fn mark_published(&mut self, sandbox: usize, chunk_idx: u64, content_tag: u64) {
+        let slot = self
+            .published_floor
+            .entry((sandbox, chunk_idx))
+            .or_insert(0);
+        *slot = (*slot).max(content_tag);
+    }
+
+    /// The durable-handoff floor for a chunk: the highest tag a flush published,
+    /// or `None` if no write to this chunk was ever published (its acked writes
+    /// are all still RAM-only or spool-transient, droppable by abrupt death).
+    pub fn handed_off_tag(&self, sandbox: usize, chunk_idx: u64) -> Option<u64> {
+        self.published_floor.get(&(sandbox, chunk_idx)).copied()
     }
 
     /// The recoverable set: the LATEST acked tag per `(sandbox, chunk_idx)`
@@ -395,9 +450,17 @@ impl SimHost {
         Ok(())
     }
 
-    /// Read a chunk back and, if the ledger has an acked tag for it, assert
-    /// the read-after-write property inline (the oracle re-checks every acked
-    /// chunk each step, but this gives a targeted read trace).
+    /// Read a chunk back and, if the ledger has an acked tag for it, assert the
+    /// HONEST read property inline (the oracle re-checks every acked chunk each
+    /// step, but this gives a targeted read trace).
+    ///
+    /// A legitimate read-back falls in the honest range
+    /// `[published_floor, latest_ack]` (by tag order): the live newest write,
+    /// the permanent published floor (a recovery that dropped newer,
+    /// un-published writes — the accepted, bounded loss of ADR 0098 P4.5), or a
+    /// transiently-durable intermediate a standing spool adopted. A read older
+    /// than the published floor (a rolled-back durable write) or newer than the
+    /// latest ack is a durability-pipeline violation.
     pub async fn guest_read(&self, idx: usize, chunk_idx: u64) -> Result<(), String> {
         if idx >= self.sandboxes.len() || chunk_idx >= NUM_CHUNKS {
             return Ok(());
@@ -410,15 +473,19 @@ impl SimHost {
             .await
             .map_err(|e| format!("guest_read sandbox {idx} chunk {chunk_idx}: {e}"))?;
         let got = decode_tag(&bytes);
-        if let Some(want) = self
+        if let Some(latest) = self
             .ledger
             .latest_by_chunk()
             .get(&(idx, chunk_idx))
             .map(|e| e.content_tag)
         {
-            if got != want {
+            // `0` = base content (never published).
+            let floor = self.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
+            if got < floor || got > latest {
                 return Err(format!(
-                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got}, acked tag {want}"
+                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got} outside \
+                     [published_floor {floor}, latest_ack {latest}] — a lost or rolled-back \
+                     durable write"
                 ));
             }
         }
@@ -441,6 +508,11 @@ impl SimHost {
             .map_err(|e| format!("flush sandbox {idx}: {e}"))?;
         let published = backend.manifest_ref().await;
         self.sandboxes[idx].published_ref = Some(published);
+        // Durable handoff: the flush published a new manifest. Observe the REAL
+        // published chunk set (read the manifest + its chunks back out of the
+        // store) and record each chunk's now-durable tag as the handoff floor —
+        // not an optimistic flag, but what actually landed in the durable tier.
+        self.mark_flush_published(idx, published).await?;
         // The flush uploaded the current dirty tier; any spool predates it
         // and is now superseded.
         spool::discard_spool(self.fs.spool_dir(), self.sandboxes[idx].sandbox_id)
@@ -461,9 +533,42 @@ impl SimHost {
         Ok(())
     }
 
+    /// Raise the published-tier floor for every chunk a flush just published.
+    /// Reads the published manifest and its chunks back out of the store — the
+    /// REAL durable state — and stamps each positional chunk's decoded tag as
+    /// the (permanent, monotonic) floor. A base (never-written) chunk decodes to
+    /// tag 0 and leaves any existing floor untouched.
+    async fn mark_flush_published(
+        &mut self,
+        idx: usize,
+        published: ManifestRef,
+    ) -> Result<(), String> {
+        let manifest = self
+            .store
+            .get_manifest(published)
+            .await
+            .map_err(|e| format!("mark_flush_published get_manifest sandbox {idx}: {e}"))?;
+        for cref in &manifest.chunks {
+            let chunk_idx = cref.offset / CHUNK_SIZE;
+            let bytes = self
+                .store
+                .get_chunk(cref.hash)
+                .await
+                .map_err(|e| format!("mark_flush_published get_chunk sandbox {idx}: {e}"))?;
+            self.ledger
+                .mark_published(idx, chunk_idx, decode_tag(&bytes));
+        }
+        Ok(())
+    }
+
     /// Write the shutdown spool for a live sandbox: export the un-uploaded
     /// tier (dirty ∪ drained-pending) and durably spool it under the
     /// sandbox's dir. Models the predecessor's SIGTERM spool leg.
+    ///
+    /// Note it does NOT raise the published floor: a chunk-bearing spool is a
+    /// TRANSIENT handoff (the successor adopts it back into the volatile dirty
+    /// tier and discards it — see [`AckedWriteLedger`]). Only a flush that
+    /// publishes to the durable tier moves the floor.
     pub async fn spool_export(&self, idx: usize) -> Result<(), String> {
         if idx >= self.sandboxes.len() {
             return Ok(());
@@ -521,6 +626,30 @@ impl SimHost {
         // loop rebuilds the bindings from the coordinator — the None-arm path.
         self.reconcile.crash_ram();
         // Flow B: a process death is a ROLL.
+        self.roll_generation();
+        Ok(())
+    }
+
+    /// ABRUPT process death (SIGKILL / power loss / OOM) — ADR 0098 P4.5. Drop
+    /// every RAM backend WITHOUT running the shutdown spool: the in-RAM dirty
+    /// tier (guest-acked-but-un-flushed-un-spooled writes) evaporates. This is
+    /// the **accepted, bounded loss** window — bounded by the flush cadence +
+    /// the periodic checkpoint (ADR 0028), NOT a durability violation. The
+    /// honest oracle keys on the durable-handoff floor, so a following
+    /// `Restart` legitimately rolls an un-handed-off acked write back to its
+    /// last flushed/spooled tag (or base) and no false "recovered" is claimed.
+    ///
+    /// The contrast with [`crash_process`](Self::crash_process): that models an
+    /// ORDERLY shutdown that completes the spool first (every acked write handed
+    /// off, so all recover). Only this variant exercises the post-ack /
+    /// pre-handoff window the pipeline is explicitly permitted to lose.
+    pub async fn abrupt_crash(&mut self) -> Result<(), String> {
+        for slot in &mut self.sandboxes {
+            slot.backend = None; // RAM dies — NO shutdown spool
+        }
+        self.reconcile.crash_ram();
+        // Flow B: an abrupt death is still a ROLL (a fresh generation reattaches
+        // the surviving FC VMs / durable disk).
         self.roll_generation();
         Ok(())
     }
@@ -870,6 +999,10 @@ impl SimHost {
                 if matches!(action, engram_host_core::SurvivorAction::Publish) {
                     let published = backend.manifest_ref().await;
                     self.sandboxes[idx].published_ref = Some(published);
+                    // Durable handoff via the published tier (the final-flush
+                    // leg completed, so these chunks are durable independent of
+                    // the spool that follows).
+                    self.mark_flush_published(idx, published).await?;
                     let req = LiveManifestPublishRequest {
                         session_id: self.sandboxes[idx].session_id,
                         sandbox_id: self.sandboxes[idx].sandbox_id,
@@ -966,6 +1099,9 @@ impl SimHost {
                 .map_err(|e| format!("crash_at flush sandbox {idx}: {e}"))?;
             let published = backend.manifest_ref().await;
             self.sandboxes[idx].published_ref = Some(published);
+            // Durable handoff via the (redundant) published tier — the spool
+            // this crash then mangles is not the only copy.
+            self.mark_flush_published(idx, published).await?;
         }
         let sandbox_id = self.sandboxes[0].sandbox_id;
         crash_state::mangle_spool(self.fs.spool_dir(), sandbox_id, cp).await
