@@ -3579,6 +3579,8 @@ impl PooledBackend {
     /// to GCS; only the coord publish is skipped.
     #[cfg(target_os = "linux")]
     pub async fn flush_nbd_data_planes_for_shutdown(&self, deadline: std::time::Duration) {
+        // The `DeviceSync` seam's `sync_device` method (ADR 0098 P4).
+        use engram_host_core::DeviceSync as _;
         let entries: Vec<(
             SandboxId,
             Arc<crate::disk_daemon::ChunkedDiskBackend>,
@@ -3624,34 +3626,24 @@ impl PooledBackend {
                     // pod-handoff dead-connection window can silently drop
                     // (`lost async page write`). Force it down into the
                     // daemon's dirty tier NOW, while our serve loop is
-                    // still alive to ack the writeback; the checkpoint
-                    // path does the same for the same reason.
+                    // still alive to ack the writeback (the checkpoint path
+                    // does the same). Routed through the DeviceSync seam
+                    // (ADR 0098 P4) — a spawn_blocking open+sync_all; a
+                    // join/sync failure is warn-and-proceed. O_DIRECT here
+                    // is a no-op (see `device_sync`), so the sync path is
+                    // unchanged.
+                    if let Err(e) = crate::device_sync::HostDeviceSync
+                        .sync_device(&device)
+                        .await
                     {
-                        let dev = device.clone();
-                        let synced = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
-                            let f = std::fs::OpenOptions::new()
-                                .read(true)
-                                .write(true)
-                                .open(&dev)?;
-                            f.sync_all()
-                        })
-                        .await;
-                        match synced {
-                            Ok(Ok(())) => {}
-                            Ok(Err(e)) => tracing::warn!(
-                                %sandbox_id,
-                                device = %device.display(),
-                                error = %e,
-                                "SIGTERM final flush: host page-cache sync of the NBD \
-                                 device failed; proceeding (pages left behind will ride \
-                                 the kernel's dead-conn parking to the successor)",
-                            ),
-                            Err(e) => tracing::warn!(
-                                %sandbox_id,
-                                error = %e,
-                                "SIGTERM final flush: host page-cache sync task died",
-                            ),
-                        }
+                        tracing::warn!(
+                            %sandbox_id,
+                            device = %device.display(),
+                            error = %e,
+                            "SIGTERM final flush: host page-cache sync of the NBD \
+                             device failed; proceeding (pages left behind will ride \
+                             the kernel's dead-conn parking to the successor)",
+                        );
                     }
                     // Quiesce the virtio → kernel-NBD → daemon pipeline so
                     // the flush captures the just-acked disk state, then
@@ -3659,9 +3651,15 @@ impl PooledBackend {
                     // when the dirty tier is empty — cheap for quiescent
                     // survivors.
                     backend.wait_idle().await;
+                    // ADR 0098 P4: the per-survivor disposition is the pure
+                    // `classify_survivor` decision; the driver only sequences
+                    // the effects off its verdict.
+                    let bound_publish = publish.zip(session_id);
                     let outcome = match backend.flush().await {
                         Ok(o) => o,
                         Err(e) => {
+                            // FlushProbe::FlushError ⇒ RelyOnSpool: the abandon
+                            // sweep's spool export is the durability backstop.
                             tracing::warn!(
                                 %sandbox_id,
                                 error = %e,
@@ -3671,9 +3669,21 @@ impl PooledBackend {
                             return;
                         }
                     };
-                    if outcome.chunks_flushed == 0 {
-                        // Nothing to publish — survivor was already clean.
-                        return;
+                    let action = engram_host_core::classify_survivor(
+                        engram_host_core::FlushProbe::Flushed {
+                            chunks_flushed: outcome.chunks_flushed,
+                            bound: bound_publish.is_some(),
+                        },
+                    );
+                    match action {
+                        // Already clean — nothing new to publish.
+                        engram_host_core::SurvivorAction::SkipClean => return,
+                        // Unreachable for a `Flushed` probe (only `FlushError`
+                        // maps to RelyOnSpool, and that returned above); keep
+                        // the arm so the match stays exhaustive.
+                        engram_host_core::SurvivorAction::RelyOnSpool => return,
+                        engram_host_core::SurvivorAction::DurableNoPublish
+                        | engram_host_core::SurvivorAction::Publish => {}
                     }
                     tracing::info!(
                         %sandbox_id,
@@ -3684,11 +3694,11 @@ impl PooledBackend {
                     );
                     // Synchronously publish so the successor rehydrates
                     // from the just-uploaded ref instead of the stale one.
-                    let (Some((coord, host_id)), Some(session_id)) = (publish, session_id) else {
-                        // No coord wired, or the sandbox isn't bound to a
-                        // session yet (warm-pool / pre-start_agent window).
-                        // The chunks are durable in GCS regardless; the
-                        // publish is what we cannot do here.
+                    let Some(((coord, host_id), session_id)) = bound_publish else {
+                        // DurableNoPublish: no coord wired, or the sandbox
+                        // isn't bound to a session yet (warm-pool /
+                        // pre-start_agent window). The chunks are durable in
+                        // GCS regardless; the publish is what we cannot do here.
                         tracing::debug!(
                             %sandbox_id,
                             "SIGTERM final flush: chunks durable in GCS but no \
@@ -3709,6 +3719,9 @@ impl PooledBackend {
                             manifest_version = outcome.manifest_ref.version,
                             "SIGTERM final flush: live_disk_manifest published to coord",
                         ),
+                        // A publish failure falls back to the same RelyOnSpool
+                        // posture: the shutdown spool's store-ahead ref covers
+                        // a same-node successor.
                         Err(e) => tracing::warn!(
                             %sandbox_id,
                             %session_id,
@@ -3742,7 +3755,10 @@ impl PooledBackend {
                 .collect();
             for (sandbox_id, backend) in stragglers {
                 let dirty = backend.dirty_bytes().await;
-                if dirty > 0 {
+                // ADR 0098 P4: `is_straggler` is the pure deadline-overrun
+                // decision (still-dirty at the deadline ⇒ loud, the spool
+                // catches it).
+                if engram_host_core::is_straggler(dirty) {
                     tracing::warn!(
                         %sandbox_id,
                         dirty_bytes = dirty,

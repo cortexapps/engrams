@@ -32,6 +32,7 @@ pub mod capture_job;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
+pub mod device_sync;
 pub mod dirty_map;
 pub mod disk_daemon;
 pub mod durable_record;
@@ -1626,16 +1627,17 @@ impl HostAgent {
                 // rehydrates from the current ref. It is budgeted against
                 // the pod's terminationGracePeriodSeconds (minus headroom
                 // for the abandon sweep + detach below); on overrun it
-                // logs the still-dirty survivors loudly and proceeds.
-                let flush_budget = std::time::Duration::from_secs_f64(
+                // logs the still-dirty survivors loudly and proceeds. The
+                // budget parse+default is the pure `plan_shutdown` decision
+                // (ADR 0098 P4, Flow A) so the simulator drives the same
+                // deadline arithmetic.
+                let plan = engram_host_core::plan_shutdown(
                     std::env::var("ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS")
                         .ok()
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .filter(|v| *v > 0.0)
-                        .unwrap_or(20.0),
+                        .and_then(|v| v.parse::<f64>().ok()),
                 );
                 pooled
-                    .flush_nbd_data_planes_for_shutdown(flush_budget)
+                    .flush_nbd_data_planes_for_shutdown(plan.flush_deadline)
                     .await;
                 // The abandon sweep also exports any still-un-uploaded
                 // dirty chunks to the node-local shutdown spool (2026-07-16
