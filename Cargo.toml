@@ -33,6 +33,7 @@ members = [
     "crates/engram-git-dev",
     "crates/engram-git-github",
     "crates/engram-postgres",
+    "crates/engram-dst",
     "crates/engram-sim",
     "crates/engram-testkit",
     "crates/engram-egress-proxy",
@@ -80,6 +81,8 @@ schemars = "0.8"
 engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
+engram-coordinator = { path = "crates/engram-coordinator" }
+engram-dst = { path = "crates/engram-dst" }
 engram-sim = { path = "crates/engram-sim" }
 engram-testkit = { path = "crates/engram-testkit" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
@@ -241,6 +244,13 @@ sha2 = "0.10"
 # persisted `proptest-regressions/` seeds turn every counterexample into a
 # checked-in deterministic regression test.
 proptest = "1"
+
+# ADR 0098 D5: the DST scheduler's seeded PRNG. ChaCha8 — portable,
+# seed-stable, documented stream layout (the standard DST choice); the
+# master seed forks per-component streams so adding a consumer doesn't
+# shift every other stream.
+rand = { version = "0.9", default-features = false, features = ["std"] }
+rand_chacha = "0.9"
 
 # tls + cert mint (host-side egress proxy)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }

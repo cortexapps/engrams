@@ -121,6 +121,26 @@ fn host_record(id: HostId, name: &str, now: chrono::DateTime<chrono::Utc>) -> Ho
     }
 }
 
+fn heartbeat_fixture() -> HostHeartbeat {
+    HostHeartbeat {
+        status: HostStatus::Ready,
+        capacity: HostCapacity {
+            total_gb: 100,
+            used_gb: 0,
+            total_mib: 32_768,
+            used_mib: 0,
+            running_sandboxes: 0,
+        },
+        utilization: Default::default(),
+        ready_images: Vec::new(),
+        current_bundles: Vec::new(),
+        total_vcpus: 16,
+        wire_version: 1,
+        stages_images: false,
+        capabilities: Default::default(),
+    }
+}
+
 fn snapshot(
     id: SnapshotId,
     session: SessionId,
@@ -656,6 +676,72 @@ async fn host_lifecycle(ctx: &Ctx) {
     assert_eq!(meta.host_status(h1).await.unwrap(), Some(HostStatus::Dead));
 }
 
+/// placement_no_fit_details: per-host fit verdicts with the shared
+/// reason labels, matching the pick's own eligibility + reservation
+/// arithmetic on both stores.
+async fn placement_no_fit(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let ready = HostId::new();
+    let cordoned = HostId::new();
+    let unknown = HostId::new();
+    // Registration alone leaves a host UNMEASURED (utilization and
+    // vcpus are heartbeat-only columns — upsert_host never writes
+    // them); the heartbeat is what makes it placeable. This split is
+    // itself conformance-tested: SimMeta originally clobbered the
+    // heartbeat columns from the record and this scenario caught it.
+    meta.upsert_host(host_record(ready, "conf-fit-ready", now))
+        .await
+        .unwrap();
+    let unmeasured = meta
+        .placement_no_fit_details(&[ready], 4096, 2)
+        .await
+        .unwrap();
+    assert_eq!(unmeasured[0].reason, "unmeasured");
+    let mut hb = heartbeat_fixture();
+    hb.utilization =
+        serde_json::from_value(serde_json::json!({"allocatable_mib": 8192})).expect("utilization");
+    hb.total_vcpus = 4;
+    meta.touch_host_heartbeat(ready, hb).await.unwrap();
+    meta.upsert_host(host_record(cordoned, "conf-fit-cord", now))
+        .await
+        .unwrap();
+    meta.set_host_cordoned(cordoned, true).await.unwrap();
+
+    let details = meta
+        .placement_no_fit_details(&[ready, cordoned, unknown], 4096, 2)
+        .await
+        .unwrap();
+    assert_eq!(details.len(), 3);
+    let by_host: std::collections::BTreeMap<_, _> =
+        details.iter().map(|d| (d.host_id, d)).collect();
+    assert_eq!(by_host[&ready].reason, "fits_now");
+    assert_eq!(by_host[&ready].free_mib, 8192);
+    assert_eq!(by_host[&cordoned].reason, "not_lockable");
+    assert_eq!(by_host[&unknown].reason, "not_lockable");
+
+    // Over-budget asks classify against the binding dimension.
+    let details = meta
+        .placement_no_fit_details(&[ready], 16_384, 2)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "ram_full");
+    // CPU budgets are overcommitted (host_cpu_budget = vcpus x factor,
+    // default 4): 4 vcpus => budget 16, so an ask of 17 is cpu_full but
+    // 8 still fits. Both stores must share the overcommit arithmetic
+    // (the conformance suite caught SimMeta using raw vcpus).
+    let details = meta
+        .placement_no_fit_details(&[ready], 4096, 8)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "fits_now");
+    let details = meta
+        .placement_no_fit_details(&[ready], 4096, 17)
+        .await
+        .unwrap();
+    assert_eq!(details[0].reason, "cpu_full");
+}
+
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
@@ -666,3 +752,4 @@ conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
 conformance!(t_host_lifecycle, super::host_lifecycle);
+conformance!(t_placement_no_fit, super::placement_no_fit);
