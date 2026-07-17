@@ -137,7 +137,7 @@ const server = buildServer(
     // Native PapercutService: orchestrator-owned friction inbox.
     registerPapercuts(router);
 
-    // Native PrRefService: durable task/session links to authored PRs (ADR 0097).
+    // Native PrRefService: durable task/session links to authored PRs (ADR 0100).
     registerPrRefs(router);
 
     // Native ProfileService: orchestrator-owned session profiles (ADR 0053).

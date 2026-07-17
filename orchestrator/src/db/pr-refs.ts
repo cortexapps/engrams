@@ -1,4 +1,4 @@
-/** Pull-request reference data-access seam (ADR 0097). */
+/** Pull-request reference data-access seam (ADR 0100). */
 
 import { desc, eq, sql } from "drizzle-orm";
 

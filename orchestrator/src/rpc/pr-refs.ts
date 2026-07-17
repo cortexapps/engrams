@@ -1,4 +1,4 @@
-/** Orchestrator-native PrRefService (ADR 0097). */
+/** Orchestrator-native PrRefService (ADR 0100). */
 
 import { timestampFromDate } from "@bufbuild/protobuf/wkt";
 import { Code, ConnectError } from "@connectrpc/connect";

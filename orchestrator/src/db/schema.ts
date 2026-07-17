@@ -141,7 +141,7 @@ export const papercut = pgTable(
 );
 
 // ---------------------------------------------------------------------------
-// Pull request references (ADR 0097)
+// Pull request references (ADR 0100)
 // ---------------------------------------------------------------------------
 
 /** Durable link from a PR observed in a session to the task that authored it. */
