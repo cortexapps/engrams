@@ -1736,6 +1736,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-sim"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "engram-core",
+ "engram-postgres",
+ "engram-testkit",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-storage-gcs"
 version = "0.1.0"
 dependencies = [

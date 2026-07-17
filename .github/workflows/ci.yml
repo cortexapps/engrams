@@ -383,6 +383,20 @@ jobs:
             --no-fail-fast \
             --test-threads=16
 
+      # ADR 0098 D4: the SimMetadataStore conformance suite's live-PG
+      # half. Every scenario runs against BOTH the in-memory sim store
+      # (normal workspace lane) and a real template-cloned database
+      # (here) — the defense against sim-fidelity drift. Same admin URL
+      # + per-test isolation as the step above.
+      - name: SimMetadataStore conformance (PG half)
+        if: always()
+        run: |
+          cargo nextest run \
+            -p engram-sim \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=16
+
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
     needs: detect

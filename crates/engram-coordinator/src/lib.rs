@@ -221,26 +221,13 @@ pub async fn run_with_registry_and_local(
         state.session_ops_wake.clone(),
     );
 
-    // Phase 3d follow-up: dead-host auto-detector. Opens its own
-    // PgPool for advisory locks (the trait doesn't expose one;
-    // sharing a connection between the trait and lock-holding code
-    // would tangle the abstraction). On Postgres-backed deployments
-    // a stale heartbeat triggers eviction within ~poll_interval +
-    // stale_threshold; deployments using a non-Postgres MetadataStore
-    // will see this task fail to connect and log the error — they
-    // can still use `POST /sessions/:id/migrate` for operator-
-    // initiated transitions.
-    let _dead_host = match sqlx::postgres::PgPool::connect(&cfg.database_url).await {
-        Ok(pool) => Some(dead_host::spawn(
-            dead_host::DeadHostConfig::default(),
-            pool,
-            state.clone(),
-        )),
-        Err(e) => {
-            tracing::warn!(error = %e, "dead-host detector disabled — couldn't open PgPool");
-            None
-        }
-    };
+    // Phase 3d follow-up: dead-host auto-detector. Fully trait-driven
+    // (ADR 0098 D4): cross-replica mutual exclusion is a MetadataStore
+    // leasing row (`dead_host_inflight`), not an advisory lock on a
+    // private PgPool — so it works against any store, including the
+    // simulator. A stale heartbeat triggers eviction within
+    // ~poll_interval + stale_threshold.
+    let _dead_host = dead_host::spawn(dead_host::DeadHostConfig::default(), state.clone());
     // ADR 0018 commit 12c: the evac-resumer scanner picks up sessions
     // marked Evacuating (by the admin /drain, /evacuate, or
     // dead_host.rs) and drives Evacuating → Created → Active on a

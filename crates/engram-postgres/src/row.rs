@@ -669,7 +669,7 @@ pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> 
     })
 }
 
-fn parse_host_status(s: &str) -> Result<HostStatus, MetaError> {
+pub(crate) fn parse_host_status(s: &str) -> Result<HostStatus, MetaError> {
     Ok(match s {
         "ready" => HostStatus::Ready,
         "draining" => HostStatus::Draining,

@@ -3428,6 +3428,69 @@ impl MetadataStore for PostgresStore {
             .collect::<Result<Vec<_>, MetaError>>()
     }
 
+    async fn host_status(&self, host_id: HostId) -> Result<Option<HostStatus>, MetaError> {
+        let raw: Option<String> = sqlx::query_scalar("SELECT status FROM hosts WHERE id = $1")
+            .bind(host_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        raw.map(|s| row::parse_host_status(&s)).transpose()
+    }
+
+    async fn try_acquire_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+        stale_after: std::time::Duration,
+    ) -> Result<bool, MetaError> {
+        let now = self.clock.now_utc();
+        let stale_cutoff = now
+            - chrono::Duration::from_std(stale_after)
+                .unwrap_or_else(|_| chrono::Duration::seconds(180));
+        // Free row: insert wins. Held row: the DO UPDATE fires only when
+        // the incumbent's claim has gone stale (crash takeover); a live
+        // incumbent means no row comes back and we lost the race.
+        let won: Option<String> = sqlx::query_scalar(
+            "INSERT INTO dead_host_inflight (host_id, claimed_by, claimed_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (host_id) DO UPDATE
+                 SET claimed_by = EXCLUDED.claimed_by, claimed_at = EXCLUDED.claimed_at
+                 WHERE dead_host_inflight.claimed_at < $4
+             RETURNING claimed_by",
+        )
+        .bind(host_id.as_uuid())
+        .bind(claimant)
+        .bind(now)
+        .bind(stale_cutoff)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(won.is_some())
+    }
+
+    async fn release_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+    ) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM dead_host_inflight WHERE host_id = $1 AND claimed_by = $2")
+            .bind(host_id.as_uuid())
+            .bind(claimant)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn notify_host_dead(&self, host_id: HostId) -> Result<(), MetaError> {
+        sqlx::query("SELECT pg_notify('host_dead', $1)")
+            .bind(host_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn put_session_runtime_spec(
         &self,
         session_id: SessionId,
