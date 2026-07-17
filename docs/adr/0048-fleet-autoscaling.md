@@ -134,6 +134,30 @@ hold arm would `set_size(N−1)` on a physically-N pool — with a live GKE
 scaler the MIG would delete an ARBITRARY node, possibly one carrying live
 microVMs.
 
+**Amendment — scale the schedulable target plus durable availability debt.**
+The count-only grow guard originally compared `desired_hosts` with the number
+of host-agent DaemonSet pods. A roll whose pod remained `Terminating` after
+the successor timeout therefore looked physical forever even though it could
+never satisfy placement: queued demand could remain at `current=2,
+physical=3, desired=3` until the 30-minute queue backstop failed it. K3 now
+marks that terminal roll state on the Node as
+`fleet.engram.io/roll-stuck=<node-pool>`. The grow-only target is:
+
+```text
+grow_target = min(max_hosts, desired_schedulable + roll_stuck_nodes)
+```
+
+The marker is written only after the bounded successor gate expires, so a
+normally provisioning or restarting host contributes no debt and cannot
+ratchet growth on repeated reconciles. `set_size(grow_target)` remains
+idempotent and grow-only. Queue or scale-up pressure blocks new image rolls;
+an in-flight scale-down wave is aborted before debt recovery. Once the queue
+is empty and `schedulable >= desired_schedulable`, the operator drain-gates
+and removes the specifically marked node through `remove_node`; it never uses
+a count-only shrink and never uncordons a failed roll merely because its drain
+timed out. If `max_hosts` prevents the surge, the normal queue timeout remains
+the explicit max-capacity backstop.
+
 ### 5. Scale-down: consolidation waves on the teleport seam
 
 `NodePoolScaler` gains `remove_node(pool, node)` — remove ONE named node,
