@@ -88,6 +88,10 @@ export type SessionEvent =
     }
   | { type: "evicted"; at: string }
   | { type: "resumed"; snapshot_id: string; at: string }
+  // The coordinator started waking an idle/parked session back up, before
+  // the multi-second restore + harness reattach. Rendered as a transient
+  // "waking up…" indicator that resolves when the first run event lands.
+  | { type: "resume_started"; at: string }
   | {
       type: "run_started";
       run_id: string;

@@ -79,7 +79,7 @@ export interface BrowserActivityArgs {
 /** Payload carried in a system message's `metadata.custom.marker` — the
  *  harness-register events that aren't agent messages. */
 export type SystemMarker =
-  | { kind: "durability"; mark: "snapshot" | "resumed"; sizeBytes?: number; at: string }
+  | { kind: "durability"; mark: "snapshot" | "resumed" | "waking"; sizeBytes?: number; at: string }
   // ADR 0056: a generic integration asset/action. Subsumes the old
   // `pull_request` marker. The renderer keys on (provider, assetKind) with a
   // generic fallback (SystemMessage.tsx) — no per-provider marker shape.
@@ -728,6 +728,18 @@ export function buildMessages(
         pushSystem(`res:${idx}`, "resumed", {
           kind: "durability",
           mark: "resumed",
+          at: ev.at,
+        });
+        break;
+
+      // The coordinator started waking the session up. Rendered as a faint
+      // "waking up…" marker so a user who prompts an evicted session sees
+      // progress during the multi-second restore, instead of dead air until
+      // the later `resumed`/first run event lands.
+      case "resume_started":
+        pushSystem(`wake:${idx}`, "waking up", {
+          kind: "durability",
+          mark: "waking",
           at: ev.at,
         });
         break;

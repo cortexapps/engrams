@@ -97,6 +97,23 @@ pub enum SessionEvent {
         snapshot_id: SnapshotId,
         at: DateTime<Utc>,
     },
+    /// The coordinator began waking an idle/parked session back up (the
+    /// resume op claimed and started restoring). Emitted BEFORE the
+    /// multi-second restore + harness (re)attach, so a surface has
+    /// something to render the instant a user prompts an evicted session
+    /// instead of dead air until `StatusChanged{→Active}` lands (the
+    /// 2026-07-17 incident UX: prompt → 40 minutes of nothing visible).
+    /// Coordinator-authoritative — like `prompt_received`/`status_changed`
+    /// it stays true across an ADR-0028 recovery rewind (the coordinator
+    /// genuinely started the resume), so `rewind_session_to_cursor`
+    /// EXCLUDES it from the tombstone UPDATE; without that a
+    /// resume-with-rollback would grey the marker and inflate
+    /// `rolled_back` by one (the same class ADR 0091 fixed for
+    /// `harness_idle`). The web renders it as a transient "waking up…"
+    /// indicator that resolves when the run's first event arrives.
+    ResumeStarted {
+        at: DateTime<Utc>,
+    },
     /// Phase 4: harness-emitted events. Web UI and Slackbot
     /// subscribe to these to render the agent's play-by-play.
     /// Track B reshape: structured summary fields replace the
@@ -393,6 +410,7 @@ impl SessionEvent {
             Self::SnapshotTaken { .. } => "snapshot_taken",
             Self::Evicted { .. } => "evicted",
             Self::Resumed { .. } => "resumed",
+            Self::ResumeStarted { .. } => "resume_started",
             Self::HarnessRunStarted { .. } => "run_started",
             Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",

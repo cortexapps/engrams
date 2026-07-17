@@ -935,6 +935,25 @@ pub(crate) async fn resume_from_idle(
     let state = ctx.state;
     let id = session.id;
 
+    // Tell surfaces we've started waking the session up, BEFORE the
+    // multi-second restore + harness (re)attach below — so a user who
+    // prompts an evicted session sees a "waking up…" marker immediately
+    // instead of dead air until the session flips Active (the 2026-07-17
+    // stall UX). Best-effort + fenced: a failed progress emit must never
+    // fail the resume, and it rides the op fence like every other
+    // resume-path event. Excluded from the ADR-0028 rewind tombstone (see
+    // `rewind_session_to_cursor`) so a resume-with-rollback doesn't grey
+    // it or inflate `rolled_back`.
+    let _ = state
+        .emit_fenced(
+            id,
+            ctx.fence(),
+            SessionEvent::ResumeStarted {
+                at: state.services.clock.now_utc(),
+            },
+        )
+        .await;
+
     // ADR 0079 note: the issue-#210 residual-sandbox destroy that lived
     // here is DELETED. A crash between the restore and the bind now
     // resumes at the op's recorded step: step >= "bind" with a live

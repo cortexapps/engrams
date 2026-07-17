@@ -3258,10 +3258,135 @@ impl MetadataStore for SimMetadataStore {
 
     async fn rewind_session_to_cursor(
         &self,
-        _session_id: SessionId,
-        _events_cursor: i64,
+        session_id: SessionId,
+        events_cursor: i64,
     ) -> Result<engram_core::types::event::RewindSummary, MetaError> {
-        panic!("SimMeta: rewind_session_to_cursor not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // Faithful mirror of `PostgresStore::rewind_session_to_cursor`
+        // (crates/engram-postgres): detect surviving side-effects in the
+        // rolled-back span, tombstone every NON-excluded live event past
+        // the cursor, and — only if anything actually rewound — bump the
+        // recovery epoch. The excluded-kind list and the side-effect line
+        // text MUST match the SQL exactly; the conformance suite
+        // (engram-sim/tests) runs the same scenario against both stores.
+        // ADR 0098 D4 conformance rule: this method changed from a panic
+        // stub to a real impl in the PR that added `resume_started` to the
+        // exclusion set.
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+
+        // Coordinator-fact kinds that survive a rewind (mirror the PG
+        // `AND kind NOT IN (...)` predicate — keep in lockstep).
+        const EXCLUDED: &[&str] = &[
+            "status_changed",
+            "snapshot_taken",
+            "evicted",
+            "resumed",
+            "resume_started",
+            "recovered_from_checkpoint",
+            "prompt_received",
+            "harness_idle",
+            "harness_parked",
+        ];
+
+        let (tombstoned, surviving_side_effects) = {
+            let Some(events) = db.session_events.get_mut(&session_id) else {
+                // No events for this session -> nothing rewinds (parity with
+                // the PG zero-rows early return; no epoch bump).
+                return Ok(engram_core::types::event::RewindSummary::default());
+            };
+
+            // Surviving side-effects: outside-world actions in the
+            // rolled-back span the rewind CANNOT undo. Same detection +
+            // one-line-each rendering as the SQL.
+            let mut surviving = Vec::new();
+            for e in events.iter() {
+                if e.idx <= events_cursor || e.rewound_at.is_some() {
+                    continue;
+                }
+                match e.kind.as_str() {
+                    "integration_asset"
+                        if e.payload.get("surface").and_then(|v| v.as_str()) == Some("asset") =>
+                    {
+                        let provider = e
+                            .payload
+                            .get("provider")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("integration");
+                        let asset_kind = e
+                            .payload
+                            .get("asset_kind")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("asset");
+                        let detail = e
+                            .payload
+                            .get("fetchable")
+                            .and_then(|f| f.get("url"))
+                            .and_then(|v| v.as_str())
+                            .or_else(|| {
+                                e.payload
+                                    .get("data")
+                                    .and_then(|d| d.get("url").or_else(|| d.get("title")))
+                                    .and_then(|v| v.as_str())
+                            });
+                        surviving.push(match detail {
+                            Some(d) => format!(
+                                "A {provider} {asset_kind} was produced and still exists: {d}"
+                            ),
+                            None => {
+                                format!("A {provider} {asset_kind} was produced and still exists")
+                            }
+                        });
+                    }
+                    "file_shared" => {
+                        let detail = e
+                            .payload
+                            .get("caption")
+                            .and_then(|v| v.as_str())
+                            .or_else(|| e.payload.get("artifact_id").and_then(|v| v.as_str()))
+                            .unwrap_or("(artifact)");
+                        surviving.push(format!("A file was shared and still exists: {detail}"));
+                    }
+                    _ => {}
+                }
+            }
+
+            // Tombstone the rolled-back span (audit-preserving) and count it.
+            let mut n: u64 = 0;
+            for e in events.iter_mut() {
+                if e.idx > events_cursor
+                    && e.rewound_at.is_none()
+                    && !EXCLUDED.contains(&e.kind.as_str())
+                {
+                    e.rewound_at = Some(now);
+                    n += 1;
+                }
+            }
+            (n, surviving)
+        };
+
+        if tombstoned == 0 {
+            // Checkpoint was already the head, or the only post-cursor rows
+            // are excluded coordinator facts: nothing user-visible rewound.
+            // Don't bump the epoch (keeps the no-op clean) — PG parity.
+            return Ok(engram_core::types::event::RewindSummary::default());
+        }
+
+        // Bump the epoch so events appended after this segment carry it.
+        let row = db
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(MetaError::NotFound)?;
+        row.recovery_epoch += 1;
+        row.updated_at = now;
+        let recovery_epoch = row.recovery_epoch;
+
+        Ok(engram_core::types::event::RewindSummary {
+            rolled_back: tombstoned,
+            recovery_epoch,
+            through_idx: events_cursor,
+            surviving_side_effects,
+        })
     }
 
     async fn set_enable_job_materialize_host(

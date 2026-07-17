@@ -1156,6 +1156,125 @@ async fn snapshot_totals_aggregate(ctx: &Ctx) {
     assert_eq!(totals.total_bytes, 3500);
 }
 
+/// ADR 0028 rung-1 rewind: `rewind_session_to_cursor` tombstones the
+/// guest-derived tail past the checkpoint cursor, EXCLUDES the
+/// coordinator-fact kinds (incl. `resume_started`, added with the
+/// resume-progress event), detects surviving outside-world side-effects,
+/// and bumps the recovery epoch only when something actually rolled back.
+/// Pins the D4 conformance obligation for the exclusion-list SQL change.
+async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:rewind")).await.unwrap();
+
+    // Anchor event AT the checkpoint cursor — never rolled back (idx <= cursor).
+    let cursor = meta
+        .append_session_event(id, "status_changed", serde_json::json!({"to": "idle"}))
+        .await
+        .unwrap();
+
+    // The post-checkpoint tail: a mix of excluded coordinator facts and
+    // rewindable guest-derived events, plus two surviving side-effects.
+    meta.append_session_event(
+        id,
+        "prompt_received",
+        serde_json::json!({"prompt_id": "p1"}),
+    )
+    .await
+    .unwrap();
+    meta.append_session_event(id, "resume_started", serde_json::json!({}))
+        .await
+        .unwrap();
+    meta.append_session_event(id, "agent_message", serde_json::json!({"text": "hi"}))
+        .await
+        .unwrap();
+    meta.append_session_event(
+        id,
+        "integration_asset",
+        serde_json::json!({
+            "provider": "forge",
+            "asset_kind": "pull_request",
+            "surface": "asset",
+            "data": {"title": "PR #5"}
+        }),
+    )
+    .await
+    .unwrap();
+    meta.append_session_event(id, "tool_call_started", serde_json::json!({"tool": "bash"}))
+        .await
+        .unwrap();
+    meta.append_session_event(
+        id,
+        "file_shared",
+        serde_json::json!({"caption": "my notes", "artifact_id": "art1"}),
+    )
+    .await
+    .unwrap();
+    meta.append_session_event(id, "harness_idle", serde_json::json!({}))
+        .await
+        .unwrap();
+
+    // Rewind everything after the anchor.
+    let summary = meta.rewind_session_to_cursor(id, cursor).await.unwrap();
+
+    // Only the guest-derived events roll back (agent_message,
+    // integration_asset, tool_call_started, file_shared = 4); the
+    // coordinator facts (prompt_received, resume_started, harness_idle) +
+    // the anchor status_changed survive.
+    assert_eq!(summary.rolled_back, 4, "rolled_back count");
+    assert_eq!(summary.through_idx, cursor, "through_idx is the cursor");
+    assert_eq!(summary.recovery_epoch, 1, "epoch bumped once");
+    assert_eq!(
+        summary.surviving_side_effects,
+        vec![
+            "A forge pull_request was produced and still exists: PR #5".to_string(),
+            "A file was shared and still exists: my notes".to_string(),
+        ],
+        "surviving side-effects, in idx order",
+    );
+
+    // Per-event tombstone state must agree across stores: excluded kinds
+    // stay live (rewound_at None), rewindable kinds are tombstoned.
+    let events = meta
+        .list_session_events_since(id, cursor, 1000)
+        .await
+        .unwrap();
+    for e in &events {
+        let excluded = matches!(
+            e.kind.as_str(),
+            "prompt_received" | "resume_started" | "harness_idle" | "status_changed"
+        );
+        assert_eq!(
+            e.rewound_at.is_none(),
+            excluded,
+            "kind {} rewound_at (excluded={excluded})",
+            e.kind
+        );
+    }
+
+    // A newly appended event carries the bumped epoch.
+    meta.append_session_event(id, "agent_message", serde_json::json!({"text": "post"}))
+        .await
+        .unwrap();
+    let tail = meta
+        .list_session_events_since(id, cursor, 1000)
+        .await
+        .unwrap();
+    let post = tail.last().unwrap();
+    assert_eq!(post.recovery_epoch, 1, "post-rewind event carries epoch 1");
+
+    // A second rewind with the head already at/after the cursor rolls back
+    // nothing and does NOT bump the epoch again (zero-rows early return).
+    let head = post.idx;
+    let again = meta.rewind_session_to_cursor(id, head).await.unwrap();
+    assert_eq!(again.rolled_back, 0, "nothing left to roll back");
+    assert_eq!(again.recovery_epoch, 0, "default summary on a no-op rewind");
+    assert_eq!(again.surviving_side_effects, Vec::<String>::new());
+}
+
+conformance!(
+    t_rewind_excludes_coordinator_facts,
+    super::rewind_excludes_coordinator_facts
+);
 conformance!(t_placement_no_fit, super::placement_no_fit);
 conformance!(
     t_enabled_image_config_update,
