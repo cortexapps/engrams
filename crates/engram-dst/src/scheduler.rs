@@ -79,8 +79,11 @@ pub enum Step {
     /// Asymmetric: heartbeats vanish, RPCs still answer (issue #231's
     /// probe-rescue case) — toggled.
     HeartbeatPartition(usize, bool),
-    /// The inverse: heartbeats land, RPCs fail — toggled.
-    RpcPartition(usize, bool),
+    /// The inverse: heartbeats land, RPC verbs HANG (G1, the #743
+    /// op-wedge class) — toggled. `true` arms a stall far above every
+    /// `op_deadline` (the deadline, on the tokio timer, is what unwedges
+    /// the op); `false` heals it.
+    RpcHang(usize, bool),
     /// Skew one replica's wall clock by the given seconds (can be
     /// negative).
     ClockSkew(usize, i64),
@@ -195,7 +198,7 @@ impl Sim {
                 91..=93 => {
                     let h = self.rng.random_range(0..hosts);
                     let on = self.rng.random_range(0..2) == 0;
-                    Step::RpcPartition(h, on)
+                    Step::RpcHang(h, on)
                 }
                 94..=96 => Step::ClockSkew(
                     self.rng.random_range(0..replicas),
@@ -206,7 +209,11 @@ impl Sim {
         }
     }
 
-    async fn execute(&mut self, step: Step) {
+    /// Execute one explicit step. `pub` so pinned regression scenarios can
+    /// hand-drive an exact interleaving (the dst-host pattern) instead of
+    /// relying on a swarm pick to reproduce it; the swarm path calls this
+    /// with `pick()`'s output.
+    pub async fn execute(&mut self, step: Step) {
         self.report.trace.push(format!("{step:?}"));
         match step {
             Step::AdvanceTime(d) => self.world.clock.advance(d).await,
@@ -496,11 +503,14 @@ impl Sim {
                     h.heartbeats_partitioned = on;
                 }
             }
-            Step::RpcPartition(i, on) => {
+            Step::RpcHang(i, on) => {
                 let id = self.world.host_ids[i];
                 let mut hw = self.world.host_world.hosts.lock();
                 if let Some(h) = hw.get_mut(&id) {
-                    h.rpc_partitioned = on;
+                    // Far above every op_deadline (Resume/CreateBoot 600s):
+                    // the wedge is broken by the deadline, never by the
+                    // hang elapsing first.
+                    h.rpc_hang = on.then_some(Duration::from_secs(3600));
                 }
             }
             Step::ClockSkew(i, secs) => {
@@ -600,7 +610,7 @@ impl Sim {
         for i in 0..self.world.host_ids.len() {
             self.execute(Step::RestartHost(i)).await;
             self.execute(Step::HeartbeatPartition(i, false)).await;
-            self.execute(Step::RpcPartition(i, false)).await;
+            self.execute(Step::RpcHang(i, false)).await;
         }
         for i in 0..self.world.replicas.len() {
             self.execute(Step::ClockSkew(i, 0)).await;

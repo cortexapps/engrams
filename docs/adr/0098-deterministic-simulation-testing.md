@@ -572,21 +572,23 @@ this program targets, yet neither is catchable by the harness as it stands.
 Both are the honest boundary of "would DST have cut this," recorded so the
 answer is a plan, not a hope:
 
-- **G1 — the op-stall belongs to the coordinator sim (`engram-dst`) and is
-  one fault-knob away.** A resume op wedged forever inside `start_agent`
+- **G1 — CLOSED.** A resume op wedged forever inside `start_agent`
   (no gRPC/host deadline) while the within-step heartbeat kept the row
   fresh, so stale-op reclaim never fired — pinned 40 min until a pod roll.
-  The `no_op_dropped` / quiescence-convergence oracle is the exact catch
-  (an op that never reaches done/failed fails quiescence), but it can't
-  fire today: `SimHostClient` (`crates/engram-dst/src/world.rs`) models
-  only fail-fast RPC *partition* (returns `Unavailable`), never the
-  *hang/delay* the fault menu specced (§"World model + faults", "RPC
-  partition/delay/reorder"). **To close G1:** a hang/delay knob on
-  `SimHostState` + a `Step`/fault to toggle it (cleared in the
-  quiescence-heal block) + a regression seed asserting a wedged op still
-  reaches done/failed via the new `op_deadline`. #743's fix (`op_deadline`
-  on the tokio/paused clock) was *deliberately built* to be fired
-  deterministically by the sim — the seam is ready; the fault isn't.
+  The close is exactly the increment specced here: `SimHostState.rpc_hang:
+  Option<Duration>` replaces the never-read fail-fast `rpc_partitioned`
+  flag (every `SimHostClient` verb sleeps the configured stall at entry —
+  above the verb's `op_deadline` it is the wedge, only the tokio-timer
+  deadline drops the dispatch; below it a plain delay), toggled by
+  `Step::RpcHang(host, bool)` (arming 3600s, far above every deadline),
+  cleared in the quiescence-heal block, and in the Chaos pick menu. The
+  pinned scenario `wedged_boot_op_reaches_terminal_via_op_deadline`
+  hand-drives the #743 shape: a Placed create's boot op dispatches onto
+  fully-hung hosts, the attempt returns ONLY because `op_deadline` drops
+  it (the step would hang the test forever pre-#743), the op requeues
+  (attempts advanced, never finished, never booted), and the healed
+  quiescence pass converges it — `no_op_dropped` +
+  `quiescence-no-stragglers` are the standing catch.
 - **G2 — the disk-corruption belongs to the host sim (`engram-dst-host`)
   and is a recurring class.** Two silent-fallback paths keyed disk
   durability on `nbd_sandboxes.get(id)` and skipped for a post-roll
