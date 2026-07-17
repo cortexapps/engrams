@@ -32,6 +32,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use engram_core::types::ids::{SandboxId, SessionId, SnapshotId};
 use engram_core::types::manifest::ManifestRef;
+use engram_host_core::{HostFs, TokioFs};
 use serde::{Deserialize, Serialize};
 
 /// Per-sandbox checkpoint chain state. Lives in
@@ -90,21 +91,24 @@ impl CheckpointRecord {
         crate::durable_record::record_path(dir, id)
     }
 
-    /// Durably persist (write + fsync via rename) into `dir`.
-    pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        crate::durable_record::persist(dir, self.snapshot_id, self, "checkpoint record").await
+    /// Durably persist (write + fsync via rename) into `dir`, through the
+    /// injected fs seam (ADR 0098 P5 — Flow D's terminal record crosses
+    /// it; other flows pass [`TokioFs`]).
+    pub async fn persist(&self, fs: &dyn HostFs, dir: &Path) -> std::io::Result<()> {
+        crate::durable_record::persist(fs, dir, self.snapshot_id, self, "checkpoint record").await
     }
 
     /// All un-acked records in `dir` (the heartbeat advert payload).
     /// Unreadable/partial files are skipped with a warn — a torn
     /// write must not wedge the heartbeat loop.
-    pub async fn load_all(dir: &Path) -> Vec<CheckpointRecord> {
-        crate::durable_record::load_all(dir, "checkpoint record").await
+    pub async fn load_all(fs: &dyn HostFs, dir: &Path) -> Vec<CheckpointRecord> {
+        crate::durable_record::load_all(fs, dir, "checkpoint record").await
     }
 
     /// Coord acked these — the PG rows own the references now.
-    pub async fn delete_acked(dir: &Path, acked: &[SnapshotId]) {
-        crate::durable_record::delete_acked(dir, acked.iter().copied(), "checkpoint record").await
+    pub async fn delete_acked(fs: &dyn HostFs, dir: &Path, acked: &[SnapshotId]) {
+        crate::durable_record::delete_acked(fs, dir, acked.iter().copied(), "checkpoint record")
+            .await
     }
 }
 
@@ -184,9 +188,11 @@ impl ChainHeadRecord {
         }
     }
 
-    /// Every record in `dir` (the startup rehydrate/GC sweep).
+    /// Every record in `dir` (the startup rehydrate/GC sweep). Not yet
+    /// behind the fs seam — the chain-head flow extracts in a later P
+    /// (the seam lands with the flows that cross it).
     pub async fn load_all(dir: &Path) -> Vec<ChainHeadRecord> {
-        crate::durable_record::load_all(dir, "chain-head record").await
+        crate::durable_record::load_all(&TokioFs, dir, "chain-head record").await
     }
 }
 
@@ -312,7 +318,10 @@ impl ChainHeadStore {
         std::fs::File::open(&tmp)?.sync_all()?;
         {
             let _g = st.io.lock().expect("chain-head io lock poisoned");
-            if st.epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch0 {
+            if !engram_host_core::checkpoint_tail_admits_publish(
+                epoch0,
+                st.epoch.load(std::sync::atomic::Ordering::SeqCst),
+            ) {
                 // A newer invalidate fenced this persist off — its
                 // record describes a baseline an FC create has since
                 // consumed. Publishing it would be the resurrection

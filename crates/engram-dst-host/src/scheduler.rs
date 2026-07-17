@@ -15,7 +15,6 @@ use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::invariants;
-use crate::simfs::CrashPoint;
 use crate::world::{SimHost, NUM_CHUNKS};
 
 /// How many sandboxes each sim host runs. Small (AGENTS.md: size to the
@@ -72,10 +71,22 @@ pub enum Step {
     /// = env unset); `u64` millis keeps [`Step`] `Eq` (an `f64` would not).
     /// A tiny budget overruns the final-flush deadline → the #225 shape.
     Sigterm(Option<u64>),
-    /// Flow A (P4): seeded crash-point injection at one of the eight durable-
-    /// operation boundaries, then RAM dies. The following `Restart` runs the
-    /// real recovery under oracle #1.
-    CrashAt(CrashPoint),
+    /// Flow D (P5): begin an eviction finalize for sandbox `idx` — the sim
+    /// analog of `snapshot_begin` (drain → stage → durable record → pause).
+    /// Idempotent: a pending finalize re-observes the same snapshot id.
+    SnapshotBegin(usize),
+    /// Flow D (P5): one REAL finalize redrive attempt
+    /// (`run_eviction_finalize_attempt`) for sandbox `idx`'s in-flight job.
+    FinalizeTick(usize),
+    /// Flow D (P5): one finalize attempt for sandbox `idx` under a `CrashFs`
+    /// cut at fs-op index `op`, then the process dies. Ops before the cut ran
+    /// for real — the on-disk state is exactly a death at that boundary.
+    FinalizeCrashAt(usize, usize),
+    /// P5 (replacing P4's post-hoc spool mangle): the predecessor's spool
+    /// write is cut at fs-op index `op` by the real seam (redundant with a
+    /// completed flush-publish), then the process dies. Every op index must
+    /// recover every acked write.
+    SpoolCrashAt(usize),
     /// Flow B (P7): rung-2 PARK sandbox `idx` (FC paused, VM resident,
     /// `evicting`-shaped) — the 731df805 pre-condition.
     Park(usize),
@@ -117,7 +128,10 @@ impl Step {
             Step::DropLocalBinding(..) => "DropLocalBinding",
             Step::RevokeOwnership(..) => "RevokeOwnership",
             Step::Sigterm(..) => "Sigterm",
-            Step::CrashAt(..) => "CrashAt",
+            Step::SnapshotBegin(..) => "SnapshotBegin",
+            Step::FinalizeTick(..) => "FinalizeTick",
+            Step::FinalizeCrashAt(..) => "FinalizeCrashAt",
+            Step::SpoolCrashAt(..) => "SpoolCrashAt",
             Step::Park(..) => "Park",
             Step::Unpause(..) => "Unpause",
             Step::RegisterRehydrate => "RegisterRehydrate",
@@ -144,9 +158,11 @@ fn pick_budget_ms(rng: &mut ChaCha8Rng) -> Option<u64> {
     }
 }
 
-/// Seeded crash-point boundary, indexed into [`CrashPoint::ALL`].
-fn pick_crashpoint(rng: &mut ChaCha8Rng) -> CrashPoint {
-    CrashPoint::ALL[rng.random_range(0..CrashPoint::ALL.len())]
+/// A seeded fs-op cut index for the CrashFs injectors. `write_spool` over a
+/// full dirty set traces ~22 ops and a finalize pass ~30; 0..32 covers every
+/// boundary plus past-the-end (which completes, then dies) — all legitimate.
+fn pick_op_index(rng: &mut ChaCha8Rng) -> usize {
+    rng.random_range(0..32usize)
 }
 
 /// Convert a seeded budget (millis) to the `plan_shutdown` env value (secs).
@@ -246,8 +262,12 @@ impl Sim {
                 87..=88 => Step::SlotPopulateTick,
                 89..=90 => Step::Park(self.rng.random_range(0..n)),
                 91..=92 => Step::Unpause(self.rng.random_range(0..n)),
-                93..=95 => Step::RegisterRehydrate,
-                96..=97 => Step::StaleSweepTick,
+                93..=94 => Step::RegisterRehydrate,
+                95 => Step::StaleSweepTick,
+                // Flow D (P5): the graceful finalize belongs in the calm
+                // durability baseline (begin → tick → tick … completes).
+                96 => Step::SnapshotBegin(self.rng.random_range(0..n)),
+                97..=98 => Step::FinalizeTick(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
@@ -273,15 +293,22 @@ impl Sim {
                 73..=76 => Step::AbruptCrash,
                 77..=79 => Step::Restart,
                 80..=82 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
-                83..=85 => Step::CrashAt(pick_crashpoint(&mut self.rng)),
+                // P5: the op-boundary crash injectors (CrashFs cuts).
+                83 => Step::SpoolCrashAt(pick_op_index(&mut self.rng)),
+                84 => {
+                    Step::FinalizeCrashAt(self.rng.random_range(0..n), pick_op_index(&mut self.rng))
+                }
+                // Flow D (P5): the finalize lifecycle under chaos.
+                85 => Step::SnapshotBegin(self.rng.random_range(0..n)),
+                86..=87 => Step::FinalizeTick(self.rng.random_range(0..n)),
                 // Flow B (P7): park → roll → rehydrate → sweep → un-pause. The
-                // roll comes from CrashProcess/AbruptCrash/Sigterm/CrashAt above.
-                86..=88 => Step::SlotClaim(self.rng.random_range(0..n)),
-                89..=90 => Step::SlotPopulateTick,
+                // roll comes from CrashProcess/AbruptCrash/Sigterm/the injectors.
+                88..=89 => Step::SlotClaim(self.rng.random_range(0..n)),
+                90 => Step::SlotPopulateTick,
                 91..=92 => Step::Park(self.rng.random_range(0..n)),
                 93..=94 => Step::Unpause(self.rng.random_range(0..n)),
-                95..=97 => Step::RegisterRehydrate,
-                98 => Step::StaleSweepTick,
+                95..=96 => Step::RegisterRehydrate,
+                97..=98 => Step::StaleSweepTick,
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -334,8 +361,17 @@ impl Sim {
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }
-            Step::CrashAt(cp) => {
-                self.host.crash_at(cp).await?;
+            Step::SnapshotBegin(idx) => {
+                let _ = self.host.snapshot_begin(idx).await?;
+            }
+            Step::FinalizeTick(idx) => self.host.finalize_tick(idx).await?,
+            Step::FinalizeCrashAt(idx, op) => {
+                self.host.finalize_crash_at(idx, op).await?;
+                self.reconcile_strikes.clear();
+                self.crashed = true;
+            }
+            Step::SpoolCrashAt(op) => {
+                self.host.spool_crash_at(op).await?;
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }
@@ -377,6 +413,30 @@ impl Sim {
         self.execute(Step::Restart).await?;
         if let Err(v) = invariants::check(&self.host).await {
             return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
+        }
+        // Flow D drain (oracle #8): every started finalize must converge to
+        // completed-or-quarantined within the attempts budget once faults are
+        // healed (post-restart the fs is the honest TokioFs again). Each
+        // round gives every slot one real redrive attempt + the backoff's
+        // virtual time.
+        for _ in 0..(crate::world::SIM_FINALIZE_MAX_ATTEMPTS as u64 + 2) {
+            if self.host.pending_finalizes.is_empty() {
+                break;
+            }
+            for idx in 0..NUM_SANDBOXES {
+                self.execute(Step::FinalizeTick(idx)).await?;
+            }
+            self.execute(Step::AdvanceTime(Duration::from_secs(600)))
+                .await?;
+        }
+        if let Err(v) = invariants::check_finalize_convergence(&self.host) {
+            return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
+        }
+        if let Err(v) = invariants::check(&self.host).await {
+            return Err(format!(
+                "quiescence-post-drain: {} — {}",
+                v.invariant, v.detail
+            ));
         }
         let seed = self.report.seed;
         Ok(std::mem::replace(

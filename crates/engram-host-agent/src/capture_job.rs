@@ -46,6 +46,7 @@ use engram_core::types::{
     CaptureJobAssignment, CaptureJobId, CaptureJobProgress, CaptureJobReport, CaptureProgress,
     CaptureTerminalReport, SandboxId,
 };
+use engram_host_core::TokioFs;
 use serde::{Deserialize, Serialize};
 
 /// The durable, on-disk shape of one capture job's host-side state —
@@ -70,21 +71,29 @@ impl CaptureJobRecord {
         crate::durable_record::record_path(dir, id)
     }
 
-    /// Durably persist (write + fsync via rename) into `dir`.
+    /// Durably persist (write + fsync via rename) into `dir`. Not yet
+    /// behind the fs seam — the capture-job flow extracts in a later P
+    /// (the seam lands with the flows that cross it).
     pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        crate::durable_record::persist(dir, self.job_id, self, "capture job record").await
+        crate::durable_record::persist(&TokioFs, dir, self.job_id, self, "capture job record").await
     }
 
     /// All records in `dir` (the heartbeat advert payload + rehydrate
     /// source). Unreadable/partial files are skipped with a warn — a
     /// torn write must not wedge the heartbeat loop.
     pub async fn load_all(dir: &Path) -> Vec<CaptureJobRecord> {
-        crate::durable_record::load_all(dir, "capture job record").await
+        crate::durable_record::load_all(&TokioFs, dir, "capture job record").await
     }
 
     /// Coord acked these — the PG rows own the references now.
     pub async fn delete_acked(dir: &Path, acked: &[CaptureJobId]) {
-        crate::durable_record::delete_acked(dir, acked.iter().copied(), "capture job record").await
+        crate::durable_record::delete_acked(
+            &TokioFs,
+            dir,
+            acked.iter().copied(),
+            "capture job record",
+        )
+        .await
     }
 }
 

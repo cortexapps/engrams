@@ -1357,7 +1357,10 @@ impl HostAgent {
                     // durable checkpoint record until a coord acks it
                     // into PG. Empty when checkpointing is disabled.
                     let checkpoint_records = match pooled_for_heartbeat.checkpoint_records_dir() {
-                        Some(dir) => checkpoint::CheckpointRecord::load_all(&dir).await,
+                        Some(dir) => {
+                            checkpoint::CheckpointRecord::load_all(&engram_host_core::TokioFs, &dir)
+                                .await
+                        }
                         None => Vec::new(),
                     };
                     let checkpoints = checkpoint_records
@@ -1486,6 +1489,7 @@ impl HostAgent {
                             if !resp.acked_checkpoints.is_empty() {
                                 if let Some(dir) = pooled_for_heartbeat.checkpoint_records_dir() {
                                     checkpoint::CheckpointRecord::delete_acked(
+                                        &engram_host_core::TokioFs,
                                         &dir,
                                         &resp.acked_checkpoints,
                                     )

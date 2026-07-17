@@ -39,17 +39,14 @@
 //! P4 drives the REAL extracted shutdown ladder
 //! ([`engram_host_core::shutdown`]): the [`Sigterm`](Step::Sigterm) step runs
 //! `plan_shutdown`/`classify_survivor` over the sim host (a seeded budget
-//! below the modeled flush cost overruns → stragglers ride the spool, #225),
-//! and [`CrashAt`](Step::CrashAt) seeds crash-point INJECTION at the eight
-//! [`CrashPoint`] boundaries — the spool boundaries land the real recovery
-//! under the acked-write oracle, the persist boundaries exercise
-//! `durable_record` tolerance (folding into the ledger in P5's Flow D). The
-//! world-model `rebuild` gains the 85e0298a store-ahead rule (attach from the
-//! spool's ahead ref, never coord's stale one). The #224 insert-after-sweep
-//! gate rides as the extracted ordering contract
+//! below the modeled flush cost overruns → stragglers ride the spool, #225).
+//! The world-model `rebuild` gains the 85e0298a store-ahead rule (attach from
+//! the spool's ahead ref, never coord's stale one). The #224
+//! insert-after-sweep gate rides as the extracted ordering contract
 //! ([`admits_new_plane`](engram_host_core::admits_new_plane)); the literal
 //! `abandon_nbd_data_planes_for_shutdown` DashMap race stays FC-lane residue.
-//! See [`crash_state`] and [`world`].
+//! (P4's static `CrashPoint` catalogue + post-hoc crash-state construction
+//! were superseded by P5's real seam interception — see below.)
 //!
 //! # P4.5 (oracle honesty — the durability pipeline, not omniscient recovery)
 //!
@@ -68,13 +65,35 @@
 //! sticky spool floor over-claims. See the regression seed
 //! `post_ack_pre_handoff_crash_is_honest_loss`.
 //!
-//! # Deferred to P5+
+//! # P5 (Flow D — eviction finalize + the real `HostFs` interception)
 //!
-//! The remaining lifecycle-flow extractions (Flow B/D/E) and their oracles.
+//! `durable_record` and the shutdown spool now perform every durable op
+//! through the injected [`HostFs`](engram_host_core::HostFs) seam, and
+//! [`CrashFs`] is the injector: it records the op trace and cuts at a seeded
+//! op index, so the crash schedule is DERIVED from the production op
+//! sequence by running it (`tests/crashpoint_coverage.rs` pins the
+//! derivation; the P2–P4 `CrashPoint`/`crash_state` machinery is retired).
+//! [`SnapshotBegin`](Step::SnapshotBegin) begins a REAL eviction finalize
+//! (drain → `persist_disk_pending_chunks` → the durable record, the VM
+//! paused for the duration); [`FinalizeTick`](Step::FinalizeTick) runs the
+//! REAL production loop body (`run_eviction_finalize_attempt`: legs +
+//! retry/quarantine verdict); [`FinalizeCrashAt`](Step::FinalizeCrashAt) and
+//! [`SpoolCrashAt`](Step::SpoolCrashAt) cut those flows mid-sequence and the
+//! restart resume leg re-drives from the persisted stage through the real
+//! `load_all`. A completed finalize's disk manifest is a durable publish —
+//! it raises the acked-write oracle's published floor; a quarantine leaves
+//! the floor at the prior tier (the honest bounded rollback). Oracles #6
+//! (`FinalizeStage` monotone + stage⇒fields, [`invariants`]) and #8
+//! (convergence at quiescence — every started finalize completes or
+//! quarantines within the attempts budget) join the suite.
+//!
+//! # Deferred to P6+
+//!
+//! The flush `SchedulerSeam` (Flow F) and the migration flow (Flow E).
 
 pub mod coord_stub;
-pub mod crash_state;
 pub mod effects;
+pub mod fs_crash;
 pub mod invariants;
 pub mod reconcile;
 pub mod scheduler;
@@ -83,10 +102,12 @@ pub mod world;
 
 pub use coord_stub::{RecordedPublish, ScriptedResponse, SimCoordClient};
 pub use effects::{sim_effects, SeamEvent, SeamLog, SimDeviceSync, SimNbd};
+pub use fs_crash::{CrashFs, FsOp};
 pub use invariants::Violation;
 pub use reconcile::{DestroyRecord, SimReconcileBackend};
 pub use scheduler::{Profile, Sim, SimReport, Step, NUM_SANDBOXES};
-pub use simfs::{CrashPoint, SimFs};
+pub use simfs::SimFs;
 pub use world::{
-    decode_tag, AckedWriteLedger, LedgerEntry, SandboxSlot, SimHost, CHUNK_SIZE, NUM_CHUNKS,
+    decode_tag, AckedWriteLedger, LedgerEntry, SandboxSlot, SimEvictionSandbox, SimHost,
+    CHUNK_SIZE, NUM_CHUNKS, SIM_FINALIZE_MAX_ATTEMPTS,
 };

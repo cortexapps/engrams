@@ -7,10 +7,11 @@
 //! granularity; the exhaustively-constructed byte-level torn states stay in
 //! ADR 0099 H5's static tests).
 //!
-//! P1 only DEFINES this trait and its prod impl. `durable_record` and the
-//! shutdown spool still call `tokio::fs` directly; rewiring them onto
-//! [`HostFs`] is P3+/P5 work (the SimFs boundary lands with the flows that
-//! cross it).
+//! P5 wired the seam for real: `durable_record` and the shutdown spool take
+//! `&dyn HostFs` and perform every durable op through it (the sim's `CrashFs`
+//! intercepts at op boundaries). Flows not yet extracted pass the prod
+//! [`TokioFs`] at their wrappers — the seam lands with the flows that cross
+//! it.
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -48,6 +49,19 @@ pub trait HostFs: Send + Sync {
     /// Remove the file at `path`. Idempotent-tolerant callers treat
     /// `NotFound` as success themselves.
     async fn remove_file(&self, path: &Path) -> io::Result<()>;
+
+    /// Recursively create `dir` and its parents (`create_dir_all`
+    /// semantics: idempotent, ok-if-exists).
+    async fn create_dir(&self, dir: &Path) -> io::Result<()>;
+
+    /// Recursively remove `dir` and everything under it (`remove_dir_all`
+    /// semantics). `NotFound` is surfaced — idempotent-tolerant callers
+    /// map it themselves, same convention as
+    /// [`remove_file`](HostFs::remove_file). Together with
+    /// [`create_dir`](HostFs::create_dir) this expresses the spool's
+    /// destructive replace-don't-merge window (remove_dir_all →
+    /// create_dir_all), which the write/rename ops alone cannot.
+    async fn remove_dir(&self, dir: &Path) -> io::Result<()>;
 }
 
 /// The production [`HostFs`]: `tokio::fs` delegation. The sync ops copy the
@@ -91,5 +105,13 @@ impl HostFs for TokioFs {
 
     async fn remove_file(&self, path: &Path) -> io::Result<()> {
         tokio::fs::remove_file(path).await
+    }
+
+    async fn create_dir(&self, dir: &Path) -> io::Result<()> {
+        tokio::fs::create_dir_all(dir).await
+    }
+
+    async fn remove_dir(&self, dir: &Path) -> io::Result<()> {
+        tokio::fs::remove_dir_all(dir).await
     }
 }

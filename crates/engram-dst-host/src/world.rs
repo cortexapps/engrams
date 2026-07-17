@@ -34,18 +34,23 @@ use engram_chunk_store::manifest::{
 use engram_chunk_store::store::ChunkStore;
 use engram_core::traits::{BlobStorage, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
+use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_host_agent::disk_daemon::backend::ChunkedDiskBackend;
 use engram_host_agent::disk_daemon::{spool, NbdSlot, NbdSlotAllocator};
-use engram_host_core::{HostEffects, LiveManifestPublishRequest};
+use engram_host_agent::eviction_finalize::{
+    persist_disk_pending_chunks, run_eviction_finalize_attempt, DiskPendingRecord,
+    EvictionFinalizeRecord, EvictionFinalizer, EvictionSandbox, FinalizeAttempt,
+};
+use engram_host_core::{FinalizeStage, HostEffects, HostFs, LiveManifestPublishRequest};
 use engram_sim::{SimClock, SimEntropy};
 use engram_storage_local::LocalBlobStorage;
 
 use crate::coord_stub::SimCoordClient;
-use crate::crash_state;
 use crate::effects::{sim_effects, SeamLog};
+use crate::fs_crash::CrashFs;
 use crate::reconcile::SimReconcileBackend;
-use crate::simfs::{CrashPoint, SimFs};
+use crate::simfs::SimFs;
 
 /// Disk geometry every sim sandbox uses. Small on purpose — the oracle
 /// asserts a correctness property (acked writes survive), not throughput, so
@@ -234,6 +239,33 @@ impl SandboxSlot {
     }
 }
 
+/// The sim's [`EvictionSandbox`] — records every terminal-destroy the REAL
+/// `run_terminal` issues (the coordinator-side teardown is out of the host
+/// sim's scope; the record is the observable).
+#[derive(Default)]
+pub struct SimEvictionSandbox {
+    destroyed: parking_lot::Mutex<Vec<SandboxId>>,
+}
+
+impl SimEvictionSandbox {
+    pub fn destroyed(&self) -> Vec<SandboxId> {
+        self.destroyed.lock().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl EvictionSandbox for SimEvictionSandbox {
+    async fn destroy(&self, id: SandboxId) -> Result<(), engram_core::SandboxError> {
+        self.destroyed.lock().push(id);
+        Ok(())
+    }
+}
+
+/// The sim's finalize redrive cap. Small so the quarantine arm + the
+/// convergence drain stay cheap; the prod default (10) only stretches the
+/// same ladder.
+pub const SIM_FINALIZE_MAX_ATTEMPTS: u32 = 3;
+
 /// One simulated host-agent process over a per-run disk.
 pub struct SimHost {
     pub host_id: HostId,
@@ -274,6 +306,27 @@ pub struct SimHost {
     /// roll). Separate from per-sandbox `lease`s so the accounting oracle sees
     /// every held slot.
     spare_leases: Vec<NbdSlot>,
+
+    // ── Flow D: eviction finalize (ADR 0098 P5) ──
+    /// The `snapshot_begin` idempotency map — RAM (the real
+    /// `PooledBackend::pending_finalizes` DashMap): dies on crash, rebuilt by
+    /// the restart resume leg from the durable records. Shared with every
+    /// [`EvictionFinalizer`] this host builds.
+    pub pending_finalizes: Arc<dashmap::DashMap<SandboxId, SnapshotId>>,
+    /// The in-flight finalize job state per slot idx — RAM (the spawned
+    /// job's `record` local). Dies on crash; the durable record on disk is
+    /// what the restart resume leg re-drives from.
+    in_flight: BTreeMap<usize, EvictionFinalizeRecord>,
+    /// The terminal-destroy recorder (the sim [`EvictionSandbox`]).
+    pub destroyer: Arc<SimEvictionSandbox>,
+    /// Oracle memory (survives crashes): every finalize ever started, for the
+    /// convergence oracle (#8) — each must reach completed-or-quarantined by
+    /// quiescence.
+    pub finalize_started: std::collections::BTreeSet<SnapshotId>,
+    /// Oracle memory (survives crashes): the highest stage ever observed
+    /// per snapshot — the FinalizeStage monotonicity watermark (#6).
+    /// A Mutex so the read-only oracle pass can update it.
+    pub finalize_stage_seen: parking_lot::Mutex<BTreeMap<SnapshotId, FinalizeStage>>,
 }
 
 impl SimHost {
@@ -363,6 +416,11 @@ impl SimHost {
             nbd_pool,
             nbd_capacity,
             spare_leases: Vec::new(),
+            pending_finalizes: Arc::new(dashmap::DashMap::new()),
+            in_flight: BTreeMap::new(),
+            destroyer: Arc::new(SimEvictionSandbox::default()),
+            finalize_started: std::collections::BTreeSet::new(),
+            finalize_stage_seen: parking_lot::Mutex::new(BTreeMap::new()),
         }
     }
 
@@ -417,6 +475,18 @@ impl SimHost {
         if let Some((sandbox_id, _)) = self.reconcile_ids(idx) {
             self.coord.revoke_owner(sandbox_id);
         }
+    }
+
+    /// Is sandbox `idx` frozen under an in-flight eviction finalize? The
+    /// prod capture lock excludes every concurrent lifecycle op for the
+    /// whole finalize (the guest is paused; the VM is destroyed at
+    /// terminal) — the sim mirrors it by gating spool adoption and the
+    /// register-time re-serve on this (the swarm found the resurrection:
+    /// a re-serve rebuilt a captured sandbox from the OLD published ref,
+    /// then the finalize published a NEWER floor over it).
+    fn finalize_pending(&self, idx: usize) -> bool {
+        self.pending_finalizes
+            .contains_key(&self.sandboxes[idx].sandbox_id)
     }
 
     fn next_tag(&mut self) -> u64 {
@@ -515,9 +585,13 @@ impl SimHost {
         self.mark_flush_published(idx, published).await?;
         // The flush uploaded the current dirty tier; any spool predates it
         // and is now superseded.
-        spool::discard_spool(self.fs.spool_dir(), self.sandboxes[idx].sandbox_id)
-            .await
-            .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
+        spool::discard_spool(
+            self.effects.fs.as_ref(),
+            self.fs.spool_dir(),
+            self.sandboxes[idx].sandbox_id,
+        )
+        .await
+        .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
         // Tell the coordinator the survivor's disk moved (Flow A/D).
         let req = LiveManifestPublishRequest {
             session_id: self.sandboxes[idx].session_id,
@@ -578,6 +652,7 @@ impl SimHost {
         };
         let (exported_ref, chunks) = backend.export_unflushed().await;
         spool::write_spool(
+            self.effects.fs.as_ref(),
             self.fs.spool_dir(),
             self.sandboxes[idx].sandbox_id,
             exported_ref,
@@ -594,7 +669,7 @@ impl SimHost {
     /// the spool into it — exactly the successor path, driven against the
     /// same host.
     pub async fn spool_adopt(&mut self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len() {
+        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
             return Ok(());
         }
         // Capture the live tier first — losslessness gate.
@@ -617,16 +692,13 @@ impl SimHost {
                 self.spool_export(idx).await?;
             }
         }
-        for slot in &mut self.sandboxes {
-            slot.backend = None; // RAM dies
-        }
         // Flow C: the pooled/capture in-RAM tables (local bindings, migration
         // roles, live captures) die with the process; the live FC set and the
         // coordinator (a separate process) survive. The successor's reconcile
         // loop rebuilds the bindings from the coordinator — the None-arm path.
-        self.reconcile.crash_ram();
-        // Flow B: a process death is a ROLL.
-        self.roll_generation();
+        // Flow B: a process death is a ROLL. Flow D: the in-flight finalize
+        // jobs + the pending map die; the durable records survive for resume.
+        self.die_abruptly();
         Ok(())
     }
 
@@ -644,13 +716,10 @@ impl SimHost {
     /// off, so all recover). Only this variant exercises the post-ack /
     /// pre-handoff window the pipeline is explicitly permitted to lose.
     pub async fn abrupt_crash(&mut self) -> Result<(), String> {
-        for slot in &mut self.sandboxes {
-            slot.backend = None; // RAM dies — NO shutdown spool
-        }
-        self.reconcile.crash_ram();
-        // Flow B: an abrupt death is still a ROLL (a fresh generation reattaches
-        // the surviving FC VMs / durable disk).
-        self.roll_generation();
+        // RAM dies — NO shutdown spool. Flow B: an abrupt death is still a
+        // ROLL (a fresh generation reattaches the surviving FC VMs / durable
+        // disk).
+        self.die_abruptly();
         Ok(())
     }
 
@@ -709,7 +778,7 @@ impl SimHost {
     /// FREE in the fresh post-roll pool, so `claim`'s fast path takes it with
     /// no retry (safe under paused tokio).
     async fn reserve_and_serve(&mut self, idx: usize) -> Result<(), String> {
-        if self.sandboxes[idx].served_by == Some(self.generation) {
+        if self.sandboxes[idx].served_by == Some(self.generation) || self.finalize_pending(idx) {
             return Ok(());
         }
         let device = self.sandboxes[idx].nbd_device.clone();
@@ -890,12 +959,48 @@ impl SimHost {
     /// un-flushed, un-spooled acked writes — which a real restart, running only
     /// after the process actually died, never does).
     pub async fn restart(&mut self) -> Result<(), String> {
+        // Flow D resume FIRST (the real startup order: `resume_pending_finalizes`
+        // runs before serving traffic): re-drive every durable finalize record
+        // through the REAL `load_all`, rebuilding the RAM idempotency map.
+        self.resume_finalizes().await;
         for idx in 0..self.sandboxes.len() {
+            // A sandbox mid-finalize stays paused (its acked writes live in the
+            // durable staging files until the disk leg publishes them; the VM
+            // is destroyed at the finalize's terminal — never rebuilt here).
+            if self
+                .pending_finalizes
+                .contains_key(&self.sandboxes[idx].sandbox_id)
+            {
+                continue;
+            }
             if self.sandboxes[idx].backend.is_none() {
                 self.rebuild(idx).await?;
             }
         }
         Ok(())
+    }
+
+    /// The `PooledBackend::resume_pending_finalizes` analog: reload every
+    /// durable `EvictionFinalizeRecord` (REAL torn-tolerant `load_all`
+    /// through the fs seam) into the RAM maps for `FinalizeTick` to re-drive.
+    async fn resume_finalizes(&mut self) {
+        let finalizer = self.finalizer(self.effects.fs.clone());
+        let records =
+            EvictionFinalizeRecord::load_all(self.effects.fs.as_ref(), &finalizer.finalize_dir())
+                .await;
+        for record in records {
+            let Some(idx) = self
+                .sandboxes
+                .iter()
+                .position(|s| s.sandbox_id == record.sandbox_id)
+            else {
+                continue;
+            };
+            self.pending_finalizes
+                .insert(record.sandbox_id, record.snapshot_id);
+            self.finalize_started.insert(record.snapshot_id);
+            self.in_flight.insert(idx, record);
+        }
     }
 
     /// Rebuild one sandbox's backend from the surviving disk. Reads the spool
@@ -920,11 +1025,17 @@ impl SimHost {
     async fn rebuild(&mut self, idx: usize) -> Result<(), String> {
         let sandbox_id = self.sandboxes[idx].sandbox_id;
         // Read the spool BEFORE picking the rebuild ref (store-ahead rule).
-        let spool = match spool::read_spool(self.fs.spool_dir(), sandbox_id).await {
+        let spool = match spool::read_spool(
+            self.effects.fs.as_ref(),
+            self.fs.spool_dir(),
+            sandbox_id,
+        )
+        .await
+        {
             Ok(s) => s,
             Err(_torn) => {
                 // Torn/spliced → discard + rebuild from the durable pointer.
-                spool::discard_spool(self.fs.spool_dir(), sandbox_id)
+                spool::discard_spool(self.effects.fs.as_ref(), self.fs.spool_dir(), sandbox_id)
                     .await
                     .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
                 None
@@ -944,11 +1055,22 @@ impl SimHost {
         }
         let backend = build_backend(&self.store, self.fs.cache_dir(), idx, rebuild_ref).await;
         if let Some((meta, chunks)) = spool {
-            if meta.manifest_ref().manifest_id == rebuild_ref.manifest_id {
+            // The REAL call site's lineage gate (`rehydrate_sandbox`): adopt
+            // only a same-lineage spool at-or-ahead-of the durable pointer
+            // (`meta.version >= disk_manifest.version`); a STALE spool (an
+            // older divergence than the durable tier — e.g. an eviction
+            // finalize published past it) is a loud discard, never an adopt
+            // of old bytes over newer durable state. The swarm found the sim
+            // missing the version half of this gate once Flow D could
+            // advance the durable pointer past a standing spool.
+            let spool_ref = meta.manifest_ref();
+            if spool_ref.manifest_id == rebuild_ref.manifest_id
+                && spool_ref.version >= rebuild_ref.version
+            {
                 backend.adopt_unflushed(chunks).await;
             }
-            // Adopted or stale-lineage: the spool is consumed either way.
-            spool::discard_spool(self.fs.spool_dir(), sandbox_id)
+            // Adopted or stale: the spool is consumed either way.
+            spool::discard_spool(self.effects.fs.as_ref(), self.fs.spool_dir(), sandbox_id)
                 .await
                 .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
         }
@@ -1020,91 +1142,232 @@ impl SimHost {
             // overrun) tier to the shutdown spool — not deadline-bound.
             self.spool_export(idx).await?;
         }
-        // Detached stage: RAM dies.
-        for slot in &mut self.sandboxes {
-            slot.backend = None;
-        }
-        self.reconcile.crash_ram();
-        // Flow B: SIGTERM is a roll (the successor pidfd-reattaches).
-        self.roll_generation();
+        // Detached stage: RAM dies. Flow B: SIGTERM is a roll (the successor
+        // pidfd-reattaches).
+        self.die_abruptly();
         Ok(())
     }
 
-    /// Seeded crash-point injection (ADR 0098 P4). Model the SIGTERM ladder's
-    /// final-flush leg COMPLETING (every acked write durable in the published
-    /// tier), then a crash landing at durable-operation boundary `cp` while
-    /// the (now redundant) shutdown spool is being written / a durable_record
-    /// is being persisted — construct that exact post-crash on-disk state via
-    /// [`crash_state`], then drop RAM. The following `Restart` runs the REAL
-    /// recovery, and oracle #1 must recover every acked write UNCONDITIONALLY:
-    /// the spool is redundant here, so a torn/absent one is safely rejected
-    /// and the published tier covers the writes. (The spool-as-only-copy path
-    /// is the separate #225 `Sigterm` overrun; a torn ONLY-copy spool is the
-    /// documented residual-loss window H5 tolerates, never constructed here.)
-    pub async fn crash_at(&mut self, cp: CrashPoint) -> Result<(), String> {
-        match cp {
-            CrashPoint::SpoolChunks
-            | CrashPoint::SpoolChunkMissing
-            | CrashPoint::SpoolMarker
-            | CrashPoint::SpoolDir => self.crash_at_spool(cp).await?,
-            CrashPoint::PersistWritePartial
-            | CrashPoint::PersistFsyncTemp
-            | CrashPoint::PersistRename
-            | CrashPoint::PersistFsyncParent => {
-                // Durability first: complete the spool for every live sandbox
-                // (no un-exported acked write is dropped), THEN exercise the
-                // durable_record recovery at the boundary.
-                for idx in 0..self.sandboxes.len() {
-                    if self.sandboxes[idx].backend.is_some() {
-                        self.spool_export(idx).await?;
-                    }
+    /// Build a REAL [`EvictionFinalizer`] over the sim's stores and the given
+    /// fs handle (the prod TokioFs via `effects.fs`, or a [`CrashFs`] cut).
+    /// `checkpoint_dir` is the tempdir root, so `finalize_dir()` / `records_dir()`
+    /// resolve to the SimFs subtrees.
+    fn finalizer(&self, fs: Arc<dyn HostFs>) -> EvictionFinalizer {
+        EvictionFinalizer::new(
+            Some((*self.store).clone()),
+            None,
+            self.fs.root().join("bundles"),
+            ".bin",
+            self.fs.root().to_path_buf(),
+            self.pending_finalizes.clone(),
+            self.destroyer.clone(),
+            fs,
+            SIM_FINALIZE_MAX_ATTEMPTS,
+        )
+    }
+
+    /// Flow D entry (ADR 0098 P5): begin an eviction finalize for sandbox
+    /// `idx` — the sim analog of `PooledBackend::snapshot_begin`. Drains the
+    /// un-uploaded tier through the REAL `export_unflushed` →
+    /// `persist_disk_pending_chunks` staging writer, persists the REAL
+    /// `EvictionFinalizeRecord` through the fs seam (the durability
+    /// boundary), and pauses the VM (backend drops — the guest is frozen for
+    /// the whole finalize; the terminal leg destroys it).
+    ///
+    /// Idempotent like the real entry: a sandbox with a pending finalize
+    /// re-observes the SAME snapshot id (the capture-lock lockout's
+    /// observable contract — no second finalize, no concurrent chain
+    /// mutation).
+    pub async fn snapshot_begin(&mut self, idx: usize) -> Result<Option<SnapshotId>, String> {
+        if idx >= self.sandboxes.len() {
+            return Ok(None);
+        }
+        let sandbox_id = self.sandboxes[idx].sandbox_id;
+        if let Some(existing) = self.pending_finalizes.get(&sandbox_id) {
+            return Ok(Some(*existing));
+        }
+        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+            return Ok(None);
+        };
+        let snapshot_id = SnapshotId::from(self.entropy.uuid());
+        let dest = self.fs.root().join("staging").join(snapshot_id.to_string());
+        // Stage the FC snapshot artifacts (state.bin + sidecar). These are
+        // FC's outputs in prod, not the flow's — seeding them with plain fs
+        // is honest; the flow's own durable ops all cross the seam.
+        tokio::fs::create_dir_all(&dest)
+            .await
+            .map_err(|e| format!("snapshot_begin staging dir: {e}"))?;
+        tokio::fs::write(dest.join("state.bin"), b"sim fc state")
+            .await
+            .map_err(|e| format!("snapshot_begin state.bin: {e}"))?;
+        tokio::fs::write(dest.join("manifest.json"), b"{}")
+            .await
+            .map_err(|e| format!("snapshot_begin manifest.json: {e}"))?;
+        // The capture disk drain: the un-uploaded tier moves from RAM to the
+        // node-durable disk-pending staging files via the REAL writer.
+        let (base_manifest, chunks) = backend.export_unflushed().await;
+        let disk_chunks: Vec<(usize, ChunkHash, bytes::Bytes)> = chunks
+            .iter()
+            .map(|(i, b)| (*i, ChunkHash::of(b), bytes::Bytes::from(b.clone())))
+            .collect();
+        persist_disk_pending_chunks(&dest, &disk_chunks)
+            .await
+            .map_err(|e| format!("persist_disk_pending_chunks: {e}"))?;
+        let now = self.effects.clock.now_utc();
+        let record = EvictionFinalizeRecord {
+            snapshot_id,
+            session_id: self.sandboxes[idx].session_id,
+            sandbox_id,
+            image_version: "sim".to_string(),
+            size_bytes: 0,
+            paused_at: now,
+            captured_at: now,
+            dest,
+            chain_prev_ref: None,
+            disk_pending: Some(DiskPendingRecord {
+                base_manifest,
+                chunk_size: CHUNK_SIZE,
+                total_bytes: NUM_CHUNKS * CHUNK_SIZE,
+                chunks: disk_chunks.iter().map(|(i, h, _)| (*i, *h)).collect(),
+            }),
+            aux_bundles: Vec::new(),
+            stage: FinalizeStage::Captured,
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        let finalizer = self.finalizer(self.effects.fs.clone());
+        record
+            .persist(self.effects.fs.as_ref(), &finalizer.finalize_dir())
+            .await
+            .map_err(|e| format!("snapshot_begin record persist: {e}"))?;
+        self.pending_finalizes.insert(sandbox_id, snapshot_id);
+        self.in_flight.insert(idx, record);
+        self.finalize_started.insert(snapshot_id);
+        // The VM is paused for the whole finalize (and destroyed at its
+        // terminal); the guest can no longer reach the data plane.
+        self.sandboxes[idx].backend = None;
+        Ok(Some(snapshot_id))
+    }
+
+    /// One finalize redrive attempt for slot `idx` — the REAL production
+    /// loop body (`run_eviction_finalize_attempt`): a sleep-free pass over
+    /// the legs + the retry/quarantine verdict. Backoff is modeled by the
+    /// scheduler's `AdvanceTime`, never a literal sleep.
+    pub async fn finalize_tick(&mut self, idx: usize) -> Result<(), String> {
+        self.finalize_tick_with(idx, self.effects.fs.clone()).await
+    }
+
+    /// [`finalize_tick`](Self::finalize_tick) with an explicit fs handle —
+    /// the [`FinalizeCrashAt`](crate::Step::FinalizeCrashAt) injector passes
+    /// a [`CrashFs`] cut here.
+    async fn finalize_tick_with(&mut self, idx: usize, fs: Arc<dyn HostFs>) -> Result<(), String> {
+        let Some(mut record) = self.in_flight.remove(&idx) else {
+            return Ok(());
+        };
+        let finalizer = self.finalizer(fs);
+        match run_eviction_finalize_attempt(&finalizer, &mut record).await {
+            FinalizeAttempt::Completed => {
+                // The terminal leg published the disk manifest — the same
+                // durability class as a flush publish: it raises the
+                // published floor and becomes the durable rebuild pointer.
+                if let Some(published) = record.disk_manifest {
+                    self.sandboxes[idx].published_ref = Some(published);
+                    self.mark_flush_published(idx, published).await?;
                 }
-                crash_state::persist_boundary_recovers(self.fs.records_dir(), cp).await?;
+            }
+            FinalizeAttempt::Quarantined => {
+                // The honest floor stays at the prior published tier; the
+                // staging inputs are freed and nothing re-drives the record.
+            }
+            FinalizeAttempt::RetryAfter(_backoff) => {
+                self.in_flight.insert(idx, record);
             }
         }
-        for slot in &mut self.sandboxes {
-            slot.backend = None;
-        }
-        self.reconcile.crash_ram();
-        // Flow B: the injected crash is a roll.
-        self.roll_generation();
         Ok(())
     }
 
-    /// The spool-boundary crash injection: complete the final-flush leg for
-    /// every live sandbox (acked writes → published tier, redundant with the
-    /// spool), then mangle sandbox 0's spool to `cp`'s post-crash state.
-    async fn crash_at_spool(&mut self, cp: CrashPoint) -> Result<(), String> {
-        // Sandbox 0 is the boundary target: guarantee ≥1 dirty chunk so a
-        // chunk-bearing spool exists to mangle (the chunk boundaries need
-        // content; a clean survivor's spool would be zero-chunk).
+    /// Flow D crash injection (ADR 0098 P5): drive one finalize attempt for
+    /// slot `idx` under a [`CrashFs`] cut at fs-op index `op_index`, then the
+    /// process dies (RAM drops, generation rolls). Ops before the cut ran for
+    /// real, so the on-disk record/staging state is exactly what a death at
+    /// that boundary leaves; the restart resume leg re-drives from it and
+    /// oracle #6 asserts the stage never regresses.
+    pub async fn finalize_crash_at(&mut self, idx: usize, op_index: usize) -> Result<(), String> {
+        let crash_fs = CrashFs::with_crash_at(Some(op_index));
+        self.finalize_tick_with(idx, crash_fs).await?;
+        self.die_abruptly();
+        Ok(())
+    }
+
+    /// Spool crash injection (ADR 0098 P5, replacing P4's post-hoc mangle):
+    /// the predecessor's spool WRITE is cut at fs-op index `op_index` by the
+    /// real seam. Shape mirrors the P4 scenario: the acked tier is first
+    /// exported to a complete spool AND flush-published (redundant
+    /// durability, floor raised), then the spool is RE-written through a
+    /// [`CrashFs`] cut — leaving, per `op_index`: the intact prior spool
+    /// (cut before its `remove_dir`), no spool, a marker-less partial, or a
+    /// complete one. Every state must recover EVERY acked write via the
+    /// published tier + the tolerant `read_spool` (adoption, when it
+    /// happens, is tag-identical to the published set). Then the process
+    /// dies.
+    pub async fn spool_crash_at(&mut self, op_index: usize) -> Result<(), String> {
+        // Guarantee a chunk-bearing spool exists to cut.
         if let Some(backend) = self.sandboxes[0].backend.clone() {
             if backend.dirty_bytes().await == 0 {
                 self.guest_write(0, 0).await?;
             }
         }
-        // Final-flush leg completes: export the dirty tier into a COMPLETE
-        // spool (consistent with the ledger), then flush to publish the same
-        // chunks (redundant durability). Direct `flush` (NOT `flush_tick`,
-        // which would discard the spool) so the on-disk spool survives to be
-        // mangled.
-        for idx in 0..self.sandboxes.len() {
-            let Some(backend) = self.sandboxes[idx].backend.clone() else {
-                continue;
-            };
-            self.spool_export(idx).await?;
-            backend
-                .flush()
-                .await
-                .map_err(|e| format!("crash_at flush sandbox {idx}: {e}"))?;
-            let published = backend.manifest_ref().await;
-            self.sandboxes[idx].published_ref = Some(published);
-            // Durable handoff via the (redundant) published tier — the spool
-            // this crash then mangles is not the only copy.
-            self.mark_flush_published(idx, published).await?;
-        }
+        let Some(backend) = self.sandboxes[0].backend.clone() else {
+            self.die_abruptly();
+            return Ok(());
+        };
         let sandbox_id = self.sandboxes[0].sandbox_id;
-        crash_state::mangle_spool(self.fs.spool_dir(), sandbox_id, cp).await
+        // The pre-crash content: export the dirty set, spool it whole, then
+        // flush-publish the SAME set (floor raised; the spool is redundant).
+        let (exported_ref, chunks) = backend.export_unflushed().await;
+        spool::write_spool(
+            self.effects.fs.as_ref(),
+            self.fs.spool_dir(),
+            sandbox_id,
+            exported_ref,
+            &chunks,
+        )
+        .await
+        .map_err(|e| format!("spool_crash_at baseline spool: {e}"))?;
+        backend
+            .flush()
+            .await
+            .map_err(|e| format!("spool_crash_at flush: {e}"))?;
+        let published = backend.manifest_ref().await;
+        self.sandboxes[0].published_ref = Some(published);
+        self.mark_flush_published(0, published).await?;
+        // The cut re-write: the process dies at fs-op `op_index` of a real
+        // `write_spool` sequence. An error IS the crash landing.
+        let crash_fs = CrashFs::with_crash_at(Some(op_index));
+        let _ = spool::write_spool(
+            crash_fs.as_ref(),
+            self.fs.spool_dir(),
+            sandbox_id,
+            exported_ref,
+            &chunks,
+        )
+        .await;
+        self.die_abruptly();
+        Ok(())
+    }
+
+    /// The common "process dies now" tail: RAM drops (backends, the
+    /// in-flight finalize jobs, the pending-finalize idempotency map), the
+    /// reconcile RAM dies, and the generation rolls.
+    fn die_abruptly(&mut self) {
+        for slot in &mut self.sandboxes {
+            slot.backend = None;
+        }
+        self.in_flight.clear();
+        self.pending_finalizes.clear();
+        self.reconcile.crash_ram();
+        self.roll_generation();
     }
 }
 

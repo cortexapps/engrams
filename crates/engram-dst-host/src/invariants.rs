@@ -67,6 +67,10 @@
 //! genuinely no longer owns. A FAILURE means `reconcile_once` reaped a live,
 //! owned VM — a real bug, not a test to update.
 
+use engram_host_agent::durable_record::record_path;
+use engram_host_agent::eviction_finalize::EvictionFinalizeRecord;
+use engram_host_core::{FinalizeStage, TokioFs};
+
 use crate::world::{decode_tag, SimHost, CHUNK_SIZE};
 
 #[derive(Debug)]
@@ -82,7 +86,100 @@ pub async fn check(host: &SimHost) -> Result<(), Violation> {
     acked_writes_recoverable(host).await?;
     reconcile_none_arm_fixed(host)?;
     slot_accounting(host).await?;
-    device_serving(host)
+    device_serving(host)?;
+    finalize_stage_monotone(host).await
+}
+
+/// Oracle #6 — `FinalizeStage` monotonicity + resume-at-persisted-stage
+/// (ADR 0098 P5, Flow D). Reads the ON-DISK finalize records back through
+/// the real torn-tolerant `load_all` after every step and asserts:
+///
+/// * **Monotone**: a record's persisted stage never regresses below the
+///   highest stage ever observed for that snapshot (the watermark survives
+///   crashes — it is oracle memory). A regression means a redrive re-ran a
+///   leg the record said was durable, or a crash rolled the record back
+///   past its stage-bump persist.
+/// * **Stage ⇒ fields**: every sim capture stages a disk-pending set, so a
+///   record at `DiskUploaded` or beyond MUST carry `disk_manifest` — a
+///   stage claiming the disk leg is durable without its output is exactly
+///   the #743 disk_manifest=None shape.
+///
+/// (The memory leg's field implication is vacuous here — the sim stages no
+/// `memory.bin`, so `memory_manifest` is legitimately `None` at every
+/// stage.) Terminal completion is oracle #8's side: the record is DELETED,
+/// which the watermark deliberately does not treat as a regression.
+async fn finalize_stage_monotone(host: &SimHost) -> Result<(), Violation> {
+    let finalize_dir = host.fs.root().join("finalize");
+    let records: Vec<EvictionFinalizeRecord> =
+        EvictionFinalizeRecord::load_all(&TokioFs, &finalize_dir).await;
+    let mut seen = host.finalize_stage_seen.lock();
+    for record in records {
+        let watermark = seen
+            .get(&record.snapshot_id)
+            .copied()
+            .unwrap_or(FinalizeStage::Captured);
+        if record.stage < watermark {
+            return Err(Violation {
+                invariant: "finalize-stage-monotone",
+                detail: format!(
+                    "snapshot {}: persisted stage {:?} regressed below the observed                      watermark {:?} — a durable leg was un-done",
+                    record.snapshot_id, record.stage, watermark
+                ),
+            });
+        }
+        seen.insert(record.snapshot_id, record.stage);
+        if record.stage >= FinalizeStage::DiskUploaded && record.disk_manifest.is_none() {
+            return Err(Violation {
+                invariant: "finalize-stage-monotone",
+                detail: format!(
+                    "snapshot {}: stage {:?} claims the disk leg is durable but                      disk_manifest is None (the #743 silent-skip shape)",
+                    record.snapshot_id, record.stage
+                ),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Oracle #8 — convergence at quiescence (ADR 0098 P5, Flow D's redrive
+/// loop). Called by the scheduler AFTER the quiesce heal + a bounded
+/// finalize drain: every finalize ever STARTED must have reached a terminal
+/// outcome — completed (the terminal `EvictionFinal` checkpoint record
+/// exists in `records/` and the finalize record is gone) or quarantined
+/// (`finalize/failed/<id>.json` exists). A finalize still pending past the
+/// drain budget is non-convergence — the "retries forever" class (#743's
+/// checkpoint-driver shape). `plan_finalize_retry`'s attempts cap is what
+/// guarantees termination under persistent fault; this oracle is what
+/// notices if that guarantee breaks.
+pub fn check_finalize_convergence(host: &SimHost) -> Result<(), Violation> {
+    if !host.pending_finalizes.is_empty() {
+        let stuck: Vec<String> = host
+            .pending_finalizes
+            .iter()
+            .map(|e| format!("{}→{}", e.key(), e.value()))
+            .collect();
+        return Err(Violation {
+            invariant: "finalize-convergence",
+            detail: format!(
+                "pending finalizes past the quiescence drain budget: {stuck:?} —                  a redrive loop that never terminates"
+            ),
+        });
+    }
+    let records_dir = host.fs.root().join("records");
+    let failed_dir = host.fs.root().join("finalize").join("failed");
+    for snapshot_id in &host.finalize_started {
+        let completed = record_path(&records_dir, snapshot_id).exists();
+        let quarantined = record_path(&failed_dir, snapshot_id).exists();
+        if !completed && !quarantined {
+            return Err(Violation {
+                invariant: "finalize-convergence",
+                detail: format!(
+                    "started finalize {snapshot_id} reached neither the terminal                      EvictionFinal record nor quarantine — it was silently dropped"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Oracle #3 — slot accounting (ADR 0098 P7, Flow B). The allocator's device

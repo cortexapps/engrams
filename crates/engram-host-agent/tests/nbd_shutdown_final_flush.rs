@@ -535,11 +535,14 @@ async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
     // The spool must carry the acked bytes and the exact lineage they
     // diverge from.
     let spool_root = checkpoints.join("spool");
-    let (meta, spooled) =
-        engram_host_agent::disk_daemon::spool::read_spool(&spool_root, restored_id)
-            .await
-            .expect("spool readable")
-            .expect("abandon with un-uploaded dirty bytes must write a spool");
+    let (meta, spooled) = engram_host_agent::disk_daemon::spool::read_spool(
+        &engram_host_core::TokioFs,
+        &spool_root,
+        restored_id,
+    )
+    .await
+    .expect("spool readable")
+    .expect("abandon with un-uploaded dirty bytes must write a spool");
     assert_eq!(meta.manifest_ref(), pre_abandon_ref);
     assert_eq!(spooled.len(), 1, "one dirty chunk");
     assert_eq!(spooled[0].0, 0);
@@ -608,10 +611,14 @@ async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
 
     // Adoption consumes the spool.
     assert!(
-        engram_host_agent::disk_daemon::spool::read_spool(&spool_root, restored_id)
-            .await
-            .expect("spool root readable")
-            .is_none(),
+        engram_host_agent::disk_daemon::spool::read_spool(
+            &engram_host_core::TokioFs,
+            &spool_root,
+            restored_id,
+        )
+        .await
+        .expect("spool root readable")
+        .is_none(),
         "an adopted spool must be discarded",
     );
 
