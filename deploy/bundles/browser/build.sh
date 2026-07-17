@@ -302,6 +302,11 @@ here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 # call above is what guarantees the /tmp stable-symlink target DT_RPATH
 # resolves through actually exists before this ever runs.
 export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
+# The bundled version is deliberately pinned. Avoid the CLI making a best-effort
+# npm registry request on every short-lived invocation (including the private
+# foregrounding call below), which adds latency or noise in network-isolated
+# sessions without providing a useful upgrade path.
+export NO_UPDATE_NOTIFIER=1
 export PATH="$here/node/bin:$PATH"
 observation_dir=/tmp/engram-browser-observations
 pending="$observation_dir/.pending-view"
@@ -334,6 +339,18 @@ done
 # base-image utility.
 "$here/node/bin/node" "$here/node/bin/playwright-cli" "$@"
 status=$?
+# A CDP-connected page can remain a background Chrome target even
+# after a successful navigation or interaction. Semantic commands would then
+# work while VNC still showed the previously active tab, violating the shared
+# headful-browser contract. Best-effort foreground the CLI session page after
+# every successful command. Invoke the real entrypoint directly so this
+# housekeeping action does not recurse through the wrapper or emit a second
+# browser-activity event; commands without a page (close, list, etc.) simply
+# fail here and retain their original successful status.
+if [ "$status" -eq 0 ]; then
+    "$here/node/bin/node" "$here/node/bin/playwright-cli" \
+        run-code "async page => await page.bringToFront()" >/dev/null 2>&1 || true
+fi
 if [ "$status" -eq 0 ] && [ "${1:-}" = screenshot ] && [ -f "$filename" ]; then
     canonical="$(readlink -f -- "$filename")"
     case "$canonical" in
