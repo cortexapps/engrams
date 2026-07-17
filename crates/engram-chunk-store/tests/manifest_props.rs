@@ -141,8 +141,9 @@ proptest! {
 
     /// Chunking geometry: densely chunk an arbitrary buffer, then prove
     /// the resulting manifest (a) reports the right chunk count, (b) has
-    /// a `chunk_at` hit at every aligned offset and a miss everywhere
-    /// else, (c) tiles `[0, total_bytes)` with contiguous non-overlapping
+    /// a `chunk_at` hit at every aligned in-bounds offset and a miss at the
+    /// first aligned out-of-bounds offset, (c) tiles `[0, total_bytes)` with
+    /// contiguous non-overlapping
     /// ranges whose lengths follow `min(chunk_size, total_bytes-offset)`,
     /// and (d) reassembles byte-for-byte to the original buffer.
     #[test]
@@ -185,19 +186,16 @@ proptest! {
         prop_assert_eq!(m.expected_chunk_count(), expected);
         prop_assert_eq!(m.chunks.len() as u64, expected);
 
-        // (b) chunk_at hits every aligned offset, misses everything else.
+        // (b) chunk_at accepts aligned offsets: every in-bounds chunk resolves,
+        // while the first aligned offset beyond the dense manifest does not.
+        // Misaligned offsets are a caller-contract violation guarded by a
+        // debug assertion, so this property must not probe them.
         for i in 0..expected {
             let aligned = i * cs;
             let hit = m.chunk_at(aligned);
             prop_assert!(hit.is_some(), "aligned offset {} must resolve", aligned);
             prop_assert_eq!(hit.unwrap().offset, aligned);
         }
-        // A misaligned interior offset never resolves (cs>1 case).
-        if cs > 1 && total_bytes > 1 {
-            prop_assert!(m.chunk_at(1).is_none());
-        }
-        // An offset at/after the end never resolves.
-        prop_assert!(m.chunk_at(total_bytes).is_none());
         prop_assert!(m.chunk_at(expected * cs).is_none());
 
         // (c)+(d) tile and reassemble. Lengths follow the production
