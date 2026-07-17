@@ -1255,6 +1255,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-dst-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "engram-chunk-store",
+ "engram-core",
+ "engram-host-agent",
+ "engram-host-core",
+ "engram-sim",
+ "engram-storage-local",
+ "parking_lot",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "tempfile",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-egress-proxy"
 version = "0.1.0"
 dependencies = [
