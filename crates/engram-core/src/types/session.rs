@@ -551,6 +551,112 @@ pub struct Session {
 mod tests {
     use super::*;
 
+    /// Every variant, exhaustiveness-guarded: a new variant makes this
+    /// `match` non-exhaustive — a compile error here, not a silent
+    /// coverage gap in the walk properties below (the wire-proto
+    /// strategy convention, ADR 0099 H4).
+    const fn all_states() -> [SessionState; 12] {
+        use SessionState::*;
+        // The match exists only for the exhaustiveness guarantee.
+        match Pending {
+            Pending | Queued | Created | Active | Unreachable | Idle | HostLost | Evacuating
+            | Evicting | Failed | Completed | Dead => {}
+        }
+        [
+            Pending,
+            Queued,
+            Created,
+            Active,
+            Unreachable,
+            Idle,
+            HostLost,
+            Evacuating,
+            Evicting,
+            Failed,
+            Completed,
+            Dead,
+        ]
+    }
+
+    mod walk_props {
+        //! ADR 0099 H3 (folded from H6): SEQUENCE properties over the
+        //! legality table — the pairwise table is exhaustively tested
+        //! below; these check what random walks along legal edges can
+        //! and cannot reach.
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_state() -> impl Strategy<Value = SessionState> {
+            proptest::sample::select(all_states().to_vec())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 96,
+                // In-crate unit test: source-relative persistence works;
+                // pin anyway so counterexamples land deterministically.
+                failure_persistence: Some(Box::new(
+                    proptest::test_runner::FileFailurePersistence::Direct(
+                        "proptest-regressions/session_walk.txt",
+                    ),
+                )),
+                ..ProptestConfig::default()
+            })]
+
+            /// A random walk along LEGAL edges never escapes a terminal
+            /// state: once Failed/Completed/Dead is reached, every
+            /// further candidate edge is rejected.
+            #[test]
+            fn walks_never_escape_terminal_states(
+                start in arb_state(),
+                steps in proptest::collection::vec(arb_state(), 1..32),
+            ) {
+                let mut cur = start;
+                for next in steps {
+                    let terminal = matches!(
+                        cur,
+                        SessionState::Failed | SessionState::Completed | SessionState::Dead
+                    );
+                    match cur.try_transition_to(next) {
+                        Ok(new) => {
+                            prop_assert!(!terminal, "escaped terminal {cur:?} -> {new:?}");
+                            prop_assert_eq!(new, next);
+                            cur = new;
+                        }
+                        Err(e) => {
+                            prop_assert_eq!(e.from, cur);
+                            prop_assert_eq!(e.to, next);
+                        }
+                    }
+                }
+            }
+
+            /// `terminal_target` always names a LEGAL edge from every
+            /// non-terminal state, and the walk it implies is one step
+            /// into a terminal state (no multi-hop teardown).
+            #[test]
+            fn terminal_target_is_a_legal_single_step(start in arb_state()) {
+                match start.terminal_target() {
+                    None => prop_assert!(matches!(
+                        start,
+                        SessionState::Failed | SessionState::Completed | SessionState::Dead
+                    )),
+                    Some(t) => {
+                        prop_assert!(start.can_transition_to(t));
+                        prop_assert!(t.terminal_target().is_none(), "target must be terminal");
+                    }
+                }
+            }
+
+            /// try/can agreement on arbitrary pairs (the dynamic twin of
+            /// the exhaustive table test).
+            #[test]
+            fn try_agrees_with_can(from in arb_state(), to in arb_state()) {
+                prop_assert_eq!(from.try_transition_to(to).is_ok(), from.can_transition_to(to));
+            }
+        }
+    }
+
     #[test]
     fn session_state_serializes_lowercase() {
         let payload = serde_json::to_value(SessionState::Active).unwrap();

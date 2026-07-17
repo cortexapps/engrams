@@ -321,6 +321,12 @@ impl MetadataStore for SimMetadataStore {
         if target == SessionState::Evicting {
             row.evict_attempts = 0;
         }
+        if target == SessionState::Queued {
+            // Mirror of PostgresStore's entering-Queued stamp (ADR 0098
+            // D4 conformance finding): FIFO columns are always valid.
+            row.queued_at = Some(now);
+            row.queue_origin = Some(row.queue_origin.unwrap_or(QueueOrigin::Create));
+        }
         drop(db);
         if reserves(current) && !reserves(target) {
             self.notify("placement_changed", "session_freed");
@@ -1210,6 +1216,10 @@ impl MetadataStore for SimMetadataStore {
         }
         if to == SessionState::Evicting {
             row.evict_attempts = 0;
+        }
+        if to == SessionState::Queued {
+            row.queued_at = Some(now);
+            row.queue_origin = Some(row.queue_origin.unwrap_or(QueueOrigin::Create));
         }
         drop(db);
         if reserves(current) && !reserves(to) {

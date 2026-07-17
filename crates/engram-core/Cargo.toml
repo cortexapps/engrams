@@ -31,6 +31,7 @@ uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+proptest.workspace = true
 # Bincode is the canonical wire-encoding for `CowState` /
 # `CowStateRecord` (carried inside the proto `bytes` field per
 # ADR 0013 / 0016). The round-trip tests exercise that wire shape;

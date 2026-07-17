@@ -1199,6 +1199,7 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",
