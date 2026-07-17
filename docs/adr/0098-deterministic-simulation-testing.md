@@ -547,6 +547,59 @@ highest-impact remaining flow; P8/P9 unchanged):
 | P8 | Flow E (migration): TTL clock → `now_mono`; #216 decision-table oracle; no-plane-leak/single-device tightening; #582/#598/#629 seeds | M |
 | P9 | CI: `test-host-sim` lane (fixed seeds, <5 min, own rust-cache key, replay-twice self-check) in `CI Gate.needs:` + a host-sim detector flag keyed on engram-dst-host's dep closure; nightly job with `--failure-report` issue auto-filing (the shipped nightly-sim pattern); regression_seeds populated; this section closed with the commit chain | S |
 
+### Coverage gaps surfaced by real incidents (tracked follow-ups)
+
+A gut-check against the 2026-07-17 incident on session `03e6535e` (PR #743 —
+two independent compounding failures: a 40-minute resume-op stall, and NBD
+disk corruption → SIGBUS) found both failures are squarely the *classes*
+this program targets, yet neither is catchable by the harness as it stands.
+Both are the honest boundary of "would DST have cut this," recorded so the
+answer is a plan, not a hope:
+
+- **G1 — the op-stall belongs to the coordinator sim (`engram-dst`) and is
+  one fault-knob away.** A resume op wedged forever inside `start_agent`
+  (no gRPC/host deadline) while the within-step heartbeat kept the row
+  fresh, so stale-op reclaim never fired — pinned 40 min until a pod roll.
+  The `no_op_dropped` / quiescence-convergence oracle is the exact catch
+  (an op that never reaches done/failed fails quiescence), but it can't
+  fire today: `SimHostClient` (`crates/engram-dst/src/world.rs`) models
+  only fail-fast RPC *partition* (returns `Unavailable`), never the
+  *hang/delay* the fault menu specced (§"World model + faults", "RPC
+  partition/delay/reorder"). **To close G1:** a hang/delay knob on
+  `SimHostState` + a `Step`/fault to toggle it (cleared in the
+  quiescence-heal block) + a regression seed asserting a wedged op still
+  reaches done/failed via the new `op_deadline`. #743's fix (`op_deadline`
+  on the tokio/paused clock) was *deliberately built* to be fired
+  deterministically by the sim — the seam is ready; the fault isn't.
+- **G2 — the disk-corruption belongs to the host sim (`engram-dst-host`)
+  and is a recurring class.** Two silent-fallback paths keyed disk
+  durability on `nbd_sandboxes.get(id)` and skipped for a post-roll
+  survivor never rehydrated: capture recorded a `recoverable` snapshot
+  with `disk_manifest=None` (dropping acked writes), and resume then booted
+  onto the stale literal `/dev/nbdN`. The **acked-write durability oracle**
+  is precisely the catch (a lost published-floor write / a boot onto the
+  wrong device is a below-floor read), but the host world model drives
+  `ChunkedDiskBackend` directly and does not yet model `PooledBackend`'s
+  `nbd_sandboxes` tracking, the capture/snapshot orchestration, or the
+  resume NBD-attach decision — those flows are extracted only past P7.
+  **The recurring shape:** this is the *second* incident in two days
+  (after 731df805/#739, register/sweep) whose mechanism is identical —
+  **a lookup keyed on a tracking map that a post-roll survivor isn't in,
+  causing a silent skip that corrupts.** #739 is register/sweep; #743 is
+  capture/resume. **To close G2:** generalize P7's 731df805 scenario into a
+  **survivor-invisibility family** spanning register, sweep, *capture*, and
+  *resume*, each asserted by the acked-write oracle — landing as the
+  capture (P5-adjacent) and resume-attach flows are extracted behind the
+  host-core seam.
+
+**The program already shapes fixes ahead of catching bugs:** #743 followed
+the D4 conformance rule (implemented `SimMetadataStore::rewind_session_to_cursor`
++ a dual-store conformance case for its PostgresStore SQL change) and made
+`op_deadline` paused-clock-deterministic — so even where the harness cannot
+yet reproduce an incident, its discipline is already load-bearing on how the
+incident's fix is written and tested. G1 and G2 are the next increments that
+turn that discipline into detection.
+
 ## Non-goals
 
 - No packet/socket-level network simulation — the trait seam is the boundary.
