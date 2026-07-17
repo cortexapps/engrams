@@ -16,14 +16,17 @@
 //! framed crates (harness/agentd/substrate/migrate), so here (c) is just the
 //! bincode-slice allocation bound.
 
-use std::collections::HashMap;
-
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::SandboxSpec;
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_protocol::wire::{WireExecRequest, WireReapStats};
 use proptest::prelude::*;
+
+// The valid-value strategies live in the shared `support` module; ADR 0099
+// H3's `codec_roundtrip.rs` reuses the exact same generators.
+mod support;
+use support::{wire_exec_request, wire_reap_stats};
 
 // ---- helpers -----------------------------------------------------------
 
@@ -37,52 +40,6 @@ fn decode_every_type(bytes: &[u8]) {
     let _ = bincode::deserialize::<SnapshotMetadata>(bytes);
     let _ = bincode::deserialize::<SandboxSpec>(bytes);
     let _ = bincode::deserialize::<SessionEgressPolicy>(bytes);
-}
-
-fn s() -> impl Strategy<Value = String> {
-    "[ -~]{0,10}"
-}
-
-fn small_bytes() -> impl Strategy<Value = Vec<u8>> {
-    proptest::collection::vec(any::<u8>(), 0..=16)
-}
-
-fn wire_exec_request() -> impl Strategy<Value = WireExecRequest> {
-    (
-        proptest::collection::vec(s(), 0..3),
-        proptest::option::of(small_bytes()),
-        proptest::option::of((s(), s())).prop_map(|kv| kv.into_iter().collect::<HashMap<_, _>>()),
-        proptest::option::of(s()),
-        proptest::option::of(any::<u64>()),
-    )
-        .prop_map(
-            |(command, stdin, env, workdir, timeout_ms)| WireExecRequest {
-                command,
-                stdin,
-                env,
-                workdir,
-                timeout_ms,
-            },
-        )
-}
-
-fn wire_reap_stats() -> impl Strategy<Value = WireReapStats> {
-    (
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-        any::<u64>(),
-    )
-        .prop_map(
-            |(files_scanned, files_deleted, bytes_freed, unparseable, too_young)| WireReapStats {
-                files_scanned,
-                files_deleted,
-                bytes_freed,
-                files_skipped_unparseable: unparseable,
-                files_skipped_too_young: too_young,
-            },
-        )
 }
 
 fn mutate_and_decode<T: serde::de::DeserializeOwned>(

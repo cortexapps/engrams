@@ -24,6 +24,12 @@ use engram_migrate_proto::{
 };
 use proptest::prelude::*;
 
+// The valid-value strategies (small values keep the shape-(b) prefix sweep
+// cheap) live in the shared `support` module; ADR 0099 H3's
+// `codec_roundtrip.rs` reuses the exact same generators.
+mod support;
+use support::{from_source, handler_control, seal_bitmap, to_source};
+
 // ---- helpers -----------------------------------------------------------
 
 fn decode_every_type(bytes: &[u8]) {
@@ -35,145 +41,6 @@ fn decode_every_type(bytes: &[u8]) {
     let _ = read_frame::<_, ToSource>(&mut Cursor::new(bytes));
     let _ = read_frame::<_, FromSource>(&mut Cursor::new(bytes));
     let _ = read_frame::<_, HandlerControl>(&mut Cursor::new(bytes));
-}
-
-// ---- strategies (small values keep the shape-(b) prefix sweep cheap) ---
-
-fn s() -> impl Strategy<Value = String> {
-    "[ -~]{0,10}"
-}
-
-fn small_bytes() -> impl Strategy<Value = Vec<u8>> {
-    proptest::collection::vec(any::<u8>(), 0..=32)
-}
-
-fn conn_purpose() -> impl Strategy<Value = ConnPurpose> {
-    prop_oneof![Just(ConnPurpose::Fault), Just(ConnPurpose::Drain)]
-}
-
-/// Arbitrary (not necessarily `validate`-passing) SealBitmap — all fields
-/// are pub, so any combination is a decodable value. `validate` is expected
-/// to *reject* the invalid ones; the property is that it never panics.
-fn seal_bitmap() -> impl Strategy<Value = SealBitmap> {
-    (any::<u64>(), any::<u64>(), small_bytes()).prop_map(|(chunk_size, chunk_count, bits)| {
-        SealBitmap {
-            chunk_size,
-            chunk_count,
-            bits,
-        }
-    })
-}
-
-fn to_source() -> impl Strategy<Value = ToSource> {
-    prop_oneof![
-        (any::<u32>(), s(), s(), conn_purpose()).prop_map(
-            |(version, export_id, token, purpose)| ToSource::Hello {
-                version,
-                export_id,
-                token,
-                purpose,
-            }
-        ),
-        (any::<u64>(), any::<u64>()).prop_map(|(req_id, chunk_offset)| ToSource::NeedAt {
-            req_id,
-            chunk_offset
-        }),
-        (any::<u64>(), any::<[u8; 32]>())
-            .prop_map(|(req_id, hash)| ToSource::GetChunk { req_id, hash }),
-        (any::<u64>(), any::<u64>(), any::<u64>()).prop_map(
-            |(pulled, alt_sourced, zero_chunks)| ToSource::DrainDone {
-                pulled,
-                alt_sourced,
-                zero_chunks,
-            }
-        ),
-    ]
-}
-
-fn from_source() -> impl Strategy<Value = FromSource> {
-    prop_oneof![
-        (any::<u32>(), any::<u64>(), any::<u64>()).prop_map(
-            |(version, chunk_size, total_bytes)| {
-                FromSource::HelloAck {
-                    version,
-                    chunk_size,
-                    total_bytes,
-                }
-            }
-        ),
-        seal_bitmap().prop_map(|bitmap| FromSource::Seal { bitmap }),
-        (
-            any::<u64>(),
-            any::<u64>(),
-            small_bytes(),
-            any::<[u8; 32]>(),
-            any::<bool>()
-        )
-            .prop_map(
-                |(req_id, chunk_offset, bytes, hash, lz4)| FromSource::Page {
-                    req_id,
-                    chunk_offset,
-                    bytes,
-                    hash,
-                    lz4,
-                }
-            ),
-        (any::<u64>(), any::<u64>()).prop_map(|(req_id, chunk_offset)| FromSource::ZeroChunk {
-            req_id,
-            chunk_offset
-        }),
-        (any::<u64>(), any::<u64>(), any::<[u8; 32]>()).prop_map(
-            |(req_id, chunk_offset, durable_sha256)| FromSource::AltSource {
-                req_id,
-                chunk_offset,
-                durable_sha256,
-            }
-        ),
-        (any::<u64>(), small_bytes())
-            .prop_map(|(req_id, bytes)| FromSource::ChunkBytes { req_id, bytes }),
-        (proptest::option::of(any::<u64>()), s())
-            .prop_map(|(req_id, message)| FromSource::Error { req_id, message }),
-    ]
-}
-
-fn handler_control() -> impl Strategy<Value = HandlerControl> {
-    prop_oneof![
-        (any::<u64>(), any::<u64>(), any::<i64>()).prop_map(
-            |(dirty_chunks, total_chunks, at_unix_ms)| {
-                HandlerControl::Sealed {
-                    dirty_chunks,
-                    total_chunks,
-                    at_unix_ms,
-                }
-            }
-        ),
-        (any::<u64>(), any::<u64>())
-            .prop_map(|(pulled, remaining)| HandlerControl::DrainProgress { pulled, remaining }),
-        (
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-            any::<u64>(),
-        )
-            .prop_map(
-                |(pulled, alt_sourced, zero_chunks, ms, faults, fault_us, fault_max_us)| {
-                    HandlerControl::DrainDone {
-                        pulled,
-                        alt_sourced,
-                        zero_chunks,
-                        ms,
-                        faults,
-                        fault_us,
-                        fault_max_us,
-                    }
-                }
-            ),
-        (any::<u64>(), s())
-            .prop_map(|(remaining, detail)| HandlerControl::PeerLost { remaining, detail }),
-    ]
 }
 
 fn mutate_and_decode<T: serde::de::DeserializeOwned>(

@@ -26,7 +26,6 @@
 
 use std::io::Cursor;
 
-use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
     read_msg, AgentRole, AttachReject, CheckpointAck, CheckpointReason, EditHunk, FileChange,
     ForgeOp, ForgeRequest, ForgeResponse, HarnessAttach, HarnessAttachAck, HarnessCommand,
@@ -79,185 +78,14 @@ fn read_frame_every_type(bytes: &[u8]) {
     });
 }
 
-// ---- strategies for VALID frames (kept small so the truncation sweep in
-//      shape (b) stays cheap) ---------------------------------------------
-
-/// Small printable-ASCII string.
-fn s() -> impl Strategy<Value = String> {
-    "[ -~]{0,10}"
-}
-
-fn opt_s() -> impl Strategy<Value = Option<String>> {
-    proptest::option::of(s())
-}
-
-fn session_id() -> impl Strategy<Value = SessionId> {
-    any::<[u8; 16]>().prop_map(|b| SessionId(uuid::Uuid::from_bytes(b)))
-}
-
-fn sandbox_id() -> impl Strategy<Value = SandboxId> {
-    any::<[u8; 16]>().prop_map(|b| SandboxId(uuid::Uuid::from_bytes(b)))
-}
-
-fn agent_role() -> impl Strategy<Value = AgentRole> {
-    prop_oneof![
-        Just(AgentRole::Assistant),
-        Just(AgentRole::User),
-        Just(AgentRole::System),
-    ]
-}
-
-fn file_change() -> impl Strategy<Value = FileChange> {
-    prop_oneof![
-        s().prop_map(|content| FileChange::Write { content }),
-        proptest::collection::vec(
-            (s(), s()).prop_map(|(old, new)| EditHunk { old, new }),
-            0..3
-        )
-        .prop_map(|hunks| FileChange::Edit { hunks }),
-        s().prop_map(|unified_diff| FileChange::Patch { unified_diff }),
-    ]
-}
-
-fn harness_event() -> impl Strategy<Value = HarnessEvent> {
-    prop_oneof![
-        (s(), opt_s(), opt_s()).prop_map(|(run_id, prompt_summary, prompt_id)| {
-            HarnessEvent::RunStarted {
-                run_id,
-                prompt_summary,
-                prompt_id,
-            }
-        }),
-        (s(), s(), agent_role(), s()).prop_map(|(run_id, message_id, role, text)| {
-            HarnessEvent::AgentMessage {
-                run_id,
-                message_id,
-                role,
-                text,
-            }
-        }),
-        (s(), s(), s(), opt_s()).prop_map(|(run_id, tool_call_id, tool_name, args_summary)| {
-            HarnessEvent::ToolCallStarted {
-                run_id,
-                tool_call_id,
-                tool_name,
-                args_summary,
-            }
-        }),
-        (s(), s(), s(), any::<bool>(), any::<u64>(), opt_s()).prop_map(
-            |(run_id, tool_call_id, tool_name, ok, duration_ms, result_summary)| {
-                HarnessEvent::ToolCallCompleted {
-                    run_id,
-                    tool_call_id,
-                    tool_name,
-                    ok,
-                    duration_ms,
-                    result_summary,
-                }
-            }
-        ),
-        (s(), any::<bool>()).prop_map(|(run_id, ok)| HarnessEvent::RunCompleted { run_id, ok }),
-        s().prop_map(|run_id| HarnessEvent::RunInterrupted { run_id }),
-        Just(HarnessEvent::Idle),
-        (s(), opt_s())
-            .prop_map(|(prompt_id, summary)| HarnessEvent::PromptQueued { prompt_id, summary }),
-        (s(), opt_s())
-            .prop_map(|(prompt_id, summary)| HarnessEvent::PromptEdited { prompt_id, summary }),
-        s().prop_map(|prompt_id| HarnessEvent::PromptDequeued { prompt_id }),
-        (s(), s(), s()).prop_map(
-            |(run_id, message_id, chunk)| HarnessEvent::AgentMessageChunk {
-                run_id,
-                message_id,
-                chunk
-            }
-        ),
-        (s(), s(), s(), file_change()).prop_map(|(run_id, tool_call_id, path, change)| {
-            HarnessEvent::FileChanged {
-                run_id,
-                tool_call_id,
-                path,
-                change,
-            }
-        }),
-        s().prop_map(|title| HarnessEvent::TitleSuggested { title }),
-        s().prop_map(|prompt_id| HarnessEvent::PromptSteered { prompt_id }),
-        (s(), s(), s(), s()).prop_map(|(run_id, call_id, name, args_json)| {
-            HarnessEvent::ToolCallRequested {
-                run_id,
-                call_id,
-                name,
-                args_json,
-            }
-        }),
-        Just(HarnessEvent::Parked),
-    ]
-}
-
-fn checkpoint_reason() -> impl Strategy<Value = CheckpointReason> {
-    prop_oneof![
-        Just(CheckpointReason::Idle),
-        Just(CheckpointReason::Preempt),
-        Just(CheckpointReason::Manual),
-        Just(CheckpointReason::RunCompleted),
-    ]
-}
-
-fn harness_command() -> impl Strategy<Value = HarnessCommand> {
-    prop_oneof![
-        checkpoint_reason().prop_map(|reason| HarnessCommand::Checkpoint { reason }),
-        any::<u32>().prop_map(|grace_secs| HarnessCommand::Shutdown { grace_secs }),
-        (s(), s()).prop_map(|(text, prompt_id)| HarnessCommand::Prompt { text, prompt_id }),
-        Just(HarnessCommand::Interrupt),
-        (s(), s()).prop_map(|(prompt_id, text)| HarnessCommand::EditQueued { prompt_id, text }),
-        s().prop_map(|prompt_id| HarnessCommand::DequeueQueued { prompt_id }),
-        (s(), s()).prop_map(|(call_id, result_json)| HarnessCommand::ToolResult {
-            call_id,
-            result_json
-        }),
-    ]
-}
-
-fn harness_frame() -> impl Strategy<Value = HarnessFrame> {
-    prop_oneof![
-        harness_event().prop_map(HarnessFrame::Event),
-        harness_command().prop_map(HarnessFrame::Command),
-    ]
-}
-
-fn harness_attach() -> impl Strategy<Value = HarnessAttach> {
-    (session_id(), sandbox_id(), any::<u64>(), s()).prop_map(
-        |(session_id, sandbox_id, binding_epoch, harness_version)| HarnessAttach {
-            session_id,
-            sandbox_id,
-            binding_epoch,
-            harness_version,
-        },
-    )
-}
-
-fn forge_request() -> impl Strategy<Value = ForgeRequest> {
-    (session_id(), s(), s(), opt_s()).prop_map(|(session_id, broker_token, host, owner)| {
-        ForgeRequest {
-            session_id,
-            broker_token,
-            op: ForgeOp::FetchCredential { host, owner },
-        }
-    })
-}
-
-fn upload_request() -> impl Strategy<Value = UploadRequest> {
-    (session_id(), s(), s(), opt_s(), any::<u64>()).prop_map(
-        |(session_id, broker_token, ext, caption, size_bytes)| UploadRequest {
-            session_id,
-            broker_token,
-            op: UploadOp::ShareFile {
-                ext,
-                caption,
-                size_bytes,
-            },
-        },
-    )
-}
+// ---- strategies for VALID frames ---------------------------------------
+//
+// The valid-value strategies live in the shared `support` module (kept small
+// so the truncation sweep in shape (b) stays cheap); ADR 0099 H3's
+// `codec_roundtrip.rs` reuses the exact same generators, so a new frame shape
+// is exercised by both suites from one definition.
+mod support;
+use support::{forge_request, harness_attach, harness_frame, upload_request};
 
 /// Apply the three mutation classes to `encoded` and decode `T` from each
 /// result, asserting none panic. `truncate at every prefix` is a full
