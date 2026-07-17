@@ -20,6 +20,13 @@ use parking_lot::Mutex;
 #[derive(Debug, Default)]
 pub struct SimHostState {
     pub up: bool,
+    /// Asymmetric partition: the host is UP and serves RPCs, but its
+    /// heartbeats never land (the dead-host detector's hardest case —
+    /// the issue-#231 probe exists exactly for this).
+    pub heartbeats_partitioned: bool,
+    /// The inverse: heartbeats land but RPCs fail (a half-open
+    /// connection / one-way network fault).
+    pub rpc_partitioned: bool,
     /// sandbox -> owning session (as told to us via create's spec).
     pub sandboxes: BTreeMap<SandboxId, Option<SessionId>>,
 }
@@ -221,6 +228,9 @@ impl HostClient for SimHostClient {
 /// exercised directly).
 pub struct Replica {
     pub state: Option<engram_coordinator::state::SharedState>,
+    /// This replica's view of wall-clock time — a SimClock over the
+    /// same paused tokio base, with its own (fault-mutable) skew.
+    pub clock: Arc<SimClock>,
 }
 
 pub struct SimWorld {
@@ -251,7 +261,7 @@ impl SimWorld {
                     *id,
                     SimHostState {
                         up: true,
-                        sandboxes: BTreeMap::new(),
+                        ..SimHostState::default()
                     },
                 );
             }
@@ -265,15 +275,24 @@ impl SimWorld {
             replicas: Vec::new(),
         };
         for _ in 0..replicas {
-            let state = world.build_replica();
-            world.replicas.push(Replica { state: Some(state) });
+            let clock = SimClock::new();
+            let state = world.build_replica_with_clock(clock.clone());
+            world.replicas.push(Replica {
+                state: Some(state),
+                clock,
+            });
         }
         world
     }
 
     /// Build a fresh replica over the shared authority — also the
-    /// restart path after a crash fault.
-    pub fn build_replica(&self) -> engram_coordinator::state::SharedState {
+    /// restart path after a crash fault. The replica keeps its own
+    /// clock (with any accumulated skew) across restarts — machines
+    /// keep their clocks when processes die.
+    pub fn build_replica_with_clock(
+        &self,
+        clock: Arc<SimClock>,
+    ) -> engram_coordinator::state::SharedState {
         let registry = Arc::new(HostRegistry::new(
             self.meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
         ));
@@ -308,7 +327,7 @@ impl SimWorld {
                 engram_storage_local::LocalBlobStorage::new(blob_dir),
             )),
             materialize_dir: None,
-            clock: self.clock.clone(),
+            clock,
             entropy: self.entropy.clone(),
         };
         Arc::new(AppState::new_with_registry(

@@ -1065,7 +1065,7 @@ pub fn spawn_eviction_scanner(
 
 /// Single scanner tick. `pub(crate)` so tests can drive the scanner
 /// deterministically without `tokio::spawn`-ing the loop.
-pub(crate) async fn scanner_run_once(
+pub async fn scanner_run_once(
     state: &SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidates = state.services.meta.list_evicting_sessions().await?;

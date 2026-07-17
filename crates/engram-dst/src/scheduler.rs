@@ -44,14 +44,24 @@ pub enum DriverKind {
     /// session_ops' reclaim sweep: stale-op reclaim + the
     /// pending-orphan create_boot backstop (ADR 0079 findings #4/#5).
     OpReclaim,
+    IdleDetector,
+    IdleEvictor,
+    EvacResumer,
+    OutboxDelivery,
+    GcSweeps,
 }
 
-const DRIVERS: [DriverKind; 5] = [
+const DRIVERS: [DriverKind; 10] = [
     DriverKind::QueueScanner,
     DriverKind::Reconcile,
     DriverKind::DeadHost,
     DriverKind::SessionOps,
     DriverKind::OpReclaim,
+    DriverKind::IdleDetector,
+    DriverKind::IdleEvictor,
+    DriverKind::EvacResumer,
+    DriverKind::OutboxDelivery,
+    DriverKind::GcSweeps,
 ];
 
 #[derive(Debug)]
@@ -59,12 +69,21 @@ pub enum Step {
     AdvanceTime(Duration),
     Driver(usize, DriverKind),
     CreateSession,
+    WorkloadBurst(u8),
     HostHeartbeats,
     CrashHost(usize),
     RestartHost(usize),
     CrashReplica(usize),
     RestartReplica(usize),
     PgOutage(bool),
+    /// Asymmetric: heartbeats vanish, RPCs still answer (issue #231's
+    /// probe-rescue case) — toggled.
+    HeartbeatPartition(usize, bool),
+    /// The inverse: heartbeats land, RPCs fail — toggled.
+    RpcPartition(usize, bool),
+    /// Skew one replica's wall clock by the given seconds (can be
+    /// negative).
+    ClockSkew(usize, i64),
 }
 
 #[derive(Debug)]
@@ -85,6 +104,8 @@ pub struct Sim {
     probe_memory: Vec<engram_coordinator::dead_host::ProbeMemoryMap>,
     dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig,
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
+    idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
+    evac_cfg: engram_coordinator::evac_resumer::EvacResumerConfig,
     report: SimReport,
     pg_out: bool,
 }
@@ -105,6 +126,8 @@ impl Sim {
             probe_memory: (0..replicas).map(|_| Default::default()).collect(),
             dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
+            idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
+            evac_cfg: engram_coordinator::evac_resumer::EvacResumerConfig::default(),
             report: SimReport {
                 seed,
                 steps_run: 0,
@@ -164,17 +187,31 @@ impl Sim {
                                 .await;
                     }
                     DriverKind::Reconcile => {
-                        // The reconcile pass consumes heartbeat-reported
-                        // sandbox sets; in the sim the heartbeat handler
-                        // path is HostHeartbeats below, so this driver
-                        // re-checks strikes/flips via its integration
-                        // seam. D5 drives the strike primitive directly.
-                        let present: Vec<_> = Vec::new();
-                        let _ = state
-                            .services
-                            .meta
-                            .apply_missing_sandbox_strikes(&present, &[], 3)
-                            .await;
+                        // The real pass: each REPORTING host's world-truth
+                        // sandbox set vs the coordinator's assignments
+                        // (a heartbeat-partitioned host reports nothing —
+                        // reconcile only ever consumes what heartbeats
+                        // carry).
+                        let reports: Vec<(HostId, Vec<engram_core::SandboxId>)> = {
+                            let hw = self.world.host_world.hosts.lock();
+                            hw.iter()
+                                .filter(|(_, h)| h.up && !h.heartbeats_partitioned)
+                                .map(|(id, h)| (*id, h.sandboxes.keys().copied().collect()))
+                                .collect()
+                        };
+                        let reconciler = engram_coordinator::reconcile::Reconciler::new(3)
+                            .with_clock(state.services.clock.clone());
+                        for (host_id, running) in reports {
+                            let _ = reconciler
+                                .reconcile_with_deps(
+                                    state.services.meta.as_ref(),
+                                    &state.events,
+                                    &state.host_registry,
+                                    host_id,
+                                    &running,
+                                )
+                                .await;
+                        }
                     }
                     DriverKind::DeadHost => {
                         let _ = engram_coordinator::dead_host::run_once(
@@ -230,6 +267,48 @@ impl Sim {
                             )
                             .await;
                         }
+                    }
+                    DriverKind::IdleDetector => {
+                        let _ = engram_coordinator::idle_detector::run_once(&self.idle_cfg, &state)
+                            .await;
+                    }
+                    DriverKind::IdleEvictor => {
+                        let _ = engram_coordinator::idle_evictor::scanner_run_once(&state).await;
+                    }
+                    DriverKind::EvacResumer => {
+                        let _ = engram_coordinator::evac_resumer::run_once(&self.evac_cfg, &state)
+                            .await;
+                    }
+                    DriverKind::OutboxDelivery => {
+                        let due = state
+                            .services
+                            .meta
+                            .outbox_due_sessions()
+                            .await
+                            .unwrap_or_default();
+                        for sid in due {
+                            engram_coordinator::outbox_delivery::enqueue_deliver_op(&state, sid)
+                                .await;
+                        }
+                    }
+                    DriverKind::GcSweeps => {
+                        let cfg = engram_coordinator::chunk_gc::ChunkGcConfig::from_env();
+                        let _ = engram_coordinator::snapshot_blob_gc::run_one_snapshot_blob_sweep(
+                            state.services.meta.clone(),
+                            state.services.blob.clone(),
+                            &cfg,
+                            engram_coordinator::chunk_gc::SweepMode::Full,
+                            &state.services.clock,
+                        )
+                        .await;
+                        let _ = engram_coordinator::bundle_gc::run_one_bundle_sweep(
+                            state.services.meta.clone(),
+                            state.services.blob.clone(),
+                            &cfg,
+                            engram_coordinator::chunk_gc::SweepMode::Full,
+                            &state.services.clock,
+                        )
+                        .await;
                     }
                 }
             }
@@ -293,7 +372,10 @@ impl Sim {
                 // hosts go silent — exactly what the detector keys on.
                 let up: Vec<HostId> = {
                     let hw = self.world.host_world.hosts.lock();
-                    hw.iter().filter(|(_, h)| h.up).map(|(id, _)| *id).collect()
+                    hw.iter()
+                        .filter(|(_, h)| h.up && !h.heartbeats_partitioned)
+                        .map(|(id, _)| *id)
+                        .collect()
                 };
                 let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
                     return;
@@ -344,8 +426,33 @@ impl Sim {
             }
             Step::RestartReplica(i) => {
                 if self.world.replicas[i].state.is_none() {
-                    self.world.replicas[i].state = Some(self.world.build_replica());
+                    let clock = self.world.replicas[i].clock.clone();
+                    self.world.replicas[i].state = Some(self.world.build_replica_with_clock(clock));
                 }
+            }
+            Step::WorkloadBurst(n) => {
+                for _ in 0..n {
+                    Box::pin(self.execute(Step::CreateSession)).await;
+                }
+            }
+            Step::HeartbeatPartition(i, on) => {
+                let id = self.world.host_ids[i];
+                let mut hw = self.world.host_world.hosts.lock();
+                if let Some(h) = hw.get_mut(&id) {
+                    h.heartbeats_partitioned = on;
+                }
+            }
+            Step::RpcPartition(i, on) => {
+                let id = self.world.host_ids[i];
+                let mut hw = self.world.host_world.hosts.lock();
+                if let Some(h) = hw.get_mut(&id) {
+                    h.rpc_partitioned = on;
+                }
+            }
+            Step::ClockSkew(i, secs) => {
+                self.world.replicas[i]
+                    .clock
+                    .set_skew(chrono::Duration::seconds(secs));
             }
             Step::PgOutage(on) => {
                 self.pg_out = on;
@@ -375,6 +482,11 @@ impl Sim {
         self.pg_out = false;
         for i in 0..self.world.host_ids.len() {
             self.execute(Step::RestartHost(i)).await;
+            self.execute(Step::HeartbeatPartition(i, false)).await;
+            self.execute(Step::RpcPartition(i, false)).await;
+        }
+        for i in 0..self.world.replicas.len() {
+            self.execute(Step::ClockSkew(i, 0)).await;
         }
         for i in 0..self.world.replicas.len() {
             self.execute(Step::RestartReplica(i)).await;

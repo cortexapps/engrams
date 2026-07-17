@@ -179,6 +179,12 @@ impl MetadataStore for SimMetadataStore {
         row.session.status = SessionState::Created;
         row.session.sandbox_id = Some(sandbox_id);
         row.session.last_active_at = now;
+        db.transition_log.push(super::TransitionLogEntry {
+            session: id,
+            from: SessionState::Pending,
+            to: SessionState::Created,
+            exempt: false,
+        });
         Ok(())
     }
 
@@ -324,6 +330,12 @@ impl MetadataStore for SimMetadataStore {
             .try_transition_to(target)
             .map_err(|e| MetaError::Conflict(e.to_string()))?;
         row.session.status = target;
+        let log_entry = super::TransitionLogEntry {
+            session: id,
+            from: current,
+            to: target,
+            exempt: false,
+        };
         row.session.last_active_at = now;
         row.updated_at = now;
         if target == SessionState::Evacuating {
@@ -338,6 +350,7 @@ impl MetadataStore for SimMetadataStore {
             row.queued_at = Some(now);
             row.queue_origin = Some(row.queue_origin.unwrap_or(QueueOrigin::Create));
         }
+        db.transition_log.push(log_entry);
         drop(db);
         if reserves(current) && !reserves(target) {
             self.notify("placement_changed", "session_freed");
@@ -416,6 +429,12 @@ impl MetadataStore for SimMetadataStore {
         row.queue_origin = Some(QueueOrigin::Resume);
         row.queued_at = Some(now);
         row.session.last_active_at = now;
+        db.transition_log.push(super::TransitionLogEntry {
+            session: id,
+            from: SessionState::Idle,
+            to: SessionState::Queued,
+            exempt: false,
+        });
         drop(db);
         self.notify("placement_changed", "enqueued");
         Ok(true)
@@ -479,6 +498,12 @@ impl MetadataStore for SimMetadataStore {
         row.session.status = SessionState::Pending;
         row.session.host_id = Some(host);
         row.session.last_active_at = now;
+        db.transition_log.push(super::TransitionLogEntry {
+            session: id,
+            from: SessionState::Queued,
+            to: SessionState::Pending,
+            exempt: false,
+        });
         Ok(Some(host))
     }
 
@@ -639,6 +664,7 @@ impl MetadataStore for SimMetadataStore {
             h.status = HostStatus::Dead;
         }
         let mut out = Vec::new();
+        let mut log = Vec::new();
         for row in db.sessions.values_mut() {
             if row.session.host_id == Some(host_id)
                 && !matches!(
@@ -651,9 +677,16 @@ impl MetadataStore for SimMetadataStore {
                 row.session.sandbox_id = None;
                 row.session.status = SessionState::HostLost;
                 row.session.last_active_at = now;
+                log.push(super::TransitionLogEntry {
+                    session: row.session.id,
+                    from: prev,
+                    to: SessionState::HostLost,
+                    exempt: true,
+                });
                 out.push((row.session.id, prev));
             }
         }
+        db.transition_log.append(&mut log);
         Ok(out)
     }
 
@@ -1238,6 +1271,12 @@ impl MetadataStore for SimMetadataStore {
             .try_transition_to(to)
             .map_err(|e| MetaError::Conflict(e.to_string()))?;
         row.session.status = to;
+        let log_entry = super::TransitionLogEntry {
+            session: session_id,
+            from: current,
+            to,
+            exempt: false,
+        };
         row.session.last_active_at = now;
         row.updated_at = now;
         if to == SessionState::Evacuating {
@@ -1250,6 +1289,7 @@ impl MetadataStore for SimMetadataStore {
             row.queued_at = Some(now);
             row.queue_origin = Some(row.queue_origin.unwrap_or(QueueOrigin::Create));
         }
+        db.transition_log.push(log_entry);
         drop(db);
         if reserves(current) && !reserves(to) {
             self.notify("placement_changed", "session_freed");
@@ -2626,10 +2666,27 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: begin_enable_job_prestage not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// The bundle-GC pin union: every snapshot's aux_bundles, plus the
+    /// (unmodeled) mount/harness catalogs — SimDb has no catalog tables
+    /// yet, so those unions are the empty set, faithfully matching a
+    /// catalog-less database.
     async fn bundle_pin_set(
         &self,
     ) -> Result<Vec<engram_core::types::sandbox::AuxBundleRef>, MetaError> {
-        panic!("SimMeta: bundle_pin_set not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let db = self.db.lock();
+        let mut out: Vec<engram_core::types::sandbox::AuxBundleRef> = Vec::new();
+        for snap in db.snapshots.values() {
+            for b in &snap.aux_bundles {
+                if !out
+                    .iter()
+                    .any(|x| x.drive_id == b.drive_id && x.sha256 == b.sha256)
+                {
+                    out.push(b.clone());
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn capture_assignments_for_host(
@@ -2662,8 +2719,10 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: cold_base_manifest_refs not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// `SELECT snapshot_id FROM cold_bases` — the GC pin source.
     async fn cold_base_snapshot_ids(&self) -> Result<Vec<SnapshotId>, MetaError> {
-        panic!("SimMeta: cold_base_snapshot_ids not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self.db.lock().cold_bases.iter().copied().collect())
     }
 
     async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
@@ -2805,11 +2864,23 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: list_active_assignments_with_budgets_on_host not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// The reconcile pass query: Active + bound sessions on `host_id`.
     async fn list_active_sandbox_assignments_on_host(
         &self,
-        _host_id: HostId,
+        host_id: HostId,
     ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
-        panic!("SimMeta: list_active_sandbox_assignments_on_host not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sessions
+            .values()
+            .filter(|r| {
+                r.session.host_id == Some(host_id)
+                    && r.session.status == SessionState::Active
+                    && r.session.sandbox_id.is_some()
+            })
+            .map(|r| (r.session.id, r.session.sandbox_id.expect("filtered")))
+            .collect())
     }
 
     async fn list_active_sandboxes_on_host_with_disk_manifest(

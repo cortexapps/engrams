@@ -205,6 +205,23 @@ pub struct SimDb {
     pub session_capabilities:
         std::collections::BTreeMap<SessionId, Vec<engram_core::types::capability::Capability>>,
     pub session_integration_policy: std::collections::BTreeMap<SessionId, String>,
+    /// `cold_bases`: snapshot ids pinned as cold base images.
+    pub cold_bases: std::collections::BTreeSet<SnapshotId>,
+    /// Every session-status flip this store performed, in order — the
+    /// D6 transition-legality oracle's input (defense-in-depth over the
+    /// FSM checks in the write paths, and it catches direct-write bugs
+    /// in SimMeta itself). `exempt` marks the documented
+    /// mark_host_dead_and_orphan_sessions bulk flip, which is broader
+    /// than the FSM table (ADR 0099 H6 finding, design call pending).
+    pub transition_log: Vec<TransitionLogEntry>,
+}
+
+#[derive(Clone, Debug)]
+pub struct TransitionLogEntry {
+    pub session: SessionId,
+    pub from: engram_core::types::session::SessionState,
+    pub to: engram_core::types::session::SessionState,
+    pub exempt: bool,
 }
 
 impl SimDb {

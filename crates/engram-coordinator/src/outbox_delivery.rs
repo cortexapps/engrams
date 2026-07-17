@@ -39,7 +39,9 @@ const RESCAN_INTERVAL: Duration = Duration::from_secs(2);
 /// Enqueue a Deliver op for `session_id` unless one is already pending.
 /// Best-effort: an error is logged, not surfaced — the shim's next wake
 /// (or any replica's) retries, and the outbox row is the durable state.
-pub(crate) async fn enqueue_deliver_op(state: &SharedState, session_id: engram_core::SessionId) {
+/// `pub` so the DST harness (engram-dst, ADR 0098 D6) drives outbox
+/// delivery like the spawn loop does.
+pub async fn enqueue_deliver_op(state: &SharedState, session_id: engram_core::SessionId) {
     match state
         .services
         .meta
