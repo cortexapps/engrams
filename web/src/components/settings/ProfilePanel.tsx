@@ -8,6 +8,9 @@ import { Avatar, AvatarFallback } from "@/components/ui/avatar";
 import { Badge } from "@/components/ui/badge";
 import { Text } from "@/components/ui/text";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Switch } from "@/components/ui/switch";
+import { Label } from "@/components/ui/label";
+import { useEnterToSend } from "@/hooks/useEnterToSend";
 
 export function ProfilePanel() {
   const { principal } = useAuth();
@@ -77,7 +80,38 @@ export function ProfilePanel() {
           </ul>
         </CardContent>
       </Card>
+
+      <ComposerPreferences />
     </div>
+  );
+}
+
+/** Personal, per-browser composer preferences (persisted in localStorage). */
+function ComposerPreferences() {
+  const [enterToSend, setEnterToSend] = useEnterToSend();
+  return (
+    <Card>
+      <CardHeader>
+        <CardTitle className="text-sm">Composer</CardTitle>
+      </CardHeader>
+      <CardContent>
+        <div className="flex items-start justify-between gap-4">
+          <div className="space-y-1">
+            <Label htmlFor="enter-to-send">Press Enter to send</Label>
+            <p className="text-sm text-muted-foreground">
+              Send with Enter and use Shift+Enter for a newline (Slack-style). Off by default: Enter
+              inserts a newline and ⌘/Ctrl+Enter sends.
+            </p>
+          </div>
+          <Switch
+            id="enter-to-send"
+            checked={enterToSend}
+            onCheckedChange={setEnterToSend}
+            aria-label="Press Enter to send"
+          />
+        </div>
+      </CardContent>
+    </Card>
   );
 }
 
