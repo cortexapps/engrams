@@ -260,6 +260,27 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
             .with_checkpoint_dir(checkpoint_dir.clone()),
     );
     pooled_b.set_self_ref(&pooled_b);
+
+    // ADR 0099 H5 redrive-with-torn-state: plant crash debris in the
+    // finalize dir alongside the one real record BEFORE generation B
+    // re-drives — a `.json` truncated mid-write (the rename never published
+    // it) and a leftover `.json.partial` (crashed before the rename). The
+    // torn-write-tolerant `EvictionFinalizeRecord::load_all` must skip both
+    // with a warn and still re-drive the real record; a torn file must never
+    // wedge startup. (Crash *during* the write — a kill between fsync and
+    // rename — is out of scope here; ADR 0098 phase 2's SimFs owns byte-level
+    // in-flight injection. These are the only on-disk states a partial
+    // `persist` can leave, and both are constructed directly.)
+    {
+        let real = tokio::fs::read(&record_path).await.unwrap();
+        tokio::fs::write(finalize_dir.join("torn.json"), &real[..real.len() / 2])
+            .await
+            .unwrap();
+        tokio::fs::write(finalize_dir.join("leftover.json.partial"), &real)
+            .await
+            .unwrap();
+    }
+
     pooled_b.resume_pending_finalizes().await;
 
     // ---- 5. The durable CheckpointRecord lands regardless of which

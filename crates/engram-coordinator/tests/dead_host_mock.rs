@@ -7,6 +7,9 @@
 //! transitioned, which don't, and how the affected-list is reported.
 //! Both Postgres and Mock impls must match these assertions.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

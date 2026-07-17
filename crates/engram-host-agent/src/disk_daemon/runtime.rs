@@ -635,6 +635,13 @@ pub async fn reattach_manifest(
     store: Arc<engram_chunk_store::ChunkStore>,
     slot: NbdSlot,
     threshold_bytes: u64,
+    // Shutdown-spool adoption (2026-07-16 RCA): the predecessor
+    // generation's acked-but-un-uploaded chunks, to seed the fresh
+    // backend's dirty tier. MUST be seeded before the RECONFIGURE
+    // below — the kernel releases the guest's parked I/O the moment
+    // it adopts our socket, and a read served before the seed would
+    // observe the rolled-back base instead of the acked bytes.
+    seed_dirty: Option<Vec<(usize, Vec<u8>)>>,
 ) -> Result<NbdSandboxState, (NbdSlot, NbdRuntimeError)> {
     // The kernel strcmp-verifies `NBD_ATTR_BACKEND_IDENTIFIER` against the
     // CONNECT-time value at RECONFIGURE (and REQUIRES one when the device
@@ -669,6 +676,17 @@ pub async fn reattach_manifest(
             Ok(b) => Arc::new(b),
             Err(e) => return Err((slot, e.into())),
         };
+    if let Some(chunks) = seed_dirty {
+        let count = chunks.len();
+        let bytes = backend.adopt_unflushed(chunks).await;
+        tracing::info!(
+            device = %slot.path().display(),
+            chunks = count,
+            bytes,
+            "rehydrate: adopted predecessor's shutdown-spool dirty chunks \
+             ahead of RECONFIGURE",
+        );
+    }
     let handle = match reattach(backend.clone(), slot.path(), &backend_id).await {
         Ok(h) => h,
         Err(e) => return Err((slot, e)),
@@ -699,12 +717,55 @@ async fn attach_backend(
     let backend = Arc::new(backend);
     let slot = slot_pool.acquire().await;
     let handle = spawn(backend.clone(), slot.path(), backend_id).await?;
+    // 2026-07-16 session-85e0298a corruption RCA: `/dev/nbdN` minors are
+    // REUSED across tenants (ADR 0049 pool) and FC reads the device through
+    // the host page cache, which the kernel does NOT reliably invalidate
+    // across disconnect/reconnect. A fresh tenant on a reused slot could be
+    // served the PREVIOUS tenant's cached pages — including pages whose
+    // writeback had failed during that tenant's teardown (observed as a
+    // corrupt-inode-bitmap CRC failure 17 minutes into a fresh session).
+    // The post-copy migration restore already guards this exact class with
+    // BLKFLSBUF; do the same on every fresh CONNECT, before the caller
+    // hands the device to FC. Hard error: serving without the invalidation
+    // risks silent cross-tenant corruption, which is strictly worse than a
+    // failed create.
+    let dev = slot.path().to_path_buf();
+    if let Err(e) = tokio::task::spawn_blocking(move || flush_block_device_cache(&dev))
+        .await
+        .map_err(|e| io::Error::other(format!("BLKFLSBUF task join: {e}")))
+        .and_then(|r| r)
+    {
+        return Err(NbdRuntimeError::Io(io::Error::other(format!(
+            "invalidate page cache (BLKFLSBUF) on freshly connected {}: {e}",
+            slot.path().display()
+        ))));
+    }
     Ok(NbdSandboxState {
         scheduler: None,
         backend,
         handle,
         slot,
     })
+}
+
+/// `BLKFLSBUF`: write back and invalidate the kernel page cache for a
+/// block device. Used on every fresh NBD CONNECT (cross-tenant slot
+/// hygiene, above) and by the post-copy migration restore before it
+/// lands `state.bin` (its stale-probe comment documents the corruption
+/// class).
+pub fn flush_block_device_cache(device: &Path) -> io::Result<()> {
+    // libc::Ioctl is the per-target request type: c_ulong on gnu,
+    // c_int on musl (the prod artifact) — a bare c_ulong breaks
+    // the musl cross-compile.
+    const BLKFLSBUF: libc::Ioctl = 0x1261; // _IO(0x12, 97)
+    let f = std::fs::OpenOptions::new().read(true).open(device)?;
+    // SAFETY: BLKFLSBUF takes no argument; the fd is valid for the
+    // duration of the call.
+    let rc = unsafe { libc::ioctl(f.as_raw_fd(), BLKFLSBUF) };
+    if rc != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 /// Spawn a daemon that serves `backend` as a block device at

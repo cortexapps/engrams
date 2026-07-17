@@ -44,6 +44,7 @@ export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
   "agent_message",
   "tool_call_started",
   "tool_call_completed",
+  "browser_activity",
   "tool_call_requested",
   "tool_result_submitted",
   "run_completed",

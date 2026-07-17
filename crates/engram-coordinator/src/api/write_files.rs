@@ -1,4 +1,4 @@
-//! App-gRPC `SessionService.WriteFiles` core (ADR 0097).
+//! App-gRPC `SessionService.WriteFiles` core (ADR 0100).
 //!
 //! File staging is a control-plane setup primitive: it auto-resumes the
 //! session and routes to the owning host, but deliberately emits no session

@@ -228,6 +228,12 @@ export async function compileSessionCreateInput(
     harness.ENGRAM_APPEND_SYSTEM_PROMPT,
     PAPERCUT_SYSTEM_PROMPT,
   ].filter(Boolean).join("\n\n");
+  // ADR 0097: the browser bundle carries a local image-observation tool. It
+  // is harness-native (not a connector capability) and is enabled only when
+  // the corresponding skill is mounted into this session.
+  const selectedSkills = [...new Set([...profile.skills, ...cliPlan.bundles])];
+  if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
+  else delete harness.ENGRAM_BROWSER_VIEW_ENABLED;
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
   // Per-session integration policy (caps + network + secrets), shipped only
@@ -255,9 +261,6 @@ export async function compileSessionCreateInput(
     });
   }
   const integrationPolicyJson = policyHasContent(policy) ? JSON.stringify(policy) : undefined;
-
-  // Profile skills ∪ the shared integrations-cli bundle (one dyn_* slot).
-  const selectedSkills = [...new Set([...profile.skills, ...cliPlan.bundles])];
 
   return {
     imageUri: image.imageUri,

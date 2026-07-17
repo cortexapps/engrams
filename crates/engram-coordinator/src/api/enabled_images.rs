@@ -219,15 +219,18 @@ pub(crate) async fn materialize_image_on_host(
     // footprint, RAM reservation, or anti-affinity. `pick_materialize_host`
     // is the ADR 0078 disk-floor-only picker; the CAPTURE stage uses the
     // reserving `place_capture_job` path instead.
-    let (host_id, host) =
-        crate::placement::pick_materialize_host(state.services.meta.as_ref(), &state.host_registry)
-            .await
-            .map_err(|e| {
-                ApiError::Unavailable(format!(
-                    "no host is available to materialize this image ({e:?}). \
+    let (host_id, host) = crate::placement::pick_materialize_host(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        state.services.clock.now_utc(),
+    )
+    .await
+    .map_err(|e| {
+        ApiError::Unavailable(format!(
+            "no host is available to materialize this image ({e:?}). \
                      Register a disk-healthy host and retry the enable."
-                ))
-            })?;
+        ))
+    })?;
     // ADR 0088: stamp the durable materialize placement BEFORE the
     // streaming RPC starts, so the host-operator's roll gate can never
     // observe work running on a host it thinks is idle. Fenced by the
@@ -284,10 +287,16 @@ pub(crate) async fn materialize_image_on_host(
 /// materialize + capture stages stamp
 /// `disk_manifest`/`oci_defaults`/`manifest_digest` and the
 /// base-snapshot refs onto it before the ready-time upsert.
-pub(crate) fn new_enable_row(image_uri: &str, config: &ImageConfig) -> EnabledImage {
-    let now = Utc::now();
+/// `id`/`now` are hoisted from the caller's injected entropy/clock
+/// (ADR 0098 D1).
+pub(crate) fn new_enable_row(
+    image_uri: &str,
+    config: &ImageConfig,
+    id: Uuid,
+    now: chrono::DateTime<Utc>,
+) -> EnabledImage {
     EnabledImage {
-        id: Uuid::new_v4(),
+        id,
         image_uri: image_uri.to_string(),
         image_config: config.clone(),
         // Stamped from the MaterializeImage result (the Dockerfile
@@ -885,15 +894,19 @@ pub(crate) async fn ensure_capture_job(
     // time (the claim handler resolves the cold-base candidate fresh per
     // attempt — ADR 0084 §B5 "known gap").
     let footprint = capture_footprint_for(state, disk_manifest_ref, &config).await;
-    let candidates =
-        crate::placement::capture_candidate_hosts(state.services.meta.as_ref(), footprint, None)
-            .await
-            .map_err(|e| {
-                ApiError::Internal(format!(
-                    "capture candidate hosts for `{}`: {e:?}",
-                    row.image_uri
-                ))
-            })?;
+    let candidates = crate::placement::capture_candidate_hosts(
+        state.services.meta.as_ref(),
+        footprint,
+        None,
+        state.services.clock.now_utc(),
+    )
+    .await
+    .map_err(|e| {
+        ApiError::Internal(format!(
+            "capture candidate hosts for `{}`: {e:?}",
+            row.image_uri
+        ))
+    })?;
     let placed = place_capture_job_preferring_materialize_host(
         state.services.meta.as_ref(),
         inserted.id,
@@ -1083,7 +1096,7 @@ pub(crate) async fn finalize_capture_job(
         }
     };
 
-    let now = Utc::now();
+    let now = state.services.clock.now_utc();
     // Record the snapshot row (session_id = NULL — a template artifact,
     // not a session capture). The caller stamps the returned id onto the
     // enabled_images row's NOT NULL base_snapshot_id and upserts it only
@@ -1208,6 +1221,8 @@ pub(crate) async fn resolve_capture_env(
 // ever holding image bytes.
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_chunk_store::{ManifestKind, ManifestRef};

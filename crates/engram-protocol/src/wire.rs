@@ -103,7 +103,7 @@ use serde::{Deserialize, Serialize};
 // serde-default JSON — but the bump makes the deploy posture explicit:
 // a v16 coord never dispatches a peer-hinted restore to a v15 host,
 // whose bincode decode would fail loudly). Lockstep coord+host roll.
-// v17 (ADR 0097): `WriteFiles` coord↔host RPC and its bincode request /
+// v17 (ADR 0100): `WriteFiles` coord↔host RPC and its bincode request /
 // response mirrors. Lockstep coord+host roll.
 pub const WIRE_VERSION: u32 = 17;
 
@@ -145,7 +145,11 @@ pub fn parse_wire_skew_message(msg: &str) -> Option<(u32, u32)> {
 /// Defined here so the gRPC payload bincode roundtrips cleanly via
 /// a stable shape — pinning the wire schema means a future change to
 /// the in-process type doesn't silently change the wire format.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+// `PartialEq`/`Eq`: not on the wire (derives don't touch byte layout, so the
+// `wire_golden` pins are unaffected and no `WIRE_VERSION` bump is needed) —
+// they let the ADR 0099 H3 `codec_roundtrip` suite assert encode→decode
+// identity structurally.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WireExecRequest {
     pub command: Vec<String>,
     pub stdin: Option<Vec<u8>>,
@@ -260,7 +264,7 @@ impl WireWriteFilesResponse {
 /// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.
 /// Defined here so `engram-protocol` doesn't drag a dep on the
 /// host-agent crate.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WireReapStats {
     pub files_scanned: u64,
     pub files_deleted: u64,

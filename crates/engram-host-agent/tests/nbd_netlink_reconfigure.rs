@@ -286,7 +286,7 @@ async fn survivor_reconfigure_resumes_parked_io() {
     // 3. Generation two: claim the SAME device + RECONFIGURE.
     let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
     let slot2 = pool2.claim(&device).await.expect("claim survivor device");
-    let state2 = reattach_manifest(manifest_ref, cache, store, slot2, u64::MAX)
+    let state2 = reattach_manifest(manifest_ref, cache, store, slot2, u64::MAX, None)
         .await
         .expect("netlink RECONFIGURE reattach");
 
@@ -426,7 +426,7 @@ async fn reattach_echoes_kernel_identifier_across_manifest_fork() {
 
     let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
     let slot2 = pool2.claim(&device).await.expect("claim survivor device");
-    let state2 = reattach_manifest(live_ref, cache, store, slot2, u64::MAX)
+    let state2 = reattach_manifest(live_ref, cache, store, slot2, u64::MAX, None)
         .await
         .expect("RECONFIGURE must adopt regardless of the ref's manifest id (pre-fix: EINVAL)");
 

@@ -338,6 +338,14 @@ impl Inner {
             }
         }
     }
+
+    /// Whether `slot` is part of this pool at all — the fast-`None`
+    /// gate for [`NbdSlotAllocator::claim`], so its retry budget is
+    /// only ever spent on transiently-reserved members, never on
+    /// devices outside the universe.
+    fn in_universe(&self, slot: u32) -> bool {
+        self.pos_of.contains_key(&slot)
+    }
 }
 
 /// Pool of `/dev/nbdN` device slots with a warm-pool front. Cheap to
@@ -450,33 +458,60 @@ impl NbdSlotAllocator {
     /// Deliberately skips the free-check: a survivor's device is busy
     /// BY DESIGN.
     ///
-    /// `None` if the device isn't in this pool, or is already reserved
+    /// `None` if the device isn't in this pool, or is durably reserved
     /// by another lease (pulling it out of the warm pool if it happens
     /// to be sitting there pre-validated).
+    ///
+    /// RETRIES across the populator's validation window: `populate`
+    /// holds a slot RESERVED for the duration of its free-check before
+    /// either warming it (free) or un-reserving it (busy — the survivor
+    /// case). A one-shot claim landing inside that window saw
+    /// "reserved" + "not warm" and wrongly concluded the device was
+    /// leased — observed as a flaky survivor rehydrate (CI 2026-07-17:
+    /// `rehydrate_sandbox` returned false 44 ms into a successor's
+    /// startup, i.e. during the pool's very first populate pass; in
+    /// prod the same race intermittently strands a survivor's disk
+    /// until the evict_local → resume ladder). A genuine lease stays
+    /// reserved past the whole retry budget and still returns `None`;
+    /// the validation window is a sysfs read and resolves within the
+    /// first retry or two.
     pub async fn claim(self: &Arc<Self>, path: &Path) -> Option<NbdSlot> {
+        const CLAIM_RETRIES: u32 = 20;
+        const CLAIM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
         let slot = parse_nbd_index(path)?;
-        let mut inner = self.inner.lock().await;
-        if inner.reserve_specific(slot) {
-            return Some(NbdSlot {
-                slot,
-                path: slot_path(slot),
-                allocator: self.clone(),
-                quarantined: false,
-            });
+        if !self.inner.lock().await.in_universe(slot) {
+            return None;
         }
-        // Already reserved — it may be sitting warm (validated free,
-        // not yet handed out). Pull it from the warm pool and hand it
-        // out, keeping the reserved bit set.
-        drop(inner);
-        let mut warm = self.warm.lock().await;
-        let pos = warm.iter().position(|&s| s == slot)?;
-        warm.remove(pos);
-        Some(NbdSlot {
-            slot,
-            path: slot_path(slot),
-            allocator: self.clone(),
-            quarantined: false,
-        })
+        for attempt in 0..CLAIM_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(CLAIM_RETRY_DELAY).await;
+            }
+            {
+                let mut inner = self.inner.lock().await;
+                if inner.reserve_specific(slot) {
+                    return Some(NbdSlot {
+                        slot,
+                        path: slot_path(slot),
+                        allocator: self.clone(),
+                        quarantined: false,
+                    });
+                }
+            }
+            // Already reserved — it may be sitting warm (validated free,
+            // not yet handed out). Pull it from the warm pool and hand it
+            // out, keeping the reserved bit set.
+            let mut warm = self.warm.lock().await;
+            if let Some(pos) = warm.iter().position(|&s| s == slot) {
+                warm.remove(pos);
+                return Some(NbdSlot {
+                    slot,
+                    path: slot_path(slot),
+                    allocator: self.clone(),
+                    quarantined: false,
+                });
+            }
+        }
+        None
     }
 
     /// Try to claim a SPECIFIC device that the caller believes to be
@@ -692,6 +727,42 @@ mod tests {
             "warm pool never reached {want} (got {})",
             pool.warm_count().await
         );
+    }
+
+    /// CI 2026-07-17 flake → real race: `populate` holds a slot
+    /// RESERVED while its free-check runs; a busy (survivor) device is
+    /// reserve→check→unreserve cycled forever, and a one-shot `claim`
+    /// landing inside the check window read "reserved, not warm" as "a
+    /// lease owns it" and returned `None` — a successor's survivor
+    /// rehydrate then strands the disk. With a single-slot pool and a
+    /// deliberately SLOW busy-reporting free-check, the window
+    /// dominates the timeline, so a non-retrying claim loses almost
+    /// surely; the retrying claim must still win.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn claim_wins_against_the_populators_validation_window() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::from([0u32])));
+        let check_busy = busy.clone();
+        let pool = NbdSlotAllocator::build(
+            vec![0],
+            1,
+            Arc::new(move |slot| {
+                // Hold the reserved-for-validation window open ~20 ms
+                // per populate pass (prod: a sysfs read, sub-ms — the
+                // exaggeration makes the pre-fix loss deterministic).
+                std::thread::sleep(Duration::from_millis(20));
+                !check_busy.lock().unwrap().contains(&slot)
+            }),
+        );
+        // Let the populator get INTO a validation pass before claiming.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let claimed = pool.claim(&slot_path(0)).await;
+        assert!(
+            claimed.is_some(),
+            "a claim racing the populator's validation window must retry \
+             through it, not report the survivor's device as leased",
+        );
+        // And a device outside the universe still fast-fails.
+        assert!(pool.claim(&slot_path(7)).await.is_none());
     }
 
     #[tokio::test]

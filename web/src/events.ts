@@ -141,6 +141,13 @@ export type SessionEvent =
       result_summary: string | null;
       at: string;
     }
+  | {
+      type: "browser_activity";
+      run_id: string;
+      tool_call_id: string;
+      intent: string;
+      at: string;
+    }
   // ADR 0089: an orchestrator-registered tool was invoked. `args_json` is
   // deliberately opaque JSON text; tool-specific presenters parse it.
   | {

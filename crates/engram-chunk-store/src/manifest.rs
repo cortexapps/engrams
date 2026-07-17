@@ -372,6 +372,18 @@ impl Manifest {
     /// to `chunk_size`). Returns `None` if no chunk is listed for
     /// that offset — treat as zero-filled.
     pub fn chunk_at(&self, offset: u64) -> Option<&ChunkRef> {
+        // ADR 0099 H6 (site 2): the contract is "offset must be exactly
+        // aligned to chunk_size" — a misaligned query silently returns
+        // None (reads as zero-fill), masking a caller's index arithmetic
+        // bug as a hole in the image. debug_assert-tier: this is on the
+        // hot NBD fault path, so it fires under tests + the simulator and
+        // compiles out in prod. `validate()` guards the manifest's own
+        // entries, not the query offset, so this is not redundant.
+        let sz = self.chunk_size.as_u64();
+        debug_assert!(
+            sz != 0 && offset.is_multiple_of(sz),
+            "chunk_at({offset}) is not aligned to chunk_size {sz}",
+        );
         // Linear scan is fine for typical manifest sizes (<10k
         // entries). Switch to a binary search if profiling shows
         // it matters.

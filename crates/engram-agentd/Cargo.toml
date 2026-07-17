@@ -54,3 +54,5 @@ async-trait.workspace = true
 # virtual time skips every backoff sleep instantly instead of the test
 # actually waiting out ~8 doublings of a 1s-capped backoff.
 tokio = { workspace = true, features = ["test-util"] }
+# ADR 0099 H4: decode-never-panics property suites (tests/decode_never_panics.rs).
+proptest.workspace = true

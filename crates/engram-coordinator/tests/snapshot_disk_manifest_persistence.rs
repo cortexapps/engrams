@@ -12,6 +12,9 @@
 //!     cargo test -p engram-coordinator --test snapshot_disk_manifest_persistence -- --ignored
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -24,22 +27,10 @@ use uuid::Uuid;
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn snapshot_disk_manifest_round_trips_through_pg() {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return;
-        }
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
     };
-
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    let meta: Arc<dyn MetadataStore> = Arc::new(store);
+    let meta: Arc<dyn MetadataStore> = Arc::new(db.store);
 
     // Need a parent session row (FK on snapshots.session_id).
     let session_id = meta
