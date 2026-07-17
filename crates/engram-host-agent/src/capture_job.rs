@@ -974,6 +974,79 @@ mod tests {
         assert_eq!(reloaded[0].stage, CaptureJobStage::Failed);
     }
 
+    /// ADR 0099 H5 redrive-with-torn-state: a torn `.json` and a leftover
+    /// `.json.partial` sitting in the records dir at restart must NOT wedge
+    /// rehydrate — the torn files are skipped (with a warn) by the
+    /// torn-write-tolerant `load_all`, and the one valid non-terminal record
+    /// is still re-driven (survivor destroyed, record rewound terminal).
+    #[tokio::test]
+    async fn rehydrate_tolerates_torn_records_and_still_drives_the_valid_one() {
+        let backend = Arc::new(MockBackend {
+            create_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            last_destroyed: Mutex::new(None),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("capture-jobs");
+
+        // The one valid record — a non-terminal survivor to be re-driven.
+        let job_id = CaptureJobId::new();
+        let sandbox_id = SandboxId::new();
+        CaptureJobRecord {
+            job_id,
+            epoch: 3,
+            stage: CaptureJobStage::Warming,
+            sandbox_id: Some(sandbox_id),
+            terminal: None,
+        }
+        .persist(&dir)
+        .await
+        .unwrap();
+
+        // A torn `.json` (a valid record's bytes truncated mid-write — the
+        // rename would never have published this) beside a leftover
+        // `.json.partial` (crashed before the rename). Both must be ignored.
+        let good = CaptureJobRecord {
+            job_id: CaptureJobId::new(),
+            epoch: 1,
+            stage: CaptureJobStage::Warming,
+            sandbox_id: Some(SandboxId::new()),
+            terminal: None,
+        };
+        let full = serde_json::to_vec_pretty(&good).unwrap();
+        tokio::fs::write(dir.join("torn.json"), &full[..full.len() / 2])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("leftover.json.partial"), &full)
+            .await
+            .unwrap();
+
+        let executor = CaptureJobExecutor::new(backend.clone(), dir.clone(), None);
+        executor.rehydrate().await;
+
+        // The torn files never wedged startup: the valid survivor was
+        // destroyed and its record rewound to a retryable Failed terminal.
+        assert_eq!(
+            *backend.last_destroyed.lock().unwrap(),
+            Some(sandbox_id),
+            "rehydrate must still destroy the one valid survivor VM",
+        );
+        let reports = executor.current_reports();
+        assert_eq!(
+            reports.len(),
+            1,
+            "only the valid record yields a report; the torn files are skipped",
+        );
+        let reloaded = CaptureJobRecord::load_all(&dir).await;
+        assert_eq!(
+            reloaded.len(),
+            1,
+            "torn files stay unparseable; not resurrected"
+        );
+        assert_eq!(reloaded[0].job_id, job_id);
+        assert_eq!(reloaded[0].stage, CaptureJobStage::Failed);
+    }
+
     /// `ack` must drop both the in-memory report and the durable file.
     #[tokio::test]
     async fn ack_clears_report_and_durable_record() {

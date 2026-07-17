@@ -149,9 +149,12 @@ export function SessionDetail() {
 
   const openPane = (tab?: PaneTabId) => {
     if (tab) setPaneTab(tab);
-    if (isMobile) {
-      setPaneOpen(true);
-    } else {
+    // Set the logical state as well as resizing the desktop panel. On the
+    // first render useIsMobile has not settled yet; keeping this true means a
+    // browser-activity signal cannot be consumed by the temporary desktop
+    // branch and then disappear when the mobile sheet mounts.
+    setPaneOpen(true);
+    if (!isMobile) {
       // resize() un-collapses to an explicit width — reliable even on a fresh
       // load that started collapsed (expand() would only restore a remembered
       // size, which doesn't exist yet).
@@ -161,9 +164,8 @@ export function SessionDetail() {
 
   const collapsePane = () => {
     setExpanded(false);
-    if (isMobile) {
-      setPaneOpen(false);
-    } else {
+    setPaneOpen(false);
+    if (!isMobile) {
       paneRef.current?.collapse();
     }
   };
@@ -173,19 +175,14 @@ export function SessionDetail() {
     else transcriptRef.current?.collapse();
   };
 
-  // ADR 0065: when the AGENT boots the shared browser, surface it. The agent
-  // runs `playwright-cli` (whose wrapper brings the stack up via
-  // `engram-browser --ensure`), so the first such exec is our signal to open the
-  // pane on the BROWSER tab — the human then watches the agent drive the same
-  // Chrome live. Fires once (ref guard) and only when the browser capability is
-  // present; we don't reopen if the human subsequently collapses the pane.
+  // ADR 0097: the shared harness enriches a browser-driving Shell/Bash call
+  // into browser_activity with the same tool id. Surface the shared Chrome on
+  // the first such event, then respect a human collapse for the rest of this
+  // page lifetime.
   const autoOpenedBrowserRef = useRef(false);
   useEffect(() => {
     if (!browserEnabled || autoOpenedBrowserRef.current) return;
-    const agentBootedBrowser = events.some(
-      (ie) =>
-        ie.event.type === "exec_started" && ie.event.command.join(" ").includes("playwright-cli"),
-    );
+    const agentBootedBrowser = events.some((ie) => ie.event.type === "browser_activity");
     if (agentBootedBrowser) {
       autoOpenedBrowserRef.current = true;
       openPane("browser");

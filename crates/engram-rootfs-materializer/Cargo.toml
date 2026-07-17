@@ -35,6 +35,7 @@ bytes.workspace = true
 engram-storage-local.workspace = true
 http.workspace = true
 parking_lot.workspace = true
+proptest.workspace = true
 sha2.workspace = true
 tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net"] }

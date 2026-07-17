@@ -16,6 +16,9 @@
 //! pattern observed today where coord restarts leave Active sessions
 //! pointing at sandbox_ids that no longer exist anywhere.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 

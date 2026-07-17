@@ -40,10 +40,11 @@ pub(crate) async fn send_prompt_core(
     // (this is what dedupes the double-render). Mint one if a non-web
     // caller left it empty, so the wire is always uniform.
     let prompt_id = if prompt_id.is_empty() {
-        uuid::Uuid::new_v4().to_string()
+        state.services.entropy.uuid().to_string()
     } else {
         prompt_id
     };
+    let now = state.services.clock.now_utc();
 
     // Issue #527 Phase 1: the durable "the user asked at time T" receipt —
     // the FIRST PG write of this function, before the auto-resume below.
@@ -75,7 +76,7 @@ pub(crate) async fn send_prompt_core(
             id,
             SessionEvent::PromptReceived {
                 prompt_id: prompt_id.clone(),
-                at: chrono::Utc::now(),
+                at: now,
             },
         )
         .await
@@ -119,14 +120,14 @@ pub(crate) async fn send_prompt_core(
             id,
             SessionEvent::HarnessAgentMessage {
                 run_id: String::new(),
-                message_id: format!("user-{}", uuid::Uuid::new_v4()),
+                message_id: format!("user-{}", state.services.entropy.uuid()),
                 role: AgentRole::User,
                 text: prompt_text.clone(),
                 // Phase 1b: tag the user-echo with the client prompt_id so
                 // the web dedupes its optimistic bubble against this event
                 // (the double-render fix) instead of rendering both.
                 prompt_id: Some(prompt_id.clone()),
-                at: chrono::Utc::now(),
+                at: now,
             },
         )
         .await
@@ -142,9 +143,9 @@ pub(crate) async fn send_prompt_core(
         session_id: id,
         kind: engram_core::types::outbox::OutboxKind::Prompt,
         payload: serde_json::json!({ "text": prompt_text }),
-        created_at: chrono::Utc::now(),
+        created_at: now,
         attempts: 0,
-        not_before: chrono::Utc::now(),
+        not_before: now,
         delivered_at: None,
         acked_at: None,
     };
@@ -182,6 +183,7 @@ pub(crate) async fn complete_tool_call_core(
         )));
     }
 
+    let now = state.services.clock.now_utc();
     let row = engram_core::types::outbox::OutboxRow {
         prompt_id: engram_core::types::outbox::tool_result_outbox_id(id, &tool_call_id),
         session_id: id,
@@ -190,9 +192,9 @@ pub(crate) async fn complete_tool_call_core(
             "tool_call_id": tool_call_id.clone(),
             "result_json": result_json.clone(),
         }),
-        created_at: chrono::Utc::now(),
+        created_at: now,
         attempts: 0,
-        not_before: chrono::Utc::now(),
+        not_before: now,
         delivered_at: None,
         acked_at: None,
     };
@@ -202,7 +204,7 @@ pub(crate) async fn complete_tool_call_core(
             SessionEvent::ToolResultSubmitted {
                 tool_call_id,
                 result_json,
-                at: chrono::Utc::now(),
+                at: now,
             },
             &row,
         )
@@ -292,6 +294,8 @@ pub(crate) async fn dequeue_queued_prompt_core(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     //! ADR 0073: the pre-outbox `deliver_with_reattach` unit tests are
     //! retired WITH the helper — that coverage lives in the outbox

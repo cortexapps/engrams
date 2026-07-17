@@ -145,6 +145,15 @@ pub enum SessionEvent {
         result_summary: Option<String>,
         at: DateTime<Utc>,
     },
+    /// A native shell tool is driving the shared browser. Correlates to the
+    /// generic tool start/completion via `tool_call_id`; web clients replace
+    /// the raw shell card with a browser presenter.
+    HarnessBrowserActivity {
+        run_id: String,
+        tool_call_id: String,
+        intent: String,
+        at: DateTime<Utc>,
+    },
     /// ADR 0089: an orchestrator-registered tool was invoked. The
     /// coordinator preserves the JSON arguments verbatim and never parses
     /// their tool-specific shape.
@@ -388,6 +397,7 @@ impl SessionEvent {
             Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
+            Self::HarnessBrowserActivity { .. } => "browser_activity",
             Self::HarnessToolCallRequested { .. } => "tool_call_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
@@ -462,6 +472,16 @@ impl SessionEvent {
                 ok,
                 duration_ms,
                 result_summary,
+                at,
+            },
+            HarnessEvent::BrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+            } => Self::HarnessBrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
                 at,
             },
             HarnessEvent::ToolCallRequested {
@@ -796,18 +816,25 @@ impl AppState {
         let bindings = engram_host_agent::bindings::BindingStore::open(bindings_dir)
             .expect("open coordinator binding store");
         let harness_hub = Arc::new(HarnessHub::new(
-            harness_event_sink(events.clone(), services.meta.clone()),
+            harness_event_sink(
+                events.clone(),
+                services.meta.clone(),
+                services.clock.clone(),
+            ),
             bindings,
         ));
         let reconciler =
             crate::reconcile::Reconciler::new(crate::reconcile::grace_ticks_from_env());
+        let boot_bundles = Arc::new(crate::boot_bundle::BootBundleCache::new(
+            services.clock.clone(),
+        ));
         Self {
             cfg,
             services,
             events,
             host_registry,
             harness_hub,
-            boot_bundles: Arc::new(crate::boot_bundle::BootBundleCache::new()),
+            boot_bundles,
             // ADR 0073: local fast-path wake for the outbox delivery
             // driver (the PG NOTIFY covers cross-pod).
             outbox_wake: Arc::new(tokio::sync::Notify::new()),
@@ -1045,7 +1072,8 @@ pub type SharedState = Arc<AppState>;
 /// `at` is the host's wall-clock at observation time, captured at
 /// the source and round-tripped through the WS. We forward it for
 /// future use (per-event timestamps on the persisted row); today the
-/// sink's `SessionEvent::from_harness` stamps its own `Utc::now()`
+/// sink's `SessionEvent::from_harness` stamps its own coordinator
+/// clock read (ADR 0098 D1: the injected `Clock`, not `Utc::now()`)
 /// because the persisted event row already has a `created_at`.
 pub async fn emit_harness_event(
     state: &SharedState,
@@ -1069,6 +1097,7 @@ pub async fn emit_harness_event(
 fn harness_event_sink(
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
+    clock: Arc<dyn engram_core::traits::Clock>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
     // to drop a `harness_idle` or `harness_parked` that would land
@@ -1079,6 +1108,7 @@ fn harness_event_sink(
     Arc::new(move |session_id, _sandbox_id, ev| {
         let events = events.clone();
         let meta = meta.clone();
+        let clock = clock.clone();
         let last_kind = last_kind.clone();
         Box::new(Box::pin(async move {
             // Forward every harness event into session_events for live
@@ -1086,7 +1116,7 @@ fn harness_event_sink(
             // auto-checkpoint branch this used to trigger on Idle /
             // RunCompleted; durability moved to hot+cold snapshots,
             // not git checkpoints.
-            let session_event = SessionEvent::from_harness(ev, Utc::now());
+            let session_event = SessionEvent::from_harness(ev, clock.now_utc());
             let kind = session_event.kind();
 
             // Issue #527 Phase 1: a run-started with a client prompt_id is
@@ -1349,6 +1379,8 @@ fn strip_jsonb_nul(v: &mut serde_json::Value) -> bool {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod tests {
     use super::*;
 
@@ -1568,6 +1600,30 @@ pub(crate) mod tests {
             outbox_ack_id(session_id, &ev).as_deref(),
             Some(expected.as_str())
         );
+    }
+
+    #[test]
+    fn browser_activity_maps_from_harness_with_correlation() {
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::BrowserActivity {
+                run_id: "r1".into(),
+                tool_call_id: "tool-browser".into(),
+                intent: "Clicking Sign in".into(),
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(ev.kind(), "browser_activity");
+        assert!(matches!(
+            ev,
+            SessionEvent::HarnessBrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+                ..
+            } if run_id == "r1"
+                && tool_call_id == "tool-browser"
+                && intent == "Clicking Sign in"
+        ));
     }
 
     #[test]
@@ -1936,6 +1992,8 @@ pub(crate) mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),
@@ -2777,7 +2835,11 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus.clone(), meta.clone());
+        let sink = super::harness_event_sink(
+            bus.clone(),
+            meta.clone(),
+            Arc::new(engram_core::traits::SystemClock::new()),
+        );
 
         // Three back-to-back idles: only the first should land.
         for _ in 0..3 {
@@ -2876,7 +2938,8 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus, meta);
+        let sink =
+            super::harness_event_sink(bus, meta, Arc::new(engram_core::traits::SystemClock::new()));
 
         sink(
             session_id,
@@ -2950,7 +3013,11 @@ pub(crate) mod tests {
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
         let events = Arc::new(SessionEventBus::new(8));
-        let sink = harness_event_sink(events, meta);
+        let sink = harness_event_sink(
+            events,
+            meta,
+            Arc::new(engram_core::traits::SystemClock::new()),
+        );
         let sandbox_id = engram_core::SandboxId::new();
 
         // A run_started carrying the outbox row's prompt_id retires that row.

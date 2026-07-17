@@ -210,7 +210,7 @@ pub(crate) async fn seal_session_secrets(
         nonce: sealed.nonce.to_vec(),
         ciphertext: sealed.ciphertext,
         key_id: sealed.key_id,
-        created_at: chrono::Utc::now(),
+        created_at: state.services.clock.now_utc(),
     })
 }
 
@@ -683,13 +683,18 @@ pub(crate) async fn create_session_core(
     req: CreateSessionRequest,
     _owner: Option<String>,
 ) -> Result<CreateSessionResponse, ApiError> {
-    let start = std::time::Instant::now();
+    let start = state.services.clock.now_mono();
     let prepared = match prepare_from_grpc(state, identity_env, &req).await {
         Ok(p) => p,
         Err(e) => {
             let result = Err(e);
             record_create_metrics(
-                start.elapsed().as_secs_f64(),
+                state
+                    .services
+                    .clock
+                    .now_mono()
+                    .saturating_sub(start)
+                    .as_secs_f64(),
                 create_outcome(&result),
                 "unknown",
             );
@@ -701,7 +706,16 @@ pub(crate) async fn create_session_core(
         Ok(body) => body.kind,
         Err(_) => "unknown",
     };
-    record_create_metrics(start.elapsed().as_secs_f64(), create_outcome(&result), kind);
+    record_create_metrics(
+        state
+            .services
+            .clock
+            .now_mono()
+            .saturating_sub(start)
+            .as_secs_f64(),
+        create_outcome(&result),
+        kind,
+    );
     result
 }
 
@@ -722,11 +736,12 @@ pub(crate) async fn create_session_core(
 async fn boot_prepared(
     state: &SharedState,
     prepared: crate::session_boot::PreparedBoot,
-    // Issue #535 (observability): `create_session_core`'s entry instant, so
-    // the `coord_prepare` phase covers everything from the RPC landing
-    // through the write-set commit — the coordinator-owned serial prefix
-    // ahead of the (now-concurrent, host-side) restore work.
-    create_start: std::time::Instant,
+    // Issue #535 (observability): `create_session_core`'s entry mark (a
+    // `Clock::now_mono` duration, ADR 0098 D1), so the `coord_prepare`
+    // phase covers everything from the RPC landing through the write-set
+    // commit — the coordinator-owned serial prefix ahead of the
+    // (now-concurrent, host-side) restore work.
+    create_start: std::time::Duration,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         inputs,
@@ -793,16 +808,26 @@ async fn boot_prepared(
         // current stamp — nothing pinned yet to prefer.
         prefer_bundles: &[],
     };
-    let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
-        .await
-        .map_err(engram_core::SandboxError::from)?;
+    let candidates = crate::placement::candidates_for(
+        state.services.meta.as_ref(),
+        &ctx,
+        state.services.clock.now_utc(),
+    )
+    .await
+    .map_err(engram_core::SandboxError::from)?;
     // ADR 0068 (core-ops-batch correction pass): this path used to fall
     // silently into the `Queued` disposition below with zero visibility
     // into why every host was excluded — the same "no capacity with free
     // hosts" mystery mode `pick_for_session` already fixed on the
     // resume/evac path. Mirror it here.
     if candidates.hosts.is_empty() {
-        crate::placement::log_empty_candidates(state.services.meta.as_ref(), &ctx, "create").await;
+        crate::placement::log_empty_candidates(
+            state.services.meta.as_ref(),
+            &ctx,
+            "create",
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
 
     // -------- Seal secrets + serialize the policy BEFORE the transaction --------
@@ -890,7 +915,7 @@ async fn boot_prepared(
                     SessionEvent::StatusChanged {
                         from: SessionState::Pending,
                         to: SessionState::Queued,
-                        at: chrono::Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await
@@ -909,6 +934,7 @@ async fn boot_prepared(
                 &candidates.hosts,
                 memory_mib as i64,
                 cpu_budget_vcpus as i32,
+                state.services.clock.now_utc(),
             )
             .await;
             return Ok(CreateSessionResponse {
@@ -943,8 +969,14 @@ async fn boot_prepared(
     // Issue #535 (observability): `coord_prepare` ends HERE — everything
     // from `create_session_core` entry through the write-set commit, right
     // before the restore RPC dispatches inside the spawned task.
-    metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_prepare")
-        .record(create_start.elapsed().as_secs_f64());
+    metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_prepare").record(
+        state
+            .services
+            .clock
+            .now_mono()
+            .saturating_sub(create_start)
+            .as_secs_f64(),
+    );
     // ADR 0019 / telemetry restoration (#526): `tokio::spawn` severs the
     // tracing context — a span created inside this future would otherwise
     // become a new orphaned trace root instead of a child of
@@ -1655,7 +1687,7 @@ pub(crate) async fn delete_session_core(
         EnqueueOutcome::Duplicate => None,
     };
 
-    let deadline = std::time::Instant::now() + DESTROY_OBSERVE_TIMEOUT;
+    let deadline = state.services.clock.now_mono() + DESTROY_OBSERVE_TIMEOUT;
     loop {
         // The terminal flip is the user-visible outcome; it lands before
         // the (best-effort, can-take-seconds) sandbox destroy finishes.
@@ -1685,7 +1717,7 @@ pub(crate) async fn delete_session_core(
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if state.services.clock.now_mono() >= deadline {
             return Err(ApiError::Conflict(
                 "session teardown in flight (destroy op enqueued behind an in-flight \
                  op); retry shortly"
@@ -1735,8 +1767,8 @@ pub(crate) async fn get_or_mint_broker_token(
     // winner's token so every replica injects the SAME value.
     let minted = format!(
         "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
+        state.services.entropy.uuid().simple(),
+        state.services.entropy.uuid().simple()
     );
     let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
     let sealed = match cipher.seal(minted.as_bytes()).await {

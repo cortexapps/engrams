@@ -1335,6 +1335,58 @@ pub trait MetadataStore: Send + Sync {
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
 
+    /// Current status of a single host row, `None` when no row exists.
+    /// The dead-host detector re-checks this after winning the eviction
+    /// lease — another replica may have flipped the host Dead in the
+    /// window since `list_stale_hosts`. Default (mock): no row.
+    async fn host_status(&self, host_id: HostId) -> Result<Option<HostStatus>, MetaError> {
+        let _ = host_id;
+        Ok(None)
+    }
+
+    /// ADR 0098 D4: cross-replica one-at-a-time guard for dead-host
+    /// eviction — a PG leasing row (`INSERT … ON CONFLICT`), replacing
+    /// the detector's session-scoped `pg_try_advisory_lock` (the repo
+    /// convention: leasing row over advisory lock). Returns `true` when
+    /// this claimant now holds the lease: either the row was free, or
+    /// the incumbent's `claimed_at` is older than `stale_after` (crash
+    /// takeover — a pod that died mid-eviction never unlocks anything).
+    /// Default (mock): always acquired — single-replica tests have no
+    /// contention.
+    async fn try_acquire_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+        stale_after: std::time::Duration,
+    ) -> Result<bool, MetaError> {
+        let _ = (host_id, claimant, stale_after);
+        Ok(true)
+    }
+
+    /// Release the dead-host eviction lease. Guarded on `claimant` so a
+    /// stale holder that was taken over cannot delete the new holder's
+    /// row. Idempotent — releasing a lease you no longer hold is a
+    /// no-op, not an error. Default (mock): no-op.
+    async fn release_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (host_id, claimant);
+        Ok(())
+    }
+
+    /// Broadcast "this host is dead" to every coordinator replica so
+    /// they drop their in-memory `HostRegistry` entry. Postgres:
+    /// `pg_notify('host_dead', host_id)`. Sim: recorded for the
+    /// scheduler to deliver (or drop) explicitly. Default (mock): no-op
+    /// — correctness must never depend on the notify arriving; the
+    /// reconcile pass repairs registries on its own cadence.
+    async fn notify_host_dead(&self, host_id: HostId) -> Result<(), MetaError> {
+        let _ = host_id;
+        Ok(())
+    }
+
     // ---- snapshots ----
     /// ADR 0077 phase 3: persist a session's RuntimeSpec (upsert). Written
     /// in the create transaction (`reserve_and_persist_create`) and

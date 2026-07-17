@@ -2735,7 +2735,7 @@ impl PooledBackend {
                     // /dev/nbdN through that cache; a stale superblock
                     // served to the resumed guest is the corruption
                     // class this line exists for.
-                    if let Err(e) = Self::flush_block_device_cache(device) {
+                    if let Err(e) = crate::disk_daemon::flush_block_device_cache(device) {
                         tracing::error!(error = %e, device = %device.display(),
                             "BLKFLSBUF failed; NOT landing state.bin (stale-probe risk)");
                         return;
@@ -2801,25 +2801,6 @@ impl PooledBackend {
         tokio::time::timeout(std::time::Duration::from_secs(600), wait)
             .await
             .map_err(|_| "disk drain timed out (600s)".to_string())?
-    }
-
-    /// `BLKFLSBUF`: invalidate the kernel page cache for a block
-    /// device. See the poller's stale-probe comment.
-    #[cfg(target_os = "linux")]
-    fn flush_block_device_cache(device: &std::path::Path) -> std::io::Result<()> {
-        use std::os::unix::io::AsRawFd;
-        // libc::Ioctl is the per-target request type: c_ulong on gnu,
-        // c_int on musl (the prod artifact) — a bare c_ulong breaks
-        // the musl cross-compile.
-        const BLKFLSBUF: libc::Ioctl = 0x1261; // _IO(0x12, 97)
-        let f = std::fs::OpenOptions::new().read(true).open(device)?;
-        // SAFETY: BLKFLSBUF takes no argument; the fd is valid for the
-        // duration of the call.
-        let rc = unsafe { libc::ioctl(f.as_raw_fd(), BLKFLSBUF) };
-        if rc != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
     }
 
     /// Dial a migration source's gRPC endpoint.
@@ -3588,10 +3569,20 @@ impl PooledBackend {
     /// to GCS; only the coord publish is skipped.
     #[cfg(target_os = "linux")]
     pub async fn flush_nbd_data_planes_for_shutdown(&self, deadline: std::time::Duration) {
-        let entries: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
+        let entries: Vec<(
+            SandboxId,
+            Arc<crate::disk_daemon::ChunkedDiskBackend>,
+            std::path::PathBuf,
+        )> = self
             .nbd_sandboxes
             .iter()
-            .map(|e| (*e.key(), e.value().backend.clone()))
+            .map(|e| {
+                (
+                    *e.key(),
+                    e.value().backend.clone(),
+                    e.value().device_path().to_path_buf(),
+                )
+            })
             .collect();
         if entries.is_empty() {
             return;
@@ -3612,10 +3603,46 @@ impl PooledBackend {
         let session_bindings = self.session_bindings.clone();
         let flush_all = async move {
             let mut tasks = Vec::with_capacity(entries.len());
-            for (sandbox_id, backend) in entries {
+            for (sandbox_id, backend, device) in entries {
                 let publish = publish.clone();
                 let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
                 tasks.push(tokio::spawn(async move {
+                    // 2026-07-16 RCA: FC's drive is buffered host I/O with
+                    // cache_type=Unsafe, so guest-acked writes can still be
+                    // sitting in the HOST page cache for /dev/nbdN — a tier
+                    // the dirty-map flush below never sees, and one the
+                    // pod-handoff dead-connection window can silently drop
+                    // (`lost async page write`). Force it down into the
+                    // daemon's dirty tier NOW, while our serve loop is
+                    // still alive to ack the writeback; the checkpoint
+                    // path does the same for the same reason.
+                    {
+                        let dev = device.clone();
+                        let synced = tokio::task::spawn_blocking(move || -> std::io::Result<()> {
+                            let f = std::fs::OpenOptions::new()
+                                .read(true)
+                                .write(true)
+                                .open(&dev)?;
+                            f.sync_all()
+                        })
+                        .await;
+                        match synced {
+                            Ok(Ok(())) => {}
+                            Ok(Err(e)) => tracing::warn!(
+                                %sandbox_id,
+                                device = %device.display(),
+                                error = %e,
+                                "SIGTERM final flush: host page-cache sync of the NBD \
+                                 device failed; proceeding (pages left behind will ride \
+                                 the kernel's dead-conn parking to the successor)",
+                            ),
+                            Err(e) => tracing::warn!(
+                                %sandbox_id,
+                                error = %e,
+                                "SIGTERM final flush: host page-cache sync task died",
+                            ),
+                        }
+                    }
                     // Quiesce the virtio → kernel-NBD → daemon pipeline so
                     // the flush captures the just-acked disk state, then
                     // drain + upload + rebase. `flush` no-ops (zero chunks)
@@ -3628,8 +3655,8 @@ impl PooledBackend {
                             tracing::warn!(
                                 %sandbox_id,
                                 error = %e,
-                                "SIGTERM final flush failed; survivor abandoned dirty \
-                                 (successor may roll back its un-flushed writes)",
+                                "SIGTERM final flush failed; survivor's un-uploaded \
+                                 writes ride the shutdown spool to the successor",
                             );
                             return;
                         }
@@ -3677,7 +3704,8 @@ impl PooledBackend {
                             %session_id,
                             error = %e,
                             "SIGTERM final flush: chunks uploaded to GCS but coord \
-                             publish failed; successor may rehydrate from the stale ref",
+                             publish failed; the shutdown spool's store-ahead ref \
+                             covers a same-node successor",
                         ),
                     }
                 }));
@@ -3688,10 +3716,12 @@ impl PooledBackend {
         };
 
         if tokio::time::timeout(deadline, flush_all).await.is_err() {
-            // Deadline overrun: some survivors were not flushed in time.
-            // Log each still-dirty sandbox LOUDLY with its byte count so
-            // the (bounded) loss is visible; the abandon sweep that runs
-            // next discards them dirty, exactly as before this fix.
+            // Deadline overrun: some survivors were not GCS-flushed in
+            // time. This is no longer a data-loss event: the abandon
+            // sweep that runs next exports every still-dirty tier to the
+            // node-local shutdown spool (2026-07-16 RCA), and the
+            // successor adopts it. Log the stragglers so the GCS-side
+            // durability gap on this node stays visible.
             // INVARIANT (see `nbd_sandboxes`): snapshot id+backend Arcs out
             // of the map, then `.await` on the owned Arcs — never hold a
             // DashMap guard across the `dirty_bytes` await.
@@ -3703,13 +3733,13 @@ impl PooledBackend {
             for (sandbox_id, backend) in stragglers {
                 let dirty = backend.dirty_bytes().await;
                 if dirty > 0 {
-                    tracing::error!(
+                    tracing::warn!(
                         %sandbox_id,
                         dirty_bytes = dirty,
                         deadline_secs = deadline.as_secs_f64(),
-                        "SIGTERM final flush DEADLINE OVERRUN: survivor abandoned with \
-                         un-flushed dirty bytes; the successor will roll back these \
-                         acked guest writes",
+                        "SIGTERM final flush DEADLINE OVERRUN: survivor still has \
+                         un-uploaded dirty bytes; they will be preserved in the \
+                         shutdown spool for the successor to adopt",
                     );
                 }
             }
@@ -3739,7 +3769,7 @@ impl PooledBackend {
     /// that lands after both saw the flag set during its own check
     /// and abandoned instead).
     #[cfg(target_os = "linux")]
-    pub fn abandon_nbd_data_planes_for_shutdown(&self) -> usize {
+    pub async fn abandon_nbd_data_planes_for_shutdown(&self) -> usize {
         // Raise the terminal flag FIRST — ordering is the correctness
         // gate. Every insert site loads it with SeqCst right before
         // its `insert`; a store-then-drain here guarantees an insert
@@ -3748,21 +3778,90 @@ impl PooledBackend {
         // one of the two drains below.
         self.abandoning
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let drain = |abandoned: &mut usize| {
+        // Keep a backend Arc per abandoned sandbox: after the serve
+        // loop dies the dirty tier is FROZEN (later guest writes park
+        // in the kernel's dead-conn window for the successor to
+        // replay), which makes post-abandon the one race-free moment
+        // to export un-uploaded chunks to the shutdown spool
+        // (2026-07-16 session-85e0298a RCA — pre-spool, these acked
+        // writes died with the process and the successor rolled the
+        // live guest's disk back under it).
+        let mut frozen: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = Vec::new();
+        let drain = |frozen: &mut Vec<_>| {
             let ids: Vec<_> = self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
             for id in ids {
                 if let Some((_, state)) = self.nbd_sandboxes.remove(&id) {
+                    let backend = state.backend.clone();
                     state.abandon_for_shutdown();
-                    *abandoned += 1;
+                    frozen.push((id, backend));
                 }
             }
         };
-        let mut abandoned = 0;
-        drain(&mut abandoned);
+        drain(&mut frozen);
         // Belt-and-braces second pass: catches a state inserted
         // between the flag store and the first drain's snapshot.
-        drain(&mut abandoned);
+        drain(&mut frozen);
+        let abandoned = frozen.len();
+
+        let Some(spool_root) = self.shutdown_spool_root() else {
+            for (sandbox_id, backend) in &frozen {
+                let dirty = backend.dirty_bytes().await;
+                if dirty > 0 {
+                    tracing::error!(
+                        %sandbox_id,
+                        dirty_bytes = dirty,
+                        "shutdown abandon: un-uploaded dirty bytes and NO spool root \
+                         (checkpoint_dir unset); the successor will roll back these \
+                         acked guest writes",
+                    );
+                }
+            }
+            return abandoned;
+        };
+        for (sandbox_id, backend) in frozen {
+            let (manifest_ref, chunks) = backend.export_unflushed().await;
+            // Written even when `chunks` is empty: a zero-chunk spool still
+            // carries the manifest ref, which covers the flush-succeeded-but-
+            // coord-publish-failed shutdown — the chunks and manifest are
+            // durable in the blob store under a version coord never heard
+            // about, and the successor must attach from THAT ref (the spool's
+            // store-ahead rule), not roll back to coord's stale one.
+            match crate::disk_daemon::spool::write_spool(
+                &spool_root,
+                sandbox_id,
+                manifest_ref,
+                &chunks,
+            )
+            .await
+            {
+                Ok(bytes) => tracing::info!(
+                    %sandbox_id,
+                    chunks = chunks.len(),
+                    bytes,
+                    manifest = %manifest_ref,
+                    "shutdown abandon: un-uploaded dirty chunks preserved in the \
+                     local spool for the successor to adopt",
+                ),
+                Err(e) => tracing::error!(
+                    %sandbox_id,
+                    chunks = chunks.len(),
+                    error = %e,
+                    "shutdown abandon: SPOOL WRITE FAILED; the successor will roll \
+                     back these acked guest writes",
+                ),
+            }
+        }
         abandoned
+    }
+
+    /// Node-local root for the shutdown spool (un-uploaded dirty
+    /// chunks handed from a dying host-agent generation to its
+    /// successor). Lives under `checkpoint_dir` — the same hostPath
+    /// volume the checkpoint chain records already rely on surviving
+    /// pod rolls. `None` ⟺ checkpointing is disabled (dev/tests).
+    #[cfg(target_os = "linux")]
+    fn shutdown_spool_root(&self) -> Option<std::path::PathBuf> {
+        self.checkpoint_dir.as_ref().map(|d| d.join("spool"))
     }
 
     /// Issue #224: whether the terminal shutdown-abandon mode is
@@ -7589,6 +7688,12 @@ impl SandboxBackend for PooledBackend {
         #[cfg(target_os = "linux")]
         {
             let _ = self.nbd_sandboxes.remove(&id);
+            // A destroyed sandbox's shutdown spool must not outlive it
+            // (the sandbox_id will never rehydrate again; a leftover
+            // spool is dead weight on the hostPath volume).
+            if let Some(root) = self.shutdown_spool_root() {
+                let _ = crate::disk_daemon::spool::discard_spool(&root, id).await;
+            }
         }
         // ADR 0016 Phase A: drop the COW diagnostic timestamp so
         // the entry doesn't outlive its sandbox. A subsequent
@@ -8627,13 +8732,62 @@ impl PooledBackend {
             return Ok(false);
         };
 
+        // Shutdown-spool peek (2026-07-16 RCA): if the predecessor
+        // generation died with acked-but-un-uploaded chunks, it left
+        // them spooled on the hostPath volume. Adopt them into the
+        // fresh backend (seeded BEFORE the RECONFIGURE releases the
+        // guest's parked I/O) instead of rolling the live guest's disk
+        // back to the last published manifest.
+        let spool_root = self.shutdown_spool_root();
+        let mut attach_ref = disk_manifest;
+        let mut seed_dirty: Option<Vec<(usize, Vec<u8>)>> = None;
+        if let Some(root) = &spool_root {
+            match crate::disk_daemon::spool::read_spool(root, sandbox_id).await {
+                Ok(Some((meta, chunks)))
+                    if meta.manifest_id == disk_manifest.manifest_id
+                        && meta.version >= disk_manifest.version =>
+                {
+                    // meta.version can be AHEAD of coord's ref: the
+                    // predecessor uploaded chunks + manifest but died
+                    // before its coord publish landed. The manifest
+                    // object is already durable in the blob store
+                    // (upload precedes publish), so attach from the
+                    // spool's ref — the store-ahead recovery the flush
+                    // path's version-conflict retry also leans on.
+                    attach_ref = meta.manifest_ref();
+                    seed_dirty = Some(chunks);
+                }
+                Ok(Some((meta, _))) => {
+                    tracing::warn!(
+                        %sandbox_id,
+                        spool_manifest = %meta.manifest_ref(),
+                        coord_manifest = %disk_manifest,
+                        "shutdown spool is stale or from a foreign lineage; discarding",
+                    );
+                    let _ = crate::disk_daemon::spool::discard_spool(root, sandbox_id).await;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    tracing::error!(
+                        %sandbox_id,
+                        error = %e,
+                        "shutdown spool unreadable; discarding — acked writes it \
+                         held are rolled back",
+                    );
+                    let _ = crate::disk_daemon::spool::discard_spool(root, sandbox_id).await;
+                }
+            }
+        }
+        let adopted_spool = seed_dirty.is_some();
+
         let store_arc = Arc::new(chunk_store.clone());
         let mut state = match crate::disk_daemon::reattach_manifest(
-            disk_manifest,
+            attach_ref,
             chunk_cache.clone(),
             store_arc,
             slot,
             self.flush_config.dirty_threshold_bytes,
+            seed_dirty,
         )
         .await
         {
@@ -8714,11 +8868,28 @@ impl PooledBackend {
         // 5163366 cold-create regression.
         self.session_bindings.insert(sandbox_id, session_id);
 
+        // The seeded chunks are now owned by the live dirty tier (and
+        // the scheduler installed above will upload them promptly);
+        // drop the spool so a LATER generation can't re-adopt stale
+        // bytes over a newer divergence.
+        if adopted_spool {
+            if let Some(root) = &spool_root {
+                if let Err(e) = crate::disk_daemon::spool::discard_spool(root, sandbox_id).await {
+                    tracing::warn!(
+                        %sandbox_id,
+                        error = %e,
+                        "adopted shutdown spool could not be discarded",
+                    );
+                }
+            }
+        }
+
         tracing::info!(
             %session_id,
             %sandbox_id,
-            manifest = %disk_manifest,
+            manifest = %attach_ref,
             device = %device.display(),
+            spool_adopted = adopted_spool,
             "rehydrated chunked-disk data plane (RECONFIGURE) for survivor sandbox",
         );
         Ok(true)

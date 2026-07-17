@@ -279,7 +279,12 @@ impl SessionState {
             Pending | Queued | Created => Failed,
             Failed | Completed | Dead => return None,
         };
-        debug_assert!(
+        // ADR 0099 H6: cold path (forced-termination routing), so pay for
+        // the always-on `invariant!` — it upgrades the prior debug-assert
+        // to `#[track_caller]` provenance and fires in prod too, where a
+        // `terminal_target` that names an illegal edge would silently
+        // drive a session off the FSM.
+        crate::invariant!(
             self.can_transition_to(target),
             "terminal_target({self:?}) = {target:?} must be a legal transition",
         );

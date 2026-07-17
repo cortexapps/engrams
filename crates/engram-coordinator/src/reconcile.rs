@@ -28,10 +28,11 @@
 //! live-migration `rebind_session`) can't null a freshly-landed binding.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
-use engram_core::traits::MetadataStore;
+use chrono::{DateTime, Utc};
+use engram_core::traits::{Clock, MetadataStore, SystemClock};
 use engram_core::types::SessionState;
 use engram_core::{HostId, SandboxId, SessionId};
 use tokio::task::JoinHandle;
@@ -64,16 +65,27 @@ pub fn grace_ticks_from_env() -> u8 {
 /// CONSECUTIVE heartbeats" semantics hold when a host's heartbeats
 /// round-robin across coordinator replicas — per-pod counters would
 /// miss the resets that land on siblings and flip healthy sessions.
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct Reconciler {
     grace_ticks: u8,
+    // ADR 0098 D1: event timestamps come from the injected clock, not a
+    // direct wall-clock read. Defaults to `SystemClock` in production;
+    // the simulation harness swaps it via `with_clock`.
+    clock: Arc<dyn Clock>,
 }
 
 impl Reconciler {
     pub fn new(grace_ticks: u8) -> Self {
         Self {
             grace_ticks: grace_ticks.max(1),
+            clock: Arc::new(SystemClock::new()),
         }
+    }
+
+    /// Override the clock (ADR 0098 D1 simulation seam).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Reconcile this host's view via the live `SharedState`. Thin
@@ -163,10 +175,11 @@ impl Reconciler {
         // happen. `to_flip` itself (crossed the strike threshold this
         // tick) is exactly what feeds the strike-reset-on-rescue path
         // inside `flip_missing`.
+        let now = self.clock.now_utc();
         let mut actually_flipped = Vec::new();
         for session_id in &to_flip {
             let sb = sandbox_by_session.get(session_id).copied();
-            if flip_missing(meta, events, host_registry, *session_id, host_id, sb).await {
+            if flip_missing(meta, events, host_registry, *session_id, host_id, sb, now).await {
                 actually_flipped.push(*session_id);
             }
         }
@@ -184,6 +197,7 @@ async fn flip_missing(
     session_id: SessionId,
     host_id: HostId,
     sandbox_id: Option<SandboxId>,
+    now: DateTime<Utc>,
 ) -> bool {
     // Cheap idempotency: if the session is already in target state
     // (or terminal beyond it), skip. Avoids racing with an operator
@@ -281,6 +295,21 @@ async fn flip_missing(
     let sandbox_id = sandbox_id.or(session.sandbox_id);
     if let Some(sb) = sandbox_id {
         if let Some(prev_host) = host_registry.invalidate_sandbox(sb) {
+            // ADR 0099 H6 (site 4): sandbox-ownership uniqueness. This
+            // sandbox came from `host_id`'s own PG assignments, so its
+            // cached owner must be `host_id`. A different `prev_host`
+            // means the routing cache attributes this sandbox to a second
+            // host — the "same sandbox reported on two hosts" anomaly.
+            // soft_invariant (not a panic): the reconciler's job is to
+            // repair, and dropping the cache row (which we just did) + the
+            // CAS-guarded flip below IS the repair — panicking here would
+            // prevent it. The log line (stable `soft-invariant violated:`
+            // prefix + `name` field) is the alerting seam.
+            engram_core::soft_invariant!(
+                prev_host == host_id,
+                "sandbox {sb} (session {session_id}) reconciled by host {host_id} \
+                 but routing cache owned it under host {prev_host}",
+            );
             tracing::debug!(
                 session_id = %session_id,
                 sandbox_id = %sb,
@@ -342,7 +371,7 @@ async fn flip_missing(
             return false;
         }
     };
-    emit_status_changed(meta, events, session_id, prev, SessionState::HostLost).await;
+    emit_status_changed(meta, events, session_id, prev, SessionState::HostLost, now).await;
 
     // ADR 0015 M2 stage 2: HostLost -> {Idle if recoverable
     // snapshot, Dead otherwise}. The `recoverable` column carries the
@@ -368,7 +397,7 @@ async fn flip_missing(
     };
     match meta.transition_session(session_id, new_status).await {
         Ok(host_lost_prev) => {
-            emit_status_changed(meta, events, session_id, host_lost_prev, new_status).await;
+            emit_status_changed(meta, events, session_id, host_lost_prev, new_status, now).await;
             tracing::info!(
                 session_id = %session_id,
                 host_id = %host_id,
@@ -398,12 +427,9 @@ async fn emit_status_changed(
     session_id: SessionId,
     from: SessionState,
     to: SessionState,
+    now: DateTime<Utc>,
 ) {
-    let event = SessionEvent::StatusChanged {
-        from,
-        to,
-        at: Utc::now(),
-    };
+    let event = SessionEvent::StatusChanged { from, to, at: now };
     let kind = event.kind();
     let payload = match serde_json::to_value(&event) {
         Ok(p) => p,

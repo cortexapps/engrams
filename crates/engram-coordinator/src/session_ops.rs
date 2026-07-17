@@ -613,7 +613,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     let due_at = op
         .not_before
         .map_or(op.created_at, |nb| nb.max(op.created_at));
-    let claim_age_ms = (chrono::Utc::now() - due_at).num_milliseconds();
+    let claim_age_ms = (state.services.clock.now_utc() - due_at).num_milliseconds();
     ::metrics::histogram!(crate::metrics::SESSION_OP_CLAIM_LATENCY_SECONDS)
         .record((claim_age_ms.max(0) as f64) / 1000.0);
     let ctx = OpCtx {

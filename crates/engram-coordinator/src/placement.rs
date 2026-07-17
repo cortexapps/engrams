@@ -723,9 +723,10 @@ pub async fn placement_preview(
     ctx: &ScheduleContext<'_>,
     mem_mib: i64,
     cpu_vcpus: i64,
+    now: DateTime<Utc>,
 ) -> Result<bool, PickError> {
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let ranked = rank_hosts(&hosts, ctx, Utc::now(), placement_ttl());
+    let ranked = rank_hosts(&hosts, ctx, now, placement_ttl());
     Ok(ranked.hosts.iter().any(|id| {
         let Some(h) = hosts.iter().find(|h| h.id == *id) else {
             return false;
@@ -754,12 +755,13 @@ pub async fn placement_preview(
 pub async fn candidates_for(
     meta: &dyn MetadataStore,
     ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
 ) -> Result<RankedCandidates, PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
         .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
-    Ok(rank_hosts(&hosts, ctx, Utc::now(), placement_ttl()))
+    Ok(rank_hosts(&hosts, ctx, now, placement_ttl()))
 }
 
 /// ADR 0068 (core-ops-batch correction pass): shared exclusion-visibility
@@ -783,6 +785,7 @@ pub async fn log_empty_candidates(
     meta: &dyn MetadataStore,
     ctx: &ScheduleContext<'_>,
     origin: &'static str,
+    now: DateTime<Utc>,
 ) {
     let hosts = match meta.list_active_hosts().await {
         Ok(hosts) => hosts,
@@ -792,7 +795,7 @@ pub async fn log_empty_candidates(
             return;
         }
     };
-    let summary = exclusion_summary(&hosts, ctx, Utc::now(), placement_ttl());
+    let summary = exclusion_summary(&hosts, ctx, now, placement_ttl());
     for (_host_id, reason) in &summary {
         ::metrics::counter!(
             crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
@@ -829,6 +832,7 @@ pub async fn log_reserve_no_fit(
     candidates: &[HostId],
     mem_budget_mib: i64,
     cpu_budget_vcpus: i32,
+    now: DateTime<Utc>,
 ) -> Vec<(HostId, String)> {
     let mut summary: Vec<(HostId, String)> = Vec::new();
     match meta
@@ -871,9 +875,7 @@ pub async fn log_reserve_no_fit(
             .into_iter()
             .filter(|h| !candidates.contains(&h.id))
             .collect();
-        for (host_id, reason) in
-            exclusion_summary(&non_candidates, ctx, Utc::now(), placement_ttl())
-        {
+        for (host_id, reason) in exclusion_summary(&non_candidates, ctx, now, placement_ttl()) {
             ::metrics::counter!(
                 crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
                 "origin" => origin,
@@ -903,8 +905,9 @@ pub async fn pick_for_session(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
     ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
-    let result = pick_for_session_inner(meta, registry, ctx).await;
+    let result = pick_for_session_inner(meta, registry, ctx, now).await;
     let outcome = match &result {
         Ok(_) => "placed",
         Err(PickError::NoCapacity) => "no_capacity",
@@ -916,7 +919,7 @@ pub async fn pick_for_session(
     // ADR 0068: on NoCapacity ONLY, name why — kills the "no capacity
     // with free hosts" mystery mode.
     if matches!(result, Err(PickError::NoCapacity)) {
-        log_empty_candidates(meta, ctx, "resume").await;
+        log_empty_candidates(meta, ctx, "resume", now).await;
     }
     result
 }
@@ -925,9 +928,10 @@ async fn pick_for_session_inner(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
     ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let id = pick_from(&hosts, &reserved, ctx, Utc::now(), placement_ttl())?;
+    let id = pick_from(&hosts, &reserved, ctx, now, placement_ttl())?;
     let backend = registry
         .backend_for(id)
         .await
@@ -944,12 +948,12 @@ pub async fn pick_specific_host(
     registry: &HostRegistry,
     host_id: HostId,
     exclude_host: Option<HostId>,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     if Some(host_id) == exclude_host {
         return Err(PickError::NoCapacity);
     }
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let now = Utc::now();
     let ttl = placement_ttl();
     let Some(h) = hosts.iter().find(|h| h.id == host_id) else {
         return Err(PickError::NoCapacity);
@@ -1058,6 +1062,7 @@ pub async fn capture_candidate_hosts(
     meta: &dyn MetadataStore,
     need: CaptureFootprint,
     required_fc_version: Option<&str>,
+    now: DateTime<Utc>,
 ) -> Result<Vec<HostId>, PickError> {
     let hosts = meta
         .list_active_hosts()
@@ -1072,7 +1077,7 @@ pub async fn capture_candidate_hosts(
         &live_capture_hosts,
         need,
         required_fc_version,
-        Utc::now(),
+        now,
         placement_ttl(),
     ))
 }
@@ -1090,12 +1095,12 @@ pub async fn capture_candidate_hosts(
 pub async fn pick_materialize_host(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
         .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
-    let now = Utc::now();
     let ttl = placement_ttl();
     let id = hosts
         .iter()
@@ -1163,8 +1168,9 @@ pub async fn restore_for_session(
     ctx: &ScheduleContext<'_>,
     metadata: SnapshotMetadata,
     fence: SessionFence,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, SandboxId), SandboxError> {
-    let (host_id, backend) = pick_for_session(meta, registry, ctx).await?;
+    let (host_id, backend) = pick_for_session(meta, registry, ctx, now).await?;
     let sandbox_id = backend.restore(metadata, fence).await?;
     registry.record_sandbox_owner(sandbox_id, host_id);
     Ok((host_id, sandbox_id))
@@ -1197,7 +1203,10 @@ pub fn host_counts_as_capacity(h: &HostRecord, now: DateTime<Utc>, ttl: Duration
 /// as schedulable capacity only per [`host_counts_as_capacity`] — so
 /// the demand signal can never read healthier than the candidate set
 /// placement actually ranks.
-pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, PickError> {
+pub async fn fleet_snapshot(
+    meta: &dyn MetadataStore,
+    now: DateTime<Utc>,
+) -> Result<FleetSnapshot, PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
@@ -1206,7 +1215,6 @@ pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, P
         .per_host_reserved()
         .await
         .map_err(|e| PickError::Internal(format!("per_host_reserved: {e}")))?;
-    let now = Utc::now();
     let ttl = placement_ttl();
     let mut m = FleetSnapshot::default();
     for h in &hosts {
@@ -1235,6 +1243,8 @@ pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, P
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_core::types::host::{HostCapacity, HostMetadata, HostUtilization};

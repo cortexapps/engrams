@@ -34,6 +34,9 @@
 //! step stamps `harness-claude` alongside `skills`/`sentinel`), and the agent
 //! tests just select `harness = "claude"`, mounted on `dyn_0`. No registration.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::time::Duration;
 

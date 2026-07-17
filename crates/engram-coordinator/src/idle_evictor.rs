@@ -22,7 +22,6 @@
 //! exec/exec_stream/SSE handlers): if status is `Idle`, enqueue-and-
 //! observe the resume op before routing.
 
-use chrono::Utc;
 use engram_core::traits::SandboxBackend;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::SessionState;
@@ -76,6 +75,7 @@ async fn park_paused_bookkeeping(
     entry_status: SessionState,
 ) -> Result<(), engram_core::MetaError> {
     let state = ctx.state;
+    let now = state.services.clock.now_utc();
     // ADR 0079 (review finding #6): FENCED — a fenced-out predecessor must
     // not stamp park_rung=2 over a successor's fresh state. Ok(false) =
     // fenced; surface it as the `fenced:` Conflict the caller already maps
@@ -83,7 +83,7 @@ async fn park_paused_bookkeeping(
     if !state
         .services
         .meta
-        .fenced_set_session_park_rung(session_id, ctx.epoch, 2, Some(Utc::now()))
+        .fenced_set_session_park_rung(session_id, ctx.epoch, 2, Some(now))
         .await?
     {
         crate::metrics::note_fenced_write();
@@ -106,7 +106,7 @@ async fn park_paused_bookkeeping(
                 crate::state::SessionEvent::StatusChanged {
                     from: SessionState::Active,
                     to: SessionState::Evicting,
-                    at: Utc::now(),
+                    at: now,
                 },
             )
             .await;
@@ -298,7 +298,7 @@ pub(crate) async fn run_evict_pipeline(
                             SessionEvent::StatusChanged {
                                 from: prev,
                                 to: SessionState::HostLost,
-                                at: Utc::now(),
+                                at: state.services.clock.now_utc(),
                             },
                         )
                         .await;
@@ -555,7 +555,7 @@ pub(crate) async fn run_evict_pipeline(
     };
 
     let host_id = state.host_registry.host_of(sandbox_id);
-    let now = Utc::now();
+    let now = state.services.clock.now_utc();
     // ADR 0028 A.log / issue #529: the event-log leg of the coherence
     // triple. Resolve the cursor from the host's EXACT pause instant
     // (`metadata.paused_at`, stamped in `SnapshotFinisher::finish`) when
@@ -863,7 +863,7 @@ async fn finish_eviction_d5(
     session: &engram_core::types::Session,
 ) -> Result<EvictOutcome, EvictError> {
     let state = ctx.state;
-    let now = Utc::now();
+    let now = state.services.clock.now_utc();
 
     if !ctx.step("mark_idle").await {
         return Ok(EvictOutcome::Fenced);
@@ -1137,7 +1137,7 @@ async fn scanner_advance_one(
                         SessionEvent::StatusChanged {
                             from: prev,
                             to: SessionState::HostLost,
-                            at: Utc::now(),
+                            at: state.services.clock.now_utc(),
                         },
                     )
                     .await;
@@ -1266,7 +1266,7 @@ async fn park_reaper_advance_one(
     let hard_cap = crate::idle_detector::IdleDetectorConfig::from_env().hard_ttl;
     let parked_for = session
         .parked_at
-        .map(|at| Utc::now().signed_duration_since(at))
+        .map(|at| state.services.clock.now_utc().signed_duration_since(at))
         .unwrap_or_else(chrono::Duration::zero);
     let hard_exceeded = parked_for.to_std().is_ok_and(|elapsed| elapsed >= hard_cap);
     // Operator escape hatch (off by default) — see `park_dwell_cap`.
@@ -1318,6 +1318,8 @@ async fn park_reaper_advance_one(
 fn _backend_unused_check<B: SandboxBackend>(_: std::sync::Arc<B>) {}
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -1429,6 +1431,8 @@ mod tests {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path,
@@ -2004,6 +2008,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -2230,6 +2236,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -2451,6 +2459,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -2782,6 +2792,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -3614,6 +3626,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
