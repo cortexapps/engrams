@@ -190,13 +190,16 @@ export async function compileSessionCreateInput(
   // API-key creator is programmatic even for a "chat" task.
   const isHuman = !opts.programmatic;
 
-  // Harness env, lowest → highest precedence: user tokens < CLI dummy env <
-  // profile env_vars < model env < effort env < git attribution < trigger
-  // extras. NEVER log values.
+  // General harness env, lowest → highest precedence: other user tokens < CLI
+  // dummy env < profile env_vars < model env < effort env < git attribution <
+  // trigger extras. The selected harness's principal credential is applied
+  // LAST below, outside this precedence chain. NEVER log values.
   const harness: Record<string, string> = {};
   // The human credential env-var name is the selected harness's declared
   // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
   const userEnv = descriptor?.auth?.userEnv;
+  const orgEnv = descriptor?.auth?.orgEnv;
+  let humanUserToken: string | undefined;
   if (isHuman) {
     // The declared user credential is MANDATORY for a human run — a
     // session without it boots unauthenticated. Always inject it, and BLOCK
@@ -214,7 +217,7 @@ export async function compileSessionCreateInput(
           Code.FailedPrecondition,
         );
       }
-      harness[userEnv] = userToken;
+      humanUserToken = userToken;
     }
     // The profile toggle additionally carries the user's OTHER saved tokens
     // (credentials for other harnesses / tools) into the sandbox.
@@ -259,6 +262,21 @@ export async function compileSessionCreateInput(
   const selectedSkills = [...new Set([...profile.skills, ...cliPlan.bundles])];
   if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
   else delete harness.ENGRAM_BROWSER_VIEW_ENABLED;
+
+  // The selected harness's credential is PRINCIPAL-authoritative, not profile
+  // configuration. A human run always gets exactly its required per-user
+  // `user_env`, applied after every configurable env layer so an admin profile,
+  // model, or trigger cannot replace it. A programmatic run gets `org_env`
+  // exclusively from the host-side org-secret policy below, so strip both auth
+  // names from the orchestrator-provided env. This also preserves the strict
+  // invariant that a session never receives both credential tiers.
+  if (isHuman) {
+    if (orgEnv) delete harness[orgEnv];
+    if (userEnv && humanUserToken !== undefined) harness[userEnv] = humanUserToken;
+  } else {
+    if (userEnv) delete harness[userEnv];
+    if (orgEnv) delete harness[orgEnv];
+  }
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
   // Per-session integration policy (caps + network + secrets), shipped only
@@ -275,7 +293,6 @@ export async function compileSessionCreateInput(
   // ships in integration_policy_json and is resolved host-side by
   // resolve_policy_secrets; an unresolvable ref is skipped+warned there (the
   // session still boots).
-  const orgEnv = descriptor?.auth?.orgEnv;
   if (!isHuman && orgEnv) {
     policy.secrets.push({
       secret_ref: orgEnv,

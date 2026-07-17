@@ -171,6 +171,16 @@ describe("compileSessionCreateInput", () => {
     expect(on.harnessEnv?.[USER_ENV]).toBe("tok");
   });
 
+  test("human auth is principal-authoritative over profile and trigger env values", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ envVars: { [USER_ENV]: "profile-token", [ORG_ENV]: "profile-org-token" } }),
+      deps("user-token"),
+      { extraHarnessEnv: { [USER_ENV]: "trigger-token", [ORG_ENV]: "trigger-org-token" } },
+    );
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("user-token");
+    expect(inp.harnessEnv?.[ORG_ENV]).toBeUndefined();
+  });
+
   // Don't silently boot un-authed — block the create with the env-var
   // name in the message (the client renders the descriptor's setup hint).
   test("blocks a human run when the harness user credential is not set", async () => {
@@ -237,10 +247,19 @@ describe("compileSessionCreateInput", () => {
     // A `ci-<repo>` API key has no per-user harness token — the programmatic
     // flag must pick the org-credential path or the harness boots
     // credential-less ("not logged in", session 47723225).
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      programmatic: true,
-    });
+    const inp = await compileSessionCreateInput(
+      profile({
+        includeUserTokens: true,
+        envVars: { [USER_ENV]: "profile-user-token", [ORG_ENV]: "profile-org-token" },
+      }),
+      deps("tok"),
+      {
+        programmatic: true,
+        extraHarnessEnv: { [USER_ENV]: "trigger-user-token", [ORG_ENV]: "trigger-org-token" },
+      },
+    );
     expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
+    expect(inp.harnessEnv?.[ORG_ENV]).toBeUndefined();
     const policy = JSON.parse(inp.integrationPolicyJson!) as {
       secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
     };

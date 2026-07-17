@@ -168,13 +168,16 @@ the environment server-side:
    longer enabled (defense in depth behind the §3 restrict guard).
 3. Send the control plane `mode: "agent"` (profiles carry no mode yet, §1). The
    request's `prompt` (the user's task) becomes the session's first prompt.
-4. **Assemble `harness_env`** in this precedence (lowest → highest):
-   1. the user's Claude token (`CLAUDE_CODE_OAUTH_TOKEN`, resolved from the
-      sealed secret store, ADR 0051 §2.3) — **only if** `include_user_tokens`
-      is true;
-   2. the profile's `env_vars` — **override** anything below, including the
-      token key if an admin set it explicitly. Admin intent wins over the user
-      token by design.
+4. **Assemble `harness_env`** using the harness-derived credential rules in ADR
+   0063 (amended 2026-07-17):
+   1. merge the profile's general `env_vars` with the other non-authentication
+      environment layers;
+   2. for a human principal, require the selected harness's declared
+      `user_env` from the per-user sealed secret store and apply it last — a
+      profile env var cannot supply or override this credential;
+   3. for a programmatic/service-account principal, remove the selected
+      harness's auth env names from profile-controlled env and resolve its
+      `org_env` exclusively from the host-side org-secret policy.
 5. Call the control plane's `CreateSession`, then write the `task` and
    `task_session` rows, recording `profile_id` on the latter.
 
@@ -184,13 +187,14 @@ as the handler does today. The shell/`dev_vm` split moves into profiles only
 when a profile needs it (§7); until then the existing direct-`CreateSession`
 dev-VM path is simply unreachable from the profile picker.
 
-**`include_user_tokens` is a capability grant, not a convenience toggle.** It
-is the admin's explicit declaration that sessions started from this profile are
-permitted to carry the user's Claude credentials. For an untrusted or
-externally-facing image, an admin leaves it off and the token never enters the
-sandbox. Today the only such token is the Claude OAuth token; the boolean is
-named and modeled to generalize, but we do not enumerate token *types* yet
-(YAGNI, §7).
+**Amended 2026-07-17 (ADR 0063): `include_user_tokens` carries other saved
+tokens only.** The selected harness's own declared `user_env` is mandatory for
+every human run and rides regardless of this toggle. Registering/enabling a
+harness is the admin authorization that its declared user credential is
+automatically injected when a human selects it; the profile toggle additionally
+grants the sandbox the user's *other* saved harness/tool credentials. A profile
+env var cannot stand in for either the per-user human credential or the
+programmatic org credential.
 
 **Edits don't reach running sessions.** A session is created from a *snapshot*
 of the profile's values at create time; `task_session.profile_id` is a

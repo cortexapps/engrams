@@ -1643,13 +1643,12 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
 });
 
 // ---------------------------------------------------------------------------
-// 6b. Harness env injection — include_user_tokens gate + env_vars precedence
-// (ADR 0053)
+// 6b. Harness env injection — principal-authoritative harness credential +
+// include_user_tokens carry for other credentials (ADR 0053/0063)
 //
-// The per-user Claude token rides CreateSession.harness_env as
-// { CLAUDE_CODE_OAUTH_TOKEN: <token> } ONLY when the profile sets
-// include_user_tokens. Profile env_vars override the user token on key
-// collision. No token + no env_vars → harness_env unset.
+// The selected harness's per-user Claude token ALWAYS rides a human session as
+// { CLAUDE_CODE_OAUTH_TOKEN: <token> } and wins on key collision. The profile's
+// include_user_tokens toggle only carries the user's OTHER saved credentials.
 // ---------------------------------------------------------------------------
 
 function oneCreatedSession(prefix: string): FakeSession {
@@ -1663,7 +1662,7 @@ function oneCreatedSession(prefix: string): FakeSession {
   };
 }
 
-describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0053)", () => {
+describe("TaskService — principal-authoritative harness credentials (ADR 0053/0063)", () => {
   test("include_user_tokens=true + token present → harness_env carries the token", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-tok")], existing: [] });
     const srv = await spawnServer({
@@ -1734,7 +1733,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     }
   });
 
-  test("profile env_vars override the user token key", async () => {
+  test("the required user token overrides the same key in profile env_vars", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-override")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
@@ -1751,7 +1750,7 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.harnessEnv).toEqual({
-        CLAUDE_CODE_OAUTH_TOKEN: "admin-token",
+        CLAUDE_CODE_OAUTH_TOKEN: "user-token",
         ANTHROPIC_MODEL: "claude-opus-4-8",
         ENGRAM_APPEND_SYSTEM_PROMPT: PAPERCUT_SYSTEM_PROMPT,
       });
