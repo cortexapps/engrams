@@ -108,6 +108,11 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
+  "SessionService.WriteFiles": {
+    action: "shell",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
   "SessionService.Resume": {
     action: "read",
     subject: "Session",

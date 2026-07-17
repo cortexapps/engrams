@@ -123,7 +123,13 @@
         "kind": "pull_request",
         "surface": "asset",
         "success": { "statusClass": "2xx" },
-        "data": { "number": "$.resp.number", "title": "$.resp.title" },
+        "data": {
+          "number": "$.resp.number",
+          "title": "$.resp.title",
+          "repo": "$.resp.base.repo.full_name",
+          "head_branch": "$.resp.head.ref",
+          "base_branch": "$.resp.base.ref"
+        },
         "fetchable": { "external": "$.resp.html_url" }
       }
     },
@@ -294,7 +300,10 @@
         "success": { "noGraphqlErrors": true },
         "data": {
           "number": "$.resp.data.createPullRequest.pullRequest.number",
-          "title": "$.resp.data.createPullRequest.pullRequest.title"
+          "title": "$.resp.data.createPullRequest.pullRequest.title",
+          "repo": "$.resp.data.createPullRequest.pullRequest.repository.nameWithOwner",
+          "head_branch": "$.resp.data.createPullRequest.pullRequest.headRefName",
+          "base_branch": "$.resp.data.createPullRequest.pullRequest.baseRefName"
         },
         "fetchable": { "external": "$.resp.data.createPullRequest.pullRequest.url" }
       }

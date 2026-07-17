@@ -59,7 +59,10 @@ use engram_core::types::sandbox::{
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{WarmStageOutcome, WarmStageRecord};
 use engram_core::{SandboxId, SessionId, SnapshotId};
-use engram_protocol::wire::{WireExecRequest, WireReapStats, WIRE_VERSION};
+use engram_protocol::wire::{
+    WireExecRequest, WireReapStats, WireWriteFileResult, WireWriteFileSpec, WireWriteFilesRequest,
+    WireWriteFilesResponse, WIRE_VERSION,
+};
 use serde::Serialize;
 use uuid::Uuid;
 
@@ -388,6 +391,29 @@ fn wire_mirrors_golden() {
             files_skipped_too_young: 2,
         },
     );
+    // ADR 0100 (wire v17): the coord↔host WriteFiles payloads.
+    assert_golden_no_eq("wire_write_files_request", &wire_write_files_request());
+    assert_golden_no_eq("wire_write_files_response", &wire_write_files_response());
+}
+
+fn wire_write_files_request() -> WireWriteFilesRequest {
+    WireWriteFilesRequest {
+        files: vec![WireWriteFileSpec {
+            path: "/workspace/.review/finder.md".into(),
+            content: b"be skeptical".to_vec(),
+            mode: Some(0o640),
+        }],
+    }
+}
+
+fn wire_write_files_response() -> WireWriteFilesResponse {
+    WireWriteFilesResponse {
+        results: vec![WireWriteFileResult {
+            path: "/workspace/.review/finder.md".into(),
+            ok: false,
+            error: Some("read-only file system".into()),
+        }],
+    }
 }
 
 #[test]
@@ -428,8 +454,10 @@ fn wire_version_pinned() {
     // JSON-ack `warm_peers` field ride this bump too (both are
     // independently roll-safe; the bump pins the deploy posture — a v16
     // coord never dispatches a peer-hinted restore to a v15 host).
+    // 16 -> 17: ADR 0100 — the coord↔host WriteFiles RPC carries new
+    // WireWriteFilesRequest/WireWriteFilesResponse bincode mirrors.
     assert_eq!(
-        WIRE_VERSION, 16,
+        WIRE_VERSION, 17,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -520,6 +548,8 @@ fn regen_golden() {
             files_skipped_too_young: 2,
         },
     );
+    write("wire_write_files_request", &wire_write_files_request());
+    write("wire_write_files_response", &wire_write_files_response());
 }
 
 /// ADR 0080 prod regression (dev-brain enable): `WarmConfig.env` holds

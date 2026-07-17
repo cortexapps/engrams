@@ -15,6 +15,7 @@ use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    WriteFileResult, WriteFileSpec,
 };
 use crate::types::snapshot::SnapshotMetadata;
 
@@ -279,6 +280,18 @@ pub trait SandboxBackend: Send + Sync {
             stderr,
             exit_status,
         })
+    }
+
+    /// Write a batch of files into a running sandbox. Every file is attempted;
+    /// file-level failures are returned in place rather than aborting the batch.
+    async fn write_files(
+        &self,
+        _id: SandboxId,
+        _files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this backend doesn't support `write_files` yet".into(),
+        ))
     }
 
     /// ADR 0066: open a raw duplex byte stream to the in-guest `engram-agentd`

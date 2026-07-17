@@ -35,6 +35,9 @@ service SessionService {
   // degenerate collected case.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc Exec(ExecRequest) returns (stream ExecOutput);
+  // ADR 0100: stage a batch of files inside a running session without
+  // embedding content in a shell command. Each file reports its own result.
+  rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
   rpc GetLog(GetLogRequest) returns (GetLogResponse);
   rpc Snapshot(SnapshotRequest) returns (SnapshotResponse);
   // ADR 0065: bring up the ephemeral in-guest browser stack (x11vnc + headful
@@ -318,6 +321,29 @@ message ExecRequest {
   map<string, string> env = 4;
   optional string workdir = 5;
   optional uint64 timeout_secs = 6;
+}
+
+message WriteFileSpec {
+  string path = 1;
+  bytes content = 2;
+  // Unix permission bits (for example, 0755). Unset preserves the default
+  // permissions chosen when the guest creates the file.
+  optional uint32 mode = 3;
+}
+
+message WriteFilesRequest {
+  string session_id = 1;
+  repeated WriteFileSpec files = 2;
+}
+
+message WriteFileResult {
+  string path = 1;
+  bool ok = 2;
+  optional string error = 3;
+}
+
+message WriteFilesResponse {
+  repeated WriteFileResult results = 1;
 }
 
 // engram_core::types::ExecEvent is authoritative for the stream body:

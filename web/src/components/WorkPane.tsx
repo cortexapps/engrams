@@ -3,6 +3,7 @@ import {
   Activity,
   Code2,
   Globe,
+  GitPullRequestArrow,
   Maximize2,
   Minimize2,
   PanelRightClose,
@@ -14,6 +15,7 @@ import { TerminalPane } from "./TerminalPane";
 import { BrowserPane } from "./BrowserPane";
 import { IdePane } from "./IdePane";
 import { DiagnosticsPanel } from "./SessionDiagnostics";
+import { SideEffectsPanel } from "./SideEffectsPanel";
 import { Button } from "@/components/ui/button";
 import { textVariants } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
@@ -30,7 +32,7 @@ import type { IndexedEvent, Session } from "../lib/types";
 // with expand-to-fill) and the mobile overlay sheet (`variant="overlay"`, where
 // collapse means "close the sheet").
 
-export type PaneTabId = "shell" | "browser" | "ide" | "diagnostics";
+export type PaneTabId = "shell" | "browser" | "ide" | "side-effects" | "diagnostics";
 
 interface PaneTabDef {
   id: PaneTabId;
@@ -41,10 +43,17 @@ interface PaneTabDef {
 const SHELL_TAB: PaneTabDef = { id: "shell", label: "Shell", icon: SquareTerminal };
 const BROWSER_TAB: PaneTabDef = { id: "browser", label: "Browser", icon: Globe };
 const IDE_TAB: PaneTabDef = { id: "ide", label: "IDE", icon: Code2 };
+const SIDE_EFFECTS_TAB: PaneTabDef = {
+  id: "side-effects",
+  label: "Side effects",
+  icon: GitPullRequestArrow,
+};
 const DIAGNOSTICS_TAB: PaneTabDef = { id: "diagnostics", label: "Diagnostics", icon: Activity };
 
 export interface WorkPaneProps {
   sessionId: string;
+  /** Owning task resolved by SessionDetail; null for orphan sessions. */
+  taskId: string | null;
   /** The session row, for the Diagnostics view. May be undefined while loading. */
   session: Session | undefined;
   /** The event stream, for the Diagnostics raw log. */
@@ -70,6 +79,7 @@ export interface WorkPaneProps {
 
 export function WorkPane({
   sessionId,
+  taskId,
   session,
   events,
   open,
@@ -86,6 +96,7 @@ export function WorkPane({
     SHELL_TAB,
     ...(browserEnabled ? [BROWSER_TAB] : []),
     ...(ideEnabled ? [IDE_TAB] : []),
+    SIDE_EFFECTS_TAB,
     DIAGNOSTICS_TAB,
   ];
 
@@ -184,6 +195,11 @@ export function WorkPane({
         {open && tab === "diagnostics" && (
           <div className="absolute inset-0 overflow-hidden">
             <DiagnosticsPanel session={session} sessionId={sessionId} events={events} />
+          </div>
+        )}
+        {open && tab === "side-effects" && (
+          <div className="absolute inset-0 overflow-hidden">
+            <SideEffectsPanel taskId={taskId} sessionId={sessionId} />
           </div>
         )}
       </div>

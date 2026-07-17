@@ -1,6 +1,6 @@
 import { useParams } from "@tanstack/react-router";
 import { Fragment, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
-import { Activity, Code2, Globe, Pencil, SquareTerminal } from "lucide-react";
+import { Activity, Code2, GitPullRequestArrow, Globe, Pencil, SquareTerminal } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
@@ -45,7 +45,13 @@ function readPanePref(): WorkPanePref {
     if (!raw) return DEFAULT_PANE_PREF;
     const p = JSON.parse(raw) as Partial<WorkPanePref>;
     return {
-      tab: p.tab === "browser" || p.tab === "ide" || p.tab === "diagnostics" ? p.tab : "shell",
+      tab:
+        p.tab === "browser" ||
+        p.tab === "ide" ||
+        p.tab === "side-effects" ||
+        p.tab === "diagnostics"
+          ? p.tab
+          : "shell",
       // Clamp within [pane minSize, 100 − transcript minSize] so a restored
       // width never collides with either panel's floor (react-resizable-panels
       // would otherwise clamp it and warn).
@@ -224,6 +230,7 @@ export function SessionDetail() {
     { id: "shell", label: "Shell", icon: SquareTerminal },
     ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
     ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    { id: "side-effects", label: "Side effects", icon: GitPullRequestArrow },
     { id: "diagnostics", label: "Diagnostics", icon: Activity },
   ];
 
@@ -297,6 +304,7 @@ export function SessionDetail() {
               <SheetTitle className="sr-only">Session work pane</SheetTitle>
               <WorkPane
                 sessionId={id}
+                taskId={taskId}
                 session={session}
                 events={events}
                 open={paneOpen}
@@ -359,6 +367,7 @@ export function SessionDetail() {
             >
               <WorkPane
                 sessionId={id}
+                taskId={taskId}
                 session={session}
                 events={events}
                 open={paneOpen}
