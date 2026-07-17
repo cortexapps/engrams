@@ -41,7 +41,7 @@ import {
 } from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
-import { useEnterToSend } from "@/hooks/useEnterToSend";
+import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -372,20 +372,7 @@ const Composer: FC = () => {
           rows={1}
           aria-label="Message input"
           onKeyDown={(e) => {
-            // Submit on ⌘/Ctrl+↵ always; also on plain ↵ (no modifiers, not
-            // mid-IME-composition) when Enter-to-send is on. Idle → starts a
-            // run; mid-run → the harness queues it (type-ahead). Driven here,
-            // not by the primitive, so it works while a run is in flight.
-            const plainEnter =
-              e.key === "Enter" &&
-              !e.shiftKey &&
-              !e.metaKey &&
-              !e.ctrlKey &&
-              !e.altKey &&
-              !e.nativeEvent.isComposing;
-            const submitsNow =
-              (e.key === "Enter" && (e.metaKey || e.ctrlKey)) || (enterToSend && plainEnter);
-            if (submitsNow) {
+            if (isSubmitKey(e, enterToSend)) {
               e.preventDefault();
               const t = text.trim();
               if (t && !sendBlocked) {

@@ -45,6 +45,7 @@ import {
 import { useAuth } from "../../auth/AuthProvider";
 import { useKeyboardUi } from "../../keyboard/store";
 import { MOD_LABEL } from "../../keyboard/platform";
+import { isSubmitKey, useEnterToSend } from "../../hooks/useEnterToSend";
 import { catalogToViews } from "../../components/integrations/useConnectorViews";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
 import { ProfileIcon } from "../../components/profiles/ProfileIcon";
@@ -194,11 +195,10 @@ export function StartScreen() {
   };
 
   // Composer focus: on mount, and whenever the keymap (`c` / ⌘K "start task")
-  // bumps the nonce after navigating here. Launching a sandbox is a heavy,
-  // costly action, so ⌘↵ / Ctrl↵ commits and a bare Enter inserts a newline —
-  // accidental Enter-to-launch is the wrong default for a multi-line task.
+  // bumps the nonce after navigating here.
   const composerRef = useRef<HTMLTextAreaElement>(null);
   const focusNonce = useKeyboardUi((s) => s.composerFocusNonce);
+  const [enterToSend] = useEnterToSend();
   useEffect(() => {
     composerRef.current?.focus();
   }, [focusNonce]);
@@ -224,7 +224,7 @@ export function StartScreen() {
   }, [windowHeight, profilesPending, profiles.length, recent.length]);
 
   const onComposerKeyDown = (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+    if (isSubmitKey(e, enterToSend)) {
       e.preventDefault();
       void launch();
     }
@@ -357,7 +357,7 @@ export function StartScreen() {
                     aria-hidden
                     className="ml-0.5 hidden items-center gap-0.5 rounded border border-primary-foreground/25 px-1 font-sans text-[0.65rem] font-medium tracking-normal text-primary-foreground/80 normal-case sm:inline-flex"
                   >
-                    {MOD_LABEL}
+                    {!enterToSend && MOD_LABEL}
                     <CornerDownLeft className="size-3" />
                   </kbd>
                 )}

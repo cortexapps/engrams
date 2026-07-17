@@ -1,3 +1,4 @@
+import type React from "react";
 import { useCallback, useEffect, useState } from "react";
 
 // Slack-style composer preference. When ON (the default, matching the Claude
@@ -17,6 +18,18 @@ function read(): boolean {
   const stored = localStorage.getItem(STORAGE_KEY);
   // Only an explicit opt-out turns it off; absence means the default.
   return stored === null ? DEFAULT_ENABLED : stored === "true";
+}
+
+/** Returns true if this keyboard event should submit the composer. */
+export function isSubmitKey(e: React.KeyboardEvent, enterToSend: boolean): boolean {
+  const plainEnter =
+    e.key === "Enter" &&
+    !e.shiftKey &&
+    !e.metaKey &&
+    !e.ctrlKey &&
+    !e.altKey &&
+    !e.nativeEvent.isComposing;
+  return (e.key === "Enter" && (e.metaKey || e.ctrlKey)) || (enterToSend && plainEnter);
 }
 
 /** Reactive accessor for the Enter-to-send preference: `[enabled, setEnabled]`. */
