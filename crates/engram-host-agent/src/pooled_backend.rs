@@ -9551,14 +9551,19 @@ mod tests {
         // Simulate the handler's background thread: the file doesn't
         // exist yet when the poll starts, and lands ~30ms later (well
         // inside the poll's bound but after several immediate misses).
+        // ATOMIC temp+rename, exactly like the real handler — a plain
+        // `write` here let the 5ms poll observe a created-but-empty file
+        // under parallel-test load (one observed flake, 2026-07-17).
         tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+            let tmp = write_path.with_extension("json.tmp");
             tokio::fs::write(
-                &write_path,
+                &tmp,
                 b"{\"trace_loaded\":true,\"installed\":3,\"skipped\":0}",
             )
             .await
             .unwrap();
+            tokio::fs::rename(&tmp, &write_path).await.unwrap();
         });
         let bytes = read_prefault_stats_with_retry_bounded(
             &path,
