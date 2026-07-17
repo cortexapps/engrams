@@ -36,6 +36,11 @@ experimental implementation and raw iteration history are preserved on the
 - Share nothing during ordinary browser work. Share one final screenshot only
   for explicit evidence or an inherently visual deliverable. Use video only
   for explicit requests or temporal bugs.
+- Bundle the target-native FFmpeg helper owned by the pinned Playwright package
+  and point the CLI daemon at that read-only bundle path. Video must not depend
+  on a per-user browser cache, a runtime download, or an artifact-CDN egress
+  exception; Playwright browser binaries remain omitted because the CLI
+  attaches to the shared Chromium over CDP.
 - Keep artifact creation/inspection separate from delivery in `share-file`.
 - Prefix browser CLI calls with a concise, outcome-neutral
   `ENGRAM_BROWSER_INTENT`. The shared harness SDK recognizes supported browser
@@ -84,9 +89,20 @@ result. Detecting framebuffer changes was rejected as the trigger because it
 would miss read-only inspection, fire for animations or human input, and
 require mounting the VNC viewer before the pane knows it should open.
 
-The browser/VNC production test must prove that the CLI observes semantic state,
-that an annotated screenshot is created, and that the same page is painted in
-the real framebuffer.
+The video-runtime addition follows a production failure in session
+`719b9424-23f3-4267-8052-69cac26817d2`: `video-start` looked for
+`~/.cache/ms-playwright/ffmpeg-1011/ffmpeg-linux`, while the shared-browser
+bundle contained Chromium and Playwright CLI but not Playwright's separately
+distributed encoder. A runtime install could not reach the artifact CDN, and
+`video-stop` could print a WebM link even though no file existed. Installing
+only the version-matched helper during the bundle build preserves the shared
+CDP design without broadening sandbox egress. Sessions mounted from an older
+read-only bundle generation are unchanged; the repair applies after the fixed
+bundle is published.
+
+The browser/VNC production test must prove that the CLI records a non-empty
+WebM, observes semantic state, creates an annotated screenshot, and exposes the
+same painted page through the real framebuffer.
 
 ## Validation
 
@@ -97,3 +113,12 @@ browser-pane tests, all 215 web tests, web lint and production build, bundle
 activation coverage, and compilation of the ignored Firecracker browser/VNC
 test. The latter remains assigned to the existing Linux+KVM CI lane, where the
 browser bundle is staged before execution.
+
+The video-runtime follow-up built a fresh arm64 bundle with Playwright FFmpeg
+revision 1011, then ran it in a disposable Debian container with Docker
+networking disabled. `video-start`, a chapter marker, and `video-stop` produced
+a non-empty 30,664-byte WebM without a writable Playwright cache or network
+access. The bundle activation e2e and Firecracker/VNC test compilation passed;
+the latter now records and asserts a real WebM before its existing semantic,
+annotated-screenshot, and framebuffer checks. The contemporary full repository
+gate passed all 1,747 nextest cases in addition to format, Clippy, and Hakari.
