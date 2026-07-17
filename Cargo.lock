@@ -1268,6 +1268,8 @@ dependencies = [
  "parking_lot",
  "rand 0.9.4",
  "rand_chacha 0.9.0",
+ "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "uuid",

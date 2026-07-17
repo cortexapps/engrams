@@ -34,15 +34,29 @@
 //! adversarial [`ScriptedResponse`] queue. Oracle #9 (the None-arm mis-reap
 //! stays fixed) joins the invariant suite. See [`reconcile`].
 //!
-//! # Deferred to P4+
+//! # P4 (Flow A — the SIGTERM ladder)
 //!
-//! The remaining lifecycle-flow extractions (Flow A/B/D/E), scheduler-driven
-//! crash-point INJECTION (the [`CrashPoint`] boundaries are named +
-//! coverage-tested here, but cutting the process at one is P4), and the #224
-//! insert-after-sweep gate (it lives in the `abandon_nbd_data_planes_for_shutdown`
-//! SIGTERM path, which is not extracted until P4's Flow A).
+//! P4 drives the REAL extracted shutdown ladder
+//! ([`engram_host_core::shutdown`]): the [`Sigterm`](Step::Sigterm) step runs
+//! `plan_shutdown`/`classify_survivor` over the sim host (a seeded budget
+//! below the modeled flush cost overruns → stragglers ride the spool, #225),
+//! and [`CrashAt`](Step::CrashAt) seeds crash-point INJECTION at the eight
+//! [`CrashPoint`] boundaries — the spool boundaries land the real recovery
+//! under the acked-write oracle, the persist boundaries exercise
+//! `durable_record` tolerance (folding into the ledger in P5's Flow D). The
+//! world-model `rebuild` gains the 85e0298a store-ahead rule (attach from the
+//! spool's ahead ref, never coord's stale one). The #224 insert-after-sweep
+//! gate rides as the extracted ordering contract
+//! ([`admits_new_plane`](engram_host_core::admits_new_plane)); the literal
+//! `abandon_nbd_data_planes_for_shutdown` DashMap race stays FC-lane residue.
+//! See [`crash_state`] and [`world`].
+//!
+//! # Deferred to P5+
+//!
+//! The remaining lifecycle-flow extractions (Flow B/D/E) and their oracles.
 
 pub mod coord_stub;
+pub mod crash_state;
 pub mod effects;
 pub mod invariants;
 pub mod reconcile;

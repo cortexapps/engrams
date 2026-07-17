@@ -27,7 +27,6 @@ The nightly long-run swarm landed post-acceptance
 (`.github/workflows/nightly-sim.yml`: 1600 seeds × 5000 steps nightly
 over a date-derived, never-repeating seed window).
 Deviations still open, tracked:
-retiring the coordinator's per-test mocks onto SimMetadataStore;
 Agent-mode workload (needs the harness-catalog surface in SimMeta);
 capture-job reservations in SimMeta placement.
 **Phase 2 (host-agent, the P-series) opened 2026-07-17** — the "future,
@@ -479,10 +478,18 @@ non-convergence); (9) the reconcile session=None arm stays fixed (the
 2026-07-11 mis-reap — already fixed in code; the oracle pins it).
 
 **Known bugs ride the arc** (user decision): O_DIRECT for the NBD device
-sync rides P4 (fall back to verify-on-read if block alignment vs FC's
-drive assumptions proves fragile); verify-on-read (post-RECONFIGURE read
-observes the seeded acked bytes) rides P7; the None-arm mis-reap needs
-only its oracle (P3). Regression seeds double as the migration-safety
+sync was evaluated in P4 and is a **NO-OP** — verdict recorded in the P4
+row and `engram_host_agent::device_sync`: all opens of `/dev/nbdN` share
+one bdev page cache, so the existing buffered `sync_all` (`fsync`) already
+writes back FC's buffered-dirtied pages; O_DIRECT only governs `read`/
+`write` on the fd (this fd is sync-only) and never changes `fsync`
+semantics, so it would add block-alignment fragility for zero benefit. The
+sync path is unchanged (now routed through the `DeviceSync` seam); the
+read-side residual (a successor reading stale/dropped pages) is a different
+mechanism — cross-tenant slot reuse is already closed by the `BLKFLSBUF`
+invalidate-on-CONNECT, and verify-on-read (post-RECONFIGURE read observes
+the seeded acked bytes) is the documented fallback, riding P7. The None-arm
+mis-reap needs only its oracle (P3). Regression seeds double as the migration-safety
 proof: each historical hazard (#224 insert-after-sweep, #225
 deadline-overrun, #204 tier-less window, #199 flush reorder, #216 family,
 the slot validation-window race, the stale-binding TOCTOU, 85e0298a
@@ -490,7 +497,12 @@ store-ahead recovery, the None-arm, checkpoint tail-cancellation) is
 reproduced where possible against pre-extraction logic, then pinned as
 proof the extraction retires it.
 
-**The P-series**:
+**The P-series** (labels are stable; **execution order** was revised
+2026-07-17 after P4: **P7 (Flow B — NBD slot/reattach) is pulled FORWARD to
+run immediately after P4**, and P5 (eviction finalize) + P6 (flush
+SchedulerSeam) slide back to after it — two device-lifecycle ordering
+incidents in two days, 85e0298a and 731df805/#739, make Flow B the
+highest-impact remaining flow; P8/P9 unchanged):
 
 | PR | Content | Size |
 |---|---|---|
@@ -498,10 +510,10 @@ proof the extraction retires it.
 | P1 | engram-host-core; the four traits + HostEffects bundle; HttpCoordClient rename; decision-feeding clock/entropy sweep + `metrics_now()`; per-crate clippy gates. Zero behavior change; full FC lane runs on it despite the mechanical label | XL |
 | P2 | engram-dst-host scaffold: SimFs + SimHost RAM/disk split + acked-write ledger + coord stub + SimNbd + scheduler skeleton + determinism audit + flow_coverage & crashpoint_coverage meta-tests | L |
 | P3 | Flow C (reconcile): `reconcile_once` extraction (pure `classify` + `ReconcileBackend` seam); the lib.rs inline loop collapses to a thin spawn wrapper; ReconcileTick + None-arm oracle (#9) + stale-binding TOCTOU scenarios. **#224 abandoning moved to P4** — its insert-after-sweep gate lives in `abandon_nbd_data_planes_for_shutdown` (the SIGTERM path, not extracted until Flow A), so it is not cleanly drivable on today's portable surface | M |
-| P4 | Flow A (SIGTERM ladder): `ShutdownStage`/`plan_shutdown`/`classify_survivor` extraction (the `abandoning` SeqCst flag + drain-twice stays in the driver byte-identical — concurrency gate, not a decision); Sigterm/SpoolExport/SpoolAdopt/CrashProcess/Restart steps; the #224 insert-after-sweep abandoning scenario (moved from P3); **the acked-write oracle**; #225 + 85e0298a seeds; O_DIRECT rider; new minimal FC regression in ci.yml's --test list | L |
+| P4 | **Landed.** Flow A (SIGTERM ladder): the pure decisions — `ShutdownStage` (+ `admits_new_plane`), `flush_budget`/`plan_shutdown`, `FlushProbe`/`classify_survivor`, `is_straggler` — extracted into **`engram-host-core::shutdown`** (cleanly-typed `std` types → the portable crate, not host-agent-local; contrast Flow C's PooledBackend-coupled `classify`). The driver (`lib.rs` shutdown handler + `flush_nbd_data_planes_for_shutdown` + the overrun sweep) becomes a thin executor off those verdicts; the `abandoning` SeqCst flag + drain-twice + the per-survivor `tokio::spawn`/`timeout` + `abandon_for_shutdown`'s ownership-consuming semantics stay byte-identical (concurrency gates, not decisions). The `spawn_blocking` device sync is now wired through the P1 `DeviceSync` seam (`HostDeviceSync` prod impl). Sim: the `Sigterm(budget)` step drives the real ladder (seeded budgets small→large; a tiny budget overruns → stragglers → spool), and `CrashAt(CrashPoint)` seeds crash-point injection over all eight H5 boundaries (spool boundaries → real recovery under the acked-write oracle; persist boundaries → reachability + `load_all` tolerance, folding into the ledger in P5's Flow D). Regression seeds: #225 deadline-overrun, 85e0298a store-ahead (world-model `rebuild` now honors the spool's store-ahead ref), #224 insert-after-sweep (the extracted ordering contract; the literal DashMap race stays FC-lane residue). **The acked-write oracle stays unconditional.** O_DIRECT rider: evaluated → **no-op** (see the known-bugs note + `device_sync`), so the sync path is unchanged and no FC regression was warranted; verify-on-read stays P7. | L |
 | P5 | Flow D (eviction finalize): route through HostEffects; EvictionFinalizeLeg + crash-between-legs; FinalizeStage + convergence oracles; checkpoint tail-cancellation | M |
 | P6 | Flow F seam: SchedulerSeam generalization; #204/#199 as seeded interleavings | M |
-| P7 | Flow B (NBD slot): NbdKernel seam; typed SlotState; pure plan_reattach (seed-dirty-before-RECONFIGURE ordering); validation-window + slot-accounting sim; verify-on-read rider; new minimal FC reattach regression | L |
+| P7 | Flow B (NBD slot): NbdKernel seam; typed SlotState; pure plan_reattach (seed-dirty-before-RECONFIGURE ordering); validation-window + slot-accounting sim; verify-on-read rider; new minimal FC reattach regression. **Also the 731df805 park→roll→register→stale-sweep→un-pause hazard (PR #739):** parked survivors were invisible to the register-time NBD rehydrate, so the stale-binding sweep disconnected a resident VM's served device and an un-pause landed on a dead data plane — oracle: *a resident VM's served device is never stale-swept/disconnected, and un-pause never lands on a dead data plane.* Scenario targets: #739's coordinator-list fix + the ChainHeadRecord local-rehydrate defense; the buggy pre-#739 filtered coordinator list rides as an adversarial coord-stub script. Production riders on P7: verify-on-read (post-RECONFIGURE read observes the seeded acked bytes), and the un-pause data-plane gate (#739 follow-up: a rung-cancel resume fails fast into `evict_local`→resume when the rootfs device isn't served by the current generation — a `soft_invariant!` candidate). | L |
 | P8 | Flow E (migration): TTL clock → `now_mono`; #216 decision-table oracle; no-plane-leak/single-device tightening; #582/#598/#629 seeds | M |
 | P9 | CI: `test-host-sim` lane (fixed seeds, <5 min, own rust-cache key, replay-twice self-check) in `CI Gate.needs:` + a host-sim detector flag keyed on engram-dst-host's dep closure; nightly job with `--failure-report` issue auto-filing (the shipped nightly-sim pattern); regression_seeds populated; this section closed with the commit chain | S |
 
