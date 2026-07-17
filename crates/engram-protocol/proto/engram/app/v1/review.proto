@@ -1,0 +1,101 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// PR code review record (ADR 0100). Reviews are org-visible: a team
+// dashboard, not a personal list. Writes happen through review tool calls
+// and the review workflow, never through this service.
+service ReviewService {
+  rpc ListReviews(ListReviewsRequest) returns (ListReviewsResponse);
+  rpc GetReview(GetReviewRequest) returns (GetReviewResponse);
+}
+
+// One review pass over a PR at a pinned head_sha.
+message Review {
+  string id = 1;
+  string repo = 2;
+  int32 pr_number = 3;
+  string task_id = 4;
+  string head_sha = 5;
+  string base_sha = 6;
+  // What started this pass, e.g. "dispatch" | "command" | "opened" | "synchronize".
+  string trigger = 7;
+  // queued | finding | verifying | posted | failed | superseded
+  string status = 8;
+  optional string github_review_id = 9;
+  optional string summary_md = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  FindingCounts finding_counts = 13;
+}
+
+// Per-severity finding counts for the list page.
+message FindingCounts {
+  int32 critical = 1;
+  int32 high = 2;
+  int32 medium = 3;
+  int32 low = 4;
+  int32 total = 5;
+}
+
+message ReviewFinding {
+  string id = 1;
+  string review_id = 2;
+  string path = 3;
+  optional int32 start_line = 4;
+  optional int32 end_line = 5;
+  // "LEFT" | "RIGHT" (GitHub diff side), when line-anchored.
+  optional string side = 6;
+  // security-privacy | stability-availability | data-integrity-integration |
+  // functional-correctness | performance-scalability | maintainability-quality
+  string category = 7;
+  // critical | high | medium | low
+  string severity = 8;
+  // high | medium | low
+  string confidence = 9;
+  string title = 10;
+  string body_md = 11;
+  optional string suggested_fix = 12;
+  // Files the finder actually read (the evidence gate).
+  repeated string evidence = 13;
+  // candidate | confirmed | suppressed_refuted | posted | ui_only |
+  // suppressed_by_config | superseded
+  string state = 14;
+  optional string verdict_reason = 15;
+  optional string github_thread_id = 16;
+  // addressed | still_open | no_longer_applies (incremental passes, P1)
+  optional string resolution = 17;
+  string session_id = 18;
+  google.protobuf.Timestamp created_at = 19;
+}
+
+// The verifier's judgment on one finding.
+message ReviewVerdict {
+  string finding_id = 1;
+  // confirmed | refuted
+  string verdict = 2;
+  // high | medium | low
+  string confidence = 3;
+  string reasoning = 4;
+}
+
+message ListReviewsRequest {
+  // Optional filter, "owner/name".
+  optional string repo = 1;
+}
+
+message ListReviewsResponse {
+  repeated Review reviews = 1;
+}
+
+message GetReviewRequest {
+  string id = 1;
+}
+
+message GetReviewResponse {
+  Review review = 1;
+  repeated ReviewFinding findings = 2;
+  repeated ReviewVerdict verdicts = 3;
+}
