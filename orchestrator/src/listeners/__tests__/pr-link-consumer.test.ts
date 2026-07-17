@@ -87,6 +87,59 @@ describe("PR-link consumer", () => {
     ]);
   });
 
+  test("derives repo from the PR URL for the production payload shape (number+title only)", async () => {
+    // The github connector historically extracted only number/title into
+    // `data` — repo/branches were never present. The row identity's repo
+    // half must come from the fetchable URL then.
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(
+      integrationAsset({
+        provider: "github",
+        asset_kind: "pull_request",
+        surface: "asset",
+        data: { number: 97, title: "Record authored pull requests" },
+        fetchable: {
+          kind: "external",
+          url: "https://github.com/openai/engrams/pull/97",
+        },
+        at: "2026-07-16T18:19:20.123Z",
+      }),
+      { sessionId: "session-1" },
+    );
+
+    expect(recorder.upserts).toHaveLength(1);
+    expect(recorder.upserts[0]?.repo).toBe("openai/engrams");
+    expect(recorder.upserts[0]?.prNumber).toBe(97);
+    expect(recorder.upserts[0]?.title).toBe("Record authored pull requests");
+  });
+
+  test("skips a PR asset whose repo is absent and underivable", async () => {
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(
+      integrationAsset({
+        provider: "github",
+        asset_kind: "pull_request",
+        surface: "asset",
+        data: { number: 97 },
+        fetchable: null,
+        at: "2026-07-16T18:19:20.123Z",
+      }),
+      { sessionId: "session-1" },
+    );
+
+    expect(recorder.upserts).toEqual([]);
+  });
+
   test("records the link even when fetchable is null and decorative fields are absent", async () => {
     // The coordinator marks `fetchable` as Option and `data` comes from the
     // egress proxy — only repo+number are guaranteed. The durable task→PR

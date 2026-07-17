@@ -10,14 +10,16 @@ import type { SessionConsumer } from "./consumer.ts";
 
 const log = rootLog.child({ component: "pr-link-consumer" });
 
-// Only `repo` + `number` are load-bearing (they are the row identity); the
-// coordinator marks `fetchable` as `Option` and `data` is whatever the egress
-// proxy extracted, so everything decorative degrades to "" rather than
-// classifying the event as malformed and silently dropping the task→PR link.
+// Only the row identity (repo + number) is load-bearing, and even `repo` may
+// be absent from `data` (older connector manifests extracted only
+// number/title; GraphQL extraction depends on the client's selection) — it is
+// then derived from the fetchable PR URL. Everything decorative degrades to
+// "" rather than classifying the event as malformed and silently dropping
+// the task→PR link.
 const pullRequestAssetSchema = z.object({
   asset_kind: z.literal("pull_request"),
   data: z.object({
-    repo: z.string().min(1),
+    repo: z.string().min(1).optional(),
     number: z.number().int().positive(),
     title: z.string().optional(),
     head_branch: z.string().optional(),
@@ -41,6 +43,24 @@ type ParseResult =
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/** Derive "owner/repo" from a forge PR URL like
+ * `https://github.com/owner/repo/pull/97`. Returns null when the URL doesn't
+ * carry that shape (or isn't a URL at all). */
+export function repoFromPrUrl(url: string): string | null {
+  if (!url) return null;
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return null;
+  }
+  const segments = parsed.pathname.split("/").filter(Boolean);
+  if (segments.length >= 4 && (segments[2] === "pull" || segments[2] === "pulls")) {
+    return `${segments[0]}/${segments[1]}`;
+  }
+  return null;
 }
 
 export function parsePullRequestAsset(event: CuratedEvent): ParseResult {
@@ -82,15 +102,25 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
         return;
       }
 
-      const taskId = await deps.findTaskId(ctx.sessionId);
       const { data, fetchable, at } = parsed.asset;
+      const url = fetchable?.kind === "external" ? fetchable.url : "";
+      const repo = data.repo ?? repoFromPrUrl(url);
+      if (!repo) {
+        log.warn(
+          { sessionId: ctx.sessionId, eventIdx: event.idx.toString() },
+          "pull-request asset carries no repo and none is derivable from its URL; skipping",
+        );
+        return;
+      }
+
+      const taskId = await deps.findTaskId(ctx.sessionId);
       await deps.prRefs.upsert({
-        repo: data.repo,
+        repo,
         prNumber: data.number,
         authoringTaskId: taskId,
         sessionId: ctx.sessionId,
         title: data.title ?? "",
-        url: fetchable?.kind === "external" ? fetchable.url : "",
+        url,
         headBranch: data.head_branch ?? "",
         baseBranch: data.base_branch ?? "",
         observedAt: new Date(at),
