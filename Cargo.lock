@@ -1415,6 +1415,7 @@ dependencies = [
  "engram-egress-proxy",
  "engram-harness-noop",
  "engram-harness-proto",
+ "engram-host-core",
  "engram-migrate-proto",
  "engram-oci",
  "engram-protocol",
@@ -1451,6 +1452,19 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "userfaultfd",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-host-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "engram-core",
+ "serde",
+ "tokio",
  "uuid",
  "workspace-hack",
 ]

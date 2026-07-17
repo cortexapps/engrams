@@ -1,0 +1,14 @@
+# ADR 0098 D1: time and entropy are world inputs, injected via a `Clock` /
+# `Entropy` (engram-core traits) so the deterministic-simulation harness can
+# substitute them. Direct calls are banned crate-wide; the host-agent reads
+# time/ids via its injected `clock`/`entropy`, with the deliberate
+# single-`#[allow]` carve-outs in `time_source` (monotonic-Instant metric
+# timers + not-yet-extracted flow timers, and path-uniqueness UUIDs). Test
+# modules that drive a live system carry a scoped
+# `#[allow(clippy::disallowed_methods)]` with a justifying comment.
+disallowed-methods = [
+    { path = "chrono::Utc::now", reason = "read time via the injected clock.now_utc() (ADR 0098 D1)" },
+    { path = "std::time::Instant::now", reason = "measure via clock.now_mono(), or time_source::metrics_now() for data-plane/not-yet-extracted timers (ADR 0098 D1)" },
+    { path = "tokio::time::Instant::now", reason = "measure via clock.now_mono(), or time_source::metrics_now_tokio() (ADR 0098 D1)" },
+    { path = "uuid::Uuid::new_v4", reason = "mint ids via the injected entropy.uuid(), or time_source::unique_path_token() for path uniqueness (ADR 0098 D1)" },
+]

@@ -156,7 +156,7 @@ impl ImageCache {
         // cache when the process is killed mid-fetch.
         let tmp = self.inner.root.join("images/.tmp");
         // Use a unique tmp subdir per pull to avoid concurrent collisions.
-        let pull_dir = tmp.join(format!("pull-{}", uuid::Uuid::new_v4()));
+        let pull_dir = tmp.join(format!("pull-{}", crate::time_source::unique_path_token()));
         fs::create_dir_all(&pull_dir)
             .await
             .map_err(CacheError::Io)?;

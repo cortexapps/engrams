@@ -18,6 +18,8 @@
 //! Knobs: ENGRAM_PEER_PULL_CONNS / ENGRAM_PEER_FRAME_BYTES /
 //! ENGRAM_PEER_SERVE_STREAMS (see peer_fill.rs), and
 //! BENCH_TOTAL_MIB (default 512).
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};

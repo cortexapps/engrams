@@ -54,8 +54,10 @@ impl LocalHostClient {
         // exercise the attach path (tests / in-process glue), and an
         // ephemeral dir keeps the ADR 0073 validation code identical
         // rather than special-cased.
-        let dir =
-            std::env::temp_dir().join(format!("engram-noop-hub-bindings-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "engram-noop-hub-bindings-{}",
+            crate::time_source::unique_path_token()
+        ));
         let bindings = crate::bindings::BindingStore::open(dir)
             .expect("open ephemeral binding store for noop hub");
         let hub = Arc::new(HarnessHub::new(

@@ -7,6 +7,8 @@
 //! with a stub host that records which method it was asked to run for which
 //! sandbox, drives it through the real `GrpcHostClient`, and asserts each
 //! verb reaches the host with the right sandbox id, in order.
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -979,7 +979,7 @@ impl HostService for HostServiceImpl {
             let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
             let agent = decode_bincode(&r.agent_bincode, "AgentSpec")?;
             let policy = decode_bincode(&r.policy_bincode, "SessionEgressPolicy")?;
-            let phase_start = std::time::Instant::now();
+            let phase_start = crate::time_source::metrics_now();
             let result = self
                 .inner
                 .start_agent(sandbox_id, agent, policy, fence)

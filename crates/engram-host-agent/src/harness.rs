@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{
@@ -489,9 +489,11 @@ impl HarnessHub {
                 return false;
             }
         }
-        let deadline = Instant::now() + Duration::from_secs(grace_secs as u64) + DRAIN_DETACH_SLACK;
+        let deadline = crate::time_source::metrics_now()
+            + Duration::from_secs(grace_secs as u64)
+            + DRAIN_DETACH_SLACK;
         while self.is_attached(sandbox_id) {
-            if Instant::now() >= deadline {
+            if crate::time_source::metrics_now() >= deadline {
                 tracing::warn!(
                     sandbox_id = %sandbox_id,
                     grace_secs,
@@ -904,6 +906,8 @@ pub async fn spawn_tcp_listener(
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use engram_harness_proto::HarnessAttach;
     use parking_lot::Mutex as PlMutex;

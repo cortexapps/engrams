@@ -236,15 +236,16 @@ impl PeerHealth {
 
     pub fn is_lost(&self, addr: &str) -> bool {
         match self.lost_until.lock().get(addr) {
-            Some(until) => Instant::now() < *until,
+            Some(until) => crate::time_source::metrics_now() < *until,
             None => false,
         }
     }
 
     pub fn mark_lost(&self, addr: &str) {
-        self.lost_until
-            .lock()
-            .insert(addr.to_string(), Instant::now() + PEER_LOST_WINDOW);
+        self.lost_until.lock().insert(
+            addr.to_string(),
+            crate::time_source::metrics_now() + PEER_LOST_WINDOW,
+        );
         metrics::counter!("engram_peer_health_trips_total").increment(1);
     }
 }

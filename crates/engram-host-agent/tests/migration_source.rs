@@ -20,7 +20,8 @@
 //!      integration's same-host precursor.
 //!
 //! Wired into ci.yml's `test-firecracker` job.
-
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;

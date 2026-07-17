@@ -107,7 +107,8 @@ pub struct MigrationExport {
 impl MigrationExport {
     /// Refresh the activity clock (every artifact/page serve).
     pub fn touch(&self) {
-        *self.last_activity.lock().expect("last_activity poisoned") = Instant::now();
+        *self.last_activity.lock().expect("last_activity poisoned") =
+            crate::time_source::metrics_now();
     }
 }
 
@@ -219,6 +220,12 @@ impl MigrationRegistry {
             .unwrap_or(false)
     }
 
+    // ADR 0098 D1 carve-out: this mints an UNGUESSABLE single-use security
+    // token (the migration export id / peer token), not a simulation-visible
+    // identifier — the same rationale D1 uses to keep crypto key material on
+    // `OsRng` rather than the seeded `entropy`. Seeding it would make the
+    // token predictable, which is the opposite of the requirement.
+    #[allow(clippy::disallowed_methods)]
     pub fn mint_export_id() -> String {
         // 32 random bytes (two v4 UUIDs, OS RNG), hex — unguessable,
         // single-use.
@@ -329,6 +336,8 @@ fn constant_time_str_eq(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     #[test]

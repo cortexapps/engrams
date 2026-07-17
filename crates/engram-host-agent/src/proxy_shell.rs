@@ -208,7 +208,7 @@ async fn connect_ttyd_cold(
     tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
     SandboxError,
 > {
-    let deadline = std::time::Instant::now() + TTYD_DIAL_DEADLINE;
+    let deadline = crate::time_source::metrics_now() + TTYD_DIAL_DEADLINE;
     let mut backoff = TTYD_BACKOFF_START;
     loop {
         let request = build_request()?;
@@ -217,7 +217,7 @@ async fn connect_ttyd_cold(
             Err(e) => {
                 let msg = e.to_string();
                 let refused = msg.contains("Connection refused");
-                if !refused || std::time::Instant::now() >= deadline {
+                if !refused || crate::time_source::metrics_now() >= deadline {
                     return Err(SandboxError::Vm(format!("connect to ttyd: {e}").into()));
                 }
                 tokio::time::sleep(backoff).await;

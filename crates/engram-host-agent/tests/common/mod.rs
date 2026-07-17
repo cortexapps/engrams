@@ -6,6 +6,8 @@
 //! Each top-level file in `tests/` is its own crate, so only the helpers a
 //! given test binary actually calls are reachable from it — hence the
 //! module-wide `dead_code` allow.
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![allow(dead_code)]
 
 use engram_chunk_store::{ChunkStore, ManifestKind, ManifestRef};

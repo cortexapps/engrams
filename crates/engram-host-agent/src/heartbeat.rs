@@ -18,6 +18,12 @@ pub trait HeartbeatSink: Send + Sync {
     async fn send(&self, hb: Heartbeat) -> HeartbeatAck;
 }
 
+// ADR 0098 D1 carve-out: this is the in-process (`--mode=all`) heartbeat
+// builder, exercised only by this module's tests; the production HTTP
+// heartbeat is assembled in `lib.rs`. `sent_at` is display-only (the coord
+// records its own authoritative `server_time`). Threading a clock here would
+// only touch test call sites for no simulation benefit.
+#[allow(clippy::disallowed_methods)]
 pub fn build_heartbeat(
     host_id: engram_core::HostId,
     cap: &CapacitySnapshot,
@@ -58,6 +64,8 @@ pub fn default_interval() -> Duration {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use engram_core::HostId;
 

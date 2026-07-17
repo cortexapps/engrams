@@ -21,8 +21,10 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use engram_core::traits::{Clock, SystemClock};
 use engram_core::{SandboxId, SessionId};
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +89,9 @@ impl From<std::io::Error> for BindError {
 #[derive(Clone, Debug)]
 pub struct BindingStore {
     dir: PathBuf,
+    /// ADR 0098 D1: wall clock is an injected world input. P1 wires the
+    /// production clock; sim injection rides the flow-extraction PRs.
+    clock: Arc<dyn Clock>,
 }
 
 impl BindingStore {
@@ -96,7 +101,10 @@ impl BindingStore {
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            clock: Arc::new(SystemClock::new()),
+        })
     }
 
     fn path_for(&self, session_id: SessionId) -> PathBuf {
@@ -138,7 +146,7 @@ impl BindingStore {
             session_id,
             sandbox_id,
             binding_epoch,
-            bound_at: Utc::now(),
+            bound_at: self.clock.now_utc(),
         };
         self.write_atomic(&record)?;
         Ok(record)
@@ -230,12 +238,17 @@ impl BindingStore {
 /// production code path is exercised unchanged.
 #[cfg(test)]
 pub fn ephemeral() -> BindingStore {
-    let dir = std::env::temp_dir().join(format!("engram-bindings-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!(
+        "engram-bindings-{}",
+        crate::time_source::unique_path_token()
+    ));
     BindingStore::open(dir).expect("ephemeral binding store")
 }
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     fn store() -> BindingStore {

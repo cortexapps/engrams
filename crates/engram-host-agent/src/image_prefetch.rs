@@ -874,7 +874,7 @@ async fn peer_prepass(
     }
     let scope = PeerChunkScope::BaseImage(image.manifest_digest.as_str().to_string());
     for peer in image.warm_peers.iter().take(2) {
-        let started = std::time::Instant::now();
+        let started = crate::time_source::metrics_now();
         let mut stats = crate::peer_fill::pull_chunks_from_peer(
             &peer.addr,
             scope.clone(),
@@ -1298,6 +1298,8 @@ impl std::error::Error for PrefetchError {}
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     // ADR 0022: pin a small (16 KiB) temp file resident — exercises the

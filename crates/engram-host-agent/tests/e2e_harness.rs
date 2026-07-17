@@ -32,7 +32,8 @@
 //! eval "$(bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)"
 //! cargo test -p engram-host-agent --test e2e_harness -- --ignored --nocapture --test-threads=1
 //! ```
-
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
