@@ -11,7 +11,8 @@
 
 use std::collections::HashMap;
 
-use engram_dst_host::{invariants, Profile, ScriptedResponse, Sim, SimHost};
+use engram_dst_host::{invariants, CrashPoint, Profile, ScriptedResponse, Sim, SimHost};
+use engram_host_agent::disk_daemon::spool;
 
 /// Drive one deterministic scenario host with `num` sandboxes.
 async fn scenario_host(seed: u64, num: usize) -> SimHost {
@@ -278,6 +279,186 @@ async fn stale_binding_sweep_never_double_claims_or_tears_a_live_binding() {
             "the stale-binding sweep must skip a device a live lease holds",
         );
         drop(survivor_guard);
+    }
+}
+
+// ───────────── Flow A incident seeds (ADR 0098 P4 — the SIGTERM ladder) ────
+//
+// The three historical SIGTERM-path hazards, each reproduced as a
+// deterministic scenario against the extracted ladder + the real
+// spool/rebuild machinery, then pinned as proof the acked-write oracle armed
+// over them.
+
+/// #225 — the deadline overrun. A tiny final-flush budget overruns the
+/// deadline, so the final-flush leg is SKIPPED: every survivor is a straggler
+/// whose acked (un-published) dirty tier rides the shutdown spool — which is
+/// NOT deadline-bound and always completes. The successor adopts it and
+/// recovers every acked write. (The pre-spool code rolled these acked writes
+/// back by up to a cadence window — the corruption the spool closed.)
+#[tokio::test(start_paused = true)]
+async fn sigterm_tiny_budget_overrun_spools_stragglers_and_recovers_every_acked_write() {
+    let mut host = scenario_host(0, 3).await;
+    // Acked writes that the final flush would upload if the deadline allowed.
+    host.guest_write(0, 1).await.unwrap();
+    host.guest_write(1, 2).await.unwrap();
+    host.guest_write(2, 3).await.unwrap();
+    assert!(host.ledger.len() >= 3);
+
+    // 1 ms budget → the plan_shutdown deadline is below SIM_FLUSH_COST → the
+    // final-flush leg overruns and is skipped; the spool is the ONLY copy.
+    host.sigterm(Some(0.001)).await.unwrap();
+    for slot in &host.sandboxes {
+        let spooled = spool::read_spool(host.fs.spool_dir(), slot.sandbox_id)
+            .await
+            .unwrap();
+        assert!(
+            spooled.is_some_and(|(_, chunks)| !chunks.is_empty()),
+            "an overrun straggler must leave a complete, chunk-bearing spool",
+        );
+    }
+
+    // The successor restarts and adopts the spool → every acked write back.
+    host.restart().await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 1).await.unwrap();
+    host.guest_read(1, 2).await.unwrap();
+    host.guest_read(2, 3).await.unwrap();
+}
+
+/// 85e0298a — the store-ahead recovery. The final flush uploads the chunks +
+/// a new manifest to the store (durable), but the coordinator publish ack is
+/// LOST — so coord's disk_manifest ref (the successor's rebuild ref) stays
+/// STALE at the base. The abandon-sweep spool export writes the store-ahead
+/// ref (zero-chunk, ref-only — spool.rs State 6). The successor MUST attach
+/// from the spool's ahead ref, never roll back to coord's stale one.
+#[tokio::test(start_paused = true)]
+async fn store_ahead_lost_publish_ack_recovers_from_the_spool_ref_not_coords_stale_one() {
+    let mut host = scenario_host(0, 1).await;
+    host.guest_write(0, 0).await.unwrap();
+    host.guest_write(0, 4).await.unwrap();
+
+    // The final flush UPLOADS chunks + a v2 manifest to the store and advances
+    // the backend's version — but the coord publish is lost, so the durable
+    // pointer (`published_ref`, standing in for coord's ref) stays base-stale.
+    let backend = host.sandboxes[0].backend.clone().unwrap();
+    backend.flush().await.unwrap();
+    let store_ahead = backend.manifest_ref().await;
+    assert!(store_ahead.version > host.sandboxes[0].base_ref.version);
+    assert!(
+        host.sandboxes[0].published_ref.is_none(),
+        "the publish ack was lost — coord never learned the store-ahead ref",
+    );
+
+    // The abandon sweep exports the ref-only store-ahead spool.
+    host.spool_export(0).await.unwrap();
+    let sid = host.sandboxes[0].sandbox_id;
+    let (meta, chunks) = spool::read_spool(host.fs.spool_dir(), sid)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        meta.manifest_ref(),
+        store_ahead,
+        "the spool carries the store-ahead ref coord never acked",
+    );
+    assert!(
+        chunks.is_empty(),
+        "ref-only spool: the chunks are already durable in the store",
+    );
+
+    // Crash + restart: the successor's rebuild ref is coord's stale base; the
+    // store-ahead rule attaches from the spool's ahead ref instead.
+    host.sandboxes[0].backend = None;
+    host.restart().await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].published_ref,
+        Some(store_ahead),
+        "the successor adopts the store-ahead ref, never rolls back to the stale one",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 0).await.unwrap();
+    host.guest_read(0, 4).await.unwrap();
+}
+
+/// #224 — insert-after-sweep. Once the ladder raises the terminal `abandoning`
+/// flag (the [`Abandon`] stage), a late `create`/`rehydrate` completing in its
+/// multi-second await window must abandon-in-place, NEVER leave a live NBD
+/// data plane for process-exit `Drop` to netlink-disconnect the successor's
+/// device. The dst-host scheduler is run-step-to-completion (no true
+/// concurrent futures), and the literal insert races a `DashMap` holding a
+/// Linux-only `NbdHandle` — so the strongest deterministic version the
+/// portable surface allows is the extracted ORDERING CONTRACT: the pure
+/// `admits_new_plane` gate flips exactly at `Abandon` and never re-opens. The
+/// concrete drain-twice sweep + SeqCst flag + the `is_abandoning()` create-
+/// reject / rehydrate abandon-in-place branches stay in the driver and are
+/// owned by the FC lane.
+///
+/// [`Abandon`]: engram_host_core::ShutdownStage::Abandon
+#[test]
+fn insert_after_abandon_stage_is_routed_to_abandon_in_place() {
+    use engram_host_core::{admits_new_plane, ShutdownStage};
+
+    // Before Abandon, a completing insert may land its live data plane.
+    for stage in [
+        ShutdownStage::Signaled,
+        ShutdownStage::TasksAborted,
+        ShutdownStage::FinalFlush,
+    ] {
+        assert!(admits_new_plane(stage), "{stage:?} still admits new planes");
+    }
+    // From Abandon onward, a late insert MUST abandon-in-place.
+    for stage in [
+        ShutdownStage::Abandon,
+        ShutdownStage::SpoolExport,
+        ShutdownStage::Detached,
+    ] {
+        assert!(
+            !admits_new_plane(stage),
+            "{stage:?} must route a late insert to abandon-in-place",
+        );
+    }
+    // The gate flips exactly at the Abandon boundary and never re-opens.
+    let ladder = ShutdownStage::LADDER;
+    let first_closed = ladder
+        .iter()
+        .position(|s| !admits_new_plane(*s))
+        .expect("some stage closes the gate");
+    assert_eq!(ladder[first_closed], ShutdownStage::Abandon);
+    assert!(
+        ladder[first_closed..].iter().all(|s| !admits_new_plane(*s)),
+        "once closed, the gate stays closed for the rest of the ladder",
+    );
+}
+
+/// The seeded crash-point injector, exhaustively: cut the process at every one
+/// of the eight durable-operation boundaries (the H5 composition contract) and
+/// prove the REAL recovery (rebuild + tolerant `read_spool` / `load_all`)
+/// recovers every acked write — oracle #1 UNCONDITIONAL. The spool boundaries
+/// model the final-flush leg completing (published tier covers the writes) and
+/// a crash mid-spool-write (the spool is redundant → torn/absent safely
+/// rejected); the persist boundaries prove reachability + tolerant recovery of
+/// the durable_record format (Flow D wires them into the ledger in P5).
+#[tokio::test(start_paused = true)]
+async fn every_crash_point_injection_recovers_every_acked_write() {
+    for cp in CrashPoint::ALL {
+        let mut host = scenario_host(0, 2).await;
+        // Acked writes at risk across the crash.
+        host.guest_write(0, 0).await.unwrap();
+        host.guest_write(1, 5).await.unwrap();
+
+        host.crash_at(cp)
+            .await
+            .unwrap_or_else(|e| panic!("crash_at({cp:?}): {e}"));
+        host.restart()
+            .await
+            .unwrap_or_else(|e| panic!("restart after {cp:?}: {e}"));
+        invariants::check(&host)
+            .await
+            .unwrap_or_else(|v| panic!("crash point {cp:?}: {} — {}", v.invariant, v.detail));
     }
 }
 

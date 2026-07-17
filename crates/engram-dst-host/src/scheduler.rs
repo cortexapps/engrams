@@ -15,6 +15,7 @@ use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
 
 use crate::invariants;
+use crate::simfs::CrashPoint;
 use crate::world::{SimHost, NUM_CHUNKS};
 
 /// How many sandboxes each sim host runs. Small (AGENTS.md: size to the
@@ -62,6 +63,15 @@ pub enum Step {
     /// ownership (a terminal/idle/rebound session). Reconcile should reap it
     /// after the strike debounce.
     RevokeOwnership(usize),
+    /// Flow A (P4): drive the REAL extracted SIGTERM ladder. The payload is
+    /// the seeded `ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS` in MILLIseconds (`None`
+    /// = env unset); `u64` millis keeps [`Step`] `Eq` (an `f64` would not).
+    /// A tiny budget overruns the final-flush deadline → the #225 shape.
+    Sigterm(Option<u64>),
+    /// Flow A (P4): seeded crash-point injection at one of the eight durable-
+    /// operation boundaries, then RAM dies. The following `Restart` runs the
+    /// real recovery under oracle #1.
+    CrashAt(CrashPoint),
 }
 
 impl Step {
@@ -80,8 +90,36 @@ impl Step {
             Step::ReconcileTick => "ReconcileTick",
             Step::DropLocalBinding(..) => "DropLocalBinding",
             Step::RevokeOwnership(..) => "RevokeOwnership",
+            Step::Sigterm(..) => "Sigterm",
+            Step::CrashAt(..) => "CrashAt",
         }
     }
+}
+
+/// A seeded final-flush budget in milliseconds (`None` = env unset). The set
+/// spans below and above [`SIM_FLUSH_COST`](crate::world::SIM_FLUSH_COST) (1 s)
+/// so both the deadline-overrun (#225) and the clean-flush ladder paths are
+/// exercised; `Some(0)` is the non-positive-env case (`plan_shutdown` defaults
+/// it, no overrun).
+fn pick_budget_ms(rng: &mut ChaCha8Rng) -> Option<u64> {
+    match rng.random_range(0..6u32) {
+        0 => None,         // env unset → default 20 s → no overrun
+        1 => Some(0),      // non-positive → default 20 s → no overrun
+        2 => Some(1),      // 1 ms → OVERRUN (#225)
+        3 => Some(500),    // 0.5 s → OVERRUN (#225)
+        4 => Some(5_000),  // 5 s → completes
+        _ => Some(30_000), // 30 s → completes
+    }
+}
+
+/// Seeded crash-point boundary, indexed into [`CrashPoint::ALL`].
+fn pick_crashpoint(rng: &mut ChaCha8Rng) -> CrashPoint {
+    CrashPoint::ALL[rng.random_range(0..CrashPoint::ALL.len())]
+}
+
+/// Convert a seeded budget (millis) to the `plan_shutdown` env value (secs).
+fn budget_secs(ms: Option<u64>) -> Option<f64> {
+    ms.map(|ms| ms as f64 / 1000.0)
 }
 
 /// The run artifact — same shape as `engram-dst`'s `SimReport`. The
@@ -153,39 +191,44 @@ impl Sim {
         // pick must NEVER branch on anything non-deterministic.
         match self.profile {
             Profile::Calm => match roll {
-                0..=39 => Step::GuestWrite(
+                0..=37 => Step::GuestWrite(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                40..=57 => Step::GuestRead(
+                38..=54 => Step::GuestRead(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                58..=69 => Step::FlushTick(self.rng.random_range(0..n)),
-                70..=77 => Step::SpoolExport(self.rng.random_range(0..n)),
-                78..=84 => Step::SpoolAdopt(self.rng.random_range(0..n)),
-                85..=91 => Step::ReconcileTick,
-                92..=94 => Step::DropLocalBinding(self.rng.random_range(0..n)),
-                95..=96 => Step::RevokeOwnership(self.rng.random_range(0..n)),
+                55..=66 => Step::FlushTick(self.rng.random_range(0..n)),
+                67..=73 => Step::SpoolExport(self.rng.random_range(0..n)),
+                74..=80 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                81..=87 => Step::ReconcileTick,
+                88..=90 => Step::DropLocalBinding(self.rng.random_range(0..n)),
+                91..=92 => Step::RevokeOwnership(self.rng.random_range(0..n)),
+                // Sigterm is a GRACEFUL shutdown (the spool always completes),
+                // so it belongs in the calm durability baseline too.
+                93..=96 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
-                0..=29 => Step::GuestWrite(
+                0..=26 => Step::GuestWrite(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                30..=42 => Step::GuestRead(
+                27..=39 => Step::GuestRead(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                43..=53 => Step::FlushTick(self.rng.random_range(0..n)),
-                54..=61 => Step::SpoolExport(self.rng.random_range(0..n)),
-                62..=69 => Step::SpoolAdopt(self.rng.random_range(0..n)),
-                70..=78 => Step::ReconcileTick,
-                79..=82 => Step::DropLocalBinding(self.rng.random_range(0..n)),
-                83..=85 => Step::RevokeOwnership(self.rng.random_range(0..n)),
-                86..=92 => Step::CrashProcess,
-                93..=97 => Step::Restart,
+                40..=50 => Step::FlushTick(self.rng.random_range(0..n)),
+                51..=58 => Step::SpoolExport(self.rng.random_range(0..n)),
+                59..=66 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                67..=74 => Step::ReconcileTick,
+                75..=78 => Step::DropLocalBinding(self.rng.random_range(0..n)),
+                79..=81 => Step::RevokeOwnership(self.rng.random_range(0..n)),
+                82..=86 => Step::CrashProcess,
+                87..=90 => Step::Restart,
+                91..=93 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
+                94..=97 => Step::CrashAt(pick_crashpoint(&mut self.rng)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -224,6 +267,18 @@ impl Sim {
             }
             Step::DropLocalBinding(idx) => self.host.drop_local_binding(idx),
             Step::RevokeOwnership(idx) => self.host.revoke_ownership(idx),
+            Step::Sigterm(budget_ms) => {
+                self.host.sigterm(budget_secs(budget_ms)).await?;
+                // A fresh host-agent process starts with an empty strike
+                // ledger; RAM died, so bias toward Restart next.
+                self.reconcile_strikes.clear();
+                self.crashed = true;
+            }
+            Step::CrashAt(cp) => {
+                self.host.crash_at(cp).await?;
+                self.reconcile_strikes.clear();
+                self.crashed = true;
+            }
         }
         Ok(())
     }

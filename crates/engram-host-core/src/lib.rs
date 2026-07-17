@@ -38,6 +38,7 @@ pub mod device;
 pub mod effects;
 pub mod fs;
 pub mod nbd;
+pub mod shutdown;
 
 pub use coord::{
     CoordControlPlane, CoordError, LiveManifestPublishOutcome, LiveManifestPublishRequest,
@@ -47,3 +48,7 @@ pub use device::DeviceSync;
 pub use effects::HostEffects;
 pub use fs::{HostFs, TokioFs};
 pub use nbd::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
+pub use shutdown::{
+    admits_new_plane, classify_survivor, flush_budget, is_straggler, plan_shutdown, FlushProbe,
+    ShutdownPlan, ShutdownStage, SurvivorAction, DEFAULT_FLUSH_BUDGET_SECS,
+};

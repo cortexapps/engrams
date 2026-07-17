@@ -11,7 +11,7 @@
 use std::collections::BTreeSet;
 use std::time::Duration;
 
-use engram_dst_host::Step;
+use engram_dst_host::{CrashPoint, Step};
 
 /// One representative of every P2 [`Step`] variant. Adding a variant to the
 /// enum without adding it here leaves `coverage_name`s below short of
@@ -29,6 +29,8 @@ fn all_step_representatives() -> Vec<Step> {
         Step::ReconcileTick,
         Step::DropLocalBinding(0),
         Step::RevokeOwnership(0),
+        Step::Sigterm(Some(1)),
+        Step::CrashAt(CrashPoint::SpoolMarker),
     ]
 }
 
@@ -46,6 +48,8 @@ const EXPECTED: &[&str] = &[
     "ReconcileTick",
     "DropLocalBinding",
     "RevokeOwnership",
+    "Sigterm",
+    "CrashAt",
 ];
 
 #[test]
