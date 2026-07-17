@@ -417,6 +417,12 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
 async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
+    // Debug-visibility for the rehydrate short-circuit branches (all of
+    // them log rather than error). Mirrors nbd_netlink_reconfigure.rs.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter("engram_host_agent=debug,engram_chunk_store=info")
+        .with_test_writer()
+        .try_init();
     let nbd_path = match preflight() {
         Some(p) => p,
         None => return,
