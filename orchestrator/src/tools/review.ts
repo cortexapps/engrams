@@ -12,6 +12,8 @@ import {
   type ToolRegistry,
 } from "./registry.ts";
 
+export const PR_REVIEW_CAPABILITY = "engram:pr_review";
+
 const CategorySchema = z.enum([
   "security-privacy",
   "stability-availability",
@@ -71,7 +73,7 @@ export function registerReviewTools(
     output: z.object({ recorded: z.boolean(), finding_id: z.string() }),
     handling: "handled",
     execution: "sync",
-    capability: "pr_review",
+    capability: PR_REVIEW_CAPABILITY,
     handler: async (ctx, args) => {
       const active = await activeReview(ctx, reviews);
       if (isToolError(active)) return active;
@@ -107,7 +109,7 @@ export function registerReviewTools(
     output: z.object({ recorded: z.boolean() }),
     handling: "handled",
     execution: "sync",
-    capability: "pr_review",
+    capability: PR_REVIEW_CAPABILITY,
     handler: async (ctx, args) => {
       const active = await activeReview(ctx, reviews);
       if (isToolError(active)) return active;
@@ -128,7 +130,7 @@ export function registerReviewTools(
     output: z.object({ recorded: z.boolean() }),
     handling: "handled",
     execution: "sync",
-    capability: "pr_review",
+    capability: PR_REVIEW_CAPABILITY,
     handler: async (ctx, args) => {
       const active = await activeReview(ctx, reviews);
       if (isToolError(active)) return active;

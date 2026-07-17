@@ -10,7 +10,7 @@ import type {
 } from "../../db/reviews.ts";
 import { compileToolManifest } from "../manifest.ts";
 import { createToolRegistry, type ToolContext } from "../registry.ts";
-import { registerReviewTools } from "../review.ts";
+import { PR_REVIEW_CAPABILITY, registerReviewTools } from "../review.ts";
 
 const REVIEW_ID = "00000000-0000-4000-8000-000000000001";
 const FINDING_ID = "00000000-0000-4000-8000-000000000002";
@@ -104,7 +104,7 @@ function context(toolName: string): ToolContext {
   return {
     sessionId: "session-1",
     taskId: "task-1",
-    capabilities: ["pr_review"],
+    capabilities: [PR_REVIEW_CAPABILITY],
     toolCallId: "call-1",
     toolName,
   };
@@ -122,7 +122,7 @@ describe("review tools", () => {
     const registry = reviewRegistry(fake.store);
 
     expect(compileToolManifest(registry, [])).toEqual([]);
-    expect(compileToolManifest(registry, ["pr_review"]).map((tool) => tool.name)).toEqual([
+    expect(compileToolManifest(registry, [PR_REVIEW_CAPABILITY]).map((tool) => tool.name)).toEqual([
       "submit_finding",
       "finder_done",
       "submit_verdict",
