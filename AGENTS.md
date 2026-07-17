@@ -43,6 +43,29 @@ Firecracker path; VZ exists to exercise that path on macOS, not to fork it.
 ## Testing
 
 - **Unit/integration**: `cargo nextest run -p <crate>` (in `just check`).
+- **Live-PG tests** use `engram_testkit::pg::fresh_db()` — every test gets its own
+  template-cloned database (ADR 0099), so the lane runs fully parallel. Never call
+  `.migrate()` on the returned store (the template is pre-migrated), and never
+  point a second pool at the admin URL — use `db.url`.
+- **The conformance rule (ADR 0098 D4)**: any PR that adds a `MetadataStore`
+  method or changes PostgresStore SQL semantics MUST extend
+  `crates/engram-sim/tests/` in the same PR — every scenario runs against BOTH
+  `SimMetadataStore` and real Postgres. In `SimMetadataStore`, an unimplemented
+  PG-semantic method panics; never let it inherit a silent no-op default.
+- **Property tests** (proptest, ADR 0099 H3/H4): persisted `proptest-regressions/`
+  files are committed — a CI property failure means *grab the counterexample from
+  the log, pin it, fix it*; rerunning until green is the banned paper-over.
+  Integration-test targets must pin `FileFailurePersistence` explicitly (the
+  default can't find `tests/` files). Wire-proto strategies carry exhaustiveness
+  guards (a wildcard-free `match` over the enum) so a new variant is a compile
+  error, not a silent coverage gap; new decode surfaces get decode-never-panics
+  suites.
+- **Crash-state tests** (ADR 0099 H5): for durable on-disk formats
+  (`durable_record`, the shutdown spool), externally construct every post-crash
+  state — torn files at every byte offset, missing completeness markers, garbage
+  siblings — and assert tolerant recovery. No `fail` crate, no test-only traits;
+  if the states aren't externally constructible, the format is the problem.
+  Scripted `engram_testkit::storage::FaultyBlobStorage` covers the blob tier.
 - **Firecracker integration** (`crates/engram-sandbox-firecracker/tests/`): `#[ignore]`'d,
   Linux+KVM only; run in CI on KVM runners. New FC/NBD regression tests **must** be wired
   into `ci.yml`'s `--test` list (not gated as local-only) or they never run. **Size a test
@@ -73,7 +96,12 @@ bakes only the changed images. A CI-workflow or detector change re-runs everythi
 EVERY lane (Linux, macOS, firecracker, AND the e2e stack), and passes iff each lane
 succeeded-or-skipped. When you add a new lane, add it to the gate's `needs:` (and give it a
 detector flag) — **never add an individual lane as a required check**, or a path-skipped lane
-will wedge the merge queue. `.github/**` is outside `just check`: validate workflow YAML
+will wedge the merge queue. **Admin mass-merges skip combined-state validation** —
+each PR was green in isolation, not together (2026-07-16: two PRs adding the same
+workspace dep auto-merged into a duplicate TOML key, and a test PR + an
+invariant PR collided on a contract — main broke twice in one day). Land batches
+through the merge queue, or tight-burst them only after a combined local check.
+`.github/**` is outside `just check`: validate workflow YAML
 (`yaml.safe_load` / actionlint) and prefer `run: |` block scalars. Keep the `merge_group`
 trigger in the required workflow.
 
@@ -103,6 +131,23 @@ trigger in the required workflow.
   when you can state why it's sound. (ADR 0064 P2b: an `as unknown as ReadableStream` masked
   that Bun's `http.request` ignores `createConnection` — the proxy only worked once
   re-architected onto `fetch` + a loopback socket.)
+
+**Determinism (ADR 0098)**
+- **Time and randomness are injected world inputs.** In coordinator/postgres code,
+  never call `Utc::now()`, `Instant::now()`, or `Uuid::new_v4()` — read
+  `services.clock` / `services.entropy` (clippy `disallowed-methods` makes a raw
+  call a hard error). PostgresStore never uses SQL `now()`; it binds the injected
+  clock. Test modules that drive a live system carry ONE scoped
+  `#[allow(clippy::disallowed_methods)]` with the standard justification comment.
+- **Keep the `spawn()`/`run_once()` split** in every background driver: the timer
+  loop is a thin wrapper, `run_once(&cfg, &state)` is the pure step the tests and
+  the simulator drive directly. A driver whose logic lives in its loop is
+  unsimulable.
+- **Targeted invariants** (ADR 0099 H6): `engram_core::invariant!` (always-on
+  panic — safe because pods are stateless over PG and host machines are
+  redrive-safe) for corruption-class violations; `soft_invariant!` (log + skip)
+  inside reconcilers, whose job is repairing what they detect. The site list is
+  deliberate — each addition gets a line in ADR 0099.
 
 **Discipline**
 - **Investigate, never paper over.** Read the production code before changing a test
@@ -157,6 +202,9 @@ trigger in the required workflow.
 - **0015** system-design v2 (the typed `SessionState` machine) · **0024** unified dev orchestration
 - **0028** eviction durability under host roll · **0034** idle-eviction state machine
 - **0025** owning the FC guest kernel · **0044** the Kubernetes host fleet
+- **0098** deterministic simulation testing (the clock/entropy seam, engram-sim,
+  the conformance rule) · **0099** correctness hardening (per-test PG isolation,
+  proptest, fault injection, invariants)
 - **0051** the TypeScript orchestration tier · **0003** the VZ backend · **0006** the egress proxy
 
 When in doubt about *why* something is shaped the way it is, grep `docs/adr/` before assuming.
