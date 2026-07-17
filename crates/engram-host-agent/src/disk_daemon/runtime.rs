@@ -723,7 +723,14 @@ pub async fn reattach_manifest(
     if let Some((idx, expected)) = probe {
         let chunk_size = backend.chunk_size();
         let offset = idx as u64 * chunk_size;
-        match backend.read(offset, chunk_size).await {
+        // Clamp the read to the device extent: the final chunk (or a device
+        // smaller than one chunk — e.g. the 4 MiB test images) is shorter than
+        // chunk_size, and reading a full chunk_size there overruns
+        // total_bytes and errors. `probe_matches` is a prefix compare, so a
+        // full (possibly-partial) chunk read is enough to prove the seeded
+        // bytes are served.
+        let read_len = chunk_size.min(backend.total_bytes().saturating_sub(offset));
+        match backend.read(offset, read_len).await {
             Ok(bytes) if engram_host_core::probe_matches(&bytes, &expected) => {}
             Ok(_) => {
                 let device = slot.path().display().to_string();
