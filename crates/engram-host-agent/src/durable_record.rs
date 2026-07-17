@@ -13,10 +13,15 @@
 //!     the PG row owns the reference now.
 //!
 //! Records are keyed by their id's `Display` form: `<dir>/<id>.json`.
+//!
+//! Every durable op goes through the injected [`HostFs`] (ADR 0098 P5) so
+//! the host-internal simulator's `CrashFs` can crash BETWEEN operations;
+//! flows not yet behind the seam pass [`TokioFs`] at their wrappers.
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
 
+use engram_host_core::HostFs;
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
@@ -27,43 +32,42 @@ pub fn record_path(dir: &Path, id: impl Display) -> PathBuf {
 /// Durably persist (write + fsync via rename) `record` at
 /// `<dir>/<id>.json`. `what` names the record type in error text.
 pub async fn persist<T: Serialize>(
+    fs: &dyn HostFs,
     dir: &Path,
     id: impl Display,
     record: &T,
     what: &str,
 ) -> std::io::Result<()> {
-    tokio::fs::create_dir_all(dir).await?;
+    fs.create_dir(dir).await?;
     let dest = record_path(dir, id);
     let tmp = dest.with_extension("json.partial");
     let bytes = serde_json::to_vec_pretty(record)
         .map_err(|e| std::io::Error::other(format!("serialize {what}: {e}")))?;
-    tokio::fs::write(&tmp, &bytes).await?;
+    fs.write(&tmp, &bytes).await?;
     // fsync the temp file so the rename publishes complete bytes.
-    let f = tokio::fs::OpenOptions::new().read(true).open(&tmp).await?;
-    f.sync_all().await?;
-    tokio::fs::rename(&tmp, &dest).await?;
+    fs.sync_file(&tmp).await?;
+    fs.rename(&tmp, &dest).await?;
     // fsync the PARENT DIRECTORY so the rename itself is durable — without
     // this, a crash after `rename` returns can still lose the directory
     // entry (the file's data is synced, but the dir's updated block that
     // points at it may sit only in the page cache). Opening a directory
     // read-only for `fsync` is valid on Linux and macOS.
-    tokio::fs::File::open(dir).await?.sync_all().await?;
+    fs.sync_dir(dir).await?;
     Ok(())
 }
 
 /// All records in `dir`. Unreadable/partial files are skipped with a
 /// warn (see the module doc's torn-write contract).
-pub async fn load_all<T: DeserializeOwned>(dir: &Path, what: &str) -> Vec<T> {
+pub async fn load_all<T: DeserializeOwned>(fs: &dyn HostFs, dir: &Path, what: &str) -> Vec<T> {
     let mut out = Vec::new();
-    let Ok(mut rd) = tokio::fs::read_dir(dir).await else {
+    let Ok(entries) = fs.read_dir(dir).await else {
         return out;
     };
-    while let Ok(Some(entry)) = rd.next_entry().await {
-        let p = entry.path();
+    for p in entries {
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
-        match tokio::fs::read(&p).await {
+        match fs.read(&p).await {
             Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
                 Ok(r) => out.push(r),
                 Err(e) => {
@@ -81,10 +85,15 @@ pub async fn load_all<T: DeserializeOwned>(dir: &Path, what: &str) -> Vec<T> {
 }
 
 /// Delete the acked records' files; NotFound is fine (already gone).
-pub async fn delete_acked(dir: &Path, acked: impl IntoIterator<Item = impl Display>, what: &str) {
+pub async fn delete_acked(
+    fs: &dyn HostFs,
+    dir: &Path,
+    acked: impl IntoIterator<Item = impl Display>,
+    what: &str,
+) {
     for id in acked {
         let p = record_path(dir, id);
-        if let Err(e) = tokio::fs::remove_file(&p).await {
+        if let Err(e) = fs.remove_file(&p).await {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %p.display(), error = %e,
                     "failed to delete acked {what}");
@@ -111,6 +120,7 @@ mod tests {
     //! are the ones enumerated above, and this module covers all of them.
 
     use super::*;
+    use engram_host_core::TokioFs;
 
     #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
     struct Rec {
@@ -138,10 +148,10 @@ mod tests {
         let dir = tmp.path();
         let a = rec("alpha", 64);
         let b = rec("beta", 128);
-        persist(dir, &a.id, &a, "rec").await.unwrap();
-        persist(dir, &b.id, &b, "rec").await.unwrap();
+        persist(&TokioFs, dir, &a.id, &a, "rec").await.unwrap();
+        persist(&TokioFs, dir, &b.id, &b, "rec").await.unwrap();
 
-        let mut out: Vec<Rec> = load_all(dir, "rec").await;
+        let mut out: Vec<Rec> = load_all(&TokioFs, dir, "rec").await;
         out.sort_by(|x, y| x.id.cmp(&y.id));
         assert_eq!(out, vec![a, b]);
     }
@@ -179,7 +189,7 @@ mod tests {
             // the value can never accidentally parse as a whole record.
             write_raw(dir, "torn.json", &full[..offset]).await;
 
-            let mut out: Vec<Rec> = load_all(dir, "rec").await;
+            let mut out: Vec<Rec> = load_all(&TokioFs, dir, "rec").await;
             out.sort_by(|x, y| x.id.cmp(&y.id));
             assert_eq!(
                 out,
@@ -200,8 +210,8 @@ mod tests {
         let dir = tmp.path();
         let a = rec("sibling-a", 128);
         let b = rec("sibling-b", 256);
-        persist(dir, &a.id, &a, "rec").await.unwrap();
-        persist(dir, &b.id, &b, "rec").await.unwrap();
+        persist(&TokioFs, dir, &a.id, &a, "rec").await.unwrap();
+        persist(&TokioFs, dir, &b.id, &b, "rec").await.unwrap();
 
         // Valid JSON body with a garbage tail appended.
         let mut poisoned = serde_json::to_vec_pretty(&rec("poison", 64)).unwrap();
@@ -214,7 +224,7 @@ mod tests {
         let partial = serde_json::to_vec_pretty(&rec("leftover", 64)).unwrap();
         write_raw(dir, "leftover.json.partial", &partial).await;
 
-        let mut out: Vec<Rec> = load_all(dir, "rec").await;
+        let mut out: Vec<Rec> = load_all(&TokioFs, dir, "rec").await;
         out.sort_by(|x, y| x.id.cmp(&y.id));
         assert_eq!(
             out,

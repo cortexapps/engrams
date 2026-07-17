@@ -12,9 +12,11 @@
 use std::collections::HashMap;
 
 use engram_dst_host::{
-    decode_tag, invariants, CrashPoint, Profile, ScriptedResponse, Sim, SimHost, CHUNK_SIZE,
+    decode_tag, invariants, CrashFs, Profile, ScriptedResponse, Sim, SimHost, CHUNK_SIZE,
+    SIM_FINALIZE_MAX_ATTEMPTS,
 };
 use engram_host_agent::disk_daemon::spool;
+use engram_host_core::TokioFs;
 
 /// Drive one deterministic scenario host with `num` sandboxes.
 async fn scenario_host(seed: u64, num: usize) -> SimHost {
@@ -310,7 +312,7 @@ async fn sigterm_tiny_budget_overrun_spools_stragglers_and_recovers_every_acked_
     // final-flush leg overruns and is skipped; the spool is the ONLY copy.
     host.sigterm(Some(0.001)).await.unwrap();
     for slot in &host.sandboxes {
-        let spooled = spool::read_spool(host.fs.spool_dir(), slot.sandbox_id)
+        let spooled = spool::read_spool(&TokioFs, host.fs.spool_dir(), slot.sandbox_id)
             .await
             .unwrap();
         assert!(
@@ -356,7 +358,7 @@ async fn store_ahead_lost_publish_ack_recovers_from_the_spool_ref_not_coords_sta
     // The abandon sweep exports the ref-only store-ahead spool.
     host.spool_export(0).await.unwrap();
     let sid = host.sandboxes[0].sandbox_id;
-    let (meta, chunks) = spool::read_spool(host.fs.spool_dir(), sid)
+    let (meta, chunks) = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
         .await
         .unwrap()
         .unwrap();
@@ -436,32 +438,253 @@ fn insert_after_abandon_stage_is_routed_to_abandon_in_place() {
     );
 }
 
-/// The seeded crash-point injector, exhaustively: cut the process at every one
-/// of the eight durable-operation boundaries (the H5 composition contract) and
-/// prove the REAL recovery (rebuild + tolerant `read_spool` / `load_all`)
-/// recovers every acked write — oracle #1 UNCONDITIONAL. The spool boundaries
-/// model the final-flush leg completing (published tier covers the writes) and
-/// a crash mid-spool-write (the spool is redundant → torn/absent safely
-/// rejected); the persist boundaries prove reachability + tolerant recovery of
-/// the durable_record format (Flow D wires them into the ledger in P5).
+/// The op-boundary spool injector, exhaustively (P5, replacing the P4
+/// static-boundary version): the predecessor's spool write is cut at EVERY
+/// fs-op index of the real `write_spool` sequence by the `CrashFs` seam.
+/// The acked set is redundantly flush-published first, so whatever the cut
+/// leaves — the intact prior spool, no spool, a marker-less partial, or a
+/// complete rewrite — the REAL recovery (rebuild + tolerant `read_spool`)
+/// recovers EVERY acked write. The crash schedule is derived from the
+/// production op trace, never a parallel list (`crashpoint_coverage.rs`).
 #[tokio::test(start_paused = true)]
-async fn every_crash_point_injection_recovers_every_acked_write() {
-    for cp in CrashPoint::ALL {
+async fn spool_cut_at_every_op_recovers_every_acked_write() {
+    // Derive the schedule length from one un-cut run of the same shape.
+    let probe = {
         let mut host = scenario_host(0, 2).await;
-        // Acked writes at risk across the crash.
+        host.guest_write(0, 0).await.unwrap();
+        let backend = host.sandboxes[0].backend.clone().unwrap();
+        let (exported_ref, chunks) = backend.export_unflushed().await;
+        let fs = CrashFs::recording();
+        spool::write_spool(
+            fs.as_ref(),
+            host.fs.spool_dir(),
+            host.sandboxes[0].sandbox_id,
+            exported_ref,
+            &chunks,
+        )
+        .await
+        .unwrap();
+        fs.trace().len()
+    };
+    assert!(probe > 0, "the probe run must trace a real op sequence");
+
+    for op_index in 0..=probe {
+        let mut host = scenario_host(0, 2).await;
+        // Acked writes at risk across the crash (sandbox 0 is the cut
+        // target; sandbox 1 proves uninvolved sandboxes ride through).
         host.guest_write(0, 0).await.unwrap();
         host.guest_write(1, 5).await.unwrap();
 
-        host.crash_at(cp)
+        host.spool_crash_at(op_index)
             .await
-            .unwrap_or_else(|e| panic!("crash_at({cp:?}): {e}"));
+            .unwrap_or_else(|e| panic!("spool_crash_at({op_index}): {e}"));
         host.restart()
             .await
-            .unwrap_or_else(|e| panic!("restart after {cp:?}: {e}"));
+            .unwrap_or_else(|e| panic!("restart after cut {op_index}: {e}"));
         invariants::check(&host)
             .await
-            .unwrap_or_else(|v| panic!("crash point {cp:?}: {} — {}", v.invariant, v.detail));
+            .unwrap_or_else(|v| panic!("cut {op_index}: {} — {}", v.invariant, v.detail));
+        // Every acked write recovers: the floor was raised to the acked tags
+        // before the cut, so the honest range pins the exact bytes.
+        host.guest_read(0, 0).await.unwrap();
+        host.guest_read(1, 5).await.unwrap();
     }
+}
+
+// ───────────────────── Flow D: eviction finalize (ADR 0098 P5) ─────────────
+
+/// The graceful finalize completes and RAISES the published floor: begin →
+/// tick to terminal → the acked writes now ride the finalize-published disk
+/// manifest, the terminal `EvictionFinal` record exists, the finalize record
+/// is gone, and the destroy was issued. A restart then rebuilds from the
+/// finalize-published ref and every acked write reads back exactly.
+#[tokio::test(start_paused = true)]
+async fn finalize_completes_publishes_the_floor_and_destroys() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 1).await.unwrap();
+    host.guest_write(0, 6).await.unwrap();
+
+    let snapshot_id = host.snapshot_begin(0).await.unwrap().expect("began");
+    assert!(
+        host.sandboxes[0].backend.is_none(),
+        "the captured VM is paused for the whole finalize",
+    );
+    // One tick completes every leg (disk → memory → blobs → terminal).
+    host.finalize_tick(0).await.unwrap();
+
+    assert!(
+        host.pending_finalizes.is_empty(),
+        "terminal cleared the map"
+    );
+    assert_eq!(
+        host.destroyer.destroyed(),
+        vec![host.sandboxes[0].sandbox_id],
+        "the terminal leg issued the (best-effort) destroy",
+    );
+    let published = host.sandboxes[0]
+        .published_ref
+        .expect("the finalize disk manifest is the durable pointer");
+    assert!(published.version > host.sandboxes[0].base_ref.version);
+
+    // The floor was raised: a restart rebuilds from the finalize-published
+    // manifest and the acked writes read back exactly (floor == latest).
+    host.restart().await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 1).await.unwrap();
+    host.guest_read(0, 6).await.unwrap();
+    invariants::check_finalize_convergence(&host)
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    let _ = snapshot_id;
+}
+
+/// Crash between EVERY pair of finalize fs-ops, then resume: for each op
+/// index, one attempt runs under a `CrashFs` cut, the process dies, and the
+/// restart re-drives from the persisted stage through the REAL `load_all` +
+/// attempt loop to completion. Oracle #6 (stage monotone + stage⇒fields)
+/// holds at every step; the terminal manifests and the raised floor are
+/// invariant to WHERE the crash landed (idempotent redrive).
+#[tokio::test(start_paused = true)]
+async fn finalize_crash_at_every_op_resumes_and_completes() {
+    // A generous bound on the finalize pass's op count (the pass ends early
+    // at the cut anyway; past-the-end cuts complete before dying).
+    const MAX_OPS: usize = 40;
+    for op_index in 0..MAX_OPS {
+        let mut host = scenario_host(0, 2).await;
+        host.guest_write(0, 2).await.unwrap();
+        host.guest_write(0, 7).await.unwrap();
+
+        let began = host.snapshot_begin(0).await.unwrap();
+        assert!(began.is_some());
+        host.finalize_crash_at(0, op_index)
+            .await
+            .unwrap_or_else(|e| panic!("finalize_crash_at({op_index}): {e}"));
+
+        // The successor: resume the durable record (if the attempt completed
+        // before the cut index, there is nothing to resume) and drive the
+        // remaining attempts to convergence.
+        host.restart().await.unwrap();
+        for _ in 0..=SIM_FINALIZE_MAX_ATTEMPTS {
+            if host.pending_finalizes.is_empty() {
+                break;
+            }
+            host.finalize_tick(0).await.unwrap();
+        }
+        invariants::check(&host)
+            .await
+            .unwrap_or_else(|v| panic!("cut {op_index}: {} — {}", v.invariant, v.detail));
+        invariants::check_finalize_convergence(&host)
+            .unwrap_or_else(|v| panic!("cut {op_index}: {} — {}", v.invariant, v.detail));
+        // Completed (never quarantined): one cut costs at most one attempt,
+        // and the healed successor completes on its first. The acked writes
+        // ride the finalize-published floor — crash placement is invisible.
+        let published = host.sandboxes[0]
+            .published_ref
+            .unwrap_or_else(|| panic!("cut {op_index}: the finalize must have published"));
+        assert!(published.version > host.sandboxes[0].base_ref.version);
+        host.restart().await.unwrap();
+        host.guest_read(0, 2).await.unwrap();
+        host.guest_read(0, 7).await.unwrap();
+    }
+}
+
+/// A finalize whose leg input is permanently gone quarantines and stays
+/// convergent: the staging `disk-pending/` files vanish (the "finding 1"
+/// ENOENT class — the input that lives only in the staging dir), so every
+/// attempt's disk leg fails while the record machinery stays healthy.
+/// Attempts exhaust → the record lands in `finalize/failed/`, the
+/// idempotency map clears, and the honest floor stays at the PRIOR
+/// published tier (the bounded rollback the quarantine doc promises) — the
+/// oracle does not demand the un-published writes back.
+#[tokio::test(start_paused = true)]
+async fn finalize_quarantine_after_max_attempts_is_convergent() {
+    let mut host = scenario_host(0, 2).await;
+    // A prior flush establishes the floor the quarantine falls back to.
+    host.guest_write(0, 3).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+    let prior_published = host.sandboxes[0].published_ref.expect("flushed");
+    // A newer acked write that will ride the (doomed) finalize.
+    host.guest_write(0, 3).await.unwrap();
+
+    let snapshot_id = host.snapshot_begin(0).await.unwrap().expect("began");
+    // The staging inputs vanish out from under the record.
+    let pending_dir = host
+        .fs
+        .root()
+        .join("staging")
+        .join(snapshot_id.to_string())
+        .join("disk-pending");
+    tokio::fs::remove_dir_all(&pending_dir).await.unwrap();
+
+    // Every attempt fails its disk leg; the ladder exhausts to quarantine.
+    for _ in 0..SIM_FINALIZE_MAX_ATTEMPTS {
+        host.finalize_tick(0).await.unwrap();
+        invariants::check(&host)
+            .await
+            .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    }
+    assert!(
+        host.pending_finalizes.is_empty(),
+        "quarantine must clear the idempotency map",
+    );
+    let failed_marker = host
+        .fs
+        .root()
+        .join("finalize")
+        .join("failed")
+        .join(format!("{snapshot_id}.json"));
+    assert!(
+        failed_marker.exists(),
+        "the quarantined record is kept for operator forensics, never dropped",
+    );
+    invariants::check_finalize_convergence(&host)
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+
+    // The honest floor: a restart rebuilds from the PRIOR published tier;
+    // the newer un-published write is the accepted bounded rollback.
+    host.restart().await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].published_ref,
+        Some(prior_published),
+        "quarantine must not move the durable pointer",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 3).await.unwrap();
+}
+
+/// The capture-lock lockout's observable contract: a second `snapshot_begin`
+/// on a sandbox with a pending finalize re-observes the SAME snapshot id —
+/// no second record, no second job, no concurrent chain mutation (the real
+/// `pending_finalizes.get` guard at the entry). Completion releases it: a
+/// LATER begin on the (restarted) sandbox mints a fresh id.
+#[tokio::test(start_paused = true)]
+async fn snapshot_begin_idempotent_under_pending_finalize() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 4).await.unwrap();
+
+    let first = host.snapshot_begin(0).await.unwrap().expect("began");
+    let second = host.snapshot_begin(0).await.unwrap().expect("re-observed");
+    assert_eq!(first, second, "a pending finalize re-observes the same id");
+    assert_eq!(
+        host.finalize_started.len(),
+        1,
+        "no second finalize was started",
+    );
+
+    // Terminal completes and releases the lockout; a fresh capture (after
+    // the sandbox is rebuilt/resumed) mints a fresh snapshot.
+    host.finalize_tick(0).await.unwrap();
+    host.restart().await.unwrap();
+    host.guest_write(0, 4).await.unwrap();
+    let third = host.snapshot_begin(0).await.unwrap().expect("fresh begin");
+    assert_ne!(third, first, "a completed finalize does not pin the id");
+    // Drain to keep the scenario convergent.
+    host.finalize_tick(0).await.unwrap();
+    invariants::check_finalize_convergence(&host)
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
 
 // ─────────────── P4.5: oracle honesty — the honest-loss boundary ───────────

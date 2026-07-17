@@ -1,113 +1,156 @@
-//! The SimFs ∘ H5 composition meta-test (ADR 0098 Phase 2, P2).
+//! The derived-from-production crash-schedule meta-test (ADR 0098 P5).
 //!
-//! P2 names the durable-operation crash boundaries ([`CrashPoint`]) but does
-//! not yet INJECT a crash at one (that is P4). What it CAN prove today is the
-//! composition contract the ADR draws: every boundary a P4 injector could cut
-//! at already has an ADR 0099 H5 test standing behind it — a test that builds
-//! the resulting post-crash on-disk state EXTERNALLY (no fault trait) and
-//! asserts tolerant recovery. This table maps each boundary to that test.
+//! P2–P4 kept a hand-maintained table mapping a static `CrashPoint` enum to
+//! the ADR 0099 H5 tests — which only proved the table was self-consistent.
+//! P5 wires `durable_record::persist` and `spool::write_spool` through the
+//! injected `HostFs` seam, so the crash-point list is now DERIVED by running
+//! the REAL production bodies through a recording [`CrashFs`] and reading
+//! the op trace back. This test pins that derivation:
 //!
-//! The map is wildcard-free over [`CrashPoint`], and it iterates
-//! [`CrashPoint::ALL`], so a new boundary is a compile error here (in the
-//! `match`) and a hard assertion failure (missing from `ALL`'s coverage) —
-//! never a silent gap. The referenced test names are the actual `#[test]`
-//! fns in the two source modules' `mod tests` blocks; when P4 wires the
-//! injector, each boundary's runtime crash lands in exactly the on-disk
-//! state its named H5 test already pins.
+//! * the recorded trace of each flow equals its production op sequence
+//!   (a change to either body shows up here as a trace diff, forcing the
+//!   crash schedule to follow reality — never a stale parallel list); and
+//! * the crash schedule is exactly `0..=trace.len()` — every boundary
+//!   between ops, both ends included (index `len` = "completed, then
+//!   died"), with a cut at every index actually refusing the op.
+//!
+//! Byte-level torn states stay ADR 0099 H5's static tests in the source
+//! modules; this seam owns operation-granularity reachability.
 
-use engram_dst_host::CrashPoint;
+use engram_core::types::manifest::ManifestRef;
+use engram_core::SandboxId;
+use engram_dst_host::{CrashFs, FsOp};
+use engram_host_agent::disk_daemon::spool;
+use engram_host_agent::durable_record;
 
-/// The H5 test that pins the post-crash on-disk state this boundary leaves.
-/// `module` is the source file's `#[cfg(test)] mod tests`; `test` is the fn.
-struct H5Backing {
-    module: &'static str,
-    test: &'static str,
-    /// Why cutting at this boundary lands in the state that test constructs.
-    _why: &'static str,
+#[derive(serde::Serialize, serde::Deserialize)]
+struct Rec {
+    id: String,
 }
 
-fn backing(cp: CrashPoint) -> H5Backing {
-    match cp {
-        // ── durable_record::persist ─────────────────────────────────────
-        CrashPoint::PersistWritePartial => H5Backing {
-            module: "engram_host_agent::durable_record",
-            test: "garbage_suffix_and_leftover_partial_are_skipped",
-            _why: "cutting mid/after the `.json.partial` write leaves a leftover \
-                   partial (or a torn one); load_all's extension filter + serde \
-                   skip it — the leftover-partial leg of that test.",
-        },
-        CrashPoint::PersistFsyncTemp => H5Backing {
-            module: "engram_host_agent::durable_record",
-            test: "garbage_suffix_and_leftover_partial_are_skipped",
-            _why: "cutting after the temp fsync, before the rename, still leaves a \
-                   complete `.json.partial`; same leftover-partial tolerance.",
-        },
-        CrashPoint::PersistRename => H5Backing {
-            module: "engram_host_agent::durable_record",
-            test: "truncation_at_every_offset_tolerated_siblings_survive",
-            _why: "cutting during/after the rename can publish a torn `.json`; the \
-                   exhaustive truncation sweep proves every prefix is skipped and \
-                   the siblings survive.",
-        },
-        CrashPoint::PersistFsyncParent => H5Backing {
-            module: "engram_host_agent::durable_record",
-            test: "persist_then_load_all_roundtrips",
-            _why: "cutting after the rename, before the parent-dir fsync, may lose \
-                   the dir entry → the record reads as absent; the happy-path \
-                   round-trip anchors that a fully-synced record loads.",
-        },
-
-        // ── disk_daemon::spool::write_spool ─────────────────────────────
-        CrashPoint::SpoolChunks => H5Backing {
-            module: "engram_host_agent::disk_daemon::spool",
-            test: "torn_chunk_under_valid_marker_is_rejected_at_every_offset",
-            _why: "cutting mid chunk write leaves a torn `chunk-*.bin`; read_spool \
-                   re-hashes each chunk and rejects a torn one at every truncation \
-                   offset, never adopting a valid sibling as a subset.",
-        },
-        CrashPoint::SpoolChunkMissing => H5Backing {
-            module: "engram_host_agent::disk_daemon::spool",
-            test: "marker_lists_a_chunk_whose_file_is_missing_is_rejected",
-            _why: "a listed chunk file gone after write → the marker's all-or-nothing \
-                   contract rejects, no partial adopt.",
-        },
-        CrashPoint::SpoolMarker => H5Backing {
-            module: "engram_host_agent::disk_daemon::spool",
-            test: "missing_completeness_marker_reads_as_absent",
-            _why: "the marker is written+fsync'd LAST; cutting before it leaves no \
-                   marker → the spool reads as absent (the torn-marker variant is \
-                   covered by `unparsable_marker_is_rejected`).",
-        },
-        CrashPoint::SpoolDir => H5Backing {
-            module: "engram_host_agent::disk_daemon::spool",
-            test: "zero_chunk_ref_only_spool_roundtrips_and_torn_ref_rejected",
-            _why: "cutting after the marker fsync, before the dir-entry fsync, is the \
-                   ref-only / zero-chunk durability leg — it round-trips, and a torn \
-                   ref is rejected.",
-        },
+fn refv(version: u64) -> ManifestRef {
+    ManifestRef {
+        manifest_id: uuid::Uuid::from_u128(0xabcd),
+        version,
     }
 }
 
-#[test]
-fn every_crash_boundary_names_an_h5_backing_test() {
-    for cp in CrashPoint::ALL {
-        let b = backing(cp);
-        assert!(
-            !b.module.is_empty() && !b.test.is_empty(),
-            "{cp:?} ({}) must name an H5-backed test",
-            cp.format(),
-        );
-        // The named test's module must be one of the two durable formats.
-        assert!(
-            b.module.contains("durable_record") || b.module.contains("spool"),
-            "{cp:?} backing module {} is neither durable_record nor spool",
-            b.module,
-        );
-    }
-    // Every boundary is accounted for exactly once.
+/// `durable_record::persist`'s production op sequence, derived by running it.
+#[tokio::test]
+async fn persist_op_trace_is_the_production_sequence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let fs = CrashFs::recording();
+    let rec = Rec { id: "r".into() };
+    durable_record::persist(fs.as_ref(), tmp.path(), &rec.id, &rec, "rec")
+        .await
+        .unwrap();
     assert_eq!(
-        CrashPoint::ALL.len(),
-        8,
-        "the P2 boundary catalogue is 8 legs"
+        fs.trace(),
+        vec![
+            FsOp::CreateDir, // create_dir_all(dir)
+            FsOp::Write,     // the .json.partial temp
+            FsOp::SyncFile,  // fsync the temp
+            FsOp::Rename,    // atomic publish
+            FsOp::SyncDir,   // fsync the parent dir
+        ],
+        "durable_record::persist's op sequence changed — update the crash \
+         schedule reasoning (and the H5 states) alongside the body",
     );
+}
+
+/// `spool::write_spool`'s production op sequence over a two-chunk set,
+/// derived by running it. The destructive replace window (`RemoveDir` →
+/// `CreateDir`) leads; the completeness marker is written LAST before the
+/// dir fsyncs.
+#[tokio::test]
+async fn write_spool_op_trace_is_the_production_sequence() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sid = SandboxId::new();
+    let chunks = vec![(0usize, vec![1u8; 32]), (3usize, vec![2u8; 32])];
+    // Seed a prior spool so the replace window's RemoveDir acts on a real
+    // dir (NotFound is tolerated either way; the trace is identical).
+    spool::write_spool(
+        &engram_host_core::TokioFs,
+        tmp.path(),
+        sid,
+        refv(1),
+        &chunks,
+    )
+    .await
+    .unwrap();
+    let fs = CrashFs::recording();
+    spool::write_spool(fs.as_ref(), tmp.path(), sid, refv(2), &chunks)
+        .await
+        .unwrap();
+    assert_eq!(
+        fs.trace(),
+        vec![
+            FsOp::RemoveDir, // replace-don't-merge: drop the prior spool
+            FsOp::CreateDir, // fresh spool dir
+            FsOp::Write,     // chunk-0.bin
+            FsOp::SyncFile,
+            FsOp::Write, // chunk-3.bin
+            FsOp::SyncFile,
+            FsOp::Write, // meta.json — the completeness marker, LAST
+            FsOp::SyncFile,
+            FsOp::SyncDir, // the spool dir's entries
+            FsOp::SyncDir, // the root's entry for the dir
+        ],
+        "spool::write_spool's op sequence changed — update the crash \
+         schedule reasoning (and the H5 states) alongside the body",
+    );
+}
+
+/// The crash schedule is exactly `0..=trace.len()`: a cut at every index k
+/// refuses op k after genuinely performing ops 0..k (the trace still records
+/// the refused op), and a cut past the end completes the flow.
+#[tokio::test]
+async fn crash_schedule_covers_every_op_boundary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sid = SandboxId::new();
+    let chunks = vec![(0usize, vec![7u8; 16])];
+
+    // Derive the full trace length from an un-cut run.
+    let recording = CrashFs::recording();
+    spool::write_spool(recording.as_ref(), tmp.path(), sid, refv(1), &chunks)
+        .await
+        .unwrap();
+    let full = recording.trace();
+
+    for k in 0..=full.len() {
+        let fs = CrashFs::with_crash_at(Some(k));
+        let result = spool::write_spool(fs.as_ref(), tmp.path(), sid, refv(2), &chunks).await;
+        let trace = fs.trace();
+        if k < full.len() {
+            assert!(
+                result.is_err(),
+                "cut at op {k} must refuse the op and error the flow"
+            );
+            // The refused op is recorded (trace = k performed + 1 refused),
+            // and the performed prefix matches the production sequence.
+            assert_eq!(
+                trace.len(),
+                k + 1,
+                "cut at {k}: ops 0..{k} ran, op {k} refused"
+            );
+            assert_eq!(
+                &trace[..k],
+                &full[..k],
+                "the performed prefix is the real sequence"
+            );
+        } else {
+            assert!(result.is_ok(), "a cut past the end completes the flow");
+            assert_eq!(trace, full, "an un-reached cut leaves the full sequence");
+        }
+        // Restore a complete spool for the next iteration's baseline.
+        spool::write_spool(
+            &engram_host_core::TokioFs,
+            tmp.path(),
+            sid,
+            refv(1),
+            &chunks,
+        )
+        .await
+        .unwrap();
+    }
 }

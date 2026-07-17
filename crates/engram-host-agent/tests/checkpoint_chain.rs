@@ -204,12 +204,12 @@ async fn checkpoint_chain_seeds_diffs_and_restores_mid_chain() {
     assert_eq!(m2.version, m1.version + 1, "diff ticks the version");
 
     // ---- 5. Durable records: both load, then ack-delete works ----
-    let records = CheckpointRecord::load_all(&records_dir).await;
+    let records = CheckpointRecord::load_all(&engram_host_core::TokioFs, &records_dir).await;
     assert_eq!(records.len(), 2, "one durable record per checkpoint");
     assert!(records.iter().all(|r| r.session_id == session_id));
     assert!(records.iter().any(|r| r.snapshot_id == ckpt2.id));
-    CheckpointRecord::delete_acked(&records_dir, &[ckpt1.id]).await;
-    let records = CheckpointRecord::load_all(&records_dir).await;
+    CheckpointRecord::delete_acked(&engram_host_core::TokioFs, &records_dir, &[ckpt1.id]).await;
+    let records = CheckpointRecord::load_all(&engram_host_core::TokioFs, &records_dir).await;
     assert_eq!(records.len(), 1, "acked record deleted, un-acked kept");
 
     // ---- 6. Restore from the DIFF checkpoint on the same backend ----

@@ -33,20 +33,24 @@
 //! behind a seam — wrapping the hot path would add per-op cost for logic
 //! the simulator never drives.
 
+pub mod checkpoint;
 pub mod coord;
 pub mod device;
 pub mod effects;
+pub mod finalize;
 pub mod fs;
 pub mod nbd;
 pub mod reattach;
 pub mod shutdown;
 
+pub use checkpoint::checkpoint_tail_admits_publish;
 pub use coord::{
     CoordControlPlane, CoordError, LiveManifestPublishOutcome, LiveManifestPublishRequest,
     LiveManifestPublishResponse,
 };
 pub use device::DeviceSync;
 pub use effects::HostEffects;
+pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
 pub use nbd::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
 pub use reattach::{

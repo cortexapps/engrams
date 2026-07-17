@@ -59,9 +59,10 @@
 //! (non-crash) path — an O(dirty-set) cost, not O(image).
 
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, OnceLock, Weak};
+use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
@@ -71,18 +72,16 @@ use engram_core::types::ids::{SandboxId, SessionId, SnapshotId};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::AuxBundleRef;
 use engram_core::SandboxError;
+pub use engram_host_core::FinalizeStage;
+use engram_host_core::{plan_finalize_retry, FinalizeRetry, HostFs};
 use engram_protocol::heartbeat::CheckpointKind;
 use serde::{Deserialize, Serialize};
 
 use crate::checkpoint::CheckpointRecord;
-use crate::pooled_backend::PooledBackend;
 
 /// Default cap on redrive attempts before a finalize job is quarantined.
 /// Overridable via `ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS`.
 const DEFAULT_MAX_ATTEMPTS: u32 = 10;
-/// Backoff: `30s * attempt`, capped at 5 minutes.
-const BACKOFF_UNIT: Duration = Duration::from_secs(30);
-const BACKOFF_CAP: Duration = Duration::from_secs(300);
 /// The disk manifest publish's own version-conflict retry budget —
 /// mirrors `ChunkedDiskBackend::flush_upload`'s `MAX_FLUSH_RETRIES`.
 const MAX_MANIFEST_PUBLISH_RETRIES: u32 = 32;
@@ -94,17 +93,10 @@ pub(crate) fn max_attempts() -> u32 {
         .unwrap_or(DEFAULT_MAX_ATTEMPTS)
 }
 
-/// Stage-explicit progress marker. Each variant means "everything up to
-/// and including this leg is durable"; `run_eviction_finalize_once` skips
-/// legs already past the persisted stage.
-#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
-pub enum FinalizeStage {
-    #[default]
-    Captured,
-    DiskUploaded,
-    MemoryChunked,
-    BlobsUploaded,
-}
+// `FinalizeStage` (the stage-explicit progress marker) moved to
+// `engram_host_core::finalize` (ADR 0098 P5) — the ladder is a pure
+// decision surface the host-internal simulator drives; serde variant
+// names are unchanged, so persisted records are byte-compatible.
 
 /// The drained NBD disk chunks + enough context to publish a disk
 /// manifest without the live `ChunkedDiskBackend`. `base_manifest` is
@@ -169,28 +161,28 @@ impl EvictionFinalizeRecord {
     /// fsync — a crash right after the rename could lose the directory
     /// entry and silently drop a pending finalize (flagged in #707;
     /// retired here per simplify-via-abstractions).
-    pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        crate::durable_record::persist(dir, self.snapshot_id, self, "eviction finalize record")
+    pub async fn persist(&self, fs: &dyn HostFs, dir: &Path) -> std::io::Result<()> {
+        crate::durable_record::persist(fs, dir, self.snapshot_id, self, "eviction finalize record")
             .await
     }
 
     /// All pending finalize records in `dir` — the host-agent startup
     /// re-drive set. Torn-write tolerant via the shared engine.
-    pub async fn load_all(dir: &Path) -> Vec<Self> {
-        crate::durable_record::load_all(dir, "eviction finalize record").await
+    pub async fn load_all(fs: &dyn HostFs, dir: &Path) -> Vec<Self> {
+        crate::durable_record::load_all(fs, dir, "eviction finalize record").await
     }
 
-    async fn delete(dir: &Path, id: SnapshotId) {
-        crate::durable_record::delete_acked(dir, [id], "eviction finalize record").await;
+    async fn delete(fs: &dyn HostFs, dir: &Path, id: SnapshotId) {
+        crate::durable_record::delete_acked(fs, dir, [id], "eviction finalize record").await;
     }
 
     /// Terminal give-up: move the record to `finalize/failed/` (kept for
     /// operator forensics, never silently dropped) and free the local
     /// staging dir — the honest floor from here on is the prior periodic
     /// checkpoint.
-    async fn quarantine(&self, finalize_dir: &Path) {
+    async fn quarantine(&self, fs: &dyn HostFs, finalize_dir: &Path) {
         let failed_dir = finalize_dir.join("failed");
-        if let Err(e) = self.persist(&failed_dir).await {
+        if let Err(e) = self.persist(fs, &failed_dir).await {
             tracing::warn!(
                 snapshot_id = %self.snapshot_id,
                 sandbox_id = %self.sandbox_id,
@@ -198,8 +190,8 @@ impl EvictionFinalizeRecord {
                 "eviction finalize quarantine: failed to persist the quarantined record",
             );
         }
-        Self::delete(finalize_dir, self.snapshot_id).await;
-        if let Err(e) = tokio::fs::remove_dir_all(&self.dest).await {
+        Self::delete(fs, finalize_dir, self.snapshot_id).await;
+        if let Err(e) = fs.remove_dir(&self.dest).await {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(
                     snapshot_id = %self.snapshot_id,
@@ -221,16 +213,29 @@ impl EvictionFinalizeRecord {
     }
 }
 
+/// The terminal leg's sandbox-teardown seam (ADR 0098 P5). The prod impl
+/// (`PooledDestroyer`, in `pooled_backend.rs`) upgrades a weak
+/// `PooledBackend` ref at call time and calls the OUTER
+/// `PooledBackend::destroy` (the full cleanup: egress unregister, NBD
+/// slot release, checkpoint-chain teardown); the simulator records the
+/// call. Destroy is BEST-EFFORT for the finalize: `NotFound` and a gone
+/// backend are success, and any other error is logged, never a leg
+/// failure — `orphan_reap` backstops it.
+#[async_trait]
+pub trait EvictionSandbox: Send + Sync {
+    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError>;
+}
+
 /// ADR 0045 D5 (issue #529): the owned, 'static bundle of everything the
 /// host-owned finalize job needs — Arc-clones of the `PooledBackend`'s
-/// fields, exactly the `SnapshotFinisher` pattern, PLUS a weak
-/// self-reference so the terminal stage can call the OUTER
-/// `PooledBackend::destroy` (the full cleanup: egress unregister, NBD
-/// slot release, checkpoint-chain teardown — not just the inner
-/// backend's VM teardown) without needing an owned `Arc<PooledBackend>`
-/// threaded through every call site.
+/// fields, exactly the `SnapshotFinisher` pattern, PLUS the
+/// [`EvictionSandbox`] seam so the terminal stage can destroy the sandbox
+/// without an owned `Arc<PooledBackend>` threaded through every call
+/// site. `pub` with a constructor so the host-internal simulator
+/// (`engram-dst-host`) can build one over its own stores and drive the
+/// REAL legs (ADR 0098 P5).
 #[derive(Clone)]
-pub(crate) struct EvictionFinalizer {
+pub struct EvictionFinalizer {
     pub(crate) chunk_store: Option<ChunkStore>,
     pub(crate) chunk_cache: Option<ChunkCache>,
     pub(crate) bundle_dir: PathBuf,
@@ -238,16 +243,42 @@ pub(crate) struct EvictionFinalizer {
     /// `<work_dir>/checkpoints` — `records/` and `finalize/` live under it.
     pub(crate) checkpoint_dir: PathBuf,
     pub(crate) pending_finalizes: Arc<DashMap<SandboxId, SnapshotId>>,
-    pub(crate) self_ref: Arc<OnceLock<Weak<PooledBackend>>>,
+    pub(crate) destroyer: Arc<dyn EvictionSandbox>,
+    pub(crate) fs: Arc<dyn HostFs>,
     pub(crate) max_attempts: u32,
 }
 
 impl EvictionFinalizer {
-    pub(crate) fn records_dir(&self) -> PathBuf {
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        chunk_store: Option<ChunkStore>,
+        chunk_cache: Option<ChunkCache>,
+        bundle_dir: PathBuf,
+        bundle_file_ext: &'static str,
+        checkpoint_dir: PathBuf,
+        pending_finalizes: Arc<DashMap<SandboxId, SnapshotId>>,
+        destroyer: Arc<dyn EvictionSandbox>,
+        fs: Arc<dyn HostFs>,
+        max_attempts: u32,
+    ) -> Self {
+        Self {
+            chunk_store,
+            chunk_cache,
+            bundle_dir,
+            bundle_file_ext,
+            checkpoint_dir,
+            pending_finalizes,
+            destroyer,
+            fs,
+            max_attempts,
+        }
+    }
+
+    pub fn records_dir(&self) -> PathBuf {
         self.checkpoint_dir.join("records")
     }
 
-    pub(crate) fn finalize_dir(&self) -> PathBuf {
+    pub fn finalize_dir(&self) -> PathBuf {
         self.checkpoint_dir.join("finalize")
     }
 }
@@ -255,10 +286,11 @@ impl EvictionFinalizer {
 /// Persist the drained disk-flush chunk bytes to `<dest>/disk-pending/`
 /// (write + fsync + rename each) — called from `snapshot_begin`,
 /// synchronously, before it returns. Empty `chunks` is a no-op (nothing
-/// dirty this capture). `#[cfg]`'d like `PendingDiskFlush::into_chunks`
-/// — its only caller (NBD is Linux-only).
-#[cfg(target_os = "linux")]
-pub(crate) async fn persist_disk_pending_chunks(
+/// dirty this capture). `pub` and cfg-free (pure fs): the host-internal
+/// simulator seeds its finalize inputs through the REAL staging writer
+/// on macOS (ADR 0098 P5); production's only caller stays the Linux-only
+/// NBD drain.
+pub async fn persist_disk_pending_chunks(
     dest: &Path,
     chunks: &[(usize, ChunkHash, Bytes)],
 ) -> std::io::Result<()> {
@@ -279,6 +311,7 @@ pub(crate) async fn persist_disk_pending_chunks(
 }
 
 async fn read_disk_pending_chunks(
+    fs: &dyn HostFs,
     dest: &Path,
     chunks: &[(usize, ChunkHash)],
 ) -> Result<Vec<(usize, ChunkHash, Bytes)>, SandboxError> {
@@ -286,7 +319,7 @@ async fn read_disk_pending_chunks(
     let mut out = Vec::with_capacity(chunks.len());
     for (idx, hash) in chunks {
         let path = dir.join(format!("{idx}.{}", hash.to_hex()));
-        let bytes = tokio::fs::read(&path).await.map_err(|e| {
+        let bytes = fs.read(&path).await.map_err(|e| {
             SandboxError::Snapshot(format!(
                 "read disk-pending chunk {idx} ({}): {e}",
                 path.display()
@@ -421,7 +454,8 @@ async fn run_disk_leg(
             record.disk_manifest = Some(pending.base_manifest);
         }
         (Some(chunk_store), Some(pending)) => {
-            let chunks = read_disk_pending_chunks(&record.dest, &pending.chunks).await?;
+            let chunks =
+                read_disk_pending_chunks(f.fs.as_ref(), &record.dest, &pending.chunks).await?;
             let published = publish_disk_manifest(
                 chunk_store,
                 pending.base_manifest,
@@ -444,14 +478,14 @@ async fn run_disk_leg(
     // the (idempotent, content-addressed) publish above.
     let prev_stage = record.stage;
     record.stage = FinalizeStage::DiskUploaded;
-    if let Err(e) = record.persist(&f.finalize_dir()).await {
+    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
         record.stage = prev_stage;
         return Err(SandboxError::Snapshot(format!(
             "persist finalize record: {e}"
         )));
     }
     let pending_dir = record.dest.join("disk-pending");
-    let _ = tokio::fs::remove_dir_all(&pending_dir).await;
+    let _ = f.fs.remove_dir(&pending_dir).await;
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "disk")
         .record(start.elapsed().as_secs_f64());
     Ok(())
@@ -549,7 +583,7 @@ async fn run_memory_leg(
     let prev_stage = record.stage;
     let prev_memory_manifest = record.memory_manifest;
     record.stage = FinalizeStage::MemoryChunked;
-    if let Err(e) = record.persist(&f.finalize_dir()).await {
+    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
         record.stage = prev_stage;
         record.memory_manifest = prev_memory_manifest;
         return Err(SandboxError::Snapshot(format!(
@@ -561,7 +595,7 @@ async fn run_memory_leg(
     // is already durable and the stage guard skips this leg on redrive,
     // so it's never re-read.
     if let Some(p) = consumed {
-        let _ = tokio::fs::remove_file(&p).await;
+        let _ = f.fs.remove_file(&p).await;
     }
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "memory")
         .record(start.elapsed().as_secs_f64());
@@ -605,7 +639,7 @@ async fn run_blobs_leg(
     }
     record.stage = FinalizeStage::BlobsUploaded;
     record
-        .persist(&f.finalize_dir())
+        .persist(f.fs.as_ref(), &f.finalize_dir())
         .await
         .map_err(|e| SandboxError::Snapshot(format!("persist finalize record: {e}")))?;
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "blobs")
@@ -642,29 +676,26 @@ async fn run_terminal(
         kind: CheckpointKind::EvictionFinal,
     };
     checkpoint
-        .persist(&f.records_dir())
+        .persist(f.fs.as_ref(), &f.records_dir())
         .await
         .map_err(|e| SandboxError::Snapshot(format!("persist eviction-final checkpoint: {e}")))?;
 
-    EvictionFinalizeRecord::delete(&f.finalize_dir(), record.snapshot_id).await;
+    EvictionFinalizeRecord::delete(f.fs.as_ref(), &f.finalize_dir(), record.snapshot_id).await;
     f.pending_finalizes.remove(&record.sandbox_id);
     metrics::counter!(crate::metrics::EVICTION_FINALIZE_COMPLETED_TOTAL).increment(1);
 
-    if let Some(pooled) = f.self_ref.get().and_then(Weak::upgrade) {
-        use engram_core::traits::SandboxBackend as _;
-        match pooled.destroy(record.sandbox_id).await {
-            Ok(()) => {}
-            Err(SandboxError::NotFound) => {
-                // Already gone (a prior attempt's destroy, the teardown
-                // reconcile, or kubelet) — success, not a failure.
-            }
-            Err(e) => {
-                tracing::warn!(
-                    sandbox_id = %record.sandbox_id,
-                    error = %e,
-                    "eviction finalize: best-effort destroy failed; orphan_reap backstops it",
-                );
-            }
+    match f.destroyer.destroy(record.sandbox_id).await {
+        Ok(()) => {}
+        Err(SandboxError::NotFound) => {
+            // Already gone (a prior attempt's destroy, the teardown
+            // reconcile, or kubelet) — success, not a failure.
+        }
+        Err(e) => {
+            tracing::warn!(
+                sandbox_id = %record.sandbox_id,
+                error = %e,
+                "eviction finalize: best-effort destroy failed; orphan_reap backstops it",
+            );
         }
     }
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "terminal")
@@ -678,7 +709,12 @@ async fn run_terminal(
     Ok(())
 }
 
-async fn run_eviction_finalize_once(
+/// One sleep-free pass over the legs — `pub` so the host-internal
+/// simulator drives the REAL leg bodies step-by-step (ADR 0098 P5); the
+/// backoff/quarantine verdict between passes is
+/// [`engram_host_core::plan_finalize_retry`], which the sim consults the
+/// same way [`run_eviction_finalize`] does.
+pub async fn run_eviction_finalize_once(
     f: &EvictionFinalizer,
     record: &mut EvictionFinalizeRecord,
 ) -> Result<(), SandboxError> {
@@ -694,25 +730,41 @@ async fn run_eviction_finalize_once(
 /// locked out until finalize completes, same as today) and by
 /// `PooledBackend::resume_pending_finalizes` at host-agent startup (for
 /// each redriven record, re-acquiring the lock fresh).
-pub(crate) async fn run_eviction_finalize(
-    f: EvictionFinalizer,
-    mut record: EvictionFinalizeRecord,
-    _capture_guard: tokio::sync::OwnedMutexGuard<()>,
-) {
-    loop {
-        match run_eviction_finalize_once(&f, &mut record).await {
-            Ok(()) => return,
-            Err(e) => {
-                record.attempts += 1;
-                tracing::warn!(
-                    snapshot_id = %record.snapshot_id,
-                    sandbox_id = %record.sandbox_id,
-                    stage = ?record.stage,
-                    attempts = record.attempts,
-                    error = %e,
-                    "eviction finalize leg failed; will retry with backoff",
-                );
-                if record.attempts >= f.max_attempts {
+/// The outcome of one redrive attempt ([`run_eviction_finalize_attempt`]).
+#[derive(Debug)]
+pub enum FinalizeAttempt {
+    /// The terminal leg ran — record deleted, destroy issued.
+    Completed,
+    /// The pass failed; retry after this backoff (the attempt count is
+    /// already bumped + persisted).
+    RetryAfter(Duration),
+    /// Attempts exhausted — the record is quarantined and `pending_finalizes`
+    /// cleared; nothing re-drives it.
+    Quarantined,
+}
+
+/// One redrive attempt: a sleep-free pass over the legs plus the REAL
+/// retry/quarantine verdict handling. `pub` so the host-internal simulator
+/// drives the exact production loop body per tick (ADR 0098 P5) — the only
+/// thing [`run_eviction_finalize`] adds is the backoff sleep.
+pub async fn run_eviction_finalize_attempt(
+    f: &EvictionFinalizer,
+    record: &mut EvictionFinalizeRecord,
+) -> FinalizeAttempt {
+    match run_eviction_finalize_once(f, record).await {
+        Ok(()) => FinalizeAttempt::Completed,
+        Err(e) => {
+            record.attempts += 1;
+            tracing::warn!(
+                snapshot_id = %record.snapshot_id,
+                sandbox_id = %record.sandbox_id,
+                stage = ?record.stage,
+                attempts = record.attempts,
+                error = %e,
+                "eviction finalize leg failed; will retry with backoff",
+            );
+            match plan_finalize_retry(record.attempts, f.max_attempts) {
+                FinalizeRetry::Quarantine => {
                     // Clear the idempotency entry BEFORE the record becomes
                     // externally observable as quarantined (quarantine()
                     // writes the finalize/failed/ marker and deletes `dest`).
@@ -723,19 +775,34 @@ pub(crate) async fn run_eviction_finalize(
                     // quarantined record, so that caller would wait out the
                     // row-watcher deadline for a row that will never land.
                     f.pending_finalizes.remove(&record.sandbox_id);
-                    record.quarantine(&f.finalize_dir()).await;
-                    return;
+                    record.quarantine(f.fs.as_ref(), &f.finalize_dir()).await;
+                    FinalizeAttempt::Quarantined
                 }
-                if let Err(persist_err) = record.persist(&f.finalize_dir()).await {
-                    tracing::warn!(
-                        snapshot_id = %record.snapshot_id,
-                        error = %persist_err,
-                        "eviction finalize: failed to persist attempt count; retrying anyway",
-                    );
+                FinalizeRetry::Retry { backoff } => {
+                    if let Err(persist_err) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await
+                    {
+                        tracing::warn!(
+                            snapshot_id = %record.snapshot_id,
+                            error = %persist_err,
+                            "eviction finalize: failed to persist attempt count; retrying anyway",
+                        );
+                    }
+                    FinalizeAttempt::RetryAfter(backoff)
                 }
-                let backoff = (BACKOFF_UNIT * record.attempts).min(BACKOFF_CAP);
-                tokio::time::sleep(backoff).await;
             }
+        }
+    }
+}
+
+pub(crate) async fn run_eviction_finalize(
+    f: EvictionFinalizer,
+    mut record: EvictionFinalizeRecord,
+    _capture_guard: tokio::sync::OwnedMutexGuard<()>,
+) {
+    loop {
+        match run_eviction_finalize_attempt(&f, &mut record).await {
+            FinalizeAttempt::Completed | FinalizeAttempt::Quarantined => return,
+            FinalizeAttempt::RetryAfter(backoff) => tokio::time::sleep(backoff).await,
         }
     }
 }

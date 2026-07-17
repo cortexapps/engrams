@@ -2425,7 +2425,8 @@ mod tests {
         let sdir = root.join(sid.to_string());
 
         // Re-spool the pristine acked set (each case starts from it).
-        let respool = || spool::write_spool(root, sid, exported_ref, &acked);
+        let respool =
+            || spool::write_spool(&engram_host_core::TokioFs, root, sid, exported_ref, &acked);
 
         // Adopt a read-back spool into a fresh backend and prove every
         // acked write is served (dirty chunk 0 = 0x11, pending chunk 2 =
@@ -2458,7 +2459,10 @@ mod tests {
         // ── Case A: pristine spool → adopts the full set, all acked
         // writes recoverable.
         respool().await.unwrap();
-        let (_m, chunks) = spool::read_spool(root, sid).await.unwrap().unwrap();
+        let (_m, chunks) = spool::read_spool(&engram_host_core::TokioFs, root, sid)
+            .await
+            .unwrap()
+            .unwrap();
         assert_full_recovery(chunks).await;
 
         // ── Case B: a chunk file torn under a complete marker → Err,
@@ -2467,7 +2471,7 @@ mod tests {
         // Truncate chunk 0 to a short remnant under the intact marker.
         // Ok(None) | Err = loud rollback; an Ok(Some) would be a torn adopt.
         std::fs::write(sdir.join("chunk-0.bin"), [0x11; 100]).unwrap();
-        let torn = spool::read_spool(root, sid).await;
+        let torn = spool::read_spool(&engram_host_core::TokioFs, root, sid).await;
         if let Ok(Some((_, c))) = torn {
             panic!("adopted a torn spool as complete: {c:?}");
         }
@@ -2476,18 +2480,24 @@ mod tests {
         // partial adopt of the chunks that did land).
         respool().await.unwrap();
         std::fs::remove_file(sdir.join("meta.json")).unwrap();
-        assert!(spool::read_spool(root, sid).await.unwrap().is_none());
+        assert!(spool::read_spool(&engram_host_core::TokioFs, root, sid)
+            .await
+            .unwrap()
+            .is_none());
 
         // ── Case D: marker lists a chunk whose file vanished → Err; the
         // surviving sibling is NOT adopted as a subset.
         respool().await.unwrap();
         std::fs::remove_file(sdir.join("chunk-2.bin")).unwrap();
         assert!(matches!(
-            spool::read_spool(root, sid).await,
+            spool::read_spool(&engram_host_core::TokioFs, root, sid).await,
             Err(_) | Ok(None)
         ));
         assert!(
-            !matches!(spool::read_spool(root, sid).await, Ok(Some(_))),
+            !matches!(
+                spool::read_spool(&engram_host_core::TokioFs, root, sid).await,
+                Ok(Some(_))
+            ),
             "a missing acked chunk must never read back as a complete spool",
         );
 
@@ -2496,7 +2506,10 @@ mod tests {
         respool().await.unwrap();
         std::fs::write(sdir.join("chunk-tmp.swp"), b"editor droppings").unwrap();
         std::fs::write(sdir.join("chunk-0.bin.partial"), b"torn tmp").unwrap();
-        let (_m, chunks) = spool::read_spool(root, sid).await.unwrap().unwrap();
+        let (_m, chunks) = spool::read_spool(&engram_host_core::TokioFs, root, sid)
+            .await
+            .unwrap()
+            .unwrap();
         assert_full_recovery(chunks).await;
     }
 

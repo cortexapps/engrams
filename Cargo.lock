@@ -1259,6 +1259,8 @@ name = "engram-dst-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
+ "dashmap",
  "engram-chunk-store",
  "engram-core",
  "engram-host-agent",
@@ -1486,6 +1488,7 @@ dependencies = [
  "chrono",
  "engram-core",
  "serde",
+ "serde_json",
  "tokio",
  "uuid",
  "workspace-hack",

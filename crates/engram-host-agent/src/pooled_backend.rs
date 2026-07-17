@@ -698,6 +698,33 @@ pub struct PooledBackend {
     /// production clock (record timestamps, the pause mark); the full
     /// `HostEffects` bundle + sim injection ride the flow-extraction PRs.
     clock: Arc<dyn engram_core::traits::Clock>,
+    /// ADR 0098 P5: the durable-fs seam. Prod is [`TokioFs`]; Flow D's
+    /// durable records + the shutdown spool perform every fs op through
+    /// it (the host-internal simulator's `CrashFs` intercepts at op
+    /// boundaries). Remaining loose-field seams consolidate into the
+    /// full `HostEffects` bundle with the last flow-extraction PRs.
+    host_fs: Arc<dyn engram_host_core::HostFs>,
+}
+
+/// ADR 0098 P5: the prod [`crate::eviction_finalize::EvictionSandbox`] —
+/// upgrades the weak `PooledBackend` ref at call time so the detached
+/// finalize job reaches the FULL `PooledBackend::destroy` (egress
+/// unregister, NBD slot release, checkpoint-chain teardown). A gone
+/// backend (process shutting down) is success: nothing left to destroy
+/// here, and `orphan_reap` backstops the sandbox itself.
+pub(crate) struct PooledDestroyer {
+    pub(crate) self_ref: Arc<std::sync::OnceLock<std::sync::Weak<PooledBackend>>>,
+}
+
+#[async_trait]
+impl crate::eviction_finalize::EvictionSandbox for PooledDestroyer {
+    async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+        let Some(pooled) = self.self_ref.get().and_then(std::sync::Weak::upgrade) else {
+            return Ok(());
+        };
+        use engram_core::traits::SandboxBackend as _;
+        pooled.destroy(id).await
+    }
 }
 
 /// Human-readable message for a [`crate::warm_progress::WarmViolation`] —
@@ -1785,6 +1812,7 @@ impl PooledBackend {
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_manifest_publish: None,
             clock: Arc::new(engram_core::traits::SystemClock::new()),
+            host_fs: Arc::new(engram_host_core::TokioFs),
         }
     }
 
@@ -1986,16 +2014,19 @@ impl PooledBackend {
     /// `snapshot_begin` checks before ever constructing one.
     pub(crate) fn eviction_finalizer(&self) -> Option<crate::eviction_finalize::EvictionFinalizer> {
         let checkpoint_dir = self.checkpoint_dir.clone()?;
-        Some(crate::eviction_finalize::EvictionFinalizer {
-            chunk_store: self.chunk_store.clone(),
-            chunk_cache: self.chunk_cache.clone(),
-            bundle_dir: self.bundle_dir.clone(),
-            bundle_file_ext: self.bundle_file_ext(),
+        Some(crate::eviction_finalize::EvictionFinalizer::new(
+            self.chunk_store.clone(),
+            self.chunk_cache.clone(),
+            self.bundle_dir.clone(),
+            self.bundle_file_ext(),
             checkpoint_dir,
-            pending_finalizes: self.pending_finalizes.clone(),
-            self_ref: self.self_ref.clone(),
-            max_attempts: crate::eviction_finalize::max_attempts(),
-        })
+            self.pending_finalizes.clone(),
+            Arc::new(PooledDestroyer {
+                self_ref: self.self_ref.clone(),
+            }),
+            self.host_fs.clone(),
+            crate::eviction_finalize::max_attempts(),
+        ))
     }
 
     /// Issue #529: re-drive every un-acked eviction finalize record at
@@ -2008,9 +2039,11 @@ impl PooledBackend {
         let Some(finalizer) = self.eviction_finalizer() else {
             return;
         };
-        let records =
-            crate::eviction_finalize::EvictionFinalizeRecord::load_all(&finalizer.finalize_dir())
-                .await;
+        let records = crate::eviction_finalize::EvictionFinalizeRecord::load_all(
+            self.host_fs.as_ref(),
+            &finalizer.finalize_dir(),
+        )
+        .await;
         if records.is_empty() {
             return;
         }
@@ -3999,6 +4032,7 @@ impl PooledBackend {
             // about, and the successor must attach from THAT ref (the spool's
             // store-ahead rule), not roll back to coord's stale one.
             match crate::disk_daemon::spool::write_spool(
+                self.host_fs.as_ref(),
                 &spool_root,
                 sandbox_id,
                 manifest_ref,
@@ -5578,7 +5612,10 @@ impl SnapshotFinisher {
             // (it uses `snapshot_begin`, not `snapshot()`).
             kind: engram_protocol::heartbeat::CheckpointKind::Periodic,
         };
-        if let Err(e) = record.persist(&records_dir).await {
+        if let Err(e) = record
+            .persist(&engram_host_core::TokioFs, &records_dir)
+            .await
+        {
             tracing::warn!(
                 sandbox_id = %id,
                 snapshot_id = %metadata.id,
@@ -6460,7 +6497,10 @@ impl SandboxBackend for PooledBackend {
                 "checkpoint_dir disappeared between the gate check and record construction".into(),
             ));
         };
-        if let Err(e) = record.persist(&finalizer.finalize_dir()).await {
+        if let Err(e) = record
+            .persist(finalizer.fs.as_ref(), &finalizer.finalize_dir())
+            .await
+        {
             // Finding 4: mirror the disk-pending failure arm above and the
             // `None` arm just before it — a persist failure here must not
             // leak the multi-GiB local staging dir. The eviction scanner
@@ -7921,7 +7961,8 @@ impl SandboxBackend for PooledBackend {
             // (the sandbox_id will never rehydrate again; a leftover
             // spool is dead weight on the hostPath volume).
             if let Some(root) = self.shutdown_spool_root() {
-                let _ = crate::disk_daemon::spool::discard_spool(&root, id).await;
+                let _ = crate::disk_daemon::spool::discard_spool(self.host_fs.as_ref(), &root, id)
+                    .await;
             }
         }
         // ADR 0016 Phase A: drop the COW diagnostic timestamp so
@@ -8971,7 +9012,9 @@ impl PooledBackend {
         let mut attach_ref = disk_manifest;
         let mut seed_dirty: Option<Vec<(usize, Vec<u8>)>> = None;
         if let Some(root) = &spool_root {
-            match crate::disk_daemon::spool::read_spool(root, sandbox_id).await {
+            match crate::disk_daemon::spool::read_spool(self.host_fs.as_ref(), root, sandbox_id)
+                .await
+            {
                 Ok(Some((meta, chunks)))
                     if meta.manifest_id == disk_manifest.manifest_id
                         && meta.version >= disk_manifest.version =>
@@ -8993,7 +9036,12 @@ impl PooledBackend {
                         coord_manifest = %disk_manifest,
                         "shutdown spool is stale or from a foreign lineage; discarding",
                     );
-                    let _ = crate::disk_daemon::spool::discard_spool(root, sandbox_id).await;
+                    let _ = crate::disk_daemon::spool::discard_spool(
+                        self.host_fs.as_ref(),
+                        root,
+                        sandbox_id,
+                    )
+                    .await;
                 }
                 Ok(None) => {}
                 Err(e) => {
@@ -9003,7 +9051,12 @@ impl PooledBackend {
                         "shutdown spool unreadable; discarding — acked writes it \
                          held are rolled back",
                     );
-                    let _ = crate::disk_daemon::spool::discard_spool(root, sandbox_id).await;
+                    let _ = crate::disk_daemon::spool::discard_spool(
+                        self.host_fs.as_ref(),
+                        root,
+                        sandbox_id,
+                    )
+                    .await;
                 }
             }
         }
@@ -9103,7 +9156,13 @@ impl PooledBackend {
         // bytes over a newer divergence.
         if adopted_spool {
             if let Some(root) = &spool_root {
-                if let Err(e) = crate::disk_daemon::spool::discard_spool(root, sandbox_id).await {
+                if let Err(e) = crate::disk_daemon::spool::discard_spool(
+                    self.host_fs.as_ref(),
+                    root,
+                    sandbox_id,
+                )
+                .await
+                {
                     tracing::warn!(
                         %sandbox_id,
                         error = %e,
@@ -14061,7 +14120,7 @@ mod tests {
             memory_manifest: None,
         };
         record
-            .persist(&ckpt_dir.join("finalize"))
+            .persist(&engram_host_core::TokioFs, &ckpt_dir.join("finalize"))
             .await
             .expect("persist finalize record");
 

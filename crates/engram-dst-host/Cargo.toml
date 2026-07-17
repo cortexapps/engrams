@@ -17,6 +17,8 @@ engram-host-core.workspace = true
 engram-sim.workspace = true
 engram-storage-local.workspace = true
 async-trait.workspace = true
+bytes.workspace = true
+dashmap.workspace = true
 parking_lot.workspace = true
 rand = { workspace = true }
 rand_chacha = { workspace = true }
