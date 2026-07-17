@@ -1,6 +1,40 @@
 # ADR 0099: Correctness hardening & test isolation
 
-Status: 2026-07-16 — **Proposed.**
+Status: 2026-07-17 — **Accepted.** The build items all landed: H1/H2
+per-test template-cloned databases (#695/#696 — the coordinator PG lane
+went from `--test-threads=1` to 16-way parallel, 143 tests in ~12s);
+H3 proptest across three PRs (#698 manifest properties, #710 codec
+round-trip identity + variant-exhaustiveness guards, #708 the mkext4
+flagship); H4 decode-never-panics for all five wire crates (#699 +
+BrowserActivity coverage in #710); H5 FaultyBlobStorage + chunk-store
+atomicity (#701), durable_record torn-write sweeps (#707), and the
+shutdown-spool crash-state sweep (#718 — whose acked-write oracle
+caught a real torn-chunk silent-adopt hole in #712's fix before it
+merged); H6 invariant!/soft_invariant! + the deliberate site list
+(#702). The follow-ups PR closed the accumulated findings (the
+transition-to-Queued fifo guard from the D4 conformance suite's first
+catch; EvictionFinalizeRecord onto durable_record, closing its missing
+parent-dir fsync; the SessionState walk properties).
+
+Dispositions for the investigation items: **H7 (#582)** was
+root-caused and fixed in #598 (the parked-probe vs in-flight-doomed
+request ambiguity; request timeout pinned under the completion budget,
+tracing wired) and the issue is closed — no recurrence across the
+heavy FC-lane activity since. **H8 (#403)**: timeline correlation
+identified the unpinned Claude CLI crossing to 2.1.187 (the ADR 0054 /
+#431 headless-regression release) as the cause; CI has since pinned
+2.1.185 and the un-quarantine PR re-adds the test with its own e2e
+lane as arbiter. One sibling flake filed with evidence during the
+program: #721 (the spool-adoption timing window in #712's FC test,
+same family as its documented claim race).
+
+Open design decision (deliberately NOT blocking this flip): the H6
+site-5 audit found `mark_host_dead_and_orphan_sessions` bulk-flips
+non-terminal sessions to `host_lost` more broadly than
+`can_transition_to` allows. The DST harness's transition-legality
+oracle carries a documented HostLost-only exemption for it; the call —
+widen the FSM edges or formally bless host-death as the one FSM-exempt
+mass transition — is recorded here for the maintainers.
 
 Companion to ADR 0098 (deterministic simulation testing). That ADR is the
 months-scale spine of the "TigerBeetle lessons" program; this one is the
