@@ -30,13 +30,35 @@
 //! <spool_root>/<sandbox_id>/chunk-<idx>.bin
 //! <spool_root>/<sandbox_id>/meta.json
 //! ```
+//!
+//! The marker records the sha256 of every chunk it lists, and
+//! [`read_spool`] re-hashes each file before returning it. The
+//! write-ordering (chunk fsync BEFORE the marker) means an orderly
+//! crash never leaves a torn chunk under a complete marker — but the
+//! spool is plain files on a hostPath volume, so bit-rot / a lying
+//! fsync / an out-of-band mangle CAN. Adopting a torn chunk as acked
+//! data would re-introduce the exact ext4 `Structure needs cleaning`
+//! corruption the spool exists to prevent (session-85e0298a), so the
+//! digest is a hard gate, not decoration: a mismatch is an `Err` the
+//! caller turns into a loud rollback, never a silent adopt.
 
+use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
 
+use engram_chunk_store::ChunkHash;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::SandboxId;
 use serde::{Deserialize, Serialize};
+
+/// One chunk a complete spool holds: its index and the sha256 of its
+/// bytes, so [`read_spool`] can prove the file on disk is the bytes
+/// [`write_spool`] intended (never a torn/short remnant).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpooledChunk {
+    pub idx: usize,
+    pub digest: ChunkHash,
+}
 
 /// Completeness + lineage marker for one sandbox's spool.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,8 +67,11 @@ pub struct SpoolMeta {
     pub manifest_id: uuid::Uuid,
     /// Manifest version the spooled chunks diverge from.
     pub version: u64,
-    /// Number of `chunk-*.bin` files a complete spool holds.
-    pub chunk_count: usize,
+    /// Every `chunk-*.bin` file a complete spool holds, keyed by index,
+    /// each with the sha256 of its bytes. The count AND the content of
+    /// the spool are both pinned here — a missing file, an extra file,
+    /// or a torn file all fail validation.
+    pub chunks: Vec<SpooledChunk>,
 }
 
 impl SpoolMeta {
@@ -85,18 +110,23 @@ pub async fn write_spool(
     tokio::fs::create_dir_all(&dir).await?;
 
     let mut bytes_total = 0u64;
+    let mut spooled = Vec::with_capacity(chunks.len());
     for (idx, data) in chunks {
         let path = dir.join(format!("chunk-{idx}.bin"));
         let mut f = tokio::fs::File::create(&path).await?;
         tokio::io::AsyncWriteExt::write_all(&mut f, data).await?;
         f.sync_all().await?;
         bytes_total += data.len() as u64;
+        spooled.push(SpooledChunk {
+            idx: *idx,
+            digest: ChunkHash::of(data),
+        });
     }
 
     let meta = SpoolMeta {
         manifest_id: manifest_ref.manifest_id,
         version: manifest_ref.version,
-        chunk_count: chunks.len(),
+        chunks: spooled,
     };
     let meta_path = dir.join("meta.json");
     let mut f = tokio::fs::File::create(&meta_path).await?;
@@ -116,9 +146,17 @@ pub async fn write_spool(
 
 /// Read the spool for `sandbox_id`. `Ok(None)` when there is no
 /// complete spool (no dir, or no `meta.json` — e.g. a crash mid-write).
-/// `Err` when a spool claims completeness but fails validation
-/// (missing/extra chunk files, unparsable names) — the caller should
-/// log and [`discard_spool`], never adopt.
+/// `Err` when a spool claims completeness but fails validation — a
+/// listed chunk file is missing, a chunk's bytes don't match the sha256
+/// the marker recorded (torn/short/mangled), an unparsable chunk name,
+/// or extra chunk files the marker doesn't account for. The caller
+/// should log and [`discard_spool`], never adopt: every validation
+/// failure is a LOUD rollback, never a silent adopt of a subset or of
+/// corrupt bytes.
+///
+/// Foreign, non-`chunk-*.bin` files (stray tmpfiles from another writer,
+/// operator scratch) are tolerated — only the marker's own listed
+/// chunks define the spool.
 pub async fn read_spool(
     root: &Path,
     sandbox_id: SandboxId,
@@ -132,34 +170,60 @@ pub async fn read_spool(
     let meta: SpoolMeta = serde_json::from_slice(&meta_bytes)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta: {e}")))?;
 
-    let mut chunks = Vec::with_capacity(meta.chunk_count);
+    // Enumerate the on-disk chunk files by index. Foreign / unparsable
+    // entries are IGNORED (a stray tmpfile must not wedge adoption of
+    // valid siblings); the marker, not the directory listing, is the
+    // authority on which chunks the spool holds.
+    let mut on_disk: HashMap<usize, PathBuf> = HashMap::new();
     let mut entries = tokio::fs::read_dir(&dir).await?;
     while let Some(entry) = entries.next_entry().await? {
         let name = entry.file_name();
         let Some(name) = name.to_str() else { continue };
-        if name == "meta.json" {
-            continue;
-        }
-        let idx: usize = name
+        let Some(idx) = name
             .strip_prefix("chunk-")
             .and_then(|s| s.strip_suffix(".bin"))
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("unexpected spool entry {name:?}"),
-                )
-            })?;
-        chunks.push((idx, tokio::fs::read(entry.path()).await?));
+            .and_then(|s| s.parse::<usize>().ok())
+        else {
+            continue;
+        };
+        on_disk.insert(idx, entry.path());
     }
-    if chunks.len() != meta.chunk_count {
+
+    // Drive the read from the marker: every chunk it lists must be
+    // present AND hash to the recorded digest. This subsumes the count
+    // check (a missing file is caught here) and, crucially, rejects a
+    // torn chunk under a complete marker — bytes that pass name+count
+    // but not content must never be adopted as acked data.
+    let mut chunks = Vec::with_capacity(meta.chunks.len());
+    for want in &meta.chunks {
+        let Some(path) = on_disk.remove(&want.idx) else {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("spool marker lists chunk {} but no file holds it", want.idx),
+            ));
+        };
+        let data = tokio::fs::read(&path).await?;
+        let got = ChunkHash::of(&data);
+        if got != want.digest {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "spool chunk {} digest mismatch (len {}): marker {} != bytes {}",
+                    want.idx,
+                    data.len(),
+                    want.digest.to_hex(),
+                    got.to_hex(),
+                ),
+            ));
+        }
+        chunks.push((want.idx, data));
+    }
+    // Any `chunk-*.bin` the marker did NOT list is an extra chunk — a
+    // spool spliced from two divergence points would surface here.
+    if let Some((extra, _)) = on_disk.into_iter().next() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
-            format!(
-                "spool claims {} chunks but holds {}",
-                meta.chunk_count,
-                chunks.len()
-            ),
+            format!("spool holds chunk {extra} the marker does not account for"),
         ));
     }
     chunks.sort_by_key(|(idx, _)| *idx);
