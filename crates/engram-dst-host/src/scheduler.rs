@@ -52,6 +52,16 @@ pub enum Step {
     Restart,
     /// Advance virtual time (fires due tokio timers).
     AdvanceTime(Duration),
+    /// Flow C (P3): one REAL `reconcile_once` tick against the reconcile
+    /// world, over the sim-owned strike ledger.
+    ReconcileTick,
+    /// Flow C perturbation: drop reconcile slot `idx`'s LOCAL binding (the ADR
+    /// 0090 survivor). The next `ReconcileTick` must repair it, never reap.
+    DropLocalBinding(usize),
+    /// Flow C perturbation: revoke reconcile slot `idx`'s coordinator
+    /// ownership (a terminal/idle/rebound session). Reconcile should reap it
+    /// after the strike debounce.
+    RevokeOwnership(usize),
 }
 
 impl Step {
@@ -67,6 +77,9 @@ impl Step {
             Step::CrashProcess => "CrashProcess",
             Step::Restart => "Restart",
             Step::AdvanceTime(..) => "AdvanceTime",
+            Step::ReconcileTick => "ReconcileTick",
+            Step::DropLocalBinding(..) => "DropLocalBinding",
+            Step::RevokeOwnership(..) => "RevokeOwnership",
         }
     }
 }
@@ -88,6 +101,14 @@ pub struct Sim {
     /// True while the process is "crashed" (RAM backends dropped, awaiting a
     /// Restart) — used only to weight the pick toward a restart.
     crashed: bool,
+    /// Flow C (P3): the teardown-reconcile strike ledger, owned by the sim
+    /// across ticks (the `reconcile_once` `strikes` parameter). A
+    /// `CrashProcess` clears it — a fresh host-agent process starts with an
+    /// empty ledger, exactly like the real interval wrapper's local
+    /// `HashMap`. `HashMap` (not `BTreeMap`) mirrors the prod signature; it is
+    /// keyed-access only inside `reconcile_once` (never iterated for a
+    /// decision), so it is not a determinism leak.
+    reconcile_strikes: std::collections::HashMap<engram_core::SandboxId, u32>,
     report: SimReport,
 }
 
@@ -105,6 +126,7 @@ impl Sim {
             rng,
             profile,
             crashed: false,
+            reconcile_strikes: std::collections::HashMap::new(),
             report: SimReport {
                 seed,
                 steps_run: 0,
@@ -131,33 +153,39 @@ impl Sim {
         // pick must NEVER branch on anything non-deterministic.
         match self.profile {
             Profile::Calm => match roll {
-                0..=44 => Step::GuestWrite(
+                0..=39 => Step::GuestWrite(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                45..=64 => Step::GuestRead(
+                40..=57 => Step::GuestRead(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                65..=79 => Step::FlushTick(self.rng.random_range(0..n)),
-                80..=89 => Step::SpoolExport(self.rng.random_range(0..n)),
-                90..=96 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                58..=69 => Step::FlushTick(self.rng.random_range(0..n)),
+                70..=77 => Step::SpoolExport(self.rng.random_range(0..n)),
+                78..=84 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                85..=91 => Step::ReconcileTick,
+                92..=94 => Step::DropLocalBinding(self.rng.random_range(0..n)),
+                95..=96 => Step::RevokeOwnership(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
-                0..=33 => Step::GuestWrite(
+                0..=29 => Step::GuestWrite(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                34..=48 => Step::GuestRead(
+                30..=42 => Step::GuestRead(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                49..=61 => Step::FlushTick(self.rng.random_range(0..n)),
-                62..=71 => Step::SpoolExport(self.rng.random_range(0..n)),
-                72..=80 => Step::SpoolAdopt(self.rng.random_range(0..n)),
-                81..=90 => Step::CrashProcess,
-                91..=96 => Step::Restart,
+                43..=53 => Step::FlushTick(self.rng.random_range(0..n)),
+                54..=61 => Step::SpoolExport(self.rng.random_range(0..n)),
+                62..=69 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                70..=78 => Step::ReconcileTick,
+                79..=82 => Step::DropLocalBinding(self.rng.random_range(0..n)),
+                83..=85 => Step::RevokeOwnership(self.rng.random_range(0..n)),
+                86..=92 => Step::CrashProcess,
+                93..=97 => Step::Restart,
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -179,6 +207,9 @@ impl Sim {
             Step::SpoolAdopt(idx) => self.host.spool_adopt(idx).await?,
             Step::CrashProcess => {
                 self.host.crash_process().await?;
+                // A fresh host-agent process starts with an empty strike
+                // ledger (the real wrapper's local `HashMap`).
+                self.reconcile_strikes.clear();
                 self.crashed = true;
             }
             Step::Restart => {
@@ -186,6 +217,13 @@ impl Sim {
                 self.crashed = false;
             }
             Step::AdvanceTime(d) => self.host.clock.advance(d).await,
+            Step::ReconcileTick => {
+                self.host
+                    .reconcile_tick(&mut self.reconcile_strikes)
+                    .await?;
+            }
+            Step::DropLocalBinding(idx) => self.host.drop_local_binding(idx),
+            Step::RevokeOwnership(idx) => self.host.revoke_ownership(idx),
         }
         Ok(())
     }

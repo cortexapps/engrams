@@ -77,6 +77,23 @@ impl SimCoordClient {
         self.inner.lock().ownership.insert(sandbox_id, session_id);
     }
 
+    /// Drop a sandbox from the honest ownership model — the coordinator no
+    /// longer binds it (a terminal/idle/rebound session). `sandbox_owner`
+    /// then answers `None`; `sandbox_ownership` answers `false`. Used by the
+    /// reconcile scenarios (ADR 0098 P3) to model a genuinely-departed
+    /// ownership that reconcile SHOULD reap.
+    pub fn revoke_owner(&self, sandbox_id: SandboxId) {
+        self.inner.lock().ownership.remove(&sandbox_id);
+    }
+
+    /// Read the honest ownership model WITHOUT consuming a scripted override
+    /// — the invariant oracle's view of who-really-owns-what. (The
+    /// `CoordControlPlane` methods consume the scripted queue; the oracle
+    /// must not perturb it.)
+    pub fn honest_owner(&self, sandbox_id: SandboxId) -> Option<SessionId> {
+        self.inner.lock().ownership.get(&sandbox_id).copied()
+    }
+
     /// Push a scripted override for the next matching call (adversarial
     /// capability — unused in P2).
     pub fn script(&self, resp: ScriptedResponse) {

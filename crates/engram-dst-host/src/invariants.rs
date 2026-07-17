@@ -24,6 +24,18 @@
 //! shutdown spool before dropping RAM, so `Restart`'s rebuild+adopt recovers
 //! every acked write. A FAILURE here is a real finding in the shipped
 //! flush/spool/adopt machinery — pin the seed, do not weaken the oracle.
+//!
+//! # Oracle #9 — the reconcile None-arm stays fixed (ADR 0098 P3)
+//!
+//! **Property:** *teardown reconcile NEVER destroys a sandbox the coordinator
+//! still owns.* The 2026-07-11 mis-reap was a missing LOCAL binding read as
+//! "orphan" and SIGKILLing a legitimately-owned, pidfd-reattached survivor
+//! mid-build (ADR 0090); the fix routes the unbound arm through
+//! `sandbox_owner` so ONLY a coordinator-confirmed absence reaps, and repairs
+//! the binding otherwise. This oracle pins that fix: after every step, every
+//! sandbox in the reconcile world's destroy log must be one the coordinator
+//! genuinely no longer owns. A FAILURE means `reconcile_once` reaped a live,
+//! owned VM — a real bug, not a test to update.
 
 use crate::world::{decode_tag, SimHost, CHUNK_SIZE};
 
@@ -33,11 +45,30 @@ pub struct Violation {
     pub detail: String,
 }
 
-/// Check the acked-write durability oracle against the host's current state.
-/// Async because it reads back through the live backends (in-memory tier
-/// resolution — microseconds).
+/// Check all host-internal oracles against the host's current state. Async
+/// because the acked-write check reads back through the live backends
+/// (in-memory tier resolution — microseconds).
 pub async fn check(host: &SimHost) -> Result<(), Violation> {
-    acked_writes_recoverable(host).await
+    acked_writes_recoverable(host).await?;
+    reconcile_none_arm_fixed(host)
+}
+
+/// Oracle #9: no sandbox reconcile ever destroyed is still coord-owned. Reads
+/// the honest ownership model (never consuming a scripted override).
+fn reconcile_none_arm_fixed(host: &SimHost) -> Result<(), Violation> {
+    for record in host.reconcile.destroyed() {
+        if let Some(owner) = host.coord.honest_owner(record.sandbox_id) {
+            return Err(Violation {
+                invariant: "reconcile-none-arm-fixed",
+                detail: format!(
+                    "reconcile destroyed sandbox {} but the coordinator still owns it \
+                     (session {owner}); had_binding={:?} — the 2026-07-11 mis-reap",
+                    record.sandbox_id, record.had_binding
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 async fn acked_writes_recoverable(host: &SimHost) -> Result<(), Violation> {

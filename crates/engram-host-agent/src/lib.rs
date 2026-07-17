@@ -480,8 +480,17 @@ impl HostAgent {
             // ADR 0047's sole authority), so a terminal/idle/rebound
             // session reliably answers "not owned".
             {
-                let pooled_for_reap = pooled.clone();
-                let capture_jobs_for_reap = capture_jobs.clone();
+                // ADR 0098 P3: the tick body is now
+                // `teardown_reconcile::reconcile_once` (pure classify +
+                // focused backend seam, driven directly by the host-internal
+                // simulator). This wrapper keeps only the interval cadence +
+                // the caller-owned strike ledger; `reconcile_once` returns
+                // `Err` only when `list()` fails, which we log + skip exactly
+                // as the old inline `continue` did.
+                let reap_backend = Arc::new(teardown_reconcile::PooledReconcileBackend::new(
+                    pooled.clone(),
+                    capture_jobs.clone(),
+                ));
                 let coord_for_reap: Arc<dyn CoordControlPlane> =
                     Arc::new(coord_client::HttpCoordClient::new(
                         coord_url.clone(),
@@ -489,93 +498,23 @@ impl HostAgent {
                     ));
                 let host_id_for_reap = host_id;
                 tokio::spawn(async move {
-                    use crate::teardown_reconcile::{
-                        orphan_strike, ORPHAN_STRIKES, RECONCILE_INTERVAL,
-                    };
-                    use engram_core::traits::sandbox::SandboxBackend as _;
+                    use crate::teardown_reconcile::{reconcile_once, RECONCILE_INTERVAL};
                     let mut strikes: std::collections::HashMap<SandboxId, u32> =
                         std::collections::HashMap::new();
                     let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tick.tick().await;
-                        let sandboxes = match pooled_for_reap.list().await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::warn!(error = %e,
-                                    "teardown reconcile: list() failed; skipping tick");
-                                continue;
-                            }
-                        };
-                        let live: std::collections::HashSet<SandboxId> =
-                            sandboxes.iter().copied().collect();
-                        strikes.retain(|id, _| live.contains(id));
-                        for sandbox_id in sandboxes {
-                            // Migration sandboxes run their own ownership rules.
-                            if pooled_for_reap.migration_role(sandbox_id).is_some() {
-                                strikes.remove(&sandbox_id);
-                                continue;
-                            }
-                            // ADR 0084 P1b: base-snapshot capture VMs are host-local
-                            // + transient and NEVER session-owned by design;
-                            // reaping one as an "orphan" kills an in-flight capture
-                            // (a slow `[warm]` hook runs past the strike debounce).
-                            // Exempt while a live (non-terminal) `capture_jobs`
-                            // record says this sandbox belongs to it — the
-                            // executor destroys the VM itself once the job
-                            // finishes, at which point this predicate goes false
-                            // again (never a permanent exemption).
-                            if capture_jobs_for_reap.is_live_sandbox(sandbox_id) {
-                                strikes.remove(&sandbox_id);
-                                continue;
-                            }
-                            let session = pooled_for_reap.session_for_sandbox(sandbox_id);
-                            let orphan = match session {
-                                Some(sid) => match coord_for_reap
-                                    .sandbox_ownership(host_id_for_reap, sid, sandbox_id)
-                                    .await
-                                {
-                                    Ok(owned) => !owned,
-                                    // Coord unreachable → assume still owned; never
-                                    // reap on a transient control-plane blip.
-                                    Err(_) => false,
-                                },
-                                // ADR 0090: a missing LOCAL binding is not ownership
-                                // truth — a fresh generation whose NBD rehydrate
-                                // failed has no entry for a legitimately-owned,
-                                // pidfd-reattached survivor, and this arm's old
-                                // unconditional `true` SIGKILLed exactly such a VM
-                                // mid-build (2026-07-11 campaign). Ask the
-                                // coordinator; an owned answer also repairs the
-                                // local table. Only a coordinator-confirmed
-                                // "no session owns this" counts as an orphan.
-                                None => match coord_for_reap
-                                    .sandbox_owner(host_id_for_reap, sandbox_id)
-                                    .await
-                                {
-                                    Ok(Some(sid)) => {
-                                        tracing::info!(%sandbox_id, session_id = %sid,
-                                            "teardown reconcile: coordinator owns this \
-                                             sandbox; repopulating the local binding");
-                                        pooled_for_reap.record_session_binding(sandbox_id, sid);
-                                        false
-                                    }
-                                    Ok(None) => true,
-                                    // Coord unreachable → assume owned (same
-                                    // posture as the Some arm).
-                                    Err(_) => false,
-                                },
-                            };
-                            if orphan_strike(&mut strikes, sandbox_id, orphan, ORPHAN_STRIKES) {
-                                tracing::warn!(%sandbox_id, ?session,
-                                    "teardown reconcile: sandbox no longer owned by its session; destroying locally");
-                                if let Err(e) = pooled_for_reap.destroy(sandbox_id).await {
-                                    tracing::warn!(%sandbox_id, error = %e,
-                                        "teardown reconcile: local destroy failed; retrying next tick");
-                                } else {
-                                    strikes.remove(&sandbox_id);
-                                }
-                            }
+                        if let Err(e) = reconcile_once(
+                            &*reap_backend,
+                            &*coord_for_reap,
+                            host_id_for_reap,
+                            &mut strikes,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e,
+                                "teardown reconcile: list() failed; skipping tick");
                         }
                     }
                 });
