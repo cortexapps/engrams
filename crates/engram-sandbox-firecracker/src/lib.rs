@@ -5475,12 +5475,25 @@ impl SandboxBackend for FirecrackerBackend {
         // impossible to distinguish from — and structurally harmless
         // either way.
         //
-        // Deliberately NO deadline on the round trip: prod has observed a
-        // 299 s handshake that eventually succeeded under guest CPU/IO
-        // starvation during UFFD/NBD page-in — a deadline would convert
-        // that slow-but-successful case into a hard failure. Starvation
-        // itself is a separate concern (prefault-admission-control, not
-        // this fold) to fix at the source.
+        // The round trip is bounded — per-attempt AND in total. The
+        // earlier shape carried NO deadline, keyed on a prod 299 s
+        // handshake that eventually succeeded under guest CPU/IO
+        // starvation during UFFD/NBD page-in. That reasoning let a single
+        // wedged exchange pin the caller unbounded: prod 2026-07-17
+        // (session 03e6535e) resumed a VM onto a dead rootfs device,
+        // agentd never answered the SpawnHarness read, and the
+        // coordinator's resume `finish` step hung for 34 minutes —
+        // bounded only by a deploy rolling the pod. Because SpawnHarness
+        // is reattach-idempotent (above), a timeout is just another
+        // retryable shape: the retry reconnects and `HarnessSupervisor::
+        // spawn` reattaches whatever the earlier attempt actually
+        // started. A genuinely starved guest that needs longer than the
+        // per-attempt budget now fails THIS attempt and is retried (fresh
+        // connect), and — once the guest is responsive — a later attempt
+        // reattaches in milliseconds. Slow success degrades to
+        // success-on-retry; a wedge stops being an unbounded hang.
+        // Starvation itself is still a separate concern
+        // (prefault-admission-control) to fix at the source.
         //
         // The true fix for the underlying muxer race lives in the
         // vendored FC fork (`third_party/firecracker`), not here — this
@@ -5488,6 +5501,20 @@ impl SandboxBackend for FirecrackerBackend {
         // from the host side (see `connect_fc_vsock`'s doc comment and
         // `harness_supervisor.rs`'s SIGUSR1 comment for why agentd can't
         // signal its own resume over an already-held vsock connection).
+        //
+        // Budgets: per-attempt 60 s bounds the single hung read (a
+        // healthy reattach answers in milliseconds; only a starved first
+        // spawn approaches it); total 210 s is a HARD cap on the retry
+        // ladder, under the coordinator's 240 s `start_agent` `grpc-timeout`
+        // (`restore_rpc_timeout`) so the host returns a typed error before
+        // the caller cancels the RPC out from under it. Each attempt is
+        // wrapped in `min(SPAWN_ATTEMPT_TIMEOUT, remaining_budget)` — a
+        // fixed per-attempt cap alone would let a 4th attempt begun near
+        // 180 s run to ~240 s and race the gRPC deadline (adversarial-review
+        // finding); the `min` keeps the WALL-CLOCK total ≤ 210 s.
+        const SPAWN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+        const SPAWN_TOTAL_BUDGET: Duration = Duration::from_secs(210);
+        let t_total = std::time::Instant::now();
         let max_attempts: u32 = 5;
         let mut attempt: u32 = 0;
         let resp: engram_agentd::WireResponse = loop {
@@ -5502,6 +5529,22 @@ impl SandboxBackend for FirecrackerBackend {
             // diagnosis below relies on (a slow CONNECT reading as a
             // starved guest that was actually just a late retry).
             let t_attempt = std::time::Instant::now();
+            // Cap this attempt at whatever remains of the total budget, so
+            // the loop's wall-clock can never exceed SPAWN_TOTAL_BUDGET
+            // (and thus stays under the caller's gRPC deadline). A hung
+            // attempt begun late no longer overshoots.
+            let remaining = SPAWN_TOTAL_BUDGET.saturating_sub(t_total.elapsed());
+            if remaining.is_zero() {
+                return Err(SandboxError::Vm(
+                    format!(
+                        "SpawnHarness exhausted its {SPAWN_TOTAL_BUDGET:?} total budget after \
+                         {} attempt(s)",
+                        attempt - 1,
+                    )
+                    .into(),
+                ));
+            }
+            let attempt_timeout = remaining.min(SPAWN_ATTEMPT_TIMEOUT);
             let inner = async {
                 let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
                 // ADR 0045 C1 tail diagnosis: split the handshake into
@@ -5529,24 +5572,55 @@ impl SandboxBackend for FirecrackerBackend {
                 // integration `-p` build failed.
                 Ok::<_, SandboxError>(resp)
             };
-            match tracing::Instrument::instrument(inner, span).await {
+            let outcome = match tokio::time::timeout(
+                attempt_timeout,
+                tracing::Instrument::instrument(inner, span),
+            )
+            .await
+            {
+                Ok(r) => r,
+                // A per-attempt deadline expiry reuses the retry ladder
+                // below (reattach-idempotent), distinguished by its
+                // message so `retryable` can admit it.
+                Err(_) => Err(SandboxError::Vm(
+                    format!(
+                        "SpawnHarness round-trip exceeded the per-attempt deadline \
+                         ({attempt_timeout:?})"
+                    )
+                    .into(),
+                )),
+            };
+            match outcome {
                 Ok(r) => break r,
                 Err(e) => {
-                    // Only retry EOF/RST-shaped errors — the muxer-settle
-                    // signature. Other failures (write failures, bincode
-                    // decode errors, protocol mismatches, connection
-                    // refused) are structural — retrying won't help, and
-                    // `Connection refused` in particular stays a
-                    // non-retryable, terminal class (the FC process
-                    // itself isn't accepting; out of scope for this fold).
+                    // Retry EOF/RST-shaped errors — the muxer-settle
+                    // signature — plus a per-attempt deadline expiry (a
+                    // wedged/starved read; the retry reconnects and
+                    // reattaches). Other failures (write failures,
+                    // bincode decode errors, protocol mismatches,
+                    // connection refused) are structural — retrying won't
+                    // help, and `Connection refused` in particular stays
+                    // a non-retryable, terminal class (the FC process
+                    // itself isn't accepting; out of scope for this
+                    // fold).
                     let msg = format!("{e}");
                     let retryable = msg.contains("early eof")
                         || msg.contains("unexpected end of file")
                         || msg.contains("connection reset")
-                        || msg.contains("broken pipe");
+                        || msg.contains("broken pipe")
+                        || msg.contains("per-attempt deadline");
+                    // Total-budget exhaustion is enforced at the top of the
+                    // loop (`remaining.is_zero()`) plus the per-attempt
+                    // `min` cap; here we only gate on retryability + the
+                    // attempt count.
                     if !retryable || attempt >= max_attempts {
                         return Err(SandboxError::Vm(
-                            format!("SpawnHarness failed after {attempt} attempt(s): {e}").into(),
+                            format!(
+                                "SpawnHarness failed after {attempt} attempt(s) \
+                                 ({:?} elapsed): {e}",
+                                t_total.elapsed(),
+                            )
+                            .into(),
                         ));
                     }
                     tracing::debug!(

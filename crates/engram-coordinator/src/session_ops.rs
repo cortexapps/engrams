@@ -659,7 +659,53 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // (RAII abort) before `op_finish` so the beat never re-stamps a
     // just-finished row.
     let heartbeat = spawn_op_heartbeat(state, op.id, epoch);
-    let outcome = crate::session_verbs::dispatch(&ctx).await;
+    // ADR 0079 backstop / the 2026-07-17 resume-stall incident (session
+    // 03e6535e): the within-step liveness heartbeat above PROVES the
+    // executor is alive independently of step progress — by design, so a
+    // long-but-healthy host RPC is never reclaimed. Its failure mode is an
+    // executor that is alive but WEDGED: a verb `await` that never returns
+    // (there, `host.start_agent` on a resume `finish` step hung on a dead
+    // rootfs device) keeps the row heartbeating forever, so the 180s
+    // stale-op reclaim can never fire and the op is pinned until a deploy
+    // rolls the pod (34 minutes, in the incident). The per-RPC
+    // `grpc-timeout`s (restore/start_agent, 240s) are the first line; this
+    // is the backstop for a hang that is NOT a single bounded RPC (a lock,
+    // a channel wait, a future whose timeout isn't honoured). On expiry the
+    // dispatch future is DROPPED (cancelled) and the op requeues with
+    // backoff. Uses the tokio timer (not the injected clock) so it bounds
+    // REAL wall-clock hangs — and so the simulator's paused-clock advance
+    // fires it deterministically.
+    //
+    // CANCELLATION SAFETY (adversarial-review finding): dropping the
+    // dispatch future is only equivalent to an executor crash for verbs
+    // whose mid-flight cancellation leaves NO unfenced host-side cleanup
+    // racing a successor. On a real crash the whole process dies, taking
+    // any detached cleanup task with it, and nothing re-claims the lane for
+    // 180s; a timeout, by contrast, keeps the process alive and frees the
+    // lane immediately. For a capture/migration verb that is exactly the
+    // hazard: cancelling `snapshot`/`snapshot_begin` (Evict,
+    // CheckpointFinalize) triggers the host's CaptureUnwind — guest-resume
+    // + disk-drain requeue on the SHARED sandbox — which would then run
+    // concurrently with the successor op (a retry's fresh capture, or a
+    // Deliver/Resume against the same guest), corrupting snapshot
+    // quiescence. So `op_deadline` returns `None` for those verbs (they keep
+    // their own bounds — the ADR-0090 quarantine capture timeout, and the
+    // 180s reclaim on genuine executor death); Resume/CreateBoot leave only
+    // an orphan-reaped half-restore or a reattach-idempotent half-spawn, and
+    // Deliver/Destroy have no shared-sandbox cleanup, so those are bounded.
+    let outcome = match op_deadline(op.kind) {
+        Some(deadline) => {
+            match tokio::time::timeout(deadline, crate::session_verbs::dispatch(&ctx)).await {
+                Ok(outcome) => outcome,
+                Err(_) => OpOutcome::Retry(format!(
+                    "op exceeded wall-clock deadline {deadline:?} at step {:?} (executor alive \
+                     but wedged); requeued with backoff",
+                    op.step.as_deref().unwrap_or("<start>"),
+                )),
+            }
+        }
+        None => crate::session_verbs::dispatch(&ctx).await,
+    };
     drop(heartbeat);
     let meta = &state.services.meta;
     let terminal = !matches!(outcome, OpOutcome::Retry(_));
@@ -734,6 +780,46 @@ fn backoff(attempts: i32) -> Duration {
     Duration::from_secs(secs.min(60))
 }
 
+/// Wall-clock backstop for a single op-dispatch attempt (see the deadline
+/// wrap in [`drive_one`]). NOT a pacing knob — sized generously ABOVE the
+/// sum of the per-RPC `grpc-timeout`s a healthy attempt can legitimately
+/// spend, so it only ever fires on a genuinely wedged executor. On expiry
+/// the attempt requeues with backoff; a fresh attempt gets a fresh
+/// deadline (this is per-attempt, never cumulative across retries).
+///
+/// Returns `None` for verbs whose mid-flight cancellation is NOT
+/// crash-equivalent — capture (Evict/CheckpointFinalize) and migration
+/// (Teleport), where dropping the host RPC spawns unfenced CaptureUnwind /
+/// abort cleanup on the shared sandbox that would race a successor op (see
+/// the cancellation-safety note in [`drive_one`]). Those verbs keep their
+/// existing bounds: the ADR-0090 quarantine capture timeout and the 180s
+/// reclaim on genuine executor death.
+fn op_deadline(kind: OpKind) -> Option<Duration> {
+    let deadline = match kind {
+        // The worst legitimate case: restore (≤240s grpc) in the `restore`
+        // step THEN start_agent (≤240s grpc) in the `finish` step, plus
+        // secret/token minting and PG writes — up to ~500s. 600s clears it.
+        // A cancelled attempt leaves only an orphan-reaped half-restore or a
+        // reattach-idempotent half-spawn — no shared-sandbox cleanup race.
+        OpKind::Resume | OpKind::CreateBoot => Duration::from_secs(600),
+        // Forward one outbox row (30s ACK budget) / tear down — fast, and
+        // no shared-sandbox unwind on cancel (retry re-forwards/re-destroys).
+        OpKind::Deliver | OpKind::Destroy => Duration::from_secs(120),
+        // Capture + migration: cancellation is unsafe (see doc comment).
+        OpKind::Evict | OpKind::CheckpointFinalize | OpKind::Teleport => return None,
+    };
+    // Operators can pin a single global backstop (and tests set a short one)
+    // via `ENGRAM_OP_DEADLINE_SECS` — applied only to deadline-eligible
+    // verbs, never to force one onto a cancel-unsafe verb. Mirrors the
+    // `ENGRAM_QUARANTINE_CAPTURE_TIMEOUT_SECS` knob.
+    let deadline = std::env::var("ENGRAM_OP_DEADLINE_SECS")
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .filter(|s| *s > 0)
+        .map_or(deadline, Duration::from_secs);
+    Some(deadline)
+}
+
 /// This pod's identity — observability only, never authority (the epoch
 /// is the authority).
 pub fn pod_id() -> String {
@@ -742,4 +828,39 @@ pub fn pod_id() -> String {
         std::env::var("HOSTNAME").unwrap_or_else(|_| format!("coord-{}", std::process::id()))
     })
     .clone()
+}
+
+#[cfg(test)]
+mod deadline_tests {
+    use super::op_deadline;
+    use engram_core::types::session_op::OpKind;
+
+    /// Cancellation safety (adversarial-review finding): the wall-clock
+    /// deadline hard-cancels the dispatch future, so it may ONLY apply to
+    /// verbs whose mid-flight cancellation leaves no unfenced host-side
+    /// cleanup racing a successor. Capture (Evict/CheckpointFinalize) and
+    /// migration (Teleport) spawn CaptureUnwind/abort on the shared sandbox,
+    /// so they must have NO deadline; the rest are bounded.
+    #[test]
+    fn only_cancel_safe_verbs_carry_a_deadline() {
+        // Cancel-unsafe: no deadline (keep their own bounds).
+        for k in [OpKind::Evict, OpKind::CheckpointFinalize, OpKind::Teleport] {
+            assert!(
+                op_deadline(k).is_none(),
+                "{k:?} must not be deadline-cancelled"
+            );
+        }
+        // Cancel-safe: bounded.
+        for k in [
+            OpKind::Resume,
+            OpKind::CreateBoot,
+            OpKind::Deliver,
+            OpKind::Destroy,
+        ] {
+            assert!(
+                op_deadline(k).is_some(),
+                "{k:?} must carry a wall-clock deadline"
+            );
+        }
+    }
 }

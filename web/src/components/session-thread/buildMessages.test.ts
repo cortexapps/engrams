@@ -277,6 +277,45 @@ describe("buildMessages — message/part shaping", () => {
     expect((msgs[0]!.content[0] as { type: string }).type).toBe("text");
   });
 
+  test("the 'waking up' resume marker is transient: repeats collapse and activity clears it", () => {
+    const markOf = (m: { metadata?: { custom?: Record<string, unknown> } }) => {
+      const mk = customMarker(m);
+      return mk?.kind === "durability" ? mk.mark : undefined;
+    };
+    const waking = (evs: SessionEvent[]) =>
+      real(buildMessages(indexed(evs), SID).messages).filter((m) => markOf(m) === "waking");
+
+    // A retrying resume emits several ResumeStarted events; while still
+    // waking (no activity after), exactly ONE marker survives.
+    expect(
+      waking([
+        { type: "resume_started", at: AT },
+        { type: "resume_started", at: AT2 },
+      ]),
+    ).toHaveLength(1);
+
+    // run_started supersedes it — the session is producing output.
+    expect(
+      waking([
+        { type: "resume_started", at: AT },
+        { type: "resume_started", at: AT2 },
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT2 },
+      ]),
+    ).toHaveLength(0);
+
+    // resumed supersedes it too (a resume that completes before any run).
+    const afterResumed = buildMessages(
+      indexed([
+        { type: "resume_started", at: AT },
+        { type: "resumed", snapshot_id: "s", at: AT2 },
+      ]),
+      SID,
+    ).messages;
+    expect(real(afterResumed).filter((m) => markOf(m) === "waking")).toHaveLength(0);
+    // ...and the durable 'resumed' marker still renders.
+    expect(real(afterResumed).filter((m) => markOf(m) === "resumed")).toHaveLength(1);
+  });
+
   test("integration_asset(forge/pull_request) becomes an integration_asset marker", () => {
     const { messages } = buildMessages(
       indexed([

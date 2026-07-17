@@ -4191,7 +4191,8 @@ impl MetadataStore for PostgresStore {
 
         // Tombstone the rolled-back span (audit-preserving) and count it.
         // Issue #529: exclude coordinator-fact kinds — `status_changed`,
-        // `snapshot_taken`, `evicted`, `resumed`, `recovered_from_checkpoint`.
+        // `snapshot_taken`, `evicted`, `resumed`, `resume_started`,
+        // `recovered_from_checkpoint`.
         // Those are control-plane bookkeeping the coordinator itself
         // appended around the eviction/resume boundary; they stay true
         // regardless of what the guest remembers, so rewinding them was
@@ -4234,8 +4235,8 @@ impl MetadataStore for PostgresStore {
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
                AND kind NOT IN (
                    'status_changed', 'snapshot_taken', 'evicted',
-                   'resumed', 'recovered_from_checkpoint', 'prompt_received',
-                   'harness_idle', 'harness_parked'
+                   'resumed', 'resume_started', 'recovered_from_checkpoint',
+                   'prompt_received', 'harness_idle', 'harness_parked'
                )
             "#,
         )

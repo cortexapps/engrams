@@ -40,6 +40,7 @@ export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
   "snapshot_taken",
   "evicted",
   "resumed",
+  "resume_started",
   "run_started",
   "agent_message",
   "tool_call_started",

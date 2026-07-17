@@ -93,7 +93,12 @@ function Recovery({ marker }: { marker: Extract<SystemMarker, { kind: "recovery"
 
 function Durability({ marker }: { marker: Extract<SystemMarker, { kind: "durability" }> }) {
   const Icon = marker.mark === "snapshot" ? CameraIcon : RotateCcwIcon;
-  const label = marker.mark === "snapshot" ? "snapshotted" : "resumed";
+  const label =
+    marker.mark === "snapshot"
+      ? "snapshotted"
+      : marker.mark === "waking"
+        ? "waking up…"
+        : "resumed";
   return (
     <div className="flex items-center justify-center gap-2 py-1 text-xs text-muted-foreground">
       <Icon className="size-3.5" />
