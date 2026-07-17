@@ -167,8 +167,11 @@ async fn reattach_verify_on_read_serves_seeded_acked_bytes_not_base() {
     let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
     cache_cfg.budget_bytes = 64 * 1024 * 1024;
     let cache = ChunkCache::new(cache_cfg);
+    // A 64 KiB chunk size (vs the 16 MiB default) so the 256 KiB image spans
+    // 4 chunks — the test seeds chunk index 1, which the default single-chunk
+    // layout would put past the device end (offset 16 MiB > 256 KiB total).
     let manifest = store
-        .chunk_file(&image, ManifestKind::Disk, None)
+        .chunk_file(&image, ManifestKind::Disk, Some(64 * 1024))
         .await
         .expect("chunk image");
     let manifest_ref = ManifestRef::new();
