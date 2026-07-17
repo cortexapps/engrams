@@ -250,12 +250,22 @@ FONTS
         curl -fsSL "https://nodejs.org/dist/v${NODE_VERSION}/node-v${NODE_VERSION}-linux-${NODE_ARCH}.tar.xz" \
             | tar -xJ -C /out/node --strip-components=1
         export PATH="/out/node/bin:$PATH"
-        # @playwright/cli ONLY — no browser install. cdpEndpoint mode connects to
-        # the running headful chrome, so the CLI needs no local browser of its own.
+        # @playwright/cli plus ONLY its video encoder — no browser install.
+        # cdpEndpoint mode connects to the running headful chrome, so the CLI
+        # needs no local browser of its own. Video is encoded by a separate,
+        # Playwright-versioned FFmpeg helper; install it at bundle-build time so
+        # isolated sessions never need an artifact-CDN egress exception.
         npm install -g --no-audit --no-fund "@playwright/cli@${PLAYWRIGHT_CLI_VERSION}"
         collect /out/node/bin/node
         [ -x /out/node/bin/playwright-cli ] \
             || { echo "FATAL: playwright-cli not installed under /out/node/bin" >&2; exit 1; }
+        export PLAYWRIGHT_BROWSERS_PATH=/out/playwright
+        /out/node/bin/node \
+            /out/node/lib/node_modules/@playwright/cli/node_modules/playwright-core/cli.js \
+            install ffmpeg
+        ffmpeg_bin="$(find /out/playwright -maxdepth 2 -type f -name ffmpeg-linux -perm -0100 -print -quit)"
+        [ -n "$ffmpeg_bin" ] && "$ffmpeg_bin" -version >/dev/null \
+            || { echo "FATAL: Playwright FFmpeg helper missing from /out/playwright" >&2; exit 1; }
 
         # CLI config: CONNECT over CDP to the shared chrome on loopback :9222,
         # never launch. The wrapper points PLAYWRIGHT_MCP_CONFIG here.
@@ -302,6 +312,10 @@ here="$(cd -- "$(dirname -- "$(readlink -f -- "$0")")/.." && pwd)"
 # call above is what guarantees the /tmp stable-symlink target DT_RPATH
 # resolves through actually exists before this ever runs.
 export PLAYWRIGHT_MCP_CONFIG="$here/cli.config.json"
+# Resolve the Playwright-versioned video helper from this read-only bundle.
+# The daemon inherits this on its first invocation, so recording never consults
+# a per-user cache or attempts a runtime artifact download.
+export PLAYWRIGHT_BROWSERS_PATH="$here/playwright"
 # The bundled version is deliberately pinned. Avoid the CLI making a best-effort
 # npm registry request on every short-lived invocation (including the private
 # foregrounding call below), which adds latency or noise in network-isolated

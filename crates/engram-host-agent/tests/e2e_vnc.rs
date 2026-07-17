@@ -17,10 +17,11 @@
 //!     raw RFB byte round-trip with x11vnc.
 //!
 //! The test first checks the RFB ProtocolVersion handshake, then drives a local
-//! fixture through Playwright CLI, verifies its semantic snapshot and annotated
-//! screenshot, completes the RFB handshake, requests a tiny RAW framebuffer
-//! rectangle, and decodes the fixture's high-contrast center pixel. This proves
-//! x11vnc and Chromium are alive and expose the same painted page.
+//! fixture through Playwright CLI, records a real WebM, verifies its semantic
+//! snapshot and annotated screenshot, completes the RFB handshake, requests a
+//! tiny RAW framebuffer rectangle, and decodes the fixture's high-contrast
+//! center pixel. This proves x11vnc and Chromium are alive and expose the same
+//! painted page, and that explicit video needs no runtime download.
 //!
 //! Coverage: `e2e_vnc_cold_via_pooled_backend` — cold-created FC sandbox. (The
 //! warm/netns path is gone with ADR 0066 — the relay reaches guest loopback
@@ -554,7 +555,7 @@ async fn e2e_vnc_cold_via_pooled_backend() {
         "expected RFB ProtocolVersion banner (`RFB 003.`); got {banner:?}",
     );
 
-    // ---- 8. Drive the same Chrome semantically and produce an annotation ----
+    // ---- 8. Drive the same Chrome, record it, and produce an annotation ----
     // Playwright CLI 0.1.17 rejects file:// navigation. Serve the fixture over
     // guest loopback instead, which also matches how production browser work
     // reaches pages. BusyBox httpd daemonizes only after successfully binding,
@@ -568,6 +569,10 @@ async fn e2e_vnc_cold_via_pooled_backend() {
                     "-c".into(),
                     "/bin/busybox httpd -p 127.0.0.1:18080 -h /workspace && \
                      playwright-cli open http://127.0.0.1:18080/browser-e2e.html && \
+                     playwright-cli video-start /workspace/browser-e2e.webm && \
+                     playwright-cli video-chapter \"Fixture painted\" --duration 100 && \
+                     playwright-cli video-stop && \
+                     test -s /workspace/browser-e2e.webm && \
                      playwright-cli snapshot && \
                      playwright-cli highlight button --style 'outline: 4px solid cyan' && \
                      playwright-cli screenshot --filename /tmp/engram-browser-observations/browser-e2e.png && \
@@ -577,7 +582,7 @@ async fn e2e_vnc_cold_via_pooled_backend() {
                 stdin: None,
                 env: HashMap::new(),
                 workdir: Some("/workspace".into()),
-                timeout: Some(Duration::from_secs(45)),
+                timeout: Some(Duration::from_secs(60)),
             },
         )
         .await
