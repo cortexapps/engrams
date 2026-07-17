@@ -72,6 +72,27 @@ pub enum Step {
     /// operation boundaries, then RAM dies. The following `Restart` runs the
     /// real recovery under oracle #1.
     CrashAt(CrashPoint),
+    /// Flow B (P7): rung-2 PARK sandbox `idx` (FC paused, VM resident,
+    /// `evicting`-shaped) — the 731df805 pre-condition.
+    Park(usize),
+    /// Flow B (P7): un-pause (rung-cancel resume) sandbox `idx`. The un-pause
+    /// data-plane gate fails fast into `evict_local → resume` if the rootfs
+    /// device is not served by this generation — never a dead-plane serve.
+    Unpause(usize),
+    /// Flow B (P7): the register-time rehydrate sequence — coord-list pass →
+    /// local ChainHeadRecord pass (#739) → stale-binding sweep. Swarm uses the
+    /// SAFE defaults (list includes parked, local pass on); the adversarial
+    /// variants ride the regression seeds.
+    RegisterRehydrate,
+    /// Flow B (P7): run the stale-binding sweep independently (DISCONNECT
+    /// devices whose recorded owner is a dead generation).
+    StaleSweepTick,
+    /// Flow B (P7): `try_claim` a spare NBD device on the real allocator (Free
+    /// → Claimed) — the slot-accounting + no-double-claim exercise.
+    SlotClaim(usize),
+    /// Flow B (P7): release the oldest held spare lease (Claimed → Free),
+    /// exercising the allocator's release path.
+    SlotPopulateTick,
 }
 
 impl Step {
@@ -92,6 +113,12 @@ impl Step {
             Step::RevokeOwnership(..) => "RevokeOwnership",
             Step::Sigterm(..) => "Sigterm",
             Step::CrashAt(..) => "CrashAt",
+            Step::Park(..) => "Park",
+            Step::Unpause(..) => "Unpause",
+            Step::RegisterRehydrate => "RegisterRehydrate",
+            Step::StaleSweepTick => "StaleSweepTick",
+            Step::SlotClaim(..) => "SlotClaim",
+            Step::SlotPopulateTick => "SlotPopulateTick",
         }
     }
 }
@@ -191,44 +218,60 @@ impl Sim {
         // pick must NEVER branch on anything non-deterministic.
         match self.profile {
             Profile::Calm => match roll {
-                0..=37 => Step::GuestWrite(
+                0..=32 => Step::GuestWrite(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                38..=54 => Step::GuestRead(
+                33..=47 => Step::GuestRead(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                55..=66 => Step::FlushTick(self.rng.random_range(0..n)),
-                67..=73 => Step::SpoolExport(self.rng.random_range(0..n)),
-                74..=80 => Step::SpoolAdopt(self.rng.random_range(0..n)),
-                81..=87 => Step::ReconcileTick,
-                88..=90 => Step::DropLocalBinding(self.rng.random_range(0..n)),
-                91..=92 => Step::RevokeOwnership(self.rng.random_range(0..n)),
+                48..=57 => Step::FlushTick(self.rng.random_range(0..n)),
+                58..=63 => Step::SpoolExport(self.rng.random_range(0..n)),
+                64..=69 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                70..=75 => Step::ReconcileTick,
+                76..=78 => Step::DropLocalBinding(self.rng.random_range(0..n)),
+                79..=80 => Step::RevokeOwnership(self.rng.random_range(0..n)),
                 // Sigterm is a GRACEFUL shutdown (the spool always completes),
                 // so it belongs in the calm durability baseline too.
-                93..=96 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
+                81..=83 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
+                // Flow B (P7): the slot/reattach lifecycle. All benign under
+                // the safe defaults — the oracles must hold every step.
+                84..=86 => Step::SlotClaim(self.rng.random_range(0..n)),
+                87..=88 => Step::SlotPopulateTick,
+                89..=90 => Step::Park(self.rng.random_range(0..n)),
+                91..=92 => Step::Unpause(self.rng.random_range(0..n)),
+                93..=95 => Step::RegisterRehydrate,
+                96..=97 => Step::StaleSweepTick,
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
-                0..=26 => Step::GuestWrite(
+                0..=22 => Step::GuestWrite(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                27..=39 => Step::GuestRead(
+                23..=34 => Step::GuestRead(
                     self.rng.random_range(0..n),
                     self.rng.random_range(0..NUM_CHUNKS),
                 ),
-                40..=50 => Step::FlushTick(self.rng.random_range(0..n)),
-                51..=58 => Step::SpoolExport(self.rng.random_range(0..n)),
-                59..=66 => Step::SpoolAdopt(self.rng.random_range(0..n)),
-                67..=74 => Step::ReconcileTick,
-                75..=78 => Step::DropLocalBinding(self.rng.random_range(0..n)),
-                79..=81 => Step::RevokeOwnership(self.rng.random_range(0..n)),
-                82..=86 => Step::CrashProcess,
-                87..=90 => Step::Restart,
-                91..=93 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
-                94..=97 => Step::CrashAt(pick_crashpoint(&mut self.rng)),
+                35..=43 => Step::FlushTick(self.rng.random_range(0..n)),
+                44..=50 => Step::SpoolExport(self.rng.random_range(0..n)),
+                51..=57 => Step::SpoolAdopt(self.rng.random_range(0..n)),
+                58..=64 => Step::ReconcileTick,
+                65..=67 => Step::DropLocalBinding(self.rng.random_range(0..n)),
+                68..=69 => Step::RevokeOwnership(self.rng.random_range(0..n)),
+                70..=74 => Step::CrashProcess,
+                75..=79 => Step::Restart,
+                80..=82 => Step::Sigterm(pick_budget_ms(&mut self.rng)),
+                83..=85 => Step::CrashAt(pick_crashpoint(&mut self.rng)),
+                // Flow B (P7): park → roll → rehydrate → sweep → un-pause. The
+                // roll comes from CrashProcess/Sigterm/CrashAt above.
+                86..=88 => Step::SlotClaim(self.rng.random_range(0..n)),
+                89..=90 => Step::SlotPopulateTick,
+                91..=92 => Step::Park(self.rng.random_range(0..n)),
+                93..=94 => Step::Unpause(self.rng.random_range(0..n)),
+                95..=97 => Step::RegisterRehydrate,
+                98 => Step::StaleSweepTick,
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -279,6 +322,19 @@ impl Sim {
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }
+            Step::Park(idx) => self.host.park(idx),
+            // The un-pause gate firing (unserved plane) is CORRECT behavior, not
+            // a step failure — the guest stays parked, routed to recovery.
+            Step::Unpause(idx) => {
+                let _ = self.host.unpause(idx);
+            }
+            // Swarm uses the SAFE defaults (coord list includes parked survivors,
+            // #739 local pass on) so the oracles hold every step; the adversarial
+            // #739 variants ride the regression seeds.
+            Step::RegisterRehydrate => self.host.register_rehydrate(true, true).await?,
+            Step::StaleSweepTick => self.host.stale_sweep_tick(),
+            Step::SlotClaim(idx) => self.host.slot_claim(idx).await,
+            Step::SlotPopulateTick => self.host.slot_populate_tick(),
         }
         Ok(())
     }

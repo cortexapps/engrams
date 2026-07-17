@@ -462,6 +462,160 @@ async fn every_crash_point_injection_recovers_every_acked_write() {
     }
 }
 
+// ────────────── Flow B: the 731df805 scenario (ADR 0098 P7) ──────────────
+//
+// The headline device-lifecycle-ordering incident, pinned as a regression
+// seed: a rung-2 PARKED survivor (paused VM, resident, `evicting`-shaped) whose
+// NBD device the register-time rehydrate MISSED, so the stale-binding sweep
+// disconnected its live rootfs and an un-pause landed on a dead data plane.
+// Both the #739 defense (the local ChainHeadRecord pass re-serves it) and the
+// un-pause data-plane gate (the last line, even when every list is wrong) are
+// pinned.
+
+/// #739 FIXED path: park → roll → register with the PRE-#739 buggy coord list
+/// (omits parked survivors) but the #739 local ChainHeadRecord pass ON. The
+/// local pass re-serves the parked survivor's device the coord list missed;
+/// the stale sweep then skips it (served ⇒ claimed ⇒ not free-in-pool); the
+/// un-pause serves the correct acked bytes.
+#[tokio::test(start_paused = true)]
+async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() {
+    let mut host = scenario_host(0, 3).await;
+    // Acked writes on the soon-to-be-parked survivor.
+    host.guest_write(0, 1).await.unwrap();
+    host.guest_write(0, 5).await.unwrap();
+
+    // Rung-2 park sandbox 0 (evicting-shaped, VM resident).
+    host.park(0);
+    assert!(host.sandboxes[0].parked);
+    let gen_before = host.generation;
+
+    // The pod roll: spool the survivors, drop RAM, fresh generation. The parked
+    // VM stays resident; its kernel device is left bound to the dead generation.
+    host.crash_process().await.unwrap();
+    assert_eq!(host.generation, gen_before + 1);
+    assert!(
+        host.sandboxes[0].parked,
+        "the parked VM stays resident across the roll"
+    );
+    assert_eq!(
+        host.sandboxes[0].served_by, None,
+        "the roll leaves the device unserved (the successor's serve socket)"
+    );
+    assert!(
+        host.sandboxes[0]
+            .kernel_owner
+            .is_some_and(|g| g < host.generation),
+        "the kernel device is still bound to the dead generation",
+    );
+
+    // Register-time rehydrate: the buggy coord list OMITS the parked survivor,
+    // but the #739 local ChainHeadRecord pass catches it.
+    host.register_rehydrate(
+        /*coord_includes_parked=*/ false, /*local_pass_enabled=*/ true,
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        host.sandboxes[0].served_by,
+        Some(host.generation),
+        "the #739 local pass re-served the parked survivor's device the coord list missed",
+    );
+    assert_eq!(
+        host.sandboxes[0].kernel_owner,
+        Some(host.generation),
+        "the stale-binding sweep did NOT disconnect the re-served live device",
+    );
+
+    // The oracles hold and the un-pause serves the correct (acked) bytes.
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    assert!(host.unpause(0), "the un-pause serves the live plane");
+    assert!(!host.sandboxes[0].parked);
+    host.guest_read(0, 1).await.unwrap();
+    host.guest_read(0, 5).await.unwrap();
+    invariants::check(&host).await.unwrap();
+}
+
+/// UNGATED path: park → roll → register with BOTH the buggy coord list AND the
+/// #739 local pass DISABLED (the pre-#739 world). Nothing re-serves the parked
+/// survivor, and the stale-binding sweep DISCONNECTS its live rootfs (the
+/// literal 731df805 bug). The un-pause data-plane gate is then the LAST LINE:
+/// it fails fast into `evict_local → resume` rather than serving the dead
+/// plane, so the guest stays parked and NO oracle fires — the corruption never
+/// happens.
+#[tokio::test(start_paused = true)]
+async fn park_roll_ungated_local_pass_off_unpause_gate_fires_never_dead_plane() {
+    let mut host = scenario_host(0, 3).await;
+    host.guest_write(0, 2).await.unwrap();
+    host.park(0);
+    host.crash_process().await.unwrap();
+
+    // The pre-#739 world: buggy coord list + no local pass.
+    host.register_rehydrate(false, false).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by, None,
+        "no pass re-served the parked survivor",
+    );
+    assert_eq!(
+        host.sandboxes[0].kernel_owner, None,
+        "the stale sweep disconnected the parked survivor's live device (the 731df805 bug)",
+    );
+
+    // The un-pause gate fires: the guest is NOT un-paused onto the dead plane.
+    assert!(
+        !host.unpause(0),
+        "the un-pause data-plane gate must fire on an unserved device",
+    );
+    assert!(
+        host.sandboxes[0].parked,
+        "the guest stays parked, routed to evict_local → resume",
+    );
+    // Crucially: the corruption never happens, so the oracles are clean.
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// Scheduler-driven slot accounting (ADR 0098 P7): interleave `SlotClaim`
+/// (Free → Claimed via the real `try_claim`) and `SlotPopulateTick`
+/// (Claimed → Free via the lease `Drop`/`release`) over the REAL allocator,
+/// asserting the accounting identity + no-double-claim hold at every step.
+///
+/// The TIGHT concurrent claim-vs-populate validation-window race stays the
+/// multi-thread host-agent test `claim_wins_against_the_populators_validation_window`
+/// (the concurrency-level complement): paused single-thread tokio can't hold a
+/// `claim` mid-populate against a `with_capacity` pool's fast free-check, and
+/// `claim`'s retry `sleep` would hang on the paused clock — so the sim drives
+/// the transitions as explicit scheduler steps and the oracle proves accounting.
+#[tokio::test(start_paused = true)]
+async fn scheduler_driven_slot_accounting_holds_across_claim_release_interleavings() {
+    let mut host = scenario_host(0, 3).await;
+    // Both spare devices claimed (Free → Claimed).
+    host.slot_claim(0).await;
+    host.slot_claim(1).await;
+    invariants::check(&host).await.unwrap();
+
+    // A second claim of a held spare must NOT double-claim (the reserved-bit
+    // protocol refuses it synchronously).
+    let held_before = host.leases_held();
+    host.slot_claim(0).await;
+    assert_eq!(
+        host.leases_held(),
+        held_before,
+        "a held device is never handed to a second owner",
+    );
+    invariants::check(&host).await.unwrap();
+
+    // Release the oldest spare (Claimed → Free) then re-claim — accounting
+    // stays exact across the interleaving.
+    host.slot_populate_tick();
+    invariants::check(&host).await.unwrap();
+    host.slot_claim(0).await;
+    invariants::check(&host).await.unwrap();
+}
+
 // ───────────────────────── pinned swarm seeds ─────────────────────────
 //
 // A handful of chaos seeds run at full length: with ReconcileTick +

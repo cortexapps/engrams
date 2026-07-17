@@ -31,6 +31,12 @@ fn all_step_representatives() -> Vec<Step> {
         Step::RevokeOwnership(0),
         Step::Sigterm(Some(1)),
         Step::CrashAt(CrashPoint::SpoolMarker),
+        Step::Park(0),
+        Step::Unpause(0),
+        Step::RegisterRehydrate,
+        Step::StaleSweepTick,
+        Step::SlotClaim(0),
+        Step::SlotPopulateTick,
     ]
 }
 
@@ -50,6 +56,12 @@ const EXPECTED: &[&str] = &[
     "RevokeOwnership",
     "Sigterm",
     "CrashAt",
+    "Park",
+    "Unpause",
+    "RegisterRehydrate",
+    "StaleSweepTick",
+    "SlotClaim",
+    "SlotPopulateTick",
 ];
 
 #[test]
