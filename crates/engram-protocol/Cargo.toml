@@ -33,3 +33,5 @@ tonic-build.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "io-util", "sync"] }
+# ADR 0099 H4: decode-never-panics property suites (tests/decode_never_panics.rs).
+proptest.workspace = true
