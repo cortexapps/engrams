@@ -453,6 +453,16 @@ NBD data plane. Fixed in the commit chain carrying this addendum:
    it to FC; failure is a hard attach error (a failed create beats
    silent cross-tenant corruption).
 
+4. **`claim` raced the populator's validation window.** `populate`
+   holds a slot RESERVED for the duration of its free-check; a busy
+   survivor device is reserve→check→unreserve cycled, so a one-shot
+   `claim` landing inside the window read "reserved, not warm" as "a
+   lease owns it" and returned `None` — the successor's rehydrate then
+   strands the survivor's disk until evict_local → resume (surfaced as
+   a CI flake of the spool regression test; the same race exists at
+   every prod successor startup). `claim` now retries across the
+   window; a genuine lease still returns `None` after the budget.
+
 Related fix in the same chain (engram-chunk-store): the cache sweep's
 `list_entries` walk aborted on any vanish-mid-walk `NotFound` stat —
 chronically, several times an hour on every busy host — so eviction
