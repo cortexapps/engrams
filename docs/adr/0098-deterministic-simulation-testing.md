@@ -461,22 +461,37 @@ sequence — dropped). Consequences P5 must honor:
 
 **Phase 2 invariant #1 — the acked-write durability oracle** (added
 2026-07-16 from the session-85e0298a corruption RCA, PR #712). The precise
-guarantee — sharpened after an adversarial review caught the original
-phrasing overstating it: *every guest-acked write that had a durable
-handoff before a crash (a flush published it, OR the shutdown spool
-captured it) is recoverable after restart, read back through the REAL
-recovery path (`from_blob(published_ref)` + spool `adopt_unflushed`) — not
-by checking a raw blob exists.* Two deliberate scope boundaries this
-makes explicit:
+guarantee — sharpened after an adversarial review, then again by the P4.5
+implementation: *every guest-acked write whose tag sits at or below the
+**published-manifest floor** — the highest tag a flush actually published
+(read back from the real manifest, so the store-ahead case is covered) — is
+recoverable after restart, read back through the REAL recovery path
+(`from_blob(published_ref)` + spool `adopt_unflushed`), not by checking a
+raw blob exists.* A legitimate post-restart read of a chunk is any tag in
+`[published_floor, latest_ack]`; the violation is a read **below** the
+floor (a published write rolled back — the 85e0298a class) or **above** the
+latest ack (impossible / corruption). Two boundaries this makes explicit:
+- **The shutdown spool is a TRANSIENT carry, not a durability floor.**
+  It prevents loss across one orderly roll (the #712 fix, the common
+  case), but the successor's `adopt_unflushed` seeds the spooled chunk
+  back into the *volatile* dirty tier and discards the spool — so the
+  write is once again only as durable as the next flush. A *later* abrupt
+  crash of the successor legitimately loses it. Only a flush→publish
+  raises the floor; a spool does not. (P4.5's first cut keyed the floor on
+  the spool and produced false violations on
+  `SpoolExport→adopt→AbruptCrash→Restart` — diagnosed as honest loss, the
+  fix in the oracle not the product.)
 - **A write acked from the RAM dirty tier and lost to abrupt process
-  death BEFORE any flush or spool is an accepted, bounded loss** — bounded
-  by the flush cadence and the periodic checkpoint (ADR 0028), NOT a
-  violation. The oracle does not claim "no acked write is ever lost by any
-  process death"; it verifies the *durability pipeline*
-  (flush→publish→spool→adopt) never loses a write it took responsibility
-  for. A mandatory regression seed crashes immediately post-ACK /
-  pre-handoff and asserts the HONEST outcome (the manifest legitimately
-  rolls back; no false "recovered").
+  death BEFORE it is flush-published is an accepted, bounded loss** —
+  bounded by the flush cadence and the periodic checkpoint (ADR 0028), NOT
+  a violation. The oracle does not claim "no acked write is ever lost by
+  any process death"; it verifies the *durability pipeline*
+  (flush→publish, with the spool as a best-effort roll-boundary carry)
+  never loses a write below the published floor. The `AbruptCrash` step
+  (drop RAM, no spool — the window every spool-first crash primitive
+  skipped) plus a mandatory `post_ack_pre_handoff_crash_is_honest_loss`
+  seed pin both directions: an un-published write is lost with no
+  violation; a flush-published write survives abrupt death.
 - **Recoverability means reachability through a durable/uploaded MANIFEST
   or the spool** — both carry the chunk's disk offset. A content-addressed
   chunk blob PUT with no manifest referencing it is NOT recoverable (no
