@@ -28,6 +28,7 @@ import {
   uniqueIndex,
   customType,
   bigint,
+  uuid,
 } from "drizzle-orm/pg-core";
 
 /** Raw binary column (Postgres `bytea`). node-postgres maps `bytea` ⇄ Buffer. */
@@ -165,6 +166,96 @@ export const prRef = pgTable(
     uniqueIndex("pr_ref_repo_pr_number_unique").on(t.repo, t.prNumber),
     index("pr_ref_authoring_task_idx").on(t.authoringTaskId),
     index("pr_ref_session_idx").on(t.sessionId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Pull request reviews (ADR 0100)
+// ---------------------------------------------------------------------------
+
+/** One durable review pass over a pull request at a pinned head SHA. */
+export const review = pgTable(
+  "review",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    repo: text("repo").notNull(),
+    prNumber: integer("pr_number").notNull(),
+    taskId: text("task_id")
+      .notNull()
+      .references(() => task.id),
+    headSha: text("head_sha").notNull(),
+    baseSha: text("base_sha").notNull(),
+    trigger: text("trigger").notNull(),
+    status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded
+    githubReviewId: text("github_review_id"),
+    summaryMd: text("summary_md"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("review_repo_pr_number_idx").on(t.repo, t.prNumber),
+    index("review_task_idx").on(t.taskId),
+  ],
+);
+
+/** A finder-reported candidate and its durable lifecycle state. */
+export const reviewFinding = pgTable(
+  "review_finding",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reviewId: uuid("review_id")
+      .notNull()
+      .references(() => review.id, { onDelete: "cascade" }),
+    path: text("path").notNull(),
+    startLine: integer("start_line"),
+    endLine: integer("end_line"),
+    side: text("side"),
+    category: text("category").notNull(),
+    severity: text("severity").notNull(),
+    confidence: text("confidence").notNull(),
+    title: text("title").notNull(),
+    bodyMd: text("body_md").notNull(),
+    suggestedFix: text("suggested_fix"),
+    evidence: jsonb("evidence").$type<string[]>().notNull().default([]),
+    // candidate|confirmed|suppressed_refuted|posted|ui_only|suppressed_by_config|superseded
+    state: text("state").notNull().default("candidate"),
+    verdictReason: text("verdict_reason"),
+    githubThreadId: text("github_thread_id"),
+    resolution: text("resolution"),
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("review_finding_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
+    index("review_finding_review_idx").on(t.reviewId),
+  ],
+);
+
+/** The first verifier judgment recorded for a finding. */
+export const reviewVerdict = pgTable(
+  "review_verdict",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    findingId: uuid("finding_id")
+      .notNull()
+      .references(() => reviewFinding.id, { onDelete: "cascade" }),
+    verdict: text("verdict").notNull(), // confirmed|refuted
+    confidence: text("confidence").notNull(),
+    reasoning: text("reasoning").notNull(),
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("review_verdict_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
+    uniqueIndex("review_verdict_finding_unique").on(t.findingId),
   ],
 );
 
