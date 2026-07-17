@@ -125,6 +125,10 @@ fn nbd_index(path: &Path) -> u32 {
 struct ImmediateInner {
     staging_root: PathBuf,
     restored_id: SandboxId,
+    /// `Some` on the SUCCESSOR side of the spool test:
+    /// `rehydrate_sandbox` resolves the survivor's device through
+    /// `inner.rootfs_device` (production: the FC sidecar records it).
+    rootfs_dev: Option<PathBuf>,
 }
 
 #[async_trait]
@@ -143,6 +147,11 @@ impl SandboxBackend for ImmediateInner {
     }
     fn restore_memory_is_lazy_for(&self, _fresh: bool) -> bool {
         true
+    }
+    fn rootfs_device(&self, id: SandboxId) -> Option<PathBuf> {
+        (id == self.restored_id)
+            .then(|| self.rootfs_dev.clone())
+            .flatten()
     }
     async fn restore(&self, _meta: SnapshotMetadata) -> Result<SandboxId, SandboxError> {
         Ok(self.restored_id)
@@ -246,6 +255,7 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
     let inner: Arc<dyn SandboxBackend> = Arc::new(ImmediateInner {
         staging_root,
         restored_id,
+        rootfs_dev: None,
     });
 
     // Tiny mock coord recording the live-manifest publish.
@@ -379,7 +389,7 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
     );
 
     // Now the normal abandon sweep can run — it leaves the kernel device alive.
-    let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
+    let abandoned = pooled.abandon_nbd_data_planes_for_shutdown().await;
     assert_eq!(
         abandoned, 1,
         "the survivor's data plane is abandoned post-flush"
@@ -389,6 +399,201 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
     coord_server.abort();
     // Operator cleanup: disconnect the left-alive device so the harness doesn't
     // leak a bound /dev/nbdN across runs.
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(index);
+}
+
+/// 2026-07-16 session-85e0298a corruption regression: when the SIGTERM
+/// final flush does NOT complete (deadline overrun / GCS unavailable — the
+/// prod incident lost 320 MiB of acked writes exactly this way), the
+/// abandon sweep must export the un-uploaded dirty tier to the hostPath
+/// shutdown spool, and a SUCCESSOR PooledBackend's `rehydrate_sandbox`
+/// must adopt it — the guest's acked bytes survive the pod roll instead
+/// of being rolled back to the last published manifest.
+///
+/// Drives the real device handoff: predecessor abandons `/dev/nbd0` with
+/// the kernel config left alive (dead connection), successor RECONFIGUREs
+/// a fresh socket onto it, seeded from the spool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
+async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
+    let nbd_path = match preflight() {
+        Some(p) => p,
+        None => return,
+    };
+    let index = nbd_index(&nbd_path);
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let checkpoints = work.path().join("checkpoints");
+
+    let chunk_size = 4 * 1024 * 1024usize;
+    let image = work.path().join("disk.img");
+    std::fs::write(&image, vec![0u8; chunk_size]).expect("write image");
+
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
+    let store = ChunkStore::new(blob);
+    let manifest = store
+        .chunk_file(&image, ManifestKind::Disk, None)
+        .await
+        .expect("chunk image");
+    let disk_ref = ManifestRef::new();
+    store
+        .put_manifest(disk_ref, &manifest)
+        .await
+        .expect("put manifest");
+
+    let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
+    cache_cfg.budget_bytes = 64 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+
+    let snapshot_id = engram_core::SnapshotId::new();
+    let staging_root = work.path().join("fc-snaps");
+    let snap_dir = staging_root.join(snapshot_id.to_string());
+    std::fs::create_dir_all(&snap_dir).expect("snap dir");
+    let sidecar = serde_json::json!({
+        "sandbox_id": uuid::Uuid::new_v4(),
+        "created_at": chrono::Utc::now(),
+        "spec": {
+            "image": "t", "rootfs_source": null, "image_uri": null,
+            "harness_pack_uri": null, "cpu": {"vcpus": 1},
+            "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
+            "ttl": null, "env": {}, "workdir": null,
+            "harness_substrate": null, "network": {}
+        },
+        "format": "fc"
+    });
+    std::fs::write(
+        snap_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&sidecar).unwrap(),
+    )
+    .expect("write sidecar");
+    std::fs::write(snap_dir.join("state.bin"), b"state").expect("write state");
+
+    let restored_id = SandboxId::new();
+    let inner: Arc<dyn SandboxBackend> = Arc::new(ImmediateInner {
+        staging_root: staging_root.clone(),
+        restored_id,
+        rootfs_dev: None,
+    });
+
+    // Predecessor generation. NO coord publisher wired — the final flush's
+    // publish leg is not what this test exercises; checkpoint_dir IS wired
+    // (it hosts the shutdown spool).
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let pooled = Arc::new(
+        PooledBackend::new(inner)
+            .with_chunk_store(store.clone(), work.path().join("mat"))
+            .with_chunk_cache(cache.clone())
+            .with_nbd_pool(pool)
+            .with_checkpoint_dir(checkpoints.clone()),
+    );
+
+    let metadata = SnapshotMetadata {
+        id: snapshot_id,
+        size_bytes: chunk_size as u64,
+        created_at: chrono::Utc::now(),
+        image_version: "t".into(),
+        disk_manifest: Some(disk_ref),
+        memory_manifest: None,
+        base_memory_manifest: None,
+        migration_source: None,
+        source_sandbox_id: None,
+        state_blob_key: None,
+        sidecar_blob_key: None,
+        rootfs_blob_key: None,
+        working_set_blob_key: None,
+        aux_bundles: vec![],
+        paused_at: None,
+        peer_hints: Vec::new(),
+    };
+    let restored = pooled.restore(metadata).await.expect("restore");
+    assert_eq!(restored, restored_id);
+
+    let session_id = SessionId::new();
+    pooled.__test_bind_session(restored_id, session_id);
+
+    // The acked-from-RAM write the incident rolled back. NO flush runs —
+    // this models the deadline-overrun / GCS-down shutdown.
+    let backend = pooled
+        .__test_nbd_backend(restored_id)
+        .expect("live backend for survivor");
+    let marker = vec![0xCDu8; chunk_size];
+    backend.write(0, &marker).await.expect("dirty write");
+    let pre_abandon_ref = backend.manifest_ref().await;
+
+    let abandoned = pooled.abandon_nbd_data_planes_for_shutdown().await;
+    assert_eq!(abandoned, 1);
+
+    // The spool must carry the acked bytes and the exact lineage they
+    // diverge from.
+    let spool_root = checkpoints.join("spool");
+    let (meta, spooled) =
+        engram_host_agent::disk_daemon::spool::read_spool(&spool_root, restored_id)
+            .await
+            .expect("spool readable")
+            .expect("abandon with un-uploaded dirty bytes must write a spool");
+    assert_eq!(meta.manifest_ref(), pre_abandon_ref);
+    assert_eq!(spooled.len(), 1, "one dirty chunk");
+    assert_eq!(spooled[0].0, 0);
+    assert_eq!(&spooled[0].1[..], &marker[..]);
+
+    drop(pooled);
+
+    // Successor generation: same node state (store, cache, checkpoints),
+    // fresh slot pool over the SAME still-configured device; the mock
+    // inner resolves the survivor's rootfs device like the FC sidecar
+    // would.
+    let successor_inner: Arc<dyn SandboxBackend> = Arc::new(ImmediateInner {
+        staging_root,
+        restored_id,
+        rootfs_dev: Some(nbd_path.clone()),
+    });
+    let successor_pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let successor = Arc::new(
+        PooledBackend::new(successor_inner)
+            .with_chunk_store(store.clone(), work.path().join("mat2"))
+            .with_chunk_cache(cache)
+            .with_nbd_pool(successor_pool)
+            .with_checkpoint_dir(checkpoints.clone()),
+    );
+
+    // Coord hands back the last PUBLISHED ref (nothing was flushed, so
+    // that's still the restore-time ref — the rollback the spool exists
+    // to prevent).
+    let rehydrated = successor
+        .rehydrate_sandbox(session_id, restored_id, pre_abandon_ref)
+        .await
+        .expect("rehydrate");
+    assert!(rehydrated, "successor must re-serve the survivor's device");
+
+    let successor_backend = successor
+        .__test_nbd_backend(restored_id)
+        .expect("successor backend");
+    assert!(
+        successor_backend.dirty_bytes().await > 0,
+        "2026-07-16 RCA: the successor must ADOPT the spooled dirty tier — \
+         an empty tier means the guest's acked writes were rolled back",
+    );
+    let bytes = successor_backend
+        .read(0, chunk_size as u64)
+        .await
+        .expect("read through successor");
+    assert_eq!(
+        &bytes[..],
+        &marker[..],
+        "the successor must serve the ACKED bytes, not the stale base",
+    );
+
+    // Adoption consumes the spool.
+    assert!(
+        engram_host_agent::disk_daemon::spool::read_spool(&spool_root, restored_id)
+            .await
+            .expect("spool root readable")
+            .is_none(),
+        "an adopted spool must be discarded",
+    );
+
+    drop(successor);
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(index);
 }

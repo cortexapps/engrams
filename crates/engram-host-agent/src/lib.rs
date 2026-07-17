@@ -1685,7 +1685,11 @@ impl HostAgent {
                 pooled
                     .flush_nbd_data_planes_for_shutdown(flush_budget)
                     .await;
-                let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
+                // The abandon sweep also exports any still-un-uploaded
+                // dirty chunks to the node-local shutdown spool (2026-07-16
+                // session-85e0298a RCA) so the successor adopts them
+                // instead of rolling the live guest's disk back.
+                let abandoned = pooled.abandon_nbd_data_planes_for_shutdown().await;
                 if abandoned > 0 {
                     tracing::info!(
                         abandoned,
