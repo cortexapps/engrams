@@ -92,10 +92,14 @@ export interface SessionCreateInput {
 /** One harness's catalog descriptor (the bits the compiler needs): the model +
  *  effort enums map an option id → the env vars that select it (ADR 0063 §1). */
 export interface HarnessDescriptorView {
+  /** Human label for error/UI copy; falls back to the catalog name. */
+  label?: string;
   /** The env-var names the harness authenticates with (ADR 0063 §1): `userEnv`
    *  is the human credential (per-user token, injected for human tasks);
-   *  `orgEnv` is the programmatic credential (B4, host-side resolved). */
-  auth?: { userEnv?: string; orgEnv?: string };
+   *  `orgEnv` is the programmatic credential (B4, host-side resolved). The
+   *  `*Hint` fields are free-text setup instructions surfaced to the user
+   *  (e.g. "Run `claude setup-token`"). */
+  auth?: { userEnv?: string; orgEnv?: string; userEnvHint?: string; orgEnvHint?: string };
   models: Array<{ id: string; default: boolean; env: Record<string, string> }>;
   effort: Array<{ id: string; default: boolean; env: Record<string, string> }>;
 }
@@ -113,8 +117,13 @@ export interface SessionCompileDeps {
    *  process-wide registry; tests may inject a focused registry. */
   toolRegistry?: ToolRegistry;
   /** Resolve the owner's harness token for `envVar` (e.g. CLAUDE_CODE_OAUTH_TOKEN),
-   *  or null. Only called when the profile sets includeUserTokens. */
+   *  or null. Called for every human run to inject (and gate on) the selected
+   *  harness's declared user credential. */
   resolveUserToken: (envVar: string) => Promise<string | null>;
+  /** Resolve ALL of the owner's saved harness tokens (envVar → value). Called
+   *  only when the profile sets includeUserTokens, to additionally carry the
+   *  user's OTHER credentials into the sandbox. */
+  resolveAllUserTokens: () => Promise<Record<string, string>>;
 }
 
 export interface SessionCompileOpts {
@@ -181,20 +190,36 @@ export async function compileSessionCreateInput(
   // API-key creator is programmatic even for a "chat" task.
   const isHuman = !opts.programmatic;
 
-  // Harness env, lowest → highest precedence: user token < CLI dummy env <
+  // Harness env, lowest → highest precedence: user tokens < CLI dummy env <
   // profile env_vars < model env < effort env < git attribution < trigger
   // extras. NEVER log values.
   const harness: Record<string, string> = {};
   // The human credential env-var name is the selected harness's declared
   // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
-  // Injected ONLY for human tasks; programmatic tasks use `org_env` (below).
   const userEnv = descriptor?.auth?.userEnv;
-  if (profile.includeUserTokens && isHuman && userEnv) {
-    try {
+  if (isHuman) {
+    // The declared user credential is MANDATORY for a human run — a
+    // session without it boots unauthenticated. Always inject it, and BLOCK
+    // the create when the user hasn't set it (surfacing the descriptor's setup
+    // hint) rather than silently booting an un-authed session.
+    if (userEnv) {
       const userToken = await deps.resolveUserToken(userEnv);
-      if (userToken) harness[userEnv] = userToken;
-    } catch (secretErr) {
-      console.warn("[task-create] user token lookup failed — booting without it", secretErr);
+      if (!userToken) {
+        const label = descriptor?.label || selectedHarness;
+        const hint = descriptor?.auth?.userEnvHint;
+        throw new ConnectError(
+          `${label} needs your ${userEnv} credential, which isn't set.` +
+            (hint ? ` ${hint}` : "") +
+            ` Add it under Settings → Tokens, then start the task again.`,
+          Code.FailedPrecondition,
+        );
+      }
+      harness[userEnv] = userToken;
+    }
+    // The profile toggle additionally carries the user's OTHER saved tokens
+    // (credentials for other harnesses / tools) into the sandbox.
+    if (profile.includeUserTokens) {
+      for (const [k, v] of Object.entries(await deps.resolveAllUserTokens())) harness[k] = v;
     }
   }
   const registry = await loadRegistry(deps.connectors);
@@ -292,8 +317,13 @@ export interface CreateTaskDeps {
   connectors: CustomConnectorSource;
   harnessCatalog: HarnessCatalogClient;
   sessions: TaskSessionsClient;
-  /** Resolve `envVar` for the OWNER (e.g. the Claude OAuth token), or null. */
-  secrets: { get(userId: string, envVar: string): Promise<string | null> };
+  /** The owner's per-user harness token store: `get` resolves one env var (the
+   *  selected harness's `user_env`); `getAll` resolves every saved token (the
+   *  includeUserTokens carry). */
+  secrets: {
+    get(userId: string, envVar: string): Promise<string | null>;
+    getAll(userId: string): Promise<Record<string, string>>;
+  };
   db: Db;
   /** ADR 0064: port-exposure store for auto-minting `profile.portExposures`.
    *  Defaults to a Drizzle store over `db` when omitted. */
@@ -377,6 +407,7 @@ export async function createTaskWithSession(
       connectors: deps.connectors,
       harnessCatalog: deps.harnessCatalog,
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
+      resolveAllUserTokens: () => deps.secrets.getAll(params.ownerUserId),
     },
     {
       ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),

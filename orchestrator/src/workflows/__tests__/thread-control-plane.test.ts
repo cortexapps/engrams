@@ -83,7 +83,7 @@ describe("makeThreadControlPlane", () => {
       images: fakeImages(),
       connectors: { list: async () => [] },
       harnessCatalog: fakeHarnessCatalog(),
-      secrets: { get: async () => null },
+      secrets: { get: async () => null, getAll: async () => ({}) },
       resolveUser: async () => "user-1",
       db: recordingDb(records),
       sessions: {
@@ -128,7 +128,7 @@ describe("makeThreadControlPlane", () => {
       images: fakeImages(),
       connectors: { list: async () => [] },
       harnessCatalog: fakeHarnessCatalog(),
-      secrets: { get: async () => null },
+      secrets: { get: async () => null, getAll: async () => ({}) },
       resolveUser: async (provider, ext) => (provider === "slack" && ext === "U1" ? "user-7" : null),
       toolRegistry: {
         complete: async (...args) => void completed.push(args),

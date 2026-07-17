@@ -78,6 +78,13 @@ message HarnessAuth {
   // Env var for the human/interactive credential (e.g. an OAuth token);
   // injected from the per-user token store on human runs.
   optional string user_env = 2;
+  // Free-text setup instructions for the org credential, shown to admins.
+  // Never a secret — safe on the wire.
+  optional string org_env_hint = 3;
+  // Free-text setup instructions for the human credential (e.g. "Run
+  // `claude setup-token`"), shown on the settings + create surfaces so a user
+  // knows how to obtain it. Never a secret.
+  optional string user_env_hint = 4;
 }
 
 // One model or effort option; env is the var(s) that select it.

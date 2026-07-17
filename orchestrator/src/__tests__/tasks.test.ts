@@ -192,6 +192,28 @@ function makeFakeTokens(
   };
 }
 
+/**
+ * A permissive token store: every user resolves the harness `user_env` token, so
+ * a human (chat) create is never blocked on the mandatory-credential gate. Use
+ * this in create-path tests that aren't about the gate; use `makeFakeTokens({})`
+ * (empty) to exercise the block itself.
+ */
+function makeSeededTokens(): UserSecretStore {
+  return {
+    async put() {},
+    async getAll() {
+      return { [USER_ENV]: "sk-fixture" };
+    },
+    async get(_userId, envVarName) {
+      return envVarName === USER_ENV ? "sk-fixture" : null;
+    },
+    async has(_userId, envVarName) {
+      return envVarName === USER_ENV;
+    },
+    async delete() {},
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Fake profile store + image catalog (ADR 0053)
 // ---------------------------------------------------------------------------
@@ -523,6 +545,10 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   const fullDeps: TaskDeps = {
     harnessCatalog: fakeHarnessCatalog(),
     users: makeFakeUsers(),
+    // A human (chat) create BLOCKS when the acting user has no token for the
+    // harness's declared user_env, so default to a permissive token store; a
+    // test overrides `secrets` to exercise the block or a specific token.
+    secrets: makeSeededTokens(),
     ...deps,
   };
   const srv = buildServer(app, (router) => {
@@ -585,7 +611,7 @@ describe("TaskService — unauthenticated", () => {
     srv = await spawnServer({
       getSession: makeGetSession(null),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
     });
@@ -930,7 +956,7 @@ describe("TaskService — type validation", () => {
     srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
     });
@@ -950,7 +976,7 @@ describe("TaskService — type validation", () => {
     const srv2 = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: makeFakeSessions({ existing: [] }),
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
       db: okDb(),
@@ -972,7 +998,7 @@ describe("TaskService — type validation", () => {
     const srv2 = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: makeFakeSessions({ existing: [] }),
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(), // profile.imageId defaults to "img-1"
       images: fakeImages([]), // empty catalog → img-1 not enabled
       db: okDb(),
@@ -1032,7 +1058,7 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
         const srv = await spawnServer({
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
-          secrets: makeFakeTokens(),
+          secrets: makeSeededTokens(),
           profiles: makeFakeProfiles(),
           images: fakeImages(),
           db,
@@ -1078,7 +1104,7 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
         const srv = await spawnServer({
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
-          secrets: makeFakeTokens(),
+          secrets: makeSeededTokens(),
           profiles: makeFakeProfiles(),
           images: fakeImages(),
           db,
@@ -1145,7 +1171,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1214,7 +1240,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     const srvB = await spawnServer({
       getSession: makeGetSession(MEMBER_B),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1296,7 +1322,7 @@ describe("TaskService — rename (UpdateTask)", () => {
     srvA = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1363,7 +1389,7 @@ describe("TaskService — rename (UpdateTask)", () => {
     const srvB = await spawnServer({
       getSession: makeGetSession(MEMBER_B),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1385,7 +1411,7 @@ describe("TaskService — rename (UpdateTask)", () => {
     const srvAdmin = await spawnServer({
       getSession: makeGetSession(ADMIN_ID, "admin"),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1452,7 +1478,7 @@ describe("TaskService — admin list sees all + synthetic unattributed rows", ()
       const srv = await spawnServer({
         getSession: makeGetSession(ADMIN_ID, "admin"),
         sessions: fakeSessions,
-        secrets: makeFakeTokens(),
+        secrets: makeSeededTokens(),
         profiles: makeFakeProfiles(),
         images: fakeImages(),
         db,
@@ -1514,7 +1540,7 @@ describe("TaskService — member scoping: orphan sessions excluded from member L
       const srv = await spawnServer({
         getSession: makeGetSession(MEMBER_A),
         sessions: fakeSessions,
-        secrets: makeFakeTokens(),
+        secrets: makeSeededTokens(),
         profiles: makeFakeProfiles(),
         images: fakeImages(),
         db,
@@ -1575,7 +1601,7 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeFakeTokens({ [MEMBER_A]: "sk-comp" }),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
       db: fakeDb,
@@ -1661,7 +1687,10 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     }
   });
 
-  test("include_user_tokens=false → token NOT injected even when present", async () => {
+  // The harness's declared user credential rides ALWAYS for a human
+  // run — independent of include_user_tokens (which now only gates the user's
+  // OTHER saved tokens).
+  test("include_user_tokens=false → the harness user_env is STILL injected", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-notok")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
@@ -1674,7 +1703,32 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     try {
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
-      expect(fakeSessions.createReqs[0]?.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      expect(fakeSessions.createReqs[0]?.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+        "sk-ant-oat01-secret",
+      );
+    } finally {
+      await srv.close();
+    }
+  });
+
+  // No token for the declared user_env → the create is blocked with
+  // FailedPrecondition instead of booting an un-authed session.
+  test("no token for the harness user_env → create blocked (FailedPrecondition)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-block")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      secrets: makeFakeTokens(), // empty → MEMBER_A has no token
+      profiles: makeFakeProfiles({ includeUserTokens: false }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await expect(client.createTask({ type: "chat", profileId: PROFILE_ID })).rejects.toThrow(
+        /CLAUDE_CODE_OAUTH_TOKEN/,
+      );
+      expect(fakeSessions.createReqs).toHaveLength(0);
     } finally {
       await srv.close();
     }
@@ -1920,7 +1974,7 @@ describe("TaskService — session status → task status mapping", () => {
           const srv = await spawnServer({
             getSession: makeGetSession(MEMBER_A),
             sessions: fakeSessions,
-            secrets: makeFakeTokens(),
+            secrets: makeSeededTokens(),
             profiles: makeFakeProfiles(),
             images: fakeImages(),
             db,

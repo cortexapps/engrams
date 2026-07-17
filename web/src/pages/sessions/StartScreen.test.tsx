@@ -12,6 +12,7 @@ import { TaskService } from "../../gen/engram/app/v1/task_pb";
 import { ProfileService } from "../../gen/engram/app/v1/profile_pb";
 import { IntegrationService } from "../../gen/engram/app/v1/integration_pb";
 import { ImageService } from "../../gen/engram/app/v1/image_pb";
+import { HarnessCatalogService } from "../../gen/engram/app/v1/harness_pb";
 
 const BUGFIX = {
   id: "pf1",
@@ -67,9 +68,36 @@ const CATALOG = [
   },
 ];
 
-function installTransport() {
+function installTransport(opts: { harnessUserEnv?: boolean } = {}) {
   const created: Array<{ type: string; profileId: string; prompt?: string }> = [];
   const transport = createRouterTransport((router) => {
+    // The harness catalog is only wired when a test needs the user-env
+    // block: a single "claude" harness declaring a user credential + setup hint.
+    if (opts.harnessUserEnv) {
+      router.service(HarnessCatalogService, {
+        listHarnesses: () => ({
+          harnesses: [
+            {
+              name: "claude",
+              builtIn: true,
+              descriptor: {
+                name: "claude",
+                label: "Claude Code",
+                auth: {
+                  userEnv: "CLAUDE_CODE_OAUTH_TOKEN",
+                  userEnvHint: "Run `claude setup-token`.",
+                },
+                models: [],
+                effort: [],
+              },
+            },
+          ],
+        }),
+        getHarness: () => ({ harness: undefined }),
+        registerHarness: () => ({ harness: undefined }),
+        deleteHarness: () => ({ deleted: false }),
+      });
+    }
     router.service(TaskService, {
       createTask: (req) => {
         created.push({ type: req.type, profileId: req.profileId, prompt: req.prompt });
@@ -159,6 +187,49 @@ describe("StartScreen", () => {
     // Docs grants no powers and no egress — every session is sandboxed, so
     // there's nothing to disclose and the reach receipt doesn't render.
     expect(screen.queryByText(/this session can reach/i)).toBeNull();
+  });
+
+  // A harness that declares a user credential blocks launch until the
+  // user sets it — the create surface shows the requirement + setup hint instead
+  // of silently launching an un-authed session.
+  test("blocks launch and shows the setup hint when the harness user credential is unset", async () => {
+    const origFetch = global.fetch;
+    global.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("/me/harness-env")) {
+        return new Response(
+          JSON.stringify({
+            vars: [
+              {
+                envVar: "CLAUDE_CODE_OAUTH_TOKEN",
+                harnesses: [{ name: "claude", label: "Claude Code" }],
+                hint: "Run `claude setup-token`.",
+                present: false,
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      throw new Error(`unexpected fetch ${String(url)}`);
+    }) as typeof fetch;
+    try {
+      const { transport, created } = installTransport({ harnessUserEnv: true });
+      renderWithProviders(<StartScreen />, { transport });
+      const user = userEvent.setup();
+
+      expect(await screen.findByText("Bug-fix agent")).toBeTruthy();
+      // The blocker names the missing env var and surfaces the descriptor's hint.
+      expect(await screen.findByText(/sessions need it to launch/i)).toBeTruthy();
+      expect(screen.getByText(/claude setup-token/i)).toBeTruthy();
+
+      // Even with a prompt typed, launch stays disabled and creates nothing.
+      await user.type(screen.getByLabelText("Task"), "Do the thing.");
+      expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true);
+      await user.click(screen.getByTestId("launch-task"));
+      expect(created).toHaveLength(0);
+    } finally {
+      global.fetch = origFetch;
+    }
   });
 
   test("discloses a network-only profile's egress (no connector powers)", async () => {

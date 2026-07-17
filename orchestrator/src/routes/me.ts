@@ -44,7 +44,7 @@ export interface HarnessCatalogReader {
   listHarnesses(req: Record<string, never>): Promise<{
     harnesses: Array<{
       name: string;
-      descriptor?: { label?: string; auth?: { userEnv?: string } };
+      descriptor?: { label?: string; auth?: { userEnv?: string; userEnvHint?: string } };
     }>;
   }>;
 }
@@ -53,6 +53,13 @@ export interface HarnessCatalogReader {
 interface HarnessRef {
   name: string;
   label: string;
+}
+
+/** The union entry for one env var: who asks for it + the first setup hint
+ *  a declaring harness provides. */
+interface EnvVarEntry {
+  harnesses: HarnessRef[];
+  hint?: string;
 }
 
 /** Injectable deps for the /me route. */
@@ -91,15 +98,17 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   /** The `user_env` union across the registered harnesses → who asks for each,
    *  in catalog order. The map's keys are the only env-var names the PUT/DELETE
    *  routes will seal (defends against sealing arbitrary names). */
-  async function userEnvUnion(): Promise<Map<string, HarnessRef[]>> {
+  async function userEnvUnion(): Promise<Map<string, EnvVarEntry>> {
     const { harnesses } = await resolveCatalog().listHarnesses({});
-    const union = new Map<string, HarnessRef[]>();
+    const union = new Map<string, EnvVarEntry>();
     for (const h of harnesses) {
       const envVar = h.descriptor?.auth?.userEnv;
       if (!envVar) continue;
-      const refs = union.get(envVar) ?? [];
-      refs.push({ name: h.name, label: h.descriptor?.label || h.name });
-      union.set(envVar, refs);
+      const entry = union.get(envVar) ?? { harnesses: [] };
+      entry.harnesses.push({ name: h.name, label: h.descriptor?.label || h.name });
+      // First non-empty hint wins (harnesses share an env var by convention).
+      if (!entry.hint && h.descriptor?.auth?.userEnvHint) entry.hint = h.descriptor.auth.userEnvHint;
+      union.set(envVar, entry);
     }
     return union;
   }
@@ -111,9 +120,10 @@ export function makeMeRoute(deps?: MeDeps): Hono {
     const store = resolveStore();
     const union = await userEnvUnion();
     const vars = await Promise.all(
-      [...union.entries()].map(async ([envVar, harnesses]) => ({
+      [...union.entries()].map(async ([envVar, entry]) => ({
         envVar,
-        harnesses,
+        harnesses: entry.harnesses,
+        ...(entry.hint ? { hint: entry.hint } : {}),
         present: await store.has(user.id, envVar),
       })),
     );

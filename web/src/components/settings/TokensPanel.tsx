@@ -60,6 +60,9 @@ function EnvVarCard({ entry }: { entry: HarnessEnvVar }) {
           <p className="text-sm text-muted-foreground">
             {askedBy ? `Used by ${askedBy}.` : "Used by a registered harness."}
           </p>
+          {entry.hint && (
+            <p className="mt-1 max-w-prose text-sm text-muted-foreground">{entry.hint}</p>
+          )}
         </div>
         <Badge variant={entry.present ? "secondary" : "outline"}>
           {entry.present ? "saved · sealed" : "not set"}

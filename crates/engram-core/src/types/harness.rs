@@ -75,6 +75,17 @@ pub struct HarnessAuth {
     /// token). Injected from the per-user token store on human runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_env: Option<String>,
+
+    /// Free-text setup instructions for the org credential, surfaced to admins.
+    /// Not validated — human guidance, never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_env_hint: Option<String>,
+
+    /// Free-text setup instructions for the human credential (e.g. "Run
+    /// `claude setup-token`"), surfaced on the settings + create surfaces so a
+    /// user knows how to obtain it. Not validated, never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_env_hint: Option<String>,
 }
 
 /// One model or effort option. `env` is the set of env vars (with values) that
@@ -273,6 +284,27 @@ env = { MAX_THINKING_TOKENS = "32000" }
         assert_eq!(d.auth.user_env.as_deref(), Some("CLAUDE_CODE_OAUTH_TOKEN"));
         assert_eq!(d.models.len(), 2);
         assert_eq!(d.effort.len(), 1);
+    }
+
+    #[test]
+    fn parses_auth_hints() {
+        let src = r#"
+name = "x"
+[auth]
+user_env = "TOK"
+user_env_hint = "Run `claude setup-token`."
+org_env = "KEY"
+org_env_hint = "Set an org secret KEY."
+"#;
+        let d = HarnessDescriptor::parse(src).unwrap();
+        assert_eq!(
+            d.auth.user_env_hint.as_deref(),
+            Some("Run `claude setup-token`.")
+        );
+        assert_eq!(
+            d.auth.org_env_hint.as_deref(),
+            Some("Set an org secret KEY.")
+        );
     }
 
     #[test]

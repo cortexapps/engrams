@@ -169,10 +169,27 @@ export function StartScreen() {
     ? images?.find((i) => i.id === selected.imageId)?.image_uri
     : undefined;
 
-  const canLaunch = !!selected && !!prompt.trim() && !createTaskMutation.isPending;
+  // A human session for a harness that declares a user credential is
+  // BLOCKED server-side when that credential isn't set (a session without it
+  // boots unauthenticated). Mirror the block here — for every user, regardless
+  // of the profile's includeUserTokens toggle — so the requirement + setup hint
+  // show up front instead of the user launching into a silent auth failure.
+  const effectiveHarnessName =
+    harnessOverride.harness ??
+    selected?.harness ??
+    (harnesses?.length === 1 ? harnesses[0]?.name : undefined);
+  const effectiveHarness = harnesses?.find((h) => h.name === effectiveHarnessName);
+  const effectiveUserEnv = effectiveHarness?.descriptor?.auth?.userEnv;
+  const userEnvHint = effectiveHarness?.descriptor?.auth?.userEnvHint;
+  const userEnvMissing =
+    !!effectiveUserEnv &&
+    (harnessEnvVars?.some((v) => v.envVar === effectiveUserEnv && !v.present) ?? false);
+
+  const canLaunch =
+    !!selected && !!prompt.trim() && !createTaskMutation.isPending && !userEnvMissing;
 
   const launch = async () => {
-    if (!selected || !prompt.trim() || createTaskMutation.isPending) return;
+    if (!selected || !prompt.trim() || createTaskMutation.isPending || userEnvMissing) return;
     setError(null);
     try {
       const res = await createTaskMutation.mutateAsync({
@@ -242,18 +259,6 @@ export function StartScreen() {
     });
   }, [hasProfilesError, refetchProfiles]);
 
-  // ADR 0063 B3: nudge to set the selected harness's user credential when the
-  // profile will inject it (includeUserTokens) but the user hasn't saved it.
-  const effectiveHarnessName =
-    harnessOverride.harness ??
-    selected?.harness ??
-    (harnesses?.length === 1 ? harnesses[0]?.name : undefined);
-  const effectiveHarness = harnesses?.find((h) => h.name === effectiveHarnessName);
-  const effectiveUserEnv = effectiveHarness?.descriptor?.auth?.userEnv;
-  const userEnvMissing =
-    !!effectiveUserEnv &&
-    (harnessEnvVars?.some((v) => v.envVar === effectiveUserEnv && !v.present) ?? false);
-  const showTokenNudge = !isAdmin && !!selected?.includeUserTokens && userEnvMissing;
   const noProfiles = !profilesPending && !profilesError && profiles.length === 0;
 
   return (
@@ -268,19 +273,23 @@ export function StartScreen() {
             Start a task
           </Text>
 
-          {showTokenNudge && (
-            <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5 rounded-lg border bg-secondary/60 px-3 py-2 text-sm">
-              <span className="flex items-center gap-2">
-                <KeyRound className="size-4 shrink-0 text-instrument-caution" />
-                No <code className="font-mono">{effectiveUserEnv}</code> saved —{" "}
-                {effectiveHarness?.descriptor?.label || effectiveHarnessName} sessions need it.
-              </span>
-              <Link
-                to="/settings/tokens"
-                className="shrink-0 font-medium underline underline-offset-4"
-              >
-                Add credential
-              </Link>
+          {userEnvMissing && (
+            <div className="flex flex-col gap-1.5 rounded-lg border border-instrument-caution/40 bg-secondary/60 px-3 py-2.5 text-sm">
+              <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
+                <span className="flex items-center gap-2">
+                  <KeyRound className="size-4 shrink-0 text-instrument-caution" />
+                  No <code className="font-mono">{effectiveUserEnv}</code> saved —{" "}
+                  {effectiveHarness?.descriptor?.label || effectiveHarnessName} sessions need it to
+                  launch.
+                </span>
+                <Link
+                  to="/settings/tokens"
+                  className="shrink-0 font-medium underline underline-offset-4"
+                >
+                  Add credential
+                </Link>
+              </div>
+              {userEnvHint && <p className="text-muted-foreground">{userEnvHint}</p>}
             </div>
           )}
 
@@ -316,21 +325,23 @@ export function StartScreen() {
                 }}
               />
               {/* The credential heads-up, kept terse: a lock beside the profile
-                  whose meaning lives in the tooltip, not a sentence in the flow. */}
+                  whose meaning lives in the tooltip, not a sentence in the flow.
+                  The harness's own credential always rides along; this
+                  toggle additionally carries your OTHER saved tokens. */}
               {selected?.includeUserTokens && (
                 <TooltipProvider delayDuration={100}>
                   <Tooltip>
                     <TooltipTrigger asChild>
                       <button
                         type="button"
-                        aria-label="This profile carries your user tokens into the sandbox"
+                        aria-label="This profile also carries your other saved tokens into the sandbox"
                         className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-instrument-caution transition-colors hover:bg-accent focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
                       >
                         <Lock className="size-3.5" />
                       </button>
                     </TooltipTrigger>
                     <TooltipContent>
-                      This profile carries your user tokens into the sandbox.
+                      This profile also carries your other saved tokens into the sandbox.
                     </TooltipContent>
                   </Tooltip>
                 </TooltipProvider>
