@@ -440,30 +440,59 @@ recovery entry points (`reattach_pass`, `reattach_manifest` +
 the real `write_chunk`, appended to an acked-write ledger at the ack
 instant; reads resolve the tier ladder and return the tag.
 
-**SimFs + the H5 composition contract**: crashes inject at
-durable-OPERATION boundaries (the scheduler crashes between real fs ops;
-`durable_record`/`spool` keep calling tokio::fs unchanged). Intra-op
-byte-level torn states remain ADR 0099 H5's exhaustively-constructed
-static tests; a `crashpoint_coverage` meta-test asserts every SimFs
-boundary maps onto an H5-constructed state (8 enumerated boundaries across
-persist's write-partial/fsync/rename/fsync-parent and the spool's
-chunks/marker/dir sequence) — SimFs owns reachability at operation
-granularity, H5 owns exhaustiveness at byte granularity. If a future flow
-exposes a boundary static construction cannot reach, the escalation is an
-in-memory `Fs` seam in durable_record/spool — a deliberate deferral, noted
-here so it reads as a decision, not an oversight.
+**SimFs + the H5 composition contract**: intra-op byte-level torn states
+remain ADR 0099 H5's exhaustively-constructed static tests (SimFs does not
+re-derive them); H5 owns exhaustiveness at byte granularity. What SimFs
+owns is reachability at operation granularity — crashes injected *between*
+the real durable operations. **P5 wires `durable_record` and the spool
+through the injected `HostFs` seam so the interception is real** (an
+earlier draft here proposed leaving those helpers on raw `tokio::fs` with
+a crashpoint meta-test mapping onto the H5 states; that only proves the
+model is self-consistent, not that it mirrors the production call
+sequence — dropped). Consequences P5 must honor:
+- `HostFs` MUST include `create_dir`/`remove_dir` (not just
+  write/sync_file/rename/sync_dir/read), because spool *replacement*
+  begins `remove_dir_all` then `create_dir_all` — a destructive crash
+  window the write/rename ops don't cover.
+- The crash-point list is **derived from the production op sequence** of
+  `persist()` and `write_spool()` (each real fs call is a boundary), not a
+  separately-enumerated parallel list a `crashpoint_coverage` test checks
+  against itself.
 
 **Phase 2 invariant #1 — the acked-write durability oracle** (added
-2026-07-16 from the session-85e0298a corruption RCA, PR #712): *every
-guest-acked write is recoverable from (published manifest ∪ shutdown spool ∪
-uploaded chunks) after any crash, at every crash point.* The RCA found a
-class of guest-silent acked-write loss with three mechanisms in one day; two
-were kernel page-cache behavior (permanently the FC lane's job — see
-non-goals), but the third — the SIGTERM flush-deadline overrun dropping the
-RAM dirty tier — was a pure shutdown-pipeline ordering bug, exactly what
-this phase's seeded crash-point injection explores systematically. The
-world model's ledger asserts the oracle after every injected
-crash/restart, so the *class* is covered rather than one bespoke
+2026-07-16 from the session-85e0298a corruption RCA, PR #712). The precise
+guarantee — sharpened after an adversarial review caught the original
+phrasing overstating it: *every guest-acked write that had a durable
+handoff before a crash (a flush published it, OR the shutdown spool
+captured it) is recoverable after restart, read back through the REAL
+recovery path (`from_blob(published_ref)` + spool `adopt_unflushed`) — not
+by checking a raw blob exists.* Two deliberate scope boundaries this
+makes explicit:
+- **A write acked from the RAM dirty tier and lost to abrupt process
+  death BEFORE any flush or spool is an accepted, bounded loss** — bounded
+  by the flush cadence and the periodic checkpoint (ADR 0028), NOT a
+  violation. The oracle does not claim "no acked write is ever lost by any
+  process death"; it verifies the *durability pipeline*
+  (flush→publish→spool→adopt) never loses a write it took responsibility
+  for. A mandatory regression seed crashes immediately post-ACK /
+  pre-handoff and asserts the HONEST outcome (the manifest legitimately
+  rolls back; no false "recovered").
+- **Recoverability means reachability through a durable/uploaded MANIFEST
+  or the spool** — both carry the chunk's disk offset. A content-addressed
+  chunk blob PUT with no manifest referencing it is NOT recoverable (no
+  production path can place it); the store-ahead case (85e0298a: manifest
+  uploaded before the coord publish landed) recovers via the spool's ref
+  naming that manifest, which is why the read-back goes through the real
+  attach, not a blob-existence check.
+
+The RCA found a class of guest-silent acked-write loss with three
+mechanisms in one day; two were kernel page-cache behavior (permanently
+the FC lane's job — see non-goals), but the third — the SIGTERM
+flush-deadline overrun dropping the RAM dirty tier — was a pure
+shutdown-pipeline ordering bug, exactly what this phase's seeded
+crash-point injection explores systematically. The world model's ledger
+tracks per-write durable-handoff state and asserts the oracle after every
+injected crash/restart, so the *class* is covered rather than one bespoke
 regression per incident. The full oracle suite: (1) acked-write
 durability; (2) no-plane-leak (every claimed slot serving or
 parked/quarantined; no dirty tier abandoned without a spool export); (3)
@@ -511,7 +540,8 @@ highest-impact remaining flow; P8/P9 unchanged):
 | P2 | engram-dst-host scaffold: SimFs + SimHost RAM/disk split + acked-write ledger + coord stub + SimNbd + scheduler skeleton + determinism audit + flow_coverage & crashpoint_coverage meta-tests | L |
 | P3 | Flow C (reconcile): `reconcile_once` extraction (pure `classify` + `ReconcileBackend` seam); the lib.rs inline loop collapses to a thin spawn wrapper; ReconcileTick + None-arm oracle (#9) + stale-binding TOCTOU scenarios. **#224 abandoning moved to P4** — its insert-after-sweep gate lives in `abandon_nbd_data_planes_for_shutdown` (the SIGTERM path, not extracted until Flow A), so it is not cleanly drivable on today's portable surface | M |
 | P4 | **Landed.** Flow A (SIGTERM ladder): the pure decisions — `ShutdownStage` (+ `admits_new_plane`), `flush_budget`/`plan_shutdown`, `FlushProbe`/`classify_survivor`, `is_straggler` — extracted into **`engram-host-core::shutdown`** (cleanly-typed `std` types → the portable crate, not host-agent-local; contrast Flow C's PooledBackend-coupled `classify`). The driver (`lib.rs` shutdown handler + `flush_nbd_data_planes_for_shutdown` + the overrun sweep) becomes a thin executor off those verdicts; the `abandoning` SeqCst flag + drain-twice + the per-survivor `tokio::spawn`/`timeout` + `abandon_for_shutdown`'s ownership-consuming semantics stay byte-identical (concurrency gates, not decisions). The `spawn_blocking` device sync is now wired through the P1 `DeviceSync` seam (`HostDeviceSync` prod impl). Sim: the `Sigterm(budget)` step drives the real ladder (seeded budgets small→large; a tiny budget overruns → stragglers → spool), and `CrashAt(CrashPoint)` seeds crash-point injection over all eight H5 boundaries (spool boundaries → real recovery under the acked-write oracle; persist boundaries → reachability + `load_all` tolerance, folding into the ledger in P5's Flow D). Regression seeds: #225 deadline-overrun, 85e0298a store-ahead (world-model `rebuild` now honors the spool's store-ahead ref), #224 insert-after-sweep (the extracted ordering contract; the literal DashMap race stays FC-lane residue). **The acked-write oracle stays unconditional.** O_DIRECT rider: evaluated → **no-op** (see the known-bugs note + `device_sync`), so the sync path is unchanged and no FC regression was warranted; verify-on-read stays P7. | L |
-| P5 | Flow D (eviction finalize): route through HostEffects; EvictionFinalizeLeg + crash-between-legs; FinalizeStage + convergence oracles; checkpoint tail-cancellation | M |
+| P4.5 | **Oracle honesty** (from the 2026-07-17 adversarial review): the acked-write ledger tracks per-write durable-handoff state (flush-published or spooled); the oracle requires recoverability only for handed-off writes and reads back through the real recovery path; a mandatory seed crashes post-ACK / pre-handoff and asserts honest loss (rolled-back manifest, not false recovery). Sharpens the core oracle all later Ps depend on; ADR §invariant-#1 already reworded. | S |
+| P5 | Flow D (eviction finalize): route through HostEffects; EvictionFinalizeLeg + crash-between-legs; FinalizeStage + convergence oracles; checkpoint tail-cancellation. **Also lands the real `HostFs` interception** (durable_record + spool wired through the seam, incl. `create_dir`/`remove_dir` for the destructive spool-replacement window; crash points derived from the production op sequence — see §SimFs) | M |
 | P6 | Flow F seam: SchedulerSeam generalization; #204/#199 as seeded interleavings | M |
 | P7 | **Landed.** Flow B (NBD slot/reattach). **Extraction:** the `NbdKernel` seam (P1's unwired trait) is rewired — `HostNbdKernel` (the Linux prod impl over `nbd_netlink` + sysfs) is bound at the public attach/reattach entry points and the CONNECT/RECONFIGURE/backend-identifier touches funnel through `&dyn NbdKernel` at `serve_at` (public signatures unchanged; no blind FC-test churn). The decision content is pure in **`engram-host-core::reattach`**: `plan_reattach` (backend-id echo-else-fallback + the seed-dirty-BEFORE-RECONFIGURE ordering as an explicit `ReattachPlan`/`ReattachStep` property), `sweep_verdict`/`PidLiveness` (the stale-binding "dead-owner-only" core, wired into `recover_one_stuck_device`), `is_local_survivor_candidate` (the #739 filter core, wired into `local_survivor_candidates`), and `resume_data_plane_served` (the un-pause gate). `SlotState` (Free/Warm/Claimed/Parked) + a transition table make the allocator's implicit FSM auditable next to the (unchurned, portable) allocator. **Riders:** verify-on-read — post-RECONFIGURE, when a spool was adopted, a single-chunk probe (`first_seeded_probe`/`probe_matches`) proves the device serves the seeded acked bytes (not rolled-back base) or returns the slot for park; a new minimal `#[ignore]`'d FC lane test (`nbd_verify_on_read`, wired into `ci.yml`) proves it at the O_DIRECT device plane. Un-pause data-plane gate — `PooledBackend::resume` fails fast into `evict_local → resume` (a `soft_invariant!`, ADR 0099 H6 site #7) when the rootfs device isn't served by the current generation. **Sim (`engram-dst-host`):** the device-serving model (generation + `served_by`/`kernel_owner`/`parked` + the real `NbdSlotAllocator`) with steps `Park`/`Unpause`/`RegisterRehydrate`/`StaleSweepTick`/`SlotClaim`/`SlotPopulateTick`; oracles #3 slot-accounting (`free + warm + held == capacity`, no double-claim) and #5 single-device-ownership + *served-device-never-dead* (the 731df805 property) as standing invariants; the local-rehydrate leg adds a recovery arm to oracle #1's closure. **The 731df805 scenario is pinned** (`park → roll → register → sweep → un-pause`): the FIXED variant (buggy coord list omits the parked survivor, the #739 local ChainHeadRecord pass re-serves it, the sweep skips it, un-pause serves) and the UNGATED variant (local pass off → the sweep disconnects the live device → the un-pause gate is the last line and fires, no dead-plane serve). The tight concurrent claim-vs-populate validation-window stays the multi-thread host-agent test (paused single-thread tokio can't hold a `claim` mid-populate, and `claim`'s retry `sleep` hangs on the paused clock — the sim drives the transitions as explicit steps). | L |
 | P8 | Flow E (migration): TTL clock → `now_mono`; #216 decision-table oracle; no-plane-leak/single-device tightening; #582/#598/#629 seeds | M |
