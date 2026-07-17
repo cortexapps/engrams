@@ -1244,7 +1244,7 @@ impl HostService for HostServiceImpl {
         Ok(Response::new(Box::pin(out_stream) as Self::ExecStartStream))
     }
 
-    /// ADR 0097: unary batch file staging. The backend owns the guest
+    /// ADR 0100: unary batch file staging. The backend owns the guest
     /// transport loop and returns one result for every requested file.
     async fn write_files(
         &self,

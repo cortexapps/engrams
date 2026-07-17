@@ -391,7 +391,7 @@ fn wire_mirrors_golden() {
             files_skipped_too_young: 2,
         },
     );
-    // ADR 0097 (wire v17): the coord↔host WriteFiles payloads.
+    // ADR 0100 (wire v17): the coord↔host WriteFiles payloads.
     assert_golden_no_eq("wire_write_files_request", &wire_write_files_request());
     assert_golden_no_eq("wire_write_files_response", &wire_write_files_response());
 }
@@ -454,7 +454,7 @@ fn wire_version_pinned() {
     // JSON-ack `warm_peers` field ride this bump too (both are
     // independently roll-safe; the bump pins the deploy posture — a v16
     // coord never dispatches a peer-hinted restore to a v15 host).
-    // 16 -> 17: ADR 0097 — the coord↔host WriteFiles RPC carries new
+    // 16 -> 17: ADR 0100 — the coord↔host WriteFiles RPC carries new
     // WireWriteFilesRequest/WireWriteFilesResponse bincode mirrors.
     assert_eq!(
         WIRE_VERSION, 17,

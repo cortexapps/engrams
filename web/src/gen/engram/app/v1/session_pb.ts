@@ -2120,7 +2120,7 @@ export const SessionService: GenService<{
     output: typeof ExecOutputSchema;
   },
   /**
-   * ADR 0097: stage a batch of files inside a running session without
+   * ADR 0100: stage a batch of files inside a running session without
    * embedding content in a shell command. Each file reports its own result.
    *
    * @generated from rpc engram.app.v1.SessionService.WriteFiles

@@ -35,7 +35,7 @@ service SessionService {
   // degenerate collected case.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc Exec(ExecRequest) returns (stream ExecOutput);
-  // ADR 0097: stage a batch of files inside a running session without
+  // ADR 0100: stage a batch of files inside a running session without
   // embedding content in a shell command. Each file reports its own result.
   rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
   rpc GetLog(GetLogRequest) returns (GetLogResponse);

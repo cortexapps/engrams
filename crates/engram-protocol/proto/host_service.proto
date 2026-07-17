@@ -197,7 +197,7 @@ service HostService {
   // immediately funnels into `update_live_disk_manifest`.
   rpc FlushSandbox(SandboxIdMessage) returns (FlushSandboxResponse);
 
-  // ADR 0097: write a batch of files through the existing in-guest agentd
+  // ADR 0100: write a batch of files through the existing in-guest agentd
   // Upload verb. Per-file failures are carried in the response payload.
   rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
 

@@ -103,7 +103,7 @@ use serde::{Deserialize, Serialize};
 // serde-default JSON — but the bump makes the deploy posture explicit:
 // a v16 coord never dispatches a peer-hinted restore to a v15 host,
 // whose bincode decode would fail loudly). Lockstep coord+host roll.
-// v17 (ADR 0097): `WriteFiles` coord↔host RPC and its bincode request /
+// v17 (ADR 0100): `WriteFiles` coord↔host RPC and its bincode request /
 // response mirrors. Lockstep coord+host roll.
 pub const WIRE_VERSION: u32 = 17;
 
