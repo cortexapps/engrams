@@ -18,9 +18,13 @@
 
 use std::io::Cursor;
 
-use engram_core::types::manifest::ManifestRef;
 use engram_substrate_proto::{read_frame, FromWriter, ToWriter, MAX_MSG_BYTES};
 use proptest::prelude::*;
+
+// The valid-value strategies live in the shared `support` module; ADR 0099
+// H3's `codec_roundtrip.rs` reuses the exact same generators.
+mod support;
+use support::{from_writer, to_writer};
 
 // ---- helpers -----------------------------------------------------------
 
@@ -30,45 +34,6 @@ fn decode_every_type(bytes: &[u8]) {
     // The framed entry point (length prefix + bincode).
     let _ = read_frame::<_, ToWriter>(&mut Cursor::new(bytes));
     let _ = read_frame::<_, FromWriter>(&mut Cursor::new(bytes));
-}
-
-fn manifest_ref() -> impl Strategy<Value = ManifestRef> {
-    // Fresh random manifest_id per case; vary the version. Fields are pub.
-    any::<u64>().prop_map(|version| ManifestRef {
-        manifest_id: ManifestRef::new().manifest_id,
-        version,
-    })
-}
-
-fn to_writer() -> impl Strategy<Value = ToWriter> {
-    prop_oneof![
-        (
-            any::<u32>(),
-            proptest::option::of(manifest_ref()),
-            proptest::option::of(manifest_ref()),
-        )
-            .prop_map(|(proto_version, canonical_manifest, session_manifest)| {
-                ToWriter::Hello {
-                    proto_version,
-                    canonical_manifest,
-                    session_manifest,
-                }
-            }),
-        any::<[u8; 32]>().prop_map(|hash| ToWriter::Populate { hash }),
-    ]
-}
-
-fn from_writer() -> impl Strategy<Value = FromWriter> {
-    prop_oneof![
-        (any::<bool>(), any::<bool>()).prop_map(|(tmpfs_ok, cache_writable)| {
-            FromWriter::HelloAck {
-                tmpfs_ok,
-                cache_writable,
-            }
-        }),
-        any::<u64>().prop_map(|len| FromWriter::Populated { len }),
-        "[ -~]{0,16}".prop_map(|msg| FromWriter::PopulateErr { msg }),
-    ]
 }
 
 fn mutate_and_decode<T: serde::de::DeserializeOwned>(
