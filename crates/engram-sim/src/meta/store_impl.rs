@@ -1041,6 +1041,18 @@ impl MetadataStore for SimMetadataStore {
     /// chunk_generation; notifies enabled_image_changed.
     async fn upsert_enabled_image(&self, image: EnabledImage) -> Result<(), MetaError> {
         self.gate()?;
+        // Fidelity: `enabled_images.base_snapshot_id` is NOT NULL + FK in
+        // PG (migration 0038). Accepting `None` here green-lit a scenario
+        // PG rejects (caught by the conformance suite's PG half,
+        // 2026-07-17) — enforce loudly instead of diverging silently.
+        assert!(
+            image.base_snapshot_id.is_some()
+                && image.base_snapshot_disk_manifest.is_some()
+                && image.base_snapshot_memory_manifest.is_some(),
+            "SimMeta fidelity: enabled_images.base_snapshot_id (migration 0038) and \
+             the base_snapshot_{{disk,memory}}_manifest pair (migration 0043) are \
+             NOT NULL in PG — record a base snapshot first and set all three"
+        );
         let uri = image.image_uri.clone();
         let mut db = self.db.lock();
         db.enabled_images.insert(uri.clone(), (image, None));
@@ -2718,11 +2730,19 @@ impl MetadataStore for SimMetadataStore {
         Ok(out)
     }
 
+    /// `SELECT id, epoch FROM capture_jobs WHERE host_id=$1 AND stage NOT
+    /// IN ('done','failed')` — this host's live capture assignments,
+    /// echoed on heartbeat.
+    ///
+    /// DIVERGENCE (documented, same family as `pick_host_2d` /
+    /// `live_enable_work_by_host`): the sim has no `capture_jobs` table,
+    /// so this is always empty. Conformance covers only that case.
     async fn capture_assignments_for_host(
         &self,
         _host: HostId,
     ) -> Result<Vec<CaptureJobAssignment>, MetaError> {
-        panic!("SimMeta: capture_assignments_for_host not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(Vec::new())
     }
 
     async fn claim_enable_jobs(
@@ -2754,8 +2774,11 @@ impl MetadataStore for SimMetadataStore {
         Ok(self.db.lock().cold_bases.iter().copied().collect())
     }
 
+    /// `SELECT count(*) FROM chunk_gc_candidates` — the fleet view's
+    /// dirty-chunk backlog gauge.
     async fn count_gc_candidates(&self) -> Result<u64, MetaError> {
-        panic!("SimMeta: count_gc_candidates not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self.db.lock().chunk_gc.len() as u64)
     }
 
     async fn create_or_get_enable_job(
@@ -2965,8 +2988,15 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: list_org_secrets not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// `SELECT prestage_ref FROM enable_jobs WHERE state='prestaging'` —
+    /// the images a host should prefetch, echoed to it on heartbeat.
+    ///
+    /// DIVERGENCE (documented, same family as `pick_host_2d` /
+    /// `live_enable_work_by_host`): the sim has no `enable_jobs` table, so
+    /// this is always the empty set. Conformance covers only that case.
     async fn list_prestaging_refs(&self) -> Result<Vec<serde_json::Value>, MetaError> {
-        panic!("SimMeta: list_prestaging_refs not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(Vec::new())
     }
 
     async fn list_recoverable_snapshot_disk_manifests(
@@ -2991,12 +3021,22 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: list_waiting_capture_jobs not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// Live materialize + capture work aggregated by host (the fleet
+    /// view's per-host busy overlay). PostgresStore sums `enable_jobs`
+    /// (fresh-claimed `materializing`) and `capture_jobs` (non-terminal
+    /// stages) by host.
+    ///
+    /// DIVERGENCE (documented, same family as `pick_host_2d`): the sim
+    /// models neither table, so this is always the empty map — a store
+    /// with no enable/capture jobs. Conformance covers only that empty
+    /// case; scenarios must not create enable/capture jobs.
     async fn live_enable_work_by_host(
         &self,
         _materialize_lease: std::time::Duration,
     ) -> Result<std::collections::HashMap<HostId, engram_core::types::LiveEnableWork>, MetaError>
     {
-        panic!("SimMeta: live_enable_work_by_host not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(std::collections::HashMap::new())
     }
 
     async fn mirror_capture_progress_to_enable_job(
@@ -3222,8 +3262,15 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: set_teleport_target not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// `SELECT count(*), coalesce(sum(size_bytes),0) FROM snapshots` —
+    /// the fleet view's storage aggregate over ALL snapshot rows (session
+    /// captures AND template/base snapshots).
     async fn snapshot_totals(&self) -> Result<SnapshotTotals, MetaError> {
-        panic!("SimMeta: snapshot_totals not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let db = self.db.lock();
+        let count = db.snapshots.len() as u64;
+        let total_bytes = db.snapshots.values().map(|s| s.size_bytes).sum();
+        Ok(SnapshotTotals { count, total_bytes })
     }
 
     async fn soft_delete_harness(&self, _name: &str) -> Result<bool, MetaError> {
@@ -3254,12 +3301,31 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: update_enable_job_progress not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// ADR 0080 cheap-edit path: `UPDATE enabled_images SET image_config,
+    /// updated_at WHERE image_uri = $1 AND soft_deleted_at IS NULL`. A
+    /// missing OR soft-deleted row affects 0 rows -> NotFound (editing a
+    /// disabled image is a re-enable's job). Same `enabled_image_changed`
+    /// notify as `upsert_enabled_image`.
     async fn update_enabled_image_config(
         &self,
-        _image_uri: &str,
-        _config: &engram_core::types::image::ImageConfig,
+        image_uri: &str,
+        config: &engram_core::types::image::ImageConfig,
     ) -> Result<(), MetaError> {
-        panic!("SimMeta: update_enabled_image_config not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some((image, deleted)) = db.enabled_images.get_mut(image_uri) else {
+            return Err(MetaError::NotFound);
+        };
+        if deleted.is_some() {
+            // soft_deleted_at IS NULL guard: the UPDATE matches 0 rows.
+            return Err(MetaError::NotFound);
+        }
+        image.image_config = config.clone();
+        image.updated_at = Some(now);
+        drop(db);
+        self.notify("enabled_image_changed", image_uri.to_string());
+        Ok(())
     }
 
     async fn upsert_cold_base(&self, _row: ColdBaseRow) -> Result<(), MetaError> {

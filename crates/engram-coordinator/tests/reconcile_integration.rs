@@ -19,7 +19,6 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -29,365 +28,112 @@ use engram_coordinator::state::SessionEventBus;
 use engram_coordinator::HostRegistry;
 use engram_core::traits::MetadataStore;
 use engram_core::types::manifest::ManifestRef;
-use engram_core::types::session::SessionMode;
-use engram_core::types::{
-    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
-};
-use engram_core::{HostId, MetaError, SandboxId, SessionId, SnapshotId};
+use engram_core::types::session::{SessionMode, SessionSpec};
+use engram_core::types::{SessionState, SnapshotRecord};
+use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
+use engram_sim::{SimEntropy, SimMetadataStore};
 use parking_lot::Mutex;
 
-/// In-memory MetadataStore stub. Covers the methods reconcile calls
-/// (`list_active_sandbox_assignments_on_host`,
-/// `latest_snapshot_for_session`, `get_session`,
-/// `transition_session`, `assign_session_sandbox`,
-/// `append_session_event`). Every other method returns a sensible
-/// empty default so the trait compiles.
-#[derive(Default)]
-struct ReconcileMeta {
-    sessions: Mutex<HashMap<SessionId, Session>>,
-    snapshots: Mutex<HashMap<SessionId, Vec<SnapshotRecord>>>,
-    next_event_idx: Mutex<HashMap<SessionId, i64>>,
-    /// Captured emitted events for assertions.
-    emitted: Mutex<Vec<(SessionId, String, serde_json::Value)>>,
-    /// ADR 0047: in-memory mirror of `sessions.missing_strikes` — the
-    /// same reset/increment/flip-at-grace semantics as the PG impl.
-    strikes: Mutex<HashMap<SessionId, i32>>,
+// ADR 0098 D4: the hand-rolled `ReconcileMeta` mock is retired onto the
+// conformance-tested `SimMetadataStore`. Sessions/strikes/snapshots are
+// staged through REAL store calls (below), so the fixtures can no longer
+// stage a state the production write paths couldn't reach.
+
+fn sim_meta() -> Arc<SimMetadataStore> {
+    SimMetadataStore::new(
+        Arc::new(engram_core::traits::SystemClock::new()),
+        Arc::new(SimEntropy::seeded(0x9EC0)),
+    )
 }
 
-impl ReconcileMeta {
-    fn seed_active(&self, host: HostId, sandbox: SandboxId) -> SessionId {
-        let id = SessionId::new();
-        let now = Utc::now();
-        self.sessions.lock().insert(
-            id,
-            Session {
-                id,
-                status: SessionState::Active,
-                host_id: Some(host),
-                sandbox_id: Some(sandbox),
-                image: "localhost:5001/demo:test".into(),
-                mode: SessionMode::Agent,
-                created_at: now,
-                last_active_at: now,
-                live_disk_manifest: None,
-                park_rung: 0,
-                parked_at: None,
-                suggested_title: None,
-            },
-        );
-        id
-    }
+/// Stage an Active session bound to `(host, sandbox)` through legal FSM
+/// edges: create (Pending) → assign host → `transition_session_created`
+/// (Created + sandbox) → Active.
+async fn seed_active(meta: &Arc<SimMetadataStore>, host: HostId, sandbox: SandboxId) -> SessionId {
+    let id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:test".into(),
+            mode: SessionMode::Agent,
+        })
+        .await
+        .expect("create");
+    meta.assign_session_host(id, Some(host))
+        .await
+        .expect("assign host");
+    meta.transition_session_created(id, sandbox)
+        .await
+        .expect("created");
+    meta.transition_session(id, SessionState::Active)
+        .await
+        .expect("active");
+    id
+}
 
-    /// Directly seed an in-flight strike streak on a session row, as
-    /// if earlier missing heartbeats (or `backend.list()` blips) had
-    /// already accrued against its *previous* binding. Issue #215.
-    fn seed_strikes(&self, session: SessionId, strikes: i32) {
-        self.strikes.lock().insert(session, strikes);
-    }
-
-    fn seed_recoverable_snapshot(&self, session: SessionId, recoverable: bool) {
-        let snap = SnapshotRecord {
-            id: SnapshotId::new(),
-            session_id: Some(session),
-            host_id: None,
-            image_version: "test".into(),
-            size_bytes: 1024,
-            created_at: Utc::now(),
-            last_accessed_at: Utc::now(),
-            disk_manifest: Some(ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 1,
-            }),
-            memory_manifest: None,
-            recoverable,
-            aux_bundles: vec![],
-            events_cursor: None,
-            fc_snapshot_version: None,
-        };
-        self.snapshots.lock().entry(session).or_default().push(snap);
-    }
-
-    fn status(&self, id: SessionId) -> SessionState {
-        self.sessions.lock().get(&id).unwrap().status
-    }
-
-    fn sandbox(&self, id: SessionId) -> Option<SandboxId> {
-        self.sessions.lock().get(&id).unwrap().sandbox_id
-    }
-
-    fn emitted_events(&self) -> Vec<(SessionId, String, serde_json::Value)> {
-        self.emitted.lock().clone()
+/// Stage an in-flight missing-heartbeat strike streak through the REAL
+/// strike path (`apply_missing_sandbox_strikes`), as if earlier missing
+/// heartbeats had already accrued against this binding (Issue #215).
+/// Resets to a known 0 (present-arm) first, then accrues `strikes` with
+/// an unreachable grace so the staging itself never flips.
+async fn seed_strikes(meta: &Arc<SimMetadataStore>, session: SessionId, strikes: i32) {
+    meta.apply_missing_sandbox_strikes(&[session], &[], i32::MAX)
+        .await
+        .expect("reset strikes");
+    for _ in 0..strikes {
+        let flipped = meta
+            .apply_missing_sandbox_strikes(&[], &[session], i32::MAX)
+            .await
+            .expect("accrue strike");
+        assert!(flipped.is_empty(), "staging strikes must not flip");
     }
 }
 
-#[async_trait]
-impl MetadataStore for ReconcileMeta {
-    async fn ping(&self) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn create_session(&self, _: SessionSpec) -> Result<SessionId, MetaError> {
-        unimplemented!("test seeds sessions directly")
-    }
-    async fn transition_session_created(
-        &self,
-        _: SessionId,
-        _: engram_core::SandboxId,
-    ) -> Result<(), MetaError> {
-        unimplemented!("test seeds sessions directly")
-    }
-    async fn reserve_and_persist_create(
-        &self,
-        _: engram_core::traits::SessionCreateWriteSet,
-        _: &[engram_core::HostId],
-        _: usize,
-    ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
-        unimplemented!("test seeds sessions directly")
-    }
-    async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
-        self.sessions
-            .lock()
-            .get(&id)
-            .cloned()
-            .ok_or(MetaError::NotFound)
-    }
-    async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
-        Ok(self
-            .sessions
-            .lock()
-            .values()
-            .filter(|s| s.status.is_live())
-            .cloned()
-            .collect())
-    }
-    async fn transition_session(
-        &self,
-        id: SessionId,
-        target: SessionState,
-    ) -> Result<SessionState, MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        let prev = s.status;
-        prev.try_transition_to(target)
-            .map_err(|e| MetaError::Conflict(e.to_string()))?;
-        s.status = target;
-        s.last_active_at = Utc::now();
-        Ok(prev)
-    }
-    async fn assign_session_host(
-        &self,
-        id: SessionId,
-        host_id: Option<HostId>,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.host_id = host_id;
-        Ok(())
-    }
-    async fn assign_session_sandbox(
-        &self,
-        id: SessionId,
-        sandbox_id: Option<SandboxId>,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.sandbox_id = sandbox_id;
-        drop(g);
-        // Issue #215: mirror the PG store — binding or unbinding a
-        // sandbox resets the reconcile strike streak, since a re-key /
-        // unbind breaks the "N CONSECUTIVE missing heartbeats against
-        // THIS binding" invariant the counter encodes.
-        self.strikes.lock().remove(&id);
-        Ok(())
-    }
-    async fn upsert_host(&self, _: HostRecord) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn set_host_status(&self, _: HostId, _: HostStatus) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn touch_host_heartbeat(
-        &self,
-        _: HostId,
-        _: engram_core::types::host::HostHeartbeat,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn apply_missing_sandbox_strikes(
-        &self,
-        present: &[SessionId],
-        missing: &[SessionId],
-        grace_ticks: i32,
-    ) -> Result<Vec<SessionId>, MetaError> {
-        let mut strikes = self.strikes.lock();
-        for id in present {
-            strikes.remove(id);
-        }
-        let mut flipped = Vec::new();
-        for id in missing {
-            let s = strikes.entry(*id).or_insert(0);
-            *s += 1;
-            if *s >= grace_ticks {
-                flipped.push(*id);
-            }
-        }
-        for id in &flipped {
-            strikes.remove(id);
-        }
-        Ok(flipped)
-    }
-    async fn list_stale_hosts(&self, _: u64) -> Result<Vec<HostRecord>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn mark_host_dead_and_orphan_sessions(
-        &self,
-        _: HostId,
-    ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
-        // Template snapshots (session_id=None) don't appear in the
-        // per-session lookup mock; ignore them. The real PG store
-        // indexes by snapshot_id so it doesn't have this issue.
-        if let Some(sid) = snap.session_id {
-            self.snapshots.lock().entry(sid).or_default().push(snap);
-        }
-        Ok(true)
-    }
-    async fn list_snapshots_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Vec<SnapshotRecord>, MetaError> {
-        Ok(self.snapshots.lock().get(&sid).cloned().unwrap_or_default())
-    }
-    async fn latest_snapshot_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Option<SnapshotRecord>, MetaError> {
-        Ok(self
-            .snapshots
-            .lock()
-            .get(&sid)
-            .and_then(|v| v.last().cloned()))
-    }
-    async fn list_live_disk_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn list_live_memory_manifest_ids(&self) -> Result<Vec<uuid::Uuid>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn append_session_event(
-        &self,
-        session_id: SessionId,
-        kind: &str,
-        payload: serde_json::Value,
-    ) -> Result<i64, MetaError> {
-        let mut counters = self.next_event_idx.lock();
-        let counter = counters.entry(session_id).or_insert(0);
-        let idx = *counter;
-        *counter += 1;
-        drop(counters);
-        self.emitted
-            .lock()
-            .push((session_id, kind.to_string(), payload));
-        Ok(idx)
-    }
-    async fn list_session_events_since(
-        &self,
-        _: SessionId,
-        _: i64,
-        _: i64,
-    ) -> Result<Vec<PersistedEvent>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn insert_artifact(
-        &self,
-        _: uuid::Uuid,
-        _: SessionId,
-        _: &str,
-        _: &str,
-        _: i64,
-        _: Option<&str>,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn get_artifact(
-        &self,
-        _: SessionId,
-        _: uuid::Uuid,
-    ) -> Result<Option<engram_core::types::ArtifactRow>, MetaError> {
-        Ok(None)
-    }
-    async fn artifact_usage(&self, _: SessionId) -> Result<(i64, i64), MetaError> {
-        Ok((0, 0))
-    }
-    async fn upsert_registry_credential(
-        &self,
-        _: engram_core::types::RegistryCredential,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_registry_credentials(
-        &self,
-    ) -> Result<Vec<engram_core::types::RegistryCredential>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn registry_credential_for_host(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::RegistryCredential>, MetaError> {
-        Ok(None)
-    }
-    async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
-    // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
-    async fn upsert_enabled_image(
-        &self,
-        _: engram_core::types::EnabledImage,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_enabled_images(
-        &self,
-    ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn get_enabled_image(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
-        Ok(None)
-    }
-    async fn get_enabled_image_any(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
-        Ok(None)
-    }
-    async fn soft_delete_enabled_image(
-        &self,
-        _: &str,
-    ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
-        Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled)
-    }
-    async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn get_session_secrets(
-        &self,
-        _: SessionId,
-    ) -> Result<Option<engram_core::types::SessionSecrets>, MetaError> {
-        Ok(None)
-    }
-    async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
-        Ok(())
-    }
+async fn seed_recoverable_snapshot(
+    meta: &Arc<SimMetadataStore>,
+    session: SessionId,
+    recoverable: bool,
+) {
+    let snap = SnapshotRecord {
+        id: SnapshotId::new(),
+        session_id: Some(session),
+        host_id: None,
+        image_version: "test".into(),
+        size_bytes: 1024,
+        created_at: Utc::now(),
+        last_accessed_at: Utc::now(),
+        disk_manifest: Some(ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 1,
+        }),
+        memory_manifest: None,
+        recoverable,
+        aux_bundles: vec![],
+        events_cursor: None,
+        fc_snapshot_version: None,
+    };
+    meta.record_snapshot(snap).await.expect("record snapshot");
+}
+
+async fn status(meta: &Arc<SimMetadataStore>, id: SessionId) -> SessionState {
+    meta.get_session(id).await.expect("session").status
+}
+
+async fn sandbox(meta: &Arc<SimMetadataStore>, id: SessionId) -> Option<SandboxId> {
+    meta.get_session(id).await.expect("session").sandbox_id
+}
+
+/// Every `append_session_event` the reconciler emitted, flattened out of
+/// the store's event log (the mock captured these in a side Vec; the
+/// faithful store persists them like PG does).
+fn emitted_events(meta: &SimMetadataStore) -> Vec<(SessionId, String, serde_json::Value)> {
+    meta.with_db(|db| {
+        db.session_events
+            .iter()
+            .flat_map(|(sid, evs)| {
+                evs.iter()
+                    .map(move |e| (*sid, e.kind.clone(), e.payload.clone()))
+            })
+            .collect()
+    })
 }
 
 /// The headline scenario from the ADR 0009 rollout doc:
@@ -398,7 +144,7 @@ impl MetadataStore for ReconcileMeta {
 /// third stayed Active."
 #[tokio::test]
 async fn three_active_sessions_drop_two_one_recoverable_one_not() {
-    let meta = Arc::new(ReconcileMeta::default());
+    let meta = sim_meta();
     let host_registry =
         HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
@@ -409,16 +155,16 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     let sb_recoverable = SandboxId::new();
     let sb_dead = SandboxId::new();
     let sb_present = SandboxId::new();
-    let s_recoverable = meta.seed_active(host, sb_recoverable);
-    let s_dead = meta.seed_active(host, sb_dead);
-    let s_present = meta.seed_active(host, sb_present);
+    let s_recoverable = seed_active(&meta, host, sb_recoverable).await;
+    let s_dead = seed_active(&meta, host, sb_dead).await;
+    let s_present = seed_active(&meta, host, sb_present).await;
 
     // Only one of the sessions has a recoverable snapshot.
-    meta.seed_recoverable_snapshot(s_recoverable, true);
+    seed_recoverable_snapshot(&meta, s_recoverable, true).await;
     // Second session: a snapshot exists but isn't recoverable
     // (mimics chunks GC'd / never replicated). Reconcile should
     // still treat this as Dead.
-    meta.seed_recoverable_snapshot(s_dead, false);
+    seed_recoverable_snapshot(&meta, s_dead, false).await;
 
     // Initial state: all three sandboxes "present" in the host's
     // heartbeat. No flips expected.
@@ -456,17 +202,17 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
 
     // Verify the per-session terminal status:
     assert_eq!(
-        meta.status(s_recoverable),
+        status(&meta, s_recoverable).await,
         SessionState::Idle,
         "session with recoverable=true → Idle (resumable via cold-tier)"
     );
     assert_eq!(
-        meta.status(s_dead),
+        status(&meta, s_dead).await,
         SessionState::Dead,
         "session with recoverable=false → Dead (terminal; no resume path)"
     );
     assert_eq!(
-        meta.status(s_present),
+        status(&meta, s_present).await,
         SessionState::Active,
         "session whose sandbox is still in the heartbeat must NOT flip"
     );
@@ -474,16 +220,16 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
     // Both flipped sessions get sandbox_id cleared so a future
     // coord restart's `repopulate_routing` doesn't try to talk to
     // the dead sandbox.
-    assert_eq!(meta.sandbox(s_recoverable), None);
-    assert_eq!(meta.sandbox(s_dead), None);
+    assert_eq!(sandbox(&meta, s_recoverable).await, None);
+    assert_eq!(sandbox(&meta, s_dead).await, None);
     // The third session keeps its sandbox_id.
-    assert_eq!(meta.sandbox(s_present), Some(sb_present));
+    assert_eq!(sandbox(&meta, s_present).await, Some(sb_present));
 
     // ADR 0015 M2: each flipped session emits TWO StatusChanged
     // events — Active -> HostLost (host went away) followed by
     // HostLost -> {Idle,Dead} (resolved per snapshot recoverability).
     // Two flipped sessions × two events = four events.
-    let emitted = meta.emitted_events();
+    let emitted = emitted_events(&meta);
     let status_changed: Vec<_> = emitted
         .iter()
         .filter(|(_, kind, _)| kind == "status_changed")
@@ -519,14 +265,14 @@ async fn three_active_sessions_drop_two_one_recoverable_one_not() {
 /// recovered" scenario.
 #[tokio::test]
 async fn re_appearing_sandbox_within_grace_does_not_flip() {
-    let meta = Arc::new(ReconcileMeta::default());
+    let meta = sim_meta();
     let host_registry =
         HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
     let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
     let host = HostId::new();
     let sb = SandboxId::new();
-    let session = meta.seed_active(host, sb);
+    let session = seed_active(&meta, host, sb).await;
 
     // Two consecutive missing ticks…
     for _ in 0..(DEFAULT_GRACE_TICKS - 1) {
@@ -569,7 +315,7 @@ async fn re_appearing_sandbox_within_grace_does_not_flip() {
 /// of a contract-promised 3-tick grace collapsed to 1).
 #[tokio::test]
 async fn stale_strikes_do_not_carry_across_sandbox_rekey() {
-    let meta = Arc::new(ReconcileMeta::default());
+    let meta = sim_meta();
     let host_registry =
         HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
@@ -580,12 +326,12 @@ async fn stale_strikes_do_not_carry_across_sandbox_rekey() {
     // `list()` blips) — one short of a flip.
     let host_a = HostId::new();
     let sb1 = SandboxId::new();
-    let session = meta.seed_active(host_a, sb1);
-    meta.seed_strikes(session, (DEFAULT_GRACE_TICKS - 1) as i32);
+    let session = seed_active(&meta, host_a, sb1).await;
+    seed_strikes(&meta, session, (DEFAULT_GRACE_TICKS - 1) as i32).await;
     // It has a recoverable snapshot, so a wrongful flip would land it
     // in Idle (in-RAM work lost) rather than Dead — but the point is
     // it must NOT flip at all here.
-    meta.seed_recoverable_snapshot(session, true);
+    seed_recoverable_snapshot(&meta, session, true).await;
 
     // S is drained off A and resumed on host B against a fresh sandbox
     // SB2 (evac/migration). This is the re-key: the binding writer
@@ -611,7 +357,7 @@ async fn stale_strikes_do_not_carry_across_sandbox_rekey() {
          stale strikes from the old sandbox leaked into the new binding's grace window"
     );
     assert_eq!(
-        meta.status(session),
+        status(&meta, session).await,
         SessionState::Active,
         "the just-resumed session must stay Active through its first post-rebind blip"
     );
@@ -643,14 +389,14 @@ async fn stale_strikes_do_not_carry_across_sandbox_rekey() {
 /// safely manually-kill a session without racing the strike-out.
 #[tokio::test]
 async fn does_not_re_flip_already_terminal_sessions() {
-    let meta = Arc::new(ReconcileMeta::default());
+    let meta = sim_meta();
     let host_registry =
         HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
     let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
     let host = HostId::new();
     let sb = SandboxId::new();
-    let session = meta.seed_active(host, sb);
+    let session = seed_active(&meta, host, sb).await;
 
     // First strike-out cycle → flip to Dead (no snapshot).
     for _ in 0..DEFAULT_GRACE_TICKS {
@@ -658,8 +404,8 @@ async fn does_not_re_flip_already_terminal_sessions() {
             .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
             .await;
     }
-    assert_eq!(meta.status(session), SessionState::Dead);
-    let after_first_flip = meta.emitted_events().len();
+    assert_eq!(status(&meta, session).await, SessionState::Dead);
+    let after_first_flip = emitted_events(&meta).len();
 
     // Even though the session row still exists, `list_active...`
     // filters status='active' so it won't be returned. Quick
@@ -670,9 +416,9 @@ async fn does_not_re_flip_already_terminal_sessions() {
             .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host, &[])
             .await;
     }
-    assert_eq!(meta.status(session), SessionState::Dead);
+    assert_eq!(status(&meta, session).await, SessionState::Dead);
     assert_eq!(
-        meta.emitted_events().len(),
+        emitted_events(&meta).len(),
         after_first_flip,
         "no further events after a session reaches a terminal state"
     );
@@ -683,7 +429,7 @@ async fn does_not_re_flip_already_terminal_sessions() {
 /// property: per-host reconciliation must not cross-contaminate.
 #[tokio::test]
 async fn reconcile_does_not_flip_sessions_on_other_hosts() {
-    let meta = Arc::new(ReconcileMeta::default());
+    let meta = sim_meta();
     let host_registry =
         HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
@@ -693,8 +439,8 @@ async fn reconcile_does_not_flip_sessions_on_other_hosts() {
 
     let sb_a = SandboxId::new();
     let sb_b = SandboxId::new();
-    let session_a = meta.seed_active(host_a, sb_a);
-    let session_b = meta.seed_active(host_b, sb_b);
+    let session_a = seed_active(&meta, host_a, sb_a).await;
+    let session_b = seed_active(&meta, host_b, sb_b).await;
 
     // Drive host_a's reconcile pass repeatedly with NO running
     // sandboxes. session_a should flip to Dead; session_b stays
@@ -704,9 +450,9 @@ async fn reconcile_does_not_flip_sessions_on_other_hosts() {
             .reconcile_with_deps(meta.as_ref(), &events, &host_registry, host_a, &[])
             .await;
     }
-    assert_eq!(meta.status(session_a), SessionState::Dead);
+    assert_eq!(status(&meta, session_a).await, SessionState::Dead);
     assert_eq!(
-        meta.status(session_b),
+        status(&meta, session_b).await,
         SessionState::Active,
         "host_a's reconcile must not affect host_b's sessions"
     );
@@ -720,7 +466,7 @@ async fn reconcile_does_not_flip_sessions_on_other_hosts() {
 /// NotFound instead of a clean 410.
 #[tokio::test]
 async fn reconcile_invalidates_host_registry_cache_on_host_lost() {
-    let meta = Arc::new(ReconcileMeta::default());
+    let meta = sim_meta();
     let host_registry =
         HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
@@ -728,8 +474,8 @@ async fn reconcile_invalidates_host_registry_cache_on_host_lost() {
     let host = HostId::new();
     let sb_lost = SandboxId::new();
     let sb_alive = SandboxId::new();
-    meta.seed_active(host, sb_lost);
-    meta.seed_active(host, sb_alive);
+    seed_active(&meta, host, sb_lost).await;
+    seed_active(&meta, host, sb_alive).await;
 
     // Mirror what create_for_session would have done at session
     // create time: seed the in-memory ownership cache.
@@ -850,14 +596,14 @@ impl engram_core::traits::HostClient for ProbeBackend {
 /// flip the instant one more heartbeat is missed).
 #[tokio::test]
 async fn probe_rescues_a_session_whose_process_is_alive_despite_missing_from_running_sandboxes() {
-    let meta = Arc::new(ReconcileMeta::default());
+    let meta = sim_meta();
     let host_registry =
         HostRegistry::new(meta.clone() as Arc<dyn engram_core::traits::MetadataStore>);
     let events = Arc::new(SessionEventBus::new(64));
     let reconciler = Reconciler::new(DEFAULT_GRACE_TICKS);
     let host = HostId::new();
     let sb = SandboxId::new();
-    let session = meta.seed_active(host, sb);
+    let session = seed_active(&meta, host, sb).await;
 
     let backend = Arc::new(ProbeBackend {
         process_alive: Mutex::new(true),
@@ -879,7 +625,7 @@ async fn probe_rescues_a_session_whose_process_is_alive_despite_missing_from_run
         );
     }
     assert_eq!(
-        meta.status(session),
+        status(&meta, session).await,
         SessionState::Active,
         "the session must never leave Active — no host_lost, no transcript rewind"
     );
@@ -891,7 +637,7 @@ async fn probe_rescues_a_session_whose_process_is_alive_despite_missing_from_run
     // (after the last rescue mid-cycle) left a nonzero-but-unspecified
     // strike count, which would make "exactly DEFAULT_GRACE_TICKS more
     // ticks" a flaky claim about this test rather than about the code.
-    meta.seed_strikes(session, 0);
+    seed_strikes(&meta, session, 0).await;
     *backend.process_alive.lock() = false;
     let mut all_flipped = Vec::new();
     for i in 0..DEFAULT_GRACE_TICKS {
@@ -913,5 +659,5 @@ async fn probe_rescues_a_session_whose_process_is_alive_despite_missing_from_run
         "once the probe agrees the process is gone, the flip proceeds exactly at the grace window \
          — probe-before-host_lost must not delay real failure detection"
     );
-    assert_eq!(meta.status(session), SessionState::Dead);
+    assert_eq!(status(&meta, session).await, SessionState::Dead);
 }
