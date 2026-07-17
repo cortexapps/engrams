@@ -31,7 +31,6 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
 use engram_core::traits::SessionFence;
 use engram_core::types::host::PreemptionNotice;
 use engram_core::types::SessionState;
@@ -234,7 +233,7 @@ pub async fn drain_session(
             SessionEvent::StatusChanged {
                 from: prev,
                 to: SessionState::HostLost,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await
@@ -263,7 +262,7 @@ pub async fn drain_session(
             SessionEvent::StatusChanged {
                 from: prev,
                 to: target,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await
@@ -295,6 +294,8 @@ impl std::error::Error for DrainError {}
 fn _arc_unused_check<T>(_: Arc<T>) {}
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -353,6 +354,8 @@ mod tests {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path,

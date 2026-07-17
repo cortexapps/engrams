@@ -270,16 +270,22 @@ pub(crate) async fn boot_on_reserved_host(
     // connector round trip) was invisible to both. Time the whole overlap
     // unconditionally; a restore failure still paid for this wall time
     // before erroring out below.
-    let overlap_start = std::time::Instant::now();
+    let overlap_start = state.services.clock.now_mono();
     let (restore_result, injects) = tokio::join!(restore_leg, env_egress_leg);
-    ::metrics::histogram!(crate::metrics::COORD_BOOT_OVERLAP_SECONDS)
-        .record(overlap_start.elapsed().as_secs_f64());
+    ::metrics::histogram!(crate::metrics::COORD_BOOT_OVERLAP_SECONDS).record(
+        state
+            .services
+            .clock
+            .now_mono()
+            .saturating_sub(overlap_start)
+            .as_secs_f64(),
+    );
     // Issue #535 (observability): `coord_finalize` starts HERE — restore
     // returned, whatever its outcome. The phase ends at the Active
     // transition below (a failure returns before recording it — this phase
     // measures the successful tail only, matching `coord_prepare`'s
     // success-path framing).
-    let finalize_start = std::time::Instant::now();
+    let finalize_start = state.services.clock.now_mono();
 
     let sandbox_id = match restore_result {
         Ok(sb) => sb,
@@ -337,6 +343,22 @@ pub(crate) async fn boot_on_reserved_host(
             ))));
         }
     };
+    // ADR 0099 H6 (site 1): a freshly minted epoch is threaded into BOTH
+    // the AgentSpec stamp and the durable bind RPC below, and every fence
+    // downstream compares against it. It must clear the floor: the column
+    // defaults to 0 and `mint_binding_epoch` is an atomic `+1 RETURNING`,
+    // so a mint yields >= 1 by construction. A 0 here would mean the
+    // counter never advanced — the spawned harness would lose every
+    // fence and never validate. (Strict pairwise monotonicity is enforced
+    // fail-closed one layer down, at the host-agent binding record's
+    // `bindings::bind`, which refuses an `existing > presented` write; the
+    // coordinator's fresh-spawn mint sites don't co-locate a prior epoch,
+    // so this floor check is the assertion available without an added DB
+    // read.)
+    engram_core::invariant!(
+        binding_epoch >= 1,
+        "minted binding epoch must be positive for session {session_id}, got {binding_epoch}",
+    );
     state
         .services
         .host
@@ -373,7 +395,7 @@ pub(crate) async fn boot_on_reserved_host(
             SessionEvent::StatusChanged {
                 from: SessionState::Pending,
                 to: SessionState::Created,
-                at: chrono::Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await
@@ -417,7 +439,7 @@ pub(crate) async fn boot_on_reserved_host(
             SessionEvent::StatusChanged {
                 from: prev,
                 to: SessionState::Active,
-                at: chrono::Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await
@@ -429,7 +451,14 @@ pub(crate) async fn boot_on_reserved_host(
     // returned → Active, the coordinator-owned tail after the host handed
     // back a live sandbox.
     ::metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_finalize")
-        .record(finalize_start.elapsed().as_secs_f64());
+        .record(
+            state
+                .services
+                .clock
+                .now_mono()
+                .saturating_sub(finalize_start)
+                .as_secs_f64(),
+        );
 
     // ADR 0073 (completion): the create-time prompt's user echo + outbox row
     // are written by `send_prompt_core` in `create_session_core` when the

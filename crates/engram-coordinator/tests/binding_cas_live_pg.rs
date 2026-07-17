@@ -20,6 +20,9 @@
 //! `ENGRAM_TEST_DATABASE_URL`. CI wires this into the Postgres-gated
 //! ignored lane alongside `eviction_live_pg`.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -28,21 +31,8 @@ use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::{HostId, MetaError, SandboxId, SessionId};
 
 async fn pg() -> Option<Arc<dyn MetadataStore>> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 /// Insert a `hosts` row so PG's `sessions_host_id_fkey` is satisfied

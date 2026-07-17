@@ -54,6 +54,7 @@ mod adapter {
     use engram_harness_proto::{
         AgentRole, EditHunk, FileChange, HarnessCommand, HarnessEvent, MAX_FILE_CHANGE_BYTES,
     };
+    use engram_harness_sdk::browser_view;
     use engram_harness_sdk::questions::{Answers, Question};
     use nix::sys::signal::{kill, Signal};
     use nix::unistd::Pid;
@@ -113,7 +114,7 @@ mod adapter {
     }
 
     fn manifest_from_env() -> ToolManifest {
-        match std::env::var("ENGRAM_TOOLS") {
+        let manifest = match std::env::var("ENGRAM_TOOLS") {
             Ok(raw) if !raw.trim().is_empty() => match parse_tool_manifest(&raw) {
                 Ok(manifest) => manifest,
                 Err(e) => {
@@ -122,7 +123,25 @@ mod adapter {
                 }
             },
             _ => Vec::new(),
+        };
+        with_browser_view(manifest, browser_view::enabled())
+    }
+
+    fn with_browser_view(mut manifest: ToolManifest, enabled: bool) -> ToolManifest {
+        if enabled
+            && !manifest
+                .iter()
+                .any(|tool| tool.name == browser_view::TOOL_NAME)
+        {
+            manifest.push(ManifestTool {
+                name: browser_view::TOOL_NAME.into(),
+                description: browser_view::TOOL_DESCRIPTION.into(),
+                input_schema: browser_view::input_schema(),
+                execution: ToolExecution::Sync,
+                native_bindings: NativeBindings::default(),
+            });
         }
+        manifest
     }
 
     fn injected_tools(manifest: &ToolManifest) -> impl Iterator<Item = &ManifestTool> {
@@ -477,9 +496,7 @@ mod adapter {
     /// connection reattaches. Errors only if the receiver is gone,
     /// i.e. the process is tearing down; treat as a debug no-op.
     async fn emit(evt_tx: &mpsc::Sender<HarnessEvent>, ev: HarnessEvent) {
-        if evt_tx.send(ev).await.is_err() {
-            tracing::debug!("event channel closed; dropping event");
-        }
+        engram_harness_sdk::emit(evt_tx, ev).await;
     }
 
     /// ADR 0054 Flavor B: the hook↔harness socket server and its shared
@@ -988,7 +1005,9 @@ mod adapter {
     /// on the long-lived harness main process over a one-line unix-socket
     /// request/response.
     pub mod mcp_bridge {
-        use super::{injected_tools, manifest_from_env, BufReader, ToolManifest, MCP_SOCK_FILE};
+        use super::{
+            browser_view, injected_tools, manifest_from_env, BufReader, ToolManifest, MCP_SOCK_FILE,
+        };
         use serde::{Deserialize, Serialize};
         use serde_json::Value;
         use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
@@ -1099,6 +1118,37 @@ mod adapter {
                         .pointer("/params/arguments")
                         .cloned()
                         .unwrap_or_else(|| serde_json::json!({}));
+                    if name == browser_view::TOOL_NAME {
+                        let result = args
+                            .get("path")
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| {
+                                "browser_view requires an absolute string path".to_string()
+                            })
+                            .and_then(browser_view::load);
+                        return Some(json_rpc_result(
+                            id,
+                            match result {
+                                Ok(image) => serde_json::json!({
+                                    "content": [
+                                        {
+                                            "type": "text",
+                                            "text": "Internal browser observation. This image was not shared with the user."
+                                        },
+                                        {
+                                            "type": "image",
+                                            "data": image.base64,
+                                            "mimeType": image.mime_type
+                                        }
+                                    ]
+                                }),
+                                Err(error) => serde_json::json!({
+                                    "content": [{"type": "text", "text": error}],
+                                    "isError": true
+                                }),
+                            },
+                        ));
+                    }
                     let tool_use_id = request
                         .pointer("/params/_meta/claudecode~1toolUseId")
                         .and_then(Value::as_str);
@@ -3565,6 +3615,40 @@ mod adapter {
                 }]),
                 "Claude-native bindings are omitted from the MCP surface"
             );
+        }
+
+        #[tokio::test]
+        async fn mcp_browser_view_is_local_and_returns_tool_errors_without_the_socket() {
+            let manifest = with_browser_view(Vec::new(), true);
+            let listed = mcp_bridge::handle_request(
+                serde_json::json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+                &manifest,
+                "/unused.sock",
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                listed["result"]["tools"][0]["name"],
+                browser_view::TOOL_NAME
+            );
+
+            let called = mcp_bridge::handle_request(
+                serde_json::json!({
+                    "jsonrpc":"2.0",
+                    "id":2,
+                    "method":"tools/call",
+                    "params":{"name":"browser_view","arguments":{}}
+                }),
+                &manifest,
+                "/unused.sock",
+            )
+            .await
+            .unwrap();
+            assert_eq!(called["result"]["isError"], true);
+            assert!(called["result"]["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("requires"));
         }
 
         #[tokio::test]

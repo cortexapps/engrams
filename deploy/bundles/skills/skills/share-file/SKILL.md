@@ -1,13 +1,18 @@
 ---
 name: share-file
-description: Share an image or video file so it appears in the engrams session's conversation history for the person who launched the session. Use when you want to SHOW your work visually — a screenshot of a page you built, a screen recording of a flow, a rendered chart. No tokens or setup needed.
+description: Deliver an existing image or video into the engrams conversation when the user explicitly requested that artifact or another active skill explicitly requires delivery. Do not use merely because an internal screenshot, render, or recording exists.
 ---
 
 # Sharing a file (image / video)
 
-This engrams session can surface an image or video in the conversation history
-the launcher is watching — use it to **show**, not just describe, your work
-(e.g. a screenshot after a UI change, a short screen recording of a flow).
+This engrams session can surface an existing image or video in the conversation
+history. Delivery is separate from creation and inspection: do not share a file
+merely because you rendered, recorded, or looked at it internally.
+
+Use this skill only when the user explicitly asks to receive visual evidence or
+the requested deliverable is itself an image/video. If another active skill
+defines a stricter sharing policy, follow it. For browser work, share one final
+screenshot by default and never share internal recovery screenshots.
 
 ## Usage
 

@@ -13,7 +13,6 @@
 //! `GET /api/registries` returns [`RegistryCredentialSummary`] only
 //! — never plaintext passwords, never ciphertext bytes.
 
-use chrono::Utc;
 use engram_core::types::registry::{
     RegistryAuthSpec, RegistryCredential, RegistryCredentialSummary,
 };
@@ -113,10 +112,10 @@ pub(crate) async fn add_registry_core(
     };
 
     let cred = RegistryCredential {
-        id: Uuid::new_v4(),
+        id: state.services.entropy.uuid(),
         registry_host: req.host.clone(),
         auth,
-        created_at: Utc::now(),
+        created_at: state.services.clock.now_utc(),
         updated_at: None,
     };
     state

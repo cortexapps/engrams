@@ -6,6 +6,7 @@ use std::sync::Arc;
 use clap::Parser;
 use engram_core::{SandboxId, SessionId};
 use engram_harness_proto::{AgentRole, FileChange, HarnessCommand, HarnessEvent};
+use engram_harness_sdk::browser_view;
 use engram_harness_sdk::parked::{ParkedCall, ParkedCallKind, ParkedCallStore};
 use engram_harness_sdk::questions::{Answers, Question, QuestionOption};
 use engram_harness_sdk::{emit, Channels, ConnectionConfig, QueuedPrompt};
@@ -85,7 +86,7 @@ fn parse_tool_manifest(raw: &str) -> Result<ToolManifest, String> {
 }
 
 fn manifest_from_env() -> ToolManifest {
-    match std::env::var("ENGRAM_TOOLS") {
+    let manifest = match std::env::var("ENGRAM_TOOLS") {
         Ok(raw) if !raw.trim().is_empty() => match parse_tool_manifest(&raw) {
             Ok(manifest) => manifest,
             Err(error) => {
@@ -94,7 +95,25 @@ fn manifest_from_env() -> ToolManifest {
             }
         },
         _ => Vec::new(),
+    };
+    with_browser_view(manifest, browser_view::enabled())
+}
+
+fn with_browser_view(mut manifest: ToolManifest, enabled: bool) -> ToolManifest {
+    if enabled
+        && !manifest
+            .iter()
+            .any(|tool| tool.name == browser_view::TOOL_NAME)
+    {
+        manifest.push(ManifestTool {
+            name: browser_view::TOOL_NAME.into(),
+            description: browser_view::TOOL_DESCRIPTION.into(),
+            input_schema: browser_view::input_schema(),
+            execution: ToolExecution::Sync,
+            codex_native_binding: None,
+        });
     }
+    manifest
 }
 
 fn dynamic_tools(manifest: &ToolManifest) -> Value {
@@ -755,6 +774,36 @@ async fn handle_dynamic_tool_call(
             .await;
         return;
     };
+    if tool.name == browser_view::TOOL_NAME {
+        let result = params
+            .pointer("/arguments/path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| "browser_view requires an absolute string path".to_string())
+            .and_then(browser_view::load);
+        let response = match result {
+            Ok(image) => json!({
+                "success": true,
+                "contentItems": [
+                    {
+                        "type": "inputText",
+                        "text": "Internal browser observation. This image was not shared with the user."
+                    },
+                    {
+                        "type": "inputImage",
+                        "imageUrl": format!("data:{};base64,{}", image.mime_type, image.base64)
+                    }
+                ]
+            }),
+            Err(error) => json!({
+                "success": false,
+                "contentItems": [{"type": "inputText", "text": error}]
+            }),
+        };
+        if let Err(error) = server.respond(request_id, response).await {
+            tracing::error!(%error, %call_id, "could not return browser observation to Codex");
+        }
+        return;
+    }
     let execution = match tool.execution {
         ToolExecution::Sync => "sync",
         ToolExecution::Deferred => "deferred",
@@ -1545,6 +1594,18 @@ async fn ensure_skills_link(home: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn browser_view_is_declared_only_when_enabled() {
+        let enabled = with_browser_view(Vec::new(), true);
+        assert_eq!(enabled.len(), 1);
+        assert_eq!(enabled[0].name, browser_view::TOOL_NAME);
+        assert_eq!(
+            dynamic_tools(&enabled)[0]["inputSchema"]["required"],
+            json!(["path"])
+        );
+        assert!(with_browser_view(Vec::new(), false).is_empty());
+    }
 
     async fn write_fake_codex(scripted_after_turn_start: &[&str]) -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;

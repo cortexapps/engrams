@@ -1670,16 +1670,39 @@ impl ChunkCache {
         // by the rest of the hex digest. Cheap on macOS/Linux for
         // <O(100k) entries; rebuild as a persistent index if it
         // gets hot.
+        //
+        // ENOENT mid-walk is NORMAL, not an error: populate's
+        // temp+rename and our own eviction unlink entries concurrently
+        // with the walk, so a listed name can vanish before its
+        // `file_type`/`metadata` stat lands. Propagating that (the
+        // pre-2026-07-16 behavior) aborted the ENTIRE sweep several
+        // times an hour on every busy host — the eviction loop never
+        // completed a pass and the cache grew far past its budget
+        // (424 GiB / 77 % of the incident node's volume). Skip the
+        // vanished entry and keep walking; only non-NotFound I/O
+        // errors abort.
+        fn vanished(e: &std::io::Error) -> bool {
+            e.kind() == std::io::ErrorKind::NotFound
+        }
         let mut out = Vec::new();
         let mut top = match fs::read_dir(&self.inner.config.root).await {
             Ok(d) => d,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) if vanished(&e) => return Ok(out),
             Err(e) => return Err(e.into()),
         };
-        while let Some(prefix_entry) = top.next_entry().await? {
+        loop {
+            let prefix_entry = match top.next_entry().await {
+                Ok(Some(entry)) => entry,
+                Ok(None) => break,
+                Err(e) if vanished(&e) => continue,
+                Err(e) => return Err(e.into()),
+            };
             let prefix_path = prefix_entry.path();
-            if !prefix_entry.file_type().await?.is_dir() {
-                continue;
+            match prefix_entry.file_type().await {
+                Ok(t) if t.is_dir() => {}
+                Ok(_) => continue,
+                Err(e) if vanished(&e) => continue,
+                Err(e) => return Err(e.into()),
             }
             let Some(prefix) = prefix_path
                 .file_name()
@@ -1691,11 +1714,24 @@ impl ChunkCache {
             if prefix.len() != 2 || !prefix.chars().all(|c| c.is_ascii_hexdigit()) {
                 continue;
             }
-            let mut inner = fs::read_dir(&prefix_path).await?;
-            while let Some(file) = inner.next_entry().await? {
+            let mut inner = match fs::read_dir(&prefix_path).await {
+                Ok(d) => d,
+                Err(e) if vanished(&e) => continue,
+                Err(e) => return Err(e.into()),
+            };
+            loop {
+                let file = match inner.next_entry().await {
+                    Ok(Some(entry)) => entry,
+                    Ok(None) => break,
+                    Err(e) if vanished(&e) => continue,
+                    Err(e) => return Err(e.into()),
+                };
                 let path = file.path();
-                if !file.file_type().await?.is_file() {
-                    continue;
+                match file.file_type().await {
+                    Ok(t) if t.is_file() => {}
+                    Ok(_) => continue,
+                    Err(e) if vanished(&e) => continue,
+                    Err(e) => return Err(e.into()),
                 }
                 let Some(rest) = file.file_name().to_str().map(str::to_owned) else {
                     continue;
@@ -1707,7 +1743,11 @@ impl ChunkCache {
                 let Ok(hash) = ChunkHash::from_hex(&full_hex) else {
                     continue;
                 };
-                let meta = file.metadata().await?;
+                let meta = match file.metadata().await {
+                    Ok(m) => m,
+                    Err(e) if vanished(&e) => continue,
+                    Err(e) => return Err(e.into()),
+                };
                 out.push(CacheEntry {
                     hash,
                     path,
@@ -3031,6 +3071,54 @@ mod tests {
         assert!(
             cache.contains(hb).await,
             "eviction disabled: b must survive"
+        );
+    }
+
+    // ---- 2026-07-16 RCA: the sweep walk tolerates vanishing entries ----
+
+    #[tokio::test]
+    #[cfg(unix)]
+    async fn sweep_skips_entries_that_vanish_mid_walk() {
+        // Pre-fix, any NotFound stat inside `list_entries` aborted the
+        // ENTIRE sweep ("periodic chunk cache sweep failed … No such
+        // file or directory" — chronic, hourly, on every busy prod
+        // host), so eviction never completed a pass and the cache blew
+        // its budget (424 GiB on the incident node). A dangling symlink
+        // reproduces the vanish-mid-walk stat deterministically: the
+        // dir entry lists, but the follow-stat is NotFound.
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ChunkCache::new_with_floor(
+            ChunkCacheConfig {
+                root: cache_dir.path().to_path_buf(),
+                budget_bytes: 1, // any chunk is "over" — the sweep must evict
+                sweep_debounce_ms: 0,
+                eviction_enabled: true,
+            },
+            0.0,
+        );
+        let a = b"aaaaaaaaaa";
+        let ha = ChunkHash::of(a);
+        cache.put_no_evict(ha, a).await.unwrap();
+
+        // A 62-hex-named dangling symlink inside a valid prefix dir:
+        // `file_type()` (no follow) sees a symlink, `metadata()`
+        // (follow) is NotFound — the exact error class the walk must
+        // skip instead of propagating.
+        let prefix = cache_dir.path().join("00");
+        std::fs::create_dir_all(&prefix).unwrap();
+        std::os::unix::fs::symlink(
+            cache_dir.path().join("no-such-target"),
+            prefix.join("0".repeat(62)),
+        )
+        .unwrap();
+
+        cache
+            .sweep()
+            .await
+            .expect("a vanished/dangling entry must not abort the sweep");
+        assert!(
+            !cache.contains(ha).await,
+            "the sweep must still complete its eviction pass",
         );
     }
 

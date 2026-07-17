@@ -2,8 +2,9 @@
 //!
 //! Background task that polls for hosts whose `last_heartbeat_at` is
 //! older than the configured threshold and races other coordinator
-//! replicas (via Postgres advisory locks) for the right to evacuate
-//! each candidate. The winner:
+//! replicas — via a PG leasing row (`dead_host_inflight`,
+//! ADR 0098 D4; the repo convention: leasing row over advisory lock)
+//! — for the right to evacuate each candidate. The winner:
 //!
 //! 1. Atomically marks the host `Dead` in Postgres and transitions
 //!    every non-terminal session pointed at it to `HostLost` with
@@ -17,9 +18,9 @@
 //! 3. Emits per-session `StatusChanged` events for both transitions
 //!    using the honest `from` returned by the bulk + the
 //!    second-stage transition_session calls.
-//! 4. Fires `pg_notify('host_dead', host_id::text)` so other replicas
-//!    drop the host from their in-memory `HostRegistry` (handled in
-//!    `pg_listener`).
+//! 4. Broadcasts `host_dead` via `MetadataStore::notify_host_dead`
+//!    (Postgres: `pg_notify`) so other replicas drop the host from
+//!    their in-memory `HostRegistry` (handled in `pg_listener`).
 //! 5. Unregisters the host locally.
 //!
 //! Active execs running on the dead host don't need explicit
@@ -56,11 +57,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use engram_core::traits::MetadataStore;
 use engram_core::types::SessionState;
 use engram_core::HostId;
-use sqlx::postgres::PgPool;
 
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus, SharedState};
 use engram_core::SessionId;
@@ -77,12 +77,9 @@ async fn emit_status_changed(
     session_id: SessionId,
     from: SessionState,
     to: SessionState,
+    now: DateTime<Utc>,
 ) {
-    let event = SessionEvent::StatusChanged {
-        from,
-        to,
-        at: Utc::now(),
-    };
+    let event = SessionEvent::StatusChanged { from, to, at: now };
     let kind = event.kind();
     let payload = match serde_json::to_value(&event) {
         Ok(p) => p,
@@ -138,6 +135,12 @@ pub struct DeadHostConfig {
     /// still gets evicted once it expires (with `min_probe_failures`
     /// long since accumulated).
     pub probe_rescue_grace: Duration,
+    /// An eviction lease older than this is presumed abandoned (the
+    /// claiming pod crashed mid-eviction) and may be taken over by any
+    /// replica. Comfortably larger than a full eviction pass; small
+    /// enough that a crashed pod delays a genuinely-dead host's
+    /// eviction by at most this long.
+    pub lease_stale_after: Duration,
 }
 
 impl Default for DeadHostConfig {
@@ -147,13 +150,14 @@ impl Default for DeadHostConfig {
             stale_threshold: Duration::from_secs(30),
             min_probe_failures: 3,
             probe_rescue_grace: Duration::from_secs(120),
+            lease_stale_after: Duration::from_secs(180),
         }
     }
 }
 
 /// Per-host probe history the detector keeps in memory. Per-replica
-/// (deliberately not persisted): with two replicas racing the advisory
-/// lock, each counts its own strikes, so eviction can take up to 2× the
+/// (deliberately not persisted): with two replicas racing the eviction
+/// lease, each counts its own strikes, so eviction can take up to 2× the
 /// strike window — a bounded, conservative error in the safe direction
 /// (never evicts EARLIER than a single replica would).
 #[derive(Clone, Copy, Debug, Default)]
@@ -161,8 +165,10 @@ struct ProbeMemory {
     /// Consecutive failed probes, one per detector tick. Reset by any
     /// answered probe.
     consecutive_failures: u32,
-    /// When this host last answered a probe while its row was stale.
-    last_rescue: Option<std::time::Instant>,
+    /// When this host last answered a probe while its row was stale, as
+    /// a `Clock::now_mono()` mark (ADR 0098 D1: monotonic marks are
+    /// stored as `Duration`, not opaque `Instant`s).
+    last_rescue: Option<Duration>,
 }
 
 /// Pure verdict for the probe-failure path: is this failure enough
@@ -173,7 +179,7 @@ struct ProbeMemory {
 /// otherwise for the grace duration).
 fn probe_failure_permits_eviction(
     mem: &ProbeMemory,
-    now: std::time::Instant,
+    now: Duration,
     min_probe_failures: u32,
     probe_rescue_grace: Duration,
 ) -> bool {
@@ -181,7 +187,7 @@ fn probe_failure_permits_eviction(
         return false;
     }
     match mem.last_rescue {
-        Some(rescued_at) => now.duration_since(rescued_at) >= probe_rescue_grace,
+        Some(rescued_at) => now.saturating_sub(rescued_at) >= probe_rescue_grace,
         None => true,
     }
 }
@@ -189,8 +195,11 @@ fn probe_failure_permits_eviction(
 /// Spawn the detector as a background task. Returns a JoinHandle the
 /// caller can drop on shutdown. Runs forever; logs and continues on
 /// per-tick errors so a transient Postgres blip doesn't stop the loop.
-pub fn spawn(cfg: DeadHostConfig, pool: PgPool, state: SharedState) -> tokio::task::JoinHandle<()> {
+pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Same claimant identity convention as the enable scanner: the
+        // pod hostname, falling back for local/dev runs.
+        let claimant = std::env::var("HOSTNAME").unwrap_or_else(|_| "coord".into());
         let mut tick = tokio::time::interval(cfg.poll_interval);
         // Skip the immediate first tick — the coordinator just
         // started and no host has had time to be considered stale.
@@ -202,7 +211,7 @@ pub fn spawn(cfg: DeadHostConfig, pool: PgPool, state: SharedState) -> tokio::ta
             std::collections::HashMap::new();
         loop {
             tick.tick().await;
-            if let Err(e) = run_once(&cfg, &pool, &state, &mut probe_memory).await {
+            if let Err(e) = run_once(&cfg, &state, &claimant, &mut probe_memory).await {
                 tracing::warn!(error = %e, "dead-host detector tick failed; will retry");
             }
         }
@@ -211,8 +220,8 @@ pub fn spawn(cfg: DeadHostConfig, pool: PgPool, state: SharedState) -> tokio::ta
 
 async fn run_once(
     cfg: &DeadHostConfig,
-    pool: &PgPool,
     state: &SharedState,
+    claimant: &str,
     probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidates = state
@@ -233,7 +242,7 @@ async fn run_once(
     );
     for host in candidates {
         let host_addr = host.host_addr.clone();
-        if let Err(e) = evict_host(cfg, pool, state, host.id, host_addr, probe_memory).await {
+        if let Err(e) = evict_host(cfg, state, claimant, host.id, host_addr, probe_memory).await {
             tracing::warn!(host_id = %host.id, error = %e, "evict failed; another replica may have it");
         }
     }
@@ -275,7 +284,39 @@ fn recovery_target(has_snapshot: bool, has_live_manifest: bool) -> SessionState 
 
 async fn evict_host(
     cfg: &DeadHostConfig,
-    pool: &PgPool,
+    state: &SharedState,
+    claimant: &str,
+    host_id: HostId,
+    host_addr: Option<String>,
+    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let meta = &state.services.meta;
+    if !meta
+        .try_acquire_dead_host_lease(host_id, claimant, cfg.lease_stale_after)
+        .await?
+    {
+        // Another coordinator replica holds a live lease on this host.
+        // It will do the eviction; we just skip.
+        tracing::debug!(host_id = %host_id, "eviction lease contested; skipping");
+        return Ok(());
+    }
+    // Run the eviction with the lease held, releasing on EVERY outcome
+    // (including errors — the lease is not a lock; a leaked row would
+    // only delay a retry by `lease_stale_after`, but there is no reason
+    // to pay that on a clean error path).
+    let result = evict_host_locked(cfg, state, host_id, host_addr, probe_memory).await;
+    if let Err(e) = meta.release_dead_host_lease(host_id, claimant).await {
+        tracing::warn!(
+            host_id = %host_id,
+            error = %e,
+            "dead-host lease release failed; stale takeover will reap it",
+        );
+    }
+    result
+}
+
+async fn evict_host_locked(
+    cfg: &DeadHostConfig,
     state: &SharedState,
     host_id: HostId,
     host_addr: Option<String>,
@@ -284,39 +325,16 @@ async fn evict_host(
     let meta = &state.services.meta;
     let host_registry = &state.host_registry;
     let events = &state.events;
-    // Pin a single connection so the advisory lock stays with us for
-    // the duration of the eviction. `pg_try_advisory_lock` is a
-    // session-scoped lock and auto-releases when the connection
-    // closes — so even if we panic mid-eviction, the lock doesn't
-    // strand the host.
-    let mut conn = pool.acquire().await?;
-    let lock_key: String = format!("dead-host:{host_id}");
 
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
-        .bind(&lock_key)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !got {
-        // Another coordinator replica won the race for this host.
-        // It will do the eviction; we just skip.
-        tracing::debug!(host_id = %host_id, "advisory lock contested; skipping");
-        return Ok(());
-    }
-
-    // Re-check the host's status *after* taking the lock — another
+    // Re-check the host's status *after* taking the lease — another
     // replica that already won may have flipped it to Dead in the
     // window between our `list_stale_hosts` and now.
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM hosts WHERE id = $1")
-        .bind(host_id.as_uuid())
-        .fetch_optional(&mut *conn)
-        .await?
-        .flatten();
-    if matches!(status.as_deref(), Some("dead") | None) {
-        tracing::debug!(host_id = %host_id, "host already dead; releasing lock");
-        sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-            .bind(&lock_key)
-            .execute(&mut *conn)
-            .await?;
+    let status = meta.host_status(host_id).await?;
+    if matches!(
+        status,
+        Some(engram_core::types::host::HostStatus::Dead) | None
+    ) {
+        tracing::debug!(host_id = %host_id, "host already dead; skipping");
         return Ok(());
     }
 
@@ -372,17 +390,13 @@ async fn evict_host(
                 host_id,
                 ProbeMemory {
                     consecutive_failures: 0,
-                    last_rescue: Some(std::time::Instant::now()),
+                    last_rescue: Some(state.services.clock.now_mono()),
                 },
             );
             tracing::warn!(
                 host_id = %host_id,
                 "stale row but live host — host answered Ping while last_heartbeat_at is stale; SKIPPING eviction. Check heartbeat persistence (coord PG pool saturation?) — see engram_heartbeat_persist_failures_total (issue #231)",
             );
-            sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-                .bind(&lock_key)
-                .execute(&mut *conn)
-                .await?;
             return Ok(());
         }
         Some(false) => {
@@ -393,7 +407,7 @@ async fn evict_host(
             // host rides it out.
             let mem = probe_memory.entry(host_id).or_default();
             mem.consecutive_failures = mem.consecutive_failures.saturating_add(1);
-            let now = std::time::Instant::now();
+            let now = state.services.clock.now_mono();
             if !probe_failure_permits_eviction(
                 mem,
                 now,
@@ -406,13 +420,9 @@ async fn evict_host(
                     min_strikes = cfg.min_probe_failures,
                     recently_rescued = mem
                         .last_rescue
-                        .is_some_and(|t| now.duration_since(t) < cfg.probe_rescue_grace),
+                        .is_some_and(|t| now.saturating_sub(t) < cfg.probe_rescue_grace),
                     "stale row + failed probe, but not enough evidence to orphan its sessions yet; deferring eviction to a later tick",
                 );
-                sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-                    .bind(&lock_key)
-                    .execute(&mut *conn)
-                    .await?;
                 return Ok(());
             }
         }
@@ -424,17 +434,22 @@ async fn evict_host(
     let affected = meta.mark_host_dead_and_orphan_sessions(host_id).await?;
 
     // Notify other replicas so they drop their HostRegistry entry.
-    sqlx::query("SELECT pg_notify('host_dead', $1)")
-        .bind(host_id.to_string())
-        .execute(&mut *conn)
-        .await?;
+    meta.notify_host_dead(host_id).await?;
 
     // Stage 1: emit StatusChanged{prev -> HostLost} for every session
     // the bulk touched. The `prev` came back from the UPDATE so the
     // `from` is honest (not a hand-encoded `Active` that would lie if
     // the session had been Idle).
     for (session_id, prev) in &affected {
-        emit_status_changed(meta, events, *session_id, *prev, SessionState::HostLost).await;
+        emit_status_changed(
+            meta,
+            events,
+            *session_id,
+            *prev,
+            SessionState::HostLost,
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
 
     // Stage 2: per-session recoverability-aware second transition.
@@ -489,7 +504,15 @@ async fn evict_host(
 
         match meta.transition_session(*session_id, target).await {
             Ok(prev) => {
-                emit_status_changed(meta, events, *session_id, prev, target).await;
+                emit_status_changed(
+                    meta,
+                    events,
+                    *session_id,
+                    prev,
+                    target,
+                    state.services.clock.now_utc(),
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -509,11 +532,6 @@ async fn evict_host(
         "host marked dead; sessions moved through HostLost to Idle/Dead",
     );
 
-    sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-        .bind(&lock_key)
-        .execute(&mut *conn)
-        .await?;
-
     Ok(())
 }
 
@@ -521,9 +539,9 @@ async fn evict_host(
 mod tests {
     use super::*;
 
-    // The detector's polling loop and advisory-lock dance are
-    // Postgres-specific and require a live database to test
-    // meaningfully. The trait-layer logic
+    // The detector's polling loop and lease dance need a
+    // MetadataStore with real lease semantics to test meaningfully
+    // (live Postgres, or engram-sim's SimMetadataStore). The trait-layer logic
     // (`mark_host_dead_and_orphan_sessions` semantics) is covered
     // by Mock-based tests in `tests/dead_host_mock.rs`. End-to-end
     // multi-replica behaviour is the live-Postgres test
@@ -688,15 +706,14 @@ mod tests {
     // is the gate that makes that impossible: a failed probe evicts
     // only with `min_probe_failures` consecutive strikes AND no rescue
     // within `probe_rescue_grace`.
-    use std::time::Instant;
-
     const MIN: u32 = 3;
     const GRACE: Duration = Duration::from_secs(120);
 
-    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Instant) {
-        // Anchor `now` far enough from the ProbeMemory's rescue instant
-        // that subtraction can't underflow.
-        let now = Instant::now() + GRACE * 10;
+    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Duration) {
+        // `now` is a monotonic mark (ADR 0098 D1: `Clock::now_mono()`
+        // returns a `Duration`). Anchor it far enough from the
+        // ProbeMemory's rescue mark that subtraction can't underflow.
+        let now = GRACE * 10;
         let m = ProbeMemory {
             consecutive_failures: failures,
             last_rescue: rescued_ago.map(|ago| now - ago),

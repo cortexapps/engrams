@@ -8,6 +8,9 @@
 //! contract — status codes, JSON error envelope, the routing table —
 //! while exercising real exec round-trips end-to-end.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -537,6 +540,8 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
         )),
         host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -592,6 +597,8 @@ async fn build_forge_app() -> (
         )),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -765,6 +772,8 @@ impl TestFixture {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             default_image_version: "warm-bootstrap".into(),

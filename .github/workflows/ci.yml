@@ -238,24 +238,12 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: engram
-          POSTGRES_DB: engram_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     env:
       DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
-      # Used by the `#[ignore]`'d ha_listener tests in
-      # crates/engram-coordinator/tests/ha_listener.rs. The tests run
-      # `store.migrate()` themselves before exercising NOTIFY/LISTEN,
-      # so a bare Postgres without engram migrations is fine.
+      # Admin URL for the Postgres-gated `#[ignore]`'d tests. ADR 0099 H1:
+      # engram-testkit clones every test its OWN database off this URL
+      # (template-cloned, pre-migrated), so a bare Postgres is fine — the
+      # role just needs CREATEDB (the `postgres` superuser here).
       ENGRAM_TEST_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
       # ADR 0007: the GCS round-trip test in engram-storage-gcs is
       # gated on these env vars (so it no-ops on hosts without the
@@ -288,6 +276,29 @@ jobs:
           shared-key: workspace-debug
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+
+      # Postgres via plain `docker run` rather than `services:` for the
+      # same reason as fake-gcs-server below: service containers can't
+      # override the image's CMD, and the Postgres-gated lane runs deeply
+      # parallel (ADR 0099 H2) — each test's PostgresStore holds up to an
+      # 8-connection pool, so 16 concurrent tests need headroom over the
+      # stock max_connections=100.
+      - name: Start postgres
+        run: |
+          docker run -d --name engram-test-pg \
+            -e POSTGRES_PASSWORD=engram \
+            -e POSTGRES_DB=engram_test \
+            -p 5432:5432 \
+            postgres:16 \
+            -c max_connections=300
+          # -h 127.0.0.1 forces TCP: initdb's temporary bootstrap server
+          # listens on the unix socket only, so a socket-based pg_isready
+          # can report ready before the real server is up.
+          for _ in $(seq 1 30); do
+            docker exec engram-test-pg pg_isready -h 127.0.0.1 -U postgres && break
+            sleep 1
+          done
+          docker exec engram-test-pg pg_isready -h 127.0.0.1 -U postgres
 
       # GCS emulator for the cold-tier round-trip test. We can't use
       # `services:` here because github actions service containers
@@ -333,12 +344,14 @@ jobs:
       # from accidentally tripping firecracker tests that share the
       # `#[ignore]` bucket.
       #
-      # `--test-threads=1` is load-bearing: the two ha_listener tests
-      # both LISTEN on the `session_events` channel of the same
-      # Postgres database. Run in parallel they cross-talk — test B's
-      # listener catches test A's NOTIFY, the session_id assertion
-      # fires on the wrong row. Production has one listener per
-      # coordinator, so this is purely a test-harness artifact.
+      # ADR 0099 H2: every test clones its own database via
+      # engram-testkit (NOTIFY is per-database, so the old ha_listener
+      # cross-talk that forced `--test-threads=1` is structurally
+      # impossible). The tests are PG-IO-bound, so oversubscribe the
+      # 4 vcpus: 16 threads × worst-case ~17 connections per test
+      # (8-conn store pool + admin conn + a second pool in a few tests)
+      # stays under the max_connections=300 the `Start postgres` step
+      # provisions.
       - name: Postgres-gated ignored tests
         if: always()
         run: |
@@ -368,7 +381,21 @@ jobs:
             --test mount_catalog_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
-            --test-threads=1
+            --test-threads=16
+
+      # ADR 0098 D4: the SimMetadataStore conformance suite's live-PG
+      # half. Every scenario runs against BOTH the in-memory sim store
+      # (normal workspace lane) and a real template-cloned database
+      # (here) — the defense against sim-fidelity drift. Same admin URL
+      # + per-test isolation as the step above.
+      - name: SimMetadataStore conformance (PG half)
+        if: always()
+        run: |
+          cargo nextest run \
+            -p engram-sim \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=16
 
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
@@ -542,7 +569,10 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Exact versions bypass setup-bun's GitHub tags API lookup. Besides
+          # making the toolchain reproducible, this keeps CI running during a
+          # degraded GitHub REST API (the lookup otherwise fails before tests).
+          bun-version: 1.3.14
       - name: bun install
         run: bun install --frozen-lockfile
       - name: bun typecheck
@@ -567,7 +597,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
       - name: bun install
         run: bun install --frozen-lockfile
       - name: bun typecheck
@@ -1717,7 +1747,7 @@ jobs:
       # under ENGRAM_SKIP_WEB=1) and the `engrams` CLI both run on bun.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
       # ADR 0027 → 0035 → 0055 → 0062: the e2e host-agent reads its RO bundles
       # from var/shared (Tiltfile sets ENGRAM_BUNDLE_DIR there), CONTENT-ADDRESSED

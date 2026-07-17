@@ -1,0 +1,24 @@
+[package]
+name = "engram-sim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Deterministic simulation substrate (ADR 0098 D4): SimClock, SimEntropy, and SimMetadataStore — an in-memory MetadataStore faithful to PostgresStore, kept honest by the conformance suite."
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+chrono.workspace = true
+engram-core.workspace = true
+parking_lot.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+engram-postgres.workspace = true
+engram-testkit.workspace = true

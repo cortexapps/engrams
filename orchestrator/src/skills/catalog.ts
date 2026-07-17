@@ -25,15 +25,15 @@ export const BUILTIN_SKILLS: { name: string; label: string; description: string 
   },
   {
     // ADR 0065: the single browser capability. Mounts the `browser` bundle
-    // (Xvfb + full chromium + x11vnc + openbox) AND the playwright-cli +
-    // show-your-work skill pointed at that same Chromium over CDP. So the human
+    // (Xvfb + full chromium + x11vnc + openbox) and the intent-aware
+    // playwright-cli 0.1.17 wrapper pointed at that same Chromium over CDP. So the human
     // drives it over VNC in the BROWSER tab and the agent drives the SAME
     // browser programmatically — one selection, one shared browser. (The old
     // headless-only `playwright` skill is retired into this.)
     name: "browser",
     label: "Browser",
     description:
-      "One shared Chromium the human drives over VNC (BROWSER tab) and the agent drives programmatically — same browser, so the human watches the agent live. Use an image sized for a browser (≥1 GiB).",
+      "One shared Chromium: the human watches or takes over through VNC while the agent uses semantic browser control with visual fallback. Evidence is shared only on request. Use an image sized for a browser (≥1 GiB).",
   },
   {
     // ADR 0085: the in-guest IDE bundle (code-server), a human surface served

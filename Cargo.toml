@@ -33,6 +33,8 @@ members = [
     "crates/engram-git-dev",
     "crates/engram-git-github",
     "crates/engram-postgres",
+    "crates/engram-sim",
+    "crates/engram-testkit",
     "crates/engram-egress-proxy",
     "crates/engram-crypto",
     "crates/engram-oci",
@@ -53,6 +55,12 @@ rust-version = "1.80"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+# ADR 0098 D1: crates that carry a clippy.toml `disallowed-methods` list
+# (coordinator, postgres) get direct time/uuid calls denied; crates
+# without one have an empty list, so this is a no-op for them.
+disallowed_methods = "deny"
+
 [workspace.dependencies]
 # kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
 # rustls (not openssl) to match reqwest's TLS choice; "latest" k8s-openapi
@@ -72,6 +80,8 @@ schemars = "0.8"
 engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
+engram-sim = { path = "crates/engram-sim" }
+engram-testkit = { path = "crates/engram-testkit" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
 engram-sandbox-vz = { path = "crates/engram-sandbox-vz" }
 engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }
@@ -226,6 +236,11 @@ url = "2"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 sha2 = "0.10"
+
+# property-based testing (ADR 0099 H3/H4). Dev-dependency only; the
+# persisted `proptest-regressions/` seeds turn every counterexample into a
+# checked-in deterministic regression test.
+proptest = "1"
 
 # tls + cert mint (host-side egress proxy)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }

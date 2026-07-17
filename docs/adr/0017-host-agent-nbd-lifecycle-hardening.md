@@ -400,3 +400,80 @@ As of 2026-05-24, dev-vm still has `/dev/nbd1..5` bound to dead
 PIDs `4203, 5562, 6911, 9093, 10683`. They'll be cleaned on the
 next host-agent startup (now that Phase B is wired). No manual
 intervention required.
+
+---
+
+## Addendum (2026-07-17): acked-write durability across pod rolls + slot hygiene
+
+Session `85e0298a` (prod, 2026-07-16) surfaced guest-visible ext4
+corruption (`Corrupt inode bitmap`, `Structure needs cleaning`,
+EUCLEAN) traced to three acked-write-loss / stale-read windows in the
+NBD data plane. Fixed in the commit chain carrying this addendum:
+
+1. **SIGTERM deadline overrun rolled back acked writes.** NBD WRITEs
+   ack from the in-RAM dirty tier; the issue-#225 final flush is
+   budgeted (20 s) against `terminationGracePeriodSeconds`, and on
+   overrun the dirty tier died with the process — the successor
+   rehydrated from the last published manifest, silently rolling a
+   RUNNING guest's disk back (320–370 MiB per sandbox in the incident;
+   9 overruns fleet-wide that week). Fix: the abandon sweep now exports
+   every un-uploaded chunk (dirty ∪ pending-upload tiers) to a
+   **shutdown spool** under `<checkpoint_dir>/spool/<sandbox_id>/`
+   (hostPath, survives the roll), and the successor's
+   `rehydrate_sandbox` adopts a lineage-matching spool into the fresh
+   backend's dirty tier BEFORE the RECONFIGURE releases parked guest
+   I/O. The spool tolerates the store-ahead case (chunks + manifest
+   uploaded, coord publish lost) by attaching from the spool's newer
+   ref. Regression: `nbd_shutdown_final_flush.rs::
+   sigterm_overrun_spools_dirty_writes_and_successor_adopts_them`.
+
+2. **Host page cache is a hidden volatile write tier.** FC's drive is
+   buffered host I/O (`cache_type=Unsafe`), so guest-acked writes sit
+   in the host page cache for `/dev/nbdN`; during the pod-handoff
+   dead-connection window their writeback fails and the kernel drops
+   them (`lost async page write` — observed at both incident rolls).
+   Fix: the SIGTERM flush pass now `sync_all`s each survivor's device
+   FIRST (while our serve loop can still ack the writeback), pushing
+   that tier into the dirty map where the flush/spool can see it. The
+   full fix (O_DIRECT FC drives so device errors surface to the guest
+   instead of vanishing) needs the ADR 0045 FC fork and stays open.
+
+3. **NBD slot reuse leaked the previous tenant's page cache.** The
+   ADR 0049 allocator reuses `/dev/nbdN` minors with no invalidation
+   anywhere in release → acquire → attach; the kernel does not
+   reliably invalidate a bdev's page cache across
+   disconnect/reconnect, so a fresh tenant could read the PRIOR
+   tenant's cached pages — including pages whose writeback had failed
+   at that tenant's teardown. (The incident session attached to a slot
+   that had just absorbed a 13-minute failed-writeback storm and hit a
+   corrupt-bitmap CRC failure 17 minutes later, before any loss event
+   of its own; the post-copy migration path already carried a
+   `BLKFLSBUF` for exactly this class.) Fix: `attach_backend` now
+   BLKFLSBUFs every freshly CONNECTed device before the caller hands
+   it to FC; failure is a hard attach error (a failed create beats
+   silent cross-tenant corruption).
+
+4. **`claim` raced the populator's validation window.** `populate`
+   holds a slot RESERVED for the duration of its free-check; a busy
+   survivor device is reserve→check→unreserve cycled, so a one-shot
+   `claim` landing inside the window read "reserved, not warm" as "a
+   lease owns it" and returned `None` — the successor's rehydrate then
+   strands the survivor's disk until evict_local → resume (surfaced as
+   a CI flake of the spool regression test; the same race exists at
+   every prod successor startup). `claim` now retries across the
+   window; a genuine lease still returns `None` after the budget.
+
+Related fix in the same chain (engram-chunk-store): the cache sweep's
+`list_entries` walk aborted on any vanish-mid-walk `NotFound` stat —
+chronically, several times an hour on every busy host — so eviction
+never completed a pass and the cache blew far past its budget (424 GiB
+/ 77 % of the incident node's volume, an ENOSPC-corruption risk). The
+walk now skips vanished entries.
+
+Still open (follow-ups, not this chain): serve-loop outage
+post-checkpoint failed guest writes for 13 minutes on the incident
+node (root cause of the storm itself, distinct from the slot-reuse
+leak above); read-path integrity is verify-on-populate only (a corrupt
+NVMe cache file or RAM tier is served unverified and can be laundered
+into new dirty chunks via RMW); periodic checkpoints retry forever
+against a dead data plane instead of escalating.
