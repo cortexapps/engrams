@@ -91,7 +91,10 @@ impl SimMetadataStore {
             }
             let (mem_res, cpu_res) = reserved.get(&h.id).copied().unwrap_or((0, 0));
             let free_mem = alloc - mem_res;
-            let free_cpu = i64::from(h.total_vcpus) - cpu_res;
+            // CPU budgets are OVERCOMMITTED (host_cpu_budget = vcpus x
+            // factor) — conformance caught SimMeta using raw vcpus.
+            let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
+            let free_cpu = cpu_budget - cpu_res;
             (free_mem >= mem_budget_mib && free_cpu >= cpu_budget_vcpus).then_some(free_mem)
         };
         let best_of = |tier: &[&HostRecord]| -> Option<HostId> {
@@ -272,6 +275,14 @@ impl MetadataStore for SimMetadataStore {
         db.runtime_specs.insert(ws.session_id, ws.runtime_spec);
         if let Some(secrets) = ws.sealed_secrets {
             db.session_secrets.insert(ws.session_id, secrets);
+        }
+        if !ws.capabilities.is_empty() {
+            db.session_capabilities
+                .insert(ws.session_id, ws.capabilities.clone());
+        }
+        if let Some(policy) = &ws.integration_policy_json {
+            db.session_integration_policy
+                .insert(ws.session_id, policy.clone());
         }
         drop(db);
         match picked {
@@ -499,22 +510,40 @@ impl MetadataStore for SimMetadataStore {
 
     // ================= hosts =================
 
+    /// Mirrors upsert_host's exact column list: hostname, metadata,
+    /// capacity, heartbeat, status, capabilities, and COALESCE'd
+    /// host_addr. Utilization (allocatable), images/bundles, vcpus,
+    /// wire_version, stages_images, and cordoned are HEARTBEAT-only
+    /// columns — registration never writes them (a fresh host is
+    /// "unmeasured" until its first heartbeat; the conformance suite
+    /// caught SimMeta clobbering them from the record).
     async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
         self.gate()?;
         let mut db = self.db.lock();
-        let entry = db.hosts.entry(host.id);
-        match entry {
+        match db.hosts.entry(host.id) {
             std::collections::btree_map::Entry::Occupied(mut o) => {
-                // `host_addr = COALESCE(EXCLUDED.host_addr, hosts.host_addr)`
-                let prev_addr = o.get().host_addr.clone();
-                let mut new = host;
-                if new.host_addr.is_none() {
-                    new.host_addr = prev_addr;
+                let prev = o.get_mut();
+                prev.hostname = host.hostname;
+                prev.cloud_metadata = host.cloud_metadata;
+                prev.capacity = host.capacity;
+                prev.last_heartbeat_at = host.last_heartbeat_at;
+                prev.status = host.status;
+                if host.host_addr.is_some() {
+                    prev.host_addr = host.host_addr;
                 }
-                o.insert(new);
+                prev.capabilities = host.capabilities;
             }
             std::collections::btree_map::Entry::Vacant(v) => {
-                v.insert(host);
+                let mut fresh = host;
+                // Schema defaults for the heartbeat-only columns.
+                fresh.utilization = Default::default();
+                fresh.ready_images = Vec::new();
+                fresh.current_bundles = Vec::new();
+                fresh.cordoned = false;
+                fresh.total_vcpus = 0;
+                fresh.wire_version = 0;
+                fresh.stages_images = false;
+                v.insert(fresh);
             }
         }
         drop(db);
@@ -2503,6 +2532,83 @@ impl MetadataStore for SimMetadataStore {
         Ok(deletable)
     }
 
+    // ============ session satellites (create-tx sidecars) ============
+
+    async fn bind_session_capabilities(
+        &self,
+        session_id: SessionId,
+        caps: &[Capability],
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        let entry = db.session_capabilities.entry(session_id).or_default();
+        for c in caps {
+            // ON CONFLICT DO NOTHING over the (provider, action,
+            // resource) key.
+            if !entry.contains(c) {
+                entry.push(c.clone());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_session_capabilities(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Vec<Capability>, MetaError> {
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .session_capabilities
+            .get(&session_id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn bind_session_integration_policy(
+        &self,
+        session_id: SessionId,
+        policy_json: &str,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        self.db
+            .lock()
+            .session_integration_policy
+            .insert(session_id, policy_json.to_string());
+        Ok(())
+    }
+
+    async fn get_session_integration_policy(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .session_integration_policy
+            .get(&session_id)
+            .cloned())
+    }
+
+    /// `SELECT harness FROM sessions WHERE id = $1` — the column
+    /// mirrored from runtime_spec.selected_harness at create time.
+    async fn get_session_harness(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<String>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        if !db.sessions.contains_key(&session_id) {
+            return Ok(None);
+        }
+        Ok(db
+            .runtime_specs
+            .get(&session_id)
+            .and_then(|spec| spec.selected_harness.clone()))
+    }
+
     // ================= panic-not-default stubs =================
     // PG-semantic methods not yet mirrored (capture/enable-job
     // machinery, catalogs, org secrets, broker tokens, teleport,
@@ -2518,22 +2624,6 @@ impl MetadataStore for SimMetadataStore {
         _prestage_ref: serde_json::Value,
     ) -> Result<(), MetaError> {
         panic!("SimMeta: begin_enable_job_prestage not implemented — add it plus a conformance case (ADR 0098 D4)")
-    }
-
-    async fn bind_session_capabilities(
-        &self,
-        _session_id: SessionId,
-        _caps: &[Capability],
-    ) -> Result<(), MetaError> {
-        panic!("SimMeta: bind_session_capabilities not implemented — add it plus a conformance case (ADR 0098 D4)")
-    }
-
-    async fn bind_session_integration_policy(
-        &self,
-        _session_id: SessionId,
-        _policy_json: &str,
-    ) -> Result<(), MetaError> {
-        panic!("SimMeta: bind_session_integration_policy not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
     async fn bundle_pin_set(
@@ -2668,27 +2758,6 @@ impl MetadataStore for SimMetadataStore {
         _name: &str,
     ) -> Result<Option<engram_core::types::org_secret::SealedOrgSecret>, MetaError> {
         panic!("SimMeta: get_org_secret_sealed not implemented — add it plus a conformance case (ADR 0098 D4)")
-    }
-
-    async fn get_session_capabilities(
-        &self,
-        _session_id: SessionId,
-    ) -> Result<Vec<Capability>, MetaError> {
-        panic!("SimMeta: get_session_capabilities not implemented — add it plus a conformance case (ADR 0098 D4)")
-    }
-
-    async fn get_session_harness(
-        &self,
-        _session_id: SessionId,
-    ) -> Result<Option<String>, MetaError> {
-        panic!("SimMeta: get_session_harness not implemented — add it plus a conformance case (ADR 0098 D4)")
-    }
-
-    async fn get_session_integration_policy(
-        &self,
-        _session_id: SessionId,
-    ) -> Result<Option<String>, MetaError> {
-        panic!("SimMeta: get_session_integration_policy not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
     async fn get_skill_by_name(
@@ -2852,13 +2921,77 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: place_capture_job not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
+    /// Diagnostic twin of `pick_host_2d` (no locking): same eligibility
+    /// predicate, same reservation sum, per-host fit verdicts with the
+    /// same reason labels (`not_lockable` / `unmeasured` / `ram_full` /
+    /// `cpu_full` / `fits_now`).
     async fn placement_no_fit_details(
         &self,
-        _candidates: &[HostId],
-        _mem_budget_mib: i64,
-        _cpu_budget_vcpus: i32,
+        candidates: &[HostId],
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i32,
     ) -> Result<Vec<PlacementNoFit>, MetaError> {
-        panic!("SimMeta: placement_no_fit_details not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        if candidates.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = self.now();
+        let db = self.db.lock();
+        let mut reserved: std::collections::BTreeMap<HostId, (i64, i64)> = Default::default();
+        for row in db.sessions.values() {
+            let Some(host) = row.session.host_id else {
+                continue;
+            };
+            let st = row.session.status;
+            let counts = st.reserves_host_memory()
+                && (st != SessionState::Pending
+                    || row.session.last_active_at > now - chrono::Duration::minutes(10));
+            if counts {
+                let e = reserved.entry(host).or_default();
+                e.0 += row.mem_budget_mib;
+                e.1 += i64::from(row.cpu_budget_vcpus);
+            }
+        }
+        Ok(candidates
+            .iter()
+            .map(|id| {
+                let eligible = db.hosts.get(id).filter(|h| {
+                    matches!(h.status, HostStatus::Ready | HostStatus::Draining) && !h.cordoned
+                });
+                let Some(h) = eligible else {
+                    return PlacementNoFit {
+                        host_id: *id,
+                        reason: "not_lockable",
+                        free_mib: 0,
+                        free_vcpus: 0,
+                    };
+                };
+                let (res_mib, res_vcpus) = reserved.get(id).copied().unwrap_or((0, 0));
+                let alloc = h.utilization.allocatable_mib as i64;
+                let cpu_budget = engram_core::types::host::host_cpu_budget(h.total_vcpus);
+                let free_vcpus = if cpu_budget > 0 {
+                    cpu_budget - res_vcpus
+                } else {
+                    i64::MAX
+                };
+                let free_mib = alloc - res_mib;
+                let reason = if alloc <= 0 {
+                    "unmeasured"
+                } else if free_mib < mem_budget_mib {
+                    "ram_full"
+                } else if free_vcpus < i64::from(cpu_budget_vcpus) {
+                    "cpu_full"
+                } else {
+                    "fits_now"
+                };
+                PlacementNoFit {
+                    host_id: *id,
+                    reason,
+                    free_mib,
+                    free_vcpus,
+                }
+            })
+            .collect())
     }
 
     async fn reassign_capture_job(

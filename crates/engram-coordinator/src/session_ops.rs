@@ -569,7 +569,9 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
 /// N queued ops for a session drains at O(1) stack depth — the old
 /// `drive_claimed → Box::pin(drive_session) → drive_claimed …` shape
 /// nested one future per op.
-pub(crate) async fn drive_session(state: &SharedState, session_id: SessionId) {
+/// Drive one session's op pipeline to its next yield point. `pub` so the
+/// DST harness (engram-dst, ADR 0098 D5) steps it directly.
+pub async fn drive_session(state: &SharedState, session_id: SessionId) {
     loop {
         let op = match state
             .services
@@ -593,7 +595,9 @@ pub(crate) async fn drive_session(state: &SharedState, session_id: SessionId) {
 /// re-drive: a busy session never waits for a notify). `pub(crate)` for
 /// deterministic test driving. The continuation is a LOOP, not a
 /// recursive self-call — [`drive_session`] invokes [`drive_one`] directly.
-pub(crate) async fn drive_claimed(state: &SharedState, op: SessionOp) {
+/// Drive an ALREADY-CLAIMED op (the reclaim sweep's continuation).
+/// `pub` so the DST harness mirrors the sweep (engram-dst, ADR 0098 D5).
+pub async fn drive_claimed(state: &SharedState, op: SessionOp) {
     let session_id = op.session_id;
     drive_one(state, op).await;
     // Completion re-drive — iterative (review finding #13).

@@ -202,6 +202,9 @@ pub struct SimDb {
     pub dead_host_inflight: std::collections::BTreeMap<HostId, (String, DateTime<Utc>)>,
     pub runtime_specs:
         std::collections::BTreeMap<SessionId, engram_core::types::runtime_spec::RuntimeSpec>,
+    pub session_capabilities:
+        std::collections::BTreeMap<SessionId, Vec<engram_core::types::capability::Capability>>,
+    pub session_integration_policy: std::collections::BTreeMap<SessionId, String>,
 }
 
 impl SimDb {

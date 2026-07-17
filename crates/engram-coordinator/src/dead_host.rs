@@ -161,7 +161,7 @@ impl Default for DeadHostConfig {
 /// strike window — a bounded, conservative error in the safe direction
 /// (never evicts EARLIER than a single replica would).
 #[derive(Clone, Copy, Debug, Default)]
-struct ProbeMemory {
+pub struct ProbeMemory {
     /// Consecutive failed probes, one per detector tick. Reset by any
     /// answered probe.
     consecutive_failures: u32,
@@ -195,6 +195,10 @@ fn probe_failure_permits_eviction(
 /// Spawn the detector as a background task. Returns a JoinHandle the
 /// caller can drop on shutdown. Runs forever; logs and continues on
 /// per-tick errors so a transient Postgres blip doesn't stop the loop.
+/// Per-host probe history, keyed by host id. Owned by the caller of
+/// [`run_once`] so strikes persist across sweeps.
+pub type ProbeMemoryMap = std::collections::HashMap<HostId, ProbeMemory>;
+
 pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Same claimant identity convention as the enable scanner: the
@@ -207,8 +211,7 @@ pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle
         // Probe history across ticks (strikes + rescue grace); pruned
         // to the current candidate set each sweep, so a host whose
         // heartbeats recover starts its next staleness episode fresh.
-        let mut probe_memory: std::collections::HashMap<HostId, ProbeMemory> =
-            std::collections::HashMap::new();
+        let mut probe_memory = ProbeMemoryMap::new();
         loop {
             tick.tick().await;
             if let Err(e) = run_once(&cfg, &state, &claimant, &mut probe_memory).await {
@@ -218,11 +221,13 @@ pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle
     })
 }
 
-async fn run_once(
+/// One detector sweep. `pub` so tests and the DST harness (engram-dst,
+/// ADR 0098 D5) drive it directly without the timer loop.
+pub async fn run_once(
     cfg: &DeadHostConfig,
     state: &SharedState,
     claimant: &str,
-    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
+    probe_memory: &mut ProbeMemoryMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidates = state
         .services
