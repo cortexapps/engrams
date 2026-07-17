@@ -87,6 +87,7 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     secrets: [],
     isDefault: false,
     portExposures: [],
+    designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -110,14 +111,17 @@ function makeProfiles(seed: ProfileRow[]): ProfileStore {
     async getDefault() {
       return [...rows.values()].find((row) => row.isDefault && row.deletedAt == null) ?? null;
     },
+    async getByDesignation(designation) {
+      return [...rows.values()].find((row) => row.designation === designation && row.deletedAt == null) ?? null;
+    },
     async getByIds(ids) {
       return ids.flatMap((id) => {
         const row = rows.get(id);
         return row ? [row] : [];
       });
     },
-    async create(input: ProfileInput) {
-      const row = profileRow({ ...input, id: `profile-${rows.size + 1}` });
+    async create(input: ProfileInput, designation) {
+      const row = profileRow({ ...input, id: `profile-${rows.size + 1}`, designation: designation ?? null });
       rows.set(row.id, row);
       return row;
     },

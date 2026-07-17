@@ -245,6 +245,7 @@ function makeFakeProfiles(opts?: {
     secrets: [],
     isDefault: false,
     portExposures: opts?.portExposures ?? [],
+    designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -263,6 +264,9 @@ function makeFakeProfiles(opts?: {
     },
     async getDefault() {
       return [...rows.values()].find((r) => r.isDefault && !r.deletedAt) ?? null;
+    },
+    async getByDesignation(designation) {
+      return [...rows.values()].find((r) => r.designation === designation && !r.deletedAt) ?? null;
     },
     async getByIds(ids) {
       return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[];

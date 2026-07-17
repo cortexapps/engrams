@@ -15,7 +15,7 @@
  * does not require them for queries but they document the FK graph).
  */
 
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import {
   pgTable,
   text,
@@ -325,52 +325,64 @@ export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   allowHostPatterns: [],
 };
 
-export const profile = pgTable("profile", {
-  id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
-  name: text("name").notNull(),
-  description: text("description").notNull().default(""),
-  icon: text("icon").notNull().default("Bot"), // lucide icon name
-  imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
-  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
-  // this profile's sessions run, with default model + effort (catalog option
-  // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
-  // "inherit deployment default" semantics were superseded; existing rows were
-  // backfilled to `claude`). model/effort stay nullable → the harness
-  // descriptor's defaults. All overridable per session.
-  harness: text("harness").notNull(),
-  model: text("model"),
-  effort: text("effort"),
-  includeUserTokens: boolean("include_user_tokens").notNull().default(false),
-  envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
-  // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-  // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
-  // mounts at session create. Empty = base session (no skills).
-  skills: jsonb("skills").$type<string[]>().notNull().default([]),
-  // ADR 0056: integration capabilities ("provider:action[@resource]") this
-  // profile's sessions are granted. Passed to the coordinator at session create
-  // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
-  // no third-party integration access.
-  capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
-  // ADR 0057: egress network allow-list (deny by default) + secrets this
-  // profile's sessions get, lifted off the image manifest. Additive in B1;
-  // compiled into the per-session SessionPolicy + consumed at boot in B2.
-  network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
-  secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
-  // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
-  // its session with this. At most one active default; the store clears the
-  // prior when one is set.
-  isDefault: boolean("is_default").notNull().default(false),
-  // ADR 0064: guest ports auto-exposed (private) for every session from this
-  // profile. The orchestrator mints one private port_exposure per declared port
-  // at session create (best-effort). Empty = no auto-exposed ports.
-  portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-  updatedAt: timestamp("updated_at")
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-  deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
-});
+export const profile = pgTable(
+  "profile",
+  {
+    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    icon: text("icon").notNull().default("Bot"), // lucide icon name
+    imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
+    // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+    // this profile's sessions run, with default model + effort (catalog option
+    // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
+    // "inherit deployment default" semantics were superseded; existing rows were
+    // backfilled to `claude`). model/effort stay nullable → the harness
+    // descriptor's defaults. All overridable per session.
+    harness: text("harness").notNull(),
+    model: text("model"),
+    effort: text("effort"),
+    includeUserTokens: boolean("include_user_tokens").notNull().default(false),
+    envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
+    // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+    // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
+    // mounts at session create. Empty = base session (no skills).
+    skills: jsonb("skills").$type<string[]>().notNull().default([]),
+    // ADR 0056: integration capabilities ("provider:action[@resource]") this
+    // profile's sessions are granted. Passed to the coordinator at session create
+    // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
+    // no third-party integration access.
+    capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
+    // ADR 0057: egress network allow-list (deny by default) + secrets this
+    // profile's sessions get, lifted off the image manifest. Additive in B1;
+    // compiled into the per-session SessionPolicy + consumed at boot in B2.
+    network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
+    secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
+    // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
+    // its session with this. At most one active default; the store clears the
+    // prior when one is set.
+    isDefault: boolean("is_default").notNull().default(false),
+    // ADR 0064: guest ports auto-exposed (private) for every session from this
+    // profile. The orchestrator mints one private port_exposure per declared port
+    // at session create (best-effort). Empty = no auto-exposed ports.
+    portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
+    // System marker (ADR 0100): at most one profile per value; the review
+    // workflow finds its profile by this marker, and designated profiles cannot
+    // be deleted.
+    designation: text("designation"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at")
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+    deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
+  },
+  (t) => [
+    uniqueIndex("profile_designation_unique")
+      .on(t.designation)
+      .where(sql`designation is not null`),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // Connector catalog (ADR 0057 C1)

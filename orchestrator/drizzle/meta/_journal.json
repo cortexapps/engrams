@@ -176,6 +176,13 @@
       "when": 1784312465128,
       "tag": "0024_swift_epoch",
       "breakpoints": true
+    },
+    {
+      "idx": 25,
+      "version": "7",
+      "when": 1784322785482,
+      "tag": "0025_motionless_whiplash",
+      "breakpoints": true
     }
   ]
 }

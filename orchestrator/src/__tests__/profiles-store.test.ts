@@ -1,5 +1,6 @@
 import { expect, test, describe } from "bun:test";
 import { checkDb, getDb } from "../db/client.ts";
+import { isUniqueViolation } from "../db/pg-errors.ts";
 import { makeProfileStore } from "../db/profiles.ts";
 import { profile as profileTable } from "../db/schema.ts";
 import { eq, inArray } from "drizzle-orm";
@@ -25,6 +26,48 @@ const baseInput = {
 };
 
 describe("ProfileStore", () => {
+  test.skipIf(!dbReachable)("designation lookup, preservation, and uniqueness", async () => {
+    const store = makeProfileStore(getDb());
+    const designation = "pr_reviewer";
+    const createdIds: string[] = [];
+    try {
+      const created = await store.create(
+        { ...baseInput, name: `Reviewer ${Date.now()}` },
+        designation,
+      );
+      createdIds.push(created.id);
+
+      expect(created.designation).toBe(designation);
+      expect((await store.getByDesignation(designation))?.id).toBe(created.id);
+      expect(await store.getByDesignation("unused_designation")).toBeNull();
+
+      const updated = await store.update(created.id, {
+        ...baseInput,
+        name: "Updated Reviewer",
+      });
+      expect(updated?.designation).toBe(designation);
+
+      await store.softDelete(created.id);
+      expect(await store.getByDesignation(designation)).toBeNull();
+
+      const duplicate = await store
+        .create({ ...baseInput, name: `Duplicate Reviewer ${Date.now()}` }, designation)
+        .then(() => null)
+        .catch((e: unknown) => e);
+      expect(duplicate).not.toBeNull();
+      // Drizzle wraps the driver error inside a transaction; the predicate the
+      // seed relies on must still recognize the unique violation.
+      expect(isUniqueViolation(duplicate)).toBe(true);
+    } finally {
+      if (createdIds.length > 0) {
+        await getDb()
+          .delete(profileTable)
+          .where(inArray(profileTable.id, createdIds))
+          .catch(() => {});
+      }
+    }
+  });
+
   test.skipIf(!dbReachable)("create → getActive → list → update → softDelete", async () => {
     const store = makeProfileStore(getDb());
     const input = {
