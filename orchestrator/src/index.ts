@@ -55,7 +55,9 @@ import { makeProductionListenerManager } from "./listeners/manager.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
+import { makeProfileStore } from "./db/profiles.ts";
 import { tools } from "./tools/registry.ts";
+import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 
 const app = new Hono();
 
@@ -204,6 +206,9 @@ setThreadControlPlane(makeThreadControlPlane());
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
+void seedReviewerProfile(makeProfileStore(getDb()), log).catch((err) =>
+  log.error({ err }, "reviewer profile seed failed"),
+);
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 const listenerManager = makeProductionListenerManager();

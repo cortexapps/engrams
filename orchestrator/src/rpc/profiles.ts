@@ -45,6 +45,7 @@ import {
   type CustomConnectorSource,
 } from "../connectors/registry.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import { toolCapabilities as registeredToolCapabilities } from "../tools/registry.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -77,6 +78,7 @@ export interface ProfileDeps {
   harnessCatalog?: HarnessCatalogClient;
   mountCatalog?: MountCatalogClient;
   connectors?: CustomConnectorSource;
+  toolCapabilities?: Set<string>;
 }
 
 function headersOf(ctx: HandlerContext): Headers {
@@ -210,6 +212,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   // (tests) doesn't throw. loadRegistry degrades to built-in seeds if the read
   // fails.
   const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  // Resolve the production registry lazily: ProfileService is registered before
+  // startup registers all built-in tools.
+  const toolCapabilities = (): Set<string> =>
+    deps?.toolCapabilities ?? registeredToolCapabilities();
 
   /** Validate image_id against the live catalog; throw InvalidArgument if absent. */
   async function assertImageEnabled(imageId: string): Promise<void> {
@@ -279,15 +285,20 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   }
 
   /**
-   * ADR 0056 (B′): validate each capability is (1) a well-formed
-   * `provider:action[@resource]` string (mirrors
+   * ADR 0056 (B′): a capability may gate a registered built-in tool. Otherwise
+   * it must be (1) a well-formed `provider:action[@resource]` string (mirrors
    * engram_core::types::Capability::parse) and (2) actually *granted* by a
    * connector — the editor offers only what a connector grants. The coordinator
    * re-validates authoritatively at session-create; rejecting here keeps a
    * profile from ever storing a grant no connector backs.
    */
-  function assertCapabilitiesValid(capabilities: string[], registry: Map<string, Connector>): void {
+  function assertCapabilitiesValid(
+    capabilities: string[],
+    registry: Map<string, Connector>,
+    builtInToolCapabilities: Set<string>,
+  ): void {
     for (const c of capabilities) {
+      if (builtInToolCapabilities.has(c)) continue;
       const parsed = parseCapability(c);
       if (!parsed) {
         throw new ConnectError(
@@ -340,7 +351,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const effort = catalogOptionId(req.effort);
       const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
+      assertCapabilitiesValid(
+        req.capabilities ?? [],
+        await loadRegistry(connectors),
+        toolCapabilities(),
+      );
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
@@ -375,7 +390,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const effort = catalogOptionId(req.effort);
       const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
+      assertCapabilitiesValid(
+        req.capabilities ?? [],
+        await loadRegistry(connectors),
+        toolCapabilities(),
+      );
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
@@ -405,6 +424,13 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
+      const row = await store.get(req.id);
+      if (row?.designation != null) {
+        throw new ConnectError(
+          `cannot delete a system profile (designation: ${row.designation})`,
+          Code.FailedPrecondition,
+        );
+      }
       await store.softDelete(req.id);
       return {};
     },

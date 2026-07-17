@@ -1,15 +1,12 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
-import { ConnectError, Code, createClient } from "@connectrpc/connect";
-import { createConnectTransport } from "@connectrpc/connect-node";
-import { Hono } from "hono";
-import type { AddressInfo } from "node:net";
+import { ConnectError, Code, createClient, createRouterTransport } from "@connectrpc/connect";
 
-import { buildServer } from "../server.ts";
 import { registerProfiles } from "../rpc/profiles.ts";
 import type { ProfileDeps, ImagesClient, GetSession, HarnessCatalogClient } from "../rpc/profiles.ts";
 import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
 import { ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
 import type { MountCatalogClient } from "../skills/catalog.ts";
+import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
 
 /** Fake catalog whose live uploaded skills are `uploadedNames` (builtins are implicit). */
 const fakeCatalog = (uploadedNames: string[] = []): MountCatalogClient => ({
@@ -69,8 +66,8 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
 function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
   const rows = new Map<string, ProfileRow>(seed.map((r) => [r.id, r]));
   let n = 0;
-  const mk = (id: string, input: ProfileInput): ProfileRow => ({
-    id, ...input, createdAt: new Date(0), updatedAt: new Date(0), deletedAt: null,
+  const mk = (id: string, input: ProfileInput, designation: string | null = null): ProfileRow => ({
+    id, ...input, designation, createdAt: new Date(0), updatedAt: new Date(0), deletedAt: null,
   });
   return {
     async list({ includeArchived }) {
@@ -81,8 +78,11 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
     async get(id) { return rows.get(id) ?? null; },
     async getActive(id) { const r = rows.get(id); return r && r.deletedAt == null ? r : null; },
     async getDefault() { return [...rows.values()].find((r) => r.isDefault && r.deletedAt == null) ?? null; },
+    async getByDesignation(designation) {
+      return [...rows.values()].find((r) => r.designation === designation && r.deletedAt == null) ?? null;
+    },
     async getByIds(ids) { return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[]; },
-    async create(input) { const id = `p${n++}`; const r = mk(id, input); rows.set(id, r); return r; },
+    async create(input, designation) { const id = `p${n++}`; const r = mk(id, input, designation); rows.set(id, r); return r; },
     async update(id, input) {
       const ex = rows.get(id); if (!ex || ex.deletedAt != null) return null;
       const r = { ...ex, ...input, updatedAt: new Date(0) }; rows.set(id, r); return r;
@@ -92,19 +92,14 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
 }
 
 async function spawn(deps: ProfileDeps) {
-  const app = new Hono();
-  app.notFound((c) => c.json({ error: "not found" }, 404));
   // ADR 0063: a profile always validates its harness against the catalog —
   // default to the fake so tests don't reach the live (coord) client. Specific
   // tests can still override.
   const withCatalog: ProfileDeps = { harnessCatalog: fakeHarnessCatalog(), ...deps };
-  const srv = buildServer(app, (router) => registerProfiles(router, withCatalog));
-  const url = await new Promise<string>((res) =>
-    srv.listen(0, "127.0.0.1", () => res(`http://127.0.0.1:${(srv.address() as AddressInfo).port}`)),
-  );
+  const transport = createRouterTransport((router) => registerProfiles(router, withCatalog));
   return {
-    client: createClient(ProfileService, createConnectTransport({ baseUrl: `${url}/rpc`, httpVersion: "1.1" })),
-    close: () => new Promise<void>((res, rej) => srv.close((e) => (e ? rej(e) : res()))),
+    client: createClient(ProfileService, transport),
+    close: async () => {},
   };
 }
 
@@ -120,6 +115,7 @@ const archived: ProfileRow = {
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   isDefault: false,
   portExposures: [],
+  designation: null,
   deletedAt: new Date(0),
 };
 const active: ProfileRow = { ...archived, id: "act", name: "Active", deletedAt: null };
@@ -255,6 +251,46 @@ describe("ProfileService — auth + field filtering", () => {
     } finally { await s.close(); }
   });
 
+  test("admin CreateProfile and UpdateProfile accept a registered tool capability", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+      connectors: { list: async () => [] },
+      toolCapabilities: new Set([PR_REVIEW_CAPABILITY]),
+    });
+    try {
+      const created = await s.client.createProfile({
+        name: "Reviewer", description: "", icon: "ScanSearch", imageId: "img-1",
+        harness: "claude", includeUserTokens: false, envVars: {},
+        capabilities: [PR_REVIEW_CAPABILITY],
+      });
+      expect(created.profile!.capabilities).toEqual([PR_REVIEW_CAPABILITY]);
+
+      const updated = await s.client.updateProfile({
+        id: created.profile!.id, name: "Reviewer Updated", description: "", icon: "ScanSearch",
+        imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
+        capabilities: [PR_REVIEW_CAPABILITY],
+      });
+      expect(updated.profile!.capabilities).toEqual([PR_REVIEW_CAPABILITY]);
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile still rejects an unregistered non-connector capability", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore(),
+      images: fakeImages(["img-1"]), mountCatalog: fakeCatalog([]),
+      connectors: { list: async () => [] },
+      toolCapabilities: new Set([PR_REVIEW_CAPABILITY]),
+    });
+    try {
+      await expectErr(s.client.createProfile({
+        name: "Bogus", description: "", icon: "Bot", imageId: "img-1",
+        harness: "claude", includeUserTokens: false, envVars: {},
+        capabilities: ["bogus:thing"],
+      }), Code.InvalidArgument);
+    } finally { await s.close(); }
+  });
+
   // ADR 0064: declarative port exposures round-trip through create/update and
   // default to [] when the field is omitted.
   test("admin CreateProfile round-trips port_exposures + defaults to [] (ADR 0064)", async () => {
@@ -295,6 +331,27 @@ describe("ProfileService — auth + field filtering", () => {
       expect(updated.profile!.harness).toBe("claude");
       expect(updated.profile!.model).toBeUndefined();
       expect(updated.profile!.effort).toBeUndefined();
+    } finally { await s.close(); }
+  });
+
+  test("admin DeleteProfile rejects a designated profile without soft-deleting it", async () => {
+    const designated: ProfileRow = { ...active, designation: "pr_reviewer" };
+    const baseStore = makeFakeStore([designated]);
+    let softDeleteCalls = 0;
+    const store: ProfileStore = {
+      ...baseStore,
+      async softDelete(id) {
+        softDeleteCalls += 1;
+        await baseStore.softDelete(id);
+      },
+    };
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
+    });
+    try {
+      await expectErr(s.client.deleteProfile({ id: designated.id }), Code.FailedPrecondition);
+      expect(softDeleteCalls).toBe(0);
+      expect((await store.get(designated.id))?.deletedAt).toBeNull();
     } finally { await s.close(); }
   });
 });
