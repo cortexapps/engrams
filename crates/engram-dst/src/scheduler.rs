@@ -84,6 +84,16 @@ pub enum Step {
     /// Skew one replica's wall clock by the given seconds (can be
     /// negative).
     ClockSkew(usize, i64),
+    /// The host-side checkpoint uploader completing a periodic
+    /// checkpoint for every bound Active session on one host — WORLD
+    /// behavior (in production this is the host-agent's background
+    /// actor, not a coordinator driver). This is what makes host death
+    /// interesting: a checkpointed session routes HostLost → Idle and
+    /// feeds the recovery ladder instead of draining to Dead.
+    HostCheckpoint(usize),
+    /// A user resuming an Idle session: the real Resume op through the
+    /// op pipeline.
+    ResumeSession,
 }
 
 #[derive(Debug)]
@@ -147,26 +157,50 @@ impl Sim {
         let roll: u32 = self.rng.random_range(0..100);
         match self.profile {
             Profile::Calm => match roll {
-                0..=29 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
-                30..=59 => Step::Driver(
+                0..=27 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
+                28..=55 => Step::Driver(
                     self.rng.random_range(0..replicas),
                     DRIVERS[self.rng.random_range(0..DRIVERS.len())],
                 ),
-                60..=74 => Step::CreateSession,
+                56..=69 => Step::CreateSession,
+                70..=75 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
+                76..=81 => Step::ResumeSession,
                 _ => Step::HostHeartbeats,
             },
+            // CORRECTION (this PR): D6's weight patch silently failed to
+            // apply (fmt-reflowed anchor, assert-less replace) — the
+            // partition/skew/burst faults had execute arms but were
+            // never PICKED, so the D6/D7 swarms ran a weaker menu than
+            // advertised. Weights below are the real full menu.
             Profile::Chaos => match roll {
-                0..=24 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
-                25..=49 => Step::Driver(
+                0..=19 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
+                20..=42 => Step::Driver(
                     self.rng.random_range(0..replicas),
                     DRIVERS[self.rng.random_range(0..DRIVERS.len())],
                 ),
-                50..=61 => Step::CreateSession,
-                62..=79 => Step::HostHeartbeats,
-                80..=85 => Step::CrashHost(self.rng.random_range(0..hosts)),
-                86..=91 => Step::RestartHost(self.rng.random_range(0..hosts)),
-                92..=94 => Step::CrashReplica(self.rng.random_range(0..replicas)),
-                95..=97 => Step::RestartReplica(self.rng.random_range(0..replicas)),
+                43..=49 => Step::CreateSession,
+                50..=51 => Step::WorkloadBurst(self.rng.random_range(2..8)),
+                52..=55 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
+                56..=58 => Step::ResumeSession,
+                59..=71 => Step::HostHeartbeats,
+                72..=76 => Step::CrashHost(self.rng.random_range(0..hosts)),
+                77..=81 => Step::RestartHost(self.rng.random_range(0..hosts)),
+                82..=84 => Step::CrashReplica(self.rng.random_range(0..replicas)),
+                85..=87 => Step::RestartReplica(self.rng.random_range(0..replicas)),
+                88..=90 => {
+                    let h = self.rng.random_range(0..hosts);
+                    let on = self.rng.random_range(0..2) == 0;
+                    Step::HeartbeatPartition(h, on)
+                }
+                91..=93 => {
+                    let h = self.rng.random_range(0..hosts);
+                    let on = self.rng.random_range(0..2) == 0;
+                    Step::RpcPartition(h, on)
+                }
+                94..=96 => Step::ClockSkew(
+                    self.rng.random_range(0..replicas),
+                    self.rng.random_range(-45..=45),
+                ),
                 _ => Step::PgOutage(!self.pg_out),
             },
         }
@@ -473,6 +507,69 @@ impl Sim {
                 self.world.replicas[i]
                     .clock
                     .set_skew(chrono::Duration::seconds(secs));
+            }
+            Step::HostCheckpoint(i) => {
+                use engram_core::traits::Entropy as _;
+                let host_id = self.world.host_ids[i];
+                let host_up = {
+                    let hw = self.world.host_world.hosts.lock();
+                    hw.get(&host_id).is_some_and(|h| h.up)
+                };
+                if !host_up {
+                    return; // a down host's uploader isn't running
+                }
+                let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
+                    return;
+                };
+                // Every bound Active session on this host gets a
+                // recoverable snapshot row — the periodic-checkpoint
+                // completion write the host-agent's uploader performs.
+                let bound = state
+                    .services
+                    .meta
+                    .list_active_sandbox_assignments_on_host(host_id)
+                    .await
+                    .unwrap_or_default();
+                for (sid, _) in bound {
+                    let now = state.services.clock.now_utc();
+                    let snap: engram_core::types::snapshot::SnapshotRecord =
+                        serde_json::from_value(serde_json::json!({
+                            "id": engram_core::SnapshotId::from(self.world.entropy.uuid()),
+                            "session_id": sid,
+                            "host_id": host_id,
+                            "image_version": SIM_IMAGE,
+                            "size_bytes": 0,
+                            "created_at": now,
+                            "last_accessed_at": now,
+                            "recoverable": true,
+                        }))
+                        .expect("sim checkpoint row");
+                    let _ = state.services.meta.record_snapshot(snap).await;
+                }
+            }
+            Step::ResumeSession => {
+                let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
+                    return;
+                };
+                // Pick the FIRST Idle session (BTreeMap order —
+                // deterministic) and drive the real Resume op.
+                let idle = self.world.meta.with_db(|db| {
+                    db.sessions
+                        .values()
+                        .find(|r| {
+                            r.session.status == engram_core::types::session::SessionState::Idle
+                        })
+                        .map(|r| r.session.id)
+                });
+                let Some(sid) = idle else { return };
+                let _ = engram_coordinator::session_ops::enqueue(
+                    &state,
+                    sid,
+                    OpKind::Resume,
+                    serde_json::json!({}),
+                    Some(&format!("resume:{sid}")),
+                )
+                .await;
             }
             Step::PgOutage(on) => {
                 self.pg_out = on;
