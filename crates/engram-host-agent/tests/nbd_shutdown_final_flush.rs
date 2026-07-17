@@ -575,10 +575,24 @@ async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
     let successor_backend = successor
         .__test_nbd_backend(restored_id)
         .expect("successor backend");
+    // Issue #721: probing `dirty_bytes() > 0` here is racy by design of the
+    // adoption path — `adopt_unflushed` pokes the threshold notify, and the
+    // flush scheduler `rehydrate_sandbox` installs can upload the adopted
+    // tier before this probe runs (that prompt upload IS the intended prod
+    // behavior). The invariant is "the acked writes were never rolled
+    // back", and at every instant the adopted bytes are either still
+    // un-uploaded — `export_unflushed` snapshots the dirty AND pending
+    // tiers, ref last, so a chunk absent from both was uploaded and the
+    // ref read afterwards covers it — or already published past the
+    // rollback point on the same lineage.
+    let (adopted_ref, unflushed) = successor_backend.export_unflushed().await;
     assert!(
-        successor_backend.dirty_bytes().await > 0,
+        !unflushed.is_empty()
+            || (adopted_ref.manifest_id == pre_abandon_ref.manifest_id
+                && adopted_ref.version > pre_abandon_ref.version),
         "2026-07-16 RCA: the successor must ADOPT the spooled dirty tier — \
-         an empty tier means the guest's acked writes were rolled back",
+         no un-uploaded copy and no advanced manifest on the survivor's \
+         lineage means the guest's acked writes were rolled back",
     );
     let bytes = successor_backend
         .read(0, chunk_size as u64)
