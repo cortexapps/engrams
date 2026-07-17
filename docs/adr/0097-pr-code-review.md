@@ -99,6 +99,12 @@ shaped this ADR:
    routed to the session that authored the PR (or a fresh fix session), which
    can push fixes and reply on finding threads. Agent-to-agent conversation
    happens *through the PR itself*, mediated and metered by the workflow.
+8. **Setup is deterministic, not agentic.** The workflow prepares each review
+   session itself — `Exec` runs the git clone, `WriteFiles` stages the
+   instruction files — before the first prompt is sent. The agent wakes up to
+   a ready workspace and spends zero tokens on mechanical setup; and because
+   the clone already happened, the review session needs no network access at
+   all in v1.
 
 ## Finding categories
 
@@ -138,10 +144,11 @@ GitHub App ──webhooks──▶ POST /api/v1/integrations/github/events   (ve
         │ conversation: dirty set + sweep sessions
         │ autofix: fix prompts to the authoring task
         │
-        │ CreateTask / SendPrompt / WriteFile          tool calls (ADR 0089)
+        │ CreateTask / Exec (clone) /                  tool calls (ADR 0089)
+        │ WriteFiles / SendPrompt                            │
         ▼                                                   │
-  ephemeral review sessions (review profile:                │ submit_finding
-  read-only clone, no write credentials)  ──────────────────┘ submit_verdict, …
+  ephemeral review sessions (reviewer profile:              │ submit_finding
+  pre-cloned, no write creds, no egress)  ──────────────────┘ submit_verdict, …
         │
         ▼
   review record (Postgres) ──▶ GitHub posting (orchestrator octokit)
@@ -232,27 +239,66 @@ schema, writes the row, and returns — replay-safe on
   The orchestrator posts the reply; free text from a session never reaches
   GitHub.
 
-### The WriteFile primitive (new, small)
+### WriteFile / WriteFiles (new primitives, small)
 
 `SessionService.Exec` exists today but has no stdin field, so pushing content
 into a guest means embedding it in a shell command string — quoting hazards
-and size limits. We add `SessionService.WriteFile {session_id, path, content,
-mode?}` (an agentd verb plumbed like Exec). The workflow uses it to place
-files in a session before sending the prompt:
+and size limits. We add two RPCs (agentd verbs plumbed like Exec):
 
-- the methodology files (`/workspace/.review/…`) — rendered fresh per review
-  by an orchestrator-side prompt builder, with org and repo config already
-  merged in;
+- `SessionService.WriteFile {session_id, path, content, mode?}` — one file.
+- `SessionService.WriteFiles {session_id, files: [{path, content, mode?}]}` —
+  a batch in one round trip; the response reports per-file success so a
+  partial failure is visible and retryable.
+
+The review workflow uses them, as a durable step, to stage a session before
+its first prompt:
+
+- the reviewer instruction files (`/workspace/.review/…`, next section) —
+  rendered fresh per review, with org instructions already merged in;
 - the verifier's `candidates.json`;
 - prior-findings context for incremental passes.
 
 Why files instead of a baked skill bundle: bundle content is frozen at
 bake/enable time, while these files are composed per run (config changes take
-effect on the next review, and methodology iteration ships with an
+effect on the next review, and instruction iteration ships with an
 orchestrator deploy, not a bundle republish). Files in `/workspace` also
 survive evict/resume and are readable by any subagent the harness spawns.
-The prompt builder is pure TypeScript with snapshot tests — prompt text is
-product surface and gets reviewed like code (the kodus discipline).
+
+### The reviewers folder: instructions as files in the orchestrator
+
+The review instructions are not string literals in TypeScript — they live as
+markdown files in the orchestrator source tree and are uploaded into each
+session verbatim (plus merge slots):
+
+```
+orchestrator/reviewers/
+  finder.md            # the finder's full instructions (mindset, workflow, hard rules)
+  verifier.md          # the verifier's refute-to-drop instructions
+  sweep.md             # answering humans on finding threads
+  lenses/
+    security-privacy.md
+    stability-availability.md
+    data-integrity-integration.md
+    functional-correctness.md
+    performance-scalability.md
+    maintainability-quality.md
+```
+
+Each lens file has the five-part shape (mission / focus list / do-not-report /
+reasoning policy / writing policy). The renderer is deliberately thin: it
+loads the role file and the enabled lens files, fills the merge slots (org
+instructions, enabled categories, the tool contract), and hands the result to
+`WriteFiles` as `/workspace/.review/…`. Snapshot tests cover the rendered
+output; wording changes show up as reviewable markdown diffs, because this
+text is where the product's precision/recall actually lives (the kodus
+discipline — their category lenses read like distilled postmortems, and every
+production false negative should become a new focus-list bullet here).
+
+The per-session system prompt (`ENGRAM_APPEND_SYSTEM_PROMPT`) is then tiny
+and stable: the role line, the binding pointer — *"Before anything else, read
+`/workspace/.review/finder.md` and follow it exactly; its rules are binding
+for this session"* — and the handful of hard rules that deserve system-prompt
+authority (never edit files, never push, findings only via the tools).
 
 ### Instructions and configuration, layered
 
@@ -267,7 +313,8 @@ overrides.
 
 1. **engrams methodology (floor, not overridable)** — the category lenses,
    the evidence rules, the WHAT/WHY/HOW writing policy, "findings only on
-   changed lines", "nits are nits". Rendered by the prompt builder.
+   changed lines", "nits are nits". Lives as markdown in the orchestrator's
+   `reviewers/` folder (see below).
 2. **Org instructions** — free text on org settings (settings UI): guidance
    that applies to every enrolled repo ("every service is multi-tenant —
    always check tenant isolation on new queries"). Merged by the prompt
@@ -318,10 +365,10 @@ directories carry instruction files is a filesystem walk instead of GitHub
 tree-API archaeology. The orchestrator-rendered files cover what the checkout
 cannot know — the engrams methodology and org instructions.
 
-### The reviewer prompt
+### What the reviewer instructions contain
 
-The finder's system prompt is a fixed skeleton rendered by the prompt
-builder. It contains, in order:
+`finder.md` (rendered and uploaded as `/workspace/.review/finder.md`) is a
+fixed skeleton containing, in order:
 
 1. **Role and mindset** (never compacted — these are the load-bearing
    behavioral cues): *"You are a code reviewer for this pull request. Assume
@@ -344,13 +391,8 @@ builder. It contains, in order:
    - *Phase 3 — submit.* One `submit_finding` call per issue, then
      `finder_done` with a short summary. Anything not submitted through the
      tool does not exist.
-3. **A pointer to the category lenses** — the six methodology files under
-   `/workspace/.review/lenses/`, each in the five-part shape
-   (mission / focus list / do-not-report / reasoning policy / writing
-   policy), with org instructions already merged in by the prompt builder.
-   The focus lists are where reviewer quality accumulates: every production
-   false negative becomes a new bullet (kodus's lists read like distilled
-   postmortems for exactly this reason).
+3. **A pointer to the category lenses** — the six lens files under
+   `/workspace/.review/lenses/`, with org instructions already merged in.
 4. **The hard rules (the floor)**: findings only on lines changed in this PR
    unless the change makes an old issue newly reachable; every finding must
    cite evidence from files actually read; WHAT/WHY/HOW writing shape, with
@@ -370,19 +412,14 @@ PR metadata, `base_sha..head_sha`, the focus directive from
 still-open findings with "do not re-report these" plus the request to judge
 their resolutions.
 
-The **verifier's system prompt** is the same skeleton with the stance
-inverted: *"Your job is to refute each finding. Re-derive the reasoning from
-the code yourself — do not trust the finder's description. If you cannot
-confirm the failure scenario from code you actually read, the verdict is
-`refuted`. If the finding's evidence list does not include the file the
-finding is about, re-derive from scratch. Confirm only what survives your
-best attempt to kill it."* Its tool contract is `submit_verdict`, and its
-user prompt is the candidate list (also written into the guest as
-`candidates.json`).
-
-Both prompts are pure functions in the orchestrator with snapshot tests —
-wording changes show up as reviewable diffs, because this text is where the
-product's precision/recall actually lives.
+`verifier.md` is the same skeleton with the stance inverted: *"Your job is to
+refute each finding. Re-derive the reasoning from the code yourself — do not
+trust the finder's description. If you cannot confirm the failure scenario
+from code you actually read, the verdict is `refuted`. If the finding's
+evidence list does not include the file the finding is about, re-derive from
+scratch. Confirm only what survives your best attempt to kill it."* Its tool
+contract is `submit_verdict`, and its user prompt is the candidate list (also
+written into the guest as `candidates.json`).
 
 ## How a review runs
 
@@ -395,15 +432,30 @@ product's precision/recall actually lives.
    the same workflow and dedupe.
 2. The workflow creates the `pr_review` task and a `review` row
    (`status: queued`, `head_sha` pinned from the event), and boots a **finder
-   session** on the review profile: a simple image (git, jq, gh, ripgrep and
-   similar), a read-only clone credential from the mint plane, tight egress,
-   and a tool manifest of `{submit_finding, finder_done}`.
-3. The workflow writes the methodology files into the guest (WriteFile), then
-   sends the prompt: repo, PR title/description, `base_sha..head_sha`, where
-   the methodology lives, and the marching orders.
-4. The finder clones at `head_sha`, reads the diff against the merge base,
-   reads `.engrams/review.md` and the free-context files (at the merge base —
-   see the instruction-pickup rules), and investigates —
+   session** on the **reviewer profile** — a normal profile row carrying a
+   `designation: "pr_reviewer"` marker. It ships seeded with a simple image
+   (git, jq, ripgrep and similar) and sensible harness/model defaults, but
+   because it is a real profile, org admins can modify it in the profiles UI
+   like any other (swap the image, model, effort, skills); the designation is
+   how the workflow finds it and why it can't be deleted. Per-repo enrollment
+   can point at a different profile. The tool manifest is
+   `{submit_finding, finder_done}`.
+3. The workflow prepares the workspace itself, as durable steps — the agent
+   never does mechanical setup:
+   - `Exec`: `git clone` the repo at `head_sha` (full history, so merge-base
+     `git show` works) into `/workspace/<repo>`, using the session's scoped
+     read-only credential. A deterministic step that retries cleanly; a
+     failed clone is an infra error on the review row, never an agent
+     giving up.
+   - `WriteFiles`: the rendered reviewer instructions into
+     `/workspace/.review/`.
+   Because the clone is already done, the finder session needs no network
+   access at all.
+4. The workflow sends the prompt: repo, PR title/description,
+   `base_sha..head_sha`, where the instructions live, and the marching
+   orders. The finder wakes to a ready workspace, reads the diff against the
+   merge base, reads `.engrams/review.md` and the free-context files (at the
+   merge base — see the instruction-pickup rules), and investigates —
    tracing callers, reading surrounding code, checking git history. Its
    stance is high recall: report anything with concrete, code-backed
    suspicion; a verifier will filter. Every suspicion becomes a
@@ -414,11 +466,12 @@ product's precision/recall actually lives.
    **verifier session** — a fresh session with no memory of the finder's
    reasoning, which is the point: genuine skepticism needs an independent
    look.
-6. The verifier gets the same checkout, `candidates.json` written into its
-   guest, and a refute-to-drop prompt: for each candidate, actively try to
-   prove it wrong; confirm only what survives; check the evidence (did the
-   finder actually read the file it cites — an unread citation means
-   re-verify from scratch). Each judgment is a `submit_verdict` call.
+6. The verifier gets the same deterministic setup (`Exec` clone,
+   `WriteFiles` with `verifier.md` and `candidates.json`) and a
+   refute-to-drop prompt: for each candidate, actively try to prove it
+   wrong; confirm only what survives; check the evidence (did the finder
+   actually read the file it cites — an unread citation means re-verify from
+   scratch). Each judgment is a `submit_verdict` call.
 7. The verifier session ends. The workflow runs the **policy gate** —
    deterministic code, no LLM (details below) — which decides, per finding:
    post inline, keep UI-only, or suppress, and computes the summary counts.
@@ -593,8 +646,9 @@ only needs `pr_ref.authoring_task_id` and the existing prompt-delivery path
 The review session is an untrusted-input sandbox — the diff, PR description,
 and comments are attacker-controlled. Containment, enforced in code:
 
-- No write credentials; the clone credential is read-only and repo-scoped;
-  egress is clone-plus-nothing.
+- No write credentials; the clone credential is read-only, repo-scoped, and
+  only exercised during the workflow-driven clone step — after setup the
+  review session has no network access at all.
 - Mediated output only: the tool manifest is the session's sole effect
   channel. The orchestrator enforces comment-verdict-only, this-PR-only, and
   schema validation regardless of what the session asks for.
@@ -644,7 +698,7 @@ service → generated connectquery client → hook → page):
 - Workflow logic (phase sequencing, dirty set, budgets, peel-off, role
   routing): orchestrator unit tests with injected fakes — the ADR 0060
   pattern, no live DBOS engine.
-- The prompt builder: snapshot tests; methodology edits show up as reviewable
+- The instruction renderer: snapshot tests; wording edits show up as reviewable
   diffs.
 - Tool handlers: schema + replay-idempotency tests (the papercut suite as
   template).
@@ -655,11 +709,12 @@ service → generated connectquery client → hook → page):
 ## Phasing
 
 - **P0 — the review pass**: GitHub App + webhook route + enrollment,
-  `WriteFile`, the review profile, the prompt builder + methodology files,
-  finder/verifier phases with `submit_finding` / `submit_verdict` /
-  `finder_done`, the v1 policy gate, batched posting, tables, minimal
-  `/reviews` list. Manual trigger (`@engrams review` + dispatch API) first;
-  auto-on-open once the loop is proven.
+  `WriteFile`/`WriteFiles`, the seeded reviewer profile (designation marker),
+  the `reviewers/` folder + renderer, the deterministic setup steps (Exec
+  clone + WriteFiles), finder/verifier phases with `submit_finding` /
+  `submit_verdict` / `finder_done`, the v1 policy gate, batched posting,
+  tables, minimal `/reviews` list. Manual trigger (`@engrams review` +
+  dispatch API) first; auto-on-open once the loop is proven.
 - **P1 — conversation + incremental**: dirty set + sweeps,
   `reply_to_review_thread`, re-review on push with force-push fallback,
   `update_finding_status` resolutions, focus directives.
