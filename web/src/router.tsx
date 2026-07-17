@@ -1,5 +1,5 @@
 // Code-based TanStack Router tree for engrams-web. The shell is RootLayout (the
-// primary destinations rail + inset). `/sessions`, `/kaizen`, `/operator`, and `/settings`
+// primary destinations rail + inset). `/sessions`, `/reviews`, `/kaizen`, `/operator`, and `/settings`
 // are nested LAYOUT routes that each render their own second sidebar + <Outlet/>.
 // `/operator` is the admin hat: one section gathers fleet, storage, images, and
 // registries behind a single rail, landing on a read-only Overview cockpit.
@@ -30,6 +30,7 @@ import { StartScreen } from "./pages/sessions/StartScreen";
 import { MySessions } from "./pages/sessions/MySessions";
 import { AllSessions } from "./pages/sessions/AllSessions";
 import { SessionDetail } from "./pages/SessionDetail";
+import { Reviews } from "./pages/reviews/Reviews";
 import { OperatorLayout } from "./pages/operator/OperatorLayout";
 import { Overview } from "./pages/operator/Overview";
 import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
@@ -162,6 +163,13 @@ const sessionDetailRoute = createRoute({
   getParentRoute: () => sessionsLayoutRoute,
   path: "$id",
   component: SessionDetail,
+});
+
+// /reviews — org-visible PR review ledger ----------------------------------
+const reviewsRoute = createRoute({
+  getParentRoute: () => appLayoutRoute,
+  path: "/reviews",
+  component: Reviews,
 });
 
 // /operator layout route (second sidebar) — the admin hat. The whole section
@@ -309,6 +317,7 @@ export const routeTree = rootRoute.addChildren([
       allSessionsRoute,
       sessionDetailRoute,
     ]),
+    reviewsRoute,
     operatorLayoutRoute.addChildren([
       operatorIndexRoute,
       operatorFleetRoute,
