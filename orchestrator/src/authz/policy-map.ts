@@ -40,6 +40,11 @@ export interface PolicyEntry {
  * FleetService: every method is admin-only.
  */
 export const POLICY: Record<string, PolicyEntry> = {
+  // ReviewService is native today; these entries keep its declared read
+  // policy explicit if it crosses the generic gate in a future split.
+  "ReviewService.ListReviews": { action: "read", subject: "Review" },
+  "ReviewService.GetReview": { action: "read", subject: "Review" },
+
   // ------------------------------------------------------------------
   // SessionService — session-scoped (member can access own sessions)
   // ------------------------------------------------------------------

@@ -28,11 +28,13 @@ import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { makeExternalToolCompletionGuard } from "./rpc/tool-completion-guard.ts";
 import { registerBuiltinTools } from "./tools/builtin.ts";
+import { registerReviewTools } from "./tools/review.ts";
 import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerPapercuts } from "./rpc/papercuts.ts";
 import { registerPrRefs } from "./rpc/pr-refs.ts";
+import { registerReviews } from "./rpc/reviews.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
@@ -52,6 +54,7 @@ import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
+import { makeReviewStore } from "./db/reviews.ts";
 import { tools } from "./tools/registry.ts";
 
 const app = new Hono();
@@ -140,6 +143,9 @@ const server = buildServer(
     // Native PrRefService: durable task/session links to authored PRs (ADR 0100).
     registerPrRefs(router);
 
+    // Native ReviewService: org-visible durable PR review records (ADR 0100).
+    registerReviews(router);
+
     // Native ProfileService: orchestrator-owned session profiles (ADR 0053).
     registerProfiles(router);
 
@@ -197,6 +203,7 @@ setThreadControlPlane(makeThreadControlPlane());
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
+registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 const listenerManager = makeProductionListenerManager();
