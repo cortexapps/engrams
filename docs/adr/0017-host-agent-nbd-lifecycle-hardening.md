@@ -477,3 +477,78 @@ leak above); read-path integrity is verify-on-populate only (a corrupt
 NVMe cache file or RAM tier is served unverified and can be laundered
 into new dirty chunks via RMW); periodic checkpoints retry forever
 against a dead data plane instead of escalating.
+
+## Addendum (2026-07-17b): parked survivors were invisible to the register-time rehydrate
+
+Session `731df805` (dev-brain), same day the addendum above shipped:
+`git`/`node` segfaulting and rootfs EIO within a minute of a rung-2
+un-pause, "corruption" symptoms that looked like the acked-write-loss
+class but were not — the guest was **paused for the whole roll**, so
+none of the flush/spool windows applied. The actual chain:
+
+1. The session idled into the eviction ladder and parked at rung 2
+   (FC paused, VM resident), session status `evicting`, at 01:52.
+2. The host-agent pod rolled at 03:57 (deploying the addendum above,
+   as it happens). The predecessor detached; the successor
+   pidfd-reattached both parked FC processes and rehydrated their
+   chain heads from durable records — all correct.
+3. The coordinator's register response returned
+   `rehydrate_sandboxes = 0`: the backing query filtered
+   `status = 'active'`, and both resident VMs were `evicting`. So
+   `rehydrate_survivors` never ran, and nothing RECONFIGUREd
+   `/dev/nbd0`/`/dev/nbd1` onto the successor's serve sockets.
+4. The stale-binding sweep then found both devices free-in-pool and
+   kernel-bound to a dead pid — exactly its definition of stale — and
+   issued netlink `NBD_CMD_DISCONNECT` at the parked survivors' live
+   rootfs devices ("STILL bound" both times, because the FCs hold
+   them open; the devices were left zombied).
+5. At 04:48 the user returned; the eviction was cancelled at the
+   parking rung and the guest un-paused onto a dead data plane. Cold
+   reads → EIO/garbage (binaries paged in as junk → SIGSEGV); hot
+   guest-page-cache entries kept working, which is why the failure
+   looked selective and "flaky" from inside.
+
+Two structural fixes in this chain:
+
+1. **The rehydrate list now covers every VM-resident session.** The
+   query (renamed
+   `list_resident_sandboxes_on_host_with_disk_manifest`) filters on
+   the SQL twin of `SessionState::reserves_host_memory()` — the
+   existing "VM is resident on its host" predicate — instead of
+   `'active'` alone. Parked (`evicting`), `created`, `unreachable`,
+   and `evacuating` sandboxes all rehydrate; the same list also feeds
+   the survivor egress re-push, which had the same blind spot.
+   Conformance scenario `t_resident_sandboxes_rehydrate_list` (ADR
+   0098 D4) pins the semantics against both SimMetadataStore and live
+   Postgres, including the manifest max/snap-wins resolution.
+2. **The host no longer lets a coordinator-side gap decide whether a
+   resident VM keeps its disk.** `rehydrate_local_survivors` runs
+   after the coord-list pass and before the sweep: any live,
+   unserved sandbox with a durable `ChainHeadRecord` (which carries
+   sandbox_id, session_id, and the chain-head manifest — everything
+   `rehydrate_sandbox` needs) is claimed + RECONFIGUREd locally. The
+   coord list is now advisory for survivors, matching the design
+   stance that binding records on local disk are the recovery source
+   of truth (ADR 0073 posture, extended to the NBD data plane).
+
+Still open (follow-ups):
+
+- **Un-pause should gate on data-plane health.** The parking-rung
+  cancel path resumed the guest with no check that its rootfs device
+  is served by the current generation. A resume onto an unserved
+  device should fail fast into `evict_local → resume`
+  (snapshot-restore recovery) instead of running the guest against a
+  dead disk. Candidate `soft_invariant!` site: "vcpus released ⇒
+  sandbox present in `nbd_sandboxes`".
+- **Host-DST oracle (ADR 0098 P-series).** The full shape — park →
+  pod roll → register(list) → sweep → un-pause — is a
+  host-lifecycle scenario `engram-dst-host` should drive once the
+  disk-daemon seams land: invariant "a device kernel-bound on behalf
+  of a live sandbox is always claimed by the serving generation
+  before the stale sweep runs; `NBD_CMD_DISCONNECT` is never issued
+  at a device a live FC holds open."
+- The post-roll periodic checkpoints (v4–v6 of the incident session)
+  re-chunked against a backend with no live guest connection;
+  whether those diffs can publish a manifest that diverges from what
+  the guest observed needs a verify pass before the next such
+  incident trusts a post-roll chain.

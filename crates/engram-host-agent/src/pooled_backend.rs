@@ -3366,6 +3366,79 @@ impl PooledBackend {
         }
     }
 
+    /// Local-first survivor NBD rehydrate (session 731df805,
+    /// 2026-07-17): claim + RECONFIGURE the NBD device of every live
+    /// survivor the coordinator's register-time list MISSED. That list
+    /// is derived from PG session status and can be wrong — it was
+    /// empty for rung-parked (`evicting`) survivors, so nothing
+    /// re-claimed their devices after the pod roll and the
+    /// stale-binding sweep disconnected the live rootfs out from under
+    /// the paused guests. Everything this needs is already durable on
+    /// this host: the write-ahead `ChainHeadRecord` carries
+    /// (sandbox_id, session_id, manifest_ref) and the reattach pass
+    /// has rebuilt `inner`'s sandbox set — so a coordinator-side gap
+    /// must never again decide whether a resident VM keeps its disk.
+    ///
+    /// Run AFTER the coord-list `rehydrate_survivors` pass (entries
+    /// covered by both are skipped via the `nbd_sandboxes` presence
+    /// check inside [`Self::rehydrate_sandbox`]) and BEFORE the
+    /// stale-binding sweep snapshots the free slot pool.
+    ///
+    /// Returns `(rehydrated, failed)`.
+    #[cfg(target_os = "linux")]
+    pub async fn rehydrate_local_survivors(&self) -> (usize, usize) {
+        let Some(store) = self.chain_heads.clone() else {
+            return (0, 0);
+        };
+        let live: std::collections::HashSet<SandboxId> = match self.inner.list().await {
+            Ok(ids) => ids.into_iter().collect(),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "local survivor rehydrate: backend list failed; skipping",
+                );
+                return (0, 0);
+            }
+        };
+        let served: std::collections::HashSet<SandboxId> =
+            self.nbd_sandboxes.iter().map(|e| *e.key()).collect();
+        let records = crate::checkpoint::ChainHeadRecord::load_all(store.dir()).await;
+        let mut rehydrated = 0usize;
+        let mut failed = 0usize;
+        for (session_id, sandbox_id, manifest_ref) in
+            local_survivor_candidates(records, &live, &served)
+        {
+            match self
+                .rehydrate_sandbox(session_id, sandbox_id, manifest_ref)
+                .await
+            {
+                Ok(true) => {
+                    tracing::warn!(
+                        %sandbox_id,
+                        %session_id,
+                        manifest = %manifest_ref,
+                        "local survivor rehydrate: re-served an NBD device the \
+                         coordinator's rehydrate list missed (coord-side gap — \
+                         the device would otherwise have been left to the \
+                         stale-binding sweep)",
+                    );
+                    rehydrated += 1;
+                }
+                Ok(false) => {}
+                Err(e) => {
+                    tracing::warn!(
+                        %sandbox_id,
+                        %session_id,
+                        error = %e,
+                        "local survivor rehydrate failed; continuing with the rest",
+                    );
+                    failed += 1;
+                }
+            }
+        }
+        (rehydrated, failed)
+    }
+
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
     /// host-owned record. Runs at the tail of every successful
     /// `snapshot()` (periodic checkpoint, eviction, drain, SIGTERM —
@@ -9117,6 +9190,41 @@ impl PooledBackend {
     }
 }
 
+/// Candidate filter for [`PooledBackend::rehydrate_local_survivors`],
+/// factored pure so the selection semantics are testable without an
+/// NBD stack: a durable chain-head record is a local rehydrate
+/// candidate iff its sandbox is live in the backend (reattach pass
+/// found the FC process's config), is not already NBD-served (the
+/// coord-list pass got there first), and the record knows its bound
+/// session (a `session_id: None` record predates binding — nothing
+/// sound to rehydrate under; the coord list remains its only path).
+#[cfg(any(target_os = "linux", test))]
+fn local_survivor_candidates(
+    records: Vec<crate::checkpoint::ChainHeadRecord>,
+    live: &std::collections::HashSet<SandboxId>,
+    served: &std::collections::HashSet<SandboxId>,
+) -> Vec<(
+    SessionId,
+    SandboxId,
+    engram_core::types::manifest::ManifestRef,
+)> {
+    records
+        .into_iter()
+        .filter(|r| live.contains(&r.sandbox_id) && !served.contains(&r.sandbox_id))
+        .filter_map(|r| {
+            let Some(session_id) = r.session_id else {
+                tracing::debug!(
+                    sandbox_id = %r.sandbox_id,
+                    "local survivor rehydrate: chain-head record has no session \
+                     binding; leaving this sandbox to the coordinator list",
+                );
+                return None;
+            };
+            Some((session_id, r.sandbox_id, r.manifest_ref))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
@@ -9125,6 +9233,50 @@ mod tests {
     use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
+
+    /// Session 731df805 (2026-07-17): the local survivor-rehydrate
+    /// candidate filter. Live + unserved + session-bound records are
+    /// candidates regardless of what the coordinator's list said;
+    /// dead sandboxes (record outlived the VM), already-served ones
+    /// (coord list got there first), and session-less records are not.
+    #[test]
+    fn local_survivor_candidates_filters() {
+        let mk = |session: Option<SessionId>| crate::checkpoint::ChainHeadRecord {
+            sandbox_id: SandboxId::new(),
+            manifest_ref: engram_core::types::manifest::ManifestRef {
+                manifest_id: uuid::Uuid::new_v4(),
+                version: 3,
+            },
+            session_id: session,
+            updated_at: chrono::Utc::now(),
+        };
+        let live_unserved = mk(Some(SessionId::new()));
+        let live_served = mk(Some(SessionId::new()));
+        let dead = mk(Some(SessionId::new()));
+        let live_sessionless = mk(None);
+
+        let live: std::collections::HashSet<SandboxId> = [
+            live_unserved.sandbox_id,
+            live_served.sandbox_id,
+            live_sessionless.sandbox_id,
+        ]
+        .into_iter()
+        .collect();
+        let served: std::collections::HashSet<SandboxId> =
+            [live_served.sandbox_id].into_iter().collect();
+
+        let expect = vec![(
+            live_unserved.session_id.unwrap(),
+            live_unserved.sandbox_id,
+            live_unserved.manifest_ref,
+        )];
+        let got = local_survivor_candidates(
+            vec![live_unserved, live_served, dead, live_sessionless],
+            &live,
+            &served,
+        );
+        assert_eq!(got, expect);
+    }
 
     /// ADR 0019 / telemetry restoration (#526): the stats-file → outcome
     /// mapping `restore()` drives `engram_resume_prefault_total` off.

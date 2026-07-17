@@ -151,7 +151,12 @@ pub struct ChainHeadRecord {
     pub sandbox_id: SandboxId,
     /// The durably-published chain head at persist time.
     pub manifest_ref: ManifestRef,
-    /// Bound session, when known — diagnostic only.
+    /// Bound session, when known. Load-bearing since the local
+    /// survivor-rehydrate pass (session 731df805, 2026-07-17):
+    /// `PooledBackend::rehydrate_local_survivors` re-serves a live
+    /// survivor's NBD device under this session when the coordinator's
+    /// register-time list misses it. `None` (a record persisted before
+    /// the binding was known) exempts the sandbox from the local pass.
     pub session_id: Option<SessionId>,
     pub updated_at: DateTime<Utc>,
 }

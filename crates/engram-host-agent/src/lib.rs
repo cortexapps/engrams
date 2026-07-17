@@ -938,6 +938,26 @@ impl HostAgent {
                                         &resp.rehydrate_sandboxes,
                                     )
                                     .await;
+                                    // Local-first backstop (session 731df805,
+                                    // 2026-07-17): the coord's list is derived
+                                    // from PG status and CAN be wrong — it
+                                    // omitted rung-parked survivors, nothing
+                                    // claimed their NBD devices, and the sweep
+                                    // below disconnected the live rootfs under
+                                    // the paused guests. Re-serve any live
+                                    // survivor the list missed from the durable
+                                    // chain-head records before the sweep
+                                    // snapshots the free pool.
+                                    let (local_rehydrated, local_failed) =
+                                        pooled_for_rehydrate.rehydrate_local_survivors().await;
+                                    if local_rehydrated + local_failed > 0 {
+                                        tracing::warn!(
+                                            rehydrated = local_rehydrated,
+                                            failed = local_failed,
+                                            "local survivor rehydrate pass acted on sandboxes \
+                                             the coordinator's rehydrate list missed",
+                                        );
+                                    }
                                     // ADR 0044 K2: stale-binding sweep AFTER
                                     // the survivors have claimed their slots
                                     // — only still-free devices are probed,
@@ -1674,7 +1694,7 @@ impl HostAgent {
 /// 1. NBD slot + ChunkedDiskBackend rebuilt from the effective
 ///    disk manifest (newer of `live_disk_manifest_*` and the
 ///    latest recoverable snapshot — picked server-side by
-///    `MetadataStore::list_active_sandboxes_on_host_with_disk_manifest`).
+///    `MetadataStore::list_resident_sandboxes_on_host_with_disk_manifest`).
 /// 2. NBD daemon spawned.
 /// 3. `nbd_sandboxes` entry installed.
 /// 4. FlushScheduler spawned with the (session_id, sandbox_id)

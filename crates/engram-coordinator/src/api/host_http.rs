@@ -98,7 +98,7 @@ pub struct RegisterResponse {
 
 /// ADR 0016 Phase B commit 7: one entry in the rehydration list
 /// the host iterates at startup. Wire format mirrors the columns
-/// `MetadataStore::list_active_sandboxes_on_host_with_disk_manifest`
+/// `MetadataStore::list_resident_sandboxes_on_host_with_disk_manifest`
 /// returns; the host's startup hook rebuilds chunked-disk tracking
 /// from these.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -213,9 +213,13 @@ pub async fn register(
     };
 
     // ADR 0016 Phase B commit 7: rehydration list. PG already
-    // knows which Active sessions are bound to this host (a host-
-    // agent restart drops `nbd_sandboxes` but PG persists the
-    // session→sandbox→host binding). Hand the list back so the
+    // knows which VM-resident sessions are bound to this host (a
+    // host-agent restart drops `nbd_sandboxes` but PG persists the
+    // session→sandbox→host binding). "Resident" = every
+    // `reserves_host_memory` state with a sandbox bound, NOT just
+    // Active: a rung-parked Evicting session's paused VM survives
+    // the pod roll too, and omitting it orphans its NBD device
+    // (session 731df805, 2026-07-17). Hand the list back so the
     // host can rebuild `ChunkedDiskBackend` + spawn the
     // FlushScheduler for each, restoring continuous-flush
     // coverage. Failure non-fatal: a host that doesn't get the
@@ -224,7 +228,7 @@ pub async fn register(
     let rehydrate_sandboxes = match state
         .services
         .meta
-        .list_active_sandboxes_on_host_with_disk_manifest(req.host_id)
+        .list_resident_sandboxes_on_host_with_disk_manifest(req.host_id)
         .await
     {
         Ok(rows) => rows
