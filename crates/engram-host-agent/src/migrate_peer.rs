@@ -102,7 +102,7 @@ impl PeerExport {
         *self
             .last_activity
             .lock()
-            .expect("peer last_activity poisoned") = std::time::Instant::now();
+            .expect("peer last_activity poisoned") = crate::time_source::metrics_now();
     }
 }
 
@@ -476,7 +476,7 @@ impl PeerServer {
                 return None;
             }
         };
-        let deadline = tokio::time::Instant::now() + self.park_budget;
+        let deadline = crate::time_source::metrics_now_tokio() + self.park_budget;
         loop {
             // Register as a waiter BEFORE re-checking `get`, so a
             // `register()` (which calls `notify_waiters`) landing between
@@ -543,7 +543,7 @@ impl PeerServer {
                     // active TCP-only drain keeps the registry export alive.
                     export.touch();
                     let resp = self.serve_need_at(export, req_id, chunk_offset, purpose);
-                    let t_write = std::time::Instant::now();
+                    let t_write = crate::time_source::metrics_now();
                     write_frame(&mut stream, &resp)?;
                     export
                         .serve
@@ -625,7 +625,7 @@ impl PeerServer {
             export.serve.drain_serves.fetch_add(1, Relaxed);
         }
         let len = export.chunk_size.min(export.total_bytes - chunk_offset) as usize;
-        let t_readv = std::time::Instant::now();
+        let t_readv = crate::time_source::metrics_now();
         let bytes = match read_guest_range(export.fc_pid, &export.vmas, chunk_offset, len) {
             Ok(b) => b,
             Err(e) => {
@@ -646,7 +646,7 @@ impl PeerServer {
         // resident bytes — it converts one stalled-vCPU round trip
         // into a dest-side cache/GCS fetch. The zero check stays on
         // both paths (cheap scan, saves the whole payload).
-        let t_classify = std::time::Instant::now();
+        let t_classify = crate::time_source::metrics_now();
         let classified = if latency_critical {
             if bytes.iter().all(|b| *b == 0) {
                 ServedChunk::Zero
@@ -678,7 +678,7 @@ impl PeerServer {
                 // v2: ship the smaller of lz4/raw; integrity covers
                 // the wire bytes (and hashing the smaller payload is
                 // itself a win on this no-SHA-NI fleet).
-                let t_encode = std::time::Instant::now();
+                let t_encode = crate::time_source::metrics_now();
                 let (wire, lz4) = engram_migrate_proto::compress_page(bytes);
                 let hash = engram_migrate_proto::wire_hash(&wire);
                 export
@@ -793,6 +793,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use std::io::Write as _;
 
     use super::*;

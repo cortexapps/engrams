@@ -22,19 +22,19 @@ use engram_egress_proxy::{
     CaSource, CertMint, InjectRefresher, Listeners, Proxy, ProxyConfig, RefreshedInject, Registry,
 };
 
-use crate::coord_client::CoordClient;
+use crate::coord_client::HttpCoordClient;
 
 /// WS4: the host-agent's [`InjectRefresher`] — bridges the egress proxy's
 /// near-expiry re-mint request to the coordinator's inject-refresh route (which
 /// holds the mint authority). The proxy AWAITS this before injecting a stale
 /// minted credential, closing the campaign's reads-401/writes-succeed asymmetry.
 pub struct CoordInjectRefresher {
-    coord: CoordClient,
+    coord: HttpCoordClient,
     host_id: HostId,
 }
 
 impl CoordInjectRefresher {
-    pub fn new(coord: CoordClient, host_id: HostId) -> Self {
+    pub fn new(coord: HttpCoordClient, host_id: HostId) -> Self {
         Self { coord, host_id }
     }
 }
@@ -333,6 +333,8 @@ pub fn register_policy(
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use engram_core::types::egress::{EgressInjectEntry, EgressObserveEntry, SessionEgressPolicy};
     use engram_core::types::image::SecretMode;

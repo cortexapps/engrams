@@ -571,7 +571,7 @@ async fn main() -> Result<(), HostAgentError> {
         .coordinator_endpoint
         .clone()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-    let auth_coord_client = engram_host_agent::coord_client::CoordClient::new(
+    let auth_coord_client = engram_host_agent::coord_client::HttpCoordClient::new(
         coord_url_for_auth,
         cfg.coordinator_token.clone(),
     );
@@ -628,11 +628,17 @@ async fn main() -> Result<(), HostAgentError> {
     // ADR 0056 Phase 4: the egress proxy's observed-asset sink — forwards each
     // proxy-built IntegrationAsset to the coord (mirrors the harness-event
     // path). Best-effort fire-and-forget: spawn the POST, log on failure.
+    // ADR 0098 D1: wall clock is an injected world input. The binary
+    // constructs the production clock once and the observe sink reads the
+    // asset timestamp through it.
+    let observe_clock: Arc<dyn engram_core::traits::Clock> =
+        Arc::new(engram_core::traits::SystemClock::new());
     let observe_sink: engram_egress_proxy::ObserveSink = Arc::new(move |session_id, asset| {
-        let cc = engram_host_agent::coord_client::CoordClient::new(
+        let cc = engram_host_agent::coord_client::HttpCoordClient::new(
             observe_coord_url.clone(),
             observe_token.clone(),
         );
+        let observe_clock = observe_clock.clone();
         tokio::spawn(async move {
             let req = engram_host_agent::coord_client::IntegrationAssetReport {
                 provider: asset.provider,
@@ -640,7 +646,7 @@ async fn main() -> Result<(), HostAgentError> {
                 surface: asset.surface,
                 data: serde_json::Value::Object(asset.data),
                 fetchable_url: asset.fetchable_url,
-                at: chrono::Utc::now(),
+                at: observe_clock.now_utc(),
             };
             if let Err(e) = cc.integration_asset(session_id, &req).await {
                 tracing::debug!(%session_id, error = %e, "forward integration asset to coord failed");
@@ -652,7 +658,7 @@ async fn main() -> Result<(), HostAgentError> {
     // sink's coord bridge, but request/response since the proxy awaits it).
     let inject_refresher: Arc<dyn engram_egress_proxy::InjectRefresher> =
         Arc::new(engram_host_agent::egress::CoordInjectRefresher::new(
-            engram_host_agent::coord_client::CoordClient::new(refresh_coord_url, refresh_token),
+            engram_host_agent::coord_client::HttpCoordClient::new(refresh_coord_url, refresh_token),
             host_id,
         ));
     match build_host_egress(&cli, Some(observe_sink), Some(inject_refresher)).await {

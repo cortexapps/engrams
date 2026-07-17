@@ -401,7 +401,7 @@ async fn run_disk_leg(
     if record.stage != FinalizeStage::Captured {
         return Ok(());
     }
-    let start = std::time::Instant::now();
+    let start = crate::time_source::metrics_now();
     match (&f.chunk_store, &record.disk_pending) {
         (_, None) => {
             // No NBD disk tier at capture — nothing to carry (matches
@@ -464,7 +464,7 @@ async fn run_memory_leg(
     if record.stage != FinalizeStage::DiskUploaded {
         return Ok(());
     }
-    let start = std::time::Instant::now();
+    let start = crate::time_source::metrics_now();
     // The input file to best-effort-delete AFTER the stage bump is
     // durable (finding 1). `None` when this attempt didn't consume a
     // fresh on-disk input (nothing to clean up, or the chunk_store leg
@@ -575,7 +575,7 @@ async fn run_blobs_leg(
     if record.stage != FinalizeStage::MemoryChunked {
         return Ok(());
     }
-    let start = std::time::Instant::now();
+    let start = crate::time_source::metrics_now();
     if let Some(chunk_store) = f.chunk_store.as_ref() {
         let blob = chunk_store.blob_storage();
         let state_path = record.dest.join("state.bin");
@@ -627,7 +627,7 @@ async fn run_terminal(
     if record.stage != FinalizeStage::BlobsUploaded {
         return Ok(());
     }
-    let start = std::time::Instant::now();
+    let start = crate::time_source::metrics_now();
     let checkpoint = CheckpointRecord {
         snapshot_id: record.snapshot_id,
         session_id: record.session_id,

@@ -391,6 +391,11 @@ pub struct ChunkedDiskBackend {
     /// (steady state → 0d metrics only).
     operation_scope: crate::trace_scope::OperationScope,
 
+    /// ADR 0098 D1: the fork-manifest identity is minted through injected
+    /// entropy (it becomes the NBD `backend_identifier` — a decision id).
+    /// P1 wires the production `OsEntropy`.
+    entropy: Arc<dyn engram_core::traits::Entropy>,
+
     /// Issue #204 regression test seam: an optional async barrier fired by
     /// `flush_local` AFTER it has moved the drained chunks into the held
     /// `pending` map but BEFORE it releases the `pending`+`dirty` locks —
@@ -667,6 +672,7 @@ impl ChunkedDiskBackend {
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
             #[cfg(test)]
             flush_local_handoff_seam: std::sync::Mutex::new(None),
         })
@@ -707,6 +713,7 @@ impl ChunkedDiskBackend {
             threshold_bytes,
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
             #[cfg(test)]
             flush_local_handoff_seam: std::sync::Mutex::new(None),
         })
@@ -1138,7 +1145,7 @@ impl ChunkedDiskBackend {
     /// Idempotent-safe: only the fresh-create call site invokes it,
     /// exactly once, before any flush.
     pub async fn fork_manifest_identity(&self) {
-        self.state.lock().await.fork_identity = Some(uuid::Uuid::new_v4());
+        self.state.lock().await.fork_identity = Some(self.entropy.uuid());
     }
 
     /// ADR 0045 C1: see `migration_fence`.
@@ -1516,7 +1523,7 @@ impl ChunkedDiskBackend {
             let Some(ov) = self.postcopy_overlay() else {
                 return;
             };
-            let started = std::time::Instant::now();
+            let started = crate::time_source::metrics_now();
             let indices: Vec<usize> = ov.sealed.lock().await.iter().copied().collect();
             let total = indices.len();
             use futures::StreamExt;
@@ -2182,6 +2189,8 @@ impl ChunkedDiskBackend {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use engram_chunk_store::cache::ChunkCacheConfig;
     use engram_chunk_store::manifest::{ChunkSize, MANIFEST_SCHEMA_VERSION};

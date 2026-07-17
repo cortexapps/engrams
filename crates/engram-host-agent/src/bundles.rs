@@ -246,7 +246,7 @@ impl BundleStore {
 
     async fn fetch_one(&self, r: &AuxBundleRef, staged: &Path) -> Result<(), SandboxError> {
         let key = AuxRoDrive::blob_key(&r.sha256);
-        let started = std::time::Instant::now();
+        let started = crate::time_source::metrics_now();
         let mut stream = self.blob.get_streaming(&key).await.map_err(|e| {
             SandboxError::Snapshot(format!(
                 "bundle materialize: get {key}: {e} — the pinned generation is \

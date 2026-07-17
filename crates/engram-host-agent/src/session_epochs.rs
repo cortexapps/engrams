@@ -21,8 +21,10 @@
 //! starts at high-water 0, which any real epoch exceeds.
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use engram_core::traits::{Clock, SystemClock};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
 
@@ -91,6 +93,9 @@ impl From<std::io::Error> for EpochError {
 #[derive(Clone, Debug)]
 pub struct SessionEpochStore {
     dir: PathBuf,
+    /// ADR 0098 D1: wall clock is an injected world input. P1 wires the
+    /// production clock; sim injection rides the flow-extraction PRs.
+    clock: Arc<dyn Clock>,
 }
 
 impl SessionEpochStore {
@@ -101,7 +106,10 @@ impl SessionEpochStore {
     pub fn open(dir: impl Into<PathBuf>) -> std::io::Result<Self> {
         let dir = dir.into();
         std::fs::create_dir_all(&dir)?;
-        Ok(Self { dir })
+        Ok(Self {
+            dir,
+            clock: Arc::new(SystemClock::new()),
+        })
     }
 
     fn path_for(&self, session_id: SessionId) -> PathBuf {
@@ -129,7 +137,7 @@ impl SessionEpochStore {
                 schema_version: EPOCH_SCHEMA_VERSION,
                 session_id,
                 epoch: incoming,
-                updated_at: Utc::now(),
+                updated_at: self.clock.now_utc(),
             })?;
         }
         Ok(())
@@ -195,7 +203,10 @@ impl SessionEpochStore {
 /// the fence. Backed by a temp dir so the production code path runs
 /// unchanged.
 pub fn ephemeral() -> SessionEpochStore {
-    let dir = std::env::temp_dir().join(format!("engram-session-epochs-{}", uuid::Uuid::new_v4()));
+    let dir = std::env::temp_dir().join(format!(
+        "engram-session-epochs-{}",
+        crate::time_source::unique_path_token()
+    ));
     SessionEpochStore::open(dir).expect("ephemeral session epoch store")
 }
 

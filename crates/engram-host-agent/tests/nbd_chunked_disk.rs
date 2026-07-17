@@ -37,7 +37,8 @@
 //!    kernel mounting it as the rootfs.
 //!  - Clean tear-down: netlink `NBD_CMD_DISCONNECT` releases the
 //!    device and the slot returns to the pool.
-
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;

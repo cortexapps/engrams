@@ -5,6 +5,7 @@ members = [
     "crates/engram-protocol",
     "crates/engram-coordinator",
     "crates/engram-host-agent",
+    "crates/engram-host-core",
     "crates/engram-host-operator",
     "crates/engram-chunk-store",
     "crates/engram-rootfs-materializer",
@@ -97,6 +98,7 @@ engram-migrate-proto = { path = "crates/engram-migrate-proto" }
 engram-substrate-proto = { path = "crates/engram-substrate-proto" }
 engram-transport = { path = "crates/engram-transport" }
 engram-host-agent = { path = "crates/engram-host-agent" }
+engram-host-core = { path = "crates/engram-host-core" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-session-bundles = { path = "crates/engram-session-bundles" }
 engram-mount-manifest = { path = "crates/engram-mount-manifest" }

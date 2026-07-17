@@ -43,7 +43,8 @@
 //! ```
 //!
 //! Self-skips when `/dev/nbdN` is missing or unwritable.
-
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 use std::path::{Path, PathBuf};
@@ -61,7 +62,7 @@ use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{ExecRequest, ExecStream, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
-use engram_host_agent::coord_client::CoordClient;
+use engram_host_agent::coord_client::HttpCoordClient;
 use engram_host_agent::disk_daemon::NbdSlotAllocator;
 use engram_host_agent::pooled_backend::PooledBackend;
 use engram_storage_local::LocalBlobStorage;
@@ -279,7 +280,8 @@ async fn sigterm_final_flush_persists_survivors_un_flushed_writes() {
     assert_eq!(pool.capacity(), 1);
 
     let host_id = engram_core::HostId::new();
-    let coord = CoordClient::new(format!("http://{coord_addr}"), None);
+    let coord: Arc<dyn engram_host_core::CoordControlPlane> =
+        Arc::new(HttpCoordClient::new(format!("http://{coord_addr}"), None));
 
     let pooled = Arc::new(
         PooledBackend::new(inner)

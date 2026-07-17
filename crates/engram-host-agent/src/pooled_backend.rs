@@ -688,7 +688,14 @@ pub struct PooledBackend {
     /// (the same wiring that builds the async publisher); `None` for
     /// the no-op / test publishers, in which case the shutdown flush
     /// still drains chunks to GCS but skips the coord publish.
-    shutdown_manifest_publish: Option<(crate::coord_client::CoordClient, engram_core::HostId)>,
+    shutdown_manifest_publish: Option<(
+        Arc<dyn engram_host_core::CoordControlPlane>,
+        engram_core::HostId,
+    )>,
+    /// ADR 0098 D1: wall clock is an injected world input. P1 wires the
+    /// production clock (record timestamps, the pause mark); the full
+    /// `HostEffects` bundle + sim injection ride the flow-extraction PRs.
+    clock: Arc<dyn engram_core::traits::Clock>,
 }
 
 /// Human-readable message for a [`crate::warm_progress::WarmViolation`] —
@@ -1001,7 +1008,7 @@ impl PooledBackend {
             workdir: None,
             timeout: Some(std::time::Duration::from_secs(120)),
         };
-        let started = std::time::Instant::now();
+        let started = crate::time_source::metrics_now();
         let stream = self
             .exec_stream(id, req)
             .await
@@ -1102,7 +1109,7 @@ impl PooledBackend {
             stall: warm_stall_secs_from_env(),
             global_timeout: warm.timeout(),
         };
-        let started = std::time::Instant::now();
+        let started = crate::time_source::metrics_now();
         let mut watchdog = WarmWatchdog::new(watchdog_cfg, started);
         let mut tail = OutputTail::default();
         let mut pending_stdout: Vec<u8> = Vec::new();
@@ -1131,7 +1138,7 @@ impl PooledBackend {
                                  detail: &Option<String>,
                                  message: String| {
             let stage = watchdog.current_stage_name().map(str::to_string);
-            let stages = watchdog.clone().finish_failed(chrono::Utc::now());
+            let stages = watchdog.clone().finish_failed(self.clock.now_utc());
             record_warm_stage_metrics(&stages);
             record_warm_hook_failure_metric(kind);
             let output_tail = tail.render();
@@ -1172,8 +1179,8 @@ impl PooledBackend {
                     match ev {
                         Some(ExecEvent::Stdout(bytes)) => {
                             tail.push(&bytes);
-                            let now = std::time::Instant::now();
-                            let wall_now = chrono::Utc::now();
+                            let now = crate::time_source::metrics_now();
+                            let wall_now = self.clock.now_utc();
                             if let Some(v) = watchdog.on_event(WatchdogInput::OutputBytes, now, wall_now) {
                                 return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
                             }
@@ -1186,8 +1193,8 @@ impl PooledBackend {
                                     continue;
                                 };
                                 last_detail = progress_line_detail(&parsed);
-                                let now = std::time::Instant::now();
-                                let wall_now = chrono::Utc::now();
+                                let now = crate::time_source::metrics_now();
+                                let wall_now = self.clock.now_utc();
                                 if let Some(v) = watchdog.on_event(WatchdogInput::Progress(parsed), now, wall_now) {
                                     return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
                                 }
@@ -1210,8 +1217,8 @@ impl PooledBackend {
                         }
                         Some(ExecEvent::Stderr(bytes)) => {
                             tail.push(&bytes);
-                            let now = std::time::Instant::now();
-                            let wall_now = chrono::Utc::now();
+                            let now = crate::time_source::metrics_now();
+                            let wall_now = self.clock.now_utc();
                             if let Some(v) = watchdog.on_event(WatchdogInput::OutputBytes, now, wall_now) {
                                 return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
                             }
@@ -1229,8 +1236,8 @@ impl PooledBackend {
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
-                    let now = std::time::Instant::now();
-                    let wall_now = chrono::Utc::now();
+                    let now = crate::time_source::metrics_now();
+                    let wall_now = self.clock.now_utc();
                     if let Some(v) = watchdog.on_event(WatchdogInput::Tick, now, wall_now) {
                         return Err(violation_failure(v.kind(), watchdog, &tail, &last_detail, warm_violation_message(v)));
                     }
@@ -1744,6 +1751,7 @@ impl PooledBackend {
             #[cfg(target_os = "linux")]
             abandoning: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             shutdown_manifest_publish: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
     }
 
@@ -1874,6 +1882,7 @@ impl PooledBackend {
             checkpoint_dir: self.checkpoint_dir.clone(),
             chain_heads: self.chain_heads.clone(),
             session_bindings: self.session_bindings.clone(),
+            clock: self.clock.clone(),
         }
     }
 
@@ -2059,7 +2068,7 @@ impl PooledBackend {
         // ADR 0038 B0: time the lock wait — the gridlock signal. With
         // B1 periodic checkpoints skip rather than queue, so a long tail
         // here is an eviction/drain blocked on an in-flight capture.
-        let lock_wait = std::time::Instant::now();
+        let lock_wait = crate::time_source::metrics_now();
         let capture_guard = capture_lock.lock_owned().await;
         metrics::histogram!(crate::metrics::SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS)
             .record(lock_wait.elapsed().as_secs_f64());
@@ -2174,7 +2183,7 @@ impl PooledBackend {
         // the (memory, disk, event-log) triple — the coord resolves
         // the session_events cursor as "last event at or before this"
         // when it records the checkpoint.
-        let paused_at = chrono::Utc::now();
+        let paused_at = self.clock.now_utc();
         self.inner
             .pause(id)
             .await
@@ -2270,7 +2279,7 @@ impl PooledBackend {
         // cold Full seed. After B2, `type="full"` should vanish on the
         // resume path (chain seeded → diff).
         let snap_type = if chain_prev.is_some() { "diff" } else { "full" };
-        let create_start = std::time::Instant::now();
+        let create_start = crate::time_source::metrics_now();
         let create_res = if chain_prev.is_some() {
             self.inner.snapshot_diff(id).await
         } else {
@@ -2403,7 +2412,7 @@ impl PooledBackend {
         }
         let scope = PeerChunkScope::Snapshot(metadata.id);
         let total = missing.len();
-        let started = std::time::Instant::now();
+        let started = crate::time_source::metrics_now();
         for addr in metadata.peer_hints.iter().take(2) {
             let stats = crate::peer_fill::pull_chunks_from_peer(
                 addr,
@@ -2599,7 +2608,7 @@ impl PooledBackend {
         use engram_core::types::snapshot::MigrationItem;
         tokio::spawn(async move {
             let budget = std::time::Duration::from_secs(240);
-            let started = std::time::Instant::now();
+            let started = crate::time_source::metrics_now();
             let tmp = dest_dir.join("postcopy-tmp");
             let _ = fs::create_dir_all(&tmp).await;
 
@@ -2629,7 +2638,7 @@ impl PooledBackend {
                         }
                     },
                 };
-                let t_fetch = std::time::Instant::now();
+                let t_fetch = crate::time_source::metrics_now();
                 match Self::fetch_export_items(
                     client,
                     &pending.export_id,
@@ -3068,6 +3077,7 @@ impl PooledBackend {
         // chunks never reached GCS.
         let chain_heads = self.chain_heads.clone();
         let chain_session = self.session_bindings.get(&id).map(|s| *s);
+        let clock = self.clock.clone();
         let handle = tokio::spawn(async move {
             let _capture_guard = capture_guard;
             // 1. Upload every pulled chunk (content-addressed,
@@ -3128,7 +3138,7 @@ impl PooledBackend {
                     sandbox_id: id,
                     manifest_ref: mig.memory_manifest_ref,
                     session_id: chain_session,
-                    updated_at: chrono::Utc::now(),
+                    updated_at: clock.now_utc(),
                 };
                 if let Err(e) = store.persist(record).await {
                     tracing::warn!(sandbox_id = %id, error = %e,
@@ -3431,7 +3441,7 @@ impl PooledBackend {
     }
 
     /// ADR 0016 Phase B commit 4: build a coord-bound publisher
-    /// using the host-agent's `CoordClient` and the freshly-wrapped
+    /// using the host-agent's `HttpCoordClient` and the freshly-wrapped
     /// `session_bindings` map. The publisher spawns its own drain
     /// task; the returned `LiveManifestPublisherHandle` is held
     /// inside PooledBackend so the task dies with us.
@@ -3447,7 +3457,7 @@ impl PooledBackend {
     /// skips with a debug log.
     pub fn with_live_manifest_coord_publisher(
         mut self,
-        coord: crate::coord_client::CoordClient,
+        coord: Arc<dyn engram_host_core::CoordControlPlane>,
         host_id: engram_core::HostId,
     ) -> Self {
         let session_bindings = Arc::clone(&self.session_bindings);
@@ -3684,7 +3694,7 @@ impl PooledBackend {
                         );
                         return;
                     };
-                    let req = crate::coord_client::LiveManifestPublishRequest {
+                    let req = engram_host_core::LiveManifestPublishRequest {
                         session_id,
                         sandbox_id,
                         manifest_id: outcome.manifest_ref.manifest_id,
@@ -4973,6 +4983,9 @@ pub(crate) struct SnapshotFinisher {
     checkpoint_dir: Option<PathBuf>,
     chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
     session_bindings: Arc<DashMap<SandboxId, SessionId>>,
+    /// ADR 0098 D1: cloned from the owning `PooledBackend` — the chain-head
+    /// record's `updated_at` reads through the injected clock.
+    clock: Arc<dyn engram_core::traits::Clock>,
 }
 
 impl SnapshotFinisher {
@@ -4986,7 +4999,7 @@ impl SnapshotFinisher {
         id: SandboxId,
         cap: SnapshotCapture,
     ) -> Result<SnapshotMetadata, SandboxError> {
-        let finish_start = std::time::Instant::now();
+        let finish_start = crate::time_source::metrics_now();
         let flavor = if cap.chain_prev.is_some() {
             "diff"
         } else {
@@ -5305,7 +5318,7 @@ impl SnapshotFinisher {
             sandbox_id: id,
             manifest_ref,
             session_id: self.session_bindings.get(&id).map(|s| *s),
-            updated_at: chrono::Utc::now(),
+            updated_at: self.clock.now_utc(),
         };
         if let Err(e) = store.persist(record).await {
             tracing::warn!(
@@ -5775,12 +5788,12 @@ async fn read_prefault_stats_with_retry_bounded(
     interval: std::time::Duration,
     timeout: std::time::Duration,
 ) -> Option<Vec<u8>> {
-    let deadline = tokio::time::Instant::now() + timeout;
+    let deadline = crate::time_source::metrics_now_tokio() + timeout;
     loop {
         if let Ok(bytes) = fs::read(stats_path).await {
             return Some(bytes);
         }
-        if tokio::time::Instant::now() >= deadline {
+        if crate::time_source::metrics_now_tokio() >= deadline {
             return None;
         }
         tokio::time::sleep(interval).await;
@@ -5915,7 +5928,7 @@ impl SandboxBackend for PooledBackend {
         // independently optional (image-only specs skip the harness
         // pull and vice-versa). The histogram labels follow the
         // contract in `crate::metrics::SANDBOX_BOOT_SECONDS`.
-        let phase_total = std::time::Instant::now();
+        let phase_total = crate::time_source::metrics_now();
         let mut image_resolve = std::time::Duration::ZERO;
         let mut materialize = std::time::Duration::ZERO;
         let result: Result<SandboxId, SandboxError> = async {
@@ -5925,7 +5938,7 @@ impl SandboxBackend for PooledBackend {
             // lineage, so the image's own disk (and its pull) is
             // irrelevant; `spec.image_uri` stays as record-keeping.
             if let Some(manifest_ref) = spec.rootfs_manifest {
-                let t = std::time::Instant::now();
+                let t = crate::time_source::metrics_now();
                 let (path, _state) = self.resolve_rootfs_from_manifest(manifest_ref).await?;
                 materialize += t.elapsed();
                 spec.rootfs_source = Some(path);
@@ -5935,13 +5948,13 @@ impl SandboxBackend for PooledBackend {
                 }
             } else if let Some(cache) = &self.image_cache {
                 if let Some(uri) = spec.image_uri.clone() {
-                    let t = std::time::Instant::now();
+                    let t = crate::time_source::metrics_now();
                     let cached = cache.ensure_image(&uri).await.map_err(|e| {
                         SandboxError::InvalidSpec(format!("image cache pull {uri}: {e}"))
                     })?;
                     image_resolve += t.elapsed();
                     tracing::debug!(uri = %uri, digest = %cached.digest, "image cache hit/pulled");
-                    let t = std::time::Instant::now();
+                    let t = crate::time_source::metrics_now();
                     let (path, _state) = self.resolve_rootfs(&uri, &cached).await?;
                     materialize += t.elapsed();
                     spec.rootfs_source = Some(path);
@@ -6527,8 +6540,8 @@ impl SandboxBackend for PooledBackend {
             let capture_guard = self.capture_lock(id).lock_owned().await;
 
             // Blackout leg 1: pause. (PR 10 decomposition.)
-            let t_pause = std::time::Instant::now();
-            let paused_at = chrono::Utc::now();
+            let t_pause = crate::time_source::metrics_now();
+            let paused_at = self.clock.now_utc();
             self.inner
                 .pause(id)
                 .await
@@ -6564,7 +6577,7 @@ impl SandboxBackend for PooledBackend {
                 .nbd_sandboxes
                 .get(&id)
                 .map(|e| (e.backend.clone(), e.device_path().to_path_buf()));
-            let t_disk = std::time::Instant::now();
+            let t_disk = crate::time_source::metrics_now();
             if let Some((backend, dev)) = &disk_entry {
                 backend.set_migration_fence(true);
                 // Issue #202: record the fence on the unwind guard.
@@ -6588,7 +6601,7 @@ impl SandboxBackend for PooledBackend {
             // Blackout leg 3: vmstate. Fork v3: state.bin + sidecar
             // only — the memory artifact never materializes (the whole
             // point).
-            let t_vmstate = std::time::Instant::now();
+            let t_vmstate = crate::time_source::metrics_now();
             let sidecar = self.inner.compose_live_sidecar(id, Some(chain_ref))?;
             let (snapshot_id, export_dir) = self
                 .inner
@@ -6598,7 +6611,7 @@ impl SandboxBackend for PooledBackend {
             let vmstate_ms = t_vmstate.elapsed().as_millis() as u64;
 
             // The pagemap dirty map (blackout-critical; measured).
-            let scan_started = std::time::Instant::now();
+            let scan_started = crate::time_source::metrics_now();
             let base_path = crate::dirty_map::find_base_mapping(view.fc_pid, &view.uffd_base_dir)
                 .map_err(|e| SandboxError::Snapshot(format!("base mapping scan: {e}")))?
                 .ok_or_else(|| {
@@ -6639,7 +6652,7 @@ impl SandboxBackend for PooledBackend {
             // drain empties `dirty`, so from here every error arm must
             // requeue before returning. Only the descriptor write and
             // the export insert sit in that window.
-            let t_seal = std::time::Instant::now();
+            let t_seal = crate::time_source::metrics_now();
             let (disk_seal, disk_seal_info) = if let Some((backend, _)) = &disk_entry {
                 let (sealed, base_manifest, base_ref) = backend.seal_for_postcopy().await;
                 let info = serde_json::json!({
@@ -6689,7 +6702,7 @@ impl SandboxBackend for PooledBackend {
             // could still fail.
             let state_served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
             let last_activity =
-                std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now()));
+                std::sync::Arc::new(std::sync::Mutex::new(crate::time_source::metrics_now()));
             // Issue #216 Gap 2: the peer page server shares THIS clock so
             // its TCP-only NeedAt/GetChunk serves refresh the same TTL
             // anchor the dumb-host sweep reads via `expired()`.
@@ -6701,7 +6714,7 @@ impl SandboxBackend for PooledBackend {
                 allowed_chunks: allowed.clone(),
                 disk_pending: None,
                 disk_seal,
-                created_at: std::time::Instant::now(),
+                created_at: crate::time_source::metrics_now(),
                 post_copy: true,
                 state_served,
                 last_activity,
@@ -6925,7 +6938,7 @@ impl SandboxBackend for PooledBackend {
             Err(SandboxError::InvalidSpec(_)) => {}
             Err(e) => return Err(SandboxError::Snapshot(format!("wait_agent_ready: {e}"))),
         }
-        let paused_at = chrono::Utc::now();
+        let paused_at = self.clock.now_utc();
         self.inner
             .pause(id)
             .await
@@ -7116,13 +7129,15 @@ impl SandboxBackend for PooledBackend {
             allowed_chunks: allowed,
             disk_pending,
             disk_seal: None,
-            created_at: std::time::Instant::now(),
+            created_at: crate::time_source::metrics_now(),
             // C1 stop-and-copy export: the guest stays frozen and the
             // dest pulls eagerly; post-copy captures (C2) construct
             // their own export with post_copy: true.
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
+                crate::time_source::metrics_now(),
+            )),
             capture_guard,
         });
         if !inserted {
@@ -7539,7 +7554,7 @@ impl SandboxBackend for PooledBackend {
                     let remaining = Self::order_hot_first(remaining, &mig.hot_chunks);
                     if !remaining.is_empty() {
                         let n = remaining.len();
-                        let t = std::time::Instant::now();
+                        let t = crate::time_source::metrics_now();
                         match Self::pull_chunks_from_source(
                             &mig.source_addr,
                             &mig.export_id,
@@ -9094,6 +9109,8 @@ impl PooledBackend {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use crate::image_cache::ImageBundle;
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};

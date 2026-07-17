@@ -16,6 +16,9 @@ use std::sync::Arc;
 use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::{CloudBackend, SandboxBackend};
 use engram_core::SandboxId;
+// ADR 0098 Phase 2: the teardown-reconcile / TTL-sweep / reattach-source
+// paths hold the coordinator via the `CoordControlPlane` seam.
+use engram_host_core::CoordControlPlane;
 
 use crate::image_cache::ImageCache;
 
@@ -58,6 +61,7 @@ pub mod ram_ledger;
 pub mod resource;
 pub mod snapshot;
 pub mod teardown_reconcile;
+mod time_source;
 pub mod trace_scope;
 pub mod util;
 pub mod warm_progress;
@@ -303,10 +307,11 @@ impl HostAgent {
                 // task is owned by `p` (via
                 // `LiveManifestPublisherHandle`), so it dies with
                 // the host-agent process.
-                let publisher_coord = coord_client::CoordClient::new(
-                    coord_url.clone(),
-                    self.cfg.coordinator_token.clone(),
-                );
+                let publisher_coord: Arc<dyn CoordControlPlane> =
+                    Arc::new(coord_client::HttpCoordClient::new(
+                        coord_url.clone(),
+                        self.cfg.coordinator_token.clone(),
+                    ));
                 p = p.with_live_manifest_coord_publisher(publisher_coord, host_id);
                 // ADR 0028 Fix A: checkpoint chains (rolling memory
                 // images + durable records) live under the work dir.
@@ -375,10 +380,11 @@ impl HostAgent {
             // destroy / stay-paused per `migration::ttl_verdict`.
             {
                 let pooled_for_ttl = pooled.clone();
-                let coord_for_ttl = coord_client::CoordClient::new(
-                    coord_url.clone(),
-                    self.cfg.coordinator_token.clone(),
-                );
+                let coord_for_ttl: Arc<dyn CoordControlPlane> =
+                    Arc::new(coord_client::HttpCoordClient::new(
+                        coord_url.clone(),
+                        self.cfg.coordinator_token.clone(),
+                    ));
                 let host_id_for_ttl = host_id;
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -476,10 +482,11 @@ impl HostAgent {
             {
                 let pooled_for_reap = pooled.clone();
                 let capture_jobs_for_reap = capture_jobs.clone();
-                let coord_for_reap = coord_client::CoordClient::new(
-                    coord_url.clone(),
-                    self.cfg.coordinator_token.clone(),
-                );
+                let coord_for_reap: Arc<dyn CoordControlPlane> =
+                    Arc::new(coord_client::HttpCoordClient::new(
+                        coord_url.clone(),
+                        self.cfg.coordinator_token.clone(),
+                    ));
                 let host_id_for_reap = host_id;
                 tokio::spawn(async move {
                     use crate::teardown_reconcile::{
@@ -603,10 +610,11 @@ impl HostAgent {
                             "reattached post-copy SOURCE: staying paused under the ownership rule (never self-resumes)");
                         pooled.note_migration_role(sandbox_id, Some(role));
                         let pooled_for_src = pooled.clone();
-                        let coord_for_src = coord_client::CoordClient::new(
-                            coord_url.clone(),
-                            self.cfg.coordinator_token.clone(),
-                        );
+                        let coord_for_src: Arc<dyn CoordControlPlane> =
+                            Arc::new(coord_client::HttpCoordClient::new(
+                                coord_url.clone(),
+                                self.cfg.coordinator_token.clone(),
+                            ));
                         let host_id_for_src = host_id;
                         tokio::spawn(async move {
                             use engram_core::traits::sandbox::SandboxBackend as _;
@@ -696,17 +704,22 @@ impl HostAgent {
             // back-to-back duplicate `harness_idle` de-dup at the
             // coord side already protects against the few extra
             // events that might land out-of-order across pods.
-            let coord_client_for_events = coord_client::CoordClient::new(
+            let coord_client_for_events = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
+            // ADR 0098 D1: the harness-event timestamp is read through the
+            // injected production clock, constructed once for this sink.
+            let events_clock: Arc<dyn engram_core::traits::Clock> =
+                Arc::new(engram_core::traits::SystemClock::new());
             let event_sink = crate::harness::event_sink_to(move |session_id, sandbox_id, ev| {
                 let cc = coord_client_for_events.clone();
+                let events_clock = events_clock.clone();
                 async move {
                     let req = coord_client::HarnessEventRequest {
                         sandbox_id,
                         event: ev,
-                        at: chrono::Utc::now(),
+                        at: events_clock.now_utc(),
                     };
                     if let Err(e) = cc.harness_event(session_id, &req).await {
                         tracing::debug!(
@@ -738,7 +751,7 @@ impl HostAgent {
             // POST it to `/api/hosts/forge`, write the `ForgeResponse`
             // back. Without this the FC forge accept loop has no sink and
             // drops every dial (guest sees "Broken pipe").
-            let coord_client_for_forge = coord_client::CoordClient::new(
+            let coord_client_for_forge = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
@@ -779,7 +792,7 @@ impl HostAgent {
             // off the vsock, then stream the raw body straight into a
             // streaming POST to `/api/hosts/upload`, and write the coord's
             // `UploadResponse` back to the guest.
-            let coord_client_for_upload = coord_client::CoordClient::new(
+            let coord_client_for_upload = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
@@ -877,10 +890,10 @@ impl HostAgent {
                 }),
             };
 
-            // ADR 0013: per-process CoordClient for HTTP traffic
+            // ADR 0013: per-process HttpCoordClient for HTTP traffic
             // (register, heartbeat, registry-auth, harness-events,
             // idle-eviction).
-            let coord_client = coord_client::CoordClient::new(
+            let coord_client = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );

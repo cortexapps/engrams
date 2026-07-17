@@ -41,8 +41,8 @@ use engram_core::{HostId, SandboxId, SessionId};
 use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 
-use crate::coord_client::{CoordClient, LiveManifestPublishOutcome, LiveManifestPublishRequest};
 use crate::disk_daemon::LiveManifestPublisher;
+use engram_host_core::{CoordControlPlane, LiveManifestPublishOutcome, LiveManifestPublishRequest};
 
 /// Look up the session a sandbox is bound to. PooledBackend's
 /// `session_bindings` is the production implementation; tests use a
@@ -101,7 +101,7 @@ impl CoordLiveManifestPublisher {
     /// FlushScheduler) and the handle (for PooledBackend's
     /// lifecycle bookkeeping).
     pub fn spawn(
-        coord: CoordClient,
+        coord: Arc<dyn CoordControlPlane>,
         host_id: HostId,
         session_resolver: Arc<dyn SessionResolver>,
     ) -> (Arc<dyn LiveManifestPublisher>, LiveManifestPublisherHandle) {
@@ -123,7 +123,7 @@ impl CoordLiveManifestPublisher {
 }
 
 async fn drain_loop(
-    coord: CoordClient,
+    coord: Arc<dyn CoordControlPlane>,
     host_id: HostId,
     pending: Arc<DashMap<SandboxId, ManifestRef>>,
     wakeup: Arc<Notify>,

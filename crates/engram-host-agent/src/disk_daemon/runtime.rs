@@ -808,7 +808,7 @@ pub async fn reattach(
     backend_id: &str,
 ) -> Result<NbdHandle, NbdRuntimeError> {
     let budget = std::time::Duration::from_secs(150);
-    let started = std::time::Instant::now();
+    let started = crate::time_source::metrics_now();
     let mut attempt = 0u32;
     loop {
         attempt += 1;
@@ -830,9 +830,9 @@ pub async fn reattach(
         // Poll for the rejection EOF over a generous window — retry the
         // moment it finishes, declare adoption only if it stays alive.
         const ADOPT_CONFIRM: std::time::Duration = std::time::Duration::from_secs(2);
-        let confirm_deadline = std::time::Instant::now() + ADOPT_CONFIRM;
+        let confirm_deadline = crate::time_source::metrics_now() + ADOPT_CONFIRM;
         let mut rejected = false;
-        while std::time::Instant::now() < confirm_deadline {
+        while crate::time_source::metrics_now() < confirm_deadline {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
             if handle
                 .serve_task

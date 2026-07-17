@@ -12,7 +12,7 @@
 //! This module makes capture a durable job instead: the coordinator
 //! dispatches `(job_id, epoch)` assignments over `HeartbeatAck.
 //! capture_assignments`; the host claims the full dispatch
-//! (`CoordClient::claim_capture_job`, the authed HTTP channel — secrets
+//! (`HttpCoordClient::claim_capture_job`, the authed HTTP channel — secrets
 //! ride only that response, never PG/heartbeat/the durable record below)
 //! and runs [`engram_core::traits::sandbox::SandboxBackend::
 //! build_base_snapshot`] UNCHANGED — this module is a layer ABOVE that
@@ -40,6 +40,7 @@ use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::traits::{Clock, SystemClock};
 use engram_core::types::capture_job::{CaptureJobSpec, CaptureJobStage};
 use engram_core::types::{
     CaptureJobAssignment, CaptureJobId, CaptureJobProgress, CaptureJobReport, CaptureProgress,
@@ -136,16 +137,17 @@ fn capture_leg_name(progress: &CaptureProgress) -> String {
 fn advance_capture_legs(
     legs: &mut Vec<engram_core::types::WarmStageRecord>,
     name: String,
+    clock: &dyn Clock,
 ) -> Option<engram_core::types::WarmStageRecord> {
     if let Some(open) = legs.last() {
         if open.ended_at.is_none() && open.name == name {
             return None; // keepalive of the open leg
         }
     }
-    let closed = close_open_capture_leg(legs);
+    let closed = close_open_capture_leg(legs, clock);
     legs.push(engram_core::types::WarmStageRecord {
         name,
-        started_at: chrono::Utc::now(),
+        started_at: clock.now_utc(),
         ended_at: None,
         outcome: engram_core::types::WarmStageOutcome::Running,
     });
@@ -154,9 +156,10 @@ fn advance_capture_legs(
 
 fn close_open_capture_leg(
     legs: &mut [engram_core::types::WarmStageRecord],
+    clock: &dyn Clock,
 ) -> Option<engram_core::types::WarmStageRecord> {
     let open = legs.last_mut().filter(|l| l.ended_at.is_none())?;
-    open.ended_at = Some(chrono::Utc::now());
+    open.ended_at = Some(clock.now_utc());
     open.outcome = engram_core::types::WarmStageOutcome::Done;
     Some(open.clone())
 }
@@ -219,6 +222,9 @@ pub struct CaptureJobExecutor {
     /// and the host that actually ran the VMM is the authority for it,
     /// not the heartbeat-lagged `hosts.capabilities` row.
     fc_snapshot_version: Option<String>,
+    /// ADR 0098 D1: wall clock is an injected world input (the durable
+    /// capture-leg timeline timestamps). P1 wires the production clock.
+    clock: Arc<dyn Clock>,
 }
 
 impl CaptureJobExecutor {
@@ -234,6 +240,7 @@ impl CaptureJobExecutor {
             running: Mutex::new(HashMap::new()),
             self_ref: std::sync::OnceLock::new(),
             fc_snapshot_version,
+            clock: Arc::new(SystemClock::new()),
         });
         let _ = arc.self_ref.set(Arc::downgrade(&arc));
         arc
@@ -332,7 +339,7 @@ impl CaptureJobExecutor {
     }
 
     /// Whether the heartbeat-ack loop should call
-    /// `CoordClient::claim_capture_job` for `(job_id, epoch)`: `true`
+    /// `HttpCoordClient::claim_capture_job` for `(job_id, epoch)`: `true`
     /// unless this exact epoch is already running. A LOWER epoch than
     /// what's running is implicitly "no" too (the assignment is stale —
     /// the coordinator hasn't caught up to a reassignment this host
@@ -504,9 +511,11 @@ impl CaptureJobExecutor {
                     }
                 }
             }
-            if let Some(closed) =
-                advance_capture_legs(&mut capture_legs, capture_leg_name(&progress))
-            {
+            if let Some(closed) = advance_capture_legs(
+                &mut capture_legs,
+                capture_leg_name(&progress),
+                self.clock.as_ref(),
+            ) {
                 record_capture_leg(&closed);
             }
             if !progress.warm_stages.is_empty() {
@@ -575,7 +584,8 @@ impl CaptureJobExecutor {
         // and carries it as-is so the timeline shows where it died.
         let final_progress = {
             if matches!(terminal, CaptureTerminalReport::Done { .. }) {
-                if let Some(closed) = close_open_capture_leg(&mut capture_legs) {
+                if let Some(closed) = close_open_capture_leg(&mut capture_legs, self.clock.as_ref())
+                {
                     record_capture_leg(&closed);
                 }
             }
@@ -636,6 +646,8 @@ fn classify_sandbox_error(
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use async_trait::async_trait;
     use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
