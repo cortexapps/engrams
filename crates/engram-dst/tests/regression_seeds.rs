@@ -8,6 +8,17 @@
 use engram_dst::{Profile, Sim};
 
 fn run(seed: u64, profile: Profile, steps: u64) {
+    run_inner(seed, profile, steps, false);
+}
+
+/// Same, but over the opt-in faithful-host world (`with_faithful_hosts`) —
+/// the digest-gated `candidates_for` scheduling path that becomes the swarm
+/// default once #789's chain clears.
+fn run_faithful(seed: u64, profile: Profile, steps: u64) {
+    run_inner(seed, profile, steps, true);
+}
+
+fn run_inner(seed: u64, profile: Profile, steps: u64, faithful: bool) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -15,6 +26,9 @@ fn run(seed: u64, profile: Profile, steps: u64) {
     rt.block_on(async {
         tokio::time::pause();
         let mut sim = Sim::new(seed, profile);
+        if faithful {
+            sim = sim.with_faithful_hosts();
+        }
         if let Err(msg) = sim.run(steps).await {
             panic!(
                 "pinned seed {seed} regressed: {msg}\ntrace tail:\n{}",
@@ -275,4 +289,51 @@ fn issue_787_dead_host_false_evict_double_boot() {
             panic!("post-repro convergence failed: {msg}");
         }
     });
+}
+
+/// Issue #790 (ADR 0098 Phase 3, R3): the evict→resume snapshot-safety
+/// hole — a session reaching `Idle` with NO recoverable durable copy.
+///
+/// ROOT CAUSE — a sim-world FIDELITY GAP, not a coordinator/product hole.
+/// `SimHostClient::snapshot` returned manifest-LESS metadata
+/// (`disk_manifest = memory_manifest = None`). The coordinator's honest
+/// capture-time recoverability check `verify_snapshot_recoverable(blob,
+/// None, None)` is `false` (nothing to HEAD), so EVERY idle-evict capture
+/// recorded a `recoverable = false` snapshot row while the pipeline still
+/// flipped the session to `Idle` — leaving it with no recoverable durable
+/// copy. In prod a real evict capture uploads its chunked disk+memory
+/// manifests (+ the portable state.bin/sidecar) to blob storage BEFORE the
+/// row is recorded, so the flag is `true`; only the sim was unfaithful.
+/// The fix makes the sim world faithful (world.rs): the snapshot verb now
+/// writes those blobs to the SAME shared store the coordinator reads and
+/// returns the refs, mirroring engram-dst-host's ledger discipline (model
+/// the artifact, never fake the flag). NOTE the idle_evictor has no
+/// explicit `recoverable`-before-`Idle` guard — it relies on captures always
+/// producing manifests, which prod does; a transiently-unrecoverable
+/// capture would land Idle-but-unrecoverable and only fail at resume
+/// (→ Dead). That hardening is a separate follow-up, not this bug.
+///
+/// This is the default (NON-faithful) chaos-lane repro that reds `test-sim`
+/// on seed 38 (surfaced once #789's dead-host timing shift reshuffled
+/// exploration). FAIL-WITHOUT / PASS-WITH: reverting the snapshot-verb
+/// change FAILS this at step 1436 ("session … at Idle has no recoverable
+/// durable copy"); with the fix it PASSES.
+#[test]
+fn issue_790_evict_resume_snapshot_safety_default_lane() {
+    run(38, Profile::Chaos, 1500);
+}
+
+/// Issue #790 under FAITHFUL hosts (the digest-gated `candidates_for`
+/// scheduling path that becomes the swarm default once #789's chain
+/// clears): the SAME seed/session reproduces the snapshot-safety hole.
+/// Seed 38 is the one isolable snapshot-safety repro in the 0..200 faithful
+/// chaos swarm — the other faithful failures are #722 `placement-accounting`
+/// firing at an earlier step and masking it, and calm-faithful never
+/// reaches the capture→Idle path. Pinned separately so the faithful world
+/// permanently re-tests the fix. FAIL-WITHOUT / PASS-WITH: pre-fix FAILS
+/// with `snapshot-safety` (NOT pre-empted by #722 on this seed); post-fix
+/// PASSES fully green.
+#[test]
+fn issue_790_evict_resume_snapshot_safety_faithful() {
+    run_faithful(38, Profile::Chaos, 1500);
 }

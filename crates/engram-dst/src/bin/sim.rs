@@ -24,9 +24,14 @@ fn main() {
     let mut steps: u64 = 1500;
     let mut profile = Profile::Chaos;
     let mut failure_report: Option<std::path::PathBuf> = None;
+    // Opt-in (kept OFF by default so the per-PR/default swarm stays
+    // non-faithful, ADR 0090 flip pending #789's chain). Lets the
+    // snapshot-safety / #722 sweeps run the faithful-host world ad hoc.
+    let mut faithful = false;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
+            "--faithful" => faithful = true,
             "--seed" => seed = args.next().and_then(|v| v.parse().ok()),
             "--failure-report" => failure_report = args.next().map(std::path::PathBuf::from),
             "--seeds" => {
@@ -66,6 +71,7 @@ fn main() {
         Profile::Calm => "calm",
         Profile::Chaos => "chaos",
     };
+    let faithful_flag = if faithful { " --faithful" } else { "" };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
@@ -78,6 +84,9 @@ fn main() {
         tokio::time::pause();
         for s in range.0..range.1 {
             let mut sim = Sim::new(s, profile);
+            if faithful {
+                sim = sim.with_faithful_hosts();
+            }
             match sim.run(steps).await {
                 Ok(report) => {
                     println!(
@@ -93,7 +102,7 @@ fn main() {
                         eprintln!("  {line}");
                     }
                     eprintln!(
-                        "replay: cargo run -p engram-dst --release --bin sim -- --seed {s} --steps {steps} --profile {profile_name}",
+                        "replay: cargo run -p engram-dst --release --bin sim -- --seed {s} --steps {steps} --profile {profile_name}{faithful_flag}",
                     );
                     // Failure messages are `step N: <invariant> — <detail>`
                     // or `quiescence: <invariant> — <detail>`; the token
