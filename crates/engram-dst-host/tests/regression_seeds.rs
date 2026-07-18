@@ -1216,3 +1216,204 @@ async fn pre_rebase_crash_is_honest_and_the_conflict_retry_recovers() {
         .await
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
+
+// ───────────────── Flow E: the migration decision table (ADR 0098 P8) ─────
+
+/// An expired export whose state.bin never shipped aborts IN PLACE with
+/// zero loss: the guest un-freezes and every acked write is exactly where
+/// it was (the dirty tier never left the live backend).
+#[tokio::test(start_paused = true)]
+async fn ttl_expired_unshipped_export_aborts_in_place_zero_loss() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 1).await.unwrap();
+    assert!(host.migration_begin(0).await.unwrap());
+    assert!(host.sandboxes[0].migrating);
+    // Frozen: the guest acks nothing while exporting.
+    let acked_before = host.ledger.len();
+    host.guest_write(0, 2).await.unwrap();
+    assert_eq!(
+        host.ledger.len(),
+        acked_before,
+        "a frozen source acks nothing"
+    );
+
+    // The TTL elapses with no serving activity and no commit/abort.
+    tokio::time::advance(std::time::Duration::from_secs(150)).await;
+    host.migration_ttl_sweep().await.unwrap();
+
+    assert!(
+        !host.sandboxes[0].migrating,
+        "un-shipped export aborts in place"
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 1).await.unwrap();
+    // The guest is live again: a new write acks.
+    host.guest_write(0, 2).await.unwrap();
+    assert_eq!(host.ledger.len(), acked_before + 1);
+}
+
+/// The #216 core: once state.bin has shipped, the expired export STAYS
+/// PAUSED under `ownership == true` (an un-pause would be the split-brain
+/// — oracle #7's catch), and only an explicit ownership flip to `false`
+/// lets the next sweep destroy the corpse. Never a resume.
+#[tokio::test(start_paused = true)]
+async fn state_served_export_never_unpauses_then_destroys_on_ownership_flip() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 3).await.unwrap();
+    host.flush_tick(0).await.unwrap(); // the shipped state's floor
+    assert!(host.migration_begin(0).await.unwrap());
+    host.migration_serve_state(0); // the split-brain moment
+
+    tokio::time::advance(std::time::Duration::from_secs(150)).await;
+    host.migration_ttl_sweep().await.unwrap();
+    assert!(
+        host.sandboxes[0].migrating,
+        "a served export must STAY PAUSED while the coordinator says we own it",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+
+    // The scanner rehomes the session (lease expired): ownership flips
+    // false — the NEXT sweep destroys the frozen corpse, never resuming it.
+    host.coord.revoke_owner(host.sandboxes[0].sandbox_id);
+    tokio::time::advance(std::time::Duration::from_secs(150)).await;
+    host.migration_ttl_sweep().await.unwrap();
+    assert!(
+        !host.sandboxes[0].migrating,
+        "ownership moved on — destroyed"
+    );
+    assert!(
+        host.sandboxes[0].backend.is_none(),
+        "the stale source is torn down, never resumed",
+    );
+    assert!(
+        host.split_brain_unpauses.is_empty(),
+        "no abort-unpause ever touched the served export (#216)",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// #216 Gap 1's standing form: an export that keeps SERVING never
+/// expires, however far past the TTL its creation slips — the activity
+/// anchor, not `created_at`, is the clock.
+#[tokio::test(start_paused = true)]
+async fn actively_serving_export_never_expires_mid_transfer() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 4).await.unwrap();
+    assert!(host.migration_begin(0).await.unwrap());
+
+    // 5 × 60 s = 300 s of transfer (>> EXPORT_TTL = 120 s), each minute
+    // touched by a page serve.
+    for _ in 0..5 {
+        tokio::time::advance(std::time::Duration::from_secs(60)).await;
+        host.migration_touch(0);
+        host.migration_ttl_sweep().await.unwrap();
+        assert!(
+            host.sandboxes[0].migrating,
+            "an actively-serving export must never expire mid-transfer (#216 Gap 1)",
+        );
+    }
+    // The move lands; the dest owns the session.
+    host.migration_commit(0);
+    assert!(!host.sandboxes[0].migrating);
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// Never guess about ownership: an unreachable coordinator leaves the
+/// expired export PAUSED (retry next sweep); the heal aborts it in place.
+#[tokio::test(start_paused = true)]
+async fn unreachable_coordinator_stays_paused_never_guesses() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 5).await.unwrap();
+    assert!(host.migration_begin(0).await.unwrap());
+
+    tokio::time::advance(std::time::Duration::from_secs(150)).await;
+    host.coord
+        .script(ScriptedResponse::Unreachable("sim: coord down"));
+    host.migration_ttl_sweep().await.unwrap();
+    assert!(
+        host.sandboxes[0].migrating,
+        "unreachable coordinator ⇒ stay paused, never guess",
+    );
+
+    // Healed: the honest answer (we still own it) aborts in place.
+    host.migration_ttl_sweep().await.unwrap();
+    assert!(!host.sandboxes[0].migrating, "post-heal abort-in-place");
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 5).await.unwrap();
+}
+
+/// #216 Gap 3 as the pure decision table: a REATTACHED frozen post-copy
+/// source never destroys on a transient not-yet-rehydrated binding or an
+/// unreachable coordinator — only an explicit `owned == false` does.
+#[test]
+fn reattached_source_verdict_never_destroys_on_a_transient_binding() {
+    use engram_host_agent::migration::{reattach_source_verdict, ReattachSourceVerdict};
+    // The binding hasn't rehydrated: NOT "nobody owns this" — stay paused
+    // regardless of what the (unaskable) ownership answer would be.
+    assert_eq!(
+        reattach_source_verdict(false, None),
+        ReattachSourceVerdict::StayPaused
+    );
+    assert_eq!(
+        reattach_source_verdict(false, Some(false)),
+        ReattachSourceVerdict::StayPaused,
+        "an ownership answer is meaningless before the binding rehydrates",
+    );
+    // Bound: unreachable or still-owned ⇒ stay paused; only an explicit
+    // `false` destroys.
+    assert_eq!(
+        reattach_source_verdict(true, None),
+        ReattachSourceVerdict::StayPaused
+    );
+    assert_eq!(
+        reattach_source_verdict(true, Some(true)),
+        ReattachSourceVerdict::StayPaused
+    );
+    assert_eq!(
+        reattach_source_verdict(true, Some(false)),
+        ReattachSourceVerdict::Destroy
+    );
+}
+
+/// The P9 lane's first CI catch (calm seeds 14/16): the sim modeled the
+/// EXPLICIT coordinator abort as forbidden after state.bin shipped —
+/// STRICTER than production, whose abort RPC documents it as legal (the
+/// coordinator carries the postcopy-never-loaded knowledge, ADR 0045 C2).
+/// The forbidden arm is only the dumb-host TTL self-resume, which
+/// `ttl_verdict` gates in the sweep. This pins the legality: an explicit
+/// abort on a served export resumes the source with every acked write
+/// intact and NO oracle fires.
+#[tokio::test(start_paused = true)]
+async fn explicit_abort_after_state_served_is_legal_and_resumes() {
+    let mut host = scenario_host(0, 2).await;
+    host.guest_write(0, 6).await.unwrap();
+    assert!(host.migration_begin(0).await.unwrap());
+    host.migration_serve_state(0);
+
+    // The coordinator learns the dest never loaded the shipped state and
+    // explicitly aborts — legal despite state_served.
+    host.migration_abort(0);
+    assert!(!host.sandboxes[0].migrating, "the source resumes in place");
+    assert!(
+        host.split_brain_unpauses.is_empty(),
+        "an explicit abort is not the TTL self-resume — no split-brain record",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+    host.guest_read(0, 6).await.unwrap();
+    // Live again: a fresh write acks.
+    let before = host.ledger.len();
+    host.guest_write(0, 6).await.unwrap();
+    assert_eq!(host.ledger.len(), before + 1);
+}

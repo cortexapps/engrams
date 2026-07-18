@@ -32,7 +32,7 @@ use engram_chunk_store::manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION,
 };
 use engram_chunk_store::store::ChunkStore;
-use engram_core::traits::{BlobStorage, Entropy as _};
+use engram_core::traits::{BlobStorage, Clock as _, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
@@ -42,6 +42,7 @@ use engram_host_agent::eviction_finalize::{
     persist_disk_pending_chunks, run_eviction_finalize_attempt, DiskPendingRecord,
     EvictionFinalizeRecord, EvictionFinalizer, EvictionSandbox, FinalizeAttempt,
 };
+use engram_host_agent::migration::{self, MigrationExport, MigrationRegistry, TtlVerdict};
 use engram_host_core::{FinalizeStage, HostEffects, HostFs, LiveManifestPublishRequest};
 use engram_sim::{SimClock, SimEntropy};
 use engram_storage_local::LocalBlobStorage;
@@ -236,6 +237,12 @@ pub struct SandboxSlot {
     /// snapshot has no manifest to attach; the sidecar still names the
     /// capture-time literal device.
     pub poisoned_snapshot: bool,
+    /// ADR 0098 P8 (Flow E): a migration export is open — the guest is
+    /// FROZEN (the source is a page server); writes/flushes/captures are
+    /// excluded exactly as the export's held capture lock excludes them
+    /// in prod. Cleared by commit/abort/destroy or a process death (the
+    /// registry is RAM).
+    pub migrating: bool,
 }
 
 impl SandboxSlot {
@@ -364,6 +371,17 @@ pub struct SimHost {
     /// per snapshot — the FinalizeStage monotonicity watermark (#6).
     /// A Mutex so the read-only oracle pass can update it.
     pub finalize_stage_seen: parking_lot::Mutex<BTreeMap<SnapshotId, FinalizeStage>>,
+
+    // ── Flow E: migration (ADR 0098 P8) ──
+    /// The REAL per-host export registry — RAM (dies on crash, like the
+    /// prod DashMap). The TTL sweep drives the REAL `expired()` over the
+    /// injected paused clock and the REAL `ttl_verdict` over the
+    /// (adversarial, scriptable) coordinator's ownership answer.
+    pub migrations: Arc<MigrationRegistry>,
+    /// Oracle #7's structural catch: any abort-unpause applied to an
+    /// export whose `state_served` was set is recorded here — the #216
+    /// split-brain the decision table forbids. Oracle memory (survives).
+    pub split_brain_unpauses: Vec<SandboxId>,
 }
 
 impl SimHost {
@@ -434,6 +452,7 @@ impl SimHost {
                 kernel_owner: Some(generation),
                 parked: false,
                 poisoned_snapshot: false,
+                migrating: false,
             });
         }
 
@@ -459,6 +478,8 @@ impl SimHost {
             destroyer: Arc::new(SimEvictionSandbox::default()),
             finalize_started: std::collections::BTreeSet::new(),
             finalize_stage_seen: parking_lot::Mutex::new(BTreeMap::new()),
+            migrations: Arc::new(MigrationRegistry::default()),
+            split_brain_unpauses: Vec::new(),
         }
     }
 
@@ -539,6 +560,9 @@ impl SimHost {
         if idx >= self.sandboxes.len() || chunk_idx >= NUM_CHUNKS {
             return Ok(());
         }
+        if self.sandboxes[idx].migrating {
+            return Ok(()); // the frozen source acks nothing
+        }
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
             return Ok(());
         };
@@ -604,8 +628,8 @@ impl SimHost {
     /// advance `published_ref`, publish to the coordinator, and discard any
     /// now-superseded spool. No-op on a crashed backend.
     pub async fn flush_tick(&mut self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len() {
-            return Ok(());
+        if idx >= self.sandboxes.len() || self.sandboxes[idx].migrating {
+            return Ok(()); // the export's capture lock excludes flushes
         }
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
             return Ok(());
@@ -1233,6 +1257,10 @@ impl SimHost {
         if idx >= self.sandboxes.len() {
             return Ok(CaptureOutcome::NotCapturable);
         }
+        if self.sandboxes[idx].migrating {
+            // The export holds the capture lock for its lifetime.
+            return Ok(CaptureOutcome::NotCapturable);
+        }
         let sandbox_id = self.sandboxes[idx].sandbox_id;
         if let Some(existing) = self.pending_finalizes.get(&sandbox_id) {
             return Ok(CaptureOutcome::AlreadyPending(*existing));
@@ -1547,8 +1575,11 @@ impl SimHost {
     /// then holds. On the pre-#204 code the read serves stale base and the
     /// write RMWs from it, silently shadowing the drained bytes.
     pub async fn flush_handoff_race(&mut self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
-            return Ok(());
+        if idx >= self.sandboxes.len()
+            || self.finalize_pending(idx)
+            || self.sandboxes[idx].migrating
+        {
+            return Ok(()); // the export's capture lock excludes flushes
         }
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
             return Ok(());
@@ -1562,6 +1593,9 @@ impl SimHost {
             .get(&(idx, 0))
             .map(|e| e.content_tag)
             .expect("just wrote chunk 0");
+        if backend.dirty_bytes().await == 0 {
+            return Ok(()); // nothing to drain — the parked seam would never fire
+        }
 
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::DirtyPendingHandoff);
         let flush_backend = backend.clone();
@@ -1621,13 +1655,19 @@ impl SimHost {
     /// fence drops a follow-up flush publishes the re-queued writes. The
     /// ledger floor never moves on the aborted attempt.
     pub async fn flush_fence_abort(&mut self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
-            return Ok(());
+        if idx >= self.sandboxes.len()
+            || self.finalize_pending(idx)
+            || self.sandboxes[idx].migrating
+        {
+            return Ok(()); // the export's capture lock excludes flushes
         }
         let Some(backend) = self.sandboxes[idx].backend.clone() else {
             return Ok(());
         };
         self.guest_write(idx, 1).await?;
+        if backend.dirty_bytes().await == 0 {
+            return Ok(()); // an empty pipeline never reaches the parked seam
+        }
         let before = backend.manifest_ref().await;
 
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
@@ -1669,7 +1709,10 @@ impl SimHost {
     /// version-conflict retry (attempts the stale next-version, hits the
     /// conflict, re-targets latest+1).
     pub async fn flush_pre_rebase_crash(&mut self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
+        if idx >= self.sandboxes.len()
+            || self.finalize_pending(idx)
+            || self.sandboxes[idx].migrating
+        {
             self.die_abruptly();
             return Ok(());
         }
@@ -1678,6 +1721,10 @@ impl SimHost {
             return Ok(());
         };
         self.guest_write(idx, 2).await?;
+        if backend.dirty_bytes().await == 0 {
+            self.die_abruptly();
+            return Ok(()); // an empty pipeline never reaches the parked seam
+        }
         let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PreRebase);
         let flush_backend = backend.clone();
         let flush = tokio::spawn(async move { flush_backend.flush().await });
@@ -1692,12 +1739,172 @@ impl SimHost {
         Ok(())
     }
 
+    // ─────────────────────── Flow E: migration (ADR 0098 P8) ─────────────
+
+    /// Open a migration export on sandbox `idx` — the sim analog of
+    /// `migration_begin`: the guest freezes (the source becomes a page
+    /// server) and a REAL [`MigrationExport`] lands in the REAL registry,
+    /// its TTL clock the injected paused clock. Deterministic export id
+    /// (entropy-minted — the prod OsRng id is a security nonce, which the
+    /// sim must not launder into its replayable id stream). Returns false
+    /// when nothing exportable (no backend / already exporting / frozen).
+    pub async fn migration_begin(&mut self, idx: usize) -> Result<bool, String> {
+        if idx >= self.sandboxes.len()
+            || self.sandboxes[idx].migrating
+            || self.sandboxes[idx].parked
+            || self.finalize_pending(idx)
+            || self.sandboxes[idx].backend.is_none()
+        {
+            return Ok(false);
+        }
+        let sandbox_id = self.sandboxes[idx].sandbox_id;
+        let export_id = format!(
+            "{}{}",
+            self.entropy.uuid().simple(),
+            self.entropy.uuid().simple()
+        );
+        let snapshot_dir = self
+            .fs
+            .root()
+            .join("staging")
+            .join(format!("migration-{export_id}"));
+        tokio::fs::create_dir_all(&snapshot_dir)
+            .await
+            .map_err(|e| format!("migration staging dir: {e}"))?;
+        let clock: Arc<dyn engram_core::traits::Clock> = self.clock.clone();
+        let guard = Arc::new(tokio::sync::Mutex::new(()))
+            .try_lock_owned()
+            .expect("fresh mutex");
+        let inserted = self.migrations.insert(MigrationExport {
+            export_id,
+            sandbox_id,
+            snapshot_dir,
+            allowed_chunks: std::collections::HashSet::new(),
+            disk_pending: None,
+            disk_seal: None,
+            clock,
+            created_at: self.clock.now_mono(),
+            post_copy: false,
+            state_served: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            last_activity: Arc::new(std::sync::Mutex::new(self.clock.now_mono())),
+            capture_guard: guard,
+        });
+        if inserted {
+            self.sandboxes[idx].migrating = true;
+        }
+        Ok(inserted)
+    }
+
+    /// `state.bin` leaves the host — the split-brain moment: from here the
+    /// dest may be running this state and the source must NEVER
+    /// self-resume ([`migration::ttl_verdict`]'s `state_served` arm).
+    pub fn migration_serve_state(&mut self, idx: usize) {
+        if idx >= self.sandboxes.len() {
+            return;
+        }
+        let sandbox_id = self.sandboxes[idx].sandbox_id;
+        self.migrations.mark_state_served(sandbox_id);
+    }
+
+    /// A page/artifact serve — refreshes the REAL activity TTL anchor.
+    pub fn migration_touch(&mut self, idx: usize) {
+        if idx >= self.sandboxes.len() {
+            return;
+        }
+        let sandbox_id = self.sandboxes[idx].sandbox_id;
+        self.migrations.touch(sandbox_id);
+    }
+
+    /// The dumb-host TTL sweep — the REAL `expired()` over the paused
+    /// clock, the REAL `ttl_verdict` over the coordinator's (scriptable,
+    /// adversarial) ownership answer, applied exactly as `lib.rs` does:
+    /// AbortInPlace un-freezes the source (zero loss — the dirty tier
+    /// never left the live backend), Destroy tears it down (ownership
+    /// moved on), StayPaused retries next sweep. An abort-unpause applied
+    /// to a `state_served` export is recorded as a split-brain (oracle #7
+    /// — unreachable unless the decision table regresses).
+    pub async fn migration_ttl_sweep(&mut self) -> Result<(), String> {
+        for sandbox_id in self.migrations.expired() {
+            let Some(idx) = self
+                .sandboxes
+                .iter()
+                .position(|s| s.sandbox_id == sandbox_id)
+            else {
+                continue;
+            };
+            let session_id = self.sandboxes[idx].session_id;
+            let ownership = self
+                .effects
+                .coord
+                .sandbox_ownership(self.host_id, session_id, sandbox_id)
+                .await
+                .ok();
+            let state_served = self.migrations.state_served(sandbox_id);
+            match migration::ttl_verdict(true, ownership, state_served) {
+                TtlVerdict::AbortInPlace => {
+                    if state_served {
+                        // The #216 split-brain: structurally recorded so
+                        // oracle #7 fires. Unreachable unless ttl_verdict
+                        // regresses.
+                        self.split_brain_unpauses.push(sandbox_id);
+                    }
+                    self.migrations.remove(sandbox_id);
+                    self.sandboxes[idx].migrating = false;
+                }
+                TtlVerdict::Destroy => {
+                    self.migrations.remove(sandbox_id);
+                    self.sandboxes[idx].migrating = false;
+                    self.sandboxes[idx].backend = None;
+                }
+                TtlVerdict::StayPaused => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// Coordinator-driven commit: the dest owns the session now; the
+    /// frozen source is torn down.
+    pub fn migration_commit(&mut self, idx: usize) {
+        if idx >= self.sandboxes.len() || !self.sandboxes[idx].migrating {
+            return;
+        }
+        let sandbox_id = self.sandboxes[idx].sandbox_id;
+        self.migrations.remove(sandbox_id);
+        self.sandboxes[idx].migrating = false;
+        self.sandboxes[idx].backend = None;
+    }
+
+    /// Coordinator-driven EXPLICIT abort: the move never landed; the
+    /// source un-freezes in place with every acked write intact. Legal
+    /// even after `state.bin` shipped — the prod RPC documents that an
+    /// explicit abort carries the coordinator's postcopy-never-loaded
+    /// knowledge (ADR 0045 C2); the FORBIDDEN arm is only the dumb-host
+    /// TTL self-resume, which `ttl_verdict` gates in the sweep. (The
+    /// first CI run of the P9 host-sim lane caught the sim being
+    /// STRICTER than prod here — calm seeds 14/16 fired oracle #7 on a
+    /// legal explicit abort.)
+    pub fn migration_abort(&mut self, idx: usize) {
+        if idx >= self.sandboxes.len() || !self.sandboxes[idx].migrating {
+            return;
+        }
+        let sandbox_id = self.sandboxes[idx].sandbox_id;
+        self.migrations.remove(sandbox_id);
+        self.sandboxes[idx].migrating = false;
+    }
+
     /// The common "process dies now" tail: RAM drops (backends, the
     /// in-flight finalize jobs, the pending-finalize idempotency map), the
     /// reconcile RAM dies, and the generation rolls.
     fn die_abruptly(&mut self) {
         for slot in &mut self.sandboxes {
             slot.backend = None;
+            // The export registry is RAM: the frozen source's export dies
+            // with the process (the reattached-source story is
+            // reattach_source_verdict's — pinned as a pure-fn seed).
+            if slot.migrating {
+                self.migrations.remove(slot.sandbox_id);
+                slot.migrating = false;
+            }
         }
         self.in_flight.clear();
         self.pending_finalizes.clear();

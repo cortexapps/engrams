@@ -694,9 +694,13 @@ pub struct PooledBackend {
         Arc<dyn engram_host_core::CoordControlPlane>,
         engram_core::HostId,
     )>,
-    /// ADR 0098 D1: wall clock is an injected world input. P1 wires the
-    /// production clock (record timestamps, the pause mark); the full
-    /// `HostEffects` bundle + sim injection ride the flow-extraction PRs.
+    /// ADR 0098 D1: wall clock is an injected world input (record
+    /// timestamps, the pause mark, the migration TTL). P8 closed the
+    /// flow-extraction arc: every seam reaches its flow through its own
+    /// field (`clock`, `host_fs`, `shutdown_manifest_publish`,
+    /// `DeviceSync`/`NbdKernel` at their entry points) — the loose fields
+    /// ARE the end state; `HostEffects::production` remains the sim's
+    /// assembly point, not a prod indirection.
     clock: Arc<dyn engram_core::traits::Clock>,
     /// ADR 0098 P5: the durable-fs seam. Prod is [`TokioFs`]; Flow D's
     /// durable records + the shutdown spool perform every fs op through
@@ -6952,8 +6956,7 @@ impl SandboxBackend for PooledBackend {
             // handler (the SEAL push) — last, after everything that
             // could still fail.
             let state_served = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-            let last_activity =
-                std::sync::Arc::new(std::sync::Mutex::new(crate::time_source::metrics_now()));
+            let last_activity = std::sync::Arc::new(std::sync::Mutex::new(self.clock.now_mono()));
             // Issue #216 Gap 2: the peer page server shares THIS clock so
             // its TCP-only NeedAt/GetChunk serves refresh the same TTL
             // anchor the dumb-host sweep reads via `expired()`.
@@ -6965,7 +6968,8 @@ impl SandboxBackend for PooledBackend {
                 allowed_chunks: allowed.clone(),
                 disk_pending: None,
                 disk_seal,
-                created_at: crate::time_source::metrics_now(),
+                clock: self.clock.clone(),
+                created_at: self.clock.now_mono(),
                 post_copy: true,
                 state_served,
                 last_activity,
@@ -6997,6 +7001,7 @@ impl SandboxBackend for PooledBackend {
                 serve: Default::default(),
                 drained: std::sync::atomic::AtomicBool::new(false),
                 last_activity: peer_last_activity,
+                clock: self.clock.clone(),
             });
 
             tracing::info!(
@@ -7380,15 +7385,14 @@ impl SandboxBackend for PooledBackend {
             allowed_chunks: allowed,
             disk_pending,
             disk_seal: None,
-            created_at: crate::time_source::metrics_now(),
+            clock: self.clock.clone(),
+            created_at: self.clock.now_mono(),
             // C1 stop-and-copy export: the guest stays frozen and the
             // dest pulls eagerly; post-copy captures (C2) construct
             // their own export with post_copy: true.
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
-                crate::time_source::metrics_now(),
-            )),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(self.clock.now_mono())),
             capture_guard,
         });
         if !inserted {
@@ -10996,10 +11000,13 @@ mod tests {
             allowed_chunks: [allowed].into_iter().collect(),
             disk_pending: None,
             disk_seal: None,
-            created_at: std::time::Instant::now(),
+            clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
+            created_at: std::time::Duration::ZERO,
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
+                engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
+            )),
             capture_guard: guard_src.clone().try_lock_owned().unwrap(),
         }));
 
@@ -11194,10 +11201,13 @@ mod tests {
             allowed_chunks: Default::default(),
             disk_pending: None,
             disk_seal: Some(Arc::new(seal)),
-            created_at: std::time::Instant::now(),
+            clock: std::sync::Arc::new(engram_core::traits::SystemClock::new()),
+            created_at: std::time::Duration::ZERO,
             post_copy: true,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
+                engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
+            )),
             capture_guard: guard.clone().try_lock_owned().unwrap(),
         }));
 
