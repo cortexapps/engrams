@@ -99,6 +99,8 @@ function fakeReviewStore(options: {
       summaries.push({ reviewId, summaryMd });
     },
     async updateReviewStatus() {},
+    async updateFindingState() {},
+    async finalizeReview() {},
   };
   return { store, findings, verdicts, summaries };
 }

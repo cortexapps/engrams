@@ -109,6 +109,18 @@ export interface ReviewStore {
   insertVerdict(input: ReviewVerdictInput): Promise<{ id: string; replayed: boolean }>;
   setFinderSummary(reviewId: string, summaryMd: string): Promise<void>;
   updateReviewStatus(reviewId: string, status: string): Promise<void>;
+  updateFindingState(
+    findingId: string,
+    state: string,
+    opts?: { githubThreadId?: string; verdictReason?: string },
+  ): Promise<void>;
+  finalizeReview(reviewId: string, input: {
+    status: string;
+    summaryMd: string;
+    githubReviewId?: string;
+    headSha?: string;
+    baseSha?: string;
+  }): Promise<void>;
 }
 
 function toReviewRow(row: typeof reviewTable.$inferSelect): ReviewRow {
@@ -346,6 +358,37 @@ export function makeReviewStore(
       await db
         .update(reviewTable)
         .set({ status, updatedAt: new Date() })
+        .where(eq(reviewTable.id, reviewId));
+    },
+
+    async updateFindingState(findingId, state, opts) {
+      await db
+        .update(findingTable)
+        .set({
+          state,
+          ...(opts?.githubThreadId !== undefined
+            ? { githubThreadId: opts.githubThreadId }
+            : {}),
+          ...(opts?.verdictReason !== undefined
+            ? { verdictReason: opts.verdictReason }
+            : {}),
+        })
+        .where(eq(findingTable.id, findingId));
+    },
+
+    async finalizeReview(reviewId, input) {
+      await db
+        .update(reviewTable)
+        .set({
+          status: input.status,
+          summaryMd: input.summaryMd,
+          ...(input.githubReviewId !== undefined
+            ? { githubReviewId: input.githubReviewId }
+            : {}),
+          ...(input.headSha !== undefined ? { headSha: input.headSha } : {}),
+          ...(input.baseSha !== undefined ? { baseSha: input.baseSha } : {}),
+          updatedAt: new Date(),
+        })
         .where(eq(reviewTable.id, reviewId));
     },
   };

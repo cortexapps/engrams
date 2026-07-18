@@ -127,6 +127,8 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
     },
     async setFinderSummary() {},
     async updateReviewStatus() {},
+    async updateFindingState() {},
+    async finalizeReview() {},
   };
 }
 

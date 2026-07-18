@@ -120,13 +120,32 @@ describe("ReviewStore", () => {
 
         await store.setFinderSummary(firstReviewId, "Two candidates found.");
         await store.updateReviewStatus(firstReviewId, "finding");
+        await store.updateFindingState(firstFinding.id, "posted", {
+          githubThreadId: "github-thread-1",
+          verdictReason: "Verified against the live branch.",
+        });
+        await store.finalizeReview(firstReviewId, {
+          status: "posted",
+          summaryMd: "One finding posted.",
+          githubReviewId: "github-review-1",
+          headSha: "live-head-sha",
+          baseSha: "live-base-sha",
+        });
         const detail = await store.getReview(firstReviewId);
         expect(detail?.review).toMatchObject({
           id: firstReviewId,
-          status: "finding",
-          summaryMd: "Two candidates found.",
+          status: "posted",
+          summaryMd: "One finding posted.",
+          githubReviewId: "github-review-1",
+          headSha: "live-head-sha",
+          baseSha: "live-base-sha",
         });
         expect(detail?.findings).toHaveLength(2);
+        expect(detail?.findings.find((row) => row.id === firstFinding.id)).toMatchObject({
+          state: "posted",
+          githubThreadId: "github-thread-1",
+          verdictReason: "Verified against the live branch.",
+        });
         expect(detail?.verdicts).toHaveLength(1);
 
         const terminalReviewId = await store.createReview(reviewInput(taskId, {
