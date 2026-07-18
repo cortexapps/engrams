@@ -13,8 +13,8 @@ use engram_core::traits::metadata::{
 };
 use engram_core::types::capability::Capability;
 use engram_core::types::capture_job::{
-    CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, ColdBaseRow,
-    NewCaptureJob,
+    CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, CaptureTerminalReport,
+    ColdBaseRow, NewCaptureJob,
 };
 use engram_core::types::event::{ArtifactRow, PersistedEvent};
 use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
@@ -30,7 +30,7 @@ use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::SandboxId;
 use engram_core::{HostId, MetaError, SessionId, SnapshotId};
 
-use super::{SessRow, SimDb, SimMetadataStore};
+use super::{EnableJobRow, SessRow, SimDb, SimMetadataStore};
 
 /// Issue #722 reservation predicate, shared by pick/reserved/no-fit:
 /// a `pending` counts while fresh OR while a live create_boot op
@@ -86,9 +86,6 @@ impl SimMetadataStore {
     /// the rest, then any unmeasured host (allocatable == 0) as a last
     /// resort.
     ///
-    /// DIVERGENCE (documented): PostgresStore also sums non-terminal
-    /// `capture_jobs` reservations; the sim has no capture-job table
-    /// yet, so conformance scenarios must not create capture jobs.
     fn pick_host_2d(
         db: &SimDb,
         candidates: &[HostId],
@@ -117,6 +114,15 @@ impl SimMetadataStore {
                 let e = reserved.entry(host).or_default();
                 e.0 += row.mem_budget_mib;
                 e.1 += i64::from(row.cpu_budget_vcpus);
+            }
+        }
+        for row in db.capture_jobs.values() {
+            if !row.stage.is_terminal() {
+                if let Some(host) = row.host_id {
+                    let e = reserved.entry(host).or_default();
+                    e.0 += row.mem_budget_mib;
+                    e.1 += i64::from(row.cpu_budget_vcpus);
+                }
             }
         }
         let fits = |h: &&HostRecord| -> Option<i64> {
@@ -2829,11 +2835,35 @@ impl MetadataStore for SimMetadataStore {
 
     async fn claim_enable_jobs(
         &self,
-        _claimant: &str,
-        _lease_secs: u32,
-        _limit: u32,
+        claimant: &str,
+        lease_secs: u32,
+        limit: u32,
     ) -> Result<Vec<EnableJob>, MetaError> {
-        panic!("SimMeta: claim_enable_jobs not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let lease = chrono::Duration::seconds(i64::from(lease_secs));
+        let mut db = self.db.lock();
+        let mut eligible: Vec<_> = db
+            .enable_jobs
+            .values()
+            .filter(|row| {
+                !row.job.state.is_terminal()
+                    && row
+                        .claimed_at
+                        .is_none_or(|claimed_at| claimed_at < now - lease)
+            })
+            .map(|row| (row.job.created_at, row.job.id))
+            .collect();
+        eligible.sort_unstable();
+        let mut claimed = Vec::new();
+        for (_, id) in eligible.into_iter().take(limit as usize) {
+            let row = db.enable_jobs.get_mut(&id).expect("selected row exists");
+            row.claimed_by = Some(claimant.to_string());
+            row.claimed_at = Some(now);
+            row.job.updated_at = now;
+            claimed.push(row.job.clone());
+        }
+        Ok(claimed)
     }
 
     async fn cold_base_fc_version_changed(
@@ -2865,8 +2895,8 @@ impl MetadataStore for SimMetadataStore {
 
     async fn create_or_get_enable_job(
         &self,
-        _image_uri: &str,
-        _manifest_digest: Option<&str>,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
         // The full image config this enable will capture under (ADR
         // 0080). Rides the job and is stamped onto the enabled_images
         // row only when the job reaches `ready` — capture-affecting
@@ -2874,19 +2904,60 @@ impl MetadataStore for SimMetadataStore {
         // snapshot actually exists. Carried from the triggering
         // request (enable/update) or inherited from the existing row
         // (refresh).
-        _image_config: &engram_core::types::image::ImageConfig,
+        image_config: &engram_core::types::image::ImageConfig,
     ) -> Result<EnableJob, MetaError> {
-        panic!("SimMeta: create_or_get_enable_job not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.create_or_get_enable_job_with_options(image_uri, manifest_digest, image_config, false)
+            .await
     }
 
     async fn create_or_get_enable_job_with_options(
         &self,
-        _image_uri: &str,
-        _manifest_digest: Option<&str>,
-        _image_config: &engram_core::types::image::ImageConfig,
-        _force_recapture: bool,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+        image_config: &engram_core::types::image::ImageConfig,
+        force_recapture: bool,
     ) -> Result<EnableJob, MetaError> {
-        panic!("SimMeta: create_or_get_enable_job_with_options not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if let Some(existing) = db
+            .enable_jobs
+            .values()
+            .find(|row| row.job.image_uri == image_uri && !row.job.state.is_terminal())
+        {
+            return Ok(existing.job.clone());
+        }
+        let job = EnableJob {
+            id: self.entropy.uuid(),
+            image_uri: image_uri.to_string(),
+            manifest_digest: manifest_digest.map(str::to_string),
+            state: EnableJobState::Pending,
+            chunks_total: None,
+            chunks_done: 0,
+            attempts: 0,
+            error: None,
+            image_config: image_config.clone(),
+            force_recapture,
+            prestage_hosts: serde_json::json!({}),
+            capture_phase: None,
+            warm_stage: None,
+            warm_stage_started_at: None,
+            warm_stages: Vec::new(),
+            materialize_stages: Vec::new(),
+            materialize_host_id: None,
+            output_tail: None,
+            created_at: now,
+            updated_at: now,
+        };
+        db.enable_jobs.insert(
+            job.id,
+            EnableJobRow {
+                job: job.clone(),
+                claimed_by: None,
+                claimed_at: None,
+            },
+        );
+        Ok(job)
     }
 
     async fn delete_broker_token(&self, _id: SessionId) -> Result<(), MetaError> {
@@ -2905,9 +2976,31 @@ impl MetadataStore for SimMetadataStore {
 
     async fn expire_capture_job_stages(
         &self,
-        _budgets: &[(CaptureJobStage, std::time::Duration)],
+        budgets: &[(CaptureJobStage, std::time::Duration)],
     ) -> Result<Vec<CaptureJobRow>, MetaError> {
-        panic!("SimMeta: expire_capture_job_stages not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        if budgets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = self.now();
+        Ok(self
+            .db
+            .lock()
+            .capture_jobs
+            .values()
+            .filter(|job| !job.stage.is_terminal() && job.host_id.is_some())
+            .filter(|job| {
+                budgets
+                    .iter()
+                    .find(|(stage, _)| *stage == job.stage)
+                    .is_some_and(|(_, budget)| {
+                        now.signed_duration_since(job.last_progress_at)
+                            .to_std()
+                            .is_ok_and(|age| age > *budget)
+                    })
+            })
+            .cloned()
+            .collect())
     }
 
     async fn find_enabled_image_by_content(
@@ -2980,8 +3073,45 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: insert_broker_token not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
-    async fn insert_capture_job(&self, _row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
-        panic!("SimMeta: insert_capture_job not implemented — add it plus a conformance case (ADR 0098 D4)")
+    async fn insert_capture_job(&self, row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if let Some(existing) = db
+            .capture_jobs
+            .values()
+            .find(|job| job.enable_job_id == row.enable_job_id && !job.stage.is_terminal())
+        {
+            return Ok(existing.clone());
+        }
+        let job = CaptureJobRow {
+            id: CaptureJobId::from(self.entropy.uuid()),
+            enable_job_id: row.enable_job_id,
+            image_uri: row.image_uri,
+            manifest_digest: row.manifest_digest,
+            disk_manifest: row.disk_manifest,
+            image_config: row.image_config,
+            oci_defaults: row.oci_defaults,
+            host_id: None,
+            mem_budget_mib: row.mem_budget_mib,
+            cpu_budget_vcpus: row.cpu_budget_vcpus,
+            waiting_since: Some(now),
+            epoch: 1,
+            stage: CaptureJobStage::Assigned,
+            stage_started_at: now,
+            stage_progress: None,
+            last_progress_at: now,
+            attempts: 1,
+            retryable: None,
+            error: None,
+            error_stage: None,
+            fc_snapshot_version: None,
+            result_bincode: None,
+            created_at: now,
+            updated_at: now,
+        };
+        db.capture_jobs.insert(job.id, job.clone());
+        Ok(job)
     }
 
     async fn latest_capture_job_for_enable(
@@ -3145,7 +3275,15 @@ impl MetadataStore for SimMetadataStore {
     }
 
     async fn list_waiting_capture_jobs(&self) -> Result<Vec<CaptureJobRow>, MetaError> {
-        panic!("SimMeta: list_waiting_capture_jobs not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .capture_jobs
+            .values()
+            .filter(|job| !job.stage.is_terminal() && job.host_id.is_none())
+            .cloned()
+            .collect())
     }
 
     /// Live materialize + capture work aggregated by host (the fleet
@@ -3182,10 +3320,40 @@ impl MetadataStore for SimMetadataStore {
 
     async fn place_capture_job(
         &self,
-        _id: CaptureJobId,
-        _candidates: &[HostId],
+        id: CaptureJobId,
+        candidates: &[HostId],
     ) -> Result<Option<CaptureJobRow>, MetaError> {
-        panic!("SimMeta: place_capture_job not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(current) = db.capture_jobs.get(&id) else {
+            return Ok(None);
+        };
+        if current.stage.is_terminal() {
+            return Ok(None);
+        }
+        if current.host_id.is_some() {
+            return Ok(Some(current.clone()));
+        }
+        let picked = Self::pick_host_2d(
+            &db,
+            candidates,
+            0,
+            current.mem_budget_mib,
+            i64::from(current.cpu_budget_vcpus),
+            now,
+        );
+        let row = db.capture_jobs.get_mut(&id).expect("checked above");
+        row.host_id = picked;
+        row.updated_at = now;
+        if picked.is_some() {
+            row.waiting_since = None;
+            row.stage_started_at = now;
+            row.last_progress_at = now;
+        } else if row.waiting_since.is_none() {
+            row.waiting_since = Some(now);
+        }
+        Ok(Some(row.clone()))
     }
 
     /// Diagnostic twin of `pick_host_2d` (no locking): same eligibility
@@ -3281,9 +3449,45 @@ impl MetadataStore for SimMetadataStore {
 
     async fn record_capture_job_report(
         &self,
-        _report: &CaptureJobReport,
+        report: &CaptureJobReport,
     ) -> Result<bool, MetaError> {
-        panic!("SimMeta: record_capture_job_report not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(row) = db.capture_jobs.get_mut(&report.job_id) else {
+            return Ok(false);
+        };
+        if row.epoch != report.epoch || row.stage.is_terminal() {
+            return Ok(false);
+        }
+        let stage = match &report.terminal {
+            Some(CaptureTerminalReport::Done { result_bincode }) => {
+                row.result_bincode = Some(result_bincode.clone());
+                CaptureJobStage::Done
+            }
+            Some(CaptureTerminalReport::Failed {
+                error,
+                error_stage,
+                retryable,
+            }) => {
+                row.error = Some(error.clone());
+                row.error_stage = Some(error_stage.clone());
+                row.retryable = Some(*retryable);
+                CaptureJobStage::Failed
+            }
+            None => report.stage,
+        };
+        if row.stage != stage {
+            row.stage_started_at = now;
+        }
+        row.stage = stage;
+        row.stage_progress = report.progress.clone();
+        row.last_progress_at = now;
+        if report.fc_snapshot_version.is_some() {
+            row.fc_snapshot_version = report.fc_snapshot_version.clone();
+        }
+        row.updated_at = now;
+        Ok(true)
     }
 
     async fn record_enable_job_failure(
