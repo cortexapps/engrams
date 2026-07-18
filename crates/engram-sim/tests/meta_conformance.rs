@@ -259,6 +259,81 @@ async fn list_host_lost_sessions(ctx: &Ctx) {
     assert!(!listed.iter().any(|session| session.id == other));
 }
 
+/// `terminate_session` picks the terminal target for the current state,
+/// drives the (row-locked) transition, and is idempotent once terminal;
+/// `notify_session_delta` is a best-effort ephemeral fan-out. Both stores
+/// must agree (ADR 0098 D4) — Sim overrides the trait defaults rather than
+/// silently inheriting them.
+async fn terminate_and_delta(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:terminate")).await.unwrap();
+    meta.transition_session(id, SessionState::Created)
+        .await
+        .unwrap();
+    meta.transition_session(id, SessionState::Active)
+        .await
+        .unwrap();
+
+    // Best-effort delta fan-out never errors on a live store.
+    meta.notify_session_delta(id, &serde_json::json!({"chunk": "hi"}))
+        .await
+        .unwrap();
+
+    // Active is non-terminal: terminate routes to Completed and reports
+    // the honest (prev, target) pair.
+    let outcome = meta.terminate_session(id).await.unwrap();
+    assert_eq!(
+        outcome,
+        Some((SessionState::Active, SessionState::Completed))
+    );
+    assert_eq!(
+        meta.get_session(id).await.unwrap().status,
+        SessionState::Completed
+    );
+
+    // Idempotent once terminal.
+    assert_eq!(meta.terminate_session(id).await.unwrap(), None);
+
+    // Missing row surfaces NotFound (not a silent None).
+    let err = meta.terminate_session(SessionId::new()).await.unwrap_err();
+    assert!(matches!(err, MetaError::NotFound));
+}
+
+/// `fc_snapshot_version_for_host` reads `hosts.capabilities.fc_snapshot_version`
+/// off the active-host scan: present when the host reported one, `None` for a
+/// host with no version and for an unknown host. Both stores must agree
+/// (ADR 0098 D4).
+async fn host_fc_snapshot_version(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let with_ver = HostId::new();
+    let without_ver = HostId::new();
+
+    let mut rec = host_record(with_ver, "conf-fcver", now);
+    rec.capabilities.fc_snapshot_version = Some("v10.0.0".to_string());
+    meta.upsert_host(rec).await.unwrap();
+    meta.upsert_host(host_record(without_ver, "conf-nofcver", now))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        meta.fc_snapshot_version_for_host(with_ver).await.unwrap(),
+        Some("v10.0.0".to_string())
+    );
+    assert_eq!(
+        meta.fc_snapshot_version_for_host(without_ver)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        meta.fc_snapshot_version_for_host(HostId::new())
+            .await
+            .unwrap(),
+        None
+    );
+}
+
 /// FIFO by queued_at; the queue drains oldest-first. Sessions enter the
 /// queue via the REAL enqueue path (`reserve_and_persist_create` with no
 /// candidates), which stamps `queue_origin` + `queued_at`.
@@ -958,6 +1033,8 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
 
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
+conformance!(t_terminate_and_delta, super::terminate_and_delta);
+conformance!(t_host_fc_snapshot_version, super::host_fc_snapshot_version);
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
