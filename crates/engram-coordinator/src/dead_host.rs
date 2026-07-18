@@ -225,7 +225,7 @@ pub type ProbeMemoryMap = std::collections::HashMap<HostId, ProbeMemory>;
 /// DELAY a destroy, never destroy a live VM earlier than a single replica
 /// would), and a settle by ANY replica ends the deferral for all via the
 /// #211 CAS + `Conflict`-idempotent transition.
-pub type StragglerStrikeMap = std::collections::HashMap<SessionId, u32>;
+pub type StragglerStrikeMap = std::collections::BTreeMap<SessionId, u32>;
 
 pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
