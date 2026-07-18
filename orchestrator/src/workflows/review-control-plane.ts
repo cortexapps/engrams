@@ -62,6 +62,10 @@ export interface EnsureReviewRecordInput {
 }
 
 export interface ReviewControlPlane {
+  resolvePrHeads(repo: string, prNumber: number): Promise<{
+    headSha: string;
+    baseSha: string;
+  }>;
   ensureReviewRecord(
     input: EnsureReviewRecordInput,
   ): Promise<{ reviewId: string; taskId: string }>;
@@ -337,6 +341,10 @@ export function makeReviewControlPlane(
     ?? ((sessionId: string) => registerExistingSessionListener(db(), sessionId));
 
   return {
+    async resolvePrHeads(repo, prNumber) {
+      return githubPoster.fetchPrHeads(repo, prNumber);
+    },
+
     async ensureReviewRecord(input) {
       const active = await reviews().getActiveReviewForPr(
         input.repo,
@@ -555,13 +563,18 @@ export function makeReviewControlPlane(
       if (!detail) throw new Error(`review not found: ${reviewId}`);
 
       const { repo, prNumber } = detail.review;
-      const { headSha, baseSha } = await githubPoster.fetchPrHeads(repo, prNumber);
-      await reviews().finalizeReview(reviewId, {
-        status: detail.review.status,
-        summaryMd: detail.review.summaryMd ?? "",
-        headSha,
-        baseSha,
-      });
+      let { headSha, baseSha } = detail.review;
+      if (headSha === "" || baseSha === "") {
+        const live = await githubPoster.fetchPrHeads(repo, prNumber);
+        if (headSha === "") headSha = live.headSha;
+        if (baseSha === "") baseSha = live.baseSha;
+        await reviews().finalizeReview(reviewId, {
+          status: detail.review.status,
+          summaryMd: detail.review.summaryMd ?? "",
+          headSha,
+          baseSha,
+        });
+      }
 
       // The marker check closes the crash window between GitHub accepting the
       // review and the local transaction recording it.

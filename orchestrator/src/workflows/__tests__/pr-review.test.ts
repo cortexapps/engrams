@@ -57,6 +57,7 @@ function fakeControlPlane(
   overrides: Partial<ReviewControlPlane> = {},
 ): ReviewControlPlane {
   return {
+    resolvePrHeads: async () => ({ headSha: "resolved-head", baseSha: "resolved-base" }),
     ensureReviewRecord: async () => ({ reviewId: "review-1", taskId: "task-1" }),
     createFinderSession: async () => ({ sessionId: "finder-session" }),
     bootstrapFinderSession: async () => {},
@@ -166,6 +167,7 @@ describe("PrReviewWorkflow", () => {
       "postReviewResults",
     ]);
     expect(steps.steps).toEqual([
+      "resolvePrHeads",
       "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
@@ -420,6 +422,7 @@ describe("PrReviewWorkflow", () => {
 
     expect(markedFailed).toBe(1);
     expect(steps.steps).toEqual([
+      "resolvePrHeads",
       "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",

@@ -677,7 +677,8 @@ describe("ReviewControlPlane", () => {
     expect(posted[0]).toMatchObject({
       repo: active.repo,
       prNumber: active.prNumber,
-      commitId: "live-head",
+      // #764-2: anchor to the REVIEWED head (the review row), never the live head.
+      commitId: active.headSha,
       comments: [{
         findingId: confirmed.id,
         path: confirmed.path,
@@ -707,7 +708,8 @@ describe("ReviewControlPlane", () => {
       input: {
         status: active.status,
         summaryMd: "",
-        headSha: "live-head",
+        // Reviewed head kept; only the empty base is filled from the live fetch.
+        headSha: active.headSha,
         baseSha: "live-base",
       },
     });
@@ -755,10 +757,44 @@ describe("ReviewControlPlane", () => {
       {
         status: active.status,
         summaryMd: "",
-        headSha: "live-head",
+        headSha: active.headSha,
         baseSha: "live-base",
       },
       { status: "posted", summaryMd: "" },
     ]);
+  });
+
+  test("posts against the reviewed head without a live fetch when both SHAs are stored", async () => {
+    const reviewed: ReviewRow = { ...active, baseSha: "base-reviewed" };
+    let fetchCalls = 0;
+    let postedCommit: string | undefined;
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => reviewed,
+        getReview: async () => ({ review: reviewed, findings: [finding("candidate")], verdicts: [] }),
+        createReview: async () => reviewed.id,
+        updateReviewStatus: async () => {},
+        updateFindingState: async () => {},
+        finalizeReview: async () => {},
+      },
+      githubPoster: {
+        fetchPrHeads: async () => {
+          fetchCalls++;
+          return { headSha: "live-head", baseSha: "live-base" };
+        },
+        alreadyPosted: async () => false,
+        async postReview(input) {
+          postedCommit = input.commitId;
+          return { githubReviewId: "gh-1", posted: true, inlinePosted: true, summaryMd: input.buildSummary(true) };
+        },
+      },
+    });
+
+    await cp.postReviewResults(reviewed.id);
+
+    // #764-2: both SHAs already stored → no live fetch, commit_id is the reviewed head.
+    expect(fetchCalls).toBe(0);
+    expect(postedCommit).toBe(reviewed.headSha);
   });
 });

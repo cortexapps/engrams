@@ -65,6 +65,8 @@ const CATEGORY_LABELS: Readonly<Record<string, string>> = {
   "performance-scalability": "🚀 Performance & Scalability",
   "maintainability-quality": "📐 Maintainability & Code Quality",
 };
+const REVIEWS_PER_PAGE = 100;
+const MAX_REVIEW_PAGES = 50;
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -222,21 +224,34 @@ export function makeGithubReviewPoster(
     },
 
     async alreadyPosted(repo, prNumber, reviewId) {
-      const response = await runOp("github", {
-        method: "GET",
-        path: `/repos/${repo}/pulls/${prNumber}/reviews`,
-        contentType: "application/json",
-      });
-      if (response.status < 200 || response.status >= 300) {
-        throw responseError("list pull request reviews", response);
-      }
-      const value = parseJson(response, "list pull request reviews");
-      if (!Array.isArray(value)) {
-        throw new Error("list pull request reviews returned a non-array response");
-      }
       const marker = `<!-- engrams-review:${reviewId} -->`;
-      return value.some((item) =>
-        isObject(item) && typeof item["body"] === "string" && item["body"].includes(marker)
+      for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
+        const response = await runOp("github", {
+          method: "GET",
+          path:
+            `/repos/${repo}/pulls/${prNumber}/reviews?per_page=${REVIEWS_PER_PAGE}&page=${page}`,
+          contentType: "application/json",
+        });
+        if (response.status < 200 || response.status >= 300) {
+          throw responseError("list pull request reviews", response);
+        }
+        const value = parseJson(response, "list pull request reviews");
+        if (!Array.isArray(value)) {
+          throw new Error("list pull request reviews returned a non-array response");
+        }
+        if (
+          value.some((item) =>
+            isObject(item)
+            && typeof item["body"] === "string"
+            && item["body"].includes(marker)
+          )
+        ) {
+          return true;
+        }
+        if (value.length < REVIEWS_PER_PAGE) return false;
+      }
+      throw new Error(
+        `list pull request reviews exceeded ${MAX_REVIEW_PAGES} pages`,
       );
     },
 

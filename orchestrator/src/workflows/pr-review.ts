@@ -52,20 +52,50 @@ export async function prReviewWorkflowImpl(
   const workflowId = deps.workflowId ?? DBOS.workflowID;
   if (!workflowId) throw new Error("Review workflow ID is unavailable");
 
+  let headSha = first.headSha ?? "";
+  let baseSha = "";
+  try {
+    // The trigger contract does not carry baseSha, so every trigger resolves
+    // the PR heads. Preserve an event-provided head SHA and only fill missing
+    // values so a later push cannot change the commit this workflow reviews.
+    const resolved = await step(
+      () => cp.resolvePrHeads(first.repo, first.prNumber),
+      "resolvePrHeads",
+    );
+    if (headSha === "") headSha = resolved.headSha;
+    baseSha = resolved.baseSha;
+  } catch (err) {
+    log.error(
+      { repo: first.repo, prNumber: first.prNumber, err },
+      "pull request head resolution failed",
+    );
+    // markReviewFailed is review-ID based, so retain a durable failed record
+    // while ensuring no worker can bootstrap against unresolved code.
+    const { reviewId } = await step(
+      () => cp.ensureReviewRecord({
+        repo: first.repo,
+        prNumber: first.prNumber,
+        headSha,
+        baseSha,
+        trigger: first.trigger,
+      }),
+      "ensureReviewRecord",
+    );
+    await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+    return;
+  }
+
   const { reviewId, taskId } = await step(
     () => cp.ensureReviewRecord({
       repo: first.repo,
       prNumber: first.prNumber,
-      headSha: first.headSha ?? "",
-      // GitHub comment and dispatch triggers do not carry the merge-base SHA.
-      // NOT NULL placeholders are filled after clone in the execution PR.
-      baseSha: "",
+      headSha,
+      baseSha,
       trigger: first.trigger,
     }),
     "ensureReviewRecord",
   );
 
-  const headSha = first.headSha ?? "";
   let finderSessionId: string | undefined;
   let verifierSessionId: string | undefined;
   const setupFinder = async (): Promise<void> => {
@@ -93,7 +123,7 @@ export async function prReviewWorkflowImpl(
         repo: first.repo,
         prNumber: first.prNumber,
         headSha,
-        baseSha: "",
+        baseSha,
         ...(first.focus !== undefined ? { focus: first.focus } : {}),
       }),
       "sendFinderPrompt",
@@ -126,7 +156,7 @@ export async function prReviewWorkflowImpl(
         repo: first.repo,
         prNumber: first.prNumber,
         headSha,
-        baseSha: "",
+        baseSha,
       }),
       "sendVerifierPrompt",
     );
