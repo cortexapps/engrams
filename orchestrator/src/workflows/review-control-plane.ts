@@ -4,7 +4,15 @@ import { getDb } from "../db/client.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
-import { makeReviewStore, type ReviewStore } from "../db/reviews.ts";
+import {
+  makeReviewStore,
+  type ReviewDetail,
+  type ReviewStore,
+} from "../db/reviews.ts";
+import {
+  makeReviewSessionStore,
+  type ReviewSessionStore,
+} from "../db/review-sessions.ts";
 import { task as taskTable } from "../db/schema.ts";
 import {
   harnessCatalog as defaultHarnessCatalog,
@@ -42,6 +50,7 @@ export interface ReviewControlPlane {
     taskId: string;
     repo: string;
     prNumber: number;
+    workflowId: string;
   }): Promise<{ sessionId: string }>;
   bootstrapFinderSession(sessionId: string, input: {
     repo: string;
@@ -57,13 +66,35 @@ export interface ReviewControlPlane {
     baseSha: string;
     focus?: string;
   }): Promise<void>;
+  getReview(reviewId: string): Promise<ReviewDetail | null>;
+  createVerifierSession(input: {
+    reviewId: string;
+    taskId: string;
+    repo: string;
+    prNumber: number;
+    workflowId: string;
+  }): Promise<{ sessionId: string }>;
+  bootstrapVerifierSession(sessionId: string, input: {
+    repo: string;
+    headSha: string;
+    reviewId: string;
+    enabledCategories?: readonly ReviewCategory[];
+    orgInstructions?: string;
+  }): Promise<void>;
+  sendVerifierPrompt(sessionId: string, input: {
+    reviewId: string;
+    repo: string;
+    prNumber: number;
+    headSha: string;
+    baseSha: string;
+  }): Promise<void>;
   markReviewFailed(reviewId: string): Promise<void>;
   markReviewHalted(repo: string, prNumber: number): Promise<void>;
 }
 
 interface ReviewControlPlaneStore extends Pick<
   ReviewStore,
-  "createReview" | "getActiveReviewForPr" | "updateReviewStatus"
+  "createReview" | "getReview" | "getActiveReviewForPr" | "updateReviewStatus"
 > {}
 
 interface ReviewExecOutput {
@@ -96,6 +127,7 @@ export interface ReviewControlPlaneDeps {
   sessions?: ReviewSessionsClient;
   profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
   enrollments?: Pick<EnrollmentStore, "get">;
+  reviewSessions?: ReviewSessionStore;
   renderReviewer?: RenderReviewer;
   /** Focused test seam; production delegates to the shared task-create helper. */
   createSessionForExistingTask?: CreateExistingTaskSession;
@@ -113,6 +145,11 @@ const FINDER_SYSTEM_PROMPT = [
   "Read /workspace/.review/finder.md and follow it. Never edit files, never push, and report findings only through the provided tools.",
 ].join("\n");
 
+const VERIFIER_SYSTEM_PROMPT = [
+  "You are the verifier for an automated pull-request review.",
+  "Read /workspace/.review/verifier.md and follow it. Refute each finding; confirm only what you can reproduce from code you read, and report every judgment through submit_verdict.",
+].join("\n");
+
 // GitHub's own charset limits (owner + repo are [A-Za-z0-9._-]); enforced here
 // so a repo/SHA can never carry shell metacharacters into the bootstrap `sh -c`
 // — defense in depth on top of the signature check + enrollment gate.
@@ -128,6 +165,44 @@ function repoName(repo: string): string {
   const name = repo.split("/").at(-1);
   if (!name) throw new ReviewSetupError(`invalid repository: ${repo}`);
   return name;
+}
+
+/** The one coarse clone step both phases share: `rm -rf` the target (so a
+ *  retried step is safe) then clone (+ checkout when a head SHA is known). repo
+ *  and headSha are validated before reaching the `sh -c` — injection defense in
+ *  depth. Throws ReviewSetupError on a non-zero/absent exit, carrying stderr. */
+async function cloneRepo(
+  sessions: ReviewSessionsClient,
+  sessionId: string,
+  repo: string,
+  headSha: string,
+  phase: string,
+): Promise<void> {
+  const name = repoName(repo);
+  if (headSha !== "" && !SHA_RE.test(headSha)) {
+    throw new ReviewSetupError(`invalid head SHA: ${headSha}`);
+  }
+  const workspace = `/workspace/${name}`;
+  let command = `rm -rf ${workspace} && git clone https://github.com/${repo}.git ${workspace}`;
+  if (headSha !== "") {
+    command += ` && git -C ${workspace} checkout ${headSha}`;
+  }
+
+  const stderrDecoder = new TextDecoder();
+  let stderr = "";
+  let exitStatus: number | undefined;
+  for await (const message of sessions.exec({ sessionId, command })) {
+    if (message.event.case === "stderr") {
+      stderr += stderrDecoder.decode(message.event.value, { stream: true });
+    } else if (message.event.case === "exit") {
+      exitStatus = message.event.value.exitStatus;
+    }
+  }
+  stderr += stderrDecoder.decode();
+  if (exitStatus !== 0) {
+    const detail = stderr.trim() || "exec stream ended without a successful exit status";
+    throw new ReviewSetupError(`${phase} clone failed: ${detail}`);
+  }
 }
 
 function productionImagesClient(): ImagesClient {
@@ -194,6 +269,10 @@ export function makeReviewControlPlane(
   const profiles = () => (profileStore ??= makeProfileStore(db()));
   let enrollmentStore = deps.enrollments;
   const enrollments = () => (enrollmentStore ??= makeEnrollmentStore(db()));
+  let reviewSessionStore = deps.reviewSessions;
+  const reviewSessions = () => (
+    reviewSessionStore ??= makeReviewSessionStore(db())
+  );
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
   const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
     const database = db();
@@ -240,48 +319,29 @@ export function makeReviewControlPlane(
         throw new ReviewSetupError("no pr_reviewer profile configured");
       }
 
-      return createExistingSession({
+      const created = await createExistingSession({
         taskId: input.taskId,
         profileId,
         role: "finder",
         extraCapabilities: [`github:contents:read@${input.repo}`],
         appendSystemPrompt: FINDER_SYSTEM_PROMPT,
+        registerListener: true,
         source: {
           reviewId: input.reviewId,
           repo: input.repo,
           prNumber: input.prNumber,
         },
       });
+      await reviewSessions().record(
+        created.sessionId,
+        input.workflowId,
+        "finder",
+      );
+      return created;
     },
 
     async bootstrapFinderSession(sessionId, input) {
-      const name = repoName(input.repo);
-      if (input.headSha !== "" && !SHA_RE.test(input.headSha)) {
-        throw new ReviewSetupError(`invalid head SHA: ${input.headSha}`);
-      }
-      const workspace = `/workspace/${name}`;
-      // Removing the target first makes the coarse checkpoint safe even if an
-      // interrupted clone is retried outside DBOS result replay.
-      let command = `rm -rf ${workspace} && git clone https://github.com/${input.repo}.git ${workspace}`;
-      if (input.headSha !== "") {
-        command += ` && git -C ${workspace} checkout ${input.headSha}`;
-      }
-
-      const stderrDecoder = new TextDecoder();
-      let stderr = "";
-      let exitStatus: number | undefined;
-      for await (const message of sessions.exec({ sessionId, command })) {
-        if (message.event.case === "stderr") {
-          stderr += stderrDecoder.decode(message.event.value, { stream: true });
-        } else if (message.event.case === "exit") {
-          exitStatus = message.event.value.exitStatus;
-        }
-      }
-      stderr += stderrDecoder.decode();
-      if (exitStatus !== 0) {
-        const detail = stderr.trim() || "exec stream ended without a successful exit status";
-        throw new ReviewSetupError(`finder clone failed: ${detail}`);
-      }
+      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "finder");
 
       const encoder = new TextEncoder();
       const files = renderReviewer({
@@ -323,6 +383,106 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "finding");
+    },
+
+    async getReview(reviewId) {
+      return reviews().getReview(reviewId);
+    },
+
+    async createVerifierSession(input) {
+      assertSafeRepo(input.repo);
+      const enrollment = await enrollments().get(input.repo);
+      const profileId = enrollment?.profileId
+        ?? (await profiles().getByDesignation("pr_reviewer"))?.id;
+      if (!profileId) {
+        throw new ReviewSetupError("no pr_reviewer profile configured");
+      }
+
+      const created = await createExistingSession({
+        taskId: input.taskId,
+        profileId,
+        role: "verifier",
+        extraCapabilities: [`github:contents:read@${input.repo}`],
+        appendSystemPrompt: VERIFIER_SYSTEM_PROMPT,
+        registerListener: true,
+        source: {
+          reviewId: input.reviewId,
+          repo: input.repo,
+          prNumber: input.prNumber,
+        },
+      });
+      await reviewSessions().record(
+        created.sessionId,
+        input.workflowId,
+        "verifier",
+      );
+      return created;
+    },
+
+    async bootstrapVerifierSession(sessionId, input) {
+      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "verifier");
+
+      const review = await reviews().getReview(input.reviewId);
+      if (!review) {
+        throw new ReviewSetupError(`review not found: ${input.reviewId}`);
+      }
+      const candidates = review.findings
+        .filter((finding) => finding.state === "candidate")
+        .map((finding) => ({
+          id: finding.id,
+          path: finding.path,
+          start_line: finding.startLine,
+          end_line: finding.endLine,
+          side: finding.side,
+          category: finding.category,
+          severity: finding.severity,
+          confidence: finding.confidence,
+          title: finding.title,
+          body_md: finding.bodyMd,
+          evidence: finding.evidence,
+        }));
+
+      const encoder = new TextEncoder();
+      const files = [
+        ...renderReviewer({
+          role: "verifier",
+          ...(input.enabledCategories ? { enabledCategories: input.enabledCategories } : {}),
+          ...(input.orgInstructions !== undefined
+            ? { orgInstructions: input.orgInstructions }
+            : {}),
+        }),
+        {
+          path: "/workspace/.review/candidates.json",
+          content: JSON.stringify(candidates),
+        },
+      ].map((file) => ({
+        path: file.path,
+        content: encoder.encode(file.content),
+        mode: 0o644,
+      }));
+      const response = await sessions.writeFiles({ sessionId, files });
+      const failed = response.results.find((result) => !result.ok);
+      if (failed) {
+        throw new ReviewSetupError(
+          `failed to stage verifier inputs at ${failed.path}: ${failed.error ?? "unknown error"}`,
+        );
+      }
+    },
+
+    async sendVerifierPrompt(sessionId, input) {
+      repoName(input.repo);
+      const prompt = [
+        `Judge the candidate findings for ${input.repo} pull request #${input.prNumber}.`,
+        "Judge each candidate in /workspace/.review/candidates.json per /workspace/.review/verifier.md.",
+        "Submit submit_verdict for every candidate; confirm only findings you can reproduce from code you read.",
+      ].join("\n");
+
+      await sessions.sendPrompt({
+        sessionId,
+        promptId: `review:${input.reviewId}:verifier`,
+        text: prompt,
+      });
+      await reviews().updateReviewStatus(input.reviewId, "verifying");
     },
 
     async markReviewFailed(reviewId) {

@@ -2,7 +2,8 @@ import { describe, expect, test } from "bun:test";
 
 import type { EnrollmentRow } from "../../db/enrollments.ts";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
-import type { ReviewRow } from "../../db/reviews.ts";
+import type { ReviewDetail, ReviewFindingRow, ReviewRow } from "../../db/reviews.ts";
+import type { ReviewSessionStore } from "../../db/review-sessions.ts";
 import type { CreateSessionForExistingTaskParams } from "../../rpc/task-create.ts";
 import {
   makeReviewControlPlane,
@@ -24,6 +25,53 @@ const active: ReviewRow = {
   createdAt: new Date("2026-07-17T00:00:00Z"),
   updatedAt: new Date("2026-07-17T00:00:00Z"),
 };
+
+function finding(
+  id: string,
+  state = "candidate",
+): ReviewFindingRow {
+  return {
+    id,
+    reviewId: active.id,
+    path: "orchestrator/src/workflows/pr-review.ts",
+    startLine: 42,
+    endLine: 45,
+    side: "RIGHT",
+    category: "functional-correctness",
+    severity: "high",
+    confidence: "medium",
+    title: "Retry skips a phase",
+    bodyMd: "The second terminal event bypasses verification.",
+    suggestedFix: null,
+    evidence: ["orchestrator/src/workflows/pr-review.ts"],
+    state,
+    verdictReason: null,
+    githubThreadId: null,
+    resolution: null,
+    sessionId: "finder-session",
+    toolCallId: `call-${id}`,
+    createdAt: new Date("2026-07-17T00:01:00Z"),
+  };
+}
+
+function detail(findings: ReviewFindingRow[] = []): ReviewDetail {
+  return { review: active, findings, verdicts: [] };
+}
+
+function reviewSessionRecorder(): ReviewSessionStore & {
+  calls: Array<[string, string, string]>;
+} {
+  const calls: Array<[string, string, string]> = [];
+  return {
+    calls,
+    async record(sessionId, reviewWorkflowId, role) {
+      calls.push([sessionId, reviewWorkflowId, role]);
+    },
+    async find() {
+      return null;
+    },
+  };
+}
 
 const reviewerProfile = (id: string): ProfileRow => ({
   id,
@@ -126,6 +174,7 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({
       reviews: {
         getActiveReviewForPr: async () => active,
+        getReview: async () => detail(),
         createReview: async () => { throw new Error("unexpected create"); },
         updateReviewStatus: async () => {},
       },
@@ -151,6 +200,7 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({
       reviews: {
         getActiveReviewForPr: async () => current,
+        getReview: async () => detail(),
         createReview: async (input) => {
           creates.push(input);
           current = { ...active, id: "review-new", taskId: input.taskId };
@@ -184,6 +234,7 @@ describe("ReviewControlPlane", () => {
 
   test("creates the finder with the designated profile and scoped clone capability", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
+    const reviewSessions = reviewSessionRecorder();
     const designated = reviewerProfile("profile-designated");
     const cp = makeReviewControlPlane({
       profiles: profileLookup(designated),
@@ -192,6 +243,7 @@ describe("ReviewControlPlane", () => {
         created.push(params);
         return { sessionId: "finder-session" };
       },
+      reviewSessions,
     });
 
     expect(await cp.createFinderSession({
@@ -199,14 +251,19 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
       repo: active.repo,
       prNumber: active.prNumber,
+      workflowId: "review-wf-1",
     })).toEqual({ sessionId: "finder-session" });
     expect(created[0]).toMatchObject({
       taskId: active.taskId,
       profileId: designated.id,
       role: "finder",
       extraCapabilities: [`github:contents:read@${active.repo}`],
+      registerListener: true,
     });
     expect(created[0]?.appendSystemPrompt).toContain("/workspace/.review/finder.md");
+    expect(reviewSessions.calls).toEqual([
+      ["finder-session", "review-wf-1", "finder"],
+    ]);
   });
 
   test("an enrollment profile overrides the designated reviewer profile", async () => {
@@ -218,6 +275,7 @@ describe("ReviewControlPlane", () => {
         created.push(params);
         return { sessionId: "finder-session" };
       },
+      reviewSessions: reviewSessionRecorder(),
     });
 
     await cp.createFinderSession({
@@ -225,6 +283,7 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
       repo: active.repo,
       prNumber: active.prNumber,
+      workflowId: "review-wf-1",
     });
     expect(created[0]?.profileId).toBe("profile-enrolled");
   });
@@ -240,7 +299,42 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
       repo: active.repo,
       prNumber: active.prNumber,
+      workflowId: "review-wf-1",
     })).rejects.toBeInstanceOf(ReviewSetupError);
+  });
+
+  test("creates the verifier with a listener and records its workflow binding", async () => {
+    const created: CreateSessionForExistingTaskParams[] = [];
+    const reviewSessions = reviewSessionRecorder();
+    const designated = reviewerProfile("profile-designated");
+    const cp = makeReviewControlPlane({
+      profiles: profileLookup(designated),
+      enrollments: { get: async () => enrollment(active.repo, null) },
+      createSessionForExistingTask: async (params) => {
+        created.push(params);
+        return { sessionId: "verifier-session" };
+      },
+      reviewSessions,
+    });
+
+    expect(await cp.createVerifierSession({
+      reviewId: active.id,
+      taskId: active.taskId,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      workflowId: "review-wf-1",
+    })).toEqual({ sessionId: "verifier-session" });
+    expect(created[0]).toMatchObject({
+      taskId: active.taskId,
+      profileId: designated.id,
+      role: "verifier",
+      extraCapabilities: [`github:contents:read@${active.repo}`],
+      registerListener: true,
+    });
+    expect(created[0]?.appendSystemPrompt).toContain("submit_verdict");
+    expect(reviewSessions.calls).toEqual([
+      ["verifier-session", "review-wf-1", "verifier"],
+    ]);
   });
 
   test("bootstraps with an idempotent clone, checkout, and rendered finder files", async () => {
@@ -300,6 +394,54 @@ describe("ReviewControlPlane", () => {
     })).rejects.toThrow(/disk full/);
   });
 
+  test("bootstraps the verifier with its instructions and candidate findings", async () => {
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        getActiveReviewForPr: async () => active,
+        getReview: async () => detail([
+          finding("candidate-1"),
+          finding("already-confirmed", "confirmed"),
+        ]),
+        createReview: async () => active.id,
+        updateReviewStatus: async () => {},
+      },
+    });
+
+    await cp.bootstrapVerifierSession("verifier-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      headSha: active.headSha,
+    });
+
+    expect(sessions.execCalls[0]).toEqual({
+      sessionId: "verifier-session",
+      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams checkout ${active.headSha}`,
+    });
+    const files = sessions.writeCalls[0]?.files ?? [];
+    expect(files.map((file) => file.path)).toEqual([
+      "/workspace/.review/verifier.md",
+      "/workspace/.review/candidates.json",
+    ]);
+    expect(new TextDecoder().decode(files[0]?.content)).toContain(
+      "You are the verifier",
+    );
+    expect(JSON.parse(new TextDecoder().decode(files[1]?.content))).toEqual([{
+      id: "candidate-1",
+      path: "orchestrator/src/workflows/pr-review.ts",
+      start_line: 42,
+      end_line: 45,
+      side: "RIGHT",
+      category: "functional-correctness",
+      severity: "high",
+      confidence: "medium",
+      title: "Retry skips a phase",
+      body_md: "The second terminal event bypasses verification.",
+      evidence: ["orchestrator/src/workflows/pr-review.ts"],
+    }]);
+  });
+
   test("sends the stable finder prompt and marks the review finding", async () => {
     const sessions = fakeSessions();
     const statuses: Array<[string, string]> = [];
@@ -307,6 +449,7 @@ describe("ReviewControlPlane", () => {
       sessions,
       reviews: {
         getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
         createReview: async () => "unused",
         updateReviewStatus: async (reviewId, status) => {
           statuses.push([reviewId, status]);
@@ -330,5 +473,37 @@ describe("ReviewControlPlane", () => {
     expect(sessions.promptCalls[0]?.text).toContain("the PR diff");
     expect(sessions.promptCalls[0]?.text).toContain("Check retry behavior");
     expect(statuses).toEqual([[active.id, "finding"]]);
+  });
+
+  test("sends the verifier prompt and marks the review verifying", async () => {
+    const sessions = fakeSessions();
+    const statuses: Array<[string, string]> = [];
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
+        createReview: async () => "unused",
+        updateReviewStatus: async (reviewId, status) => {
+          statuses.push([reviewId, status]);
+        },
+      },
+    });
+
+    await cp.sendVerifierPrompt("verifier-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: active.headSha,
+      baseSha: "",
+    });
+
+    expect(sessions.promptCalls[0]).toMatchObject({
+      sessionId: "verifier-session",
+      promptId: `review:${active.id}:verifier`,
+    });
+    expect(sessions.promptCalls[0]?.text).toContain("candidates.json");
+    expect(sessions.promptCalls[0]?.text).toContain("submit_verdict");
+    expect(statuses).toEqual([[active.id, "verifying"]]);
   });
 });
