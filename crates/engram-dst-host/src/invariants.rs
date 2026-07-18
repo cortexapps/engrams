@@ -18,8 +18,8 @@
 //! FLOOR (the highest tag a flush published to the durable/uploaded tier,
 //! observed from the REAL published manifest — see [`crate::world`]). For each
 //! chunk with a live backend, the check reads the chunk back and requires the
-//! decoded tag to fall in the honest RANGE `[published_floor, latest_ack]` (by
-//! tag order). Everything in that range is legitimate:
+//! decoded tag to be a MEMBER of that chunk's acked-tag set (or the tag-0
+//! base), bounded below by `published_floor`. Legitimate members include:
 //!
 //! * `== latest_ack` — a live backend that never crashed still holds the newest
 //!   write; and a rebuild where the latest write WAS itself published has
@@ -31,9 +31,10 @@
 //!   shutdown spool adopted at recovery (the spool preserves an un-published
 //!   write across one roll; it is not a permanent floor).
 //!
-//! Only two reads are violations: OLDER than the published floor (a durable
-//! published write rolled back — the 85e0298a corruption class) or NEWER than
-//! the latest ack (a never-acked tag). The published floor is the ONLY
+//! Three reads are violations: OLDER than the published floor (a durable
+//! published write rolled back — the 85e0298a corruption class), NEWER than
+//! the latest ack (a never-acked tag), or in-range but NEVER ACKED for this
+//! chunk (a misdirected read serving another chunk's write). The published floor is the ONLY
 //! permanent durability promise; spool RECOVERY is asserted separately by the
 //! regression seeds that crash with a STANDING spool. Reading through the live
 //! backend IS the recovery path: `from_blob(published_ref)` resolves the
@@ -358,31 +359,81 @@ async fn acked_writes_recoverable(host: &SimHost) -> Result<(), Violation> {
         // to the durable tier — its acked writes are all RAM-only or
         // spool-transient, droppable by abrupt death.
         let floor = host.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-        // Honest range (ADR 0098 P4.5): a legitimate read is anywhere in
-        // `[published_floor, latest_ack]` by tag order — the live newest write
-        // (== latest), the permanent published floor (a rebuild that dropped
-        // newer un-published writes — an accepted, bounded loss), or a
-        // transiently-durable intermediate a standing spool adopted. Only two
-        // things are violations:
-        //   * a read OLDER than the published floor — a DURABLE published write
-        //     rolled back (the 85e0298a corruption class); or
-        //   * a read NEWER than the latest ack — a never-acked future tag.
-        if floor <= got && got <= latest {
+        let acked = host.ledger.acked_tags(idx, chunk_idx);
+        // A legitimate read is a tag actually acked for THIS chunk (or the tag-0
+        // base), bounded below by the published floor. Membership implies
+        // `got <= latest` (tags are globally monotone, so the chunk's latest ack
+        // is its max member) — the interval alone was NOT sufficient: tags are
+        // global, so another chunk's in-range tag must be a violation
+        // (misdirection), not a pass.
+        let member = got == 0 || acked.contains(&got);
+        if member && got >= floor {
             continue;
         }
         let why = if got < floor {
             "a durable published write rolled back below the floor"
-        } else {
+        } else if got > latest {
             "a read newer than the latest ack (a never-acked tag)"
+        } else {
+            "an in-range tag never acked for THIS chunk (a misdirected read \
+             serving another chunk's write)"
         };
         return Err(Violation {
             invariant: "acked-write-durability",
             detail: format!(
-                "sandbox {idx} chunk {chunk_idx}: read {got} outside [published_floor {floor}, \
-                 latest_ack {latest}] — {why}; lineage-at-ack {}v{}",
+                "sandbox {idx} chunk {chunk_idx}: read {got} not a member of this chunk's acked \
+                 set within [published_floor {floor}, latest_ack {latest}] — {why}; \
+                 lineage-at-ack {}v{}",
                 entry.lineage_at_ack.manifest_id, entry.lineage_at_ack.version
             ),
         });
+    }
+    Ok(())
+}
+
+/// Quiescence-only tightening of oracle #1 (ADR 0098 Phase 3, R1.5): after
+/// the quiesce pass has driven a final REAL flush through every live
+/// backend, **no surviving chunk's content may sit above the published
+/// floor** — read back through the live backend, every acked-written chunk
+/// must decode at-or-below the floor (and with oracle #1's lower bound,
+/// exactly AT it: everything that survived is published). This turns
+/// "bounded loss" from an unenforced flush-cadence claim into a checked
+/// guarantee: loss is bounded by "un-flushed at crash", never "we forgot
+/// to ever flush". A write lost to an earlier abrupt crash is already gone
+/// from the backend (its `latest_ack` legitimately exceeds the floor
+/// forever — the accepted crash-window loss), so it does NOT fire; what
+/// fires is a write that SURVIVED to quiescence and the final flush still
+/// failed to publish — a flush-pipeline liveness hole. Sandboxes with no
+/// live backend (destroyed at a finalize/migration terminal, or
+/// quarantined) are exempt — their durability story is oracle #6/#8's.
+pub async fn check_quiescent_floor(host: &SimHost) -> Result<(), Violation> {
+    for ((idx, chunk_idx), _entry) in host.ledger.latest_by_chunk() {
+        let Some(slot) = host.sandboxes.get(idx) else {
+            continue;
+        };
+        let Some(backend) = slot.backend.clone() else {
+            continue;
+        };
+        let bytes = backend
+            .read(chunk_idx * CHUNK_SIZE, CHUNK_SIZE)
+            .await
+            .map_err(|e| Violation {
+                invariant: "quiescent-floor",
+                detail: format!("sandbox {idx} chunk {chunk_idx} read failed: {e}"),
+            })?;
+        let got = decode_tag(&bytes);
+        let floor = host.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
+        if got > floor {
+            return Err(Violation {
+                invariant: "quiescent-floor",
+                detail: format!(
+                    "sandbox {idx} chunk {chunk_idx}: live content {got} above the published \
+                     floor {floor} after the quiescence flush — a surviving acked write the \
+                     world never flushed (the loss bound is 'un-flushed at crash', not 'never \
+                     flushed')"
+                ),
+            });
+        }
     }
     Ok(())
 }

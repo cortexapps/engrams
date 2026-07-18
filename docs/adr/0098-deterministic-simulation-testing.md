@@ -759,10 +759,26 @@ Host sim (`engram-dst-host`) + storage:
 - The acked-write oracle is a numeric interval check
   (`floor <= tag <= latest`) over globally-incremented tags: a misdirected
   read serving another chunk's in-range tag passes. The ledger carries the
-  per-chunk history needed for a membership check; the oracle discards it.
+  per-chunk history needed for a membership check; the oracle discards it. —
+  *Closed by R1.5:* the oracle (and `guest_read`) now require the observed tag
+  to be a MEMBER of that chunk's acked-tag set (or the tag-0 base), still
+  bounded below by the floor; the third violation class
+  (in-range-but-never-acked misdirection) is pinned by a regression test that
+  fails against the old interval form.
 - "Bounded by the flush cadence and the periodic checkpoint" is not modeled:
   the host scheduler has **no periodic-checkpoint step** and enforces no
   cadence bound — arbitrarily old unpublished acked writes are accepted loss.
+  — *Bounded at quiescence by R1.5:* the run's quiescence pass now drives a
+  final REAL flush per live sandbox and then asserts no surviving chunk's
+  content sits above the published floor (`quiescent-floor` — with oracle
+  #1's lower bound, content == floor: everything that survived is
+  published), so accepted loss is exactly 'un-flushed at crash', never
+  'never flushed'. (Asserting `floor == latest_ack` was the first cut and
+  is over-strict: a write lost to an earlier abrupt crash keeps its
+  `latest_ack` above the floor forever — the chaos swarm fired it on every
+  crash-loss seed; content-based is the honest form.) The mid-run
+  periodic-checkpoint step and cadence bound remain open (the rest of the
+  R1 row).
 - The restart leg runs the sim's own `rebuild`, not production
   `reattach_manifest`; the ledger has no per-write handoff enum (one floor
   per chunk).
