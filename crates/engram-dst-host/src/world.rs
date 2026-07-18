@@ -24,7 +24,7 @@
 //! decodes the tag back and the oracle can prove *which* acked write a
 //! recovered chunk carries. `tag = 0` is the base (never-written) content.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
@@ -134,9 +134,11 @@ pub struct LedgerEntry {
 ///   permanent floor; spool RECOVERY is asserted by the dedicated regression
 ///   seeds that crash with a STANDING spool, not by the standing-state oracle.
 ///
-/// The oracle therefore tolerates any read in `[published_floor, latest_ack]`
-/// (by tag order) and flags only a read OLDER than the published floor (a
-/// published write rolled back) or NEWER than the latest ack.
+/// The oracle therefore tolerates any read that is a MEMBER of this chunk's
+/// acked-tag set (or the tag-0 base), bounded below by `published_floor`. It
+/// flags a read OLDER than the published floor (a published write rolled back),
+/// NEWER than the latest ack, or in-range but never acked for this chunk (a
+/// misdirected read).
 #[derive(Default)]
 pub struct AckedWriteLedger {
     log: Vec<LedgerEntry>,
@@ -182,6 +184,17 @@ impl AckedWriteLedger {
     /// are all still RAM-only or spool-transient, droppable by abrupt death).
     pub fn handed_off_tag(&self, sandbox: usize, chunk_idx: u64) -> Option<u64> {
         self.published_floor.get(&(sandbox, chunk_idx)).copied()
+    }
+
+    /// Every tag ever acked for `(sandbox, chunk_idx)` — the membership set
+    /// the oracle checks reads against (a read must be one of THESE, never
+    /// merely a numerically in-range tag minted for another chunk).
+    pub fn acked_tags(&self, sandbox: usize, chunk_idx: u64) -> BTreeSet<u64> {
+        self.log
+            .iter()
+            .filter(|e| e.sandbox == sandbox && e.chunk_idx == chunk_idx)
+            .map(|e| e.content_tag)
+            .collect()
     }
 
     /// The recoverable set: the LATEST acked tag per `(sandbox, chunk_idx)`
@@ -586,13 +599,14 @@ impl SimHost {
     /// HONEST read property inline (the oracle re-checks every acked chunk each
     /// step, but this gives a targeted read trace).
     ///
-    /// A legitimate read-back falls in the honest range
-    /// `[published_floor, latest_ack]` (by tag order): the live newest write,
-    /// the permanent published floor (a recovery that dropped newer,
+    /// A legitimate read-back is a tag actually acked for this chunk (or the
+    /// tag-0 base), bounded below by the published floor: the live newest
+    /// write, the permanent published floor (a recovery that dropped newer,
     /// un-published writes — the accepted, bounded loss of ADR 0098 P4.5), or a
     /// transiently-durable intermediate a standing spool adopted. A read older
-    /// than the published floor (a rolled-back durable write) or newer than the
-    /// latest ack is a durability-pipeline violation.
+    /// than the published floor (a rolled-back durable write), newer than the
+    /// latest ack, or in-range but never acked for this chunk (misdirection) is
+    /// a durability-pipeline violation.
     pub async fn guest_read(&self, idx: usize, chunk_idx: u64) -> Result<(), String> {
         if idx >= self.sandboxes.len() || chunk_idx >= NUM_CHUNKS {
             return Ok(());
@@ -613,11 +627,20 @@ impl SimHost {
         {
             // `0` = base content (never published).
             let floor = self.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-            if got < floor || got > latest {
+            let acked = self.ledger.acked_tags(idx, chunk_idx);
+            let member = got == 0 || acked.contains(&got);
+            if !member || got < floor {
+                let why = if got < floor {
+                    "a lost or rolled-back durable write"
+                } else if got > latest {
+                    "a read newer than the latest ack (a never-acked tag)"
+                } else {
+                    "an in-range tag never acked for this chunk (misdirection)"
+                };
                 return Err(format!(
-                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got} outside \
-                     [published_floor {floor}, latest_ack {latest}] — a lost or rolled-back \
-                     durable write"
+                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got} not a \
+                     member of this chunk's acked set within [published_floor {floor}, \
+                     latest_ack {latest}] — {why}"
                 ));
             }
         }

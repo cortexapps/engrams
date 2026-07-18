@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use engram_dst_host::{
-    decode_tag, invariants, CrashFs, Profile, ScriptedResponse, Sim, SimHost, CHUNK_SIZE,
-    SIM_FINALIZE_MAX_ATTEMPTS,
+    decode_tag, invariants, synth_chunk, CrashFs, Profile, ScriptedResponse, Sim, SimHost,
+    CHUNK_SIZE, SIM_FINALIZE_MAX_ATTEMPTS,
 };
 use engram_host_agent::disk_daemon::spool;
 use engram_host_core::TokioFs;
@@ -792,6 +792,43 @@ async fn post_ack_pre_handoff_crash_is_honest_loss() {
     invariants::check(&host)
         .await
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+#[tokio::test(start_paused = true)]
+async fn misdirected_read_in_range_tag_fires_the_membership_oracle() {
+    let mut host = scenario_host(0xA55E_7718, 3).await;
+    host.guest_write(0, 0).await.unwrap();
+    host.guest_write(0, 1).await.unwrap();
+    host.guest_write(0, 0).await.unwrap();
+
+    host.sandboxes[0]
+        .backend
+        .clone()
+        .unwrap()
+        .write(0, &synth_chunk(2))
+        .await
+        .unwrap();
+
+    let violation = invariants::check(&host)
+        .await
+        .expect_err("the in-range tag belongs to another chunk");
+    assert_eq!(violation.invariant, "acked-write-durability");
+    assert!(violation.detail.contains("never acked"), "{violation:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unflushed_acked_write_fires_the_quiescent_floor_oracle() {
+    let mut host = scenario_host(0xA55E_7719, 3).await;
+    host.guest_write(0, 0).await.unwrap();
+
+    invariants::check(&host).await.unwrap();
+    let violation = invariants::check_quiescent_floor(&host)
+        .await
+        .expect_err("a surviving unflushed ack must fail the quiescence-only oracle");
+    assert_eq!(violation.invariant, "quiescent-floor");
+
+    host.flush_tick(0).await.unwrap();
+    invariants::check_quiescent_floor(&host).await.unwrap();
 }
 
 // ────────────── Flow B: the 731df805 scenario (ADR 0098 P7) ──────────────

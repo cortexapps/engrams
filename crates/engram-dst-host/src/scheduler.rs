@@ -476,8 +476,11 @@ impl Sim {
     }
 
     /// Run `steps` picks, checking the oracle after every step, then quiesce
-    /// (a final orderly crash→restart) and re-check — the durability property
-    /// must hold across a clean shutdown/recovery cycle too.
+    /// (a final orderly crash→restart), drain finalizes, drive one final REAL
+    /// flush per live sandbox, and require every surviving chunk's content
+    /// at-or-below the published floor. The durability property must hold
+    /// across a clean shutdown/recovery cycle, and no SURVIVING acked write
+    /// may remain never-flushed at quiescence.
     pub async fn run(&mut self, steps: u64) -> Result<SimReport, String> {
         for _ in 0..steps {
             let step = self.pick();
@@ -518,6 +521,28 @@ impl Sim {
         if let Err(v) = invariants::check(&self.host).await {
             return Err(format!(
                 "quiescence-post-drain: {} — {}",
+                v.invariant, v.detail
+            ));
+        }
+        // R1.5: the quiescence flush — drive one final REAL flush per live
+        // sandbox, then require every surviving chunk's content at-or-below
+        // (with oracle #1, exactly at) the published floor. This is what makes
+        // "bounded loss" a checked bound: any acked write still SURVIVING
+        // above the floor here was never flushed by anyone — a flush-pipeline
+        // liveness hole, not an accepted crash-window loss (a crash-lost
+        // write is already gone from the backend and stays accepted).
+        for idx in 0..NUM_SANDBOXES {
+            self.execute(Step::FlushTick(idx)).await?;
+        }
+        if let Err(v) = invariants::check(&self.host).await {
+            return Err(format!(
+                "quiescence-post-flush: {} — {}",
+                v.invariant, v.detail
+            ));
+        }
+        if let Err(v) = invariants::check_quiescent_floor(&self.host).await {
+            return Err(format!(
+                "quiescence-post-flush: {} — {}",
                 v.invariant, v.detail
             ));
         }
