@@ -104,9 +104,26 @@
 //! seeds add the #199 ordering leg (two flushes serialize behind the
 //! pipeline guard, never publishing old-over-new).
 //!
-//! # Deferred to P8+
+//! # P8 (Flow E — migration)
 //!
-//! The migration flow (Flow E).
+//! The export TTL clock moved off raw `Instant` onto the injected
+//! `now_mono` (expiry DECIDES destroy/abort — decision-feeding time), so
+//! the paused clock drives the REAL `MigrationRegistry::expired()`. Steps
+//! [`MigrationBegin`](Step::MigrationBegin) (a REAL `MigrationExport` in
+//! the REAL registry; the guest freezes) /
+//! [`MigrationServeState`](Step::MigrationServeState) (the split-brain
+//! flag) / [`MigrationTouch`](Step::MigrationTouch) (the activity anchor) /
+//! [`MigrationTtlSweep`](Step::MigrationTtlSweep) (REAL `expired()` +
+//! `ttl_verdict` over the scriptable coordinator's ownership answer) /
+//! [`MigrationCommit`](Step::MigrationCommit) /
+//! [`MigrationAbort`](Step::MigrationAbort). Oracle #7 pins the #216
+//! decision table (`state_served` ⇒ never abort-unpause — a split-brain
+//! un-pause is structurally recorded and flagged); oracle #2 pins
+//! plane accounting (`migrating` ⟺ an open export, with a live backend —
+//! no frozen guest ever leaks without an export to end it). Seeds cover
+//! the #216 gap family: abort-in-place zero loss, served-stays-paused-
+//! then-destroys, activity-anchored expiry, unreachable-never-guesses,
+//! and the reattached-source verdict table.
 
 pub mod coord_stub;
 pub mod effects;

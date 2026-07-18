@@ -90,8 +90,12 @@ pub struct PeerExport {
     /// page channel never refreshed the clock, so a >120 s drain let
     /// `expired()` fire and the sweep DESTROY the source mid-drain.
     /// Every `NeedAt`/`GetChunk` serve now stamps this, keeping the
-    /// registry export alive exactly as long as the dest is pulling.
-    pub last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
+    /// registry export alive exactly as long as the dest is pulling. A
+    /// `now_mono` reading off the injected clock (ADR 0098 P8).
+    pub last_activity: Arc<std::sync::Mutex<std::time::Duration>>,
+    /// The injected monotonic clock the TTL anchor is stamped from —
+    /// the SAME clock the registry export carries (ADR 0098 P8).
+    pub clock: Arc<dyn engram_core::traits::Clock>,
 }
 
 impl PeerExport {
@@ -102,7 +106,7 @@ impl PeerExport {
         *self
             .last_activity
             .lock()
-            .expect("peer last_activity poisoned") = crate::time_source::metrics_now();
+            .expect("peer last_activity poisoned") = self.clock.now_mono();
     }
 }
 
@@ -830,13 +834,13 @@ mod tests {
     fn test_export(token: &str) -> PeerExport {
         test_export_with_clock(
             token,
-            Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            Arc::new(std::sync::Mutex::new(std::time::Duration::ZERO)),
         )
     }
 
     fn test_export_with_clock(
         token: &str,
-        last_activity: Arc<std::sync::Mutex<std::time::Instant>>,
+        last_activity: Arc<std::sync::Mutex<std::time::Duration>>,
     ) -> PeerExport {
         let mut seal = SealBitmap::new(4096, 4);
         seal.set(1);
@@ -855,6 +859,7 @@ mod tests {
             serve: Default::default(),
             drained: AtomicBool::new(false),
             last_activity,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
     }
 
@@ -1041,7 +1046,10 @@ mod tests {
     /// refresh holds regardless of the readv outcome.)
     #[tokio::test]
     async fn page_serving_refreshes_the_shared_ttl_clock() {
-        let stale = std::time::Instant::now() - std::time::Duration::from_secs(3600);
+        // Duration::ZERO = the process epoch — maximally stale in
+        // now_mono terms; a touch stamps the strictly-later current
+        // reading (SystemClock is monotone from construction).
+        let stale = std::time::Duration::ZERO;
         let clock = Arc::new(std::sync::Mutex::new(stale));
         let server = PeerServer::new(9102, None, None);
         server.register(test_export_with_clock("t", clock.clone()));

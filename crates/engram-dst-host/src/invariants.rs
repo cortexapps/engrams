@@ -87,7 +87,62 @@ pub async fn check(host: &SimHost) -> Result<(), Violation> {
     reconcile_none_arm_fixed(host)?;
     slot_accounting(host).await?;
     device_serving(host)?;
-    finalize_stage_monotone(host).await
+    finalize_stage_monotone(host).await?;
+    migration_decision_table(host)?;
+    no_plane_leak(host)
+}
+
+/// Oracle #7 — the migration decision table (ADR 0098 P8, issue #216):
+/// **`state_served` ⇒ the dumb-host TTL sweep never abort-unpauses.**
+/// Once `state.bin` has shipped, the dest may be running this state; a
+/// TTL-driven self-resume of the frozen source is the split-brain. The
+/// SWEEP records any abort-unpause it applies to a served export, so this
+/// fires exactly when `ttl_verdict`'s `state_served` arm regresses. An
+/// EXPLICIT coordinator abort is deliberately exempt: the prod RPC allows
+/// it even post-ship (the coordinator carries the postcopy-never-loaded
+/// knowledge — ADR 0045 C2), and the P9 lane's first CI run caught the
+/// sim over-claiming there (calm seeds 14/16).
+fn migration_decision_table(host: &SimHost) -> Result<(), Violation> {
+    if let Some(id) = host.split_brain_unpauses.first() {
+        return Err(Violation {
+            invariant: "migration-decision-table",
+            detail: format!(
+                "sandbox {id}: an abort-unpause was applied to an export whose                  state.bin had shipped — the #216 split-brain ttl_verdict forbids"
+            ),
+        });
+    }
+    Ok(())
+}
+
+/// Oracle #2 — no-plane-leak (ADR 0098 P8 tightening): the frozen/pending
+/// lifecycle states stay bidirectionally accounted. A `migrating` slot
+/// must have an open export (a frozen guest with nothing to ever end it
+/// is a leaked plane) and a live backend (the source IS a page server);
+/// an open export must belong to a `migrating` slot. A pending finalize
+/// must have its job state (in RAM or re-drivable on disk — checked via
+/// the idempotency map the resume leg rebuilds).
+fn no_plane_leak(host: &SimHost) -> Result<(), Violation> {
+    for (idx, slot) in host.sandboxes.iter().enumerate() {
+        let has_export = host.migrations.export_id_of(slot.sandbox_id).is_some();
+        if slot.migrating != has_export {
+            return Err(Violation {
+                invariant: "no-plane-leak",
+                detail: format!(
+                    "sandbox {idx}: migrating={} but open-export={} — a frozen                      guest with no export to end it (or an export on an                      un-frozen guest)",
+                    slot.migrating, has_export
+                ),
+            });
+        }
+        if slot.migrating && slot.backend.is_none() {
+            return Err(Violation {
+                invariant: "no-plane-leak",
+                detail: format!(
+                    "sandbox {idx}: migrating without a live backend — the                      frozen source must keep serving its tiers"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Oracle #6 — `FinalizeStage` monotonicity + resume-at-persisted-stage

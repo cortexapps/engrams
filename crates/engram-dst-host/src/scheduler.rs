@@ -101,6 +101,24 @@ pub enum Step {
     /// loss (the floor never rose); the successor's next flush recovers
     /// via the version-conflict retry.
     FlushPreRebaseCrash(usize),
+    /// Flow E (P8): open a migration export on sandbox `idx` — the guest
+    /// freezes, a REAL export lands in the REAL registry (paused-clock
+    /// TTL).
+    MigrationBegin(usize),
+    /// Flow E (P8): `state.bin` ships — the split-brain flag rises;
+    /// `ttl_verdict`'s served arm forbids every later abort-unpause.
+    MigrationServeState(usize),
+    /// Flow E (P8): a page/artifact serve refreshes the activity TTL.
+    MigrationTouch(usize),
+    /// Flow E (P8): the dumb-host TTL sweep — REAL `expired()` +
+    /// `ttl_verdict` over the coordinator's answer.
+    MigrationTtlSweep,
+    /// Flow E (P8): coordinator-driven commit (dest owns; source torn
+    /// down).
+    MigrationCommit(usize),
+    /// Flow E (P8): coordinator-driven abort (move never landed; source
+    /// un-freezes, zero loss).
+    MigrationAbort(usize),
     /// Flow B (P7): rung-2 PARK sandbox `idx` (FC paused, VM resident,
     /// `evicting`-shaped) — the 731df805 pre-condition.
     Park(usize),
@@ -149,6 +167,12 @@ impl Step {
             Step::FlushHandoffRace(..) => "FlushHandoffRace",
             Step::FlushFenceAbort(..) => "FlushFenceAbort",
             Step::FlushPreRebaseCrash(..) => "FlushPreRebaseCrash",
+            Step::MigrationBegin(..) => "MigrationBegin",
+            Step::MigrationServeState(..) => "MigrationServeState",
+            Step::MigrationTouch(..) => "MigrationTouch",
+            Step::MigrationTtlSweep => "MigrationTtlSweep",
+            Step::MigrationCommit(..) => "MigrationCommit",
+            Step::MigrationAbort(..) => "MigrationAbort",
             Step::Park(..) => "Park",
             Step::Unpause(..) => "Unpause",
             Step::RegisterRehydrate => "RegisterRehydrate",
@@ -250,7 +274,10 @@ impl Sim {
             }
             return Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30)));
         }
-        let roll: u32 = self.rng.random_range(0..100);
+        // 0..112: 0..=99 the pre-P8 menu, 100..=106 the migration
+        // lifecycle, the tail AdvanceTime. Widening the range re-shuffles
+        // old seeds' exploration (fine — seeds pin to a commit).
+        let roll: u32 = self.rng.random_range(0..112);
         // Weights are part of the seed contract: changing them makes old
         // seeds explore differently (fine — seeds pin to a commit), but the
         // pick must NEVER branch on anything non-deterministic.
@@ -289,6 +316,14 @@ impl Sim {
                 // in the calm baseline too.
                 98 => Step::FlushHandoffRace(self.rng.random_range(0..n)),
                 99 => Step::FlushFenceAbort(self.rng.random_range(0..n)),
+                // Flow E (P8): the migration lifecycle (benign under the
+                // honest coordinator; abort/commit converge).
+                100..=101 => Step::MigrationBegin(self.rng.random_range(0..n)),
+                102 => Step::MigrationServeState(self.rng.random_range(0..n)),
+                103 => Step::MigrationTouch(self.rng.random_range(0..n)),
+                104 => Step::MigrationTtlSweep,
+                105 => Step::MigrationCommit(self.rng.random_range(0..n)),
+                106 => Step::MigrationAbort(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
@@ -334,6 +369,14 @@ impl Sim {
                 97 => Step::FlushHandoffRace(self.rng.random_range(0..n)),
                 98 => Step::FlushFenceAbort(self.rng.random_range(0..n)),
                 99 => Step::FlushPreRebaseCrash(self.rng.random_range(0..n)),
+                // Flow E (P8): the migration lifecycle under chaos (crash
+                // steps above kill the RAM registry mid-export).
+                100..=101 => Step::MigrationBegin(self.rng.random_range(0..n)),
+                102 => Step::MigrationServeState(self.rng.random_range(0..n)),
+                103 => Step::MigrationTouch(self.rng.random_range(0..n)),
+                104 => Step::MigrationTtlSweep,
+                105 => Step::MigrationCommit(self.rng.random_range(0..n)),
+                106 => Step::MigrationAbort(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -407,6 +450,14 @@ impl Sim {
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }
+            Step::MigrationBegin(idx) => {
+                let _ = self.host.migration_begin(idx).await?;
+            }
+            Step::MigrationServeState(idx) => self.host.migration_serve_state(idx),
+            Step::MigrationTouch(idx) => self.host.migration_touch(idx),
+            Step::MigrationTtlSweep => self.host.migration_ttl_sweep().await?,
+            Step::MigrationCommit(idx) => self.host.migration_commit(idx),
+            Step::MigrationAbort(idx) => self.host.migration_abort(idx),
             Step::Park(idx) => self.host.park(idx),
             // The un-pause gate firing (unserved plane) is CORRECT behavior, not
             // a step failure — the guest stays parked, routed to recovery.
