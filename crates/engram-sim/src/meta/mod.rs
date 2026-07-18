@@ -123,9 +123,11 @@ impl SimMetadataStore {
 // The database.
 // ---------------------------------------------------------------------------
 
+use engram_core::types::capture_job::CaptureJobRow;
 use engram_core::types::event::{ArtifactRow, PersistedEvent};
 use engram_core::types::host::HostRecord;
 use engram_core::types::outbox::OutboxRow;
+use engram_core::types::registry::EnableJob;
 use engram_core::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
 use engram_core::types::session::{QueueOrigin, Session};
 use engram_core::types::session_op::{OpKind, OpState};
@@ -182,6 +184,13 @@ pub struct GcCandidate {
     pub last_seen_at: DateTime<Utc>,
 }
 
+#[derive(Clone, Debug)]
+pub struct EnableJobRow {
+    pub job: EnableJob,
+    pub claimed_by: Option<String>,
+    pub claimed_at: Option<DateTime<Utc>>,
+}
+
 #[derive(Default)]
 pub struct SimDb {
     pub serial: u64,
@@ -193,6 +202,8 @@ pub struct SimDb {
     pub registry_credentials: std::collections::BTreeMap<String, RegistryCredential>,
     /// `image_uri -> (image, soft_deleted_at)`.
     pub enabled_images: std::collections::BTreeMap<String, (EnabledImage, Option<DateTime<Utc>>)>,
+    pub enable_jobs: std::collections::BTreeMap<uuid::Uuid, EnableJobRow>,
+    pub capture_jobs: std::collections::BTreeMap<engram_core::CaptureJobId, CaptureJobRow>,
     pub session_secrets: std::collections::BTreeMap<SessionId, SessionSecrets>,
     pub session_ops: std::collections::BTreeMap<i64, OpRow>,
     pub outbox: std::collections::BTreeMap<String, OutboxRow>,

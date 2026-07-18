@@ -47,11 +47,19 @@ pub enum DriverKind {
     IdleDetector,
     IdleEvictor,
     EvacResumer,
+    /// Empty-sweep boundary: the sim world creates no enable jobs, so this
+    /// exercises deadline/list/claim calls against real SimMeta methods.
+    /// Deeper capture legs remain panic-stubbed per ADR 0098's deviation.
+    EnableScanner,
+    /// Prune aged session checkpoints through the extracted pure step.
+    CheckpointRetention,
+    /// Prune orphaned image base snapshots through the extracted pure step.
+    BaseSnapshotRetention,
     OutboxDelivery,
     GcSweeps,
 }
 
-const DRIVERS: [DriverKind; 10] = [
+const DRIVERS: [DriverKind; 13] = [
     DriverKind::QueueScanner,
     DriverKind::Reconcile,
     DriverKind::DeadHost,
@@ -60,6 +68,9 @@ const DRIVERS: [DriverKind; 10] = [
     DriverKind::IdleDetector,
     DriverKind::IdleEvictor,
     DriverKind::EvacResumer,
+    DriverKind::EnableScanner,
+    DriverKind::CheckpointRetention,
+    DriverKind::BaseSnapshotRetention,
     DriverKind::OutboxDelivery,
     DriverKind::GcSweeps,
 ];
@@ -120,6 +131,10 @@ pub struct Sim {
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
     idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
     evac_cfg: engram_coordinator::evac_resumer::EvacResumerConfig,
+    enable_cfg: engram_coordinator::enable_scanner::EnableScannerConfig,
+    checkpoint_retention_cfg: engram_coordinator::checkpoint_retention::CheckpointRetentionConfig,
+    base_snapshot_retention_cfg:
+        engram_coordinator::base_snapshot_retention::BaseSnapshotRetentionConfig,
     report: SimReport,
     pg_out: bool,
 }
@@ -143,6 +158,17 @@ impl Sim {
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
             evac_cfg: engram_coordinator::evac_resumer::EvacResumerConfig::default(),
+            enable_cfg: engram_coordinator::enable_scanner::EnableScannerConfig::default(),
+            checkpoint_retention_cfg:
+                engram_coordinator::checkpoint_retention::CheckpointRetentionConfig {
+                    poll_interval: Duration::from_secs(600),
+                    retention: Duration::from_secs(24 * 60 * 60),
+                },
+            base_snapshot_retention_cfg:
+                engram_coordinator::base_snapshot_retention::BaseSnapshotRetentionConfig {
+                    poll_interval: Duration::from_secs(60 * 60),
+                    grace: Duration::from_secs(24 * 60 * 60),
+                },
             report: SimReport {
                 seed,
                 steps_run: 0,
@@ -346,6 +372,25 @@ impl Sim {
                     DriverKind::EvacResumer => {
                         let _ = engram_coordinator::evac_resumer::run_once(&self.evac_cfg, &state)
                             .await;
+                    }
+                    DriverKind::EnableScanner => {
+                        let _ =
+                            engram_coordinator::enable_scanner::run_once(&self.enable_cfg, &state)
+                                .await;
+                    }
+                    DriverKind::CheckpointRetention => {
+                        let _ = engram_coordinator::checkpoint_retention::run_once(
+                            &self.checkpoint_retention_cfg,
+                            &state,
+                        )
+                        .await;
+                    }
+                    DriverKind::BaseSnapshotRetention => {
+                        let _ = engram_coordinator::base_snapshot_retention::run_once(
+                            &self.base_snapshot_retention_cfg,
+                            &state,
+                        )
+                        .await;
                     }
                     DriverKind::OutboxDelivery => {
                         let due = state

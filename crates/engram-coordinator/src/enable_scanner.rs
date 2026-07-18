@@ -214,9 +214,9 @@ pub fn spawn(cfg: EnableScannerConfig, state: SharedState) -> tokio::task::JoinH
     })
 }
 
-/// Single scanner tick. `pub(crate)` so live-PG tests can drive the
-/// scanner deterministically without `tokio::spawn`-ing the loop.
-pub(crate) async fn run_once(
+/// Single scanner tick. Public so live-PG tests and the deterministic
+/// simulator can drive it without `tokio::spawn`-ing the timer loop.
+pub async fn run_once(
     cfg: &EnableScannerConfig,
     state: &SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {

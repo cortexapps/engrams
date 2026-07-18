@@ -16,7 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::{Clock, MetadataStore};
+use engram_core::types::capture_job::{
+    CaptureJobReport, CaptureJobStage, CaptureTerminalReport, NewCaptureJob,
+};
 use engram_core::types::host::{HostCapacity, HostHeartbeat, HostRecord, HostStatus};
+use engram_core::types::image::ImageConfig;
 use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
 use engram_core::types::snapshot::SnapshotRecord;
@@ -193,9 +197,166 @@ fn enabled_image(
     }
 }
 
+fn new_capture(enable_job_id: uuid::Uuid) -> NewCaptureJob {
+    NewCaptureJob {
+        enable_job_id,
+        image_uri: format!("conf:capture:{enable_job_id}"),
+        manifest_digest: "sha256:conf".into(),
+        disk_manifest: format!("{}@v1", uuid::Uuid::nil()),
+        image_config: ImageConfig::default(),
+        oci_defaults: Default::default(),
+        mem_budget_mib: 512,
+        cpu_budget_vcpus: 1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
+
+async fn enable_job_claim_boundary(ctx: &Ctx) {
+    let config = ImageConfig::default();
+    let first = ctx
+        .meta
+        .create_or_get_enable_job("conf:enable:first", Some("sha256:first"), &config)
+        .await
+        .unwrap();
+    let same = ctx
+        .meta
+        .create_or_get_enable_job("conf:enable:first", Some("sha256:changed"), &config)
+        .await
+        .unwrap();
+    assert_eq!(same.id, first.id, "active create-or-get is idempotent");
+
+    ctx.clock.advance(Duration::from_secs(1));
+    let second = ctx
+        .meta
+        .create_or_get_enable_job("conf:enable:second", None, &config)
+        .await
+        .unwrap();
+    let claimed = ctx.meta.claim_enable_jobs("pod-a", 30, 1).await.unwrap();
+    assert_eq!(claimed.len(), 1, "claim_limit is respected");
+    assert_eq!(
+        claimed[0].id, first.id,
+        "oldest active job is claimed first"
+    );
+
+    let by_b = ctx.meta.claim_enable_jobs("pod-b", 30, 1).await.unwrap();
+    assert_eq!(by_b.len(), 1);
+    assert_eq!(by_b[0].id, second.id, "held lease is skipped");
+    assert!(ctx
+        .meta
+        .claim_enable_jobs("pod-b", 30, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    ctx.clock.advance(Duration::from_secs(31));
+    let reclaimed = ctx.meta.claim_enable_jobs("pod-b", 30, 1).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(
+        reclaimed[0].id, first.id,
+        "expired oldest lease is reclaimable"
+    );
+}
+
+async fn capture_job_scan_boundary(ctx: &Ctx) {
+    let now = ctx.clock.now_utc();
+    let host = HostId::from(uuid::Uuid::from_u128(0xc001));
+    ctx.meta
+        .upsert_host(host_record(host, "capture-host", now))
+        .await
+        .unwrap();
+
+    // Real enable-job parents: `capture_jobs.enable_job_id` is an FK in
+    // PG, so a made-up uuid is rejected there (and prod never inserts a
+    // capture job without its enable row).
+    let config = ImageConfig::default();
+    let waiting_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:waiting", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let placed_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:placed", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let terminal_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:terminal", None, &config)
+        .await
+        .unwrap()
+        .id;
+
+    let waiting = ctx
+        .meta
+        .insert_capture_job(new_capture(waiting_parent))
+        .await
+        .unwrap();
+    let placed = ctx
+        .meta
+        .insert_capture_job(new_capture(placed_parent))
+        .await
+        .unwrap();
+    let placed = ctx
+        .meta
+        .place_capture_job(placed.id, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placed.host_id, Some(host));
+
+    let terminal = ctx
+        .meta
+        .insert_capture_job(new_capture(terminal_parent))
+        .await
+        .unwrap();
+    let terminal = ctx
+        .meta
+        .place_capture_job(terminal.id, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ctx
+        .meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: terminal.id,
+            epoch: terminal.epoch,
+            stage: CaptureJobStage::Done,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Done {
+                result_bincode: Vec::new(),
+            }),
+        })
+        .await
+        .unwrap());
+
+    let waiting_rows = ctx.meta.list_waiting_capture_jobs().await.unwrap();
+    assert_eq!(waiting_rows.len(), 1);
+    assert_eq!(
+        waiting_rows[0].id, waiting.id,
+        "only unplaced non-terminal rows wait"
+    );
+
+    let budgets = [(CaptureJobStage::Assigned, Duration::from_secs(30))];
+    assert!(ctx
+        .meta
+        .expire_capture_job_stages(&budgets)
+        .await
+        .unwrap()
+        .is_empty());
+    ctx.clock.advance(Duration::from_secs(31));
+    let expired = ctx.meta.expire_capture_job_stages(&budgets).await.unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(
+        expired[0].id, placed.id,
+        "only placed over-budget rows expire"
+    );
+}
 
 /// Transition legality: illegal edges are Conflict, transitions return
 /// the PREVIOUS state, terminal states have no exits, missing rows are
@@ -1035,6 +1196,14 @@ conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
 conformance!(t_terminate_and_delta, super::terminate_and_delta);
 conformance!(t_host_fc_snapshot_version, super::host_fc_snapshot_version);
+conformance!(
+    t_enable_job_claim_boundary,
+    super::enable_job_claim_boundary
+);
+conformance!(
+    t_capture_job_scan_boundary,
+    super::capture_job_scan_boundary
+);
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
