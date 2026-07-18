@@ -36,7 +36,7 @@ use super::{SessRow, SimDb, SimMetadataStore};
 /// a `pending` counts while fresh OR while a live create_boot op
 /// exists — a written-off pending can then never boot (the reclaim
 /// sweep fails stale op-less orphans).
-fn pending_counts(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
+pub fn pending_counts(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
     if row.session.status != SessionState::Pending {
         return true;
     }
@@ -61,6 +61,20 @@ fn reserves(state: SessionState) -> bool {
 impl SimMetadataStore {
     fn pending_counts_row(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
         pending_counts(db, row, now)
+    }
+
+    /// Oracle-only helper for engram-dst — reuses the EXACT reserve-path
+    /// predicate so the capacity-aware Queued-at-quiescence check cannot
+    /// drift from the store.
+    pub fn oracle_pick_any_host(
+        &self,
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i64,
+    ) -> Option<HostId> {
+        let now = self.now();
+        let db = self.db.lock();
+        let candidates: Vec<HostId> = db.hosts.keys().copied().collect();
+        Self::pick_host_2d(&db, &candidates, 0, mem_budget_mib, cpu_budget_vcpus, now)
     }
 
     /// Mirror of `pick_host_2d` + `choose_placement_host`: candidates
