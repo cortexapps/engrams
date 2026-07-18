@@ -100,6 +100,13 @@ impl SimMetadataStore {
         f(&self.db.lock())
     }
 
+    /// Direct MUTABLE access — for tests that inject corruption to prove
+    /// an oracle is non-vacuous (e.g. drop a live session row and assert
+    /// the model auditor fires). Not used by production drivers.
+    pub fn with_db_mut<R>(&self, f: impl FnOnce(&mut SimDb) -> R) -> R {
+        f(&mut self.db.lock())
+    }
+
     pub(crate) fn gate(&self) -> Result<(), MetaError> {
         if self.outage.load(Ordering::SeqCst) {
             return Err(MetaError::Db("sim: pg outage window".into()));

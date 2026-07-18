@@ -161,6 +161,9 @@ pub struct Sim {
         engram_coordinator::base_snapshot_retention::BaseSnapshotRetentionConfig,
     report: SimReport,
     pg_out: bool,
+    /// The R2 expected-state model oracle (the auditor), fed by acked
+    /// workload outcomes and diffed against world truth every step.
+    model: crate::model::ModelState,
 }
 
 impl Sim {
@@ -201,7 +204,29 @@ impl Sim {
                 trace: Vec::new(),
             },
             pg_out: false,
+            model: Default::default(),
         }
+    }
+
+    /// Feed the model oracle: if `session_id` is currently `Active` with a
+    /// durable row, that is the acked create/resume milestone (the boot
+    /// fully established). A create whose boot never established — a
+    /// lost-response op — never reaches here and is legitimately absent
+    /// from the model (the auditor's honesty boundary).
+    fn record_if_live(&mut self, session_id: SessionId) {
+        let live = self.world.meta.with_db(|db| {
+            db.sessions.get(&session_id).is_some_and(|r| {
+                r.session.status == engram_core::types::session::SessionState::Active
+            })
+        });
+        if live {
+            self.model.record_live(session_id, SIM_IMAGE.to_string());
+        }
+    }
+
+    /// Test-only accessor for the model oracle (non-vacuity proof).
+    pub fn model(&self) -> &crate::model::ModelState {
+        &self.model
     }
 
     fn pick(&mut self) -> Step {
@@ -520,6 +545,9 @@ impl Sim {
                 if disp.is_ok() {
                     self.report.sessions_created += 1;
                 }
+                // Feed the auditor: an acked create that fully established
+                // (reached Active) must never silently vanish afterward.
+                self.record_if_live(session_id);
             }
             Step::HostHeartbeats => {
                 // Every UP host re-registers + heartbeats, mirroring the
@@ -691,6 +719,9 @@ impl Sim {
                 {
                     engram_coordinator::session_ops::drive_claimed(&state, op).await;
                 }
+                // A resume that re-established the session to Active is an
+                // acked live milestone the auditor tracks.
+                self.record_if_live(sid);
             }
             Step::PgOutage(on) => {
                 self.pg_out = on;
@@ -739,6 +770,13 @@ impl Sim {
                     self.report.steps_run, v.invariant, v.detail
                 ));
             }
+            // The R2 auditor runs in the same standing invariant pass.
+            if let Err(v) = self.model.check(&self.world) {
+                return Err(format!(
+                    "step {}: {} — {}",
+                    self.report.steps_run, v.invariant, v.detail
+                ));
+            }
         }
         // Quiesce: heal every fault, then round-robin all drivers with
         // time advances until convergence.
@@ -775,6 +813,11 @@ impl Sim {
                 .await;
         }
         if let Err(v) = invariants::check_quiescence(&self.world) {
+            return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
+        }
+        // The auditor at rest: no acked-live session silently lost, no
+        // acked field repainted, after the fleet fully converges.
+        if let Err(v) = self.model.check(&self.world) {
             return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
         }
         let seed = self.report.seed;

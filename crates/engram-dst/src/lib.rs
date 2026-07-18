@@ -10,6 +10,7 @@
 //! per-component streams, so a failure replays exactly from its seed.
 
 pub mod invariants;
+pub mod model;
 pub mod scheduler;
 pub mod workload;
 pub mod world;
