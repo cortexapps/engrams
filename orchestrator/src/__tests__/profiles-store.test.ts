@@ -26,6 +26,36 @@ const baseInput = {
 };
 
 describe("ProfileStore", () => {
+  test.skipIf(!dbReachable)("setDesignation sets, transfers, and clears a designation", async () => {
+    const store = makeProfileStore(getDb());
+    const designation = "pr_reviewer";
+    const previous = await store.getByDesignation(designation);
+    const a = await store.create({ ...baseInput, name: `Reviewer A ${Date.now()}` });
+    const b = await store.create({ ...baseInput, name: `Reviewer B ${Date.now()}` });
+    try {
+      await store.setDesignation(a.id, designation);
+      expect((await store.get(a.id))?.designation).toBe(designation);
+      expect((await store.getByDesignation(designation))?.id).toBe(a.id);
+
+      await store.setDesignation(b.id, designation);
+      expect((await store.get(a.id))?.designation).toBeNull();
+      expect((await store.get(b.id))?.designation).toBe(designation);
+      expect((await store.getByDesignation(designation))?.id).toBe(b.id);
+
+      await store.setDesignation(b.id, null);
+      expect((await store.get(b.id))?.designation).toBeNull();
+      expect(await store.getByDesignation(designation)).toBeNull();
+    } finally {
+      await store.setDesignation(a.id, null).catch(() => {});
+      await store.setDesignation(b.id, null).catch(() => {});
+      await getDb()
+        .delete(profileTable)
+        .where(inArray(profileTable.id, [a.id, b.id]))
+        .catch(() => {});
+      if (previous) await store.setDesignation(previous.id, designation).catch(() => {});
+    }
+  });
+
   test.skipIf(!dbReachable)("designation lookup, preservation, and uniqueness", async () => {
     const store = makeProfileStore(getDb());
     const designation = "pr_reviewer";

@@ -276,6 +276,7 @@ function makeFakeProfiles(opts?: {
       rows.set(r.id, r);
       return r;
     },
+    async setDesignation() {},
     async update() {
       return null;
     },

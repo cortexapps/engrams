@@ -6,7 +6,7 @@
  * fake. Drizzle-backed by default. Soft delete only (deleted_at).
  */
 
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import {
@@ -82,6 +82,8 @@ export interface ProfileStore {
   /** Rows for the given ids (active or archived) — for snapshot enrichment. */
   getByIds(ids: string[]): Promise<ProfileRow[]>;
   create(input: ProfileInput, designation?: string | null): Promise<ProfileRow>;
+  /** Assign or clear a system designation, keeping each value on at most one profile. */
+  setDesignation(id: string, designation: string | null): Promise<void>;
   /** Returns the updated row, or null if the id is absent / archived. */
   update(id: string, input: ProfileInput): Promise<ProfileRow | null>;
   /** Idempotent soft delete (sets deleted_at). */
@@ -169,6 +171,21 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
       });
       const row = await this.get(id);
       return row!;
+    },
+    async setDesignation(id, designation) {
+      const updatedAt = new Date();
+      await db.transaction(async (tx) => {
+        if (designation !== null) {
+          await tx
+            .update(profileTable)
+            .set({ designation: null, updatedAt })
+            .where(and(eq(profileTable.designation, designation), ne(profileTable.id, id)));
+        }
+        await tx
+          .update(profileTable)
+          .set({ designation, updatedAt })
+          .where(eq(profileTable.id, id));
+      });
     },
     async update(id, input) {
       const existing = await this.getActive(id);
