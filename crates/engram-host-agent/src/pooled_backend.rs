@@ -7768,6 +7768,7 @@ impl SandboxBackend for PooledBackend {
             // diverts control — the explicit early-return below is what routes
             // the caller into recovery.
             engram_core::soft_invariant!(
+                "un-pause-dead-plane",
                 ok,
                 "resume {id}: rootfs NBD device is not served by this host-agent \
                  generation; refusing to un-pause onto a dead data plane"

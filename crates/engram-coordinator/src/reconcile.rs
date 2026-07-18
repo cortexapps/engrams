@@ -306,6 +306,7 @@ async fn flip_missing(
             // prevent it. The log line (stable `soft-invariant violated:`
             // prefix + `name` field) is the alerting seam.
             engram_core::soft_invariant!(
+                "sandbox-cached-under-two-hosts",
                 prev_host == host_id,
                 "sandbox {sb} (session {session_id}) reconciled by host {host_id} \
                  but routing cache owned it under host {prev_host}",
