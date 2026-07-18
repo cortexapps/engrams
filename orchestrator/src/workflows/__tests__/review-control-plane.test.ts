@@ -2,8 +2,15 @@ import { describe, expect, test } from "bun:test";
 
 import type { EnrollmentRow } from "../../db/enrollments.ts";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
-import type { ReviewDetail, ReviewFindingRow, ReviewRow } from "../../db/reviews.ts";
+import type {
+  ReviewDetail,
+  ReviewFindingRow,
+  ReviewRow,
+  ReviewStore,
+  ReviewVerdictRow,
+} from "../../db/reviews.ts";
 import type { ReviewSessionStore } from "../../db/review-sessions.ts";
+import type { GithubReviewPoster, PostReviewInput } from "../../reviews/github-review.ts";
 import type { CreateSessionForExistingTaskParams } from "../../rpc/task-create.ts";
 import {
   makeReviewControlPlane,
@@ -57,6 +64,11 @@ function finding(
 function detail(findings: ReviewFindingRow[] = []): ReviewDetail {
   return { review: active, findings, verdicts: [] };
 }
+
+const reviewPostingNoops = {
+  updateFindingState: async () => {},
+  finalizeReview: async () => {},
+};
 
 function reviewSessionRecorder(): ReviewSessionStore & {
   calls: Array<[string, string, string]>;
@@ -173,6 +185,7 @@ describe("ReviewControlPlane", () => {
     let taskInserts = 0;
     const cp = makeReviewControlPlane({
       reviews: {
+        ...reviewPostingNoops,
         getActiveReviewForPr: async () => active,
         getReview: async () => detail(),
         createReview: async () => { throw new Error("unexpected create"); },
@@ -199,6 +212,7 @@ describe("ReviewControlPlane", () => {
     const statuses: unknown[] = [];
     const cp = makeReviewControlPlane({
       reviews: {
+        ...reviewPostingNoops,
         getActiveReviewForPr: async () => current,
         getReview: async () => detail(),
         createReview: async (input) => {
@@ -399,6 +413,7 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({
       sessions,
       reviews: {
+        ...reviewPostingNoops,
         getActiveReviewForPr: async () => active,
         getReview: async () => detail([
           finding("candidate-1"),
@@ -448,6 +463,7 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({
       sessions,
       reviews: {
+        ...reviewPostingNoops,
         getActiveReviewForPr: async () => null,
         getReview: async () => detail(),
         createReview: async () => "unused",
@@ -481,6 +497,7 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({
       sessions,
       reviews: {
+        ...reviewPostingNoops,
         getActiveReviewForPr: async () => null,
         getReview: async () => detail(),
         createReview: async () => "unused",
@@ -505,5 +522,163 @@ describe("ReviewControlPlane", () => {
     expect(sessions.promptCalls[0]?.text).toContain("candidates.json");
     expect(sessions.promptCalls[0]?.text).toContain("submit_verdict");
     expect(statuses).toEqual([[active.id, "verifying"]]);
+  });
+
+  test("posts folded review results and persists SHAs, dispositions, and GitHub review id", async () => {
+    const confirmed = {
+      ...finding("confirmed"),
+      suggestedFix: "return afterVerification;",
+    };
+    const refuted = finding("refuted");
+    const verdicts: ReviewVerdictRow[] = [
+      {
+        id: "verdict-confirmed",
+        findingId: confirmed.id,
+        verdict: "confirmed",
+        confidence: "high",
+        reasoning: "Confirmed from the retry branch.",
+        sessionId: "verifier-session",
+        toolCallId: "verdict-call-confirmed",
+        createdAt: new Date(1),
+      },
+      {
+        id: "verdict-refuted",
+        findingId: refuted.id,
+        verdict: "refuted",
+        confidence: "high",
+        reasoning: "The terminal guard prevents this path.",
+        sessionId: "verifier-session",
+        toolCallId: "verdict-call-refuted",
+        createdAt: new Date(1),
+      },
+    ];
+    const findingUpdates: Array<{
+      id: string;
+      state: string;
+      opts?: { githubThreadId?: string; verdictReason?: string };
+    }> = [];
+    const finalizations: Array<{
+      id: string;
+      input: Parameters<ReviewStore["finalizeReview"]>[1];
+    }> = [];
+    const posted: PostReviewInput[] = [];
+    const githubPoster: GithubReviewPoster = {
+      fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
+      alreadyPosted: async () => false,
+      async postReview(input) {
+        posted.push(input);
+        return {
+          githubReviewId: "github-review-42",
+          posted: true,
+          inlinePosted: true,
+          summaryMd: input.buildSummary(true),
+        };
+      },
+    };
+    const cp = makeReviewControlPlane({
+      reviews: {
+        getActiveReviewForPr: async () => active,
+        getReview: async () => ({ review: active, findings: [confirmed, refuted], verdicts }),
+        createReview: async () => active.id,
+        updateReviewStatus: async () => {},
+        async updateFindingState(id, state, opts) {
+          findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
+        },
+        async finalizeReview(id, input) {
+          finalizations.push({ id, input });
+        },
+      },
+      githubPoster,
+    });
+
+    await cp.postReviewResults(active.id);
+
+    expect(posted).toHaveLength(1);
+    expect(posted[0]).toMatchObject({
+      repo: active.repo,
+      prNumber: active.prNumber,
+      commitId: "live-head",
+      comments: [{
+        findingId: confirmed.id,
+        path: confirmed.path,
+        startLine: 42,
+        line: 45,
+        side: "RIGHT",
+      }],
+    });
+    expect(posted[0]?.comments[0]?.body).toContain(
+      "```suggestion\nreturn afterVerification;\n```",
+    );
+    // The concise (inline) summary the poster would post ends with the marker.
+    expect(posted[0]?.buildSummary(true).endsWith(`<!-- engrams-review:${active.id} -->`)).toBe(true);
+    expect(
+      String(finalizations.at(-1)?.input.summaryMd).endsWith(`<!-- engrams-review:${active.id} -->`),
+    ).toBe(true);
+    expect(findingUpdates).toEqual([
+      { id: confirmed.id, state: "posted" },
+      {
+        id: refuted.id,
+        state: "suppressed_refuted",
+        opts: { verdictReason: "The terminal guard prevents this path." },
+      },
+    ]);
+    expect(finalizations[0]).toEqual({
+      id: active.id,
+      input: {
+        status: active.status,
+        summaryMd: "",
+        headSha: "live-head",
+        baseSha: "live-base",
+      },
+    });
+    expect(finalizations.at(-1)).toMatchObject({
+      id: active.id,
+      input: {
+        status: "posted",
+        githubReviewId: "github-review-42",
+      },
+    });
+  });
+
+  test("marker idempotency fills SHAs and marks posted without posting or refolding", async () => {
+    const finalizations: Array<Parameters<ReviewStore["finalizeReview"]>[1]> = [];
+    let postCalls = 0;
+    let findingUpdates = 0;
+    const cp = makeReviewControlPlane({
+      reviews: {
+        getActiveReviewForPr: async () => active,
+        getReview: async () => detail([finding("candidate")]),
+        createReview: async () => active.id,
+        updateReviewStatus: async () => {},
+        updateFindingState: async () => {
+          findingUpdates++;
+        },
+        finalizeReview: async (_id, input) => {
+          finalizations.push(input);
+        },
+      },
+      githubPoster: {
+        fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
+        alreadyPosted: async () => true,
+        postReview: async () => {
+          postCalls++;
+          return { posted: true, inlinePosted: true, summaryMd: "" };
+        },
+      },
+    });
+
+    await cp.postReviewResults(active.id);
+
+    expect(postCalls).toBe(0);
+    expect(findingUpdates).toBe(0);
+    expect(finalizations).toEqual([
+      {
+        status: active.status,
+        summaryMd: "",
+        headSha: "live-head",
+        baseSha: "live-base",
+      },
+      { status: "posted", summaryMd: "" },
+    ]);
   });
 });

@@ -65,6 +65,7 @@ function fakeControlPlane(
     createVerifierSession: async () => ({ sessionId: "verifier-session" }),
     bootstrapVerifierSession: async () => {},
     sendVerifierPrompt: async () => {},
+    postReviewResults: async () => {},
     markReviewFailed: async () => {},
     markReviewHalted: async () => {},
     ...overrides,
@@ -126,6 +127,9 @@ describe("PrReviewWorkflow", () => {
       async sendVerifierPrompt(sessionId, input) {
         calls.push({ name: "sendVerifierPrompt", input: { sessionId, ...input } });
       },
+      async postReviewResults(reviewId) {
+        calls.push({ name: "postReviewResults", input: reviewId });
+      },
     });
 
     await run(cp, [
@@ -153,6 +157,7 @@ describe("PrReviewWorkflow", () => {
       "createVerifierSession",
       "bootstrapVerifierSession",
       "sendVerifierPrompt",
+      "postReviewResults",
     ]);
     expect(steps.steps).toEqual([
       "ensureReviewRecord",
@@ -163,6 +168,7 @@ describe("PrReviewWorkflow", () => {
       "createVerifierSession",
       "bootstrapVerifierSession",
       "sendVerifierPrompt",
+      "postReviewResults",
     ]);
     expect(calls.find((call) => call.name === "createFinderSession")?.input)
       .toMatchObject({ workflowId: "review-wf-1" });
@@ -170,7 +176,7 @@ describe("PrReviewWorkflow", () => {
       .toMatchObject({ workflowId: "review-wf-1" });
   });
 
-  test("finder completion with zero candidates returns without a verifier", async () => {
+  test("finder completion with zero candidates posts and returns without a verifier", async () => {
     const calls: string[] = [];
     const steps = runner();
     const cp = fakeControlPlane({
@@ -179,6 +185,9 @@ describe("PrReviewWorkflow", () => {
         return { sessionId: "unexpected" };
       },
       getReview: async () => ({ ...candidateDetail, findings: [] }),
+      postReviewResults: async () => {
+        calls.push("postReviewResults");
+      },
     });
 
     await run(cp, [
@@ -191,9 +200,10 @@ describe("PrReviewWorkflow", () => {
       },
     ], steps.step);
 
-    expect(calls).toEqual([]);
+    expect(calls).toEqual(["postReviewResults"]);
     expect(steps.steps).toContain("getReviewAfterFinder");
     expect(steps.steps).not.toContain("createVerifierSession");
+    expect(steps.steps.at(-1)).toBe("postReviewResults");
   });
 
   test("a failed finder gets one fresh-session retry, then fails the review", async () => {
@@ -231,13 +241,17 @@ describe("PrReviewWorkflow", () => {
     expect(steps.steps.at(-1)).toBe("markReviewFailed");
   });
 
-  test("verifier completion returns cleanly after the status-changing prompt", async () => {
+  test("verifier completion posts once and returns cleanly", async () => {
     let verifierPrompts = 0;
+    let posted = 0;
     let markedFailed = 0;
     const steps = runner();
     const cp = fakeControlPlane({
       sendVerifierPrompt: async () => {
         verifierPrompts++;
+      },
+      postReviewResults: async () => {
+        posted++;
       },
       markReviewFailed: async () => {
         markedFailed++;
@@ -261,7 +275,44 @@ describe("PrReviewWorkflow", () => {
     ], steps.step);
 
     expect(verifierPrompts).toBe(1);
+    expect(posted).toBe(1);
     expect(markedFailed).toBe(0);
+    expect(steps.steps.at(-1)).toBe("postReviewResults");
+  });
+
+  test("a posting failure marks the review failed", async () => {
+    let markedFailed = 0;
+    const steps = runner();
+    const cp = fakeControlPlane({
+      postReviewResults: async () => {
+        throw new Error("GitHub unavailable");
+      },
+      markReviewFailed: async () => {
+        markedFailed++;
+      },
+    });
+
+    await run(cp, [
+      trigger,
+      {
+        kind: "session_ended",
+        role: "finder",
+        sessionId: "finder-session",
+        outcome: "completed",
+      },
+      {
+        kind: "session_ended",
+        role: "verifier",
+        sessionId: "verifier-session",
+        outcome: "completed",
+      },
+    ], steps.step);
+
+    expect(markedFailed).toBe(1);
+    expect(steps.steps.slice(-2)).toEqual([
+      "postReviewResults",
+      "markReviewFailed",
+    ]);
   });
 
   test("a failed verifier gets one fresh-session retry, then fails the review", async () => {

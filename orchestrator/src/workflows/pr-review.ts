@@ -180,10 +180,9 @@ export async function prReviewWorkflowImpl(
           (finding) => finding.state === "candidate",
         ).length;
         if (candidateCount === 0) {
-          // TODO(ADR 0100: post the no-findings summary).
-          log.info(
-            { repo: first.repo, prNumber: first.prNumber },
-            "finder done with no candidates; posting not yet implemented",
+          await step(
+            () => cp.postReviewResults(reviewId),
+            "postReviewResults",
           );
           return;
         }
@@ -200,11 +199,18 @@ export async function prReviewWorkflowImpl(
     }
     if (message.kind === "session_ended" && message.role === "verifier") {
       if (message.outcome === "completed") {
-        // TODO(ADR 0100: policy gate → post).
-        log.info(
-          { repo: first.repo, prNumber: first.prNumber },
-          "verifier done; posting not yet implemented",
-        );
+        try {
+          await step(
+            () => cp.postReviewResults(reviewId),
+            "postReviewResults",
+          );
+        } catch (err) {
+          log.error(
+            { repo: first.repo, prNumber: first.prNumber, err },
+            "review posting failed",
+          );
+          await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+        }
         return;
       }
       if (verifierRetried) {

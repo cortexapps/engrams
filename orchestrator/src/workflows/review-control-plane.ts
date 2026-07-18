@@ -14,6 +14,7 @@ import {
   type ReviewSessionStore,
 } from "../db/review-sessions.ts";
 import { task as taskTable } from "../db/schema.ts";
+import { config } from "../config.ts";
 import {
   harnessCatalog as defaultHarnessCatalog,
   images as defaultImages,
@@ -26,6 +27,16 @@ import {
   type TaskSessionsClient,
 } from "../rpc/task-create.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
+import {
+  buildInlineCommentBody,
+  buildReviewSummary,
+  makeGithubReviewPoster,
+  type GithubReviewPoster,
+} from "../reviews/github-review.ts";
+import {
+  runPolicyGate,
+  type FindingDecision,
+} from "../reviews/policy-gate.ts";
 import {
   renderReviewer as defaultRenderReviewer,
   type RenderReviewerOptions,
@@ -88,13 +99,19 @@ export interface ReviewControlPlane {
     headSha: string;
     baseSha: string;
   }): Promise<void>;
+  postReviewResults(reviewId: string): Promise<void>;
   markReviewFailed(reviewId: string): Promise<void>;
   markReviewHalted(repo: string, prNumber: number): Promise<void>;
 }
 
 interface ReviewControlPlaneStore extends Pick<
   ReviewStore,
-  "createReview" | "getReview" | "getActiveReviewForPr" | "updateReviewStatus"
+  | "createReview"
+  | "getReview"
+  | "getActiveReviewForPr"
+  | "updateReviewStatus"
+  | "updateFindingState"
+  | "finalizeReview"
 > {}
 
 interface ReviewExecOutput {
@@ -128,6 +145,7 @@ export interface ReviewControlPlaneDeps {
   profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
   enrollments?: Pick<EnrollmentStore, "get">;
   reviewSessions?: ReviewSessionStore;
+  githubPoster?: GithubReviewPoster;
   renderReviewer?: RenderReviewer;
   /** Focused test seam; production delegates to the shared task-create helper. */
   createSessionForExistingTask?: CreateExistingTaskSession;
@@ -274,6 +292,7 @@ export function makeReviewControlPlane(
     reviewSessionStore ??= makeReviewSessionStore(db())
   );
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
+  const githubPoster = deps.githubPoster ?? makeGithubReviewPoster();
   const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
     const database = db();
     return createSessionForExistingTask(
@@ -483,6 +502,102 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "verifying");
+    },
+
+    async postReviewResults(reviewId) {
+      const detail = await reviews().getReview(reviewId);
+      if (!detail) throw new Error(`review not found: ${reviewId}`);
+
+      const { repo, prNumber } = detail.review;
+      const { headSha, baseSha } = await githubPoster.fetchPrHeads(repo, prNumber);
+      await reviews().finalizeReview(reviewId, {
+        status: detail.review.status,
+        summaryMd: detail.review.summaryMd ?? "",
+        headSha,
+        baseSha,
+      });
+
+      // The marker check closes the crash window between GitHub accepting the
+      // review and the local transaction recording it.
+      if (await githubPoster.alreadyPosted(repo, prNumber, reviewId)) {
+        await reviews().finalizeReview(reviewId, {
+          status: "posted",
+          summaryMd: detail.review.summaryMd ?? "",
+        });
+        return;
+      }
+
+      const policy = runPolicyGate(detail);
+      const missingAnchors: FindingDecision[] = [];
+      const anchored = policy.toPost.filter((item) => {
+        const hasAnchor = item.finding.endLine != null || item.finding.startLine != null;
+        if (!hasAnchor) missingAnchors.push({ ...item, state: "ui_only" });
+        return hasAnchor;
+      });
+      const decision = {
+        ...policy,
+        toPost: anchored,
+        uiOnly: [...policy.uiOnly, ...missingAnchors],
+      };
+      const comments = anchored.map((item) => {
+        const line = item.finding.endLine ?? item.finding.startLine;
+        if (line == null) {
+          throw new Error(`finding ${item.finding.id} has no inline anchor`);
+        }
+        const startLine = item.finding.startLine;
+        return {
+          findingId: item.finding.id,
+          path: item.finding.path,
+          line,
+          side: item.finding.side ?? "RIGHT",
+          ...(startLine != null && startLine !== line ? { startLine } : {}),
+          body: buildInlineCommentBody(item.finding),
+        };
+      });
+
+      // The summary is rendered for the actual outcome: concise when the inline
+      // comments land (they carry their own detail), fuller on the 422 fallback
+      // (re-quotes every surviving finding so none is lost). The poster returns
+      // the body it actually posted, which we persist below.
+      const reviewUrl = `${config.baseUrl.replace(/\/$/, "")}/reviews`;
+      const posted = await githubPoster.postReview({
+        repo,
+        prNumber,
+        commitId: headSha,
+        buildSummary: (inlinePosted) =>
+          buildReviewSummary({ reviewId, reviewUrl, decision, inlinePosted }),
+        comments,
+      });
+      if (!posted.posted) throw new Error("GitHub review was not posted");
+
+      for (const item of decision.toPost) {
+        await reviews().updateFindingState(
+          item.finding.id,
+          posted.inlinePosted ? "posted" : "ui_only",
+          item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+        );
+      }
+      for (const item of decision.uiOnly) {
+        await reviews().updateFindingState(
+          item.finding.id,
+          "ui_only",
+          item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+        );
+      }
+      for (const item of decision.suppressed) {
+        await reviews().updateFindingState(
+          item.finding.id,
+          item.state,
+          item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+        );
+      }
+      await reviews().finalizeReview(reviewId, {
+        status: "posted",
+        summaryMd: posted.summaryMd,
+        ...(posted.githubReviewId !== undefined
+          ? { githubReviewId: posted.githubReviewId }
+          : {}),
+      });
     },
 
     async markReviewFailed(reviewId) {
