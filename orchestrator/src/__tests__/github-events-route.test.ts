@@ -38,12 +38,17 @@ function pullRequestBody() {
   });
 }
 
-function commentBody(body: string) {
+function commentBody(
+  body: string,
+  authorAssociation = "MEMBER",
+  senderType = "User",
+) {
   return JSON.stringify({
     action: "created",
     repository: { full_name: enrollment.repo },
     issue: { number: 100, pull_request: { url: "https://api.github.test/pr/100" } },
-    comment: { id: 42, body },
+    comment: { id: 42, body, author_association: authorAssociation },
+    sender: { type: senderType },
   });
 }
 
@@ -64,6 +69,27 @@ function app(enrolled = true) {
 }
 
 describe("POST /api/v1/integrations/github/events", () => {
+  test("rejects an over-cap content-length before signature verification", async () => {
+    let secretCalls = 0;
+    const route = makeGithubEventsRoute({
+      webhookSecret: async () => {
+        secretCalls++;
+        return SECRET;
+      },
+    });
+    const body = "{}";
+    const res = await route.request(PATH, {
+      method: "POST",
+      body,
+      headers: {
+        ...headers(body, "ping"),
+        "content-length": String(2 * 1024 * 1024 + 1),
+      },
+    });
+    expect(res.status).toBe(413);
+    expect(secretCalls).toBe(0);
+  });
+
   test("rejects a bad signature", async () => {
     const body = JSON.stringify({ zen: "hi" });
     const fixture = app();
@@ -133,6 +159,30 @@ describe("POST /api/v1/integrations/github/events", () => {
       idempotencyKey: "delivery-1",
       focus: "focus on auth",
     }]);
+  });
+
+  test("drops commands from unauthorized commenters", async () => {
+    const body = commentBody("@acme-reviewer review", "NONE");
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issue_comment"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.dispatches).toEqual([]);
+  });
+
+  test("drops commands from bot senders", async () => {
+    const body = commentBody("@acme-reviewer stop", "MEMBER", "Bot");
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issue_comment"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.dispatches).toEqual([]);
   });
 
   test("ignores a junk comment", async () => {

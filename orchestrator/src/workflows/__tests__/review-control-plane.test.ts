@@ -260,7 +260,7 @@ describe("ReviewControlPlane", () => {
     expect(statuses).toEqual([["review-new", "halted"]]);
   });
 
-  test("creates the finder with the designated profile and scoped clone capability", async () => {
+  test("creates the finder with the designated profile and clamped review policy", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
     const order: string[] = [];
     const reviewSessions = reviewSessionRecorder(order);
@@ -290,8 +290,18 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
       profileId: designated.id,
       role: "finder",
-      extraCapabilities: [`github:contents:read@${active.repo}`],
+      capabilityOverride: [
+        "engram:pr_review",
+        `github:contents:read@${active.repo}`,
+      ],
+      networkOverride: {
+        default: "deny",
+        allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+        allowHostPatterns: [],
+      },
+      dropProfileSecretsAndEnv: true,
     });
+    expect(created[0]?.extraCapabilities).toBeUndefined();
     expect(created[0]?.registerListener).toBeUndefined();
     expect(created[0]?.appendSystemPrompt).toContain("/workspace/.review/finder.md");
     expect(reviewSessions.calls).toEqual([
@@ -342,7 +352,7 @@ describe("ReviewControlPlane", () => {
     })).rejects.toBeInstanceOf(ReviewSetupError);
   });
 
-  test("creates the verifier with a listener and records its workflow binding", async () => {
+  test("creates the verifier with a clamped policy and records its workflow binding", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
     const order: string[] = [];
     const reviewSessions = reviewSessionRecorder(order);
@@ -372,8 +382,18 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
       profileId: designated.id,
       role: "verifier",
-      extraCapabilities: [`github:contents:read@${active.repo}`],
+      capabilityOverride: [
+        "engram:pr_review",
+        `github:contents:read@${active.repo}`,
+      ],
+      networkOverride: {
+        default: "deny",
+        allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+        allowHostPatterns: [],
+      },
+      dropProfileSecretsAndEnv: true,
     });
+    expect(created[0]?.extraCapabilities).toBeUndefined();
     expect(created[0]?.registerListener).toBeUndefined();
     expect(created[0]?.appendSystemPrompt).toContain("submit_verdict");
     expect(reviewSessions.calls).toEqual([

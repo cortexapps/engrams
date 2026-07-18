@@ -202,6 +202,49 @@ describe("review tools", () => {
     });
   });
 
+  test("finder tools reject calls outside the finding phase", async () => {
+    const fake = fakeReviewStore({ active: reviewRow({ status: "verifying" }) });
+    const registry = reviewRegistry(fake.store);
+    const submit = registry.get("submit_finding");
+    const done = registry.get("finder_done");
+    if (!submit || submit.handling !== "handled" || !done || done.handling !== "handled") {
+      throw new Error("finder tools not registered");
+    }
+
+    await expect(submit.handler(context(submit.name), submit.input.parse({
+      path: "src/index.ts",
+      category: "functional-correctness",
+      severity: "high",
+      confidence: "high",
+      title: "Wrong branch",
+      body_md: "Body",
+      evidence: ["src/index.ts"],
+    }))).resolves.toEqual({ error: "review is not in the finding phase" });
+    await expect(done.handler(
+      context(done.name),
+      done.input.parse({ summary_md: "Finished." }),
+    )).resolves.toEqual({ error: "review is not in the finding phase" });
+    expect(fake.findings).toEqual([]);
+    expect(fake.summaries).toEqual([]);
+  });
+
+  test("submit_verdict rejects calls outside the verifying phase", async () => {
+    const fake = fakeReviewStore({
+      active: reviewRow({ status: "finding" }),
+      detail: { review: reviewRow(), findings: [findingRow()], verdicts: [] },
+    });
+    const tool = reviewRegistry(fake.store).get("submit_verdict");
+    if (!tool || tool.handling !== "handled") throw new Error("submit_verdict not registered");
+
+    await expect(tool.handler(context(tool.name), tool.input.parse({
+      finding_id: FINDING_ID,
+      verdict: "confirmed",
+      confidence: "high",
+      reasoning: "Reproduced.",
+    }))).resolves.toEqual({ error: "review is not in the verifying phase" });
+    expect(fake.verdicts).toEqual([]);
+  });
+
   test("finder handlers persist a candidate and its phase summary", async () => {
     const fake = fakeReviewStore();
     const registry = reviewRegistry(fake.store);
@@ -292,6 +335,7 @@ describe("review tools", () => {
 
   test("submit_verdict rejects a finding owned by another review", async () => {
     const fake = fakeReviewStore({
+      active: reviewRow({ status: "verifying" }),
       detail: { review: reviewRow(), findings: [findingRow()], verdicts: [] },
     });
     const tool = reviewRegistry(fake.store).get("submit_verdict");
@@ -310,6 +354,7 @@ describe("review tools", () => {
 
   test("submit_verdict signals only after the last candidate is judged", async () => {
     const fake = fakeReviewStore({
+      active: reviewRow({ status: "verifying" }),
       detail: {
         review: reviewRow({ status: "verifying" }),
         findings: [findingRow(), findingRow({ id: OTHER_FINDING_ID })],

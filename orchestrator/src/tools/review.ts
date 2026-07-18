@@ -39,6 +39,12 @@ const ConfidenceSchema = z.enum(["high", "medium", "low"]);
 const NO_ACTIVE_REVIEW: ToolProtocolError = {
   error: "no active review for this session",
 };
+const NOT_FINDING_PHASE: ToolProtocolError = {
+  error: "review is not in the finding phase",
+};
+const NOT_VERIFYING_PHASE: ToolProtocolError = {
+  error: "review is not in the verifying phase",
+};
 
 export interface ReviewToolDeps {
   reviews: ReviewStore;
@@ -135,6 +141,9 @@ export function registerReviewTools(
     handler: async (ctx, args) => {
       const active = await activeReview(ctx, reviews);
       if (isToolError(active)) return active;
+      if (active.status !== "queued" && active.status !== "finding") {
+        return NOT_FINDING_PHASE;
+      }
 
       const inserted = await reviews.insertFinding({
         reviewId: active.id,
@@ -171,6 +180,9 @@ export function registerReviewTools(
     handler: async (ctx, args) => {
       const active = await activeReview(ctx, reviews);
       if (isToolError(active)) return active;
+      if (active.status !== "queued" && active.status !== "finding") {
+        return NOT_FINDING_PHASE;
+      }
       await reviews.setFinderSummary(active.id, args.summary_md);
       await notifyPhaseDone(ctx, "finder");
       return { recorded: true };
@@ -193,6 +205,7 @@ export function registerReviewTools(
     handler: async (ctx, args) => {
       const active = await activeReview(ctx, reviews);
       if (isToolError(active)) return active;
+      if (active.status !== "verifying") return NOT_VERIFYING_PHASE;
 
       const detail = await reviews.getReview(active.id);
       if (!detail?.findings.some((finding) => finding.id === args.finding_id)) {

@@ -15,7 +15,10 @@ import {
   makeReviewSessionStore,
   type ReviewSessionStore,
 } from "../db/review-sessions.ts";
-import { task as taskTable } from "../db/schema.ts";
+import {
+  task as taskTable,
+  type ProfileNetwork,
+} from "../db/schema.ts";
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import {
@@ -182,6 +185,19 @@ const VERIFIER_SYSTEM_PROMPT = [
 // — defense in depth on top of the signature check + enrollment gate.
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+
+// Security clamp: reviewer workers may read only the reviewed repo, while the
+// orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
+// explicit because the GitHub connector itself declares only api.github.com.
+const REVIEW_CAPABILITIES = (repo: string): readonly string[] => [
+  "engram:pr_review",
+  `github:contents:read@${repo}`,
+];
+const REVIEW_NETWORK: ProfileNetwork = {
+  default: "deny",
+  allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+  allowHostPatterns: [],
+};
 
 function assertSafeRepo(repo: string): void {
   if (!REPO_RE.test(repo)) throw new ReviewSetupError(`invalid repository: ${repo}`);
@@ -353,7 +369,9 @@ export function makeReviewControlPlane(
         taskId: input.taskId,
         profileId,
         role: "finder",
-        extraCapabilities: [`github:contents:read@${input.repo}`],
+        capabilityOverride: REVIEW_CAPABILITIES(input.repo),
+        networkOverride: REVIEW_NETWORK,
+        dropProfileSecretsAndEnv: true,
         appendSystemPrompt: FINDER_SYSTEM_PROMPT,
         source: {
           reviewId: input.reviewId,
@@ -432,7 +450,9 @@ export function makeReviewControlPlane(
         taskId: input.taskId,
         profileId,
         role: "verifier",
-        extraCapabilities: [`github:contents:read@${input.repo}`],
+        capabilityOverride: REVIEW_CAPABILITIES(input.repo),
+        networkOverride: REVIEW_NETWORK,
+        dropProfileSecretsAndEnv: true,
         appendSystemPrompt: VERIFIER_SYSTEM_PROMPT,
         source: {
           reviewId: input.reviewId,
