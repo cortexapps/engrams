@@ -164,6 +164,12 @@ pub struct Sim {
     /// The R2 expected-state model oracle (the auditor), fed by acked
     /// workload outcomes and diffed against world truth every step.
     model: crate::model::ModelState,
+    /// Opt-in: hosts advertise the current WIRE_VERSION + the seeded
+    /// image digest in `ready_images` + `stages_images` (the FAITHFUL
+    /// host — schedulable through the digest-gated `candidates_for`
+    /// path). Default `false` so the swarm is byte-identical to pre-#787;
+    /// the #787 double-boot regression opts in. See `sim_heartbeat`.
+    faithful_hosts: bool,
 }
 
 impl Sim {
@@ -205,7 +211,16 @@ impl Sim {
             },
             pg_out: false,
             model: Default::default(),
+            faithful_hosts: false,
         }
+    }
+
+    /// Opt into FAITHFUL host heartbeats (schedulable through the
+    /// digest-gated placement path). Used by the #787 double-boot
+    /// regression; NOT the swarm default (see `sim_heartbeat`).
+    pub fn with_faithful_hosts(mut self) -> Self {
+        self.faithful_hosts = true;
+        self
     }
 
     /// Feed the model oracle: if `session_id` is currently `Active` with a
@@ -567,11 +582,15 @@ impl Sim {
                     return;
                 };
                 for id in up {
-                    let hb = sim_heartbeat();
+                    let hb = sim_heartbeat(self.faithful_hosts);
                     let _ = state
                         .services
                         .meta
-                        .upsert_host(sim_host_record(id, self.world.clock.clone()))
+                        .upsert_host(sim_host_record(
+                            id,
+                            self.world.clock.clone(),
+                            self.faithful_hosts,
+                        ))
                         .await;
                     let _ = state.services.meta.touch_host_heartbeat(id, hb).await;
                     // Re-register on every live replica (the register
@@ -842,7 +861,24 @@ impl Sim {
     }
 }
 
-fn sim_heartbeat() -> engram_core::types::host::HostHeartbeat {
+/// The digest the seeded enabled image advertises
+/// (`world::seed_enabled_image` sets `manifest_digest = "sha256:sim"`). A
+/// FAITHFUL host reports it in `ready_images` so the digest-gated placement
+/// path (`candidates_for`, used by the queue-scanner / resume / reclaim)
+/// treats the host as schedulable — pre-R2 the sim left this empty (and the
+/// wire version skewed at 1 ≠ WIRE_VERSION), which silently suppressed that
+/// whole path (issue #787, PR #786 finding #2).
+///
+/// `faithful` is deliberately OPT-IN (default `false` for every swarm
+/// seed) rather than the global default: making hosts schedulable unmasks
+/// not only the #787 single-ownership double-boot (fixed by the dead-host
+/// probe change in this PR) but also two DISTINCT, still-open classes —
+/// `placement-accounting` (the #722 crash-orphan / pending-revival
+/// over-reservation) and evict→resume `snapshot-safety`. Flipping this to
+/// the swarm default is blocked on those (findings in the PR body); the
+/// #787 double-boot regression drives it hand-wired instead (the
+/// `wedged_boot` precedent).
+fn sim_heartbeat(faithful: bool) -> engram_core::types::host::HostHeartbeat {
     engram_core::types::host::HostHeartbeat {
         status: engram_core::types::host::HostStatus::Ready,
         capacity: engram_core::types::host::HostCapacity {
@@ -853,12 +889,24 @@ fn sim_heartbeat() -> engram_core::types::host::HostHeartbeat {
             running_sandboxes: 0,
         },
         utilization: sim_utilization(),
-        ready_images: Vec::new(),
+        ready_images: sim_ready_images(faithful),
         current_bundles: Vec::new(),
         total_vcpus: 16,
-        wire_version: 1,
-        stages_images: false,
+        wire_version: if faithful {
+            engram_protocol::WIRE_VERSION
+        } else {
+            1
+        },
+        stages_images: faithful,
         capabilities: Default::default(),
+    }
+}
+
+fn sim_ready_images(faithful: bool) -> Vec<String> {
+    if faithful {
+        vec!["sha256:sim".to_string()]
+    } else {
+        Vec::new()
     }
 }
 
@@ -871,6 +919,7 @@ fn sim_utilization() -> engram_core::types::host::HostUtilization {
 fn sim_host_record(
     id: HostId,
     clock: Arc<engram_sim::SimClock>,
+    faithful: bool,
 ) -> engram_core::types::host::HostRecord {
     use engram_core::traits::Clock;
     engram_core::types::host::HostRecord {
@@ -888,12 +937,16 @@ fn sim_host_record(
         status: engram_core::types::host::HostStatus::Ready,
         last_heartbeat_at: clock.now_utc(),
         host_addr: None,
-        ready_images: Vec::new(),
+        ready_images: sim_ready_images(faithful),
         current_bundles: Vec::new(),
         cordoned: false,
         total_vcpus: 16,
-        wire_version: 1,
-        stages_images: false,
+        wire_version: if faithful {
+            engram_protocol::WIRE_VERSION
+        } else {
+            1
+        },
+        stages_images: faithful,
         capabilities: Default::default(),
     }
 }
