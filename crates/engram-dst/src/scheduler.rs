@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use engram_core::traits::metadata::{CreateDisposition, SessionCreateWriteSet};
 use engram_core::types::session::{SessionMode, SessionSpec};
-use engram_core::types::session_op::OpKind;
+use engram_core::types::session_op::{EnqueueOutcome, OpKind};
 use engram_core::{HostId, SessionId};
 use rand::prelude::*;
 use rand::Rng;
@@ -319,14 +319,19 @@ impl Sim {
                                 continue;
                             }
                             let key = format!("boot-recover:{sid}");
-                            let _ = engram_coordinator::session_ops::enqueue(
-                                &state,
-                                sid,
-                                OpKind::CreateBoot,
-                                serde_json::json!({ "recovered": true }),
-                                Some(&key),
-                            )
-                            .await;
+                            // The sim never detach-spawns mutating work; drive inside the step.
+                            if let Ok(EnqueueOutcome::Claimed(op)) =
+                                engram_coordinator::session_ops::enqueue_claim(
+                                    &state,
+                                    sid,
+                                    OpKind::CreateBoot,
+                                    serde_json::json!({ "recovered": true }),
+                                    Some(&key),
+                                )
+                                .await
+                            {
+                                engram_coordinator::session_ops::drive_claimed(&state, op).await;
+                            }
                         }
                     }
                     DriverKind::IdleDetector => {
@@ -411,14 +416,18 @@ impl Sim {
                     .reserve_and_persist_create(ws, &candidates, 0)
                     .await;
                 if matches!(disp, Ok(CreateDisposition::Placed(_))) {
-                    let _ = engram_coordinator::session_ops::enqueue(
-                        &state,
-                        session_id,
-                        OpKind::CreateBoot,
-                        serde_json::json!({}),
-                        Some(&format!("create:{session_id}")),
-                    )
-                    .await;
+                    if let Ok(EnqueueOutcome::Claimed(op)) =
+                        engram_coordinator::session_ops::enqueue_claim(
+                            &state,
+                            session_id,
+                            OpKind::CreateBoot,
+                            serde_json::json!({}),
+                            Some(&format!("create:{session_id}")),
+                        )
+                        .await
+                    {
+                        engram_coordinator::session_ops::drive_claimed(&state, op).await;
+                    }
                 }
                 if disp.is_ok() {
                     self.report.sessions_created += 1;
@@ -572,14 +581,18 @@ impl Sim {
                         .map(|r| r.session.id)
                 });
                 let Some(sid) = idle else { return };
-                let _ = engram_coordinator::session_ops::enqueue(
-                    &state,
-                    sid,
-                    OpKind::Resume,
-                    serde_json::json!({}),
-                    Some(&format!("resume:{sid}")),
-                )
-                .await;
+                if let Ok(EnqueueOutcome::Claimed(op)) =
+                    engram_coordinator::session_ops::enqueue_claim(
+                        &state,
+                        sid,
+                        OpKind::Resume,
+                        serde_json::json!({}),
+                        Some(&format!("resume:{sid}")),
+                    )
+                    .await
+                {
+                    engram_coordinator::session_ops::drive_claimed(&state, op).await;
+                }
             }
             Step::PgOutage(on) => {
                 self.pg_out = on;

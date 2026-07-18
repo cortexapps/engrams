@@ -140,6 +140,25 @@ impl OpCtx<'_> {
     }
 }
 
+/// Callers that receive `Claimed(op)` own driving it. Production uses
+/// [`enqueue`] (which spawns detached); the simulator drives synchronously
+/// inside its step so no mutating work outlives a scheduler step (ADR 0098
+/// determinism discipline).
+pub async fn enqueue_claim(
+    state: &SharedState,
+    session_id: SessionId,
+    kind: OpKind,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> Result<EnqueueOutcome, engram_core::MetaError> {
+    let pod = pod_id();
+    state
+        .services
+        .meta
+        .op_enqueue_and_claim(session_id, kind, payload, idempotency_key, &pod)
+        .await
+}
+
 /// Enqueue a verb and, when the session is idle (no running/queued op),
 /// drive it INLINE on this task — the one-round-trip happy path. When
 /// something is already in flight, the row waits its turn and the
@@ -154,12 +173,7 @@ pub async fn enqueue(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> Result<EnqueueOutcome, engram_core::MetaError> {
-    let pod = pod_id();
-    let outcome = state
-        .services
-        .meta
-        .op_enqueue_and_claim(session_id, kind, payload, idempotency_key, &pod)
-        .await?;
+    let outcome = enqueue_claim(state, session_id, kind, payload, idempotency_key).await?;
     if let EnqueueOutcome::Claimed(op) = &outcome {
         // Drive detached from the caller's (possibly wire-lifetime)
         // future: the op row is the durable owner, this spawn is just

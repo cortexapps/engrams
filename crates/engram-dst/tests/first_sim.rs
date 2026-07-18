@@ -123,6 +123,7 @@ fn driver_coverage_is_declared() {
     let _ = engram_coordinator::dead_host::run_once;
     let _ = engram_coordinator::session_ops::drive_session;
     let _ = engram_coordinator::session_ops::drive_claimed;
+    let _ = engram_coordinator::session_ops::enqueue_claim;
     let _ = engram_coordinator::session_ops::enqueue;
     let _ = <engram_sim::SimMetadataStore as engram_core::traits::MetadataStore>::apply_missing_sandbox_strikes;
 }
