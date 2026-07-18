@@ -111,6 +111,7 @@ pub struct SimReport {
 
 pub struct Sim {
     pub world: SimWorld,
+    oracles: invariants::Oracles,
     rng: ChaCha8Rng,
     profile: Profile,
     /// dead_host probe history, owned across sweeps like the real loop.
@@ -134,6 +135,7 @@ impl Sim {
         let replicas = world.replicas.len();
         Self {
             world,
+            oracles: Default::default(),
             rng,
             profile,
             probe_memory: (0..replicas).map(|_| Default::default()).collect(),
@@ -596,7 +598,7 @@ impl Sim {
             let step = self.pick();
             self.execute(step).await;
             self.report.steps_run += 1;
-            if let Err(v) = invariants::check_step(&self.world) {
+            if let Err(v) = self.oracles.check_step(&self.world) {
                 return Err(format!(
                     "step {}: {} — {}",
                     self.report.steps_run, v.invariant, v.detail
