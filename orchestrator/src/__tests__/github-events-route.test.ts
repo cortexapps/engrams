@@ -53,6 +53,7 @@ function app(enrolled = true) {
     dispatches,
     app: makeGithubEventsRoute({
       webhookSecret: async () => SECRET,
+      mentionHandle: "acme-reviewer",
       enrollments: { get: async () => enrolled ? enrollment : null },
       dispatch: async (input) => {
         dispatches.push(input);
@@ -116,8 +117,8 @@ describe("POST /api/v1/integrations/github/events", () => {
     }]);
   });
 
-  test("dispatches @engrams review with its focus", async () => {
-    const body = commentBody("@engrams review focus on auth");
+  test("dispatches a review command (mentioning the configured App handle) with its focus", async () => {
+    const body = commentBody("@acme-reviewer review focus on auth");
     const fixture = app();
     const res = await fixture.app.request(PATH, {
       method: "POST",

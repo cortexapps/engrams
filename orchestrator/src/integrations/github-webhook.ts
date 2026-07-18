@@ -1,4 +1,5 @@
-/** Pure GitHub webhook classification and @engrams command parsing (ADR 0100). */
+/** Pure GitHub webhook classification and review-command parsing — the command
+ *  mention matches the configured App handle, not a hardcoded name (ADR 0100). */
 
 export type GithubEvent =
   | {
@@ -96,16 +97,35 @@ export function classifyGithubEvent(
   return { kind: "ignore" };
 }
 
-/** Find a command line whose first token is @engrams. Leading prose on earlier
- * lines is allowed; the command itself remains an exact deterministic match. */
-export function parseEngramsCommand(body: string): EngramsCommand | null {
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+/** Normalize a configured handle: drop a leading "@" and a trailing "[bot]"
+ * (GitHub App bot logins are "<slug>[bot]", but people @-mention "<slug>"). */
+export function normalizeMentionHandle(handle: string): string {
+  return handle.trim().replace(/^@/, "").replace(/\[bot\]$/i, "").trim();
+}
+
+/**
+ * Find a command line that @-mentions the review App by its configured handle
+ * (`handle`, e.g. the App's slug) — NOT a hardcoded name. Leading prose on
+ * earlier lines is allowed; the command itself is an exact deterministic match.
+ * An `[bot]` suffix on the mention is tolerated. Returns null when the handle is
+ * unset/blank (mention commands are then disabled).
+ */
+export function parseReviewCommand(body: string, handle: string): EngramsCommand | null {
+  const slug = normalizeMentionHandle(handle);
+  if (!slug) return null;
+  const mention = `@${escapeRegExp(slug)}(?:\\[bot\\])?`;
+  const lineMatcher = new RegExp(`^${mention}(?:\\s|$)`, "i");
   const line = body
     .split(/\r?\n/)
     .map((candidate) => candidate.trim())
-    .find((candidate) => /^@engrams(?:\s|$)/i.test(candidate));
+    .find((candidate) => lineMatcher.test(candidate));
   if (!line) return null;
 
-  const match = /^@engrams\s+(review|fix|stop)(?:\s+([\s\S]*))?$/i.exec(line);
+  const match = new RegExp(`^${mention}\\s+(review|fix|stop)(?:\\s+([\\s\\S]*))?$`, "i").exec(line);
   if (!match) return null;
   const verb = match[1]?.toLowerCase();
   const text = sanitize(match[2] ?? "");

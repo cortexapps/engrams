@@ -2,10 +2,11 @@
 
 import { Hono } from "hono";
 
+import { config } from "../config.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import {
   classifyGithubEvent,
-  parseEngramsCommand,
+  parseReviewCommand,
 } from "../integrations/github-webhook.ts";
 import {
   getGithubWebhookSecret,
@@ -24,10 +25,14 @@ export interface GithubEventsDeps {
   webhookSecret?: () => Promise<string>;
   enrollments?: Pick<EnrollmentStore, "get">;
   dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>;
+  /** The review App's @-mention handle (its slug). Defaults to the deployment's
+   *  GITHUB_APP_LOGIN; blank disables mention commands. */
+  mentionHandle?: string;
 }
 
 export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   const webhookSecret = deps.webhookSecret ?? getGithubWebhookSecret;
+  const mentionHandle = deps.mentionHandle ?? config.githubAppLogin;
   let enrollmentStore = deps.enrollments;
   const enrollments = (): Pick<EnrollmentStore, "get"> =>
     (enrollmentStore ??= makeEnrollmentStore());
@@ -80,7 +85,7 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
       return c.body(null, 200);
     }
 
-    const command = parseEngramsCommand(event.body);
+    const command = parseReviewCommand(event.body, mentionHandle);
     if (command?.kind === "review") {
       await dispatch({
         repo: event.repo,
@@ -100,7 +105,7 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     } else if (command?.kind === "fix") {
       log.info(
         { repo: event.repo, prNumber: event.prNumber, commentId: event.commentId },
-        "github @engrams fix queued for a later PR",
+        "github fix command queued for a later PR",
       );
     }
     return c.body(null, 200);
