@@ -94,6 +94,31 @@ fn status(sim: &Sim, sid: SessionId) -> SessionState {
         .with_db(|db| db.sessions.get(&sid).expect("session row").session.status)
 }
 
+/// Insert `sandbox` into the world-side host `host`, owned by `sid` — the
+/// live VM the coordinator's `probe_sandbox` will report `process_alive`
+/// for (world-truth: the VMM is up).
+fn place_live_sandbox(sim: &Sim, host: HostId, sandbox: SandboxId, sid: SessionId) {
+    sim.world
+        .host_world
+        .hosts
+        .lock()
+        .get_mut(&host)
+        .expect("host in world")
+        .sandboxes
+        .insert(sandbox, Some(sid));
+}
+
+/// Is `sandbox` still present on world-side host `host`? (i.e. the sweep
+/// has NOT destroyed the live VM.)
+fn sandbox_live(sim: &Sim, host: HostId, sandbox: SandboxId) -> bool {
+    sim.world
+        .host_world
+        .hosts
+        .lock()
+        .get(&host)
+        .is_some_and(|h| h.sandboxes.contains_key(&sandbox))
+}
+
 /// Commit 1 (honest-Dead): a bound HostLost straggler whose ONLY snapshot
 /// is un-recoverable must settle to `Dead`, never a lying `Idle`.
 ///
@@ -105,7 +130,7 @@ fn status(sim: &Sim, sid: SessionId) -> SessionState {
 /// cycle in BOTH commits — isolating the Idle-vs-Dead PREDICATE.
 #[test]
 fn unrecoverable_only_straggler_settles_dead_not_idle() {
-    on_sim(0x0777_D, |mut sim| async move {
+    on_sim(777_001, |mut sim| async move {
         let host = sim.world.host_ids[0];
         let sandbox = SandboxId::new();
         let meta = sim.world.meta.clone();
@@ -126,6 +151,72 @@ fn unrecoverable_only_straggler_settles_dead_not_idle() {
             status(&sim, sid),
             SessionState::Dead,
             "an un-recoverable-only straggler must settle Dead — never a lying Idle (#777 honest-Dead)",
+        );
+    });
+}
+
+/// Commit 2 (ask-the-host): a bound HostLost straggler whose host still
+/// reports the sandbox SERVING (a live VM under a HostLost row — the >60s
+/// partition/desync window) must NOT be destroyed on the first sweep. The
+/// sweep defers for the reattach machinery, banking a serving-strike each
+/// cycle, until the `straggler_serving_strike_cap` (default 3) is reached
+/// — then it destroys+settles (bounded convergence, oracle #8's shape).
+///
+/// Red-then-green: with the pre-#777 sweep the FIRST cycle best-effort
+/// destroyed the still-bound sandbox and settled the row (killing the live
+/// VM); after ask-the-host the first two cycles leave the row HostLost and
+/// the sandbox alive, and only the third settles. A recoverable snapshot
+/// is on record, so the eventual settle is `Idle` (proving the row was
+/// recovered, not condemned).
+#[test]
+fn serving_straggler_is_deferred_then_settles_at_the_strike_cap() {
+    on_sim(777_002, |mut sim| async move {
+        let host = sim.world.host_ids[0];
+        let sandbox = SandboxId::new();
+        let meta = sim.world.meta.clone();
+        let sid = seed_bound_host_lost(&meta, host, sandbox).await;
+
+        // World-truth: the VM is still up and serving on its host, even
+        // though the coordinator parked the session at HostLost.
+        place_live_sandbox(&sim, host, sandbox, sid);
+        // A recoverable snapshot so the eventual settle target is Idle.
+        let now = sim.world.clock.now_utc();
+        record_snapshot(&meta, sid, true, now).await;
+
+        // Age past the 60s min-age (no further advances between sweeps —
+        // last_active_at stays stale, so every cycle acts).
+        sim.execute(Step::AdvanceTime(Duration::from_secs(120)))
+            .await;
+
+        // Cap is 3 → cycles 1 and 2 DEFER (strike < cap), cycle 3 settles.
+        // Cycle 1:
+        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+        assert_eq!(
+            status(&sim, sid),
+            SessionState::HostLost,
+            "a still-serving straggler must survive the first sweep (ask-the-host defer)",
+        );
+        assert!(
+            sandbox_live(&sim, host, sandbox),
+            "the live VM must NOT be destroyed while the host reports it serving",
+        );
+
+        // Cycle 2 (still under the cap):
+        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+        assert_eq!(status(&sim, sid), SessionState::HostLost);
+        assert!(sandbox_live(&sim, host, sandbox));
+
+        // Cycle 3: strike reaches the cap → destroy + settle. The snapshot
+        // is recoverable, so it lands Idle.
+        sim.execute(Step::Driver(0, DriverKind::DeadHost)).await;
+        assert_eq!(
+            status(&sim, sid),
+            SessionState::Idle,
+            "at the serving-strike cap the straggler settles (bounded convergence, #777)",
+        );
+        assert!(
+            !sandbox_live(&sim, host, sandbox),
+            "the sandbox is destroyed on the settling cycle",
         );
     });
 }

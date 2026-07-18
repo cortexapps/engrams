@@ -127,6 +127,9 @@ pub struct Sim {
     profile: Profile,
     /// dead_host probe history, owned across sweeps like the real loop.
     probe_memory: Vec<engram_coordinator::dead_host::ProbeMemoryMap>,
+    /// dead_host straggler serving-strike history (#777 ask-the-host),
+    /// owned per replica across sweeps like the real loop.
+    straggler_strikes: Vec<engram_coordinator::dead_host::StragglerStrikeMap>,
     dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig,
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
     idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
@@ -154,6 +157,7 @@ impl Sim {
             rng,
             profile,
             probe_memory: (0..replicas).map(|_| Default::default()).collect(),
+            straggler_strikes: (0..replicas).map(|_| Default::default()).collect(),
             dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
@@ -288,6 +292,7 @@ impl Sim {
                             &state,
                             "sim-pod",
                             &mut self.probe_memory[r],
+                            &mut self.straggler_strikes[r],
                         )
                         .await;
                     }
@@ -540,6 +545,7 @@ impl Sim {
             Step::CrashReplica(i) => {
                 self.world.replicas[i].state = None;
                 self.probe_memory[i].clear();
+                self.straggler_strikes[i].clear();
             }
             Step::RestartReplica(i) => {
                 if self.world.replicas[i].state.is_none() {
