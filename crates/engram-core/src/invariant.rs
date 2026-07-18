@@ -11,8 +11,9 @@
 //!   precedent. Use it where a violated condition means the surrounding
 //!   code has already lost its footing — continuing would corrupt state.
 //!
-//! - [`soft_invariant!`] — logs at `error!` with the stable, greppable
-//!   prefix `soft-invariant violated:` plus a `name` field, and does
+//! - [`soft_invariant!`] — requires an explicit name slug and logs at
+//!   `error!` with the stable, greppable prefix `soft-invariant violated:`
+//!   plus that slug in a `name` field, and does
 //!   **not** panic. For reconciler-class sites whose *job* is repairing
 //!   anomalies: panicking the checker on detection would prevent the
 //!   repair. A counter can ride on the log pipeline (alert on the
@@ -49,19 +50,19 @@ macro_rules! invariant {
 }
 
 /// Non-fatal runtime invariant. Logs at `error!` with the stable prefix
-/// `soft-invariant violated:` and a `name` field (the stringified
-/// condition) if `cond` is false; never panics. For reconciler-class
-/// sites that must go on to repair the anomaly they just detected.
+/// `soft-invariant violated:` and the explicit name slug in a `name`
+/// field if `cond` is false; never panics. For reconciler-class sites
+/// that must go on to repair the anomaly they just detected.
 ///
 /// ```ignore
-/// soft_invariant!(prev_host == host_id, "sandbox {sb} cached under {prev_host}, not {host_id}");
+/// soft_invariant!("sandbox-cached-under-two-hosts", prev_host == host_id, "sandbox {sb} cached under {prev_host}, not {host_id}");
 /// ```
 #[macro_export]
 macro_rules! soft_invariant {
-    ($cond:expr, $($arg:tt)+) => {{
+    ($name:literal, $cond:expr, $($arg:tt)+) => {{
         if !$cond {
             $crate::invariant::__soft_invariant_violated(
-                ::core::stringify!($cond),
+                $name,
                 ::core::format_args!($($arg)+),
             );
         }
@@ -85,11 +86,11 @@ pub fn __invariant_panic(cond: &'static str, detail: Option<core::fmt::Arguments
 /// public API — call the macro.
 #[doc(hidden)]
 #[track_caller]
-pub fn __soft_invariant_violated(cond: &'static str, detail: core::fmt::Arguments<'_>) {
+pub fn __soft_invariant_violated(name: &'static str, detail: core::fmt::Arguments<'_>) {
     let location = core::panic::Location::caller();
     tracing::error!(
         soft_invariant = true,
-        name = cond,
+        name = name,
         %location,
         "soft-invariant violated: {detail}",
     );
@@ -121,7 +122,7 @@ mod tests {
 
     #[test]
     fn soft_invariant_holds_is_a_noop() {
-        crate::soft_invariant!(true, "should never log");
+        crate::soft_invariant!("test-condition-holds", true, "should never log");
     }
 
     #[test]
@@ -130,7 +131,12 @@ mod tests {
         // the reconciler can proceed to repair. Reaching past the macro
         // proves control flow continued past the violation.
         let reached_before = true;
-        crate::soft_invariant!(false, "detected an anomaly worth an alert: {}", 42);
+        crate::soft_invariant!(
+            "test-anomaly-detected",
+            false,
+            "detected an anomaly worth an alert: {}",
+            42
+        );
         let reached_after = true;
         assert!(
             reached_before && reached_after,
