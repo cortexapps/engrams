@@ -1,7 +1,7 @@
 //! The simulated world: replicas, hosts, and the world-truth the
 //! invariant checkers compare against.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -37,9 +37,55 @@ pub struct SimHostState {
     pub sandboxes: BTreeMap<SandboxId, Option<SessionId>>,
 }
 
+/// A mutating host-verb's WORLD-side effect (ADR 0098 R2). Every
+/// state-changing `SimHostClient` verb produces one of these instead of
+/// touching `SimHostState.sandboxes` inline. In the default (inline)
+/// mode the effect applies immediately — byte-for-byte the pre-R2 world,
+/// so Calm seeds are unchanged. When the target host is in the deferred
+/// set (a Chaos fault window), the effect is queued for a later
+/// scheduler step to deliver / drop / duplicate / reorder — which is
+/// what makes RPC loss/reorder/dup and a replica crash BETWEEN the store
+/// commit (the ack the coordinator already got) and the world effect a
+/// reachable state (the audit's finding #2/#4).
+#[derive(Debug, Clone)]
+pub enum Effect {
+    /// `create` / `restore` / `restore_base_for_session`: a new sandbox
+    /// appears on the host, ownership learned later at bind time.
+    Create {
+        sandbox: SandboxId,
+    },
+    Destroy {
+        sandbox: SandboxId,
+    },
+    Bind {
+        session: SessionId,
+        sandbox: SandboxId,
+    },
+    Unbind {
+        session: SessionId,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct QueuedEffect {
+    pub host: HostId,
+    pub effect: Effect,
+}
+
+/// Deferred host-effects, keyed by a monotonic serial so delivery order
+/// (and the seeded reorder fault) is deterministic. `deferred` is the set
+/// of hosts whose verbs currently enqueue instead of applying inline.
+#[derive(Debug, Default)]
+pub struct EffectQueue {
+    next_serial: u64,
+    pending: BTreeMap<u64, QueuedEffect>,
+    deferred: BTreeSet<HostId>,
+}
+
 #[derive(Debug, Default)]
 pub struct SimHostWorld {
     pub hosts: Mutex<BTreeMap<HostId, SimHostState>>,
+    pub effects: Mutex<EffectQueue>,
 }
 
 impl SimHostWorld {
@@ -56,6 +102,153 @@ impl SimHostWorld {
             return Err(SandboxError::Unavailable(format!("sim: host {id} is down")));
         }
         f(host)
+    }
+
+    /// The RPC-time liveness gate for a MUTATING verb: a down/unknown host
+    /// fails exactly as `with_host` did (so a create against a dead host
+    /// still surfaces `Unavailable`/`HostLost`), but the world mutation is
+    /// separated out into an [`Effect`] recorded via [`record_effect`].
+    fn require_up(&self, id: HostId) -> Result<(), SandboxError> {
+        let hosts = self.hosts.lock();
+        let host = hosts.get(&id).ok_or(SandboxError::HostLost)?;
+        if !host.up {
+            return Err(SandboxError::Unavailable(format!("sim: host {id} is down")));
+        }
+        Ok(())
+    }
+
+    /// Record a verb's world-effect. Inline unless the host is deferred.
+    fn record_effect(&self, host: HostId, effect: Effect) {
+        let deferred = {
+            let mut q = self.effects.lock();
+            if q.deferred.contains(&host) {
+                let serial = q.next_serial;
+                q.next_serial += 1;
+                q.pending.insert(
+                    serial,
+                    QueuedEffect {
+                        host,
+                        effect: effect.clone(),
+                    },
+                );
+                true
+            } else {
+                false
+            }
+        };
+        if !deferred {
+            self.apply_effect(host, &effect);
+        }
+    }
+
+    /// Apply one effect to world truth. A down/absent host swallows it —
+    /// the machine that would have held the sandbox is gone (a create
+    /// effect never resurrects a restarted host's cleared VM set; a stale
+    /// destroy is a harmless no-op).
+    fn apply_effect(&self, host: HostId, effect: &Effect) {
+        let mut hosts = self.hosts.lock();
+        let Some(h) = hosts.get_mut(&host) else {
+            return;
+        };
+        if !h.up {
+            return;
+        }
+        match effect {
+            Effect::Create { sandbox } => {
+                h.sandboxes.entry(*sandbox).or_insert(None);
+            }
+            Effect::Destroy { sandbox } => {
+                h.sandboxes.remove(sandbox);
+            }
+            Effect::Bind { session, sandbox } => {
+                if let Some(owner) = h.sandboxes.get_mut(sandbox) {
+                    *owner = Some(*session);
+                }
+            }
+            Effect::Unbind { session } => {
+                for owner in h.sandboxes.values_mut() {
+                    if *owner == Some(*session) {
+                        *owner = None;
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Scheduler-driven queue control (ADR 0098 R2) -----------------
+
+    /// Toggle a host's deferred window. While on, that host's mutating
+    /// verbs enqueue; the committed-but-unapplied window opens.
+    pub fn set_deferred(&self, host: HostId, on: bool) {
+        let mut q = self.effects.lock();
+        if on {
+            q.deferred.insert(host);
+        } else {
+            q.deferred.remove(&host);
+        }
+    }
+
+    pub fn clear_deferred(&self) {
+        self.effects.lock().deferred.clear();
+    }
+
+    pub fn pending_serials(&self) -> Vec<u64> {
+        self.effects.lock().pending.keys().copied().collect()
+    }
+
+    pub fn pending_len(&self) -> usize {
+        self.effects.lock().pending.len()
+    }
+
+    /// Deliver every pending effect in serial (causal) order and clear the
+    /// queue — the normal, fault-free delivery step and the quiescence
+    /// flush.
+    pub fn deliver_in_order(&self) {
+        let drained: Vec<QueuedEffect> = {
+            let mut q = self.effects.lock();
+            std::mem::take(&mut q.pending).into_values().collect()
+        };
+        for qe in drained {
+            self.apply_effect(qe.host, &qe.effect);
+        }
+    }
+
+    /// Deliver pending effects in the caller-supplied (seeded-shuffled)
+    /// serial order — the REORDER fault. Serials absent from `order` are
+    /// dropped; the scheduler always passes a full permutation.
+    pub fn deliver_shuffled(&self, order: &[u64]) {
+        let pending: BTreeMap<u64, QueuedEffect> = {
+            let mut q = self.effects.lock();
+            std::mem::take(&mut q.pending)
+        };
+        for serial in order {
+            if let Some(qe) = pending.get(serial) {
+                self.apply_effect(qe.host, &qe.effect);
+            }
+        }
+    }
+
+    /// Drop one queued effect without applying it — the LOSS fault.
+    pub fn drop_pending(&self, serial: u64) -> bool {
+        self.effects.lock().pending.remove(&serial).is_some()
+    }
+
+    /// Apply one queued effect an EXTRA time while leaving it queued — the
+    /// DUPLICATE fault. Our effects are map-keyed and hence idempotent, so
+    /// this exercises the coordinator's tolerance of a re-delivered verb
+    /// rather than corrupting world truth.
+    pub fn duplicate_pending(&self, serial: u64) {
+        let qe = self.effects.lock().pending.get(&serial).cloned();
+        if let Some(qe) = qe {
+            self.apply_effect(qe.host, &qe.effect);
+        }
+    }
+
+    /// A crashed/restarted host severs its in-flight RPCs: pending effects
+    /// targeting it die with the machine (never resurrected onto the
+    /// cleared VM set).
+    pub fn drop_host_pending(&self, host: HostId) {
+        self.effects.lock().pending.retain(|_, qe| qe.host != host);
     }
 }
 
@@ -93,21 +286,24 @@ impl SimHostClient {
 impl HostClient for SimHostClient {
     async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
         self.maybe_hang().await;
+        // Draw the id BEFORE the liveness gate so the entropy stream is
+        // identical to the pre-effect-queue world even on a down-host
+        // failure (Calm determinism).
         let id = SandboxId::from(self.entropy.uuid());
-        self.world.with_host(self.host_id, |h| {
-            // Ownership is learned at bind_session time (the spec is a
-            // template, not a binding — see sandbox.rs's type docs).
-            h.sandboxes.insert(id, None);
-            Ok(id)
-        })
+        self.world.require_up(self.host_id)?;
+        // Ownership is learned at bind_session time (the spec is a
+        // template, not a binding — see sandbox.rs's type docs).
+        self.world
+            .record_effect(self.host_id, Effect::Create { sandbox: id });
+        Ok(id)
     }
 
     async fn destroy(&self, id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
         self.maybe_hang().await;
-        self.world.with_host(self.host_id, |h| {
-            h.sandboxes.remove(&id);
-            Ok(())
-        })
+        self.world.require_up(self.host_id)?;
+        self.world
+            .record_effect(self.host_id, Effect::Destroy { sandbox: id });
+        Ok(())
     }
 
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
@@ -173,10 +369,10 @@ impl HostClient for SimHostClient {
     ) -> Result<SandboxId, SandboxError> {
         self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
-        self.world.with_host(self.host_id, |h| {
-            h.sandboxes.insert(id, None);
-            Ok(id)
-        })
+        self.world.require_up(self.host_id)?;
+        self.world
+            .record_effect(self.host_id, Effect::Create { sandbox: id });
+        Ok(id)
     }
 
     async fn start_agent(
@@ -209,10 +405,10 @@ impl HostClient for SimHostClient {
     ) -> Result<SandboxId, SandboxError> {
         self.maybe_hang().await;
         let id = SandboxId::from(self.entropy.uuid());
-        self.world.with_host(self.host_id, |h| {
-            h.sandboxes.insert(id, None);
-            Ok(id)
-        })
+        self.world.require_up(self.host_id)?;
+        self.world
+            .record_effect(self.host_id, Effect::Create { sandbox: id });
+        Ok(id)
     }
 
     async fn apply_egress_policy(&self, _policy: SessionEgressPolicy) -> Result<(), SandboxError> {
@@ -231,24 +427,27 @@ impl HostClient for SimHostClient {
         _binding_epoch: u64,
     ) {
         self.maybe_hang().await;
-        let _ = self.world.with_host(self.host_id, |h| {
-            if let Some(owner) = h.sandboxes.get_mut(&sandbox_id) {
-                *owner = Some(session_id);
-            }
-            Ok(())
-        });
+        if self.world.require_up(self.host_id).is_ok() {
+            self.world.record_effect(
+                self.host_id,
+                Effect::Bind {
+                    session: session_id,
+                    sandbox: sandbox_id,
+                },
+            );
+        }
     }
 
     async fn unbind_session(&self, session_id: SessionId) {
         self.maybe_hang().await;
-        let _ = self.world.with_host(self.host_id, |h| {
-            for owner in h.sandboxes.values_mut() {
-                if *owner == Some(session_id) {
-                    *owner = None;
-                }
-            }
-            Ok(())
-        });
+        if self.world.require_up(self.host_id).is_ok() {
+            self.world.record_effect(
+                self.host_id,
+                Effect::Unbind {
+                    session: session_id,
+                },
+            );
+        }
     }
 
     async fn send_prompt(

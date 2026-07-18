@@ -13,6 +13,7 @@ use engram_core::types::session::{SessionMode, SessionSpec};
 use engram_core::types::session_op::{EnqueueOutcome, OpKind};
 use engram_core::{HostId, SessionId};
 use rand::prelude::*;
+use rand::seq::SliceRandom;
 use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 
@@ -108,6 +109,26 @@ pub enum Step {
     /// A user resuming an Idle session: the real Resume op through the
     /// op pipeline.
     ResumeSession,
+    // --- ADR 0098 R2: the host-effect queue (in-flight interruption +
+    // message faults). Chaos-only picks; Calm never defers, so its verbs
+    // apply inline and its seeds are byte-identical to pre-R2. ---
+    /// Open (`true`) / close (`false`) a host's deferred-effect window.
+    /// While open, that host's mutating RPC verbs record their world
+    /// effect on the queue instead of applying it — the committed-but-
+    /// unapplied window a replica crash can now land inside.
+    DeferHost(usize, bool),
+    /// Deliver every queued effect in serial (causal) order — normal
+    /// message delivery, draining the window a defer opened.
+    DeliverEffects,
+    /// Loss: drop one queued effect (a seeded pick) — the acked verb's
+    /// world mutation never lands.
+    DropEffect,
+    /// Duplication: re-deliver one queued effect an extra time (a seeded
+    /// pick) while leaving it queued.
+    DuplicateEffect,
+    /// Reorder: deliver the whole queue in a seeded-shuffled order rather
+    /// than serial order.
+    ReorderEffects,
 }
 
 #[derive(Debug)]
@@ -207,36 +228,51 @@ impl Sim {
             // partition/skew/burst faults had execute arms but were
             // never PICKED, so the D6/D7 swarms ran a weaker menu than
             // advertised. Weights below are the real full menu.
+            // R2 carved 9 weight points out of AdvanceTime/Driver/
+            // HostHeartbeats/Crash/RestartHost for the effect-queue arms
+            // (DeferHost/DeliverEffects + the loss/dup/reorder faults).
+            // The re-weighting shifts every Chaos seed's exploration (fine
+            // — seeds pin to a commit); the pinned chaos seeds are re-checked
+            // and re-pinned in tests/ where they legitimately move.
             Profile::Chaos => match roll {
-                0..=19 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
-                20..=42 => Step::Driver(
+                0..=16 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
+                17..=37 => Step::Driver(
                     self.rng.random_range(0..replicas),
                     DRIVERS[self.rng.random_range(0..DRIVERS.len())],
                 ),
-                43..=49 => Step::CreateSession,
-                50..=51 => Step::WorkloadBurst(self.rng.random_range(2..8)),
-                52..=55 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
-                56..=58 => Step::ResumeSession,
-                59..=71 => Step::HostHeartbeats,
-                72..=76 => Step::CrashHost(self.rng.random_range(0..hosts)),
-                77..=81 => Step::RestartHost(self.rng.random_range(0..hosts)),
-                82..=84 => Step::CrashReplica(self.rng.random_range(0..replicas)),
-                85..=87 => Step::RestartReplica(self.rng.random_range(0..replicas)),
-                88..=90 => {
+                38..=44 => Step::CreateSession,
+                45..=46 => Step::WorkloadBurst(self.rng.random_range(2..8)),
+                47..=50 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
+                51..=53 => Step::ResumeSession,
+                54..=64 => Step::HostHeartbeats,
+                65..=68 => Step::CrashHost(self.rng.random_range(0..hosts)),
+                69..=72 => Step::RestartHost(self.rng.random_range(0..hosts)),
+                73..=75 => Step::CrashReplica(self.rng.random_range(0..replicas)),
+                76..=78 => Step::RestartReplica(self.rng.random_range(0..replicas)),
+                79..=81 => {
                     let h = self.rng.random_range(0..hosts);
                     let on = self.rng.random_range(0..2) == 0;
                     Step::HeartbeatPartition(h, on)
                 }
-                91..=93 => {
+                82..=84 => {
                     let h = self.rng.random_range(0..hosts);
                     let on = self.rng.random_range(0..2) == 0;
                     Step::RpcHang(h, on)
                 }
-                94..=96 => Step::ClockSkew(
+                85..=87 => Step::ClockSkew(
                     self.rng.random_range(0..replicas),
                     self.rng.random_range(-45..=45),
                 ),
-                _ => Step::PgOutage(!self.pg_out),
+                88..=89 => Step::PgOutage(!self.pg_out),
+                90..=92 => {
+                    let h = self.rng.random_range(0..hosts);
+                    let on = self.rng.random_range(0..2) == 0;
+                    Step::DeferHost(h, on)
+                }
+                93..=96 => Step::DeliverEffects,
+                97 => Step::DropEffect,
+                98 => Step::DuplicateEffect,
+                _ => Step::ReorderEffects,
             },
         }
     }
@@ -528,19 +564,28 @@ impl Sim {
             }
             Step::CrashHost(i) => {
                 let id = self.world.host_ids[i];
-                let mut hw = self.world.host_world.hosts.lock();
-                if let Some(h) = hw.get_mut(&id) {
-                    h.up = false;
+                {
+                    let mut hw = self.world.host_world.hosts.lock();
+                    if let Some(h) = hw.get_mut(&id) {
+                        h.up = false;
+                    }
                 }
+                // A crashed machine severs its in-flight RPC effects.
+                self.world.host_world.drop_host_pending(id);
             }
             Step::RestartHost(i) => {
                 let id = self.world.host_ids[i];
-                let mut hw = self.world.host_world.hosts.lock();
-                if let Some(h) = hw.get_mut(&id) {
-                    h.up = true;
-                    // A restarted host machine lost its VMs.
-                    h.sandboxes.clear();
+                {
+                    let mut hw = self.world.host_world.hosts.lock();
+                    if let Some(h) = hw.get_mut(&id) {
+                        h.up = true;
+                        // A restarted host machine lost its VMs.
+                        h.sandboxes.clear();
+                    }
                 }
+                // In-flight effects for the old boot die with it — never
+                // resurrected onto the freshly-cleared VM set.
+                self.world.host_world.drop_host_pending(id);
             }
             Step::CrashReplica(i) => {
                 self.world.replicas[i].state = None;
@@ -651,6 +696,32 @@ impl Sim {
                 self.pg_out = on;
                 self.world.meta.set_outage(on);
             }
+            Step::DeferHost(i, on) => {
+                let id = self.world.host_ids[i];
+                self.world.host_world.set_deferred(id, on);
+            }
+            Step::DeliverEffects => {
+                self.world.host_world.deliver_in_order();
+            }
+            Step::DropEffect => {
+                let serials = self.world.host_world.pending_serials();
+                if !serials.is_empty() {
+                    let idx = self.rng.random_range(0..serials.len());
+                    self.world.host_world.drop_pending(serials[idx]);
+                }
+            }
+            Step::DuplicateEffect => {
+                let serials = self.world.host_world.pending_serials();
+                if !serials.is_empty() {
+                    let idx = self.rng.random_range(0..serials.len());
+                    self.world.host_world.duplicate_pending(serials[idx]);
+                }
+            }
+            Step::ReorderEffects => {
+                let mut serials = self.world.host_world.pending_serials();
+                serials.shuffle(&mut self.rng);
+                self.world.host_world.deliver_shuffled(&serials);
+            }
         }
     }
 
@@ -673,6 +744,12 @@ impl Sim {
         // time advances until convergence.
         self.world.meta.set_outage(false);
         self.pg_out = false;
+        // Close every deferred window and flush the effect queue in causal
+        // order BEFORE the fleet heals, so any acked-but-unapplied verb
+        // lands (or, for a since-restarted host, is harmlessly swallowed)
+        // and world truth is consistent with the coordinator's commits.
+        self.world.host_world.clear_deferred();
+        self.world.host_world.deliver_in_order();
         for i in 0..self.world.host_ids.len() {
             self.execute(Step::RestartHost(i)).await;
             self.execute(Step::HeartbeatPartition(i, false)).await;
