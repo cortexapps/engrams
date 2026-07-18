@@ -26,6 +26,7 @@ export type Subjects =
   | "EnabledImage"
   | "Profile"
   | "Harness"
+  | "Review"
   | "Fleet"
   | "Registry"
   | "all";
@@ -77,6 +78,9 @@ export function abilityFor(user: AbilityUser): AppAbility {
   // sees are config (model ids, flags — never secrets), so the catalog is
   // readable; register/delete are admin-only (manage("all") below).
   can("read", "Harness");
+
+  // PR reviews are an org-visible team dashboard (ADR 0100).
+  can("read", "Review");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");
