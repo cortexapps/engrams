@@ -325,6 +325,15 @@ async fn read_disk_pending_chunks(
                 path.display()
             ))
         })?;
+        let actual_hash = ChunkHash::of(&bytes);
+        if actual_hash != *hash {
+            return Err(SandboxError::Snapshot(format!(
+                "disk-pending chunk {} recorded hash {} does not match actual hash {}",
+                path.display(),
+                hash,
+                actual_hash
+            )));
+        }
         out.push((*idx, *hash, Bytes::from(bytes)));
     }
     Ok(out)
@@ -344,10 +353,17 @@ async fn publish_disk_manifest(
 ) -> Result<ManifestRef, SandboxError> {
     // Idempotent content-addressed puts — safe to redo on a redrive that
     // crashed after some (but not all) chunks landed.
-    for (_, _hash, bytes) in chunks {
-        chunk_store.put_chunk(bytes).await.map_err(|e| {
+    for (_, recorded_hash, bytes) in chunks {
+        let returned_hash = chunk_store.put_chunk(bytes).await.map_err(|e| {
             SandboxError::Snapshot(format!("eviction finalize disk chunk upload: {e}"))
         })?;
+        if returned_hash != *recorded_hash {
+            return Err(SandboxError::Snapshot(format!(
+                "eviction finalize disk chunk upload returned hash {returned_hash}, not recorded \
+                 hash {recorded_hash}; the manifest would reference a chunk that does not exist \
+                 under the recorded hash"
+            )));
+        }
     }
 
     let base = chunk_store.get_manifest(base_manifest).await.map_err(|e| {
@@ -816,6 +832,129 @@ pub(crate) async fn run_eviction_finalize(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct NoopDestroyer;
+
+    #[async_trait]
+    impl EvictionSandbox for NoopDestroyer {
+        async fn destroy(&self, _id: SandboxId) -> Result<(), SandboxError> {
+            Ok(())
+        }
+    }
+
+    async fn disk_store_with_empty_base(root: &Path) -> (ChunkStore, ManifestRef) {
+        let blob: Arc<dyn engram_core::traits::BlobStorage> = Arc::new(
+            engram_storage_local::LocalBlobStorage::new(root.join("blob")),
+        );
+        let chunk_store = ChunkStore::new(blob);
+        let base_ref = ManifestRef::new();
+        let base = Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(4096),
+            total_bytes: 4096,
+            chunks: Vec::new(),
+            parent: None,
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        chunk_store
+            .put_manifest(base_ref, &base)
+            .await
+            .expect("seed base manifest");
+        (chunk_store, base_ref)
+    }
+
+    #[tokio::test]
+    async fn corrupted_staged_disk_chunk_retries_then_quarantines_without_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (chunk_store, base_ref) = disk_store_with_empty_base(tmp.path()).await;
+        let dest = tmp.path().join("capture");
+        let bytes = Bytes::from(vec![0xaa; 4096]);
+        let recorded_hash = ChunkHash::of(&bytes);
+        persist_disk_pending_chunks(&dest, &[(0, recorded_hash, bytes)])
+            .await
+            .expect("stage disk chunk");
+        let staged_path = dest
+            .join("disk-pending")
+            .join(format!("0.{}", recorded_hash.to_hex()));
+        tokio::fs::write(&staged_path, vec![0xbb; 4096])
+            .await
+            .expect("corrupt staged chunk");
+
+        let checkpoint_dir = tmp.path().join("checkpoints");
+        let pending_finalizes = Arc::new(DashMap::new());
+        let mut record = EvictionFinalizeRecord {
+            snapshot_id: SnapshotId::new(),
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            image_version: "test".to_owned(),
+            size_bytes: 0,
+            paused_at: DateTime::<Utc>::UNIX_EPOCH,
+            captured_at: DateTime::<Utc>::UNIX_EPOCH,
+            dest,
+            chain_prev_ref: None,
+            disk_pending: Some(DiskPendingRecord {
+                base_manifest: base_ref,
+                chunk_size: 4096,
+                total_bytes: 4096,
+                chunks: vec![(0, recorded_hash)],
+            }),
+            aux_bundles: Vec::new(),
+            stage: FinalizeStage::Captured,
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        };
+        pending_finalizes.insert(record.sandbox_id, record.snapshot_id);
+        let finalizer = EvictionFinalizer::new(
+            Some(chunk_store.clone()),
+            None,
+            tmp.path().join("bundles"),
+            "tar",
+            checkpoint_dir,
+            pending_finalizes,
+            Arc::new(NoopDestroyer),
+            Arc::new(engram_host_core::TokioFs),
+            2,
+        );
+
+        assert!(matches!(
+            run_eviction_finalize_attempt(&finalizer, &mut record).await,
+            FinalizeAttempt::RetryAfter(_)
+        ));
+        assert!(matches!(
+            run_eviction_finalize_attempt(&finalizer, &mut record).await,
+            FinalizeAttempt::Quarantined
+        ));
+        assert!(chunk_store
+            .get_manifest(base_ref.next_version())
+            .await
+            .is_err());
+    }
+
+    #[tokio::test]
+    async fn publish_disk_manifest_rejects_recorded_hash_mismatch_without_manifest() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (chunk_store, base_ref) = disk_store_with_empty_base(tmp.path()).await;
+        let bytes = Bytes::from(vec![0xaa; 4096]);
+        let recorded_hash = ChunkHash::of(b"other");
+
+        let result = publish_disk_manifest(
+            &chunk_store,
+            base_ref,
+            4096,
+            4096,
+            &[(0, recorded_hash, bytes)],
+        )
+        .await;
+
+        assert!(matches!(result, Err(SandboxError::Snapshot(_))));
+        assert!(chunk_store
+            .get_manifest(base_ref.next_version())
+            .await
+            .is_err());
+    }
 
     /// Correction-pass item C (T7): `publish_disk_manifest`'s
     /// idempotent-redrive arm (this file, ~line 404) — a `VersionConflict`

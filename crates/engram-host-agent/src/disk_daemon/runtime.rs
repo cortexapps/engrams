@@ -53,7 +53,10 @@ use tokio::task::JoinHandle as TokioJoinHandle;
 use engram_host_core::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
 
 use super::backend::{ChunkedDiskBackend, DiskBackendError, InFlightGuard};
-use super::nbd::{NbdCommand, NbdReply, NbdRequest, REPLY_HEADER_LEN, REQUEST_HEADER_LEN};
+use super::nbd::{
+    NbdCommand, NbdReply, NbdRequest, MAX_REQUEST_PAYLOAD_BYTES, REPLY_HEADER_LEN,
+    REQUEST_HEADER_LEN,
+};
 use super::nbd_kernel::HostNbdKernel;
 use super::nbd_netlink;
 use super::slot::{NbdSlot, NbdSlotAllocator};
@@ -1108,6 +1111,14 @@ async fn serve_loop(backend: Arc<ChunkedDiskBackend>, stream: TokioUnixStream) {
         // be consumed here IN ORDER — it cannot be deferred to a
         // concurrent handler without desyncing the stream.
         let write_data = if matches!(req.command, NbdCommand::Write) {
+            if req.length > MAX_REQUEST_PAYLOAD_BYTES || (req.length as u64) > backend.total_bytes()
+            {
+                tracing::error!(
+                    length = req.length,
+                    "NBD serve loop: WRITE payload length exceeds request or disk bound"
+                );
+                break;
+            }
             let mut data = vec![0u8; req.length as usize];
             if let Err(e) = read_half.read_exact(&mut data).await {
                 tracing::warn!(error = %e, "NBD write payload read failed");
@@ -1412,5 +1423,30 @@ mod tests {
 
         wr.write_all(&req_bytes(2, 0, 0, 0)).await.unwrap();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(5), serve).await;
+    }
+
+    #[tokio::test]
+    async fn serve_loop_rejects_oversized_write_before_payload_allocation() {
+        let (backend, _dir) = three_chunk_backend().await;
+        let backend = Arc::new(backend);
+        let assertion_backend = backend.clone();
+        let (client, server) = TokioUnixStream::pair().unwrap();
+        let serve = tokio::spawn(serve_loop(backend, server));
+        let (mut rd, mut wr) = client.into_split();
+
+        wr.write_all(&req_bytes(1, 1, 0, u32::MAX)).await.unwrap();
+        let mut reply = [0u8; REPLY_HEADER_LEN];
+        let read =
+            tokio::time::timeout(std::time::Duration::from_secs(2), rd.read_exact(&mut reply))
+                .await
+                .expect("oversized WRITE did not tear down the connection promptly");
+        assert_eq!(read.unwrap_err().kind(), io::ErrorKind::UnexpectedEof);
+        tokio::time::timeout(std::time::Duration::from_secs(2), serve)
+            .await
+            .expect("serve loop did not join promptly")
+            .expect("serve loop task panicked");
+
+        let contents = assertion_backend.read(0, 4096).await.unwrap();
+        assert!(contents.iter().all(|byte| *byte == 0xaa));
     }
 }

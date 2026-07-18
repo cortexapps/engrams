@@ -44,6 +44,13 @@ pub const NBD_REPLY_MAGIC: u32 = 0x6744_6698;
 pub const REQUEST_HEADER_LEN: usize = 28;
 pub const REPLY_HEADER_LEN: usize = 16;
 
+/// Upper bound on a single request's payload (`length`). The Linux nbd
+/// driver caps a request at 32 MiB (drivers/block/nbd.c sets
+/// max_hw_sectors to 65536 512-byte sectors), and the NBD protocol doc
+/// says servers may reject payloads beyond that. Anything larger is a
+/// corrupted or hostile header — reject it BEFORE allocating.
+pub const MAX_REQUEST_PAYLOAD_BYTES: u32 = 32 * 1024 * 1024;
+
 /// NBD command types (the `type` u16 in the request header).
 ///
 /// We deliberately keep this enum small — the daemon supports the
