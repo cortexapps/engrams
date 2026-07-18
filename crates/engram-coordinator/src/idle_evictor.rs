@@ -1112,9 +1112,8 @@ async fn scanner_advance_one(
 
     // An Evicting row with no bound sandbox is structurally
     // inconsistent (nothing to evict): fall back to HostLost NOW rather
-    // than enqueue a guaranteed no-op. The existing HostLost machinery
-    // (dead-host second stage, host-side orphan reap, manual /resume)
-    // owns recovery from there, and HostLost is not Active so neither
+    // than enqueue a guaranteed no-op. The dead_host HostLost straggler
+    // sweep owns recovery from there, and HostLost is not Active so neither
     // detector re-nominates — the loop is broken by construction.
     // (The evict verb has the same fallback for a binding that vanishes
     // between this enqueue and its claim.)

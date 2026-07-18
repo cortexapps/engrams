@@ -2271,6 +2271,28 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, status, host_id, sandbox_id,
+                   image_uri, mode,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   evac_attempts
+            FROM sessions
+            WHERE status = 'host_lost'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(row::session_from_row(r)?);
+        }
+        Ok(out)
+    }
+
     /// ADR 0018 commit 12b: atomic `+= 1 RETURNING`. Scanner calls
     /// this before each resume attempt so the returned count is
     /// the scanner's "this is my Nth try" view; when it crosses

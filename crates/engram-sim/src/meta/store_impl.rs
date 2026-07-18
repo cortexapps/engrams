@@ -2415,6 +2415,17 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
+    async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sessions
+            .values()
+            .filter(|r| r.session.status == SessionState::HostLost)
+            .map(|r| r.session.clone())
+            .collect())
+    }
+
     async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
         self.gate()?;
         let db = self.db.lock();

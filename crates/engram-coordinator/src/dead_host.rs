@@ -58,9 +58,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use engram_core::traits::MetadataStore;
+use engram_core::traits::{MetadataStore, SessionFence};
 use engram_core::types::SessionState;
-use engram_core::HostId;
+use engram_core::{HostId, MetaError};
 
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus, SharedState};
 use engram_core::SessionId;
@@ -234,6 +234,7 @@ pub async fn run_once(
         .meta
         .list_stale_hosts(cfg.stale_threshold.as_secs())
         .await?;
+    host_lost_straggler_sweep(state).await?;
     // A host that stopped being a candidate recovered (its heartbeats
     // are landing again) — drop its strikes/rescue history.
     let ids: std::collections::HashSet<HostId> = candidates.iter().map(|h| h.id).collect();
@@ -251,6 +252,103 @@ pub async fn run_once(
             tracing::warn!(host_id = %host.id, error = %e, "evict failed; another replica may have it");
         }
     }
+    Ok(())
+}
+
+/// Settle HostLost rows whose inline second-stage transition never ran
+/// or failed. This is deliberately a delayed backstop, not the normal
+/// HostLost path.
+pub async fn host_lost_straggler_sweep(
+    state: &SharedState,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let meta = &state.services.meta;
+    let sessions = meta.list_host_lost_sessions().await?;
+
+    for session in sessions {
+        let now = state.services.clock.now_utc();
+        // Keep this sweep a backstop: flip_missing and evict_host normally
+        // settle HostLost inline. Only rows stranded for more than a tick's
+        // grace should be repaired here.
+        if now - session.last_active_at <= chrono::Duration::seconds(60) {
+            continue;
+        }
+
+        if let Some(sandbox_id) = session.sandbox_id {
+            state.host_registry.invalidate_sandbox(sandbox_id);
+
+            if let Some(backend) = session
+                .host_id
+                .and_then(|host_id| state.host_registry.backend_of(host_id))
+            {
+                if let Err(e) = backend.destroy(sandbox_id, SessionFence::unfenced()).await {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session.id,
+                        %sandbox_id,
+                        "host-lost straggler destroy failed; continuing settlement",
+                    );
+                }
+            }
+
+            if let Err(e) = meta
+                .assign_session_sandbox_guarded(session.id, None, Some(Some(sandbox_id)), &[])
+                .await
+            {
+                if !matches!(e, MetaError::Conflict(_)) {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session.id,
+                        "host-lost straggler sandbox clear failed",
+                    );
+                }
+                continue;
+            }
+        }
+
+        if session.host_id.is_some() {
+            if let Err(e) = meta.assign_session_host(session.id, None).await {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session.id,
+                    "host-lost straggler host clear failed",
+                );
+                continue;
+            }
+        }
+
+        let snapshot = match meta.latest_snapshot_for_session(session.id).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session.id,
+                    "host-lost straggler snapshot lookup failed",
+                );
+                continue;
+            }
+        };
+        let target = recovery_target(snapshot.is_some(), session.live_disk_manifest.is_some());
+        match meta.transition_session(session.id, target).await {
+            Ok(prev) => {
+                emit_status_changed(meta, &state.events, session.id, prev, target, now).await;
+                ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLERS_SETTLED_TOTAL)
+                    .increment(1);
+                tracing::info!(
+                    session_id = %session.id,
+                    ?target,
+                    "host-lost straggler settled",
+                );
+            }
+            Err(MetaError::Conflict(_)) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                session_id = %session.id,
+                ?target,
+                "host-lost straggler second-stage transition failed",
+            ),
+        }
+    }
+
     Ok(())
 }
 
