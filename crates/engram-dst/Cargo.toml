@@ -17,6 +17,7 @@ engram-cloud-mock.workspace = true
 engram-coordinator.workspace = true
 engram-core.workspace = true
 engram-crypto.workspace = true
+engram-harness-proto.workspace = true
 engram-oci.workspace = true
 engram-protocol.workspace = true
 engram-secrets-dev.workspace = true
@@ -29,6 +30,7 @@ rand_chacha = { workspace = true }
 serde_json.workspace = true
 tempfile = "3"
 tokio.workspace = true
+tonic = { workspace = true }
 toml.workspace = true
 tower.workspace = true
 uuid.workspace = true

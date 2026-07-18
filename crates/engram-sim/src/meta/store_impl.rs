@@ -2960,8 +2960,10 @@ impl MetadataStore for SimMetadataStore {
         Ok(job)
     }
 
-    async fn delete_broker_token(&self, _id: SessionId) -> Result<(), MetaError> {
-        panic!("SimMeta: delete_broker_token not implemented — add it plus a conformance case (ADR 0098 D4)")
+    async fn delete_broker_token(&self, id: SessionId) -> Result<(), MetaError> {
+        self.gate()?;
+        self.db.lock().broker_tokens.remove(&id);
+        Ok(())
     }
 
     async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
@@ -3013,9 +3015,10 @@ impl MetadataStore for SimMetadataStore {
 
     async fn get_broker_token(
         &self,
-        _id: SessionId,
+        id: SessionId,
     ) -> Result<Option<engram_core::types::registry::SessionBrokerToken>, MetaError> {
-        panic!("SimMeta: get_broker_token not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self.db.lock().broker_tokens.get(&id).cloned())
     }
 
     async fn get_capture_job(&self, _id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
@@ -3057,7 +3060,8 @@ impl MetadataStore for SimMetadataStore {
         &self,
         _id: SessionId,
     ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
-        panic!("SimMeta: get_teleport_target not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self.db.lock().teleport_targets.get(&_id).copied())
     }
 
     async fn hosts_with_live_capture_jobs(
@@ -3068,9 +3072,19 @@ impl MetadataStore for SimMetadataStore {
 
     async fn insert_broker_token(
         &self,
-        _token: engram_core::types::registry::SessionBrokerToken,
+        token: engram_core::types::registry::SessionBrokerToken,
     ) -> Result<bool, MetaError> {
-        panic!("SimMeta: insert_broker_token not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // First-writer-wins (PG: ON CONFLICT (session_id) DO NOTHING).
+        self.gate()?;
+        let mut db = self.db.lock();
+        if let std::collections::btree_map::Entry::Vacant(slot) =
+            db.broker_tokens.entry(token.session_id)
+        {
+            slot.insert(token);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     async fn insert_capture_job(&self, row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
@@ -3123,9 +3137,27 @@ impl MetadataStore for SimMetadataStore {
 
     async fn list_active_assignments_with_budgets_on_host(
         &self,
-        _host_id: HostId,
+        host_id: HostId,
     ) -> Result<Vec<SandboxAssignment>, MetaError> {
-        panic!("SimMeta: list_active_assignments_with_budgets_on_host not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // PG twin: Active + bound sessions on `host_id`, with their
+        // reservation budgets (COALESCE NULL → 0).
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sessions
+            .values()
+            .filter(|r| {
+                r.session.host_id == Some(host_id)
+                    && r.session.status == SessionState::Active
+                    && r.session.sandbox_id.is_some()
+            })
+            .map(|r| SandboxAssignment {
+                session_id: r.session.id,
+                sandbox_id: r.session.sandbox_id.expect("filtered"),
+                mem_budget_mib: r.mem_budget_mib,
+                cpu_budget_vcpus: r.cpu_budget_vcpus,
+            })
+            .collect())
     }
 
     /// The reconcile pass query: Active + bound sessions on `host_id`.
@@ -3438,13 +3470,42 @@ impl MetadataStore for SimMetadataStore {
 
     async fn rebind_session_guarded(
         &self,
-        _id: SessionId,
-        _host_id: HostId,
-        _sandbox_id: SandboxId,
-        _expected_current: Option<Option<SandboxId>>,
-        _allowed_states: &[SessionState],
+        id: SessionId,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
     ) -> Result<(), MetaError> {
-        panic!("SimMeta: rebind_session_guarded not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // PG twin (rebind onto a fresh host+sandbox under the same CAS as
+        // assign_session_sandbox_guarded, also stamping host_id and — issue
+        // #215 — clearing the reconcile strike streak). A guard miss is a
+        // Conflict; a missing row is NotFound.
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(r) = db.sessions.get_mut(&id) else {
+            return Err(MetaError::NotFound);
+        };
+        if let Some(expected) = expected_current {
+            if r.session.sandbox_id != expected {
+                return Err(MetaError::Conflict(format!(
+                    "rebind_session_guarded CAS: sandbox_id is {:?}, expected {:?}",
+                    r.session.sandbox_id, expected
+                )));
+            }
+        }
+        if !allowed_states.is_empty() && !allowed_states.contains(&r.session.status) {
+            return Err(MetaError::Conflict(format!(
+                "rebind_session_guarded CAS: status is {}, not in {:?}",
+                r.session.status.as_str(),
+                allowed_states
+            )));
+        }
+        r.session.host_id = Some(host_id);
+        r.session.sandbox_id = Some(sandbox_id);
+        r.missing_strikes = 0;
+        r.updated_at = now;
+        Ok(())
     }
 
     async fn record_capture_job_report(
@@ -3712,10 +3773,23 @@ impl MetadataStore for SimMetadataStore {
 
     async fn set_teleport_target(
         &self,
-        _id: SessionId,
-        _target: Option<HostId>,
+        id: SessionId,
+        target: Option<HostId>,
     ) -> Result<(), MetaError> {
-        panic!("SimMeta: set_teleport_target not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // PG twin: set/clear the pin + its `_set_at` together (issue #214).
+        // A no-op for an absent session, like the bare UPDATE.
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        match target {
+            Some(h) => {
+                db.teleport_targets.insert(id, (h, Some(now)));
+            }
+            None => {
+                db.teleport_targets.remove(&id);
+            }
+        }
+        Ok(())
     }
 
     /// `SELECT count(*), coalesce(sum(size_bytes),0) FROM snapshots` —

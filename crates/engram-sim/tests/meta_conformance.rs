@@ -1259,6 +1259,50 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
     assert_eq!(rows, expected);
 }
 
+/// ADR 0023 broker tokens (R2): first-writer-wins insert, get, delete.
+async fn broker_token_flow(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:broker")).await.unwrap();
+    let token = engram_core::types::registry::SessionBrokerToken {
+        session_id: id,
+        wrapped_dek: vec![1, 2, 3],
+        nonce: vec![4, 5],
+        ciphertext: vec![6, 7, 8, 9],
+        key_id: "conf:kek:v1".to_string(),
+    };
+    assert!(meta.insert_broker_token(token.clone()).await.unwrap());
+    // ON CONFLICT DO NOTHING: the racing sibling loses cleanly.
+    assert!(!meta.insert_broker_token(token.clone()).await.unwrap());
+    let got = meta.get_broker_token(id).await.unwrap().expect("present");
+    assert_eq!(got.wrapped_dek, token.wrapped_dek);
+    assert_eq!(got.key_id, token.key_id);
+    meta.delete_broker_token(id).await.unwrap();
+    assert!(meta.get_broker_token(id).await.unwrap().is_none());
+    // A never-inserted session reads None (not an error).
+    assert!(meta
+        .get_broker_token(SessionId::new())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// ADR 0045 teleport target pin (R2): set stamps host+`_set_at`, clear
+/// nulls both, get round-trips.
+async fn teleport_target_flow(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:teleport")).await.unwrap();
+    assert!(meta.get_teleport_target(id).await.unwrap().is_none());
+    let host = HostId::new();
+    meta.set_teleport_target(id, Some(host)).await.unwrap();
+    let (got_host, set_at) = meta.get_teleport_target(id).await.unwrap().expect("pinned");
+    assert_eq!(got_host, host);
+    assert!(set_at.is_some(), "a set pin stamps its set_at");
+    meta.set_teleport_target(id, None).await.unwrap();
+    assert!(meta.get_teleport_target(id).await.unwrap().is_none());
+}
+
+conformance!(t_broker_token_flow, super::broker_token_flow);
+conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
 conformance!(

@@ -1078,7 +1078,11 @@ pub(crate) async fn prepare_from_grpc(
         req.mode,
         req.prompt.clone(),
         req.secrets.clone(),
-        SessionId::new(),
+        // ADR 0098 D1: mint from the INJECTED entropy (in prod this is
+        // `OsEntropy`, identical randomness; the deterministic simulator
+        // needs the id to be seed-derived). A raw `SessionId::new()` here
+        // was a determinism leak — the session id diverged every replay.
+        SessionId::from(state.services.entropy.uuid()),
         bundle,
         req.selected_skills.clone(),
         req.capabilities.clone(),
