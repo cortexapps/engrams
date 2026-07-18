@@ -137,6 +137,7 @@ jobs:
       test_fc: ${{ steps.lanes.outputs.test_fc }}
       test_web: ${{ steps.lanes.outputs.test_web }}
       test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
+      test_host_sim: ${{ steps.lanes.outputs.test_host_sim }}
       test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
     steps:
@@ -2067,6 +2068,44 @@ jobs:
       - name: calm swarm (100 seeds x 1500 steps)
         run: cargo run -p engram-dst --release --bin sim -- --seeds 0..100 --steps 1500 --profile calm
 
+  # ADR 0098 P9: the HOST-INTERNAL deterministic-simulation swarm
+  # (engram-dst-host — Flows A-F over the real host-agent machinery on a
+  # per-run tempdir). Fixed seed windows (a failure is always locally
+  # reproducible: `just sim-host <n> <steps> <profile>`); the deep-horizon
+  # arm is nightly-sim.yml's host-swarm job. Gated on the sim binary's own
+  # release closure (detect's `test_host_sim`), which is disjoint from
+  # engram-dst's coordinator closure by construction.
+  test-host-sim:
+    name: host simulation swarm (engram-dst-host)
+    needs: detect
+    if: needs.detect.outputs.test_host_sim == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release-host-sim
+      - name: replay-twice determinism self-check (seed 5, chaos)
+        # Two runs of one seed must produce byte-identical per-seed output
+        # (the bin's success lines are a pure function of the seed) — the
+        # cheapest whole-binary guard against a nondeterminism leak
+        # (BTreeMap discipline, entropy stream, paused-clock ordering).
+        run: |
+          cargo run -p engram-dst-host --release --bin sim-host -- --seed 5 --steps 800 --profile chaos > "$RUNNER_TEMP/replay-a.txt"
+          cargo run -p engram-dst-host --release --bin sim-host -- --seed 5 --steps 800 --profile chaos > "$RUNNER_TEMP/replay-b.txt"
+          diff "$RUNNER_TEMP/replay-a.txt" "$RUNNER_TEMP/replay-b.txt"
+      - name: chaos swarm (60 seeds x 1000 steps)
+        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds 0..60 --steps 1000 --profile chaos
+      - name: calm swarm (30 seeds x 1000 steps)
+        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds 0..30 --steps 1000 --profile calm
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -2083,6 +2122,7 @@ jobs:
       - vz
       - test-macos
       - test-sim
+      - test-host-sim
       # The end-to-end coord lane + its upstream bake/artifact deps. Previously
       # omitted (e2e was non-required), which let a red e2e merge — now gated.
       - bake-harness-claude-artifact

@@ -13,6 +13,11 @@
 # crates/engram-dst/tests/regression_seeds.rs (the ADR 0098 rule: every fixed
 # failure becomes a pinned regression).
 #
+# The `host-swarm` job is the same exploration arm for the HOST-INTERNAL
+# simulator (ADR 0098 P9, engram-dst-host / ci.yml `test-host-sim`): fresh
+# date-derived windows at deep horizons, failures pinned into
+# crates/engram-dst-host/tests/regression_seeds.rs via `just sim-host <n>`.
+#
 # Not a PR check: this never appears in ci.yml's `CI Gate` and must never be
 # made a required status (AGENTS.md — only the gate aggregator is required).
 
@@ -101,6 +106,81 @@ jobs:
           slug=${slug:-invariant-violation}
           title="nightly sim: \`${slug}\` violated"
           body=$(printf '%s\n\n%s\n\n---\n_Run: %s • commit %s • fix flow: replay locally at this commit, fix, then pin the seed in `crates/engram-dst/tests/regression_seeds.rs` (ADR 0098)._\n' \
+            "**Commit:** \`${GITHUB_SHA}\` — replay commands below assume \`git checkout ${GITHUB_SHA}\`." \
+            "$reports" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "${GITHUB_SHA}")
+          existing=$(gh issue list --state open --label sim-failure --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "commenting on existing issue #$existing"
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label sim-failure --body "$body"
+          fi
+
+  host-swarm:
+    name: nightly host swarm (engram-dst-host, deep horizon)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # Same key as ci.yml's test-host-sim lane — reuse its release cache.
+          shared-key: workspace-release-host-sim
+      - name: Pick tonight's seed window
+        id: seeds
+        # Day-derived, non-overlapping windows (the same discipline as the
+        # coordinator swarm above; the two sims' seed spaces are independent,
+        # so sharing the day formula is fine). 480 seeds/night: 360 chaos +
+        # 120 calm at 4000 steps — the host sim's steps run real tempdir fs +
+        # chunk-store I/O, so the nightly volume sits below the coordinator
+        # sim's at a comparable wall budget.
+        run: |
+          day=$(( $(date -u +%s) / 86400 ))
+          base=$(( day * 480 ))
+          chaos_start=$base
+          chaos_end=$(( base + 360 ))
+          calm_start=$chaos_end
+          calm_end=$(( base + 480 ))
+          echo "chaos=${chaos_start}..${chaos_end}" >> "$GITHUB_OUTPUT"
+          echo "calm=${calm_start}..${calm_end}" >> "$GITHUB_OUTPUT"
+          echo "UTC day ${day}: host chaos seeds ${chaos_start}..${chaos_end}, calm seeds ${calm_start}..${calm_end}, 4000 steps"
+      - name: chaos swarm (360 seeds x 4000 steps)
+        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds ${{ steps.seeds.outputs.chaos }} --steps 4000 --profile chaos --failure-report "$RUNNER_TEMP/host-chaos-report.md"
+      - name: calm swarm (120 seeds x 4000 steps)
+        if: ${{ !cancelled() }}
+        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds ${{ steps.seeds.outputs.calm }} --steps 4000 --profile calm --failure-report "$RUNNER_TEMP/host-calm-report.md"
+      - name: File a failure issue with repro steps
+        # Same dedup discipline as the coordinator swarm: one open issue per
+        # invariant slug, repeats accumulate as comments. The title prefix
+        # keeps host-sim slugs from colliding with same-named coordinator
+        # invariants.
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reports=""
+          for f in "$RUNNER_TEMP/host-chaos-report.md" "$RUNNER_TEMP/host-calm-report.md"; do
+            if [ -s "$f" ]; then
+              reports="${reports}$(cat "$f")"$'\n'
+            fi
+          done
+          if [ -z "$reports" ]; then
+            echo "job failed with no failure report — infra error, not filing an issue"
+            exit 0
+          fi
+          slug=$(printf '%s' "$reports" | sed -n 's/^<!-- sim-failure-slug: \(.*\) -->$/\1/p' | head -1)
+          slug=${slug:-invariant-violation}
+          title="nightly host sim: \`${slug}\` violated"
+          body=$(printf '%s\n\n%s\n\n---\n_Run: %s • commit %s • fix flow: replay locally at this commit (`just sim-host <seed> <steps> <profile>`), fix, then pin the seed in `crates/engram-dst-host/tests/regression_seeds.rs` (ADR 0098)._\n' \
             "**Commit:** \`${GITHUB_SHA}\` — replay commands below assume \`git checkout ${GITHUB_SHA}\`." \
             "$reports" \
             "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
