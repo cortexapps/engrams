@@ -52,6 +52,22 @@ fn issue_762_host_lost_straggler_after_evict_budget_exhaustion() {
     run(33043259, Profile::Chaos, 5000);
 }
 
+/// R1.7a swarm find (chaos seed 96 at 1500 steps): first exposed once the
+/// EnableScanner / CheckpointRetention / BaseSnapshotRetention DriverKinds
+/// grew the driver menu and reshuffled exploration. A different route into
+/// `HostLost` than seed 33043259 above (the grown menu manufactures its own
+/// interleaving), it lands a session at `HostLost` that no inline stage-2
+/// ever settles — the row sits stuck through full quiescence, tripping
+/// `quiescence-no-stragglers`. Only `dead_host::host_lost_straggler_sweep`
+/// (#770) moves it on: verified this pin FAILS ("session … stuck at
+/// HostLost after convergence") with the sweep call commented out and
+/// PASSES with it, so it is a live regression guard on the sweep, not a
+/// tautology.
+#[test]
+fn seed_96_host_lost_straggler_settles_via_sweep() {
+    run(96, Profile::Chaos, 1500);
+}
+
 /// ADR 0098 coverage-gap G1 (PR #743, session 03e6535e): a resume-class op
 /// wedged forever inside its host RPC while the within-step heartbeat kept
 /// the op row fresh — stale-op reclaim never fired and the op pinned for
