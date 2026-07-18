@@ -7,9 +7,13 @@
 //! consecutive heartbeats (default 3, ~15 s at the 5 s cadence)
 //! transition per the missing-sandbox policy:
 //!
-//! - latest `snapshots` row has `recoverable = true`  → `Idle`
-//!   (next user prompt rehydrates via the existing resume path).
-//! - else → `Dead` (terminal).
+//! - latest `snapshots` row has `recoverable = true`, OR the session
+//!   carries a live disk manifest → `Idle` (next user prompt rehydrates
+//!   via the existing resume / disk-only cold-boot path).
+//! - else → `Dead` (terminal). Issue #777 honest-Dead: an un-recoverable
+//!   snapshot row is NOT enough — the shared `dead_host::recovery_target`
+//!   predicate keys on the `recoverable` flag, never mere row presence,
+//!   so we never land an `Idle` that lies about resumability.
 //!
 //! This closes case **B** from the failure-mode taxonomy (Active
 //! sessions stuck pointing at sandbox_ids that no longer exist
@@ -374,28 +378,34 @@ async fn flip_missing(
     };
     emit_status_changed(meta, events, session_id, prev, SessionState::HostLost, now).await;
 
-    // ADR 0015 M2 stage 2: HostLost -> {Idle if recoverable
-    // snapshot, Dead otherwise}. The `recoverable` column carries the
-    // result of the BlobStorage HEAD check at snapshot-take time —
-    // false here means even an Idle-ready snapshot wouldn't survive a
-    // /resume request.
-    let recoverable = match meta.latest_snapshot_for_session(session_id).await {
-        Ok(Some(s)) => s.recoverable,
-        Ok(None) => false,
+    // ADR 0015 M2 stage 2, unified in issue #777 (ADR 0098 Phase 3):
+    // HostLost -> {Idle, Dead} via the ONE shared predicate
+    // `dead_host::recovery_target`. A session is recoverable iff its
+    // latest snapshot's `recoverable` flag is true (the BlobStorage HEAD
+    // result at snapshot-take time — false means even an Idle-ready
+    // snapshot wouldn't survive a /resume) OR it has a live disk manifest
+    // (disk-only cold-boot resume). Before #777 this site ignored the
+    // manifest (a disk-recoverable session could be lied into Dead) and
+    // the two dead-host sites keyed on mere snapshot presence (an
+    // un-recoverable snapshot could be lied into Idle) — the shared
+    // predicate closes both directions.
+    let latest_snapshot = match meta.latest_snapshot_for_session(session_id).await {
+        Ok(opt) => opt,
         Err(e) => {
             tracing::warn!(
                 session_id = %session_id,
                 error = %e,
                 "reconcile: latest_snapshot_for_session failed; treating as not-recoverable"
             );
-            false
+            None
         }
     };
-    let new_status = if recoverable {
-        SessionState::Idle
-    } else {
-        SessionState::Dead
-    };
+    let has_recoverable_snapshot = latest_snapshot.as_ref().is_some_and(|s| s.recoverable);
+    let new_status = crate::dead_host::recovery_target(
+        has_recoverable_snapshot,
+        session.live_disk_manifest.is_some(),
+    );
+    crate::dead_host::note_unrecoverable_if_dead(new_status, latest_snapshot.as_ref(), session_id);
     match meta.transition_session(session_id, new_status).await {
         Ok(host_lost_prev) => {
             emit_status_changed(meta, events, session_id, host_lost_prev, new_status, now).await;
@@ -403,7 +413,8 @@ async fn flip_missing(
                 session_id = %session_id,
                 host_id = %host_id,
                 final_state = ?new_status,
-                recoverable,
+                has_recoverable_snapshot,
+                has_live_manifest = session.live_disk_manifest.is_some(),
                 "ADR 0009 reconcile: orphaned session moved through HostLost"
             );
         }

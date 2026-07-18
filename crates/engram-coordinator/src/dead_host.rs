@@ -327,7 +327,12 @@ pub async fn host_lost_straggler_sweep(
                 continue;
             }
         };
-        let target = recovery_target(snapshot.is_some(), session.live_disk_manifest.is_some());
+        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
+        let target = recovery_target(
+            has_recoverable_snapshot,
+            session.live_disk_manifest.is_some(),
+        );
+        note_unrecoverable_if_dead(target, snapshot.as_ref(), session.id);
         match meta.transition_session(session.id, target).await {
             Ok(prev) => {
                 emit_status_changed(meta, &state.events, session.id, prev, target, now).await;
@@ -370,18 +375,55 @@ async fn host_responds(client: &Arc<dyn engram_core::traits::HostClient>) -> boo
     client.ping().await.is_ok()
 }
 
-/// The dead-host detector's stage-2 routing decision (ADR 0045 Phase
-/// A). A session is recoverable — and routed to `Idle` for lazy
-/// `/resume` on next access — if it has a memory snapshot OR a live
-/// disk manifest (the latter still resumes via the cold-boot path).
-/// With nothing to recover from, it goes to `Dead`. The detector no
-/// longer routes into `Evacuating`; proactive relocation is operator
-/// drain only (ADR 0044 K3).
-fn recovery_target(has_snapshot: bool, has_live_manifest: bool) -> SessionState {
-    if has_snapshot || has_live_manifest {
+/// THE HostLost stage-2 routing predicate (ADR 0045 Phase A; unified in
+/// issue #777, ADR 0098 Phase 3 "honest-Dead"). A session is recoverable
+/// — routed to `Idle` for lazy `/resume` on next access — iff it has a
+/// **recoverable** memory snapshot OR a live disk manifest (the latter
+/// still resumes via the cold-boot path). With nothing recoverable it
+/// goes to `Dead` — never an `Idle` that lies about resumability.
+///
+/// `has_recoverable_snapshot` is the honest predicate: it is the latest
+/// snapshot's `recoverable` flag (the BlobStorage HEAD result at
+/// snapshot-take time), NOT the mere presence of a snapshot row. Before
+/// #777 the two dead-host sites keyed on `snapshot.is_some()`, disagreeing
+/// with `reconcile::flip_missing`, which already keyed on `recoverable`;
+/// the filtered predicate is now the one true stage-2 decision, shared by
+/// every site.
+///
+/// The detector no longer routes into `Evacuating`; proactive relocation
+/// is operator drain only (ADR 0044 K3).
+pub(crate) fn recovery_target(
+    has_recoverable_snapshot: bool,
+    has_live_manifest: bool,
+) -> SessionState {
+    if has_recoverable_snapshot || has_live_manifest {
         SessionState::Idle
     } else {
         SessionState::Dead
+    }
+}
+
+/// The "snapshot rows exist but none is recoverable" signal (issue #777,
+/// ADR 0098 Phase 3 honest-Dead). When stage 2 routes a session to `Dead`
+/// while a snapshot row DID exist, the snapshot was un-recoverable (its
+/// BlobStorage HEAD failed at take-time) and there was no live disk
+/// manifest either. Emit a distinct warn + counter so a bad-capture
+/// pipeline stays visible instead of hiding behind a generic Dead — a
+/// no-op when the target is `Idle` (recoverable) or when there was no
+/// snapshot at all (a genuinely never-checkpointed session).
+pub(crate) fn note_unrecoverable_if_dead(
+    target: SessionState,
+    latest_snapshot: Option<&engram_core::types::snapshot::SnapshotRecord>,
+    session_id: SessionId,
+) {
+    if target == SessionState::Dead && latest_snapshot.is_some() {
+        ::metrics::counter!(crate::metrics::HOST_LOST_UNRECOVERABLE_SNAPSHOT_TOTAL).increment(1);
+        tracing::warn!(
+            session_id = %session_id,
+            "HostLost stage 2: snapshot row(s) exist but none is recoverable and no live disk \
+             manifest — routing to Dead (bad-capture signal, issue #777). Check snapshot \
+             durability (BlobStorage HEAD at capture time)",
+        );
     }
 }
 
@@ -564,13 +606,15 @@ async fn evict_host_locked(
     // resume-from-idle wedge + deploy-storm cascade). Proactive
     // relocation now happens only via operator drain (ADR 0044 K3).
     //
-    // Decision matrix:
+    // Decision matrix (issue #777 honest-Dead: the snapshot column is the
+    // `recoverable` FLAG, not mere row presence — an un-recoverable
+    // snapshot is NOT resumable and must not route to a lying Idle):
     //
-    // | snapshot | live_manifest | next state | who recovers it          |
-    // |----------|---------------|------------|--------------------------|
-    // | Some     | _             | Idle       | user/exec /resume        |
-    // | None     | Some          | Idle       | /resume (disk-only cold) |
-    // | None     | None          | Dead       | (no recoverable state)   |
+    // | recoverable snap | live_manifest | next state | who recovers it          |
+    // |------------------|---------------|------------|--------------------------|
+    // | true             | _             | Idle       | user/exec /resume        |
+    // | false/none       | Some          | Idle       | /resume (disk-only cold) |
+    // | false/none       | None          | Dead       | (no recoverable state)   |
     //
     // Failures of any query/transition are logged and skipped; the
     // row stays at HostLost and a future reconcile pass (or
@@ -603,7 +647,9 @@ async fn evict_host_locked(
             }
         };
 
-        let target = recovery_target(snapshot.is_some(), has_live_manifest);
+        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
+        let target = recovery_target(has_recoverable_snapshot, has_live_manifest);
+        note_unrecoverable_if_dead(target, snapshot.as_ref(), *session_id);
 
         match meta.transition_session(*session_id, target).await {
             Ok(prev) => {
@@ -650,19 +696,21 @@ mod tests {
     // multi-replica behaviour is the live-Postgres test
     // (`#[ignore]`'d, gated behind dev-VM Docker compose).
 
-    // ADR 0045 Phase A: the stage-2 routing decision. A recoverable
-    // dead-host session goes to Idle (lazy /resume), never Evacuating
-    // (the reactive auto-evac is retired); only the no-state case is
-    // terminal.
+    // ADR 0045 Phase A + issue #777 honest-Dead: the stage-2 routing
+    // decision. A RECOVERABLE dead-host session goes to Idle (lazy
+    // /resume), never Evacuating (the reactive auto-evac is retired);
+    // only the no-recoverable-state case is terminal. The first arg is
+    // the snapshot's `recoverable` FLAG, not mere row presence — an
+    // un-recoverable snapshot alone is NOT resumable.
     #[test]
     fn recovery_target_routes_recoverable_to_idle_never_evacuating() {
-        // snapshot present → Idle (memory + disk resume).
+        // recoverable snapshot → Idle (memory + disk resume).
         assert_eq!(recovery_target(true, false), SessionState::Idle);
-        // disk-only (live manifest, no snapshot) → Idle (cold-boot resume).
+        // disk-only (live manifest, no recoverable snapshot) → Idle (cold-boot resume).
         assert_eq!(recovery_target(false, true), SessionState::Idle);
         // both present → Idle.
         assert_eq!(recovery_target(true, true), SessionState::Idle);
-        // nothing recoverable → Dead.
+        // nothing recoverable (no recoverable snapshot, no manifest) → Dead.
         assert_eq!(recovery_target(false, false), SessionState::Dead);
 
         // The reactive auto-evac target is gone: no input combination
