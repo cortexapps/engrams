@@ -475,13 +475,13 @@ async fn gate_drain(
     host: HostId,
     budget: Duration,
 ) -> Result<(), OperatorError> {
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = crate::time_source::metrics_now_tokio() + budget;
     loop {
         match coord.host_status(host).await? {
             None => return Ok(()), // already deregistered
             Some(st) if st.running_sandboxes == 0 && !st.has_enable_work() => return Ok(()),
             Some(st) => {
-                if tokio::time::Instant::now() >= deadline {
+                if crate::time_source::metrics_now_tokio() >= deadline {
                     return Err(OperatorError::DrainTimeout {
                         host_id: host.to_string(),
                         remaining: st.running_sandboxes,

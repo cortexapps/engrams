@@ -17,6 +17,12 @@ description = "Per-host daemon: chunked-OCI session create, snapshot manager, re
 [lints.rust]
 unsafe_code = "allow"
 
+# Replicated from the workspace `[workspace.lints.clippy]` table because
+# `[lints] workspace = true` cannot coexist with the crate-local `unsafe_code`
+# override (cargo forbids mixing); keep in sync with the root Cargo.toml.
+[lints.clippy]
+disallowed_methods = "deny"
+
 [lib]
 path = "src/lib.rs"
 

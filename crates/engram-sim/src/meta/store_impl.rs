@@ -393,6 +393,27 @@ impl MetadataStore for SimMetadataStore {
         Ok(current)
     }
 
+    /// Terminal transition (ADR 0015 M2): pick the terminal target for the
+    /// current state and drive `transition_session` to it; `None` when the
+    /// session is already terminal. PostgresStore does NOT override the trait
+    /// default either — both stores compose `get_session` +
+    /// `transition_session`. Written out explicitly here (rather than
+    /// inheriting the default) so the conformance suite exercises the
+    /// composition against Sim's own row-locked `transition_session`, and so a
+    /// future PG-side divergence surfaces as a Sim gap, not a silent drift
+    /// (ADR 0098 D4).
+    async fn terminate_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<(SessionState, SessionState)>, MetaError> {
+        let session = self.get_session(id).await?;
+        let Some(target) = session.status.terminal_target() else {
+            return Ok(None);
+        };
+        let prev = self.transition_session(id, target).await?;
+        Ok(Some((prev, target)))
+    }
+
     /// `UPDATE sessions SET host_id=$2, updated_at=$3 WHERE id=$1`.
     async fn assign_session_host(
         &self,
@@ -619,6 +640,24 @@ impl MetadataStore for SimMetadataStore {
             .filter(|h| matches!(h.status, HostStatus::Ready | HostStatus::Draining))
             .cloned()
             .collect())
+    }
+
+    /// ADR 0068: `hosts.capabilities.fc_snapshot_version` for one host.
+    /// PostgresStore does not override the trait default; both stores derive
+    /// it from an active-host scan. Written out explicitly (rather than
+    /// inheriting the default) so the conformance suite pins Sim's
+    /// `list_active_hosts` semantics (`ready|draining`) as the backing lookup
+    /// and a future PG divergence surfaces as a Sim gap (ADR 0098 D4).
+    async fn fc_snapshot_version_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Option<String>, MetaError> {
+        Ok(self
+            .list_active_hosts()
+            .await?
+            .into_iter()
+            .find(|h| h.id == host_id)
+            .and_then(|h| h.capabilities.fc_snapshot_version))
     }
 
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError> {
@@ -948,6 +987,24 @@ impl MetadataStore for SimMetadataStore {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// Phase 1c (ADR 0052): PostgresStore fans one EPHEMERAL live-token delta
+    /// out cross-replica via `NOTIFY session_event_deltas` — no row, no idx,
+    /// best-effort by contract (a dropped notification costs only live
+    /// animation, never correctness; the durable event log is the record).
+    /// The simulator models a single logical store with no peer-replica
+    /// listener bus, so there is nobody to fan out to — a no-op is the CORRECT
+    /// Sim behavior, not a silently-inherited default. Still gated so a
+    /// simulated PG-outage window mirrors PG's failing `pg_notify` execute
+    /// (ADR 0098 D4).
+    async fn notify_session_delta(
+        &self,
+        _session_id: SessionId,
+        _payload: &serde_json::Value,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        Ok(())
     }
 
     // ================= artifacts =================

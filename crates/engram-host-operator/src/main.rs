@@ -12,6 +12,7 @@ mod crd;
 mod error;
 mod reconcile;
 mod scaler;
+mod time_source;
 mod wave;
 
 use std::sync::Arc;

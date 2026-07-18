@@ -20,6 +20,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use engram_agentd::serve_connection;
+use engram_agentd::time_source;
 
 fn main() -> ExitCode {
     // ADR 0023: in-guest forge client mode. `engram-agentd
@@ -421,7 +422,7 @@ async fn run_transport(
         );
     }
     if !skip_ready_dial {
-        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(90);
+        let ready_deadline = time_source::metrics_now() + std::time::Duration::from_secs(90);
         let mut attempt: u32 = 0;
         loop {
             attempt += 1;
@@ -457,7 +458,7 @@ async fn run_transport(
                     "ready-port dial failed; will re-dial (likely FC vsock starved by slow rootfs I/O on a cold boot)",
                 ),
             }
-            if std::time::Instant::now() >= ready_deadline {
+            if time_source::metrics_now() >= ready_deadline {
                 tracing::warn!(
                     attempt,
                     port = engram_agentd::ENGRAM_AGENTD_READY_PORT,

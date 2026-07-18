@@ -93,10 +93,14 @@ pub struct WorkingSetTrace {
 }
 
 impl WorkingSetTrace {
-    pub fn new(vcpu_count: u32, capture_window_ms: u32) -> Self {
+    pub fn new(
+        vcpu_count: u32,
+        capture_window_ms: u32,
+        captured_at: chrono::DateTime<chrono::Utc>,
+    ) -> Self {
         Self {
             schema_version: 1,
-            captured_at: Utc::now(),
+            captured_at,
             vcpu_count,
             capture_window_ms,
             chunks: Vec::new(),
@@ -112,6 +116,10 @@ impl WorkingSetTrace {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a
+    // decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
 
     #[test]
@@ -135,7 +143,7 @@ mod tests {
 
     #[test]
     fn trace_round_trips_through_json() {
-        let mut t = WorkingSetTrace::new(2, 5000);
+        let mut t = WorkingSetTrace::new(2, 5000, DateTime::<Utc>::UNIX_EPOCH);
         t.chunks.push(ChunkHash::of(b"a"));
         t.chunks.push(ChunkHash::of(b"b"));
         let json = serde_json::to_string(&t).unwrap();
@@ -145,7 +153,7 @@ mod tests {
 
     #[test]
     fn approx_bytes_multiplies_chunks_by_size() {
-        let mut t = WorkingSetTrace::new(1, 5000);
+        let mut t = WorkingSetTrace::new(1, 5000, DateTime::<Utc>::UNIX_EPOCH);
         t.chunks.push(ChunkHash::of(b"a"));
         t.chunks.push(ChunkHash::of(b"b"));
         t.chunks.push(ChunkHash::of(b"c"));

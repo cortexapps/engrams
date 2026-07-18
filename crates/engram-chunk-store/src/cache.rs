@@ -784,7 +784,7 @@ impl ChunkCache {
         // fragmentation, etc). Time the read regardless of hit/miss; a miss
         // here is a fast negative stat (no file), not a meaningful latency
         // sample, so only record on a hit.
-        let nvme_read_start = std::time::Instant::now();
+        let nvme_read_start = crate::time_source::metrics_now();
         let nvme_read = read_if_present(&path).await?;
         if let Some(bytes) = nvme_read {
             metrics::histogram!(
@@ -881,7 +881,7 @@ impl ChunkCache {
                 // cost that stretches cold boot (the slow tier). Histogram +
                 // the bytes counter below quantify "how much of the boot is
                 // blob page-in" without per-read trace spam.
-                let fetch_start = std::time::Instant::now();
+                let fetch_start = crate::time_source::metrics_now();
                 let fetched = fetch().await;
                 let source = fetched
                     .as_ref()
@@ -1309,7 +1309,7 @@ impl ChunkCache {
                         None => return, // cache dropped
                     },
                 };
-                let started = std::time::Instant::now();
+                let started = crate::time_source::metrics_now();
                 let scrubbed = cache.scrub_one(hash).await;
                 // Rate limit: sleep so that (bytes hashed) / (elapsed +
                 // sleep) ≤ bytes_per_sec. Zero-byte outcomes (missing)

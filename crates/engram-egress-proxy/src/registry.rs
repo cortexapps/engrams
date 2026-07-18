@@ -172,7 +172,7 @@ impl RefreshableCred {
     fn fresh_enough(&self) -> bool {
         match self.current.read().expires_at {
             None => true,
-            Some(exp) => exp > Utc::now() + Duration::minutes(5),
+            Some(exp) => exp > crate::time_source::wall_now() + Duration::minutes(5),
         }
     }
 }
@@ -480,6 +480,10 @@ pub enum Decision<'a> {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a
+    // decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use std::str::FromStr;
 

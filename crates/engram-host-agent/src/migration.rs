@@ -260,7 +260,7 @@ impl MigrationRegistry {
             .unwrap_or(false)
     }
 
-    // ADR 0098 D1 carve-out: this mints an UNGUESSABLE single-use security
+    // ADR 0098 D1 carve-out, reaffirmed P8: this mints an UNGUESSABLE single-use security
     // token (the migration export id / peer token), not a simulation-visible
     // identifier — the same rationale D1 uses to keep crypto key material on
     // `OsRng` rather than the seeded `entropy`. Seeding it would make the

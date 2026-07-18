@@ -572,7 +572,11 @@ impl Runtime {
             return;
         };
         let r = self.recorder.lock().expect("recorder poisoned");
-        let mut trace = WorkingSetTrace::new(r.vcpu_count_snapshot(), r.window_ms_snapshot());
+        let mut trace = WorkingSetTrace::new(
+            r.vcpu_count_snapshot(),
+            r.window_ms_snapshot(),
+            chrono::Utc::now(),
+        );
         trace.chunks = r.chunks_snapshot();
         drop(r);
         match serde_json::to_vec(&trace) {

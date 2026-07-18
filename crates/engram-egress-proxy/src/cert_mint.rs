@@ -63,7 +63,7 @@ impl CertMint {
         // 25h validity — slightly over a day so we don't churn at
         // exactly the same wall-clock time tomorrow.
         use chrono::Datelike;
-        let now = chrono::Utc::now();
+        let now = crate::time_source::wall_now();
         let earlier = now - chrono::Duration::minutes(5);
         let later = now + chrono::Duration::hours(25);
         params.not_before =

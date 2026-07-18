@@ -224,7 +224,7 @@ impl ChunkStore {
                     break;
                 }
                 // Starved: nothing to upload, block on the reader.
-                let scan_start = std::time::Instant::now();
+                let scan_start = crate::time_source::metrics_now();
                 let item = rx.recv().await;
                 stats.scan_seconds += scan_start.elapsed().as_secs_f64();
                 match item {
@@ -236,7 +236,7 @@ impl ChunkStore {
                 }
             } else {
                 // Await one completion; its slot refills next iteration.
-                let flush_start = std::time::Instant::now();
+                let flush_start = crate::time_source::metrics_now();
                 let done_put = inflight.next().await.expect("non-empty inflight");
                 stats.flush_seconds += flush_start.elapsed().as_secs_f64();
                 refs.push(done_put?);
