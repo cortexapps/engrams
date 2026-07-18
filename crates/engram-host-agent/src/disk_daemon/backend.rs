@@ -76,6 +76,15 @@ pub enum DiskBackendError {
         length: u64,
         total: u64,
     },
+    /// A resolver-fetched chunk's byte length does not match the manifest
+    /// slice width — serving it would read out of bounds. Hash-valid but
+    /// short/long blobs (manifest corruption, a bad flush) land here as a
+    /// typed EIO instead of a slice panic in the NBD daemon.
+    ShortChunk {
+        chunk_idx: usize,
+        expected: u64,
+        actual: usize,
+    },
     /// Internal invariant tripped (an "unreachable" branch fired).
     /// Used by `write_chunk` to surface a logic bug without
     /// panicking the daemon. Replied back to the NBD client as
@@ -94,6 +103,14 @@ impl std::fmt::Display for DiskBackendError {
                 length,
                 total,
             } => write!(f, "NBD range {offset}+{length} exceeds total_bytes {total}"),
+            Self::ShortChunk {
+                chunk_idx,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "chunk {chunk_idx} length {actual} does not match manifest width {expected}"
+            ),
             Self::InvariantViolation(m) => write!(f, "invariant violation: {m}"),
         }
     }
@@ -880,8 +897,17 @@ impl ChunkedDiskBackend {
             .await?;
 
         let mut out = Vec::with_capacity(length as usize);
-        for (&(_, _, intra, take), chunk_bytes) in descriptors.iter().zip(fetched.iter()) {
-            out.extend_from_slice(&chunk_bytes[intra..intra + take]);
+        for (&(chunk_idx, read_len, intra, take), chunk_bytes) in
+            descriptors.iter().zip(fetched.iter())
+        {
+            let slice = chunk_bytes.get(intra..intra + take).ok_or_else(|| {
+                DiskBackendError::ShortChunk {
+                    chunk_idx,
+                    expected: read_len,
+                    actual: chunk_bytes.len(),
+                }
+            })?;
+            out.extend_from_slice(slice);
         }
         Ok(Bytes::from(out))
     }
@@ -2073,6 +2099,13 @@ impl ChunkedDiskBackend {
                 {
                     let mut mem = self.mem_cache.lock().unwrap();
                     if let Some(bytes) = mem.get(&hash) {
+                        if bytes.len() as u64 != chunk_len {
+                            return Err(DiskBackendError::ShortChunk {
+                                chunk_idx,
+                                expected: chunk_len,
+                                actual: bytes.len(),
+                            });
+                        }
                         // Emit a zero-cost marker span so the trace shows the
                         // mem tier serving hot re-reads (the win is countable).
                         if let Some(op) = self.operation_scope.current() {
@@ -2107,6 +2140,13 @@ impl ChunkedDiskBackend {
                 let bytes = self
                     .fetch_chunk_bounded(hash, chunk_idx, chunk_len, tier)
                     .await?;
+                if bytes.len() as u64 != chunk_len {
+                    return Err(DiskBackendError::ShortChunk {
+                        chunk_idx,
+                        expected: chunk_len,
+                        actual: bytes.len(),
+                    });
+                }
                 self.mem_cache.lock().unwrap().put(hash, bytes.clone());
                 Ok(bytes)
             }
@@ -2284,6 +2324,32 @@ mod tests {
     async fn put_chunk(store: &ChunkStore, byte: u8, size: usize) -> ChunkHash {
         let bytes = vec![byte; size];
         store.put_chunk(&bytes).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_returns_short_chunk_error_for_manifest_width_mismatch() {
+        let chunk_size = 4096u64;
+        let dir = tempfile::tempdir().unwrap();
+        let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().to_path_buf()));
+        let store = Arc::new(ChunkStore::new(blob));
+        let hash = store.put_chunk(&[0xaa; 100]).await.unwrap();
+        let manifest = synth_manifest(chunk_size, chunk_size, vec![(0, hash)]);
+        let manifest_ref = ManifestRef::new();
+        store.put_manifest(manifest_ref, &manifest).await.unwrap();
+        let mut cfg = ChunkCacheConfig::new(dir.path().join("cache"));
+        cfg.budget_bytes = 64 * 1024 * 1024;
+        let cache = ChunkCache::new(cfg);
+        let backend =
+            ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
+
+        assert!(matches!(
+            backend.read(0, chunk_size).await,
+            Err(DiskBackendError::ShortChunk {
+                chunk_idx: 0,
+                expected: 4096,
+                actual: 100,
+            })
+        ));
     }
 
     /// 2026-07-16 session-85e0298a RCA: the shutdown spool export must
