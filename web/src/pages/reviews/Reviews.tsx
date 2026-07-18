@@ -56,69 +56,71 @@ export function Reviews() {
   const reviews = data?.reviews ?? [];
 
   return (
-    <div className="flex flex-col gap-6">
-      <PageHeading
-        title="Reviews"
-        eyebrow="Pull requests"
-        description="Durable review passes and the findings recorded by finder and verifier sessions."
-      />
+    <div className="flex-1 overflow-auto p-4 md:p-6">
+      <div className="flex flex-col gap-6">
+        <PageHeading
+          title="Reviews"
+          eyebrow="Pull requests"
+          description="Durable review passes and the findings recorded by finder and verifier sessions."
+        />
 
-      {isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
+        {isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
 
-      {!isPending && error && reviews.length === 0 && (
-        <div role="alert" className="rounded-lg border border-dashed p-8 text-center">
-          <p className="text-sm text-destructive">Couldn’t load reviews. {errorMessage(error)}</p>
-        </div>
-      )}
+        {!isPending && error && reviews.length === 0 && (
+          <div role="alert" className="rounded-lg border border-dashed p-8 text-center">
+            <p className="text-sm text-destructive">Couldn’t load reviews. {errorMessage(error)}</p>
+          </div>
+        )}
 
-      {!isPending && !error && reviews.length === 0 && (
-        <div className="rounded-lg border border-dashed p-8 text-center">
-          <p className="text-sm text-muted-foreground">No reviews yet</p>
-        </div>
-      )}
+        {!isPending && !error && reviews.length === 0 && (
+          <div className="rounded-lg border border-dashed p-8 text-center">
+            <p className="text-sm text-muted-foreground">No reviews yet</p>
+          </div>
+        )}
 
-      {reviews.length > 0 && (
-        <div className="rounded-lg border bg-card shadow-xs">
-          <Table>
-            <TableHeader>
-              <TableRow>
-                <TableHead>Repository</TableHead>
-                <TableHead>PR</TableHead>
-                <TableHead>Status</TableHead>
-                <TableHead>Findings</TableHead>
-                <TableHead>Created</TableHead>
-              </TableRow>
-            </TableHeader>
-            <TableBody>
-              {reviews.map((review) => (
-                <TableRow key={review.id}>
-                  <TableCell className="font-mono text-xs">{review.repo}</TableCell>
-                  <TableCell>
-                    <a
-                      href={`https://github.com/${review.repo}/pull/${review.prNumber}`}
-                      target="_blank"
-                      rel="noreferrer"
-                      className="inline-flex items-center gap-1 underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
-                    >
-                      #{review.prNumber}
-                      <ExternalLink className="size-3" aria-hidden />
-                    </a>
-                  </TableCell>
-                  <TableCell>
-                    <Badge variant="secondary">{review.status}</Badge>
-                  </TableCell>
-                  <TableCell>
-                    <FindingCounts review={review} />
-                  </TableCell>
-                  <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
-                    <CreatedAt review={review} now={now} />
-                  </TableCell>
+        {reviews.length > 0 && (
+          <div className="rounded-lg border bg-card shadow-xs">
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Repository</TableHead>
+                  <TableHead>PR</TableHead>
+                  <TableHead>Status</TableHead>
+                  <TableHead>Findings</TableHead>
+                  <TableHead>Created</TableHead>
                 </TableRow>
-              ))}
-            </TableBody>
-          </Table>
-        </div>
-      )}
+              </TableHeader>
+              <TableBody>
+                {reviews.map((review) => (
+                  <TableRow key={review.id}>
+                    <TableCell className="font-mono text-xs">{review.repo}</TableCell>
+                    <TableCell>
+                      <a
+                        href={`https://github.com/${review.repo}/pull/${review.prNumber}`}
+                        target="_blank"
+                        rel="noreferrer"
+                        className="inline-flex items-center gap-1 underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
+                      >
+                        #{review.prNumber}
+                        <ExternalLink className="size-3" aria-hidden />
+                      </a>
+                    </TableCell>
+                    <TableCell>
+                      <Badge variant="secondary">{review.status}</Badge>
+                    </TableCell>
+                    <TableCell>
+                      <FindingCounts review={review} />
+                    </TableCell>
+                    <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
+                      <CreatedAt review={review} now={now} />
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
