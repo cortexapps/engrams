@@ -850,7 +850,19 @@ straggler sweep drained a live prod backlog on its first ticks) and
 #771/#772/#775/#776/#779/#780 (R1; burst-merged after a combined-state
 check per the AGENTS.md rule). The #777 design calls are decided
 (honest-Dead stage-2 predicate; ask-the-host bound-row policy) and in
-implementation. R2 opens with the CoSim rung-1 crate + the #777 policy PR;
+implementation. R2 is MERGED: #782 (the #777 calls, incl. the flip_missing
+reverse-lie fix), #783 (CoSim rung 1 — **#570 reproduced against real code
+on both sides and fixed**; the capture_in_flight reconcile exemption;
+issue closed), and #786 (the effect queue, the real tonic+axum-driven
+workload, and the acked-only expected-state model oracle — which caught a
+live D1 entropy leak in the API create path in its first swarm). The
+faithful-host work behind #786 unmasked **#787** (suspected
+queue-scanner/OpReclaim double-boot split-brain — the pre-R2 world's
+wire-skewed hosts had silently suppressed the entire digest-gated
+placement path, the exact "stale fake green-lights bugs" risk this ADR
+named). #787 is the next wave's opener; the API-verb swarm integration +
+harness-idle eviction + drain workload steps are deliberately held until
+it is fixed. Rung 2 lives in #784. Historical note superseded:
 the R2 model-oracle/Router-workload/effect-queue track deliberately waits
 for rung 1 to land (the effect queue restructures the same SimHostClient
 seam the cosim bridge consumes). Invariant alerting is live-pending-apply
