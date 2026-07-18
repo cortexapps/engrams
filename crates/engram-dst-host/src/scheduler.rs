@@ -87,6 +87,20 @@ pub enum Step {
     /// completed flush-publish), then the process dies. Every op index must
     /// recover every acked write.
     SpoolCrashAt(usize),
+    /// Flow F (P6): the #204 interleaving — a REAL flush parked at the
+    /// dirty→pending handoff races a guest read+write of the drained
+    /// chunk. The read must never observe pre-drain stale base.
+    FlushHandoffRace(usize),
+    /// Flow F (P6): the #199 fence interleaving — the migration fence
+    /// rises while a REAL flush is parked post-upload/pre-publish; the
+    /// publish must abort (manifest unmoved, dirty re-queued) and the
+    /// post-heal flush publishes the re-queued writes.
+    FlushFenceAbort(usize),
+    /// Flow F (P6): the store-ahead crash window — the process dies with
+    /// a REAL flush parked between `put_manifest` and the rebase. Honest
+    /// loss (the floor never rose); the successor's next flush recovers
+    /// via the version-conflict retry.
+    FlushPreRebaseCrash(usize),
     /// Flow B (P7): rung-2 PARK sandbox `idx` (FC paused, VM resident,
     /// `evicting`-shaped) — the 731df805 pre-condition.
     Park(usize),
@@ -132,6 +146,9 @@ impl Step {
             Step::FinalizeTick(..) => "FinalizeTick",
             Step::FinalizeCrashAt(..) => "FinalizeCrashAt",
             Step::SpoolCrashAt(..) => "SpoolCrashAt",
+            Step::FlushHandoffRace(..) => "FlushHandoffRace",
+            Step::FlushFenceAbort(..) => "FlushFenceAbort",
+            Step::FlushPreRebaseCrash(..) => "FlushPreRebaseCrash",
             Step::Park(..) => "Park",
             Step::Unpause(..) => "Unpause",
             Step::RegisterRehydrate => "RegisterRehydrate",
@@ -267,7 +284,11 @@ impl Sim {
                 // Flow D (P5): the graceful finalize belongs in the calm
                 // durability baseline (begin → tick → tick … completes).
                 96 => Step::SnapshotBegin(self.rng.random_range(0..n)),
-                97..=98 => Step::FinalizeTick(self.rng.random_range(0..n)),
+                97 => Step::FinalizeTick(self.rng.random_range(0..n)),
+                // Flow F (P6): both fault-free-converging interleavings run
+                // in the calm baseline too.
+                98 => Step::FlushHandoffRace(self.rng.random_range(0..n)),
+                99 => Step::FlushFenceAbort(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
@@ -307,8 +328,12 @@ impl Sim {
                 90 => Step::SlotPopulateTick,
                 91..=92 => Step::Park(self.rng.random_range(0..n)),
                 93..=94 => Step::Unpause(self.rng.random_range(0..n)),
-                95..=96 => Step::RegisterRehydrate,
-                97..=98 => Step::StaleSweepTick,
+                95 => Step::RegisterRehydrate,
+                96 => Step::StaleSweepTick,
+                // Flow F (P6): the flush-pipeline interleavings.
+                97 => Step::FlushHandoffRace(self.rng.random_range(0..n)),
+                98 => Step::FlushFenceAbort(self.rng.random_range(0..n)),
+                99 => Step::FlushPreRebaseCrash(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -372,6 +397,13 @@ impl Sim {
             }
             Step::SpoolCrashAt(op) => {
                 self.host.spool_crash_at(op).await?;
+                self.reconcile_strikes.clear();
+                self.crashed = true;
+            }
+            Step::FlushHandoffRace(idx) => self.host.flush_handoff_race(idx).await?,
+            Step::FlushFenceAbort(idx) => self.host.flush_fence_abort(idx).await?,
+            Step::FlushPreRebaseCrash(idx) => {
+                self.host.flush_pre_rebase_crash(idx).await?;
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }

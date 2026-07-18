@@ -36,7 +36,7 @@ use engram_core::traits::{BlobStorage, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
-use engram_host_agent::disk_daemon::backend::ChunkedDiskBackend;
+use engram_host_agent::disk_daemon::backend::{ChunkedDiskBackend, FlushSeamPoint};
 use engram_host_agent::disk_daemon::{spool, NbdSlot, NbdSlotAllocator};
 use engram_host_agent::eviction_finalize::{
     persist_disk_pending_chunks, run_eviction_finalize_attempt, DiskPendingRecord,
@@ -614,12 +614,25 @@ impl SimHost {
             .flush()
             .await
             .map_err(|e| format!("flush sandbox {idx}: {e}"))?;
+        self.note_flush_published(idx).await
+    }
+
+    /// The post-flush bookkeeping every flush-shaped step shares: adopt the
+    /// backend's (possibly advanced) manifest as the durable pointer,
+    /// observe the REAL published chunk set into the ledger floor, discard
+    /// the now-superseded spool, and tell the coordinator. Idempotent when
+    /// the flush was a no-op/abort (the manifest didn't move; re-marking
+    /// the same manifest is monotonic).
+    pub async fn note_flush_published(&mut self, idx: usize) -> Result<(), String> {
+        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+            return Ok(());
+        };
         let published = backend.manifest_ref().await;
         self.sandboxes[idx].published_ref = Some(published);
-        // Durable handoff: the flush published a new manifest. Observe the REAL
-        // published chunk set (read the manifest + its chunks back out of the
-        // store) and record each chunk's now-durable tag as the handoff floor —
-        // not an optimistic flag, but what actually landed in the durable tier.
+        // Durable handoff: observe the REAL published chunk set (read the
+        // manifest + its chunks back out of the store) and record each
+        // chunk's now-durable tag as the handoff floor — not an optimistic
+        // flag, but what actually landed in the durable tier.
         self.mark_flush_published(idx, published).await?;
         // The flush uploaded the current dirty tier; any spool predates it
         // and is now superseded.
@@ -1519,6 +1532,162 @@ impl SimHost {
             &chunks,
         )
         .await;
+        self.die_abruptly();
+        Ok(())
+    }
+
+    // ──────────────── Flow F: flush-pipeline interleavings (ADR 0098 P6) ──
+
+    /// #204 as a seeded interleaving: park a REAL `flush()` at the
+    /// dirty→pending handoff (both tier locks held), race a guest read AND
+    /// a guest write of the drained chunk against it, then release. The
+    /// racing read must decode a tag in the honest range (the drained
+    /// content or the racing write — never pre-drain stale base), the
+    /// racing write must survive to the ledger, and the standing oracle
+    /// then holds. On the pre-#204 code the read serves stale base and the
+    /// write RMWs from it, silently shadowing the drained bytes.
+    pub async fn flush_handoff_race(&mut self, idx: usize) -> Result<(), String> {
+        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
+            return Ok(());
+        }
+        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+            return Ok(());
+        };
+        // The drained-and-raced chunk is always chunk 0: write it (acked,
+        // recorded) so the drain is guaranteed non-empty at that index.
+        self.guest_write(idx, 0).await?;
+        let drained_tag = self
+            .ledger
+            .latest_by_chunk()
+            .get(&(idx, 0))
+            .map(|e| e.content_tag)
+            .expect("just wrote chunk 0");
+
+        let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::DirtyPendingHandoff);
+        let flush_backend = backend.clone();
+        let flush = tokio::spawn(async move { flush_backend.flush().await });
+        arrived.notified().await;
+
+        // The racing pair. The write's tag is minted BEFORE the spawn so
+        // the id stream stays a pure function of the step sequence; its
+        // ledger ack is recorded when the write returns (post-join).
+        let racing_tag = self.next_tag();
+        let read_backend = backend.clone();
+        let read = tokio::spawn(async move { read_backend.read(0, CHUNK_SIZE).await });
+        let write_backend = backend.clone();
+        let write =
+            tokio::spawn(async move { write_backend.write(0, &synth_chunk(racing_tag)).await });
+        // Let the racers reach the held locks (single-threaded runtime:
+        // one yield runs every ready task to its await point).
+        tokio::task::yield_now().await;
+        proceed.notify_one();
+
+        let flush_outcome = flush
+            .await
+            .map_err(|e| format!("flush task join: {e}"))?
+            .map_err(|e| format!("handoff-race flush sandbox {idx}: {e}"))?;
+        let read_bytes = read
+            .await
+            .map_err(|e| format!("read task join: {e}"))?
+            .map_err(|e| format!("handoff-race read sandbox {idx}: {e}"))?;
+        write
+            .await
+            .map_err(|e| format!("write task join: {e}"))?
+            .map_err(|e| format!("handoff-race write sandbox {idx}: {e}"))?;
+        let _ = flush_outcome;
+        // The racing write is now acked.
+        let lineage = backend.manifest_ref().await;
+        self.ledger.record(LedgerEntry {
+            sandbox: idx,
+            chunk_idx: 0,
+            content_tag: racing_tag,
+            lineage_at_ack: lineage,
+        });
+        // The racing read observed either the drained content or the
+        // racing write — NEVER anything older (the #204 stale-base gap).
+        let got = decode_tag(&read_bytes);
+        if got != drained_tag && got != racing_tag {
+            return Err(format!(
+                "flush handoff race: read tag {got}, expected the drained                  {drained_tag} or the racing {racing_tag} — the #204                  tier-less stale-base gap"
+            ));
+        }
+        self.note_flush_published(idx).await
+    }
+
+    /// #199's fence leg as a seeded interleaving: park a REAL `flush()`
+    /// after its uploads but BEFORE the fence re-check + publish, raise
+    /// the migration fence while parked, release — the flush must abort
+    /// the publish (manifest not advanced, dirty re-queued), and after the
+    /// fence drops a follow-up flush publishes the re-queued writes. The
+    /// ledger floor never moves on the aborted attempt.
+    pub async fn flush_fence_abort(&mut self, idx: usize) -> Result<(), String> {
+        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
+            return Ok(());
+        }
+        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+            return Ok(());
+        };
+        self.guest_write(idx, 1).await?;
+        let before = backend.manifest_ref().await;
+
+        let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
+        let flush_backend = backend.clone();
+        let flush = tokio::spawn(async move { flush_backend.flush().await });
+        arrived.notified().await;
+        // The #199 hazard: the fence rises while the flush is mid-pipeline.
+        backend.set_migration_fence(true);
+        proceed.notify_one();
+        let outcome = flush
+            .await
+            .map_err(|e| format!("flush task join: {e}"))?
+            .map_err(|e| format!("fence-abort flush sandbox {idx}: {e}"))?;
+        if outcome.chunks_flushed != 0 || backend.manifest_ref().await != before {
+            return Err(format!(
+                "fence raised mid-pipeline did not abort the publish                  (chunks_flushed {}, manifest {} -> {}) — issue #199",
+                outcome.chunks_flushed,
+                before,
+                backend.manifest_ref().await,
+            ));
+        }
+        // Heal: drop the fence; the re-queued dirty tier publishes on the
+        // next flush (driven here so the step leaves a converged sandbox).
+        backend.set_migration_fence(false);
+        backend
+            .flush()
+            .await
+            .map_err(|e| format!("post-fence flush sandbox {idx}: {e}"))?;
+        self.note_flush_published(idx).await
+    }
+
+    /// The pre-rebase store-ahead crash window as a seeded interleaving:
+    /// park a REAL `flush()` AFTER `put_manifest` succeeded but BEFORE the
+    /// rebase, then the process dies (the parked task is aborted — its
+    /// held locks drop with it). The store now holds a manifest nothing
+    /// references (85e0298a store-ahead); the durable pointer never
+    /// advanced and the ledger floor never rose, so the loss is HONEST,
+    /// and the successor's next flush recovers through the REAL
+    /// version-conflict retry (attempts the stale next-version, hits the
+    /// conflict, re-targets latest+1).
+    pub async fn flush_pre_rebase_crash(&mut self, idx: usize) -> Result<(), String> {
+        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
+            self.die_abruptly();
+            return Ok(());
+        }
+        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+            self.die_abruptly();
+            return Ok(());
+        };
+        self.guest_write(idx, 2).await?;
+        let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PreRebase);
+        let flush_backend = backend.clone();
+        let flush = tokio::spawn(async move { flush_backend.flush().await });
+        arrived.notified().await;
+        // The crash: the parked flush dies mid-instant. Abort is
+        // deterministic here — the task is parked at the seam's Notify on
+        // a single-threaded runtime, so it never resumes past the park.
+        flush.abort();
+        let _ = flush.await;
+        drop(proceed);
         self.die_abruptly();
         Ok(())
     }

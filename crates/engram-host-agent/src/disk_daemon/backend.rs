@@ -396,24 +396,46 @@ pub struct ChunkedDiskBackend {
     /// P1 wires the production `OsEntropy`.
     entropy: Arc<dyn engram_core::traits::Entropy>,
 
-    /// Issue #204 regression test seam: an optional async barrier fired by
-    /// `flush_local` AFTER it has moved the drained chunks into the held
-    /// `pending` map but BEFORE it releases the `pending`+`dirty` locks —
-    /// i.e. exactly the instant the pre-fix code left a chunk in NO tier.
-    /// The test parks `flush_local` here and races a concurrent read/write
-    /// of a drained index to prove the dirty→pending handoff is atomic.
-    /// `None` in every non-test build/path (no runtime cost).
-    #[cfg(test)]
-    flush_local_handoff_seam: std::sync::Mutex<Option<FlushHandoffSeam>>,
+    /// ADR 0098 P6 (Flow F): the flush pipeline's 3-point scheduler seam —
+    /// the generalization of the old test-only #204 handoff barrier. An
+    /// armed seam parks the pipeline at exactly one [`FlushSeamPoint`]
+    /// (signal `arrived`, await `proceed`) so a test or the host-internal
+    /// simulator can interleave reads/writes/fence-raises/crashes against
+    /// the documented flush hazards (#204 tier-less window, #199 fence +
+    /// publish ordering, the pre-rebase store-ahead crash window).
+    ///
+    /// Deliberately NOT `#[cfg(test)]`: `engram-dst-host` (a separate
+    /// crate) drives it. The prod cost is one uncontended mutex check per
+    /// flush STAGE on a ~30 s flush cadence — the data-plane per-op paths
+    /// (read/write/serve) never touch it. `None` in every prod build.
+    scheduler_seam: std::sync::Mutex<Option<ArmedFlushSeam>>,
 }
 
-/// Issue #204: the two-phase handshake a test installs to pause
-/// `flush_local` at the dirty→pending handoff. `flush_local` signals
-/// `arrived` once it reaches the seam (locks held), then awaits
-/// `proceed`; the test releases `proceed` after it has launched the
-/// racing read/write.
-#[cfg(test)]
-struct FlushHandoffSeam {
+/// The three flush-pipeline instants an armed [`ChunkedDiskBackend`]
+/// scheduler seam can park at (ADR 0098 P6, Flow F).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FlushSeamPoint {
+    /// Inside `flush_local`: the drained chunks have moved into the held
+    /// `pending` map, BOTH locks still held — exactly the instant the
+    /// pre-fix #204 code left a chunk in NO tier.
+    DirtyPendingHandoff,
+    /// Inside `flush_upload`: every GCS put is durable, BEFORE the state
+    /// lock, the #199 migration-fence re-check, and the manifest publish
+    /// — the window a fence raised mid-upload must still abort.
+    PostUploadPrePublish,
+    /// Inside `flush_upload`: the manifest is PUBLISHED (`put_manifest`
+    /// succeeded), BEFORE the base/state rebase and the pending-tier
+    /// drop — a crash here leaves the store AHEAD of every consumer (the
+    /// 85e0298a store-ahead shape; recovery is the version-conflict
+    /// retry).
+    PreRebase,
+}
+
+/// The two-phase handshake an armed seam point carries: the pipeline
+/// signals `arrived` at the point (relevant locks held), then awaits
+/// `proceed`.
+struct ArmedFlushSeam {
+    point: FlushSeamPoint,
     arrived: Arc<Notify>,
     proceed: Arc<Notify>,
 }
@@ -673,8 +695,7 @@ impl ChunkedDiskBackend {
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
             entropy: Arc::new(engram_core::traits::OsEntropy),
-            #[cfg(test)]
-            flush_local_handoff_seam: std::sync::Mutex::new(None),
+            scheduler_seam: std::sync::Mutex::new(None),
         })
     }
 
@@ -714,8 +735,7 @@ impl ChunkedDiskBackend {
             in_flight: Arc::new(InFlightTracker::new()),
             operation_scope: crate::trace_scope::OperationScope::default(),
             entropy: Arc::new(engram_core::traits::OsEntropy),
-            #[cfg(test)]
-            flush_local_handoff_seam: std::sync::Mutex::new(None),
+            scheduler_seam: std::sync::Mutex::new(None),
         })
     }
 
@@ -1217,18 +1237,10 @@ impl ChunkedDiskBackend {
             pending.insert(chunk_idx, (hash, bytes.clone()));
             new_chunks.push((chunk_idx, hash, bytes));
         }
-        // Issue #204 regression seam: fire while BOTH locks are still held,
+        // Issue #204 seam point: fire while BOTH locks are still held,
         // i.e. at the exact instant the pre-fix code left a chunk tier-less.
-        #[cfg(test)]
-        {
-            let seam = self.flush_local_handoff_seam.lock().unwrap().take();
-            if let Some(seam) = seam {
-                seam.arrived.notify_one();
-                let proceed = seam.proceed.notified();
-                tokio::pin!(proceed);
-                proceed.await;
-            }
-        }
+        self.fire_flush_seam(FlushSeamPoint::DirtyPendingHandoff)
+            .await;
         drop(dirty_guard);
         drop(pending);
         Ok(PendingDiskFlush {
@@ -1237,20 +1249,38 @@ impl ChunkedDiskBackend {
         })
     }
 
-    /// Issue #204 test-only: arm the `flush_local` dirty→pending handoff
-    /// seam. The returned `(arrived, proceed)` pair lets a test park
-    /// `flush_local` at the handoff (both locks held) and then race a
-    /// concurrent read/write. `arrived` fires once `flush_local` reaches
-    /// the seam; `flush_local` blocks until the test notifies `proceed`.
-    #[cfg(test)]
-    fn arm_flush_handoff_seam(&self) -> (Arc<Notify>, Arc<Notify>) {
+    /// Arm the flush scheduler seam at `point` (ADR 0098 P6). The
+    /// returned `(arrived, proceed)` pair lets the caller park the
+    /// pipeline at that instant and interleave against it: `arrived`
+    /// fires when the pipeline reaches the point; the pipeline blocks
+    /// until `proceed` is notified. One-shot: firing disarms it.
+    pub fn arm_flush_seam(&self, point: FlushSeamPoint) -> (Arc<Notify>, Arc<Notify>) {
         let arrived = Arc::new(Notify::new());
         let proceed = Arc::new(Notify::new());
-        *self.flush_local_handoff_seam.lock().unwrap() = Some(FlushHandoffSeam {
+        *self.scheduler_seam.lock().unwrap() = Some(ArmedFlushSeam {
+            point,
             arrived: arrived.clone(),
             proceed: proceed.clone(),
         });
         (arrived, proceed)
+    }
+
+    /// Fire the seam if one is armed at `point` — park until `proceed`.
+    /// A seam armed at a DIFFERENT point stays armed untouched.
+    async fn fire_flush_seam(&self, point: FlushSeamPoint) {
+        let seam = {
+            let mut armed = self.scheduler_seam.lock().unwrap();
+            match armed.as_ref() {
+                Some(a) if a.point == point => armed.take(),
+                _ => None,
+            }
+        };
+        if let Some(seam) = seam {
+            seam.arrived.notify_one();
+            let proceed = seam.proceed.notified();
+            tokio::pin!(proceed);
+            proceed.await;
+        }
     }
 
     /// ADR 0038 B3 — phase 2 (runs post-resume on the snapshot path):
@@ -1746,6 +1776,12 @@ impl ChunkedDiskBackend {
             }
         }
 
+        // Issue #199 seam point: every put is durable; the fence re-check
+        // and the publish are still ahead — a fence raised while parked
+        // here must abort the publish exactly like one raised mid-upload.
+        self.fire_flush_seam(FlushSeamPoint::PostUploadPrePublish)
+            .await;
+
         // Now atomically: rebuild the manifest from the (locked)
         // current base + the just-uploaded hashes, publish to the
         // store, and rebase `state` so future reads serve from the
@@ -1909,6 +1945,13 @@ impl ChunkedDiskBackend {
                 Err(e) => return Err(e.into()),
             }
         };
+
+        // Store-ahead seam point: the manifest is published but nothing
+        // local (or coordinator-side) has learned it yet — a crash parked
+        // here is the 85e0298a store-ahead shape; the version-conflict
+        // retry above is the recovery. The `state` lock is deliberately
+        // still held (a parked crash drops it with the task).
+        self.fire_flush_seam(FlushSeamPoint::PreRebase).await;
 
         // Rebase: future reads of any chunk_idx we just rewrote
         // resolve to the NEW hash via the cache + store. Without
@@ -2882,7 +2925,7 @@ mod tests {
 
         // Arm the seam, then run flush_local on a task; it will park at the
         // dirty→pending handoff with both locks held.
-        let (arrived, proceed) = backend.arm_flush_handoff_seam();
+        let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::DirtyPendingHandoff);
         let flush_backend = backend.clone();
         let flush_task = tokio::spawn(async move { flush_backend.flush_local().await.map(|_| ()) });
 

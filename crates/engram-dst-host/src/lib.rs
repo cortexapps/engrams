@@ -87,9 +87,26 @@
 //! (convergence at quiescence — every started finalize completes or
 //! quarantines within the attempts budget) join the suite.
 //!
-//! # Deferred to P6+
+//! # P6 (Flow F — the flush scheduler seam)
 //!
-//! The flush `SchedulerSeam` (Flow F) and the migration flow (Flow E).
+//! The P2-era test-only #204 handoff barrier generalized into the 3-point
+//! [`FlushSeamPoint`](engram_host_agent::disk_daemon::backend::FlushSeamPoint)
+//! seam (dirty→pending handoff / post-upload-pre-publish / pre-rebase),
+//! armed per-point on the REAL `ChunkedDiskBackend` at zero data-plane
+//! cost. Steps [`FlushHandoffRace`](Step::FlushHandoffRace) (#204: a read
+//! and a write race the parked handoff — never stale base, the racing
+//! write survives the floor), [`FlushFenceAbort`](Step::FlushFenceAbort)
+//! (#199: a fence raised mid-pipeline aborts the publish; dirty re-queues
+//! and re-publishes post-heal), and
+//! [`FlushPreRebaseCrash`](Step::FlushPreRebaseCrash) (death between
+//! `put_manifest` and the rebase — honest loss, and the successor's next
+//! flush recovers through the real version-conflict retry). The pinned
+//! seeds add the #199 ordering leg (two flushes serialize behind the
+//! pipeline guard, never publishing old-over-new).
+//!
+//! # Deferred to P8+
+//!
+//! The migration flow (Flow E).
 
 pub mod coord_stub;
 pub mod effects;
