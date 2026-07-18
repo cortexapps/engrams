@@ -370,12 +370,27 @@ strong migration-safety story for both ADRs.
 
 ## Phase 2: host-agent simulation (the P-series)
 
-**Status 2026-07-17: active.** The original sketch here said "future, own
+**Status 2026-07-17: COMPLETE.** The original sketch here said "future, own
 ADR" — superseded: Phase 2 extends THIS ADR in place as the P-series,
 mirroring the D-series (decision recorded the day the D-chain merged; the
 incidents this phase targets — 85e0298a acked-write loss, torn
 base-capture, the NBD teardown flake family, the teardown mis-reap — all
 lived in host-agent paths the coordinator sim cannot see).
+
+**The commit chain (opened and closed 2026-07-17):** P0 #733 → P1 #736 →
+P2 #737 → P3 #738 → P4 #740 → P7 #742 (pulled forward) → adversarial
+clarification #747 → P4.5 #749 → gap record #750 → P5 #753 → G1 #754 →
+G2 #756 → P6 #757 → P8 #758 → P9 #759 (the `test-host-sim` lane + the
+nightly host swarm). Six flows extracted and
+simulated (A shutdown, B slot/reattach, C reconcile, D eviction finalize,
+E migration, F flush-seam), eight of the nine oracles standing (#1 acked-
+write, #2 no-plane-leak, #3 slot accounting, #5 single-device +
+served-never-dead, #6 finalize-stage monotone, #7 migration decision
+table, #8 finalize convergence, #9 None-arm; #4 spool-only-copy is
+subsumed by the P4.5 published-floor split — recorded in the P5 row),
+both #743 coverage gaps closed, and every portable historical hazard
+pinned as a regression seed. Kernel truth stays in the FC lane forever
+(non-goals below).
 
 **Scope**: the host-agent's six multi-step lifecycle flows, extracted into
 pure typed state machines (the `SessionState` pattern) with side effects
@@ -561,7 +576,7 @@ highest-impact remaining flow; P8/P9 unchanged):
 | P6 | **Landed.** Flow F — the flush scheduler seam. The P2-era `#[cfg(test)]` #204 handoff barrier generalized into the 3-point **`FlushSeamPoint`** seam on `ChunkedDiskBackend` (`DirtyPendingHandoff` — drained chunks in `pending`, both tier locks held; `PostUploadPrePublish` — puts durable, fence re-check + publish ahead; `PreRebase` — manifest published, rebase not) with `arm_flush_seam(point)`/one-shot fire. Deliberately un-`cfg`'d so `engram-dst-host` can drive it: the cost is one uncontended mutex check per flush STAGE on a ~30 s cadence — the per-op data plane never touches it (the ADR's original zero-hot-path-cost intent holds). The existing host-agent #204 atomicity test rides the new arm API unchanged. **Sim:** steps `FlushHandoffRace` (#204 — a guest read+write race the parked handoff; the read must decode the drained or racing tag, never pre-drain stale base; the racing write is ledger-acked and must survive the published floor), `FlushFenceAbort` (#199 fence leg — the migration fence rises while parked post-upload; the publish aborts with the manifest unmoved and dirty re-queued, the floor never moves on the aborted attempt, the post-heal flush publishes the re-queue), and `FlushPreRebaseCrash` (the store-ahead crash window — the parked task dies between `put_manifest` and the rebase; the orphaned manifest occupies next-version, the floor never rose so the rollback is honest, and the successor's next flush recovers through the REAL version-conflict retry). All three ride both swarm profiles (the crash variant Chaos-only). Pinned seeds: the four above plus `concurrent_flushes_serialize_never_reorder_publishes` (#199 ordering leg — a second flush blocks on the pipeline guard behind a parked first; drain order == publish order, or the floor would sit above the served content and oracle #1 fires). | M |
 | P7 | **Landed.** Flow B (NBD slot/reattach). **Extraction:** the `NbdKernel` seam (P1's unwired trait) is rewired — `HostNbdKernel` (the Linux prod impl over `nbd_netlink` + sysfs) is bound at the public attach/reattach entry points and the CONNECT/RECONFIGURE/backend-identifier touches funnel through `&dyn NbdKernel` at `serve_at` (public signatures unchanged; no blind FC-test churn). The decision content is pure in **`engram-host-core::reattach`**: `plan_reattach` (backend-id echo-else-fallback + the seed-dirty-BEFORE-RECONFIGURE ordering as an explicit `ReattachPlan`/`ReattachStep` property), `sweep_verdict`/`PidLiveness` (the stale-binding "dead-owner-only" core, wired into `recover_one_stuck_device`), `is_local_survivor_candidate` (the #739 filter core, wired into `local_survivor_candidates`), and `resume_data_plane_served` (the un-pause gate). `SlotState` (Free/Warm/Claimed/Parked) + a transition table make the allocator's implicit FSM auditable next to the (unchurned, portable) allocator. **Riders:** verify-on-read — post-RECONFIGURE, when a spool was adopted, a single-chunk probe (`first_seeded_probe`/`probe_matches`) proves the device serves the seeded acked bytes (not rolled-back base) or returns the slot for park; a new minimal `#[ignore]`'d FC lane test (`nbd_verify_on_read`, wired into `ci.yml`) proves it at the O_DIRECT device plane. Un-pause data-plane gate — `PooledBackend::resume` fails fast into `evict_local → resume` (a `soft_invariant!`, ADR 0099 H6 site #7) when the rootfs device isn't served by the current generation. **Sim (`engram-dst-host`):** the device-serving model (generation + `served_by`/`kernel_owner`/`parked` + the real `NbdSlotAllocator`) with steps `Park`/`Unpause`/`RegisterRehydrate`/`StaleSweepTick`/`SlotClaim`/`SlotPopulateTick`; oracles #3 slot-accounting (`free + warm + held == capacity`, no double-claim) and #5 single-device-ownership + *served-device-never-dead* (the 731df805 property) as standing invariants; the local-rehydrate leg adds a recovery arm to oracle #1's closure. **The 731df805 scenario is pinned** (`park → roll → register → sweep → un-pause`): the FIXED variant (buggy coord list omits the parked survivor, the #739 local ChainHeadRecord pass re-serves it, the sweep skips it, un-pause serves) and the UNGATED variant (local pass off → the sweep disconnects the live device → the un-pause gate is the last line and fires, no dead-plane serve). The tight concurrent claim-vs-populate validation-window stays the multi-thread host-agent test (paused single-thread tokio can't hold a `claim` mid-populate, and `claim`'s retry `sleep` hangs on the paused clock — the sim drives the transitions as explicit steps). | L |
 | P8 | **Landed.** Flow E (migration). **TTL clock → `now_mono`:** `MigrationExport` carries the injected clock; `created_at`/`last_activity` are `now_mono` readings and `expired()` subtracts against the injected clock — expiry DECIDES destroy/abort, so it is decision-feeding time (D1), off the `metrics_now` carve-out it previously rode; the prod constructors bind `PooledBackend.clock`, and the paused sim clock drives the REAL `expired()` deterministically. The decision table was already pure (`ttl_verdict`, `reattach_source_verdict` — extracted with #216's fix); P8 wires it into the sim. **Sim:** steps `MigrationBegin` (a REAL `MigrationExport` in the REAL `MigrationRegistry`; deterministic entropy-minted export id — the prod OsRng nonce must not launder into the replayable stream; the guest freezes exactly as the export's capture lock excludes writes/flushes/captures) / `MigrationServeState` / `MigrationTouch` / `MigrationTtlSweep` (REAL `expired()` + `ttl_verdict` over the scriptable coordinator, applied as `lib.rs` does) / `MigrationCommit` / `MigrationAbort`, in both swarm profiles. **Oracle #7** (the #216 decision table): `state_served` ⇒ the dumb-host TTL sweep never abort-unpauses — the SWEEP structurally records any un-pause it applies to a served export, so a `ttl_verdict` regression fires it. The EXPLICIT coordinator abort is deliberately exempt: prod's `migration_abort` RPC allows it even post-ship (the coordinator carries the postcopy-never-loaded knowledge, ADR 0045 C2) — **the P9 lane's very first CI run caught the sim being STRICTER than prod here** (calm seeds 14/16 fired #7 on a legal explicit abort; the model fix + the `explicit_abort_after_state_served_is_legal_and_resumes` pin rode this row). **Oracle #2** (no-plane-leak, the P8 tightening): `migrating` ⟺ an open registry export, with a live backend — a frozen guest with nothing to end it (or an export on an un-frozen guest) is the leak. Seeds: `ttl_expired_unshipped_export_aborts_in_place_zero_loss`, `state_served_export_never_unpauses_then_destroys_on_ownership_flip`, `actively_serving_export_never_expires_mid_transfer` (#216 Gap 1), `unreachable_coordinator_stays_paused_never_guesses`, `reattached_source_verdict_never_destroys_on_a_transient_binding` (#216 Gap 3). **Scope notes:** #582/#598/#629 (named in the original row) turned out to be FC-lane/test-hygiene issues (a netlink parked-IO flake + two test races) whose portable content the P5/P7 machinery already absorbed — no hollow seeds manufactured; the literal races stay FC-lane residue. The full resume-attach flow extraction (G2's rider) is subsumed by the G2 decision seams + this row's registry modeling. **`HostEffects::production` consolidation: deliberately retired rather than done** — every seam reaches its flow through a dedicated field (`clock`, `host_fs`, the coord publish pair, `DeviceSync`/`NbdKernel` at their entry points), the sim injects per-seam, and folding them into one bundle field now would churn `PooledBackend`/`lib.rs` + the FC lane for zero new simulability; the bundle ctor remains the sim's assembly point. | M |
-| P9 | CI: `test-host-sim` lane (fixed seeds, <5 min, own rust-cache key, replay-twice self-check) in `CI Gate.needs:` + a host-sim detector flag keyed on engram-dst-host's dep closure; nightly job with `--failure-report` issue auto-filing (the shipped nightly-sim pattern); regression_seeds populated; this section closed with the commit chain | S |
+| P9 | **Landed.** CI: the `test-host-sim` lane — fixed windows (chaos 0..60 × 1000, calm 0..30 × 1000; `just sim-host <n>` replays any failure) behind a whole-binary replay-twice self-check (one seed run twice, stdout diffed — the cheapest guard against a nondeterminism leak), own rust-cache key (`workspace-release-host-sim`), gated on the new `test_host_sim` detector flag (the release closure of `engram-dst-host` itself — engram-host-agent/host-core/sim/chunk-store ride in as normal deps; disjoint from engram-dst's coordinator closure by construction), and in `CI Gate.needs:` (never individually required — the aggregator rule). Nightly: `nightly-sim.yml` gains the `host-swarm` job — date-derived non-overlapping windows (360 chaos + 120 calm × 4000 steps; sized below the coordinator swarm's volume for the host sim's real-fs step cost), `--failure-report` → the same slug-deduped `sim-failure` issue auto-filing, title-prefixed `nightly host sim:` so host slugs never collide with same-named coordinator invariants. Regression seeds: populated across P3–P8 (26 pinned scenarios + the two swarm suites). This section closed with the commit chain above. | S |
 
 ### Coverage gaps surfaced by real incidents (tracked follow-ups)
 
@@ -622,6 +637,55 @@ the D4 conformance rule (implemented `SimMetadataStore::rewind_session_to_cursor
 yet reproduce an incident, its discipline is already load-bearing on how the
 incident's fix is written and tested. G1 and G2 are the next increments that
 turn that discipline into detection.
+
+### Residual risk, recorded at close (2026-07-17)
+
+Phase 2 is closed, and this list is the honest boundary of what closing it
+bought. The durability-decision core — everything that decides what
+survives a crash, roll, eviction, or migration — is covered by standing
+oracles with a track record of catching real bugs pre-merge (#722, the
+verify-on-read overrun, the mid-finalize resurrection, the stale-spool
+version gate, the frozen-slot hang, and the P9 lane's first CI run
+catching a stricter-than-prod abort model). What is NOT covered, ranked by
+where the next bad incident most plausibly comes from:
+
+1. **Kernel/data-plane behavior** — permanently out of scope by design
+   (non-goals below). Two of 85e0298a's three mechanisms were kernel
+   page-cache behavior; the netlink false-adopt and parked-IO classes are
+   FC-lane territory, and the FC lane is deliberately minimal. The sim
+   proves our ordering/decision logic **assuming the kernel behaves as
+   modeled**; the prod guards (BLKFLSBUF, verify-on-read, the spool,
+   device `sync_all`) are point defenses. *Named next increment (outside
+   this ADR): an FC-lane "kernel assumptions audit" tier — one minimal
+   test per assumption the world model bakes in (dead-conn park/replay,
+   RECONFIGURE semantics, cache invalidation on CONNECT) — so the sim's
+   foundation is itself pinned.*
+2. **The coordinator↔host boundary is not co-simulated** — the two sims
+   are disjoint by design (state-space product avoided; disjoint CI
+   closures). #739 was exactly a cross-system interaction, covered today
+   only because it happened and its shape was replayed into the
+   adversarial stubs. A NOVEL cross-system interaction will be found in
+   prod first, then pinned. *Named next increment (outside this ADR): a
+   thin boundary harness — recorded coordinator wire traces replayed into
+   the host sim's stub (or vice versa) — buying cross-system coverage
+   without the product state space.*
+3. **Oracle coverage is what someone thought to assert.** The #743
+   gut-check proved both failures were in-scope classes yet uncatchable
+   until G1/G2 landed the knob and the family. The standing mitigation is
+   the gut-check ritual itself: every incident gets "which oracle should
+   have caught this?" answered in this section, as G1/G2 were.
+4. **Deliberate point-test residue** — the real-thread races (claim/
+   populate validation window, the ChainHeadStore epoch race, the #224
+   DashMap literal) stay targeted host-agent tests; targeted tests don't
+   explore.
+5. **The ops layer is untouched by this program** — rolls, capacity,
+   cordons, disk pressure, wire skew, bakes. A large fraction of recent
+   operational pages came from this layer; no simulator here covers it,
+   and sim seeds are the wrong tool for it.
+6. **Exploration volume is modest** — ~2k nightly seeds against an
+   astronomically larger interleaving space, biased by hand-chosen pick
+   weights. Rare multi-fault pileups may still need directed scenarios
+   when suspicion arises.
 
 ## Non-goals
 
