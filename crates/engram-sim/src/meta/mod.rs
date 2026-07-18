@@ -205,6 +205,15 @@ pub struct SimDb {
     pub enable_jobs: std::collections::BTreeMap<uuid::Uuid, EnableJobRow>,
     pub capture_jobs: std::collections::BTreeMap<engram_core::CaptureJobId, CaptureJobRow>,
     pub session_secrets: std::collections::BTreeMap<SessionId, SessionSecrets>,
+    /// ADR 0023 in-guest forge broker tokens, keyed by session (PG:
+    /// `session_broker_tokens`, PK `session_id`).
+    pub broker_tokens:
+        std::collections::BTreeMap<SessionId, engram_core::types::registry::SessionBrokerToken>,
+    /// ADR 0045 live-migration teleport pin (PG: `sessions.
+    /// teleport_target_host_id` + `_set_at`). Present only while a pin is
+    /// set. The sim runs no teleport workload today, but the boot/rebind
+    /// path clears the pin, so get/set must round-trip.
+    pub teleport_targets: std::collections::BTreeMap<SessionId, (HostId, Option<DateTime<Utc>>)>,
     pub session_ops: std::collections::BTreeMap<i64, OpRow>,
     pub outbox: std::collections::BTreeMap<String, OutboxRow>,
     pub bundle_gc: std::collections::BTreeMap<String, GcCandidate>,
