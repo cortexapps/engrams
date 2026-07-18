@@ -42,6 +42,7 @@ pub mod fs;
 pub mod nbd;
 pub mod reattach;
 pub mod shutdown;
+pub mod survivor;
 
 pub use checkpoint::checkpoint_tail_admits_publish;
 pub use coord::{
@@ -57,6 +58,10 @@ pub use reattach::{
     first_seeded_probe, is_local_survivor_candidate, plan_reattach, probe_matches,
     resume_data_plane_served, sweep_verdict, PidLiveness, ReattachPlan, ReattachStep, SweepAction,
 };
+pub use survivor::{
+    plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan, ResumeAttachPlan,
+};
+
 pub use shutdown::{
     admits_new_plane, classify_survivor, flush_budget, is_straggler, plan_shutdown, FlushProbe,
     ShutdownPlan, ShutdownStage, SurvivorAction, DEFAULT_FLUSH_BUDGET_SECS,

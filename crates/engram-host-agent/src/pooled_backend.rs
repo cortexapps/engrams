@@ -1553,20 +1553,31 @@ impl PooledBackend {
             // instead of silently corrupting. (The materialize-to-file
             // fallback below is only legitimate when the rootfs is NOT a
             // block device — a flat-file rootfs, macOS/dev — which the
-            // sidecar reports as a non-`/dev/nbd` `rootfs_source`.)
-            if self.host_runs_nbd_data_plane() {
-                if let Some(dev) = read_sidecar_rootfs_source(&src).await {
-                    if dev.starts_with("/dev/nbd") {
-                        return Err(SandboxError::Snapshot(format!(
-                            "resume of {} would reopen the capture-time literal rootfs device {dev} \
-                             (sidecar spec.rootfs_source) because no NBD attach happened \
-                             (disk_manifest={:?}) — that device is dead or owned by another \
-                             session on this host. Refusing to boot onto a stale/foreign \
-                             /dev/nbdN; the snapshot's disk lineage must be repaired.",
-                            metadata.id, metadata.disk_manifest,
-                        )));
-                    }
-                }
+            // sidecar reports as a non-`/dev/nbd` `rootfs_source`.) The
+            // verdict is the pure `plan_resume_attach` (ADR 0098 G2 — the
+            // survivor-invisibility family's resume leg, which the host
+            // simulator drives).
+            let sidecar_dev = read_sidecar_rootfs_source(&src).await;
+            let sidecar_is_nbd_literal = sidecar_dev
+                .as_deref()
+                .is_some_and(|d| d.starts_with("/dev/nbd"));
+            if matches!(
+                engram_host_core::plan_resume_attach(
+                    false,
+                    self.host_runs_nbd_data_plane(),
+                    sidecar_is_nbd_literal,
+                ),
+                engram_host_core::ResumeAttachPlan::RefuseStaleLiteral
+            ) {
+                let dev = sidecar_dev.expect("RefuseStaleLiteral implies a sidecar device");
+                return Err(SandboxError::Snapshot(format!(
+                    "resume of {} would reopen the capture-time literal rootfs device {dev} \
+                     (sidecar spec.rootfs_source) because no NBD attach happened \
+                     (disk_manifest={:?}) — that device is dead or owned by another \
+                     session on this host. Refusing to boot onto a stale/foreign \
+                     /dev/nbdN; the snapshot's disk lineage must be repaired.",
+                    metadata.id, metadata.disk_manifest,
+                )));
             }
             if let Some(chunk_store) = self.chunk_store.as_ref() {
                 if let Err(e) = materialize_disk_if_missing(
@@ -2341,7 +2352,7 @@ impl PooledBackend {
                 // never raises the migration fence.
                 unwind.disk_backend = Some(backend);
                 unwind.disk_pending = Some(pending);
-            } else if self.host_runs_nbd_data_plane() {
+            } else {
                 // The 2026-07-17 corruption path (session 03e6535e): a
                 // sandbox with an NBD-backed rootfs but NO `nbd_sandboxes`
                 // entry is a post-pod-roll survivor whose in-pod NBD server
@@ -2351,25 +2362,35 @@ impl PooledBackend {
                 // `recoverable=true` — dropping EVERY acked disk write of
                 // the session and poisoning its lineage (the next resume
                 // then boots onto a literal /dev/nbdN — see
-                // `prepare_resume_nbd_attach`'s D4 guard). Refuse to
-                // snapshot instead: an error requeues the eviction op
-                // (redrive-safe), and on a dead device the host-cache
-                // `sync_all` above already fails loudly rather than
-                // recording a "recoverable" poisoned snapshot. The skip is
-                // still correct for a legitimately non-NBD rootfs
+                // `prepare_resume_nbd_attach`'s D4 guard). The verdict is
+                // the pure `plan_capture_disk_drain` (ADR 0098 G2 — the
+                // survivor-invisibility family's capture leg, which the
+                // host simulator drives): refuse rather than skip; the
+                // error requeues the eviction op (redrive-safe). The skip
+                // stays correct for a legitimately non-NBD rootfs
                 // (macOS/dev/flat-file), which `rootfs_device` reports as
                 // `None`.
-                if let Some(dev) = self.inner.rootfs_device(id) {
-                    if dev.to_string_lossy().starts_with("/dev/nbd") {
-                        return Err(SandboxError::Snapshot(format!(
-                            "sandbox {id} has an NBD-backed rootfs ({}) but no nbd_sandboxes \
-                             entry — a post-roll survivor whose disk server is gone. Refusing to \
-                             snapshot with disk_manifest=None (would drop the session's acked \
-                             disk writes and poison its lineage); the session must be rehydrated \
-                             or evicted-locally first.",
-                            dev.display(),
-                        )));
-                    }
+                let rootfs_dev = self.inner.rootfs_device(id);
+                let rootfs_is_nbd = rootfs_dev
+                    .as_ref()
+                    .is_some_and(|d| d.to_string_lossy().starts_with("/dev/nbd"));
+                if matches!(
+                    engram_host_core::plan_capture_disk_drain(
+                        false,
+                        self.host_runs_nbd_data_plane(),
+                        rootfs_is_nbd,
+                    ),
+                    engram_host_core::CaptureDrainPlan::RefuseUntracked
+                ) {
+                    let dev = rootfs_dev.expect("RefuseUntracked implies an nbd rootfs device");
+                    return Err(SandboxError::Snapshot(format!(
+                        "sandbox {id} has an NBD-backed rootfs ({}) but no nbd_sandboxes \
+                         entry — a post-roll survivor whose disk server is gone. Refusing to \
+                         snapshot with disk_manifest=None (would drop the session's acked \
+                         disk writes and poison its lineage); the session must be rehydrated \
+                         or evicted-locally first.",
+                        dev.display(),
+                    )));
                 }
             }
         }
