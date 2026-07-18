@@ -76,11 +76,12 @@ fn wedged_boot_op_reaches_terminal_via_op_deadline() {
         // Hosts must be registered (heartbeats) for the create to PLACE —
         // only a Placed create enqueues the create_boot op.
         sim.execute(Step::HostHeartbeats).await;
-        // A session whose create_boot op is about to dispatch...
-        sim.execute(Step::CreateSession).await;
-        // ...onto hosts whose every RPC verb hangs far past the 600s
-        // CreateBoot deadline (the #743 wedge: heartbeats stay healthy,
-        // the verb never returns).
+        // Every RPC verb on both hosts hangs far past the 600s CreateBoot
+        // deadline (the #743 wedge: heartbeats stay healthy, the verb
+        // never returns). Armed BEFORE the create: since R1.7c the sim
+        // drives a claimed op synchronously inside the enqueuing step
+        // (no detached spawn), so the wedged dispatch happens inline in
+        // CreateSession below.
         sim.execute(Step::RpcHang(0, true)).await;
         sim.execute(Step::RpcHang(1, true)).await;
 
@@ -88,6 +89,10 @@ fn wedged_boot_op_reaches_terminal_via_op_deadline() {
         // working — only the tokio-timer op_deadline breaks the hang
         // (auto-advance fires it deterministically on the paused clock);
         // the op requeues with backoff rather than completing.
+        sim.execute(Step::CreateSession).await;
+
+        // The executor pass finds nothing dispatchable (the op is backing
+        // off) and must not wedge either.
         sim.execute(Step::Driver(0, DriverKind::SessionOps)).await;
 
         // The wedge genuinely happened AND the deadline genuinely broke it:
