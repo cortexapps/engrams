@@ -204,7 +204,7 @@ export function makeReviewControlPlane(
         connectors: { list: () => makeConnectorStore(database).list() },
         harnessCatalog: productionHarnessCatalogClient(),
         sessions,
-        secrets: { get: async () => null },
+        secrets: { get: async () => null, getAll: async () => ({}) },
         db: database,
       },
       params,

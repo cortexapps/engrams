@@ -449,6 +449,10 @@ export async function createSessionForExistingTask(
         params.ownerUserId === undefined
           ? Promise.resolve(null)
           : deps.secrets.get(params.ownerUserId, envVar),
+      resolveAllUserTokens: () =>
+        params.ownerUserId === undefined
+          ? Promise.resolve({})
+          : deps.secrets.getAll(params.ownerUserId),
     },
     {
       // An automation-owned review task has no human token; use the harness's
