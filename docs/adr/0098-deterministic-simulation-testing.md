@@ -845,6 +845,18 @@ program's most acute gap.
 
 ### The R-series
 
+**Wave status (2026-07-18):** R0 + R1 are MERGED — #766/#767/#770 (R0; the
+straggler sweep drained a live prod backlog on its first ticks) and
+#771/#772/#775/#776/#779/#780 (R1; burst-merged after a combined-state
+check per the AGENTS.md rule). The #777 design calls are decided
+(honest-Dead stage-2 predicate; ask-the-host bound-row policy) and in
+implementation. R2 opens with the CoSim rung-1 crate + the #777 policy PR;
+the R2 model-oracle/Router-workload/effect-queue track deliberately waits
+for rung 1 to land (the effect queue restructures the same SimHostClient
+seam the cosim bridge consumes). Invariant alerting is live-pending-apply
+in engrams-internal #89 (Slack #project-engrams).
+
+
 | Phase | Content |
 |---|---|
 | R0 | Truth + the response loop: this addendum; explicit `soft_invariant!` name slugs; nightly infra-failure filing; a log-based alert on the soft-invariant prefix (engrams-internal) + a triage SLO for `sim-failure` issues; RCAs for #762, the dead-plane recurrence, and the double-OOM. |
