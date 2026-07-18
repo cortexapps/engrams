@@ -1447,8 +1447,8 @@ mod tests {
         }
         // The response only pins that spawn() returned, not that the
         // detached child finished execing — poll for its marker.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !marker.exists() && std::time::Instant::now() < deadline {
+        let deadline = crate::time_source::metrics_now() + Duration::from_secs(2);
+        while !marker.exists() && crate::time_source::metrics_now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let state = std::fs::read_to_string(&marker).unwrap_or_default();

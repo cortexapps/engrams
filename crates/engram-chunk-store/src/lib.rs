@@ -51,6 +51,7 @@ pub mod region;
 pub mod resolver;
 pub mod snapshot_blob;
 pub mod store;
+mod time_source;
 pub mod working_set;
 
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};

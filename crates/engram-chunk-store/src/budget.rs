@@ -57,7 +57,7 @@ impl UploadBudget {
     /// Acquire one PUT slot (FIFO). Infallible: the semaphore is never
     /// closed. The wait is recorded so budget contention is visible.
     pub async fn acquire(&self) -> OwnedSemaphorePermit {
-        let started = std::time::Instant::now();
+        let started = crate::time_source::metrics_now();
         let permit = Arc::clone(&self.permits)
             .acquire_owned()
             .await

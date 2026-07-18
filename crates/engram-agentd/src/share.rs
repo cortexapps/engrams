@@ -146,7 +146,7 @@ async fn run_inner(rest: &[String]) -> Result<String, String> {
 /// Give the producer a short bounded window to publish a non-empty file so one
 /// explicit share intent does not turn into a spurious retry or duplicate.
 async fn wait_for_file(path: &str) -> Result<std::fs::Metadata, String> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = crate::time_source::metrics_now_tokio() + Duration::from_secs(2);
     loop {
         match tokio::fs::metadata(path).await {
             Ok(meta) if !meta.is_file() => return Err(format!("{path}: not a regular file")),
@@ -155,7 +155,7 @@ async fn wait_for_file(path: &str) -> Result<std::fs::Metadata, String> {
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(error) => return Err(format!("{path}: stat: {error}")),
         }
-        if tokio::time::Instant::now() >= deadline {
+        if crate::time_source::metrics_now_tokio() >= deadline {
             return Err(format!(
                 "{path}: file did not become ready within 2 seconds"
             ));

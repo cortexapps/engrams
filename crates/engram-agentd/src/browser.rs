@@ -14,7 +14,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -368,10 +368,10 @@ async fn terminate_pgid(_pgid: i32) {}
 /// themselves, so gating `start_browser` on it just makes the spawn flaky
 /// (chromium's cold-start on FC can exceed the ready deadline).
 async fn wait_until_ready(port: u16) -> io::Result<()> {
-    let deadline = Instant::now() + READY_DEADLINE;
+    let deadline = crate::time_source::metrics_now() + READY_DEADLINE;
     let mut backoff = READY_PROBE_START;
     let mut last_err: Option<io::Error> = None;
-    while Instant::now() < deadline {
+    while crate::time_source::metrics_now() < deadline {
         match probe_ready(port).await {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
@@ -489,12 +489,12 @@ async fn probe_cdp_once(port: u16, budget: Duration) -> bool {
 /// given.
 async fn probe_cdp(session_env: &HashMap<String, String>, budget: Duration) -> Option<String> {
     let cdp = cdp_port(session_env);
-    let deadline = Instant::now() + budget;
+    let deadline = crate::time_source::metrics_now() + budget;
     loop {
         if probe_cdp_once(cdp, CDP_PROBE_INTERVAL).await {
             return None;
         }
-        if Instant::now() >= deadline {
+        if crate::time_source::metrics_now() >= deadline {
             break;
         }
         sleep(CDP_PROBE_INTERVAL).await;
@@ -515,6 +515,14 @@ pub async fn shutdown_for_tests() -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a
+    // decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
+
+    // Only the Linux-gated spawn/wedge tests read the wall clock directly.
+    #[cfg(target_os = "linux")]
+    use std::time::Instant;
+
     use super::*;
 
     /// Guards the process-global `ENGRAM_BROWSER_BIN` / `ENGRAM_BROWSER_PIDFILE`

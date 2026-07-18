@@ -1,0 +1,9 @@
+# ADR 0098 D1: time and entropy are world inputs. engram-chunk-store inherits the
+# workspace disallowed_methods gate; reviewed production carve-outs are
+# isolated behind explicit helpers, and live-system tests use scoped allows.
+disallowed-methods = [
+    { path = "chrono::Utc::now", reason = "read time via services.clock.now_utc() (ADR 0098 D1)" },
+    { path = "std::time::Instant::now", reason = "measure via services.clock.now_mono() (ADR 0098 D1)" },
+    { path = "tokio::time::Instant::now", reason = "measure via services.clock.now_mono() (ADR 0098 D1)" },
+    { path = "uuid::Uuid::new_v4", reason = "mint ids via services.entropy.uuid() (ADR 0098 D1)" },
+]

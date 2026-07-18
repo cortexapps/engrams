@@ -133,7 +133,7 @@ fn build_params() -> CertificateParams {
     // 10 years — sandboxes are ephemeral but the CA is host-side
     // and we don't want surprise expiry to break sessions.
     use chrono::Datelike;
-    let now = chrono::Utc::now();
+    let now = crate::time_source::wall_now();
     let later = now + chrono::Duration::days(3650);
     params.not_before = rcgen::date_time_ymd(now.year(), now.month() as u8, now.day() as u8);
     params.not_after = rcgen::date_time_ymd(later.year(), later.month() as u8, later.day() as u8);
