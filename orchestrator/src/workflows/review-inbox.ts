@@ -1,5 +1,7 @@
 /** The PrReviewWorkflow's single mailbox contract (ADR 0100). */
 
+import type { TerminalOutcome } from "../control-plane/session-events.ts";
+
 export const REVIEW_TOPIC = "review";
 
 export type ReviewInbox =
@@ -14,4 +16,10 @@ export type ReviewInbox =
       focus?: string;
     }
   | { kind: "comment"; commentId: string; body: string }
+  | {
+      kind: "session_ended";
+      role: string;
+      sessionId: string;
+      outcome: TerminalOutcome;
+    }
   | { kind: "stop" };

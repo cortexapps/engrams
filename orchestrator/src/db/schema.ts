@@ -306,6 +306,15 @@ export const slackSession = pgTable("slack_session", {
   threadWfId: text("thread_wf_id").notNull(),
 });
 
+/** Review worker sessions route terminal state into their owning review
+ * workflow mailbox. Absence means the review consumer does not apply. */
+export const reviewSession = pgTable("review_session", {
+  sessionId: text("session_id").primaryKey(),
+  reviewWorkflowId: text("review_workflow_id").notNull(),
+  role: text("role").notNull(), // finder|verifier
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
 // ---------------------------------------------------------------------------
 // Session profiles (ADR 0053)
 //

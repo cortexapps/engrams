@@ -395,6 +395,9 @@ export interface CreateSessionForExistingTaskParams {
   prompt?: string;
   extraCapabilities?: readonly string[];
   appendSystemPrompt?: string;
+  /** Register the session for terminal/event consumption in the same
+   * transaction as its task_session row. */
+  registerListener?: boolean;
   /** Optional caller context; the existing task already owns its durable
    *  source metadata, so this path does not insert or update it. */
   source?: Record<string, unknown>;
@@ -412,8 +415,8 @@ export interface CreatedTask {
 /**
  * Create a session and attach it to an already-persisted task. Review phases
  * use this path because their automation-owned `pr_review` task is created
- * before any worker session exists. No listener is registered yet: this slice
- * deliberately does not await terminal session state.
+ * before any worker session exists. Callers opt into listener registration
+ * when their workflow needs terminal session state.
  */
 export async function createSessionForExistingTask(
   deps: CreateSessionForExistingTaskDeps,
@@ -479,7 +482,11 @@ export async function createSessionForExistingTask(
         role: params.role,
         profileId: profile.id,
       });
-      // No session_listeners row: terminal awaiting is a later ADR 0100 slice.
+      if (params.registerListener === true) {
+        await tx.insert(sessionListenerTable).values({
+          sessionId: created.sessionId,
+        });
+      }
     });
   } catch (err) {
     try {

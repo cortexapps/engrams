@@ -751,7 +751,7 @@ describe("createTaskWithSession", () => {
 });
 
 describe("createSessionForExistingTask", () => {
-  test("creates promptlessly and inserts only the finder task_session row", async () => {
+  test("creates promptlessly and leaves listener registration off by default", async () => {
     const records: Record<string, unknown>[] = [];
     const sessions = fakeSessions();
 
@@ -783,6 +783,44 @@ describe("createSessionForExistingTask", () => {
     expect(request.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
       `finder system prompt\n\n${PAPERCUT_SYSTEM_PROMPT}`,
     );
+  });
+
+  test("registers the listener in the same transaction when requested", async () => {
+    const records: Record<string, unknown>[] = [];
+
+    await createSessionForExistingTask(
+      createDeps(fakeSessions(), recordingDb(records)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "verifier",
+        registerListener: true,
+      },
+    );
+
+    expect(records).toEqual([
+      {
+        taskId: "task-existing",
+        sessionId: "sess-1",
+        role: "verifier",
+        profileId: "p1",
+      },
+      { sessionId: "sess-1" },
+    ]);
+  });
+
+  test("compensates when requested listener registration fails", async () => {
+    const sessions = fakeSessions();
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], false, 2)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "verifier",
+        registerListener: true,
+      },
+    )).rejects.toThrow(/insert boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
   test("deletes the orphan session when task_session persistence fails", async () => {
