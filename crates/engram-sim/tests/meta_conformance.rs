@@ -235,6 +235,30 @@ async fn session_lifecycle(ctx: &Ctx) {
     assert!(matches!(err, MetaError::NotFound));
 }
 
+/// The dead-host straggler listing returns only HostLost sessions.
+async fn list_host_lost_sessions(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let stranded = meta
+        .create_session(spec("conf:host-lost-straggler"))
+        .await
+        .unwrap();
+    let other = meta
+        .create_session(spec("conf:not-host-lost"))
+        .await
+        .unwrap();
+
+    meta.transition_session(stranded, SessionState::Created)
+        .await
+        .unwrap();
+    meta.transition_session(stranded, SessionState::HostLost)
+        .await
+        .unwrap();
+
+    let listed = meta.list_host_lost_sessions().await.unwrap();
+    assert!(listed.iter().any(|session| session.id == stranded));
+    assert!(!listed.iter().any(|session| session.id == other));
+}
+
 /// FIFO by queued_at; the queue drains oldest-first. Sessions enter the
 /// queue via the REAL enqueue path (`reserve_and_persist_create` with no
 /// candidates), which stamps `queue_origin` + `queued_at`.
@@ -933,6 +957,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
 }
 
 conformance!(t_session_lifecycle, super::session_lifecycle);
+conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);

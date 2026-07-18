@@ -464,6 +464,11 @@ pub const RECONCILE_PROBE_RESCUES_TOTAL: &str = "engram_reconcile_probe_rescues_
 /// rescue counter above so both rescue paths are graphable together.
 pub const DEAD_HOST_PROBE_RESCUES_TOTAL: &str = "engram_dead_host_probe_rescues_total";
 
+/// Counter (issue #762). `dead_host::host_lost_straggler_sweep`
+/// completed the delayed HostLost stage-2 transition for a row whose
+/// inline transition never ran or failed.
+pub const HOST_LOST_STRAGGLERS_SETTLED_TOTAL: &str = "engram_host_lost_stragglers_settled_total";
+
 /// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
 /// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`
 /// once placement resolves. Labels: `placement` = `same_host` (the

@@ -42,6 +42,16 @@ fn issue_722_placement_over_reservation_interleaving() {
     run(0, Profile::Chaos, 600);
 }
 
+/// Nightly seed 33043259: idle-eviction nomination plus a host restart
+/// loses the VM, the evict op exhausts its 20-attempt budget, and the
+/// fallback parks the session at HostLost with bindings still set. Before
+/// issue #762, no driver ever ran HostLost stage 2 again; dead_host's
+/// host_lost_straggler_sweep is the fix.
+#[test]
+fn issue_762_host_lost_straggler_after_evict_budget_exhaustion() {
+    run(33043259, Profile::Chaos, 5000);
+}
+
 /// ADR 0098 coverage-gap G1 (PR #743, session 03e6535e): a resume-class op
 /// wedged forever inside its host RPC while the within-step heartbeat kept
 /// the op row fresh — stale-op reclaim never fired and the op pinned for

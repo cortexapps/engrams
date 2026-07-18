@@ -2985,6 +2985,16 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Input to the dead-host driver's straggler sweep: `HostLost` rows
+    /// whose inline stage-2 transition never ran or failed. These arise
+    /// when eviction exhausts its retry budget or a coordinator replica
+    /// crashes between the two HostLost stages. Default `Ok(vec![])`
+    /// keeps in-memory mocks quiet; durable stores must implement the
+    /// listing explicitly.
+    async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// Atomically `evac_attempts = evac_attempts + 1 RETURNING
     /// evac_attempts`. Scanner calls this before each resume attempt;
     /// when the returned count exceeds the budget, scanner gives up
