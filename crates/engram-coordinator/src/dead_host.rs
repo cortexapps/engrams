@@ -141,6 +141,15 @@ pub struct DeadHostConfig {
     /// enough that a crashed pod delays a genuinely-dead host's
     /// eviction by at most this long.
     pub lease_stale_after: Duration,
+    /// Issue #777 "ask-the-host": how many consecutive sweep cycles the
+    /// straggler sweep will DEFER destroying a still-bound sandbox whose
+    /// host still reports it serving (a live VM under a HostLost row —
+    /// the >60s partition/desync window) before giving up and
+    /// destroying+settling anyway. The cap keeps the sweep convergent
+    /// (never parks forever, the #762/#769 wedge) while giving the
+    /// reattach machinery a bounded window to recover the live VM in
+    /// place. Default 3 (~3 sweep cycles).
+    pub straggler_serving_strike_cap: u32,
 }
 
 impl Default for DeadHostConfig {
@@ -151,6 +160,7 @@ impl Default for DeadHostConfig {
             min_probe_failures: 3,
             probe_rescue_grace: Duration::from_secs(120),
             lease_stale_after: Duration::from_secs(180),
+            straggler_serving_strike_cap: 3,
         }
     }
 }
@@ -199,6 +209,24 @@ fn probe_failure_permits_eviction(
 /// [`run_once`] so strikes persist across sweeps.
 pub type ProbeMemoryMap = std::collections::HashMap<HostId, ProbeMemory>;
 
+/// Per-session serving-strike history for the straggler sweep (issue
+/// #777 "ask-the-host"), keyed by session id. Counts consecutive sweep
+/// cycles on which the host still reported a still-bound sandbox as
+/// serving, so the sweep can defer the destroy up to
+/// `straggler_serving_strike_cap` cycles before giving up. Owned by the
+/// caller of [`run_once`] so it persists across sweeps and pruned to the
+/// current HostLost set each cycle.
+///
+/// Per-replica and deliberately in-memory (the same choice as
+/// [`ProbeMemory`]): the running-sandbox SET is not persisted in PG, so
+/// there is no natural column to mirror; and this is a per-pod backstop,
+/// not cross-pod truth. With replicas racing, each counts its own strikes
+/// — a bounded, conservative error in the safe direction (it can only
+/// DELAY a destroy, never destroy a live VM earlier than a single replica
+/// would), and a settle by ANY replica ends the deferral for all via the
+/// #211 CAS + `Conflict`-idempotent transition.
+pub type StragglerStrikeMap = std::collections::BTreeMap<SessionId, u32>;
+
 pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
         // Same claimant identity convention as the enable scanner: the
@@ -212,9 +240,21 @@ pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle
         // to the current candidate set each sweep, so a host whose
         // heartbeats recover starts its next staleness episode fresh.
         let mut probe_memory = ProbeMemoryMap::new();
+        // Serving-strike history across ticks for the straggler sweep
+        // (issue #777 ask-the-host); pruned to the current HostLost set
+        // inside the sweep.
+        let mut straggler_strikes = StragglerStrikeMap::new();
         loop {
             tick.tick().await;
-            if let Err(e) = run_once(&cfg, &state, &claimant, &mut probe_memory).await {
+            if let Err(e) = run_once(
+                &cfg,
+                &state,
+                &claimant,
+                &mut probe_memory,
+                &mut straggler_strikes,
+            )
+            .await
+            {
                 tracing::warn!(error = %e, "dead-host detector tick failed; will retry");
             }
         }
@@ -228,13 +268,14 @@ pub async fn run_once(
     state: &SharedState,
     claimant: &str,
     probe_memory: &mut ProbeMemoryMap,
+    straggler_strikes: &mut StragglerStrikeMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidates = state
         .services
         .meta
         .list_stale_hosts(cfg.stale_threshold.as_secs())
         .await?;
-    host_lost_straggler_sweep(state).await?;
+    host_lost_straggler_sweep(cfg, state, straggler_strikes).await?;
     // A host that stopped being a candidate recovered (its heartbeats
     // are landing again) — drop its strikes/rescue history.
     let ids: std::collections::HashSet<HostId> = candidates.iter().map(|h| h.id).collect();
@@ -258,11 +299,29 @@ pub async fn run_once(
 /// Settle HostLost rows whose inline second-stage transition never ran
 /// or failed. This is deliberately a delayed backstop, not the normal
 /// HostLost path.
+///
+/// **Convergence (oracle #8's shape):** every arm terminates in a settle
+/// within bounded cycles. A row younger than the 60s min-age is skipped
+/// (a later cycle handles it); an unbound row settles immediately; a
+/// bound row whose host is gone/silent (probe fails / no backend) settles
+/// immediately; a bound row whose host still reports the sandbox SERVING
+/// is deferred at most `straggler_serving_strike_cap` cycles (the
+/// ask-the-host defer, #777) and then settles. No arm parks forever — the
+/// #762/#769 eternal-wedge is not reintroduced.
 pub async fn host_lost_straggler_sweep(
+    cfg: &DeadHostConfig,
     state: &SharedState,
+    straggler_strikes: &mut StragglerStrikeMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let meta = &state.services.meta;
     let sessions = meta.list_host_lost_sessions().await?;
+
+    // Prune serving-strike history to the rows still HostLost — a session
+    // that settled (or a competing replica settled) drops its strikes, so
+    // a fresh HostLost episode starts clean.
+    let host_lost_ids: std::collections::HashSet<SessionId> =
+        sessions.iter().map(|s| s.id).collect();
+    straggler_strikes.retain(|sid, _| host_lost_ids.contains(sid));
 
     for session in sessions {
         let now = state.services.clock.now_utc();
@@ -274,6 +333,58 @@ pub async fn host_lost_straggler_sweep(
         }
 
         if let Some(sandbox_id) = session.sandbox_id {
+            // ADR 0098 Phase 3 / #777 "ask-the-host": before destroying a
+            // still-bound sandbox, consult HOST TRUTH. The running-sandbox
+            // SET is not persisted in PG (only a count + last_heartbeat_at),
+            // so we use the same direct probe reconcile's ADR 0068 belt uses
+            // — `probe_sandbox` → `process_alive`. A live-and-serving VM
+            // under a HostLost row is the >60s partition/desync window
+            // (#776 review): the reattach machinery may still recover it in
+            // place, so DEFER the destroy and bank a serving-strike rather
+            // than kill the live VM. Only a probe that FAILS (host gone /
+            // unreachable / `Unsupported` from an old host-agent), a
+            // process that is NOT alive, or the strike cap being reached
+            // proceeds to destroy — mirroring reconcile's "only an explicit
+            // process_alive == true rescues" asymmetry. No backend in the
+            // registry ⇒ the host is already gone ⇒ nothing to protect ⇒
+            // proceed.
+            let serving = match session
+                .host_id
+                .and_then(|host_id| state.host_registry.backend_of(host_id))
+            {
+                Some(backend) => {
+                    matches!(backend.probe_sandbox(sandbox_id).await, Ok(p) if p.process_alive)
+                }
+                None => false,
+            };
+            if serving {
+                let strikes = straggler_strikes.entry(session.id).or_default();
+                *strikes += 1;
+                if *strikes < cfg.straggler_serving_strike_cap {
+                    ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLER_DEFERRED_SERVING_TOTAL)
+                        .increment(1);
+                    tracing::warn!(
+                        session_id = %session.id,
+                        %sandbox_id,
+                        strikes = *strikes,
+                        cap = cfg.straggler_serving_strike_cap,
+                        "host-lost straggler: host still reports the sandbox SERVING — deferring \
+                         destroy+settle for the reattach machinery (ask-the-host, #777)",
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    session_id = %session.id,
+                    %sandbox_id,
+                    strikes = *strikes,
+                    "host-lost straggler: serving-strike cap reached — destroying and settling \
+                     (bounded convergence, #777)",
+                );
+            }
+            // Not serving, or the strike cap is reached: proceed to destroy
+            // + settle as before. Drop any strike history for this row.
+            straggler_strikes.remove(&session.id);
+
             state.host_registry.invalidate_sandbox(sandbox_id);
 
             if let Some(backend) = session
@@ -327,7 +438,12 @@ pub async fn host_lost_straggler_sweep(
                 continue;
             }
         };
-        let target = recovery_target(snapshot.is_some(), session.live_disk_manifest.is_some());
+        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
+        let target = recovery_target(
+            has_recoverable_snapshot,
+            session.live_disk_manifest.is_some(),
+        );
+        note_unrecoverable_if_dead(target, snapshot.as_ref(), session.id);
         match meta.transition_session(session.id, target).await {
             Ok(prev) => {
                 emit_status_changed(meta, &state.events, session.id, prev, target, now).await;
@@ -370,18 +486,55 @@ async fn host_responds(client: &Arc<dyn engram_core::traits::HostClient>) -> boo
     client.ping().await.is_ok()
 }
 
-/// The dead-host detector's stage-2 routing decision (ADR 0045 Phase
-/// A). A session is recoverable — and routed to `Idle` for lazy
-/// `/resume` on next access — if it has a memory snapshot OR a live
-/// disk manifest (the latter still resumes via the cold-boot path).
-/// With nothing to recover from, it goes to `Dead`. The detector no
-/// longer routes into `Evacuating`; proactive relocation is operator
-/// drain only (ADR 0044 K3).
-fn recovery_target(has_snapshot: bool, has_live_manifest: bool) -> SessionState {
-    if has_snapshot || has_live_manifest {
+/// THE HostLost stage-2 routing predicate (ADR 0045 Phase A; unified in
+/// issue #777, ADR 0098 Phase 3 "honest-Dead"). A session is recoverable
+/// — routed to `Idle` for lazy `/resume` on next access — iff it has a
+/// **recoverable** memory snapshot OR a live disk manifest (the latter
+/// still resumes via the cold-boot path). With nothing recoverable it
+/// goes to `Dead` — never an `Idle` that lies about resumability.
+///
+/// `has_recoverable_snapshot` is the honest predicate: it is the latest
+/// snapshot's `recoverable` flag (the BlobStorage HEAD result at
+/// snapshot-take time), NOT the mere presence of a snapshot row. Before
+/// #777 the two dead-host sites keyed on `snapshot.is_some()`, disagreeing
+/// with `reconcile::flip_missing`, which already keyed on `recoverable`;
+/// the filtered predicate is now the one true stage-2 decision, shared by
+/// every site.
+///
+/// The detector no longer routes into `Evacuating`; proactive relocation
+/// is operator drain only (ADR 0044 K3).
+pub(crate) fn recovery_target(
+    has_recoverable_snapshot: bool,
+    has_live_manifest: bool,
+) -> SessionState {
+    if has_recoverable_snapshot || has_live_manifest {
         SessionState::Idle
     } else {
         SessionState::Dead
+    }
+}
+
+/// The "snapshot rows exist but none is recoverable" signal (issue #777,
+/// ADR 0098 Phase 3 honest-Dead). When stage 2 routes a session to `Dead`
+/// while a snapshot row DID exist, the snapshot was un-recoverable (its
+/// BlobStorage HEAD failed at take-time) and there was no live disk
+/// manifest either. Emit a distinct warn + counter so a bad-capture
+/// pipeline stays visible instead of hiding behind a generic Dead — a
+/// no-op when the target is `Idle` (recoverable) or when there was no
+/// snapshot at all (a genuinely never-checkpointed session).
+pub(crate) fn note_unrecoverable_if_dead(
+    target: SessionState,
+    latest_snapshot: Option<&engram_core::types::snapshot::SnapshotRecord>,
+    session_id: SessionId,
+) {
+    if target == SessionState::Dead && latest_snapshot.is_some() {
+        ::metrics::counter!(crate::metrics::HOST_LOST_UNRECOVERABLE_SNAPSHOT_TOTAL).increment(1);
+        tracing::warn!(
+            session_id = %session_id,
+            "HostLost stage 2: snapshot row(s) exist but none is recoverable and no live disk \
+             manifest — routing to Dead (bad-capture signal, issue #777). Check snapshot \
+             durability (BlobStorage HEAD at capture time)",
+        );
     }
 }
 
@@ -564,13 +717,15 @@ async fn evict_host_locked(
     // resume-from-idle wedge + deploy-storm cascade). Proactive
     // relocation now happens only via operator drain (ADR 0044 K3).
     //
-    // Decision matrix:
+    // Decision matrix (issue #777 honest-Dead: the snapshot column is the
+    // `recoverable` FLAG, not mere row presence — an un-recoverable
+    // snapshot is NOT resumable and must not route to a lying Idle):
     //
-    // | snapshot | live_manifest | next state | who recovers it          |
-    // |----------|---------------|------------|--------------------------|
-    // | Some     | _             | Idle       | user/exec /resume        |
-    // | None     | Some          | Idle       | /resume (disk-only cold) |
-    // | None     | None          | Dead       | (no recoverable state)   |
+    // | recoverable snap | live_manifest | next state | who recovers it          |
+    // |------------------|---------------|------------|--------------------------|
+    // | true             | _             | Idle       | user/exec /resume        |
+    // | false/none       | Some          | Idle       | /resume (disk-only cold) |
+    // | false/none       | None          | Dead       | (no recoverable state)   |
     //
     // Failures of any query/transition are logged and skipped; the
     // row stays at HostLost and a future reconcile pass (or
@@ -603,7 +758,9 @@ async fn evict_host_locked(
             }
         };
 
-        let target = recovery_target(snapshot.is_some(), has_live_manifest);
+        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
+        let target = recovery_target(has_recoverable_snapshot, has_live_manifest);
+        note_unrecoverable_if_dead(target, snapshot.as_ref(), *session_id);
 
         match meta.transition_session(*session_id, target).await {
             Ok(prev) => {
@@ -650,19 +807,21 @@ mod tests {
     // multi-replica behaviour is the live-Postgres test
     // (`#[ignore]`'d, gated behind dev-VM Docker compose).
 
-    // ADR 0045 Phase A: the stage-2 routing decision. A recoverable
-    // dead-host session goes to Idle (lazy /resume), never Evacuating
-    // (the reactive auto-evac is retired); only the no-state case is
-    // terminal.
+    // ADR 0045 Phase A + issue #777 honest-Dead: the stage-2 routing
+    // decision. A RECOVERABLE dead-host session goes to Idle (lazy
+    // /resume), never Evacuating (the reactive auto-evac is retired);
+    // only the no-recoverable-state case is terminal. The first arg is
+    // the snapshot's `recoverable` FLAG, not mere row presence — an
+    // un-recoverable snapshot alone is NOT resumable.
     #[test]
     fn recovery_target_routes_recoverable_to_idle_never_evacuating() {
-        // snapshot present → Idle (memory + disk resume).
+        // recoverable snapshot → Idle (memory + disk resume).
         assert_eq!(recovery_target(true, false), SessionState::Idle);
-        // disk-only (live manifest, no snapshot) → Idle (cold-boot resume).
+        // disk-only (live manifest, no recoverable snapshot) → Idle (cold-boot resume).
         assert_eq!(recovery_target(false, true), SessionState::Idle);
         // both present → Idle.
         assert_eq!(recovery_target(true, true), SessionState::Idle);
-        // nothing recoverable → Dead.
+        // nothing recoverable (no recoverable snapshot, no manifest) → Dead.
         assert_eq!(recovery_target(false, false), SessionState::Dead);
 
         // The reactive auto-evac target is gone: no input combination

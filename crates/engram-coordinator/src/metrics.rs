@@ -469,6 +469,28 @@ pub const DEAD_HOST_PROBE_RESCUES_TOTAL: &str = "engram_dead_host_probe_rescues_
 /// inline transition never ran or failed.
 pub const HOST_LOST_STRAGGLERS_SETTLED_TOTAL: &str = "engram_host_lost_stragglers_settled_total";
 
+/// Counter (issue #777, ADR 0098 Phase 3 honest-Dead). A HostLost
+/// stage-2 transition routed a session to `Dead` while a snapshot row
+/// DID exist — the snapshot was un-recoverable (its BlobStorage HEAD
+/// failed at take-time) and there was no live disk manifest either.
+/// Distinct from "no snapshot at all" so a bad-capture pipeline stays
+/// visible instead of hiding behind a generic Dead. Fired from every
+/// stage-2 site (`reconcile::flip_missing`, `dead_host::evict_host`,
+/// `dead_host::host_lost_straggler_sweep`).
+pub const HOST_LOST_UNRECOVERABLE_SNAPSHOT_TOTAL: &str =
+    "engram_host_lost_unrecoverable_snapshot_total";
+
+/// Counter (issue #777, ADR 0098 Phase 3 ask-the-host).
+/// `host_lost_straggler_sweep` was about to destroy a still-bound
+/// sandbox, probed the host, and found the VMM process ALIVE — so it
+/// DEFERRED the destroy+settle for the reattach machinery and banked a
+/// serving-strike instead. Sustained nonzero means live VMs are sitting
+/// under HostLost rows (a partition/desync parking bug upstream); the
+/// sweep no longer kills them on sight (removes the >60s-partition
+/// destroy-a-live-VM window of #762/#769).
+pub const HOST_LOST_STRAGGLER_DEFERRED_SERVING_TOTAL: &str =
+    "engram_host_lost_straggler_deferred_serving_total";
+
 /// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
 /// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`
 /// once placement resolves. Labels: `placement` = `same_host` (the

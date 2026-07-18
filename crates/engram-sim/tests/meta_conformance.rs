@@ -871,6 +871,73 @@ async fn snapshot_durable_head(ctx: &Ctx) {
     assert_eq!(meta.durable_head_snapshot(sid).await.unwrap(), Some(s1));
 }
 
+/// Issue #777 honest-Dead: `latest_snapshot_for_session` returns the
+/// newest snapshot row AND its `recoverable` flag faithfully — the
+/// foundation the unified HostLost stage-2 predicate
+/// (`dead_host::recovery_target`) keys on. Pin it across BOTH stores so
+/// the "un-recoverable-only ⇒ Dead, recoverable ⇒ Idle" decision rests
+/// on identical store semantics: a session whose ONLY (or latest)
+/// snapshot is `recoverable=false` must NOT masquerade as recoverable.
+async fn latest_snapshot_reports_recoverable_flag(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta
+        .create_session(spec("conf:latest-snap-recoverable"))
+        .await
+        .unwrap();
+
+    // No snapshot yet → None (a genuinely never-checkpointed session;
+    // the predicate routes this to Dead only when there's also no
+    // manifest, and never lies it into Idle).
+    assert!(meta
+        .latest_snapshot_for_session(sid)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The only snapshot is un-recoverable (a torn/HEAD-failed capture):
+    // the row exists, but `recoverable` is false. The honest predicate
+    // must see false here, not "a snapshot exists".
+    let t0 = ctx.clock.now_utc();
+    let bad = SnapshotId::new();
+    assert!(meta
+        .record_snapshot(snapshot(bad, sid, t0, false))
+        .await
+        .unwrap());
+    let latest = meta
+        .latest_snapshot_for_session(sid)
+        .await
+        .unwrap()
+        .expect("a snapshot row exists");
+    assert_eq!(latest.id, bad);
+    assert!(
+        !latest.recoverable,
+        "an un-recoverable snapshot must report recoverable=false — honest-Dead (#777) keys on it",
+    );
+
+    // A newer recoverable snapshot becomes the latest and reports true —
+    // now the same session IS recoverable (routes to Idle).
+    ctx.clock.advance(Duration::from_secs(10));
+    let t1 = ctx.clock.now_utc();
+    let good = SnapshotId::new();
+    assert!(meta
+        .record_snapshot(snapshot(good, sid, t1, true))
+        .await
+        .unwrap());
+    let latest = meta
+        .latest_snapshot_for_session(sid)
+        .await
+        .unwrap()
+        .expect("a snapshot row exists");
+    assert_eq!(
+        latest.id, good,
+        "the newest row (by created_at) is the latest"
+    );
+    assert!(
+        latest.recoverable,
+        "a recoverable snapshot must report recoverable=true — the Idle arm keys on it",
+    );
+}
+
 /// GC candidates: first_seen_at is sticky across re-upserts; the
 /// expiry cutoff keys on it; delete removes.
 async fn gc_candidates(ctx: &Ctx) {
@@ -1194,6 +1261,10 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
 
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
+conformance!(
+    t_latest_snapshot_reports_recoverable_flag,
+    super::latest_snapshot_reports_recoverable_flag
+);
 conformance!(t_terminate_and_delta, super::terminate_and_delta);
 conformance!(t_host_fc_snapshot_version, super::host_fc_snapshot_version);
 conformance!(
