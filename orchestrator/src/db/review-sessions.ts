@@ -15,6 +15,7 @@ export interface ReviewSessionStore {
     role: string,
   ): Promise<void>;
   find(sessionId: string): Promise<ReviewSessionBinding | null>;
+  remove(sessionId: string): Promise<void>;
 }
 
 export type ReviewSessionDb = ReturnType<typeof getDb>;
@@ -41,6 +42,12 @@ export function makeReviewSessionStore(
         .where(eq(reviewSession.sessionId, sessionId))
         .limit(1);
       return rows[0] ?? null;
+    },
+
+    async remove(sessionId) {
+      await db
+        .delete(reviewSession)
+        .where(eq(reviewSession.sessionId, sessionId));
     },
   };
 }

@@ -66,7 +66,31 @@ describe("Review consumer", () => {
     expect(sent.calls).toEqual([]);
   });
 
-  test("ignores curated events because review data arrives through tools", async () => {
+  test("sends run completion as the idle fallback with a stable key", async () => {
+    const sent = sender();
+    const consumer = makeReviewConsumer({
+      findReviewSession: async () => ({
+        reviewWorkflowId: "review-wf-1",
+        role: "finder",
+      }),
+      send: sent.send,
+    });
+
+    await consumer.appliesTo("session-1");
+    await consumer.handle(
+      { idx: 7n, kind: "run_completed", payloadJson: "{}" },
+      { sessionId: "session-1" },
+    );
+
+    expect(sent.calls).toEqual([{
+      destinationId: "review-wf-1",
+      message: { kind: "session_idle", role: "finder" },
+      topic: REVIEW_TOPIC,
+      idempotencyKey: "review:session-1:idle",
+    }]);
+  });
+
+  test("ignores curated events other than run completion", async () => {
     const sent = sender();
     const consumer = makeReviewConsumer({
       findReviewSession: async () => ({

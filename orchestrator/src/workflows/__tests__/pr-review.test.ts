@@ -65,6 +65,7 @@ function fakeControlPlane(
     createVerifierSession: async () => ({ sessionId: "verifier-session" }),
     bootstrapVerifierSession: async () => {},
     sendVerifierPrompt: async () => {},
+    deleteReviewSession: async () => {},
     postReviewResults: async () => {},
     markReviewFailed: async () => {},
     markReviewHalted: async () => {},
@@ -95,7 +96,7 @@ async function run(
 }
 
 describe("PrReviewWorkflow", () => {
-  test("chains finder completion with candidates into verifier setup in order", async () => {
+  test("dedupes completion signals while deleting each worker and advancing phases", async () => {
     const calls: Array<{ name: string; input?: unknown }> = [];
     const steps = runner();
     const cp = fakeControlPlane({
@@ -112,6 +113,9 @@ describe("PrReviewWorkflow", () => {
       },
       async sendFinderPrompt(sessionId, input) {
         calls.push({ name: "sendFinderPrompt", input: { sessionId, ...input } });
+      },
+      async deleteReviewSession(sessionId) {
+        calls.push({ name: "deleteReviewSession", input: sessionId });
       },
       async getReview(reviewId) {
         calls.push({ name: "getReview", input: reviewId });
@@ -135,16 +139,16 @@ describe("PrReviewWorkflow", () => {
     await run(cp, [
       trigger,
       {
-        kind: "session_ended",
+        kind: "phase_done",
         role: "finder",
-        sessionId: "finder-session",
-        outcome: "completed",
       },
       {
-        kind: "session_ended",
+        kind: "session_idle",
+        role: "finder",
+      },
+      {
+        kind: "phase_done",
         role: "verifier",
-        sessionId: "verifier-session",
-        outcome: "completed",
       },
     ], steps.step);
 
@@ -153,10 +157,12 @@ describe("PrReviewWorkflow", () => {
       "createFinderSession",
       "bootstrapFinderSession",
       "sendFinderPrompt",
+      "deleteReviewSession",
       "getReview",
       "createVerifierSession",
       "bootstrapVerifierSession",
       "sendVerifierPrompt",
+      "deleteReviewSession",
       "postReviewResults",
     ]);
     expect(steps.steps).toEqual([
@@ -164,10 +170,12 @@ describe("PrReviewWorkflow", () => {
       "createFinderSession",
       "bootstrapFinderSession",
       "sendFinderPrompt",
+      "deleteReviewSession",
       "getReviewAfterFinder",
       "createVerifierSession",
       "bootstrapVerifierSession",
       "sendVerifierPrompt",
+      "deleteReviewSession",
       "postReviewResults",
     ]);
     expect(calls.find((call) => call.name === "createFinderSession")?.input)
@@ -202,6 +210,7 @@ describe("PrReviewWorkflow", () => {
 
     expect(calls).toEqual(["postReviewResults"]);
     expect(steps.steps).toContain("getReviewAfterFinder");
+    expect(steps.steps).toContain("deleteReviewSession");
     expect(steps.steps).not.toContain("createVerifierSession");
     expect(steps.steps.at(-1)).toBe("postReviewResults");
   });
@@ -368,7 +377,31 @@ describe("PrReviewWorkflow", () => {
     await run(cp, [trigger, { kind: "stop" }], steps.step);
 
     expect(halted).toEqual([["openai/engrams", 100]]);
+    expect(steps.steps).toContain("deleteReviewSession");
     expect(steps.steps.at(-1)).toBe("markReviewHalted");
+  });
+
+  test("marks the review failed after two phase receive timeouts", async () => {
+    let markedFailed = 0;
+    const deleted: string[] = [];
+    const steps = runner();
+    const cp = fakeControlPlane({
+      deleteReviewSession: async (sessionId) => {
+        deleted.push(sessionId);
+      },
+      markReviewFailed: async () => {
+        markedFailed++;
+      },
+    });
+
+    await run(cp, [trigger, null, null], steps.step);
+
+    expect(deleted).toEqual(["finder-session"]);
+    expect(markedFailed).toBe(1);
+    expect(steps.steps.slice(-2)).toEqual([
+      "deleteReviewSession",
+      "markReviewFailed",
+    ]);
   });
 
   test("marks the review failed when initial finder setup throws", async () => {
@@ -390,6 +423,7 @@ describe("PrReviewWorkflow", () => {
       "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
+      "deleteReviewSession",
       "markReviewFailed",
     ]);
   });

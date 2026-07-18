@@ -8,6 +8,10 @@ import { REVIEW_TOPIC, type ReviewInbox } from "./review-inbox.ts";
 
 const log = rootLog.child({ component: "github-review" });
 const RECV_TIMEOUT_S = 3_600;
+// A worker gets two full durable receive windows (two hours) per attempt. This
+// preserves the coarse, low-churn mailbox cadence while bounding a lost-signal
+// phase without consulting non-deterministic wall-clock time.
+const PHASE_DEADLINE_WINDOWS = 2;
 
 export type StepRunner = <T>(fn: () => Promise<T>, name: string) => Promise<T>;
 export type ReviewReceiver = (
@@ -62,6 +66,8 @@ export async function prReviewWorkflowImpl(
   );
 
   const headSha = first.headSha ?? "";
+  let finderSessionId: string | undefined;
+  let verifierSessionId: string | undefined;
   const setupFinder = async (): Promise<void> => {
     const { sessionId } = await step(
       () => cp.createFinderSession({
@@ -73,6 +79,7 @@ export async function prReviewWorkflowImpl(
       }),
       "createFinderSession",
     );
+    finderSessionId = sessionId;
     await step(
       () => cp.bootstrapFinderSession(sessionId, {
         repo: first.repo,
@@ -104,6 +111,7 @@ export async function prReviewWorkflowImpl(
       }),
       "createVerifierSession",
     );
+    verifierSessionId = sessionId;
     await step(
       () => cp.bootstrapVerifierSession(sessionId, {
         reviewId,
@@ -124,6 +132,32 @@ export async function prReviewWorkflowImpl(
     );
   };
 
+  const deleteWorkerSession = async (
+    role: "finder" | "verifier",
+  ): Promise<void> => {
+    const sessionId = role === "finder" ? finderSessionId : verifierSessionId;
+    if (sessionId === undefined) return;
+    await step(
+      () => cp.deleteReviewSession(sessionId),
+      "deleteReviewSession",
+    );
+    if (role === "finder") finderSessionId = undefined;
+    else verifierSessionId = undefined;
+  };
+
+  const deleteWorkerSessionBestEffort = async (
+    role: "finder" | "verifier",
+  ): Promise<void> => {
+    try {
+      await deleteWorkerSession(role);
+    } catch (err) {
+      log.error(
+        { repo: first.repo, prNumber: first.prNumber, role, err },
+        "review worker cleanup failed",
+      );
+    }
+  };
+
   try {
     await setupFinder();
   } catch (err) {
@@ -131,46 +165,66 @@ export async function prReviewWorkflowImpl(
       { repo: first.repo, prNumber: first.prNumber, err },
       "finder setup failed",
     );
+    await deleteWorkerSessionBestEffort("finder");
     await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
     return;
   }
 
   // These flags are workflow-local on purpose: DBOS replays the same recv
-  // history, deterministically rebuilding whether each role spent its one
-  // fresh-session retry before it executes new work.
+  // history, deterministically rebuilding retries and completion dedup before
+  // it executes new work.
   let finderRetried = false;
   let verifierRetried = false;
+  let finderDone = false;
+  let verifierDone = false;
+  let phaseTimeoutWindows = 0;
   for (;;) {
     const message = await recv(REVIEW_TOPIC, RECV_TIMEOUT_S);
-    if (message === null) continue;
+    if (message === null) {
+      phaseTimeoutWindows++;
+      if (phaseTimeoutWindows < PHASE_DEADLINE_WINDOWS) continue;
+      const role = finderDone ? "verifier" : "finder";
+      log.error(
+        {
+          repo: first.repo,
+          prNumber: first.prNumber,
+          role,
+          deadlineSeconds: RECV_TIMEOUT_S * PHASE_DEADLINE_WINDOWS,
+        },
+        "review phase deadline expired",
+      );
+      await deleteWorkerSessionBestEffort(role);
+      await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      return;
+    }
     if (message.kind === "stop") {
+      await deleteWorkerSessionBestEffort(finderDone ? "verifier" : "finder");
       await step(
         () => cp.markReviewHalted(first.repo, first.prNumber),
         "markReviewHalted",
       );
       return;
     }
-    if (message.kind === "session_ended" && message.role === "finder") {
-      if (message.outcome !== "completed") {
-        if (finderRetried) {
-          await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-          return;
-        }
-        finderRetried = true;
-        try {
-          await setupFinder();
-        } catch (err) {
-          log.error(
-            { repo: first.repo, prNumber: first.prNumber, err },
-            "finder retry setup failed",
-          );
-          await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-          return;
-        }
-        continue;
-      }
-
+    const completionRole = message.kind === "phase_done"
+        || message.kind === "session_idle"
+      ? message.role
+      : message.kind === "session_ended" && message.outcome === "completed"
+      ? message.role
+      : undefined;
+    if (
+      message.kind === "session_ended"
+      && message.outcome === "completed"
+      && message.sessionId !== (
+        message.role === "finder" ? finderSessionId : verifierSessionId
+      )
+    ) {
+      continue;
+    }
+    if (completionRole === "finder") {
+      if (finderDone) continue;
+      finderDone = true;
       try {
+        await deleteWorkerSession("finder");
         const detail = await step(
           () => cp.getReview(reviewId),
           "getReviewAfterFinder",
@@ -187,6 +241,7 @@ export async function prReviewWorkflowImpl(
           return;
         }
         await setupVerifier();
+        phaseTimeoutWindows = 0;
       } catch (err) {
         log.error(
           { repo: first.repo, prNumber: first.prNumber, err },
@@ -197,22 +252,57 @@ export async function prReviewWorkflowImpl(
       }
       continue;
     }
-    if (message.kind === "session_ended" && message.role === "verifier") {
-      if (message.outcome === "completed") {
-        try {
-          await step(
-            () => cp.postReviewResults(reviewId),
-            "postReviewResults",
-          );
-        } catch (err) {
-          log.error(
-            { repo: first.repo, prNumber: first.prNumber, err },
-            "review posting failed",
-          );
-          await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-        }
+    if (completionRole === "verifier") {
+      if (!finderDone || verifierDone) continue;
+      verifierDone = true;
+      try {
+        await deleteWorkerSession("verifier");
+        await step(
+          () => cp.postReviewResults(reviewId),
+          "postReviewResults",
+        );
+      } catch (err) {
+        log.error(
+          { repo: first.repo, prNumber: first.prNumber, err },
+          "review posting failed",
+        );
+        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      }
+      return;
+    }
+    if (
+      message.kind === "session_ended"
+      && message.role === "finder"
+      && !finderDone
+    ) {
+      if (message.sessionId !== finderSessionId) continue;
+      await deleteWorkerSessionBestEffort("finder");
+      if (finderRetried) {
+        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
         return;
       }
+      finderRetried = true;
+      try {
+        await setupFinder();
+        phaseTimeoutWindows = 0;
+      } catch (err) {
+        log.error(
+          { repo: first.repo, prNumber: first.prNumber, err },
+          "finder retry setup failed",
+        );
+        await deleteWorkerSessionBestEffort("finder");
+        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+        return;
+      }
+      continue;
+    }
+    if (
+      message.kind === "session_ended"
+      && message.role === "verifier"
+      && !verifierDone
+    ) {
+      if (message.sessionId !== verifierSessionId) continue;
+      await deleteWorkerSessionBestEffort("verifier");
       if (verifierRetried) {
         await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
         return;
@@ -220,11 +310,13 @@ export async function prReviewWorkflowImpl(
       verifierRetried = true;
       try {
         await setupVerifier();
+        phaseTimeoutWindows = 0;
       } catch (err) {
         log.error(
           { repo: first.repo, prNumber: first.prNumber, err },
           "verifier retry setup failed",
         );
+        await deleteWorkerSessionBestEffort("verifier");
         await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
         return;
       }
@@ -232,7 +324,7 @@ export async function prReviewWorkflowImpl(
     }
     log.info(
       { repo: first.repo, prNumber: first.prNumber, kind: message.kind },
-      "github review finder running; later execution phases not yet implemented",
+      "ignoring review workflow message that does not match the active phase",
     );
   }
 }

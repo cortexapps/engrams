@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 import type { EnrollmentRow } from "../../db/enrollments.ts";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
@@ -70,17 +71,24 @@ const reviewPostingNoops = {
   finalizeReview: async () => {},
 };
 
-function reviewSessionRecorder(): ReviewSessionStore & {
+function reviewSessionRecorder(order?: string[]): ReviewSessionStore & {
   calls: Array<[string, string, string]>;
+  removes: string[];
 } {
   const calls: Array<[string, string, string]> = [];
+  const removes: string[] = [];
   return {
     calls,
+    removes,
     async record(sessionId, reviewWorkflowId, role) {
+      order?.push(`binding:${sessionId}`);
       calls.push([sessionId, reviewWorkflowId, role]);
     },
     async find() {
       return null;
+    },
+    async remove(sessionId) {
+      removes.push(sessionId);
     },
   };
 }
@@ -139,16 +147,22 @@ function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & 
   execCalls: Array<{ sessionId: string; command: string }>;
   writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]>;
   promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]>;
+  deletedIds: string[];
 } {
   const execCalls: Array<{ sessionId: string; command: string }> = [];
   const writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]> = [];
   const promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]> = [];
+  const deletedIds: string[] = [];
   return {
     execCalls,
     writeCalls,
     promptCalls,
+    deletedIds,
     createSession: async () => ({ sessionId: "finder-session" }),
-    deleteSession: async () => ({}),
+    deleteSession: async ({ sessionId }) => {
+      deletedIds.push(sessionId);
+      return {};
+    },
     async *exec(req) {
       execCalls.push(req);
       if (options.stderr) {
@@ -248,16 +262,21 @@ describe("ReviewControlPlane", () => {
 
   test("creates the finder with the designated profile and scoped clone capability", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
-    const reviewSessions = reviewSessionRecorder();
+    const order: string[] = [];
+    const reviewSessions = reviewSessionRecorder(order);
     const designated = reviewerProfile("profile-designated");
     const cp = makeReviewControlPlane({
       profiles: profileLookup(designated),
       enrollments: { get: async () => enrollment(active.repo, null) },
       createSessionForExistingTask: async (params) => {
+        order.push("create");
         created.push(params);
         return { sessionId: "finder-session" };
       },
       reviewSessions,
+      registerSessionListener: async (sessionId) => {
+        order.push(`listener:${sessionId}`);
+      },
     });
 
     expect(await cp.createFinderSession({
@@ -272,11 +291,16 @@ describe("ReviewControlPlane", () => {
       profileId: designated.id,
       role: "finder",
       extraCapabilities: [`github:contents:read@${active.repo}`],
-      registerListener: true,
     });
+    expect(created[0]?.registerListener).toBeUndefined();
     expect(created[0]?.appendSystemPrompt).toContain("/workspace/.review/finder.md");
     expect(reviewSessions.calls).toEqual([
       ["finder-session", "review-wf-1", "finder"],
+    ]);
+    expect(order).toEqual([
+      "create",
+      "binding:finder-session",
+      "listener:finder-session",
     ]);
   });
 
@@ -290,6 +314,7 @@ describe("ReviewControlPlane", () => {
         return { sessionId: "finder-session" };
       },
       reviewSessions: reviewSessionRecorder(),
+      registerSessionListener: async () => {},
     });
 
     await cp.createFinderSession({
@@ -319,16 +344,21 @@ describe("ReviewControlPlane", () => {
 
   test("creates the verifier with a listener and records its workflow binding", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
-    const reviewSessions = reviewSessionRecorder();
+    const order: string[] = [];
+    const reviewSessions = reviewSessionRecorder(order);
     const designated = reviewerProfile("profile-designated");
     const cp = makeReviewControlPlane({
       profiles: profileLookup(designated),
       enrollments: { get: async () => enrollment(active.repo, null) },
       createSessionForExistingTask: async (params) => {
+        order.push("create");
         created.push(params);
         return { sessionId: "verifier-session" };
       },
       reviewSessions,
+      registerSessionListener: async (sessionId) => {
+        order.push(`listener:${sessionId}`);
+      },
     });
 
     expect(await cp.createVerifierSession({
@@ -343,12 +373,42 @@ describe("ReviewControlPlane", () => {
       profileId: designated.id,
       role: "verifier",
       extraCapabilities: [`github:contents:read@${active.repo}`],
-      registerListener: true,
     });
+    expect(created[0]?.registerListener).toBeUndefined();
     expect(created[0]?.appendSystemPrompt).toContain("submit_verdict");
     expect(reviewSessions.calls).toEqual([
       ["verifier-session", "review-wf-1", "verifier"],
     ]);
+    expect(order).toEqual([
+      "create",
+      "binding:verifier-session",
+      "listener:verifier-session",
+    ]);
+  });
+
+  test("deletes a worker session and removes its review binding", async () => {
+    const sessions = fakeSessions();
+    const reviewSessions = reviewSessionRecorder();
+    const cp = makeReviewControlPlane({ sessions, reviewSessions });
+
+    await cp.deleteReviewSession("review-session");
+
+    expect(sessions.deletedIds).toEqual(["review-session"]);
+    expect(reviewSessions.removes).toEqual(["review-session"]);
+  });
+
+  test("removes the binding when the worker session is already absent", async () => {
+    const sessions = {
+      ...fakeSessions(),
+      deleteSession: async () => {
+        throw new ConnectError("missing", Code.NotFound);
+      },
+    };
+    const reviewSessions = reviewSessionRecorder();
+    const cp = makeReviewControlPlane({ sessions, reviewSessions });
+
+    await expect(cp.deleteReviewSession("review-session")).resolves.toBeUndefined();
+    expect(reviewSessions.removes).toEqual(["review-session"]);
   });
 
   test("bootstraps with an idempotent clone, checkout, and rendered finder files", async () => {

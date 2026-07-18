@@ -1,5 +1,7 @@
 /** Durable review-record and finder-session operations behind the workflow seam. */
 
+import { Code, ConnectError } from "@connectrpc/connect";
+
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
@@ -15,6 +17,7 @@ import {
 } from "../db/review-sessions.ts";
 import { task as taskTable } from "../db/schema.ts";
 import { config } from "../config.ts";
+import { log as rootLog } from "../log.ts";
 import {
   harnessCatalog as defaultHarnessCatalog,
   images as defaultImages,
@@ -22,6 +25,7 @@ import {
 } from "../control-plane/client.ts";
 import {
   createSessionForExistingTask,
+  registerSessionListener as registerExistingSessionListener,
   type CreateSessionForExistingTaskParams,
   type HarnessCatalogClient,
   type TaskSessionsClient,
@@ -43,6 +47,8 @@ import {
   type RenderedReviewerFile,
   type ReviewCategory,
 } from "../reviewers/render.ts";
+
+const log = rootLog.child({ component: "review-control-plane" });
 
 export interface EnsureReviewRecordInput {
   repo: string;
@@ -99,6 +105,7 @@ export interface ReviewControlPlane {
     headSha: string;
     baseSha: string;
   }): Promise<void>;
+  deleteReviewSession(sessionId: string): Promise<void>;
   postReviewResults(reviewId: string): Promise<void>;
   markReviewFailed(reviewId: string): Promise<void>;
   markReviewHalted(repo: string, prNumber: number): Promise<void>;
@@ -149,6 +156,8 @@ export interface ReviewControlPlaneDeps {
   renderReviewer?: RenderReviewer;
   /** Focused test seam; production delegates to the shared task-create helper. */
   createSessionForExistingTask?: CreateExistingTaskSession;
+  /** Focused seam for asserting binding-before-listener publication. */
+  registerSessionListener?: (sessionId: string) => Promise<void>;
 }
 
 export class ReviewSetupError extends Error {
@@ -308,6 +317,8 @@ export function makeReviewControlPlane(
       params,
     );
   });
+  const registerSessionListener = deps.registerSessionListener
+    ?? ((sessionId: string) => registerExistingSessionListener(db(), sessionId));
 
   return {
     async ensureReviewRecord(input) {
@@ -344,7 +355,6 @@ export function makeReviewControlPlane(
         role: "finder",
         extraCapabilities: [`github:contents:read@${input.repo}`],
         appendSystemPrompt: FINDER_SYSTEM_PROMPT,
-        registerListener: true,
         source: {
           reviewId: input.reviewId,
           repo: input.repo,
@@ -356,6 +366,7 @@ export function makeReviewControlPlane(
         input.workflowId,
         "finder",
       );
+      await registerSessionListener(created.sessionId);
       return created;
     },
 
@@ -423,7 +434,6 @@ export function makeReviewControlPlane(
         role: "verifier",
         extraCapabilities: [`github:contents:read@${input.repo}`],
         appendSystemPrompt: VERIFIER_SYSTEM_PROMPT,
-        registerListener: true,
         source: {
           reviewId: input.reviewId,
           repo: input.repo,
@@ -435,6 +445,7 @@ export function makeReviewControlPlane(
         input.workflowId,
         "verifier",
       );
+      await registerSessionListener(created.sessionId);
       return created;
     },
 
@@ -502,6 +513,21 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "verifying");
+    },
+
+    async deleteReviewSession(sessionId) {
+      try {
+        await sessions.deleteSession({ sessionId });
+      } catch (err) {
+        if (!(err instanceof ConnectError) || err.code !== Code.NotFound) {
+          throw err;
+        }
+        log.info(
+          { sessionId },
+          "review worker session was already absent during cleanup",
+        );
+      }
+      await reviewSessions().remove(sessionId);
     },
 
     async postReviewResults(reviewId) {

@@ -8,9 +8,14 @@ import type {
   ReviewStore,
   ReviewVerdictInput,
 } from "../../db/reviews.ts";
+import { REVIEW_TOPIC, type ReviewInbox } from "../../workflows/review-inbox.ts";
 import { compileToolManifest } from "../manifest.ts";
 import { createToolRegistry, type ToolContext } from "../registry.ts";
-import { PR_REVIEW_CAPABILITY, registerReviewTools } from "../review.ts";
+import {
+  PR_REVIEW_CAPABILITY,
+  registerReviewTools,
+  type ReviewToolDeps,
+} from "../review.ts";
 
 const REVIEW_ID = "00000000-0000-4000-8000-000000000001";
 const FINDING_ID = "00000000-0000-4000-8000-000000000002";
@@ -93,7 +98,13 @@ function fakeReviewStore(options: {
     },
     async insertVerdict(input) {
       verdicts.push(input);
-      return { id: "00000000-0000-4000-8000-000000000004", replayed: false };
+      const id = `00000000-0000-4000-8000-${String(verdicts.length + 3).padStart(12, "0")}`;
+      detail?.verdicts.push({
+        id,
+        ...input,
+        createdAt: new Date(verdicts.length),
+      });
+      return { id, replayed: false };
     },
     async setFinderSummary(reviewId, summaryMd) {
       summaries.push({ reviewId, summaryMd });
@@ -115,10 +126,33 @@ function context(toolName: string): ToolContext {
   };
 }
 
-function reviewRegistry(store: ReviewStore) {
+function reviewRegistry(
+  store: ReviewStore,
+  deps: Omit<ReviewToolDeps, "reviews"> = {},
+) {
   const registry = createToolRegistry();
-  registerReviewTools(registry, { reviews: store });
+  registerReviewTools(registry, {
+    reviews: store,
+    reviewSessions: deps.reviewSessions ?? { find: async () => null },
+    ...(deps.notify ? { notify: deps.notify } : {}),
+  });
   return registry;
+}
+
+function notifier() {
+  const calls: Array<{
+    destinationId: string;
+    message: ReviewInbox;
+    topic: string;
+    idempotencyKey: string;
+  }> = [];
+  const notify: NonNullable<ReviewToolDeps["notify"]> = async (
+    destinationId,
+    message,
+    topic,
+    idempotencyKey,
+  ) => void calls.push({ destinationId, message, topic, idempotencyKey });
+  return { notify, calls };
 }
 
 describe("review tools", () => {
@@ -202,6 +236,60 @@ describe("review tools", () => {
     expect(fake.summaries).toEqual([{ reviewId: REVIEW_ID, summaryMd: "One candidate." }]);
   });
 
+  test("finder_done signals the bound workflow with a stable key", async () => {
+    const fake = fakeReviewStore();
+    const sent = notifier();
+    const done = reviewRegistry(fake.store, {
+      reviewSessions: {
+        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "finder" }),
+      },
+      notify: sent.notify,
+    }).get("finder_done");
+    if (!done || done.handling !== "handled") throw new Error("finder_done not registered");
+
+    await expect(done.handler(
+      context(done.name),
+      done.input.parse({ summary_md: "Finished." }),
+    )).resolves.toEqual({ recorded: true });
+
+    expect(sent.calls).toEqual([{
+      destinationId: "review-wf-1",
+      message: { kind: "phase_done", role: "finder" },
+      topic: REVIEW_TOPIC,
+      idempotencyKey: "review:session-1:finder-done",
+    }]);
+  });
+
+  test("finder_done skips a missing binding and tolerates notification failure", async () => {
+    const fake = fakeReviewStore();
+    const sent = notifier();
+    const unbound = reviewRegistry(fake.store, { notify: sent.notify }).get("finder_done");
+    if (!unbound || unbound.handling !== "handled") {
+      throw new Error("finder_done not registered");
+    }
+    await expect(unbound.handler(
+      context(unbound.name),
+      unbound.input.parse({ summary_md: "Unbound." }),
+    )).resolves.toEqual({ recorded: true });
+    expect(sent.calls).toEqual([]);
+
+    const failing = reviewRegistry(fake.store, {
+      reviewSessions: {
+        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "finder" }),
+      },
+      notify: async () => {
+        throw new Error("mailbox unavailable");
+      },
+    }).get("finder_done");
+    if (!failing || failing.handling !== "handled") {
+      throw new Error("finder_done not registered");
+    }
+    await expect(failing.handler(
+      context(failing.name),
+      failing.input.parse({ summary_md: "Still recorded." }),
+    )).resolves.toEqual({ recorded: true });
+  });
+
   test("submit_verdict rejects a finding owned by another review", async () => {
     const fake = fakeReviewStore({
       detail: { review: reviewRow(), findings: [findingRow()], verdicts: [] },
@@ -218,5 +306,47 @@ describe("review tools", () => {
 
     expect(result).toEqual({ error: "finding does not belong to the active review" });
     expect(fake.verdicts).toEqual([]);
+  });
+
+  test("submit_verdict signals only after the last candidate is judged", async () => {
+    const fake = fakeReviewStore({
+      detail: {
+        review: reviewRow({ status: "verifying" }),
+        findings: [findingRow(), findingRow({ id: OTHER_FINDING_ID })],
+        verdicts: [],
+      },
+    });
+    const sent = notifier();
+    const tool = reviewRegistry(fake.store, {
+      reviewSessions: {
+        find: async () => ({ reviewWorkflowId: "review-wf-1", role: "verifier" }),
+      },
+      notify: sent.notify,
+    }).get("submit_verdict");
+    if (!tool || tool.handling !== "handled") throw new Error("submit_verdict not registered");
+
+    await tool.handler(context(tool.name), tool.input.parse({
+      finding_id: FINDING_ID,
+      verdict: "confirmed",
+      confidence: "high",
+      reasoning: "Reproduced.",
+    }));
+    expect(sent.calls).toEqual([]);
+
+    await tool.handler(
+      { ...context(tool.name), toolCallId: "call-2" },
+      tool.input.parse({
+        finding_id: OTHER_FINDING_ID,
+        verdict: "refuted",
+        confidence: "high",
+        reasoning: "Not reproducible.",
+      }),
+    );
+    expect(sent.calls).toEqual([{
+      destinationId: "review-wf-1",
+      message: { kind: "phase_done", role: "verifier" },
+      topic: REVIEW_TOPIC,
+      idempotencyKey: "review:session-1:verifier-done",
+    }]);
   });
 });

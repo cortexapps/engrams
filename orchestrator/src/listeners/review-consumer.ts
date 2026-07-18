@@ -37,9 +37,18 @@ export function makeReviewConsumer(deps: ReviewConsumerDeps): SessionConsumer {
       }
       return binding !== null;
     },
-    async handle() {
-      // Review findings and verdicts arrive through tools; the workflow only
-      // needs the terminal signal from this event stream.
+    async handle(event, ctx) {
+      // A successful harness run returns the reusable session to Idle instead
+      // of terminating it. `run_completed` is the curated event for that
+      // transition and backs up the authoritative in-band tool signal.
+      if (event.kind !== "run_completed") return;
+      const { reviewWorkflowId, role } = destination();
+      await deps.send(
+        reviewWorkflowId,
+        { kind: "session_idle", role },
+        REVIEW_TOPIC,
+        `review:${ctx.sessionId}:idle`,
+      );
     },
     async onTerminal(outcome, ctx) {
       const { reviewWorkflowId, role } = destination();

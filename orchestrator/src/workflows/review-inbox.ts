@@ -16,6 +16,8 @@ export type ReviewInbox =
       focus?: string;
     }
   | { kind: "comment"; commentId: string; body: string }
+  | { kind: "phase_done"; role: string }
+  | { kind: "session_idle"; role: string }
   | {
       kind: "session_ended";
       role: string;

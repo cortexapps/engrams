@@ -1,10 +1,20 @@
+import { DBOS } from "@dbos-inc/dbos-sdk";
 import { z } from "zod";
 
+import {
+  makeReviewSessionStore,
+  type ReviewSessionStore,
+} from "../db/review-sessions.ts";
 import {
   makeReviewStore,
   type ReviewRow,
   type ReviewStore,
 } from "../db/reviews.ts";
+import { log as rootLog } from "../log.ts";
+import {
+  REVIEW_TOPIC,
+  type ReviewInbox,
+} from "../workflows/review-inbox.ts";
 import {
   tools,
   type ToolContext,
@@ -13,6 +23,8 @@ import {
 } from "./registry.ts";
 
 export const PR_REVIEW_CAPABILITY = "engram:pr_review";
+
+const log = rootLog.child({ component: "review-tools" });
 
 const CategorySchema = z.enum([
   "security-privacy",
@@ -30,6 +42,13 @@ const NO_ACTIVE_REVIEW: ToolProtocolError = {
 
 export interface ReviewToolDeps {
   reviews: ReviewStore;
+  reviewSessions?: Pick<ReviewSessionStore, "find">;
+  notify?: (
+    destinationId: string,
+    message: ReviewInbox,
+    topic: string,
+    idempotencyKey: string,
+  ) => Promise<void>;
 }
 
 async function activeReview(
@@ -52,6 +71,45 @@ export function registerReviewTools(
   deps?: ReviewToolDeps,
 ): void {
   const reviews = deps?.reviews ?? makeReviewStore();
+  let reviewSessionStore = deps?.reviewSessions;
+  const reviewSessions = () => (
+    reviewSessionStore ??= makeReviewSessionStore()
+  );
+  const notify = deps?.notify ?? (async (
+    destinationId: string,
+    message: ReviewInbox,
+    topic: string,
+    idempotencyKey: string,
+  ) => {
+    await DBOS.send<ReviewInbox>(
+      destinationId,
+      message,
+      topic,
+      idempotencyKey,
+    );
+  });
+  const notifyPhaseDone = async (
+    ctx: ToolContext,
+    role: "finder" | "verifier",
+  ): Promise<void> => {
+    try {
+      const binding = await reviewSessions().find(ctx.sessionId);
+      if (!binding || binding.role !== role) return;
+      await notify(
+        binding.reviewWorkflowId,
+        { kind: "phase_done", role },
+        REVIEW_TOPIC,
+        `review:${ctx.sessionId}:${role}-done`,
+      );
+    } catch (err) {
+      // Persisting the tool result is authoritative. The stream fallback and
+      // workflow deadline keep a notification outage from failing the tool.
+      log.warn(
+        { sessionId: ctx.sessionId, role, err },
+        "review phase completion notification failed",
+      );
+    }
+  };
 
   registry.register({
     name: "submit_finding",
@@ -114,6 +172,7 @@ export function registerReviewTools(
       const active = await activeReview(ctx, reviews);
       if (isToolError(active)) return active;
       await reviews.setFinderSummary(active.id, args.summary_md);
+      await notifyPhaseDone(ctx, "finder");
       return { recorded: true };
     },
   });
@@ -148,6 +207,25 @@ export function registerReviewTools(
         sessionId: ctx.sessionId,
         toolCallId: ctx.toolCallId,
       });
+      const updated = await reviews.getReview(active.id);
+      if (updated) {
+        const candidateIds = new Set(
+          updated.findings
+            .filter((finding) => finding.state === "candidate")
+            .map((finding) => finding.id),
+        );
+        const judgedCandidates = new Set(
+          updated.verdicts
+            .map((verdict) => verdict.findingId)
+            .filter((findingId) => candidateIds.has(findingId)),
+        );
+        if (
+          candidateIds.size > 0
+          && judgedCandidates.size === candidateIds.size
+        ) {
+          await notifyPhaseDone(ctx, "verifier");
+        }
+      }
       return { recorded: true };
     },
   });

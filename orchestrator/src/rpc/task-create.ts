@@ -412,6 +412,15 @@ export interface CreatedTask {
   sessionId: string;
 }
 
+/** Make an already-persisted session discoverable by the listener scanner.
+ * Callers with consumer-specific bindings must persist those bindings first. */
+export async function registerSessionListener(
+  db: Db,
+  sessionId: string,
+): Promise<void> {
+  await db.insert(sessionListenerTable).values({ sessionId });
+}
+
 /**
  * Create a session and attach it to an already-persisted task. Review phases
  * use this path because their automation-owned `pr_review` task is created
