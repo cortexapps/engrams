@@ -604,34 +604,49 @@ async fn evict_host_locked(
     // an operator catches the heartbeat-persistence fault instead of a
     // fleet section flapping mid-run.
     //
-    // We probe via the in-memory pool entry when present, otherwise we
-    // warm a fresh dial from the candidate's persisted `host_addr` (the
-    // cross-pod case: this pod never saw H register, so its registry is
-    // empty for H). No `host_addr` (pre-0013 row) ⇒ unprobeable ⇒ fall
-    // through to eviction, exactly as before this guard existed.
-    // `Some(answered)` = we had something to probe with (a dial that
-    // failed to warm counts as a FAILED probe — it's unreachability
-    // evidence, same as a failed Ping); `None` = unprobeable (pre-0013
-    // row with no `host_addr`) ⇒ fall through to eviction, exactly as
-    // before this guard existed.
-    let probe_outcome: Option<bool> = match state.services.host_pool.get(host_id) {
-        Ok(c) => {
-            let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
-            Some(host_responds(&client).await)
-        }
-        Err(_) => match host_addr {
-            Some(addr) => match state.services.host_pool.get_or_warm(host_id, addr).await {
-                Ok(c) => {
-                    let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
-                    Some(host_responds(&client).await)
-                }
-                Err(e) => {
-                    tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as a failed probe");
-                    Some(false)
-                }
+    // Probe via the client THIS pod already holds for the host — the same
+    // `host_registry` seam reconcile and the straggler sweep probe through
+    // (`backend_of`), not a second, lower-level channel cache. The primary
+    // #231 failure mode is exactly the one where THIS pod is healthy: a
+    // PEER pod's PG pool saturates and stops persisting H's
+    // `last_heartbeat_at`, staling the row, while this pod still receives
+    // H's heartbeats and so holds a live registry client — probing it is
+    // the most direct "is H actually gone?" test. (Before ADR 0098 Phase 3,
+    // this path went straight to `host_pool.get`, a seam the coordinator
+    // otherwise never uses for host RPCs and that the DST harness leaves
+    // unpopulated, so the probe silently never ran in-sim and a live-but-
+    // stale host was orphaned on mere heartbeat staleness — issue #787.)
+    //
+    // Only when the registry has nothing for H (the cross-pod case: this
+    // pod never saw H register) do we fall back to warming a fresh dial
+    // from the persisted `host_addr`. No client anywhere and no addr
+    // (pre-0013 row) ⇒ unprobeable ⇒ fall through to eviction, exactly as
+    // before this guard existed. `Some(answered)` = we had something to
+    // probe with (a dial that failed to warm counts as a FAILED probe —
+    // unreachability evidence, same as a failed Ping); `None` = unprobeable.
+    let probe_outcome: Option<bool> = if let Some(client) = state.host_registry.backend_of(host_id)
+    {
+        Some(host_responds(&client).await)
+    } else {
+        match state.services.host_pool.get(host_id) {
+            Ok(c) => {
+                let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
+                Some(host_responds(&client).await)
+            }
+            Err(_) => match host_addr {
+                Some(addr) => match state.services.host_pool.get_or_warm(host_id, addr).await {
+                    Ok(c) => {
+                        let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
+                        Some(host_responds(&client).await)
+                    }
+                    Err(e) => {
+                        tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as a failed probe");
+                        Some(false)
+                    }
+                },
+                None => None,
             },
-            None => None,
-        },
+        }
     };
     match probe_outcome {
         Some(true) => {

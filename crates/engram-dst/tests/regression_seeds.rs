@@ -8,6 +8,17 @@
 use engram_dst::{Profile, Sim};
 
 fn run(seed: u64, profile: Profile, steps: u64) {
+    run_inner(seed, profile, steps, false);
+}
+
+/// Same, but over the opt-in faithful-host world (`with_faithful_hosts`) —
+/// the digest-gated `candidates_for` scheduling path that becomes the swarm
+/// default once #789's chain clears.
+fn run_faithful(seed: u64, profile: Profile, steps: u64) {
+    run_inner(seed, profile, steps, true);
+}
+
+fn run_inner(seed: u64, profile: Profile, steps: u64, faithful: bool) {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
         .build()
@@ -15,6 +26,9 @@ fn run(seed: u64, profile: Profile, steps: u64) {
     rt.block_on(async {
         tokio::time::pause();
         let mut sim = Sim::new(seed, profile);
+        if faithful {
+            sim = sim.with_faithful_hosts();
+        }
         if let Err(msg) = sim.run(steps).await {
             panic!(
                 "pinned seed {seed} regressed: {msg}\ntrace tail:\n{}",
@@ -146,4 +160,180 @@ fn wedged_boot_op_reaches_terminal_via_op_deadline() {
             panic!("wedged op failed to converge after heal: {msg}");
         }
     });
+}
+
+/// Issue #787 (ADR 0098 Phase 3, R3): the ADR 0090 single-ownership
+/// split-brain — a session ending up with TWO live sandboxes across the
+/// fleet — reproduced from the op-path workload alone once the sim's hosts
+/// are made FAITHFUL (schedulable through the digest-gated `candidates_for`
+/// path). Hand-driven (the `wedged_boot` precedent) rather than a swarm
+/// pick, because the faithful-host mode is opt-in (`with_faithful_hosts`)
+/// until the sibling classes it also unmasks — `placement-accounting`
+/// (#722) and evict→resume `snapshot-safety` — are fixed and it can become
+/// the swarm default.
+///
+/// ROOT CAUSE: the dead-host detector's issue-#231 liveness probe was
+/// structurally unmodeled in the DST harness — it dialed through
+/// `services.host_pool` (a concrete `GrpcHostPool` the sim leaves empty)
+/// with hosts carrying `host_addr = None`, so `evict_host_locked` hit the
+/// "unprobeable → legacy immediate eviction" arm and marked a LIVE host
+/// dead on mere heartbeat staleness. The session flipped
+/// Active→HostLost→Idle (its VM never torn down — the host was up the whole
+/// time), then a resume booted a SECOND sandbox while the first survived.
+/// The fix routes the probe through `host_registry.backend_of` (the same
+/// seam reconcile and the straggler sweep already use), so a live host
+/// answers the Ping and is rescued — no false HostLost, no second boot.
+///
+/// FAIL-WITHOUT / PASS-WITH: with the `dead_host` probe change reverted
+/// this test FAILS (the live host is falsely evicted; the resume double-
+/// boots and the session owns 2 live sandboxes); with the fix it PASSES
+/// (the host is rescued, the session stays Active with its one VM).
+#[test]
+fn issue_787_dead_host_false_evict_double_boot() {
+    use engram_core::types::session::SessionState;
+    use engram_dst::{DriverKind, Step};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        tokio::time::pause();
+        // Faithful hosts: schedulable, so the create boots a real bound VM
+        // and a later resume can place a fresh one (the second boot).
+        let mut sim = Sim::new(4, Profile::Calm).with_faithful_hosts();
+
+        // Register the fleet (heartbeats stamp last_heartbeat_at = now) and
+        // boot one session to Active with a bound sandbox.
+        sim.execute(Step::HostHeartbeats).await;
+        sim.execute(Step::CreateSession).await;
+
+        // A recoverable checkpoint on every host so the (false) HostLost
+        // routes stage-2 to Idle (resumable), not Dead — the resume is what
+        // manufactures the second sandbox.
+        sim.execute(Step::HostCheckpoint(0)).await;
+        sim.execute(Step::HostCheckpoint(1)).await;
+        sim.execute(Step::HostCheckpoint(2)).await;
+
+        let session_id = sim
+            .world
+            .meta
+            .with_db(|db| {
+                db.sessions
+                    .values()
+                    .find(|r| r.session.status == SessionState::Active)
+                    .map(|r| r.session.id)
+            })
+            .expect("one Active session with a bound sandbox after create");
+
+        // Advance the clock past the 30s dead-host staleness threshold
+        // WITHOUT another heartbeat: every host is now a stale candidate,
+        // though every host is still UP in the world.
+        sim.execute(Step::AdvanceTime(std::time::Duration::from_secs(90)))
+            .await;
+
+        // The dead-host sweep. This is where the bug lived: pre-fix the
+        // probe never ran (empty host_pool + host_addr=None) so a LIVE host
+        // was marked dead and the session orphaned to HostLost→Idle. Post-
+        // fix the probe dials the live registry client, the host answers,
+        // and the eviction is skipped.
+        for r in 0..2 {
+            sim.execute(Step::Driver(r, DriverKind::DeadHost)).await;
+        }
+
+        // The session must NOT have been falsely evicted: still Active, and
+        // its VM never went through HostLost.
+        let (status, host_lost_seen) = sim.world.meta.with_db(|db| {
+            let status = db.sessions.get(&session_id).map(|r| r.session.status);
+            let host_lost = db
+                .transition_log
+                .iter()
+                .any(|e| e.session == session_id && e.to == SessionState::HostLost);
+            (status, host_lost)
+        });
+        assert!(
+            !host_lost_seen,
+            "the live host was falsely evicted: session transitioned to HostLost \
+             while its host was UP (issue #787 dead-host probe regression)",
+        );
+        assert_eq!(
+            status,
+            Some(SessionState::Active),
+            "the rescued session must stay Active (its one VM intact), not be \
+             orphaned by a false dead-host eviction",
+        );
+
+        // Drive a resume attempt + the executor: with the pre-fix false
+        // Idle this booted a second sandbox; post-fix there is no Idle
+        // session to resume, so nothing new is booted.
+        sim.execute(Step::ResumeSession).await;
+        sim.execute(Step::Driver(0, DriverKind::SessionOps)).await;
+
+        // THE #787 INVARIANT: exactly one live sandbox is owned by the
+        // session across the whole fleet (ADR 0090 single-ownership).
+        let owned = {
+            let hosts = sim.world.host_world.hosts.lock();
+            hosts
+                .values()
+                .flat_map(|h| h.sandboxes.values().flatten().copied())
+                .filter(|owner| *owner == session_id)
+                .count()
+        };
+        assert_eq!(
+            owned, 1,
+            "session must own exactly ONE live sandbox across the fleet; owning \
+             {owned} is the ADR 0090 split-brain (issue #787)",
+        );
+
+        // And it converges cleanly once the fleet heals.
+        if let Err(msg) = sim.run(0).await {
+            panic!("post-repro convergence failed: {msg}");
+        }
+    });
+}
+
+/// Issue #790 (ADR 0098 Phase 3, R3): the evict→resume snapshot-safety
+/// hole — a session reaching `Idle` with NO recoverable durable copy.
+///
+/// ROOT CAUSE — a sim-world FIDELITY GAP, not a coordinator/product hole.
+/// `SimHostClient::snapshot` returned manifest-LESS metadata
+/// (`disk_manifest = memory_manifest = None`). The coordinator's honest
+/// capture-time recoverability check `verify_snapshot_recoverable(blob,
+/// None, None)` is `false` (nothing to HEAD), so EVERY idle-evict capture
+/// recorded a `recoverable = false` snapshot row while the pipeline still
+/// flipped the session to `Idle` — leaving it with no recoverable durable
+/// copy. In prod a real evict capture uploads its chunked disk+memory
+/// manifests (+ the portable state.bin/sidecar) to blob storage BEFORE the
+/// row is recorded, so the flag is `true`; only the sim was unfaithful.
+/// The fix makes the sim world faithful (world.rs): the snapshot verb now
+/// writes those blobs to the SAME shared store the coordinator reads and
+/// returns the refs, mirroring engram-dst-host's ledger discipline (model
+/// the artifact, never fake the flag). NOTE the idle_evictor has no
+/// explicit `recoverable`-before-`Idle` guard — it relies on captures always
+/// producing manifests, which prod does; a transiently-unrecoverable
+/// capture would land Idle-but-unrecoverable and only fail at resume
+/// (→ Dead). That hardening is a separate follow-up, not this bug.
+///
+/// This is the default (NON-faithful) chaos-lane repro that reds `test-sim`
+/// on seed 38 (surfaced once #789's dead-host timing shift reshuffled
+/// exploration). FAIL-WITHOUT / PASS-WITH: reverting the snapshot-verb
+/// change FAILS this at step 1436 ("session … at Idle has no recoverable
+/// durable copy"); with the fix it PASSES.
+#[test]
+fn issue_790_evict_resume_snapshot_safety_default_lane() {
+    run(38, Profile::Chaos, 1500);
+}
+
+/// Issue #790 under FAITHFUL hosts (the digest-gated `candidates_for`
+/// scheduling path that becomes the swarm default once #789's chain
+/// clears): the SAME seed/session reproduces the snapshot-safety hole.
+/// Seed 38 is the one isolable snapshot-safety repro in the 0..200 faithful
+/// chaos swarm — the other faithful failures are #722 `placement-accounting`
+/// firing at an earlier step and masking it, and calm-faithful never
+/// reaches the capture→Idle path. Pinned separately so the faithful world
+/// permanently re-tests the fix. FAIL-WITHOUT / PASS-WITH: pre-fix FAILS
+/// with `snapshot-safety` (NOT pre-empted by #722 on this seed); post-fix
+/// PASSES fully green.
+#[test]
+fn issue_790_evict_resume_snapshot_safety_faithful() {
+    run_faithful(38, Profile::Chaos, 1500);
 }

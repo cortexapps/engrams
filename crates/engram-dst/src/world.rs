@@ -6,8 +6,9 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use engram_coordinator::{AppState, CoordinatorConfig, HostRegistry, Services};
-use engram_core::traits::{Entropy as _, HostClient, SessionFence};
+use engram_core::traits::{BlobStorage as _, Entropy as _, HostClient, SessionFence};
 use engram_core::types::egress::SessionEgressPolicy;
+use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxProbe, SandboxSpec};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SessionId};
@@ -344,22 +345,61 @@ impl HostClient for SimHostClient {
     ) -> Result<SnapshotMetadata, SandboxError> {
         self.maybe_hang().await;
         let entropy = self.entropy.clone();
-        self.world.with_host(self.host_id, |h| {
-            if !h.sandboxes.contains_key(&id) {
-                return Err(SandboxError::NotFound);
-            }
-            // Round-trip through serde: every Option field is
-            // `#[serde(default)]`, so an id-only JSON object IS the
-            // canonical minimal metadata — no hand-listing 12 fields.
-            let meta: SnapshotMetadata = serde_json::from_value(serde_json::json!({
-                "id": engram_core::SnapshotId::from(entropy.uuid()),
-                "size_bytes": 0,
-                "created_at": chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
-                "image_version": "sim",
-            }))
-            .expect("minimal snapshot metadata");
-            Ok(meta)
-        })
+        // Draw every id under the host lock (existence-gated, deterministic
+        // ordering: snapshot, then disk, then memory manifest), then drop
+        // the lock before touching blob storage.
+        let (snapshot_id, disk_manifest, memory_manifest) =
+            self.world.with_host(self.host_id, |h| {
+                if !h.sandboxes.contains_key(&id) {
+                    return Err(SandboxError::NotFound);
+                }
+                let snapshot_id = engram_core::SnapshotId::from(entropy.uuid());
+                let disk_manifest = ManifestRef {
+                    manifest_id: entropy.uuid(),
+                    version: 1,
+                };
+                let memory_manifest = ManifestRef {
+                    manifest_id: entropy.uuid(),
+                    version: 1,
+                };
+                Ok((snapshot_id, disk_manifest, memory_manifest))
+            })?;
+        // FIDELITY (issue #790): a real evict capture uploads its chunked
+        // disk+memory manifests AND the portable FC state.bin/sidecar.json
+        // to blob storage BEFORE the coordinator records the row — so the
+        // coordinator's honest `verify_snapshot_recoverable` (a real
+        // `blob.head` on the manifest keys) and resume-time
+        // `snapshot_artifacts_present` (state.bin/sidecar HEADs) both pass and
+        // the row lands `recoverable = true`. The old manifest-less metadata
+        // made every capture record `recoverable = false`, so an idle-evicted
+        // session reached `Idle` with no recoverable durable copy and tripped
+        // the snapshot-safety oracle. We back the refs with REAL blobs in the
+        // SAME shared store the coordinator reads, mirroring engram-dst-host's
+        // ledger discipline (model the artifact, never fake the flag).
+        let blob = engram_storage_local::LocalBlobStorage::new(blob_dir());
+        for key in [
+            disk_manifest.storage_key(),
+            memory_manifest.storage_key(),
+            engram_chunk_store::snapshot_blob::state_blob_key(snapshot_id),
+            engram_chunk_store::snapshot_blob::sidecar_blob_key(snapshot_id),
+        ] {
+            blob.put(&key, bytes::Bytes::from_static(b"sim"))
+                .await
+                .map_err(|e| SandboxError::Snapshot(format!("sim: blob put {key}: {e}")))?;
+        }
+        // Round-trip through serde: every other Option field is
+        // `#[serde(default)]`, so this JSON IS the canonical metadata — no
+        // hand-listing the remaining fields.
+        let meta: SnapshotMetadata = serde_json::from_value(serde_json::json!({
+            "id": snapshot_id,
+            "size_bytes": 0,
+            "created_at": chrono::DateTime::<chrono::Utc>::UNIX_EPOCH,
+            "image_version": "sim",
+            "disk_manifest": disk_manifest,
+            "memory_manifest": memory_manifest,
+        }))
+        .expect("minimal snapshot metadata");
+        Ok(meta)
     }
 
     async fn restore(
@@ -544,7 +584,7 @@ impl SimWorld {
                 }) as Arc<dyn HostClient>,
             );
         }
-        let blob_dir = std::env::temp_dir().join("engram-dst-blobs");
+        let blob_dir = blob_dir();
         let services = Services {
             meta: self.meta.clone(),
             cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
@@ -629,6 +669,17 @@ impl SimWorld {
                 .expect("seed enabled image");
         });
     }
+}
+
+/// The shared on-disk blob store standing in for GCS. Every replica's
+/// `Services.blob`/`chunk_store` and the `SimHostClient` capture path read
+/// and write the SAME directory (as a real pod + host share one bucket), so
+/// a manifest/state blob the host wrote at capture is HEAD-visible to the
+/// coordinator's honest recoverability check. Keys are content-addressed by
+/// seeded-unique ids, so presence is deterministic per seed regardless of
+/// cross-seed residue in the dir.
+fn blob_dir() -> std::path::PathBuf {
+    std::env::temp_dir().join("engram-dst-blobs")
 }
 
 /// Poll a future to completion on the CURRENT thread without a nested
