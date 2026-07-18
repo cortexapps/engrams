@@ -1,0 +1,40 @@
+[package]
+name = "engram-dst-cosim"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The coordinator↔host boundary simulator (ADR 0098 R-CoSim, rung 1): directed scenarios where BOTH the real coordinator drivers and the real host-agent lifecycle flows run against one shared deterministic clock/store, with only the transport between them faked."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-chunk-store.workspace = true
+engram-cloud-mock.workspace = true
+engram-coordinator.workspace = true
+engram-core.workspace = true
+engram-crypto.workspace = true
+engram-dst-host.workspace = true
+engram-host-agent.workspace = true
+engram-host-core.workspace = true
+engram-oci.workspace = true
+engram-protocol.workspace = true
+engram-secrets-dev.workspace = true
+engram-sim.workspace = true
+engram-storage-local.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+dashmap.workspace = true
+parking_lot.workspace = true
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

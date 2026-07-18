@@ -1633,6 +1633,21 @@ pub async fn live_manifest_publish(
     Path(host_id): Path<HostId>,
     Json(req): Json<LiveManifestPublishRequest>,
 ) -> Result<Json<LiveManifestPublishResponse>, ApiError> {
+    let outcome = live_manifest_publish_core(&state, host_id, &req).await?;
+    Ok(Json(LiveManifestPublishResponse { outcome }))
+}
+
+/// The pure store-level core of [`live_manifest_publish`] (ADR 0098
+/// R-CoSim, the run_once pattern applied to handlers): the HTTP wrapper
+/// thins to extractor + JSON, this holds the real logic so the boundary
+/// simulator (`engram-dst-cosim`) can drive the exact coordinator code
+/// path the host-agent's `CoordControlPlane::publish_live_manifest` hits.
+/// Zero behavior change.
+pub async fn live_manifest_publish_core(
+    state: &SharedState,
+    host_id: HostId,
+    req: &LiveManifestPublishRequest,
+) -> Result<LiveManifestPublishOutcome, ApiError> {
     let manifest_ref = engram_core::types::manifest::ManifestRef {
         manifest_id: req.manifest_id,
         version: req.manifest_version,
@@ -1652,9 +1667,7 @@ pub async fn live_manifest_publish(
                 manifest_version = req.manifest_version,
                 "live_disk_manifest applied",
             );
-            Ok(Json(LiveManifestPublishResponse {
-                outcome: LiveManifestPublishOutcome::Applied,
-            }))
+            Ok(LiveManifestPublishOutcome::Applied)
         }
         engram_core::traits::UpdateOutcome::DroppedStale => {
             tracing::warn!(
@@ -1665,9 +1678,7 @@ pub async fn live_manifest_publish(
                 manifest_version = req.manifest_version,
                 "live_disk_manifest dropped as stale (sandbox_id mismatch)",
             );
-            Ok(Json(LiveManifestPublishResponse {
-                outcome: LiveManifestPublishOutcome::Stale,
-            }))
+            Ok(LiveManifestPublishOutcome::Stale)
         }
     }
 }
@@ -1699,6 +1710,19 @@ pub async fn sandbox_ownership(
     State(state): State<SharedState>,
     Path((_host_id, session_id, sandbox_id)): Path<(HostId, SessionId, SandboxId)>,
 ) -> Result<Json<SandboxOwnershipResponse>, ApiError> {
+    let owned = sandbox_ownership_core(&state, session_id, sandbox_id).await?;
+    Ok(Json(SandboxOwnershipResponse { owned }))
+}
+
+/// The store-level core of [`sandbox_ownership`] (ADR 0098 R-CoSim, the
+/// run_once pattern applied to handlers). Zero behavior change — the
+/// ADR 0092 non-terminal predicate lives here so the boundary simulator
+/// drives the exact ownership answer the host-agent's reconcile tick reads.
+pub async fn sandbox_ownership_core(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
     // ADR 0092 hardening: a terminal row owns nothing, even if its
     // `sandbox_id` column still carries the binding — a create that
     // failed AFTER the VM spawned flips the session Failed and leans on
@@ -1706,12 +1730,11 @@ pub async fn sandbox_ownership(
     // `owned=true` here kept those orphans alive (and their guest
     // memory pinned) indefinitely. Mirrors `session_owning_sandbox`'s
     // non-terminal predicate.
-    let owned = match state.services.meta.get_session(session_id).await {
-        Ok(s) => s.sandbox_id == Some(sandbox_id) && !s.status.is_terminal(),
-        Err(engram_core::MetaError::NotFound) => false,
-        Err(e) => return Err(ApiError::Internal(format!("get_session: {e}"))),
-    };
-    Ok(Json(SandboxOwnershipResponse { owned }))
+    match state.services.meta.get_session(session_id).await {
+        Ok(s) => Ok(s.sandbox_id == Some(sandbox_id) && !s.status.is_terminal()),
+        Err(engram_core::MetaError::NotFound) => Ok(false),
+        Err(e) => Err(ApiError::Internal(format!("get_session: {e}"))),
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1729,13 +1752,23 @@ pub async fn sandbox_owner(
     State(state): State<SharedState>,
     Path((host_id, sandbox_id)): Path<(HostId, SandboxId)>,
 ) -> Result<Json<SandboxOwnerResponse>, ApiError> {
-    let session_id = state
+    let session_id = sandbox_owner_core(&state, host_id, sandbox_id).await?;
+    Ok(Json(SandboxOwnerResponse { session_id }))
+}
+
+/// The store-level core of [`sandbox_owner`] (ADR 0098 R-CoSim, the
+/// run_once pattern applied to handlers). Zero behavior change.
+pub async fn sandbox_owner_core(
+    state: &SharedState,
+    host_id: HostId,
+    sandbox_id: SandboxId,
+) -> Result<Option<SessionId>, ApiError> {
+    state
         .services
         .meta
         .session_owning_sandbox(host_id, sandbox_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("session_owning_sandbox: {e}")))?;
-    Ok(Json(SandboxOwnerResponse { session_id }))
+        .map_err(|e| ApiError::Internal(format!("session_owning_sandbox: {e}")))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]

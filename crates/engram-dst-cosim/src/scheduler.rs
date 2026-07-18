@@ -1,0 +1,484 @@
+//! The directed-scenario harness (ADR 0098 R-CoSim, rung 1).
+//!
+//! Rung 1 is DIRECTED, not a swarm: a scenario hand-drives an exact
+//! interleaving of real coordinator drivers and real host steps over one
+//! shared paused clock (the pinned-seed discipline). Every method here steps
+//! a REAL driver / a REAL host flow — the harness only sequences them and
+//! bridges the two facts the boundary needs (the eviction cursor a capture
+//! is taken at, and the durable snapshot row a completed finalize lands, the
+//! way prod's heartbeat reconcile does).
+//!
+//! The single standing oracle is [`Cosim::assert_idle_snapshot_durable`]:
+//! *the coordinator reaching `Idle` implies the snapshot its resume path
+//! will select is durable and at-or-above the eviction cursor* — the exact
+//! property issue #570 violates.
+
+use std::collections::{BTreeMap, HashMap};
+use std::time::Duration;
+
+use engram_core::traits::metadata::{CreateDisposition, SessionCreateWriteSet};
+use engram_core::traits::MetadataStore as _;
+use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
+use engram_core::types::session_op::OpKind;
+use engram_core::{SandboxId, SessionId};
+
+use crate::bridge::recoverable_snapshot_row;
+use crate::world::{CosimWorld, COSIM_IMAGE};
+
+/// The co-simulation harness.
+pub struct Cosim {
+    pub world: CosimWorld,
+    idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
+    queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
+    /// The reconcile strike ledger, owned across ticks like the real loop.
+    strikes: HashMap<SandboxId, u32>,
+    /// The sandbox each session was last bound to (captured before the D5
+    /// unbind clears the coordinator's `sandbox_id`).
+    session_sandbox: BTreeMap<SessionId, SandboxId>,
+    /// The work cursor a session's eviction capture was taken at.
+    evict_cursor: BTreeMap<SessionId, i64>,
+    /// A human-readable step trace (for failure artifacts).
+    pub trace: Vec<String>,
+}
+
+impl Cosim {
+    pub async fn new(seed: u64) -> Self {
+        Self {
+            world: CosimWorld::new(seed).await,
+            idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
+            queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
+            strikes: HashMap::new(),
+            session_sandbox: BTreeMap::new(),
+            evict_cursor: BTreeMap::new(),
+            trace: Vec::new(),
+        }
+    }
+
+    fn log(&mut self, s: impl Into<String>) {
+        self.trace.push(s.into());
+    }
+
+    // ───────────────────────── time ─────────────────────────
+
+    pub async fn advance(&mut self, secs: u64) {
+        self.log(format!("advance {secs}s"));
+        self.world.clock.advance(Duration::from_secs(secs)).await;
+    }
+
+    // ─────────────────────── coordinator drivers ───────────────────────
+
+    /// Enqueue an op and drive it to a terminal (or requeued) row state
+    /// INLINE on this task — NOT via the production `session_ops::enqueue`,
+    /// which detaches the drive onto a `tokio::spawn`. The detached form is
+    /// correct in prod (and fine in `engram-dst`, whose toy `SimHostClient`
+    /// does zero I/O and settles in one poll), but here the REAL host flows
+    /// perform real chunk-store / eviction-finalize I/O whose multi-poll
+    /// futures starve inside a background task under a directed paused-clock
+    /// harness. Driving `drive_claimed` inline runs the SAME verb body on
+    /// this task, where the reactor drains it deterministically. The op row
+    /// is the durable owner either way — this is purely where the compute
+    /// runs.
+    async fn enqueue_and_drive(
+        &mut self,
+        session_id: SessionId,
+        kind: OpKind,
+        payload: serde_json::Value,
+        key: &str,
+    ) {
+        match engram_coordinator::session_ops::enqueue_claim(
+            &self.world.state,
+            session_id,
+            kind,
+            payload,
+            Some(key),
+        )
+        .await
+        {
+            Ok(engram_core::types::session_op::EnqueueOutcome::Claimed(op)) => {
+                engram_coordinator::session_ops::drive_claimed(&self.world.state, op).await;
+            }
+            // Queued behind an in-flight op / duplicate: the settle loop
+            // drives it.
+            _ => self.drive_ops().await,
+        }
+    }
+
+    /// The create handler's persistence shape (crib of `engram-dst`): reserve
+    /// (Placed on the fitting host) + drive the create_boot op inline.
+    pub async fn create_session(&mut self) -> SessionId {
+        use engram_core::traits::Entropy as _;
+        let session_id = SessionId::from(self.world.entropy.uuid());
+        let ws = SessionCreateWriteSet {
+            session_id,
+            spec: SessionSpec {
+                image: COSIM_IMAGE.into(),
+                mode: SessionMode::DevVm,
+            },
+            mem_budget_mib: 2048,
+            cpu_budget_vcpus: 2,
+            sealed_secrets: None,
+            capabilities: Vec::new(),
+            integration_policy_json: None,
+            runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(
+                Vec::new(),
+                None,
+                None,
+            ),
+        };
+        let candidates = vec![self.world.host_id];
+        let disp = self
+            .world
+            .meta
+            .reserve_and_persist_create(ws, &candidates, 0)
+            .await;
+        self.log(format!("create_session {session_id} -> {disp:?}"));
+        if matches!(disp, Ok(CreateDisposition::Placed(_))) {
+            let key = format!("create:{session_id}");
+            self.enqueue_and_drive(session_id, OpKind::CreateBoot, serde_json::json!({}), &key)
+                .await;
+        }
+        session_id
+    }
+
+    pub async fn queue_scanner(&mut self) {
+        let _ =
+            engram_coordinator::queue_scanner::run_once(&self.queue_cfg, &self.world.state).await;
+    }
+
+    pub async fn idle_detector(&mut self) {
+        let _ =
+            engram_coordinator::idle_detector::run_once(&self.idle_cfg, &self.world.state).await;
+        self.log("idle_detector");
+    }
+
+    pub async fn idle_evictor(&mut self) {
+        let _ = engram_coordinator::idle_evictor::scanner_run_once(&self.world.state).await;
+        self.log("idle_evictor");
+    }
+
+    /// Drive every session with a due op (the SessionOps loop body).
+    pub async fn drive_ops(&mut self) {
+        let due = self.world.meta.op_due_sessions().await.unwrap_or_default();
+        for sid in due {
+            engram_coordinator::session_ops::drive_session(&self.world.state, sid).await;
+        }
+    }
+
+    /// Create → boot a session all the way to `Active`, capturing its
+    /// sandbox binding. The boot verb runs inline (see [`enqueue_and_drive`]).
+    pub async fn boot_session(&mut self) -> SessionId {
+        let session_id = self.create_session().await;
+        // Settle any backed-off retry (the boot is single-pass on the happy
+        // path).
+        for _ in 0..8 {
+            if self.session_state(session_id).await == Some(SessionState::Active) {
+                break;
+            }
+            self.advance(2).await;
+            self.drive_ops().await;
+        }
+        if let Some(sandbox) = self.sandbox_of(session_id).await {
+            self.session_sandbox.insert(session_id, sandbox);
+        }
+        session_id
+    }
+
+    /// Nominate + evict a session to `Idle` via the REAL D5 path, recording
+    /// the eviction cursor (captured from the host before the D5 unbind).
+    ///
+    /// The real `idle_detector::run_once` nominates (Active → Evicting); the
+    /// real Evict VERB (`session_verbs::dispatch`, holding the D5 fast path)
+    /// runs inline. The production `idle_evictor` scanner's only job is to
+    /// enqueue that Evict op — which it does via the detached-spawn
+    /// `session_ops::enqueue`; rung 1 enqueues+drives it inline instead (same
+    /// verb body, same idempotency key shape) so the real capture I/O drains
+    /// on this task.
+    pub async fn evict_to_idle(&mut self, session_id: SessionId) {
+        // Capture the sandbox + its work cursor NOW — the D5 fast path is
+        // about to clear the coordinator's `sandbox_id`.
+        let sandbox = self
+            .sandbox_of(session_id)
+            .await
+            .or_else(|| self.session_sandbox.get(&session_id).copied())
+            .expect("evicting session has a bound sandbox");
+        self.session_sandbox.insert(session_id, sandbox);
+        let cursor = self
+            .world
+            .host
+            .lock()
+            .await
+            .cursor(sandbox)
+            .expect("sandbox present at eviction");
+
+        // The idle_detector's `nominate` does two things: `Active → Evicting`
+        // AND `session_ops::enqueue(Evict)` — but that enqueue is the same
+        // detached spawn that starves the real capture I/O here, so rung 1
+        // applies the nomination transition directly and drives the Evict
+        // verb inline below (identical to what the detector enqueues).
+        let _ = self
+            .world
+            .meta
+            .transition_session(session_id, SessionState::Evicting)
+            .await;
+        let key = format!("evict:{session_id}");
+        self.enqueue_and_drive(
+            session_id,
+            OpKind::Evict,
+            serde_json::json!({ "target": "idle", "allow_park": true, "nominated": true }),
+            &key,
+        )
+        .await;
+        // Settle a backed-off capture retry.
+        for _ in 0..6 {
+            if self.session_state(session_id).await == Some(SessionState::Idle) {
+                break;
+            }
+            self.advance(1).await;
+            self.drive_ops().await;
+        }
+        self.evict_cursor.insert(session_id, cursor);
+        self.log(format!(
+            "evict_to_idle {session_id} sandbox={sandbox} cursor={cursor} state={:?}",
+            self.session_state(session_id).await
+        ));
+    }
+
+    // ─────────────────────── host steps ───────────────────────
+
+    /// A unit of guest work on the session's sandbox (advances the cursor).
+    pub async fn guest_work(&mut self, session_id: SessionId, units: u32) {
+        let Some(sandbox) = self.sandbox_of(session_id).await else {
+            return;
+        };
+        let mut host = self.world.host.lock().await;
+        for _ in 0..units {
+            let _ = host.guest_write(sandbox).await;
+        }
+    }
+
+    /// Record a periodic checkpoint at the session's current cursor (the
+    /// host-driven recoverable snapshot row). This is the "prior checkpoint"
+    /// a lost eviction snapshot falls back to (issue #570 scenario 1).
+    pub async fn periodic_checkpoint(&mut self, session_id: SessionId) {
+        let Some(sandbox) = self.sandbox_of(session_id).await else {
+            return;
+        };
+        let (cursor, now) = {
+            let host = self.world.host.lock().await;
+            (host.cursor(sandbox).unwrap_or(0), self.world.clock_now())
+        };
+        let _ = self.world.host.lock().await.flush(sandbox).await;
+        use engram_core::traits::Entropy as _;
+        let snap = recoverable_snapshot_row(
+            engram_core::SnapshotId::from(self.world.entropy.uuid()),
+            session_id,
+            self.world.host_id,
+            COSIM_IMAGE,
+            cursor,
+            now,
+        );
+        let _ = self.world.meta.record_snapshot(snap).await;
+        self.log(format!("periodic_checkpoint {session_id} cursor={cursor}"));
+    }
+
+    /// One teardown-reconcile tick over the REAL `reconcile_once`.
+    /// `honor_capture_signal` = false replays the PRE-#570-fix reconcile
+    /// (never consulted the capture-in-flight signal).
+    pub async fn reconcile_tick(&mut self, honor_capture_signal: bool) {
+        let backend = self.world.reconcile_backend(honor_capture_signal);
+        let _ = engram_host_agent::teardown_reconcile::reconcile_once(
+            &backend,
+            &*self.world.coord_plane,
+            self.world.host_id,
+            &mut self.strikes,
+        )
+        .await;
+        self.log(format!("reconcile_tick(honor={honor_capture_signal})"));
+    }
+
+    /// Drive one finalize attempt for every in-flight capture; on completion
+    /// land the durable recoverable snapshot row (prod: the heartbeat
+    /// reconcile).
+    pub async fn finalize_pending(&mut self) {
+        let sandboxes = self.world.host.lock().await.pending_finalize_sandboxes();
+        for sandbox in sandboxes {
+            let outcome = self.world.host.lock().await.finalize_tick(sandbox).await;
+            if let crate::host::FinalizeTickOutcome::Completed {
+                snapshot_id,
+                session_id,
+                cursor,
+                ..
+            } = outcome
+            {
+                let snap = recoverable_snapshot_row(
+                    snapshot_id,
+                    session_id,
+                    self.world.host_id,
+                    COSIM_IMAGE,
+                    cursor,
+                    self.world.clock_now(),
+                );
+                let _ = self.world.meta.record_snapshot(snap).await;
+                self.log(format!(
+                    "finalize completed {session_id} snapshot={snapshot_id} cursor={cursor}"
+                ));
+            }
+        }
+    }
+
+    /// Resume an `Idle` session back to `Active` (the real Resume op).
+    pub async fn resume_session(&mut self, session_id: SessionId) {
+        let key = format!("resume:{session_id}");
+        self.enqueue_and_drive(session_id, OpKind::Resume, serde_json::json!({}), &key)
+            .await;
+        // A resume from Idle may route through Queued (placement); the real
+        // queue_scanner places it, then its boot op drives to Active.
+        for _ in 0..12 {
+            if self.session_state(session_id).await == Some(SessionState::Active) {
+                break;
+            }
+            self.queue_scanner().await;
+            self.drive_ops().await;
+            self.advance(2).await;
+        }
+        if let Some(sandbox) = self.sandbox_of(session_id).await {
+            self.session_sandbox.insert(session_id, sandbox);
+        }
+        self.log(format!(
+            "resume_session {session_id} -> {:?}",
+            self.session_state(session_id).await
+        ));
+    }
+
+    // ─────────────────────── the oracle ───────────────────────
+
+    /// The boundary oracle (issue #570): every session the coordinator drove
+    /// to `Idle` via eviction must have a recoverable snapshot at-or-above
+    /// the cursor its capture was taken at. A stale-or-missing snapshot means
+    /// the resume path will rewind past completed work.
+    pub fn assert_idle_snapshot_durable(&self, session_id: SessionId) -> Result<(), String> {
+        let Some(&evicted_at) = self.evict_cursor.get(&session_id) else {
+            return Ok(()); // never evicted — nothing to assert
+        };
+        let newest = self.world.newest_recoverable_cursor(session_id);
+        match newest {
+            Some(c) if c >= evicted_at => Ok(()),
+            other => Err(format!(
+                "issue #570: session {session_id} reached Idle with its eviction capture at \
+                 cursor {evicted_at}, but the newest recoverable snapshot the resume path \
+                 will select is {other:?} — the eviction snapshot was lost; resume rewinds \
+                 to a stale checkpoint"
+            )),
+        }
+    }
+
+    /// Publish a live disk manifest from the host to the coordinator, via
+    /// the REAL `CoordControlPlane` bridge (→ `live_manifest_publish_core`).
+    /// This is the host→coordinator survivor-publish the flush/finalize legs
+    /// make; the returned outcome is what the host reads back over the wire.
+    pub async fn publish_manifest(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        manifest_id: uuid::Uuid,
+        version: u64,
+    ) -> engram_host_core::LiveManifestPublishOutcome {
+        use engram_host_core::CoordControlPlane as _;
+        let req = engram_host_core::LiveManifestPublishRequest {
+            session_id,
+            sandbox_id,
+            manifest_id,
+            manifest_version: version,
+        };
+        self.world
+            .coord_plane
+            .publish_live_manifest(self.world.host_id, &req)
+            .await
+            .expect("publish reaches the coordinator")
+            .outcome
+    }
+
+    /// The session's persisted live disk manifest ref (the durable survivor
+    /// pointer the publish updates).
+    pub fn live_disk_manifest(
+        &self,
+        session_id: SessionId,
+    ) -> Option<engram_core::types::manifest::ManifestRef> {
+        self.world.meta.with_db(|db| {
+            db.sessions
+                .get(&session_id)
+                .and_then(|r| r.session.live_disk_manifest)
+        })
+    }
+
+    /// Is an eviction finalize (capture lock) in flight for a sandbox?
+    pub async fn capture_in_flight(&self, sandbox: SandboxId) -> bool {
+        self.world.host.lock().await.capture_in_flight(sandbox)
+    }
+
+    /// The sandboxes teardown-reconcile locally destroyed (oracle memory).
+    pub fn reconcile_destroys(&self) -> Vec<SandboxId> {
+        self.world.view.destroyed()
+    }
+
+    /// The local bindings teardown-reconcile repaired (oracle memory).
+    pub fn reconcile_binding_repairs(&self) -> Vec<(SandboxId, SessionId)> {
+        self.world.view.binding_repairs()
+    }
+
+    /// Drop the host's in-RAM local binding for a sandbox (the post-roll
+    /// survivor: its `PooledBackend` binding table died with the process).
+    pub fn drop_local_binding(&self, sandbox: SandboxId) {
+        self.world.view.drop_binding(sandbox);
+    }
+
+    /// Force a session state transition (models the dead-host detector
+    /// flipping a survivor to `HostLost` without going through the op path).
+    pub async fn force_session_state(&self, session_id: SessionId, to: SessionState) {
+        let _ = self.world.meta.transition_session(session_id, to).await;
+    }
+
+    /// The eviction cursor recorded for a session (the capture point).
+    pub fn evict_cursor(&self, session_id: SessionId) -> Option<i64> {
+        self.evict_cursor.get(&session_id).copied()
+    }
+
+    /// The newest recoverable snapshot cursor the resume path would select.
+    pub fn newest_recoverable_cursor(&self, session_id: SessionId) -> Option<i64> {
+        self.world.newest_recoverable_cursor(session_id)
+    }
+
+    // ─────────────────────── coordinator reads ───────────────────────
+
+    pub async fn session_state(&self, session_id: SessionId) -> Option<SessionState> {
+        self.world
+            .meta
+            .with_db(|db| db.sessions.get(&session_id).map(|r| r.session.status))
+    }
+
+    /// Debug dump of a session's latest op (kind/state/step/attempts/error).
+    pub async fn op_debug(&self, session_id: SessionId) -> String {
+        self.world.meta.with_db(|db| {
+            db.session_ops
+                .values()
+                .filter(|o| o.session_id == session_id)
+                .max_by_key(|o| o.id)
+                .map(|o| {
+                    format!(
+                        "{:?}/{:?} step={:?} attempts={} err={:?}",
+                        o.kind, o.state, o.step, o.attempts, o.error
+                    )
+                })
+                .unwrap_or_else(|| "<no op>".into())
+        })
+    }
+
+    /// The coordinator's currently-bound sandbox for a session.
+    pub async fn sandbox_of(&self, session_id: SessionId) -> Option<SandboxId> {
+        self.world.meta.with_db(|db| {
+            db.sessions
+                .get(&session_id)
+                .and_then(|r| r.session.sandbox_id)
+        })
+    }
+}
