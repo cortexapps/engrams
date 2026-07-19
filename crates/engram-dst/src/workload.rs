@@ -15,6 +15,7 @@
 //! | resume                  | handler-direct gRPC | as above |
 //! | delete_session          | handler-direct gRPC | as above |
 //! | admin_drain_host        | handler-direct gRPC | `AppFleetService` — the operator-drain that exercises Evacuating |
+//! | rename (title)          | **real-wire** HTTP | there is no user-facing rename RPC — the coordinator OWNS `suggested_title`, materialized from a harness `TitleSuggested` event through the SAME host-ingestion route (`/api/v1/sessions/:id/harness-events`). The sink runs synchronously (`emit_external` awaits it), so the title lands within the request |
 //!
 //! The gRPC verbs are invoked with a constructed `tonic::Request` carrying
 //! the bearer in metadata — the real auth check runs — but WITHOUT a
@@ -187,6 +188,63 @@ pub async fn api_pause_then_resume(state: &SharedState, session_id: SessionId) {
         Body::empty(),
     );
     let _ = router.oneshot(resume).await;
+}
+
+/// Real-wire HTTP "rename": ingest a harness `TitleSuggested` event on the
+/// SAME host-ingestion route the coordinator materializes session titles
+/// from. The sink (`emit_external` awaits it) runs `set_session_suggested_title`
+/// synchronously within the request, so on a 204 the title is materialized
+/// (barring a PG outage the sink swallows — the caller confirms by read-back
+/// before trusting the write, which is why the model records rename
+/// confirmed-at-write rather than on the bare 204).
+pub async fn api_rename(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+    title: &str,
+    at: DateTime<Utc>,
+) {
+    let body = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "event": HarnessEvent::TitleSuggested { title: title.to_string() },
+        "at": at,
+    });
+    let req = bearer_post(
+        format!("/api/v1/sessions/{session_id}/harness-events"),
+        Body::from(serde_json::to_vec(&body).expect("serialize title event")),
+    );
+    let _ = http_router(state).oneshot(req).await;
+}
+
+/// Real-wire HTTP host-ingestion of a `run_started` harness event carrying
+/// the prompt's id — the CONFIRMING event that retires the durable outbox
+/// row (ADR 0073, via the sink's `outbox_ack`). In production the harness
+/// emits this when it begins the forwarded prompt; the sim emits it to
+/// close the prompt→deliver→ack loop so an unacked row does not redeliver
+/// forever (there is no real guest harness). Without this ack, a prompted
+/// session that later leaves Active leaves a Deliver op retrying against a
+/// perpetually-due row — the wedge the swarm surfaced.
+pub async fn api_run_started(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+    prompt_id: &str,
+    at: DateTime<Utc>,
+) {
+    let body = serde_json::json!({
+        "sandbox_id": sandbox_id,
+        "event": HarnessEvent::RunStarted {
+            run_id: format!("sim-run:{prompt_id}"),
+            prompt_summary: None,
+            prompt_id: Some(prompt_id.to_string()),
+        },
+        "at": at,
+    });
+    let req = bearer_post(
+        format!("/api/v1/sessions/{session_id}/harness-events"),
+        Body::from(serde_json::to_vec(&body).expect("serialize run_started event")),
+    );
+    let _ = http_router(state).oneshot(req).await;
 }
 
 /// Real-wire HTTP host-ingestion of a `harness_idle` event — the newest

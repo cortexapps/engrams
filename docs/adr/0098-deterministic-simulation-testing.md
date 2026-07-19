@@ -943,9 +943,30 @@ victims chosen by read_dir order. Per-world TempDirs + a SORTED
 LocalBlobStorage::list_prefix (the GCS/S3 contract) fix it, and
 "shared on-disk state + unsorted listings ⇒ concurrency/platform-
 divergent replay the replay-twice check structurally misses" is now
-determinism-audit item 6. Deferred to next waves: the API-verb/drain
-workload Steps, #792's recoverable-before-Idle guard,
-touch_session_activity retirement. Rung 2 lives in #784. Historical note superseded:
+determinism-audit item 6. **Wave 4 (the workload-verb fold-in) is in
+review**: the deterministic API verbs — Prompt (the full send_prompt →
+Deliver op → run_started-ack loop), Rename (the coordinator-owned
+`set_session_suggested_title` write), and Destroy (the real Destroy op +
+teardown) — are folded into BOTH swarm profiles at small weights, each
+feeding the acked-only model oracle, which grew two assertions:
+**acked-destroy-never-resurrects** and **acked-rename read-your-writes**.
+The CI-window swarms stay green (chaos 0..200, calm 0..100 ×1500) and calm
+replays byte-identically; the verbs draw only WORLD entropy so they never
+perturb the `self.rng` pick stream. Two findings kept the **operator-drain**
+verb OUT of the profile menu (driven only by dedicated tests): (1) it drives
+the evict pipeline, whose `SimHostClient::snapshot` does real-fs blob writes
+that race the paused clock — the same latent faithful-world nondeterminism
+as determinism-audit item 6 / the in-memory-blob-store migration; and (2) it
+uncovers a REAL **capacity-soft evac over-reservation** — evac_resumer's
+`evacuate_dead_source → pick_for_session` is capacity-SOFT (ADR 0046), so a
+drain-driven wave of evacuations binds measured-FULL survivors and drives Σ
+reserved > allocatable. This is the #722/#795 over-reservation class on the
+EVAC leg, which #795's `status == Idle` gate never covered — the dormant
+#775 leg the drain was expected to expose. The contained-but-partial fix
+(honor the hard bound before the soft pick) was reverted as incomplete; the
+full fix needs RESERVED evac placement (a follow-up). Also deferred: #792's
+recoverable-before-Idle guard, touch_session_activity retirement. Rung 2
+lives in #784. Historical note superseded:
 the R2 model-oracle/Router-workload/effect-queue track deliberately waits
 for rung 1 to land (the effect queue restructures the same SimHostClient
 seam the cosim bridge consumes). Invariant alerting is live-pending-apply

@@ -4,6 +4,15 @@
 //! naming the finding and its fix — the sim-swarm's permanent memory.
 //! Random exploration lives in the CI swarm (`just sim-swarm`); this
 //! file replays known-bad interleavings forever.
+//!
+//! ADR 0098 wave 4 reweighted BOTH pick tables (carving 6 points for the
+//! Prompt/Rename/Destroy workload verbs from AdvanceTime/Driver/
+//! HostHeartbeats). Per the D6 precedent, seeds pin to a commit: the shift
+//! moves each seed's exploration. Every pin below was re-verified to still
+//! CONVERGE and to REPLAY byte-identically after the reweight (kept as-is,
+//! like #786's Chaos re-weight). The verbs draw only WORLD entropy, never
+//! `self.rng` (the pick stream), so the reweight is the sole shift — the
+//! seeds do not otherwise perturb.
 
 use engram_dst::{Profile, Sim};
 
