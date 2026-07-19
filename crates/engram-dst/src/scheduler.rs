@@ -869,14 +869,15 @@ impl Sim {
 /// wire version skewed at 1 ≠ WIRE_VERSION), which silently suppressed that
 /// whole path (issue #787, PR #786 finding #2).
 ///
-/// R3 (#722): `faithful` is now the swarm DEFAULT (`sim.rs` defaults it on;
-/// `--no-faithful` opts out) — making hosts schedulable exercises the
-/// digest-gated `candidates_for` path the coordinator actually runs. The
-/// three classes the flip was blocked on are all fixed: the #787
-/// single-ownership double-boot (the dead-host probe change), evict→resume
-/// `snapshot-safety` (#790 faithful capture manifests), and
-/// `placement-accounting` (#722 — one reservation authority: a `pending`
-/// reserves unconditionally + resume honors the hard reserved-budget bound).
+/// `faithful` is deliberately OPT-IN (default `false` for every swarm
+/// seed) rather than the global default: making hosts schedulable unmasks
+/// not only the #787 single-ownership double-boot (fixed by the dead-host
+/// probe change in this PR) but also two DISTINCT, still-open classes —
+/// `placement-accounting` (the #722 crash-orphan / pending-revival
+/// over-reservation) and evict→resume `snapshot-safety`. Flipping this to
+/// the swarm default is blocked on those (findings in the PR body); the
+/// #787 double-boot regression drives it hand-wired instead (the
+/// `wedged_boot` precedent).
 fn sim_heartbeat(faithful: bool) -> engram_core::types::host::HostHeartbeat {
     engram_core::types::host::HostHeartbeat {
         status: engram_core::types::host::HostStatus::Ready,

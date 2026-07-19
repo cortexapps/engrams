@@ -32,24 +32,37 @@ use engram_core::{HostId, MetaError, SessionId, SnapshotId};
 
 use super::{EnableJobRow, SessRow, SimDb, SimMetadataStore};
 
+/// Issue #722 reservation predicate, shared by pick/reserved/no-fit:
+/// a `pending` counts while fresh OR while a live create_boot op
+/// exists — a written-off pending can then never boot (the reclaim
+/// sweep fails stale op-less orphans).
+pub fn pending_counts(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
+    if row.session.status != SessionState::Pending {
+        return true;
+    }
+    if row.session.last_active_at > now - chrono::Duration::minutes(10) {
+        return true;
+    }
+    use engram_core::types::session_op::{OpKind, OpState};
+    db.session_ops.values().any(|o| {
+        o.session_id == row.session.id
+            && o.kind == OpKind::CreateBoot
+            && matches!(o.state, OpState::Queued | OpState::Running)
+    })
+}
+
 /// States that hold a host-memory reservation — mirrors
 /// `PostgresStore::host_memory_reserving_states()` /
 /// `SessionState::reserves_host_memory`.
-///
-/// R3 (#722): ONE reservation authority — a session in a reserving state
-/// (including a `pending` pinned to a host) reserves its budget
-/// UNCONDITIONALLY, for exactly as long as it is in that state. There is NO
-/// crash-orphan wall-age / live-op exclusion: an aged pending physically
-/// holds its slot until it LEAVES the reserving state, and the ADR 0079
-/// pending-orphan backstop reclaims a true orphan by a real
-/// `pending → failed` transition (the sole reclaimer). This mirrors the
-/// PostgresStore SQL twin and equals the unconditional
-/// placement-accounting oracle by construction.
 fn reserves(state: SessionState) -> bool {
     state.reserves_host_memory()
 }
 
 impl SimMetadataStore {
+    fn pending_counts_row(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
+        pending_counts(db, row, now)
+    }
+
     /// Oracle-only helper for engram-dst — reuses the EXACT reserve-path
     /// predicate so the capacity-aware Queued-at-quiescence check cannot
     /// drift from the store.
@@ -58,18 +71,20 @@ impl SimMetadataStore {
         mem_budget_mib: i64,
         cpu_budget_vcpus: i64,
     ) -> Option<HostId> {
+        let now = self.now();
         let db = self.db.lock();
         let candidates: Vec<HostId> = db.hosts.keys().copied().collect();
-        Self::pick_host_2d(&db, &candidates, 0, mem_budget_mib, cpu_budget_vcpus)
+        Self::pick_host_2d(&db, &candidates, 0, mem_budget_mib, cpu_budget_vcpus, now)
     }
 
     /// Mirror of `pick_host_2d` + `choose_placement_host`: candidates
     /// filtered to ready|draining and not cordoned; reservations summed
-    /// over reserving-state sessions (R3 #722: every `pending` counts
-    /// unconditionally — no crash-orphan exclusion); best-fit = smallest
-    /// allocatable-minus-reserved RAM that fits both budgets, affinity tier
-    /// (`candidates[..affinity_len]`) first, then the rest, then any
-    /// unmeasured host (allocatable == 0) as a last resort.
+    /// over reserving-state sessions (a `pending` older than 10 minutes
+    /// is crash-orphaned and excluded, keyed on `last_active_at`);
+    /// best-fit = smallest allocatable-minus-reserved RAM that fits both
+    /// budgets, affinity tier (`candidates[..affinity_len]`) first, then
+    /// the rest, then any unmeasured host (allocatable == 0) as a last
+    /// resort.
     ///
     fn pick_host_2d(
         db: &SimDb,
@@ -77,6 +92,7 @@ impl SimMetadataStore {
         affinity_len: usize,
         mem_budget_mib: i64,
         cpu_budget_vcpus: i64,
+        now: DateTime<Utc>,
     ) -> Option<HostId> {
         let eligible: Vec<&HostRecord> = candidates
             .iter()
@@ -93,7 +109,7 @@ impl SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = reserves(st);
+            let counts = reserves(st) && Self::pending_counts_row(db, row, now);
             if counts {
                 let e = reserved.entry(host).or_default();
                 e.0 += row.mem_budget_mib;
@@ -258,6 +274,7 @@ impl MetadataStore for SimMetadataStore {
             affinity_len,
             ws.mem_budget_mib,
             i64::from(ws.cpu_budget_vcpus),
+            now,
         );
         let (status, host_id, queue_origin, queued_at) = match picked {
             Some(h) => (SessionState::Pending, Some(h), None, None),
@@ -532,6 +549,7 @@ impl MetadataStore for SimMetadataStore {
             affinity_len,
             mem_budget_mib,
             i64::from(cpu_budget_vcpus),
+            now,
         ) else {
             return Ok(None);
         };
@@ -556,6 +574,7 @@ impl MetadataStore for SimMetadataStore {
         &self,
     ) -> Result<std::collections::HashMap<HostId, ReservedBudget>, MetaError> {
         self.gate()?;
+        let now = self.now();
         let db = self.db.lock();
         let mut out: std::collections::HashMap<HostId, ReservedBudget> =
             std::collections::HashMap::new();
@@ -564,7 +583,7 @@ impl MetadataStore for SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = reserves(st);
+            let counts = reserves(st) && Self::pending_counts_row(&db, row, now);
             if counts {
                 let e = out.entry(host).or_default();
                 e.mem_mib += row.mem_budget_mib;
@@ -3354,6 +3373,7 @@ impl MetadataStore for SimMetadataStore {
             0,
             current.mem_budget_mib,
             i64::from(current.cpu_budget_vcpus),
+            now,
         );
         let row = db.capture_jobs.get_mut(&id).expect("checked above");
         row.host_id = picked;
@@ -3382,6 +3402,7 @@ impl MetadataStore for SimMetadataStore {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
+        let now = self.now();
         let db = self.db.lock();
         let mut reserved: std::collections::BTreeMap<HostId, (i64, i64)> = Default::default();
         for row in db.sessions.values() {
@@ -3389,7 +3410,7 @@ impl MetadataStore for SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = st.reserves_host_memory();
+            let counts = st.reserves_host_memory() && Self::pending_counts_row(&db, row, now);
             if counts {
                 let e = reserved.entry(host).or_default();
                 e.0 += row.mem_budget_mib;

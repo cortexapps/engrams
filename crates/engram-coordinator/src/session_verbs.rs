@@ -941,12 +941,11 @@ async fn create_boot(ctx: &OpCtx<'_>) -> OpOutcome {
 /// the Failed flip frees the `pending` reservation).
 async fn create_boot_retry_or_fail(ctx: &OpCtx<'_>, reason: String) -> OpOutcome {
     if ctx.op.attempts < CREATE_BOOT_MAX_ATTEMPTS {
-        // Keep an actively-retried pending recently-active for the ADR 0079
-        // orphan backstop's grace. R3 (#722): now belt-and-suspenders —
-        // placement counts a pending's reservation unconditionally and the
-        // orphan sweep already skips a session with a live create_boot op
-        // (which this retry is). Best-effort: a failed touch just means this
-        // attempt didn't refresh.
+        // Issue #722: an actively-retried pending must stay FRESH in
+        // placement's eyes — the crash-orphan exclusion writes a stale
+        // pending's reservation off the books, and if it later boots
+        // anyway the host is over-packed. Best-effort: a failed touch
+        // just means this attempt didn't refresh.
         let _ = ctx
             .state
             .services

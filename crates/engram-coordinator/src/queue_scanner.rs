@@ -48,16 +48,13 @@
 //! sweep (unlike `NoCapacity`, which stops the whole class), so a
 //! digest-mismatched head never blocks a same-class session behind it.
 //!
-//! Resume-origin mirrors this per-class/global split (R3 #722): the check
-//! now does a HARD 2D fit (the same `placement_preview` the resume verb's
-//! own gate uses, so dequeue never churns Idle↔Queued on a full fleet). A
-//! present-but-full fleet is `NoFit` — stops only THIS class (a
-//! smaller-budget class may still place); zero schedulable hosts fleet-wide
-//! is `NoHost` — the one legitimate GLOBAL stop (no resume class can
-//! proceed). The timeout check is unchanged and still applies sweep-wide.
-//! (ADR 0079: the boot `JoinSet`, its concurrency bound, and the
-//! stale-pending crash recovery are gone — the create_boot op owns all
-//! three.)
+//! One stop remains global: a resume-origin `NoCapacity` means
+//! `candidates_for` returned zero schedulable hosts fleet-wide (not a fit
+//! failure for one class — the fleet itself has no room), so it
+//! legitimately breaks the whole sweep. The timeout check is unchanged
+//! and still applies sweep-wide. (ADR 0079: the boot `JoinSet`, its
+//! concurrency bound, and the stale-pending crash recovery are gone —
+//! the create_boot op owns all three.)
 //!
 //! **Starvation, deliberately unaddressed:** oldest-head-first class
 //! ordering gives a starved big class the FIRST placement attempt every
@@ -329,26 +326,22 @@ pub async fn run_once(
                     }
                 }
                 QueueOrigin::Resume => {
-                    // Only dequeue when a host actually FITS this session's
-                    // budget (R3 #722) — otherwise leave it queued (don't
-                    // churn Idle↔Queued, which would reset the timeout clock
-                    // AND, worse, leave the session stuck-Queued the instant
-                    // a host frees mid-churn). `NoFit` stops THIS class only
-                    // (strict FIFO, like create's NoCapacity — a
-                    // smaller-budget class may still place); `NoHost` (no
-                    // schedulable host fleet-wide) is the one legitimate
-                    // GLOBAL stop: no class's resume can dequeue.
+                    // Only dequeue when a host is actually available —
+                    // otherwise leave it queued (don't churn Idle↔Queued,
+                    // which would reset the timeout clock). Empty
+                    // candidates = no schedulable host fleet-wide (not a
+                    // per-class fit failure), so — unlike create's
+                    // NoCapacity — this is the one legitimate GLOBAL stop:
+                    // no class's resume can dequeue if the fleet has zero
+                    // schedulable hosts.
                     match resume_has_capacity(state, &q).await {
-                        ResumeCapacity::Fits => {
+                        Some(true) => {
                             dequeue_resume(state, &q).await;
                         }
-                        ResumeCapacity::NoFit => {
-                            break;
-                        }
-                        ResumeCapacity::NoHost => {
+                        Some(false) => {
                             break 'classes;
                         }
-                        ResumeCapacity::Error => {
+                        None => {
                             summary.errored += 1;
                             continue; // transient read error; don't starve the rest
                         }
@@ -567,7 +560,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
 /// Is there a schedulable host for a resume-origin session? `Some(true)`
 /// = a candidate exists (resume's own soft placement will pick one),
 /// `Some(false)` = none (stay queued), `None` = transient read error.
-async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> ResumeCapacity {
+async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<bool> {
     let (repo, tag) = engram_core::types::session::split_image_ref(&q.session.image);
     // ADR 0036 amendment (issue #538): `required_image_digest` below is
     // deliberately `None`, NOT the create-path digest gate. This is the
@@ -611,70 +604,36 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> ResumeCa
         // real pins); ordering is irrelevant to an emptiness test.
         prefer_bundles: &[],
     };
-    let now = state.services.clock.now_utc();
-    let candidates =
-        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx, now).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(session_id = %q.session.id, error = ?e,
-                "queue-scanner: resume candidates_for failed");
-                return ResumeCapacity::Error;
-            }
-        };
-    if candidates.hosts.is_empty() {
-        // No schedulable host fleet-wide (fully cordoned / scaled to zero)
-        // — the one legitimate GLOBAL stop in the sweep loop. Same
-        // exclusion-reason visibility the other empty-candidate paths have.
-        crate::placement::log_empty_candidates(
-            state.services.meta.as_ref(),
-            &ctx,
-            "queue_resume_precheck",
-            now,
-        )
-        .await;
-        return ResumeCapacity::NoHost;
-    }
-    // R3 (#722): dequeue ONLY when this session's budget actually FITS —
-    // the SAME hard 2D check (`placement_preview`) the resume verb's own
-    // gate uses. The old soft `!hosts.is_empty()` dequeued whenever any
-    // host was schedulable; on a present-but-FULL fleet the resume verb
-    // then re-queued (no fit), churning Idle↔Queued every sweep and leaving
-    // a session stuck-Queued at a moment a host had just freed (the seed-142
-    // `quiescence-queued-with-capacity` regression). Aligning the check
-    // with the placement removes the churn: stay Queued until a host fits.
-    match crate::placement::placement_preview(
+    match crate::placement::candidates_for(
         state.services.meta.as_ref(),
         &ctx,
-        q.mem_budget_mib,
-        i64::from(q.cpu_budget_vcpus),
-        now,
+        state.services.clock.now_utc(),
     )
     .await
     {
-        Ok(true) => ResumeCapacity::Fits,
-        Ok(false) => ResumeCapacity::NoFit,
+        Ok(c) => {
+            let has_capacity = !c.hosts.is_empty();
+            // ADR 0068 (core-ops-batch correction pass): `Some(false)` is
+            // the one legitimate GLOBAL stop in the sweep loop (see the
+            // caller's comment) — give it the same exclusion-reason
+            // visibility the other empty-candidate paths now have.
+            if !has_capacity {
+                crate::placement::log_empty_candidates(
+                    state.services.meta.as_ref(),
+                    &ctx,
+                    "queue_resume_precheck",
+                    state.services.clock.now_utc(),
+                )
+                .await;
+            }
+            Some(has_capacity)
+        }
         Err(e) => {
             tracing::warn!(session_id = %q.session.id, error = ?e,
-                "queue-scanner: resume placement_preview failed");
-            ResumeCapacity::Error
+                "queue-scanner: resume candidates_for failed");
+            None
         }
     }
-}
-
-/// The resume-origin re-queue check's verdict (R3 #722). Distinguishes a
-/// per-session capacity miss (stay queued, try other classes) from a
-/// fleet-wide stall (global stop) — the soft `Option<bool>` this replaced
-/// conflated them.
-enum ResumeCapacity {
-    /// A schedulable host FITS this session's budget — dequeue and resume.
-    Fits,
-    /// Hosts are schedulable but none fit THIS budget — stay queued; a
-    /// smaller-budget class may still place this sweep.
-    NoFit,
-    /// No schedulable host fleet-wide — no resume class can proceed.
-    NoHost,
-    /// Transient read error — skip this one, don't starve the rest.
-    Error,
 }
 
 /// Dequeue a resume-origin session: `Queued → Idle`, then enqueue the

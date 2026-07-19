@@ -513,26 +513,34 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
                 {
                     Ok(ids) => {
                         for session_id in ids {
-                            // R3 (#722): REVIVE, always. The D7 stack failed an
-                            // aged orphan here instead of reviving it, because
-                            // placement's crash-orphan exclusion had already
-                            // WRITTEN OFF its reservation — so a revived boot
-                            // would have over-packed the host (Σ reserved >
-                            // allocatable). That exclusion is GONE: a `pending`
-                            // now reserves its slot UNCONDITIONALLY for as long
-                            // as it is `pending` (ONE reservation authority), so
-                            // reviving it is always safe — the boot lands on the
-                            // host placement never re-sold. Failing a
-                            // crash-orphaned session that could still boot was
-                            // user-hostile; this restores the ADR 0079 #5
-                            // intent: an orphan (crash between the flip and the
-                            // enqueue, or a terminal-Failed create_boot whose
-                            // fenced flip also errored) is re-driven to boot. A
-                            // genuinely-doomed boot exhausts the op's 30-attempt
-                            // budget → terminal Failed → the verb's fenced flip
-                            // clears it; the reservation releases with that real
-                            // transition (the sole reclaimer), never a
-                            // placement-side write-off.
+                            // Issue #722: past placement's crash-orphan
+                            // horizon the reservation is already written
+                            // off — reviving the boot would over-pack the
+                            // host. Fail it honestly instead (frees the
+                            // row's budget for everyone's arithmetic).
+                            let stale = match state.services.meta.get_session(session_id).await {
+                                Ok(s) => {
+                                    state.services.clock.now_utc() - s.last_active_at
+                                        > chrono::Duration::minutes(10)
+                                }
+                                Err(_) => false,
+                            };
+                            if stale {
+                                tracing::warn!(
+                                    %session_id,
+                                    "reclaim sweep: orphaned Pending past the placement \
+                                     horizon; failing instead of reviving (issue #722)",
+                                );
+                                let _ = state
+                                    .services
+                                    .meta
+                                    .transition_session(
+                                        session_id,
+                                        engram_core::types::SessionState::Failed,
+                                    )
+                                    .await;
+                                continue;
+                            }
                             ::metrics::counter!(
                                 crate::metrics::SESSION_OP_PENDING_ORPHANS_RECOVERED_TOTAL
                             )
