@@ -87,21 +87,27 @@ pub struct EffectQueue {
 pub struct SimHostWorld {
     pub hosts: Mutex<BTreeMap<HostId, SimHostState>>,
     pub effects: Mutex<EffectQueue>,
-    /// This world's PRIVATE on-disk blob "bucket" (ADR 0098 D5). Every
-    /// replica's `Services.blob`/`chunk_store` and this host's capture path
-    /// point at THIS directory (coordinator + host share one bucket, as in
-    /// prod), but two DIFFERENT worlds — sibling seeds running concurrently
-    /// under `nextest --workspace`, or successive seeds in the swarm binary —
-    /// never share it. The pre-R3 design used ONE process-global dir, which
-    /// let one world's snapshot-blob GC sweep LIST a sibling world's live
-    /// `snapshots/<id>/state.bin` blobs (unpinned in ITS metadata), mark them
-    /// orphan candidates, and promote-delete them — stranding the sibling's
-    /// queued resume. WHICH blob died was decided by `fs::read_dir` order, so
-    /// the firing was platform-divergent: green on macOS, tripping
-    /// `quiescence-queued-with-capacity` on Linux (the #722 re-land divergence
-    /// #794 blocked on). Owned as a `TempDir` so the bucket is torn down when
-    /// the world drops.
-    blob_root: tempfile::TempDir,
+    /// This world's PRIVATE blob "bucket" — a deterministic in-memory
+    /// [`MemBlobStorage`](engram_sim::MemBlobStorage) (ADR 0098 D5 +
+    /// determinism-audit item 7). Every replica's `Services.blob`/`chunk_store`
+    /// and this host's capture path share THIS `Arc` (coordinator + host share
+    /// one bucket, as in prod), but two DIFFERENT worlds — sibling seeds under
+    /// `nextest --workspace`, or successive seeds in the swarm binary — get
+    /// distinct values, so cross-world residue is structurally impossible.
+    ///
+    /// It replaces the pre-R4 per-world `LocalBlobStorage` over a `TempDir`
+    /// (#791/#795). That backed blob ops with real `tokio::fs` I/O, which the
+    /// blocking thread pool serviced off the current thread — and on the sim's
+    /// `start_paused` runtime an awaited off-thread op makes the runtime "idle",
+    /// so the paused clock AUTO-ADVANCES by however long the real filesystem
+    /// took. Virtual time became a function of real disk latency, host load, and
+    /// platform (green on macOS, invariant on Linux; #795's per-world TempDir
+    /// killed cross-world *contamination* but left this real-time leak, which
+    /// #797's extra blob-HEAD await re-exposed). The in-memory store completes
+    /// every op synchronously in-poll — no blocking-pool handoff, no idle
+    /// window, no clock auto-advance mid-I/O — and its `BTreeMap` gives sorted
+    /// `list_prefix` (the GCS/S3 contract) for free.
+    blob: Arc<engram_sim::MemBlobStorage>,
 }
 
 impl Default for SimHostWorld {
@@ -109,20 +115,18 @@ impl Default for SimHostWorld {
         Self {
             hosts: Mutex::new(BTreeMap::new()),
             effects: Mutex::new(EffectQueue::default()),
-            blob_root: tempfile::Builder::new()
-                .prefix("engram-dst-blobs-")
-                .tempdir()
-                .expect("create per-world sim blob bucket"),
+            blob: Arc::new(engram_sim::MemBlobStorage::new()),
         }
     }
 }
 
 impl SimHostWorld {
-    /// This world's isolated blob-store root. The path itself never enters a
-    /// simulated decision (blob keys are relative + content-addressed by
-    /// seeded ids), so a unique physical dir per world is determinism-neutral.
-    pub fn blob_dir(&self) -> std::path::PathBuf {
-        self.blob_root.path().to_path_buf()
+    /// This world's isolated in-memory blob store, shared by the coordinator
+    /// replicas and the host capture path within the world (as in prod), never
+    /// across worlds. Returned as the concrete `Arc` so callers can hand it to
+    /// both `Services.blob` and `ChunkStore` (each coerces to `dyn BlobStorage`).
+    pub fn blob(&self) -> Arc<engram_sim::MemBlobStorage> {
+        self.blob.clone()
     }
 
     fn with_host<R>(
@@ -412,7 +416,7 @@ impl HostClient for SimHostClient {
         // SAME per-world store the coordinator reads, mirroring
         // engram-dst-host's ledger discipline (model the artifact, never fake
         // the flag).
-        let blob = engram_storage_local::LocalBlobStorage::new(self.world.blob_dir());
+        let blob = self.world.blob();
         for key in [
             disk_manifest.storage_key(),
             memory_manifest.storage_key(),
@@ -620,7 +624,7 @@ impl SimWorld {
                 }) as Arc<dyn HostClient>,
             );
         }
-        let blob_dir = self.host_world.blob_dir();
+        let blob = self.host_world.blob();
         let services = Services {
             meta: self.meta.clone(),
             cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
@@ -634,12 +638,8 @@ impl SimWorld {
                 engram_oci::AnonymousResolver,
             ))),
             auth_resolver: Arc::new(engram_oci::AnonymousResolver),
-            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
-                blob_dir.clone(),
-            )),
-            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
-                engram_storage_local::LocalBlobStorage::new(blob_dir),
-            )),
+            blob: blob.clone(),
+            chunk_store: engram_chunk_store::ChunkStore::new(blob),
             materialize_dir: None,
             clock,
             entropy: self.entropy.clone(),

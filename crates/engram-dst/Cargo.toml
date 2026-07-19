@@ -23,13 +23,11 @@ engram-oci.workspace = true
 engram-protocol.workspace = true
 engram-secrets-dev.workspace = true
 engram-sim.workspace = true
-engram-storage-local.workspace = true
 async-trait.workspace = true
 parking_lot.workspace = true
 rand = { workspace = true }
 rand_chacha = { workspace = true }
 serde_json.workspace = true
-tempfile = "3"
 tokio.workspace = true
 tonic = { workspace = true }
 toml.workspace = true

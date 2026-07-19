@@ -11,8 +11,10 @@ workspace = true
 
 [dependencies]
 async-trait.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 engram-core.workspace = true
+futures.workspace = true
 parking_lot.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
