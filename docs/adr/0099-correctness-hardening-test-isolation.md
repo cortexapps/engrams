@@ -289,6 +289,17 @@ the `soft_invariant` field). Per-site dispositions:
    handler proceeds to route the caller into the `evict_local → resume` ladder
    (an explicit early-return; the macro only adds the alertable line), so a
    future listing-bug recurrence can never serve dead-plane reads.
+8. **Added** (`soft_invariant!`, ADR 0098 §Phase 3 Wave 6 / R6, #784 layer 1)
+   — the startup stale-binding sweep (`recover_one_stuck_device`) fires
+   `sweep-blocked-live-holder` when a dead-owner NBD device it would otherwise
+   DISCONNECT still has a live process holding its node open (the
+   `device_has_live_holder` proc-scan returned `LiveHolder`/`Unknown`). The
+   #769 gap-A class: a survivor whose rehydrate was missed upstream still has a
+   live guest reading its rootfs. The sweep leaves the device RECONNECTABLE and
+   parks (the macro only adds the alertable line; a companion
+   `engram_nbd_sweep_blocked_live_holder_total` counter carries the same signal
+   to Prometheus). Should stay at/near zero — a firing is the gap-A recurrence
+   counter until layers 2–4 land.
 
 ### H7 / H8 — Dispositions for the known flaky tests
 

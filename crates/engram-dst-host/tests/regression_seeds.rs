@@ -907,41 +907,114 @@ async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() 
     invariants::check(&host).await.unwrap();
 }
 
-/// UNGATED path: park → roll → register with BOTH the buggy coord list AND the
-/// #739 local pass DISABLED (the pre-#739 world). Nothing re-serves the parked
-/// survivor, and the stale-binding sweep DISCONNECTS its live rootfs (the
-/// literal 731df805 bug). The un-pause data-plane gate is then the LAST LINE:
-/// it fails fast into `evict_local → resume` rather than serving the dead
-/// plane, so the guest stays parked and NO oracle fires — the corruption never
-/// happens.
+/// R6 headline (ADR 0098 §Phase 3, #784 layer 1 / #769 gap A): the UNGATED
+/// path — park → roll → register with BOTH the buggy coord list AND the #739
+/// local pass DISABLED (every upstream rehydrate misses the survivor). The
+/// survivor's FC guest is STILL LIVE and holds its rootfs device open, so the
+/// stale-binding sweep now PARKS (proof of death not met) instead of
+/// DISCONNECTing. The device is left RECONNECTABLE, and a later reattach pass
+/// (a corrected coord list) re-serves it with ZERO loss.
+///
+/// This is the exact 2026-07-18/19 firing turned into a non-event. Fail-without
+/// / pass-with proof: revert `sweep_verdict` to the pre-R6 form (dead-owner ⇒
+/// Disconnect regardless of holder) and the sweep clears `kernel_owner` under a
+/// live holder → the `severed-live-holder` oracle fires here (the old seed's
+/// disconnect returns). With the Park guard, `kernel_owner` survives, the oracle
+/// holds, and the re-serve is lossless.
 #[tokio::test(start_paused = true)]
-async fn park_roll_ungated_local_pass_off_unpause_gate_fires_never_dead_plane() {
+async fn park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_loss() {
     let mut host = scenario_host(0, 3).await;
     host.guest_write(0, 2).await.unwrap();
     host.park(0);
     host.crash_process().await.unwrap();
+    assert!(
+        host.sandboxes[0].guest_holds_device,
+        "the survivor's FC guest survives the roll and still holds its device open",
+    );
 
-    // The pre-#739 world: buggy coord list + no local pass.
+    // The pre-#739 world: buggy coord list + no local pass. Nothing re-serves
+    // the parked survivor, so its dead-owner device reaches the stale sweep.
     host.register_rehydrate(false, false).await.unwrap();
     assert_eq!(
         host.sandboxes[0].served_by, None,
         "no pass re-served the parked survivor",
     );
+    // The R6 change: the sweep PARKED the live-held device instead of
+    // disconnecting it — the kernel binding is intact (RECONNECTABLE).
+    assert!(
+        host.sandboxes[0]
+            .kernel_owner
+            .is_some_and(|g| g < host.generation),
+        "the stale sweep PARKED the live-held survivor device (kernel binding intact), \
+         not disconnected — the #769 gap-A guard",
+    );
+    // The severed-live-holder oracle holds: a live guest's device is never left
+    // both unserved AND unbound.
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+
+    // A later reattach pass with a corrected coord list re-serves the SAME
+    // device — the guest kept reading it the whole time, so the acked bytes are
+    // served with zero loss.
+    host.register_rehydrate(true, true).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by,
+        Some(host.generation),
+        "the corrected reattach pass re-served the parked survivor's device",
+    );
+    assert_eq!(
+        host.sandboxes[0].kernel_owner,
+        Some(host.generation),
+        "the re-served device is bound to the current generation",
+    );
+    assert!(
+        host.unpause(0),
+        "the un-pause now serves the live re-served plane"
+    );
+    host.guest_read(0, 2).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// The un-pause gate's own coverage, kept honest under R6: a survivor whose FC
+/// guest is GENUINELY GONE (crashed/destroyed) no longer holds its device open,
+/// so the stale sweep sees `NoHolder` and a DISCONNECT is LEGAL (proof of death
+/// met — there is no live guest to protect). If a stale coordinator then
+/// attempts a late un-pause onto that now-disconnected device, the un-pause
+/// data-plane gate is still the last line: it fails fast into `evict_local →
+/// resume` rather than serving a dead plane, and no oracle fires.
+#[tokio::test(start_paused = true)]
+async fn park_roll_guest_gone_noholder_disconnect_legal_unpause_gate_still_guards() {
+    let mut host = scenario_host(0, 3).await;
+    host.guest_write(0, 2).await.unwrap();
+    host.park(0);
+    host.crash_process().await.unwrap();
+    // The guest genuinely died after the roll — nothing holds the device open.
+    host.kill_guest(0);
+
+    // Pre-#739 world again, but this time the sweep has proof of death.
+    host.register_rehydrate(false, false).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by, None,
+        "no pass re-served the survivor",
+    );
     assert_eq!(
         host.sandboxes[0].kernel_owner, None,
-        "the stale sweep disconnected the parked survivor's live device (the 731df805 bug)",
+        "the sweep legally DISCONNECTED a dead-owner device with no live holder (NoHolder)",
     );
 
-    // The un-pause gate fires: the guest is NOT un-paused onto the dead plane.
+    // A late un-pause is still refused by the data-plane gate — the guest is
+    // NOT un-paused onto the dead plane.
     assert!(
         !host.unpause(0),
-        "the un-pause data-plane gate must fire on an unserved device",
+        "the un-pause data-plane gate must still fire on an unserved device",
     );
     assert!(
         host.sandboxes[0].parked,
         "the guest stays parked, routed to evict_local → resume",
     );
-    // Crucially: the corruption never happens, so the oracles are clean.
     invariants::check(&host)
         .await
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
