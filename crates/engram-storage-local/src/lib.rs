@@ -196,6 +196,13 @@ impl BlobStorage for LocalBlobStorage {
                 }
             }
         }
+        // GCS/S3 `list` returns keys in lexicographic order; `fs::read_dir`
+        // yields them in filesystem-dependent order (differs across
+        // filesystems AND platforms). Sort so this local backend matches the
+        // production object-store contract — dev/sim behavior mirrors prod,
+        // and no consumer can pick up a `read_dir`-order determinism leak
+        // (ADR 0098 D5).
+        out.sort();
         Ok(out)
     }
 }
@@ -304,20 +311,17 @@ mod tests {
             .unwrap();
         store.put("b/q", Bytes::from_static(b"1")).await.unwrap();
 
-        let mut keys = store.list_prefix("a").await.unwrap();
-        keys.sort();
+        // list_prefix returns keys already in lexicographic order (the
+        // GCS/S3 contract), NOT filesystem `read_dir` order — assert the
+        // returned Vec directly, with no test-side re-sort to mask a leak.
+        let keys = store.list_prefix("a").await.unwrap();
         assert_eq!(keys, vec!["a/nested/z", "a/x", "a/y"]);
 
         let nested = store.list_prefix("a/nested").await.unwrap();
         assert_eq!(nested, vec!["a/nested/z"]);
 
-        let everything: std::collections::HashSet<_> =
-            store.list_prefix("").await.unwrap().into_iter().collect();
-        let want: std::collections::HashSet<String> = ["a/x", "a/y", "a/nested/z", "b/q"]
-            .iter()
-            .map(|s| s.to_string())
-            .collect();
-        assert_eq!(everything, want);
+        let everything = store.list_prefix("").await.unwrap();
+        assert_eq!(everything, vec!["a/nested/z", "a/x", "a/y", "b/q"]);
     }
 
     #[tokio::test]

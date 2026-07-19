@@ -288,6 +288,26 @@ driver cannot be silently unsimulated.
    not promised.
 5. CI runs each PR seed **twice** and diffs the traces — determinism leaks
    are caught the day they land, not when a failing seed won't replay.
+6. **Shared on-disk state + unsorted directory listings are a
+   PLATFORM-divergent replay class** (added R3, wave3-placement-authority).
+   Two failure modes compound: (a) an `fs::read_dir` listing feeding a
+   decision yields keys in filesystem-dependent order, so the same seed can
+   diverge across filesystems/platforms (green on macOS, invariant on
+   Linux) — the replay-twice self-check (#5) is same-machine and CANNOT see
+   this; and (b) a PROCESS-GLOBAL on-disk store shared across worlds lets one
+   seed's world observe/mutate another's state. Both bit the faithful-host
+   blob store: a single `std::env::temp_dir().join("engram-dst-blobs")` shared
+   by every `SimWorld` let one world's snapshot-blob GC sweep list a sibling
+   world's live `state.bin` blobs (unpinned in ITS metadata) and delete them,
+   in `read_dir` order — stranding the sibling's queued resume
+   (`quiescence-queued-with-capacity`), Linux-only, only under
+   `nextest --workspace` concurrency. Fixes: each `SimWorld` owns a PRIVATE
+   `TempDir` bucket (no cross-world residue), and `LocalBlobStorage::list_prefix`
+   returns lexicographically SORTED keys (the GCS/S3 `list` contract — the
+   local backend must match prod, and no consumer inherits a `read_dir`-order
+   leak). Audit rule: any real-filesystem or otherwise process-global resource
+   a driven path reads must be per-world isolated, and every directory listing
+   sorted at the source.
 
 ### The world model, faults, and invariants (D5–D6)
 
