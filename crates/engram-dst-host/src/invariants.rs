@@ -310,6 +310,25 @@ fn device_serving(host: &SimHost) -> Result<(), Violation> {
                 ),
             });
         }
+        // R6 (#769 gap A): a device whose FC guest still holds it open must
+        // never be fully severed — it is either served by us OR still
+        // kernel-bound (RECONNECTABLE for a re-serve pass). Both unserved AND
+        // kernel-unbound with a live holder is the stale sweep having
+        // DISCONNECTed a live guest's rootfs (the exact 2026-07-18/19 firing
+        // this layer prevents). Fails against the pre-R6 `sweep_verdict`
+        // (dead-owner ⇒ Disconnect regardless of holder); passes with the Park
+        // guard.
+        if s.guest_holds_device && !served && s.kernel_owner.is_none() {
+            return Err(Violation {
+                invariant: "severed-live-holder",
+                detail: format!(
+                    "sandbox {idx}: a live guest still holds device {} open, but it is \
+                     unserved AND kernel-unbound — the stale sweep severed a surviving \
+                     guest's rootfs (#769 gap A)",
+                    s.nbd_device.display()
+                ),
+            });
+        }
     }
     Ok(())
 }

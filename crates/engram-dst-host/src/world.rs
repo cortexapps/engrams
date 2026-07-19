@@ -256,6 +256,16 @@ pub struct SandboxSlot {
     /// in prod. Cleared by commit/abort/destroy or a process death (the
     /// registry is RAM).
     pub migrating: bool,
+    /// R6 (ADR 0098 §Phase 3, #784 layer 1 / #769 gap A): does the FC guest
+    /// process still hold this sandbox's `/dev/nbdN` node open? The guest is a
+    /// SEPARATE process from the host-agent, so it SURVIVES a host-agent roll
+    /// (the whole survivor premise) and keeps reading its rootfs across the
+    /// gap. This is the world-side twin of the prod `device_has_live_holder`
+    /// proc-scan: a live holder ⇒ [`DeviceHolder::LiveHolder`], driving the
+    /// stale-binding sweep to PARK (never DISCONNECT) a dead-owner device the
+    /// rehydrate passes missed. `false` models a genuinely-gone guest (FC
+    /// crashed/destroyed) ⇒ `NoHolder` ⇒ a DISCONNECT is legal.
+    pub guest_holds_device: bool,
 }
 
 impl SandboxSlot {
@@ -466,6 +476,9 @@ impl SimHost {
                 parked: false,
                 poisoned_snapshot: false,
                 migrating: false,
+                // A fresh sandbox's guest is resident and holds its rootfs
+                // device open.
+                guest_holds_device: true,
             });
         }
 
@@ -947,12 +960,19 @@ impl SimHost {
         Ok(())
     }
 
-    /// The stale-binding sweep (ADR 0098 P7): DISCONNECT devices whose recorded
-    /// owner is a genuinely-dead generation, driven over the pure
-    /// [`sweep_verdict`](engram_host_core::sweep_verdict). Only devices FREE in
-    /// the pool are reached — the `served_by == current` (claimed) gate mirrors
-    /// the driver's `try_claim` free-in-pool gate, so a device THIS generation
-    /// serves (a re-served survivor) is NEVER swept (the 731df805 protection).
+    /// The stale-binding sweep (ADR 0098 P7 + R6): a dead-owner device is
+    /// DISCONNECTed only with **proof of death** — no live process holds its
+    /// node open. Driven over the pure
+    /// [`sweep_verdict`](engram_host_core::sweep_verdict) with the holder input.
+    /// Only devices FREE in the pool are reached — the `served_by == current`
+    /// (claimed) gate mirrors the driver's `try_claim` free-in-pool gate, so a
+    /// device THIS generation serves (a re-served survivor) is NEVER swept (the
+    /// 731df805 protection).
+    ///
+    /// R6 (#769 gap A): a dead-owner device whose FC guest still holds it open
+    /// (`guest_holds_device`) — a survivor the rehydrate passes missed — PARKs
+    /// (left kernel-bound, RECONNECTABLE) instead of being severed. The
+    /// world-side `guest_holds_device` is the twin of the prod proc-scan.
     pub fn stale_sweep_tick(&mut self) {
         let gen = self.generation;
         for slot in &mut self.sandboxes {
@@ -967,13 +987,35 @@ impl SimHost {
                 // An older generation is a dead process.
                 Some(_) => engram_host_core::PidLiveness::Dead,
             };
-            if matches!(
-                engram_host_core::sweep_verdict(liveness),
-                engram_host_core::SweepAction::Disconnect
-            ) {
-                // NBD_CMD_DISCONNECT: the kernel binding is torn down.
-                slot.kernel_owner = None;
+            // The holder input: a resident guest still reading its rootfs is a
+            // live holder; a genuinely-gone guest is NoHolder. The sim never
+            // produces Unknown (no scan errors in the model) — that fail-safe
+            // arm is pinned by the pure-core unit test.
+            let holder = if slot.guest_holds_device {
+                engram_host_core::DeviceHolder::LiveHolder
+            } else {
+                engram_host_core::DeviceHolder::NoHolder
+            };
+            match engram_host_core::sweep_verdict(liveness, holder) {
+                // NBD_CMD_DISCONNECT: proof of death met — tear the binding down.
+                engram_host_core::SweepAction::Disconnect => slot.kernel_owner = None,
+                // PARK: a live holder blocked the disconnect. Leave the device
+                // kernel-bound (RECONNECTABLE) for a later re-serve pass — the
+                // #769 gap-A guard. `kernel_owner` is deliberately untouched.
+                engram_host_core::SweepAction::Park => {}
+                engram_host_core::SweepAction::NotStuck => {}
             }
+        }
+    }
+
+    /// R6 (#769 gap A): model the FC guest process genuinely dying (crash /
+    /// destroy), so it no longer holds its `/dev/nbdN` node open. After this a
+    /// dead-owner sweep sees `NoHolder` and a DISCONNECT is legal — the
+    /// un-pause gate's own coverage (a device whose holder is truly gone). A
+    /// no-op on an out-of-range index.
+    pub fn kill_guest(&mut self, idx: usize) {
+        if let Some(slot) = self.sandboxes.get_mut(idx) {
+            slot.guest_holds_device = false;
         }
     }
 

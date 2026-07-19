@@ -56,7 +56,8 @@ pub use fs::{HostFs, TokioFs};
 pub use nbd::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
 pub use reattach::{
     first_seeded_probe, is_local_survivor_candidate, plan_reattach, probe_matches,
-    resume_data_plane_served, sweep_verdict, PidLiveness, ReattachPlan, ReattachStep, SweepAction,
+    resume_data_plane_served, sweep_verdict, DeviceHolder, PidLiveness, ReattachPlan, ReattachStep,
+    SweepAction,
 };
 pub use survivor::{
     plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan, ResumeAttachPlan,

@@ -284,6 +284,7 @@ pub async fn recover_stuck_nbd_devices(
     let mut probed = 0;
     let mut recovered = 0;
     let mut still_stuck = 0;
+    let mut parked = 0;
     for path in paths {
         // Reserve the slot before probing/disconnecting. A failed claim
         // means a concurrent acquire/claim already owns it — by
@@ -316,6 +317,17 @@ pub async fn recover_stuck_nbd_devices(
                 probed += 1;
                 still_stuck += 1;
             }
+            Ok(Ok(NbdRecoveryOutcome::Parked)) => {
+                // R6 (#769 gap A): a live holder blocked the disconnect. The
+                // slot was dropped back to the pool above, but the device stays
+                // kernel-bound (we did NOT disconnect), so the populator's
+                // `nbd_kernel_busy` validation keeps it out of new-claim
+                // circulation while a later rehydrate re-serves it by path. The
+                // soft-invariant + metric already fired inside
+                // `recover_one_stuck_device`.
+                probed += 1;
+                parked += 1;
+            }
             Ok(Err(e)) => {
                 probed += 1;
                 still_stuck += 1;
@@ -341,7 +353,9 @@ pub async fn recover_stuck_nbd_devices(
             probed,
             recovered,
             still_stuck,
-            "NBD startup cleanup: recovered {recovered} stale NBD devices (of {probed} probed; {still_stuck} still stuck)",
+            parked,
+            "NBD startup cleanup: recovered {recovered} stale NBD devices (of {probed} probed; \
+             {still_stuck} still stuck; {parked} parked — live holder, left reconnectable)",
         );
     }
     (probed, recovered, still_stuck)
@@ -351,6 +365,81 @@ enum NbdRecoveryOutcome {
     NotStuck,
     Recovered,
     StillStuck,
+    /// R6 (#769 gap A): the dead-owner binding is left RECONNECTABLE — a live
+    /// process still holds the device node open (or the holder scan was
+    /// inconclusive), so DISCONNECTing would sever a surviving guest. The
+    /// device stays kernel-bound (structurally invisible to new claims via the
+    /// `nbd_kernel_busy` probe) for a later rehydrate/re-serve pass to adopt.
+    Parked,
+}
+
+/// Scan `/proc/*/fd/*` for any live process holding an open fd on `device`
+/// (`/dev/nbdN`) — the R6 proof-of-death probe (ADR 0098 §Phase 3, #784 layer
+/// 1 / #769 gap A). The stale-binding sweep must never DISCONNECT a device a
+/// surviving guest is still reading, even when the configuring server pid is
+/// dead: the host-side FC process opens the NBD device node directly (its
+/// virtio-blk rootfs drive source), so a live guest shows up here as an fd
+/// readlink resolving to the device node.
+///
+/// **Cold path only** — called at most once per FREE candidate device during
+/// the startup stale-binding sweep (never on the request path). Cost is a
+/// single `/proc` readdir plus a bounded per-process fd readdir, so it is
+/// O(processes × open-fds) on the host, paid once at boot.
+///
+/// Fail-safe: returns [`DeviceHolder::Unknown`] whenever the scan cannot rule
+/// a holder out — `/proc` unreadable, or ANY process's fd directory
+/// unreadable for a reason other than the process having exited (a permission
+/// error means we cannot see that process's fds, so it could be the holder).
+/// Absence of proof is not proof of death, and the pure verdict PARKs on
+/// Unknown exactly as it does on a live holder.
+///
+/// `pub` so the FC-lane test (`nbd_proc_holder`) can pin the kernel assumption
+/// this guard leans on: an open fd on a real `/dev/nbdN` with a dead netlink
+/// server is detectable via the `/proc` scan.
+pub fn device_has_live_holder(device: &std::path::Path) -> engram_host_core::DeviceHolder {
+    use engram_host_core::DeviceHolder;
+    // Canonicalize once so a symlinked /dev entry compares equal to the
+    // kernel's readlink result; fall back to the literal path if it can't be
+    // resolved (still a valid comparison target).
+    let target = std::fs::canonicalize(device).unwrap_or_else(|_| device.to_path_buf());
+    let proc = match std::fs::read_dir("/proc") {
+        Ok(rd) => rd,
+        Err(_) => return DeviceHolder::Unknown,
+    };
+    let mut inconclusive = false;
+    for entry in proc.flatten() {
+        // Only numeric (pid) directories carry an fd table.
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let fds = match std::fs::read_dir(entry.path().join("fd")) {
+            Ok(fds) => fds,
+            Err(e) => {
+                // ENOENT: the process exited between the /proc readdir and here
+                // — a real negative, skip it. Any other error (EACCES/EPERM)
+                // means we cannot see this process's fds, so it could be the
+                // holder: the scan is inconclusive → fail safe to Unknown.
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    inconclusive = true;
+                }
+                continue;
+            }
+        };
+        for fd in fds.flatten() {
+            if let Ok(link) = std::fs::read_link(fd.path()) {
+                if link == target || link == *device {
+                    return DeviceHolder::LiveHolder;
+                }
+            }
+        }
+    }
+    if inconclusive {
+        DeviceHolder::Unknown
+    } else {
+        DeviceHolder::NoHolder
+    }
 }
 
 /// `true` if `pid` names a live process. `kill(pid, 0)` sends no signal
@@ -404,7 +493,18 @@ fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOut
         Ok(pid) if pid_is_alive(pid) => engram_host_core::PidLiveness::Alive,
         Ok(_) | Err(_) => engram_host_core::PidLiveness::Dead,
     };
-    match engram_host_core::sweep_verdict(liveness) {
+    // R6 proof-of-death (#769 gap A): a dead-owner device is only a genuine
+    // stale binding if NO live process still holds its node open. Probe the
+    // holder ONLY when the owner is dead (the sole arm whose verdict depends on
+    // it — for a live/self/no owner the device is never swept, so the cold
+    // `/proc` scan is skipped). A live (or unprovable) holder PARKs; only a
+    // completed no-holder scan clears the device for DISCONNECT.
+    let holder = if matches!(liveness, engram_host_core::PidLiveness::Dead) {
+        device_has_live_holder(path)
+    } else {
+        engram_host_core::DeviceHolder::NoHolder // unused by a non-Dead verdict
+    };
+    match engram_host_core::sweep_verdict(liveness, holder) {
         engram_host_core::SweepAction::NotStuck => {
             tracing::info!(
                 device = %path.display(),
@@ -414,6 +514,30 @@ fn recover_one_stuck_device(path: &std::path::Path) -> io::Result<NbdRecoveryOut
                  generation); not a stale binding (would be wrong to disconnect)",
             );
             return Ok(NbdRecoveryOutcome::NotStuck);
+        }
+        engram_host_core::SweepAction::Park => {
+            // Proof of death was NOT met: a live process still holds the device
+            // node open (or the scan was inconclusive). NEVER disconnect — this
+            // is the 2026-07-18/19 gap-A firing: a survivor whose rehydrate was
+            // missed upstream still has a live guest reading its rootfs. Leave
+            // the device RECONNECTABLE (kernel binding intact) so a later
+            // rehydrate/re-serve pass (the coord list or the local
+            // ChainHeadRecord pass — the survivor is live ∧ unserved) adopts it
+            // with zero loss. The sweep has no sandbox identity for a free-pool
+            // device, hence "sandbox=?"; the alertable line names the device
+            // and the holder-owner pid.
+            engram_core::soft_invariant!(
+                "sweep-blocked-live-holder",
+                false,
+                "NBD stale-binding sweep blocked: device {} is kernel-bound to a \
+                 dead owner (pid {bound_pid}) but a live process still holds its \
+                 node open (holder={holder:?}); left RECONNECTABLE for a later \
+                 re-serve pass instead of DISCONNECTed (sandbox=? — free-pool sweep). \
+                 A survivor's rehydrate was missed upstream (#769 gap A)",
+                path.display(),
+            );
+            ::metrics::counter!(crate::metrics::SWEEP_BLOCKED_LIVE_HOLDER_TOTAL).increment(1);
+            return Ok(NbdRecoveryOutcome::Parked);
         }
         engram_host_core::SweepAction::Disconnect => {}
     }

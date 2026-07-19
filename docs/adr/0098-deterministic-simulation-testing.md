@@ -1060,6 +1060,45 @@ D4 conformance case for the new store method, a non-vacuous unit gate
 pass-with proven). Faithful swarms green with drain enabled: chaos 0..200 →
 200/200, calm 0..100 → 100/100 (×1500).
 
+**Wave 6 (wave6-sweep-live-holder, #784 layer 1 / #769 gap A) — the sweep
+requires proof of death.** The first LIVE alert firing (`un-pause-dead-plane`,
+3× at 18:31Z on 2026-07-18, recurring 2026-07-19) confirmed the 731df805
+survivor-severing class recurs upstream: a survivor left rootfs-less (its
+rehydrate missed by both the coord list AND the #739 local pass) reaches the
+startup stale-binding sweep, whose test was "server pid dead ⇒ Disconnect."
+That test severs a LIVE guest's data plane. The #784 prevention design (four
+layers; this is layer 1) inverts the kill test: **destructive actions require
+positive proof of death, not absence-from-a-map** (the #782 ask-the-host
+pattern one level down). `sweep_verdict` gains a `DeviceHolder`
+(`LiveHolder`/`NoHolder`/`Unknown`) input — the full `(liveness × holder)`
+transition table, wildcard-free: a dead owner DISCONNECTs only with proof of
+death (a completed holder scan that found no live process); a `LiveHolder`
+(surviving guest still reading its rootfs) — or an `Unknown` (scan error, not
+proof) — yields a new `Park` verdict that leaves the device RECONNECTABLE, never
+severed. Prod (`recover_one_stuck_device`): `device_has_live_holder` scans
+`/proc/*/fd` readlinks for the device node (cold-path sweep only, bounded by
+process count, fail-safe `Unknown` on a permission error we can't rule out);
+on `Park` it fires the `sweep-blocked-live-holder` soft-invariant (ADR 0099 H6
+site, alertable + a `engram_nbd_sweep_blocked_live_holder_total` counter) and
+leaves the kernel binding intact so the `nbd_kernel_busy` probe keeps it out of
+new-claim circulation while the coord list / local ChainHeadRecord pass
+re-serves it by path — no new subsystem. Sim (`engram-dst-host`): the device
+model gains `guest_holds_device` (a live world-side guest ⇒ `LiveHolder`, the
+twin of the proc-scan); `StaleSweepTick` drives the REAL new verdict; a new
+`severed-live-holder` oracle asserts a live guest's device is never left both
+unserved AND unbound. The 731df805 UNGATED seed is updated honestly — the sweep
+now PARKS the live-held device and a later reattach re-serves it with ZERO loss
+(`park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_loss`,
+fail-without / pass-with proven: reverting the verdict returns the disconnect and
+fires the oracle) — and the un-pause gate keeps its own coverage via a
+genuinely-gone-guest scenario (`NoHolder` ⇒ Disconnect legal ⇒ the gate still
+guards a late un-pause). One minimal `#[ignore]`'d FC-lane test
+(`nbd_proc_holder`, wired into `ci.yml`) pins the kernel assumption: an open fd
+on a real `/dev/nbdN` is proc-scan-detectable with a dead netlink server. Host
+CI windows green (chaos 0..60, calm 0..30 ×1000) + replay-twice identical.
+Layers 2–4 (kernel-derived rehydrate inventory; startup classification barrier;
+the rung-2 co-sim family) remain #784's.
+
 
 | Phase | Content |
 |---|---|
