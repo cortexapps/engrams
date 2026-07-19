@@ -24,14 +24,18 @@ fn main() {
     let mut steps: u64 = 1500;
     let mut profile = Profile::Chaos;
     let mut failure_report: Option<std::path::PathBuf> = None;
-    // Opt-in (kept OFF by default so the per-PR/default swarm stays
-    // non-faithful, ADR 0090 flip pending #789's chain). Lets the
-    // snapshot-safety / #722 sweeps run the faithful-host world ad hoc.
-    let mut faithful = false;
+    // R3: faithful hosts are now the swarm DEFAULT. The two classes that
+    // blocked the flip are fixed — evict→resume `snapshot-safety` (#790) and
+    // `placement-accounting` (#722, this change: one reservation authority) —
+    // so every swarm seed exercises the schedulable, digest-gated
+    // `candidates_for` path the coordinator actually runs. `--no-faithful`
+    // opts back to the legacy non-schedulable world for ad-hoc bisection.
+    let mut faithful = true;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         match a.as_str() {
             "--faithful" => faithful = true,
+            "--no-faithful" => faithful = false,
             "--seed" => seed = args.next().and_then(|v| v.parse().ok()),
             "--failure-report" => failure_report = args.next().map(std::path::PathBuf::from),
             "--seeds" => {
@@ -71,7 +75,9 @@ fn main() {
         Profile::Calm => "calm",
         Profile::Chaos => "chaos",
     };
-    let faithful_flag = if faithful { " --faithful" } else { "" };
+    // Faithful is the default now, so a replay only needs a flag to REPRODUCE
+    // the non-faithful case.
+    let faithful_flag = if faithful { "" } else { " --no-faithful" };
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_time()
