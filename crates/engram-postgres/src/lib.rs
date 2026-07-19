@@ -534,7 +534,6 @@ async fn pick_host_2d(
     affinity_len: usize,
     budget_mib: i64,
     budget_vcpus: i64,
-    now: DateTime<Utc>,
 ) -> Result<Option<uuid::Uuid>, MetaError> {
     if cand.is_empty() {
         return Ok(None);
@@ -593,23 +592,18 @@ async fn pick_host_2d(
             WHERE host_id = ANY($1)
               AND status IN ('pending','created','active','unreachable',
                              'evacuating','evicting')
-              -- A `pending` row older than 10 min is a crash-orphaned
-              -- reservation (a boot never takes that long); don't let it
-              -- leak into the reserved figure and false-reject the host.
-              -- ADR 0048: gate on last_active_at, not created_at — a
-              -- session can sit `queued` for many minutes before
-              -- `place_queued_session` flips it to `pending` (bumping
-              -- last_active_at), and an old created_at would make that
-              -- fresh reservation look crash-orphaned and leak
-              -- (overcommit). reserve_and_persist_create sets both to NOW().
-              -- Issue #722: live-op pendings always count (see the
-              -- companion predicate below).
-              AND (status <> 'pending'
-                   OR last_active_at > $2 - INTERVAL '10 minutes'
-                       OR EXISTS (SELECT 1 FROM session_ops o
-                                   WHERE o.session_id = sessions.id
-                                     AND o.kind = 'create_boot'
-                                     AND o.state IN ('queued','running')))
+              -- R3 (#722): ONE reservation authority — a `pending` pinned to
+              -- a host reserves its budget UNCONDITIONALLY, for exactly as
+              -- long as it is `pending`. No wall-age / live-op exclusion: an
+              -- aged crash-orphan physically holds its slot until it LEAVES
+              -- the reserving state, and the ADR 0079 pending-orphan backstop
+              -- reclaims it by a REAL `pending → failed` transition (the sole
+              -- reclaimer) — never by a placement-side exclusion. The old
+              -- 10-minute crash-orphan gate stopped counting an aged pending
+              -- while the backstop could still revive it, so a revival landed
+              -- on re-sold capacity (Σ reserved > allocatable). This predicate
+              -- now equals the unconditional placement-accounting oracle by
+              -- construction (engram-dst invariants.rs).
             UNION ALL
             -- ADR 0084 (c): a capture VM reserves like a session. The
             -- reservation lives on `capture_jobs` now (moved off
@@ -625,7 +619,6 @@ async fn pick_host_2d(
         "#,
     )
     .bind(cand)
-    .bind(now)
     .fetch_all(&mut **tx)
     .await
     .map_err(db_err)?;
@@ -1109,7 +1102,6 @@ impl MetadataStore for PostgresStore {
             affinity_len,
             ws.mem_budget_mib,
             ws.cpu_budget_vcpus as i64,
-            now,
         )
         .await?;
 
@@ -1614,7 +1606,6 @@ impl MetadataStore for PostgresStore {
             affinity_len,
             mem_budget_mib,
             cpu_budget_vcpus as i64,
-            now,
         )
         .await?
         else {
@@ -1688,9 +1679,10 @@ impl MetadataStore for PostgresStore {
         MetaError,
     > {
         // Same predicate as `pick_host_2d` / `fleet_free_mib` — the
-        // memory-reserving states, with crash-orphaned `pending` rows
-        // excluded, UNION the capturing enable jobs (ADR 0081) — summing
-        // BOTH budget dimensions (ADR 0048).
+        // memory-reserving states (R3 #722: a `pending` reserves
+        // UNCONDITIONALLY until it leaves that state; no crash-orphan gate),
+        // UNION the capturing enable jobs (ADR 0081) — summing BOTH budget
+        // dimensions (ADR 0048).
         let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
             r#"
             SELECT host_id,
@@ -1702,18 +1694,6 @@ impl MetadataStore for PostgresStore {
                 WHERE host_id IS NOT NULL
                   AND status IN ('pending','created','active','unreachable',
                                  'evacuating','evicting')
-                  -- ADR 0048: gate on last_active_at, not created_at — a session
-                  -- can sit `queued` for many minutes before `place_queued_session`
-                  -- flips it to `pending` (bumping last_active_at), and an old
-                  -- created_at would make that fresh reservation look crash-orphaned
-                  -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
-                  -- Issue #722: live-op pendings always count.
-                  AND (status <> 'pending'
-                       OR last_active_at > $1 - INTERVAL '10 minutes'
-                       OR EXISTS (SELECT 1 FROM session_ops o
-                                   WHERE o.session_id = sessions.id
-                                     AND o.kind = 'create_boot'
-                                     AND o.state IN ('queued','running')))
                 UNION ALL
                 -- ADR 0084 (c): capturing VMs reserve on `capture_jobs`.
                 SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
@@ -1724,7 +1704,6 @@ impl MetadataStore for PostgresStore {
             GROUP BY host_id
             "#,
         )
-        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1801,8 +1780,9 @@ impl MetadataStore for PostgresStore {
 
     /// Diagnostic twin of `pick_host_2d`, without the `FOR UPDATE`: same
     /// fit-map construction (same status/cordon predicate, same reserved
-    /// SUM incl. capture jobs and the 10-min crash-orphan gate), then the
-    /// pure [`classify_no_fit`]. Runs only on the no-capacity path.
+    /// SUM incl. capture jobs — R3 #722: a `pending` reserves
+    /// unconditionally, no crash-orphan gate), then the pure
+    /// [`classify_no_fit`]. Runs only on the no-capacity path.
     async fn placement_no_fit_details(
         &self,
         candidates: &[HostId],
@@ -1853,18 +1833,13 @@ impl MetadataStore for PostgresStore {
                 WHERE host_id = ANY($1)
                   AND status IN ('pending','created','active','unreachable',
                                  'evacuating','evicting')
-                  -- Issue #722: a pending is written off ONLY when it is
-                  -- both stale AND has no live create_boot op — an
-                  -- actively-booting session (however slow its backoff)
-                  -- always holds its reservation; op-less orphans are
-                  -- failed by the reclaim sweep, so an excluded pending
-                  -- can never boot later and over-pack the host.
-                  AND (status <> 'pending'
-                       OR last_active_at > $2 - INTERVAL '10 minutes'
-                       OR EXISTS (SELECT 1 FROM session_ops o
-                                   WHERE o.session_id = sessions.id
-                                     AND o.kind = 'create_boot'
-                                     AND o.state IN ('queued','running')))
+                  -- R3 (#722): a `pending` reserves UNCONDITIONALLY until it
+                  -- leaves the reserving state — no wall-age / live-op gate.
+                  -- The ADR 0079 backstop reclaims a true crash-orphan by a
+                  -- real `pending → failed` transition (the sole reclaimer),
+                  -- so placement never re-sells a slot a revival could reclaim
+                  -- (Σ reserved > allocatable). Matches the unconditional
+                  -- placement-accounting oracle by construction.
                 UNION ALL
                 SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
                 FROM capture_jobs
@@ -1875,7 +1850,6 @@ impl MetadataStore for PostgresStore {
             "#,
         )
         .bind(&cand)
-        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -5696,7 +5670,7 @@ impl MetadataStore for PostgresStore {
             tx.rollback().await.map_err(db_err)?;
             return self.get_capture_job(id).await;
         }
-        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64, now).await?;
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
         // Fit → bind host_id, clear the wait clock, re-anchor the
         // `assigned` deadline from dispatch. No fit → leave waiting,
         // stamping `waiting_since` on the first miss (COALESCE).
@@ -5755,7 +5729,7 @@ impl MetadataStore for PostgresStore {
             tx.rollback().await.map_err(db_err)?;
             return Ok(None); // fence missed (already reassigned, or terminal)
         };
-        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64, now).await?;
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
         let row = sqlx::query(
             r#"
             UPDATE capture_jobs
@@ -5823,7 +5797,7 @@ impl MetadataStore for PostgresStore {
             tx.rollback().await.map_err(db_err)?;
             return Ok(None); // exhausted, raced, or no longer retryable-failed
         };
-        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64, now).await?;
+        let picked = pick_host_2d(&mut tx, &cand, 0, mem, cpu as i64).await?;
         let row = sqlx::query(
             r#"
             UPDATE capture_jobs
