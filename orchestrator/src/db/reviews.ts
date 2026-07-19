@@ -12,6 +12,7 @@ import {
 import { getDb } from "./client.ts";
 import {
   review as reviewTable,
+  reviewEvent as eventTable,
   reviewFinding as findingTable,
   reviewVerdict as verdictTable,
 } from "./schema.ts";
@@ -102,6 +103,14 @@ export interface ReviewDetail {
   verdicts: ReviewVerdictRow[];
 }
 
+export interface ReviewEventRow {
+  id: string;
+  reviewId: string;
+  kind: string;
+  detail: string | null;
+  createdAt: Date;
+}
+
 export interface ReviewStore {
   createReview(input: CreateReviewInput): Promise<string>;
   getReview(id: string): Promise<ReviewDetail | null>;
@@ -110,6 +119,8 @@ export interface ReviewStore {
   getActiveReviewForPr(repo: string, prNumber: number): Promise<ReviewRow | null>;
   insertFinding(input: ReviewFindingInput): Promise<{ id: string; replayed: boolean }>;
   insertVerdict(input: ReviewVerdictInput): Promise<{ id: string; replayed: boolean }>;
+  recordEvent(reviewId: string, kind: string, detail?: string): Promise<void>;
+  listEvents(reviewId: string): Promise<ReviewEventRow[]>;
   setFinderSummary(reviewId: string, summaryMd: string): Promise<void>;
   setStatusCommentId(reviewId: string, statusCommentId: string): Promise<void>;
   setReviewSessionId(
@@ -186,6 +197,16 @@ function toVerdictRow(row: typeof verdictTable.$inferSelect): ReviewVerdictRow {
     reasoning: row.reasoning,
     sessionId: row.sessionId,
     toolCallId: row.toolCallId,
+    createdAt: row.createdAt,
+  };
+}
+
+function toEventRow(row: typeof eventTable.$inferSelect): ReviewEventRow {
+  return {
+    id: row.id,
+    reviewId: row.reviewId,
+    kind: row.kind,
+    detail: row.detail ?? null,
     createdAt: row.createdAt,
   };
 }
@@ -357,6 +378,23 @@ export function makeReviewStore(
         throw new Error("conflicting review verdict was not found after insert replay");
       }
       return { id: firstForFinding[0].id, replayed: true };
+    },
+
+    async recordEvent(reviewId, kind, detail) {
+      await db.insert(eventTable).values({
+        reviewId,
+        kind,
+        ...(detail !== undefined ? { detail } : {}),
+      });
+    },
+
+    async listEvents(reviewId) {
+      const rows = await db
+        .select()
+        .from(eventTable)
+        .where(eq(eventTable.reviewId, reviewId))
+        .orderBy(eventTable.createdAt);
+      return rows.map(toEventRow);
     },
 
     async setFinderSummary(reviewId, summaryMd) {

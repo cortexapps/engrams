@@ -153,4 +153,22 @@ message GetReviewResponse {
   Review review = 1;
   repeated ReviewFinding findings = 2;
   repeated ReviewVerdict verdicts = 3;
+  // The review's step-by-step activity log, oldest first (ADR 0100). Milestones
+  // the control plane records as it drives the review — queued, cloning the
+  // repo, reviewing, verifying, posted — so the UI can show progress inside a
+  // phase, not just the coarse status.
+  repeated ReviewEvent events = 4;
+}
+
+// One entry in a review's activity log.
+message ReviewEvent {
+  string id = 1;
+  string review_id = 2;
+  // Milestone kind, mapped to a human label in the UI: queued | finder_started
+  // | cloning | reviewing | verifier_started | verifying | posted | failed |
+  // halted.
+  string kind = 3;
+  // Optional human-readable detail (e.g. "3 candidate findings", "finder").
+  optional string detail = 4;
+  google.protobuf.Timestamp created_at = 5;
 }

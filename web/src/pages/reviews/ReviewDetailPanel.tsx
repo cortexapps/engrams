@@ -1,9 +1,28 @@
 import { Link } from "@tanstack/react-router";
-import { ExternalLink, GitPullRequestArrow, Terminal } from "lucide-react";
+import { timestampDate } from "@bufbuild/protobuf/wkt";
+import {
+  Ban,
+  Bot,
+  CheckCircle2,
+  Clock,
+  ExternalLink,
+  GitBranch,
+  GitPullRequestArrow,
+  ScanSearch,
+  ShieldCheck,
+  Terminal,
+  XCircle,
+} from "lucide-react";
 
-import type { Review, ReviewFinding, ReviewVerdict } from "../../gen/engram/app/v1/review_pb";
+import type {
+  Review,
+  ReviewEvent,
+  ReviewFinding,
+  ReviewVerdict,
+} from "../../gen/engram/app/v1/review_pb";
 import { useReview } from "../../hooks/useReviews";
 import { errorMessage } from "../../lib/errors";
+import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import { Skeleton } from "@/components/ui/skeleton";
 
@@ -75,6 +94,90 @@ function SessionLink({
   );
 }
 
+// Activity-log milestones the control plane records → a human label + icon.
+// `terminal` colours the final outcome so the log scans at a glance.
+const EVENT: Record<string, { label: string; icon: typeof Clock; className?: string }> = {
+  queued: { label: "Queued", icon: Clock },
+  finder_started: { label: "Finder session started", icon: Bot },
+  cloning: { label: "Cloning repository", icon: GitBranch },
+  reviewing: { label: "Reviewing changes", icon: ScanSearch },
+  verifier_started: { label: "Verifier session started", icon: Bot },
+  verifying: { label: "Verifying findings", icon: ShieldCheck },
+  posted: { label: "Posted review", icon: CheckCircle2, className: "text-emerald-500" },
+  failed: { label: "Failed", icon: XCircle, className: "text-destructive" },
+  halted: { label: "Halted", icon: Ban, className: "text-muted-foreground" },
+};
+
+// Short, human span between two log entries: "12s", "3m 4s", "1h 2m".
+function shortDuration(ms: number): string {
+  if (ms < 1000) return "<1s";
+  const s = Math.round(ms / 1000);
+  if (s < 60) return `${s}s`;
+  const m = Math.floor(s / 60);
+  if (m < 60) {
+    const rem = s % 60;
+    return rem ? `${m}m ${rem}s` : `${m}m`;
+  }
+  const h = Math.floor(m / 60);
+  return `${h}h ${m % 60}m`;
+}
+
+function ReviewLog({ events, active }: { events: ReviewEvent[]; active: boolean }) {
+  if (events.length === 0) return null;
+  return (
+    <div>
+      <h4 className="mb-2 text-xs font-medium uppercase tracking-wide text-muted-foreground">
+        Activity
+      </h4>
+      <ol className="space-y-1.5">
+        {events.map((event, i) => {
+          const meta = EVENT[event.kind] ?? { label: event.kind, icon: Clock };
+          const Icon = meta.icon;
+          const isLast = i === events.length - 1;
+          const running = isLast && active;
+          const at = event.createdAt ? timestampDate(event.createdAt) : undefined;
+          const next = events[i + 1]?.createdAt;
+          // Per-step duration comes from adjacent log entries (no wall clock
+          // needed); the last entry is either still running or just done.
+          const span =
+            at && next ? shortDuration(timestampDate(next).getTime() - at.getTime()) : undefined;
+          return (
+            <li key={event.id} className="flex items-center gap-2 text-sm">
+              <Icon
+                className={cn(
+                  "size-3.5 shrink-0",
+                  meta.className ?? "text-muted-foreground",
+                  running && "animate-pulse",
+                )}
+                aria-hidden
+              />
+              <span className={cn(running ? "font-medium" : undefined)}>{meta.label}</span>
+              {event.detail && (
+                <span className="text-xs text-muted-foreground">· {event.detail}</span>
+              )}
+              <span className="ml-auto font-mono text-xs tabular-nums text-muted-foreground">
+                {running ? (
+                  <span className="inline-flex items-center gap-1 text-emerald-600 dark:text-emerald-400">
+                    in progress
+                    <span className="relative flex size-1.5" aria-hidden>
+                      <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500/70" />
+                      <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+                    </span>
+                  </span>
+                ) : span ? (
+                  span
+                ) : at ? (
+                  at.toLocaleTimeString()
+                ) : null}
+              </span>
+            </li>
+          );
+        })}
+      </ol>
+    </div>
+  );
+}
+
 function FindingCard({
   finding,
   verdict,
@@ -115,8 +218,11 @@ function FindingCard({
   );
 }
 
+const ACTIVE_STATUSES: ReadonlySet<string> = new Set(["queued", "finding", "verifying"]);
+
 export function ReviewDetailPanel({ review }: { review: Review }) {
-  const { data, isPending, error } = useReview(review.id);
+  const active = ACTIVE_STATUSES.has(review.status);
+  const { data, isPending, error } = useReview(review.id, { active });
 
   if (isPending) {
     return (
@@ -187,8 +293,12 @@ export function ReviewDetailPanel({ review }: { review: Review }) {
         )}
       </div>
 
+      <ReviewLog events={data?.events ?? []} active={active} />
+
       {findings.length === 0 ? (
-        <p className="text-sm text-muted-foreground">No findings recorded.</p>
+        <p className="text-sm text-muted-foreground">
+          {active ? "No findings yet." : "No findings recorded."}
+        </p>
       ) : (
         <div className="space-y-2">
           {findings.map((finding) => (

@@ -14,6 +14,7 @@ import type {
 } from "../db/enrollments.ts";
 import type {
   ReviewDetail,
+  ReviewEventRow,
   ReviewFindingRow,
   ReviewListRow,
   ReviewRow,
@@ -91,7 +92,10 @@ interface FakeReviewStore extends ReviewStore {
   listCalls: Array<{ repo?: string }>;
 }
 
-function makeStore(detail: ReviewDetail | null): FakeReviewStore {
+function makeStore(
+  detail: ReviewDetail | null,
+  events: ReviewEventRow[] = [],
+): FakeReviewStore {
   const listCalls: Array<{ repo?: string }> = [];
   return {
     listCalls,
@@ -100,6 +104,10 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
     },
     async getReview(id) {
       return detail?.review.id === id ? detail : null;
+    },
+    async recordEvent() {},
+    async listEvents() {
+      return events;
     },
     async listReviews(opts) {
       listCalls.push(opts);
@@ -247,6 +255,30 @@ describe("ReviewService", () => {
       reasoning: "The failing path is reachable.",
       sessionId: "verifier-session",
     });
+  });
+
+  test("GetReview surfaces the review activity log, oldest first", async () => {
+    const events: ReviewEventRow[] = [
+      {
+        id: "e1",
+        reviewId: REVIEW_ID,
+        kind: "queued",
+        detail: null,
+        createdAt: new Date("2026-07-17T10:00:00Z"),
+      },
+      {
+        id: "e2",
+        reviewId: REVIEW_ID,
+        kind: "cloning",
+        detail: "finder",
+        createdAt: new Date("2026-07-17T10:00:05Z"),
+      },
+    ];
+    const response = await spawn(makeStore(detail, events)).getReview({ id: REVIEW_ID });
+
+    expect(response.events.map((e) => e.kind)).toEqual(["queued", "cloning"]);
+    expect(response.events[1]).toMatchObject({ kind: "cloning", detail: "finder" });
+    expect(response.events[1]?.createdAt).toBeDefined();
   });
 
   test("GetReview returns NotFound for an unknown id", async () => {

@@ -114,6 +114,10 @@ function fakeReviewStore(options: {
     },
     async setStatusCommentId() {},
     async setReviewSessionId() {},
+    async recordEvent() {},
+    async listEvents() {
+      return [];
+    },
     async updateReviewStatus() {},
     async updateFindingState() {},
     async finalizeReview() {},

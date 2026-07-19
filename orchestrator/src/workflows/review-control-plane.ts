@@ -79,6 +79,7 @@ export interface ReviewControlPlane {
     workflowId: string;
   }): Promise<{ sessionId: string }>;
   bootstrapFinderSession(sessionId: string, input: {
+    reviewId: string;
     repo: string;
     headSha: string;
     enabledCategories?: readonly ReviewCategory[];
@@ -130,6 +131,7 @@ interface ReviewControlPlaneStore extends Pick<
   | "finalizeReview"
   | "setStatusCommentId"
   | "setReviewSessionId"
+  | "recordEvent"
 > {}
 
 interface ReviewExecOutput {
@@ -169,6 +171,12 @@ export interface ReviewControlPlaneDeps {
   createSessionForExistingTask?: CreateExistingTaskSession;
   /** Focused seam for asserting binding-before-listener publication. */
   registerSessionListener?: (sessionId: string) => Promise<void>;
+}
+
+/** Human detail for a `posted` activity-log entry. */
+function postedSummary(count: number): string {
+  if (count === 0) return "No findings";
+  return `${count} finding${count === 1 ? "" : "s"} posted`;
 }
 
 export class ReviewSetupError extends Error {
@@ -360,6 +368,21 @@ export function makeReviewControlPlane(
       log.error({ reviewId, phase, err }, "review status ack failed (best-effort)");
     }
   };
+  // Append one milestone to the review's activity log. Best-effort like
+  // ackStatus: an activity-log write must never wedge a review, so a failure is
+  // logged and swallowed. Recorded inside the existing control-plane steps, so
+  // DBOS memoization keeps a replayed workflow from duplicating entries.
+  const recordEvent = async (
+    reviewId: string,
+    kind: string,
+    detail?: string,
+  ): Promise<void> => {
+    try {
+      await reviews().recordEvent(reviewId, kind, detail);
+    } catch (err) {
+      log.error({ reviewId, kind, err }, "review event record failed (best-effort)");
+    }
+  };
   const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
     const database = db();
     return createSessionForExistingTask(
@@ -399,6 +422,7 @@ export function makeReviewControlPlane(
         taskId,
         status: "queued",
       });
+      await recordEvent(reviewId, "queued");
       await ackStatus(reviewId, "acknowledged");
       return { reviewId, taskId };
     },
@@ -434,11 +458,13 @@ export function makeReviewControlPlane(
       // Stamp the session on the review at kickoff so the UI can offer a live
       // "watch" link the moment the finding phase starts.
       await reviews().setReviewSessionId(input.reviewId, "finder", created.sessionId);
+      await recordEvent(input.reviewId, "finder_started");
       await registerSessionListener(created.sessionId);
       return created;
     },
 
     async bootstrapFinderSession(sessionId, input) {
+      await recordEvent(input.reviewId, "cloning", "finder");
       await cloneRepo(sessions, sessionId, input.repo, input.headSha, "finder");
 
       const encoder = new TextEncoder();
@@ -481,6 +507,7 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "finding");
+      await recordEvent(input.reviewId, "reviewing");
       await ackStatus(input.reviewId, "finding");
     },
 
@@ -517,11 +544,13 @@ export function makeReviewControlPlane(
         "verifier",
       );
       await reviews().setReviewSessionId(input.reviewId, "verifier", created.sessionId);
+      await recordEvent(input.reviewId, "verifier_started");
       await registerSessionListener(created.sessionId);
       return created;
     },
 
     async bootstrapVerifierSession(sessionId, input) {
+      await recordEvent(input.reviewId, "cloning", "verifier");
       await cloneRepo(sessions, sessionId, input.repo, input.headSha, "verifier");
 
       const review = await reviews().getReview(input.reviewId);
@@ -589,6 +618,11 @@ export function makeReviewControlPlane(
       const candidateCount = detail?.findings.filter(
         (finding) => finding.state === "candidate",
       ).length ?? 0;
+      await recordEvent(
+        input.reviewId,
+        "verifying",
+        `${candidateCount} candidate finding${candidateCount === 1 ? "" : "s"}`,
+      );
       await ackStatus(input.reviewId, "verifying", candidateCount);
     },
 
@@ -635,6 +669,7 @@ export function makeReviewControlPlane(
         const postedCount = detail.findings.filter(
           (finding) => finding.state === "posted" || finding.state === "ui_only",
         ).length;
+        await recordEvent(reviewId, "posted", postedSummary(postedCount));
         await ackStatus(reviewId, "posted", postedCount);
         return;
       }
@@ -710,11 +745,14 @@ export function makeReviewControlPlane(
           ? { githubReviewId: posted.githubReviewId }
           : {}),
       });
-      await ackStatus(reviewId, "posted", decision.toPost.length + decision.uiOnly.length);
+      const surfaced = decision.toPost.length + decision.uiOnly.length;
+      await recordEvent(reviewId, "posted", postedSummary(surfaced));
+      await ackStatus(reviewId, "posted", surfaced);
     },
 
     async markReviewFailed(reviewId) {
       await reviews().updateReviewStatus(reviewId, "failed");
+      await recordEvent(reviewId, "failed");
       await ackStatus(reviewId, "failed");
     },
 
@@ -722,6 +760,7 @@ export function makeReviewControlPlane(
       const active = await reviews().getActiveReviewForPr(repo, prNumber);
       if (active) {
         await reviews().updateReviewStatus(active.id, "halted");
+        await recordEvent(active.id, "halted");
         await ackStatus(active.id, "halted");
       }
     },

@@ -42,6 +42,12 @@ const detail = {
       sessionId: "verifier-sess-1",
     },
   ],
+  events: [
+    { id: "e1", reviewId: "review-1", kind: "queued" },
+    { id: "e2", reviewId: "review-1", kind: "cloning", detail: "finder" },
+    { id: "e3", reviewId: "review-1", kind: "reviewing" },
+    { id: "e4", reviewId: "review-1", kind: "verifying", detail: "1 candidate finding" },
+  ],
 };
 
 vi.mock("../../hooks/useReviews", () => ({
@@ -77,5 +83,18 @@ describe("Reviews page", () => {
     expect(finderLink.getAttribute("href")).toContain("/sessions/finder-sess-1");
     const verifierLink = screen.getByRole("link", { name: /verifier session/i });
     expect(verifierLink.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+  });
+
+  it("renders the review activity log with per-step milestones", async () => {
+    renderWithProviders(<Reviews />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByText("cortexapps/engrams"));
+
+    // The durable log surfaces sub-phase steps the coarse status can't show.
+    expect(await screen.findByText("Cloning repository")).toBeTruthy();
+    expect(screen.getByText("Reviewing changes")).toBeTruthy();
+    expect(screen.getByText("Verifying findings")).toBeTruthy();
+    // status "verifying" → the last step ("Verifying findings") reads as live.
+    expect(screen.getByText("in progress")).toBeTruthy();
   });
 });

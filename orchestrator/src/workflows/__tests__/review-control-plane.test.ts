@@ -74,6 +74,7 @@ const reviewPostingNoops = {
   finalizeReview: async () => {},
   setStatusCommentId: async () => {},
   setReviewSessionId: async () => {},
+  recordEvent: async () => {},
 };
 
 // A full ReviewControlPlaneStore of no-ops for the session-lifecycle tests that
@@ -550,6 +551,7 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({ sessions });
 
     await cp.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
       repo: active.repo,
       headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
@@ -575,10 +577,10 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({ sessions });
 
     await expect(
-      cp.bootstrapFinderSession("finder-session", { repo: "openai/engrams; rm -rf /", headSha: "" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: "openai/engrams; rm -rf /", headSha: "" }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     await expect(
-      cp.bootstrapFinderSession("finder-session", { repo: active.repo, headSha: "$(touch pwned)" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: active.repo, headSha: "$(touch pwned)" }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     // Nothing was executed for the rejected inputs.
     expect(sessions.execCalls).toEqual([]);
@@ -589,6 +591,7 @@ describe("ReviewControlPlane", () => {
       sessions: fakeSessions({ exitStatus: 1, stderr: "clone denied" }),
     });
     await expect(cloneFailure.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
       repo: active.repo,
       headSha: "",
     })).rejects.toThrow(/clone denied/);
@@ -597,6 +600,7 @@ describe("ReviewControlPlane", () => {
       sessions: fakeSessions({ writeFailure: "disk full" }),
     });
     await expect(writeFailure.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
       repo: active.repo,
       headSha: "",
     })).rejects.toThrow(/disk full/);
@@ -654,6 +658,7 @@ describe("ReviewControlPlane", () => {
   test("sends the stable finder prompt and marks the review finding", async () => {
     const sessions = fakeSessions();
     const statuses: Array<[string, string]> = [];
+    const events: Array<[string, string, string | undefined]> = [];
     const cp = makeReviewControlPlane({
       sessions,
       reviews: {
@@ -663,6 +668,9 @@ describe("ReviewControlPlane", () => {
         createReview: async () => "unused",
         updateReviewStatus: async (reviewId, status) => {
           statuses.push([reviewId, status]);
+        },
+        recordEvent: async (reviewId, kind, detail) => {
+          events.push([reviewId, kind, detail]);
         },
       },
     });
@@ -683,6 +691,9 @@ describe("ReviewControlPlane", () => {
     expect(sessions.promptCalls[0]?.text).toContain("the PR diff");
     expect(sessions.promptCalls[0]?.text).toContain("Check retry behavior");
     expect(statuses).toEqual([[active.id, "finding"]]);
+    // The activity log gains a "reviewing" milestone so the UI can show the
+    // finder is running, not just the coarse "finding" status.
+    expect(events).toEqual([[active.id, "reviewing", undefined]]);
   });
 
   test("sends the verifier prompt and marks the review verifying", async () => {
@@ -778,6 +789,7 @@ describe("ReviewControlPlane", () => {
         updateReviewStatus: async () => {},
         setStatusCommentId: async () => {},
         setReviewSessionId: async () => {},
+        recordEvent: async () => {},
         async updateFindingState(id, state, opts) {
           findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
         },
@@ -851,6 +863,7 @@ describe("ReviewControlPlane", () => {
         updateReviewStatus: async () => {},
         setStatusCommentId: async () => {},
         setReviewSessionId: async () => {},
+        recordEvent: async () => {},
         updateFindingState: async () => {
           findingUpdates++;
         },

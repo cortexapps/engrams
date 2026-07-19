@@ -267,6 +267,25 @@ export const reviewVerdict = pgTable(
   ],
 );
 
+/** A review's step-by-step activity log (ADR 0100). Append-only milestones the
+ *  control plane records as it drives the review, so the UI can show progress
+ *  inside a phase ("cloning repo", "reviewing") — not just the coarse status.
+ *  The worker sessions are deleted per phase, so this outlives them. */
+export const reviewEvent = pgTable(
+  "review_event",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reviewId: uuid("review_id")
+      .notNull()
+      .references(() => review.id, { onDelete: "cascade" }),
+    // queued|finder_started|cloning|reviewing|verifier_started|verifying|posted|failed|halted
+    kind: text("kind").notNull(),
+    detail: text("detail"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("review_event_review_idx").on(t.reviewId, t.createdAt)],
+);
+
 /** Per-repository PR-review enrollment. The text fields are constrained by
  * ReviewService to triggerMode: auto|manual and autofix: auto|manual|off. */
 export const reviewEnrollment = pgTable("review_enrollment", {

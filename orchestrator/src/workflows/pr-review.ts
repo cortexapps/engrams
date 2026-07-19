@@ -112,6 +112,7 @@ export async function prReviewWorkflowImpl(
     finderSessionId = sessionId;
     await step(
       () => cp.bootstrapFinderSession(sessionId, {
+        reviewId,
         repo: first.repo,
         headSha,
       }),
