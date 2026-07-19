@@ -294,7 +294,10 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     })
     .await;
     let bytes = tokio::fs::read(&checkpoint_path).await.unwrap();
-    let checkpoint: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+    // R5: the record is sealed in a content-hash envelope keyed on the
+    // snapshot id; open it before deserializing.
+    let body = engram_host_agent::durable_envelope::open(&bytes, &snapshot_id.to_string()).unwrap();
+    let checkpoint: CheckpointRecord = serde_json::from_slice(&body).unwrap();
     assert_eq!(checkpoint.session_id, session_id);
     assert_eq!(
         checkpoint.kind,

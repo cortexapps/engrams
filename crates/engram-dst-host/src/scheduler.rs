@@ -140,6 +140,13 @@ pub enum Step {
     /// Flow B (P7): release the oldest held spare lease (Claimed → Free),
     /// exercising the allocator's release path.
     SlotPopulateTick,
+    /// R5 (Phase 3, storage lies): rehydrate sandbox `.0` from a STANDING
+    /// spool whose bytes a seeded storage fault corrupts — `.1` selects the
+    /// META marker (`true`) vs the first CHUNK (`false`), byte-flipped at
+    /// offset `.2`. The recovery must DETECT the lie (the spool's per-chunk
+    /// re-hash, or R5's meta envelope) or TOLERATE it (the redundant published
+    /// floor) — never a silent corrupt adopt.
+    CorruptSpoolRecovery(usize, bool, usize),
 }
 
 impl Step {
@@ -179,6 +186,7 @@ impl Step {
             Step::StaleSweepTick => "StaleSweepTick",
             Step::SlotClaim(..) => "SlotClaim",
             Step::SlotPopulateTick => "SlotPopulateTick",
+            Step::CorruptSpoolRecovery(..) => "CorruptSpoolRecovery",
         }
     }
 }
@@ -377,6 +385,15 @@ impl Sim {
                 104 => Step::MigrationTtlSweep,
                 105 => Step::MigrationCommit(self.rng.random_range(0..n)),
                 106 => Step::MigrationAbort(self.rng.random_range(0..n)),
+                // R5 (Phase 3, storage lies): a small-weight seeded storage
+                // fault on a spool rehydrate — 107 corrupts the META marker,
+                // 108 the first CHUNK. The idx + byte offset draw off the
+                // pick stream so the corruption is a pure function of the seed.
+                107..=108 => {
+                    let idx = self.rng.random_range(0..n);
+                    let offset = self.rng.random_range(0..64usize);
+                    Step::CorruptSpoolRecovery(idx, roll == 107, offset)
+                }
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -471,6 +488,12 @@ impl Sim {
             Step::StaleSweepTick => self.host.stale_sweep_tick(),
             Step::SlotClaim(idx) => self.host.slot_claim(idx).await,
             Step::SlotPopulateTick => self.host.slot_populate_tick(),
+            Step::CorruptSpoolRecovery(idx, meta, offset) => {
+                // A per-sandbox rehydrate (drop + rebuild through a corrupting
+                // read) — like SpoolAdopt, it leaves the sandbox live, so no
+                // whole-host crash/restart bias.
+                self.host.corrupt_spool_recovery(idx, meta, offset).await?;
+            }
         }
         Ok(())
     }

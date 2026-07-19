@@ -1454,3 +1454,74 @@ async fn explicit_abort_after_state_served_is_legal_and_resumes() {
     host.guest_write(0, 6).await.unwrap();
     assert_eq!(host.ledger.len(), before + 1);
 }
+
+// ───────────── R5: storage lies — seeded read corruption (Phase 3) ─────────
+//
+// The seam (`CrashFs::with_read_fault`) lies about the bytes a stored file
+// returns; `corrupt_spool_recovery` drives a spool rehydrate through it after
+// raising a redundant published floor. Whatever the lie — a bit-flip on the
+// meta marker or the first chunk — the recovery must DETECT it (the chunk
+// re-hash, or R5's meta content-hash envelope) or TOLERATE it (rebuild from
+// the floor), never a silent corrupt adopt. The oracle holds at every landing.
+
+/// The end-to-end swarm step, exhaustively over the meta marker AND the first
+/// chunk, at every byte offset the flip can land on. Each landing rehydrates
+/// through the lie and must leave the acked-write oracle clean.
+#[tokio::test(start_paused = true)]
+async fn corrupt_spool_recovery_never_silently_adopts_and_the_oracle_holds() {
+    for meta in [true, false] {
+        for offset in 0..48usize {
+            let mut host = scenario_host(0xB17E_0000 + offset as u64, 2).await;
+            host.corrupt_spool_recovery(1, meta, offset)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("corrupt_spool_recovery(meta={meta}, off={offset}): {e}")
+                });
+            invariants::check(&host).await.unwrap_or_else(|v| {
+                panic!("meta={meta} off={offset}: {} — {}", v.invariant, v.detail)
+            });
+            // The redundant floor always survives; sandbox 1 chunk 0 reads its
+            // flushed value (the un-published spooled write is a legitimate
+            // transient-spool loss when the lie forced a discard).
+            host.guest_read(1, 0).await.unwrap();
+        }
+    }
+}
+
+/// The sharp fail-without/pass-with pin at the recovery seam: a spool META
+/// bit-rot that stays a SYNTACTICALLY VALID `SpoolMeta` (a bumped version — the
+/// exact lie that defeats the rebuild's stale-spool lineage gate). R5's
+/// envelope makes `read_spool` reject it as a loud `checksum` rollback; WITHOUT
+/// the envelope the corrupt marker parses and is TRUSTED. This is the standing
+/// spool the sim's rehydrate reads, so the format-level rejection is what keeps
+/// `corrupt_spool_recovery` honest.
+#[tokio::test(start_paused = true)]
+async fn a_valid_but_corrupt_spool_marker_is_rejected_not_trusted() {
+    let mut host = scenario_host(0xB17E_5EED, 2).await;
+    // Establish a floor, then a standing spool holding a newer write.
+    host.guest_write(0, 0).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+    host.guest_write(0, 1).await.unwrap();
+    host.spool_export(0).await.unwrap();
+    let sid = host.sandboxes[0].sandbox_id;
+    let meta_path = host.fs.spool_dir().join(sid.to_string()).join("meta.json");
+
+    // Rewrite the sealed marker's BODY (bump the version) without fixing the
+    // content hash — a perfect `SpoolMeta`, but a lie the envelope catches.
+    let mut env: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&meta_path).await.unwrap()).unwrap();
+    let mut meta: spool::SpoolMeta = serde_json::from_str(env["body"].as_str().unwrap()).unwrap();
+    meta.version += 500;
+    env["body"] = serde_json::Value::String(serde_json::to_string(&meta).unwrap());
+    tokio::fs::write(&meta_path, serde_json::to_vec(&env).unwrap())
+        .await
+        .unwrap();
+
+    let err = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
+        .await
+        .expect_err("a bit-rotted-but-valid spool marker must be rejected, never trusted");
+    assert!(
+        err.to_string().contains("checksum"),
+        "the R5 envelope names the content-hash gap: {err}",
+    );
+}

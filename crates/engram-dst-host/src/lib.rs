@@ -136,7 +136,7 @@ pub mod world;
 
 pub use coord_stub::{RecordedPublish, ScriptedResponse, SimCoordClient};
 pub use effects::{sim_effects, SeamEvent, SeamLog, SimDeviceSync, SimNbd};
-pub use fs_crash::{CrashFs, FsOp};
+pub use fs_crash::{CrashFs, FsOp, ReadCorruption, ReadFault};
 pub use invariants::Violation;
 pub use reconcile::{DestroyRecord, SimReconcileBackend};
 pub use scheduler::{Profile, Sim, SimReport, Step, NUM_SANDBOXES};
