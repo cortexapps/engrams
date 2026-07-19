@@ -56,6 +56,43 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     }
 }
 
+/// Diagnostic for the negative arm: enumerate every process currently holding
+/// `device` open (pid + comm + fd), mirroring the readlink scan
+/// `device_has_live_holder` performs. Printed on a poll timeout so a CI failure
+/// identifies the holder conclusively even when it can't be reproduced locally
+/// (the run 29693222107 failure gave no holder identity).
+fn holders_of(device: &std::path::Path) -> Vec<String> {
+    let target = std::fs::canonicalize(device).unwrap_or_else(|_| device.to_path_buf());
+    let mut out = Vec::new();
+    let Ok(proc) = std::fs::read_dir("/proc") else {
+        return out;
+    };
+    for entry in proc.flatten() {
+        let name = entry.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if name.is_empty() || !name.bytes().all(|b| b.is_ascii_digit()) {
+            continue;
+        }
+        let Ok(fds) = std::fs::read_dir(entry.path().join("fd")) else {
+            continue;
+        };
+        for fd in fds.flatten() {
+            if let Ok(link) = std::fs::read_link(fd.path()) {
+                if link == target || link == *device {
+                    let comm =
+                        std::fs::read_to_string(entry.path().join("comm")).unwrap_or_default();
+                    out.push(format!(
+                        "pid={name} comm={} fd={}",
+                        comm.trim(),
+                        fd.file_name().to_string_lossy()
+                    ));
+                }
+            }
+        }
+    }
+    out
+}
+
 fn preflight() -> Option<PathBuf> {
     let nbd_path = PathBuf::from(
         std::env::var("ENGRAM_TEST_NBD_DEVICE").unwrap_or_else(|_| "/dev/nbd0".to_string()),
@@ -163,15 +200,38 @@ async fn proc_scan_detects_open_fd_on_nbd_device_with_dead_server() {
         device.display(),
     );
 
-    // Release the guest's fd → the scan now reports NoHolder (a genuinely-gone
-    // guest), so a DISCONNECT would be legal. This is the negative half that
-    // proves the scan discriminates, not just always-true.
+    // Release the guest's fd → the scan should now report NoHolder (a
+    // genuinely-gone guest), so a DISCONNECT would be legal. This is the
+    // negative half that proves the scan discriminates, not just always-true.
+    //
+    // TEST TIMING, not a scan bug: a block-device connect/change uevent makes
+    // systemd-udevd transiently OPEN the device to probe it (blkid et al.),
+    // which raced an immediate post-close assertion on the KVM runner (run
+    // 29693222107: "left != right"). udev settles in milliseconds, so we
+    // `udevadm settle` then POLL until the transient holder clears, bounded by
+    // a few seconds. In prod this exact race costs at most a one-tick spurious
+    // Park that the next sweep retries away — see the note on
+    // `device_has_live_holder`. On timeout we PRINT the holder identity so a CI
+    // failure names it conclusively (and distinguishes a transient probe from a
+    // persistent system holder, which would change the design).
     drop(guest_fd);
-    assert_eq!(
-        device_has_live_holder(&device),
-        DeviceHolder::NoHolder,
-        "once the guest's fd is closed, the proc scan reports no live holder",
-    );
+    let _ = std::process::Command::new("udevadm").arg("settle").status();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if device_has_live_holder(&device) == DeviceHolder::NoHolder {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the proc scan still reports a live holder 10s after the guest fd \
+             closed — holders now: {:?}. If this is a PERSISTENT system holder \
+             (not transient udev block-device probing) the R6 Park would never \
+             converge for a genuinely-gone guest and the design must change; if \
+             it is udev, this poll should have outlasted it.",
+            holders_of(&device),
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
 
     // Clean teardown so the device is free for the next run.
     clear_stale_nbd_binding(&device);

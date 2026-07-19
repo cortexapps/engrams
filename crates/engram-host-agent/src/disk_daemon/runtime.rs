@@ -393,6 +393,20 @@ enum NbdRecoveryOutcome {
 /// Absence of proof is not proof of death, and the pure verdict PARKs on
 /// Unknown exactly as it does on a live holder.
 ///
+/// TRANSIENT SYSTEM HOLDERS are benign here. An NBD connect/change uevent makes
+/// systemd-udevd briefly open the block device to probe it (blkid et al.); if
+/// that probe overlaps a sweep tick, this returns `LiveHolder` for a device
+/// whose guest is actually gone. The cost is bounded and self-healing: the
+/// verdict PARKs (leaves the device kernel-bound, RECONNECTABLE — the
+/// `nbd_kernel_busy` probe keeps it out of new-claim circulation) instead of
+/// disconnecting. udev closes its probe fd within milliseconds, so a subsequent
+/// sweep pass (the next host-agent register/roll — the sweep is per-register,
+/// not a periodic loop) sees `NoHolder` and disconnects legally; the interim
+/// cost is one reconnectable-but-parked slot, never a wrongful disconnect of a
+/// live device. This is the intended fail-safe asymmetry: deferring a
+/// disconnect is cheap and reversible, severing a device a guest is reading is
+/// not.
+///
 /// `pub` so the FC-lane test (`nbd_proc_holder`) can pin the kernel assumption
 /// this guard leans on: an open fd on a real `/dev/nbdN` with a dead netlink
 /// server is detectable via the `/proc` scan.
