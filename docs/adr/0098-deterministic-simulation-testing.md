@@ -893,7 +893,25 @@ wire-skewed hosts had silently suppressed the entire digest-gated
 placement path, the exact "stale fake green-lights bugs" risk this ADR
 named). #787 is the next wave's opener; the API-verb swarm integration +
 harness-idle eviction + drain workload steps are deliberately held until
-it is fixed. Rung 2 lives in #784. Historical note superseded:
+it is fixed. Wave 3 (the R3 chain) is MERGED — three RCAs, each of which
+OVERTURNED its going-in hypothesis: #791 (the #787 "double-boot" was the
+dead-host #231 probe dialing an empty sim host_pool — fidelity gap, prod
+analog epoch-fenced; plus the #790 snapshot-fidelity fix: model the
+artifact, never fake the flag) and #795 (the #722 over-reservation was
+the unreserved resume soft-pick, NOT the crash-orphan exclusion — the
+D7-era fix had hardened an untriggered path; one reservation authority
+now holds on every placement path, the UNCONDITIONAL placement oracle is
+restored, and faithful hosts are the swarm default). #795 also closed a
+class the harness could not see about itself: the first landing (#793)
+was reverted (#794) after main's Linux lane caught cross-world blob-GC
+contamination — every SimWorld shared one process-global temp blob dir,
+victims chosen by read_dir order. Per-world TempDirs + a SORTED
+LocalBlobStorage::list_prefix (the GCS/S3 contract) fix it, and
+"shared on-disk state + unsorted listings ⇒ concurrency/platform-
+divergent replay the replay-twice check structurally misses" is now
+determinism-audit item 6. Deferred to next waves: the API-verb/drain
+workload Steps, #792's recoverable-before-Idle guard,
+touch_session_activity retirement. Rung 2 lives in #784. Historical note superseded:
 the R2 model-oracle/Router-workload/effect-queue track deliberately waits
 for rung 1 to land (the effect queue restructures the same SimHostClient
 seam the cosim bridge consumes). Invariant alerting is live-pending-apply
