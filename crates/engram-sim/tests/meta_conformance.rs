@@ -1333,11 +1333,13 @@ conformance!(
     super::resident_sandboxes_rehydrate_list
 );
 
-/// Issue #722: the reservation predicate. A stale `pending` WITH a live
-/// create_boot op still holds its budget (visible through
-/// placement_no_fit_details' free_mib); a stale op-less pending is
-/// written off — and the reclaim sweep fails those, so they can never
-/// boot later and over-pack the host.
+/// Issue #722 (R3): the reservation predicate is UNCONDITIONAL — a
+/// `pending` pinned to a host holds its budget (visible through
+/// placement_no_fit_details' free_mib) for as long as it is `pending`,
+/// whether fresh, aged, live-op, or op-less. There is no crash-orphan
+/// wall-age exclusion: an aged op-less orphan STILL reserves until the
+/// ADR 0079 backstop reclaims it by a real `pending → failed` transition.
+/// (Both stores must agree — the D4 conformance contract.)
 async fn stale_pending_reservation(ctx: &Ctx) {
     use engram_core::types::session_op::{EnqueueOutcome, OpKind};
     let meta = &ctx.meta;
@@ -1401,17 +1403,24 @@ async fn stale_pending_reservation(ctx: &Ctx) {
         engram_core::traits::metadata::CreateDisposition::Placed(_)
     ));
 
-    // Fresh: both reserve — 8192 - 2*2048 = 4096 free.
+    // Both reserve — 8192 - 2*2048 = 4096 free.
     let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
     assert_eq!(details[0].free_mib, 4096);
 
-    // Cross the 10-minute horizon: the live-op pending still counts,
-    // the op-less orphan is written off — 8192 - 2048 = 6144 free.
+    // R3 (#722): cross the old 10-minute horizon. BOTH pendings STILL
+    // reserve — a `pending` holds its slot UNCONDITIONALLY (no wall-age /
+    // op-liveness exclusion) until it LEAVES the reserving state. The old
+    // predicate wrote off the op-less orphan here (6144 free), which let
+    // placement re-sell a slot the ADR 0079 backstop could still revive
+    // onto → Σ reserved > allocatable. The backstop reclaims a true orphan
+    // by a real `pending → failed` transition (the sole reclaimer), never
+    // a placement-side write-off.
     ctx.clock.advance(Duration::from_secs(11 * 60));
     let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
     assert_eq!(
-        details[0].free_mib, 6144,
-        "stale live-op pending must keep its reservation; op-less orphan must not"
+        details[0].free_mib, 4096,
+        "R3 #722: a pending reserves unconditionally — neither the live-op \
+         pending nor the aged op-less orphan may be written off while pending"
     );
 }
 

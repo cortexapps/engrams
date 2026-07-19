@@ -121,20 +121,28 @@ fn one_running_op_per_session(world: &SimWorld) -> Result<(), Violation> {
 /// advertises as allocatable (checked only for measured hosts — an
 /// unmeasured host takes only last-resort placements by design).
 ///
-/// SELF-CONSISTENCY check: placement never over-reserves by its own sum,
-/// with the reservation predicate shared with `pick_host_2d` by
-/// construction. This is not the aspirational unconditional bound,
-/// which still FAILS today because the crash-orphan exclusion conflicts
-/// with the ADR 0079 pending-revival backstop (issue #722).
+/// UNCONDITIONAL bound (the ADR's original intent): EVERY session that
+/// holds a host reservation (any `reserves_host_memory` state pinned to a
+/// host) is summed — no crash-orphan exclusion, because a Pending pinned
+/// to a host physically holds that slot until it leaves the reserving
+/// state, and the ADR 0079 pending-revival backstop can put it back on the
+/// CPU. History: #722's crash-orphan exclusion (placement stopped counting
+/// an aged Pending) contradicted that backstop, so a revival could land on
+/// re-sold capacity (Σ reserved > allocatable). #775 scoped THIS oracle to
+/// self-consistency (sharing `pending_counts` with `pick_host_2d`) as a
+/// stopgap *precisely because the product was broken* — that scoping could
+/// only ever prove placement agreed with itself, never that the physical
+/// sum was safe. With the R3 fix landed (reservation-counting no longer
+/// keys on wall-age; reclamation is a real Pending→terminal transition, not
+/// a placement-side exclusion — one authority), the unconditional bound
+/// holds and is restored here as the real oracle.
 fn placement_accounting(world: &SimWorld) -> Result<(), Violation> {
-    use engram_core::traits::Clock as _;
-    let now = world.clock.now_utc();
     world.meta.with_db(|db| {
         let mut reserved: std::collections::BTreeMap<engram_core::HostId, i64> = Default::default();
         for row in db.sessions.values() {
             if let Some(host) = row.session.host_id {
                 let st = row.session.status;
-                let counts = st.reserves_host_memory() && engram_sim::pending_counts(db, row, now);
+                let counts = st.reserves_host_memory();
                 if counts {
                     *reserved.entry(host).or_default() += row.mem_budget_mib;
                 }

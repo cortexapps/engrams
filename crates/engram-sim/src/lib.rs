@@ -23,4 +23,4 @@ pub mod meta;
 
 pub use clock::{ManualClock, SimClock};
 pub use entropy::SimEntropy;
-pub use meta::{pending_counts, SimMetadataStore};
+pub use meta::SimMetadataStore;
