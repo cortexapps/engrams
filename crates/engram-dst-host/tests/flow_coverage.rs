@@ -50,6 +50,7 @@ fn all_step_representatives() -> Vec<Step> {
         Step::StaleSweepTick,
         Step::SlotClaim(0),
         Step::SlotPopulateTick,
+        Step::CorruptSpoolRecovery(0, true, 0),
     ]
 }
 
@@ -88,6 +89,7 @@ const EXPECTED: &[&str] = &[
     "StaleSweepTick",
     "SlotClaim",
     "SlotPopulateTick",
+    "CorruptSpoolRecovery",
 ];
 
 #[test]

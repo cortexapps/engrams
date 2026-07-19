@@ -1121,19 +1121,23 @@ impl SimHost {
     /// The lineage gate mirrors the real call site: a spool from a DIFFERENT
     /// manifest lineage is a loud discard, never an adopt.
     async fn rebuild(&mut self, idx: usize) -> Result<(), String> {
+        self.rebuild_with(idx, self.effects.fs.clone()).await
+    }
+
+    /// [`rebuild`](Self::rebuild) over an EXPLICIT fs handle — the honest
+    /// `TokioFs` for the normal recovery legs, or a [`CrashFs`] armed with a
+    /// seeded read fault for the R5 storage-lie injection
+    /// ([`corrupt_spool_recovery`](Self::corrupt_spool_recovery)). Every spool
+    /// read/discard goes through `fs`, so a lie about the spool's bytes is
+    /// seen exactly where a real rehydrate would see it.
+    async fn rebuild_with(&mut self, idx: usize, fs: Arc<dyn HostFs>) -> Result<(), String> {
         let sandbox_id = self.sandboxes[idx].sandbox_id;
         // Read the spool BEFORE picking the rebuild ref (store-ahead rule).
-        let spool = match spool::read_spool(
-            self.effects.fs.as_ref(),
-            self.fs.spool_dir(),
-            sandbox_id,
-        )
-        .await
-        {
+        let spool = match spool::read_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id).await {
             Ok(s) => s,
             Err(_torn) => {
                 // Torn/spliced → discard + rebuild from the durable pointer.
-                spool::discard_spool(self.effects.fs.as_ref(), self.fs.spool_dir(), sandbox_id)
+                spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
                     .await
                     .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
                 None
@@ -1168,12 +1172,67 @@ impl SimHost {
                 backend.adopt_unflushed(chunks).await;
             }
             // Adopted or stale: the spool is consumed either way.
-            spool::discard_spool(self.effects.fs.as_ref(), self.fs.spool_dir(), sandbox_id)
+            spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
                 .await
                 .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
         }
         self.sandboxes[idx].backend = Some(Arc::new(backend));
         Ok(())
+    }
+
+    /// R5 (ADR 0098 Phase 3, storage lies): rehydrate sandbox `idx` from a
+    /// STANDING shutdown spool whose bytes a seeded storage fault LIES about.
+    ///
+    /// The setup keeps the oracle honest by construction: a flush first raises
+    /// the durable published FLOOR over an acked write (a redundant copy that
+    /// survives any spool loss), then a newer, un-published write is captured
+    /// into a standing transient spool. The rebuild then reads that spool
+    /// through a [`CrashFs`] armed to corrupt read `on_read` — `meta` selects
+    /// the completeness marker (read #0) vs the first chunk (read #1) — with a
+    /// byte-flip at `offset`.
+    ///
+    /// Whatever the lie:
+    /// * a corrupt CHUNK fails `read_spool`'s per-chunk re-hash → loud discard;
+    /// * a corrupt META (once R5's envelope lands) fails the content hash →
+    ///   loud discard; before the envelope it is TRUSTED (the gap this wave
+    ///   exists for), but the setup's redundant floor keeps a trusted adopt of
+    ///   the SAME-lineage newer chunks at-or-above the floor;
+    /// * a lie that breaks the JSON → parse error → loud discard.
+    ///
+    /// A discard rebuilds from the published floor (the newer un-published
+    /// write is a legitimately-lost transient-spool write — oracle #1 keys on
+    /// the floor). So the step converges for the oracle EITHER way; it exists
+    /// to drive the detection machinery across the swarm's interleavings.
+    pub async fn corrupt_spool_recovery(
+        &mut self,
+        idx: usize,
+        meta: bool,
+        offset: usize,
+    ) -> Result<(), String> {
+        if idx >= self.sandboxes.len()
+            || self.finalize_pending(idx)
+            || self.sandboxes[idx].migrating
+        {
+            return Ok(());
+        }
+        if self.sandboxes[idx].backend.is_none() {
+            return Ok(());
+        }
+        // 1. A flushed write raises the durable floor (the redundant copy).
+        self.guest_write(idx, 0).await?;
+        self.flush_tick(idx).await?;
+        // 2. A newer, un-published write captured into a standing spool.
+        self.guest_write(idx, 1).await?;
+        self.spool_export(idx).await?;
+        // 3. The roll: RAM dies; the successor rehydrates from the (lied-about)
+        //    spool. read #0 = meta.json, read #1 = the first chunk file.
+        self.sandboxes[idx].backend = None;
+        let fault = crate::fs_crash::ReadFault {
+            on_read: if meta { 0 } else { 1 },
+            corruption: crate::fs_crash::ReadCorruption::FlipByte { offset },
+        };
+        let crash_fs = CrashFs::with_read_fault(fault);
+        self.rebuild_with(idx, crash_fs).await
     }
 
     /// The `/dev/nbdN`-shaped path a sandbox slot's device sync records
