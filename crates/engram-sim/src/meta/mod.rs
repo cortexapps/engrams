@@ -44,6 +44,8 @@ use parking_lot::Mutex;
 
 mod store_impl;
 
+pub use store_impl::pending_counts;
+
 /// A would-be `pg_notify` recorded instead of fired. The D5 scheduler
 /// drains these and decides delivery (or dropping) explicitly; the
 /// polling drivers must converge without them.

@@ -729,17 +729,6 @@ Coordinator sim (`engram-dst`), as of 2b4b89ea:
   unconditionally at quiescence (the capacity qualifier lives in a comment,
   not code). The placement oracle has drifted from the corrected store
   predicate (#722's "tightened back to unconditional" did not hold).
-  — *Closed by R3 (wave3-placement-authority):* the unconditional
-  placement-accounting oracle is RESTORED, and the store predicate now
-  satisfies it by construction — a `pending` reserves UNCONDITIONALLY (no
-  wall-age / live-op exclusion; ONE reservation authority), reclaimed only by
-  the ADR 0079 backstop's real `pending → failed` transition. RCA of the
-  12/200 faithful-chaos firings: the failing path was NOT the crash-orphan
-  pending exclusion (the D6/D7-era hypothesis) but the UNRESERVED RESUME
-  soft-pick (`pick_from`'s capacity-soft fallback binding a resume onto a
-  measured-full host); resume now honors the same hard reserved-budget bound
-  as create (queue-when-no-fit via `placement_preview`). With #722 and #790
-  closed, faithful hosts are the swarm DEFAULT.
 - The "DriverKind coverage meta-test" is five function-pointer visibility
   checks; it inspects neither `DriverKind` nor the run_once inventory.
   Coverage is ~8/14 production task families — `enable_scanner::run_once`

@@ -46,33 +46,14 @@ fn run_inner(seed: u64, profile: Profile, steps: u64, faithful: bool) {
 }
 
 /// Issue #722: chaos seed 0 first exposed the placement over-reservation
-/// hole at step 547 under the UNCONDITIONAL accounting oracle, back when
-/// that oracle was scoped to self-consistency because the product was
-/// broken. R3 landed the fix (ONE reservation authority: a `pending`
-/// reserves unconditionally + resume honors the hard reserved-budget bound)
-/// and RESTORED the unconditional oracle (engram-dst invariants.rs). This
-/// pin keeps the non-faithful interleaving green against that armed oracle.
+/// hole (the 10-minute crash-orphan exclusion vs the ADR 0079 pending
+/// revival backstop) at step 547 under the UNCONDITIONAL accounting
+/// oracle. The shipped oracle is scoped to placement's self-consistent
+/// arithmetic until #722's fix lands; this pin keeps the interleaving
+/// alive so tightening the oracle back re-tests the exact scenario.
 #[test]
 fn issue_722_placement_over_reservation_interleaving() {
     run(0, Profile::Chaos, 600);
-}
-
-/// Issue #722 (R3): the SMALLEST-step faithful-host firing (chaos seed 5,
-/// step 208) of the actual bug the re-open surfaced. RCA: NOT the
-/// pending crash-orphan exclusion (D6-era hypothesis) — every one of the
-/// 12/200 faithful firings was the UNRESERVED RESUME path. `pick_from`'s
-/// capacity-soft fallback (the ADR 0046 "resume-isn't-reserved posture")
-/// bound a resuming session onto a `measured_full` host (free=0), and under
-/// crash/partition churn a wave of forced resumes onto full survivors drove
-/// Σ reserved > allocatable (13×2048 > 24576). The fix makes resume queue
-/// (Idle→queued, resume origin) when no host FITS — `placement_preview`,
-/// the SAME hard 2D check the queue-scanner precheck uses (so no
-/// Idle↔Queued churn). This pin runs the full 1500-step window so the
-/// resume also has to queue, re-place via the RESERVED `place_queued_session`
-/// once capacity frees, and converge through the quiescence drain.
-#[test]
-fn issue_722_r3_resume_over_commit_faithful_smallest_seed() {
-    run_faithful(5, Profile::Chaos, 1500);
 }
 
 /// Nightly seed 33043259: idle-eviction nomination plus a host restart
@@ -186,10 +167,10 @@ fn wedged_boot_op_reaches_terminal_via_op_deadline() {
 /// fleet — reproduced from the op-path workload alone once the sim's hosts
 /// are made FAITHFUL (schedulable through the digest-gated `candidates_for`
 /// path). Hand-driven (the `wedged_boot` precedent) rather than a swarm
-/// pick, because it needs a specific create→false-evict→resume interleaving;
-/// the swarm now runs faithful BY DEFAULT (R3 #722: the sibling classes it
-/// unmasked — `placement-accounting` and evict→resume `snapshot-safety` —
-/// are fixed).
+/// pick, because the faithful-host mode is opt-in (`with_faithful_hosts`)
+/// until the sibling classes it also unmasks — `placement-accounting`
+/// (#722) and evict→resume `snapshot-safety` — are fixed and it can become
+/// the swarm default.
 ///
 /// ROOT CAUSE: the dead-host detector's issue-#231 liveness probe was
 /// structurally unmodeled in the DST harness — it dialed through
@@ -343,15 +324,15 @@ fn issue_790_evict_resume_snapshot_safety_default_lane() {
 }
 
 /// Issue #790 under FAITHFUL hosts (the digest-gated `candidates_for`
-/// scheduling path, now the swarm default — R3 #722): the SAME seed/session
-/// reproduces the snapshot-safety hole. Seed 38 was the one isolable
-/// snapshot-safety repro in the 0..200 faithful chaos swarm — the other
-/// faithful failures were #722 `placement-accounting` (the resume
-/// over-commit) firing at an earlier step and masking it (now fixed), and
-/// calm-faithful never reaches the capture→Idle path. Pinned separately so
-/// the faithful world permanently re-tests the fix. FAIL-WITHOUT /
-/// PASS-WITH: pre-fix FAILS with `snapshot-safety` (NOT pre-empted by #722
-/// on this seed); post-fix PASSES fully green.
+/// scheduling path that becomes the swarm default once #789's chain
+/// clears): the SAME seed/session reproduces the snapshot-safety hole.
+/// Seed 38 is the one isolable snapshot-safety repro in the 0..200 faithful
+/// chaos swarm — the other faithful failures are #722 `placement-accounting`
+/// firing at an earlier step and masking it, and calm-faithful never
+/// reaches the capture→Idle path. Pinned separately so the faithful world
+/// permanently re-tests the fix. FAIL-WITHOUT / PASS-WITH: pre-fix FAILS
+/// with `snapshot-safety` (NOT pre-empted by #722 on this seed); post-fix
+/// PASSES fully green.
 #[test]
 fn issue_790_evict_resume_snapshot_safety_faithful() {
     run_faithful(38, Profile::Chaos, 1500);
