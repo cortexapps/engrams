@@ -204,6 +204,13 @@
       "when": 1784437060451,
       "tag": "0028_peaceful_sugar_man",
       "breakpoints": true
+    },
+    {
+      "idx": 29,
+      "version": "7",
+      "when": 1784474820890,
+      "tag": "0029_soft_betty_brant",
+      "breakpoints": true
     }
   ]
 }

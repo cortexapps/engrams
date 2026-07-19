@@ -30,6 +30,8 @@ const active: ReviewRow = {
   status: "queued",
   githubReviewId: null,
   statusCommentId: null,
+  finderSessionId: null,
+  verifierSessionId: null,
   summaryMd: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
   updatedAt: new Date("2026-07-17T00:00:00Z"),
@@ -71,6 +73,18 @@ const reviewPostingNoops = {
   updateFindingState: async () => {},
   finalizeReview: async () => {},
   setStatusCommentId: async () => {},
+  setReviewSessionId: async () => {},
+};
+
+// A full ReviewControlPlaneStore of no-ops for the session-lifecycle tests that
+// don't otherwise care about the store (createFinderSession/createVerifierSession
+// now stamp the session id on the review at kickoff).
+const reviewStoreStub = {
+  ...reviewPostingNoops,
+  getActiveReviewForPr: async () => null,
+  getReview: async () => detail(),
+  createReview: async () => "review-stub",
+  updateReviewStatus: async () => {},
 };
 
 function reviewSessionRecorder(order?: string[]): ReviewSessionStore & {
@@ -336,6 +350,7 @@ describe("ReviewControlPlane", () => {
     const reviewSessions = reviewSessionRecorder(order);
     const designated = reviewerProfile("profile-designated");
     const cp = makeReviewControlPlane({
+      reviews: reviewStoreStub,
       profiles: profileLookup(designated),
       enrollments: { get: async () => enrollment(active.repo, null) },
       createSessionForExistingTask: async (params) => {
@@ -384,9 +399,37 @@ describe("ReviewControlPlane", () => {
     ]);
   });
 
+  test("stamps the worker session on the review at kickoff for a live watch link", async () => {
+    const stamped: Array<[string, string, string]> = [];
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewStoreStub,
+        setReviewSessionId: async (reviewId, role, sessionId) => {
+          stamped.push([reviewId, role, sessionId]);
+        },
+      },
+      profiles: profileLookup(reviewerProfile("profile-designated")),
+      enrollments: { get: async () => enrollment(active.repo, null) },
+      createSessionForExistingTask: async () => ({ sessionId: "finder-session" }),
+      reviewSessions: reviewSessionRecorder(),
+      registerSessionListener: async () => {},
+    });
+
+    await cp.createFinderSession({
+      reviewId: active.id,
+      taskId: active.taskId,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      workflowId: "review-wf-1",
+    });
+
+    expect(stamped).toEqual([[active.id, "finder", "finder-session"]]);
+  });
+
   test("an enrollment profile overrides the designated reviewer profile", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
     const cp = makeReviewControlPlane({
+      reviews: reviewStoreStub,
       profiles: profileLookup(reviewerProfile("profile-designated")),
       enrollments: { get: async () => enrollment(active.repo, "profile-enrolled") },
       createSessionForExistingTask: async (params) => {
@@ -428,6 +471,7 @@ describe("ReviewControlPlane", () => {
     const reviewSessions = reviewSessionRecorder(order);
     const designated = reviewerProfile("profile-designated");
     const cp = makeReviewControlPlane({
+      reviews: reviewStoreStub,
       profiles: profileLookup(designated),
       enrollments: { get: async () => enrollment(active.repo, null) },
       createSessionForExistingTask: async (params) => {
@@ -733,6 +777,7 @@ describe("ReviewControlPlane", () => {
         createReview: async () => active.id,
         updateReviewStatus: async () => {},
         setStatusCommentId: async () => {},
+        setReviewSessionId: async () => {},
         async updateFindingState(id, state, opts) {
           findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
         },
@@ -805,6 +850,7 @@ describe("ReviewControlPlane", () => {
         createReview: async () => active.id,
         updateReviewStatus: async () => {},
         setStatusCommentId: async () => {},
+        setReviewSessionId: async () => {},
         updateFindingState: async () => {
           findingUpdates++;
         },

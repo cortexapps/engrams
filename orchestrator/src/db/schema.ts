@@ -191,6 +191,11 @@ export const review = pgTable(
     // The sticky GitHub issue-comment we post on pickup and edit in place
     // through the lifecycle (👀 → ⏳ → ✅). Null until the first ack lands.
     statusCommentId: text("status_comment_id"),
+    // The worker sessions, stamped at kickoff so the UI can offer a live
+    // "watch" link while the phase runs. The session is deleted when its phase
+    // ends, but the id is kept as the durable record of which session ran.
+    finderSessionId: text("finder_session_id"),
+    verifierSessionId: text("verifier_session_id"),
     summaryMd: text("summary_md"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -10,6 +10,8 @@ const review = {
   prNumber: 100,
   status: "verifying",
   githubReviewId: "",
+  finderSessionId: "finder-sess-1",
+  verifierSessionId: "verifier-sess-1",
   findingCounts: { critical: 0, high: 1, medium: 0, low: 0, total: 1 },
 };
 
@@ -54,6 +56,13 @@ describe("Reviews page", () => {
     expect(await screen.findByText("cortexapps/engrams")).toBeTruthy();
     // status "verifying" → the "Verifying" stage label.
     expect(screen.getByText("Verifying")).toBeTruthy();
+  });
+
+  it("offers a live watch link to the active phase's session without expanding", async () => {
+    renderWithProviders(<Reviews />);
+    // status "verifying" → the verifier session is the live one.
+    const watch = await screen.findByRole("link", { name: /watch live/i });
+    expect(watch.getAttribute("href")).toContain("/sessions/verifier-sess-1");
   });
 
   it("expands a row to reveal findings, verdict, and the finder session link", async () => {

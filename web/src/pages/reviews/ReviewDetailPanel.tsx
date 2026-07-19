@@ -48,7 +48,15 @@ function anchor(finding: ReviewFinding): string {
   return line ? `${finding.path}:L${line}` : finding.path;
 }
 
-function SessionLink({ label, sessionId }: { label: string; sessionId: string }) {
+function SessionLink({
+  label,
+  sessionId,
+  live,
+}: {
+  label: string;
+  sessionId: string;
+  live?: boolean;
+}) {
   return (
     <Link
       to="/sessions/$id"
@@ -56,7 +64,13 @@ function SessionLink({ label, sessionId }: { label: string; sessionId: string })
       className="inline-flex items-center gap-1 text-xs underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
     >
       <Terminal className="size-3" aria-hidden />
-      {label}
+      {live ? `Watch ${label.toLowerCase()} live` : label}
+      {live && (
+        <span className="relative flex size-1.5" aria-hidden>
+          <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500/70" />
+          <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+        </span>
+      )}
     </Link>
   );
 }
@@ -124,9 +138,12 @@ export function ReviewDetailPanel({ review }: { review: Review }) {
     (a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9),
   );
   const verdictByFinding = new Map((data?.verdicts ?? []).map((v) => [v.findingId, v]));
-  // All findings share the finder session; all verdicts share the verifier session.
-  const finderSession = findings[0]?.sessionId;
-  const verifierSession = data?.verdicts.find((v) => v.sessionId)?.sessionId;
+  // Prefer the session ids stamped on the review at kickoff (present before any
+  // finding/verdict exists, so the link shows the moment a phase starts); fall
+  // back to the producing session recorded on a finding/verdict.
+  const finderSession = review.finderSessionId || findings[0]?.sessionId;
+  const verifierSession =
+    review.verifierSessionId || data?.verdicts.find((v) => v.sessionId)?.sessionId;
   const reviewUrl = review.githubReviewId
     ? `https://github.com/${review.repo}/pull/${review.prNumber}#pullrequestreview-${review.githubReviewId}`
     : undefined;
@@ -154,8 +171,20 @@ export function ReviewDetailPanel({ review }: { review: Review }) {
             Review on GitHub
           </a>
         )}
-        {finderSession && <SessionLink label="Finder session" sessionId={finderSession} />}
-        {verifierSession && <SessionLink label="Verifier session" sessionId={verifierSession} />}
+        {finderSession && (
+          <SessionLink
+            label="Finder session"
+            sessionId={finderSession}
+            live={review.status === "finding"}
+          />
+        )}
+        {verifierSession && (
+          <SessionLink
+            label="Verifier session"
+            sessionId={verifierSession}
+            live={review.status === "verifying"}
+          />
+        )}
       </div>
 
       {findings.length === 0 ? (

@@ -77,6 +77,11 @@ message Review {
   google.protobuf.Timestamp created_at = 11;
   google.protobuf.Timestamp updated_at = 12;
   FindingCounts finding_counts = 13;
+  // Worker sessions, stamped at kickoff so the UI can offer a live "watch" link
+  // while a phase runs. Empty until that phase starts; the session is deleted
+  // when its phase ends, so the id survives as the record of which session ran.
+  optional string finder_session_id = 14;
+  optional string verifier_session_id = 15;
 }
 
 // Per-severity finding counts for the list page.

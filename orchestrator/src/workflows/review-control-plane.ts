@@ -129,6 +129,7 @@ interface ReviewControlPlaneStore extends Pick<
   | "updateFindingState"
   | "finalizeReview"
   | "setStatusCommentId"
+  | "setReviewSessionId"
 > {}
 
 interface ReviewExecOutput {
@@ -430,6 +431,9 @@ export function makeReviewControlPlane(
         input.workflowId,
         "finder",
       );
+      // Stamp the session on the review at kickoff so the UI can offer a live
+      // "watch" link the moment the finding phase starts.
+      await reviews().setReviewSessionId(input.reviewId, "finder", created.sessionId);
       await registerSessionListener(created.sessionId);
       return created;
     },
@@ -512,6 +516,7 @@ export function makeReviewControlPlane(
         input.workflowId,
         "verifier",
       );
+      await reviews().setReviewSessionId(input.reviewId, "verifier", created.sessionId);
       await registerSessionListener(created.sessionId);
       return created;
     },

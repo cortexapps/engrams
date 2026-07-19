@@ -105,6 +105,8 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     trigger: row.trigger,
     status: row.status,
     ...(row.githubReviewId != null ? { githubReviewId: row.githubReviewId } : {}),
+    ...(row.finderSessionId != null ? { finderSessionId: row.finderSessionId } : {}),
+    ...(row.verifierSessionId != null ? { verifierSessionId: row.verifierSessionId } : {}),
     ...(row.summaryMd != null ? { summaryMd: row.summaryMd } : {}),
     createdAt: timestampFromDate(row.createdAt),
     updatedAt: timestampFromDate(row.updatedAt),

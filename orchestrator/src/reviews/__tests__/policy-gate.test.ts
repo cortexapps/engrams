@@ -19,6 +19,8 @@ const review: ReviewRow = {
   status: "verifying",
   githubReviewId: null,
   statusCommentId: null,
+  finderSessionId: null,
+  verifierSessionId: null,
   summaryMd: null,
   createdAt: new Date(0),
   updatedAt: new Date(0),

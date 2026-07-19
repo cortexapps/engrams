@@ -1,4 +1,5 @@
 import { useState } from "react";
+import { Link } from "@tanstack/react-router";
 import { timestampDate } from "@bufbuild/protobuf/wkt";
 import {
   Ban,
@@ -59,6 +60,34 @@ function ReviewStage({ status }: { status: string }) {
   );
 }
 
+// The session for the phase running right now, so the row can offer a live
+// "watch" link without expanding. Empty outside an active phase (or before the
+// session id has been stamped).
+function liveSession(review: Review): string | undefined {
+  if (review.status === "finding") return review.finderSessionId;
+  if (review.status === "verifying") return review.verifierSessionId;
+  return undefined;
+}
+
+function WatchLive({ review }: { review: Review }) {
+  const sessionId = liveSession(review);
+  if (!sessionId) return null;
+  return (
+    <Link
+      to="/sessions/$id"
+      params={{ id: sessionId }}
+      onClick={(e) => e.stopPropagation()}
+      className="inline-flex items-center gap-1 text-xs text-emerald-600 underline decoration-emerald-500/40 underline-offset-4 transition-colors hover:text-emerald-500 dark:text-emerald-400"
+    >
+      Watch live
+      <span className="relative flex size-1.5" aria-hidden>
+        <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500/70" />
+        <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
+      </span>
+    </Link>
+  );
+}
+
 function CreatedAt({ review, now }: { review: Review; now: number }) {
   if (!review.createdAt) return null;
   const createdAt = timestampDate(review.createdAt);
@@ -115,7 +144,10 @@ function ReviewRow({ review, now }: { review: Review; now: number }) {
           </a>
         </TableCell>
         <TableCell>
-          <ReviewStage status={review.status} />
+          <div className="flex items-center gap-3">
+            <ReviewStage status={review.status} />
+            <WatchLive review={review} />
+          </div>
         </TableCell>
         <TableCell>
           <FindingCounts review={review} />
