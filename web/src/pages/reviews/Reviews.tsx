@@ -1,5 +1,15 @@
+import { useState } from "react";
 import { timestampDate } from "@bufbuild/protobuf/wkt";
-import { ExternalLink } from "lucide-react";
+import {
+  Ban,
+  CheckCircle2,
+  ChevronDown,
+  ChevronRight,
+  Clock,
+  ExternalLink,
+  Loader2,
+  XCircle,
+} from "lucide-react";
 
 import { PageHeading } from "../../components/page-heading";
 import type { Review } from "../../gen/engram/app/v1/review_pb";
@@ -7,6 +17,7 @@ import { useNow } from "../../hooks/useNow";
 import { useReviews } from "../../hooks/useReviews";
 import { errorMessage } from "../../lib/errors";
 import { relativeTime } from "../sessions/session-format";
+import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
 import {
   Table,
@@ -16,6 +27,37 @@ import {
   TableHeader,
   TableRow,
 } from "@/components/ui/table";
+import { ReviewDetailPanel } from "./ReviewDetailPanel";
+
+// The workflow's durable status → a human-facing stage. Active phases spin; the
+// terminal ones carry their own colour so the ledger scans at a glance.
+const STAGE: Record<
+  string,
+  { label: string; icon: typeof Clock; spin?: boolean; className: string }
+> = {
+  queued: { label: "Queued", icon: Clock, className: "text-muted-foreground" },
+  finding: { label: "Finding", icon: Loader2, spin: true, className: "text-sky-500" },
+  verifying: { label: "Verifying", icon: Loader2, spin: true, className: "text-amber-500" },
+  posted: { label: "Posted", icon: CheckCircle2, className: "text-emerald-500" },
+  failed: { label: "Failed", icon: XCircle, className: "text-destructive" },
+  halted: { label: "Halted", icon: Ban, className: "text-muted-foreground" },
+  superseded: { label: "Superseded", icon: Ban, className: "text-muted-foreground" },
+};
+
+function ReviewStage({ status }: { status: string }) {
+  const stage = STAGE[status] ?? {
+    label: status,
+    icon: Clock,
+    className: "text-muted-foreground",
+  };
+  const Icon = stage.icon;
+  return (
+    <span className={cn("inline-flex items-center gap-1.5 text-sm", stage.className)}>
+      <Icon className={cn("size-3.5", stage.spin && "animate-spin")} aria-hidden />
+      {stage.label}
+    </span>
+  );
+}
 
 function CreatedAt({ review, now }: { review: Review; now: number }) {
   if (!review.createdAt) return null;
@@ -50,6 +92,49 @@ function FindingCounts({ review }: { review: Review }) {
   );
 }
 
+function ReviewRow({ review, now }: { review: Review; now: number }) {
+  const [open, setOpen] = useState(false);
+  const Chevron = open ? ChevronDown : ChevronRight;
+  return (
+    <>
+      <TableRow className="cursor-pointer" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <TableCell className="w-8 pr-0 text-muted-foreground">
+          <Chevron className="size-4" aria-hidden />
+        </TableCell>
+        <TableCell className="font-mono text-xs">{review.repo}</TableCell>
+        <TableCell>
+          <a
+            href={`https://github.com/${review.repo}/pull/${review.prNumber}`}
+            target="_blank"
+            rel="noreferrer"
+            onClick={(e) => e.stopPropagation()}
+            className="inline-flex items-center gap-1 underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
+          >
+            #{review.prNumber}
+            <ExternalLink className="size-3" aria-hidden />
+          </a>
+        </TableCell>
+        <TableCell>
+          <ReviewStage status={review.status} />
+        </TableCell>
+        <TableCell>
+          <FindingCounts review={review} />
+        </TableCell>
+        <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
+          <CreatedAt review={review} now={now} />
+        </TableCell>
+      </TableRow>
+      {open && (
+        <TableRow className="hover:bg-transparent">
+          <TableCell colSpan={6} className="p-0">
+            <ReviewDetailPanel review={review} />
+          </TableCell>
+        </TableRow>
+      )}
+    </>
+  );
+}
+
 export function Reviews() {
   const { data, error, isPending } = useReviews();
   const now = useNow();
@@ -61,7 +146,7 @@ export function Reviews() {
         <PageHeading
           title="Reviews"
           eyebrow="Pull requests"
-          description="Durable review passes and the findings recorded by finder and verifier sessions."
+          description="Durable review passes and the findings recorded by finder and verifier sessions. Expand a row to see findings, verdicts, and the sessions that produced them."
         />
 
         {isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
@@ -83,38 +168,17 @@ export function Reviews() {
             <Table>
               <TableHeader>
                 <TableRow>
+                  <TableHead className="w-8" />
                   <TableHead>Repository</TableHead>
                   <TableHead>PR</TableHead>
-                  <TableHead>Status</TableHead>
+                  <TableHead>Stage</TableHead>
                   <TableHead>Findings</TableHead>
                   <TableHead>Created</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
                 {reviews.map((review) => (
-                  <TableRow key={review.id}>
-                    <TableCell className="font-mono text-xs">{review.repo}</TableCell>
-                    <TableCell>
-                      <a
-                        href={`https://github.com/${review.repo}/pull/${review.prNumber}`}
-                        target="_blank"
-                        rel="noreferrer"
-                        className="inline-flex items-center gap-1 underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
-                      >
-                        #{review.prNumber}
-                        <ExternalLink className="size-3" aria-hidden />
-                      </a>
-                    </TableCell>
-                    <TableCell>
-                      <Badge variant="secondary">{review.status}</Badge>
-                    </TableCell>
-                    <TableCell>
-                      <FindingCounts review={review} />
-                    </TableCell>
-                    <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
-                      <CreatedAt review={review} now={now} />
-                    </TableCell>
-                  </TableRow>
+                  <ReviewRow key={review.id} review={review} now={now} />
                 ))}
               </TableBody>
             </Table>
