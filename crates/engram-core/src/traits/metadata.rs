@@ -307,6 +307,26 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// #800 (RESERVED evac placement): the `Evacuating` twin of
+    /// [`Self::enqueue_session_resume`]. When the evac resumer's reserved
+    /// placement finds NO survivor that fits the session's budget, it
+    /// queues the session (`evacuating → queued`, resume-origin) instead of
+    /// binding a measured-full host — the queue scanner then re-homes it
+    /// once capacity returns, honoring the hard reserved bound (the #795
+    /// resume precedent, on the evac leg). Gated on `status='evacuating'`
+    /// AND the evac op's fencing epoch (ADR 0079), same shape as the resume
+    /// enqueue: a reclaimed-away zombie evac executor must not fork the
+    /// state machine. Returns whether the flip landed: `false` = the row was
+    /// no longer `evacuating` (a peer relocated it) OR the epoch moved (a
+    /// successor re-claimed). Default no-op: `false`.
+    async fn enqueue_evacuating_session_resume(
+        &self,
+        _id: SessionId,
+        _epoch: i64,
+    ) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
     /// Every `queued` session, oldest-first (FIFO). The scanner walks
     /// this each tick. Default impl (mocks): empty.
     async fn list_queued_sessions_fifo(&self) -> Result<Vec<QueuedSession>, MetaError> {

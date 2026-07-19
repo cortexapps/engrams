@@ -257,5 +257,57 @@ per-category attribution rides the wire as `HostUtilization.{base_shm_mib,
 parked_pss_mib, running_pss_mib}` (migration 0078) and the
 `engram_host_ram_ledger_mib{category=...}` gauge family.
 
+## Addendum (2026-07-19, #800): the reserve-at-pick bound now covers the resume AND evac legs
+
+Implementation-note 3 above deferred resume/evac placement to the
+capacity-**soft** in-memory picker (`pick_for_session` → `pick_from`'s
+last-resort `ranked.hosts[0]` fallback) — "the incident this fixes was
+create-bursts." Two ADR 0098-Phase-3 simulator findings closed that gap, each on
+a different leg of the soft picker, and the pattern is the same: **honor the hard
+reserved bound; when nothing fits, QUEUE (resume-origin) rather than bind a
+measured-full host**, and let the queue scanner re-home the session once capacity
+returns.
+
+- **Resume (#795, #722).** A crash/partition wave of forced resumes soft-picked
+  measured-full survivors → Σ reserved > allocatable. Fix: the resume verb gates
+  on `placement_preview` (the hard 2D fit) and enqueues `Idle → Queued` when no
+  host fits.
+
+- **Evac (#800).** The drain-driven `evac_resumer → evacuate_dead_source →
+  pick_for_session` leg had the SAME soft fallback, and #795's gate keyed on
+  `status == Idle`, never covering `Evacuating`. Once the simulator could drive
+  operator-drain (ADR 0098 Phase 3 wave 5), ~19/100 calm seeds bound full
+  survivors on the evac leg. Fix: **RESERVED evac placement** — the evac ctx now
+  carries the session's reserved 2D budget (was hard-coded `None`,
+  capacity-blind), and a new `pick_for_session_reserved` drops the soft fallback
+  (`pick_from_2d(require_fit=true)`), returning `NoCapacity` when no MEASURED
+  survivor fits. The resumer then flips `Evacuating → Queued` (resume-origin, via
+  `enqueue_evacuating_session_resume`, fenced on the evac op's epoch), and the
+  queue scanner re-homes it. An **unmeasured** host still counts as fitting under
+  `require_fit` (the same last-resort posture `pick_host_2d`/`placement_preview`
+  take), so the reserved pick and the queue scanner's `placement_preview` can
+  never disagree and churn `Queued↔Idle` (the #795 livelock class).
+
+**Deviation from strict FOR-UPDATE atomicity, and why it's sound.** Create
+placement commits its reservation inside one `pick_host_2d` FOR-UPDATE txn
+(`reserve_and_persist_create` / `place_queued_session`). Evac cannot: the sandbox
+is restored on the target *between* the pick and the `assign_session_host`
+rebind, so the reservation-committing write is that rebind — the same
+"accepted residual window" this ADR already documents for eviction *release*
+(PG-first, backstopped by the periodic reconcile). Under prod's multi-placer
+concurrency two evac picks could still race that window; that residual is bounded
+by the reconcile and is strictly better than the pre-#800 unconditional
+overcommit. In the deterministic simulator (single-threaded, one fresh capacity
+read per pick, sessions processed sequentially) the window is closed by
+construction, which is why the placement-accounting oracle now holds with drain
+folded into both swarm profiles. An evacuation that genuinely fits nowhere
+**queuing honestly beats binding a full host**, so the reserved bound takes
+precedence over evac "urgency" (ADR 0018) when they conflict.
+
+Coverage: `enqueue_evacuating_session_resume` has a two-store conformance case
+(ADR 0098 D4); `evac_reserved_queues_when_no_survivor_fits` pins the unit-level
+gate (non-vacuously — a fitting budget on the SAME host still places); the
+operator-drain swarm step (ADR 0098 Phase 3 wave 5) is the integration guard.
+
 [#147]: https://github.com/cortexapps/engrams/issues/147
 [#148]: https://github.com/cortexapps/engrams/issues/148

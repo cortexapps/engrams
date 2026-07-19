@@ -1562,6 +1562,41 @@ impl MetadataStore for PostgresStore {
         Ok(n > 0)
     }
 
+    async fn enqueue_evacuating_session_resume(
+        &self,
+        id: SessionId,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        // #800: Evacuating → queued (resume origin), the RESERVED
+        // evac-placement overflow path. Same fenced-CAS shape as
+        // `enqueue_session_resume` above, but gated on `status='evacuating'`
+        // (the evac resumer's input state) instead of `'idle'`. The row
+        // keeps its `mem_budget_mib` / `cpu_budget_vcpus` from create, so
+        // the queue scanner's resume precheck fits it against the SAME hard
+        // 2D bound. A no-op (0 rows) means a peer already relocated the
+        // session or the epoch moved — the caller stops without emitting the
+        // Queued event.
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'queued', queued_at = $3, queue_origin = 'resume',
+                   last_active_at = $3
+             WHERE id = $1 AND status = 'evacuating' AND current_epoch = $2
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(epoch)
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n > 0 {
+            self.notify_placement_changed("enqueued").await;
+        }
+        Ok(n > 0)
+    }
+
     async fn list_queued_sessions_fifo(
         &self,
     ) -> Result<Vec<engram_core::types::session::QueuedSession>, MetaError> {

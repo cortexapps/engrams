@@ -1074,6 +1074,14 @@ async fn resume_disk_only_cold_boot(
         // never strands the resume.
         origin,
         ctx.fence(),
+        // #800: `None` keeps this user-initiated single /resume path on its
+        // pre-#800 capacity-soft placement. The reserved (queue-on-no-fit)
+        // bound is wired on the drain-driven EVAC-SCANNER leg (`evac_resumer`
+        // — the #800 over-reservation wave); the resume verb's own
+        // MEMORY-snapshot path already queues via `placement_preview`
+        // (#795). Widening the reserved bound to this disk-only resume arm
+        // is a separate follow-up, out of #800's scope.
+        None,
         state.services.clock.now_utc(),
     )
     .await

@@ -485,6 +485,37 @@ impl MetadataStore for SimMetadataStore {
         Ok(true)
     }
 
+    async fn enqueue_evacuating_session_resume(
+        &self,
+        id: SessionId,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        // #800: fenced `evacuating → queued` (resume origin) — the sim twin
+        // of the PG CAS, gated on `status='evacuating'` + epoch.
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(row) = db.sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        if row.session.status != SessionState::Evacuating || row.current_epoch != epoch {
+            return Ok(false);
+        }
+        row.session.status = SessionState::Queued;
+        row.queue_origin = Some(QueueOrigin::Resume);
+        row.queued_at = Some(now);
+        row.session.last_active_at = now;
+        db.transition_log.push(super::TransitionLogEntry {
+            session: id,
+            from: SessionState::Evacuating,
+            to: SessionState::Queued,
+            exempt: false,
+        });
+        drop(db);
+        self.notify("placement_changed", "enqueued");
+        Ok(true)
+    }
+
     /// `WHERE status='queued' ORDER BY queued_at ASC` (serial-stable).
     async fn list_queued_sessions_fifo(&self) -> Result<Vec<QueuedSession>, MetaError> {
         self.gate()?;

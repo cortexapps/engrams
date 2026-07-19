@@ -785,6 +785,97 @@ async fn fenced_transition(ctx: &Ctx) {
     assert_eq!(prev, Some(SessionState::Pending));
 }
 
+/// #800: `enqueue_evacuating_session_resume` — the RESERVED evac-placement
+/// overflow CAS. Fenced `evacuating → queued` (resume-origin): matches only
+/// on `status='evacuating'` AND the op's epoch; a wrong epoch, a wrong
+/// status, and a second call are all clean no-ops. Both stores must agree.
+async fn enqueue_evacuating_resume(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:evacq")).await.unwrap();
+    // Claim an op to establish the fencing epoch (as the evac resumer does).
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Resume, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    let epoch = op.epoch.unwrap();
+
+    // Walk Pending → Created → Active → Evacuating (the resumer's input).
+    for target in [
+        SessionState::Created,
+        SessionState::Active,
+        SessionState::Evacuating,
+    ] {
+        meta.transition_session(sid, target).await.unwrap();
+    }
+
+    // Wrong epoch: no-op (a reclaimed-away zombie can't fork the machine).
+    assert!(
+        !meta
+            .enqueue_evacuating_session_resume(sid, epoch + 1)
+            .await
+            .unwrap(),
+        "epoch mismatch must not flip the row",
+    );
+    let still = meta.get_session(sid).await.unwrap();
+    assert_eq!(still.status, SessionState::Evacuating);
+
+    // Correct epoch + status: flips to queued (resume-origin), FIFO-visible.
+    assert!(meta
+        .enqueue_evacuating_session_resume(sid, epoch)
+        .await
+        .unwrap());
+    let q = meta.list_queued_sessions_fifo().await.unwrap();
+    let row = q
+        .iter()
+        .find(|r| r.session.id == sid)
+        .expect("queued after evac overflow");
+    assert!(matches!(
+        row.origin,
+        engram_core::types::session::QueueOrigin::Resume
+    ));
+
+    // Second call is a clean no-op — the row already left `evacuating`.
+    assert!(
+        !meta
+            .enqueue_evacuating_session_resume(sid, epoch)
+            .await
+            .unwrap(),
+        "a session no longer Evacuating must not re-queue",
+    );
+
+    // Wrong status guard: an Idle session is never eligible for this CAS.
+    let other = meta.create_session(spec("conf:evacq2")).await.unwrap();
+    let EnqueueOutcome::Claimed(op2) = meta
+        .op_enqueue_and_claim(other, OpKind::Resume, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    let epoch2 = op2.epoch.unwrap();
+    for target in [
+        SessionState::Created,
+        SessionState::Active,
+        SessionState::Idle,
+    ] {
+        meta.transition_session(other, target).await.unwrap();
+    }
+    assert!(
+        !meta
+            .enqueue_evacuating_session_resume(other, epoch2)
+            .await
+            .unwrap(),
+        "an Idle session must not be evac-queued",
+    );
+    assert_eq!(
+        meta.get_session(other).await.unwrap().status,
+        SessionState::Idle,
+    );
+}
+
 /// Outbox: due-ness rides not_before on the shared clock; ack is
 /// once-only; delivered rows can't be deleted as undelivered.
 async fn outbox_flow(ctx: &Ctx) {
@@ -1324,6 +1415,10 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
 conformance!(t_ops_idempotency, super::ops_idempotency);
 conformance!(t_fenced_transition, super::fenced_transition);
+conformance!(
+    t_enqueue_evacuating_resume,
+    super::enqueue_evacuating_resume
+);
 conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);

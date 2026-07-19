@@ -337,6 +337,15 @@ async fn run_resume_pipeline(
     // there fails structurally rather than burning the budget.
     let cold_boot_spec = resolve_cold_boot_spec(&state.services.meta, &session).await;
 
+    // #800 (RESERVED evac placement): the session's reserved 2D budget,
+    // resolved from the enabled image the same way the resume verb resolves
+    // it (`resume_from_fc_snapshot`). `None` (image un-enabled) keeps the
+    // pre-#800 capacity-soft placement inside `evacuate_dead_source`. Read
+    // here, before `cold_boot_spec` is moved into the call below.
+    let evac_budget = cold_boot_spec
+        .as_ref()
+        .map(|s| (s.memory.max_mib, s.cpu.vcpus));
+
     // ADR 0045 Phase F: an operator-pinned teleport destination, if any.
     // Honored strictly (a bad pin retries then falls back to Idle, never
     // silently lands elsewhere); cleared below once the session resolves.
@@ -390,11 +399,57 @@ async fn run_resume_pipeline(
         // host, migration parachute) is moving AWAY from the source.
         None,
         fence,
+        evac_budget,
         state.services.clock.now_utc(),
     )
     .await
     {
         Ok(r) => r,
+        // #800: RESERVED evac placement found no survivor that fits — QUEUE
+        // (Evacuating → Queued, resume-origin) instead of overcommitting a
+        // measured-full host. The queue scanner re-homes it once capacity
+        // returns (fenced on the evac op's epoch, like the resume enqueue).
+        // A `false` return = the row already left Evacuating (a peer
+        // relocated it) or the epoch moved — stop silently. Handing
+        // ownership to the scanner is the honest overflow path; the resumer
+        // does NOT burn a retry attempt on it.
+        Err(EvacError::NoCapacityQueue) => {
+            match state
+                .services
+                .meta
+                .enqueue_evacuating_session_resume(session_id, fence.epoch as i64)
+                .await
+            {
+                Ok(true) => {
+                    tracing::info!(
+                        %session_id,
+                        "evac-resumer: no survivor fits the reserved budget — queued \
+                         (resume-origin) instead of overcommitting (#800)",
+                    );
+                    let _ = state
+                        .emit(
+                            session_id,
+                            SessionEvent::StatusChanged {
+                                from: SessionState::Evacuating,
+                                to: SessionState::Queued,
+                                at: state.services.clock.now_utc(),
+                            },
+                        )
+                        .await;
+                }
+                Ok(false) => {
+                    tracing::debug!(
+                        %session_id,
+                        "evac-resumer: enqueue-for-capacity no-op (row moved / epoch bumped)",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(%session_id, error = %e,
+                        "evac-resumer: enqueue-for-capacity failed; leaving Evacuating (retry)");
+                }
+            }
+            return Ok(());
+        }
         // ADR 0028 Fix B fail-fast: structural errors can never be
         // fixed by retrying — the pre-Fix-B behavior of letting the
         // budget loop burn 20 attempts (~3 min of RestoreFailed churn
