@@ -2064,10 +2064,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-release-sim
-      - name: chaos swarm (200 seeds x 1500 steps)
-        run: cargo run -p engram-dst --release --bin sim -- --seeds 0..200 --steps 1500 --profile chaos
-      - name: calm swarm (100 seeds x 1500 steps)
-        run: cargo run -p engram-dst --release --bin sim -- --seeds 0..100 --steps 1500 --profile calm
+      # R3 (#722): faithful hosts are the swarm default now — every seed
+      # exercises the schedulable, digest-gated `candidates_for` path the
+      # coordinator actually runs. `--faithful` is passed explicitly (it is
+      # also the binary default) so the swarm's intent is self-documenting.
+      - name: chaos swarm (200 seeds x 1500 steps, faithful hosts)
+        run: cargo run -p engram-dst --release --bin sim -- --faithful --seeds 0..200 --steps 1500 --profile chaos
+      - name: calm swarm (100 seeds x 1500 steps, faithful hosts)
+        run: cargo run -p engram-dst --release --bin sim -- --faithful --seeds 0..100 --steps 1500 --profile calm
 
   # ADR 0098 P9: the HOST-INTERNAL deterministic-simulation swarm
   # (engram-dst-host — Flows A-F over the real host-agent machinery on a

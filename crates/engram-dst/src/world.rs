@@ -638,7 +638,24 @@ impl SimWorld {
         let image = engram_core::types::EnabledImage {
             id: self.entropy.uuid(),
             image_uri: uri.to_string(),
-            image_config: toml::from_str(r#"name = "sim""#).expect("sim image config"),
+            // FIDELITY (R3 #722): the workload reserves `mem_budget_mib: 2048`
+            // / `cpu_budget_vcpus: 2` at create (scheduler.rs), so the enabled
+            // image MUST resolve to the SAME budget — in production
+            // `reserve_and_persist_create` and `resolve_cold_boot_spec` both
+            // derive from `ImageConfig::resolved_memory_mib`/`_vcpus`, so
+            // create-reserve == resume-resolve by construction. The old
+            // `name = "sim"`-only config left memory at DEFAULT_MEMORY_MIB
+            // (4096) while create reserved 2048: a resume's cold-boot spec then
+            // needed 4096 where the queued row recorded 2048, so the
+            // queue-scanner precheck (2048, fits) and the resume verb's own gate
+            // (4096, no fit) disagreed forever — an Idle↔Queued livelock the
+            // faithful-host resume-capacity fix surfaced (seed 142). vCPUs
+            // already default to DEFAULT_VCPUS (2) = the create budget; pin
+            // memory to close the gap.
+            image_config: toml::from_str(
+                "name = \"sim\"\n[resources]\nsuggested_memory_mib = 2048\nsuggested_vcpus = 2\n",
+            )
+            .expect("sim image config"),
             oci_defaults: Default::default(),
             manifest_digest: "sha256:sim".into(),
             disk_manifest: None,

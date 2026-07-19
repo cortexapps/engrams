@@ -275,13 +275,17 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
-    /// Issue #722: refresh `last_active_at` WITHOUT a state transition.
-    /// The create_boot retry path stamps this each attempt so placement's
-    /// crash-orphan exclusion (`pending` older than 10 minutes drops out
-    /// of the reservation sum) never writes off a session that is still
-    /// actively being booted — the over-reservation hole the DST harness
-    /// found (a written-off pending that later boots re-enters every
-    /// reservation sum on its Created flip, over-packing the host).
+    /// Refresh `last_active_at` WITHOUT a state transition. The create_boot
+    /// retry path stamps this each attempt so an actively-retried `pending`
+    /// looks recently-active to the ADR 0079 pending-orphan backstop (whose
+    /// grace gates on `last_active_at`).
+    ///
+    /// R3 (#722): this is now largely REDUNDANT — placement no longer
+    /// excludes an aged pending from the reservation sum (a `pending`
+    /// reserves unconditionally), and the orphan backstop already skips a
+    /// session with a live (`queued`/`running`) create_boot op, which a
+    /// retrying boot always has. Kept as belt-and-suspenders freshness;
+    /// safe to retire in a followup (trait + both stores + conformance).
     /// Default (mock): no-op.
     async fn touch_session_activity(&self, session_id: SessionId) -> Result<(), MetaError> {
         let _ = session_id;
