@@ -16,9 +16,23 @@
 //! - **acked fields never repainted** — the image a session was created
 //!   with never changes under it (read-your-acked-writes; both replicas
 //!   read the same shared SimMeta, so a present row is readable on either).
+//! - **acked-destroy never resurrects** (wave 4) — once a `delete_session`
+//!   is ACKED (the row is terminal or already gone), the session must never
+//!   be observed live again. A destroyed session that reappears in a
+//!   non-terminal (reserving/live) state is a driver re-booting a torn-down
+//!   session — the double-boot / orphan-backstop class the faithful-host
+//!   fold-in exists to catch.
+//! - **acked-rename read-your-writes** (wave 4) — a `suggested_title` we
+//!   CONFIRMED materialized (read back == what the acked rename set) is
+//!   never silently reverted or repainted to a different value under a live
+//!   session (a resume/rebuild dropping the sticky title would be the bug).
+//!   Recorded confirmed-at-write because the harness-event title path is
+//!   best-effort (a 204 ack does not by itself prove the write landed).
 //!
-//! Non-vacuity is proven by `tests/model_oracle.rs`: dropping a live
-//! session's row directly makes the oracle fire; restoring it passes.
+//! Non-vacuity is proven by `tests/model_oracle.rs` and
+//! `tests/workload_verbs.rs`: dropping a live session's row makes the
+//! create-not-lost oracle fire; resurrecting a destroyed session fires the
+//! destroy oracle; repainting a confirmed title fires the rename oracle.
 
 use std::collections::BTreeMap;
 
@@ -32,8 +46,13 @@ use crate::world::SimWorld;
 struct LiveFact {
     /// The image the create/resume acked — never repainted afterward.
     image: String,
-    /// A later ACKED destroy retired it; the row may now be absent.
+    /// A later ACKED destroy retired it; the row may now be absent (and if
+    /// present must stay terminal — never resurrect live).
     destroyed: bool,
+    /// The latest `suggested_title` a rename CONFIRMED materialized
+    /// (read-back == set). `None` until a confirmed rename; once set it is
+    /// read-your-writes — never lost or repainted under a live session.
+    title: Option<String>,
 }
 
 #[derive(Default)]
@@ -49,13 +68,26 @@ impl ModelState {
         self.acked_live.entry(id).or_insert(LiveFact {
             image,
             destroyed: false,
+            title: None,
         });
     }
 
-    /// Record an ACKED destroy — after this the session's row may be gone.
+    /// Record an ACKED destroy — after this the session's row may be gone,
+    /// and if it is present it must stay terminal (never resurrect live).
+    /// Only meaningful for a session the model already tracks as acked-live.
     pub fn record_destroy_acked(&mut self, id: SessionId) {
         if let Some(f) = self.acked_live.get_mut(&id) {
             f.destroyed = true;
+        }
+    }
+
+    /// Record a CONFIRMED rename: the workload set `title` via the harness
+    /// title path AND read it back materialized. Latest-wins (a later
+    /// confirmed rename overwrites). Only tracked for an acked-live session
+    /// (the honesty boundary — the model asserts on what it saw established).
+    pub fn record_rename_acked(&mut self, id: SessionId, title: String) {
+        if let Some(f) = self.acked_live.get_mut(&id) {
+            f.title = Some(title);
         }
     }
 
@@ -70,7 +102,23 @@ impl ModelState {
         world.meta.with_db(|db| {
             for (id, fact) in &self.acked_live {
                 if fact.destroyed {
-                    // An acked destroy legitimately removes the row.
+                    // An acked destroy legitimately removes the row (or
+                    // leaves it terminal). What it must NEVER do is let the
+                    // session come back to life: a present row that is
+                    // non-terminal after an acked destroy is a driver
+                    // re-booting a torn-down session (the double-boot class).
+                    if let Some(row) = db.sessions.get(id) {
+                        if !row.session.status.is_terminal() {
+                            return Err(Violation {
+                                invariant: "model-acked-destroy-resurrected",
+                                detail: format!(
+                                    "session {id} was destroyed (acked) but is live again \
+                                     at {:?} — a torn-down session resurrected",
+                                    row.session.status
+                                ),
+                            });
+                        }
+                    }
                     continue;
                 }
                 let Some(row) = db.sessions.get(id) else {
@@ -94,6 +142,21 @@ impl ModelState {
                             fact.image, row.session.image
                         ),
                     });
+                }
+                // Read-your-acked-writes for a CONFIRMED rename: the sticky
+                // title never silently reverts or repaints under the live
+                // session (a resume/rebuild that dropped it is the bug).
+                if let Some(expected) = &fact.title {
+                    if row.session.suggested_title.as_ref() != Some(expected) {
+                        return Err(Violation {
+                            invariant: "model-acked-rename-lost",
+                            detail: format!(
+                                "session {id} title was {expected:?} (confirmed acked) \
+                                 but is now {:?} — read-your-acked-writes violated",
+                                row.session.suggested_title
+                            ),
+                        });
+                    }
                 }
             }
             Ok(())

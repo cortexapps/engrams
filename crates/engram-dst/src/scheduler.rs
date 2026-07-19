@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::metadata::{CreateDisposition, SessionCreateWriteSet};
-use engram_core::types::session::{SessionMode, SessionSpec};
+use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::session_op::{EnqueueOutcome, OpKind};
 use engram_core::{HostId, SessionId};
 use rand::prelude::*;
@@ -129,6 +129,36 @@ pub enum Step {
     /// Reorder: deliver the whole queue in a seeded-shuffled order rather
     /// than serial order.
     ReorderEffects,
+    // --- ADR 0098 wave 4: the API workload verbs over the REAL service
+    // surface #786 wired (workload.rs). Prompt/Rename/Destroy are folded
+    // into both profiles at small weights; each drives a real handler (auth
+    // + convert + core) and feeds the acked-only model oracle. ---
+    /// A user prompt through the real gRPC `send_prompt` → the real Deliver
+    /// op → a `run_started` ack (the full prompt→deliver→ack loop). Picks an
+    /// Active session; a prompt that acks keeps it tracked as acked-live.
+    Prompt,
+    /// A "rename": the coordinator-owned `set_session_suggested_title` store
+    /// write (the exact call the harness-title sink performs). Store-direct
+    /// (like CreateSession) — the real-wire harness route is nondeterministic
+    /// under the swarm's time advances; that path is covered single-shot in
+    /// tests/api_surface.rs. A confirmed materialization feeds the model's
+    /// read-your-writes title oracle.
+    Rename,
+    /// An explicit `delete_session` through the real Destroy op + teardown.
+    /// A destroy that acks feeds the acked-destroy-never-resurrects oracle.
+    Destroy,
+    /// An operator draining a host: cordon + evacuate its bound sessions to
+    /// Evacuating (the EvacResumer driver then re-homes them — the #775
+    /// dormant leg). NOT in the profile menu — driven only by the dedicated
+    /// tests (tests/api_surface.rs drives the real gRPC `admin_drain_host`;
+    /// tests/workload_verbs.rs the sequential cordon+evict). Folding it into
+    /// the swarm is blocked on two reported wave-4 findings: (1) the evict
+    /// pipeline's SimHostClient::snapshot does real-fs blob writes that race
+    /// the paused clock (the in-memory-blob-store determinism issue), and
+    /// (2) it uncovers a real capacity-soft evac over-reservation (the
+    /// dormant #775 leg — evac_resumer's `pick_for_session` binds a
+    /// measured-full survivor, the #722/#795 class on the evac path).
+    DrainHost(usize),
 }
 
 #[derive(Debug)]
@@ -252,15 +282,31 @@ impl Sim {
         // commit), but NEVER branch on anything non-deterministic here.
         let roll: u32 = self.rng.random_range(0..100);
         match self.profile {
+            // Wave 4 carves 6 points (2 each) for the deterministic API
+            // workload verbs (Prompt/Rename/Destroy) from AdvanceTime/Driver/
+            // HostHeartbeats — NOT from CreateSession/HostCheckpoint/
+            // ResumeSession, which feed the create→idle→resume + host-death
+            // recovery lifecycle (`host_death_feeds_the_recovery_ladder`
+            // guards it, and #786 carved from these same time/fault buckets
+            // for the same reason). The operator-drain verb is deliberately
+            // NOT in the profile menu (see `Step::DrainHost` / the wave-4
+            // findings): its evict-pipeline blob writes race the paused clock
+            // (the known in-memory-blob-store determinism issue), and it
+            // uncovers a real capacity-soft evac over-reservation — both
+            // reported, neither folded. Calm has no swarm-pick pins
+            // (regressions are hand-driven), so the reweight re-pins nothing.
             Profile::Calm => match roll {
-                0..=27 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
-                28..=55 => Step::Driver(
+                0..=24 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
+                25..=50 => Step::Driver(
                     self.rng.random_range(0..replicas),
                     DRIVERS[self.rng.random_range(0..DRIVERS.len())],
                 ),
-                56..=69 => Step::CreateSession,
-                70..=75 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
-                76..=81 => Step::ResumeSession,
+                51..=64 => Step::CreateSession,
+                65..=70 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
+                71..=76 => Step::ResumeSession,
+                77..=78 => Step::Prompt,
+                79..=80 => Step::Rename,
+                81..=82 => Step::Destroy,
                 _ => Step::HostHeartbeats,
             },
             // CORRECTION (this PR): D6's weight patch silently failed to
@@ -274,17 +320,34 @@ impl Sim {
             // The re-weighting shifts every Chaos seed's exploration (fine
             // — seeds pin to a commit); the pinned chaos seeds are re-checked
             // and re-pinned in tests/ where they legitimately move.
+            // Wave 4 carves 6 points (2 each) for the deterministic API
+            // workload verbs (Prompt/Rename/Destroy) from AdvanceTime(-3)/
+            // Driver(-2)/HostHeartbeats(-1) — the same time/fault buckets #786
+            // carved for the effect-queue arms. CreateSession/HostCheckpoint/
+            // ResumeSession keep their ORIGINAL weights: they feed the
+            // create→idle→resume + host-death→Idle recovery lifecycle
+            // (`host_death_feeds_the_recovery_ladder` reds if the resume leg
+            // goes dark). The operator-drain verb is deliberately NOT in the
+            // menu (see the Calm note + `Step::DrainHost`): its evict-pipeline
+            // blob writes race the paused clock (the known determinism issue)
+            // and it uncovers a real capacity-soft evac over-reservation —
+            // reported, not folded. The reweighting shifts every Chaos seed's
+            // exploration (fine — seeds pin to a commit); the pinned chaos
+            // seeds are re-checked and stay green (tests/regression_seeds.rs).
             Profile::Chaos => match roll {
-                0..=16 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
-                17..=37 => Step::Driver(
+                0..=13 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
+                14..=32 => Step::Driver(
                     self.rng.random_range(0..replicas),
                     DRIVERS[self.rng.random_range(0..DRIVERS.len())],
                 ),
-                38..=44 => Step::CreateSession,
-                45..=46 => Step::WorkloadBurst(self.rng.random_range(2..8)),
-                47..=50 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
-                51..=53 => Step::ResumeSession,
-                54..=64 => Step::HostHeartbeats,
+                33..=39 => Step::CreateSession,
+                40..=41 => Step::WorkloadBurst(self.rng.random_range(2..8)),
+                42..=45 => Step::HostCheckpoint(self.rng.random_range(0..hosts)),
+                46..=48 => Step::ResumeSession,
+                49..=50 => Step::Prompt,
+                51..=52 => Step::Rename,
+                53..=54 => Step::Destroy,
+                55..=64 => Step::HostHeartbeats,
                 65..=68 => Step::CrashHost(self.rng.random_range(0..hosts)),
                 69..=72 => Step::RestartHost(self.rng.random_range(0..hosts)),
                 73..=75 => Step::CrashReplica(self.rng.random_range(0..replicas)),
@@ -772,6 +835,210 @@ impl Sim {
                 serials.shuffle(&mut self.rng);
                 self.world.host_world.deliver_shuffled(&serials);
             }
+            Step::Prompt => {
+                use engram_core::traits::Entropy as _;
+                let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
+                    return;
+                };
+                // Pick the FIRST Active session (BTreeMap order —
+                // deterministic) with a bound sandbox and drive the full
+                // prompt→deliver→ack loop over the real surface:
+                //   1. send_prompt (gRPC)  → durable outbox row
+                //   2. the real Deliver op → forward to the host relay
+                //   3. run_started (real-wire harness event) → outbox_ack
+                // Active-only + closing the ack: an unacked outbox row
+                // redelivers forever (no real guest harness emits the ack),
+                // so a prompted session that later leaves Active would leave
+                // a Deliver op retrying against a perpetually-due row
+                // ("scanner owns recovery") — a real wedge (finding in the
+                // report). Acking the row here retires it, so the Deliver leg
+                // is exercised without folding that wedge into the lane.
+                let target = self.world.meta.with_db(|db| {
+                    db.sessions
+                        .values()
+                        .find(|r| {
+                            r.session.status == SessionState::Active
+                                && r.session.sandbox_id.is_some()
+                        })
+                        .map(|r| (r.session.id, r.session.sandbox_id))
+                });
+                let Some((sid, Some(sandbox))) = target else {
+                    return;
+                };
+                let prompt_id = format!("sim-prompt:{}", self.world.entropy.uuid());
+                let acked = crate::workload::api_prompt(&state, sid, &prompt_id).await;
+                crate::workload::drain_detached().await;
+                if acked {
+                    // Drive the real Deliver op inline (the session is Active
+                    // → forward_outbox_row reaches the host relay).
+                    if let Ok(EnqueueOutcome::Claimed(op)) =
+                        engram_coordinator::session_ops::enqueue_claim(
+                            &state,
+                            sid,
+                            OpKind::Deliver,
+                            serde_json::json!({}),
+                            None,
+                        )
+                        .await
+                    {
+                        engram_coordinator::session_ops::drive_claimed(&state, op).await;
+                    }
+                    crate::workload::drain_detached().await;
+                    // The confirming harness event retires the outbox row.
+                    let at = state.services.clock.now_utc();
+                    crate::workload::api_run_started(&state, sid, sandbox, &prompt_id, at).await;
+                    crate::workload::drain_detached().await;
+                    // An acked prompt on a live session keeps it tracked.
+                    self.record_if_live(sid);
+                }
+            }
+            Step::Rename => {
+                let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
+                    return;
+                };
+                // Pick the FIRST non-terminal session and set a fresh title.
+                // The rename materializes `sessions.suggested_title` via the
+                // coordinator-owned store write `set_session_suggested_title`
+                // — the EXACT call the harness-event sink performs
+                // (state.rs). Driven store-direct (like CreateSession drives
+                // reserve_and_persist_create), NOT over the real-wire harness
+                // route: that route's sink does an axum-oneshot + event-bus
+                // publish whose task completion races the paused clock under
+                // the swarm's time advances (nondeterministic — it diverged
+                // the replay-twice trace). The full real-wire title path is
+                // covered single-shot by tests/api_surface.rs
+                // (`api_rename_materializes_title_real_wire`).
+                let target = self.world.meta.with_db(|db| {
+                    db.sessions
+                        .values()
+                        .find(|r| !r.session.status.is_terminal())
+                        .map(|r| r.session.id)
+                });
+                let Some(sid) = target else { return };
+                // Title uniqueness comes from WORLD entropy, never `self.rng`:
+                // `self.rng` is the scheduler's PICK stream, and drawing from
+                // it here would shift every later pick (and, transitively,
+                // which Driver steps run) — perturbing the run for a value
+                // that only needs to be a fresh, replayable string.
+                use engram_core::traits::Entropy as _;
+                let title = format!("sim-title-{}", self.world.entropy.uuid().simple());
+                let acked = state
+                    .services
+                    .meta
+                    .set_session_suggested_title(sid, &title)
+                    .await
+                    .is_ok();
+                // Confirm-at-write: only record when the row actually shows
+                // the title (a PG outage returns Err), so the model asserts
+                // it is never later lost/repainted.
+                if acked {
+                    let materialized = self.world.meta.with_db(|db| {
+                        db.sessions
+                            .get(&sid)
+                            .and_then(|r| r.session.suggested_title.clone())
+                            == Some(title.clone())
+                    });
+                    if materialized {
+                        self.model.record_rename_acked(sid, title);
+                    }
+                }
+            }
+            Step::Destroy => {
+                let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
+                    return;
+                };
+                // Target an ACTIVE session (the interesting teardown, and a
+                // tracked acked-live one). BTreeMap order — deterministic.
+                // Active-only deliberately: falling back to Idle/Queued would
+                // eat the very sessions the resume + recovery-ladder workload
+                // depends on (`host_death_feeds_the_recovery_ladder` guards
+                // that the resume leg never goes dark).
+                let target = self.world.meta.with_db(|db| {
+                    db.sessions
+                        .values()
+                        .find(|r| r.session.status == SessionState::Active)
+                        .map(|r| r.session.id)
+                });
+                let Some(sid) = target else { return };
+                // Capture the live fact BEFORE the destroy (an Active
+                // session is acked-live), so the never-resurrect assertion
+                // has a tracked session to key on.
+                self.record_if_live(sid);
+                // Drive the REAL Destroy op through the op pipeline —
+                // mirroring Step::ResumeSession (which drives Resume, not the
+                // blocking api_resume handler). The full client-facing
+                // `delete_session` verb (its terminal-observe wait-loop is
+                // driven by the injected clock and can't step under the sim's
+                // single-step-per-pick model) is exercised end-to-end by the
+                // dedicated tests/api_surface.rs instead; here we drive its
+                // Destroy op + teardown, the state-mutating heart.
+                if let Ok(EnqueueOutcome::Claimed(op)) =
+                    engram_coordinator::session_ops::enqueue_claim(
+                        &state,
+                        sid,
+                        OpKind::Destroy,
+                        serde_json::json!({}),
+                        Some(&format!("destroy:{sid}")),
+                    )
+                    .await
+                {
+                    engram_coordinator::session_ops::drive_claimed(&state, op).await;
+                }
+                crate::workload::drain_detached().await;
+                // Record the acked destroy only once CONFIRMED (row gone or
+                // terminal), so the never-resurrect assertion keys on a
+                // genuinely torn-down session.
+                let torn_down = self.world.meta.with_db(|db| {
+                    db.sessions
+                        .get(&sid)
+                        .map(|r| r.session.status.is_terminal())
+                        .unwrap_or(true)
+                });
+                if torn_down {
+                    self.model.record_destroy_acked(sid);
+                }
+            }
+            Step::DrainHost(i) => {
+                let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) else {
+                    return;
+                };
+                let host_id = self.world.host_ids[i];
+                // The operator drain: the DURABLE cordon (ADR 0047) + evacuate
+                // each bound session to Evacuating, which the EvacResumer
+                // driver then re-homes (the #775 dormant leg). The real
+                // `admin_drain_host` fans the per-session moves out over a
+                // detached `JoinSet`; that concurrency is UNSIMULABLE — the
+                // in-flight `blob.put`s complete in nondeterministic order and
+                // diverge the entropy stream — so here we drive the SAME cordon
+                // + evict-to-Evacuating pipeline (the drain's ADR 0079
+                // fallback) SEQUENTIALLY in deterministic BTreeMap order. The
+                // full gRPC handler (JoinSet, live-teleport preview, the
+                // don't-strand guard) is exercised in tests/api_surface.rs.
+                let _ = state.services.meta.set_host_cordoned(host_id, true).await;
+                let bound = state
+                    .services
+                    .meta
+                    .list_active_sandbox_assignments_on_host(host_id)
+                    .await
+                    .unwrap_or_default();
+                for (sid, _) in bound {
+                    if let Ok(EnqueueOutcome::Claimed(op)) =
+                        engram_coordinator::session_ops::enqueue_claim(
+                            &state,
+                            sid,
+                            OpKind::Evict,
+                            serde_json::json!({
+                                "target": "evacuating", "allow_park": false, "nominated": false
+                            }),
+                            Some(&format!("drain-evict:{sid}")),
+                        )
+                        .await
+                    {
+                        engram_coordinator::session_ops::drive_claimed(&state, op).await;
+                    }
+                }
+                crate::workload::drain_detached().await;
+            }
         }
     }
 
@@ -811,6 +1078,18 @@ impl Sim {
             self.execute(Step::RestartHost(i)).await;
             self.execute(Step::HeartbeatPartition(i, false)).await;
             self.execute(Step::RpcHang(i, false)).await;
+            // Uncordon: an operator DrainHost cordon is DURABLE (heartbeats
+            // never clobber it), so a drained fleet would keep queued/
+            // evacuated sessions un-placeable through quiescence and mask
+            // convergence. Healing it forces them to actually re-home — the
+            // quiescence-no-stragglers / queued-with-capacity checks then
+            // hold the drain's evac + resume legs to a real terminal.
+            use engram_core::traits::MetadataStore as _;
+            let _ = self
+                .world
+                .meta
+                .set_host_cordoned(self.world.host_ids[i], false)
+                .await;
         }
         for i in 0..self.world.replicas.len() {
             self.execute(Step::ClockSkew(i, 0)).await;
