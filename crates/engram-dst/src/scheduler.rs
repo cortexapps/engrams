@@ -149,15 +149,19 @@ pub enum Step {
     Destroy,
     /// An operator draining a host: cordon + evacuate its bound sessions to
     /// Evacuating (the EvacResumer driver then re-homes them — the #775
-    /// dormant leg). NOT in the profile menu — driven only by the dedicated
-    /// tests (tests/api_surface.rs drives the real gRPC `admin_drain_host`;
-    /// tests/workload_verbs.rs the sequential cordon+evict). Folding it into
-    /// the swarm is blocked on two reported wave-4 findings: (1) the evict
-    /// pipeline's SimHostClient::snapshot does real-fs blob writes that race
-    /// the paused clock (the in-memory-blob-store determinism issue), and
-    /// (2) it uncovers a real capacity-soft evac over-reservation (the
-    /// dormant #775 leg — evac_resumer's `pick_for_session` binds a
-    /// measured-full survivor, the #722/#795 class on the evac path).
+    /// dormant leg). FOLDED into both profile menus at small weight (#800),
+    /// completing the dormant-Evacuating-leg coverage. Both wave-4 blockers
+    /// are now cleared: (1) #799's in-memory `MemBlobStorage` removed the
+    /// evict-pipeline fs race (determinism-audit item 7), and (2) #800's
+    /// RESERVED evac placement closed the capacity-soft over-reservation
+    /// (evac now QUEUES rather than binding a measured-full survivor). The
+    /// full gRPC handler (JoinSet, live-teleport preview, don't-strand
+    /// guard) still lives only in the dedicated tests (tests/api_surface.rs
+    /// drives the real `admin_drain_host`; tests/workload_verbs.rs the
+    /// sequential cordon+evict); the swarm arm drives the same
+    /// cordon+evict-to-Evacuating pipeline sequentially. The host index is
+    /// drawn from WORLD entropy (never `self.rng`), so folding it in shifts
+    /// only the pick-table weights, not the scheduler's own pick stream.
     DrainHost(usize),
 }
 
@@ -275,6 +279,11 @@ impl Sim {
     }
 
     fn pick(&mut self) -> Step {
+        // #800: the DrainHost arms draw their host index from WORLD entropy
+        // (never `self.rng`, the scheduler pick stream), so folding the drain
+        // verb in shifts only the pick-table weights — the same discipline
+        // the wave-4 workload verbs follow.
+        use engram_core::traits::Entropy as _;
         let hosts = self.world.host_ids.len();
         let replicas = self.world.replicas.len();
         // Weighted pick. Weights are part of the seed contract: change
@@ -288,13 +297,13 @@ impl Sim {
             // ResumeSession, which feed the create→idle→resume + host-death
             // recovery lifecycle (`host_death_feeds_the_recovery_ladder`
             // guards it, and #786 carved from these same time/fault buckets
-            // for the same reason). The operator-drain verb is deliberately
-            // NOT in the profile menu (see `Step::DrainHost` / the wave-4
-            // findings): its evict-pipeline blob writes race the paused clock
-            // (the known in-memory-blob-store determinism issue), and it
-            // uncovers a real capacity-soft evac over-reservation — both
-            // reported, neither folded. Calm has no swarm-pick pins
-            // (regressions are hand-driven), so the reweight re-pins nothing.
+            // for the same reason). #800 folds the operator-drain verb in at
+            // a small weight (2 pts, carved from HostHeartbeats — again NOT
+            // Create/HostCheckpoint/Resume): both wave-4 blockers cleared
+            // (#799's in-memory blob store killed the evict-pipeline fs race;
+            // #800's RESERVED evac placement closed the over-reservation the
+            // drain exposed). Calm has no swarm-pick pins (regressions are
+            // hand-driven), so the reweight re-pins nothing.
             Profile::Calm => match roll {
                 0..=24 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
                 25..=50 => Step::Driver(
@@ -307,6 +316,8 @@ impl Sim {
                 77..=78 => Step::Prompt,
                 79..=80 => Step::Rename,
                 81..=82 => Step::Destroy,
+                // #800: operator drain — host index from WORLD entropy.
+                83..=84 => Step::DrainHost(self.world.entropy.u64(0..hosts.max(1) as u64) as usize),
                 _ => Step::HostHeartbeats,
             },
             // CORRECTION (this PR): D6's weight patch silently failed to
@@ -327,13 +338,13 @@ impl Sim {
             // ResumeSession keep their ORIGINAL weights: they feed the
             // create→idle→resume + host-death→Idle recovery lifecycle
             // (`host_death_feeds_the_recovery_ladder` reds if the resume leg
-            // goes dark). The operator-drain verb is deliberately NOT in the
-            // menu (see the Calm note + `Step::DrainHost`): its evict-pipeline
-            // blob writes race the paused clock (the known determinism issue)
-            // and it uncovers a real capacity-soft evac over-reservation —
-            // reported, not folded. The reweighting shifts every Chaos seed's
-            // exploration (fine — seeds pin to a commit); the pinned chaos
-            // seeds are re-checked and stay green (tests/regression_seeds.rs).
+            // goes dark). #800 folds the operator-drain verb in (2 pts carved
+            // from HostHeartbeats, world-entropy host index) now that both
+            // wave-4 blockers are cleared (#799 in-memory blob store; #800
+            // RESERVED evac placement). The reweighting shifts every Chaos
+            // seed's exploration (fine — seeds pin to a commit); the pinned
+            // chaos seeds are re-checked and stay green
+            // (tests/regression_seeds.rs).
             Profile::Chaos => match roll {
                 0..=13 => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
                 14..=32 => Step::Driver(
@@ -347,7 +358,9 @@ impl Sim {
                 49..=50 => Step::Prompt,
                 51..=52 => Step::Rename,
                 53..=54 => Step::Destroy,
-                55..=64 => Step::HostHeartbeats,
+                55..=62 => Step::HostHeartbeats,
+                // #800: operator drain — host index from WORLD entropy.
+                63..=64 => Step::DrainHost(self.world.entropy.u64(0..hosts.max(1) as u64) as usize),
                 65..=68 => Step::CrashHost(self.rng.random_range(0..hosts)),
                 69..=72 => Step::RestartHost(self.rng.random_range(0..hosts)),
                 73..=75 => Step::CrashReplica(self.rng.random_range(0..replicas)),

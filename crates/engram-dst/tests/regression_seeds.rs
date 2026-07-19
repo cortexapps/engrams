@@ -365,3 +365,30 @@ fn issue_790_evict_resume_snapshot_safety_default_lane() {
 fn issue_790_evict_resume_snapshot_safety_faithful() {
     run_faithful(38, Profile::Chaos, 1500);
 }
+
+/// Issue #800: the RESERVED evac-placement over-reservation, exposed by
+/// folding the operator-drain verb into the swarm (ADR 0098 Phase 3 wave
+/// 5). Before the fix, `evac_resumer → evacuate_dead_source →
+/// pick_for_session` was capacity-SOFT: a drain-driven wave of evacuations
+/// bound measured-FULL survivors, driving Σ reserved > allocatable — the
+/// #722/#795 over-reservation class on the EVAC leg, which #795's
+/// `status == Idle` gate never covered (evac sessions are `Evacuating`).
+/// With the drain step live, calm seeds 0, 4, 5, 7, 16, 21, 22 (and more
+/// past 30) fire `placement-accounting`. Seed 0 is the SMALLEST firing seed
+/// — the drain wave over-reserves host `…0d570000` (32768 MiB > allocatable
+/// 24576) at step 240 under the faithful default.
+///
+/// The fix is RESERVED evac placement: the evac ctx now carries the
+/// session's reserved 2D budget, `pick_for_session_reserved` drops the soft
+/// fallback (honoring the hard bound), and an evac that fits no survivor
+/// QUEUES (`Evacuating → Queued`, resume-origin) rather than binding a full
+/// host — the queue scanner re-homes it once capacity returns (the #795
+/// resume precedent, on the evac leg). FAIL-WITHOUT / PASS-WITH: forcing the
+/// evac budget to `None` (reverting to the soft pick) FAILS this at step 240
+/// with `placement-accounting`; with the reserved pick it PASSES the full
+/// 1500-step window, drain-evacuated sessions queuing + re-homing through
+/// quiescence.
+#[test]
+fn issue_800_reserved_evac_over_reservation_smallest_calm_seed() {
+    run_faithful(0, Profile::Calm, 1500);
+}

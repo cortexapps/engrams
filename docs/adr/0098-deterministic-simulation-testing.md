@@ -1021,6 +1021,45 @@ driven path; per-seed runtimes; a named watchdog over every swarm window.**
 #800 tracks the reserved-evac-placement follow-up; the drain verb joins the
 profiles when it lands.
 
+**Wave 5 (wave5-reserved-evac, #800) — the drain verb joins the swarm.**
+Folding the operator-drain step (`Step::DrainHost`) into both profiles was
+held through wave 4 on two findings; wave 5 cleared both and folded it in at
+a small weight (2 pts each, carved from `HostHeartbeats`, host index drawn
+from WORLD entropy so only the weights shift). (1) The evict-pipeline blob
+race was already gone — #799's in-memory `MemBlobStorage` (determinism-audit
+item 7) removed the `tokio::fs` I/O. (2) The real one: **capacity-soft evac
+over-reservation.** With drain live, ~19/100 calm seeds (0, 4, 5, 7, 16, 21,
+22, … the smallest is seed 0, firing at step 240) tripped
+`placement-accounting` — `evac_resumer → evacuate_dead_source →
+pick_for_session` was capacity-SOFT (ADR 0046's deliberate evac-urgency
+choice), so a drain-driven wave bound measured-FULL survivors and drove Σ
+reserved > allocatable. This is the #722/#795 class on the EVAC leg, which
+#795's `status == Idle` gate never covered (evac sessions are `Evacuating`).
+A contained-but-partial fix (a hard `placement_preview` gate) was written and
+reverted in #798 as incomplete: it left the ctx budget `None`, so preview and
+the soft pick disagreed and a full host still got bound.
+
+The honest fix is **RESERVED evac placement** (ADR 0046 addendum 2026-07-19):
+the evac ctx now carries the session's reserved 2D budget (was hard-coded
+`None`, capacity-blind), and `pick_for_session_reserved`
+(`pick_from_2d(require_fit=true)`) drops the soft `ranked.hosts[0]` fallback —
+returning `NoCapacity` when no MEASURED survivor fits (an UNMEASURED host
+still counts as fitting, matching `placement_preview`/`pick_host_2d`, so the
+reserved pick and the queue scanner's precheck never disagree and churn
+`Queued↔Idle` — the #795 livelock class). On no-fit the resumer flips
+`Evacuating → Queued` (resume-origin, `enqueue_evacuating_session_resume`,
+fenced on the evac op's epoch) and the queue scanner re-homes it once capacity
+returns — an evacuation that fits nowhere queuing honestly beats overcommit.
+The pick→rebind residual window (evac can't commit its reservation inside one
+FOR-UPDATE txn — the restore happens between) is the same window ADR 0046
+already accepts for eviction release, backstopped by the periodic reconcile
+and closed by construction in the single-threaded sim. Coverage: a two-store
+D4 conformance case for the new store method, a non-vacuous unit gate
+(`evac_reserved_queues_when_no_survivor_fits`), and pinned seed 0
+(`issue_800_reserved_evac_over_reservation_smallest_calm_seed`, fail-without /
+pass-with proven). Faithful swarms green with drain enabled: chaos 0..200 →
+200/200, calm 0..100 → 100/100 (×1500).
+
 
 | Phase | Content |
 |---|---|
