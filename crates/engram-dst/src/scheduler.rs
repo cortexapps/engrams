@@ -818,18 +818,51 @@ impl Sim {
         for i in 0..self.world.replicas.len() {
             self.execute(Step::RestartReplica(i)).await;
         }
-        // Long enough for exhausted-backoff ops (create_boot's budget
-        // is 30 attempts with growing backoff) to either land on the
-        // healed fleet or fail terminally — both stable.
-        for _ in 0..40 {
+        // Drive every driver + advance time until the world QUIESCES —
+        // all sessions stable, no op left running, the auditor clean —
+        // bounded by a generous cap, breaking the instant it is at rest.
+        //
+        // Two properties this replaces a fixed 40×120s drain with (both
+        // exposed once the in-memory blob store, ADR 0098 determinism-audit
+        // item 7, removed the `tokio::fs` I/O that auto-advanced the paused
+        // clock and thereby masked them):
+        //
+        // 1. **Sub-TTL advances keep the healed fleet FRESH.** The registry
+        //    TTL is 60s (`placement_ttl`); heartbeating once per round then
+        //    advancing 120s left every host >TTL STALE for the second half
+        //    of each round. A resume op enqueued by `dequeue_resume` runs
+        //    (detached) at the post-advance await and sampled that stale
+        //    window — `placement_preview` saw ZERO schedulable hosts and
+        //    re-queued the session, which the next sweep (post-heartbeat,
+        //    fresh) dequeued again: an infinite Queued↔Idle loop that never
+        //    quiesces (the #722 faithful resume-over-commit seed). A drain
+        //    models a HEALED fleet, whose hosts heartbeat well within TTL,
+        //    so advancing by `< TTL` per heartbeat is the faithful cadence.
+        // 2. **Drain to ACTUAL quiescence, not a fixed count.** A hardcoded
+        //    round count is timeline-sensitive; looping until the invariant
+        //    set + auditor are clean is robust, and fast seeds break on
+        //    their first stable round (cheaper for the common case).
+        //    Exhausted-backoff ops (create_boot's 30-attempt growing
+        //    backoff) still get the advances they need. The cap keeps total
+        //    drain time well under the 24h snapshot-GC grace.
+        const DRAIN_CAP: usize = 1000;
+        const DRAIN_ADVANCE: Duration = Duration::from_secs(30);
+        for _ in 0..DRAIN_CAP {
             self.execute(Step::HostHeartbeats).await;
             for r in 0..self.world.replicas.len() {
                 for kind in DRIVERS {
                     self.execute(Step::Driver(r, kind)).await;
                 }
             }
-            self.execute(Step::AdvanceTime(Duration::from_secs(120)))
-                .await;
+            self.execute(Step::AdvanceTime(DRAIN_ADVANCE)).await;
+            // Break the moment the world is fully at rest. The final asserts
+            // below re-run these and surface the real violation if the cap
+            // is hit without converging.
+            if invariants::check_quiescence(&self.world).is_ok()
+                && self.model.check(&self.world).is_ok()
+            {
+                break;
+            }
         }
         if let Err(v) = invariants::check_quiescence(&self.world) {
             return Err(format!("quiescence: {} — {}", v.invariant, v.detail));

@@ -308,6 +308,40 @@ driver cannot be silently unsimulated.
    leak). Audit rule: any real-filesystem or otherwise process-global resource
    a driven path reads must be per-world isolated, and every directory listing
    sorted at the source.
+7. **Real (blocking-pool) I/O inside a driven step races the paused
+   clock's idle auto-advance** (added R4, wave4-sim-mem-blob). Item 6's
+   per-world `TempDir` removed cross-world *contamination* but left the
+   backend a real one: `LocalBlobStorage` does its I/O through `tokio::fs`,
+   which hands each op to tokio's **blocking thread pool** and awaits it.
+   The simulator runs on a `start_paused` current-thread runtime, where
+   virtual time auto-advances **whenever the runtime goes idle** — and an
+   awaited off-thread op makes it idle. So the clock jumped by however long
+   the real filesystem took: virtual time became a function of real disk
+   latency, host load, and platform. #791's faithful-capture blobs
+   (`Services.blob` = a tempdir `LocalBlobStorage`) turned every driven
+   capture/HEAD/list into such a jump; the same #722 seed then replayed to
+   *different* virtual timelines (green on macOS, tripping the queue-scanner
+   convergence on Linux-under-load), and #797's extra blob-HEAD await
+   re-exposed it after #795 fixed only the contamination half. Fix: a
+   deterministic **in-memory** `BlobStorage` for the sim's faithful world
+   (`engram_sim::MemBlobStorage`, a `Mutex<BTreeMap>` — every op completes
+   synchronously in-poll, no blocking-pool handoff, so no idle window ever
+   opens; `BTreeMap` gives the sorted-`list_prefix` GCS/S3 contract for
+   free). The #795 sorted `LocalBlobStorage::list_prefix` stays — it is a
+   real prod-fidelity fix for dev/integration. **Rule: a sim world backs
+   `Services.blob` (and every other seam a driven step touches) with a
+   deterministic in-memory backend; a real-filesystem backend is only for
+   crash-semantics seams that own their OWN determinism story** (externally
+   constructed states, no paused-clock dependence — e.g. the
+   `engram-dst-host` `SimFs` crash tests, whose replay-twice lane has stayed
+   stable because it never awaits real I/O inside a *decision-feeding*
+   driven step; noted as theoretical exposure to re-audit, not a live leak).
+   A second-order corollary this seed also surfaced: the quiescence **drain
+   must model a HEALED fleet faithfully** — advance in `< TTL` steps so the
+   per-round heartbeat keeps hosts fresh (the fixed 40×120s drain left hosts
+   >60s-TTL stale for half of every round, and a detached resume op sampling
+   that window re-queued forever), and drain to ACTUAL quiescence (a fixed
+   round count is timeline-sensitive) bounded by a cap.
 
 ### The world model, faults, and invariants (D5–D6)
 
@@ -916,6 +950,33 @@ the R2 model-oracle/Router-workload/effect-queue track deliberately waits
 for rung 1 to land (the effect queue restructures the same SimHostClient
 seam the cosim bridge consumes). Invariant alerting is live-pending-apply
 in engrams-internal #89 (Slack #project-engrams).
+
+**R4 (wave4-sim-mem-blob) — the last blob-store determinism leak.** #795
+fixed cross-world *contamination* but left the sim's faithful world backing
+`Services.blob` with a real-tempdir `LocalBlobStorage`, whose `tokio::fs`
+I/O auto-advances the `start_paused` clock on every driven capture/HEAD/list
+(the blocking-pool-idle race — now **determinism-audit item 7**). #797's
+extra blob-HEAD await re-exposed it on the #722 faithful seed. Fix: a
+deterministic in-memory `engram_sim::MemBlobStorage` (`Mutex<BTreeMap>`, no
+real I/O, sorted `list_prefix` for free) replaces the tempdir backend
+per-world; #795's sorted `LocalBlobStorage::list_prefix` stays as a real
+prod-fidelity fix. RCA OVERTURNED the going-in "just re-pin the seed"
+hypothesis twice: the deterministic timeline exposed (a) a pre-existing
+**fake periodic-checkpoint** fidelity gap (the sim writes a `recoverable`
+snapshot row with NO manifests/blobs — the "fake the flag" anti-pattern;
+harmless here only because `snapshot_artifacts_present` short-circuits true
+for a manifest-less record and the sim `restore` is a no-op — noted for a
+future "model the artifact" pass, not fixed in R4), and (b) the real
+blocker: the quiescence **drain advanced 120s per single heartbeat against a
+60s registry TTL**, so a detached resume op sampled the >TTL-stale window,
+found zero schedulable hosts, and re-queued forever while the sweep (fresh)
+re-dequeued it — an infinite Queued↔Idle loop the fs-timeline had masked.
+Drain fix: advance in `< TTL` steps (per-round heartbeat keeps the healed
+fleet fresh) and drain to ACTUAL quiescence bounded by a cap, not a fixed
+round count. The #797 recoverable-before-Idle guard, blocked only on this
+flake, is unblocked. Verified zero-divergence ≥30× under concurrent load on
+both macOS and the Linux dev VM, full `-p engram-dst -p engram-sim`, the
+faithful swarm, and the replay-twice self-check.
 
 
 | Phase | Content |
