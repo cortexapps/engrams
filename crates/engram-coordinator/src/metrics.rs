@@ -323,6 +323,18 @@ pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattac
 /// snapshot pipeline is persistently failing for some session.
 pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhausted_total";
 
+/// Counter (#792, R4, ADR 0098 Phase 3). The recoverable-before-Idle
+/// guard fired: an idle-evict capture produced manifests but
+/// `verify_snapshot_recoverable`'s BlobStorage HEAD failed
+/// (`recoverable = false`) with no live disk manifest, so the pipeline
+/// refused to land `Idle` and returned a retryable error. A transient
+/// blip clears on the op redrive; a persistently-high value means the
+/// snapshot pipeline (or the BlobStorage HEAD path) is genuinely failing
+/// and sessions are riding the budget out to the HostLost/Dead honest
+/// route.
+pub const EVICTION_UNRECOVERABLE_CAPTURE_GUARD_TOTAL: &str =
+    "engram_eviction_unrecoverable_capture_guard_total";
+
 /// Gauge (ADR 0034). Rows in `status='evicting'` observed by the
 /// eviction scanner at the top of each tick — its queue depth.
 /// Healthy steady-state drains to 0 between ticks; a climbing value
