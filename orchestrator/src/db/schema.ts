@@ -74,6 +74,12 @@ export const taskSession = pgTable(
     // Nullable for pre-feature / out-of-band sessions. Profiles are only ever
     // soft-deleted, so the target always exists; ON DELETE is moot.
     profileId: text("profile_id").references(() => profile.id),
+    // The session's EFFECTIVE granted capabilities at create time (profile caps,
+    // or a capabilityOverride/extraCapabilities set — e.g. a review worker's
+    // clamped `engram:pr_review` + repo-scoped read). The tool-exec gate reads
+    // these so an override is honored; NULL means a legacy row → fall back to
+    // the profile's capabilities.
+    capabilities: jsonb("capabilities").$type<string[]>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [

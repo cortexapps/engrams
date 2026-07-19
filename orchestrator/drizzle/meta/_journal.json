@@ -218,6 +218,13 @@
       "when": 1784485572243,
       "tag": "0030_organic_storm",
       "breakpoints": true
+    },
+    {
+      "idx": 31,
+      "version": "7",
+      "when": 1784501828354,
+      "tag": "0031_bright_bruce_banner",
+      "breakpoints": true
     }
   ]
 }
