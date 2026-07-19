@@ -16,6 +16,7 @@ const candidateDetail: ReviewDetail = {
     trigger: "opened",
     status: "finding",
     githubReviewId: null,
+    statusCommentId: null,
     summaryMd: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),

@@ -36,6 +36,7 @@ export interface ReviewRow {
   trigger: string;
   status: string;
   githubReviewId: string | null;
+  statusCommentId: string | null;
   summaryMd: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -108,6 +109,7 @@ export interface ReviewStore {
   insertFinding(input: ReviewFindingInput): Promise<{ id: string; replayed: boolean }>;
   insertVerdict(input: ReviewVerdictInput): Promise<{ id: string; replayed: boolean }>;
   setFinderSummary(reviewId: string, summaryMd: string): Promise<void>;
+  setStatusCommentId(reviewId: string, statusCommentId: string): Promise<void>;
   updateReviewStatus(reviewId: string, status: string): Promise<void>;
   updateFindingState(
     findingId: string,
@@ -134,6 +136,7 @@ function toReviewRow(row: typeof reviewTable.$inferSelect): ReviewRow {
     trigger: row.trigger,
     status: row.status,
     githubReviewId: row.githubReviewId ?? null,
+    statusCommentId: row.statusCommentId ?? null,
     summaryMd: row.summaryMd ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -351,6 +354,13 @@ export function makeReviewStore(
       await db
         .update(reviewTable)
         .set({ summaryMd, updatedAt: new Date() })
+        .where(eq(reviewTable.id, reviewId));
+    },
+
+    async setStatusCommentId(reviewId, statusCommentId) {
+      await db
+        .update(reviewTable)
+        .set({ statusCommentId, updatedAt: new Date() })
         .where(eq(reviewTable.id, reviewId));
     },
 

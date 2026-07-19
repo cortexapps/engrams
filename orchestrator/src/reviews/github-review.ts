@@ -38,6 +38,14 @@ export interface PostReviewResult {
   summaryMd: string;
 }
 
+export interface UpsertStatusCommentInput {
+  repo: string;
+  prNumber: number;
+  /** The comment to edit in place; omit to post a fresh one. */
+  commentId?: string;
+  body: string;
+}
+
 export interface GithubReviewPoster {
   fetchPrHeads(repo: string, prNumber: number): Promise<{
     headSha: string;
@@ -45,6 +53,51 @@ export interface GithubReviewPoster {
   }>;
   alreadyPosted(repo: string, prNumber: number, reviewId: string): Promise<boolean>;
   postReview(input: PostReviewInput): Promise<PostReviewResult>;
+  /** Post (or edit, when `commentId` is given) the sticky status comment and
+   *  return the live comment id. A PATCH against a comment that has since been
+   *  deleted (404) transparently falls back to a fresh POST. */
+  upsertStatusComment(input: UpsertStatusCommentInput): Promise<{ commentId: string }>;
+}
+
+export type ReviewStatusPhase =
+  | "acknowledged"
+  | "finding"
+  | "verifying"
+  | "posted"
+  | "failed"
+  | "halted";
+
+export interface StatusCommentInput {
+  reviewId: string;
+  phase: ReviewStatusPhase;
+  /** Candidate count (verifying) or posted-finding count (posted). */
+  count?: number;
+  reviewUrl?: string;
+}
+
+/** Render the sticky status body. The hidden marker is deliberately the last
+ *  line so it never bleeds into the visible text. */
+export function buildStatusComment(input: StatusCommentInput): string {
+  const n = input.count ?? 0;
+  const plural = n === 1 ? "" : "s";
+  const link = input.reviewUrl ? ` · [View details](${input.reviewUrl})` : "";
+  const line = ((): string => {
+    switch (input.phase) {
+      case "acknowledged":
+        return "👀 **engrams review** — acknowledged, queued.";
+      case "finding":
+        return "⏳ **engrams review** — analyzing the diff…";
+      case "verifying":
+        return `⏳ **engrams review** — confirming ${n} candidate finding${plural}…`;
+      case "posted":
+        return `✅ **engrams review** — complete. ${n} finding${plural} posted.${link}`;
+      case "failed":
+        return "⚠️ **engrams review** — the run failed. It will retry on the next push or @mention.";
+      case "halted":
+        return "🛑 **engrams review** — stopped.";
+    }
+  })();
+  return `${line}\n\n<!-- engrams-status:${input.reviewId} -->`;
 }
 
 export interface ReviewSummaryInput {
@@ -95,6 +148,14 @@ function responseError(operation: string, result: IntegrationOpResult): Error {
 function reviewIdFrom(result: IntegrationOpResult): string | undefined {
   if (result.body.length === 0) return undefined;
   const value = parseJson(result, "create pull request review");
+  if (!isObject(value)) return undefined;
+  const id = value["id"];
+  return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
+}
+
+function commentIdFrom(result: IntegrationOpResult): string | undefined {
+  if (result.body.length === 0) return undefined;
+  const value = parseJson(result, "status comment");
   if (!isObject(value)) return undefined;
   const id = value["id"];
   return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
@@ -308,6 +369,38 @@ export function makeGithubReviewPoster(
         inlinePosted: false,
         summaryMd: summaryOnlyBody,
       };
+    },
+
+    async upsertStatusComment(input) {
+      const create = async (): Promise<{ commentId: string }> => {
+        const response = await runOp("github", {
+          method: "POST",
+          path: `/repos/${input.repo}/issues/${input.prNumber}/comments`,
+          body: JSON.stringify({ body: input.body }),
+          contentType: "application/json",
+        });
+        if (response.status < 200 || response.status >= 300) {
+          throw responseError("create status comment", response);
+        }
+        const id = commentIdFrom(response);
+        if (id === undefined) throw new Error("create status comment returned no id");
+        return { commentId: id };
+      };
+
+      if (input.commentId === undefined) return create();
+
+      const response = await runOp("github", {
+        method: "PATCH",
+        path: `/repos/${input.repo}/issues/comments/${input.commentId}`,
+        body: JSON.stringify({ body: input.body }),
+        contentType: "application/json",
+      });
+      // The sticky comment was deleted out from under us — post a fresh one.
+      if (response.status === 404) return create();
+      if (response.status < 200 || response.status >= 300) {
+        throw responseError("edit status comment", response);
+      }
+      return { commentId: input.commentId };
     },
   };
 }

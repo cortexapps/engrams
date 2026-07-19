@@ -188,6 +188,9 @@ export const review = pgTable(
     trigger: text("trigger").notNull(),
     status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded|halted
     githubReviewId: text("github_review_id"),
+    // The sticky GitHub issue-comment we post on pickup and edit in place
+    // through the lifecycle (👀 → ⏳ → ✅). Null until the first ack lands.
+    statusCommentId: text("status_comment_id"),
     summaryMd: text("summary_md"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

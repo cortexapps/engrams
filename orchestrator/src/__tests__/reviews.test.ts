@@ -39,6 +39,7 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     trigger: "dispatch",
     status: "verifying",
     githubReviewId: null,
+    statusCommentId: null,
     summaryMd: "Finder summary",
     createdAt: CREATED_AT,
     updatedAt: UPDATED_AT,
@@ -126,6 +127,7 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
       throw new Error("unused");
     },
     async setFinderSummary() {},
+    async setStatusCommentId() {},
     async updateReviewStatus() {},
     async updateFindingState() {},
     async finalizeReview() {},

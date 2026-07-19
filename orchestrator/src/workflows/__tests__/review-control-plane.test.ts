@@ -29,6 +29,7 @@ const active: ReviewRow = {
   trigger: "opened",
   status: "queued",
   githubReviewId: null,
+  statusCommentId: null,
   summaryMd: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
   updatedAt: new Date("2026-07-17T00:00:00Z"),
@@ -69,6 +70,7 @@ function detail(findings: ReviewFindingRow[] = []): ReviewDetail {
 const reviewPostingNoops = {
   updateFindingState: async () => {},
   finalizeReview: async () => {},
+  setStatusCommentId: async () => {},
 };
 
 function reviewSessionRecorder(order?: string[]): ReviewSessionStore & {
@@ -258,6 +260,74 @@ describe("ReviewControlPlane", () => {
     }]);
     await cp.markReviewHalted(active.repo, active.prNumber);
     expect(statuses).toEqual([["review-new", "halted"]]);
+  });
+
+  test("acks the sticky status comment on pickup and persists its id", async () => {
+    const upserts: Array<{ commentId?: string; body: string }> = [];
+    let persisted: string | undefined;
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
+        createReview: async () => "review-new",
+        updateReviewStatus: async () => {},
+        setStatusCommentId: async (_id, commentId) => {
+          persisted = commentId;
+        },
+      },
+      insertTask: async () => "task-new",
+      githubPoster: {
+        fetchPrHeads: async () => ({ headSha: "h", baseSha: "b" }),
+        alreadyPosted: async () => false,
+        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
+        async upsertStatusComment(input) {
+          upserts.push({ ...(input.commentId ? { commentId: input.commentId } : {}), body: input.body });
+          return { commentId: "gh-comment-1" };
+        },
+      },
+    });
+
+    await cp.ensureReviewRecord({
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: "h",
+      baseSha: "b",
+      trigger: "command",
+    });
+
+    expect(upserts).toHaveLength(1);
+    expect(upserts[0]?.commentId).toBeUndefined();
+    expect(upserts[0]?.body).toContain("👀");
+    expect(persisted).toBe("gh-comment-1");
+  });
+
+  test("a failing status ack never wedges the review record", async () => {
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
+        createReview: async () => "review-new",
+        updateReviewStatus: async () => {},
+        setStatusCommentId: async () => {},
+      },
+      insertTask: async () => "task-new",
+      githubPoster: {
+        fetchPrHeads: async () => ({ headSha: "h", baseSha: "b" }),
+        alreadyPosted: async () => false,
+        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
+        upsertStatusComment: async () => { throw new Error("GitHub down"); },
+      },
+    });
+
+    expect(await cp.ensureReviewRecord({
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: "h",
+      baseSha: "b",
+      trigger: "command",
+    })).toEqual({ reviewId: "review-new", taskId: "task-new" });
   });
 
   test("creates the finder with the designated profile and clamped review policy", async () => {
@@ -645,6 +715,7 @@ describe("ReviewControlPlane", () => {
     const githubPoster: GithubReviewPoster = {
       fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
       alreadyPosted: async () => false,
+      upsertStatusComment: async () => ({ commentId: "status-1" }),
       async postReview(input) {
         posted.push(input);
         return {
@@ -661,6 +732,7 @@ describe("ReviewControlPlane", () => {
         getReview: async () => ({ review: active, findings: [confirmed, refuted], verdicts }),
         createReview: async () => active.id,
         updateReviewStatus: async () => {},
+        setStatusCommentId: async () => {},
         async updateFindingState(id, state, opts) {
           findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
         },
@@ -732,6 +804,7 @@ describe("ReviewControlPlane", () => {
         getReview: async () => detail([finding("candidate")]),
         createReview: async () => active.id,
         updateReviewStatus: async () => {},
+        setStatusCommentId: async () => {},
         updateFindingState: async () => {
           findingUpdates++;
         },
@@ -742,6 +815,7 @@ describe("ReviewControlPlane", () => {
       githubPoster: {
         fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
         alreadyPosted: async () => true,
+        upsertStatusComment: async () => ({ commentId: "status-1" }),
         postReview: async () => {
           postCalls++;
           return { posted: true, inlinePosted: true, summaryMd: "" };
@@ -784,6 +858,7 @@ describe("ReviewControlPlane", () => {
           return { headSha: "live-head", baseSha: "live-base" };
         },
         alreadyPosted: async () => false,
+        upsertStatusComment: async () => ({ commentId: "status-1" }),
         async postReview(input) {
           postedCommit = input.commitId;
           return { githubReviewId: "gh-1", posted: true, inlinePosted: true, summaryMd: input.buildSummary(true) };

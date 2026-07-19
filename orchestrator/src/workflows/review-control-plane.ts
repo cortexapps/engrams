@@ -37,8 +37,10 @@ import type { ImagesClient } from "../rpc/profiles.ts";
 import {
   buildInlineCommentBody,
   buildReviewSummary,
+  buildStatusComment,
   makeGithubReviewPoster,
   type GithubReviewPoster,
+  type ReviewStatusPhase,
 } from "../reviews/github-review.ts";
 import {
   runPolicyGate,
@@ -126,6 +128,7 @@ interface ReviewControlPlaneStore extends Pick<
   | "updateReviewStatus"
   | "updateFindingState"
   | "finalizeReview"
+  | "setStatusCommentId"
 > {}
 
 interface ReviewExecOutput {
@@ -322,6 +325,40 @@ export function makeReviewControlPlane(
   );
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
   const githubPoster = deps.githubPoster ?? makeGithubReviewPoster();
+
+  // The sticky GitHub status comment (👀 → ⏳ → ✅). Best-effort: an ack that
+  // fails must never wedge the review, so every failure is logged and
+  // swallowed. The comment id is persisted on first post so later phases edit
+  // in place rather than stacking new comments.
+  const reviewsPageUrl = `${config.baseUrl.replace(/\/$/, "")}/reviews`;
+  const ackStatus = async (
+    reviewId: string,
+    phase: ReviewStatusPhase,
+    count?: number,
+  ): Promise<void> => {
+    try {
+      const detail = await reviews().getReview(reviewId);
+      if (!detail) return;
+      const { repo, prNumber, statusCommentId } = detail.review;
+      const body = buildStatusComment({
+        reviewId,
+        phase,
+        ...(count !== undefined ? { count } : {}),
+        ...(phase === "posted" ? { reviewUrl: reviewsPageUrl } : {}),
+      });
+      const { commentId } = await githubPoster.upsertStatusComment({
+        repo,
+        prNumber,
+        ...(statusCommentId ? { commentId: statusCommentId } : {}),
+        body,
+      });
+      if (commentId !== statusCommentId) {
+        await reviews().setStatusCommentId(reviewId, commentId);
+      }
+    } catch (err) {
+      log.error({ reviewId, phase, err }, "review status ack failed (best-effort)");
+    }
+  };
   const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
     const database = db();
     return createSessionForExistingTask(
@@ -361,6 +398,7 @@ export function makeReviewControlPlane(
         taskId,
         status: "queued",
       });
+      await ackStatus(reviewId, "acknowledged");
       return { reviewId, taskId };
     },
 
@@ -439,6 +477,7 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "finding");
+      await ackStatus(input.reviewId, "finding");
     },
 
     async getReview(reviewId) {
@@ -541,6 +580,11 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "verifying");
+      const detail = await reviews().getReview(input.reviewId);
+      const candidateCount = detail?.findings.filter(
+        (finding) => finding.state === "candidate",
+      ).length ?? 0;
+      await ackStatus(input.reviewId, "verifying", candidateCount);
     },
 
     async deleteReviewSession(sessionId) {
@@ -583,6 +627,10 @@ export function makeReviewControlPlane(
           status: "posted",
           summaryMd: detail.review.summaryMd ?? "",
         });
+        const postedCount = detail.findings.filter(
+          (finding) => finding.state === "posted" || finding.state === "ui_only",
+        ).length;
+        await ackStatus(reviewId, "posted", postedCount);
         return;
       }
 
@@ -657,15 +705,20 @@ export function makeReviewControlPlane(
           ? { githubReviewId: posted.githubReviewId }
           : {}),
       });
+      await ackStatus(reviewId, "posted", decision.toPost.length + decision.uiOnly.length);
     },
 
     async markReviewFailed(reviewId) {
       await reviews().updateReviewStatus(reviewId, "failed");
+      await ackStatus(reviewId, "failed");
     },
 
     async markReviewHalted(repo, prNumber) {
       const active = await reviews().getActiveReviewForPr(repo, prNumber);
-      if (active) await reviews().updateReviewStatus(active.id, "halted");
+      if (active) {
+        await reviews().updateReviewStatus(active.id, "halted");
+        await ackStatus(active.id, "halted");
+      }
     },
   };
 }
