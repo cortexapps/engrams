@@ -19,53 +19,39 @@ fn rt() -> tokio::runtime::Runtime {
 
 /// Calm profile: workload + drivers, no faults. The liveness baseline —
 /// every session must reach a stable state at quiescence.
+///
+/// Each seed runs on its OWN runtime via `engram_dst::run_seed` (dropped
+/// before the next), so no detached task leaks across the seed boundary —
+/// the hermetic seed independence the swarm binary also relies on (a
+/// shared runtime across seeds is the cross-seed paused-clock deadlock).
 #[test]
 fn calm_seeds_converge() {
-    let rt = rt();
-    rt.block_on(async {
-        tokio::time::pause();
-        for seed in 0..24u64 {
-            let mut sim = Sim::new(seed, Profile::Calm);
-            match sim.run(400).await {
-                Ok(report) => {
-                    assert_eq!(report.steps_run, 400);
-                }
-                Err(msg) => panic!(
-                    "calm seed {seed} violated an invariant after {} steps: {msg}\nlast trace:\n{}",
-                    sim.report().steps_run,
-                    sim.report()
-                        .trace
-                        .iter()
-                        .rev()
-                        .take(25)
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join("\n"),
-                ),
-            }
+    for seed in 0..24u64 {
+        let outcome = engram_dst::run_seed(seed, Profile::Calm, 400, false, 25);
+        match outcome.result {
+            Ok(report) => assert_eq!(report.steps_run, 400),
+            Err(msg) => panic!(
+                "calm seed {seed} violated an invariant: {msg}\nlast trace:\n{}",
+                outcome.trace.join("\n"),
+            ),
         }
-    });
+    }
 }
 
 /// Chaos profile: host crashes/restarts, replica crashes/restarts, PG
 /// outage windows — the system must still converge once faults heal.
+/// Per-seed hermetic runtime as in `calm_seeds_converge`.
 #[test]
 fn chaos_seeds_converge() {
-    let rt = rt();
-    rt.block_on(async {
-        tokio::time::pause();
-        for seed in 0..24u64 {
-            let mut sim = Sim::new(seed, Profile::Chaos);
-            match sim.run(600).await {
-                Ok(_) => {}
-                Err(msg) => panic!(
-                    "chaos seed {seed} violated an invariant after {} steps: {msg}\nlast trace:\n{}",
-                    sim.report().steps_run,
-                    sim.report().trace.iter().rev().take(25).cloned().collect::<Vec<_>>().join("\n"),
-                ),
-            }
+    for seed in 0..24u64 {
+        let outcome = engram_dst::run_seed(seed, Profile::Chaos, 600, false, 25);
+        if let Err(msg) = outcome.result {
+            panic!(
+                "chaos seed {seed} violated an invariant: {msg}\nlast trace:\n{}",
+                outcome.trace.join("\n"),
+            );
         }
-    });
+    }
 }
 
 /// THE determinism contract: the same seed produces byte-identical
@@ -263,12 +249,15 @@ fn driver_coverage_is_declared() {
 #[test]
 fn host_death_feeds_the_recovery_ladder() {
     use engram_core::types::session::SessionState;
-    let rt = rt();
-    rt.block_on(async {
-        tokio::time::pause();
-        let mut hostlost_to_idle = 0u32;
-        let mut resume_ops = 0u32;
-        for seed in 0..16u64 {
+    let mut hostlost_to_idle = 0u32;
+    let mut resume_ops = 0u32;
+    // Per-seed hermetic runtime (see `calm_seeds_converge`): this test
+    // inspects the world AFTER each run, so it drives `Sim` directly on a
+    // fresh runtime per seed rather than through `run_seed`.
+    for seed in 0..16u64 {
+        let rt = rt();
+        rt.block_on(async {
+            tokio::time::pause();
             let mut sim = Sim::new(seed, Profile::Chaos);
             let _ = sim.run(600).await;
             sim.world.meta.with_db(|db| {
@@ -283,16 +272,17 @@ fn host_death_feeds_the_recovery_ladder() {
                     .filter(|o| o.kind == engram_core::types::session_op::OpKind::Resume)
                     .count() as u32;
             });
-        }
-        assert!(
-            hostlost_to_idle > 0,
-            "no session traversed HostLost -> Idle across 16 chaos seeds — \
-             host death has become an absorbing funnel (checkpoint modeling broken?)"
-        );
-        assert!(
-            resume_ops > 0,
-            "no Resume op was ever enqueued across 16 chaos seeds — \
-             the resume workload is dark"
-        );
-    });
+        });
+        // `rt` drops here, reaping this seed's detached tasks.
+    }
+    assert!(
+        hostlost_to_idle > 0,
+        "no session traversed HostLost -> Idle across 16 chaos seeds — \
+         host death has become an absorbing funnel (checkpoint modeling broken?)"
+    );
+    assert!(
+        resume_ops > 0,
+        "no Resume op was ever enqueued across 16 chaos seeds — \
+         the resume workload is dark"
+    );
 }
