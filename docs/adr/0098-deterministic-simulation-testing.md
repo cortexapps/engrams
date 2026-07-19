@@ -999,6 +999,28 @@ flake, is unblocked. Verified zero-divergence ≥30× under concurrent load on
 both macOS and the Linux dev VM, full `-p engram-dst -p engram-sim`, the
 faithful swarm, and the replay-twice self-check.
 
+**Wave 4 CLOSED (all merged: #797/#798/#799 + two follow-on fixes).** The
+verb fold-in's CI run forced two more determinism layers into the open:
+(1) **cross-seed runtime sharing** — the swarm binary ran every seed of a
+`--seeds` window on ONE shared paused-clock runtime, so detached
+timer-parked tasks (the op executor's spawned re-drive, the within-step
+op-heartbeat interval) leaked across seed boundaries until a later seed's
+runtime futex-parked instead of auto-advancing (a 6h silent CI hang). Fix:
+`run_seed` gives each seed its own runtime dropped at the boundary, plus a
+per-seed 600s WATCHDOG that converts any future liveness hang into a fast
+NAMED failure — which promptly fired on CI and exposed (2) the capstone, a
+REAL PRODUCTION concurrency bug: `HostRegistry::list`/`unbind_session`
+held a DashMap shard read-guard ACROSS an `.await`; with shard count =
+`available_parallelism()` and getrandom-seeded hashing, a same-shard
+`register` write-lock on the single-threaded runtime was a permanent,
+environment-dependent deadlock (4-vcpu CI reliably; 1.3% under load on 16
+cores) — in production the same collision is a silent worker stall. Fixed
+by snapshot-then-await (gdb-proven, 0/550 hangs across the constraint
+matrix). Determinism-audit item 8: **no lock held across an await in any
+driven path; per-seed runtimes; a named watchdog over every swarm window.**
+#800 tracks the reserved-evac-placement follow-up; the drain verb joins the
+profiles when it lands.
+
 
 | Phase | Content |
 |---|---|
