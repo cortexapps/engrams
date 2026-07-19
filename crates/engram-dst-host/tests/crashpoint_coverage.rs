@@ -154,3 +154,48 @@ async fn crash_schedule_covers_every_op_boundary() {
         .unwrap();
     }
 }
+
+/// R5 (storage lies): the on-disk bytes `persist` and `write_spool` produce are
+/// R5 content-hash ENVELOPES (not the raw record/marker JSON) — sealed under
+/// the record's id, so `open` recovers the body only under the correct id. The
+/// op TRACES above are unchanged (the envelope changes bytes, not ops), so the
+/// crash schedule reasoning still holds; this pins the byte format.
+#[tokio::test]
+async fn persisted_records_and_spool_markers_are_sealed_envelopes() {
+    use engram_host_agent::durable_envelope;
+
+    // durable_record: `<id>.json` opens under the id, fails under a wrong id.
+    let tmp = tempfile::tempdir().unwrap();
+    let rec = Rec { id: "r".into() };
+    durable_record::persist(&engram_host_core::TokioFs, tmp.path(), &rec.id, &rec, "rec")
+        .await
+        .unwrap();
+    let on_disk = tokio::fs::read(tmp.path().join("r.json")).await.unwrap();
+    let body = durable_envelope::open(&on_disk, "r").expect("opens under the record id");
+    let back: Rec = serde_json::from_slice(&body).unwrap();
+    assert_eq!(back.id, "r");
+    assert!(
+        durable_envelope::open(&on_disk, "not-r").is_err(),
+        "a wrong id is a misdirected-read rejection",
+    );
+
+    // spool: `meta.json` is sealed under the sandbox id.
+    let stmp = tempfile::tempdir().unwrap();
+    let sid = SandboxId::new();
+    spool::write_spool(
+        &engram_host_core::TokioFs,
+        stmp.path(),
+        sid,
+        refv(3),
+        &[(0usize, vec![1u8; 8])],
+    )
+    .await
+    .unwrap();
+    let marker = tokio::fs::read(stmp.path().join(sid.to_string()).join("meta.json"))
+        .await
+        .unwrap();
+    assert!(
+        durable_envelope::open(&marker, &sid.to_string()).is_ok(),
+        "the spool marker is a sealed envelope under the sandbox id",
+    );
+}
