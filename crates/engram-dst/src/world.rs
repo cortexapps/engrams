@@ -83,13 +83,48 @@ pub struct EffectQueue {
     deferred: BTreeSet<HostId>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct SimHostWorld {
     pub hosts: Mutex<BTreeMap<HostId, SimHostState>>,
     pub effects: Mutex<EffectQueue>,
+    /// This world's PRIVATE on-disk blob "bucket" (ADR 0098 D5). Every
+    /// replica's `Services.blob`/`chunk_store` and this host's capture path
+    /// point at THIS directory (coordinator + host share one bucket, as in
+    /// prod), but two DIFFERENT worlds — sibling seeds running concurrently
+    /// under `nextest --workspace`, or successive seeds in the swarm binary —
+    /// never share it. The pre-R3 design used ONE process-global dir, which
+    /// let one world's snapshot-blob GC sweep LIST a sibling world's live
+    /// `snapshots/<id>/state.bin` blobs (unpinned in ITS metadata), mark them
+    /// orphan candidates, and promote-delete them — stranding the sibling's
+    /// queued resume. WHICH blob died was decided by `fs::read_dir` order, so
+    /// the firing was platform-divergent: green on macOS, tripping
+    /// `quiescence-queued-with-capacity` on Linux (the #722 re-land divergence
+    /// #794 blocked on). Owned as a `TempDir` so the bucket is torn down when
+    /// the world drops.
+    blob_root: tempfile::TempDir,
+}
+
+impl Default for SimHostWorld {
+    fn default() -> Self {
+        Self {
+            hosts: Mutex::new(BTreeMap::new()),
+            effects: Mutex::new(EffectQueue::default()),
+            blob_root: tempfile::Builder::new()
+                .prefix("engram-dst-blobs-")
+                .tempdir()
+                .expect("create per-world sim blob bucket"),
+        }
+    }
 }
 
 impl SimHostWorld {
+    /// This world's isolated blob-store root. The path itself never enters a
+    /// simulated decision (blob keys are relative + content-addressed by
+    /// seeded ids), so a unique physical dir per world is determinism-neutral.
+    pub fn blob_dir(&self) -> std::path::PathBuf {
+        self.blob_root.path().to_path_buf()
+    }
+
     fn with_host<R>(
         &self,
         id: HostId,
@@ -374,9 +409,10 @@ impl HostClient for SimHostClient {
         // made every capture record `recoverable = false`, so an idle-evicted
         // session reached `Idle` with no recoverable durable copy and tripped
         // the snapshot-safety oracle. We back the refs with REAL blobs in the
-        // SAME shared store the coordinator reads, mirroring engram-dst-host's
-        // ledger discipline (model the artifact, never fake the flag).
-        let blob = engram_storage_local::LocalBlobStorage::new(blob_dir());
+        // SAME per-world store the coordinator reads, mirroring
+        // engram-dst-host's ledger discipline (model the artifact, never fake
+        // the flag).
+        let blob = engram_storage_local::LocalBlobStorage::new(self.world.blob_dir());
         for key in [
             disk_manifest.storage_key(),
             memory_manifest.storage_key(),
@@ -584,7 +620,7 @@ impl SimWorld {
                 }) as Arc<dyn HostClient>,
             );
         }
-        let blob_dir = blob_dir();
+        let blob_dir = self.host_world.blob_dir();
         let services = Services {
             meta: self.meta.clone(),
             cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
@@ -638,7 +674,24 @@ impl SimWorld {
         let image = engram_core::types::EnabledImage {
             id: self.entropy.uuid(),
             image_uri: uri.to_string(),
-            image_config: toml::from_str(r#"name = "sim""#).expect("sim image config"),
+            // FIDELITY (R3 #722): the workload reserves `mem_budget_mib: 2048`
+            // / `cpu_budget_vcpus: 2` at create (scheduler.rs), so the enabled
+            // image MUST resolve to the SAME budget — in production
+            // `reserve_and_persist_create` and `resolve_cold_boot_spec` both
+            // derive from `ImageConfig::resolved_memory_mib`/`_vcpus`, so
+            // create-reserve == resume-resolve by construction. The old
+            // `name = "sim"`-only config left memory at DEFAULT_MEMORY_MIB
+            // (4096) while create reserved 2048: a resume's cold-boot spec then
+            // needed 4096 where the queued row recorded 2048, so the
+            // queue-scanner precheck (2048, fits) and the resume verb's own gate
+            // (4096, no fit) disagreed forever — an Idle↔Queued livelock the
+            // faithful-host resume-capacity fix surfaced (seed 142). vCPUs
+            // already default to DEFAULT_VCPUS (2) = the create budget; pin
+            // memory to close the gap.
+            image_config: toml::from_str(
+                "name = \"sim\"\n[resources]\nsuggested_memory_mib = 2048\nsuggested_vcpus = 2\n",
+            )
+            .expect("sim image config"),
             oci_defaults: Default::default(),
             manifest_digest: "sha256:sim".into(),
             disk_manifest: None,
@@ -669,17 +722,6 @@ impl SimWorld {
                 .expect("seed enabled image");
         });
     }
-}
-
-/// The shared on-disk blob store standing in for GCS. Every replica's
-/// `Services.blob`/`chunk_store` and the `SimHostClient` capture path read
-/// and write the SAME directory (as a real pod + host share one bucket), so
-/// a manifest/state blob the host wrote at capture is HEAD-visible to the
-/// coordinator's honest recoverability check. Keys are content-addressed by
-/// seeded-unique ids, so presence is deterministic per seed regardless of
-/// cross-seed residue in the dir.
-fn blob_dir() -> std::path::PathBuf {
-    std::env::temp_dir().join("engram-dst-blobs")
 }
 
 /// Poll a future to completion on the CURRENT thread without a nested

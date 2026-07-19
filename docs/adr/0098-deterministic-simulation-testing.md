@@ -288,6 +288,26 @@ driver cannot be silently unsimulated.
    not promised.
 5. CI runs each PR seed **twice** and diffs the traces — determinism leaks
    are caught the day they land, not when a failing seed won't replay.
+6. **Shared on-disk state + unsorted directory listings are a
+   PLATFORM-divergent replay class** (added R3, wave3-placement-authority).
+   Two failure modes compound: (a) an `fs::read_dir` listing feeding a
+   decision yields keys in filesystem-dependent order, so the same seed can
+   diverge across filesystems/platforms (green on macOS, invariant on
+   Linux) — the replay-twice self-check (#5) is same-machine and CANNOT see
+   this; and (b) a PROCESS-GLOBAL on-disk store shared across worlds lets one
+   seed's world observe/mutate another's state. Both bit the faithful-host
+   blob store: a single `std::env::temp_dir().join("engram-dst-blobs")` shared
+   by every `SimWorld` let one world's snapshot-blob GC sweep list a sibling
+   world's live `state.bin` blobs (unpinned in ITS metadata) and delete them,
+   in `read_dir` order — stranding the sibling's queued resume
+   (`quiescence-queued-with-capacity`), Linux-only, only under
+   `nextest --workspace` concurrency. Fixes: each `SimWorld` owns a PRIVATE
+   `TempDir` bucket (no cross-world residue), and `LocalBlobStorage::list_prefix`
+   returns lexicographically SORTED keys (the GCS/S3 `list` contract — the
+   local backend must match prod, and no consumer inherits a `read_dir`-order
+   leak). Audit rule: any real-filesystem or otherwise process-global resource
+   a driven path reads must be per-world isolated, and every directory listing
+   sorted at the source.
 
 ### The world model, faults, and invariants (D5–D6)
 
@@ -729,6 +749,17 @@ Coordinator sim (`engram-dst`), as of 2b4b89ea:
   unconditionally at quiescence (the capacity qualifier lives in a comment,
   not code). The placement oracle has drifted from the corrected store
   predicate (#722's "tightened back to unconditional" did not hold).
+  — *Closed by R3 (wave3-placement-authority):* the unconditional
+  placement-accounting oracle is RESTORED, and the store predicate now
+  satisfies it by construction — a `pending` reserves UNCONDITIONALLY (no
+  wall-age / live-op exclusion; ONE reservation authority), reclaimed only by
+  the ADR 0079 backstop's real `pending → failed` transition. RCA of the
+  12/200 faithful-chaos firings: the failing path was NOT the crash-orphan
+  pending exclusion (the D6/D7-era hypothesis) but the UNRESERVED RESUME
+  soft-pick (`pick_from`'s capacity-soft fallback binding a resume onto a
+  measured-full host); resume now honors the same hard reserved-budget bound
+  as create (queue-when-no-fit via `placement_preview`). With #722 and #790
+  closed, faithful hosts are the swarm DEFAULT.
 - The "DriverKind coverage meta-test" is five function-pointer visibility
   checks; it inspects neither `DriverKind` nor the run_once inventory.
   Coverage is ~8/14 production task families — `enable_scanner::run_once`
