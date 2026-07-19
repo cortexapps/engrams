@@ -124,8 +124,9 @@ export function ReviewDetailPanel({ review }: { review: Review }) {
     (a, b) => (SEVERITY_ORDER[a.severity] ?? 9) - (SEVERITY_ORDER[b.severity] ?? 9),
   );
   const verdictByFinding = new Map((data?.verdicts ?? []).map((v) => [v.findingId, v]));
-  // All findings share the finder session that produced them.
+  // All findings share the finder session; all verdicts share the verifier session.
   const finderSession = findings[0]?.sessionId;
+  const verifierSession = data?.verdicts.find((v) => v.sessionId)?.sessionId;
   const reviewUrl = review.githubReviewId
     ? `https://github.com/${review.repo}/pull/${review.prNumber}#pullrequestreview-${review.githubReviewId}`
     : undefined;
@@ -154,6 +155,7 @@ export function ReviewDetailPanel({ review }: { review: Review }) {
           </a>
         )}
         {finderSession && <SessionLink label="Finder session" sessionId={finderSession} />}
+        {verifierSession && <SessionLink label="Verifier session" sessionId={verifierSession} />}
       </div>
 
       {findings.length === 0 ? (

@@ -242,6 +242,7 @@ describe("ReviewService", () => {
       findingId: FINDING_ID,
       verdict: "confirmed",
       reasoning: "The failing path is reachable.",
+      sessionId: "verifier-session",
     });
   });
 

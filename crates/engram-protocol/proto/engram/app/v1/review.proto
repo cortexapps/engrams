@@ -127,6 +127,8 @@ message ReviewVerdict {
   // high | medium | low
   string confidence = 3;
   string reasoning = 4;
+  // The verifier session that recorded this judgment.
+  string session_id = 5;
 }
 
 message ListReviewsRequest {

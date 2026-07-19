@@ -37,6 +37,7 @@ const detail = {
       verdict: "confirmed",
       confidence: "high",
       reasoning: "Reproduced from the diff.",
+      sessionId: "verifier-sess-1",
     },
   ],
 };
@@ -65,5 +66,7 @@ describe("Reviews page", () => {
     expect(screen.getByText(/Verifier: confirmed/)).toBeTruthy();
     const finderLink = screen.getByRole("link", { name: /finder session/i });
     expect(finderLink.getAttribute("href")).toContain("/sessions/finder-sess-1");
+    const verifierLink = screen.getByRole("link", { name: /verifier session/i });
+    expect(verifierLink.getAttribute("href")).toContain("/sessions/verifier-sess-1");
   });
 });

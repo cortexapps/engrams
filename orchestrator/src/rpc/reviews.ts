@@ -146,6 +146,7 @@ function verdictToProto(row: ReviewVerdictRow): ReviewVerdictProto {
     verdict: row.verdict,
     confidence: row.confidence,
     reasoning: row.reasoning,
+    sessionId: row.sessionId,
   } as ReviewVerdictProto;
 }
 
