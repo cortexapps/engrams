@@ -208,6 +208,39 @@ export async function prReviewWorkflowImpl(
   let finderDone = false;
   let verifierDone = false;
   let phaseTimeoutWindows = 0;
+
+  // A phase that could not produce a result — the worker died (terminal
+  // `session_ended`) or its harness run errored (`session_idle` + `runFailed`)
+  // — gets exactly one clean retry, then the review is marked failed. Returns
+  // true when the review was failed (the caller must stop the workflow), false
+  // when a fresh worker was started (the caller continues the loop).
+  const retryPhaseOnceOrFail = async (
+    role: "finder" | "verifier",
+  ): Promise<boolean> => {
+    await deleteWorkerSessionBestEffort(role);
+    const alreadyRetried = role === "finder" ? finderRetried : verifierRetried;
+    if (alreadyRetried) {
+      await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      return true;
+    }
+    if (role === "finder") finderRetried = true;
+    else verifierRetried = true;
+    try {
+      if (role === "finder") await setupFinder();
+      else await setupVerifier();
+      phaseTimeoutWindows = 0;
+      return false;
+    } catch (err) {
+      log.error(
+        { repo: first.repo, prNumber: first.prNumber, role, err },
+        "review phase retry setup failed",
+      );
+      await deleteWorkerSessionBestEffort(role);
+      await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      return true;
+    }
+  };
+
   for (;;) {
     const message = await recv(REVIEW_TOPIC, RECV_TIMEOUT_S);
     if (message === null) {
@@ -235,12 +268,25 @@ export async function prReviewWorkflowImpl(
       );
       return;
     }
-    const completionRole = message.kind === "phase_done"
-        || message.kind === "session_idle"
+    // A harness run that ERRORED returns the reusable session to idle exactly
+    // like a clean turn. It is NOT a completion — reporting it as one would post
+    // a false "no findings" review — so it routes to the retry/fail path below.
+    const failedIdle = message.kind === "session_idle" && message.runFailed === true;
+    const completionRole = failedIdle
+      ? undefined
+      : message.kind === "phase_done" || message.kind === "session_idle"
       ? message.role
       : message.kind === "session_ended" && message.outcome === "completed"
       ? message.role
       : undefined;
+    if (failedIdle && !finderDone && message.role === "finder") {
+      if (await retryPhaseOnceOrFail("finder")) return;
+      continue;
+    }
+    if (failedIdle && finderDone && !verifierDone && message.role === "verifier") {
+      if (await retryPhaseOnceOrFail("verifier")) return;
+      continue;
+    }
     if (
       message.kind === "session_ended"
       && message.outcome === "completed"
@@ -306,24 +352,7 @@ export async function prReviewWorkflowImpl(
       && !finderDone
     ) {
       if (message.sessionId !== finderSessionId) continue;
-      await deleteWorkerSessionBestEffort("finder");
-      if (finderRetried) {
-        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-        return;
-      }
-      finderRetried = true;
-      try {
-        await setupFinder();
-        phaseTimeoutWindows = 0;
-      } catch (err) {
-        log.error(
-          { repo: first.repo, prNumber: first.prNumber, err },
-          "finder retry setup failed",
-        );
-        await deleteWorkerSessionBestEffort("finder");
-        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-        return;
-      }
+      if (await retryPhaseOnceOrFail("finder")) return;
       continue;
     }
     if (
@@ -332,24 +361,7 @@ export async function prReviewWorkflowImpl(
       && !verifierDone
     ) {
       if (message.sessionId !== verifierSessionId) continue;
-      await deleteWorkerSessionBestEffort("verifier");
-      if (verifierRetried) {
-        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-        return;
-      }
-      verifierRetried = true;
-      try {
-        await setupVerifier();
-        phaseTimeoutWindows = 0;
-      } catch (err) {
-        log.error(
-          { repo: first.repo, prNumber: first.prNumber, err },
-          "verifier retry setup failed",
-        );
-        await deleteWorkerSessionBestEffort("verifier");
-        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-        return;
-      }
+      if (await retryPhaseOnceOrFail("verifier")) return;
       continue;
     }
     log.info(

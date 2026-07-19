@@ -255,6 +255,63 @@ describe("PrReviewWorkflow", () => {
     expect(steps.steps.at(-1)).toBe("markReviewFailed");
   });
 
+  test("a failed finder run (idle+runFailed) retries once then fails, never posting", async () => {
+    let finderCreates = 0;
+    let markedFailed = 0;
+    let posted = 0;
+    const steps = runner();
+    const cp = fakeControlPlane({
+      createFinderSession: async () => ({
+        sessionId: `finder-session-${++finderCreates}`,
+      }),
+      getReview: async () => ({ ...candidateDetail, findings: [] }),
+      postReviewResults: async () => {
+        posted++;
+      },
+      markReviewFailed: async () => {
+        markedFailed++;
+      },
+    });
+
+    await run(cp, [
+      trigger,
+      { kind: "session_idle", role: "finder", runFailed: true },
+      { kind: "session_idle", role: "finder", runFailed: true },
+    ], steps.step);
+
+    // One retry (two finder sessions), then failed — and crucially never a
+    // "no findings" post despite the empty getReview.
+    expect(finderCreates).toBe(2);
+    expect(markedFailed).toBe(1);
+    expect(posted).toBe(0);
+    expect(steps.steps).not.toContain("postReviewResults");
+    expect(steps.steps.at(-1)).toBe("markReviewFailed");
+  });
+
+  test("a clean finder run with zero candidates still posts (idle without runFailed)", async () => {
+    let posted = 0;
+    let markedFailed = 0;
+    const steps = runner();
+    const cp = fakeControlPlane({
+      getReview: async () => ({ ...candidateDetail, findings: [] }),
+      postReviewResults: async () => {
+        posted++;
+      },
+      markReviewFailed: async () => {
+        markedFailed++;
+      },
+    });
+
+    await run(cp, [
+      trigger,
+      { kind: "session_idle", role: "finder" },
+    ], steps.step);
+
+    expect(posted).toBe(1);
+    expect(markedFailed).toBe(0);
+    expect(steps.steps.at(-1)).toBe("postReviewResults");
+  });
+
   test("verifier completion posts once and returns cleanly", async () => {
     let verifierPrompts = 0;
     let posted = 0;
