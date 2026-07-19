@@ -46,6 +46,7 @@ import { SecretsPanel } from "./components/settings/SecretsPanel";
 import { ApiKeysPanel } from "./components/settings/ApiKeysPanel";
 import { HarnessesPanel } from "./components/settings/HarnessesPanel";
 import { IntegrationsPanel } from "./components/settings/IntegrationsPanel";
+import { ReviewedReposPanel } from "./components/settings/ReviewedReposPanel";
 import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
@@ -279,6 +280,12 @@ const integrationsRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationsPanel,
 });
+const reviewedReposRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "reviewed-repos",
+  beforeLoad: requireAdmin,
+  component: ReviewedReposPanel,
+});
 const integrationDetailRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
   path: "integrations/$provider",
@@ -336,6 +343,7 @@ export const routeTree = rootRoute.addChildren([
       harnessesRoute,
       integrationsRoute,
       integrationDetailRoute,
+      reviewedReposRoute,
       profilesRoute,
       profilesNewRoute,
       profileEditRoute,

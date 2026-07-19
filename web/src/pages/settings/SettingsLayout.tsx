@@ -1,4 +1,14 @@
-import { KeyRound, KeySquare, Lock, Plug, Users, UserCircle, IdCard, Cpu } from "lucide-react";
+import {
+  KeyRound,
+  KeySquare,
+  Lock,
+  Plug,
+  Users,
+  UserCircle,
+  IdCard,
+  Cpu,
+  GitPullRequestArrow,
+} from "lucide-react";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { useAbility } from "../../auth/AuthProvider";
 import {
@@ -28,6 +38,7 @@ const ORG: NavItem[] = [
   { to: "/settings/integrations", label: "Integrations", icon: Plug },
   { to: "/settings/harnesses", label: "Harnesses", icon: Cpu },
   { to: "/settings/profiles", label: "Profiles", icon: IdCard },
+  { to: "/settings/reviewed-repos", label: "Reviewed repos", icon: GitPullRequestArrow },
 ];
 
 export function SettingsLayout() {
