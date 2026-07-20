@@ -151,6 +151,18 @@ export function StartScreen() {
   }, [profiles, recent, selectedId]);
 
   const selected = profiles.find((p) => p.id === selectedId) ?? null;
+
+  // A human session for a harness that declares a user credential is
+  // BLOCKED server-side when that credential isn't set (a session without it
+  // boots unauthenticated). Mirror the block here — for every user, regardless
+  // of the profile's includeUserTokens toggle — so the requirement + setup hint
+  // show up front instead of the user launching into a silent auth failure.
+  const effectiveHarnessName =
+    harnessOverride.harness ??
+    selected?.harness ??
+    (harnesses?.length === 1 ? harnesses[0]?.name : undefined);
+  const effectiveHarness = harnesses?.find((h) => h.name === effectiveHarnessName);
+
   const policy: DerivedPolicy | null = selected
     ? derivePolicy(
         {
@@ -163,22 +175,19 @@ export function StartScreen() {
           secrets: [],
         },
         views,
+        // ADR 0063 addendum: the selected harness's own egress ([egress] in
+        // harness.toml) rides the "Reaches" receipt — it's merged into the
+        // session allowlist server-side at create.
+        {
+          allowHosts: effectiveHarness?.descriptor?.egress?.allowHosts ?? [],
+          allowHostPatterns: effectiveHarness?.descriptor?.egress?.allowHostPatterns ?? [],
+        },
       )
     : null;
   const imageName = selected
     ? images?.find((i) => i.id === selected.imageId)?.image_uri
     : undefined;
 
-  // A human session for a harness that declares a user credential is
-  // BLOCKED server-side when that credential isn't set (a session without it
-  // boots unauthenticated). Mirror the block here — for every user, regardless
-  // of the profile's includeUserTokens toggle — so the requirement + setup hint
-  // show up front instead of the user launching into a silent auth failure.
-  const effectiveHarnessName =
-    harnessOverride.harness ??
-    selected?.harness ??
-    (harnesses?.length === 1 ? harnesses[0]?.name : undefined);
-  const effectiveHarness = harnesses?.find((h) => h.name === effectiveHarnessName);
   const effectiveUserEnv = effectiveHarness?.descriptor?.auth?.userEnv;
   const userEnvHint = effectiveHarness?.descriptor?.auth?.userEnvHint;
   const userEnvMissing =
