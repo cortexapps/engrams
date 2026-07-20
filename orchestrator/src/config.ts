@@ -29,6 +29,12 @@ export interface Config {
   controlPlaneHttpUrl: string;
   /** CONTROL_PLANE_BEARER — required: the coordinator app-gRPC bearer token */
   controlPlaneBearer: string;
+  /** GITHUB_APP_LOGIN — the review GitHub App's handle (its bot login/slug,
+   * e.g. "acme-reviewer"), the token users @-mention on a PR to run a review.
+   * ADR 0100 uses one App per deployment, so this is deployment config, not a
+   * hardcoded string. Empty = `@`-mention commands are disabled (dispatch API
+   * and auto-on-open still work). Accepts an optional leading "@" / "[bot]". */
+  githubAppLogin: string;
   /** TRUSTED_ORIGINS — comma-separated list; dev default: http://localhost:5173 */
   trustedOrigins: string[];
   /**
@@ -164,6 +170,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const port = parseInt(portStr, 10);
   const baseUrl = optional("ORCHESTRATOR_PUBLIC_URL", `http://127.0.0.1:${port}`);
   const controlPlaneBearer = require("CONTROL_PLANE_BEARER");
+  const githubAppLogin = optional("GITHUB_APP_LOGIN", "");
   const controlPlaneGrpcUrl = optional("CONTROL_PLANE_GRPC_URL", "http://127.0.0.1:50061");
   const controlPlaneHttpUrl = optional("CONTROL_PLANE_HTTP_URL", "http://127.0.0.1:8090");
   const databaseUrl = require("ORCHESTRATOR_DATABASE_URL");
@@ -270,6 +277,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     controlPlaneGrpcUrl,
     controlPlaneHttpUrl,
     controlPlaneBearer,
+    githubAppLogin,
     trustedOrigins,
     deviceVerificationUrl,
     betterAuthSecret,

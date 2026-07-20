@@ -77,6 +77,11 @@ message Review {
   google.protobuf.Timestamp created_at = 11;
   google.protobuf.Timestamp updated_at = 12;
   FindingCounts finding_counts = 13;
+  // Worker sessions, stamped at kickoff so the UI can offer a live "watch" link
+  // while a phase runs. Empty until that phase starts; the session is deleted
+  // when its phase ends, so the id survives as the record of which session ran.
+  optional string finder_session_id = 14;
+  optional string verifier_session_id = 15;
 }
 
 // Per-severity finding counts for the list page.
@@ -127,6 +132,8 @@ message ReviewVerdict {
   // high | medium | low
   string confidence = 3;
   string reasoning = 4;
+  // The verifier session that recorded this judgment.
+  string session_id = 5;
 }
 
 message ListReviewsRequest {
@@ -146,4 +153,22 @@ message GetReviewResponse {
   Review review = 1;
   repeated ReviewFinding findings = 2;
   repeated ReviewVerdict verdicts = 3;
+  // The review's step-by-step activity log, oldest first (ADR 0100). Milestones
+  // the control plane records as it drives the review — queued, cloning the
+  // repo, reviewing, verifying, posted — so the UI can show progress inside a
+  // phase, not just the coarse status.
+  repeated ReviewEvent events = 4;
+}
+
+// One entry in a review's activity log.
+message ReviewEvent {
+  string id = 1;
+  string review_id = 2;
+  // Milestone kind, mapped to a human label in the UI: queued | finder_started
+  // | cloning | reviewing | verifier_started | verifying | posted | failed |
+  // halted.
+  string kind = 3;
+  // Optional human-readable detail (e.g. "3 candidate findings", "finder").
+  optional string detail = 4;
+  google.protobuf.Timestamp created_at = 5;
 }
