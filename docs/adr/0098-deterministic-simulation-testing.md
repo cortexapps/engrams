@@ -1099,6 +1099,76 @@ CI windows green (chaos 0..60, calm 0..30 ×1000) + replay-twice identical.
 Layers 2–4 (kernel-derived rehydrate inventory; startup classification barrier;
 the rung-2 co-sim family) remain #784's.
 
+**Wave 7 (resilience/wave7-boundary-swarm, #784 rung 2) — the NBD device-plane
+family co-simulated + the seeded boundary swarm.** Rung 1 co-simulated only the
+OWNERSHIP leg of the survivor family; the NBD generation/slot/park/un-pause
+data plane stayed `engram-dst-host`'s domain. Wave 7 ports it to the boundary
+and adds the swarm arm.
+
+*Reuse (simplify-via-abstractions).* The P7/#806 device-plane world model —
+generation, the real `NbdSlotAllocator`, `served_by`/`kernel_owner`/`parked`,
+the `guest_holds_device` proof-of-death input — is extracted into a pub,
+reusable `engram_dst_host::device_plane::DevicePlane` keyed by `SandboxId`;
+every decision delegates to the REAL host-core verdicts (`sweep_verdict` incl.
+the #806 holder table, `resume_data_plane_served`, `is_local_survivor_candidate`)
+and every lease to the REAL allocator. The `CosimHost` composes it keyed by the
+coordinator-minted ids (rung 1's documented divergence). *Divergence deferred,
+honestly:* migrating the merged `SimHost` onto `DevicePlane` is a mechanical
+follow-up NOT taken this wave — destabilizing the verified P-series host swarm
+mid-wave trades reliability for tidiness; the substantive shared pieces (the
+allocator + the host-core verdicts) are already the single source both sides
+run, and `DevicePlane` is now the canonical home the SimHost migration lands
+against.
+
+*The family, co-simulated, all real code both sides:* host-agent roll (new
+generation; survivors resident) → register-rehydrate against the REAL
+coordinator listing (`register_rehydrate_list_core`, extracted with the
+run_once-for-handlers pattern) → the REAL stale-binding sweep incl. the #806
+(liveness × holder) table → the un-pause gate; plus the coordinator's REAL
+`host_lost_straggler_sweep` with the #782 probe/strike arms driven ACROSS the
+boundary against the host's `probe_sandbox` — the #777 tension end-to-end (a
+bound HostLost row whose VM probes ALIVE past the 60s min-age is DEFERRED, then
+settles at the strike cap; a departed VM settles at once). Directed pins for the
+fixed happy path, the #806 ungated PARK-then-reserve-zero-loss, the un-pause
+gate firing on a disconnected dead-guest plane, both straggler arms, and the
+capture-lock release pin (a QUARANTINED finalize releases the capture lock, so
+#783's teardown-reconcile exemption can never become a permanent reap-shield).
+
+*The swarm (deliverable 2/3).* A `--seeds` `sim-cosim` binary over the boundary,
+small world (1 replica, 1 host, ≤3 sessions — the state-space product is the
+risk, bounded and documented), profile biased to boundary faults (roll /
+rehydrate / sweep / un-pause / straggler) + bridge faults reaching the
+applied-commit-but-ack-lost window via explicit perturbations mirroring the
+effect-queue outcomes (a transparently-interposed effect queue on the bridge
+stays a fidelity refinement). Determinism (audit items 6–8): per-seed runtime
+dropped at the boundary + the named 600s watchdog (the `engram-dst` `run_seed`
+shape); coarse explicit time steps so no fs-I/O clock auto-advance can tip a
+decision threshold; replay-twice byte-identical (verified). *The I/O-audit
+verdict:* the co-sim reuses the REAL `ChunkedDiskBackend` (its `ChunkCache` does
+real tempdir fs I/O, as `engram-dst-host`'s deterministic swarm already does),
+so rather than an in-memory HostFs migration this wave leans on the same
+property that keeps the host swarm replay-deterministic — the trace/oracle
+verdicts never observe the auto-advanced virtual time, and all decision-bearing
+time is driven by coarse explicit advances well past every threshold; the
+replay-twice self-check is the guard. Standing oracles: severed-live-holder
+(#806), slot-accounting no-plane-leak, the ACTIVE-serve ownership split-brain
+guard, idle⇒durable-snapshot (#570, at quiescence post-finalize-drain),
+teardown/ownership completeness, bounded convergence.
+
+*Swarm firings (the point of the wave — each RCA'd, no oracle weakened).* (1)
+The ownership oracle fired on a terminal session's served device and on an
+evicted sandbox mid-finalize — both teardown/transition windows, not re-home
+split-brains; scoped the every-step guard to ACTIVELY-serving planes (live
+backend, non-terminal) and added the STRONG quiescence completeness closure so
+those cases stay covered. (2) #570 idle-durability fired on the
+D5-Idle-before-async-finalize window (a real prod window the heartbeat reconcile
+closes); moved to quiescence post-finalize-drain, detection of a
+cancelled-finalize loss preserved. (3) An Evicting-wedge exposed a harness
+fidelity gap — a Roll decoupled from rehydrate left an unrehydrated Active
+session (unreachable in prod, where a roll's startup always rehydrates); coupled
+Roll → register-rehydrate. (4) A real device double-allocation bug in the shared
+plane (`next_free_device` ignored spare leases) — fixed. PR window 0..40 × 600
+chaos+calm (~1.2s, per-seed ~29ms); nightly `cosim-swarm` at 1500 steps.
 
 | Phase | Content |
 |---|---|
@@ -1106,7 +1176,7 @@ the rung-2 co-sim family) remain #784's.
 | R1 | Soundness of what exists: the missing coordinator oracles (snapshot-safety, orphan, epoch/`sandbox_owners`), capacity-aware Queued-at-quiescence, placement-oracle realignment; per-chunk membership in the acked-write oracle + a periodic-checkpoint step + a cadence bound; the eviction-finalize hash fix + NBD length validation (prod); a real DriverKind meta-test + the missing drivers (enable_scanner first) + run_once extraction for the two inline-loop retention drivers; panic-stub the 3 default-inheriting SimMeta methods; lints inheritance + gate extension to the decision-bearing crates; fix the two determinism leaks. |
 | R2 | The auditor: an expected-state model diffing acked API responses against world truth (acked-create never lost; acked results never contradicted; completed runs never repainted); workload through the real Router/gRPC surface as originally specified; an effect queue giving in-flight interruption + message loss/reorder/duplication. |
 | R3 | Storage lies: corruption injection (CrashFs byte-flip/misdirect/stale-read; seeded FaultyBlobStorage in the host chaos profile); checksums on the unprotected durable formats (durable_record envelope, spool metadata, manifest digest, chain-head) as clean-break bumps; detection→response policy (resolver deletes/refetches corrupt primary copies); route the four HostFs-bypassing writers through the seam; the two missing kernel-assumption pins in the FC lane. |
-| R-CoSim | Coordinator↔host co-simulation — the boundary where #570, #739/731df805, #602, #216, and 85e0298a all live and which both sims exclude by construction. Rung 1: `engram-dst-cosim` — the REAL coordinator handlers/drivers over SimMeta bridged to the REAL extracted host flows (transport faked, both sides' code real), one interleaved scheduler, directed scenarios for the four known handshakes (#570 must reproduce first). Oracles: coordinator-says-Idle ⇒ the resume-visible snapshot is durable and covers the acked ledger; ownership agreement across the boundary. Rung 2 (post-R2 effect queue): a seeded boundary-fault swarm, small world, own detector flag + CI-Gate membership. |
+| R-CoSim | Coordinator↔host co-simulation — the boundary where #570, #739/731df805, #602, #216, and 85e0298a all live and which both sims exclude by construction. Rung 1: `engram-dst-cosim` — the REAL coordinator handlers/drivers over SimMeta bridged to the REAL extracted host flows (transport faked, both sides' code real), one interleaved scheduler, directed scenarios for the four known handshakes (#570 must reproduce first). Oracles: coordinator-says-Idle ⇒ the resume-visible snapshot is durable and covers the acked ledger; ownership agreement across the boundary. Rung 2 (post-R2 effect queue): a seeded boundary-fault swarm, small world, own detector flag + CI-Gate membership. **Rung 2 LANDED (Wave 7, #784):** the NBD device-plane family (`DevicePlane`) co-simulated + the `sim-cosim` seeded swarm + the nightly `cosim-swarm` job — see the Wave 7 bookend above. |
 | R4 | The untouched tier + exhaustion: orchestrator DST (#704's zombie-listener class — clock/entropy injection in TS, run_once-shaped listener/lease/cursor steps, lease-held ⇒ stream-consuming oracle) + the cross-tier smoke un-skipped into the e2e lane; memory/backpressure bounds from the OOM RCA, "every queue names its bound" enforced mechanically, OOM-kill faults in both sims. |
 | R5 | Exploration depth: per-seed randomized fault weights + world config (swarm testing proper); disk-pressure/ENOSPC + mixed-WIRE_VERSION faults; the canary lane (revert a known-caught fix behind a cfg, assert the swarm re-finds it); nightly volume scaled across runners. |
 
