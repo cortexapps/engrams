@@ -380,6 +380,43 @@ impl Cosim {
         }
     }
 
+    /// Wave 7b (#784 layer 2): lose a session's tracked records (#769 gap A) — a
+    /// resident guest ends up holding a device no record accounts for, which the
+    /// classification barrier must QUARANTINE (not skip, not sever).
+    pub async fn lose_record(&mut self, session_id: SessionId) {
+        if let Some(sandbox) = self.resolve_sandbox(session_id).await {
+            self.world.host.lock().await.lose_record(sandbox);
+            self.log(format!("lose_record {session_id} sandbox={sandbox}"));
+        }
+    }
+
+    /// The operator/runbook reconcile the `rehydrate-unknown-device` alert
+    /// drives: restore the record of EVERY quarantined device so the drain's
+    /// register re-serves it. Ensures bounded convergence — a quarantined slot
+    /// reaches a terminal disposition rather than wedging forever.
+    pub async fn reconcile_quarantined(&mut self) {
+        let host = self.world.host.lock().await;
+        let quarantined = host.quarantined_unknown();
+        drop(host);
+        if quarantined.is_empty() {
+            return;
+        }
+        let mut host = self.world.host.lock().await;
+        for id in &quarantined {
+            host.regain_record(*id);
+        }
+        drop(host);
+        self.log(format!("reconcile_quarantined n={}", quarantined.len()));
+    }
+
+    /// Quiescence heal (Wave 7b): restore EVERY device's record — the record-loss
+    /// fault is healed globally at quiescence, exactly like the re-served
+    /// survivors and drained finalizes, so convergence is required against a
+    /// fully-healed world.
+    pub async fn heal_all_records(&mut self) {
+        self.world.host.lock().await.regain_all_records();
+    }
+
     /// One tick of the coordinator's REAL `host_lost_straggler_sweep` (#782 /
     /// #777): for a bound HostLost row past the 60s min-age it probes the host
     /// (`probe_sandbox → process_alive`, across the boundary) and DEFERS the
@@ -606,6 +643,12 @@ impl Cosim {
         self.world.host.lock().await.sweep_parked_live()
     }
 
+    /// Sandboxes the classification barrier put in `QuarantinedUnknown` — a
+    /// record-invisible live survivor (#769 gap A). CLASSIFIED, never skipped.
+    pub async fn quarantined_unknown(&self) -> Vec<SandboxId> {
+        self.world.host.lock().await.quarantined_unknown()
+    }
+
     /// **Oracle — severed-live-holder (#806):** no device is left both
     /// UNSERVED and UNBOUND (`kernel_owner == None`) while a live guest still
     /// holds it open. A device in that state was severed out from under a
@@ -622,6 +665,34 @@ impl Cosim {
                     "severed-live-holder (#806): sandbox {id}'s device is unserved AND unbound \
                      (kernel_owner=None) while its guest still holds it open — a live guest's \
                      data plane was severed (the 731df805 EIO class)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// **Oracle — record-invisible-survivor-classified (Wave 7b, #784 layers
+    /// 2–3):** every current record-invisible resident survivor (live, unserved,
+    /// dead-owner, no record — the #769 gap-A precondition) that has been through
+    /// a register/sweep MUST have been CLASSIFIED `QuarantinedUnknown`, not
+    /// silently skipped. We assert the barrier's promise directly: any such
+    /// survivor whose device is UNBOUND (kernel_owner cleared) is a severed
+    /// classification failure, and any quarantined device must stay
+    /// RECONNECTABLE. Checked every step. (The strong revert-detecting proof is
+    /// the directed `gap_a_*` pin; this guards the swarm-scale invariant.)
+    pub async fn assert_quarantine_reconnectable(&self) -> Result<(), String> {
+        let host = self.world.host.lock().await;
+        for id in host.quarantined_unknown() {
+            // A quarantined device is served (recovered) OR reconnectable
+            // (kernel-bound). Never both unserved AND unbound while guest-held.
+            let served = host.served_by_current(id);
+            let bound = host.kernel_owner(id).is_some();
+            let live = host.guest_holds_device(id);
+            if !served && live && !bound {
+                return Err(format!(
+                    "quarantine-reconnectable (#784): sandbox {id} was classified \
+                     QuarantinedUnknown but is now unserved, kernel-unbound, and still \
+                     guest-held — a quarantined survivor was severed, not left reconnectable"
                 ));
             }
         }

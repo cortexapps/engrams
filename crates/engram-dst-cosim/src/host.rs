@@ -283,8 +283,16 @@ pub struct CosimHost {
     pub device: DevicePlane,
     /// Oracle memory (survives): sandboxes the stale-sweep PARKed because a
     /// live guest still held the device (the `sweep-blocked-live-holder` set,
-    /// #806) — never severed, must be re-served.
+    /// #806) — never severed, must be re-served. Under Wave 7b this is the
+    /// dead-owner live-holder set the barrier classified `ReconnectMe` OR
+    /// `QuarantinedUnknown` (both left RECONNECTABLE).
     sweep_parked_live: BTreeSet<SandboxId>,
+    /// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3): oracle memory — sandboxes
+    /// the classification barrier put in
+    /// [`SlotClass::QuarantinedUnknown`](engram_host_core::SlotClass::QuarantinedUnknown):
+    /// a kernel-connected device with a live holder that NO tracked record
+    /// accounted for (#769 gap A). CLASSIFIED + alertable, never skipped.
+    quarantined_unknown: BTreeSet<SandboxId>,
 }
 
 impl CosimHost {
@@ -318,6 +326,7 @@ impl CosimHost {
             next_tag: 0,
             device: DevicePlane::new(DEVICE_CAPACITY),
             sweep_parked_live: BTreeSet::new(),
+            quarantined_unknown: BTreeSet::new(),
         }
     }
 
@@ -491,28 +500,56 @@ impl CosimHost {
         rehydrate_list: &[SandboxId],
         local_pass_enabled: bool,
     ) -> Result<(), String> {
-        // 1. Coord-list pass: re-serve every LISTED resident survivor.
+        // 1. Coord-list pass: re-serve every LISTED resident survivor. The coord
+        //    list is authoritative for what it CONTAINS (each listed survivor
+        //    carries the coordinator's disk-manifest ref), so it is NOT gated on
+        //    the local record — a gap-A survivor is one the list OMITS (e.g. a
+        //    HostLost row is not reserves-host-memory), which the REAL
+        //    `register_rehydrate_list_core` already excludes. Only the #739 local
+        //    pass below reads the (loseable) ChainHeadRecord.
         for &id in rehydrate_list {
             if self.device.is_resident_survivor(id) {
                 self.serve_and_rebuild(id).await?;
             }
         }
         // 2. Local ChainHeadRecord pass (#739): re-serve any live survivor the
-        //    coord list missed (live ∧ unserved ∧ session-bound).
+        //    coord list missed (live ∧ unserved ∧ session-bound) — but only when
+        //    a record actually exists to read.
         if local_pass_enabled {
             let ids: Vec<SandboxId> = self.device.slots.keys().copied().collect();
             for id in ids {
+                if !self.device.record_present(id) {
+                    continue;
+                }
                 let has_session = self.sandboxes.get(&id).and_then(|s| s.session_id).is_some();
                 if self.device.is_local_survivor_candidate(id, has_session) {
                     self.serve_and_rebuild(id).await?;
                 }
             }
         }
-        // 3. Stale-binding sweep (REAL `sweep_verdict` incl. the #806 holder
-        //    table). A dead-owner device a live guest still holds is PARKed.
-        let parked = self.device.stale_sweep_tick();
-        self.sweep_parked_live.extend(parked);
+        // 3. The Wave 7b classification barrier: reconcile the kernel inventory
+        //    against the records, reap ONLY TerminalSafeToReap. A dead-owner
+        //    device a live guest still holds is ReconnectMe (record) or
+        //    QuarantinedUnknown (no record) — NEITHER reaped (never severed).
+        self.barrier_sweep();
         Ok(())
+    }
+
+    /// Wave 7b (#784 layers 2–3): classify the kernel-derived inventory against
+    /// the records, then reap ONLY the `TerminalSafeToReap` subset via the REAL
+    /// [`DevicePlane::reap_terminal`] (which accepts only a
+    /// [`ReapList`](engram_host_core::ReapList) — the ordering contract). Records
+    /// the parked-live (ReconnectMe ∪ QuarantinedUnknown) + the quarantined
+    /// (record-invisible) sets for the oracles.
+    fn barrier_sweep(&mut self) {
+        let classification = self.device.classify_startup();
+        self.sweep_parked_live
+            .extend(classification.reconnect.iter().copied());
+        self.sweep_parked_live
+            .extend(classification.quarantined.iter().copied());
+        self.quarantined_unknown
+            .extend(classification.quarantined.iter().copied());
+        self.device.reap_terminal(classification.reap);
     }
 
     /// Serve `id`'s device on the current generation (RECONFIGURE) and rebuild
@@ -565,10 +602,33 @@ impl CosimHost {
         self.device.kill_guest(id);
     }
 
-    /// Run the stale-binding sweep independently (REAL `sweep_verdict`).
+    /// Wave 7b (#784 layer 2): lose `id`'s tracked records (#769 gap A) — a
+    /// resident guest holds a device no record accounts for.
+    pub fn lose_record(&mut self, id: SandboxId) {
+        self.device.lose_record(id);
+    }
+
+    /// The operator/runbook reconcile: restore `id`'s record so the next register
+    /// re-serves the reconnectable device with zero loss.
+    pub fn regain_record(&mut self, id: SandboxId) {
+        self.device.regain_record(id);
+    }
+
+    /// Quiescence heal (Wave 7b): restore EVERY device's record — the record-loss
+    /// fault is healed globally at quiescence exactly like every other fault
+    /// (re-served survivors, drained finalizes), so the drain's rehydrate can
+    /// re-serve every survivor and convergence is required against a healed world.
+    pub fn regain_all_records(&mut self) {
+        let ids: Vec<SandboxId> = self.device.slots.keys().copied().collect();
+        for id in ids {
+            self.device.regain_record(id);
+        }
+    }
+
+    /// Run the stale-binding sweep independently, GATED by the Wave 7b
+    /// classification barrier (classify → reap only TerminalSafeToReap).
     pub fn stale_sweep_tick(&mut self) {
-        let parked = self.device.stale_sweep_tick();
-        self.sweep_parked_live.extend(parked);
+        self.barrier_sweep();
     }
 
     /// `try_claim` a spare device on the real allocator (slot-accounting).
@@ -621,6 +681,20 @@ impl CosimHost {
     /// device (#806) — never severed.
     pub fn sweep_parked_live(&self) -> Vec<SandboxId> {
         self.sweep_parked_live.iter().copied().collect()
+    }
+    /// Oracle read (Wave 7b): sandboxes the classification barrier put in
+    /// `QuarantinedUnknown` — a record-invisible live survivor (#769 gap A).
+    pub fn quarantined_unknown(&self) -> Vec<SandboxId> {
+        self.quarantined_unknown.iter().copied().collect()
+    }
+    /// Oracle read (Wave 7b): is `id` a record-invisible resident survivor —
+    /// live, unserved, dead-owner, no record — the gap-A precondition the barrier
+    /// must have QUARANTINED (never left unclassified)?
+    pub fn is_record_invisible_survivor(&self, id: SandboxId) -> bool {
+        self.device.is_resident_survivor(id)
+            && !self.device.served_by_current(id)
+            && self.device.guest_holds_device(id)
+            && !self.device.record_present(id)
     }
 
     /// A unit of guest work: write one real content-tagged chunk (advancing
@@ -818,6 +892,7 @@ impl CosimHost {
         // the whole plane entry down.
         self.device.remove_slot(sandbox_id);
         self.sweep_parked_live.remove(&sandbox_id);
+        self.quarantined_unknown.remove(&sandbox_id);
         let mut view = self.view.inner.lock();
         view.live.remove(&sandbox_id);
         view.bindings.remove(&sandbox_id);

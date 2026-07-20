@@ -1020,6 +1020,89 @@ async fn park_roll_guest_gone_noholder_disconnect_legal_unpause_gate_still_guard
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
 
+/// Wave 7b headline (ADR 0098 §Phase 3, #784 layers 2–3 / #769 gap A): the
+/// startup CLASSIFICATION BARRIER. A parked survivor whose tracked records are
+/// LOST upstream (missing from the coordinator rehydrate list AND its durable
+/// `ChainHeadRecord` gone) rolls with its FC guest still resident and holding
+/// its rootfs device. NEITHER rehydrate pass can re-serve it (both derive from
+/// the lost records). Pre-Wave-7b this reached the sweep as a nameless free-pool
+/// device — under R6 the sweep PARKS it (live holder) but SILENTLY, with no
+/// record-level accounting. Wave 7b reconciles the KERNEL-DERIVED inventory
+/// against the records and QUARANTINES it: classified, alerted
+/// (`rehydrate-unknown-device`), left RECONNECTABLE — never skipped, never
+/// severed. An operator/runbook then reconciles the record and the next register
+/// re-serves with ZERO loss.
+///
+/// Fail-without / pass-with proof: revert the barrier (make `stale_sweep_tick`
+/// the raw R6 sweep that never populates `quarantined_unknown`) and the
+/// `quarantined_unknown.contains(..)` assertion below fails — the survivor was
+/// silently handled, not classified. With the barrier it is classified and the
+/// oracles hold.
+#[tokio::test(start_paused = true)]
+async fn gap_a_record_invisible_survivor_is_quarantined_not_severed_then_recovers_zero_loss() {
+    let mut host = scenario_host(0, 3).await;
+    let sandbox_id = host.sandboxes[0].sandbox_id;
+    // Acked writes on the soon-to-be-invisible survivor.
+    host.guest_write(0, 2).await.unwrap();
+    host.guest_write(0, 6).await.unwrap();
+
+    // Rung-2 park, then the pod roll: the parked VM stays resident and keeps
+    // holding its device; its kernel binding survives at the now-dead generation.
+    host.park(0);
+    host.crash_process().await.unwrap();
+    // The records are LOST upstream (#769 gap A) — the coord list dropped it and
+    // its ChainHeadRecord is gone. The guest is still alive and holding the
+    // device.
+    host.lose_record(0);
+    assert!(
+        host.sandboxes[0].guest_holds_device,
+        "the survivor's FC guest survives the roll and still holds its device",
+    );
+
+    // The coord list OMITS the parked survivor (`coord_includes_parked=false`,
+    // the 731df805 shape) AND the #739 local pass can't read its lost record —
+    // neither pass can re-serve it. The barrier must QUARANTINE it.
+    host.register_rehydrate(false, true).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by, None,
+        "no rehydrate pass could re-serve the record-invisible survivor",
+    );
+    assert!(
+        host.sandboxes[0]
+            .kernel_owner
+            .is_some_and(|g| g < host.generation),
+        "the device is left RECONNECTABLE (kernel binding intact) — never severed",
+    );
+    assert!(
+        host.quarantined_unknown.contains(&sandbox_id),
+        "the barrier CLASSIFIED the survivor as QuarantinedUnknown — not silently \
+         skipped (fail-without: the raw R6 sweep never records this)",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+
+    // The operator/runbook reconcile: the record is restored, and the next
+    // register re-serves the reconnectable device with ZERO loss (the guest kept
+    // reading it the whole time).
+    host.regain_record(0);
+    host.register_rehydrate(true, true).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by,
+        Some(host.generation),
+        "the reconciled record let the reattach re-serve the quarantined device",
+    );
+    assert!(
+        host.unpause(0),
+        "the un-pause serves the live re-served plane"
+    );
+    host.guest_read(0, 2).await.unwrap();
+    host.guest_read(0, 6).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
 /// Scheduler-driven slot accounting (ADR 0098 P7): interleave `SlotClaim`
 /// (Free → Claimed via the real `try_claim`) and `SlotPopulateTick`
 /// (Claimed → Free via the lease `Drop`/`release`) over the REAL allocator,
