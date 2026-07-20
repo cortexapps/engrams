@@ -850,11 +850,15 @@ describe("createSessionForExistingTask", () => {
     );
 
     expect(out).toEqual({ sessionId: "sess-1" });
+    // The effective granted set (profile caps + extras) is persisted on the
+    // task_session so the tool-exec gate honors it — the profile itself has no
+    // capabilities here, yet the session carries the extra grant.
     expect(records).toEqual([{
       taskId: "task-existing",
       sessionId: "sess-1",
       role: "finder",
       profileId: "p1",
+      capabilities: ["github:contents:read@openai/engrams"],
     }]);
     const request = sessions.createReqs[0] as {
       prompt?: string;
@@ -887,6 +891,7 @@ describe("createSessionForExistingTask", () => {
         sessionId: "sess-1",
         role: "verifier",
         profileId: "p1",
+        capabilities: [],
       },
       { sessionId: "sess-1" },
     ]);

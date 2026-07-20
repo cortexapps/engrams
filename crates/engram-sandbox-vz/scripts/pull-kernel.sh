@@ -31,8 +31,15 @@ KERNEL_ASSET="${ENGRAM_VZ_KERNEL_ASSET:-Image-engram-6.1.102-1}"
 
 mkdir -p "${CACHE_DIR}"
 
-if [ -s "${DST}" ]; then
-    echo "kernel already cached at ${DST}"
+# Cache hit requires the stamp to match the pinned TAG/ASSET — a bare
+# "file exists" check kept serving the retired Kata kernel (no squashfs)
+# after ADR 0096 moved bundles to squashfs, and every VZ guest panicked
+# with "no agentd bundle mounted" (2026-07-18). A pre-stamp cache file
+# (no stamp sidecar) is treated as stale and re-fetched.
+STAMP="${DST}.release"
+WANT_RELEASE="${KERNEL_TAG}/${KERNEL_ASSET}"
+if [ -s "${DST}" ] && [ "$(cat "${STAMP}" 2>/dev/null)" = "${WANT_RELEASE}" ]; then
+    echo "kernel already cached at ${DST} (${WANT_RELEASE})"
     ls -lh "${DST}"
     exit 0
 fi
@@ -52,5 +59,6 @@ if [ "$want" != "$got" ]; then
 fi
 rm -f "${DST}.sha256.tmp"
 mv "${DST}.tmp" "${DST}"
+printf '%s' "${WANT_RELEASE}" > "${STAMP}"
 echo "cached ${DST}"
 ls -lh "${DST}"

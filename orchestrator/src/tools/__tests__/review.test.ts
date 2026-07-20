@@ -32,6 +32,9 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     trigger: "dispatch",
     status: "finding",
     githubReviewId: null,
+    statusCommentId: null,
+    finderSessionId: null,
+    verifierSessionId: null,
     summaryMd: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
@@ -108,6 +111,12 @@ function fakeReviewStore(options: {
     },
     async setFinderSummary(reviewId, summaryMd) {
       summaries.push({ reviewId, summaryMd });
+    },
+    async setStatusCommentId() {},
+    async setReviewSessionId() {},
+    async recordEvent() {},
+    async listEvents() {
+      return [];
     },
     async updateReviewStatus() {},
     async updateFindingState() {},
