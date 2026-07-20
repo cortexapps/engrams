@@ -787,7 +787,15 @@ service → generated connectquery client → hook → page):
   a changed graph. (This leaves the standing computed-hash trade-off: a graph
   change rotates the version and strands in-flight reviews until drained — the
   broader fix is explicit `applicationVersion` / DBOS patching, tracked
-  separately.)
+  separately.) The step vocabulary is kept deliberately coarse so the body reads
+  as a short sequence of high-level steps: each terminal or phase-boundary action
+  is one control-plane step that folds in the worker teardown — `failReview` /
+  `haltReview` (best-effort teardown + status change, with the reason recorded on
+  the activity log), `concludeFinderPhase` (retire the finder + report its
+  candidate count), and `postReviewResults` (retire the verifier + post). Phase
+  *setup* stays three granular steps (create/bootstrap/prompt) on purpose — those
+  are distinct, expensive, non-idempotent checkpoints, and collapsing them would
+  re-create sessions or re-clone on crash recovery.
 - **No in-workflow retry (supersedes the "session dies" retry-once above).** A
   dead/errored phase marks the review `failed` immediately. Re-running is an
   explicit `ReviewService.RetryReview` RPC (the `/reviews` **Retry** button) or

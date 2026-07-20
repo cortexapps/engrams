@@ -1,52 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
-import type { ReviewDetail } from "../../db/reviews.ts";
 import type { ReviewControlPlane } from "../review-control-plane.ts";
 import type { ReviewInbox } from "../review-inbox.ts";
 import { prReviewWorkflowImpl, type StepRunner } from "../pr-review.ts";
-
-const candidateDetail: ReviewDetail = {
-  review: {
-    id: "review-1",
-    repo: "openai/engrams",
-    prNumber: 100,
-    taskId: "task-1",
-    headSha: "head-sha",
-    baseSha: "",
-    trigger: "opened",
-    status: "finding",
-    githubReviewId: null,
-    statusCommentId: null,
-    finderSessionId: null,
-    verifierSessionId: null,
-    summaryMd: null,
-    createdAt: new Date(0),
-    updatedAt: new Date(0),
-  },
-  findings: [{
-    id: "finding-1",
-    reviewId: "review-1",
-    path: "src/index.ts",
-    startLine: 10,
-    endLine: 10,
-    side: "RIGHT",
-    category: "functional-correctness",
-    severity: "high",
-    confidence: "high",
-    title: "Wrong result",
-    bodyMd: "The result is wrong.",
-    suggestedFix: null,
-    evidence: ["src/index.ts"],
-    state: "candidate",
-    verdictReason: null,
-    githubThreadId: null,
-    resolution: null,
-    sessionId: "finder-session",
-    toolCallId: "finding-call-1",
-    createdAt: new Date(0),
-  }],
-  verdicts: [],
-};
 
 const trigger: ReviewInbox = {
   kind: "trigger",
@@ -65,14 +21,14 @@ function fakeControlPlane(
     createFinderSession: async () => ({ sessionId: "finder-session" }),
     bootstrapFinderSession: async () => {},
     sendFinderPrompt: async () => {},
-    getReview: async () => candidateDetail,
+    // One candidate by default → the finder hands off to a verifier.
+    concludeFinderPhase: async () => ({ candidateCount: 1 }),
     createVerifierSession: async () => ({ sessionId: "verifier-session" }),
     bootstrapVerifierSession: async () => {},
     sendVerifierPrompt: async () => {},
-    deleteReviewSession: async () => {},
     postReviewResults: async () => {},
-    markReviewFailed: async () => {},
-    markReviewHalted: async () => {},
+    failReview: async () => {},
+    haltReview: async () => {},
     ...overrides,
   };
 }
@@ -100,180 +56,119 @@ async function run(
 }
 
 describe("PrReviewWorkflow", () => {
-  test("dedupes completion signals while deleting each worker and advancing phases", async () => {
+  test("dedupes completion signals and advances finder → verifier → post", async () => {
     const calls: Array<{ name: string; input?: unknown }> = [];
     const steps = runner();
     const cp = fakeControlPlane({
-      async ensureReviewRecord(input) {
-        calls.push({ name: "ensureReviewRecord", input });
-        return { reviewId: "review-1", taskId: "task-1" };
-      },
       async createFinderSession(input) {
         calls.push({ name: "createFinderSession", input });
         return { sessionId: "finder-session" };
       },
-      async bootstrapFinderSession(sessionId, input) {
-        calls.push({ name: "bootstrapFinderSession", input: { sessionId, ...input } });
-      },
-      async sendFinderPrompt(sessionId, input) {
-        calls.push({ name: "sendFinderPrompt", input: { sessionId, ...input } });
-      },
-      async deleteReviewSession(sessionId) {
-        calls.push({ name: "deleteReviewSession", input: sessionId });
-      },
-      async getReview(reviewId) {
-        calls.push({ name: "getReview", input: reviewId });
-        return candidateDetail;
+      async concludeFinderPhase(reviewId, opts) {
+        calls.push({ name: "concludeFinderPhase", input: { reviewId, ...opts } });
+        return { candidateCount: 1 };
       },
       async createVerifierSession(input) {
         calls.push({ name: "createVerifierSession", input });
         return { sessionId: "verifier-session" };
       },
-      async bootstrapVerifierSession(sessionId, input) {
-        calls.push({ name: "bootstrapVerifierSession", input: { sessionId, ...input } });
-      },
-      async sendVerifierPrompt(sessionId, input) {
-        calls.push({ name: "sendVerifierPrompt", input: { sessionId, ...input } });
-      },
-      async postReviewResults(reviewId) {
-        calls.push({ name: "postReviewResults", input: reviewId });
+      async postReviewResults(reviewId, opts) {
+        calls.push({ name: "postReviewResults", input: { reviewId, ...opts } });
       },
     });
 
     await run(cp, [
       trigger,
-      {
-        kind: "phase_done",
-        role: "finder",
-      },
-      {
-        kind: "session_idle",
-        role: "finder",
-      },
-      {
-        kind: "phase_done",
-        role: "verifier",
-      },
+      { kind: "phase_done", role: "finder" },
+      // A duplicate finder completion must be ignored.
+      { kind: "session_idle", role: "finder" },
+      { kind: "phase_done", role: "verifier" },
     ], steps.step);
 
-    expect(calls.map((call) => call.name)).toEqual([
-      "ensureReviewRecord",
-      "createFinderSession",
-      "bootstrapFinderSession",
-      "sendFinderPrompt",
-      "deleteReviewSession",
-      "getReview",
-      "createVerifierSession",
-      "bootstrapVerifierSession",
-      "sendVerifierPrompt",
-      "deleteReviewSession",
-      "postReviewResults",
-    ]);
     expect(steps.steps).toEqual([
       "resolvePrHeads",
       "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
       "sendFinderPrompt",
-      "deleteReviewSession",
-      "getReviewAfterFinder",
+      "concludeFinderPhase",
       "createVerifierSession",
       "bootstrapVerifierSession",
       "sendVerifierPrompt",
-      "deleteReviewSession",
       "postReviewResults",
     ]);
-    expect(calls.find((call) => call.name === "createFinderSession")?.input)
+    // The finder session is retired via concludeFinderPhase; the verifier
+    // session is retired inside postReviewResults.
+    expect(calls.find((c) => c.name === "concludeFinderPhase")?.input)
+      .toEqual({ reviewId: "review-1", sessionId: "finder-session" });
+    expect(calls.find((c) => c.name === "postReviewResults")?.input)
+      .toEqual({ reviewId: "review-1", sessionId: "verifier-session" });
+    expect(calls.find((c) => c.name === "createFinderSession")?.input)
       .toMatchObject({ workflowId: "review-wf-1" });
-    expect(calls.find((call) => call.name === "createVerifierSession")?.input)
+    expect(calls.find((c) => c.name === "createVerifierSession")?.input)
       .toMatchObject({ workflowId: "review-wf-1" });
   });
 
   test("finder completion with zero candidates posts and returns without a verifier", async () => {
-    const calls: string[] = [];
+    const created: string[] = [];
     const steps = runner();
     const cp = fakeControlPlane({
+      concludeFinderPhase: async () => ({ candidateCount: 0 }),
       createVerifierSession: async () => {
-        calls.push("createVerifierSession");
+        created.push("verifier");
         return { sessionId: "unexpected" };
-      },
-      getReview: async () => ({ ...candidateDetail, findings: [] }),
-      postReviewResults: async () => {
-        calls.push("postReviewResults");
       },
     });
 
     await run(cp, [
       trigger,
-      {
-        kind: "session_ended",
-        role: "finder",
-        sessionId: "finder-session",
-        outcome: "completed",
-      },
+      { kind: "session_ended", role: "finder", sessionId: "finder-session", outcome: "completed" },
     ], steps.step);
 
-    expect(calls).toEqual(["postReviewResults"]);
-    expect(steps.steps).toContain("getReviewAfterFinder");
-    expect(steps.steps).toContain("deleteReviewSession");
+    expect(created).toEqual([]);
+    expect(steps.steps).toContain("concludeFinderPhase");
     expect(steps.steps).not.toContain("createVerifierSession");
     expect(steps.steps.at(-1)).toBe("postReviewResults");
   });
 
-  test("a failed finder session marks the review failed with no retry", async () => {
+  test("a failed finder session fails the review in one step, no retry", async () => {
     let finderCreates = 0;
-    let markedFailed = 0;
+    const failed: Array<{ reviewId: string; opts?: unknown }> = [];
     const steps = runner();
     const cp = fakeControlPlane({
-      createFinderSession: async () => ({
-        sessionId: `finder-session-${++finderCreates}`,
-      }),
-      markReviewFailed: async () => {
-        markedFailed++;
+      createFinderSession: async () => ({ sessionId: `finder-session-${++finderCreates}` }),
+      failReview: async (reviewId, opts) => {
+        failed.push({ reviewId, opts });
       },
     });
 
-    // A second message is queued to prove the workflow returns after the first
-    // failure and never consumes it (no retry).
+    // A second failure is queued to prove the workflow returns without a retry.
     await run(cp, [
       trigger,
-      {
-        kind: "session_ended",
-        role: "finder",
-        sessionId: "finder-session-1",
-        outcome: "failed",
-      },
-      {
-        kind: "session_ended",
-        role: "finder",
-        sessionId: "finder-session-2",
-        outcome: "failed",
-      },
+      { kind: "session_ended", role: "finder", sessionId: "finder-session-1", outcome: "failed" },
+      { kind: "session_ended", role: "finder", sessionId: "finder-session-2", outcome: "failed" },
     ], steps.step);
 
     expect(finderCreates).toBe(1);
-    expect(markedFailed).toBe(1);
-    expect(steps.steps.filter((name) => name === "createFinderSession")).toHaveLength(1);
-    expect(steps.steps.slice(-2)).toEqual(["deleteReviewSession", "markReviewFailed"]);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.opts).toMatchObject({ sessionId: "finder-session-1" });
+    expect(steps.steps.at(-1)).toBe("failReview");
+    expect(steps.steps).not.toContain("createVerifierSession");
   });
 
-  test("a failed finder run (idle+runFailed) marks failed, never posting", async () => {
-    let finderCreates = 0;
-    let markedFailed = 0;
+  test("a failed finder run (idle+runFailed) fails, never posting", async () => {
+    let failedCount = 0;
     let posted = 0;
     const steps = runner();
     const cp = fakeControlPlane({
-      createFinderSession: async () => ({
-        sessionId: `finder-session-${++finderCreates}`,
-      }),
-      // An empty review would post "no findings" on a CLEAN idle — prove the
-      // errored run never reaches that path.
-      getReview: async () => ({ ...candidateDetail, findings: [] }),
+      // A zero-candidate conclude would post "no findings" — prove the errored
+      // run never reaches conclude/post at all.
+      concludeFinderPhase: async () => ({ candidateCount: 0 }),
       postReviewResults: async () => {
         posted++;
       },
-      markReviewFailed: async () => {
-        markedFailed++;
+      failReview: async () => {
+        failedCount++;
       },
     });
 
@@ -282,24 +177,24 @@ describe("PrReviewWorkflow", () => {
       { kind: "session_idle", role: "finder", runFailed: true },
     ], steps.step);
 
-    expect(finderCreates).toBe(1);
-    expect(markedFailed).toBe(1);
+    expect(failedCount).toBe(1);
     expect(posted).toBe(0);
+    expect(steps.steps).not.toContain("concludeFinderPhase");
     expect(steps.steps).not.toContain("postReviewResults");
-    expect(steps.steps.at(-1)).toBe("markReviewFailed");
+    expect(steps.steps.at(-1)).toBe("failReview");
   });
 
   test("a clean finder run with zero candidates still posts (idle without runFailed)", async () => {
     let posted = 0;
-    let markedFailed = 0;
+    let failedCount = 0;
     const steps = runner();
     const cp = fakeControlPlane({
-      getReview: async () => ({ ...candidateDetail, findings: [] }),
+      concludeFinderPhase: async () => ({ candidateCount: 0 }),
       postReviewResults: async () => {
         posted++;
       },
-      markReviewFailed: async () => {
-        markedFailed++;
+      failReview: async () => {
+        failedCount++;
       },
     });
 
@@ -309,181 +204,134 @@ describe("PrReviewWorkflow", () => {
     ], steps.step);
 
     expect(posted).toBe(1);
-    expect(markedFailed).toBe(0);
+    expect(failedCount).toBe(0);
     expect(steps.steps.at(-1)).toBe("postReviewResults");
   });
 
   test("verifier completion posts once and returns cleanly", async () => {
-    let verifierPrompts = 0;
     let posted = 0;
-    let markedFailed = 0;
+    let failedCount = 0;
     const steps = runner();
     const cp = fakeControlPlane({
-      sendVerifierPrompt: async () => {
-        verifierPrompts++;
-      },
       postReviewResults: async () => {
         posted++;
       },
-      markReviewFailed: async () => {
-        markedFailed++;
+      failReview: async () => {
+        failedCount++;
       },
     });
 
     await run(cp, [
       trigger,
-      {
-        kind: "session_ended",
-        role: "finder",
-        sessionId: "finder-session",
-        outcome: "completed",
-      },
-      {
-        kind: "session_ended",
-        role: "verifier",
-        sessionId: "verifier-session",
-        outcome: "completed",
-      },
+      { kind: "session_ended", role: "finder", sessionId: "finder-session", outcome: "completed" },
+      { kind: "session_ended", role: "verifier", sessionId: "verifier-session", outcome: "completed" },
     ], steps.step);
 
-    expect(verifierPrompts).toBe(1);
     expect(posted).toBe(1);
-    expect(markedFailed).toBe(0);
+    expect(failedCount).toBe(0);
     expect(steps.steps.at(-1)).toBe("postReviewResults");
   });
 
-  test("a posting failure marks the review failed", async () => {
-    let markedFailed = 0;
+  test("a posting failure fails the review", async () => {
+    let failedCount = 0;
     const steps = runner();
     const cp = fakeControlPlane({
       postReviewResults: async () => {
         throw new Error("GitHub unavailable");
       },
-      markReviewFailed: async () => {
-        markedFailed++;
+      failReview: async () => {
+        failedCount++;
       },
     });
 
     await run(cp, [
       trigger,
-      {
-        kind: "session_ended",
-        role: "finder",
-        sessionId: "finder-session",
-        outcome: "completed",
-      },
-      {
-        kind: "session_ended",
-        role: "verifier",
-        sessionId: "verifier-session",
-        outcome: "completed",
-      },
+      { kind: "session_ended", role: "finder", sessionId: "finder-session", outcome: "completed" },
+      { kind: "session_ended", role: "verifier", sessionId: "verifier-session", outcome: "completed" },
     ], steps.step);
 
-    expect(markedFailed).toBe(1);
-    expect(steps.steps.slice(-2)).toEqual([
-      "postReviewResults",
-      "markReviewFailed",
-    ]);
+    expect(failedCount).toBe(1);
+    expect(steps.steps.slice(-2)).toEqual(["postReviewResults", "failReview"]);
   });
 
-  test("a failed verifier session marks the review failed with no retry", async () => {
+  test("a failed verifier session fails the review in one step, no retry", async () => {
     let verifierCreates = 0;
-    let markedFailed = 0;
+    let failedCount = 0;
     const steps = runner();
     const cp = fakeControlPlane({
-      createVerifierSession: async () => ({
-        sessionId: `verifier-session-${++verifierCreates}`,
-      }),
-      markReviewFailed: async () => {
-        markedFailed++;
+      createVerifierSession: async () => ({ sessionId: `verifier-session-${++verifierCreates}` }),
+      failReview: async () => {
+        failedCount++;
       },
     });
 
     await run(cp, [
       trigger,
-      {
-        kind: "session_ended",
-        role: "finder",
-        sessionId: "finder-session",
-        outcome: "completed",
-      },
-      {
-        kind: "session_ended",
-        role: "verifier",
-        sessionId: "verifier-session-1",
-        outcome: "neutral",
-      },
+      { kind: "session_ended", role: "finder", sessionId: "finder-session", outcome: "completed" },
+      { kind: "session_ended", role: "verifier", sessionId: "verifier-session-1", outcome: "neutral" },
     ], steps.step);
 
     expect(verifierCreates).toBe(1);
-    expect(markedFailed).toBe(1);
-    expect(steps.steps.filter((name) => name === "createVerifierSession"))
-      .toHaveLength(1);
-    expect(steps.steps.at(-1)).toBe("markReviewFailed");
+    expect(failedCount).toBe(1);
+    expect(steps.steps.at(-1)).toBe("failReview");
   });
 
-  test("stop marks the active review halted", async () => {
-    const halted: Array<[string, number]> = [];
+  test("stop halts the review in one step", async () => {
+    const halted: Array<{ reviewId: string; opts?: unknown }> = [];
     const steps = runner();
     const cp = fakeControlPlane({
-      markReviewHalted: async (repo, prNumber) => {
-        halted.push([repo, prNumber]);
+      haltReview: async (reviewId, opts) => {
+        halted.push({ reviewId, opts });
       },
     });
 
     await run(cp, [trigger, { kind: "stop" }], steps.step);
 
-    expect(halted).toEqual([["openai/engrams", 100]]);
-    expect(steps.steps).toContain("deleteReviewSession");
-    expect(steps.steps.at(-1)).toBe("markReviewHalted");
+    expect(halted).toEqual([
+      { reviewId: "review-1", opts: { sessionId: "finder-session" } },
+    ]);
+    expect(steps.steps.at(-1)).toBe("haltReview");
+    expect(steps.steps).not.toContain("deleteReviewSession");
   });
 
-  test("marks the review failed after a phase receive-window timeout", async () => {
-    let markedFailed = 0;
-    const deleted: string[] = [];
+  test("fails the review after a phase receive-window timeout", async () => {
+    const failed: Array<{ reviewId: string; opts?: unknown }> = [];
     const steps = runner();
     const cp = fakeControlPlane({
-      deleteReviewSession: async (sessionId) => {
-        deleted.push(sessionId);
-      },
-      markReviewFailed: async () => {
-        markedFailed++;
+      failReview: async (reviewId, opts) => {
+        failed.push({ reviewId, opts });
       },
     });
 
     await run(cp, [trigger, null], steps.step);
 
-    expect(deleted).toEqual(["finder-session"]);
-    expect(markedFailed).toBe(1);
-    expect(steps.steps.slice(-2)).toEqual([
-      "deleteReviewSession",
-      "markReviewFailed",
-    ]);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.opts).toMatchObject({ sessionId: "finder-session" });
+    expect(steps.steps.at(-1)).toBe("failReview");
   });
 
-  test("marks the review failed when initial finder setup throws", async () => {
-    let markedFailed = 0;
+  test("fails the review when initial finder setup throws", async () => {
+    const failed: Array<{ reviewId: string; opts?: unknown }> = [];
     const steps = runner();
     const cp = fakeControlPlane({
       bootstrapFinderSession: async () => {
         throw new Error("clone failed");
       },
-      markReviewFailed: async () => {
-        markedFailed++;
+      failReview: async (reviewId, opts) => {
+        failed.push({ reviewId, opts });
       },
     });
 
     await run(cp, [trigger], steps.step);
 
-    expect(markedFailed).toBe(1);
+    expect(failed).toHaveLength(1);
+    expect(failed[0]?.opts).toMatchObject({ sessionId: "finder-session" });
     expect(steps.steps).toEqual([
       "resolvePrHeads",
       "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
-      "deleteReviewSession",
-      "markReviewFailed",
+      "failReview",
     ]);
   });
 });

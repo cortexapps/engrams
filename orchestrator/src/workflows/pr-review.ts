@@ -101,7 +101,10 @@ export async function prReviewWorkflowImpl(
       }),
       "ensureReviewRecord",
     );
-    await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+    await step(
+      () => cp.failReview(reviewId, { reason: "head resolution failed" }),
+      "failReview",
+    );
     return;
   }
 
@@ -161,25 +164,6 @@ export async function prReviewWorkflowImpl(
   const sessionIdFor = (role: string): string | undefined =>
     role === "finder" ? finderSessionId : verifierSessionId;
 
-  const teardownWorker = async (role: Role): Promise<void> => {
-    const sessionId = sessionIdFor(role);
-    if (sessionId === undefined) return;
-    await step(() => cp.deleteReviewSession(sessionId), "deleteReviewSession");
-    if (role === "finder") finderSessionId = undefined;
-    else verifierSessionId = undefined;
-  };
-
-  const teardownWorkerBestEffort = async (role: Role): Promise<void> => {
-    try {
-      await teardownWorker(role);
-    } catch (err) {
-      log.error(
-        { repo: first.repo, prNumber: first.prNumber, role, err },
-        "review worker cleanup failed",
-      );
-    }
-  };
-
   try {
     await setupPhase("finder");
   } catch (err) {
@@ -187,8 +171,10 @@ export async function prReviewWorkflowImpl(
       { repo: first.repo, prNumber: first.prNumber, err },
       "finder setup failed",
     );
-    await teardownWorkerBestEffort("finder");
-    await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+    await step(
+      () => cp.failReview(reviewId, { sessionId: finderSessionId, reason: "finder setup failed" }),
+      "failReview",
+    );
     return;
   }
 
@@ -202,21 +188,24 @@ export async function prReviewWorkflowImpl(
 
     if (message === null) {
       // The active worker went silent for a full receive window. There is no
-      // in-workflow retry: mark failed and stop. Re-running a review is an
-      // explicit action (the /reviews retry button / dispatch endpoint), which
-      // mints a fresh review record + workflow epoch.
-      log.error(
-        { repo: first.repo, prNumber: first.prNumber, role: activeRole, deadlineSeconds: RECV_TIMEOUT_S },
-        "review phase deadline expired",
+      // in-workflow retry: tear it down and mark failed in one step. Re-running
+      // a review is an explicit action (the /reviews retry button / dispatch
+      // endpoint), which mints a fresh review record + workflow epoch.
+      await step(
+        () => cp.failReview(reviewId, {
+          sessionId: sessionIdFor(activeRole),
+          reason: `${activeRole} phase deadline expired`,
+        }),
+        "failReview",
       );
-      await teardownWorkerBestEffort(activeRole);
-      await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
       return;
     }
 
     if (message.kind === "stop") {
-      await teardownWorkerBestEffort(activeRole);
-      await step(() => cp.markReviewHalted(first.repo, first.prNumber), "markReviewHalted");
+      await step(
+        () => cp.haltReview(reviewId, { sessionId: sessionIdFor(activeRole) }),
+        "haltReview",
+      );
       return;
     }
 
@@ -248,8 +237,13 @@ export async function prReviewWorkflowImpl(
           && message.outcome !== "completed"
           && message.sessionId === sessionIdFor(activeRole)));
     if (phaseFailed) {
-      await teardownWorkerBestEffort(activeRole);
-      await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      await step(
+        () => cp.failReview(reviewId, {
+          sessionId: sessionIdFor(activeRole),
+          reason: `${activeRole} phase failed`,
+        }),
+        "failReview",
+      );
       return;
     }
 
@@ -274,12 +268,13 @@ export async function prReviewWorkflowImpl(
       if (finderDone) continue;
       finderDone = true;
       try {
-        await teardownWorker("finder");
-        const detail = await step(() => cp.getReview(reviewId), "getReviewAfterFinder");
-        if (!detail) throw new Error(`review not found: ${reviewId}`);
-        const candidateCount = detail.findings.filter(
-          (finding) => finding.state === "candidate",
-        ).length;
+        // Retire the finder and read its candidate count in one step; with no
+        // candidates there is nothing to verify, so post straight away.
+        const { candidateCount } = await step(
+          () => cp.concludeFinderPhase(reviewId, { sessionId: finderSessionId }),
+          "concludeFinderPhase",
+        );
+        finderSessionId = undefined;
         if (candidateCount === 0) {
           await step(() => cp.postReviewResults(reviewId), "postReviewResults");
           return;
@@ -290,7 +285,10 @@ export async function prReviewWorkflowImpl(
           { repo: first.repo, prNumber: first.prNumber, err },
           "verifier setup failed",
         );
-        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+        await step(
+          () => cp.failReview(reviewId, { sessionId: verifierSessionId, reason: "verifier setup failed" }),
+          "failReview",
+        );
         return;
       }
       continue;
@@ -300,14 +298,21 @@ export async function prReviewWorkflowImpl(
       if (!finderDone || verifierDone) continue;
       verifierDone = true;
       try {
-        await teardownWorker("verifier");
-        await step(() => cp.postReviewResults(reviewId), "postReviewResults");
+        // Retire the verifier and post in one step.
+        await step(
+          () => cp.postReviewResults(reviewId, { sessionId: verifierSessionId }),
+          "postReviewResults",
+        );
+        verifierSessionId = undefined;
       } catch (err) {
         log.error(
           { repo: first.repo, prNumber: first.prNumber, err },
           "review posting failed",
         );
-        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+        await step(
+          () => cp.failReview(reviewId, { reason: "posting failed" }),
+          "failReview",
+        );
       }
       return;
     }

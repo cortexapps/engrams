@@ -15,42 +15,12 @@ import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
 import { checkDb } from "../../db/client.ts";
-import type {
-  ReviewDetail,
-  ReviewFindingRow,
-} from "../../db/reviews.ts";
 import type { ReviewControlPlane } from "../review-control-plane.ts";
 import { prReviewWorkflow, setReviewControlPlane } from "../pr-review.ts";
 import { REVIEW_TOPIC, type ReviewInbox } from "../review-inbox.ts";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 const dbReachable = DB_URL ? await checkDb() : false;
-
-function candidateFinding(index: number): ReviewFindingRow {
-  return {
-    id: `f${index}`, reviewId: "rev-1", path: "src/index.ts",
-    startLine: 1, endLine: 1, side: "RIGHT",
-    category: "functional-correctness", severity: "high", confidence: "high",
-    title: "candidate", bodyMd: "body", suggestedFix: null,
-    evidence: ["src/index.ts"], state: "candidate", verdictReason: null,
-    githubThreadId: null, resolution: null,
-    sessionId: "finder-1", toolCallId: `call-${index}`, createdAt: new Date(0),
-  };
-}
-
-function reviewDetail(candidateCount: number): ReviewDetail {
-  return {
-    review: {
-      id: "rev-1", repo: "acme/repo", prNumber: 7, taskId: "task-1",
-      headSha: "h", baseSha: "b", trigger: "opened", status: "finding",
-      githubReviewId: null, statusCommentId: null, finderSessionId: null,
-      verifierSessionId: null, summaryMd: null,
-      createdAt: new Date(0), updatedAt: new Date(0),
-    },
-    findings: Array.from({ length: candidateCount }, (_, i) => candidateFinding(i)),
-    verdicts: [],
-  };
-}
 
 /** A control plane that records the method call order and returns canned data;
  *  `candidateCount` drives whether the finder hands off to a verifier. */
@@ -62,21 +32,19 @@ function recordingControlPlane(
     calls.push(name);
     return value;
   };
-  const detail = reviewDetail(candidateCount);
   return {
     resolvePrHeads: async () => rec("resolvePrHeads", { headSha: "h", baseSha: "b" }),
     ensureReviewRecord: async () => rec("ensureReviewRecord", { reviewId: "rev-1", taskId: "task-1" }),
     createFinderSession: async () => rec("createFinderSession", { sessionId: "finder-1" }),
     bootstrapFinderSession: async () => { rec("bootstrapFinderSession", undefined); },
     sendFinderPrompt: async () => { rec("sendFinderPrompt", undefined); },
-    getReview: async () => rec("getReview", detail),
+    concludeFinderPhase: async () => rec("concludeFinderPhase", { candidateCount }),
     createVerifierSession: async () => rec("createVerifierSession", { sessionId: "verifier-1" }),
     bootstrapVerifierSession: async () => { rec("bootstrapVerifierSession", undefined); },
     sendVerifierPrompt: async () => { rec("sendVerifierPrompt", undefined); },
-    deleteReviewSession: async () => { rec("deleteReviewSession", undefined); },
     postReviewResults: async () => { rec("postReviewResults", undefined); },
-    markReviewFailed: async () => { rec("markReviewFailed", undefined); },
-    markReviewHalted: async () => { rec("markReviewHalted", undefined); },
+    failReview: async () => { rec("failReview", undefined); },
+    haltReview: async () => { rec("haltReview", undefined); },
   };
 }
 
@@ -125,9 +93,9 @@ describe.skipIf(!dbReachable)("PrReviewWorkflow (real DBOS engine)", () => {
     expect(calls).toEqual([
       "resolvePrHeads", "ensureReviewRecord",
       "createFinderSession", "bootstrapFinderSession", "sendFinderPrompt",
-      "deleteReviewSession", "getReview",
+      "concludeFinderPhase",
       "createVerifierSession", "bootstrapVerifierSession", "sendVerifierPrompt",
-      "deleteReviewSession", "postReviewResults",
+      "postReviewResults",
     ]);
   }, 60_000);
 
@@ -150,10 +118,10 @@ describe.skipIf(!dbReachable)("PrReviewWorkflow (real DBOS engine)", () => {
       trigger,
       { kind: "session_ended", role: "finder", sessionId: "finder-1", outcome: "failed" },
     ]);
-    // The workflow returns normally (SUCCESS) after marking the review failed;
-    // it does not spin up a replacement finder or a verifier.
+    // The workflow returns normally (SUCCESS) after failing the review; it does
+    // not spin up a replacement finder or a verifier.
     expect(status).toBe("SUCCESS");
-    expect(calls).toContain("markReviewFailed");
+    expect(calls).toContain("failReview");
     expect(calls.filter((c) => c === "createFinderSession")).toHaveLength(1);
     expect(calls).not.toContain("createVerifierSession");
   }, 60_000);

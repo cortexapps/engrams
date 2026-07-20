@@ -273,7 +273,7 @@ describe("ReviewControlPlane", () => {
       taskId: "task-new",
       status: "queued",
     }]);
-    await cp.markReviewHalted(active.repo, active.prNumber);
+    await cp.haltReview("review-new");
     expect(statuses).toEqual([["review-new", "halted"]]);
   });
 
@@ -521,18 +521,22 @@ describe("ReviewControlPlane", () => {
     ]);
   });
 
-  test("deletes a worker session and removes its review binding", async () => {
+  test("failReview tears down the worker session and removes its review binding", async () => {
     const sessions = fakeSessions();
     const reviewSessions = reviewSessionRecorder();
-    const cp = makeReviewControlPlane({ sessions, reviewSessions });
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviewSessions,
+      reviews: { ...reviewStoreStub, getReview: async () => null },
+    });
 
-    await cp.deleteReviewSession("review-session");
+    await cp.failReview("review-1", { sessionId: "review-session" });
 
     expect(sessions.deletedIds).toEqual(["review-session"]);
     expect(reviewSessions.removes).toEqual(["review-session"]);
   });
 
-  test("removes the binding when the worker session is already absent", async () => {
+  test("failReview still settles when the worker session is already absent", async () => {
     const sessions = {
       ...fakeSessions(),
       deleteSession: async () => {
@@ -540,9 +544,14 @@ describe("ReviewControlPlane", () => {
       },
     };
     const reviewSessions = reviewSessionRecorder();
-    const cp = makeReviewControlPlane({ sessions, reviewSessions });
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviewSessions,
+      reviews: { ...reviewStoreStub, getReview: async () => null },
+    });
 
-    await expect(cp.deleteReviewSession("review-session")).resolves.toBeUndefined();
+    await expect(cp.failReview("review-1", { sessionId: "review-session" }))
+      .resolves.toBeUndefined();
     expect(reviewSessions.removes).toEqual(["review-session"]);
   });
 
