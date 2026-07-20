@@ -118,6 +118,8 @@ export interface ReviewStore {
   getActiveReviewForTask(taskId: string): Promise<ReviewRow | null>;
   getActiveReviewForPr(repo: string, prNumber: number): Promise<ReviewRow | null>;
   insertFinding(input: ReviewFindingInput): Promise<{ id: string; replayed: boolean }>;
+  /** Number of findings recorded for a review — used to enforce the per-review cap. */
+  countFindings(reviewId: string): Promise<number>;
   insertVerdict(input: ReviewVerdictInput): Promise<{ id: string; replayed: boolean }>;
   recordEvent(reviewId: string, kind: string, detail?: string): Promise<void>;
   listEvents(reviewId: string): Promise<ReviewEventRow[]>;
@@ -129,6 +131,13 @@ export interface ReviewStore {
     sessionId: string,
   ): Promise<void>;
   updateReviewStatus(reviewId: string, status: string): Promise<void>;
+  /**
+   * Remove every candidate finding a specific worker session persisted. Used
+   * when a failed finder attempt is retried under a fresh session id — its
+   * candidates would otherwise re-insert as new rows (dedup is keyed on
+   * session_id + tool_call_id) and post twice.
+   */
+  deleteFindingsForSession(reviewId: string, sessionId: string): Promise<void>;
   updateFindingState(
     findingId: string,
     state: string,
@@ -347,6 +356,14 @@ export function makeReviewStore(
       return { id: existing[0].id, replayed: true };
     },
 
+    async countFindings(reviewId) {
+      const rows = await db
+        .select({ count: sql<number>`count(*)::int` })
+        .from(findingTable)
+        .where(eq(findingTable.reviewId, reviewId));
+      return rows[0]?.count ?? 0;
+    },
+
     async insertVerdict(input) {
       // Either replay anchor may conflict: the tool call itself, or the
       // finding's first-write-wins verdict constraint.
@@ -419,6 +436,17 @@ export function makeReviewStore(
         .update(reviewTable)
         .set({ ...column, updatedAt: new Date() })
         .where(eq(reviewTable.id, reviewId));
+    },
+
+    async deleteFindingsForSession(reviewId, sessionId) {
+      await db
+        .delete(findingTable)
+        .where(
+          and(
+            eq(findingTable.reviewId, reviewId),
+            eq(findingTable.sessionId, sessionId),
+          ),
+        );
     },
 
     async updateReviewStatus(reviewId, status) {

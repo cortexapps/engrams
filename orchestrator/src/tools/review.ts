@@ -46,6 +46,23 @@ const NOT_VERIFYING_PHASE: ToolProtocolError = {
   error: "review is not in the verifying phase",
 };
 
+// Bounds on submitted findings. A runaway or prompt-injected finder must not be
+// able to flood the record or produce a body that blows GitHub's 65,536-char
+// comment limit (which would 422 the batch and oversize the fallback too). The
+// per-review cap is generous — real reviews land well under it.
+const MAX_PATH_LEN = 1024;
+const MAX_TITLE_LEN = 500;
+const MAX_BODY_LEN = 20_000;
+const MAX_SUGGESTED_FIX_LEN = 20_000;
+const MAX_EVIDENCE_ITEMS = 100;
+const MAX_EVIDENCE_ITEM_LEN = 1024;
+const MAX_SUMMARY_LEN = 20_000;
+const MAX_REASONING_LEN = 20_000;
+const PER_REVIEW_FINDING_CAP = 200;
+const FINDING_CAP_REACHED: ToolProtocolError = {
+  error: `finding cap reached (${PER_REVIEW_FINDING_CAP} per review)`,
+};
+
 export interface ReviewToolDeps {
   reviews: ReviewStore;
   reviewSessions?: Pick<ReviewSessionStore, "find">;
@@ -122,17 +139,17 @@ export function registerReviewTools(
     description:
       "Submit a review finding to the durable review record. Anything not submitted through this tool does not exist.",
     input: z.object({
-      path: z.string(),
+      path: z.string().max(MAX_PATH_LEN),
       start_line: z.number().int().optional(),
       end_line: z.number().int().optional(),
       side: z.enum(["LEFT", "RIGHT"]).optional(),
       category: CategorySchema,
       severity: SeveritySchema,
       confidence: ConfidenceSchema,
-      title: z.string(),
-      body_md: z.string(),
-      suggested_fix: z.string().optional(),
-      evidence: z.array(z.string()),
+      title: z.string().max(MAX_TITLE_LEN),
+      body_md: z.string().max(MAX_BODY_LEN),
+      suggested_fix: z.string().max(MAX_SUGGESTED_FIX_LEN).optional(),
+      evidence: z.array(z.string().max(MAX_EVIDENCE_ITEM_LEN)).max(MAX_EVIDENCE_ITEMS),
     }),
     output: z.object({ recorded: z.boolean(), finding_id: z.string() }),
     handling: "handled",
@@ -143,6 +160,9 @@ export function registerReviewTools(
       if (isToolError(active)) return active;
       if (active.status !== "queued" && active.status !== "finding") {
         return NOT_FINDING_PHASE;
+      }
+      if (await reviews.countFindings(active.id) >= PER_REVIEW_FINDING_CAP) {
+        return FINDING_CAP_REACHED;
       }
 
       const inserted = await reviews.insertFinding({
@@ -172,7 +192,7 @@ export function registerReviewTools(
   registry.register({
     name: "finder_done",
     description: "Record the finder phase summary for the active review.",
-    input: z.object({ summary_md: z.string() }),
+    input: z.object({ summary_md: z.string().max(MAX_SUMMARY_LEN) }),
     output: z.object({ recorded: z.boolean() }),
     handling: "handled",
     execution: "sync",
@@ -196,7 +216,7 @@ export function registerReviewTools(
       finding_id: z.string().uuid(),
       verdict: z.enum(["confirmed", "refuted"]),
       confidence: ConfidenceSchema,
-      reasoning: z.string(),
+      reasoning: z.string().max(MAX_REASONING_LEN),
     }),
     output: z.object({ recorded: z.boolean() }),
     handling: "handled",

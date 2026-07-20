@@ -200,4 +200,66 @@ describe("ReviewStore", () => {
       }
     },
   );
+
+  test.skipIf(!dbReachable)(
+    "countFindings and deleteFindingsForSession scope by review and session",
+    async () => {
+      const db = getDb();
+      const store = makeReviewStore(db);
+      const taskId = `review-store-${crypto.randomUUID()}`;
+      const repo = `review-store-${crypto.randomUUID()}/engrams`;
+      const reviewIds: string[] = [];
+      await db.insert(taskTable).values({
+        id: taskId,
+        type: "pr_review",
+        title: "Review store delete test",
+      });
+
+      try {
+        const reviewId = await store.createReview(reviewInput(taskId, { repo }));
+        reviewIds.push(reviewId);
+        const otherReviewId = await store.createReview(
+          reviewInput(taskId, { repo, prNumber: 200 }),
+        );
+        reviewIds.push(otherReviewId);
+
+        // Two findings from a first (failed) finder session, one from the retry.
+        await store.insertFinding(findingInput(reviewId, {
+          sessionId: "finder-1",
+          toolCallId: "c1",
+        }));
+        await store.insertFinding(findingInput(reviewId, {
+          sessionId: "finder-1",
+          toolCallId: "c2",
+        }));
+        await store.insertFinding(findingInput(reviewId, {
+          sessionId: "finder-2",
+          toolCallId: "c3",
+        }));
+        // A finding on a different review must never be touched.
+        await store.insertFinding(findingInput(otherReviewId, {
+          sessionId: "finder-1",
+          toolCallId: "c4",
+        }));
+
+        expect(await store.countFindings(reviewId)).toBe(3);
+
+        // Dropping the failed session's findings leaves the retry's — and the
+        // other review's — intact.
+        await store.deleteFindingsForSession(reviewId, "finder-1");
+        expect(await store.countFindings(reviewId)).toBe(1);
+        expect(await store.countFindings(otherReviewId)).toBe(1);
+        const remaining = await store.getReview(reviewId);
+        expect(remaining?.findings.map((f) => f.sessionId)).toEqual(["finder-2"]);
+      } finally {
+        if (reviewIds.length > 0) {
+          await db
+            .delete(reviewTable)
+            .where(inArray(reviewTable.id, reviewIds))
+            .catch(() => {});
+        }
+        await db.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
+      }
+    },
+  );
 });

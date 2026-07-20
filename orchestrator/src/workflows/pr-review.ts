@@ -218,7 +218,20 @@ export async function prReviewWorkflowImpl(
   const retryPhaseOnceOrFail = async (
     role: "finder" | "verifier",
   ): Promise<boolean> => {
+    // The failed finder attempt may have persisted candidate findings before it
+    // errored. A fresh finder session gets a new session id, so those rows would
+    // re-insert as duplicates (dedup is keyed on session_id + tool_call_id) and
+    // post twice. Capture the dying session id *before* teardown clears it, then
+    // drop its findings. Verifier retries never write findings, so scope to
+    // finder only.
+    const failedFinderSessionId = role === "finder" ? finderSessionId : undefined;
     await deleteWorkerSessionBestEffort(role);
+    if (role === "finder" && failedFinderSessionId !== undefined) {
+      await step(
+        () => cp.deleteFindingsForSession(reviewId, failedFinderSessionId),
+        "deleteFindingsForSession",
+      );
+    }
     const alreadyRetried = role === "finder" ? finderRetried : verifierRetried;
     if (alreadyRetried) {
       await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");

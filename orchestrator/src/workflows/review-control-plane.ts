@@ -45,6 +45,7 @@ import {
 import {
   runPolicyGate,
   type FindingDecision,
+  type PolicyDecision,
 } from "../reviews/policy-gate.ts";
 import {
   renderReviewer as defaultRenderReviewer,
@@ -116,6 +117,8 @@ export interface ReviewControlPlane {
     baseSha: string;
   }): Promise<void>;
   deleteReviewSession(sessionId: string): Promise<void>;
+  /** Drop a failed finder attempt's candidate findings before it is retried. */
+  deleteFindingsForSession(reviewId: string, sessionId: string): Promise<void>;
   postReviewResults(reviewId: string): Promise<void>;
   markReviewFailed(reviewId: string): Promise<void>;
   markReviewHalted(repo: string, prNumber: number): Promise<void>;
@@ -128,6 +131,7 @@ interface ReviewControlPlaneStore extends Pick<
   | "getActiveReviewForPr"
   | "updateReviewStatus"
   | "updateFindingState"
+  | "deleteFindingsForSession"
   | "finalizeReview"
   | "setStatusCommentId"
   | "setReviewSessionId"
@@ -177,6 +181,26 @@ export interface ReviewControlPlaneDeps {
 function postedSummary(count: number): string {
   if (count === 0) return "No findings";
   return `${count} finding${count === 1 ? "" : "s"} posted`;
+}
+
+/**
+ * The v1 policy gate plus the anchor split: a confirmed finding with no inline
+ * anchor is demoted to ui_only. Shared by the live post and the crash-recovery
+ * marker path so both settle findings into the same terminal states.
+ */
+function buildDecision(detail: ReviewDetail): PolicyDecision {
+  const policy = runPolicyGate(detail);
+  const missingAnchors: FindingDecision[] = [];
+  const anchored = policy.toPost.filter((item) => {
+    const hasAnchor = item.finding.endLine != null || item.finding.startLine != null;
+    if (!hasAnchor) missingAnchors.push({ ...item, state: "ui_only" });
+    return hasAnchor;
+  });
+  return {
+    ...policy,
+    toPost: anchored,
+    uiOnly: [...policy.uiOnly, ...missingAnchors],
+  };
 }
 
 export class ReviewSetupError extends Error {
@@ -641,6 +665,10 @@ export function makeReviewControlPlane(
       await reviewSessions().remove(sessionId);
     },
 
+    async deleteFindingsForSession(reviewId, sessionId) {
+      await reviews().deleteFindingsForSession(reviewId, sessionId);
+    },
+
     async postReviewResults(reviewId) {
       const detail = await reviews().getReview(reviewId);
       if (!detail) throw new Error(`review not found: ${reviewId}`);
@@ -659,34 +687,56 @@ export function makeReviewControlPlane(
         });
       }
 
+      // Settle every finding into its decided terminal state. Idempotent, so it
+      // is safe on both the live post and the crash-recovery marker path.
+      const applyFindingStates = async (
+        settled: PolicyDecision,
+        inlinePosted: boolean,
+      ): Promise<void> => {
+        for (const item of settled.toPost) {
+          await reviews().updateFindingState(
+            item.finding.id,
+            inlinePosted ? "posted" : "ui_only",
+            item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+          );
+        }
+        for (const item of settled.uiOnly) {
+          await reviews().updateFindingState(
+            item.finding.id,
+            "ui_only",
+            item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+          );
+        }
+        for (const item of settled.suppressed) {
+          await reviews().updateFindingState(
+            item.finding.id,
+            item.state,
+            item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
+          );
+        }
+      };
+
       // The marker check closes the crash window between GitHub accepting the
-      // review and the local transaction recording it.
+      // review and the local transaction recording it. On recovery the review is
+      // already on GitHub, so we cannot know whether it posted inline or fell
+      // back to a summary — assume inline (the common case) and re-run the
+      // idempotent state updates the crashed transaction never committed, so
+      // findings don't stay stuck at `candidate`.
       if (await githubPoster.alreadyPosted(repo, prNumber, reviewId)) {
+        const decision = buildDecision(detail);
+        await applyFindingStates(decision, true);
         await reviews().finalizeReview(reviewId, {
           status: "posted",
           summaryMd: detail.review.summaryMd ?? "",
         });
-        const postedCount = detail.findings.filter(
-          (finding) => finding.state === "posted" || finding.state === "ui_only",
-        ).length;
-        await recordEvent(reviewId, "posted", postedSummary(postedCount));
-        await ackStatus(reviewId, "posted", postedCount);
+        const surfaced = decision.toPost.length + decision.uiOnly.length;
+        await recordEvent(reviewId, "posted", postedSummary(surfaced));
+        await ackStatus(reviewId, "posted", surfaced);
         return;
       }
 
-      const policy = runPolicyGate(detail);
-      const missingAnchors: FindingDecision[] = [];
-      const anchored = policy.toPost.filter((item) => {
-        const hasAnchor = item.finding.endLine != null || item.finding.startLine != null;
-        if (!hasAnchor) missingAnchors.push({ ...item, state: "ui_only" });
-        return hasAnchor;
-      });
-      const decision = {
-        ...policy,
-        toPost: anchored,
-        uiOnly: [...policy.uiOnly, ...missingAnchors],
-      };
-      const comments = anchored.map((item) => {
+      const decision = buildDecision(detail);
+      const comments = decision.toPost.map((item) => {
         const line = item.finding.endLine ?? item.finding.startLine;
         if (line == null) {
           throw new Error(`finding ${item.finding.id} has no inline anchor`);
@@ -717,27 +767,7 @@ export function makeReviewControlPlane(
       });
       if (!posted.posted) throw new Error("GitHub review was not posted");
 
-      for (const item of decision.toPost) {
-        await reviews().updateFindingState(
-          item.finding.id,
-          posted.inlinePosted ? "posted" : "ui_only",
-          item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
-        );
-      }
-      for (const item of decision.uiOnly) {
-        await reviews().updateFindingState(
-          item.finding.id,
-          "ui_only",
-          item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
-        );
-      }
-      for (const item of decision.suppressed) {
-        await reviews().updateFindingState(
-          item.finding.id,
-          item.state,
-          item.verdictReason == null ? undefined : { verdictReason: item.verdictReason },
-        );
-      }
+      await applyFindingStates(decision, posted.inlinePosted);
       await reviews().finalizeReview(reviewId, {
         status: "posted",
         summaryMd: posted.summaryMd,

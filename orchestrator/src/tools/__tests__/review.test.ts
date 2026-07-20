@@ -71,6 +71,7 @@ function findingRow(overrides: Partial<ReviewFindingRow> = {}): ReviewFindingRow
 function fakeReviewStore(options: {
   active?: ReviewRow | null;
   detail?: ReviewDetail | null;
+  findingCount?: number;
 } = {}) {
   const findings: ReviewFindingInput[] = [];
   const verdicts: ReviewVerdictInput[] = [];
@@ -98,6 +99,14 @@ function fakeReviewStore(options: {
     async insertFinding(input) {
       findings.push(input);
       return { id: FINDING_ID, replayed: false };
+    },
+    async countFindings() {
+      return (options.findingCount ?? 0) + findings.length;
+    },
+    async deleteFindingsForSession(_reviewId, sessionId) {
+      for (let i = findings.length - 1; i >= 0; i--) {
+        if (findings[i]?.sessionId === sessionId) findings.splice(i, 1);
+      }
     },
     async insertVerdict(input) {
       verdicts.push(input);
@@ -190,6 +199,46 @@ describe("review tools", () => {
       body_md: "Body",
       evidence: [],
     }).success).toBe(false);
+  });
+
+  test("submit_finding schema bounds oversized fields", () => {
+    const tool = reviewRegistry(fakeReviewStore().store).get("submit_finding");
+    if (!tool) throw new Error("submit_finding not registered");
+    const base = {
+      path: "src/index.ts",
+      category: "functional-correctness",
+      severity: "high",
+      confidence: "high",
+      title: "ok",
+      body_md: "ok",
+      evidence: ["src/index.ts"],
+    };
+
+    expect(tool.input.safeParse({ ...base, title: "x".repeat(5_000) }).success).toBe(false);
+    expect(tool.input.safeParse({ ...base, body_md: "x".repeat(50_000) }).success).toBe(false);
+    expect(
+      tool.input.safeParse({ ...base, evidence: Array(200).fill("f.ts") }).success,
+    ).toBe(false);
+  });
+
+  test("submit_finding rejects a call once the per-review cap is reached", async () => {
+    const fake = fakeReviewStore({ findingCount: 200 });
+    const tool = reviewRegistry(fake.store).get("submit_finding");
+    if (!tool || tool.handling !== "handled") throw new Error("submit_finding not registered");
+    const args = tool.input.parse({
+      path: "src/index.ts",
+      category: "functional-correctness",
+      severity: "high",
+      confidence: "high",
+      title: "One too many",
+      body_md: "Body",
+      evidence: ["src/index.ts"],
+    });
+
+    await expect(tool.handler(context(tool.name), args)).resolves.toEqual({
+      error: "finding cap reached (200 per review)",
+    });
+    expect(fake.findings).toHaveLength(0);
   });
 
   test("no active review returns the protocol error object", async () => {

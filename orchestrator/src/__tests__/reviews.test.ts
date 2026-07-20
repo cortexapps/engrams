@@ -133,6 +133,10 @@ function makeStore(
     async insertFinding() {
       throw new Error("unused");
     },
+    async countFindings() {
+      return 0;
+    },
+    async deleteFindingsForSession() {},
     async insertVerdict() {
       throw new Error("unused");
     },
@@ -370,6 +374,17 @@ describe("ReviewService", () => {
       triggerMode: "manual",
       autofix: "always",
     }), Code.InvalidArgument);
+  });
+
+  test("rejects an enrollment repo that isn't owner/name form", async () => {
+    const admin = spawn(makeStore(null), true, "admin", makeEnrollmentStore([]));
+    for (const repo of ["openai/engrams/", "engrams", "owner/name/extra", "bad repo/name"]) {
+      await expectConnectError(admin.upsertEnrollment({
+        repo,
+        triggerMode: "manual",
+        autofix: "off",
+      }), Code.InvalidArgument);
+    }
   });
 
   test("rejects an unknown enrollment profile_id", async () => {

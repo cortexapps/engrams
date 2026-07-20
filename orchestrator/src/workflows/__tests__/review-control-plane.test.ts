@@ -71,6 +71,7 @@ function detail(findings: ReviewFindingRow[] = []): ReviewDetail {
 
 const reviewPostingNoops = {
   updateFindingState: async () => {},
+  deleteFindingsForSession: async () => {},
   finalizeReview: async () => {},
   setStatusCommentId: async () => {},
   setReviewSessionId: async () => {},
@@ -790,6 +791,7 @@ describe("ReviewControlPlane", () => {
         setStatusCommentId: async () => {},
         setReviewSessionId: async () => {},
         recordEvent: async () => {},
+        deleteFindingsForSession: async () => {},
         async updateFindingState(id, state, opts) {
           findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
         },
@@ -851,10 +853,10 @@ describe("ReviewControlPlane", () => {
     });
   });
 
-  test("marker idempotency fills SHAs and marks posted without posting or refolding", async () => {
+  test("marker idempotency fills SHAs and settles finding states without re-posting", async () => {
     const finalizations: Array<Parameters<ReviewStore["finalizeReview"]>[1]> = [];
     let postCalls = 0;
-    let findingUpdates = 0;
+    const findingStates: Array<[string, string]> = [];
     const cp = makeReviewControlPlane({
       reviews: {
         getActiveReviewForPr: async () => active,
@@ -864,8 +866,9 @@ describe("ReviewControlPlane", () => {
         setStatusCommentId: async () => {},
         setReviewSessionId: async () => {},
         recordEvent: async () => {},
-        updateFindingState: async () => {
-          findingUpdates++;
+        deleteFindingsForSession: async () => {},
+        updateFindingState: async (id, state) => {
+          findingStates.push([id, state]);
         },
         finalizeReview: async (_id, input) => {
           finalizations.push(input);
@@ -884,8 +887,12 @@ describe("ReviewControlPlane", () => {
 
     await cp.postReviewResults(active.id);
 
+    // Recovery never re-posts to GitHub...
     expect(postCalls).toBe(0);
-    expect(findingUpdates).toBe(0);
+    // ...but it DOES run the idempotent finding-state updates the crashed
+    // transaction never committed — an unverdicted candidate becomes ui_only,
+    // so it can't stay stuck at `candidate` in the UI.
+    expect(findingStates).toEqual([["candidate", "ui_only"]]);
     expect(finalizations).toEqual([
       {
         status: active.status,

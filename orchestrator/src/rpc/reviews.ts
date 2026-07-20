@@ -71,6 +71,11 @@ function enrollmentToProto(row: EnrollmentRow): RepoEnrollment {
 const TRIGGER_MODES: ReadonlySet<string> = new Set(["auto", "manual"]);
 const AUTOFIX_MODES: ReadonlySet<string> = new Set(["auto", "manual", "off"]);
 
+// GitHub owner/repo charset ([A-Za-z0-9._-]). An enrollment whose repo doesn't
+// match a webhook `full_name` (e.g. a trailing slash) is silently dead, so
+// reject it at the door instead of storing an un-triggerable row.
+const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
+
 function isTriggerMode(value: string): value is ReviewTriggerMode {
   return TRIGGER_MODES.has(value);
 }
@@ -214,6 +219,12 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const repo = req.repo.trim();
       if (!repo) throw new ConnectError("repo is required", Code.InvalidArgument);
+      if (!REPO_RE.test(repo)) {
+        throw new ConnectError(
+          "repo must be in owner/name form",
+          Code.InvalidArgument,
+        );
+      }
       if (!isTriggerMode(req.triggerMode)) {
         throw new ConnectError(
           "trigger_mode must be auto or manual",

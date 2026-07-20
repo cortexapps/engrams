@@ -70,6 +70,7 @@ function fakeControlPlane(
     bootstrapVerifierSession: async () => {},
     sendVerifierPrompt: async () => {},
     deleteReviewSession: async () => {},
+    deleteFindingsForSession: async () => {},
     postReviewResults: async () => {},
     markReviewFailed: async () => {},
     markReviewHalted: async () => {},
@@ -286,6 +287,58 @@ describe("PrReviewWorkflow", () => {
     expect(posted).toBe(0);
     expect(steps.steps).not.toContain("postReviewResults");
     expect(steps.steps.at(-1)).toBe("markReviewFailed");
+  });
+
+  test("a finder retry clears the failed attempt's candidate findings", async () => {
+    let finderCreates = 0;
+    const cleared: Array<[string, string]> = [];
+    const steps = runner();
+    const cp = fakeControlPlane({
+      createFinderSession: async () => ({
+        sessionId: `finder-session-${++finderCreates}`,
+      }),
+      deleteFindingsForSession: async (reviewId, sessionId) => {
+        cleared.push([reviewId, sessionId]);
+      },
+      // Second attempt succeeds cleanly with no candidates so the loop posts and ends.
+      getReview: async () => ({ ...candidateDetail, findings: [] }),
+    });
+
+    await run(cp, [
+      trigger,
+      { kind: "session_idle", role: "finder", runFailed: true },
+      { kind: "session_idle", role: "finder" },
+    ], steps.step);
+
+    // The first attempt's findings (finder-session-1) are dropped before the
+    // fresh attempt runs — never re-inserted as duplicates.
+    expect(cleared).toEqual([["review-1", "finder-session-1"]]);
+    expect(steps.steps).toContain("deleteFindingsForSession");
+  });
+
+  test("a verifier retry never clears findings", async () => {
+    const cleared: Array<[string, string]> = [];
+    let verifierCreates = 0;
+    const steps = runner();
+    const cp = fakeControlPlane({
+      createVerifierSession: async () => ({
+        sessionId: `verifier-session-${++verifierCreates}`,
+      }),
+      deleteFindingsForSession: async (reviewId, sessionId) => {
+        cleared.push([reviewId, sessionId]);
+      },
+    });
+
+    await run(cp, [
+      trigger,
+      { kind: "session_idle", role: "finder" },
+      { kind: "session_idle", role: "verifier", runFailed: true },
+      { kind: "session_idle", role: "verifier", runFailed: true },
+    ], steps.step);
+
+    // Findings belong to the finder; a verifier retry must not touch them.
+    expect(cleared).toEqual([]);
+    expect(steps.steps).not.toContain("deleteFindingsForSession");
   });
 
   test("a clean finder run with zero candidates still posts (idle without runFailed)", async () => {
