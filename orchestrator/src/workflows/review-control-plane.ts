@@ -1,5 +1,7 @@
 /** Durable review-record and finder-session operations behind the workflow seam. */
 
+import { Code, ConnectError } from "@connectrpc/connect";
+
 import { getDb } from "../db/client.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
@@ -13,8 +15,12 @@ import {
   makeReviewSessionStore,
   type ReviewSessionStore,
 } from "../db/review-sessions.ts";
-import { task as taskTable } from "../db/schema.ts";
+import {
+  task as taskTable,
+  type ProfileNetwork,
+} from "../db/schema.ts";
 import { config } from "../config.ts";
+import { log as rootLog } from "../log.ts";
 import {
   harnessCatalog as defaultHarnessCatalog,
   images as defaultImages,
@@ -22,6 +28,7 @@ import {
 } from "../control-plane/client.ts";
 import {
   createSessionForExistingTask,
+  registerSessionListener as registerExistingSessionListener,
   type CreateSessionForExistingTaskParams,
   type HarnessCatalogClient,
   type TaskSessionsClient,
@@ -30,8 +37,10 @@ import type { ImagesClient } from "../rpc/profiles.ts";
 import {
   buildInlineCommentBody,
   buildReviewSummary,
+  buildStatusComment,
   makeGithubReviewPoster,
   type GithubReviewPoster,
+  type ReviewStatusPhase,
 } from "../reviews/github-review.ts";
 import {
   runPolicyGate,
@@ -44,6 +53,8 @@ import {
   type ReviewCategory,
 } from "../reviewers/render.ts";
 
+const log = rootLog.child({ component: "review-control-plane" });
+
 export interface EnsureReviewRecordInput {
   repo: string;
   prNumber: number;
@@ -53,6 +64,10 @@ export interface EnsureReviewRecordInput {
 }
 
 export interface ReviewControlPlane {
+  resolvePrHeads(repo: string, prNumber: number): Promise<{
+    headSha: string;
+    baseSha: string;
+  }>;
   ensureReviewRecord(
     input: EnsureReviewRecordInput,
   ): Promise<{ reviewId: string; taskId: string }>;
@@ -64,6 +79,7 @@ export interface ReviewControlPlane {
     workflowId: string;
   }): Promise<{ sessionId: string }>;
   bootstrapFinderSession(sessionId: string, input: {
+    reviewId: string;
     repo: string;
     headSha: string;
     enabledCategories?: readonly ReviewCategory[];
@@ -99,6 +115,7 @@ export interface ReviewControlPlane {
     headSha: string;
     baseSha: string;
   }): Promise<void>;
+  deleteReviewSession(sessionId: string): Promise<void>;
   postReviewResults(reviewId: string): Promise<void>;
   markReviewFailed(reviewId: string): Promise<void>;
   markReviewHalted(repo: string, prNumber: number): Promise<void>;
@@ -112,6 +129,9 @@ interface ReviewControlPlaneStore extends Pick<
   | "updateReviewStatus"
   | "updateFindingState"
   | "finalizeReview"
+  | "setStatusCommentId"
+  | "setReviewSessionId"
+  | "recordEvent"
 > {}
 
 interface ReviewExecOutput {
@@ -149,6 +169,14 @@ export interface ReviewControlPlaneDeps {
   renderReviewer?: RenderReviewer;
   /** Focused test seam; production delegates to the shared task-create helper. */
   createSessionForExistingTask?: CreateExistingTaskSession;
+  /** Focused seam for asserting binding-before-listener publication. */
+  registerSessionListener?: (sessionId: string) => Promise<void>;
+}
+
+/** Human detail for a `posted` activity-log entry. */
+function postedSummary(count: number): string {
+  if (count === 0) return "No findings";
+  return `${count} finding${count === 1 ? "" : "s"} posted`;
 }
 
 export class ReviewSetupError extends Error {
@@ -173,6 +201,19 @@ const VERIFIER_SYSTEM_PROMPT = [
 // — defense in depth on top of the signature check + enrollment gate.
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+
+// Security clamp: reviewer workers may read only the reviewed repo, while the
+// orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
+// explicit because the GitHub connector itself declares only api.github.com.
+const REVIEW_CAPABILITIES = (repo: string): readonly string[] => [
+  "engram:pr_review",
+  `github:contents:read@${repo}`,
+];
+const REVIEW_NETWORK: ProfileNetwork = {
+  default: "deny",
+  allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+  allowHostPatterns: [],
+};
 
 function assertSafeRepo(repo: string): void {
   if (!REPO_RE.test(repo)) throw new ReviewSetupError(`invalid repository: ${repo}`);
@@ -293,6 +334,55 @@ export function makeReviewControlPlane(
   );
   const renderReviewer = deps.renderReviewer ?? defaultRenderReviewer;
   const githubPoster = deps.githubPoster ?? makeGithubReviewPoster();
+
+  // The sticky GitHub status comment (👀 → ⏳ → ✅). Best-effort: an ack that
+  // fails must never wedge the review, so every failure is logged and
+  // swallowed. The comment id is persisted on first post so later phases edit
+  // in place rather than stacking new comments.
+  const reviewsPageUrl = `${config.baseUrl.replace(/\/$/, "")}/reviews`;
+  const ackStatus = async (
+    reviewId: string,
+    phase: ReviewStatusPhase,
+    count?: number,
+  ): Promise<void> => {
+    try {
+      const detail = await reviews().getReview(reviewId);
+      if (!detail) return;
+      const { repo, prNumber, statusCommentId } = detail.review;
+      const body = buildStatusComment({
+        reviewId,
+        phase,
+        ...(count !== undefined ? { count } : {}),
+        ...(phase === "posted" ? { reviewUrl: reviewsPageUrl } : {}),
+      });
+      const { commentId } = await githubPoster.upsertStatusComment({
+        repo,
+        prNumber,
+        ...(statusCommentId ? { commentId: statusCommentId } : {}),
+        body,
+      });
+      if (commentId !== statusCommentId) {
+        await reviews().setStatusCommentId(reviewId, commentId);
+      }
+    } catch (err) {
+      log.error({ reviewId, phase, err }, "review status ack failed (best-effort)");
+    }
+  };
+  // Append one milestone to the review's activity log. Best-effort like
+  // ackStatus: an activity-log write must never wedge a review, so a failure is
+  // logged and swallowed. Recorded inside the existing control-plane steps, so
+  // DBOS memoization keeps a replayed workflow from duplicating entries.
+  const recordEvent = async (
+    reviewId: string,
+    kind: string,
+    detail?: string,
+  ): Promise<void> => {
+    try {
+      await reviews().recordEvent(reviewId, kind, detail);
+    } catch (err) {
+      log.error({ reviewId, kind, err }, "review event record failed (best-effort)");
+    }
+  };
   const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
     const database = db();
     return createSessionForExistingTask(
@@ -308,8 +398,14 @@ export function makeReviewControlPlane(
       params,
     );
   });
+  const registerSessionListener = deps.registerSessionListener
+    ?? ((sessionId: string) => registerExistingSessionListener(db(), sessionId));
 
   return {
+    async resolvePrHeads(repo, prNumber) {
+      return githubPoster.fetchPrHeads(repo, prNumber);
+    },
+
     async ensureReviewRecord(input) {
       const active = await reviews().getActiveReviewForPr(
         input.repo,
@@ -326,6 +422,8 @@ export function makeReviewControlPlane(
         taskId,
         status: "queued",
       });
+      await recordEvent(reviewId, "queued");
+      await ackStatus(reviewId, "acknowledged");
       return { reviewId, taskId };
     },
 
@@ -342,9 +440,10 @@ export function makeReviewControlPlane(
         taskId: input.taskId,
         profileId,
         role: "finder",
-        extraCapabilities: [`github:contents:read@${input.repo}`],
+        capabilityOverride: REVIEW_CAPABILITIES(input.repo),
+        networkOverride: REVIEW_NETWORK,
+        dropProfileSecretsAndEnv: true,
         appendSystemPrompt: FINDER_SYSTEM_PROMPT,
-        registerListener: true,
         source: {
           reviewId: input.reviewId,
           repo: input.repo,
@@ -356,10 +455,16 @@ export function makeReviewControlPlane(
         input.workflowId,
         "finder",
       );
+      // Stamp the session on the review at kickoff so the UI can offer a live
+      // "watch" link the moment the finding phase starts.
+      await reviews().setReviewSessionId(input.reviewId, "finder", created.sessionId);
+      await recordEvent(input.reviewId, "finder_started");
+      await registerSessionListener(created.sessionId);
       return created;
     },
 
     async bootstrapFinderSession(sessionId, input) {
+      await recordEvent(input.reviewId, "cloning", "finder");
       await cloneRepo(sessions, sessionId, input.repo, input.headSha, "finder");
 
       const encoder = new TextEncoder();
@@ -402,6 +507,8 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "finding");
+      await recordEvent(input.reviewId, "reviewing");
+      await ackStatus(input.reviewId, "finding");
     },
 
     async getReview(reviewId) {
@@ -421,9 +528,10 @@ export function makeReviewControlPlane(
         taskId: input.taskId,
         profileId,
         role: "verifier",
-        extraCapabilities: [`github:contents:read@${input.repo}`],
+        capabilityOverride: REVIEW_CAPABILITIES(input.repo),
+        networkOverride: REVIEW_NETWORK,
+        dropProfileSecretsAndEnv: true,
         appendSystemPrompt: VERIFIER_SYSTEM_PROMPT,
-        registerListener: true,
         source: {
           reviewId: input.reviewId,
           repo: input.repo,
@@ -435,10 +543,14 @@ export function makeReviewControlPlane(
         input.workflowId,
         "verifier",
       );
+      await reviews().setReviewSessionId(input.reviewId, "verifier", created.sessionId);
+      await recordEvent(input.reviewId, "verifier_started");
+      await registerSessionListener(created.sessionId);
       return created;
     },
 
     async bootstrapVerifierSession(sessionId, input) {
+      await recordEvent(input.reviewId, "cloning", "verifier");
       await cloneRepo(sessions, sessionId, input.repo, input.headSha, "verifier");
 
       const review = await reviews().getReview(input.reviewId);
@@ -502,6 +614,31 @@ export function makeReviewControlPlane(
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "verifying");
+      const detail = await reviews().getReview(input.reviewId);
+      const candidateCount = detail?.findings.filter(
+        (finding) => finding.state === "candidate",
+      ).length ?? 0;
+      await recordEvent(
+        input.reviewId,
+        "verifying",
+        `${candidateCount} candidate finding${candidateCount === 1 ? "" : "s"}`,
+      );
+      await ackStatus(input.reviewId, "verifying", candidateCount);
+    },
+
+    async deleteReviewSession(sessionId) {
+      try {
+        await sessions.deleteSession({ sessionId });
+      } catch (err) {
+        if (!(err instanceof ConnectError) || err.code !== Code.NotFound) {
+          throw err;
+        }
+        log.info(
+          { sessionId },
+          "review worker session was already absent during cleanup",
+        );
+      }
+      await reviewSessions().remove(sessionId);
     },
 
     async postReviewResults(reviewId) {
@@ -509,13 +646,18 @@ export function makeReviewControlPlane(
       if (!detail) throw new Error(`review not found: ${reviewId}`);
 
       const { repo, prNumber } = detail.review;
-      const { headSha, baseSha } = await githubPoster.fetchPrHeads(repo, prNumber);
-      await reviews().finalizeReview(reviewId, {
-        status: detail.review.status,
-        summaryMd: detail.review.summaryMd ?? "",
-        headSha,
-        baseSha,
-      });
+      let { headSha, baseSha } = detail.review;
+      if (headSha === "" || baseSha === "") {
+        const live = await githubPoster.fetchPrHeads(repo, prNumber);
+        if (headSha === "") headSha = live.headSha;
+        if (baseSha === "") baseSha = live.baseSha;
+        await reviews().finalizeReview(reviewId, {
+          status: detail.review.status,
+          summaryMd: detail.review.summaryMd ?? "",
+          headSha,
+          baseSha,
+        });
+      }
 
       // The marker check closes the crash window between GitHub accepting the
       // review and the local transaction recording it.
@@ -524,6 +666,11 @@ export function makeReviewControlPlane(
           status: "posted",
           summaryMd: detail.review.summaryMd ?? "",
         });
+        const postedCount = detail.findings.filter(
+          (finding) => finding.state === "posted" || finding.state === "ui_only",
+        ).length;
+        await recordEvent(reviewId, "posted", postedSummary(postedCount));
+        await ackStatus(reviewId, "posted", postedCount);
         return;
       }
 
@@ -598,15 +745,24 @@ export function makeReviewControlPlane(
           ? { githubReviewId: posted.githubReviewId }
           : {}),
       });
+      const surfaced = decision.toPost.length + decision.uiOnly.length;
+      await recordEvent(reviewId, "posted", postedSummary(surfaced));
+      await ackStatus(reviewId, "posted", surfaced);
     },
 
     async markReviewFailed(reviewId) {
       await reviews().updateReviewStatus(reviewId, "failed");
+      await recordEvent(reviewId, "failed");
+      await ackStatus(reviewId, "failed");
     },
 
     async markReviewHalted(repo, prNumber) {
       const active = await reviews().getActiveReviewForPr(repo, prNumber);
-      if (active) await reviews().updateReviewStatus(active.id, "halted");
+      if (active) {
+        await reviews().updateReviewStatus(active.id, "halted");
+        await recordEvent(active.id, "halted");
+        await ackStatus(active.id, "halted");
+      }
     },
   };
 }

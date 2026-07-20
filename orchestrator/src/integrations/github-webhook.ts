@@ -17,6 +17,8 @@ export type GithubEvent =
       prNumber: number;
       body: string;
       commentId: string;
+      authorAssociation: string;
+      senderType: string;
     }
   | { kind: "ping" }
   | { kind: "ignore" };
@@ -143,14 +145,32 @@ function classifyComment(
 ): GithubEvent {
   const repository = recordField(body, "repository");
   const comment = recordField(body, "comment");
+  const sender = recordField(body, "sender");
   const repo = repository && stringField(repository, "full_name");
   const prNumber = integerField(pr, "number");
   const commentBody = comment && stringField(comment, "body");
   const commentId = comment && identifierField(comment, "id");
-  if (!repo || prNumber == null || commentBody == null || commentId == null) {
+  const authorAssociation = comment && stringField(comment, "author_association");
+  const senderType = sender && stringField(sender, "type");
+  if (
+    !repo
+    || prNumber == null
+    || commentBody == null
+    || commentId == null
+    || authorAssociation == null
+    || senderType == null
+  ) {
     return { kind: "ignore" };
   }
-  return { kind: "comment", repo, prNumber, body: commentBody, commentId };
+  return {
+    kind: "comment",
+    repo,
+    prNumber,
+    body: commentBody,
+    commentId,
+    authorAssociation,
+    senderType,
+  };
 }
 
 function sanitize(value: string): string {

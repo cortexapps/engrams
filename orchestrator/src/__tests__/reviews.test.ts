@@ -14,6 +14,7 @@ import type {
 } from "../db/enrollments.ts";
 import type {
   ReviewDetail,
+  ReviewEventRow,
   ReviewFindingRow,
   ReviewListRow,
   ReviewRow,
@@ -39,6 +40,9 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     trigger: "dispatch",
     status: "verifying",
     githubReviewId: null,
+    statusCommentId: null,
+    finderSessionId: null,
+    verifierSessionId: null,
     summaryMd: "Finder summary",
     createdAt: CREATED_AT,
     updatedAt: UPDATED_AT,
@@ -88,7 +92,10 @@ interface FakeReviewStore extends ReviewStore {
   listCalls: Array<{ repo?: string }>;
 }
 
-function makeStore(detail: ReviewDetail | null): FakeReviewStore {
+function makeStore(
+  detail: ReviewDetail | null,
+  events: ReviewEventRow[] = [],
+): FakeReviewStore {
   const listCalls: Array<{ repo?: string }> = [];
   return {
     listCalls,
@@ -97,6 +104,10 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
     },
     async getReview(id) {
       return detail?.review.id === id ? detail : null;
+    },
+    async recordEvent() {},
+    async listEvents() {
+      return events;
     },
     async listReviews(opts) {
       listCalls.push(opts);
@@ -126,6 +137,8 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
       throw new Error("unused");
     },
     async setFinderSummary() {},
+    async setStatusCommentId() {},
+    async setReviewSessionId() {},
     async updateReviewStatus() {},
     async updateFindingState() {},
     async finalizeReview() {},
@@ -240,7 +253,32 @@ describe("ReviewService", () => {
       findingId: FINDING_ID,
       verdict: "confirmed",
       reasoning: "The failing path is reachable.",
+      sessionId: "verifier-session",
     });
+  });
+
+  test("GetReview surfaces the review activity log, oldest first", async () => {
+    const events: ReviewEventRow[] = [
+      {
+        id: "e1",
+        reviewId: REVIEW_ID,
+        kind: "queued",
+        detail: null,
+        createdAt: new Date("2026-07-17T10:00:00Z"),
+      },
+      {
+        id: "e2",
+        reviewId: REVIEW_ID,
+        kind: "cloning",
+        detail: "finder",
+        createdAt: new Date("2026-07-17T10:00:05Z"),
+      },
+    ];
+    const response = await spawn(makeStore(detail, events)).getReview({ id: REVIEW_ID });
+
+    expect(response.events.map((e) => e.kind)).toEqual(["queued", "cloning"]);
+    expect(response.events[1]).toMatchObject({ kind: "cloning", detail: "finder" });
+    expect(response.events[1]?.createdAt).toBeDefined();
   });
 
   test("GetReview returns NotFound for an unknown id", async () => {

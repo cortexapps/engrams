@@ -38,7 +38,12 @@ describe("classifyGithubEvent", () => {
     const base = {
       action: "created",
       repository: { full_name: "openai/engrams" },
-      comment: { id: 42, body: "@engrams review" },
+      comment: {
+        id: 42,
+        body: "@engrams review",
+        author_association: "MEMBER",
+      },
+      sender: { type: "User" },
     };
     expect(classifyGithubEvent("issue_comment", JSON.stringify({
       ...base,
@@ -49,6 +54,8 @@ describe("classifyGithubEvent", () => {
       prNumber: 100,
       body: "@engrams review",
       commentId: "42",
+      authorAssociation: "MEMBER",
+      senderType: "User",
     });
     expect(classifyGithubEvent("issue_comment", JSON.stringify({
       ...base,
@@ -61,13 +68,20 @@ describe("classifyGithubEvent", () => {
       action: "created",
       repository: { full_name: "openai/engrams" },
       pull_request: { number: 100 },
-      comment: { id: "rc-1", body: "@engrams stop" },
+      comment: {
+        id: "rc-1",
+        body: "@engrams stop",
+        author_association: "COLLABORATOR",
+      },
+      sender: { type: "Bot" },
     }))).toEqual({
       kind: "comment",
       repo: "openai/engrams",
       prNumber: 100,
       body: "@engrams stop",
       commentId: "rc-1",
+      authorAssociation: "COLLABORATOR",
+      senderType: "Bot",
     });
   });
 

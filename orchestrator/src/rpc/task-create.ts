@@ -32,6 +32,7 @@ import {
   slackSession as slackSessionTable,
   task as taskTable,
   taskSession as taskSessionTable,
+  type ProfileNetwork,
 } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
 import {
@@ -130,8 +131,14 @@ export interface SessionCompileOpts {
   prompt?: string;
   /** Per-session integration grants layered on top of the profile. These may
    *  affect the bound capabilities and integration policy, but never the tool
-   *  manifest (for example, a review session's scoped clone credential). */
+   *  manifest (for example, a scoped clone credential). */
   extraCapabilities?: readonly string[];
+  /** Replace every profile/per-session capability with this exact set. */
+  capabilityOverride?: readonly string[];
+  /** Replace the profile's network policy for this session. */
+  networkOverride?: ProfileNetwork;
+  /** Exclude profile-defined secrets and harness env from this session. */
+  dropProfileSecretsAndEnv?: boolean;
   /** The task type ("chat" = human/interactive; anything else = programmatic,
    *  e.g. "slack_thread"). Drives the strict-by-run-type credential pick (ADR
    *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
@@ -230,12 +237,29 @@ export async function compileSessionCreateInput(
     }
   }
   const registry = await loadRegistry(deps.connectors);
-  const cliPlan = compileCliIntegrations(profile.capabilities, registry);
+  const capabilities = opts.capabilityOverride !== undefined
+    ? [...opts.capabilityOverride]
+    : [...new Set([
+      ...profile.capabilities,
+      ...(opts.extraCapabilities ?? []),
+    ])];
+  // A capability override is the complete session authority and therefore
+  // also owns its CLI/tool surface. Without one, preserve the narrower
+  // profile-owned surface: extra integration grants do not add model tools.
+  const surfacedCapabilities = opts.capabilityOverride !== undefined
+    ? capabilities
+    : profile.capabilities;
+  const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
-  const toolManifest = compileToolManifest(deps.toolRegistry ?? productionTools, profile.capabilities);
+  const toolManifest = compileToolManifest(
+    deps.toolRegistry ?? productionTools,
+    surfacedCapabilities,
+  );
   if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
-  for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
+  if (!opts.dropProfileSecretsAndEnv) {
+    for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
+  }
   // ADR 0063: the selected model/effort map to env vars via the harness
   // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in env_vars).
   if (descriptor) {
@@ -283,19 +307,11 @@ export async function compileSessionCreateInput(
   }
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
-  // Extra capabilities are per-session integration grants (such as the review
-  // clone token). They intentionally never widen the profile-owned tool
-  // manifest compiled above.
-  const capabilities = [...new Set([
-    ...profile.capabilities,
-    ...(opts.extraCapabilities ?? []),
-  ])];
-
   // Per-session integration policy (caps + network + secrets), shipped only
   // when it carries content.
   const policy = compileIntegrationPolicy(capabilities, registry, {
-    network: profile.network,
-    secrets: profile.secrets,
+    network: opts.networkOverride ?? profile.network,
+    secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
   });
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
@@ -394,6 +410,9 @@ export interface CreateSessionForExistingTaskParams {
   ownerUserId?: string;
   prompt?: string;
   extraCapabilities?: readonly string[];
+  capabilityOverride?: readonly string[];
+  networkOverride?: ProfileNetwork;
+  dropProfileSecretsAndEnv?: boolean;
   appendSystemPrompt?: string;
   /** Register the session for terminal/event consumption in the same
    * transaction as its task_session row. */
@@ -410,6 +429,15 @@ export interface CreateSessionForExistingTaskDeps extends Omit<CreateTaskDeps, "
 export interface CreatedTask {
   taskId: string;
   sessionId: string;
+}
+
+/** Make an already-persisted session discoverable by the listener scanner.
+ * Callers with consumer-specific bindings must persist those bindings first. */
+export async function registerSessionListener(
+  db: Db,
+  sessionId: string,
+): Promise<void> {
+  await db.insert(sessionListenerTable).values({ sessionId });
 }
 
 /**
@@ -463,6 +491,15 @@ export async function createSessionForExistingTask(
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
+      ...(params.capabilityOverride !== undefined
+        ? { capabilityOverride: params.capabilityOverride }
+        : {}),
+      ...(params.networkOverride !== undefined
+        ? { networkOverride: params.networkOverride }
+        : {}),
+      ...(params.dropProfileSecretsAndEnv !== undefined
+        ? { dropProfileSecretsAndEnv: params.dropProfileSecretsAndEnv }
+        : {}),
       ...(params.appendSystemPrompt
         ? { extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: params.appendSystemPrompt } }
         : {}),
@@ -481,6 +518,10 @@ export async function createSessionForExistingTask(
         sessionId: created.sessionId,
         role: params.role,
         profileId: profile.id,
+        // Persist the effective granted capabilities so the tool-exec gate
+        // honors a capabilityOverride (review workers) rather than re-deriving
+        // from the profile, which may not carry them.
+        capabilities: sessionInput.capabilities ?? [],
       });
       if (params.registerListener === true) {
         await tx.insert(sessionListenerTable).values({
@@ -584,6 +625,9 @@ export async function createTaskWithSession(
         sessionId: created.sessionId,
         role: "primary",
         profileId: profile.id,
+        // See createSessionForExistingTask: persist the effective granted
+        // capabilities so the tool-exec gate honors overrides/extras.
+        capabilities: sessionInput.capabilities ?? [],
       });
       if (params.slackThreadWorkflowId !== undefined) {
         await tx.insert(slackSessionTable).values({

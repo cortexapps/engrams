@@ -20,6 +20,12 @@ import {
 } from "../workflows/dispatch-review.ts";
 
 const log = rootLog.child({ component: "github-webhook" });
+const MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024;
+const AUTHORIZED_COMMENT_ASSOCIATIONS: ReadonlySet<string> = new Set([
+  "OWNER",
+  "MEMBER",
+  "COLLABORATOR",
+]);
 
 export interface GithubEventsDeps {
   webhookSecret?: () => Promise<string>;
@@ -42,6 +48,13 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   const app = new Hono();
 
   app.post("/api/v1/integrations/github/events", async (c) => {
+    const contentLength = c.req.header("content-length");
+    if (
+      contentLength !== undefined
+      && Number(contentLength) > MAX_WEBHOOK_BODY_BYTES
+    ) {
+      return c.body(null, 413);
+    }
     const rawBody = await c.req.text();
     const valid = verifyGithubSignature(
       await webhookSecret(),
@@ -69,10 +82,13 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
         );
         return c.body(null, 200);
       }
-      if (
-        (event.action === "opened" || event.action === "ready_for_review") &&
-        (enrollment.triggerMode !== "auto" || event.draft)
-      ) {
+      // Every remaining pull_request action (opened / synchronize /
+      // ready_for_review) is an AUTOMATIC trigger. It fires a review only when
+      // the repo is enrolled in auto mode and the PR isn't a draft; in manual
+      // (mention-only) mode all of them are ignored — a review comes from an
+      // @mention command instead. (synchronize was previously ungated, so a
+      // push to a manual-mode PR auto-reviewed — the #802 bug.)
+      if (enrollment.triggerMode !== "auto" || event.draft) {
         return c.body(null, 200);
       }
       await dispatch({
@@ -86,7 +102,28 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     }
 
     const command = parseReviewCommand(event.body, mentionHandle);
-    if (command?.kind === "review") {
+    if (!command) return c.body(null, 200);
+    if (event.senderType === "Bot") {
+      log.info(
+        { repo: event.repo, prNumber: event.prNumber, commentId: event.commentId },
+        "github command ignored from bot sender",
+      );
+      return c.body(null, 200);
+    }
+    if (!AUTHORIZED_COMMENT_ASSOCIATIONS.has(event.authorAssociation)) {
+      log.info(
+        {
+          repo: event.repo,
+          prNumber: event.prNumber,
+          commentId: event.commentId,
+          authorAssociation: event.authorAssociation,
+        },
+        "github command ignored from unauthorized commenter",
+      );
+      return c.body(null, 200);
+    }
+
+    if (command.kind === "review") {
       await dispatch({
         repo: event.repo,
         prNumber: event.prNumber,
@@ -94,7 +131,7 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
         idempotencyKey,
         ...(command.focus != null ? { focus: command.focus } : {}),
       });
-    } else if (command?.kind === "stop") {
+    } else if (command.kind === "stop") {
       await dispatch({
         repo: event.repo,
         prNumber: event.prNumber,
@@ -102,7 +139,7 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
         idempotencyKey,
         stop: true,
       });
-    } else if (command?.kind === "fix") {
+    } else if (command.kind === "fix") {
       log.info(
         { repo: event.repo, prNumber: event.prNumber, commentId: event.commentId },
         "github fix command queued for a later PR",

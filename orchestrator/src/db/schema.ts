@@ -74,6 +74,12 @@ export const taskSession = pgTable(
     // Nullable for pre-feature / out-of-band sessions. Profiles are only ever
     // soft-deleted, so the target always exists; ON DELETE is moot.
     profileId: text("profile_id").references(() => profile.id),
+    // The session's EFFECTIVE granted capabilities at create time (profile caps,
+    // or a capabilityOverride/extraCapabilities set — e.g. a review worker's
+    // clamped `engram:pr_review` + repo-scoped read). The tool-exec gate reads
+    // these so an override is honored; NULL means a legacy row → fall back to
+    // the profile's capabilities.
+    capabilities: jsonb("capabilities").$type<string[]>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -188,6 +194,14 @@ export const review = pgTable(
     trigger: text("trigger").notNull(),
     status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded|halted
     githubReviewId: text("github_review_id"),
+    // The sticky GitHub issue-comment we post on pickup and edit in place
+    // through the lifecycle (👀 → ⏳ → ✅). Null until the first ack lands.
+    statusCommentId: text("status_comment_id"),
+    // The worker sessions, stamped at kickoff so the UI can offer a live
+    // "watch" link while the phase runs. The session is deleted when its phase
+    // ends, but the id is kept as the durable record of which session ran.
+    finderSessionId: text("finder_session_id"),
+    verifierSessionId: text("verifier_session_id"),
     summaryMd: text("summary_md"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -257,6 +271,25 @@ export const reviewVerdict = pgTable(
     ),
     uniqueIndex("review_verdict_finding_unique").on(t.findingId),
   ],
+);
+
+/** A review's step-by-step activity log (ADR 0100). Append-only milestones the
+ *  control plane records as it drives the review, so the UI can show progress
+ *  inside a phase ("cloning repo", "reviewing") — not just the coarse status.
+ *  The worker sessions are deleted per phase, so this outlives them. */
+export const reviewEvent = pgTable(
+  "review_event",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reviewId: uuid("review_id")
+      .notNull()
+      .references(() => review.id, { onDelete: "cascade" }),
+    // queued|finder_started|cloning|reviewing|verifier_started|verifying|posted|failed|halted
+    kind: text("kind").notNull(),
+    detail: text("detail"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("review_event_review_idx").on(t.reviewId, t.createdAt)],
 );
 
 /** Per-repository PR-review enrollment. The text fields are constrained by

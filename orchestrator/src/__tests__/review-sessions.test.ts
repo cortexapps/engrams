@@ -21,6 +21,8 @@ describe("ReviewSessionStore", () => {
         reviewWorkflowId: "review:openai/engrams#100",
         role: "verifier",
       });
+      await store.remove(sessionId);
+      expect(await store.find(sessionId)).toBeNull();
     } finally {
       await db
         .delete(reviewSessionTable)
