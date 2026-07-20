@@ -1,7 +1,7 @@
 import { useState, type ReactNode } from "react";
 import { toast } from "sonner";
 import { PlusIcon, XIcon } from "lucide-react";
-import { create } from "@bufbuild/protobuf";
+import { create, equals } from "@bufbuild/protobuf";
 import { ConnectError, Code } from "@connectrpc/connect";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useFieldArray, useForm, useWatch, type Control } from "react-hook-form";
@@ -418,6 +418,30 @@ function buildConfig(data: EnableImageValues): ImageConfig {
   });
 }
 
+// Capture-affecting edits are intentionally a two-step operation: unlike
+// name/env/workdir changes, resources and warm are baked into the base
+// snapshot and require the minutes-long enable pipeline to run again. Detect
+// the diff before the first request so confirmation is normal UI flow, while
+// the coordinator's allow_recapture gate remains the authoritative backstop.
+function recaptureFields(image: EnabledImageSummary, next: ImageConfig): string[] {
+  const current = buildConfig(formDefaults(image));
+  const fields: string[] = [];
+
+  const resourcesChanged =
+    current.resources && next.resources
+      ? !equals(ImageResourcesSchema, current.resources, next.resources)
+      : current.resources !== next.resources;
+  if (resourcesChanged) fields.push("resources");
+
+  const warmChanged =
+    current.warm && next.warm
+      ? !equals(ImageWarmConfigSchema, current.warm, next.warm)
+      : current.warm !== next.warm;
+  if (warmChanged) fields.push("warm");
+
+  return fields;
+}
+
 // One editable capture-env row: name · type toggle · value · remove. A
 // secret_ref row picks an org-secret name via the same typeahead the
 // profile secrets editor uses (only names cross the wire, never values);
@@ -564,10 +588,11 @@ function ImageEnvRow({
 // Enable a new image, or edit an already-enabled image's config. In edit
 // mode the URI is pinned (read-only), the form pre-fills with the row's
 // current config, and saving goes through UpdateImage (ADR 0080 phase 2b):
-// the full config is sent with allow_recapture=false first — cheap fields
-// (name/description/env/workdir) apply immediately; a diff touching
-// resources or warm comes back FailedPrecondition, and an inline confirm
-// block re-sends with allow_recapture=true (spawning a recapture job).
+// cheap fields (name/description/env/workdir) are sent immediately with
+// allow_recapture=false. A local diff touching resources or warm first opens
+// an inline confirmation block; confirming sends allow_recapture=true and
+// spawns a recapture job. The server's FailedPrecondition remains a fallback
+// for stale/concurrent edits the local comparison could not anticipate.
 // Create mode keeps EnableImage, which queues the initial enable job.
 function EnableImageDialog({
   editImage,
@@ -631,6 +656,14 @@ function EnableImageDialog({
         // failure) instead of an opaque `[internal] HTTP 400`.
         form.setError("root", { message: errorMessage(err) });
       }
+      return;
+    }
+    const fields = recaptureFields(editImage, config);
+    if (fields.length > 0) {
+      setPendingRecapture({
+        config,
+        reason: `This edit changes ${fields.join(" and ")} — applying it requires a base-snapshot recapture.`,
+      });
       return;
     }
     // Edit: optimistically try the cheap path. The server accepts a diff

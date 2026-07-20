@@ -25,7 +25,6 @@ import type { AddressInfo } from "node:net";
 import { Hono } from "hono";
 import {
   createClient,
-  createRouterTransport,
   ConnectError,
   Code,
 } from "@connectrpc/connect";
@@ -52,13 +51,22 @@ const INCIDENT_MSG =
 
 /** Spawn the orchestrator pointed at a fake upstream whose EnableImage throws. */
 async function spawnWithFailingUpstream() {
-  const upstream: Transport = createRouterTransport((router: ConnectRouter) => {
-    router.service(ImageService, {
-      enableImage() {
-        throw new ConnectError(INCIDENT_MSG, INCIDENT_CODE);
-      },
-    } as never);
-  });
+  // Model the exact error object createGrpcTransport returns. A router
+  // transport sanitizes its own protocol metadata before this boundary and
+  // therefore cannot reproduce the production failure.
+  const upstream = {
+    unary() {
+      throw new ConnectError(INCIDENT_MSG, INCIDENT_CODE, {
+        "content-type": "application/grpc",
+        "grpc-status": String(INCIDENT_CODE),
+        "grpc-message": INCIDENT_MSG,
+        "x-request-id": "incident-request",
+      });
+    },
+    stream() {
+      throw new Error("unexpected streaming call");
+    },
+  } as Transport;
 
   const app = new Hono();
   const server = buildServer(app, (router: ConnectRouter) => {
@@ -92,6 +100,9 @@ describe("passthrough error propagation (enable-image incident)", () => {
       // be the Connect error envelope (this is what stops connect-web from
       // collapsing to "[internal] HTTP 400").
       expect(resp.headers.get("content-type")).toContain("json");
+      expect(resp.headers.get("content-type")).not.toContain("application/grpc");
+      expect(resp.headers.get("grpc-status")).toBeNull();
+      expect(resp.headers.get("x-request-id")).toBe("incident-request");
       const body = (await resp.json()) as { code?: string; message?: string };
       expect(body.code).toBe("invalid_argument");
       expect(body.message).toBe(INCIDENT_MSG);
