@@ -137,24 +137,68 @@ pub enum PidLiveness {
     Dead,
 }
 
+/// Whether a live process still holds the device node (`/dev/nbdN`) open,
+/// independent of the netlink server pid. This is the **proof-of-death** input
+/// the R6 layer-1 guard adds (ADR 0098 §Phase 3, #784 / #769 gap A): the
+/// stale-binding sweep must never disconnect a device a surviving guest is
+/// actively reading, even when the configuring server pid is dead. In prod
+/// this is a `/proc/*/fd` readlink scan for the device node
+/// (`device_has_live_holder`); in the sim it is the world's guest-liveness
+/// model.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DeviceHolder {
+    /// A live process holds an open fd on the device node — the surviving FC
+    /// guest is still reading its rootfs. Disconnecting would EIO a live guest.
+    LiveHolder,
+    /// The scan completed and found no live holder — nothing is reading the
+    /// device.
+    NoHolder,
+    /// The holder could not be determined (a scan error). Treated as
+    /// fail-safe: absence of proof is not proof of death, so an Unknown holder
+    /// blocks the disconnect exactly like a live one.
+    Unknown,
+}
+
 /// The stale-binding sweep's action for one candidate device.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SweepAction {
-    /// Leave it alone — not a genuine stale binding.
+    /// Leave it alone — not a genuine stale binding (the owner is live/self,
+    /// or there is no binding to sweep).
     NotStuck,
-    /// Netlink `NBD_CMD_DISCONNECT` — a genuinely dead owner.
+    /// The dead-owner binding still has a live (or unprovable) holder — leave
+    /// the device RECONNECTABLE (do NOT disconnect) and surface it as a
+    /// survivor candidate for a later re-serve pass. The R6 proof-of-death
+    /// guard: `sweep-blocked-live-holder`.
+    Park,
+    /// Netlink `NBD_CMD_DISCONNECT` — a genuinely dead owner AND no live holder
+    /// (proof of death). This is the only arm that tears the binding down.
     Disconnect,
 }
 
-/// The pure stale-binding verdict: **only a dead recorded owner is stale.**
-/// A no-pid, self-pid, or live-pid device is left serving — the 731df805
-/// class was exactly a *live* (parked-survivor) device being swept, which the
-/// `free-in-pool` gate (the caller's `try_claim`) and this verdict together
-/// prevent: the sweep only reaches devices free in the pool AND dead here.
-pub fn sweep_verdict(pid_liveness: PidLiveness) -> SweepAction {
-    match pid_liveness {
-        PidLiveness::NoPid | PidLiveness::SelfPid | PidLiveness::Alive => SweepAction::NotStuck,
-        PidLiveness::Dead => SweepAction::Disconnect,
+/// The pure stale-binding verdict: **a dead recorded owner is disconnected
+/// only with proof of death** — i.e. a completed holder scan that found NO
+/// live process holding the device node open. A no-pid, self-pid, or live-pid
+/// device is never stale (the 731df805 class); a dead-owner device whose node
+/// is still held open by a surviving guest — or whose holder is unprovable —
+/// is PARKED (left reconnectable), never severed (the #769 gap-A class).
+///
+/// The match is the full `(liveness × holder)` transition table, wildcard-free
+/// so a new variant on EITHER enum is a compile error, not a silent gap.
+pub fn sweep_verdict(pid_liveness: PidLiveness, holder: DeviceHolder) -> SweepAction {
+    use DeviceHolder::{LiveHolder, NoHolder, Unknown};
+    use PidLiveness::{Alive, Dead, NoPid, SelfPid};
+    match (pid_liveness, holder) {
+        // No binding / a live or self owner is never stale — the holder is
+        // irrelevant, but every combination is enumerated so neither enum can
+        // grow a silently-uncovered variant.
+        (NoPid, NoHolder) | (NoPid, LiveHolder) | (NoPid, Unknown) => SweepAction::NotStuck,
+        (SelfPid, NoHolder) | (SelfPid, LiveHolder) | (SelfPid, Unknown) => SweepAction::NotStuck,
+        (Alive, NoHolder) | (Alive, LiveHolder) | (Alive, Unknown) => SweepAction::NotStuck,
+        // Dead owner: the disconnect requires PROOF OF DEATH (a scan that found
+        // no holder). A live holder — or an unprovable one — parks instead.
+        (Dead, NoHolder) => SweepAction::Disconnect,
+        (Dead, LiveHolder) => SweepAction::Park,
+        (Dead, Unknown) => SweepAction::Park,
     }
 }
 
@@ -246,12 +290,48 @@ mod tests {
     }
 
     #[test]
-    fn sweep_disconnects_only_dead_owners() {
-        assert_eq!(sweep_verdict(PidLiveness::Dead), SweepAction::Disconnect);
-        // The 731df805 protections: none of these is swept.
-        assert_eq!(sweep_verdict(PidLiveness::NoPid), SweepAction::NotStuck);
-        assert_eq!(sweep_verdict(PidLiveness::SelfPid), SweepAction::NotStuck);
-        assert_eq!(sweep_verdict(PidLiveness::Alive), SweepAction::NotStuck);
+    fn sweep_disconnects_only_dead_owners_with_proof_of_death() {
+        // The 731df805 protections: a live/self/no-pid owner is never stale,
+        // regardless of the holder scan.
+        for holder in [
+            DeviceHolder::NoHolder,
+            DeviceHolder::LiveHolder,
+            DeviceHolder::Unknown,
+        ] {
+            assert_eq!(
+                sweep_verdict(PidLiveness::NoPid, holder),
+                SweepAction::NotStuck
+            );
+            assert_eq!(
+                sweep_verdict(PidLiveness::SelfPid, holder),
+                SweepAction::NotStuck
+            );
+            assert_eq!(
+                sweep_verdict(PidLiveness::Alive, holder),
+                SweepAction::NotStuck
+            );
+        }
+        // The R6 proof-of-death rule (#769 gap A): a dead owner disconnects
+        // ONLY when the holder scan completed and found no live holder.
+        assert_eq!(
+            sweep_verdict(PidLiveness::Dead, DeviceHolder::NoHolder),
+            SweepAction::Disconnect,
+            "a dead owner with a completed no-holder scan is a genuine stale binding",
+        );
+        // A live holder — a surviving guest still reading its rootfs — parks
+        // instead of severing (the #769 gap-A class).
+        assert_eq!(
+            sweep_verdict(PidLiveness::Dead, DeviceHolder::LiveHolder),
+            SweepAction::Park,
+            "a dead owner whose device a live guest still holds must NEVER disconnect",
+        );
+        // Fail-safe: an unprovable holder is not proof of death — park, never
+        // sever.
+        assert_eq!(
+            sweep_verdict(PidLiveness::Dead, DeviceHolder::Unknown),
+            SweepAction::Park,
+            "absence of proof (a scan error) is not proof of death — park, never sever",
+        );
     }
 
     #[test]

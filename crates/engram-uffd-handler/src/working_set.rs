@@ -106,7 +106,8 @@ impl WorkingSetRecorder {
     /// window the runtime *intended* to record over.
     pub fn finish(self) -> WorkingSetTrace {
         let capture_window_ms = u32::try_from(self.window.as_millis()).unwrap_or(u32::MAX);
-        let mut trace = WorkingSetTrace::new(self.vcpu_count, capture_window_ms);
+        let mut trace =
+            WorkingSetTrace::new(self.vcpu_count, capture_window_ms, chrono::Utc::now());
         trace.chunks = self.chunks_in_order;
         trace
     }

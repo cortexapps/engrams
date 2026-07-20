@@ -178,11 +178,22 @@ impl ChainHeadRecord {
     pub async fn load(dir: &Path, id: SandboxId) -> Option<ChainHeadRecord> {
         let path = crate::durable_record::record_path(dir, id);
         let bytes = tokio::fs::read(&path).await.ok()?;
-        match serde_json::from_slice(&bytes) {
+        // R5: open the sealed envelope (content hash + sandbox-id identity); a
+        // torn/bit-rotted/misdirected record is treated as absent, same as the
+        // pre-envelope unparseable arm — the chain seeds Full next capture.
+        let body = match crate::durable_envelope::open(&bytes, &id.to_string()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "corrupt chain-head record; treating as absent");
+                return None;
+            }
+        };
+        match serde_json::from_slice(&body) {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e,
-                    "unparseable chain-head record; treating as absent");
+                    "unparseable chain-head record body; treating as absent");
                 None
             }
         }
@@ -312,8 +323,13 @@ impl ChainHeadStore {
         let dest = crate::durable_record::record_path(dir, record.sandbox_id);
         let nonce = PERSIST_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = dest.with_extension(format!("json.partial.{nonce}"));
-        let bytes = serde_json::to_vec_pretty(&record)
+        // R5: seal the record under a content hash + the sandbox id, so its
+        // custom epoch-checked write matches the durable_record envelope its
+        // `load`/`load_all` now expect (chain-head persists here, not through
+        // durable_record::persist, for the epoch-fenced rename).
+        let body = serde_json::to_string_pretty(&record)
             .map_err(|e| std::io::Error::other(format!("serialize chain-head record: {e}")))?;
+        let bytes = crate::durable_envelope::seal(&record.sandbox_id.to_string(), &body);
         std::fs::write(&tmp, &bytes)?;
         std::fs::File::open(&tmp)?.sync_all()?;
         {

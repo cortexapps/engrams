@@ -30,6 +30,7 @@ pub mod replayed;
 pub mod resolver;
 pub mod sni;
 pub mod substitute;
+mod time_source;
 pub mod violation;
 
 pub use proxy::{Listeners, Proxy, ProxyConfig};

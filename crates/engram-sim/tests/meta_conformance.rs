@@ -16,7 +16,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use engram_core::traits::{Clock, MetadataStore};
+use engram_core::types::capture_job::{
+    CaptureJobReport, CaptureJobStage, CaptureTerminalReport, NewCaptureJob,
+};
 use engram_core::types::host::{HostCapacity, HostHeartbeat, HostRecord, HostStatus};
+use engram_core::types::image::ImageConfig;
 use engram_core::types::session::{SessionMode, SessionSpec, SessionState};
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
 use engram_core::types::snapshot::SnapshotRecord;
@@ -193,9 +197,166 @@ fn enabled_image(
     }
 }
 
+fn new_capture(enable_job_id: uuid::Uuid) -> NewCaptureJob {
+    NewCaptureJob {
+        enable_job_id,
+        image_uri: format!("conf:capture:{enable_job_id}"),
+        manifest_digest: "sha256:conf".into(),
+        disk_manifest: format!("{}@v1", uuid::Uuid::nil()),
+        image_config: ImageConfig::default(),
+        oci_defaults: Default::default(),
+        mem_budget_mib: 512,
+        cpu_budget_vcpus: 1,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Scenarios
 // ---------------------------------------------------------------------------
+
+async fn enable_job_claim_boundary(ctx: &Ctx) {
+    let config = ImageConfig::default();
+    let first = ctx
+        .meta
+        .create_or_get_enable_job("conf:enable:first", Some("sha256:first"), &config)
+        .await
+        .unwrap();
+    let same = ctx
+        .meta
+        .create_or_get_enable_job("conf:enable:first", Some("sha256:changed"), &config)
+        .await
+        .unwrap();
+    assert_eq!(same.id, first.id, "active create-or-get is idempotent");
+
+    ctx.clock.advance(Duration::from_secs(1));
+    let second = ctx
+        .meta
+        .create_or_get_enable_job("conf:enable:second", None, &config)
+        .await
+        .unwrap();
+    let claimed = ctx.meta.claim_enable_jobs("pod-a", 30, 1).await.unwrap();
+    assert_eq!(claimed.len(), 1, "claim_limit is respected");
+    assert_eq!(
+        claimed[0].id, first.id,
+        "oldest active job is claimed first"
+    );
+
+    let by_b = ctx.meta.claim_enable_jobs("pod-b", 30, 1).await.unwrap();
+    assert_eq!(by_b.len(), 1);
+    assert_eq!(by_b[0].id, second.id, "held lease is skipped");
+    assert!(ctx
+        .meta
+        .claim_enable_jobs("pod-b", 30, 10)
+        .await
+        .unwrap()
+        .is_empty());
+
+    ctx.clock.advance(Duration::from_secs(31));
+    let reclaimed = ctx.meta.claim_enable_jobs("pod-b", 30, 1).await.unwrap();
+    assert_eq!(reclaimed.len(), 1);
+    assert_eq!(
+        reclaimed[0].id, first.id,
+        "expired oldest lease is reclaimable"
+    );
+}
+
+async fn capture_job_scan_boundary(ctx: &Ctx) {
+    let now = ctx.clock.now_utc();
+    let host = HostId::from(uuid::Uuid::from_u128(0xc001));
+    ctx.meta
+        .upsert_host(host_record(host, "capture-host", now))
+        .await
+        .unwrap();
+
+    // Real enable-job parents: `capture_jobs.enable_job_id` is an FK in
+    // PG, so a made-up uuid is rejected there (and prod never inserts a
+    // capture job without its enable row).
+    let config = ImageConfig::default();
+    let waiting_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:waiting", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let placed_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:placed", None, &config)
+        .await
+        .unwrap()
+        .id;
+    let terminal_parent = ctx
+        .meta
+        .create_or_get_enable_job("conf:capture:terminal", None, &config)
+        .await
+        .unwrap()
+        .id;
+
+    let waiting = ctx
+        .meta
+        .insert_capture_job(new_capture(waiting_parent))
+        .await
+        .unwrap();
+    let placed = ctx
+        .meta
+        .insert_capture_job(new_capture(placed_parent))
+        .await
+        .unwrap();
+    let placed = ctx
+        .meta
+        .place_capture_job(placed.id, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(placed.host_id, Some(host));
+
+    let terminal = ctx
+        .meta
+        .insert_capture_job(new_capture(terminal_parent))
+        .await
+        .unwrap();
+    let terminal = ctx
+        .meta
+        .place_capture_job(terminal.id, &[host])
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(ctx
+        .meta
+        .record_capture_job_report(&CaptureJobReport {
+            job_id: terminal.id,
+            epoch: terminal.epoch,
+            stage: CaptureJobStage::Done,
+            progress: None,
+            fc_snapshot_version: None,
+            terminal: Some(CaptureTerminalReport::Done {
+                result_bincode: Vec::new(),
+            }),
+        })
+        .await
+        .unwrap());
+
+    let waiting_rows = ctx.meta.list_waiting_capture_jobs().await.unwrap();
+    assert_eq!(waiting_rows.len(), 1);
+    assert_eq!(
+        waiting_rows[0].id, waiting.id,
+        "only unplaced non-terminal rows wait"
+    );
+
+    let budgets = [(CaptureJobStage::Assigned, Duration::from_secs(30))];
+    assert!(ctx
+        .meta
+        .expire_capture_job_stages(&budgets)
+        .await
+        .unwrap()
+        .is_empty());
+    ctx.clock.advance(Duration::from_secs(31));
+    let expired = ctx.meta.expire_capture_job_stages(&budgets).await.unwrap();
+    assert_eq!(expired.len(), 1);
+    assert_eq!(
+        expired[0].id, placed.id,
+        "only placed over-budget rows expire"
+    );
+}
 
 /// Transition legality: illegal edges are Conflict, transitions return
 /// the PREVIOUS state, terminal states have no exits, missing rows are
@@ -233,6 +394,105 @@ async fn session_lifecycle(ctx: &Ctx) {
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::NotFound));
+}
+
+/// The dead-host straggler listing returns only HostLost sessions.
+async fn list_host_lost_sessions(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let stranded = meta
+        .create_session(spec("conf:host-lost-straggler"))
+        .await
+        .unwrap();
+    let other = meta
+        .create_session(spec("conf:not-host-lost"))
+        .await
+        .unwrap();
+
+    meta.transition_session(stranded, SessionState::Created)
+        .await
+        .unwrap();
+    meta.transition_session(stranded, SessionState::HostLost)
+        .await
+        .unwrap();
+
+    let listed = meta.list_host_lost_sessions().await.unwrap();
+    assert!(listed.iter().any(|session| session.id == stranded));
+    assert!(!listed.iter().any(|session| session.id == other));
+}
+
+/// `terminate_session` picks the terminal target for the current state,
+/// drives the (row-locked) transition, and is idempotent once terminal;
+/// `notify_session_delta` is a best-effort ephemeral fan-out. Both stores
+/// must agree (ADR 0098 D4) — Sim overrides the trait defaults rather than
+/// silently inheriting them.
+async fn terminate_and_delta(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:terminate")).await.unwrap();
+    meta.transition_session(id, SessionState::Created)
+        .await
+        .unwrap();
+    meta.transition_session(id, SessionState::Active)
+        .await
+        .unwrap();
+
+    // Best-effort delta fan-out never errors on a live store.
+    meta.notify_session_delta(id, &serde_json::json!({"chunk": "hi"}))
+        .await
+        .unwrap();
+
+    // Active is non-terminal: terminate routes to Completed and reports
+    // the honest (prev, target) pair.
+    let outcome = meta.terminate_session(id).await.unwrap();
+    assert_eq!(
+        outcome,
+        Some((SessionState::Active, SessionState::Completed))
+    );
+    assert_eq!(
+        meta.get_session(id).await.unwrap().status,
+        SessionState::Completed
+    );
+
+    // Idempotent once terminal.
+    assert_eq!(meta.terminate_session(id).await.unwrap(), None);
+
+    // Missing row surfaces NotFound (not a silent None).
+    let err = meta.terminate_session(SessionId::new()).await.unwrap_err();
+    assert!(matches!(err, MetaError::NotFound));
+}
+
+/// `fc_snapshot_version_for_host` reads `hosts.capabilities.fc_snapshot_version`
+/// off the active-host scan: present when the host reported one, `None` for a
+/// host with no version and for an unknown host. Both stores must agree
+/// (ADR 0098 D4).
+async fn host_fc_snapshot_version(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let with_ver = HostId::new();
+    let without_ver = HostId::new();
+
+    let mut rec = host_record(with_ver, "conf-fcver", now);
+    rec.capabilities.fc_snapshot_version = Some("v10.0.0".to_string());
+    meta.upsert_host(rec).await.unwrap();
+    meta.upsert_host(host_record(without_ver, "conf-nofcver", now))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        meta.fc_snapshot_version_for_host(with_ver).await.unwrap(),
+        Some("v10.0.0".to_string())
+    );
+    assert_eq!(
+        meta.fc_snapshot_version_for_host(without_ver)
+            .await
+            .unwrap(),
+        None
+    );
+    assert_eq!(
+        meta.fc_snapshot_version_for_host(HostId::new())
+            .await
+            .unwrap(),
+        None
+    );
 }
 
 /// FIFO by queued_at; the queue drains oldest-first. Sessions enter the
@@ -525,6 +785,97 @@ async fn fenced_transition(ctx: &Ctx) {
     assert_eq!(prev, Some(SessionState::Pending));
 }
 
+/// #800: `enqueue_evacuating_session_resume` — the RESERVED evac-placement
+/// overflow CAS. Fenced `evacuating → queued` (resume-origin): matches only
+/// on `status='evacuating'` AND the op's epoch; a wrong epoch, a wrong
+/// status, and a second call are all clean no-ops. Both stores must agree.
+async fn enqueue_evacuating_resume(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:evacq")).await.unwrap();
+    // Claim an op to establish the fencing epoch (as the evac resumer does).
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Resume, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    let epoch = op.epoch.unwrap();
+
+    // Walk Pending → Created → Active → Evacuating (the resumer's input).
+    for target in [
+        SessionState::Created,
+        SessionState::Active,
+        SessionState::Evacuating,
+    ] {
+        meta.transition_session(sid, target).await.unwrap();
+    }
+
+    // Wrong epoch: no-op (a reclaimed-away zombie can't fork the machine).
+    assert!(
+        !meta
+            .enqueue_evacuating_session_resume(sid, epoch + 1)
+            .await
+            .unwrap(),
+        "epoch mismatch must not flip the row",
+    );
+    let still = meta.get_session(sid).await.unwrap();
+    assert_eq!(still.status, SessionState::Evacuating);
+
+    // Correct epoch + status: flips to queued (resume-origin), FIFO-visible.
+    assert!(meta
+        .enqueue_evacuating_session_resume(sid, epoch)
+        .await
+        .unwrap());
+    let q = meta.list_queued_sessions_fifo().await.unwrap();
+    let row = q
+        .iter()
+        .find(|r| r.session.id == sid)
+        .expect("queued after evac overflow");
+    assert!(matches!(
+        row.origin,
+        engram_core::types::session::QueueOrigin::Resume
+    ));
+
+    // Second call is a clean no-op — the row already left `evacuating`.
+    assert!(
+        !meta
+            .enqueue_evacuating_session_resume(sid, epoch)
+            .await
+            .unwrap(),
+        "a session no longer Evacuating must not re-queue",
+    );
+
+    // Wrong status guard: an Idle session is never eligible for this CAS.
+    let other = meta.create_session(spec("conf:evacq2")).await.unwrap();
+    let EnqueueOutcome::Claimed(op2) = meta
+        .op_enqueue_and_claim(other, OpKind::Resume, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    let epoch2 = op2.epoch.unwrap();
+    for target in [
+        SessionState::Created,
+        SessionState::Active,
+        SessionState::Idle,
+    ] {
+        meta.transition_session(other, target).await.unwrap();
+    }
+    assert!(
+        !meta
+            .enqueue_evacuating_session_resume(other, epoch2)
+            .await
+            .unwrap(),
+        "an Idle session must not be evac-queued",
+    );
+    assert_eq!(
+        meta.get_session(other).await.unwrap().status,
+        SessionState::Idle,
+    );
+}
+
 /// Outbox: due-ness rides not_before on the shared clock; ack is
 /// once-only; delivered rows can't be deleted as undelivered.
 async fn outbox_flow(ctx: &Ctx) {
@@ -609,6 +960,73 @@ async fn snapshot_durable_head(ctx: &Ctx) {
         .await
         .unwrap());
     assert_eq!(meta.durable_head_snapshot(sid).await.unwrap(), Some(s1));
+}
+
+/// Issue #777 honest-Dead: `latest_snapshot_for_session` returns the
+/// newest snapshot row AND its `recoverable` flag faithfully — the
+/// foundation the unified HostLost stage-2 predicate
+/// (`dead_host::recovery_target`) keys on. Pin it across BOTH stores so
+/// the "un-recoverable-only ⇒ Dead, recoverable ⇒ Idle" decision rests
+/// on identical store semantics: a session whose ONLY (or latest)
+/// snapshot is `recoverable=false` must NOT masquerade as recoverable.
+async fn latest_snapshot_reports_recoverable_flag(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta
+        .create_session(spec("conf:latest-snap-recoverable"))
+        .await
+        .unwrap();
+
+    // No snapshot yet → None (a genuinely never-checkpointed session;
+    // the predicate routes this to Dead only when there's also no
+    // manifest, and never lies it into Idle).
+    assert!(meta
+        .latest_snapshot_for_session(sid)
+        .await
+        .unwrap()
+        .is_none());
+
+    // The only snapshot is un-recoverable (a torn/HEAD-failed capture):
+    // the row exists, but `recoverable` is false. The honest predicate
+    // must see false here, not "a snapshot exists".
+    let t0 = ctx.clock.now_utc();
+    let bad = SnapshotId::new();
+    assert!(meta
+        .record_snapshot(snapshot(bad, sid, t0, false))
+        .await
+        .unwrap());
+    let latest = meta
+        .latest_snapshot_for_session(sid)
+        .await
+        .unwrap()
+        .expect("a snapshot row exists");
+    assert_eq!(latest.id, bad);
+    assert!(
+        !latest.recoverable,
+        "an un-recoverable snapshot must report recoverable=false — honest-Dead (#777) keys on it",
+    );
+
+    // A newer recoverable snapshot becomes the latest and reports true —
+    // now the same session IS recoverable (routes to Idle).
+    ctx.clock.advance(Duration::from_secs(10));
+    let t1 = ctx.clock.now_utc();
+    let good = SnapshotId::new();
+    assert!(meta
+        .record_snapshot(snapshot(good, sid, t1, true))
+        .await
+        .unwrap());
+    let latest = meta
+        .latest_snapshot_for_session(sid)
+        .await
+        .unwrap()
+        .expect("a snapshot row exists");
+    assert_eq!(
+        latest.id, good,
+        "the newest row (by created_at) is the latest"
+    );
+    assert!(
+        latest.recoverable,
+        "a recoverable snapshot must report recoverable=true — the Idle arm keys on it",
+    );
 }
 
 /// GC candidates: first_seen_at is sticky across re-upserts; the
@@ -932,12 +1350,75 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
     assert_eq!(rows, expected);
 }
 
+/// ADR 0023 broker tokens (R2): first-writer-wins insert, get, delete.
+async fn broker_token_flow(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:broker")).await.unwrap();
+    let token = engram_core::types::registry::SessionBrokerToken {
+        session_id: id,
+        wrapped_dek: vec![1, 2, 3],
+        nonce: vec![4, 5],
+        ciphertext: vec![6, 7, 8, 9],
+        key_id: "conf:kek:v1".to_string(),
+    };
+    assert!(meta.insert_broker_token(token.clone()).await.unwrap());
+    // ON CONFLICT DO NOTHING: the racing sibling loses cleanly.
+    assert!(!meta.insert_broker_token(token.clone()).await.unwrap());
+    let got = meta.get_broker_token(id).await.unwrap().expect("present");
+    assert_eq!(got.wrapped_dek, token.wrapped_dek);
+    assert_eq!(got.key_id, token.key_id);
+    meta.delete_broker_token(id).await.unwrap();
+    assert!(meta.get_broker_token(id).await.unwrap().is_none());
+    // A never-inserted session reads None (not an error).
+    assert!(meta
+        .get_broker_token(SessionId::new())
+        .await
+        .unwrap()
+        .is_none());
+}
+
+/// ADR 0045 teleport target pin (R2): set stamps host+`_set_at`, clear
+/// nulls both, get round-trips.
+async fn teleport_target_flow(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:teleport")).await.unwrap();
+    assert!(meta.get_teleport_target(id).await.unwrap().is_none());
+    let host = HostId::new();
+    meta.set_teleport_target(id, Some(host)).await.unwrap();
+    let (got_host, set_at) = meta.get_teleport_target(id).await.unwrap().expect("pinned");
+    assert_eq!(got_host, host);
+    assert!(set_at.is_some(), "a set pin stamps its set_at");
+    meta.set_teleport_target(id, None).await.unwrap();
+    assert!(meta.get_teleport_target(id).await.unwrap().is_none());
+}
+
+conformance!(t_broker_token_flow, super::broker_token_flow);
+conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
+conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
+conformance!(
+    t_latest_snapshot_reports_recoverable_flag,
+    super::latest_snapshot_reports_recoverable_flag
+);
+conformance!(t_terminate_and_delta, super::terminate_and_delta);
+conformance!(t_host_fc_snapshot_version, super::host_fc_snapshot_version);
+conformance!(
+    t_enable_job_claim_boundary,
+    super::enable_job_claim_boundary
+);
+conformance!(
+    t_capture_job_scan_boundary,
+    super::capture_job_scan_boundary
+);
 conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
 conformance!(t_ops_idempotency, super::ops_idempotency);
 conformance!(t_fenced_transition, super::fenced_transition);
+conformance!(
+    t_enqueue_evacuating_resume,
+    super::enqueue_evacuating_resume
+);
 conformance!(t_outbox_flow, super::outbox_flow);
 conformance!(t_snapshot_durable_head, super::snapshot_durable_head);
 conformance!(t_gc_candidates, super::gc_candidates);
@@ -947,11 +1428,13 @@ conformance!(
     super::resident_sandboxes_rehydrate_list
 );
 
-/// Issue #722: the reservation predicate. A stale `pending` WITH a live
-/// create_boot op still holds its budget (visible through
-/// placement_no_fit_details' free_mib); a stale op-less pending is
-/// written off — and the reclaim sweep fails those, so they can never
-/// boot later and over-pack the host.
+/// Issue #722 (R3): the reservation predicate is UNCONDITIONAL — a
+/// `pending` pinned to a host holds its budget (visible through
+/// placement_no_fit_details' free_mib) for as long as it is `pending`,
+/// whether fresh, aged, live-op, or op-less. There is no crash-orphan
+/// wall-age exclusion: an aged op-less orphan STILL reserves until the
+/// ADR 0079 backstop reclaims it by a real `pending → failed` transition.
+/// (Both stores must agree — the D4 conformance contract.)
 async fn stale_pending_reservation(ctx: &Ctx) {
     use engram_core::types::session_op::{EnqueueOutcome, OpKind};
     let meta = &ctx.meta;
@@ -1015,17 +1498,24 @@ async fn stale_pending_reservation(ctx: &Ctx) {
         engram_core::traits::metadata::CreateDisposition::Placed(_)
     ));
 
-    // Fresh: both reserve — 8192 - 2*2048 = 4096 free.
+    // Both reserve — 8192 - 2*2048 = 4096 free.
     let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
     assert_eq!(details[0].free_mib, 4096);
 
-    // Cross the 10-minute horizon: the live-op pending still counts,
-    // the op-less orphan is written off — 8192 - 2048 = 6144 free.
+    // R3 (#722): cross the old 10-minute horizon. BOTH pendings STILL
+    // reserve — a `pending` holds its slot UNCONDITIONALLY (no wall-age /
+    // op-liveness exclusion) until it LEAVES the reserving state. The old
+    // predicate wrote off the op-less orphan here (6144 free), which let
+    // placement re-sell a slot the ADR 0079 backstop could still revive
+    // onto → Σ reserved > allocatable. The backstop reclaims a true orphan
+    // by a real `pending → failed` transition (the sole reclaimer), never
+    // a placement-side write-off.
     ctx.clock.advance(Duration::from_secs(11 * 60));
     let details = meta.placement_no_fit_details(&[host], 1, 1).await.unwrap();
     assert_eq!(
-        details[0].free_mib, 6144,
-        "stale live-op pending must keep its reservation; op-less orphan must not"
+        details[0].free_mib, 4096,
+        "R3 #722: a pending reserves unconditionally — neither the live-op \
+         pending nor the aged op-less orphan may be written off while pending"
     );
 }
 

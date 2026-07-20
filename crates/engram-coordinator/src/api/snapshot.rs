@@ -1074,6 +1074,14 @@ async fn resume_disk_only_cold_boot(
         // never strands the resume.
         origin,
         ctx.fence(),
+        // #800: `None` keeps this user-initiated single /resume path on its
+        // pre-#800 capacity-soft placement. The reserved (queue-on-no-fit)
+        // bound is wired on the drain-driven EVAC-SCANNER leg (`evac_resumer`
+        // — the #800 over-reservation wave); the resume verb's own
+        // MEMORY-snapshot path already queues via `placement_preview`
+        // (#795). Widening the reserved bound to this disk-only resume arm
+        // is a separate follow-up, out of #800's scope.
+        None,
         state.services.clock.now_utc(),
     )
     .await
@@ -1590,62 +1598,105 @@ async fn resume_from_fc_snapshot(
         prefer_bundles: record.aux_bundles.as_slice(),
     };
 
-    // ADR 0048 C7: if NO host can take this resume (the fleet is fully
-    // cordoned for a scale-down wave, or scaled to zero), QUEUE it
-    // (Idle → queued) instead of erroring. The queue scanner resumes it
-    // once capacity returns / the fleet scales up. Only triggers on an
-    // empty candidate set — a present-but-full fleet still soft-picks
-    // (the pre-existing ADR 0046 resume-isn't-reserved posture).
+    // ADR 0048 C7 → R3 (#722): if NO schedulable host FITS this resume's
+    // budget, QUEUE it (Idle → queued, resume origin) instead of placing.
+    // The queue scanner resumes it via the RESERVED `place_queued_session`
+    // once capacity returns / the fleet scales up.
+    //
+    // This closes the faithful-host #722 over-reservation. The pre-existing
+    // "resume-isn't-reserved posture" queued ONLY on an EMPTY candidate set
+    // (fully cordoned / scaled-to-zero) and let a present-but-FULL fleet
+    // soft-pick — `pick_from`'s capacity-soft fallback binds
+    // `ranked.hosts[0]` even when it is measured-full, over-committing that
+    // host. Under crash/partition churn a wave of forced resumes onto full
+    // survivors drove Σ reserved > allocatable (12/200 faithful chaos
+    // seeds, all `pick_from` SOFT-FALLBACK onto a free=0 host). Resume now
+    // honors the SAME hard reserved-budget bound as create: one authority.
+    // `placement_preview` is the HARD 2D fit check (ADR 0048 C8) — an
+    // unmeasured host still counts as fitting (dev / brand-new-host soft
+    // posture, matching `reserve_placement`), and it already returns
+    // `false` for an empty fleet, subsuming the old is_empty() gate. A
+    // budget we couldn't resolve (`None`) keeps the old soft pick — never
+    // strand a resume on a spec-resolution blip.
     if matches!(session.status, SessionState::Idle) {
-        match crate::placement::candidates_for(
-            state.services.meta.as_ref(),
-            &ctx,
-            state.services.clock.now_utc(),
-        )
-        .await
-        {
-            Ok(c) if c.hosts.is_empty() => {
-                // ADR 0079 (0078 re-review finding #4): fenced, like every
-                // sibling write in this pipeline — an unfenced Idle→Queued
-                // here let a reclaimed-away zombie executor fork the state
-                // machine. `false` = the epoch moved (successor re-claimed)
-                // or the row left Idle under us: stop silently, no event
-                // (the `fenced:` Conflict convention — the verb's Retry
-                // re-reads the session and dispatches on its real state).
-                let queued = state
-                    .services
-                    .meta
-                    .enqueue_session_resume(id, op_ctx.epoch)
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("enqueue_session_resume: {e}")))?;
-                if !queued {
-                    return Err(fenced_error());
+        let now = state.services.clock.now_utc();
+        let no_fitting_host = match (ctx.memory_mib, ctx.cpu_budget_vcpus) {
+            (Some(mib), Some(vcpus)) => {
+                // Budget resolved: HARD 2D fit. `placement_preview` also
+                // returns false for an empty/cordoned fleet (any() over no
+                // ranked hosts), so it subsumes the old is_empty() gate.
+                match crate::placement::placement_preview(
+                    state.services.meta.as_ref(),
+                    &ctx,
+                    i64::from(mib),
+                    i64::from(vcpus),
+                    now,
+                )
+                .await
+                {
+                    // Some host fits → proceed with the placement pick.
+                    Ok(true) => false,
+                    // No host fits (present-but-full, or empty/cordoned) → queue.
+                    Ok(false) => true,
+                    // Read error: don't queue blindly — fall through to the
+                    // restore attempt (which surfaces the real error).
+                    Err(e) => {
+                        tracing::warn!(%id, error = ?e,
+                            "resume: placement_preview failed; attempting restore");
+                        false
+                    }
                 }
-                let _ = state
-                    .emit_fenced(
-                        id,
-                        op_ctx.fence(),
-                        SessionEvent::StatusChanged {
-                            from: SessionState::Idle,
-                            to: SessionState::Queued,
-                            at: state.services.clock.now_utc(),
-                        },
-                    )
-                    .await;
-                tracing::info!(%id, "resume found no host capacity — queued (ADR 0048)");
-                return Ok(SnapshotResponse {
-                    session_id: id,
-                    snapshot_id: Some(record.id.to_string()),
-                    size_bytes: Some(record.size_bytes),
-                    note: "queued",
-                });
             }
-            Ok(_) => {} // a candidate exists — proceed with the soft pick
-            Err(e) => {
-                // Read error: don't queue blindly, fall through to the
-                // restore attempt (which surfaces the real error).
-                tracing::warn!(%id, error = ?e, "resume: candidates_for failed; attempting restore");
+            // Budget unresolved (image un-enabled, etc.): can't do a fit
+            // check, but the ORIGINAL ADR 0048 C7 gate still applies — queue
+            // when there is NO schedulable host at all rather than error out
+            // of `restore_for_session`.
+            _ => match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx, now)
+                .await
+            {
+                Ok(c) => c.hosts.is_empty(),
+                Err(e) => {
+                    tracing::warn!(%id, error = ?e,
+                        "resume: candidates_for failed; attempting restore");
+                    false
+                }
+            },
+        };
+        if no_fitting_host {
+            // ADR 0079 (0078 re-review finding #4): fenced, like every
+            // sibling write in this pipeline — an unfenced Idle→Queued
+            // here let a reclaimed-away zombie executor fork the state
+            // machine. `false` = the epoch moved (successor re-claimed)
+            // or the row left Idle under us: stop silently, no event
+            // (the `fenced:` Conflict convention — the verb's Retry
+            // re-reads the session and dispatches on its real state).
+            let queued = state
+                .services
+                .meta
+                .enqueue_session_resume(id, op_ctx.epoch)
+                .await
+                .map_err(|e| ApiError::Internal(format!("enqueue_session_resume: {e}")))?;
+            if !queued {
+                return Err(fenced_error());
             }
+            let _ = state
+                .emit_fenced(
+                    id,
+                    op_ctx.fence(),
+                    SessionEvent::StatusChanged {
+                        from: SessionState::Idle,
+                        to: SessionState::Queued,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+            tracing::info!(%id, "resume found no fitting host capacity — queued (ADR 0048/R3)");
+            return Ok(SnapshotResponse {
+                session_id: id,
+                snapshot_id: Some(record.id.to_string()),
+                size_bytes: Some(record.size_bytes),
+                note: "queued",
+            });
         }
     }
     // ADR 0016 Phase B commit 6: pick the newer of

@@ -59,6 +59,14 @@ FC_BINS = {"engram-host-agent", "engram-uffd-handler"}
 # coordinator closure by construction — the two sims share no sim crate
 # dep direction).
 HOST_SIM_BINS = {"engram-dst-host"}
+
+# ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator. Unlike
+# the two disjoint sims above, engram-dst-cosim deliberately spans BOTH
+# closures — it pulls engram-coordinator AND engram-host-agent/-core +
+# engram-dst-host + engram-sim as normal deps — so any change that can alter
+# either side's boundary behavior trips this lane. Its own release closure
+# is therefore the union that gates `test-cosim`.
+COSIM_BINS = {"engram-dst-cosim"}
 # engram-host-operator (ADR 0044 K3) bakes into its own container image; add
 # it so an operator-only crate change rebuilds the images lane.
 #
@@ -288,6 +296,7 @@ def main():
     agentd_closure = release_closure(meta, AGENTD_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
     host_sim_closure = release_closure(meta, HOST_SIM_BINS)
+    cosim_closure = release_closure(meta, COSIM_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
     # FC binary in the node-assets image, so it trips the images lane (which
@@ -376,6 +385,9 @@ def main():
     test_buf = ci_self or proto
     # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
     test_host_sim = ci_self or bool(cc & host_sim_closure)
+    # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
+    # release closure.
+    test_cosim = ci_self or bool(cc & cosim_closure)
 
     # ── per-image bake selectivity ─────────────────────────────────────
     bake_all = any_path(changed, BAKE_ALL_PATHS)
@@ -410,7 +422,7 @@ def main():
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto} "
-          f"test_host_sim={test_host_sim}",
+          f"test_host_sim={test_host_sim} test_cosim={test_cosim}",
           file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
 
@@ -439,6 +451,7 @@ def main():
             f.write(f"test_cli={b(test_cli)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
             f.write(f"test_host_sim={b(test_host_sim)}\n")
+            f.write(f"test_cosim={b(test_cosim)}\n")
             # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
             f.write(f"images_matrix={json.dumps(images_matrix)}\n")
 

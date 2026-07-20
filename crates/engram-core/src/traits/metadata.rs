@@ -275,13 +275,17 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
-    /// Issue #722: refresh `last_active_at` WITHOUT a state transition.
-    /// The create_boot retry path stamps this each attempt so placement's
-    /// crash-orphan exclusion (`pending` older than 10 minutes drops out
-    /// of the reservation sum) never writes off a session that is still
-    /// actively being booted — the over-reservation hole the DST harness
-    /// found (a written-off pending that later boots re-enters every
-    /// reservation sum on its Created flip, over-packing the host).
+    /// Refresh `last_active_at` WITHOUT a state transition. The create_boot
+    /// retry path stamps this each attempt so an actively-retried `pending`
+    /// looks recently-active to the ADR 0079 pending-orphan backstop (whose
+    /// grace gates on `last_active_at`).
+    ///
+    /// R3 (#722): this is now largely REDUNDANT — placement no longer
+    /// excludes an aged pending from the reservation sum (a `pending`
+    /// reserves unconditionally), and the orphan backstop already skips a
+    /// session with a live (`queued`/`running`) create_boot op, which a
+    /// retrying boot always has. Kept as belt-and-suspenders freshness;
+    /// safe to retire in a followup (trait + both stores + conformance).
     /// Default (mock): no-op.
     async fn touch_session_activity(&self, session_id: SessionId) -> Result<(), MetaError> {
         let _ = session_id;
@@ -300,6 +304,26 @@ pub trait MetadataStore: Send + Sync {
     /// moved (a successor re-claimed) — either way the caller must stop
     /// without emitting the Queued event. Default no-op: `false`.
     async fn enqueue_session_resume(&self, _id: SessionId, _epoch: i64) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
+    /// #800 (RESERVED evac placement): the `Evacuating` twin of
+    /// [`Self::enqueue_session_resume`]. When the evac resumer's reserved
+    /// placement finds NO survivor that fits the session's budget, it
+    /// queues the session (`evacuating → queued`, resume-origin) instead of
+    /// binding a measured-full host — the queue scanner then re-homes it
+    /// once capacity returns, honoring the hard reserved bound (the #795
+    /// resume precedent, on the evac leg). Gated on `status='evacuating'`
+    /// AND the evac op's fencing epoch (ADR 0079), same shape as the resume
+    /// enqueue: a reclaimed-away zombie evac executor must not fork the
+    /// state machine. Returns whether the flip landed: `false` = the row was
+    /// no longer `evacuating` (a peer relocated it) OR the epoch moved (a
+    /// successor re-claimed). Default no-op: `false`.
+    async fn enqueue_evacuating_session_resume(
+        &self,
+        _id: SessionId,
+        _epoch: i64,
+    ) -> Result<bool, MetaError> {
         Ok(false)
     }
 
@@ -2982,6 +3006,16 @@ pub trait MetadataStore: Send + Sync {
     /// Default `Ok(vec![])` keeps in-memory mocks quiet; PG impl
     /// runs an indexed `WHERE status = 'evacuating'` query.
     async fn list_evacuating_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// Input to the dead-host driver's straggler sweep: `HostLost` rows
+    /// whose inline stage-2 transition never ran or failed. These arise
+    /// when eviction exhausts its retry budget or a coordinator replica
+    /// crashes between the two HostLost stages. Default `Ok(vec![])`
+    /// keeps in-memory mocks quiet; durable stores must implement the
+    /// listing explicitly.
+    async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
         Ok(Vec::new())
     }
 

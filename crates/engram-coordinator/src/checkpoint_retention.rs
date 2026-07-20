@@ -59,36 +59,36 @@ pub fn spawn(cfg: CheckpointRetentionConfig, state: SharedState) -> tokio::task:
         tick.tick().await;
         loop {
             tick.tick().await;
-            match state
-                .services
-                .meta
-                .prune_session_snapshots(
-                    chrono::Duration::from_std(cfg.retention)
-                        .unwrap_or_else(|_| chrono::Duration::hours(24)),
-                )
-                .await
-            {
-                Ok(deleted) if deleted.is_empty() => {}
-                Ok(deleted) => {
-                    // The generation bump inside `prune_session_snapshots`
-                    // re-classifies the chunks/manifests these rows
-                    // exclusively referenced. The per-snapshot portable
-                    // blobs (`snapshots/<id>/`) are now unpinned (no row)
-                    // and reaped by the snapshot-blob GC sweep on its next
-                    // tick — we no longer delete them inline here (ADR 0028
-                    // addendum: portable blobs are pin-set-governed, so
-                    // nothing but the sweep deletes a durable snapshot
-                    // blob).
-                    tracing::info!(
-                        deleted = deleted.len(),
-                        retention_secs = cfg.retention.as_secs(),
-                        "checkpoint retention sweep pruned aged-out session snapshots",
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "checkpoint retention sweep failed; will retry");
-                }
+            if let Err(e) = run_once(&cfg, &state).await {
+                tracing::warn!(error = %e, "checkpoint retention sweep failed; will retry");
             }
         }
     })
+}
+
+/// Run one retention sweep. Production calls this from [`spawn`]; the
+/// deterministic simulator calls it directly without a timer loop.
+pub async fn run_once(
+    cfg: &CheckpointRetentionConfig,
+    state: &SharedState,
+) -> Result<usize, engram_core::MetaError> {
+    let deleted = state
+        .services
+        .meta
+        .prune_session_snapshots(
+            chrono::Duration::from_std(cfg.retention)
+                .unwrap_or_else(|_| chrono::Duration::hours(24)),
+        )
+        .await?;
+    if !deleted.is_empty() {
+        // The generation bump inside `prune_session_snapshots`
+        // re-classifies the chunks/manifests these rows exclusively
+        // referenced. Portable blobs are reaped by snapshot-blob GC.
+        tracing::info!(
+            deleted = deleted.len(),
+            retention_secs = cfg.retention.as_secs(),
+            "checkpoint retention sweep pruned aged-out session snapshots",
+        );
+    }
+    Ok(deleted.len())
 }

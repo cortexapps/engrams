@@ -21,7 +21,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -258,10 +258,10 @@ async fn terminate_pgid(_pgid: i32) {}
 /// Wait until code-server answers `/healthz` on `port` — that's "the IDE
 /// is up".
 async fn wait_until_ready(port: u16) -> io::Result<()> {
-    let deadline = Instant::now() + READY_DEADLINE;
+    let deadline = crate::time_source::metrics_now() + READY_DEADLINE;
     let mut backoff = READY_PROBE_START;
     let mut last_err: Option<io::Error> = None;
-    while Instant::now() < deadline {
+    while crate::time_source::metrics_now() < deadline {
         match probe_ready(port).await {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),

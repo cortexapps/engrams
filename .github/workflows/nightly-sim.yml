@@ -86,8 +86,8 @@ jobs:
         # failures of the same invariant become comments on it, so a
         # recurring bug accumulates seeds instead of spamming issues.
         # A job failure WITHOUT a report file is an infra error (build
-        # break, runner death) — no issue; the workflow failure itself
-        # is the signal there.
+        # break, runner death, or timeout), so file or update a dedicated
+        # deduplicated issue rather than treating it as a sim invariant.
         if: ${{ failure() }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -99,7 +99,18 @@ jobs:
             fi
           done
           if [ -z "$reports" ]; then
-            echo "job failed with no failure report — infra error, not filing an issue"
+            title="nightly sim: infra failure (no failure report)"
+            body=$(printf '%s\n\n**Run:** %s\n**Commit:** `%s`\n' \
+              "The nightly job failed without producing a failure report, so this is an infra error — build break, runner death, or timeout — not a sim invariant." \
+              "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              "${GITHUB_SHA}")
+            existing=$(gh issue list --state open --label sim-failure --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              echo "commenting on existing issue #$existing"
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title "$title" --label sim-failure --body "$body"
+            fi
             exit 0
           fi
           slug=$(printf '%s' "$reports" | sed -n 's/^<!-- sim-failure-slug: \(.*\) -->$/\1/p' | head -1)
@@ -162,7 +173,8 @@ jobs:
         # Same dedup discipline as the coordinator swarm: one open issue per
         # invariant slug, repeats accumulate as comments. The title prefix
         # keeps host-sim slugs from colliding with same-named coordinator
-        # invariants.
+        # invariants. A failure without a report is filed or updated as a
+        # dedicated infra-error issue instead.
         if: ${{ failure() }}
         env:
           GH_TOKEN: ${{ github.token }}
@@ -174,7 +186,18 @@ jobs:
             fi
           done
           if [ -z "$reports" ]; then
-            echo "job failed with no failure report — infra error, not filing an issue"
+            title="nightly host sim: infra failure (no failure report)"
+            body=$(printf '%s\n\n**Run:** %s\n**Commit:** `%s`\n' \
+              "The nightly job failed without producing a failure report, so this is an infra error — build break, runner death, or timeout — not a sim invariant." \
+              "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              "${GITHUB_SHA}")
+            existing=$(gh issue list --state open --label sim-failure --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              echo "commenting on existing issue #$existing"
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title "$title" --label sim-failure --body "$body"
+            fi
             exit 0
           fi
           slug=$(printf '%s' "$reports" | sed -n 's/^<!-- sim-failure-slug: \(.*\) -->$/\1/p' | head -1)

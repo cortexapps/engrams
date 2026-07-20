@@ -388,6 +388,10 @@ impl ChunkStore {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a
+    // decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
+
     use super::*;
     use crate::cache::{ChunkCache, ChunkCacheConfig};
     use crate::manifest::{ChunkRef, ManifestKind};
@@ -582,7 +586,7 @@ mod tests {
     async fn put_and_get_trace_round_trips() {
         let (s, _d) = store().await;
         let r = TraceRef::canonical(Uuid::new_v4());
-        let mut t = WorkingSetTrace::new(2, 5000);
+        let mut t = WorkingSetTrace::new(2, 5000, chrono::DateTime::<chrono::Utc>::UNIX_EPOCH);
         t.chunks.push(ChunkHash::of(b"a"));
         t.chunks.push(ChunkHash::of(b"b"));
         s.put_trace(r, &t).await.unwrap();

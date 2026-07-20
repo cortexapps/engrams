@@ -136,12 +136,12 @@ pub mod world;
 
 pub use coord_stub::{RecordedPublish, ScriptedResponse, SimCoordClient};
 pub use effects::{sim_effects, SeamEvent, SeamLog, SimDeviceSync, SimNbd};
-pub use fs_crash::{CrashFs, FsOp};
+pub use fs_crash::{CrashFs, FsOp, ReadCorruption, ReadFault};
 pub use invariants::Violation;
 pub use reconcile::{DestroyRecord, SimReconcileBackend};
 pub use scheduler::{Profile, Sim, SimReport, Step, NUM_SANDBOXES};
 pub use simfs::SimFs;
 pub use world::{
-    decode_tag, AckedWriteLedger, CaptureOutcome, LedgerEntry, ResumeOutcome, SandboxSlot,
-    SimEvictionSandbox, SimHost, CHUNK_SIZE, NUM_CHUNKS, SIM_FINALIZE_MAX_ATTEMPTS,
+    decode_tag, synth_chunk, AckedWriteLedger, CaptureOutcome, LedgerEntry, ResumeOutcome,
+    SandboxSlot, SimEvictionSandbox, SimHost, CHUNK_SIZE, NUM_CHUNKS, SIM_FINALIZE_MAX_ATTEMPTS,
 };

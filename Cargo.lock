@@ -1231,12 +1231,46 @@ version = "0.1.0"
 dependencies = [
  "async-trait",
  "axum",
+ "bytes",
  "chrono",
  "engram-chunk-store",
  "engram-cloud-mock",
  "engram-coordinator",
  "engram-core",
  "engram-crypto",
+ "engram-harness-proto",
+ "engram-oci",
+ "engram-protocol",
+ "engram-secrets-dev",
+ "engram-sim",
+ "parking_lot",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower 0.5.3",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-dst-cosim"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "engram-chunk-store",
+ "engram-cloud-mock",
+ "engram-coordinator",
+ "engram-core",
+ "engram-crypto",
+ "engram-dst-host",
+ "engram-host-agent",
+ "engram-host-core",
  "engram-oci",
  "engram-protocol",
  "engram-secrets-dev",
@@ -1246,10 +1280,8 @@ dependencies = [
  "rand 0.9.4",
  "rand_chacha 0.9.0",
  "serde_json",
- "tempfile",
  "tokio",
  "toml",
- "tower 0.5.3",
  "uuid",
  "workspace-hack",
 ]
@@ -1811,10 +1843,12 @@ name = "engram-sim"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
  "engram-core",
  "engram-postgres",
  "engram-testkit",
+ "futures",
  "parking_lot",
  "serde_json",
  "tokio",
@@ -1922,6 +1956,7 @@ name = "engram-uffd-handler"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "engram-chunk-store",
  "engram-core",
  "engram-migrate-proto",

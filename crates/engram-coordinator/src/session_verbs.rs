@@ -323,7 +323,7 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
             session.status.as_str()
         )),
         SessionState::HostLost => OpOutcome::Failed(
-            "session's host went away; resume from a snapshot once reconcile settles it".into(),
+            "session's host went away; resume from a snapshot once the dead-host straggler sweep settles it".into(),
         ),
         SessionState::Dead => OpOutcome::Failed(
             "gone: snapshot_invalidated: session is terminal; chunked manifests are gone \
@@ -424,7 +424,8 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
             // budget, and the fallback DESTROYS the sandbox first. The VM
             // is structurally crippled (disk unserved, often egress-dead);
             // "healthy runtime" doesn't apply, and only its death lets the
-            // ownership reconcile drive HostLost → Idle (recoverable) so
+            // dead_host's straggler sweep drives HostLost → Idle
+            // (recoverable) so
             // the user's next prompt resumes from the last checkpoint.
             // Without the destroy, the session stays Active-and-crippled,
             // the host re-advertises the quarantine every 5s, and the
@@ -453,15 +454,16 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
                                         attempts = ctx.op.attempts,
                                         error = %e,
                                         "quarantined-survivor evict budget exhausted; destroyed \
-                                         the crippled VM (reconcile drives HostLost → Idle, \
+                                         the crippled VM (the dead-host straggler sweep drives \
+                                         HostLost → Idle, \
                                          resume rewinds to the last checkpoint)",
                                     ),
                                     Err(de) => tracing::warn!(
                                         session_id = %ctx.op.session_id,
                                         %sandbox_id,
                                         error = %de,
-                                        "quarantined-survivor destroy failed; the ownership \
-                                         reconcile / next advert re-drives recovery",
+                                        "quarantined-survivor destroy failed; the dead-host \
+                                         straggler sweep re-drives recovery",
                                     ),
                                 }
                             }
@@ -939,11 +941,12 @@ async fn create_boot(ctx: &OpCtx<'_>) -> OpOutcome {
 /// the Failed flip frees the `pending` reservation).
 async fn create_boot_retry_or_fail(ctx: &OpCtx<'_>, reason: String) -> OpOutcome {
     if ctx.op.attempts < CREATE_BOOT_MAX_ATTEMPTS {
-        // Issue #722: an actively-retried pending must stay FRESH in
-        // placement's eyes — the crash-orphan exclusion writes a stale
-        // pending's reservation off the books, and if it later boots
-        // anyway the host is over-packed. Best-effort: a failed touch
-        // just means this attempt didn't refresh.
+        // Keep an actively-retried pending recently-active for the ADR 0079
+        // orphan backstop's grace. R3 (#722): now belt-and-suspenders —
+        // placement counts a pending's reservation unconditionally and the
+        // orphan sweep already skips a session with a live create_boot op
+        // (which this retry is). Best-effort: a failed touch just means this
+        // attempt didn't refresh.
         let _ = ctx
             .state
             .services

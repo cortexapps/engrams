@@ -200,6 +200,10 @@ impl SessionState {
     ///                hit no capacity, ADR 0048)
     /// HostLost    -> Created | Idle | Dead | Completed
     /// Evacuating  -> Created (scanner resumes on peer)
+    ///              | Queued (RESERVED evac placement found no host that
+    ///                fits the session's budget; queue rather than bind a
+    ///                measured-full survivor — #800, resume-origin so the
+    ///                queue scanner re-homes it once capacity returns)
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
     ///              | Completed (user delete mid-evac)
@@ -252,7 +256,12 @@ impl SessionState {
             // create path and for the harness-failed resume arm.
             Idle => matches!(target, Active | Created | Dead | Completed | Queued),
             HostLost => matches!(target, Created | Idle | Dead | Completed),
-            Evacuating => matches!(target, Created | Idle | Dead | Completed),
+            // #800: `Queued` is the RESERVED evac placement's honest-overflow
+            // edge — when no survivor fits the session's budget, the evac
+            // resumer queues (resume-origin) instead of binding a
+            // measured-full host, and the queue scanner re-homes it once
+            // capacity returns (the #795 resume precedent, on the evac leg).
+            Evacuating => matches!(target, Created | Queued | Idle | Dead | Completed),
             // ADR 0074 rung 1: `Active` is the cancel edge — a returning
             // user's prompt un-nominates an eviction whose capture has
             // not begun (lease-guarded CAS; see
@@ -745,6 +754,8 @@ mod tests {
             (HostLost, Dead),
             (HostLost, Completed),
             (Evacuating, Created),
+            // #800: RESERVED evac placement queues instead of overcommitting.
+            (Evacuating, Queued),
             (Evacuating, Idle),
             (Evacuating, Dead),
             (Evacuating, Completed),

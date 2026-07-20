@@ -156,6 +156,18 @@ impl ReconcileBackend for SimReconcileBackend {
         self.inner.lock().live_captures.contains(&id)
     }
 
+    fn capture_in_flight(&self, _id: SandboxId) -> bool {
+        // The host-internal sim keeps the teardown-reconcile world
+        // decoupled from the eviction-finalize model by design (P3: a
+        // reconcile destroy never touches a `SandboxSlot`); this sim never
+        // co-simulates a D5 capture racing a reconcile tick. The
+        // finalize-in-flight-vs-reconcile race is the R-CoSim boundary
+        // scenario (`engram-dst-cosim`), where a real capture lock drives
+        // this signal. Here it is always `false` — honest for a model
+        // with no in-flight capture concept.
+        false
+    }
+
     fn session_for_sandbox(&self, id: SandboxId) -> Option<SessionId> {
         self.inner.lock().local_bindings.get(&id).copied()
     }

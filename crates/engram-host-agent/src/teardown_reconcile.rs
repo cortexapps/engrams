@@ -166,6 +166,24 @@ pub trait ReconcileBackend: Send + Sync {
     /// Is this the live sandbox of a non-terminal capture job?
     /// (`CaptureJobExecutor::is_live_sandbox`.)
     fn is_live_capture(&self, id: SandboxId) -> bool;
+    /// Is a capture / eviction-finalize in flight for this sandbox
+    /// (`PooledBackend::capture_in_flight` — the capture lock is held)?
+    ///
+    /// ADR 0098 R-CoSim / issue #570: the ADR 0045 D5 idle-eviction fast
+    /// path marks the session `Idle` and clears `sessions.sandbox_id` the
+    /// instant `snapshot_begin` returns, while the snapshot upload
+    /// finalizes in a host-owned background job. During that window
+    /// `sandbox_ownership` / `sandbox_owner` answer "no owner" for a
+    /// sandbox whose capture is still running — so the orphan-strike arm
+    /// would SIGKILL the VM mid-upload, cancelling the finalize and losing
+    /// the eviction snapshot (resume then rewinds to a stale checkpoint).
+    /// The signal already exists on the host — the periodic checkpointer
+    /// consults exactly this method to skip a sandbox with a capture in
+    /// flight — the reconcile ownership check just never did. An in-flight
+    /// capture is therefore an exemption, like a migration role or a live
+    /// base-capture VM: the coordinator's transient unbind is not orphan
+    /// truth while the host is mid-capture.
+    fn capture_in_flight(&self, id: SandboxId) -> bool;
     /// The local session binding, if any (`session_for_sandbox`).
     fn session_for_sandbox(&self, id: SandboxId) -> Option<SessionId>;
     /// Repopulate a local binding the table missed (`record_session_binding`).
@@ -185,7 +203,10 @@ async fn gather_input(
     sandbox_id: SandboxId,
     session: Option<SessionId>,
 ) -> ReconcileInput {
-    if backend.migration_role_present(sandbox_id) || backend.is_live_capture(sandbox_id) {
+    if backend.migration_role_present(sandbox_id)
+        || backend.is_live_capture(sandbox_id)
+        || backend.capture_in_flight(sandbox_id)
+    {
         return ReconcileInput::Exempt;
     }
     match session {
@@ -283,6 +304,12 @@ impl ReconcileBackend for PooledReconcileBackend {
     }
     fn is_live_capture(&self, id: SandboxId) -> bool {
         self.capture_jobs.is_live_sandbox(id)
+    }
+    fn capture_in_flight(&self, id: SandboxId) -> bool {
+        // The exact signal the periodic checkpointer consults to skip a
+        // sandbox mid-capture (issue #570): the capture lock is held for
+        // the whole snapshot_begin → background-finalize window.
+        self.pooled.capture_in_flight(id)
     }
     fn session_for_sandbox(&self, id: SandboxId) -> Option<SessionId> {
         self.pooled.session_for_sandbox(id)
@@ -434,5 +461,122 @@ mod tests {
                                                                   // The caller's destroy failed, so it did NOT remove the entry: the
                                                                   // count stays at/over threshold and re-fires on the next tick.
         assert!(orphan_strike(&mut s, id, true, ORPHAN_STRIKES));
+    }
+
+    // ---- ADR 0098 R-CoSim / issue #570: an in-flight capture is exempt ----
+    //
+    // The D5 idle-eviction window: the coordinator has cleared
+    // `sessions.sandbox_id` (so both ownership calls answer "no owner"),
+    // but the host is still finalizing the snapshot upload (capture lock
+    // held). The reconcile tick must NOT reap the sandbox — doing so
+    // cancels the upload and loses the eviction snapshot. The full
+    // co-simulated reproduction (real coordinator + real host) lives in
+    // `engram-dst-cosim`; this pins the exemption at the unit boundary.
+
+    use engram_host_core::{CoordError, LiveManifestPublishRequest, LiveManifestPublishResponse};
+
+    struct MidCaptureBackend {
+        sandbox: SandboxId,
+        session: SessionId,
+        capture_in_flight: bool,
+        destroyed: parking_lot::Mutex<Vec<SandboxId>>,
+    }
+
+    #[async_trait]
+    impl ReconcileBackend for MidCaptureBackend {
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            Ok(vec![self.sandbox])
+        }
+        fn migration_role_present(&self, _: SandboxId) -> bool {
+            false
+        }
+        fn is_live_capture(&self, _: SandboxId) -> bool {
+            false
+        }
+        fn capture_in_flight(&self, _: SandboxId) -> bool {
+            self.capture_in_flight
+        }
+        fn session_for_sandbox(&self, _: SandboxId) -> Option<SessionId> {
+            Some(self.session)
+        }
+        fn record_session_binding(&self, _: SandboxId, _: SessionId) {}
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.destroyed.lock().push(id);
+            Ok(())
+        }
+    }
+
+    /// The coordinator during the D5 window: `sessions.sandbox_id` cleared,
+    /// so ownership is `false` and the owner lookup is `None`.
+    struct UnownedCoord;
+
+    #[async_trait]
+    impl CoordControlPlane for UnownedCoord {
+        async fn publish_live_manifest(
+            &self,
+            _: HostId,
+            _: &LiveManifestPublishRequest,
+        ) -> Result<LiveManifestPublishResponse, CoordError> {
+            unreachable!("reconcile never publishes")
+        }
+        async fn sandbox_ownership(
+            &self,
+            _: HostId,
+            _: SessionId,
+            _: SandboxId,
+        ) -> Result<bool, CoordError> {
+            Ok(false)
+        }
+        async fn sandbox_owner(
+            &self,
+            _: HostId,
+            _: SandboxId,
+        ) -> Result<Option<SessionId>, CoordError> {
+            Ok(None)
+        }
+    }
+
+    async fn ticks_to_destroy(capture_in_flight: bool) -> usize {
+        let backend = MidCaptureBackend {
+            sandbox: SandboxId::new(),
+            session: SessionId::new(),
+            capture_in_flight,
+            destroyed: parking_lot::Mutex::new(Vec::new()),
+        };
+        let coord = UnownedCoord;
+        let host = HostId::new();
+        let mut strikes = HashMap::new();
+        for tick in 1..=(ORPHAN_STRIKES as usize + 3) {
+            reconcile_once(&backend, &coord, host, &mut strikes)
+                .await
+                .expect("tick");
+            if !backend.destroyed.lock().is_empty() {
+                return tick;
+            }
+        }
+        usize::MAX
+    }
+
+    #[tokio::test]
+    async fn capture_in_flight_sandbox_is_never_reaped() {
+        // The fix: mid-capture, the unowned sandbox is exempt — no destroy
+        // however long the D5 window lasts.
+        assert_eq!(
+            ticks_to_destroy(true).await,
+            usize::MAX,
+            "a sandbox with a capture in flight must never be reaped (issue #570)",
+        );
+    }
+
+    #[tokio::test]
+    async fn unowned_idle_sandbox_is_still_reaped_when_no_capture() {
+        // The exemption is scoped: a genuinely-unowned sandbox with NO
+        // capture in flight is still reaped after the strike debounce — the
+        // fix must not blunt the reconciler's real job.
+        assert_eq!(
+            ticks_to_destroy(false).await,
+            ORPHAN_STRIKES as usize,
+            "an unowned sandbox with no capture must reap after the strikes",
+        );
     }
 }

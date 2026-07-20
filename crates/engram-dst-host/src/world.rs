@@ -24,7 +24,7 @@
 //! decodes the tag back and the oracle can prove *which* acked write a
 //! recovered chunk carries. `tag = 0` is the base (never-written) content.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
@@ -134,9 +134,11 @@ pub struct LedgerEntry {
 ///   permanent floor; spool RECOVERY is asserted by the dedicated regression
 ///   seeds that crash with a STANDING spool, not by the standing-state oracle.
 ///
-/// The oracle therefore tolerates any read in `[published_floor, latest_ack]`
-/// (by tag order) and flags only a read OLDER than the published floor (a
-/// published write rolled back) or NEWER than the latest ack.
+/// The oracle therefore tolerates any read that is a MEMBER of this chunk's
+/// acked-tag set (or the tag-0 base), bounded below by `published_floor`. It
+/// flags a read OLDER than the published floor (a published write rolled back),
+/// NEWER than the latest ack, or in-range but never acked for this chunk (a
+/// misdirected read).
 #[derive(Default)]
 pub struct AckedWriteLedger {
     log: Vec<LedgerEntry>,
@@ -182,6 +184,17 @@ impl AckedWriteLedger {
     /// are all still RAM-only or spool-transient, droppable by abrupt death).
     pub fn handed_off_tag(&self, sandbox: usize, chunk_idx: u64) -> Option<u64> {
         self.published_floor.get(&(sandbox, chunk_idx)).copied()
+    }
+
+    /// Every tag ever acked for `(sandbox, chunk_idx)` — the membership set
+    /// the oracle checks reads against (a read must be one of THESE, never
+    /// merely a numerically in-range tag minted for another chunk).
+    pub fn acked_tags(&self, sandbox: usize, chunk_idx: u64) -> BTreeSet<u64> {
+        self.log
+            .iter()
+            .filter(|e| e.sandbox == sandbox && e.chunk_idx == chunk_idx)
+            .map(|e| e.content_tag)
+            .collect()
     }
 
     /// The recoverable set: the LATEST acked tag per `(sandbox, chunk_idx)`
@@ -243,6 +256,16 @@ pub struct SandboxSlot {
     /// in prod. Cleared by commit/abort/destroy or a process death (the
     /// registry is RAM).
     pub migrating: bool,
+    /// R6 (ADR 0098 §Phase 3, #784 layer 1 / #769 gap A): does the FC guest
+    /// process still hold this sandbox's `/dev/nbdN` node open? The guest is a
+    /// SEPARATE process from the host-agent, so it SURVIVES a host-agent roll
+    /// (the whole survivor premise) and keeps reading its rootfs across the
+    /// gap. This is the world-side twin of the prod `device_has_live_holder`
+    /// proc-scan: a live holder ⇒ [`DeviceHolder::LiveHolder`], driving the
+    /// stale-binding sweep to PARK (never DISCONNECT) a dead-owner device the
+    /// rehydrate passes missed. `false` models a genuinely-gone guest (FC
+    /// crashed/destroyed) ⇒ `NoHolder` ⇒ a DISCONNECT is legal.
+    pub guest_holds_device: bool,
 }
 
 impl SandboxSlot {
@@ -453,6 +476,9 @@ impl SimHost {
                 parked: false,
                 poisoned_snapshot: false,
                 migrating: false,
+                // A fresh sandbox's guest is resident and holds its rootfs
+                // device open.
+                guest_holds_device: true,
             });
         }
 
@@ -586,13 +612,14 @@ impl SimHost {
     /// HONEST read property inline (the oracle re-checks every acked chunk each
     /// step, but this gives a targeted read trace).
     ///
-    /// A legitimate read-back falls in the honest range
-    /// `[published_floor, latest_ack]` (by tag order): the live newest write,
-    /// the permanent published floor (a recovery that dropped newer,
+    /// A legitimate read-back is a tag actually acked for this chunk (or the
+    /// tag-0 base), bounded below by the published floor: the live newest
+    /// write, the permanent published floor (a recovery that dropped newer,
     /// un-published writes — the accepted, bounded loss of ADR 0098 P4.5), or a
     /// transiently-durable intermediate a standing spool adopted. A read older
-    /// than the published floor (a rolled-back durable write) or newer than the
-    /// latest ack is a durability-pipeline violation.
+    /// than the published floor (a rolled-back durable write), newer than the
+    /// latest ack, or in-range but never acked for this chunk (misdirection) is
+    /// a durability-pipeline violation.
     pub async fn guest_read(&self, idx: usize, chunk_idx: u64) -> Result<(), String> {
         if idx >= self.sandboxes.len() || chunk_idx >= NUM_CHUNKS {
             return Ok(());
@@ -613,11 +640,20 @@ impl SimHost {
         {
             // `0` = base content (never published).
             let floor = self.ledger.handed_off_tag(idx, chunk_idx).unwrap_or(0);
-            if got < floor || got > latest {
+            let acked = self.ledger.acked_tags(idx, chunk_idx);
+            let member = got == 0 || acked.contains(&got);
+            if !member || got < floor {
+                let why = if got < floor {
+                    "a lost or rolled-back durable write"
+                } else if got > latest {
+                    "a read newer than the latest ack (a never-acked tag)"
+                } else {
+                    "an in-range tag never acked for this chunk (misdirection)"
+                };
                 return Err(format!(
-                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got} outside \
-                     [published_floor {floor}, latest_ack {latest}] — a lost or rolled-back \
-                     durable write"
+                    "read-after-write: sandbox {idx} chunk {chunk_idx} read tag {got} not a \
+                     member of this chunk's acked set within [published_floor {floor}, \
+                     latest_ack {latest}] — {why}"
                 ));
             }
         }
@@ -924,12 +960,19 @@ impl SimHost {
         Ok(())
     }
 
-    /// The stale-binding sweep (ADR 0098 P7): DISCONNECT devices whose recorded
-    /// owner is a genuinely-dead generation, driven over the pure
-    /// [`sweep_verdict`](engram_host_core::sweep_verdict). Only devices FREE in
-    /// the pool are reached — the `served_by == current` (claimed) gate mirrors
-    /// the driver's `try_claim` free-in-pool gate, so a device THIS generation
-    /// serves (a re-served survivor) is NEVER swept (the 731df805 protection).
+    /// The stale-binding sweep (ADR 0098 P7 + R6): a dead-owner device is
+    /// DISCONNECTed only with **proof of death** — no live process holds its
+    /// node open. Driven over the pure
+    /// [`sweep_verdict`](engram_host_core::sweep_verdict) with the holder input.
+    /// Only devices FREE in the pool are reached — the `served_by == current`
+    /// (claimed) gate mirrors the driver's `try_claim` free-in-pool gate, so a
+    /// device THIS generation serves (a re-served survivor) is NEVER swept (the
+    /// 731df805 protection).
+    ///
+    /// R6 (#769 gap A): a dead-owner device whose FC guest still holds it open
+    /// (`guest_holds_device`) — a survivor the rehydrate passes missed — PARKs
+    /// (left kernel-bound, RECONNECTABLE) instead of being severed. The
+    /// world-side `guest_holds_device` is the twin of the prod proc-scan.
     pub fn stale_sweep_tick(&mut self) {
         let gen = self.generation;
         for slot in &mut self.sandboxes {
@@ -944,13 +987,35 @@ impl SimHost {
                 // An older generation is a dead process.
                 Some(_) => engram_host_core::PidLiveness::Dead,
             };
-            if matches!(
-                engram_host_core::sweep_verdict(liveness),
-                engram_host_core::SweepAction::Disconnect
-            ) {
-                // NBD_CMD_DISCONNECT: the kernel binding is torn down.
-                slot.kernel_owner = None;
+            // The holder input: a resident guest still reading its rootfs is a
+            // live holder; a genuinely-gone guest is NoHolder. The sim never
+            // produces Unknown (no scan errors in the model) — that fail-safe
+            // arm is pinned by the pure-core unit test.
+            let holder = if slot.guest_holds_device {
+                engram_host_core::DeviceHolder::LiveHolder
+            } else {
+                engram_host_core::DeviceHolder::NoHolder
+            };
+            match engram_host_core::sweep_verdict(liveness, holder) {
+                // NBD_CMD_DISCONNECT: proof of death met — tear the binding down.
+                engram_host_core::SweepAction::Disconnect => slot.kernel_owner = None,
+                // PARK: a live holder blocked the disconnect. Leave the device
+                // kernel-bound (RECONNECTABLE) for a later re-serve pass — the
+                // #769 gap-A guard. `kernel_owner` is deliberately untouched.
+                engram_host_core::SweepAction::Park => {}
+                engram_host_core::SweepAction::NotStuck => {}
             }
+        }
+    }
+
+    /// R6 (#769 gap A): model the FC guest process genuinely dying (crash /
+    /// destroy), so it no longer holds its `/dev/nbdN` node open. After this a
+    /// dead-owner sweep sees `NoHolder` and a DISCONNECT is legal — the
+    /// un-pause gate's own coverage (a device whose holder is truly gone). A
+    /// no-op on an out-of-range index.
+    pub fn kill_guest(&mut self, idx: usize) {
+        if let Some(slot) = self.sandboxes.get_mut(idx) {
+            slot.guest_holds_device = false;
         }
     }
 
@@ -1098,19 +1163,23 @@ impl SimHost {
     /// The lineage gate mirrors the real call site: a spool from a DIFFERENT
     /// manifest lineage is a loud discard, never an adopt.
     async fn rebuild(&mut self, idx: usize) -> Result<(), String> {
+        self.rebuild_with(idx, self.effects.fs.clone()).await
+    }
+
+    /// [`rebuild`](Self::rebuild) over an EXPLICIT fs handle — the honest
+    /// `TokioFs` for the normal recovery legs, or a [`CrashFs`] armed with a
+    /// seeded read fault for the R5 storage-lie injection
+    /// ([`corrupt_spool_recovery`](Self::corrupt_spool_recovery)). Every spool
+    /// read/discard goes through `fs`, so a lie about the spool's bytes is
+    /// seen exactly where a real rehydrate would see it.
+    async fn rebuild_with(&mut self, idx: usize, fs: Arc<dyn HostFs>) -> Result<(), String> {
         let sandbox_id = self.sandboxes[idx].sandbox_id;
         // Read the spool BEFORE picking the rebuild ref (store-ahead rule).
-        let spool = match spool::read_spool(
-            self.effects.fs.as_ref(),
-            self.fs.spool_dir(),
-            sandbox_id,
-        )
-        .await
-        {
+        let spool = match spool::read_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id).await {
             Ok(s) => s,
             Err(_torn) => {
                 // Torn/spliced → discard + rebuild from the durable pointer.
-                spool::discard_spool(self.effects.fs.as_ref(), self.fs.spool_dir(), sandbox_id)
+                spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
                     .await
                     .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
                 None
@@ -1145,12 +1214,67 @@ impl SimHost {
                 backend.adopt_unflushed(chunks).await;
             }
             // Adopted or stale: the spool is consumed either way.
-            spool::discard_spool(self.effects.fs.as_ref(), self.fs.spool_dir(), sandbox_id)
+            spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
                 .await
                 .map_err(|e| format!("discard_spool sandbox {idx}: {e}"))?;
         }
         self.sandboxes[idx].backend = Some(Arc::new(backend));
         Ok(())
+    }
+
+    /// R5 (ADR 0098 Phase 3, storage lies): rehydrate sandbox `idx` from a
+    /// STANDING shutdown spool whose bytes a seeded storage fault LIES about.
+    ///
+    /// The setup keeps the oracle honest by construction: a flush first raises
+    /// the durable published FLOOR over an acked write (a redundant copy that
+    /// survives any spool loss), then a newer, un-published write is captured
+    /// into a standing transient spool. The rebuild then reads that spool
+    /// through a [`CrashFs`] armed to corrupt read `on_read` — `meta` selects
+    /// the completeness marker (read #0) vs the first chunk (read #1) — with a
+    /// byte-flip at `offset`.
+    ///
+    /// Whatever the lie:
+    /// * a corrupt CHUNK fails `read_spool`'s per-chunk re-hash → loud discard;
+    /// * a corrupt META (once R5's envelope lands) fails the content hash →
+    ///   loud discard; before the envelope it is TRUSTED (the gap this wave
+    ///   exists for), but the setup's redundant floor keeps a trusted adopt of
+    ///   the SAME-lineage newer chunks at-or-above the floor;
+    /// * a lie that breaks the JSON → parse error → loud discard.
+    ///
+    /// A discard rebuilds from the published floor (the newer un-published
+    /// write is a legitimately-lost transient-spool write — oracle #1 keys on
+    /// the floor). So the step converges for the oracle EITHER way; it exists
+    /// to drive the detection machinery across the swarm's interleavings.
+    pub async fn corrupt_spool_recovery(
+        &mut self,
+        idx: usize,
+        meta: bool,
+        offset: usize,
+    ) -> Result<(), String> {
+        if idx >= self.sandboxes.len()
+            || self.finalize_pending(idx)
+            || self.sandboxes[idx].migrating
+        {
+            return Ok(());
+        }
+        if self.sandboxes[idx].backend.is_none() {
+            return Ok(());
+        }
+        // 1. A flushed write raises the durable floor (the redundant copy).
+        self.guest_write(idx, 0).await?;
+        self.flush_tick(idx).await?;
+        // 2. A newer, un-published write captured into a standing spool.
+        self.guest_write(idx, 1).await?;
+        self.spool_export(idx).await?;
+        // 3. The roll: RAM dies; the successor rehydrates from the (lied-about)
+        //    spool. read #0 = meta.json, read #1 = the first chunk file.
+        self.sandboxes[idx].backend = None;
+        let fault = crate::fs_crash::ReadFault {
+            on_read: if meta { 0 } else { 1 },
+            corruption: crate::fs_crash::ReadCorruption::FlipByte { offset },
+        };
+        let crash_fs = CrashFs::with_read_fault(fault);
+        self.rebuild_with(idx, crash_fs).await
     }
 
     /// The `/dev/nbdN`-shaped path a sandbox slot's device sync records

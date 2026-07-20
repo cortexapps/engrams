@@ -362,7 +362,7 @@ async fn gate_enable_work(
         return;
     }
     const MAX_CONSECUTIVE_ERRORS: u32 = 6;
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = crate::time_source::metrics_now_tokio() + budget;
     let mut consecutive_errors = 0u32;
     let mut waiting_logged = false;
     loop {
@@ -386,7 +386,7 @@ async fn gate_enable_work(
                     );
                     waiting_logged = true;
                 }
-                if tokio::time::Instant::now() >= deadline {
+                if crate::time_source::metrics_now_tokio() >= deadline {
                     tracing::warn!(
                         %node, %host,
                         live_materializes = st.live_materializes,
@@ -400,7 +400,7 @@ async fn gate_enable_work(
             Err(e) => {
                 consecutive_errors += 1;
                 if consecutive_errors >= MAX_CONSECUTIVE_ERRORS
-                    || tokio::time::Instant::now() >= deadline
+                    || crate::time_source::metrics_now_tokio() >= deadline
                 {
                     tracing::warn!(
                         %node, %host, error = %e,
@@ -436,7 +436,7 @@ async fn gate_successor_ready(
     budget: Duration,
 ) -> Result<(), OperatorError> {
     let ds_api: Api<DaemonSet> = Api::namespaced(client.clone(), &spec.daemon_set.namespace);
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = crate::time_source::metrics_now_tokio() + budget;
     loop {
         let ds = ds_api.get(&spec.daemon_set.name).await?;
         let pods = list_ds_pods(client, &spec.daemon_set.namespace, &ds).await?;
@@ -444,7 +444,7 @@ async fn gate_successor_ready(
             tracing::info!(%node, "successor pod Ready on target");
             return Ok(());
         }
-        if tokio::time::Instant::now() >= deadline {
+        if crate::time_source::metrics_now_tokio() >= deadline {
             return Err(OperatorError::RollTimeout {
                 node: node.to_string(),
             });

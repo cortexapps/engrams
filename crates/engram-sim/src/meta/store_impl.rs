@@ -13,8 +13,8 @@ use engram_core::traits::metadata::{
 };
 use engram_core::types::capability::Capability;
 use engram_core::types::capture_job::{
-    CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, ColdBaseRow,
-    NewCaptureJob,
+    CaptureJobAssignment, CaptureJobReport, CaptureJobRow, CaptureJobStage, CaptureTerminalReport,
+    ColdBaseRow, NewCaptureJob,
 };
 use engram_core::types::event::{ArtifactRow, PersistedEvent};
 use engram_core::types::host::{HostRecord, HostStatus, ReservedBudget};
@@ -30,58 +30,53 @@ use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::SandboxId;
 use engram_core::{HostId, MetaError, SessionId, SnapshotId};
 
-use super::{SessRow, SimDb, SimMetadataStore};
-
-/// Issue #722 reservation predicate, shared by pick/reserved/no-fit:
-/// a `pending` counts while fresh OR while a live create_boot op
-/// exists — a written-off pending can then never boot (the reclaim
-/// sweep fails stale op-less orphans).
-fn pending_counts(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
-    if row.session.status != SessionState::Pending {
-        return true;
-    }
-    if row.session.last_active_at > now - chrono::Duration::minutes(10) {
-        return true;
-    }
-    use engram_core::types::session_op::{OpKind, OpState};
-    db.session_ops.values().any(|o| {
-        o.session_id == row.session.id
-            && o.kind == OpKind::CreateBoot
-            && matches!(o.state, OpState::Queued | OpState::Running)
-    })
-}
+use super::{EnableJobRow, SessRow, SimDb, SimMetadataStore};
 
 /// States that hold a host-memory reservation — mirrors
 /// `PostgresStore::host_memory_reserving_states()` /
 /// `SessionState::reserves_host_memory`.
+///
+/// R3 (#722): ONE reservation authority — a session in a reserving state
+/// (including a `pending` pinned to a host) reserves its budget
+/// UNCONDITIONALLY, for exactly as long as it is in that state. There is NO
+/// crash-orphan wall-age / live-op exclusion: an aged pending physically
+/// holds its slot until it LEAVES the reserving state, and the ADR 0079
+/// pending-orphan backstop reclaims a true orphan by a real
+/// `pending → failed` transition (the sole reclaimer). This mirrors the
+/// PostgresStore SQL twin and equals the unconditional
+/// placement-accounting oracle by construction.
 fn reserves(state: SessionState) -> bool {
     state.reserves_host_memory()
 }
 
 impl SimMetadataStore {
-    fn pending_counts_row(db: &SimDb, row: &SessRow, now: DateTime<Utc>) -> bool {
-        pending_counts(db, row, now)
+    /// Oracle-only helper for engram-dst — reuses the EXACT reserve-path
+    /// predicate so the capacity-aware Queued-at-quiescence check cannot
+    /// drift from the store.
+    pub fn oracle_pick_any_host(
+        &self,
+        mem_budget_mib: i64,
+        cpu_budget_vcpus: i64,
+    ) -> Option<HostId> {
+        let db = self.db.lock();
+        let candidates: Vec<HostId> = db.hosts.keys().copied().collect();
+        Self::pick_host_2d(&db, &candidates, 0, mem_budget_mib, cpu_budget_vcpus)
     }
 
     /// Mirror of `pick_host_2d` + `choose_placement_host`: candidates
     /// filtered to ready|draining and not cordoned; reservations summed
-    /// over reserving-state sessions (a `pending` older than 10 minutes
-    /// is crash-orphaned and excluded, keyed on `last_active_at`);
-    /// best-fit = smallest allocatable-minus-reserved RAM that fits both
-    /// budgets, affinity tier (`candidates[..affinity_len]`) first, then
-    /// the rest, then any unmeasured host (allocatable == 0) as a last
-    /// resort.
+    /// over reserving-state sessions (R3 #722: every `pending` counts
+    /// unconditionally — no crash-orphan exclusion); best-fit = smallest
+    /// allocatable-minus-reserved RAM that fits both budgets, affinity tier
+    /// (`candidates[..affinity_len]`) first, then the rest, then any
+    /// unmeasured host (allocatable == 0) as a last resort.
     ///
-    /// DIVERGENCE (documented): PostgresStore also sums non-terminal
-    /// `capture_jobs` reservations; the sim has no capture-job table
-    /// yet, so conformance scenarios must not create capture jobs.
     fn pick_host_2d(
         db: &SimDb,
         candidates: &[HostId],
         affinity_len: usize,
         mem_budget_mib: i64,
         cpu_budget_vcpus: i64,
-        now: DateTime<Utc>,
     ) -> Option<HostId> {
         let eligible: Vec<&HostRecord> = candidates
             .iter()
@@ -98,11 +93,20 @@ impl SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = reserves(st) && Self::pending_counts_row(db, row, now);
+            let counts = reserves(st);
             if counts {
                 let e = reserved.entry(host).or_default();
                 e.0 += row.mem_budget_mib;
                 e.1 += i64::from(row.cpu_budget_vcpus);
+            }
+        }
+        for row in db.capture_jobs.values() {
+            if !row.stage.is_terminal() {
+                if let Some(host) = row.host_id {
+                    let e = reserved.entry(host).or_default();
+                    e.0 += row.mem_budget_mib;
+                    e.1 += i64::from(row.cpu_budget_vcpus);
+                }
             }
         }
         let fits = |h: &&HostRecord| -> Option<i64> {
@@ -254,7 +258,6 @@ impl MetadataStore for SimMetadataStore {
             affinity_len,
             ws.mem_budget_mib,
             i64::from(ws.cpu_budget_vcpus),
-            now,
         );
         let (status, host_id, queue_origin, queued_at) = match picked {
             Some(h) => (SessionState::Pending, Some(h), None, None),
@@ -379,6 +382,27 @@ impl MetadataStore for SimMetadataStore {
         Ok(current)
     }
 
+    /// Terminal transition (ADR 0015 M2): pick the terminal target for the
+    /// current state and drive `transition_session` to it; `None` when the
+    /// session is already terminal. PostgresStore does NOT override the trait
+    /// default either — both stores compose `get_session` +
+    /// `transition_session`. Written out explicitly here (rather than
+    /// inheriting the default) so the conformance suite exercises the
+    /// composition against Sim's own row-locked `transition_session`, and so a
+    /// future PG-side divergence surfaces as a Sim gap, not a silent drift
+    /// (ADR 0098 D4).
+    async fn terminate_session(
+        &self,
+        id: SessionId,
+    ) -> Result<Option<(SessionState, SessionState)>, MetaError> {
+        let session = self.get_session(id).await?;
+        let Some(target) = session.status.terminal_target() else {
+            return Ok(None);
+        };
+        let prev = self.transition_session(id, target).await?;
+        Ok(Some((prev, target)))
+    }
+
     /// `UPDATE sessions SET host_id=$2, updated_at=$3 WHERE id=$1`.
     async fn assign_session_host(
         &self,
@@ -461,6 +485,37 @@ impl MetadataStore for SimMetadataStore {
         Ok(true)
     }
 
+    async fn enqueue_evacuating_session_resume(
+        &self,
+        id: SessionId,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        // #800: fenced `evacuating → queued` (resume origin) — the sim twin
+        // of the PG CAS, gated on `status='evacuating'` + epoch.
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(row) = db.sessions.get_mut(&id) else {
+            return Ok(false);
+        };
+        if row.session.status != SessionState::Evacuating || row.current_epoch != epoch {
+            return Ok(false);
+        }
+        row.session.status = SessionState::Queued;
+        row.queue_origin = Some(QueueOrigin::Resume);
+        row.queued_at = Some(now);
+        row.session.last_active_at = now;
+        db.transition_log.push(super::TransitionLogEntry {
+            session: id,
+            from: SessionState::Evacuating,
+            to: SessionState::Queued,
+            exempt: false,
+        });
+        drop(db);
+        self.notify("placement_changed", "enqueued");
+        Ok(true)
+    }
+
     /// `WHERE status='queued' ORDER BY queued_at ASC` (serial-stable).
     async fn list_queued_sessions_fifo(&self) -> Result<Vec<QueuedSession>, MetaError> {
         self.gate()?;
@@ -508,7 +563,6 @@ impl MetadataStore for SimMetadataStore {
             affinity_len,
             mem_budget_mib,
             i64::from(cpu_budget_vcpus),
-            now,
         ) else {
             return Ok(None);
         };
@@ -533,7 +587,6 @@ impl MetadataStore for SimMetadataStore {
         &self,
     ) -> Result<std::collections::HashMap<HostId, ReservedBudget>, MetaError> {
         self.gate()?;
-        let now = self.now();
         let db = self.db.lock();
         let mut out: std::collections::HashMap<HostId, ReservedBudget> =
             std::collections::HashMap::new();
@@ -542,7 +595,7 @@ impl MetadataStore for SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = reserves(st) && Self::pending_counts_row(&db, row, now);
+            let counts = reserves(st);
             if counts {
                 let e = out.entry(host).or_default();
                 e.mem_mib += row.mem_budget_mib;
@@ -605,6 +658,24 @@ impl MetadataStore for SimMetadataStore {
             .filter(|h| matches!(h.status, HostStatus::Ready | HostStatus::Draining))
             .cloned()
             .collect())
+    }
+
+    /// ADR 0068: `hosts.capabilities.fc_snapshot_version` for one host.
+    /// PostgresStore does not override the trait default; both stores derive
+    /// it from an active-host scan. Written out explicitly (rather than
+    /// inheriting the default) so the conformance suite pins Sim's
+    /// `list_active_hosts` semantics (`ready|draining`) as the backing lookup
+    /// and a future PG divergence surfaces as a Sim gap (ADR 0098 D4).
+    async fn fc_snapshot_version_for_host(
+        &self,
+        host_id: HostId,
+    ) -> Result<Option<String>, MetaError> {
+        Ok(self
+            .list_active_hosts()
+            .await?
+            .into_iter()
+            .find(|h| h.id == host_id)
+            .and_then(|h| h.capabilities.fc_snapshot_version))
     }
 
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError> {
@@ -934,6 +1005,24 @@ impl MetadataStore for SimMetadataStore {
                     .collect()
             })
             .unwrap_or_default())
+    }
+
+    /// Phase 1c (ADR 0052): PostgresStore fans one EPHEMERAL live-token delta
+    /// out cross-replica via `NOTIFY session_event_deltas` — no row, no idx,
+    /// best-effort by contract (a dropped notification costs only live
+    /// animation, never correctness; the durable event log is the record).
+    /// The simulator models a single logical store with no peer-replica
+    /// listener bus, so there is nobody to fan out to — a no-op is the CORRECT
+    /// Sim behavior, not a silently-inherited default. Still gated so a
+    /// simulated PG-outage window mirrors PG's failing `pg_notify` execute
+    /// (ADR 0098 D4).
+    async fn notify_session_delta(
+        &self,
+        _session_id: SessionId,
+        _payload: &serde_json::Value,
+    ) -> Result<(), MetaError> {
+        self.gate()?;
+        Ok(())
     }
 
     // ================= artifacts =================
@@ -2415,6 +2504,17 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
+    async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sessions
+            .values()
+            .filter(|r| r.session.status == SessionState::HostLost)
+            .map(|r| r.session.clone())
+            .collect())
+    }
+
     async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
@@ -2747,11 +2847,35 @@ impl MetadataStore for SimMetadataStore {
 
     async fn claim_enable_jobs(
         &self,
-        _claimant: &str,
-        _lease_secs: u32,
-        _limit: u32,
+        claimant: &str,
+        lease_secs: u32,
+        limit: u32,
     ) -> Result<Vec<EnableJob>, MetaError> {
-        panic!("SimMeta: claim_enable_jobs not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let lease = chrono::Duration::seconds(i64::from(lease_secs));
+        let mut db = self.db.lock();
+        let mut eligible: Vec<_> = db
+            .enable_jobs
+            .values()
+            .filter(|row| {
+                !row.job.state.is_terminal()
+                    && row
+                        .claimed_at
+                        .is_none_or(|claimed_at| claimed_at < now - lease)
+            })
+            .map(|row| (row.job.created_at, row.job.id))
+            .collect();
+        eligible.sort_unstable();
+        let mut claimed = Vec::new();
+        for (_, id) in eligible.into_iter().take(limit as usize) {
+            let row = db.enable_jobs.get_mut(&id).expect("selected row exists");
+            row.claimed_by = Some(claimant.to_string());
+            row.claimed_at = Some(now);
+            row.job.updated_at = now;
+            claimed.push(row.job.clone());
+        }
+        Ok(claimed)
     }
 
     async fn cold_base_fc_version_changed(
@@ -2783,8 +2907,8 @@ impl MetadataStore for SimMetadataStore {
 
     async fn create_or_get_enable_job(
         &self,
-        _image_uri: &str,
-        _manifest_digest: Option<&str>,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
         // The full image config this enable will capture under (ADR
         // 0080). Rides the job and is stamped onto the enabled_images
         // row only when the job reaches `ready` — capture-affecting
@@ -2792,23 +2916,66 @@ impl MetadataStore for SimMetadataStore {
         // snapshot actually exists. Carried from the triggering
         // request (enable/update) or inherited from the existing row
         // (refresh).
-        _image_config: &engram_core::types::image::ImageConfig,
+        image_config: &engram_core::types::image::ImageConfig,
     ) -> Result<EnableJob, MetaError> {
-        panic!("SimMeta: create_or_get_enable_job not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.create_or_get_enable_job_with_options(image_uri, manifest_digest, image_config, false)
+            .await
     }
 
     async fn create_or_get_enable_job_with_options(
         &self,
-        _image_uri: &str,
-        _manifest_digest: Option<&str>,
-        _image_config: &engram_core::types::image::ImageConfig,
-        _force_recapture: bool,
+        image_uri: &str,
+        manifest_digest: Option<&str>,
+        image_config: &engram_core::types::image::ImageConfig,
+        force_recapture: bool,
     ) -> Result<EnableJob, MetaError> {
-        panic!("SimMeta: create_or_get_enable_job_with_options not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if let Some(existing) = db
+            .enable_jobs
+            .values()
+            .find(|row| row.job.image_uri == image_uri && !row.job.state.is_terminal())
+        {
+            return Ok(existing.job.clone());
+        }
+        let job = EnableJob {
+            id: self.entropy.uuid(),
+            image_uri: image_uri.to_string(),
+            manifest_digest: manifest_digest.map(str::to_string),
+            state: EnableJobState::Pending,
+            chunks_total: None,
+            chunks_done: 0,
+            attempts: 0,
+            error: None,
+            image_config: image_config.clone(),
+            force_recapture,
+            prestage_hosts: serde_json::json!({}),
+            capture_phase: None,
+            warm_stage: None,
+            warm_stage_started_at: None,
+            warm_stages: Vec::new(),
+            materialize_stages: Vec::new(),
+            materialize_host_id: None,
+            output_tail: None,
+            created_at: now,
+            updated_at: now,
+        };
+        db.enable_jobs.insert(
+            job.id,
+            EnableJobRow {
+                job: job.clone(),
+                claimed_by: None,
+                claimed_at: None,
+            },
+        );
+        Ok(job)
     }
 
-    async fn delete_broker_token(&self, _id: SessionId) -> Result<(), MetaError> {
-        panic!("SimMeta: delete_broker_token not implemented — add it plus a conformance case (ADR 0098 D4)")
+    async fn delete_broker_token(&self, id: SessionId) -> Result<(), MetaError> {
+        self.gate()?;
+        self.db.lock().broker_tokens.remove(&id);
+        Ok(())
     }
 
     async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
@@ -2823,9 +2990,31 @@ impl MetadataStore for SimMetadataStore {
 
     async fn expire_capture_job_stages(
         &self,
-        _budgets: &[(CaptureJobStage, std::time::Duration)],
+        budgets: &[(CaptureJobStage, std::time::Duration)],
     ) -> Result<Vec<CaptureJobRow>, MetaError> {
-        panic!("SimMeta: expire_capture_job_stages not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        if budgets.is_empty() {
+            return Ok(Vec::new());
+        }
+        let now = self.now();
+        Ok(self
+            .db
+            .lock()
+            .capture_jobs
+            .values()
+            .filter(|job| !job.stage.is_terminal() && job.host_id.is_some())
+            .filter(|job| {
+                budgets
+                    .iter()
+                    .find(|(stage, _)| *stage == job.stage)
+                    .is_some_and(|(_, budget)| {
+                        now.signed_duration_since(job.last_progress_at)
+                            .to_std()
+                            .is_ok_and(|age| age > *budget)
+                    })
+            })
+            .cloned()
+            .collect())
     }
 
     async fn find_enabled_image_by_content(
@@ -2838,9 +3027,10 @@ impl MetadataStore for SimMetadataStore {
 
     async fn get_broker_token(
         &self,
-        _id: SessionId,
+        id: SessionId,
     ) -> Result<Option<engram_core::types::registry::SessionBrokerToken>, MetaError> {
-        panic!("SimMeta: get_broker_token not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self.db.lock().broker_tokens.get(&id).cloned())
     }
 
     async fn get_capture_job(&self, _id: CaptureJobId) -> Result<Option<CaptureJobRow>, MetaError> {
@@ -2882,7 +3072,8 @@ impl MetadataStore for SimMetadataStore {
         &self,
         _id: SessionId,
     ) -> Result<Option<(HostId, Option<chrono::DateTime<chrono::Utc>>)>, MetaError> {
-        panic!("SimMeta: get_teleport_target not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self.db.lock().teleport_targets.get(&_id).copied())
     }
 
     async fn hosts_with_live_capture_jobs(
@@ -2893,13 +3084,60 @@ impl MetadataStore for SimMetadataStore {
 
     async fn insert_broker_token(
         &self,
-        _token: engram_core::types::registry::SessionBrokerToken,
+        token: engram_core::types::registry::SessionBrokerToken,
     ) -> Result<bool, MetaError> {
-        panic!("SimMeta: insert_broker_token not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // First-writer-wins (PG: ON CONFLICT (session_id) DO NOTHING).
+        self.gate()?;
+        let mut db = self.db.lock();
+        if let std::collections::btree_map::Entry::Vacant(slot) =
+            db.broker_tokens.entry(token.session_id)
+        {
+            slot.insert(token);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
-    async fn insert_capture_job(&self, _row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
-        panic!("SimMeta: insert_capture_job not implemented — add it plus a conformance case (ADR 0098 D4)")
+    async fn insert_capture_job(&self, row: NewCaptureJob) -> Result<CaptureJobRow, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        if let Some(existing) = db
+            .capture_jobs
+            .values()
+            .find(|job| job.enable_job_id == row.enable_job_id && !job.stage.is_terminal())
+        {
+            return Ok(existing.clone());
+        }
+        let job = CaptureJobRow {
+            id: CaptureJobId::from(self.entropy.uuid()),
+            enable_job_id: row.enable_job_id,
+            image_uri: row.image_uri,
+            manifest_digest: row.manifest_digest,
+            disk_manifest: row.disk_manifest,
+            image_config: row.image_config,
+            oci_defaults: row.oci_defaults,
+            host_id: None,
+            mem_budget_mib: row.mem_budget_mib,
+            cpu_budget_vcpus: row.cpu_budget_vcpus,
+            waiting_since: Some(now),
+            epoch: 1,
+            stage: CaptureJobStage::Assigned,
+            stage_started_at: now,
+            stage_progress: None,
+            last_progress_at: now,
+            attempts: 1,
+            retryable: None,
+            error: None,
+            error_stage: None,
+            fc_snapshot_version: None,
+            result_bincode: None,
+            created_at: now,
+            updated_at: now,
+        };
+        db.capture_jobs.insert(job.id, job.clone());
+        Ok(job)
     }
 
     async fn latest_capture_job_for_enable(
@@ -2911,9 +3149,27 @@ impl MetadataStore for SimMetadataStore {
 
     async fn list_active_assignments_with_budgets_on_host(
         &self,
-        _host_id: HostId,
+        host_id: HostId,
     ) -> Result<Vec<SandboxAssignment>, MetaError> {
-        panic!("SimMeta: list_active_assignments_with_budgets_on_host not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // PG twin: Active + bound sessions on `host_id`, with their
+        // reservation budgets (COALESCE NULL → 0).
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sessions
+            .values()
+            .filter(|r| {
+                r.session.host_id == Some(host_id)
+                    && r.session.status == SessionState::Active
+                    && r.session.sandbox_id.is_some()
+            })
+            .map(|r| SandboxAssignment {
+                session_id: r.session.id,
+                sandbox_id: r.session.sandbox_id.expect("filtered"),
+                mem_budget_mib: r.mem_budget_mib,
+                cpu_budget_vcpus: r.cpu_budget_vcpus,
+            })
+            .collect())
     }
 
     /// The reconcile pass query: Active + bound sessions on `host_id`.
@@ -3063,7 +3319,15 @@ impl MetadataStore for SimMetadataStore {
     }
 
     async fn list_waiting_capture_jobs(&self) -> Result<Vec<CaptureJobRow>, MetaError> {
-        panic!("SimMeta: list_waiting_capture_jobs not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        Ok(self
+            .db
+            .lock()
+            .capture_jobs
+            .values()
+            .filter(|job| !job.stage.is_terminal() && job.host_id.is_none())
+            .cloned()
+            .collect())
     }
 
     /// Live materialize + capture work aggregated by host (the fleet
@@ -3100,10 +3364,39 @@ impl MetadataStore for SimMetadataStore {
 
     async fn place_capture_job(
         &self,
-        _id: CaptureJobId,
-        _candidates: &[HostId],
+        id: CaptureJobId,
+        candidates: &[HostId],
     ) -> Result<Option<CaptureJobRow>, MetaError> {
-        panic!("SimMeta: place_capture_job not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(current) = db.capture_jobs.get(&id) else {
+            return Ok(None);
+        };
+        if current.stage.is_terminal() {
+            return Ok(None);
+        }
+        if current.host_id.is_some() {
+            return Ok(Some(current.clone()));
+        }
+        let picked = Self::pick_host_2d(
+            &db,
+            candidates,
+            0,
+            current.mem_budget_mib,
+            i64::from(current.cpu_budget_vcpus),
+        );
+        let row = db.capture_jobs.get_mut(&id).expect("checked above");
+        row.host_id = picked;
+        row.updated_at = now;
+        if picked.is_some() {
+            row.waiting_since = None;
+            row.stage_started_at = now;
+            row.last_progress_at = now;
+        } else if row.waiting_since.is_none() {
+            row.waiting_since = Some(now);
+        }
+        Ok(Some(row.clone()))
     }
 
     /// Diagnostic twin of `pick_host_2d` (no locking): same eligibility
@@ -3120,7 +3413,6 @@ impl MetadataStore for SimMetadataStore {
         if candidates.is_empty() {
             return Ok(Vec::new());
         }
-        let now = self.now();
         let db = self.db.lock();
         let mut reserved: std::collections::BTreeMap<HostId, (i64, i64)> = Default::default();
         for row in db.sessions.values() {
@@ -3128,7 +3420,7 @@ impl MetadataStore for SimMetadataStore {
                 continue;
             };
             let st = row.session.status;
-            let counts = st.reserves_host_memory() && Self::pending_counts_row(&db, row, now);
+            let counts = st.reserves_host_memory();
             if counts {
                 let e = reserved.entry(host).or_default();
                 e.0 += row.mem_budget_mib;
@@ -3188,20 +3480,85 @@ impl MetadataStore for SimMetadataStore {
 
     async fn rebind_session_guarded(
         &self,
-        _id: SessionId,
-        _host_id: HostId,
-        _sandbox_id: SandboxId,
-        _expected_current: Option<Option<SandboxId>>,
-        _allowed_states: &[SessionState],
+        id: SessionId,
+        host_id: HostId,
+        sandbox_id: SandboxId,
+        expected_current: Option<Option<SandboxId>>,
+        allowed_states: &[SessionState],
     ) -> Result<(), MetaError> {
-        panic!("SimMeta: rebind_session_guarded not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // PG twin (rebind onto a fresh host+sandbox under the same CAS as
+        // assign_session_sandbox_guarded, also stamping host_id and — issue
+        // #215 — clearing the reconcile strike streak). A guard miss is a
+        // Conflict; a missing row is NotFound.
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(r) = db.sessions.get_mut(&id) else {
+            return Err(MetaError::NotFound);
+        };
+        if let Some(expected) = expected_current {
+            if r.session.sandbox_id != expected {
+                return Err(MetaError::Conflict(format!(
+                    "rebind_session_guarded CAS: sandbox_id is {:?}, expected {:?}",
+                    r.session.sandbox_id, expected
+                )));
+            }
+        }
+        if !allowed_states.is_empty() && !allowed_states.contains(&r.session.status) {
+            return Err(MetaError::Conflict(format!(
+                "rebind_session_guarded CAS: status is {}, not in {:?}",
+                r.session.status.as_str(),
+                allowed_states
+            )));
+        }
+        r.session.host_id = Some(host_id);
+        r.session.sandbox_id = Some(sandbox_id);
+        r.missing_strikes = 0;
+        r.updated_at = now;
+        Ok(())
     }
 
     async fn record_capture_job_report(
         &self,
-        _report: &CaptureJobReport,
+        report: &CaptureJobReport,
     ) -> Result<bool, MetaError> {
-        panic!("SimMeta: record_capture_job_report not implemented — add it plus a conformance case (ADR 0098 D4)")
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let Some(row) = db.capture_jobs.get_mut(&report.job_id) else {
+            return Ok(false);
+        };
+        if row.epoch != report.epoch || row.stage.is_terminal() {
+            return Ok(false);
+        }
+        let stage = match &report.terminal {
+            Some(CaptureTerminalReport::Done { result_bincode }) => {
+                row.result_bincode = Some(result_bincode.clone());
+                CaptureJobStage::Done
+            }
+            Some(CaptureTerminalReport::Failed {
+                error,
+                error_stage,
+                retryable,
+            }) => {
+                row.error = Some(error.clone());
+                row.error_stage = Some(error_stage.clone());
+                row.retryable = Some(*retryable);
+                CaptureJobStage::Failed
+            }
+            None => report.stage,
+        };
+        if row.stage != stage {
+            row.stage_started_at = now;
+        }
+        row.stage = stage;
+        row.stage_progress = report.progress.clone();
+        row.last_progress_at = now;
+        if report.fc_snapshot_version.is_some() {
+            row.fc_snapshot_version = report.fc_snapshot_version.clone();
+        }
+        row.updated_at = now;
+        Ok(true)
     }
 
     async fn record_enable_job_failure(
@@ -3426,10 +3783,23 @@ impl MetadataStore for SimMetadataStore {
 
     async fn set_teleport_target(
         &self,
-        _id: SessionId,
-        _target: Option<HostId>,
+        id: SessionId,
+        target: Option<HostId>,
     ) -> Result<(), MetaError> {
-        panic!("SimMeta: set_teleport_target not implemented — add it plus a conformance case (ADR 0098 D4)")
+        // PG twin: set/clear the pin + its `_set_at` together (issue #214).
+        // A no-op for an absent session, like the bare UPDATE.
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        match target {
+            Some(h) => {
+                db.teleport_targets.insert(id, (h, Some(now)));
+            }
+            None => {
+                db.teleport_targets.remove(&id);
+            }
+        }
+        Ok(())
     }
 
     /// `SELECT count(*), coalesce(sum(size_bytes),0) FROM snapshots` —

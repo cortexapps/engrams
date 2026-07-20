@@ -207,13 +207,21 @@ impl MigrationRegistry {
     /// live-teleport that was actively serving `migration_fetch`
     /// streams was spuriously aborted mid-read — issue #216 Gap 1.)
     pub fn expired(&self) -> Vec<SandboxId> {
-        self.by_sandbox
+        let mut expired = self
+            .by_sandbox
             .iter()
             .filter(|e| {
                 let anchor = *e.last_activity.lock().expect("last_activity poisoned");
                 e.clock.now_mono().saturating_sub(anchor) > EXPORT_TTL
             })
-            .map(|e| e.sandbox_id)
+            .map(|e| (e.export_id.clone(), e.sandbox_id))
+            .collect::<Vec<_>>();
+        // DashMap iteration order is nondeterministic; this list feeds decisions in both the
+        // prod sweep and host sim, so pin it by export_id (ADR 0098).
+        expired.sort_by(|a, b| a.0.cmp(&b.0));
+        expired
+            .into_iter()
+            .map(|(_, sandbox_id)| sandbox_id)
             .collect()
     }
 
@@ -252,7 +260,7 @@ impl MigrationRegistry {
             .unwrap_or(false)
     }
 
-    // ADR 0098 D1 carve-out: this mints an UNGUESSABLE single-use security
+    // ADR 0098 D1 carve-out, reaffirmed P8: this mints an UNGUESSABLE single-use security
     // token (the migration export id / peer token), not a simulation-visible
     // identifier — the same rationale D1 uses to keep crypto key material on
     // `OsRng` rather than the seeded `entropy`. Seeding it would make the

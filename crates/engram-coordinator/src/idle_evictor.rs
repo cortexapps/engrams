@@ -643,6 +643,65 @@ pub(crate) async fn run_evict_pipeline(
         }
     }
 
+    // #792 (R4, ADR 0098 Phase 3): the recoverable-before-Idle guard. The
+    // capture produced manifests and we recorded the row, but the
+    // `verify_snapshot_recoverable` above does a live BlobStorage HEAD of
+    // each manifest — a TRANSIENT head blip stamps `recoverable = false` on
+    // a capture whose artifacts are actually durable. Landing the session
+    // `Idle` on that lie strands it un-resumable: the falsehood surfaces
+    // only at `/resume`, which then fails (→ `Dead` via the #782 honest
+    // predicate) after the user already tried to come back. Gate the
+    // terminal transition on the SAME honest predicate the dead-host
+    // stage-2 ladder uses (#782 `dead_host::recovery_target`): a capture
+    // with no recoverable snapshot AND no live disk manifest is not a safe
+    // basis for `Idle`.
+    //
+    // Scope is exactly the transient-blip class — `manifests_present &&
+    // !recoverable` means "the capture DID produce manifests but a HEAD
+    // failed." A manifest-LESS capture keeps its prior behavior on purpose:
+    // the dev backends (Process/VZ) and the pre-#791 sim fidelity gap
+    // produce no chunked manifests, #791 already closed the manifest-less
+    // case at the sim-fidelity layer, and gating it here would wedge those
+    // backends into an eternal retry. Only the idle path is gated (drain /
+    // `Evacuating` is out of #792's scope and routes differently).
+    //
+    // Recovery routes through the existing ladder — no new state or RPC:
+    // abort the still-in-flight snapshot and return a RETRYABLE error (do
+    // NOT commit, NOT flip `Idle`, NOT destroy the still-live VM). The op
+    // machinery redrives within the evict budget (`session_verbs::evict`);
+    // a transient blip clears on the fresh capture+verify → `Idle`
+    // recoverable. A PERSISTENTLY unrecoverable capture exhausts the budget
+    // and falls back (nominated) to `HostLost`, where the dead-host
+    // straggler sweep applies `recovery_target` and settles the session
+    // `Dead` WITH the distinct unrecoverable-snapshot signal
+    // (`note_unrecoverable_if_dead`) — never a lying `Idle`. The
+    // `recoverable = false` row recorded just above is precisely what lets
+    // that sweep emit the signal.
+    let manifests_present = metadata.disk_manifest.is_some() || metadata.memory_manifest.is_some();
+    if target_state == SessionState::Idle
+        && manifests_present
+        && !record.recoverable
+        && session.live_disk_manifest.is_none()
+    {
+        ::metrics::counter!(crate::metrics::EVICTION_UNRECOVERABLE_CAPTURE_GUARD_TOTAL)
+            .increment(1);
+        tracing::warn!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            snapshot_id = %record.id,
+            "idle eviction: capture recorded recoverable=false (manifests present but a \
+             BlobStorage HEAD failed) with no live disk manifest — refusing to land Idle on \
+             an un-resumable capture; aborting and retrying verification via the op budget",
+        );
+        abort_inflight_snapshot(ctx, session_id, sandbox_id, "recoverable-guard").await;
+        return Err(EvictError::Meta(format!(
+            "capture {} recorded recoverable=false (transient BlobStorage HEAD failure) with \
+             no live disk manifest; refusing to land Idle on an un-resumable capture — \
+             retrying verification within the evict op budget",
+            record.id,
+        )));
+    }
+
     // ADR 0034 durability: commit the host's in-flight snapshot NOW —
     // while the sandbox is still bound and its owner resolvable, and
     // BEFORE `unbind`/`destroy` below or the racing periodic-checkpoint
@@ -1112,9 +1171,8 @@ async fn scanner_advance_one(
 
     // An Evicting row with no bound sandbox is structurally
     // inconsistent (nothing to evict): fall back to HostLost NOW rather
-    // than enqueue a guaranteed no-op. The existing HostLost machinery
-    // (dead-host second stage, host-side orphan reap, manual /resume)
-    // owns recovery from there, and HostLost is not Active so neither
+    // than enqueue a guaranteed no-op. The dead_host HostLost straggler
+    // sweep owns recovery from there, and HostLost is not Active so neither
     // detector re-nominates — the loop is broken by construction.
     // (The evict verb has the same fallback for a binding that vanishes
     // between this enqueue and its claim.)
@@ -1397,6 +1455,20 @@ mod tests {
         sandbox_root: &Path,
         backend: Arc<dyn SandboxBackend>,
     ) -> (SharedState, Arc<MiniMeta>) {
+        build_state_and_meta_with_backend_and_blob(session, sandbox_root, backend, None)
+    }
+
+    /// #792: variant that also injects the coordinator's `BlobStorage`, so
+    /// the recoverable-guard tests can script `head` faults
+    /// (`FaultyBlobStorage`) that drive `verify_snapshot_recoverable` to
+    /// `recoverable = false` on a manifest-bearing capture. `None` keeps the
+    /// default shared LocalBlobStorage.
+    fn build_state_and_meta_with_backend_and_blob(
+        session: Session,
+        sandbox_root: &Path,
+        backend: Arc<dyn SandboxBackend>,
+        blob: Option<Arc<dyn engram_core::traits::BlobStorage>>,
+    ) -> (SharedState, Arc<MiniMeta>) {
         let local_path = sandbox_root.join("local");
         std::fs::create_dir_all(&local_path).unwrap();
         let meta = Arc::new(MiniMeta::new(session));
@@ -1421,9 +1493,11 @@ mod tests {
                 engram_oci::AnonymousResolver,
             ))),
             auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
-            blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
-                std::env::temp_dir().join("engram-blobs-test"),
-            )),
+            blob: blob.unwrap_or_else(|| {
+                std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-blobs-test"),
+                ))
+            }),
             chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
                 engram_storage_local::LocalBlobStorage::new(
                     std::env::temp_dir().join("engram-blobs-test"),
@@ -3946,6 +4020,331 @@ mod tests {
                 .contains("wall-clock deadline"),
             "the op wall-clock deadline is what fired: {:?}",
             row.error,
+        );
+    }
+
+    // =============== #792: recoverable-before-Idle guard ================
+
+    use bytes::Bytes;
+    use engram_core::traits::BlobStorage;
+    use engram_core::types::manifest::ManifestRef;
+    use engram_storage_local::LocalBlobStorage;
+    use engram_testkit::storage::{
+        FaultPlan, FaultyBlobStorage, HeadFault, HeadFaultKind, InjectedError, KeyMatch, When,
+    };
+
+    /// #792: a backend whose COMPOSED `snapshot()` returns metadata that
+    /// carries a disk manifest — unlike ProcessBackend, which is
+    /// manifest-less. That makes `verify_snapshot_recoverable` actually HEAD
+    /// a manifest key (the surface the recoverable-guard gates). It does NOT
+    /// implement `snapshot_begin` (inherits the InvalidSpec default), so the
+    /// coordinator takes the COMPOSED idle-evict path where the guard lives.
+    /// Everything else delegates to an inner ProcessBackend.
+    struct ManifestSnapshotBackend {
+        inner: Arc<dyn SandboxBackend>,
+        manifest: ManifestRef,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for ManifestSnapshotBackend {
+        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            self.inner.create(spec).await
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.inner.destroy(id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            self.inner.list().await
+        }
+        async fn exec_stream(
+            &self,
+            id: SandboxId,
+            cmd: ExecRequest,
+        ) -> Result<engram_core::types::sandbox::ExecStream, SandboxError> {
+            self.inner.exec_stream(id, cmd).await
+        }
+        async fn snapshot(
+            &self,
+            id: SandboxId,
+        ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
+            let mut m = self.inner.snapshot(id).await?;
+            // Inject a disk manifest so the capture is "manifest-bearing":
+            // verify_snapshot_recoverable will HEAD this ref's storage key.
+            m.disk_manifest = Some(self.manifest);
+            Ok(m)
+        }
+        async fn restore(
+            &self,
+            metadata: engram_core::types::snapshot::SnapshotMetadata,
+        ) -> Result<SandboxId, SandboxError> {
+            self.inner.restore(metadata).await
+        }
+        fn snapshot_path_for(&self, id: engram_core::types::SnapshotId) -> std::path::PathBuf {
+            self.inner.snapshot_path_for(id)
+        }
+    }
+
+    /// A fresh LocalBlobStorage with `manifest`'s key pre-seeded (so a
+    /// non-faulted HEAD succeeds), wrapped in a FaultyBlobStorage running
+    /// `plan` — the rig for driving `verify_snapshot_recoverable` to a
+    /// scripted `recoverable = false` on a manifest-bearing capture.
+    async fn faulty_blob_with_manifest(
+        dir: std::path::PathBuf,
+        manifest: &ManifestRef,
+        plan: FaultPlan,
+    ) -> Arc<dyn BlobStorage> {
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir));
+        inner
+            .put(&manifest.storage_key(), Bytes::from_static(b"{}"))
+            .await
+            .expect("seed manifest blob");
+        Arc::new(FaultyBlobStorage::new(inner, plan))
+    }
+
+    /// Claim a nominated idle-evict op and hand back the row, so a test can
+    /// drive `run_evict_pipeline` directly (re-running the pipeline across a
+    /// transient blip without waiting out the op's requeue backoff). Mirrors
+    /// `drive_evict`'s claim.
+    async fn claim_evict_op(state: &SharedState, session_id: SessionId) -> SessionOp {
+        match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": true }),
+                None,
+                "test-pod",
+            )
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+    }
+
+    /// #792: a TRANSIENT BlobStorage-HEAD blip records `recoverable = false`
+    /// on a manifest-bearing capture whose artifacts are actually durable.
+    /// The recoverable-before-Idle guard must REFUSE to land Idle on that lie
+    /// (retryable error; session stays Evicting; the VM stays alive), and once
+    /// the blip clears on the redrive the fresh capture verifies recoverable
+    /// and the session lands Idle. Proves "fails once → retries → Idle
+    /// recoverable".
+    #[tokio::test]
+    async fn recoverable_guard_transient_head_blip_retries_then_lands_idle() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let manifest = ManifestRef::new();
+        // HEAD faults on the FIRST manifests/ lookup (attempt 1), then passes
+        // through to the seeded blob (attempt 2).
+        let plan = FaultPlan::new().with_head(HeadFault {
+            key: KeyMatch::Prefix("manifests/".into()),
+            when: When::Nth(1),
+            kind: HeadFaultKind::Error(InjectedError::Sdk("transient blob HEAD blip".into())),
+        });
+        let blob =
+            faulty_blob_with_manifest(sandbox_root.path().join("blobs"), &manifest, plan).await;
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ManifestSnapshotBackend {
+            inner: Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes"))),
+            manifest,
+        });
+        let (state, meta) = build_state_and_meta_with_backend_and_blob(
+            evicting_session(session_id),
+            sandbox_root.path(),
+            backend,
+            Some(blob),
+        );
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_evict_op(&state, session_id).await;
+        let epoch = op.epoch.expect("claimed");
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch,
+        };
+
+        // Attempt 1: HEAD blips → recoverable=false → the guard refuses Idle.
+        let first = run_evict_pipeline(&ctx, SessionState::Idle, false, true).await;
+        assert!(
+            matches!(first, Err(EvictError::Meta(ref m)) if m.contains("recoverable=false")),
+            "the guard must return a retryable error on the transient blip, got {first:?}",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Evicting,
+            "the session must stay Evicting for the retry — never Idle on the lie",
+        );
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the live VM must NOT be destroyed while retrying verification",
+        );
+        assert!(
+            meta.snapshots.lock().iter().any(|s| !s.recoverable),
+            "the recoverable=false row IS recorded (it feeds the dead-host bad-capture signal)",
+        );
+
+        // Attempt 2 (the op redrive): the blip has cleared; HEAD now succeeds.
+        let second = run_evict_pipeline(&ctx, SessionState::Idle, false, true).await;
+        assert!(
+            matches!(second, Ok(EvictOutcome::Evacuated)),
+            "the retry lands the eviction once the capture verifies recoverable, got {second:?}",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Idle,
+            "the session lands Idle only once a recoverable capture backs it",
+        );
+        assert!(
+            meta.snapshots.lock().iter().any(|s| s.recoverable),
+            "a recoverable=true row now exists — a resume can honor it",
+        );
+    }
+
+    /// #792: a PERSISTENTLY unrecoverable capture (HEAD fails every attempt)
+    /// must never settle Idle-but-unresumable. The guard returns a retryable
+    /// error each attempt; once the evict op budget is exhausted the verb
+    /// falls the session back to HostLost — the existing honest terminal
+    /// route (the dead-host straggler sweep then settles it Dead WITH the
+    /// unrecoverable-snapshot signal against the recorded recoverable=false
+    /// row). Asserts: HostLost, never Idle.
+    #[tokio::test]
+    async fn recoverable_guard_persistent_failure_exhausts_budget_to_host_lost() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let manifest = ManifestRef::new();
+        let plan = FaultPlan::new().with_head(HeadFault {
+            key: KeyMatch::Prefix("manifests/".into()),
+            when: When::Always,
+            kind: HeadFaultKind::Error(InjectedError::Sdk("persistent blob HEAD failure".into())),
+        });
+        let blob =
+            faulty_blob_with_manifest(sandbox_root.path().join("blobs"), &manifest, plan).await;
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ManifestSnapshotBackend {
+            inner: Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes"))),
+            manifest,
+        });
+        let (state, meta) = build_state_and_meta_with_backend_and_blob(
+            evicting_session(session_id),
+            sandbox_root.path(),
+            backend,
+            Some(blob),
+        );
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // Age the attempt count past EVICT_MAX_ATTEMPTS so this claim is the
+        // budget-exhausting one (mirrors evict_op_budget_exhaustion_*).
+        let mut op = claim_evict_op(&state, session_id).await;
+        op.attempts = 21;
+        let epoch = op.epoch.expect("claimed");
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch,
+        };
+        let outcome = crate::session_verbs::dispatch(&ctx).await;
+        assert!(
+            matches!(outcome, crate::session_ops::OpOutcome::Failed(_)),
+            "budget exhaustion on a persistently-unrecoverable capture must be terminal (Failed)",
+        );
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::HostLost,
+            "the honest terminal route is HostLost (→ dead-host sweep → Dead), never a lying Idle",
+        );
+        assert_ne!(after.status, SessionState::Idle, "never Idle-unrecoverable");
+        assert!(
+            meta.snapshots.lock().iter().all(|s| !s.recoverable),
+            "only recoverable=false rows were recorded — the sweep's unrecoverable signal fires on them",
+        );
+    }
+
+    /// #792 scope: the recoverable-before-Idle guard is deliberately scoped
+    /// to MANIFEST-BEARING captures (the transient-HEAD-blip class). A
+    /// manifest-LESS capture (ProcessBackend, VZ, the pre-#791 sim gap) still
+    /// lands Idle even when every HEAD would fail — #791 closed the
+    /// manifest-less case at the sim-fidelity layer, and gating it here would
+    /// wedge the dev backends that never emit chunked manifests.
+    #[tokio::test]
+    async fn recoverable_guard_does_not_fire_for_a_manifestless_capture() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        // HEAD always fails — but ProcessBackend's capture is manifest-less,
+        // so verify_snapshot_recoverable HEADs nothing (returns false without
+        // a blob call) and `manifests_present` is false → the guard is skipped.
+        let plan = FaultPlan::new().with_head(HeadFault {
+            key: KeyMatch::Any,
+            when: When::Always,
+            kind: HeadFaultKind::Error(InjectedError::Sdk("head down".into())),
+        });
+        let inner: Arc<dyn BlobStorage> =
+            Arc::new(LocalBlobStorage::new(sandbox_root.path().join("blobs")));
+        let blob: Arc<dyn BlobStorage> = Arc::new(FaultyBlobStorage::new(inner, plan));
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let (state, _meta) = build_state_and_meta_with_backend_and_blob(
+            evicting_session(session_id),
+            sandbox_root.path(),
+            backend,
+            Some(blob),
+        );
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = drive_evict(&state, session_id, false, true).await;
+        assert_eq!(
+            op.state,
+            OpState::Done,
+            "a manifest-less capture completes the evict op unchanged",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Idle,
+            "a manifest-less capture still lands Idle — the guard is scoped to manifest-bearing captures",
         );
     }
 }

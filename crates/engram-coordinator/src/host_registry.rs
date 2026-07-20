@@ -767,10 +767,27 @@ impl HostClient for HostRegistry {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         // Aggregate across all connected hosts. Errors from any one
         // host are surfaced; partial results aren't reported in 3a.
+        //
+        // Snapshot the backends FIRST (cheap Arc clones), dropping every
+        // `hosts` shard guard, THEN await per host. Awaiting while a
+        // DashMap `iter()` guard is live holds that shard's RwLock across
+        // the suspension; a concurrent `register`/`unregister` that hashes
+        // to the same shard then blocks on it — a permanent deadlock on a
+        // SINGLE-THREADED executor (the DST sim), where the suspended
+        // iterator can never be polled to release the guard. (Shard
+        // assignment is `RandomState`-seeded and `available_parallelism`-
+        // sized, so the collision was a ~1% getrandom-/host-count-
+        // dependent hang — determinism-audit item 8.) Same rule
+        // `backend_of` documents: clone the Arc, never hold the entry
+        // across an `.await`.
+        let backends: Vec<Arc<dyn HostClient>> = self
+            .hosts
+            .iter()
+            .map(|e| e.value().backend.clone())
+            .collect();
         let mut all = Vec::new();
-        for entry in self.hosts.iter() {
-            let ids = entry.value().backend.list().await?;
-            all.extend(ids);
+        for backend in backends {
+            all.extend(backend.list().await?);
         }
         Ok(all)
     }
@@ -793,8 +810,17 @@ impl HostClient for HostRegistry {
         // connected host so whichever one had the binding clears it.
         // Each host's `unbind_session` is a no-op for unknown session
         // ids, so the broadcast is cheap.
-        for entry in self.hosts.iter() {
-            entry.value().backend.unbind_session(session_id).await;
+        //
+        // Snapshot backends FIRST so no `hosts` shard guard is held across
+        // the per-host `.await` (see `list` — the DashMap-guard-across-
+        // await deadlock on a single-threaded executor).
+        let backends: Vec<Arc<dyn HostClient>> = self
+            .hosts
+            .iter()
+            .map(|e| e.value().backend.clone())
+            .collect();
+        for backend in backends {
+            backend.unbind_session(session_id).await;
         }
     }
 

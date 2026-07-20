@@ -140,6 +140,25 @@ impl OpCtx<'_> {
     }
 }
 
+/// Callers that receive `Claimed(op)` own driving it. Production uses
+/// [`enqueue`] (which spawns detached); the simulator drives synchronously
+/// inside its step so no mutating work outlives a scheduler step (ADR 0098
+/// determinism discipline).
+pub async fn enqueue_claim(
+    state: &SharedState,
+    session_id: SessionId,
+    kind: OpKind,
+    payload: serde_json::Value,
+    idempotency_key: Option<&str>,
+) -> Result<EnqueueOutcome, engram_core::MetaError> {
+    let pod = pod_id();
+    state
+        .services
+        .meta
+        .op_enqueue_and_claim(session_id, kind, payload, idempotency_key, &pod)
+        .await
+}
+
 /// Enqueue a verb and, when the session is idle (no running/queued op),
 /// drive it INLINE on this task — the one-round-trip happy path. When
 /// something is already in flight, the row waits its turn and the
@@ -154,12 +173,7 @@ pub async fn enqueue(
     payload: serde_json::Value,
     idempotency_key: Option<&str>,
 ) -> Result<EnqueueOutcome, engram_core::MetaError> {
-    let pod = pod_id();
-    let outcome = state
-        .services
-        .meta
-        .op_enqueue_and_claim(session_id, kind, payload, idempotency_key, &pod)
-        .await?;
+    let outcome = enqueue_claim(state, session_id, kind, payload, idempotency_key).await?;
     if let EnqueueOutcome::Claimed(op) = &outcome {
         // Drive detached from the caller's (possibly wire-lifetime)
         // future: the op row is the durable owner, this spawn is just
@@ -499,34 +513,26 @@ pub fn spawn(state: SharedState, wake: Arc<Notify>) -> tokio::task::JoinHandle<(
                 {
                     Ok(ids) => {
                         for session_id in ids {
-                            // Issue #722: past placement's crash-orphan
-                            // horizon the reservation is already written
-                            // off — reviving the boot would over-pack the
-                            // host. Fail it honestly instead (frees the
-                            // row's budget for everyone's arithmetic).
-                            let stale = match state.services.meta.get_session(session_id).await {
-                                Ok(s) => {
-                                    state.services.clock.now_utc() - s.last_active_at
-                                        > chrono::Duration::minutes(10)
-                                }
-                                Err(_) => false,
-                            };
-                            if stale {
-                                tracing::warn!(
-                                    %session_id,
-                                    "reclaim sweep: orphaned Pending past the placement \
-                                     horizon; failing instead of reviving (issue #722)",
-                                );
-                                let _ = state
-                                    .services
-                                    .meta
-                                    .transition_session(
-                                        session_id,
-                                        engram_core::types::SessionState::Failed,
-                                    )
-                                    .await;
-                                continue;
-                            }
+                            // R3 (#722): REVIVE, always. The D7 stack failed an
+                            // aged orphan here instead of reviving it, because
+                            // placement's crash-orphan exclusion had already
+                            // WRITTEN OFF its reservation — so a revived boot
+                            // would have over-packed the host (Σ reserved >
+                            // allocatable). That exclusion is GONE: a `pending`
+                            // now reserves its slot UNCONDITIONALLY for as long
+                            // as it is `pending` (ONE reservation authority), so
+                            // reviving it is always safe — the boot lands on the
+                            // host placement never re-sold. Failing a
+                            // crash-orphaned session that could still boot was
+                            // user-hostile; this restores the ADR 0079 #5
+                            // intent: an orphan (crash between the flip and the
+                            // enqueue, or a terminal-Failed create_boot whose
+                            // fenced flip also errored) is re-driven to boot. A
+                            // genuinely-doomed boot exhausts the op's 30-attempt
+                            // budget → terminal Failed → the verb's fenced flip
+                            // clears it; the reservation releases with that real
+                            // transition (the sole reclaimer), never a
+                            // placement-side write-off.
                             ::metrics::counter!(
                                 crate::metrics::SESSION_OP_PENDING_ORPHANS_RECOVERED_TOTAL
                             )

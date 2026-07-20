@@ -380,3 +380,13 @@ pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skippe
 /// Counter (ADR 0075). Populate requests served by the substrate
 /// writer. Labels: outcome = already_local | populated | error.
 pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_requests_total";
+
+/// R6 (ADR 0098 §Phase 3, #784 layer 1 / #769 gap A): counter incremented
+/// each time the startup stale-binding sweep declined to DISCONNECT a
+/// dead-owner NBD device because a live process still holds the device node
+/// open (`sweep-blocked-live-holder`). The device is left RECONNECTABLE for a
+/// later re-serve pass. This should stay at/near zero in steady state; a
+/// non-zero value means a survivor's rehydrate was missed upstream (the
+/// gap-A recurrence counter) — the same signal as the `sweep-blocked-live-holder`
+/// soft-invariant, exported for alerting.
+pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live_holder_total";

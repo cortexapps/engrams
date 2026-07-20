@@ -31,7 +31,7 @@ where
     R: AsyncRead + Unpin,
 {
     let mut buf = Vec::with_capacity(2048);
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = crate::time_source::metrics_now_tokio() + budget;
 
     loop {
         // Try to parse what we have. tls-parser's `parse_tls_plaintext`
@@ -76,7 +76,7 @@ where
         if buf.len() >= max_peek {
             return Err(PeekError::TooLarge);
         }
-        let now = tokio::time::Instant::now();
+        let now = crate::time_source::metrics_now_tokio();
         if now >= deadline {
             return Err(PeekError::Timeout);
         }

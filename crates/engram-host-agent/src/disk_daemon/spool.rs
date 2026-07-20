@@ -41,6 +41,15 @@
 //! corruption the spool exists to prevent (session-85e0298a), so the
 //! digest is a hard gate, not decoration: a mismatch is an `Err` the
 //! caller turns into a loud rollback, never a silent adopt.
+//!
+//! The chunk digests protect the chunk BYTES — but until R5 the marker
+//! ITSELF (`meta.json`: the lineage version + the digest list) was
+//! unchecksummed JSON, so a bit-flip that stayed valid (a bumped version,
+//! an altered digest) was TRUSTED. R5 (ADR 0098 Phase 3) seals `meta.json`
+//! in a [`durable_envelope`](crate::durable_envelope) keyed on the
+//! `sandbox_id`: [`read_spool`] verifies the marker's content hash + identity
+//! before trusting it, so a lying marker is a loud `InvalidData` rollback like
+//! any other validation failure.
 
 use std::collections::HashMap;
 use std::io;
@@ -130,7 +139,11 @@ pub async fn write_spool(
         chunks: spooled,
     };
     let meta_path = dir.join("meta.json");
-    fs.write(&meta_path, &serde_json::to_vec(&meta)?).await?;
+    // R5: seal the completeness marker under a content hash + the sandbox id,
+    // so a lying disk cannot bump the version / rewrite a digest undetected.
+    let meta_body = serde_json::to_string(&meta)?;
+    let meta_bytes = crate::durable_envelope::seal(&sandbox_id.to_string(), &meta_body);
+    fs.write(&meta_path, &meta_bytes).await?;
     fs.sync_file(&meta_path).await?;
 
     // fsync the directory entries (chunk files + meta) and the root's
@@ -164,8 +177,13 @@ pub async fn read_spool(
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e),
     };
-    let meta: SpoolMeta = serde_json::from_slice(&meta_bytes)
+    // R5: open the sealed marker (content hash + sandbox-id identity) BEFORE
+    // trusting it. A bit-flipped/misdirected marker is a loud InvalidData
+    // rollback — never a trusted lineage/digest.
+    let meta_body = crate::durable_envelope::open(&meta_bytes, &sandbox_id.to_string())
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta: {e}")))?;
+    let meta: SpoolMeta = serde_json::from_slice(&meta_body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta body: {e}")))?;
 
     // Enumerate the on-disk chunk files by index. Foreign / unparsable
     // entries are IGNORED (a stray tmpfile must not wedge adoption of
@@ -535,5 +553,58 @@ mod tests {
         // Torn ref file on a zero-chunk spool → Err, not a phantom empty.
         std::fs::write(spool_dir(tmp.path(), sid).join("meta.json"), b"{").unwrap();
         assert!(read_spool(&TokioFs, tmp.path(), sid).await.is_err());
+    }
+
+    /// State 7 (R5, storage lies): a marker corruption that stays
+    /// SYNTACTICALLY VALID. The chunk digests protect the chunk bytes, but the
+    /// marker's own lineage/digest fields are the checksum gap: a lying disk
+    /// that bumps the recorded `version` (defeating the rebuild's stale-spool
+    /// lineage gate) or rewrites a stored digest leaves the marker a perfectly
+    /// valid `SpoolMeta`. Pre-envelope that is TRUSTED; the R5 content-hash
+    /// envelope makes it a loud `InvalidData` rollback.
+    #[tokio::test]
+    async fn valid_but_bit_rotted_marker_is_rejected_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        write_spool(&TokioFs, tmp.path(), sid, refv(2), &[(0, vec![1u8; 8])])
+            .await
+            .unwrap();
+        let meta_path = spool_dir(tmp.path(), sid).join("meta.json");
+
+        // The lie: bump the marker's recorded version to 999 — still a valid
+        // SpoolMeta, but the sealed content hash no longer matches. Mutate the
+        // envelope's `body` field in place (the hash stays stale).
+        let mut env: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&meta_path).unwrap()).unwrap();
+        let body = env["body"].as_str().unwrap();
+        let mut meta: SpoolMeta = serde_json::from_str(body).unwrap();
+        meta.version = 999;
+        env["body"] = serde_json::Value::String(serde_json::to_string(&meta).unwrap());
+        std::fs::write(&meta_path, serde_json::to_vec(&env).unwrap()).unwrap();
+
+        let err = read_spool(&TokioFs, tmp.path(), sid)
+            .await
+            .expect_err("a bit-rotted-but-valid marker must be rejected, never trusted");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+        assert!(
+            err.to_string().contains("checksum"),
+            "the rejection reason must name the content-hash gap: {err}",
+        );
+
+        // A MISDIRECTED marker — another sandbox's validly-sealed marker served
+        // here — is caught on the identity binding, not the hash.
+        let other = SandboxId::new();
+        write_spool(&TokioFs, tmp.path(), other, refv(2), &[(0, vec![1u8; 8])])
+            .await
+            .unwrap();
+        let foreign = std::fs::read(spool_dir(tmp.path(), other).join("meta.json")).unwrap();
+        std::fs::write(&meta_path, &foreign).unwrap();
+        let err = read_spool(&TokioFs, tmp.path(), sid)
+            .await
+            .expect_err("another sandbox's marker at this path is a misdirected read");
+        assert!(
+            err.to_string().contains("identity"),
+            "the rejection reason must name the identity binding: {err}",
+        );
     }
 }

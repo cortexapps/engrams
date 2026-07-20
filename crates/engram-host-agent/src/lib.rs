@@ -35,6 +35,7 @@ pub mod coord_client;
 pub mod device_sync;
 pub mod dirty_map;
 pub mod disk_daemon;
+pub mod durable_envelope;
 pub mod durable_record;
 pub mod egress;
 pub mod eviction_finalize;

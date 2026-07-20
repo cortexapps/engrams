@@ -17,6 +17,15 @@
 //! Every durable op goes through the injected [`HostFs`] (ADR 0098 P5) so
 //! the host-internal simulator's `CrashFs` can crash BETWEEN operations;
 //! flows not yet behind the seam pass [`TokioFs`] at their wrappers.
+//!
+//! **Content envelope (ADR 0098 Phase 3, R5 — storage lies).** The record
+//! bytes are wrapped in a [`durable_envelope`](crate::durable_envelope): a
+//! sha256 over the body + the record's id (its filename stem). `load_all`
+//! verifies both, so a bit-flip / lying fsync that leaves the JSON valid is
+//! a LOUD skip (a DISTINCT `checksum mismatch` log), not a silently-trusted
+//! parse — and a misdirected read (another id's sealed bytes at this path)
+//! is caught too. This is a clean-break format bump; these files are
+//! host-local transient state with no cross-host/version reader.
 
 use std::fmt::Display;
 use std::path::{Path, PathBuf};
@@ -39,10 +48,14 @@ pub async fn persist<T: Serialize>(
     what: &str,
 ) -> std::io::Result<()> {
     fs.create_dir(dir).await?;
-    let dest = record_path(dir, id);
+    let id = id.to_string();
+    let dest = record_path(dir, &id);
     let tmp = dest.with_extension("json.partial");
-    let bytes = serde_json::to_vec_pretty(record)
+    let body = serde_json::to_string_pretty(record)
         .map_err(|e| std::io::Error::other(format!("serialize {what}: {e}")))?;
+    // R5: seal the body under a content hash + the record id (the filename
+    // stem), so a lying disk cannot hand a resume a corrupt-but-valid record.
+    let bytes = crate::durable_envelope::seal(&id, &body);
     fs.write(&tmp, &bytes).await?;
     // fsync the temp file so the rename publishes complete bytes.
     fs.sync_file(&tmp).await?;
@@ -67,12 +80,31 @@ pub async fn load_all<T: DeserializeOwned>(fs: &dyn HostFs, dir: &Path, what: &s
         if p.extension().and_then(|e| e.to_str()) != Some("json") {
             continue;
         }
+        // The record's expected identity is its filename stem — bind the
+        // envelope's sealed id to it so a misdirected read is rejected.
+        let expected_id = p.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
         match fs.read(&p).await {
-            Ok(bytes) => match serde_json::from_slice::<T>(&bytes) {
-                Ok(r) => out.push(r),
-                Err(e) => {
+            Ok(bytes) => match crate::durable_envelope::open(&bytes, expected_id) {
+                Ok(body) => match serde_json::from_slice::<T>(&body) {
+                    Ok(r) => out.push(r),
+                    Err(e) => {
+                        tracing::warn!(path = %p.display(), error = %e,
+                            "unparseable {what} body; skipping");
+                    }
+                },
+                // R5: DISTINCT logs — a checksum/identity failure is
+                // corruption (a real finding), not a torn write.
+                Err(e @ crate::durable_envelope::OpenError::ChecksumMismatch { .. }) => {
                     tracing::warn!(path = %p.display(), error = %e,
-                        "unparseable {what}; skipping");
+                        "corrupt {what} (checksum); skipping");
+                }
+                Err(e @ crate::durable_envelope::OpenError::IdMismatch { .. }) => {
+                    tracing::warn!(path = %p.display(), error = %e,
+                        "misdirected {what} (identity); skipping");
+                }
+                Err(e @ crate::durable_envelope::OpenError::Malformed(_)) => {
+                    tracing::warn!(path = %p.display(), error = %e,
+                        "malformed {what} envelope; skipping");
                 }
             },
             Err(e) => {
@@ -165,22 +197,23 @@ mod tests {
     async fn truncation_at_every_offset_tolerated_siblings_survive() {
         let a = rec("sibling-a", 128);
         let b = rec("sibling-b", 256);
-        let a_bytes = serde_json::to_vec_pretty(&a).unwrap();
-        let b_bytes = serde_json::to_vec_pretty(&b).unwrap();
 
-        // ~1 KB record whose every truncation prefix we sweep.
+        // ~1 KB record whose every truncation prefix we sweep — as the REAL
+        // on-disk shape, an R5 envelope (seal over the body + id).
         let torn = rec("torn", 1000);
-        let full = serde_json::to_vec_pretty(&torn).unwrap();
+        let torn_body = serde_json::to_string_pretty(&torn).unwrap();
+        let full = crate::durable_envelope::seal("torn", &torn_body);
         assert!(
             full.len() >= 1000,
-            "record should be ~1 KB, got {}",
+            "sealed record should be ~1 KB, got {}",
             full.len()
         );
 
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path();
-        write_raw(dir, "sibling-a.json", &a_bytes).await;
-        write_raw(dir, "sibling-b.json", &b_bytes).await;
+        // Siblings via the real persist path (enveloped) so load_all accepts them.
+        persist(&TokioFs, dir, &a.id, &a, "rec").await.unwrap();
+        persist(&TokioFs, dir, &b.id, &b, "rec").await.unwrap();
 
         for offset in 0..full.len() {
             // Overwrite the torn file at each truncation length. offset 0 is
@@ -230,6 +263,54 @@ mod tests {
             out,
             vec![a, b],
             "garbage-suffix and .json.partial must both skip; the two siblings still load",
+        );
+    }
+
+    /// R5 (storage lies): the checksum-gap the envelope closes. A
+    /// syntactically-VALID corruption — a body byte-flipped into a different
+    /// valid record — would be TRUSTED by a pre-envelope loader; `load_all`
+    /// now rejects it (checksum mismatch) and drops it. And a MISDIRECTED read
+    /// — another id's validly-sealed bytes served at this path — is rejected on
+    /// the identity binding. In both cases the valid sibling still loads.
+    #[tokio::test]
+    async fn checksum_and_identity_corruption_are_rejected_not_trusted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path();
+        let good = rec("good", 64);
+        persist(&TokioFs, dir, &good.id, &good, "rec")
+            .await
+            .unwrap();
+
+        // (1) Bit-rot that stays valid JSON: mutate the sealed body in place
+        // WITHOUT updating the content hash. Pre-envelope this parses fine.
+        {
+            let victim = rec("victim", 64);
+            persist(&TokioFs, dir, &victim.id, &victim, "rec")
+                .await
+                .unwrap();
+            let path = record_path(dir, &victim.id);
+            let mut env: serde_json::Value =
+                serde_json::from_slice(&tokio::fs::read(&path).await.unwrap()).unwrap();
+            // A different, still-valid Rec body — the stored hash no longer matches.
+            let mangled = serde_json::to_string(&rec("victim", 4096)).unwrap();
+            env["body"] = serde_json::Value::String(mangled);
+            write_raw(dir, "victim.json", &serde_json::to_vec(&env).unwrap()).await;
+        }
+
+        // (2) Misdirection: another id's sealed bytes dropped at foreign.json.
+        {
+            let elsewhere = rec("elsewhere", 32);
+            let body = serde_json::to_string_pretty(&elsewhere).unwrap();
+            let sealed = crate::durable_envelope::seal("elsewhere", &body);
+            write_raw(dir, "foreign.json", &sealed).await;
+        }
+
+        let out: Vec<Rec> = load_all(&TokioFs, dir, "rec").await;
+        assert_eq!(
+            out,
+            vec![good],
+            "a checksum-failing body and a misdirected read are both dropped; \
+             only the untouched sibling survives",
         );
     }
 }

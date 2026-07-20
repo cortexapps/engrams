@@ -138,6 +138,7 @@ jobs:
       test_web: ${{ steps.lanes.outputs.test_web }}
       test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
       test_host_sim: ${{ steps.lanes.outputs.test_host_sim }}
+      test_cosim: ${{ steps.lanes.outputs.test_cosim }}
       test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
     steps:
@@ -1027,6 +1028,7 @@ jobs:
             --test nbd_shutdown_abandon_race \
             --test nbd_shutdown_final_flush \
             --test nbd_verify_on_read \
+            --test nbd_proc_holder \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -2063,10 +2065,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: workspace-release-sim
-      - name: chaos swarm (200 seeds x 1500 steps)
-        run: cargo run -p engram-dst --release --bin sim -- --seeds 0..200 --steps 1500 --profile chaos
-      - name: calm swarm (100 seeds x 1500 steps)
-        run: cargo run -p engram-dst --release --bin sim -- --seeds 0..100 --steps 1500 --profile calm
+      # R3 (#722): faithful hosts are the swarm default now — every seed
+      # exercises the schedulable, digest-gated `candidates_for` path the
+      # coordinator actually runs. `--faithful` is passed explicitly (it is
+      # also the binary default) so the swarm's intent is self-documenting.
+      - name: chaos swarm (200 seeds x 1500 steps, faithful hosts)
+        run: cargo run -p engram-dst --release --bin sim -- --faithful --seeds 0..200 --steps 1500 --profile chaos
+      - name: calm swarm (100 seeds x 1500 steps, faithful hosts)
+        run: cargo run -p engram-dst --release --bin sim -- --faithful --seeds 0..100 --steps 1500 --profile calm
 
   # ADR 0098 P9: the HOST-INTERNAL deterministic-simulation swarm
   # (engram-dst-host — Flows A-F over the real host-agent machinery on a
@@ -2106,6 +2112,35 @@ jobs:
       - name: calm swarm (30 seeds x 1000 steps)
         run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds 0..30 --steps 1000 --profile calm
 
+  # ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator
+  # (engram-dst-cosim). Unlike test-sim / test-host-sim (swarm binaries over
+  # disjoint closures), this is a small set of DIRECTED pinned-seed scenarios
+  # — the real coordinator drivers and the real host-agent flows co-simulated
+  # over one shared clock — so it runs as `nextest`, not a swarm bin. Gated on
+  # the crate's own (deliberately spanning) release closure (detect's
+  # `test_cosim`).
+  test-cosim:
+    name: boundary simulation (engram-dst-cosim)
+    needs: detect
+    if: needs.detect.outputs.test_cosim == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-cosim
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: directed boundary scenarios
+        run: cargo nextest run -p engram-dst-cosim
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -2123,6 +2158,7 @@ jobs:
       - test-macos
       - test-sim
       - test-host-sim
+      - test-cosim
       # The end-to-end coord lane + its upstream bake/artifact deps. Previously
       # omitted (e2e was non-required), which let a red e2e merge — now gated.
       - bake-harness-claude-artifact

@@ -7768,6 +7768,7 @@ impl SandboxBackend for PooledBackend {
             // diverts control — the explicit early-return below is what routes
             // the caller into recovery.
             engram_core::soft_invariant!(
+                "un-pause-dead-plane",
                 ok,
                 "resume {id}: rootfs NBD device is not served by this host-agent \
                  generation; refusing to un-pause onto a dead data plane"
@@ -14036,8 +14037,11 @@ mod tests {
         let bytes = tokio::fs::read(&record_path)
             .await
             .expect("finalize record must be on disk before snapshot_begin returns");
+        // R5: records are sealed in a content-hash envelope keyed on their id.
+        let body = crate::durable_envelope::open(&bytes, &snapshot_id.to_string())
+            .expect("finalize record envelope must open");
         let record: crate::eviction_finalize::EvictionFinalizeRecord =
-            serde_json::from_slice(&bytes).expect("finalize record must parse");
+            serde_json::from_slice(&body).expect("finalize record must parse");
         assert_eq!(record.sandbox_id, sandbox_id);
         assert_eq!(record.session_id, session_id);
         // The gate freezes the job inside the memory leg (the first
@@ -14077,7 +14081,9 @@ mod tests {
         wait_for("eviction-final checkpoint record", || record_path.exists()).await;
 
         let bytes = tokio::fs::read(&record_path).await.unwrap();
-        let record: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+        // R5: records are sealed in a content-hash envelope keyed on their id.
+        let body = crate::durable_envelope::open(&bytes, &snapshot_id.to_string()).unwrap();
+        let record: CheckpointRecord = serde_json::from_slice(&body).unwrap();
         assert_eq!(record.snapshot_id, snapshot_id);
         assert_eq!(record.sandbox_id, sandbox_id);
         assert_eq!(record.session_id, session_id);
@@ -14168,7 +14174,8 @@ mod tests {
         })
         .await;
         let bytes = tokio::fs::read(&record_path).await.unwrap();
-        let checkpoint: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+        let body = crate::durable_envelope::open(&bytes, &snapshot_id.to_string()).unwrap();
+        let checkpoint: CheckpointRecord = serde_json::from_slice(&body).unwrap();
         assert_eq!(checkpoint.sandbox_id, sandbox_id);
         assert_eq!(
             checkpoint.kind,

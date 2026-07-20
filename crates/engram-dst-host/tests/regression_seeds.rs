@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 
 use engram_dst_host::{
-    decode_tag, invariants, CrashFs, Profile, ScriptedResponse, Sim, SimHost, CHUNK_SIZE,
-    SIM_FINALIZE_MAX_ATTEMPTS,
+    decode_tag, invariants, synth_chunk, CrashFs, Profile, ScriptedResponse, Sim, SimHost,
+    CHUNK_SIZE, SIM_FINALIZE_MAX_ATTEMPTS,
 };
 use engram_host_agent::disk_daemon::spool;
 use engram_host_core::TokioFs;
@@ -794,6 +794,43 @@ async fn post_ack_pre_handoff_crash_is_honest_loss() {
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
 
+#[tokio::test(start_paused = true)]
+async fn misdirected_read_in_range_tag_fires_the_membership_oracle() {
+    let mut host = scenario_host(0xA55E_7718, 3).await;
+    host.guest_write(0, 0).await.unwrap();
+    host.guest_write(0, 1).await.unwrap();
+    host.guest_write(0, 0).await.unwrap();
+
+    host.sandboxes[0]
+        .backend
+        .clone()
+        .unwrap()
+        .write(0, &synth_chunk(2))
+        .await
+        .unwrap();
+
+    let violation = invariants::check(&host)
+        .await
+        .expect_err("the in-range tag belongs to another chunk");
+    assert_eq!(violation.invariant, "acked-write-durability");
+    assert!(violation.detail.contains("never acked"), "{violation:?}");
+}
+
+#[tokio::test(start_paused = true)]
+async fn unflushed_acked_write_fires_the_quiescent_floor_oracle() {
+    let mut host = scenario_host(0xA55E_7719, 3).await;
+    host.guest_write(0, 0).await.unwrap();
+
+    invariants::check(&host).await.unwrap();
+    let violation = invariants::check_quiescent_floor(&host)
+        .await
+        .expect_err("a surviving unflushed ack must fail the quiescence-only oracle");
+    assert_eq!(violation.invariant, "quiescent-floor");
+
+    host.flush_tick(0).await.unwrap();
+    invariants::check_quiescent_floor(&host).await.unwrap();
+}
+
 // ────────────── Flow B: the 731df805 scenario (ADR 0098 P7) ──────────────
 //
 // The headline device-lifecycle-ordering incident, pinned as a regression
@@ -870,41 +907,114 @@ async fn park_roll_local_pass_reserves_survivor_sweep_skips_it_unpause_serves() 
     invariants::check(&host).await.unwrap();
 }
 
-/// UNGATED path: park → roll → register with BOTH the buggy coord list AND the
-/// #739 local pass DISABLED (the pre-#739 world). Nothing re-serves the parked
-/// survivor, and the stale-binding sweep DISCONNECTS its live rootfs (the
-/// literal 731df805 bug). The un-pause data-plane gate is then the LAST LINE:
-/// it fails fast into `evict_local → resume` rather than serving the dead
-/// plane, so the guest stays parked and NO oracle fires — the corruption never
-/// happens.
+/// R6 headline (ADR 0098 §Phase 3, #784 layer 1 / #769 gap A): the UNGATED
+/// path — park → roll → register with BOTH the buggy coord list AND the #739
+/// local pass DISABLED (every upstream rehydrate misses the survivor). The
+/// survivor's FC guest is STILL LIVE and holds its rootfs device open, so the
+/// stale-binding sweep now PARKS (proof of death not met) instead of
+/// DISCONNECTing. The device is left RECONNECTABLE, and a later reattach pass
+/// (a corrected coord list) re-serves it with ZERO loss.
+///
+/// This is the exact 2026-07-18/19 firing turned into a non-event. Fail-without
+/// / pass-with proof: revert `sweep_verdict` to the pre-R6 form (dead-owner ⇒
+/// Disconnect regardless of holder) and the sweep clears `kernel_owner` under a
+/// live holder → the `severed-live-holder` oracle fires here (the old seed's
+/// disconnect returns). With the Park guard, `kernel_owner` survives, the oracle
+/// holds, and the re-serve is lossless.
 #[tokio::test(start_paused = true)]
-async fn park_roll_ungated_local_pass_off_unpause_gate_fires_never_dead_plane() {
+async fn park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_loss() {
     let mut host = scenario_host(0, 3).await;
     host.guest_write(0, 2).await.unwrap();
     host.park(0);
     host.crash_process().await.unwrap();
+    assert!(
+        host.sandboxes[0].guest_holds_device,
+        "the survivor's FC guest survives the roll and still holds its device open",
+    );
 
-    // The pre-#739 world: buggy coord list + no local pass.
+    // The pre-#739 world: buggy coord list + no local pass. Nothing re-serves
+    // the parked survivor, so its dead-owner device reaches the stale sweep.
     host.register_rehydrate(false, false).await.unwrap();
     assert_eq!(
         host.sandboxes[0].served_by, None,
         "no pass re-served the parked survivor",
     );
+    // The R6 change: the sweep PARKED the live-held device instead of
+    // disconnecting it — the kernel binding is intact (RECONNECTABLE).
+    assert!(
+        host.sandboxes[0]
+            .kernel_owner
+            .is_some_and(|g| g < host.generation),
+        "the stale sweep PARKED the live-held survivor device (kernel binding intact), \
+         not disconnected — the #769 gap-A guard",
+    );
+    // The severed-live-holder oracle holds: a live guest's device is never left
+    // both unserved AND unbound.
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+
+    // A later reattach pass with a corrected coord list re-serves the SAME
+    // device — the guest kept reading it the whole time, so the acked bytes are
+    // served with zero loss.
+    host.register_rehydrate(true, true).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by,
+        Some(host.generation),
+        "the corrected reattach pass re-served the parked survivor's device",
+    );
+    assert_eq!(
+        host.sandboxes[0].kernel_owner,
+        Some(host.generation),
+        "the re-served device is bound to the current generation",
+    );
+    assert!(
+        host.unpause(0),
+        "the un-pause now serves the live re-served plane"
+    );
+    host.guest_read(0, 2).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
+/// The un-pause gate's own coverage, kept honest under R6: a survivor whose FC
+/// guest is GENUINELY GONE (crashed/destroyed) no longer holds its device open,
+/// so the stale sweep sees `NoHolder` and a DISCONNECT is LEGAL (proof of death
+/// met — there is no live guest to protect). If a stale coordinator then
+/// attempts a late un-pause onto that now-disconnected device, the un-pause
+/// data-plane gate is still the last line: it fails fast into `evict_local →
+/// resume` rather than serving a dead plane, and no oracle fires.
+#[tokio::test(start_paused = true)]
+async fn park_roll_guest_gone_noholder_disconnect_legal_unpause_gate_still_guards() {
+    let mut host = scenario_host(0, 3).await;
+    host.guest_write(0, 2).await.unwrap();
+    host.park(0);
+    host.crash_process().await.unwrap();
+    // The guest genuinely died after the roll — nothing holds the device open.
+    host.kill_guest(0);
+
+    // Pre-#739 world again, but this time the sweep has proof of death.
+    host.register_rehydrate(false, false).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by, None,
+        "no pass re-served the survivor",
+    );
     assert_eq!(
         host.sandboxes[0].kernel_owner, None,
-        "the stale sweep disconnected the parked survivor's live device (the 731df805 bug)",
+        "the sweep legally DISCONNECTED a dead-owner device with no live holder (NoHolder)",
     );
 
-    // The un-pause gate fires: the guest is NOT un-paused onto the dead plane.
+    // A late un-pause is still refused by the data-plane gate — the guest is
+    // NOT un-paused onto the dead plane.
     assert!(
         !host.unpause(0),
-        "the un-pause data-plane gate must fire on an unserved device",
+        "the un-pause data-plane gate must still fire on an unserved device",
     );
     assert!(
         host.sandboxes[0].parked,
         "the guest stays parked, routed to evict_local → resume",
     );
-    // Crucially: the corruption never happens, so the oracles are clean.
     invariants::check(&host)
         .await
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
@@ -1416,4 +1526,75 @@ async fn explicit_abort_after_state_served_is_legal_and_resumes() {
     let before = host.ledger.len();
     host.guest_write(0, 6).await.unwrap();
     assert_eq!(host.ledger.len(), before + 1);
+}
+
+// ───────────── R5: storage lies — seeded read corruption (Phase 3) ─────────
+//
+// The seam (`CrashFs::with_read_fault`) lies about the bytes a stored file
+// returns; `corrupt_spool_recovery` drives a spool rehydrate through it after
+// raising a redundant published floor. Whatever the lie — a bit-flip on the
+// meta marker or the first chunk — the recovery must DETECT it (the chunk
+// re-hash, or R5's meta content-hash envelope) or TOLERATE it (rebuild from
+// the floor), never a silent corrupt adopt. The oracle holds at every landing.
+
+/// The end-to-end swarm step, exhaustively over the meta marker AND the first
+/// chunk, at every byte offset the flip can land on. Each landing rehydrates
+/// through the lie and must leave the acked-write oracle clean.
+#[tokio::test(start_paused = true)]
+async fn corrupt_spool_recovery_never_silently_adopts_and_the_oracle_holds() {
+    for meta in [true, false] {
+        for offset in 0..48usize {
+            let mut host = scenario_host(0xB17E_0000 + offset as u64, 2).await;
+            host.corrupt_spool_recovery(1, meta, offset)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("corrupt_spool_recovery(meta={meta}, off={offset}): {e}")
+                });
+            invariants::check(&host).await.unwrap_or_else(|v| {
+                panic!("meta={meta} off={offset}: {} — {}", v.invariant, v.detail)
+            });
+            // The redundant floor always survives; sandbox 1 chunk 0 reads its
+            // flushed value (the un-published spooled write is a legitimate
+            // transient-spool loss when the lie forced a discard).
+            host.guest_read(1, 0).await.unwrap();
+        }
+    }
+}
+
+/// The sharp fail-without/pass-with pin at the recovery seam: a spool META
+/// bit-rot that stays a SYNTACTICALLY VALID `SpoolMeta` (a bumped version — the
+/// exact lie that defeats the rebuild's stale-spool lineage gate). R5's
+/// envelope makes `read_spool` reject it as a loud `checksum` rollback; WITHOUT
+/// the envelope the corrupt marker parses and is TRUSTED. This is the standing
+/// spool the sim's rehydrate reads, so the format-level rejection is what keeps
+/// `corrupt_spool_recovery` honest.
+#[tokio::test(start_paused = true)]
+async fn a_valid_but_corrupt_spool_marker_is_rejected_not_trusted() {
+    let mut host = scenario_host(0xB17E_5EED, 2).await;
+    // Establish a floor, then a standing spool holding a newer write.
+    host.guest_write(0, 0).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+    host.guest_write(0, 1).await.unwrap();
+    host.spool_export(0).await.unwrap();
+    let sid = host.sandboxes[0].sandbox_id;
+    let meta_path = host.fs.spool_dir().join(sid.to_string()).join("meta.json");
+
+    // Rewrite the sealed marker's BODY (bump the version) without fixing the
+    // content hash — a perfect `SpoolMeta`, but a lie the envelope catches.
+    let mut env: serde_json::Value =
+        serde_json::from_slice(&tokio::fs::read(&meta_path).await.unwrap()).unwrap();
+    let mut meta: spool::SpoolMeta = serde_json::from_str(env["body"].as_str().unwrap()).unwrap();
+    meta.version += 500;
+    env["body"] = serde_json::Value::String(serde_json::to_string(&meta).unwrap());
+    tokio::fs::write(&meta_path, serde_json::to_vec(&env).unwrap())
+        .await
+        .unwrap();
+
+    let err = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
+        .await
+        .expect_err("a bit-rotted-but-valid spool marker must be rejected, never trusted");
+    assert!(
+        err.to_string().contains("checksum"),
+        "the R5 envelope names the content-hash gap: {err}",
+    );
 }

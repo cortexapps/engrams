@@ -28,6 +28,11 @@ pub mod refresh;
 pub mod remount;
 pub mod share;
 pub mod shell;
+// `pub` so the `engram-agentd` binary (main.rs) shares this one module rather
+// than recompiling its own copy — the bin's readiness dial reads
+// `time_source::metrics_now`, and a second `mod time_source` in main.rs would
+// flag the lib-only `metrics_now_tokio` as dead code in the bin build.
+pub mod time_source;
 
 pub use cacerts::{CaCertInstaller, CaCertPaths};
 pub use handler::serve_connection;

@@ -289,6 +289,17 @@ the `soft_invariant` field). Per-site dispositions:
    handler proceeds to route the caller into the `evict_local → resume` ladder
    (an explicit early-return; the macro only adds the alertable line), so a
    future listing-bug recurrence can never serve dead-plane reads.
+8. **Added** (`soft_invariant!`, ADR 0098 §Phase 3 Wave 6 / R6, #784 layer 1)
+   — the startup stale-binding sweep (`recover_one_stuck_device`) fires
+   `sweep-blocked-live-holder` when a dead-owner NBD device it would otherwise
+   DISCONNECT still has a live process holding its node open (the
+   `device_has_live_holder` proc-scan returned `LiveHolder`/`Unknown`). The
+   #769 gap-A class: a survivor whose rehydrate was missed upstream still has a
+   live guest reading its rootfs. The sweep leaves the device RECONNECTABLE and
+   parks (the macro only adds the alertable line; a companion
+   `engram_nbd_sweep_blocked_live_holder_total` counter carries the same signal
+   to Prometheus). Should stay at/near zero — a firing is the gap-A recurrence
+   counter until layers 2–4 land.
 
 ### H7 / H8 — Dispositions for the known flaky tests
 
@@ -307,6 +318,57 @@ re-ranks the flake budget with data, the only defensible shape is
 `retries = 1` scoped to the e2e-stack binary only, paired with a CI step that
 greps for `FLAKY` and files an issue — retries as a *detector with a paper
 trail*, never a suppressor.
+
+## Addendum 2026-07-18 (the ADR 0098 Phase 3 audit): corrections + H9/H10
+
+The full-code audit that opened ADR 0098's Phase 3 (the R-series) touched
+this ADR in four places; recorded here so this document stays honest:
+
+1. **H5 correction.** "The plan is seedable so the simulator reuses the same
+   wrapper" did not happen: `engram-dst-host` has no engram-testkit
+   dependency and no swarm run injects storage faults —
+   `FaultyBlobStorage` is used only by targeted chunk-store unit tests.
+   Wiring it into the host chaos profile is R3.
+2. **H6 correction + change.** The `soft_invariant!` `name` field was
+   `stringify!(cond)` — the P7 site's condition is a variable named `ok`, so
+   every prod violation logged `name="ok"`, useless as an alert-grouping
+   key. R0 changes the macro to take an explicit slug as its first argument
+   (all sites updated). More importantly: when the P7 un-pause gate fired in
+   prod on 2026-07-18 (three times per sandbox, two sandboxes — the
+   731df805 class recurring), **nothing consumed the log prefix** — "a
+   counter can ride the log pipeline" had no consumer. R0 wires a real
+   log-based alert (engrams-internal) and a triage SLO for the nightly
+   `sim-failure` issues; detection without response was the program's most
+   acute gap.
+3. **H6 chokepoint gaps** found by the audit, queued as R1 site-list
+   additions (each will get its numbered entry here when it lands): chunk
+   read-path length validation against the manifest (a hash-valid short blob
+   currently panics the NBD slice); the NBD serve loop's pre-validation
+   allocation of a corrupt header's claimed length (violates H4's
+   no-alloc-before-validation principle on a non-proto surface);
+   first-`bind` accepting epoch 0. The open `mark_host_dead` FSM divergence
+   (site 5 above) is now load-bearing: the nightly sim's first real catch
+   (#762) and the live prod stall (session 5941d947) are both
+   HostLost-convergence failures — the design call should be made as part
+   of that RCA, not deferred again.
+4. **H9 (new, rides R3): checksums on durable formats.** `durable_record`,
+   the spool *metadata*, chunk-store manifests, and chain-head records are
+   plain JSON — a syntactically-valid corruption is trusted, so H5's
+   torn-write tolerance and the resolvers' chunk-digest checks guard only
+   part of the durable surface. R3 adds envelope checksums (clean-break
+   format bumps) plus a detection→response policy: the tiered resolver
+   currently *falls through* on a hash mismatch and leaves the corrupt copy
+   in place (cache-fill even skips because the object exists) — detection
+   without repair.
+5. **H10 (new, rides R1): mechanical teeth for the process rules.** The D4
+   same-PR conformance rule and the DriverKind coverage claim were
+   convention only (the shipped "meta-test" checks five function pointers;
+   three `MetadataStore` methods silently inherit trait defaults contra
+   panic-not-default; the clippy gate is effective in 4 of 45 crates, with
+   `engram-host-agent` missing `[lints] workspace = true`). R1 replaces
+   convention with mechanism: a real run_once/DriverKind inventory test,
+   panic stubs for the default-inheriting methods, lints inheritance fixed,
+   and the gate extended to every decision-bearing crate.
 
 ## TigerBeetle practices we explicitly reject
 

@@ -426,6 +426,7 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
         None,
         None,
         engram_core::traits::SessionFence::unfenced(),
+        None, // #800: budget — these tests keep the capacity-soft pick
         chrono::Utc::now(),
     )
     .await
@@ -481,6 +482,7 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
         None,
         None,
         engram_core::traits::SessionFence::unfenced(),
+        None, // #800: budget — these tests keep the capacity-soft pick
         chrono::Utc::now(),
     )
     .await
@@ -522,6 +524,7 @@ async fn evacuate_dead_source_no_state_returns_no_recoverable() {
         None,
         None,
         engram_core::traits::SessionFence::unfenced(),
+        None, // #800: budget — these tests keep the capacity-soft pick
         chrono::Utc::now(),
     )
     .await;

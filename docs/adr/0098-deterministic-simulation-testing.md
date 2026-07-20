@@ -32,6 +32,10 @@ capture-job reservations in SimMeta placement.
 **Phase 2 (host-agent, the P-series) opened 2026-07-17** — the "future,
 own ADR" sketch is superseded; the full design and P0–P9 chain live in
 §"Phase 2: host-agent simulation" below.
+**Phase 3 (the R-series, the honest-gap program) opened 2026-07-18** from a
+full audit of this ADR against the shipped code and TigerBeetle's actual
+practice — including a corrections list for claims above that overstated
+what landed. See §"Phase 3: the honest-gap program".
 
 Companion to ADR 0099 (correctness hardening & test isolation — the weeks-scale
 arc; this ADR is the months-scale one). Builds on ADR 0011 (the
@@ -284,6 +288,60 @@ driver cannot be silently unsimulated.
    not promised.
 5. CI runs each PR seed **twice** and diffs the traces — determinism leaks
    are caught the day they land, not when a failing seed won't replay.
+6. **Shared on-disk state + unsorted directory listings are a
+   PLATFORM-divergent replay class** (added R3, wave3-placement-authority).
+   Two failure modes compound: (a) an `fs::read_dir` listing feeding a
+   decision yields keys in filesystem-dependent order, so the same seed can
+   diverge across filesystems/platforms (green on macOS, invariant on
+   Linux) — the replay-twice self-check (#5) is same-machine and CANNOT see
+   this; and (b) a PROCESS-GLOBAL on-disk store shared across worlds lets one
+   seed's world observe/mutate another's state. Both bit the faithful-host
+   blob store: a single `std::env::temp_dir().join("engram-dst-blobs")` shared
+   by every `SimWorld` let one world's snapshot-blob GC sweep list a sibling
+   world's live `state.bin` blobs (unpinned in ITS metadata) and delete them,
+   in `read_dir` order — stranding the sibling's queued resume
+   (`quiescence-queued-with-capacity`), Linux-only, only under
+   `nextest --workspace` concurrency. Fixes: each `SimWorld` owns a PRIVATE
+   `TempDir` bucket (no cross-world residue), and `LocalBlobStorage::list_prefix`
+   returns lexicographically SORTED keys (the GCS/S3 `list` contract — the
+   local backend must match prod, and no consumer inherits a `read_dir`-order
+   leak). Audit rule: any real-filesystem or otherwise process-global resource
+   a driven path reads must be per-world isolated, and every directory listing
+   sorted at the source.
+7. **Real (blocking-pool) I/O inside a driven step races the paused
+   clock's idle auto-advance** (added R4, wave4-sim-mem-blob). Item 6's
+   per-world `TempDir` removed cross-world *contamination* but left the
+   backend a real one: `LocalBlobStorage` does its I/O through `tokio::fs`,
+   which hands each op to tokio's **blocking thread pool** and awaits it.
+   The simulator runs on a `start_paused` current-thread runtime, where
+   virtual time auto-advances **whenever the runtime goes idle** — and an
+   awaited off-thread op makes it idle. So the clock jumped by however long
+   the real filesystem took: virtual time became a function of real disk
+   latency, host load, and platform. #791's faithful-capture blobs
+   (`Services.blob` = a tempdir `LocalBlobStorage`) turned every driven
+   capture/HEAD/list into such a jump; the same #722 seed then replayed to
+   *different* virtual timelines (green on macOS, tripping the queue-scanner
+   convergence on Linux-under-load), and #797's extra blob-HEAD await
+   re-exposed it after #795 fixed only the contamination half. Fix: a
+   deterministic **in-memory** `BlobStorage` for the sim's faithful world
+   (`engram_sim::MemBlobStorage`, a `Mutex<BTreeMap>` — every op completes
+   synchronously in-poll, no blocking-pool handoff, so no idle window ever
+   opens; `BTreeMap` gives the sorted-`list_prefix` GCS/S3 contract for
+   free). The #795 sorted `LocalBlobStorage::list_prefix` stays — it is a
+   real prod-fidelity fix for dev/integration. **Rule: a sim world backs
+   `Services.blob` (and every other seam a driven step touches) with a
+   deterministic in-memory backend; a real-filesystem backend is only for
+   crash-semantics seams that own their OWN determinism story** (externally
+   constructed states, no paused-clock dependence — e.g. the
+   `engram-dst-host` `SimFs` crash tests, whose replay-twice lane has stayed
+   stable because it never awaits real I/O inside a *decision-feeding*
+   driven step; noted as theoretical exposure to re-audit, not a live leak).
+   A second-order corollary this seed also surfaced: the quiescence **drain
+   must model a HEALED fleet faithfully** — advance in `< TTL` steps so the
+   per-round heartbeat keeps hosts fresh (the fixed 40×120s drain left hosts
+   >60s-TTL stale for half of every round, and a detached resume op sampling
+   that window re-queued forever), and drain to ACTUAL quiescence (a fixed
+   round count is timeline-sensitive) bounded by a cap.
 
 ### The world model, faults, and invariants (D5–D6)
 
@@ -686,6 +744,376 @@ where the next bad incident most plausibly comes from:
    astronomically larger interleaving space, biased by hand-chosen pick
    weights. Rare multi-fault pileups may still need directed scenarios
    when suspicion arises.
+
+## Phase 3: the honest-gap program (the R-series)
+
+**Opened 2026-07-18** (bookend), the day after Phase 2 closed, from a
+full-code audit of this ADR + ADR 0099 against both the shipped code and
+TigerBeetle's actual practice (VOPR fault model, the auditor/state-checker
+oracles, storage-fault injection, swarm-tested fault parameters). The audit's
+verdict, recorded honestly: **what shipped is a deterministic lifecycle
+regression harness with a real track record, not yet a simulator of the
+system.** Three structural absences dominate — no client-visible model
+oracle, no in-flight interruption (a step runs to completion, so
+committed-but-unacked crash windows are structurally unreachable), and no
+silent-corruption fault model anywhere (nothing injects bitrot/misdirection,
+and several durable formats carry no checksum to detect it) — and this ADR's
+own narrative overstated what landed in enough places that the corrections
+below are themselves part of the record.
+
+### Corrections to the record (claims above vs what actually shipped)
+
+Coordinator sim (`engram-dst`), as of 2b4b89ea:
+
+- Profiles are `Calm`/`Chaos` only; `pg-flaky`/`partition-heavy` never
+  existed. Preemption-via-SimCloud was never a step.
+- There is **no `Api(WorkloadOp)` step and no Router**: nothing tower-oneshots
+  the real axum/gRPC surface (0/17 HTTP routes, 0/~69 RPCs driven). The
+  workload is fixed-shape DevVM create + resume-first-idle + create-burst —
+  2/7 `OpKind`s; Agent mode absent (the "open deviation" above understated
+  this).
+- The world has **no effect queue**: `SimHostClient` verbs mutate the world
+  synchronously after one optional delay. RPC reorder/duplicate/loss — listed
+  in the fault menu above — are structurally impossible. `RpcHang` is one
+  host-wide stall; `PgOutage` one global fail-before-call bit; `ClockSkew` a
+  constant offset (no drift/step model).
+- **7 oracles, not 9**: snapshot-safety (#5 in the list above) and
+  orphan-sandboxes (#8) were never written; single-ownership checks neither
+  `sandbox_owners` nor epoch monotonicity. `Queued` is accepted
+  unconditionally at quiescence (the capacity qualifier lives in a comment,
+  not code). The placement oracle has drifted from the corrected store
+  predicate (#722's "tightened back to unconditional" did not hold).
+  — *Closed by R3 (wave3-placement-authority):* the unconditional
+  placement-accounting oracle is RESTORED, and the store predicate now
+  satisfies it by construction — a `pending` reserves UNCONDITIONALLY (no
+  wall-age / live-op exclusion; ONE reservation authority), reclaimed only by
+  the ADR 0079 backstop's real `pending → failed` transition. RCA of the
+  12/200 faithful-chaos firings: the failing path was NOT the crash-orphan
+  pending exclusion (the D6/D7-era hypothesis) but the UNRESERVED RESUME
+  soft-pick (`pick_from`'s capacity-soft fallback binding a resume onto a
+  measured-full host); resume now honors the same hard reserved-budget bound
+  as create (queue-when-no-fit via `placement_preview`). With #722 and #790
+  closed, faithful hosts are the swarm DEFAULT.
+- The "DriverKind coverage meta-test" is five function-pointer visibility
+  checks; it inspects neither `DriverKind` nor the run_once inventory.
+  Coverage is ~8/14 production task families — `enable_scanner::run_once`
+  (the whole durable enable/capture pipeline, extant since June) was never a
+  `DriverKind` variant; pg_listener, checkpoint retention, base-snapshot
+  retention (both of which keep their logic inline in spawn loops,
+  contradicting the "every driver is a run_once" claim above), preemption
+  drain, and chunk GC are absent.
+- SimMeta: 136/198 methods implemented, 59 panic stubs, and **3 methods
+  silently inherit trait defaults** (`terminate_session`,
+  `fc_snapshot_version_for_host`, `notify_session_delta` — the last a silent
+  no-op), contradicting panic-not-default. The conformance suite is 17
+  scenarios touching ~49/198 methods; the same-PR rule has no mechanical
+  enforcement.
+- "CI runs each PR seed twice and diffs the traces" is false: three fixed
+  unit-test seeds are replayed twice; the swarm ranges run once. The failure
+  artifact is the last 40 Debug-formatted steps — no virtual time, no state
+  deltas. Per-component forked RNG streams were not implemented (scheduler
+  RNG + one shared world entropy).
+- The D6 weight patch silently failed to apply, so the D6/D7-era swarms
+  never picked the partition/skew/burst arms (since corrected in the
+  scheduler with a confession comment). The lesson generalizes: **the harness
+  has no sensitivity proof** — nothing demonstrates the swarm can re-find a
+  known bug (R5 adds the canary lane).
+
+Host sim (`engram-dst-host`) + storage:
+
+- The acked-write oracle is a numeric interval check
+  (`floor <= tag <= latest`) over globally-incremented tags: a misdirected
+  read serving another chunk's in-range tag passes. The ledger carries the
+  per-chunk history needed for a membership check; the oracle discards it. —
+  *Closed by R1.5:* the oracle (and `guest_read`) now require the observed tag
+  to be a MEMBER of that chunk's acked-tag set (or the tag-0 base), still
+  bounded below by the floor; the third violation class
+  (in-range-but-never-acked misdirection) is pinned by a regression test that
+  fails against the old interval form.
+- "Bounded by the flush cadence and the periodic checkpoint" is not modeled:
+  the host scheduler has **no periodic-checkpoint step** and enforces no
+  cadence bound — arbitrarily old unpublished acked writes are accepted loss.
+  — *Bounded at quiescence by R1.5:* the run's quiescence pass now drives a
+  final REAL flush per live sandbox and then asserts no surviving chunk's
+  content sits above the published floor (`quiescent-floor` — with oracle
+  #1's lower bound, content == floor: everything that survived is
+  published), so accepted loss is exactly 'un-flushed at crash', never
+  'never flushed'. (Asserting `floor == latest_ack` was the first cut and
+  is over-strict: a write lost to an earlier abrupt crash keeps its
+  `latest_ack` above the floor forever — the chaos swarm fired it on every
+  crash-loss seed; content-based is the honest form.) The mid-run
+  periodic-checkpoint step and cadence bound remain open (the rest of the
+  R1 row).
+- The restart leg runs the sim's own `rebuild`, not production
+  `reattach_manifest`; the ledger has no per-write handoff enum (one floor
+  per chunk).
+- "Everything that decides what survives a crash, roll, eviction, or
+  migration is covered" was overstated: capture-job records, chain-head
+  records, periodic-checkpoint records, and **eviction disk-pending staging**
+  (files that can hold the only durable copy of acked writes) all bypass
+  `HostFs` — zero crash-point exploration; migration transfers no disk bytes
+  and commit drops the backend, exiting the sandbox from the durability
+  oracle entirely.
+- The "adversarial" coordinator stub is benign in swarm runs: its
+  adversarial arms are one-shot queues used only by pinned tests — no
+  scheduler step scripts them — and it structurally cannot express the
+  applied-commit-but-lost-ack window (it returns before recording), ignores
+  `host_id` scoping, and models 3 of ~15 host→coord routes.
+- ADR 0099's claim that the seedable `FaultyBlobStorage` plan "is reused by
+  the simulator" is false: `engram-dst-host` does not depend on
+  engram-testkit; no storage-fault injection runs in any swarm.
+- The kernel-assumptions audit named in residual risk #1: 2 of 4 assumptions
+  pinned (park/replay, RECONFIGURE identifier); BLKFLSBUF cross-tenant
+  invalidation and cross-fd-fsync-through-the-bdev-page-cache have no test.
+
+Enforcement perimeter:
+
+- The clippy time/entropy gate is effective in **4 of 45** workspace crates.
+  `engram-host-agent` has the list but not `[lints] workspace = true` (its
+  gate holds only via CI's command-line `-D warnings`). Ungated raw calls sit
+  in decision paths: the `engram-core` ID macro mints `Uuid::new_v4()`
+  directly, host-operator roll/autoscale deadlines, agentd readiness,
+  egress-proxy token freshness. Three `#[allow(disallowed_methods)]` sites
+  are outside the blessed list (`mint_export_id`, `build_heartbeat`,
+  `unique_path_token`).
+- Two determinism leaks in driven paths survived the D5 audit:
+  `session_ops::enqueue` detached-spawns `drive_claimed` (mutating work
+  escapes the step boundary), and `MigrationRegistry::expired()` feeds
+  DashMap iteration order into decisions consumed by both the prod TTL sweep
+  and the host sim.
+
+Product bugs found by the audit (fixes ride R1, not the harness):
+eviction-finalize uploads staged disk-pending bytes without re-hashing and
+stamps the *recorded* hash into the published manifest (corrupt staged bytes
+→ chunk stored under a new digest, manifest referencing the old one —
+dangling ref, unresumable snapshot, silent); the NBD serve loop allocates a
+corrupt header's claimed length (≈4 GiB) before range validation; chunk
+length is never validated against the manifest on the read path (a
+hash-valid short blob panics the slice); a first bind accepts epoch 0.
+
+### Prod anchors (2026-07-16..18) — why this phase, ranked by these
+
+The nightly swarm's first real catch (#762, seed 33043259: a session stuck
+at HostLost after convergence) landed the same day prod had session
+5941d947 wedged at `host_lost`: its evict op died on the P7 un-pause gate
+(the 731df805 survivor class RECURRED upstream — the gate held, three
+firings per sandbox), the coordinator destroyed the VM promising "reconcile
+drives HostLost → Idle", and that convergence never happened. **No alerting
+consumes the `soft-invariant violated:` prefix** — the firings went
+unnoticed until this audit — and the macro's `name` field logs
+`stringify!(cond)` (literally `name="ok"`). Two days earlier both
+coordinator pods OOMKilled simultaneously (the #704 trigger; no root-cause
+issue existed). #570 — the coordinator-unbind vs host-teardown-reconcile
+race destroying eviction snapshots mid-upload — remains open: a live
+instance of residual risk #2. Detection without response is currently the
+program's most acute gap.
+
+### The R-series
+
+**Wave status (2026-07-18):** R0 + R1 are MERGED — #766/#767/#770 (R0; the
+straggler sweep drained a live prod backlog on its first ticks) and
+#771/#772/#775/#776/#779/#780 (R1; burst-merged after a combined-state
+check per the AGENTS.md rule). The #777 design calls are decided
+(honest-Dead stage-2 predicate; ask-the-host bound-row policy) and in
+implementation. R2 is MERGED: #782 (the #777 calls, incl. the flip_missing
+reverse-lie fix), #783 (CoSim rung 1 — **#570 reproduced against real code
+on both sides and fixed**; the capture_in_flight reconcile exemption;
+issue closed), and #786 (the effect queue, the real tonic+axum-driven
+workload, and the acked-only expected-state model oracle — which caught a
+live D1 entropy leak in the API create path in its first swarm). The
+faithful-host work behind #786 unmasked **#787** (suspected
+queue-scanner/OpReclaim double-boot split-brain — the pre-R2 world's
+wire-skewed hosts had silently suppressed the entire digest-gated
+placement path, the exact "stale fake green-lights bugs" risk this ADR
+named). #787 is the next wave's opener; the API-verb swarm integration +
+harness-idle eviction + drain workload steps are deliberately held until
+it is fixed. Wave 3 (the R3 chain) is MERGED — three RCAs, each of which
+OVERTURNED its going-in hypothesis: #791 (the #787 "double-boot" was the
+dead-host #231 probe dialing an empty sim host_pool — fidelity gap, prod
+analog epoch-fenced; plus the #790 snapshot-fidelity fix: model the
+artifact, never fake the flag) and #795 (the #722 over-reservation was
+the unreserved resume soft-pick, NOT the crash-orphan exclusion — the
+D7-era fix had hardened an untriggered path; one reservation authority
+now holds on every placement path, the UNCONDITIONAL placement oracle is
+restored, and faithful hosts are the swarm default). #795 also closed a
+class the harness could not see about itself: the first landing (#793)
+was reverted (#794) after main's Linux lane caught cross-world blob-GC
+contamination — every SimWorld shared one process-global temp blob dir,
+victims chosen by read_dir order. Per-world TempDirs + a SORTED
+LocalBlobStorage::list_prefix (the GCS/S3 contract) fix it, and
+"shared on-disk state + unsorted listings ⇒ concurrency/platform-
+divergent replay the replay-twice check structurally misses" is now
+determinism-audit item 6. **Wave 4 (the workload-verb fold-in) is in
+review**: the deterministic API verbs — Prompt (the full send_prompt →
+Deliver op → run_started-ack loop), Rename (the coordinator-owned
+`set_session_suggested_title` write), and Destroy (the real Destroy op +
+teardown) — are folded into BOTH swarm profiles at small weights, each
+feeding the acked-only model oracle, which grew two assertions:
+**acked-destroy-never-resurrects** and **acked-rename read-your-writes**.
+The CI-window swarms stay green (chaos 0..200, calm 0..100 ×1500) and calm
+replays byte-identically; the verbs draw only WORLD entropy so they never
+perturb the `self.rng` pick stream. Two findings kept the **operator-drain**
+verb OUT of the profile menu (driven only by dedicated tests): (1) it drives
+the evict pipeline, whose `SimHostClient::snapshot` does real-fs blob writes
+that race the paused clock — the same latent faithful-world nondeterminism
+as determinism-audit item 6 / the in-memory-blob-store migration; and (2) it
+uncovers a REAL **capacity-soft evac over-reservation** — evac_resumer's
+`evacuate_dead_source → pick_for_session` is capacity-SOFT (ADR 0046), so a
+drain-driven wave of evacuations binds measured-FULL survivors and drives Σ
+reserved > allocatable. This is the #722/#795 over-reservation class on the
+EVAC leg, which #795's `status == Idle` gate never covered — the dormant
+#775 leg the drain was expected to expose. The contained-but-partial fix
+(honor the hard bound before the soft pick) was reverted as incomplete; the
+full fix needs RESERVED evac placement (a follow-up). Also deferred: #792's
+recoverable-before-Idle guard, touch_session_activity retirement. Rung 2
+lives in #784. Historical note superseded:
+the R2 model-oracle/Router-workload/effect-queue track deliberately waits
+for rung 1 to land (the effect queue restructures the same SimHostClient
+seam the cosim bridge consumes). Invariant alerting is live-pending-apply
+in engrams-internal #89 (Slack #project-engrams).
+
+**R4 (wave4-sim-mem-blob) — the last blob-store determinism leak.** #795
+fixed cross-world *contamination* but left the sim's faithful world backing
+`Services.blob` with a real-tempdir `LocalBlobStorage`, whose `tokio::fs`
+I/O auto-advances the `start_paused` clock on every driven capture/HEAD/list
+(the blocking-pool-idle race — now **determinism-audit item 7**). #797's
+extra blob-HEAD await re-exposed it on the #722 faithful seed. Fix: a
+deterministic in-memory `engram_sim::MemBlobStorage` (`Mutex<BTreeMap>`, no
+real I/O, sorted `list_prefix` for free) replaces the tempdir backend
+per-world; #795's sorted `LocalBlobStorage::list_prefix` stays as a real
+prod-fidelity fix. RCA OVERTURNED the going-in "just re-pin the seed"
+hypothesis twice: the deterministic timeline exposed (a) a pre-existing
+**fake periodic-checkpoint** fidelity gap (the sim writes a `recoverable`
+snapshot row with NO manifests/blobs — the "fake the flag" anti-pattern;
+harmless here only because `snapshot_artifacts_present` short-circuits true
+for a manifest-less record and the sim `restore` is a no-op — noted for a
+future "model the artifact" pass, not fixed in R4), and (b) the real
+blocker: the quiescence **drain advanced 120s per single heartbeat against a
+60s registry TTL**, so a detached resume op sampled the >TTL-stale window,
+found zero schedulable hosts, and re-queued forever while the sweep (fresh)
+re-dequeued it — an infinite Queued↔Idle loop the fs-timeline had masked.
+Drain fix: advance in `< TTL` steps (per-round heartbeat keeps the healed
+fleet fresh) and drain to ACTUAL quiescence bounded by a cap, not a fixed
+round count. The #797 recoverable-before-Idle guard, blocked only on this
+flake, is unblocked. Verified zero-divergence ≥30× under concurrent load on
+both macOS and the Linux dev VM, full `-p engram-dst -p engram-sim`, the
+faithful swarm, and the replay-twice self-check.
+
+**Wave 4 CLOSED (all merged: #797/#798/#799 + two follow-on fixes).** The
+verb fold-in's CI run forced two more determinism layers into the open:
+(1) **cross-seed runtime sharing** — the swarm binary ran every seed of a
+`--seeds` window on ONE shared paused-clock runtime, so detached
+timer-parked tasks (the op executor's spawned re-drive, the within-step
+op-heartbeat interval) leaked across seed boundaries until a later seed's
+runtime futex-parked instead of auto-advancing (a 6h silent CI hang). Fix:
+`run_seed` gives each seed its own runtime dropped at the boundary, plus a
+per-seed 600s WATCHDOG that converts any future liveness hang into a fast
+NAMED failure — which promptly fired on CI and exposed (2) the capstone, a
+REAL PRODUCTION concurrency bug: `HostRegistry::list`/`unbind_session`
+held a DashMap shard read-guard ACROSS an `.await`; with shard count =
+`available_parallelism()` and getrandom-seeded hashing, a same-shard
+`register` write-lock on the single-threaded runtime was a permanent,
+environment-dependent deadlock (4-vcpu CI reliably; 1.3% under load on 16
+cores) — in production the same collision is a silent worker stall. Fixed
+by snapshot-then-await (gdb-proven, 0/550 hangs across the constraint
+matrix). Determinism-audit item 8: **no lock held across an await in any
+driven path; per-seed runtimes; a named watchdog over every swarm window.**
+#800 tracks the reserved-evac-placement follow-up; the drain verb joins the
+profiles when it lands.
+
+**Wave 5 (wave5-reserved-evac, #800) — the drain verb joins the swarm.**
+Folding the operator-drain step (`Step::DrainHost`) into both profiles was
+held through wave 4 on two findings; wave 5 cleared both and folded it in at
+a small weight (2 pts each, carved from `HostHeartbeats`, host index drawn
+from WORLD entropy so only the weights shift). (1) The evict-pipeline blob
+race was already gone — #799's in-memory `MemBlobStorage` (determinism-audit
+item 7) removed the `tokio::fs` I/O. (2) The real one: **capacity-soft evac
+over-reservation.** With drain live, ~19/100 calm seeds (0, 4, 5, 7, 16, 21,
+22, … the smallest is seed 0, firing at step 240) tripped
+`placement-accounting` — `evac_resumer → evacuate_dead_source →
+pick_for_session` was capacity-SOFT (ADR 0046's deliberate evac-urgency
+choice), so a drain-driven wave bound measured-FULL survivors and drove Σ
+reserved > allocatable. This is the #722/#795 class on the EVAC leg, which
+#795's `status == Idle` gate never covered (evac sessions are `Evacuating`).
+A contained-but-partial fix (a hard `placement_preview` gate) was written and
+reverted in #798 as incomplete: it left the ctx budget `None`, so preview and
+the soft pick disagreed and a full host still got bound.
+
+The honest fix is **RESERVED evac placement** (ADR 0046 addendum 2026-07-19):
+the evac ctx now carries the session's reserved 2D budget (was hard-coded
+`None`, capacity-blind), and `pick_for_session_reserved`
+(`pick_from_2d(require_fit=true)`) drops the soft `ranked.hosts[0]` fallback —
+returning `NoCapacity` when no MEASURED survivor fits (an UNMEASURED host
+still counts as fitting, matching `placement_preview`/`pick_host_2d`, so the
+reserved pick and the queue scanner's precheck never disagree and churn
+`Queued↔Idle` — the #795 livelock class). On no-fit the resumer flips
+`Evacuating → Queued` (resume-origin, `enqueue_evacuating_session_resume`,
+fenced on the evac op's epoch) and the queue scanner re-homes it once capacity
+returns — an evacuation that fits nowhere queuing honestly beats overcommit.
+The pick→rebind residual window (evac can't commit its reservation inside one
+FOR-UPDATE txn — the restore happens between) is the same window ADR 0046
+already accepts for eviction release, backstopped by the periodic reconcile
+and closed by construction in the single-threaded sim. Coverage: a two-store
+D4 conformance case for the new store method, a non-vacuous unit gate
+(`evac_reserved_queues_when_no_survivor_fits`), and pinned seed 0
+(`issue_800_reserved_evac_over_reservation_smallest_calm_seed`, fail-without /
+pass-with proven). Faithful swarms green with drain enabled: chaos 0..200 →
+200/200, calm 0..100 → 100/100 (×1500).
+
+**Wave 6 (wave6-sweep-live-holder, #784 layer 1 / #769 gap A) — the sweep
+requires proof of death.** The first LIVE alert firing (`un-pause-dead-plane`,
+3× at 18:31Z on 2026-07-18, recurring 2026-07-19) confirmed the 731df805
+survivor-severing class recurs upstream: a survivor left rootfs-less (its
+rehydrate missed by both the coord list AND the #739 local pass) reaches the
+startup stale-binding sweep, whose test was "server pid dead ⇒ Disconnect."
+That test severs a LIVE guest's data plane. The #784 prevention design (four
+layers; this is layer 1) inverts the kill test: **destructive actions require
+positive proof of death, not absence-from-a-map** (the #782 ask-the-host
+pattern one level down). `sweep_verdict` gains a `DeviceHolder`
+(`LiveHolder`/`NoHolder`/`Unknown`) input — the full `(liveness × holder)`
+transition table, wildcard-free: a dead owner DISCONNECTs only with proof of
+death (a completed holder scan that found no live process); a `LiveHolder`
+(surviving guest still reading its rootfs) — or an `Unknown` (scan error, not
+proof) — yields a new `Park` verdict that leaves the device RECONNECTABLE, never
+severed. Prod (`recover_one_stuck_device`): `device_has_live_holder` scans
+`/proc/*/fd` readlinks for the device node (cold-path sweep only, bounded by
+process count, fail-safe `Unknown` on a permission error we can't rule out);
+on `Park` it fires the `sweep-blocked-live-holder` soft-invariant (ADR 0099 H6
+site, alertable + a `engram_nbd_sweep_blocked_live_holder_total` counter) and
+leaves the kernel binding intact so the `nbd_kernel_busy` probe keeps it out of
+new-claim circulation while the coord list / local ChainHeadRecord pass
+re-serves it by path — no new subsystem. Sim (`engram-dst-host`): the device
+model gains `guest_holds_device` (a live world-side guest ⇒ `LiveHolder`, the
+twin of the proc-scan); `StaleSweepTick` drives the REAL new verdict; a new
+`severed-live-holder` oracle asserts a live guest's device is never left both
+unserved AND unbound. The 731df805 UNGATED seed is updated honestly — the sweep
+now PARKS the live-held device and a later reattach re-serves it with ZERO loss
+(`park_roll_ungated_live_holder_sweep_parks_then_reattach_reserves_zero_loss`,
+fail-without / pass-with proven: reverting the verdict returns the disconnect and
+fires the oracle) — and the un-pause gate keeps its own coverage via a
+genuinely-gone-guest scenario (`NoHolder` ⇒ Disconnect legal ⇒ the gate still
+guards a late un-pause). One minimal `#[ignore]`'d FC-lane test
+(`nbd_proc_holder`, wired into `ci.yml`) pins the kernel assumption: an open fd
+on a real `/dev/nbdN` is proc-scan-detectable with a dead netlink server. Host
+CI windows green (chaos 0..60, calm 0..30 ×1000) + replay-twice identical.
+Layers 2–4 (kernel-derived rehydrate inventory; startup classification barrier;
+the rung-2 co-sim family) remain #784's.
+
+
+| Phase | Content |
+|---|---|
+| R0 | Truth + the response loop: this addendum; explicit `soft_invariant!` name slugs; nightly infra-failure filing; a log-based alert on the soft-invariant prefix (engrams-internal) + a triage SLO for `sim-failure` issues; RCAs for #762, the dead-plane recurrence, and the double-OOM. |
+| R1 | Soundness of what exists: the missing coordinator oracles (snapshot-safety, orphan, epoch/`sandbox_owners`), capacity-aware Queued-at-quiescence, placement-oracle realignment; per-chunk membership in the acked-write oracle + a periodic-checkpoint step + a cadence bound; the eviction-finalize hash fix + NBD length validation (prod); a real DriverKind meta-test + the missing drivers (enable_scanner first) + run_once extraction for the two inline-loop retention drivers; panic-stub the 3 default-inheriting SimMeta methods; lints inheritance + gate extension to the decision-bearing crates; fix the two determinism leaks. |
+| R2 | The auditor: an expected-state model diffing acked API responses against world truth (acked-create never lost; acked results never contradicted; completed runs never repainted); workload through the real Router/gRPC surface as originally specified; an effect queue giving in-flight interruption + message loss/reorder/duplication. |
+| R3 | Storage lies: corruption injection (CrashFs byte-flip/misdirect/stale-read; seeded FaultyBlobStorage in the host chaos profile); checksums on the unprotected durable formats (durable_record envelope, spool metadata, manifest digest, chain-head) as clean-break bumps; detection→response policy (resolver deletes/refetches corrupt primary copies); route the four HostFs-bypassing writers through the seam; the two missing kernel-assumption pins in the FC lane. |
+| R-CoSim | Coordinator↔host co-simulation — the boundary where #570, #739/731df805, #602, #216, and 85e0298a all live and which both sims exclude by construction. Rung 1: `engram-dst-cosim` — the REAL coordinator handlers/drivers over SimMeta bridged to the REAL extracted host flows (transport faked, both sides' code real), one interleaved scheduler, directed scenarios for the four known handshakes (#570 must reproduce first). Oracles: coordinator-says-Idle ⇒ the resume-visible snapshot is durable and covers the acked ledger; ownership agreement across the boundary. Rung 2 (post-R2 effect queue): a seeded boundary-fault swarm, small world, own detector flag + CI-Gate membership. |
+| R4 | The untouched tier + exhaustion: orchestrator DST (#704's zombie-listener class — clock/entropy injection in TS, run_once-shaped listener/lease/cursor steps, lease-held ⇒ stream-consuming oracle) + the cross-tier smoke un-skipped into the e2e lane; memory/backpressure bounds from the OOM RCA, "every queue names its bound" enforced mechanically, OOM-kill faults in both sims. |
+| R5 | Exploration depth: per-seed randomized fault weights + world config (swarm testing proper); disk-pressure/ENOSPC + mixed-WIRE_VERSION faults; the canary lane (revert a known-caught fix behind a cfg, assert the swarm re-finds it); nightly volume scaled across runners. |
+
+Execution note: implementation fans out to Codex (gpt-5.6-sol, low effort)
+subagents in isolated worktrees, one PR per row-item, orchestrated in waves;
+every subagent diff is reviewed in-session before human merge. The addendum
+is updated between waves (bookend convention).
 
 ## Non-goals
 
