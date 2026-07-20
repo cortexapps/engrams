@@ -66,7 +66,82 @@ describe("Review consumer", () => {
     expect(sent.calls).toEqual([]);
   });
 
-  test("ignores curated events because review data arrives through tools", async () => {
+  test("sends run completion as the idle fallback with a stable key", async () => {
+    const sent = sender();
+    const consumer = makeReviewConsumer({
+      findReviewSession: async () => ({
+        reviewWorkflowId: "review-wf-1",
+        role: "finder",
+      }),
+      send: sent.send,
+    });
+
+    await consumer.appliesTo("session-1");
+    await consumer.handle(
+      { idx: 7n, kind: "run_completed", payloadJson: "{}" },
+      { sessionId: "session-1" },
+    );
+
+    expect(sent.calls).toEqual([{
+      destinationId: "review-wf-1",
+      message: { kind: "session_idle", role: "finder" },
+      topic: REVIEW_TOPIC,
+      idempotencyKey: "review:session-1:idle",
+    }]);
+  });
+
+  test("flags a failed harness run so the workflow never posts a clean result", async () => {
+    const sent = sender();
+    const consumer = makeReviewConsumer({
+      findReviewSession: async () => ({
+        reviewWorkflowId: "review-wf-1",
+        role: "finder",
+      }),
+      send: sent.send,
+    });
+
+    await consumer.appliesTo("session-1");
+    await consumer.handle(
+      {
+        idx: 7n,
+        kind: "run_completed",
+        payloadJson: JSON.stringify({ ok: false, type: "harness_run_completed" }),
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(sent.calls).toEqual([{
+      destinationId: "review-wf-1",
+      message: { kind: "session_idle", role: "finder", runFailed: true },
+      topic: REVIEW_TOPIC,
+      idempotencyKey: "review:session-1:idle",
+    }]);
+  });
+
+  test("a clean run (ok:true) carries no failure flag", async () => {
+    const sent = sender();
+    const consumer = makeReviewConsumer({
+      findReviewSession: async () => ({
+        reviewWorkflowId: "review-wf-1",
+        role: "finder",
+      }),
+      send: sent.send,
+    });
+
+    await consumer.appliesTo("session-1");
+    await consumer.handle(
+      {
+        idx: 7n,
+        kind: "run_completed",
+        payloadJson: JSON.stringify({ ok: true, type: "harness_run_completed" }),
+      },
+      { sessionId: "session-1" },
+    );
+
+    expect(sent.calls[0]?.message).toEqual({ kind: "session_idle", role: "finder" });
+  });
+
+  test("ignores curated events other than run completion", async () => {
     const sent = sender();
     const consumer = makeReviewConsumer({
       findReviewSession: async () => ({
