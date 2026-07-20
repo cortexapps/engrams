@@ -1,15 +1,21 @@
 /**
  * Durable per-PR review workflow (ADR 0100).
  *
- * The registered workflow body is a deliberately tiny, stable forwarder. DBOS
- * computes the application version by hashing the *source text of every
- * registered workflow function* (`computeAppVersion` → `origFunction.toString()`).
- * A version bump orphans in-flight reviews on redeploy: a review parked on
- * `recv` under the old hash is not recovered by an executor running the new
- * hash, and the completion `send` piles up unconsumed. So all evolving
- * orchestration — phase setup, message classification, logging, validation —
- * lives in the plain module functions below, which never enter the hash. Same
- * discipline as ToolExecWorkflow and SlackThreadWorkflow.
+ * The registered function body holds the operation graph on purpose: the recv
+ * loop and the ORDER + NAMES of every `step(...)` call live here, inline. DBOS
+ * derives the application version from registered workflow function source
+ * (`computeAppVersion` → `origFunction.toString()`, which does NOT recurse into
+ * module-level helpers), and it replays an in-flight workflow only against code
+ * of its own version. Keeping the graph in this function means a change to it
+ * rotates the version, so DBOS version-gates replay instead of running a
+ * recovered review through a changed graph — which would raise
+ * `DBOSUnexpectedStepError` or silently take a wrong branch.
+ *
+ * The heavy work — session lifecycle, GitHub, persistence — lives behind the
+ * injected `ReviewControlPlane`, exactly as ToolExecWorkflow keeps its logic in
+ * the functions its steps call. A completed step is memoized on replay, so a
+ * control-plane method's internals evolve freely without touching the graph;
+ * only the graph itself (this body) is version-sensitive.
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
@@ -54,394 +60,263 @@ function requireControlPlane(): ReviewControlPlane {
   return controlPlane;
 }
 
-/**
- * Live review state, threaded through the module functions. `cp`/`step` are the
- * injected seams; the rest is workflow-local state rebuilt deterministically on
- * replay from the checkpointed recv history + step outputs, so it needs no
- * table and no continue-as-new.
- */
-interface Review {
-  cp: ReviewControlPlane;
-  step: StepRunner;
-  workflowId: string;
-  repo: string;
-  prNumber: number;
-  trigger: string;
-  reviewId: string;
-  taskId: string;
-  headSha: string;
-  baseSha: string;
-  focus?: string;
-  finderSessionId?: string;
-  verifierSessionId?: string;
-  finderDone: boolean;
-  verifierDone: boolean;
-}
+export async function prReviewWorkflowImpl(
+  deps: PrReviewWorkflowDeps = {},
+): Promise<void> {
+  const cp = deps.controlPlane ?? requireControlPlane();
+  const step: StepRunner = deps.step ?? ((fn, name) => DBOS.runStep(fn, { name }));
+  const recv: ReviewReceiver = deps.recv ?? ((topic, timeout) => DBOS.recv(topic, timeout));
 
-/**
- * Resolve the PR heads and create (or adopt) the durable review record.
- * Returns null when head resolution fails — the review is already marked failed
- * so no worker can bootstrap against unresolved code.
- */
-async function beginReview(
-  cp: ReviewControlPlane,
-  step: StepRunner,
-  trigger: Extract<ReviewInbox, { kind: "trigger" }>,
-  workflowId: string,
-): Promise<Review | null> {
-  let headSha = trigger.headSha ?? "";
+  const first = await recv(REVIEW_TOPIC, RECV_TIMEOUT_S);
+  if (first === null || first.kind !== "trigger") return;
+  const workflowId = deps.workflowId ?? DBOS.workflowID;
+  if (!workflowId) throw new Error("Review workflow ID is unavailable");
+
+  let headSha = first.headSha ?? "";
   let baseSha = "";
   try {
     // The trigger contract does not carry baseSha, so every trigger resolves
     // the PR heads. Preserve an event-provided head SHA and only fill missing
     // values so a later push cannot change the commit this workflow reviews.
     const resolved = await step(
-      () => cp.resolvePrHeads(trigger.repo, trigger.prNumber),
+      () => cp.resolvePrHeads(first.repo, first.prNumber),
       "resolvePrHeads",
     );
     if (headSha === "") headSha = resolved.headSha;
     baseSha = resolved.baseSha;
   } catch (err) {
     log.error(
-      { repo: trigger.repo, prNumber: trigger.prNumber, err },
+      { repo: first.repo, prNumber: first.prNumber, err },
       "pull request head resolution failed",
     );
     // markReviewFailed is review-ID based, so retain a durable failed record
     // while ensuring no worker can bootstrap against unresolved code.
     const { reviewId } = await step(
       () => cp.ensureReviewRecord({
-        repo: trigger.repo,
-        prNumber: trigger.prNumber,
+        repo: first.repo,
+        prNumber: first.prNumber,
         headSha,
         baseSha,
-        trigger: trigger.trigger,
+        trigger: first.trigger,
       }),
       "ensureReviewRecord",
     );
     await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
-    return null;
+    return;
   }
 
   const { reviewId, taskId } = await step(
     () => cp.ensureReviewRecord({
-      repo: trigger.repo,
-      prNumber: trigger.prNumber,
+      repo: first.repo,
+      prNumber: first.prNumber,
       headSha,
       baseSha,
-      trigger: trigger.trigger,
+      trigger: first.trigger,
     }),
     "ensureReviewRecord",
   );
 
-  return {
-    cp,
-    step,
-    workflowId,
-    repo: trigger.repo,
-    prNumber: trigger.prNumber,
-    trigger: trigger.trigger,
-    reviewId,
-    taskId,
-    headSha,
-    baseSha,
-    ...(trigger.focus !== undefined ? { focus: trigger.focus } : {}),
-    finderDone: false,
-    verifierDone: false,
-  };
-}
+  // Worker session ids are workflow-local state, rebuilt deterministically on
+  // replay from the checkpointed step outputs. The setup/teardown closures are
+  // defined here (not hoisted to module scope) so their step sequence is part
+  // of this function's source and therefore of the version hash.
+  let finderSessionId: string | undefined;
+  let verifierSessionId: string | undefined;
 
-function activeRole(review: Review): Role {
-  return review.finderDone ? "verifier" : "finder";
-}
-
-function sessionIdFor(review: Review, role: string): string | undefined {
-  return role === "finder" ? review.finderSessionId : review.verifierSessionId;
-}
-
-/**
- * Create, bootstrap, and prompt the worker for one phase. Returns true on
- * success; on any failure the worker is torn down, the review is marked failed,
- * and it returns false (the caller must stop the workflow).
- */
-async function setupPhase(review: Review, role: Role): Promise<boolean> {
-  const { cp, step } = review;
-  try {
+  const setupPhase = async (role: Role): Promise<void> => {
     if (role === "finder") {
       const { sessionId } = await step(
-        () => cp.createFinderSession({
-          reviewId: review.reviewId,
-          taskId: review.taskId,
-          repo: review.repo,
-          prNumber: review.prNumber,
-          workflowId: review.workflowId,
-        }),
+        () => cp.createFinderSession({ reviewId, taskId, repo: first.repo, prNumber: first.prNumber, workflowId }),
         "createFinderSession",
       );
-      review.finderSessionId = sessionId;
+      finderSessionId = sessionId;
       await step(
-        () => cp.bootstrapFinderSession(sessionId, {
-          reviewId: review.reviewId,
-          repo: review.repo,
-          headSha: review.headSha,
-        }),
+        () => cp.bootstrapFinderSession(sessionId, { reviewId, repo: first.repo, headSha }),
         "bootstrapFinderSession",
       );
       await step(
         () => cp.sendFinderPrompt(sessionId, {
-          reviewId: review.reviewId,
-          repo: review.repo,
-          prNumber: review.prNumber,
-          headSha: review.headSha,
-          baseSha: review.baseSha,
-          ...(review.focus !== undefined ? { focus: review.focus } : {}),
+          reviewId, repo: first.repo, prNumber: first.prNumber, headSha, baseSha,
+          ...(first.focus !== undefined ? { focus: first.focus } : {}),
         }),
         "sendFinderPrompt",
       );
     } else {
       const { sessionId } = await step(
-        () => cp.createVerifierSession({
-          reviewId: review.reviewId,
-          taskId: review.taskId,
-          repo: review.repo,
-          prNumber: review.prNumber,
-          workflowId: review.workflowId,
-        }),
+        () => cp.createVerifierSession({ reviewId, taskId, repo: first.repo, prNumber: first.prNumber, workflowId }),
         "createVerifierSession",
       );
-      review.verifierSessionId = sessionId;
+      verifierSessionId = sessionId;
       await step(
-        () => cp.bootstrapVerifierSession(sessionId, {
-          reviewId: review.reviewId,
-          repo: review.repo,
-          headSha: review.headSha,
-        }),
+        () => cp.bootstrapVerifierSession(sessionId, { reviewId, repo: first.repo, headSha }),
         "bootstrapVerifierSession",
       );
       await step(
-        () => cp.sendVerifierPrompt(sessionId, {
-          reviewId: review.reviewId,
-          repo: review.repo,
-          prNumber: review.prNumber,
-          headSha: review.headSha,
-          baseSha: review.baseSha,
-        }),
+        () => cp.sendVerifierPrompt(sessionId, { reviewId, repo: first.repo, prNumber: first.prNumber, headSha, baseSha }),
         "sendVerifierPrompt",
       );
     }
-    return true;
-  } catch (err) {
-    log.error(
-      { repo: review.repo, prNumber: review.prNumber, role, err },
-      `${role} setup failed`,
-    );
-    await teardownWorkerBestEffort(review, role);
-    await step(() => cp.markReviewFailed(review.reviewId), "markReviewFailed");
-    return false;
-  }
-}
+  };
 
-/** Delete a phase worker's session and clear its id. */
-async function teardownWorker(review: Review, role: Role): Promise<void> {
-  const sessionId = sessionIdFor(review, role);
-  if (sessionId === undefined) return;
-  await review.step(
-    () => review.cp.deleteReviewSession(sessionId),
-    "deleteReviewSession",
-  );
-  if (role === "finder") review.finderSessionId = undefined;
-  else review.verifierSessionId = undefined;
-}
+  const sessionIdFor = (role: string): string | undefined =>
+    role === "finder" ? finderSessionId : verifierSessionId;
 
-async function teardownWorkerBestEffort(
-  review: Review,
-  role: Role,
-): Promise<void> {
-  try {
-    await teardownWorker(review, role);
-  } catch (err) {
-    log.error(
-      { repo: review.repo, prNumber: review.prNumber, role, err },
-      "review worker cleanup failed",
-    );
-  }
-}
+  const teardownWorker = async (role: Role): Promise<void> => {
+    const sessionId = sessionIdFor(role);
+    if (sessionId === undefined) return;
+    await step(() => cp.deleteReviewSession(sessionId), "deleteReviewSession");
+    if (role === "finder") finderSessionId = undefined;
+    else verifierSessionId = undefined;
+  };
 
-/**
- * Handle the finder phase completing: tear down the finder, then post directly
- * when there are no candidates, otherwise start the verifier. Returns true when
- * the workflow should stop (posted, deduped, or failed).
- */
-async function completeFinder(review: Review): Promise<boolean> {
-  if (review.finderDone) return false;
-  review.finderDone = true;
-  const { cp, step } = review;
-  try {
-    await teardownWorker(review, "finder");
-    const detail = await step(
-      () => cp.getReview(review.reviewId),
-      "getReviewAfterFinder",
-    );
-    if (!detail) throw new Error(`review not found: ${review.reviewId}`);
-    const candidateCount = detail.findings.filter(
-      (finding) => finding.state === "candidate",
-    ).length;
-    if (candidateCount === 0) {
-      await step(() => cp.postReviewResults(review.reviewId), "postReviewResults");
-      return true;
+  const teardownWorkerBestEffort = async (role: Role): Promise<void> => {
+    try {
+      await teardownWorker(role);
+    } catch (err) {
+      log.error(
+        { repo: first.repo, prNumber: first.prNumber, role, err },
+        "review worker cleanup failed",
+      );
     }
-  } catch (err) {
-    log.error(
-      { repo: review.repo, prNumber: review.prNumber, err },
-      "verifier setup failed",
-    );
-    await step(() => cp.markReviewFailed(review.reviewId), "markReviewFailed");
-    return true;
-  }
-  // setupPhase owns its own failure path (teardown + markReviewFailed), so a
-  // false result means the workflow is already settled and must stop.
-  return !(await setupPhase(review, "verifier"));
-}
+  };
 
-/** Handle the verifier phase completing: tear it down and post the results. */
-async function completeVerifier(review: Review): Promise<boolean> {
-  if (!review.finderDone || review.verifierDone) return false;
-  review.verifierDone = true;
-  const { cp, step } = review;
   try {
-    await teardownWorker(review, "verifier");
-    await step(() => cp.postReviewResults(review.reviewId), "postReviewResults");
+    await setupPhase("finder");
   } catch (err) {
     log.error(
-      { repo: review.repo, prNumber: review.prNumber, err },
-      "review posting failed",
+      { repo: first.repo, prNumber: first.prNumber, err },
+      "finder setup failed",
     );
-    await step(() => cp.markReviewFailed(review.reviewId), "markReviewFailed");
-  }
-  return true;
-}
-
-/**
- * Interpret one mailbox message (or a receive-window timeout) against the active
- * phase. Returns true when the workflow should stop.
- *
- * A phase that cannot produce a result — the worker died (terminal
- * `session_ended`) or its harness run errored (`session_idle` + `runFailed`) —
- * marks the review failed with no in-workflow retry. Re-running a review is an
- * explicit action (the /reviews retry button / dispatch endpoint), which mints
- * a fresh review record + workflow epoch.
- */
-async function advanceReview(
-  review: Review,
-  message: ReviewInbox | null,
-): Promise<boolean> {
-  const { cp, step, repo, prNumber } = review;
-  const role = activeRole(review);
-
-  if (message === null) {
-    log.error(
-      { repo, prNumber, role, deadlineSeconds: RECV_TIMEOUT_S },
-      "review phase deadline expired",
-    );
-    await teardownWorkerBestEffort(review, role);
-    await step(() => cp.markReviewFailed(review.reviewId), "markReviewFailed");
-    return true;
+    await teardownWorkerBestEffort("finder");
+    await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+    return;
   }
 
-  if (message.kind === "stop") {
-    await teardownWorkerBestEffort(review, role);
-    await step(() => cp.markReviewHalted(repo, prNumber), "markReviewHalted");
-    return true;
-  }
-
-  // Only role-bearing signals (worker phase events) drive phase transitions;
-  // anything else (e.g. an unhandled comment) falls through to "ignore".
-  const messageRole = message.kind === "phase_done"
-    || message.kind === "session_idle"
-    || message.kind === "session_ended"
-    ? message.role
-    : undefined;
-  if (messageRole === undefined) {
-    log.info(
-      { repo, prNumber, kind: message.kind },
-      "ignoring review workflow message that does not match the active phase",
-    );
-    return false;
-  }
-
-  // A harness run that ERRORED returns the reusable session to idle exactly
-  // like a clean turn. It is NOT a completion — reporting it as one would post
-  // a false "no findings" review — so it counts as a phase failure below.
-  const failedIdle = message.kind === "session_idle" && message.runFailed === true;
-
-  const completionRole = !failedIdle
-    && (message.kind === "phase_done"
-      || message.kind === "session_idle"
-      || (message.kind === "session_ended" && message.outcome === "completed"))
-    ? messageRole
-    : undefined;
-
-  const phaseFailed = messageRole === role
-    && (failedIdle
-      || (message.kind === "session_ended"
-        && message.outcome !== "completed"
-        && message.sessionId === sessionIdFor(review, role)));
-  if (phaseFailed) {
-    await teardownWorkerBestEffort(review, role);
-    await step(() => cp.markReviewFailed(review.reviewId), "markReviewFailed");
-    return true;
-  }
-
-  // A completed terminal from a session other than the active one is a late
-  // echo of an already-finished phase — ignore it.
-  if (
-    message.kind === "session_ended"
-    && message.outcome === "completed"
-    && message.sessionId !== sessionIdFor(review, message.role)
-  ) {
-    return false;
-  }
-
-  if (completionRole === "finder") return completeFinder(review);
-  if (completionRole === "verifier") return completeVerifier(review);
-
-  log.info(
-    { repo, prNumber, kind: message.kind },
-    "ignoring review workflow message that does not match the active phase",
-  );
-  return false;
-}
-
-/** The full review lifecycle, kept out of the hashed workflow body. */
-export async function runPrReview(
-  cp: ReviewControlPlane,
-  step: StepRunner,
-  recv: ReviewReceiver,
-  workflowId: string | undefined,
-): Promise<void> {
-  const first = await recv(REVIEW_TOPIC, RECV_TIMEOUT_S);
-  if (first === null || first.kind !== "trigger") return;
-  if (!workflowId) throw new Error("Review workflow ID is unavailable");
-
-  const review = await beginReview(cp, step, first, workflowId);
-  if (review === null) return;
-
-  if (!(await setupPhase(review, "finder"))) return;
+  // Workflow-local phase state, replay-deterministic from the recv history.
+  let finderDone = false;
+  let verifierDone = false;
 
   for (;;) {
     const message = await recv(REVIEW_TOPIC, RECV_TIMEOUT_S);
-    if (await advanceReview(review, message)) return;
-  }
-}
+    const activeRole: Role = finderDone ? "verifier" : "finder";
 
-export async function prReviewWorkflowImpl(
-  deps: PrReviewWorkflowDeps = {},
-): Promise<void> {
-  await runPrReview(
-    deps.controlPlane ?? requireControlPlane(),
-    deps.step ?? ((fn, name) => DBOS.runStep(fn, { name })),
-    deps.recv ?? ((topic, timeout) => DBOS.recv(topic, timeout)),
-    deps.workflowId ?? DBOS.workflowID,
-  );
+    if (message === null) {
+      // The active worker went silent for a full receive window. There is no
+      // in-workflow retry: mark failed and stop. Re-running a review is an
+      // explicit action (the /reviews retry button / dispatch endpoint), which
+      // mints a fresh review record + workflow epoch.
+      log.error(
+        { repo: first.repo, prNumber: first.prNumber, role: activeRole, deadlineSeconds: RECV_TIMEOUT_S },
+        "review phase deadline expired",
+      );
+      await teardownWorkerBestEffort(activeRole);
+      await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      return;
+    }
+
+    if (message.kind === "stop") {
+      await teardownWorkerBestEffort(activeRole);
+      await step(() => cp.markReviewHalted(first.repo, first.prNumber), "markReviewHalted");
+      return;
+    }
+
+    // Only role-bearing worker events drive phase transitions; anything else
+    // (e.g. an unhandled comment) is ignored.
+    const messageRole = message.kind === "phase_done"
+      || message.kind === "session_idle"
+      || message.kind === "session_ended"
+      ? message.role
+      : undefined;
+    if (messageRole === undefined) {
+      log.info(
+        { repo: first.repo, prNumber: first.prNumber, kind: message.kind },
+        "ignoring review workflow message that does not match the active phase",
+      );
+      continue;
+    }
+
+    // A harness run that ERRORED returns the reusable session to idle exactly
+    // like a clean turn. It is NOT a completion — reporting it as one would post
+    // a false "no findings" review — so it counts as a phase failure.
+    const failedIdle = message.kind === "session_idle" && message.runFailed === true;
+
+    // Failure of the active phase (errored run, or the worker session died
+    // without completing) → mark failed, no retry.
+    const phaseFailed = messageRole === activeRole
+      && (failedIdle
+        || (message.kind === "session_ended"
+          && message.outcome !== "completed"
+          && message.sessionId === sessionIdFor(activeRole)));
+    if (phaseFailed) {
+      await teardownWorkerBestEffort(activeRole);
+      await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      return;
+    }
+
+    const completionRole = !failedIdle
+      && (message.kind === "phase_done"
+        || message.kind === "session_idle"
+        || (message.kind === "session_ended" && message.outcome === "completed"))
+      ? messageRole
+      : undefined;
+
+    // A completed terminal from a session other than the active one is a late
+    // echo of an already-finished phase — ignore it.
+    if (
+      message.kind === "session_ended"
+      && message.outcome === "completed"
+      && message.sessionId !== sessionIdFor(message.role)
+    ) {
+      continue;
+    }
+
+    if (completionRole === "finder") {
+      if (finderDone) continue;
+      finderDone = true;
+      try {
+        await teardownWorker("finder");
+        const detail = await step(() => cp.getReview(reviewId), "getReviewAfterFinder");
+        if (!detail) throw new Error(`review not found: ${reviewId}`);
+        const candidateCount = detail.findings.filter(
+          (finding) => finding.state === "candidate",
+        ).length;
+        if (candidateCount === 0) {
+          await step(() => cp.postReviewResults(reviewId), "postReviewResults");
+          return;
+        }
+        await setupPhase("verifier");
+      } catch (err) {
+        log.error(
+          { repo: first.repo, prNumber: first.prNumber, err },
+          "verifier setup failed",
+        );
+        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+        return;
+      }
+      continue;
+    }
+
+    if (completionRole === "verifier") {
+      if (!finderDone || verifierDone) continue;
+      verifierDone = true;
+      try {
+        await teardownWorker("verifier");
+        await step(() => cp.postReviewResults(reviewId), "postReviewResults");
+      } catch (err) {
+        log.error(
+          { repo: first.repo, prNumber: first.prNumber, err },
+          "review posting failed",
+        );
+        await step(() => cp.markReviewFailed(reviewId), "markReviewFailed");
+      }
+      return;
+    }
+
+    log.info(
+      { repo: first.repo, prNumber: first.prNumber, kind: message.kind },
+      "ignoring review workflow message that does not match the active phase",
+    );
+  }
 }
 
 export const prReviewWorkflow = DBOS.registerWorkflow(prReviewWorkflowImpl, {

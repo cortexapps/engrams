@@ -769,17 +769,25 @@ service → generated connectquery client → hook → page):
 
 ## Implementation divergences
 
-- **The workflow body is a thin, hash-stable shell.** DBOS derives the
-  application version by hashing the *source of every registered workflow
-  function* (`computeAppVersion` → `origFunction.toString()`); a version bump
-  is not recovered for in-flight workflows stamped with the old hash, so a
-  redeploy that touches the body strands every review parked on `recv` (the
-  same failure mode ADR 0060's SlackThreadWorkflow hit). `PrReviewWorkflow` was
-  originally one ~340-line function with the whole state machine, logging, and
-  validation inline — every retry/deadline tweak rotated the hash. It is now a
-  tiny forwarder (`prReviewWorkflowImpl` → `runPrReview`); all evolving
-  orchestration lives in plain module functions that never enter the hash, the
-  same discipline as `ToolExecWorkflow` and `SlackThreadWorkflow`.
+- **The operation graph stays inline in the registered function.** DBOS derives
+  the application version from registered workflow function source
+  (`computeAppVersion` → `origFunction.toString()`, which does **not** recurse
+  into module-level helpers) and replays an in-flight workflow only against code
+  of its own version. So the recv loop and the order + names of every `step(...)`
+  call live inline in `prReviewWorkflowImpl`: a change to the graph rotates the
+  version, and DBOS version-gates replay rather than running a recovered review
+  through a changed graph (which would raise `DBOSUnexpectedStepError` or take a
+  wrong branch). The heavy work stays behind the injected `ReviewControlPlane` —
+  the `ToolExecWorkflow` shape (graph in the body, logic in the functions the
+  steps call; a completed step is memoized on replay, so its internals evolve
+  freely). An earlier revision hoisted the graph into plain module functions for
+  a "hash-stable" thin shell; that was reverted after review — it moved
+  replay-sensitive control flow *out* from under versioning, so a later
+  helper-only edit would ship under an unchanged version and be replayed against
+  a changed graph. (This leaves the standing computed-hash trade-off: a graph
+  change rotates the version and strands in-flight reviews until drained — the
+  broader fix is explicit `applicationVersion` / DBOS patching, tracked
+  separately.)
 - **No in-workflow retry (supersedes the "session dies" retry-once above).** A
   dead/errored phase marks the review `failed` immediately. Re-running is an
   explicit `ReviewService.RetryReview` RPC (the `/reviews` **Retry** button) or
