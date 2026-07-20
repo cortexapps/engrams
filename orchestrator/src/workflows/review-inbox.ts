@@ -16,6 +16,12 @@ export type ReviewInbox =
       focus?: string;
     }
   | { kind: "comment"; commentId: string; body: string }
+  | { kind: "phase_done"; role: string }
+  // `session_idle` is the backup completion signal: the harness run ended and
+  // the reusable session returned to idle. `runFailed` distinguishes a run that
+  // ERRORED (e.g. the agent could not authenticate) from a clean turn — a
+  // failed run must never be reported to a PR as a "no findings" completion.
+  | { kind: "session_idle"; role: string; runFailed?: boolean }
   | {
       kind: "session_ended";
       role: string;

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { Code, ConnectError } from "@connectrpc/connect";
 
 import type { EnrollmentRow } from "../../db/enrollments.ts";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
@@ -28,6 +29,9 @@ const active: ReviewRow = {
   trigger: "opened",
   status: "queued",
   githubReviewId: null,
+  statusCommentId: null,
+  finderSessionId: null,
+  verifierSessionId: null,
   summaryMd: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
   updatedAt: new Date("2026-07-17T00:00:00Z"),
@@ -68,19 +72,40 @@ function detail(findings: ReviewFindingRow[] = []): ReviewDetail {
 const reviewPostingNoops = {
   updateFindingState: async () => {},
   finalizeReview: async () => {},
+  setStatusCommentId: async () => {},
+  setReviewSessionId: async () => {},
+  recordEvent: async () => {},
 };
 
-function reviewSessionRecorder(): ReviewSessionStore & {
+// A full ReviewControlPlaneStore of no-ops for the session-lifecycle tests that
+// don't otherwise care about the store (createFinderSession/createVerifierSession
+// now stamp the session id on the review at kickoff).
+const reviewStoreStub = {
+  ...reviewPostingNoops,
+  getActiveReviewForPr: async () => null,
+  getReview: async () => detail(),
+  createReview: async () => "review-stub",
+  updateReviewStatus: async () => {},
+};
+
+function reviewSessionRecorder(order?: string[]): ReviewSessionStore & {
   calls: Array<[string, string, string]>;
+  removes: string[];
 } {
   const calls: Array<[string, string, string]> = [];
+  const removes: string[] = [];
   return {
     calls,
+    removes,
     async record(sessionId, reviewWorkflowId, role) {
+      order?.push(`binding:${sessionId}`);
       calls.push([sessionId, reviewWorkflowId, role]);
     },
     async find() {
       return null;
+    },
+    async remove(sessionId) {
+      removes.push(sessionId);
     },
   };
 }
@@ -139,16 +164,22 @@ function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & 
   execCalls: Array<{ sessionId: string; command: string }>;
   writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]>;
   promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]>;
+  deletedIds: string[];
 } {
   const execCalls: Array<{ sessionId: string; command: string }> = [];
   const writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]> = [];
   const promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]> = [];
+  const deletedIds: string[] = [];
   return {
     execCalls,
     writeCalls,
     promptCalls,
+    deletedIds,
     createSession: async () => ({ sessionId: "finder-session" }),
-    deleteSession: async () => ({}),
+    deleteSession: async ({ sessionId }) => {
+      deletedIds.push(sessionId);
+      return {};
+    },
     async *exec(req) {
       execCalls.push(req);
       if (options.stderr) {
@@ -246,18 +277,92 @@ describe("ReviewControlPlane", () => {
     expect(statuses).toEqual([["review-new", "halted"]]);
   });
 
-  test("creates the finder with the designated profile and scoped clone capability", async () => {
+  test("acks the sticky status comment on pickup and persists its id", async () => {
+    const upserts: Array<{ commentId?: string; body: string }> = [];
+    let persisted: string | undefined;
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
+        createReview: async () => "review-new",
+        updateReviewStatus: async () => {},
+        setStatusCommentId: async (_id, commentId) => {
+          persisted = commentId;
+        },
+      },
+      insertTask: async () => "task-new",
+      githubPoster: {
+        fetchPrHeads: async () => ({ headSha: "h", baseSha: "b" }),
+        alreadyPosted: async () => false,
+        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
+        async upsertStatusComment(input) {
+          upserts.push({ ...(input.commentId ? { commentId: input.commentId } : {}), body: input.body });
+          return { commentId: "gh-comment-1" };
+        },
+      },
+    });
+
+    await cp.ensureReviewRecord({
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: "h",
+      baseSha: "b",
+      trigger: "command",
+    });
+
+    expect(upserts).toHaveLength(1);
+    expect(upserts[0]?.commentId).toBeUndefined();
+    expect(upserts[0]?.body).toContain("👀");
+    expect(persisted).toBe("gh-comment-1");
+  });
+
+  test("a failing status ack never wedges the review record", async () => {
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
+        createReview: async () => "review-new",
+        updateReviewStatus: async () => {},
+        setStatusCommentId: async () => {},
+      },
+      insertTask: async () => "task-new",
+      githubPoster: {
+        fetchPrHeads: async () => ({ headSha: "h", baseSha: "b" }),
+        alreadyPosted: async () => false,
+        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
+        upsertStatusComment: async () => { throw new Error("GitHub down"); },
+      },
+    });
+
+    expect(await cp.ensureReviewRecord({
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: "h",
+      baseSha: "b",
+      trigger: "command",
+    })).toEqual({ reviewId: "review-new", taskId: "task-new" });
+  });
+
+  test("creates the finder with the designated profile and clamped review policy", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
-    const reviewSessions = reviewSessionRecorder();
+    const order: string[] = [];
+    const reviewSessions = reviewSessionRecorder(order);
     const designated = reviewerProfile("profile-designated");
     const cp = makeReviewControlPlane({
+      reviews: reviewStoreStub,
       profiles: profileLookup(designated),
       enrollments: { get: async () => enrollment(active.repo, null) },
       createSessionForExistingTask: async (params) => {
+        order.push("create");
         created.push(params);
         return { sessionId: "finder-session" };
       },
       reviewSessions,
+      registerSessionListener: async (sessionId) => {
+        order.push(`listener:${sessionId}`);
+      },
     });
 
     expect(await cp.createFinderSession({
@@ -271,18 +376,61 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
       profileId: designated.id,
       role: "finder",
-      extraCapabilities: [`github:contents:read@${active.repo}`],
-      registerListener: true,
+      capabilityOverride: [
+        "engram:pr_review",
+        `github:contents:read@${active.repo}`,
+      ],
+      networkOverride: {
+        default: "deny",
+        allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+        allowHostPatterns: [],
+      },
+      dropProfileSecretsAndEnv: true,
     });
+    expect(created[0]?.extraCapabilities).toBeUndefined();
+    expect(created[0]?.registerListener).toBeUndefined();
     expect(created[0]?.appendSystemPrompt).toContain("/workspace/.review/finder.md");
     expect(reviewSessions.calls).toEqual([
       ["finder-session", "review-wf-1", "finder"],
     ]);
+    expect(order).toEqual([
+      "create",
+      "binding:finder-session",
+      "listener:finder-session",
+    ]);
+  });
+
+  test("stamps the worker session on the review at kickoff for a live watch link", async () => {
+    const stamped: Array<[string, string, string]> = [];
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewStoreStub,
+        setReviewSessionId: async (reviewId, role, sessionId) => {
+          stamped.push([reviewId, role, sessionId]);
+        },
+      },
+      profiles: profileLookup(reviewerProfile("profile-designated")),
+      enrollments: { get: async () => enrollment(active.repo, null) },
+      createSessionForExistingTask: async () => ({ sessionId: "finder-session" }),
+      reviewSessions: reviewSessionRecorder(),
+      registerSessionListener: async () => {},
+    });
+
+    await cp.createFinderSession({
+      reviewId: active.id,
+      taskId: active.taskId,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      workflowId: "review-wf-1",
+    });
+
+    expect(stamped).toEqual([[active.id, "finder", "finder-session"]]);
   });
 
   test("an enrollment profile overrides the designated reviewer profile", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
     const cp = makeReviewControlPlane({
+      reviews: reviewStoreStub,
       profiles: profileLookup(reviewerProfile("profile-designated")),
       enrollments: { get: async () => enrollment(active.repo, "profile-enrolled") },
       createSessionForExistingTask: async (params) => {
@@ -290,6 +438,7 @@ describe("ReviewControlPlane", () => {
         return { sessionId: "finder-session" };
       },
       reviewSessions: reviewSessionRecorder(),
+      registerSessionListener: async () => {},
     });
 
     await cp.createFinderSession({
@@ -317,18 +466,24 @@ describe("ReviewControlPlane", () => {
     })).rejects.toBeInstanceOf(ReviewSetupError);
   });
 
-  test("creates the verifier with a listener and records its workflow binding", async () => {
+  test("creates the verifier with a clamped policy and records its workflow binding", async () => {
     const created: CreateSessionForExistingTaskParams[] = [];
-    const reviewSessions = reviewSessionRecorder();
+    const order: string[] = [];
+    const reviewSessions = reviewSessionRecorder(order);
     const designated = reviewerProfile("profile-designated");
     const cp = makeReviewControlPlane({
+      reviews: reviewStoreStub,
       profiles: profileLookup(designated),
       enrollments: { get: async () => enrollment(active.repo, null) },
       createSessionForExistingTask: async (params) => {
+        order.push("create");
         created.push(params);
         return { sessionId: "verifier-session" };
       },
       reviewSessions,
+      registerSessionListener: async (sessionId) => {
+        order.push(`listener:${sessionId}`);
+      },
     });
 
     expect(await cp.createVerifierSession({
@@ -342,13 +497,53 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
       profileId: designated.id,
       role: "verifier",
-      extraCapabilities: [`github:contents:read@${active.repo}`],
-      registerListener: true,
+      capabilityOverride: [
+        "engram:pr_review",
+        `github:contents:read@${active.repo}`,
+      ],
+      networkOverride: {
+        default: "deny",
+        allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+        allowHostPatterns: [],
+      },
+      dropProfileSecretsAndEnv: true,
     });
+    expect(created[0]?.extraCapabilities).toBeUndefined();
+    expect(created[0]?.registerListener).toBeUndefined();
     expect(created[0]?.appendSystemPrompt).toContain("submit_verdict");
     expect(reviewSessions.calls).toEqual([
       ["verifier-session", "review-wf-1", "verifier"],
     ]);
+    expect(order).toEqual([
+      "create",
+      "binding:verifier-session",
+      "listener:verifier-session",
+    ]);
+  });
+
+  test("deletes a worker session and removes its review binding", async () => {
+    const sessions = fakeSessions();
+    const reviewSessions = reviewSessionRecorder();
+    const cp = makeReviewControlPlane({ sessions, reviewSessions });
+
+    await cp.deleteReviewSession("review-session");
+
+    expect(sessions.deletedIds).toEqual(["review-session"]);
+    expect(reviewSessions.removes).toEqual(["review-session"]);
+  });
+
+  test("removes the binding when the worker session is already absent", async () => {
+    const sessions = {
+      ...fakeSessions(),
+      deleteSession: async () => {
+        throw new ConnectError("missing", Code.NotFound);
+      },
+    };
+    const reviewSessions = reviewSessionRecorder();
+    const cp = makeReviewControlPlane({ sessions, reviewSessions });
+
+    await expect(cp.deleteReviewSession("review-session")).resolves.toBeUndefined();
+    expect(reviewSessions.removes).toEqual(["review-session"]);
   });
 
   test("bootstraps with an idempotent clone, checkout, and rendered finder files", async () => {
@@ -356,6 +551,7 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({ sessions });
 
     await cp.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
       repo: active.repo,
       headSha: active.headSha,
       enabledCategories: ["functional-correctness"],
@@ -381,10 +577,10 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({ sessions });
 
     await expect(
-      cp.bootstrapFinderSession("finder-session", { repo: "openai/engrams; rm -rf /", headSha: "" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: "openai/engrams; rm -rf /", headSha: "" }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     await expect(
-      cp.bootstrapFinderSession("finder-session", { repo: active.repo, headSha: "$(touch pwned)" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: active.repo, headSha: "$(touch pwned)" }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     // Nothing was executed for the rejected inputs.
     expect(sessions.execCalls).toEqual([]);
@@ -395,6 +591,7 @@ describe("ReviewControlPlane", () => {
       sessions: fakeSessions({ exitStatus: 1, stderr: "clone denied" }),
     });
     await expect(cloneFailure.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
       repo: active.repo,
       headSha: "",
     })).rejects.toThrow(/clone denied/);
@@ -403,6 +600,7 @@ describe("ReviewControlPlane", () => {
       sessions: fakeSessions({ writeFailure: "disk full" }),
     });
     await expect(writeFailure.bootstrapFinderSession("finder-session", {
+      reviewId: active.id,
       repo: active.repo,
       headSha: "",
     })).rejects.toThrow(/disk full/);
@@ -460,6 +658,7 @@ describe("ReviewControlPlane", () => {
   test("sends the stable finder prompt and marks the review finding", async () => {
     const sessions = fakeSessions();
     const statuses: Array<[string, string]> = [];
+    const events: Array<[string, string, string | undefined]> = [];
     const cp = makeReviewControlPlane({
       sessions,
       reviews: {
@@ -469,6 +668,9 @@ describe("ReviewControlPlane", () => {
         createReview: async () => "unused",
         updateReviewStatus: async (reviewId, status) => {
           statuses.push([reviewId, status]);
+        },
+        recordEvent: async (reviewId, kind, detail) => {
+          events.push([reviewId, kind, detail]);
         },
       },
     });
@@ -489,6 +691,9 @@ describe("ReviewControlPlane", () => {
     expect(sessions.promptCalls[0]?.text).toContain("the PR diff");
     expect(sessions.promptCalls[0]?.text).toContain("Check retry behavior");
     expect(statuses).toEqual([[active.id, "finding"]]);
+    // The activity log gains a "reviewing" milestone so the UI can show the
+    // finder is running, not just the coarse "finding" status.
+    expect(events).toEqual([[active.id, "reviewing", undefined]]);
   });
 
   test("sends the verifier prompt and marks the review verifying", async () => {
@@ -565,6 +770,7 @@ describe("ReviewControlPlane", () => {
     const githubPoster: GithubReviewPoster = {
       fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
       alreadyPosted: async () => false,
+      upsertStatusComment: async () => ({ commentId: "status-1" }),
       async postReview(input) {
         posted.push(input);
         return {
@@ -581,6 +787,9 @@ describe("ReviewControlPlane", () => {
         getReview: async () => ({ review: active, findings: [confirmed, refuted], verdicts }),
         createReview: async () => active.id,
         updateReviewStatus: async () => {},
+        setStatusCommentId: async () => {},
+        setReviewSessionId: async () => {},
+        recordEvent: async () => {},
         async updateFindingState(id, state, opts) {
           findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
         },
@@ -597,7 +806,8 @@ describe("ReviewControlPlane", () => {
     expect(posted[0]).toMatchObject({
       repo: active.repo,
       prNumber: active.prNumber,
-      commitId: "live-head",
+      // #764-2: anchor to the REVIEWED head (the review row), never the live head.
+      commitId: active.headSha,
       comments: [{
         findingId: confirmed.id,
         path: confirmed.path,
@@ -627,7 +837,8 @@ describe("ReviewControlPlane", () => {
       input: {
         status: active.status,
         summaryMd: "",
-        headSha: "live-head",
+        // Reviewed head kept; only the empty base is filled from the live fetch.
+        headSha: active.headSha,
         baseSha: "live-base",
       },
     });
@@ -650,6 +861,9 @@ describe("ReviewControlPlane", () => {
         getReview: async () => detail([finding("candidate")]),
         createReview: async () => active.id,
         updateReviewStatus: async () => {},
+        setStatusCommentId: async () => {},
+        setReviewSessionId: async () => {},
+        recordEvent: async () => {},
         updateFindingState: async () => {
           findingUpdates++;
         },
@@ -660,6 +874,7 @@ describe("ReviewControlPlane", () => {
       githubPoster: {
         fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
         alreadyPosted: async () => true,
+        upsertStatusComment: async () => ({ commentId: "status-1" }),
         postReview: async () => {
           postCalls++;
           return { posted: true, inlinePosted: true, summaryMd: "" };
@@ -675,10 +890,45 @@ describe("ReviewControlPlane", () => {
       {
         status: active.status,
         summaryMd: "",
-        headSha: "live-head",
+        headSha: active.headSha,
         baseSha: "live-base",
       },
       { status: "posted", summaryMd: "" },
     ]);
+  });
+
+  test("posts against the reviewed head without a live fetch when both SHAs are stored", async () => {
+    const reviewed: ReviewRow = { ...active, baseSha: "base-reviewed" };
+    let fetchCalls = 0;
+    let postedCommit: string | undefined;
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => reviewed,
+        getReview: async () => ({ review: reviewed, findings: [finding("candidate")], verdicts: [] }),
+        createReview: async () => reviewed.id,
+        updateReviewStatus: async () => {},
+        updateFindingState: async () => {},
+        finalizeReview: async () => {},
+      },
+      githubPoster: {
+        fetchPrHeads: async () => {
+          fetchCalls++;
+          return { headSha: "live-head", baseSha: "live-base" };
+        },
+        alreadyPosted: async () => false,
+        upsertStatusComment: async () => ({ commentId: "status-1" }),
+        async postReview(input) {
+          postedCommit = input.commitId;
+          return { githubReviewId: "gh-1", posted: true, inlinePosted: true, summaryMd: input.buildSummary(true) };
+        },
+      },
+    });
+
+    await cp.postReviewResults(reviewed.id);
+
+    // #764-2: both SHAs already stored → no live fetch, commit_id is the reviewed head.
+    expect(fetchCalls).toBe(0);
+    expect(postedCommit).toBe(reviewed.headSha);
   });
 });
