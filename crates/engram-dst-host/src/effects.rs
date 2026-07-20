@@ -112,6 +112,26 @@ impl NbdKernel for SimNbd {
         });
         self.backends.lock().get(&device).cloned()
     }
+
+    fn connected_devices(&self) -> Vec<engram_host_core::ConnectedDevice> {
+        // The seam's device registry stands in for `/sys/block/nbd*`: every
+        // device with a recorded backend id is "connected". This impl exists to
+        // keep the trait total — the classification barrier's inventory is built
+        // by the world models (`SimHost` / `DevicePlane`) directly from their
+        // generation/kernel-owner/holder state, NOT through this seam (they own
+        // the pid-liveness ground truth this ZST seam does not model). Owner pid
+        // is a placeholder (`1`) for the same reason. Deterministic `BTreeMap`
+        // order.
+        self.backends
+            .lock()
+            .iter()
+            .map(|(device, backend_id)| engram_host_core::ConnectedDevice {
+                device: std::path::PathBuf::from(device),
+                owner_pid: 1,
+                backend_id: Some(backend_id.clone()),
+            })
+            .collect()
+    }
 }
 
 /// [`DeviceSync`] that records every host-page-cache sync. The real impl

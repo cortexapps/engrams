@@ -93,6 +93,9 @@ pub enum Step {
     StaleSweep,
     /// The FC guest for session slot `.0` genuinely dies (#806 holder gone).
     KillGuest(usize),
+    /// Wave 7b (#784 layer 2): lose session slot `.0`'s tracked records (#769
+    /// gap A) — a resident guest holds a device no record accounts for.
+    LoseRecord(usize),
     /// One teardown-reconcile tick (`.0` = honor the capture signal).
     ReconcileTick(bool),
     /// One coordinator `host_lost_straggler_sweep` tick (#782/#777).
@@ -131,6 +134,7 @@ impl Step {
             Step::RegisterRehydrate(..) => "RegisterRehydrate",
             Step::StaleSweep => "StaleSweep",
             Step::KillGuest(..) => "KillGuest",
+            Step::LoseRecord(..) => "LoseRecord",
             Step::ReconcileTick(..) => "ReconcileTick",
             Step::StragglerSweep => "StragglerSweep",
             Step::DropHostBinding(..) => "DropHostBinding",
@@ -245,6 +249,10 @@ impl CosimSwarm {
                 93 => Step::SlotClaim,
                 94 => Step::SlotPopulate,
                 95 => Step::IdleDetector,
+                // Wave 7b (#784 layer 2): a small-weight record-loss fault so the
+                // gap-A family — a resident survivor invisible to the records —
+                // arises across the boundary and the barrier's oracles guard it.
+                96 => Step::LoseRecord(slot),
                 _ => Step::AdvanceTime(self.rng.random_range(1..4) * 30),
             },
         }
@@ -313,6 +321,11 @@ impl CosimSwarm {
                     self.sim.kill_guest(s).await;
                 }
             }
+            Step::LoseRecord(slot) => {
+                if let Some(s) = self.session(slot) {
+                    self.sim.lose_record(s).await;
+                }
+            }
             Step::ReconcileTick(honor) => self.sim.reconcile_tick(honor).await,
             Step::StragglerSweep => self.sim.straggler_sweep_tick().await,
             Step::DropHostBinding(slot) => {
@@ -378,6 +391,7 @@ impl CosimSwarm {
     /// snapshot by quiescence, so the detection is preserved.
     async fn check_oracles(&self) -> Result<(), String> {
         self.sim.assert_no_severed_live_holder().await?;
+        self.sim.assert_quarantine_reconnectable().await?;
         self.sim.assert_slot_accounting().await?;
         self.sim.assert_ownership_agreement().await?;
         Ok(())
@@ -388,6 +402,12 @@ impl CosimSwarm {
     /// convergence — every session terminal-or-stable, every device classified,
     /// within bounded rounds — and re-check the standing oracles.
     async fn quiesce(&mut self) -> Result<(), String> {
+        // Wave 7b (#784): heal the record-loss fault globally (the operator/runbook
+        // reconcile the `rehydrate-unknown-device` alert drives, applied to every
+        // survivor at quiescence like every other healed fault) so the rehydrate
+        // below re-serves every survivor. A quarantined slot MUST reach a terminal
+        // disposition (served or reaped) within bounded rounds, never wedge.
+        self.sim.heal_all_records().await;
         // A fresh host generation with a clean rehydrate re-serves every
         // survivor whose session still reserves host memory.
         self.sim.register_rehydrate(true).await;

@@ -266,6 +266,18 @@ pub struct SandboxSlot {
     /// rehydrate passes missed. `false` models a genuinely-gone guest (FC
     /// crashed/destroyed) ⇒ `NoHolder` ⇒ a DISCONNECT is legal.
     pub guest_holds_device: bool,
+    /// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3): does a TRACKED RECORD (the
+    /// coordinator rehydrate list OR the durable `ChainHeadRecord`) reference
+    /// this device? The Layer-2 reconcile: the startup classification barrier
+    /// matches records AGAINST the kernel-derived inventory, so a device with NO
+    /// record — a survivor whose records were lost upstream (#769 gap A) — is
+    /// QUARANTINED, never silently skipped. `false` models that record loss.
+    /// Mirrors prod, where the record set is built from `rootfs_device` over the
+    /// resident-and-recorded sandboxes: a device is "recorded" only while a live
+    /// guest still holds it (`record_present && guest_holds_device` — a
+    /// genuinely-gone guest's FC is not resident, so `rootfs_device` returns
+    /// `None` and the device is reap-eligible on proof of death).
+    pub record_present: bool,
 }
 
 impl SandboxSlot {
@@ -405,6 +417,15 @@ pub struct SimHost {
     /// export whose `state_served` was set is recorded here — the #216
     /// split-brain the decision table forbids. Oracle memory (survives).
     pub split_brain_unpauses: Vec<SandboxId>,
+
+    // ── Wave 7b: the startup classification barrier (ADR 0098 §Phase 3, #784) ──
+    /// Oracle memory (survives crashes): every sandbox the barrier ever
+    /// classified [`SlotClass::QuarantinedUnknown`](engram_host_core::SlotClass::QuarantinedUnknown)
+    /// — a kernel-connected device with a live holder that no tracked record
+    /// accounted for (#769 gap A). The `record-invisible-survivor-classified`
+    /// oracle asserts every such survivor was CLASSIFIED here, never silently
+    /// skipped-or-severed.
+    pub quarantined_unknown: std::collections::BTreeSet<SandboxId>,
 }
 
 impl SimHost {
@@ -479,6 +500,9 @@ impl SimHost {
                 // A fresh sandbox's guest is resident and holds its rootfs
                 // device open.
                 guest_holds_device: true,
+                // A fresh sandbox has a tracked record (coord ownership + a
+                // chain-head record); record loss is a seeded/faulted event.
+                record_present: true,
             });
         }
 
@@ -506,6 +530,7 @@ impl SimHost {
             finalize_stage_seen: parking_lot::Mutex::new(BTreeMap::new()),
             migrations: Arc::new(MigrationRegistry::default()),
             split_brain_unpauses: Vec::new(),
+            quarantined_unknown: std::collections::BTreeSet::new(),
         }
     }
 
@@ -931,8 +956,11 @@ impl SimHost {
         local_pass_enabled: bool,
     ) -> Result<(), String> {
         let n = self.sandboxes.len();
-        // 1. Coord-list pass: re-serve every LISTED survivor. The buggy list
-        //    omits parked survivors.
+        // 1. Coord-list pass: re-serve every LISTED survivor. The coord list is
+        //    authoritative for what it contains (its listed survivors carry the
+        //    coordinator's disk-manifest ref); a gap-A survivor is one the list
+        //    OMITS (the `coord_includes_parked=false` knob), so this pass is NOT
+        //    gated on the LOCAL record — only the #739 local pass below is.
         for idx in 0..n {
             if !self.is_resident_survivor(idx) {
                 continue;
@@ -944,10 +972,14 @@ impl SimHost {
         }
         // 2. Local ChainHeadRecord pass (#739 defense): re-serve any live
         //    survivor the coord list missed, via the pure candidate predicate
-        //    (live ∧ unserved ∧ session-bound). Every sim sandbox's record
-        //    carries a bound session.
+        //    (live ∧ unserved ∧ session-bound). A LOST record (gap A) leaves
+        //    nothing for this pass to read either — the whole point of Layers
+        //    2–3 is that the barrier catches what BOTH passes miss.
         if local_pass_enabled {
             for idx in 0..n {
+                if !self.sandboxes[idx].record_present {
+                    continue;
+                }
                 let live = self.is_resident_survivor(idx);
                 let served = self.sandboxes[idx].served_by == Some(self.generation);
                 if engram_host_core::is_local_survivor_candidate(live, served, true) {
@@ -955,56 +987,106 @@ impl SimHost {
                 }
             }
         }
-        // 3. Stale-binding sweep.
+        // 3. The classification barrier: reconcile the kernel inventory against
+        //    the records, then reap ONLY TerminalSafeToReap. A survivor invisible
+        //    to both passes above (record lost, guest still live) is QUARANTINED
+        //    here — classified, never skipped-or-severed.
         self.stale_sweep_tick();
         Ok(())
     }
 
-    /// The stale-binding sweep (ADR 0098 P7 + R6): a dead-owner device is
-    /// DISCONNECTed only with **proof of death** — no live process holds its
-    /// node open. Driven over the pure
-    /// [`sweep_verdict`](engram_host_core::sweep_verdict) with the holder input.
-    /// Only devices FREE in the pool are reached — the `served_by == current`
-    /// (claimed) gate mirrors the driver's `try_claim` free-in-pool gate, so a
-    /// device THIS generation serves (a re-served survivor) is NEVER swept (the
-    /// 731df805 protection).
-    ///
-    /// R6 (#769 gap A): a dead-owner device whose FC guest still holds it open
-    /// (`guest_holds_device`) — a survivor the rehydrate passes missed — PARKs
-    /// (left kernel-bound, RECONNECTABLE) instead of being severed. The
-    /// world-side `guest_holds_device` is the twin of the prod proc-scan.
-    pub fn stale_sweep_tick(&mut self) {
+    /// The Wave 7b (#784 layers 2–3) startup CLASSIFICATION over the REAL
+    /// [`classify_startup_slots`](engram_host_core::classify_startup_slots):
+    /// build a [`StartupSlot`](engram_host_core::StartupSlot) per sandbox device
+    /// from the world state (owner liveness × the holder proof-of-death × whether
+    /// a tracked record accounts for it) and partition into the four classes. The
+    /// device handle is the slot INDEX. `has_record` mirrors prod: a device is
+    /// recorded only while a live guest still holds it AND a record is present
+    /// (`record_present && guest_holds_device`) — a genuinely-gone guest's FC is
+    /// not resident, so prod's `rootfs_device` reconcile can't map it, and it is
+    /// reap-eligible on proof of death.
+    pub fn classify_startup(&self) -> engram_host_core::StartupClassification<usize> {
         let gen = self.generation;
-        for slot in &mut self.sandboxes {
-            // Served this generation ⇒ claimed ⇒ not free in the pool ⇒ the
-            // sweep skips it (try_claim would return None).
-            if slot.served_by == Some(gen) {
-                continue;
-            }
-            let liveness = match slot.kernel_owner {
-                None => engram_host_core::PidLiveness::NoPid,
-                Some(g) if g == gen => engram_host_core::PidLiveness::SelfPid,
-                // An older generation is a dead process.
-                Some(_) => engram_host_core::PidLiveness::Dead,
-            };
-            // The holder input: a resident guest still reading its rootfs is a
-            // live holder; a genuinely-gone guest is NoHolder. The sim never
-            // produces Unknown (no scan errors in the model) — that fail-safe
-            // arm is pinned by the pure-core unit test.
-            let holder = if slot.guest_holds_device {
-                engram_host_core::DeviceHolder::LiveHolder
-            } else {
-                engram_host_core::DeviceHolder::NoHolder
-            };
-            match engram_host_core::sweep_verdict(liveness, holder) {
-                // NBD_CMD_DISCONNECT: proof of death met — tear the binding down.
-                engram_host_core::SweepAction::Disconnect => slot.kernel_owner = None,
-                // PARK: a live holder blocked the disconnect. Leave the device
-                // kernel-bound (RECONNECTABLE) for a later re-serve pass — the
-                // #769 gap-A guard. `kernel_owner` is deliberately untouched.
-                engram_host_core::SweepAction::Park => {}
-                engram_host_core::SweepAction::NotStuck => {}
-            }
+        let slots = self
+            .sandboxes
+            .iter()
+            .enumerate()
+            .map(|(idx, slot)| {
+                let liveness = match slot.kernel_owner {
+                    None => engram_host_core::PidLiveness::NoPid,
+                    Some(g) if g == gen => engram_host_core::PidLiveness::SelfPid,
+                    Some(_) => engram_host_core::PidLiveness::Dead,
+                };
+                // A resident guest still reading its rootfs is a live holder; a
+                // genuinely-gone guest is NoHolder. The sim never produces
+                // Unknown (no scan errors) — that fail-safe arm is pinned by the
+                // pure-core unit test.
+                let holder = if slot.guest_holds_device {
+                    engram_host_core::DeviceHolder::LiveHolder
+                } else {
+                    engram_host_core::DeviceHolder::NoHolder
+                };
+                let has_record = slot.record_present && slot.guest_holds_device;
+                engram_host_core::StartupSlot {
+                    device: idx,
+                    liveness,
+                    holder,
+                    has_record,
+                }
+            })
+            .collect();
+        engram_host_core::classify_startup_slots(slots)
+    }
+
+    /// The stale-binding sweep, now GATED by the startup classification barrier
+    /// (ADR 0098 P7 + R6 + Wave 7b). Classify every device first, then reap ONLY
+    /// the [`SlotClass::TerminalSafeToReap`](engram_host_core::SlotClass::TerminalSafeToReap)
+    /// subset (`recover_stuck_nbd_devices` accepts nothing else — the ordering
+    /// contract enforced by the [`ReapList`](engram_host_core::ReapList) type).
+    ///
+    /// A device THIS generation serves is `Serving` (self-owned) and never
+    /// reaped — the 731df805 protection. A dead-owner device a live guest still
+    /// holds is `ReconnectMe` (record) or `QuarantinedUnknown` (no record) —
+    /// NEITHER is reaped, so a live guest's rootfs is never severed (#769 gap A).
+    /// A `QuarantinedUnknown` device (a survivor invisible to the records) is
+    /// recorded in [`quarantined_unknown`](SimHost::quarantined_unknown) + the
+    /// counter — CLASSIFIED, never silently skipped.
+    pub fn stale_sweep_tick(&mut self) {
+        let classification = self.classify_startup();
+        for &idx in &classification.quarantined {
+            // Record the classification (oracle memory). Prod additionally fires
+            // the `rehydrate-unknown-device` soft-invariant + counter; the sim's
+            // observable is this set the quarantine oracles assert against.
+            let id = self.sandboxes[idx].sandbox_id;
+            self.quarantined_unknown.insert(id);
+        }
+        // reconnect devices are left kernel-bound (RECONNECTABLE) for a later
+        // re-serve pass — never reaped. Only the terminal subset is DISCONNECTed.
+        for idx in classification.reap.into_devices() {
+            // NBD_CMD_DISCONNECT: proof of death met, no record — tear it down.
+            self.sandboxes[idx].kernel_owner = None;
+        }
+    }
+
+    /// Wave 7b (#784 layer 2): model the loss of a survivor's tracked records
+    /// (its rehydrate ref missing from the coordinator list AND its durable
+    /// `ChainHeadRecord` gone) — the #769 gap-A precondition. A resident guest
+    /// still holds the device, but no record accounts for it, so the barrier
+    /// must QUARANTINE (not skip, not sever) it. A no-op on an out-of-range
+    /// index.
+    pub fn lose_record(&mut self, idx: usize) {
+        if let Some(slot) = self.sandboxes.get_mut(idx) {
+            slot.record_present = false;
+        }
+    }
+
+    /// The operator/runbook reconcile: a quarantined device's record is restored
+    /// (the coordinator re-lists it / a ChainHeadRecord is re-written), so the
+    /// next register pass re-serves the RECONNECTABLE device with zero loss — the
+    /// recovery path the `rehydrate-unknown-device` alert drives.
+    pub fn regain_record(&mut self, idx: usize) {
+        if let Some(slot) = self.sandboxes.get_mut(idx) {
+            slot.record_present = true;
         }
     }
 

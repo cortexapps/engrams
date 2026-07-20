@@ -88,9 +88,41 @@ pub async fn check(host: &SimHost) -> Result<(), Violation> {
     reconcile_none_arm_fixed(host)?;
     slot_accounting(host).await?;
     device_serving(host)?;
+    quarantine_reconnectable(host)?;
     finalize_stage_monotone(host).await?;
     migration_decision_table(host)?;
     no_plane_leak(host)
+}
+
+/// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3): the classification barrier's
+/// promise. A device the barrier QUARANTINED — a record-invisible live survivor
+/// (#769 gap A), recorded in
+/// [`quarantined_unknown`](crate::SimHost::quarantined_unknown) — must stay
+/// RECOVERABLE: it is either re-served by this generation OR left kernel-bound
+/// (RECONNECTABLE) while its guest still holds it. It is NEVER left both
+/// unserved AND kernel-unbound with a live holder — quarantine PARKS + ALERTS,
+/// it never skips-and-severs. (The broader "no live holder is ever severed"
+/// invariant is `device_serving`'s `severed-live-holder` arm; this pins that the
+/// specific quarantine bookkeeping stays consistent as the barrier evolves.)
+fn quarantine_reconnectable(host: &SimHost) -> Result<(), Violation> {
+    let gen = host.generation;
+    for (idx, slot) in host.sandboxes.iter().enumerate() {
+        if !host.quarantined_unknown.contains(&slot.sandbox_id) {
+            continue;
+        }
+        let served = slot.served_by == Some(gen);
+        if !served && slot.guest_holds_device && slot.kernel_owner.is_none() {
+            return Err(Violation {
+                invariant: "quarantine-reconnectable",
+                detail: format!(
+                    "sandbox {idx} was classified QuarantinedUnknown but is now unserved, \
+                     kernel-unbound, and still guest-held — a quarantined survivor was \
+                     severed instead of left reconnectable (#769 gap A)"
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Oracle #7 — the migration decision table (ADR 0098 P8, issue #216):

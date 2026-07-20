@@ -20,9 +20,27 @@
 //! side) so this crate stays portable — the sim ignores it.
 
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use async_trait::async_trait;
+
+/// One `/dev/nbdN` device the kernel currently has CONNECTED — the Layer-2
+/// kernel-derived rehydrate inventory (ADR 0098 §Phase 3, Wave 7b, #784). Read
+/// from sysfs ground truth, not from any tracked record: a survivor whose
+/// records were lost still appears here as long as its kernel binding survives.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConnectedDevice {
+    /// The device node (`/dev/nbdN`).
+    pub device: PathBuf,
+    /// The configuring owner pid the kernel records (`/sys/block/nbdN/pid`). The
+    /// stale-binding sweep probes this against liveness (self / alive / dead).
+    pub owner_pid: i32,
+    /// The identifier the kernel recorded at CONNECT (`/sys/block/nbdN/backend`,
+    /// the P7 backend identifier), if present — the corroborating reconcile key
+    /// alongside the device path. `None` for a pre-identifier kernel or an
+    /// unreadable attr.
+    pub backend_id: Option<String>,
+}
 
 /// `NBD_CMD_CONNECT` parameters: configure a fresh `/dev/nbdN` to serve
 /// from `serve_fd` with the given geometry and the stable
@@ -75,4 +93,14 @@ pub trait NbdKernel: Send + Sync {
     /// unreadable (device never netlink-configured, or pre-identifier
     /// kernel).
     fn backend_identifier(&self, device: &Path) -> Option<String>;
+
+    /// Enumerate every `/dev/nbdN` the kernel currently has CONNECTED — those
+    /// with a populated `/sys/block/nbdN/pid` — as the Layer-2 kernel-derived
+    /// rehydrate inventory (ADR 0098 §Phase 3, Wave 7b, #784). This is GROUND
+    /// TRUTH: the startup reconcile classifies tracked records AGAINST this list,
+    /// never the reverse, so a survivor whose records were lost is still seen
+    /// (and quarantined) rather than silently skipped. Deterministically ordered
+    /// (device-ordinal ascending). A cold-path sysfs scan, called once at
+    /// register time.
+    fn connected_devices(&self) -> Vec<ConnectedDevice>;
 }

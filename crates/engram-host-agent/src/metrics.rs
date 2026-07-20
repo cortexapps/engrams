@@ -390,3 +390,17 @@ pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_r
 /// gap-A recurrence counter) — the same signal as the `sweep-blocked-live-holder`
 /// soft-invariant, exported for alerting.
 pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live_holder_total";
+
+/// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3): counter incremented each time
+/// the startup classification barrier reconciled the kernel-derived NBD
+/// inventory against the tracked records and found a CONNECTED device whose live
+/// (or unprovable) holder no record could account for — the #769 gap-A survivor,
+/// invisible to both the coord-list and the #739 local pass
+/// ([`engram_host_core::SlotClass::QuarantinedUnknown`]). The device is parked
+/// (left kernel-bound, RECONNECTABLE) and this fires alongside the
+/// `rehydrate-unknown-device` soft-invariant. Should stay at zero in steady
+/// state; a non-zero value means a survivor's records were lost upstream and an
+/// operator/runbook must reconcile it. Distinct from
+/// `sweep_blocked_live_holder`: THAT is the per-device sweep declining to sever;
+/// THIS is the reconcile finding a device it cannot account for at all.
+pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_device_total";

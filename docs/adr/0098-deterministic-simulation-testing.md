@@ -1170,6 +1170,85 @@ Roll → register-rehydrate. (4) A real device double-allocation bug in the shar
 plane (`next_free_device` ignored spare leases) — fixed. PR window 0..40 × 600
 chaos+calm (~1.2s, per-seed ~29ms); nightly `cosim-swarm` at 1500 steps.
 
+**Wave 7b (resilience/wave7-classification-barrier, #784 layers 2–3) — the
+kernel-derived rehydrate inventory + the startup classification barrier.** Layer
+1 (R6/#806) inverted the sweep's kill test (a dead-owner device DISCONNECTs only
+with proof of death); layers 2–3 close the gap ABOVE that verdict — the gap where
+a survivor invisible to the tracked records ("rehydrate skipped: survivor has no
+block-device rootfs to re-serve", the #769 gap-A skip) never reached the sweep's
+protection at all, because the sweep's work-list was the FREE slot pool derived
+from those same records.
+
+*Layer 2 — kernel-derived inventory.* The startup work-list is no longer the
+tracked records; it is KERNEL GROUND TRUTH — the connected `/dev/nbdN` devices
+(`NbdKernel::connected_devices`, a new sysfs `/sys/block/nbd*/pid` +
+backend-identifier enumeration on the existing seam) crossed with the surviving
+guest processes (the `/proc` holder scan). The tracked records are RECONCILED
+AGAINST that inventory, NEVER the reverse: a kernel-connected device NO record
+accounts for becomes a quarantine + an alert, not a skip.
+
+*Layer 3 — the classification barrier.* A pure
+`engram_host_core::classify_startup_slots` assigns every connected slot exactly
+ONE `SlotClass` — `{Serving, ReconnectMe, TerminalSafeToReap, QuarantinedUnknown}`
+— via a wildcard-free match over `(PidLiveness × DeviceHolder × has_record)` (a
+new variant on either enum is a compile error). The classification is a strict
+REFINEMENT of `sweep_verdict`: every `TerminalSafeToReap` is a `sweep_verdict`
+`Disconnect` AND has no record — the barrier only ever narrows what may be reaped.
+The ordering contract is enforced STRUCTURALLY, not by comment: the destructive
+`recover_stuck_nbd_devices` sweep accepts only a `ReapList`, a newtype
+constructible SOLELY by `classify_startup_slots`, so a device reaches a
+`NBD_CMD_DISCONNECT` iff classification put it in `TerminalSafeToReap`; the sweep
+can touch no other class. `ReconnectMe` (a dead-owner device a record accounts
+for) and `QuarantinedUnknown` (a dead-owner device a live/unprovable holder holds
+that NO record accounts for — the gap-A survivor) are BOTH left kernel-bound
+(RECONNECTABLE); the quarantine additionally fires the `rehydrate-unknown-device`
+soft-invariant (ADR 0099 H6 site) + `engram_nbd_rehydrate_unknown_device_total`
+counter so an operator/runbook reconciles the device — never a silent skip, never
+a sever.
+
+*Prod.* `HostNbdKernel::connected_devices` (Linux sysfs); `PooledBackend::classify_startup_slots`
+builds the record set from `rootfs_device` over the coord-list survivors ∪ the
+`ChainHeadRecord`s ∪ the now-served sandboxes, runs the barrier AFTER the two
+rehydrate passes (re-served survivors show self-owned ⇒ `Serving`), fires the
+quarantine alert, and hands ONLY `.reap` to the detached sweep. The old
+`free_paths` snapshot is retired — the reap set is a kernel-proven subset of it.
+One minimal `#[ignore]`'d FC-lane test (`nbd_connected_inventory`, wired into
+`ci.yml`) pins the sysfs assumption: a netlink-CONNECTed `/dev/nbdN` appears in
+the inventory with its recorded pid + backend id, a free one does not.
+
+*Honest boundary.* The sysfs/`/proc` probes are Linux kernel surface (prod-Linux,
+behind `NbdKernel`); the sims build the same `StartupSlot` inputs from their
+world models directly (`SimHost` / the shared `DevicePlane`), so BOTH drive the
+ONE pure `classify_startup_slots`. `has_record` mirrors prod (`record_present &&
+guest_holds_device` — a genuinely-gone guest's FC is not resident, so prod's
+`rootfs_device` reconcile can't map it and it is reap-eligible on proof of death).
+
+*Sims (both swarms drive the REAL barrier).* `SimHost` (host swarm) and
+`DevicePlane` (cosim boundary swarm) each gained `classify_startup` +
+`reap_terminal`, replacing their raw sweeps; the register-rehydrate step 3 now
+goes THROUGH the barrier. A `LoseRecord` step (small chaos weight) makes the
+gap-A family — a resident survivor invisible to the records — arise under both
+swarms, where the standing `severed-live-holder` (#806) oracle guards it every
+step and a new `quarantine-reconnectable` oracle pins the barrier's promise. The
+coord-list pass is authoritative for what it contains (only the #739 LOCAL pass
+is record-gated), so a gap-A survivor is one the list OMITS (HostLost /
+`coord_includes_parked=false`) AND whose local record is lost — an Evicting
+session stays listed and re-serves, so record loss never wedges an eviction
+(caught + fixed via the cosim convergence closure). Directed pins in BOTH sims
+(`gap_a_record_invisible_survivor_is_quarantined_*`) prove fail-without /
+pass-with: reverting the barrier's classification bookkeeping leaves
+`quarantined_unknown` empty and the pin's "was CLASSIFIED, not skipped" assertion
+fires. Quiescence heals the record-loss fault globally, so every classified slot
+reaches a terminal disposition within bounded rounds.
+
+*Verification.* fmt / clippy `-D warnings` / nextest clean on host-core,
+host-agent (macOS lib), dst-host, dst-cosim; all pinned seeds green; host windows
+chaos 0..60 + calm 0..30 ×1000, cosim windows 0..40 ×600 both profiles +
+nightly-scale, replay-twice byte-identical. The Linux-gated FC test +
+`classify_startup_inventory` are CI-arbitrated (the musl cross needs
+`linux/userfaultfd.h`, unavailable locally — the #806 constraint). No
+MetadataStore / PostgresStore SQL change (D4 n/a).
+
 | Phase | Content |
 |---|---|
 | R0 | Truth + the response loop: this addendum; explicit `soft_invariant!` name slugs; nightly infra-failure filing; a log-based alert on the soft-invariant prefix (engrams-internal) + a triage SLO for `sim-failure` issues; RCAs for #762, the dead-plane recurrence, and the double-OOM. |

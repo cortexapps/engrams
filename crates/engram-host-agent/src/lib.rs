@@ -970,21 +970,35 @@ impl HostAgent {
                                     // killed a survivor's disk in prod
                                     // (2026-06-11, /dev/nbd4).
                                     if let Some(nbd_pool) = pooled_for_rehydrate.nbd_pool() {
-                                        // The sweep snapshots free paths,
-                                        // then claim-then-disconnects each
-                                        // candidate so a session that races
-                                        // the (slow, 100ms/device) sweep for
-                                        // the same slot can never have its
-                                        // live binding torn out. Detached so
+                                        // Wave 7b (#784 layers 2–3): the startup
+                                        // classification BARRIER. Before any
+                                        // destructive pass runs, reconcile the
+                                        // KERNEL-DERIVED inventory (connected
+                                        // `/dev/nbdN` × the holder scan) against
+                                        // the tracked records and classify every
+                                        // slot. A survivor invisible to the
+                                        // records is QUARANTINED + alerted
+                                        // (`rehydrate-unknown-device`), never
+                                        // skipped; the sweep then reaps ONLY the
+                                        // `TerminalSafeToReap` subset — the
+                                        // ordering contract enforced by the
+                                        // `ReapList` type, not a comment. The
+                                        // barrier subsumes the old free-paths
+                                        // snapshot (the reap set is a subset of
+                                        // it, kernel-proven stale). Detached so
                                         // register returns promptly; the
-                                        // claim is the correctness gate, not
-                                        // ordering.
-                                        let unclaimed = nbd_pool.free_paths().await;
-                                        tokio::spawn(async move {
-                                            disk_daemon::recover_stuck_nbd_devices(
-                                                &nbd_pool, &unclaimed,
+                                        // per-device claim inside the sweep is
+                                        // still the TOCTOU correctness gate.
+                                        let reap = pooled_for_rehydrate
+                                            .classify_startup_slots(
+                                                &disk_daemon::HostNbdKernel,
+                                                &resp.rehydrate_sandboxes,
                                             )
-                                            .await;
+                                            .await
+                                            .reap;
+                                        tokio::spawn(async move {
+                                            disk_daemon::recover_stuck_nbd_devices(&nbd_pool, reap)
+                                                .await;
                                         });
                                     }
                                 }

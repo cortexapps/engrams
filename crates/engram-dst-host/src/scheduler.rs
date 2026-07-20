@@ -131,9 +131,15 @@ pub enum Step {
     /// SAFE defaults (list includes parked, local pass on); the adversarial
     /// variants ride the regression seeds.
     RegisterRehydrate,
-    /// Flow B (P7): run the stale-binding sweep independently (DISCONNECT
-    /// devices whose recorded owner is a dead generation).
+    /// Flow B (P7): run the stale-binding sweep independently, now GATED by the
+    /// Wave 7b classification barrier — reap ONLY the `TerminalSafeToReap` class.
     StaleSweepTick,
+    /// Wave 7b (#784 layer 2): LOSE sandbox `idx`'s tracked records (the coord
+    /// list and the durable `ChainHeadRecord`) — the #769 gap-A precondition. A
+    /// later roll then register leaves a resident guest holding a device NO
+    /// record accounts for; the classification barrier must QUARANTINE (not skip,
+    /// not sever) it.
+    LoseRecord(usize),
     /// Flow B (P7): `try_claim` a spare NBD device on the real allocator (Free
     /// → Claimed) — the slot-accounting + no-double-claim exercise.
     SlotClaim(usize),
@@ -184,6 +190,7 @@ impl Step {
             Step::Unpause(..) => "Unpause",
             Step::RegisterRehydrate => "RegisterRehydrate",
             Step::StaleSweepTick => "StaleSweepTick",
+            Step::LoseRecord(..) => "LoseRecord",
             Step::SlotClaim(..) => "SlotClaim",
             Step::SlotPopulateTick => "SlotPopulateTick",
             Step::CorruptSpoolRecovery(..) => "CorruptSpoolRecovery",
@@ -394,6 +401,11 @@ impl Sim {
                     let offset = self.rng.random_range(0..64usize);
                     Step::CorruptSpoolRecovery(idx, roll == 107, offset)
                 }
+                // Wave 7b (#784 layer 2): a small-weight record-loss fault so the
+                // gap-A family — a resident survivor invisible to the records —
+                // arises under the swarm and the barrier's severed-live-holder +
+                // quarantine oracles guard it every step.
+                109 => Step::LoseRecord(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -486,6 +498,7 @@ impl Sim {
             // #739 variants ride the regression seeds.
             Step::RegisterRehydrate => self.host.register_rehydrate(true, true).await?,
             Step::StaleSweepTick => self.host.stale_sweep_tick(),
+            Step::LoseRecord(idx) => self.host.lose_record(idx),
             Step::SlotClaim(idx) => self.host.slot_claim(idx).await,
             Step::SlotPopulateTick => self.host.slot_populate_tick(),
             Step::CorruptSpoolRecovery(idx, meta, offset) => {
