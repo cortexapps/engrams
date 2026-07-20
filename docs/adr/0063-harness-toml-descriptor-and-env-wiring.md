@@ -237,6 +237,46 @@ landed (incl. the A5 built-in-harness redesign) — B1/B2 validate against `List
 - The coordinator remains harness-agnostic (ADR 0051): it mounts the named bundle (ADR 0062) and
   injects the orchestrator-computed env verbatim.
 
+## Addendum (2026-07-20): `[egress]` — the harness declares its own network needs
+
+The first live ADR 0100 review run exposed a gap in the descriptor contract: the reviewer
+workflow's deny-default network override listed only the GitHub hosts, so the finder session
+cloned fine and then its claude harness died with `API Error: Unable to connect to API
+(ConnectionRefused)` — nothing allowed `api.anthropic.com`. The env contract said *how to
+authenticate* the harness but not *what it must reach*, leaving every profile/override to
+re-discover the LLM provider's hostnames by trial.
+
+The descriptor now carries that missing half:
+
+```toml
+[egress]
+allow_hosts         = ["api.anthropic.com", "statsig.anthropic.com"]  # claude
+allow_host_patterns = []                                              # optional
+```
+
+Semantics (`engram_core::types::merge_harness_egress`): at session create — after
+`resolve_harness`, before the session policy is read for the boot network or persisted — the
+selected harness's `[egress]` is concatenated into `IntegrationPolicy.network`:
+
+- deny-default policy → append the hosts/patterns not already present (exact-string dedupe);
+- allow-default policy → no-op (everything is already reachable);
+- absent policy (a deny-all direct/CLI create) → synthesize a minimal policy carrying just the
+  harness egress;
+- empty `[egress]` → no-op (a harness that declares nothing opts out).
+
+Merging **once at create-persist** is the point: ADR 0057 made the persisted session policy the
+single network source that queued boots, resume, and recovery all re-read, so no other path
+needs to know the feature exists. The coordinator stays harness-agnostic in the ADR 0051 sense —
+it reads a declared field; it hardcodes no provider hostnames. Profiles and per-session network
+overrides (e.g. ADR 0100's review network) now list only *task* egress; the harness's own
+API/telemetry hosts ride the descriptor.
+
+The proto projection (`HarnessDescriptor.egress`) carries the block to the UI so the egress
+receipts stay truthful: `derivePolicy` (the client-side mirror of the policy compilation) folds
+the selected harness's hosts into `reachable` with the same deny/allow semantics, which surfaces
+them in the composer's "Reaches" receipt, the profile editor's "Can reach" rail, and the profile
+cards' reach count.
+
 ## Alternatives considered
 
 - **Flat `model_env` + values list.** Rejected — cannot express multi-var model selection

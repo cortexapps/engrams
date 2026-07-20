@@ -38,6 +38,12 @@ fn descriptor_to_proto(
         }),
         models: d.models.iter().map(option_to_proto).collect(),
         effort: d.effort.iter().map(option_to_proto).collect(),
+        // ADR 0063 addendum: surfaced so the UI's "Reaches" receipts include
+        // the hosts the harness itself opens (merged server-side at create).
+        egress: Some(app::HarnessEgress {
+            allow_hosts: d.egress.allow_hosts.clone(),
+            allow_host_patterns: d.egress.allow_host_patterns.clone(),
+        }),
     }
 }
 

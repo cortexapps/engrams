@@ -111,7 +111,10 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         .await
         .ok()
         .flatten();
-    let (mut agent, _harness_mount) = crate::api::sessions::resolve_harness(
+    // The harness egress is dropped alongside the mount: the resume path
+    // re-reads the session policy persisted at create, which already carries
+    // the merged harness egress (ADR 0063 addendum).
+    let (mut agent, _harness_mount, _harness_egress) = crate::api::sessions::resolve_harness(
         state,
         selected_harness.as_deref(),
         session.mode,

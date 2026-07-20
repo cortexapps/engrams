@@ -29,7 +29,10 @@ export interface DerivedPolicy {
   derivedHosts: string[];
   extraHosts: string[];
   extraPatterns: string[];
-  /** Everything a session can reach: derived ∪ extra hosts ∪ patterns. */
+  /** Hosts the selected harness itself opens (ADR 0063 addendum `[egress]`):
+   *  its model API / telemetry, merged server-side at session create. */
+  harnessHosts: string[];
+  /** Everything a session can reach: derived ∪ extra ∪ patterns ∪ harness. */
   reachable: string[];
   credentials: DerivedCredential[];
   capCount: number;
@@ -50,7 +53,17 @@ function splitCap(cap: string): { provider: string; action: string } | null {
   return { provider: head.slice(0, colon), action: head.slice(colon + 1) };
 }
 
-export function derivePolicy(draft: ProfileDraftPolicy, views: ConnectorView[]): DerivedPolicy {
+/** The selected harness's declared egress (`HarnessDescriptor.egress`). */
+export interface HarnessEgressView {
+  allowHosts: string[];
+  allowHostPatterns: string[];
+}
+
+export function derivePolicy(
+  draft: ProfileDraftPolicy,
+  views: ConnectorView[],
+  harnessEgress?: HarnessEgressView,
+): DerivedPolicy {
   const byProvider = new Map(views.map((v) => [v.provider, v]));
   const used = new Map<string, DerivedProvider>();
 
@@ -70,6 +83,13 @@ export function derivePolicy(draft: ProfileDraftPolicy, views: ConnectorView[]):
   const derivedHosts = [...new Set(providers.flatMap((p) => p.view.hosts))];
   const extraHosts = draft.network.allowHosts;
   const extraPatterns = draft.network.allowHostPatterns;
+  // Mirror of the coordinator's merge_harness_egress: on a deny-default
+  // network the harness's declared hosts are concatenated at create; on
+  // allow-default they add nothing (everything is already reachable).
+  const harnessHosts =
+    draft.network.default === "deny" && harnessEgress
+      ? [...harnessEgress.allowHosts, ...harnessEgress.allowHostPatterns]
+      : [];
 
   const credentials: DerivedCredential[] = providers.map((p) =>
     p.view.credentialSource === "mint"
@@ -101,7 +121,8 @@ export function derivePolicy(draft: ProfileDraftPolicy, views: ConnectorView[]):
     derivedHosts,
     extraHosts,
     extraPatterns,
-    reachable: [...derivedHosts, ...extraHosts, ...extraPatterns],
+    harnessHosts,
+    reachable: [...new Set([...derivedHosts, ...extraHosts, ...extraPatterns, ...harnessHosts])],
     credentials,
     capCount: draft.capabilities.length,
     writeCount: providers.reduce(
