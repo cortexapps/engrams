@@ -82,6 +82,26 @@ describe("renderReviewer", () => {
     }
   });
 
+  test("fills org instructions literally — `$`-metacharacters and slot-shaped text are not interpreted", () => {
+    // `$&`/`$$`/`$1` are JS replacement-pattern metacharacters, and `{{TOOL_CONTRACT}}`
+    // is another slot. A naive string replace would expand the first and re-expand
+    // the second; a single-pass function replacement must take all of it verbatim.
+    const orgInstructions =
+      "Document replacements using literal $& and $$ and $1; never write {{TOOL_CONTRACT}} yourself.";
+    const files = renderReviewer({ role: "finder", orgInstructions });
+    const content = files[0]?.content ?? "";
+
+    expect(content).toContain(orgInstructions);
+    expect(content).not.toContain("{{ORG_INSTRUCTIONS}}");
+    // The literal `{{TOOL_CONTRACT}}` inside org text must survive as text, not be
+    // re-expanded into a second copy of the tool contract.
+    expect(content.match(/submit_finding/g)?.length ?? 0).toBe(
+      renderReviewer({ role: "finder", orgInstructions: "none" })[0]!.content.match(
+        /submit_finding/g,
+      )!.length,
+    );
+  });
+
   test("rejects an unknown category", () => {
     expect(() =>
       Reflect.apply(renderReviewer, undefined, [

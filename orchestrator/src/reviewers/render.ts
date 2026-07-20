@@ -44,7 +44,7 @@ const CATEGORY_METADATA: Record<ReviewCategory, { emoji: string; title: string }
 };
 
 const NO_ORG_INSTRUCTIONS = "_No organization instructions configured._";
-const SLOT_PATTERN = /\{\{[^{}]+\}\}/;
+const SLOT_PATTERN_GLOBAL = /\{\{[^{}]+\}\}/g;
 
 const FINDER_TOOL_CONTRACT = [
   "You report exclusively through these tools. Prose in your transcript is never",
@@ -137,17 +137,32 @@ export function renderReviewer(opts: RenderReviewerOptions): RenderedReviewerFil
   const orgInstructions = opts.orgInstructions?.trim() || NO_ORG_INSTRUCTIONS;
   const toolContract = opts.role === "finder" ? FINDER_TOOL_CONTRACT : VERIFIER_TOOL_CONTRACT;
 
-  let roleContent = loadMarkdown(`${opts.role}.md`);
+  // Fill every slot in a SINGLE pass with a function replacement. Two properties
+  // matter: (1) function replacements are always literal, so a filled value
+  // containing `$&`/`$1`/`$$` is inserted verbatim (a string replacement would
+  // interpret them and could even leave the slot behind), and (2) one pass means
+  // inserted text is never rescanned, so a value that happens to contain another
+  // slot's text (e.g. org instructions mentioning `{{TOOL_CONTRACT}}`) can't be
+  // re-expanded into an injection.
+  const slotValues = new Map<string, string>([
+    ["{{ORG_INSTRUCTIONS}}", orgInstructions],
+    ["{{TOOL_CONTRACT}}", toolContract],
+  ]);
   if (opts.role === "finder") {
-    roleContent = roleContent.replaceAll("{{ENABLED_CATEGORIES}}", categoryList(categories));
+    slotValues.set("{{ENABLED_CATEGORIES}}", categoryList(categories));
   }
-  roleContent = roleContent
-    .replaceAll("{{ORG_INSTRUCTIONS}}", orgInstructions)
-    .replaceAll("{{TOOL_CONTRACT}}", toolContract);
 
-  const residualSlot = roleContent.match(SLOT_PATTERN)?.[0];
-  if (residualSlot !== undefined) {
-    throw new Error(`unfilled reviewer slot: ${residualSlot}`);
+  let unfilledSlot: string | undefined;
+  const roleContent = loadMarkdown(`${opts.role}.md`).replace(SLOT_PATTERN_GLOBAL, (slot) => {
+    const value = slotValues.get(slot);
+    if (value === undefined) {
+      unfilledSlot ??= slot;
+      return slot;
+    }
+    return value;
+  });
+  if (unfilledSlot !== undefined) {
+    throw new Error(`unfilled reviewer slot: ${unfilledSlot}`);
   }
 
   const files: RenderedReviewerFile[] = [
