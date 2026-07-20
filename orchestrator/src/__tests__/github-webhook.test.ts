@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 
 import {
   classifyGithubEvent,
-  parseEngramsCommand,
+  parseReviewCommand,
 } from "../integrations/github-webhook.ts";
 
 function pullRequest(action: string, overrides: Record<string, unknown> = {}) {
@@ -38,7 +38,12 @@ describe("classifyGithubEvent", () => {
     const base = {
       action: "created",
       repository: { full_name: "openai/engrams" },
-      comment: { id: 42, body: "@engrams review" },
+      comment: {
+        id: 42,
+        body: "@engrams review",
+        author_association: "MEMBER",
+      },
+      sender: { type: "User" },
     };
     expect(classifyGithubEvent("issue_comment", JSON.stringify({
       ...base,
@@ -49,6 +54,8 @@ describe("classifyGithubEvent", () => {
       prNumber: 100,
       body: "@engrams review",
       commentId: "42",
+      authorAssociation: "MEMBER",
+      senderType: "User",
     });
     expect(classifyGithubEvent("issue_comment", JSON.stringify({
       ...base,
@@ -61,13 +68,20 @@ describe("classifyGithubEvent", () => {
       action: "created",
       repository: { full_name: "openai/engrams" },
       pull_request: { number: 100 },
-      comment: { id: "rc-1", body: "@engrams stop" },
+      comment: {
+        id: "rc-1",
+        body: "@engrams stop",
+        author_association: "COLLABORATOR",
+      },
+      sender: { type: "Bot" },
     }))).toEqual({
       kind: "comment",
       repo: "openai/engrams",
       prNumber: 100,
       body: "@engrams stop",
       commentId: "rc-1",
+      authorAssociation: "COLLABORATOR",
+      senderType: "Bot",
     });
   });
 
@@ -80,26 +94,41 @@ describe("classifyGithubEvent", () => {
   });
 });
 
-describe("parseEngramsCommand", () => {
-  test("parses review, focused review, stop, and fix", () => {
-    expect(parseEngramsCommand("@engrams review")).toEqual({ kind: "review" });
-    expect(parseEngramsCommand("@ENGRAMS review focus on auth"))
+describe("parseReviewCommand", () => {
+  // The mention is the CONFIGURED App handle, not a hardcoded name.
+  const handle = "acme-reviewer";
+
+  test("parses review, focused review, stop, and fix against the App handle", () => {
+    expect(parseReviewCommand("@acme-reviewer review", handle)).toEqual({ kind: "review" });
+    expect(parseReviewCommand("@ACME-REVIEWER review focus on auth", handle))
       .toEqual({ kind: "review", focus: "focus on auth" });
-    expect(parseEngramsCommand("@engrams stop")).toEqual({ kind: "stop" });
-    expect(parseEngramsCommand("@engrams fix this"))
+    expect(parseReviewCommand("@acme-reviewer stop", handle)).toEqual({ kind: "stop" });
+    expect(parseReviewCommand("@acme-reviewer fix this", handle))
       .toEqual({ kind: "fix", text: "this" });
   });
 
+  test("tolerates a [bot] suffix on the mention and on the configured handle", () => {
+    expect(parseReviewCommand("@acme-reviewer[bot] review", handle)).toEqual({ kind: "review" });
+    expect(parseReviewCommand("@acme-reviewer review", "@acme-reviewer[bot]"))
+      .toEqual({ kind: "review" });
+  });
+
+  test("does not match a different handle, and a blank handle disables commands", () => {
+    expect(parseReviewCommand("@engrams review", handle)).toBeNull();
+    expect(parseReviewCommand("@someone-else review", handle)).toBeNull();
+    expect(parseReviewCommand("@acme-reviewer review", "")).toBeNull();
+  });
+
   test("allows leading prose on its own line and rejects non-commands", () => {
-    expect(parseEngramsCommand("Please take another look.\n  @engrams review auth  "))
+    expect(parseReviewCommand("Please take another look.\n  @acme-reviewer review auth  ", handle))
       .toEqual({ kind: "review", focus: "auth" });
-    expect(parseEngramsCommand("hello @engrams review")).toBeNull();
-    expect(parseEngramsCommand("@engrams dance")).toBeNull();
-    expect(parseEngramsCommand("@engrams stop now")).toBeNull();
+    expect(parseReviewCommand("hello @acme-reviewer review", handle)).toBeNull();
+    expect(parseReviewCommand("@acme-reviewer dance", handle)).toBeNull();
+    expect(parseReviewCommand("@acme-reviewer stop now", handle)).toBeNull();
   });
 
   test("strips control characters and caps focus at 500 characters", () => {
-    const parsed = parseEngramsCommand(`@engrams review auth\u0000${"x".repeat(600)}`);
+    const parsed = parseReviewCommand(`@acme-reviewer review auth\u0000${"x".repeat(600)}`, handle);
     expect(parsed?.kind).toBe("review");
     if (parsed?.kind !== "review") throw new Error("expected review command");
     expect(parsed.focus).not.toContain("\u0000");
