@@ -525,9 +525,15 @@ export function makeReviewControlPlane(
         "Report findings only through the provided review tools; do not edit files or push changes.",
       ].join("\n");
 
+      // The prompt id MUST be scoped to the session: the coordinator's
+      // outbox is keyed globally by prompt_id (ON CONFLICT DO NOTHING), so
+      // a retry finder session re-sending `review:<id>:finder` deduped
+      // against the FAILED attempt's consumed row and silently never got
+      // its prompt — the session idled forever and the review wedged in
+      // `finding` (first observed live: review f33ad531).
       await sessions.sendPrompt({
         sessionId,
-        promptId: `review:${input.reviewId}:finder`,
+        promptId: `review:${input.reviewId}:finder:${sessionId}`,
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "finding");
@@ -632,9 +638,11 @@ export function makeReviewControlPlane(
         "Submit submit_verdict for every candidate; confirm only findings you can reproduce from code you read.",
       ].join("\n");
 
+      // Session-scoped for the same reason as the finder prompt id: a
+      // verifier retry must not dedupe against a dead attempt's row.
       await sessions.sendPrompt({
         sessionId,
-        promptId: `review:${input.reviewId}:verifier`,
+        promptId: `review:${input.reviewId}:verifier:${sessionId}`,
         text: prompt,
       });
       await reviews().updateReviewStatus(input.reviewId, "verifying");
