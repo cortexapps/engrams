@@ -18,6 +18,7 @@ import { makeProfileStore } from "../db/profiles.ts";
 import {
   makeReviewStore,
   type FindingCounts,
+  type ReviewEventRow,
   type ReviewFindingRow,
   type ReviewListRow,
   type ReviewRow,
@@ -28,6 +29,7 @@ import {
   ReviewService,
   type RepoEnrollment,
   type Review as ReviewProto,
+  type ReviewEvent as ReviewEventProto,
   type ReviewFinding as ReviewFindingProto,
   type ReviewVerdict as ReviewVerdictProto,
 } from "../gen/engram/app/v1/review_pb.ts";
@@ -105,6 +107,8 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     trigger: row.trigger,
     status: row.status,
     ...(row.githubReviewId != null ? { githubReviewId: row.githubReviewId } : {}),
+    ...(row.finderSessionId != null ? { finderSessionId: row.finderSessionId } : {}),
+    ...(row.verifierSessionId != null ? { verifierSessionId: row.verifierSessionId } : {}),
     ...(row.summaryMd != null ? { summaryMd: row.summaryMd } : {}),
     createdAt: timestampFromDate(row.createdAt),
     updatedAt: timestampFromDate(row.updatedAt),
@@ -146,7 +150,18 @@ function verdictToProto(row: ReviewVerdictRow): ReviewVerdictProto {
     verdict: row.verdict,
     confidence: row.confidence,
     reasoning: row.reasoning,
+    sessionId: row.sessionId,
   } as ReviewVerdictProto;
+}
+
+function eventToProto(row: ReviewEventRow): ReviewEventProto {
+  return {
+    id: row.id,
+    reviewId: row.reviewId,
+    kind: row.kind,
+    ...(row.detail != null ? { detail: row.detail } : {}),
+    createdAt: timestampFromDate(row.createdAt),
+  } as ReviewEventProto;
 }
 
 export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void {
@@ -173,10 +188,12 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       await requireUser(ctx, getSession);
       const detail = await reviews().getReview(req.id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
+      const events = await reviews().listEvents(req.id);
       return {
         review: reviewToProto(detail.review, findingCounts(detail.findings)),
         findings: detail.findings.map(findingToProto),
         verdicts: detail.verdicts.map(verdictToProto),
+        events: events.map(eventToProto),
       };
     },
 

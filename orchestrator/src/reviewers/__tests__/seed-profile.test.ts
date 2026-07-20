@@ -86,6 +86,11 @@ function fakeStore(options: {
       });
       return designatedProfile;
     },
+    async setDesignation(id, designation) {
+      if (designatedProfile?.id === id) {
+        designatedProfile = { ...designatedProfile, designation };
+      }
+    },
     async update(id, input) {
       if (designatedProfile?.id !== id || designatedProfile.deletedAt != null) return null;
       designatedProfile = { ...designatedProfile, ...input };
