@@ -13,3 +13,18 @@ export const listReviews = ReviewService.method.listReviews;
  * @generated from rpc engram.app.v1.ReviewService.GetReview
  */
 export const getReview = ReviewService.method.getReview;
+
+/**
+ * @generated from rpc engram.app.v1.ReviewService.ListEnrollments
+ */
+export const listEnrollments = ReviewService.method.listEnrollments;
+
+/**
+ * @generated from rpc engram.app.v1.ReviewService.UpsertEnrollment
+ */
+export const upsertEnrollment = ReviewService.method.upsertEnrollment;
+
+/**
+ * @generated from rpc engram.app.v1.ReviewService.DeleteEnrollment
+ */
+export const deleteEnrollment = ReviewService.method.deleteEnrollment;

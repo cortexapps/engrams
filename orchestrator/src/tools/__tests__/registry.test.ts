@@ -2,7 +2,7 @@ import { describe, expect, test } from "bun:test";
 import { z } from "zod";
 
 import { compileToolManifest } from "../manifest.ts";
-import { createToolRegistry } from "../registry.ts";
+import { createToolRegistry, toolCapabilities } from "../registry.ts";
 
 describe("tool registry", () => {
   test("duplicate names are rejected", () => {
@@ -72,6 +72,32 @@ describe("tool registry", () => {
       presenters: { web: "QuestionCard" },
     });
     expect(registered.execution).toBe("deferred");
+  });
+
+  test("toolCapabilities returns each registered non-null capability", () => {
+    const registry = createToolRegistry();
+    for (const [name, capability] of [
+      ["ungated", undefined],
+      ["review_finding", "engram:pr_review"],
+      ["review_verdict", "engram:pr_review"],
+      ["other", "engram:other"],
+    ] as const) {
+      registry.register({
+        name,
+        description: name,
+        input: z.object({}),
+        output: z.object({ ok: z.boolean() }),
+        handling: "handled",
+        execution: "sync",
+        capability,
+        handler: async () => ({ ok: true }),
+      });
+    }
+
+    expect(toolCapabilities(registry)).toEqual(new Set([
+      "engram:pr_review",
+      "engram:other",
+    ]));
   });
 });
 

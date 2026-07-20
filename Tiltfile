@@ -912,6 +912,11 @@ orchestrator_env = {
     'CONTROL_PLANE_GRPC_URL': 'http://127.0.0.1:50061',
     'CONTROL_PLANE_HTTP_URL': 'http://127.0.0.1:8090',
     'ORCHESTRATOR_PORT': '8787',
+    # ADR 0100: the review GitHub App's handle (its bot slug) that users
+    # @-mention on a PR to trigger a review. Set GITHUB_APP_LOGIN to your App's
+    # slug (e.g. "acme-reviewer"); empty → @-mention commands are disabled (the
+    # dispatch API + auto-on-open triggers still work).
+    'GITHUB_APP_LOGIN': env_or('GITHUB_APP_LOGIN', 'engrams-local-test[bot]'),
     # Public origin the BROWSER uses (the web dev server) — NOT the orchestrator's
     # own :8787. better-auth's session cookie is scoped here, /api is proxied here
     # (vite.config.ts), and the OAuth redirect + Slack session links are built from

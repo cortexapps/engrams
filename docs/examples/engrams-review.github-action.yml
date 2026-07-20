@@ -1,0 +1,17 @@
+# Copy-paste reference: dispatch an engrams review when a pull request changes.
+name: engrams review
+on:
+  pull_request:
+
+jobs:
+  review:
+    runs-on: ubuntu-latest
+    steps:
+      - run: |
+          curl --fail-with-body \
+            -H "Authorization: Bearer ${{ secrets.ENGRAMS_API_KEY }}" \
+            -H "Content-Type: application/json" \
+            -d '{"repo":"${{ github.repository }}","pr_number":${{ github.event.pull_request.number }}}' \
+            "$ENGRAMS_URL/api/v1/reviews/dispatch"
+        env:
+          ENGRAMS_URL: ${{ vars.ENGRAMS_URL }}

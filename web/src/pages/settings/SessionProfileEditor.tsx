@@ -93,6 +93,7 @@ const schema = z.object({
   model: z.string().nullable(),
   effort: z.string().nullable(),
   isDefault: z.boolean(),
+  designation: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
   capabilities: z.array(z.string()),
@@ -116,6 +117,7 @@ const EMPTY: ProfileFormValues = {
   model: null,
   effort: null,
   isDefault: false,
+  designation: false,
   includeUserTokens: false,
   skills: [],
   capabilities: [],
@@ -183,6 +185,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       model: optionId(p.model),
       effort: optionId(p.effort),
       isDefault: p.isDefault,
+      designation: p.designation === "pr_reviewer",
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
       capabilities: p.capabilities ?? [],
@@ -283,6 +286,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       model: optionId(vals.model) ?? undefined,
       effort: optionId(vals.effort) ?? undefined,
       isDefault: vals.isDefault,
+      designation: vals.designation ? "pr_reviewer" : "",
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
       capabilities: vals.capabilities,
@@ -399,6 +403,26 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                       <div className="text-[0.74rem] text-muted-foreground">
                         Externally triggered sessions (e.g. a Slack mention) launch with the default
                         profile. Only one profile can be the default.
+                      </div>
+                    </div>
+                  </div>
+                )}
+              />
+              <Controller
+                control={control}
+                name="designation"
+                render={({ field }) => (
+                  <div className="flex items-center gap-3 rounded-md border bg-background px-3 py-2.5">
+                    <Switch
+                      checked={field.value}
+                      onCheckedChange={field.onChange}
+                      aria-label="PR reviewer profile"
+                    />
+                    <div className="flex-1">
+                      <div className="text-[0.84rem]">Designate as the PR reviewer</div>
+                      <div className="text-[0.74rem] text-muted-foreground">
+                        Pull-request reviews run on this profile&apos;s image, model, and skills.
+                        Only one profile can be the reviewer.
                       </div>
                     </div>
                   </div>

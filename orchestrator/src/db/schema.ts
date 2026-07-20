@@ -15,7 +15,7 @@
  * does not require them for queries but they document the FK graph).
  */
 
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import {
   pgTable,
   text,
@@ -74,6 +74,12 @@ export const taskSession = pgTable(
     // Nullable for pre-feature / out-of-band sessions. Profiles are only ever
     // soft-deleted, so the target always exists; ON DELETE is moot.
     profileId: text("profile_id").references(() => profile.id),
+    // The session's EFFECTIVE granted capabilities at create time (profile caps,
+    // or a capabilityOverride/extraCapabilities set — e.g. a review worker's
+    // clamped `engram:pr_review` + repo-scoped read). The tool-exec gate reads
+    // these so an override is honored; NULL means a legacy row → fall back to
+    // the profile's capabilities.
+    capabilities: jsonb("capabilities").$type<string[]>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -186,8 +192,16 @@ export const review = pgTable(
     headSha: text("head_sha").notNull(),
     baseSha: text("base_sha").notNull(),
     trigger: text("trigger").notNull(),
-    status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded
+    status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded|halted
     githubReviewId: text("github_review_id"),
+    // The sticky GitHub issue-comment we post on pickup and edit in place
+    // through the lifecycle (👀 → ⏳ → ✅). Null until the first ack lands.
+    statusCommentId: text("status_comment_id"),
+    // The worker sessions, stamped at kickoff so the UI can offer a live
+    // "watch" link while the phase runs. The session is deleted when its phase
+    // ends, but the id is kept as the durable record of which session ran.
+    finderSessionId: text("finder_session_id"),
+    verifierSessionId: text("verifier_session_id"),
     summaryMd: text("summary_md"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -259,6 +273,39 @@ export const reviewVerdict = pgTable(
   ],
 );
 
+/** A review's step-by-step activity log (ADR 0100). Append-only milestones the
+ *  control plane records as it drives the review, so the UI can show progress
+ *  inside a phase ("cloning repo", "reviewing") — not just the coarse status.
+ *  The worker sessions are deleted per phase, so this outlives them. */
+export const reviewEvent = pgTable(
+  "review_event",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reviewId: uuid("review_id")
+      .notNull()
+      .references(() => review.id, { onDelete: "cascade" }),
+    // queued|finder_started|cloning|reviewing|verifier_started|verifying|posted|failed|halted
+    kind: text("kind").notNull(),
+    detail: text("detail"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("review_event_review_idx").on(t.reviewId, t.createdAt)],
+);
+
+/** Per-repository PR-review enrollment. The text fields are constrained by
+ * ReviewService to triggerMode: auto|manual and autofix: auto|manual|off. */
+export const reviewEnrollment = pgTable("review_enrollment", {
+  repo: text("repo").primaryKey(), // "owner/name"
+  triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
+  autofix: text("autofix").notNull().default("off"), // auto|manual|off
+  profileId: text("profile_id").references(() => profile.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
+
 // ---------------------------------------------------------------------------
 // Stream-fed session listeners (ingest v2)
 // ---------------------------------------------------------------------------
@@ -290,6 +337,15 @@ export const consumerCursor = pgTable(
 export const slackSession = pgTable("slack_session", {
   sessionId: text("session_id").primaryKey(),
   threadWfId: text("thread_wf_id").notNull(),
+});
+
+/** Review worker sessions route terminal state into their owning review
+ * workflow mailbox. Absence means the review consumer does not apply. */
+export const reviewSession = pgTable("review_session", {
+  sessionId: text("session_id").primaryKey(),
+  reviewWorkflowId: text("review_workflow_id").notNull(),
+  role: text("role").notNull(), // finder|verifier
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 });
 
 // ---------------------------------------------------------------------------
@@ -325,52 +381,64 @@ export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   allowHostPatterns: [],
 };
 
-export const profile = pgTable("profile", {
-  id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
-  name: text("name").notNull(),
-  description: text("description").notNull().default(""),
-  icon: text("icon").notNull().default("Bot"), // lucide icon name
-  imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
-  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
-  // this profile's sessions run, with default model + effort (catalog option
-  // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
-  // "inherit deployment default" semantics were superseded; existing rows were
-  // backfilled to `claude`). model/effort stay nullable → the harness
-  // descriptor's defaults. All overridable per session.
-  harness: text("harness").notNull(),
-  model: text("model"),
-  effort: text("effort"),
-  includeUserTokens: boolean("include_user_tokens").notNull().default(false),
-  envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
-  // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-  // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
-  // mounts at session create. Empty = base session (no skills).
-  skills: jsonb("skills").$type<string[]>().notNull().default([]),
-  // ADR 0056: integration capabilities ("provider:action[@resource]") this
-  // profile's sessions are granted. Passed to the coordinator at session create
-  // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
-  // no third-party integration access.
-  capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
-  // ADR 0057: egress network allow-list (deny by default) + secrets this
-  // profile's sessions get, lifted off the image manifest. Additive in B1;
-  // compiled into the per-session SessionPolicy + consumed at boot in B2.
-  network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
-  secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
-  // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
-  // its session with this. At most one active default; the store clears the
-  // prior when one is set.
-  isDefault: boolean("is_default").notNull().default(false),
-  // ADR 0064: guest ports auto-exposed (private) for every session from this
-  // profile. The orchestrator mints one private port_exposure per declared port
-  // at session create (best-effort). Empty = no auto-exposed ports.
-  portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-  updatedAt: timestamp("updated_at")
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-  deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
-});
+export const profile = pgTable(
+  "profile",
+  {
+    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    icon: text("icon").notNull().default("Bot"), // lucide icon name
+    imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
+    // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+    // this profile's sessions run, with default model + effort (catalog option
+    // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
+    // "inherit deployment default" semantics were superseded; existing rows were
+    // backfilled to `claude`). model/effort stay nullable → the harness
+    // descriptor's defaults. All overridable per session.
+    harness: text("harness").notNull(),
+    model: text("model"),
+    effort: text("effort"),
+    includeUserTokens: boolean("include_user_tokens").notNull().default(false),
+    envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
+    // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+    // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
+    // mounts at session create. Empty = base session (no skills).
+    skills: jsonb("skills").$type<string[]>().notNull().default([]),
+    // ADR 0056: integration capabilities ("provider:action[@resource]") this
+    // profile's sessions are granted. Passed to the coordinator at session create
+    // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
+    // no third-party integration access.
+    capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
+    // ADR 0057: egress network allow-list (deny by default) + secrets this
+    // profile's sessions get, lifted off the image manifest. Additive in B1;
+    // compiled into the per-session SessionPolicy + consumed at boot in B2.
+    network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
+    secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
+    // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
+    // its session with this. At most one active default; the store clears the
+    // prior when one is set.
+    isDefault: boolean("is_default").notNull().default(false),
+    // ADR 0064: guest ports auto-exposed (private) for every session from this
+    // profile. The orchestrator mints one private port_exposure per declared port
+    // at session create (best-effort). Empty = no auto-exposed ports.
+    portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
+    // System marker (ADR 0100): at most one profile per value; the review
+    // workflow finds its profile by this marker, and designated profiles cannot
+    // be deleted.
+    designation: text("designation"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at")
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+    deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
+  },
+  (t) => [
+    uniqueIndex("profile_designation_unique")
+      .on(t.designation)
+      .where(sql`designation is not null`),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // Connector catalog (ADR 0057 C1)
