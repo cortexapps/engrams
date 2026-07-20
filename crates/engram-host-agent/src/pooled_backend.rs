@@ -3570,6 +3570,95 @@ impl PooledBackend {
         (rehydrated, failed)
     }
 
+    /// The Layer-2 kernel-derived inventory + Layer-3 classification barrier
+    /// (ADR 0098 §Phase 3, Wave 7b, #784). Run AFTER the two rehydrate passes
+    /// (coord-list + #739 local) and BEFORE the destructive stale-binding sweep:
+    /// enumerate the kernel's CONNECTED devices as ground truth and RECONCILE the
+    /// tracked records against them, classifying every connected slot into
+    /// exactly one [`SlotClass`](engram_host_core::SlotClass). The tracked-record
+    /// device set is every device a coord-list survivor, a durable
+    /// `ChainHeadRecord`, or a now-served sandbox maps to — so a re-served
+    /// survivor shows self-owned (`Serving`) and a device NO record accounts for
+    /// (its live guest invisible to both passes) surfaces as
+    /// `QuarantinedUnknown`, fires the `rehydrate-unknown-device` soft-invariant
+    /// + counter (parked, RECONNECTABLE), and is NEVER handed to the sweep.
+    ///
+    /// Returns the classification; the caller feeds `.reap` (the sole
+    /// `TerminalSafeToReap` subset) to [`recover_stuck_nbd_devices`] — the
+    /// ordering contract enforced by the [`ReapList`](engram_host_core::ReapList)
+    /// type, not a comment.
+    #[cfg(target_os = "linux")]
+    pub async fn classify_startup_slots(
+        &self,
+        kernel: &dyn engram_host_core::NbdKernel,
+        coord_survivors: &[crate::coord_client::RehydrateSandboxRef],
+    ) -> engram_host_core::StartupClassification<std::path::PathBuf> {
+        // The tracked-record device set — the Layer-2 reconcile key. A device is
+        // "accounted for" if a coord-list survivor, a durable ChainHeadRecord, or
+        // an already-served sandbox maps to it (`rootfs_device` resolves the
+        // sandbox's `/dev/nbdN`). Anything CONNECTED but absent from this set is
+        // a survivor invisible to the records.
+        let mut record_devices: std::collections::HashSet<std::path::PathBuf> =
+            std::collections::HashSet::new();
+        for entry in coord_survivors {
+            if let Some(dev) = self.inner.rootfs_device(entry.sandbox_id) {
+                record_devices.insert(dev);
+            }
+        }
+        if let Some(store) = self.chain_heads.clone() {
+            for record in crate::checkpoint::ChainHeadRecord::load_all(store.dir()).await {
+                if let Some(dev) = self.inner.rootfs_device(record.sandbox_id) {
+                    record_devices.insert(dev);
+                }
+            }
+        }
+        for entry in self.nbd_sandboxes.iter() {
+            if let Some(dev) = self.inner.rootfs_device(*entry.key()) {
+                record_devices.insert(dev);
+            }
+        }
+
+        let classification =
+            crate::disk_daemon::classify_startup_inventory(kernel, &record_devices);
+
+        // Quarantine: a CONNECTED device the reconcile could not account for. Fire
+        // the alertable soft-invariant + counter per device and leave it
+        // kernel-bound (RECONNECTABLE) — never sever, never silently skip.
+        for device in &classification.quarantined {
+            engram_core::soft_invariant!(
+                "rehydrate-unknown-device",
+                false,
+                "startup classification barrier: kernel-CONNECTED NBD device {} has a \
+                 live (or unprovable) holder but NO tracked record accounts for it — a \
+                 survivor invisible to both the coordinator rehydrate list AND the #739 \
+                 local ChainHeadRecord pass (#769 gap A). Quarantined: left RECONNECTABLE \
+                 (kernel binding intact, kept out of new-claim circulation by the \
+                 nbd_kernel_busy probe), NEVER handed to the stale-binding sweep. An \
+                 operator/runbook must reconcile this device's session",
+                device.display(),
+            );
+            ::metrics::counter!(crate::metrics::REHYDRATE_UNKNOWN_DEVICE_TOTAL).increment(1);
+        }
+        if !classification.reconnect.is_empty() {
+            tracing::warn!(
+                count = classification.reconnect.len(),
+                "startup classification: {} kernel-connected device(s) are known survivors \
+                 the rehydrate passes did not (yet) re-serve — left RECONNECTABLE for a \
+                 retry, never reaped",
+                classification.reconnect.len(),
+            );
+        }
+        tracing::info!(
+            serving = classification.serving.len(),
+            reconnect = classification.reconnect.len(),
+            quarantined = classification.quarantined.len(),
+            reap = classification.reap.len(),
+            "startup NBD classification barrier complete (kernel-derived inventory \
+             reconciled against tracked records)",
+        );
+        classification
+    }
+
     /// ADR 0028 Fix A: post-capture chain bookkeeping + the durable
     /// host-owned record. Runs at the tail of every successful
     /// `snapshot()` (periodic checkpoint, eviction, drain, SIGTERM —

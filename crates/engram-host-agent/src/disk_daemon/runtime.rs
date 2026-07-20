@@ -279,13 +279,22 @@ impl Drop for NbdHandle {
 /// is the defense-in-depth second line.
 pub async fn recover_stuck_nbd_devices(
     pool: &Arc<NbdSlotAllocator>,
-    paths: &[std::path::PathBuf],
+    reap: engram_host_core::ReapList<std::path::PathBuf>,
 ) -> (usize, usize, usize) {
     let mut probed = 0;
     let mut recovered = 0;
     let mut still_stuck = 0;
     let mut parked = 0;
-    for path in paths {
+    // The ordering contract, enforced by the TYPE: this destructive pass accepts
+    // ONLY a `ReapList` — the [`SlotClass::TerminalSafeToReap`] subset the
+    // startup classification barrier produced (ADR 0098 §Phase 3, Wave 7b, #784
+    // layer 3). It is unconstructible without having classified, so a device
+    // reaches the DISCONNECT below iff classification proved it a genuine stale
+    // binding. The per-device liveness/holder re-check inside
+    // `recover_one_stuck_device` remains as defense-in-depth against the
+    // classify→disconnect TOCTOU (a device that gained a live holder since
+    // classification re-PARKs).
+    for path in reap.devices() {
         // Reserve the slot before probing/disconnecting. A failed claim
         // means a concurrent acquire/claim already owns it — by
         // definition not a stale binding, so skip it entirely.
@@ -454,6 +463,62 @@ pub fn device_has_live_holder(device: &std::path::Path) -> engram_host_core::Dev
     } else {
         DeviceHolder::NoHolder
     }
+}
+
+/// The Layer-2 kernel-derived inventory + Layer-3 classification barrier (ADR
+/// 0098 §Phase 3, Wave 7b, #784). Enumerate KERNEL GROUND TRUTH — every
+/// CONNECTED `/dev/nbdN` ([`NbdKernel::connected_devices`]) — and RECONCILE the
+/// tracked records against it: for each connected device resolve the owner's
+/// liveness (self / alive / dead vs this process's pid), the live-holder proof
+/// of death (only for a dead owner — the cold `/proc` scan is skipped where the
+/// verdict can't depend on it), and whether any tracked record references the
+/// device (`record_devices`). [`classify_startup_slots`] then assigns each slot
+/// exactly one class.
+///
+/// The records are matched AGAINST the kernel inventory, never the reverse — a
+/// connected device NO record accounts for surfaces as
+/// [`SlotClass::QuarantinedUnknown`](engram_host_core::SlotClass::QuarantinedUnknown)
+/// (the #769 gap-A survivor), not a silent skip. The returned
+/// [`StartupClassification`](engram_host_core::StartupClassification)'s
+/// `reap` is the ONLY input the destructive [`recover_stuck_nbd_devices`] sweep
+/// accepts (the ordering contract, enforced by the type).
+///
+/// A cold-path scan run once at register time, after the rehydrate passes have
+/// re-served the survivors they cover (those show as self-owned ⇒ `Serving`).
+pub fn classify_startup_inventory(
+    kernel: &dyn NbdKernel,
+    record_devices: &std::collections::HashSet<PathBuf>,
+) -> engram_host_core::StartupClassification<PathBuf> {
+    let self_pid = std::process::id() as i32;
+    let slots = kernel
+        .connected_devices()
+        .into_iter()
+        .map(|dev| {
+            let liveness = if dev.owner_pid == self_pid {
+                engram_host_core::PidLiveness::SelfPid
+            } else if pid_is_alive(dev.owner_pid) {
+                engram_host_core::PidLiveness::Alive
+            } else {
+                engram_host_core::PidLiveness::Dead
+            };
+            // The holder scan (proof of death) only changes a DEAD owner's
+            // verdict — a live/self owner is `Serving` regardless — so we pay the
+            // cold `/proc` scan only there.
+            let holder = if matches!(liveness, engram_host_core::PidLiveness::Dead) {
+                device_has_live_holder(&dev.device)
+            } else {
+                engram_host_core::DeviceHolder::NoHolder
+            };
+            let has_record = record_devices.contains(&dev.device);
+            engram_host_core::StartupSlot {
+                device: dev.device,
+                liveness,
+                holder,
+                has_record,
+            }
+        })
+        .collect();
+    engram_host_core::classify_startup_slots(slots)
 }
 
 /// `true` if `pid` names a live process. `kill(pid, 0)` sends no signal
