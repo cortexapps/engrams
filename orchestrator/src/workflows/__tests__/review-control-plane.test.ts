@@ -687,7 +687,7 @@ describe("ReviewControlPlane", () => {
 
     expect(sessions.promptCalls[0]).toMatchObject({
       sessionId: "finder-session",
-      promptId: `review:${active.id}:finder`,
+      promptId: `review:${active.id}:finder:finder-session`,
     });
     expect(sessions.promptCalls[0]?.text).toContain("the PR diff");
     expect(sessions.promptCalls[0]?.text).toContain("Check retry behavior");
@@ -695,6 +695,35 @@ describe("ReviewControlPlane", () => {
     // The activity log gains a "reviewing" milestone so the UI can show the
     // finder is running, not just the coarse "finding" status.
     expect(events).toEqual([[active.id, "reviewing", undefined]]);
+  });
+
+  test("a retry finder session gets a DISTINCT prompt id", async () => {
+    // The coordinator outbox is keyed globally by prompt_id with
+    // ON CONFLICT DO NOTHING: if a retry session reuses the failed
+    // attempt's prompt id, its enqueue silently no-ops and the fresh
+    // session never receives a prompt (live wedge: review f33ad531).
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
+        createReview: async () => "unused",
+        updateReviewStatus: async () => {},
+      },
+    });
+    const input = {
+      reviewId: active.id,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: active.headSha,
+      baseSha: "",
+    };
+    await cp.sendFinderPrompt("finder-attempt-1", input);
+    await cp.sendFinderPrompt("finder-attempt-2", input);
+    const ids = sessions.promptCalls.map((c) => c.promptId);
+    expect(new Set(ids).size).toBe(2);
   });
 
   test("sends the verifier prompt and marks the review verifying", async () => {
@@ -723,7 +752,7 @@ describe("ReviewControlPlane", () => {
 
     expect(sessions.promptCalls[0]).toMatchObject({
       sessionId: "verifier-session",
-      promptId: `review:${active.id}:verifier`,
+      promptId: `review:${active.id}:verifier:verifier-session`,
     });
     expect(sessions.promptCalls[0]?.text).toContain("candidates.json");
     expect(sessions.promptCalls[0]?.text).toContain("submit_verdict");
