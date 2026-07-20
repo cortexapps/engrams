@@ -1,0 +1,406 @@
+/** GitHub review posting over the coordinator-owned IntegrationOp seam. */
+
+import type { ReviewFindingRow } from "../db/reviews.ts";
+import {
+  runIntegrationOp as defaultRunIntegrationOp,
+  type IntegrationOpResult,
+} from "../integrations/run-op.ts";
+import type {
+  FindingDecision,
+  PolicyDecision,
+} from "./policy-gate.ts";
+
+export interface InlineComment {
+  findingId: string;
+  path: string;
+  line: number;
+  side: string;
+  startLine?: number;
+  body: string;
+}
+
+export interface PostReviewInput {
+  repo: string;
+  prNumber: number;
+  commitId: string;
+  /** Renders the summary body for the actual outcome: `true` when the inline
+   *  comments post (concise — they carry their own detail), `false` on the 422
+   *  fallback (must re-quote every surviving finding so none is lost). */
+  buildSummary: (inlinePosted: boolean) => string;
+  comments: InlineComment[];
+}
+
+export interface PostReviewResult {
+  githubReviewId?: string;
+  posted: boolean;
+  inlinePosted: boolean;
+  /** The summary body actually posted — persist this on the review record. */
+  summaryMd: string;
+}
+
+export interface UpsertStatusCommentInput {
+  repo: string;
+  prNumber: number;
+  /** The comment to edit in place; omit to post a fresh one. */
+  commentId?: string;
+  body: string;
+}
+
+export interface GithubReviewPoster {
+  fetchPrHeads(repo: string, prNumber: number): Promise<{
+    headSha: string;
+    baseSha: string;
+  }>;
+  alreadyPosted(repo: string, prNumber: number, reviewId: string): Promise<boolean>;
+  postReview(input: PostReviewInput): Promise<PostReviewResult>;
+  /** Post (or edit, when `commentId` is given) the sticky status comment and
+   *  return the live comment id. A PATCH against a comment that has since been
+   *  deleted (404) transparently falls back to a fresh POST. */
+  upsertStatusComment(input: UpsertStatusCommentInput): Promise<{ commentId: string }>;
+}
+
+export type ReviewStatusPhase =
+  | "acknowledged"
+  | "finding"
+  | "verifying"
+  | "posted"
+  | "failed"
+  | "halted";
+
+export interface StatusCommentInput {
+  reviewId: string;
+  phase: ReviewStatusPhase;
+  /** Candidate count (verifying) or posted-finding count (posted). */
+  count?: number;
+  reviewUrl?: string;
+}
+
+/** Render the sticky status body. The hidden marker is deliberately the last
+ *  line so it never bleeds into the visible text. */
+export function buildStatusComment(input: StatusCommentInput): string {
+  const n = input.count ?? 0;
+  const plural = n === 1 ? "" : "s";
+  const link = input.reviewUrl ? ` · [View details](${input.reviewUrl})` : "";
+  const line = ((): string => {
+    switch (input.phase) {
+      case "acknowledged":
+        return "👀 **engrams review** — acknowledged, queued.";
+      case "finding":
+        return "⏳ **engrams review** — analyzing the diff…";
+      case "verifying":
+        return `⏳ **engrams review** — confirming ${n} candidate finding${plural}…`;
+      case "posted":
+        return `✅ **engrams review** — complete. ${n} finding${plural} posted.${link}`;
+      case "failed":
+        return "⚠️ **engrams review** — the run failed. It will retry on the next push or @mention.";
+      case "halted":
+        return "🛑 **engrams review** — stopped.";
+    }
+  })();
+  return `${line}\n\n<!-- engrams-status:${input.reviewId} -->`;
+}
+
+export interface ReviewSummaryInput {
+  reviewId: string;
+  reviewUrl: string;
+  decision: PolicyDecision;
+  /** False means every non-suppressed finding must be preserved in the body. */
+  inlinePosted: boolean;
+}
+
+type RunIntegrationOp = typeof defaultRunIntegrationOp;
+
+const CATEGORY_LABELS: Readonly<Record<string, string>> = {
+  "security-privacy": "🔒 Security & Privacy",
+  "stability-availability": "🩺 Stability & Availability",
+  "data-integrity-integration": "🗄️ Data Integrity & Integration",
+  "functional-correctness": "🎯 Functional Correctness",
+  "performance-scalability": "🚀 Performance & Scalability",
+  "maintainability-quality": "📐 Maintainability & Code Quality",
+};
+const REVIEWS_PER_PAGE = 100;
+const MAX_REVIEW_PAGES = 50;
+
+function isObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function decodeBody(body: Uint8Array): string {
+  return new TextDecoder().decode(body);
+}
+
+function parseJson(result: IntegrationOpResult, operation: string): unknown {
+  const text = decodeBody(result.body);
+  try {
+    return JSON.parse(text);
+  } catch {
+    throw new Error(`${operation} returned invalid JSON`);
+  }
+}
+
+function responseError(operation: string, result: IntegrationOpResult): Error {
+  const detail = decodeBody(result.body).trim();
+  return new Error(
+    `${operation} failed with GitHub status ${result.status}${detail ? `: ${detail}` : ""}`,
+  );
+}
+
+function reviewIdFrom(result: IntegrationOpResult): string | undefined {
+  if (result.body.length === 0) return undefined;
+  const value = parseJson(result, "create pull request review");
+  if (!isObject(value)) return undefined;
+  const id = value["id"];
+  return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
+}
+
+function commentIdFrom(result: IntegrationOpResult): string | undefined {
+  if (result.body.length === 0) return undefined;
+  const value = parseJson(result, "status comment");
+  if (!isObject(value)) return undefined;
+  const id = value["id"];
+  return typeof id === "string" || typeof id === "number" ? String(id) : undefined;
+}
+
+function commentPayload(comment: InlineComment): Record<string, unknown> {
+  return {
+    path: comment.path,
+    side: comment.side,
+    line: comment.line,
+    ...(comment.startLine != null && comment.startLine !== comment.line
+      ? { start_line: comment.startLine, start_side: comment.side }
+      : {}),
+    body: comment.body,
+  };
+}
+
+function findingLocation(item: FindingDecision): string {
+  const line = item.finding.endLine ?? item.finding.startLine;
+  return line == null ? item.finding.path : `${item.finding.path}:L${line}`;
+}
+
+function quoteFinding(item: FindingDecision): string {
+  const body = item.finding.bodyMd
+    .split("\n")
+    .map((line) => `> ${line}`)
+    .join("\n");
+  return [
+    `> \`${findingLocation(item)}\` — **${item.finding.title}**`,
+    ">",
+    body,
+  ].join("\n");
+}
+
+/** Build the durable GitHub summary. The marker is deliberately the last line. */
+export function buildReviewSummary(input: ReviewSummaryInput): string {
+  const visible = [...input.decision.toPost, ...input.decision.uiOnly];
+  const categoryCounts = new Map<string, number>();
+  for (const item of visible) {
+    categoryCounts.set(
+      item.finding.category,
+      (categoryCounts.get(item.finding.category) ?? 0) + 1,
+    );
+  }
+
+  const verdict = input.decision.counts.total === 0
+    ? "No findings."
+    : input.inlinePosted
+    ? `${input.decision.toPost.length} finding${input.decision.toPost.length === 1 ? "" : "s"} posted inline.`
+    : `${input.decision.counts.total} finding${input.decision.counts.total === 1 ? "" : "s"} included in this summary.`;
+  const severities = input.decision.counts;
+  const categories = [...categoryCounts.entries()]
+    .map(([category, count]) => `${CATEGORY_LABELS[category] ?? category}: ${count}`)
+    .join(" · ");
+  const details = input.inlinePosted ? input.decision.uiOnly : visible;
+
+  const lines = [
+    "## Engrams review",
+    "",
+    `**Verdict:** ${verdict}`,
+    `**Severity:** Critical ${severities.critical} · High ${severities.high} · Medium ${severities.medium} · Low ${severities.low}`,
+    ...(categories ? [`**Categories:** ${categories}`] : []),
+    "",
+    `[View the full engrams review](${input.reviewUrl})`,
+    ...(input.decision.overflow > 0
+      ? [
+          "",
+          `${input.decision.overflow} more finding${input.decision.overflow === 1 ? "" : "s"} on the review page.`,
+        ]
+      : []),
+    ...(details.length > 0
+      ? [
+          "",
+          "### Findings on the review page",
+          "",
+          details.map(quoteFinding).join("\n\n"),
+        ]
+      : []),
+    "",
+    `<!-- engrams-review:${input.reviewId} -->`,
+  ];
+  return lines.join("\n");
+}
+
+export function buildInlineCommentBody(finding: ReviewFindingRow): string {
+  const category = CATEGORY_LABELS[finding.category] ?? finding.category;
+  return [
+    `**${category} · ${finding.severity.toUpperCase()} — ${finding.title}**`,
+    "",
+    finding.bodyMd,
+    ...(finding.suggestedFix
+      ? ["", "```suggestion", finding.suggestedFix, "```"]
+      : []),
+  ].join("\n");
+}
+
+/**
+ * Production uses a sessionless IntegrationOp mint. It is installation-wide
+ * today (owner=None), so multi-installation owner routing remains a follow-up;
+ * credentials and HTTP execution stay entirely in the coordinator either way.
+ */
+export function makeGithubReviewPoster(
+  deps: { runIntegrationOp?: RunIntegrationOp } = {},
+): GithubReviewPoster {
+  const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
+
+  return {
+    async fetchPrHeads(repo, prNumber) {
+      const response = await runOp("github", {
+        method: "GET",
+        path: `/repos/${repo}/pulls/${prNumber}`,
+        contentType: "application/json",
+      });
+      if (response.status < 200 || response.status >= 300) {
+        throw responseError("get pull request", response);
+      }
+      const value = parseJson(response, "get pull request");
+      if (!isObject(value) || !isObject(value["head"]) || !isObject(value["base"])) {
+        throw new Error("get pull request response is missing head/base");
+      }
+      const headSha = value["head"]["sha"];
+      const baseSha = value["base"]["sha"];
+      if (typeof headSha !== "string" || typeof baseSha !== "string") {
+        throw new Error("get pull request response is missing head/base SHAs");
+      }
+      return { headSha, baseSha };
+    },
+
+    async alreadyPosted(repo, prNumber, reviewId) {
+      const marker = `<!-- engrams-review:${reviewId} -->`;
+      for (let page = 1; page <= MAX_REVIEW_PAGES; page++) {
+        const response = await runOp("github", {
+          method: "GET",
+          path:
+            `/repos/${repo}/pulls/${prNumber}/reviews?per_page=${REVIEWS_PER_PAGE}&page=${page}`,
+          contentType: "application/json",
+        });
+        if (response.status < 200 || response.status >= 300) {
+          throw responseError("list pull request reviews", response);
+        }
+        const value = parseJson(response, "list pull request reviews");
+        if (!Array.isArray(value)) {
+          throw new Error("list pull request reviews returned a non-array response");
+        }
+        if (
+          value.some((item) =>
+            isObject(item)
+            && typeof item["body"] === "string"
+            && item["body"].includes(marker)
+          )
+        ) {
+          return true;
+        }
+        if (value.length < REVIEWS_PER_PAGE) return false;
+      }
+      throw new Error(
+        `list pull request reviews exceeded ${MAX_REVIEW_PAGES} pages`,
+      );
+    },
+
+    async postReview(input) {
+      const path = `/repos/${input.repo}/pulls/${input.prNumber}/reviews`;
+      const inlineBody = input.buildSummary(true);
+      let response = await runOp("github", {
+        method: "POST",
+        path,
+        body: JSON.stringify({
+          commit_id: input.commitId,
+          event: "COMMENT",
+          body: inlineBody,
+          comments: input.comments.map(commentPayload),
+        }),
+        contentType: "application/json",
+      });
+
+      if (response.status >= 200 && response.status < 300) {
+        const githubReviewId = reviewIdFrom(response);
+        return {
+          ...(githubReviewId ? { githubReviewId } : {}),
+          posted: true,
+          inlinePosted: true,
+          summaryMd: inlineBody,
+        };
+      }
+      if (response.status !== 422) {
+        throw responseError("create pull request review", response);
+      }
+
+      // GitHub validates the whole batch atomically. A single stale/non-diff
+      // anchor yields 422, so v1 coarse-demotes every inline finding and retries
+      // exactly once without comments — with a fuller body that re-quotes every
+      // finding so none is lost. Per-finding pre-validation is deferred.
+      const summaryOnlyBody = input.buildSummary(false);
+      response = await runOp("github", {
+        method: "POST",
+        path,
+        body: JSON.stringify({
+          commit_id: input.commitId,
+          event: "COMMENT",
+          body: summaryOnlyBody,
+        }),
+        contentType: "application/json",
+      });
+      if (response.status < 200 || response.status >= 300) {
+        throw responseError("create summary-only pull request review", response);
+      }
+      const githubReviewId = reviewIdFrom(response);
+      return {
+        ...(githubReviewId ? { githubReviewId } : {}),
+        posted: true,
+        inlinePosted: false,
+        summaryMd: summaryOnlyBody,
+      };
+    },
+
+    async upsertStatusComment(input) {
+      const create = async (): Promise<{ commentId: string }> => {
+        const response = await runOp("github", {
+          method: "POST",
+          path: `/repos/${input.repo}/issues/${input.prNumber}/comments`,
+          body: JSON.stringify({ body: input.body }),
+          contentType: "application/json",
+        });
+        if (response.status < 200 || response.status >= 300) {
+          throw responseError("create status comment", response);
+        }
+        const id = commentIdFrom(response);
+        if (id === undefined) throw new Error("create status comment returned no id");
+        return { commentId: id };
+      };
+
+      if (input.commentId === undefined) return create();
+
+      const response = await runOp("github", {
+        method: "PATCH",
+        path: `/repos/${input.repo}/issues/comments/${input.commentId}`,
+        body: JSON.stringify({ body: input.body }),
+        contentType: "application/json",
+      });
+      // The sticky comment was deleted out from under us — post a fresh one.
+      if (response.status === 404) return create();
+      if (response.status < 200 || response.status >= 300) {
+        throw responseError("edit status comment", response);
+      }
+      return { commentId: input.commentId };
+    },
+  };
+}

@@ -83,6 +83,17 @@ function makeFakeStore(seed: ProfileRow[] = []): ProfileStore {
     },
     async getByIds(ids) { return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[]; },
     async create(input, designation) { const id = `p${n++}`; const r = mk(id, input, designation); rows.set(id, r); return r; },
+    async setDesignation(id, designation) {
+      if (designation !== null) {
+        for (const [otherId, row] of rows) {
+          if (otherId !== id && row.designation === designation) {
+            rows.set(otherId, { ...row, designation: null, updatedAt: new Date(0) });
+          }
+        }
+      }
+      const row = rows.get(id);
+      if (row) rows.set(id, { ...row, designation, updatedAt: new Date(0) });
+    },
     async update(id, input) {
       const ex = rows.get(id); if (!ex || ex.deletedAt != null) return null;
       const r = { ...ex, ...input, updatedAt: new Date(0) }; rows.set(id, r); return r;
@@ -178,6 +189,57 @@ describe("ProfileService — auth + field filtering", () => {
       expect(r.profile!.archived).toBe(false);
       expect(r.profile!.envVars).toEqual({ ANTHROPIC_MODEL: "claude-opus-4-8" });
       expect(r.profile!.includeUserTokens).toBe(true);
+    } finally { await s.close(); }
+  });
+
+  test("admin CreateProfile sets and returns the PR reviewer designation", async () => {
+    const store = makeFakeStore();
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
+    });
+    try {
+      const r = await s.client.createProfile({
+        name: "Reviewer", description: "", icon: "Bot", imageId: "img-1",
+        harness: "claude", includeUserTokens: false, envVars: {},
+        designation: "pr_reviewer",
+      });
+      expect(r.profile!.designation).toBe("pr_reviewer");
+      expect((await store.getByDesignation("pr_reviewer"))?.id).toBe(r.profile!.id);
+    } finally { await s.close(); }
+  });
+
+  test("admin UpdateProfile sets, preserves when omitted, and clears designation", async () => {
+    const store = makeFakeStore([active]);
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
+    });
+    const input = {
+      id: active.id, name: active.name, description: "", icon: "Bot", imageId: "img-1",
+      harness: "claude", includeUserTokens: false, envVars: {},
+    };
+    try {
+      const designated = await s.client.updateProfile({ ...input, designation: "pr_reviewer" });
+      expect(designated.profile!.designation).toBe("pr_reviewer");
+
+      const preserved = await s.client.updateProfile({ ...input, name: "Still Reviewer" });
+      expect(preserved.profile!.designation).toBe("pr_reviewer");
+
+      const cleared = await s.client.updateProfile({ ...input, designation: "" });
+      expect(cleared.profile!.designation).toBeUndefined();
+      expect(await store.getByDesignation("pr_reviewer")).toBeNull();
+    } finally { await s.close(); }
+  });
+
+  test("admin UpdateProfile rejects an unknown designation", async () => {
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store: makeFakeStore([active]),
+      images: fakeImages(["img-1"]),
+    });
+    try {
+      await expectErr(s.client.updateProfile({
+        id: active.id, name: active.name, description: "", icon: "Bot", imageId: "img-1",
+        harness: "claude", includeUserTokens: false, envVars: {}, designation: "unknown",
+      }), Code.InvalidArgument);
     } finally { await s.close(); }
   });
 
