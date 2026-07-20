@@ -96,6 +96,32 @@ function copyHeaders(src: Headers | undefined, dst: Headers): void {
 }
 
 /**
+ * Rebuild an upstream gRPC error for the browser-facing Connect response.
+ *
+ * A ConnectError parsed by createGrpcTransport carries the upstream
+ * `content-type: application/grpc` in its metadata. Re-throwing it verbatim
+ * lets that metadata overwrite the Connect handler's
+ * `content-type: application/json`, so connect-web cannot parse the body and
+ * degrades the useful error to `[internal] HTTP 400`. Preserve the semantic
+ * code/message/details while stripping protocol-owned metadata, just like the
+ * successful response path above.
+ */
+function browserFacingError(error: unknown): ConnectError {
+  const upstream = ConnectError.from(error);
+  const metadata = new Headers();
+  copyHeaders(upstream.metadata, metadata);
+  const clean = new ConnectError(
+    upstream.rawMessage,
+    upstream.code,
+    metadata,
+    undefined,
+    upstream.cause,
+  );
+  clean.details = upstream.details;
+  return clean;
+}
+
+/**
  * Build a Web-standard Headers object from a HandlerContext's requestHeader.
  * getSessionFromHeaders takes a Headers instance; the context provides one
  * already.
@@ -251,20 +277,25 @@ export function registerPassthrough(
           await gate(req, ctx);
           const pf = preflight?.[key];
           if (pf) await pf(req, ctx);
-          const res = await upstream.unary(
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            m as any,
-            ctx.signal,
-            undefined,
-            // Use clean headers — inbound Connect headers (content-type: application/json,
-            // connect-protocol-version, etc.) must NOT be forwarded to the outbound gRPC
-            // transport or Tonic returns NGHTTP2_PROTOCOL_ERROR. The transport's
-            // bearerInterceptor injects Authorization; only safe tracing headers are passed.
-            upstreamHeaders(ctx.requestHeader),
-            // eslint-disable-next-line @typescript-eslint/no-explicit-any
-            req as any,
-            ctx.values,
-          );
+          let res;
+          try {
+            res = await upstream.unary(
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              m as any,
+              ctx.signal,
+              undefined,
+              // Use clean headers — inbound Connect headers (content-type: application/json,
+              // connect-protocol-version, etc.) must NOT be forwarded to the outbound gRPC
+              // transport or Tonic returns NGHTTP2_PROTOCOL_ERROR. The transport's
+              // bearerInterceptor injects Authorization; only safe tracing headers are passed.
+              upstreamHeaders(ctx.requestHeader),
+              // eslint-disable-next-line @typescript-eslint/no-explicit-any
+              req as any,
+              ctx.values,
+            );
+          } catch (error) {
+            throw browserFacingError(error);
+          }
           copyHeaders(res.header, ctx.responseHeader);
           copyHeaders(res.trailer, ctx.responseTrailer);
           return res.message;

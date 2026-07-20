@@ -265,17 +265,13 @@ describe("ImagesPanel RPC contract", () => {
     });
   });
 
-  test("capture-affecting edit confirms, then re-sends with allowRecapture=true", async () => {
-    // ADR 0080 phase 2b: a diff touching resources/warm is refused with
-    // FailedPrecondition on the first (allowRecapture=false) attempt; the
-    // dialog surfaces the server's message in an inline confirm block, and
-    // "Recapture and apply" re-sends the SAME config with
+  test("capture-affecting edit confirms before sending with allowRecapture=true", async () => {
+    // A resources/warm diff is detected locally. The dialog confirms before
+    // any request, then "Recapture and apply" sends the config once with
     // allowRecapture=true (spawning the recapture job).
     const { transport, captures } = installCapturingTransport(
       [makeProtoImage("ghcr.io/cortex/api:warm-1")],
       [],
-      undefined,
-      /* updateRequiresRecapture */ true,
     );
     renderWithProviders(<ImagesPanel />, { transport });
 
@@ -288,23 +284,41 @@ describe("ImagesPanel RPC contract", () => {
     await user.type(vcpus, "4");
     await user.click(screen.getByRole("button", { name: /^save$/i }));
 
-    // The confirm block appears, carrying the server's field-naming message.
+    // The confirm block appears before any update request is sent.
     await screen.findByText("This edit changes capture-affecting fields");
-    expect(screen.getByText(/resources\.suggested_vcpus/)).toBeTruthy();
-    expect(captures.updateCalls).toHaveLength(1);
-    expect(captures.updateCalls[0].allowRecapture).toBe(false);
+    expect(screen.getByText(/This edit changes resources —/)).toBeTruthy();
+    expect(captures.updateCalls).toHaveLength(0);
 
     await user.click(screen.getByRole("button", { name: /recapture and apply/i }));
 
     await waitFor(() => {
-      expect(captures.updateCalls.length).toBe(2);
+      expect(captures.updateCalls.length).toBe(1);
     });
-    expect(captures.updateCalls[1].allowRecapture).toBe(true);
-    expect(captures.updateCalls[1].config?.resources?.suggestedVcpus).toBe(4);
-    // Same config both attempts — confirming must not rebuild/mutate it.
-    expect(
-      equals(ImageConfigSchema, captures.updateCalls[0].config!, captures.updateCalls[1].config!),
-    ).toBe(true);
+    expect(captures.updateCalls[0].allowRecapture).toBe(true);
+    expect(captures.updateCalls[0].config?.resources?.suggestedVcpus).toBe(4);
+  });
+
+  test("server FailedPrecondition still opens confirmation for an unanticipated diff", async () => {
+    const { transport, captures } = installCapturingTransport(
+      [makeProtoImage("ghcr.io/cortex/api:warm-1")],
+      [],
+      undefined,
+      /* updateRequiresRecapture */ true,
+    );
+    renderWithProviders(<ImagesPanel />, { transport });
+
+    const user = userEvent.setup();
+    await screen.findByText("ghcr.io/cortex/api:warm-1");
+    await user.click(screen.getByRole("button", { name: /edit config/i }));
+    const name = screen.getByLabelText("Name");
+    await user.clear(name);
+    await user.type(name, "renamed-api");
+    await user.click(screen.getByRole("button", { name: /^save$/i }));
+
+    await screen.findByText("This edit changes capture-affecting fields");
+    expect(screen.getByText(/resources\.suggested_vcpus/)).toBeTruthy();
+    expect(captures.updateCalls).toHaveLength(1);
+    expect(captures.updateCalls[0].allowRecapture).toBe(false);
   });
 
   test("untouched edit round-trips the row's config exactly (server sees a no-op)", async () => {
