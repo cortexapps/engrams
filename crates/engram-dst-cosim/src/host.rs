@@ -67,7 +67,6 @@ use engram_host_agent::eviction_finalize::{
 use engram_host_agent::teardown_reconcile::ReconcileBackend;
 use engram_host_core::{FinalizeStage, HostFs, TokioFs};
 use engram_sim::{SimClock, SimEntropy};
-use engram_storage_local::LocalBlobStorage;
 use parking_lot::Mutex;
 
 /// Disk geometry — small on purpose (the oracle asserts a boundary
@@ -293,8 +292,15 @@ impl CosimHost {
     /// co-sim shares) and its own per-run [`SimFs`] + [`ChunkStore`].
     pub fn new(host_id: HostId, clock: Arc<SimClock>, entropy: Arc<SimEntropy>) -> Self {
         let fs = SimFs::new().expect("sim tempdir");
+        // The blob tier is the deterministic in-memory `MemBlobStorage` (ADR
+        // 0098 determinism-audit item 7 / the #799 fix): no `tokio::fs`
+        // blocking-pool I/O to auto-advance the paused clock, and sorted
+        // `list_prefix` for free. The `ChunkedDiskBackend`'s own `ChunkCache`
+        // still uses the `SimFs` tempdir (inherent to reusing the REAL
+        // backend), but its I/O never feeds a decision — see the swarm's
+        // I/O-audit verdict.
         let blob: Arc<dyn engram_core::traits::BlobStorage> =
-            Arc::new(LocalBlobStorage::new(fs.chunks_dir().to_path_buf()));
+            Arc::new(engram_sim::MemBlobStorage::new());
         let store = Arc::new(ChunkStore::new(blob));
         Self {
             host_id,
