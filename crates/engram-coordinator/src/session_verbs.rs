@@ -352,6 +352,31 @@ const EVICT_MAX_ATTEMPTS: i32 = 20;
 /// the lane for ~50 minutes with the user's resume queued behind it).
 const QUARANTINE_EVICT_MAX_ATTEMPTS: i32 = 3;
 
+/// #810 finding 2 (the Evicting-convergence hole): on evict-budget
+/// exhaustion, which flavors MUST settle the session into `HostLost`?
+///
+/// `HostLost` is the only non-terminal lane the dead-host straggler sweep
+/// re-drives (`list_host_lost_sessions` → destroy/settle → Idle-recoverable),
+/// so a settled-but-failed eviction that does not land there strands with no
+/// re-driver.
+///
+/// - `nominated`: the eviction was the coordinator's own densification pick;
+///   it cannot stay Active (it would just re-nominate forever) and there is no
+///   durable snapshot to call it Idle — HostLost is the honest limbo.
+/// - `quarantine` (ADR 0090): the exhaustion arm has just DESTROYED the
+///   crippled survivor VM precisely so the straggler sweep can drive
+///   HostLost → Idle. Pre-#810 the flip was gated on `nominated` ALONE, so a
+///   non-nominated quarantine survivor (the #739/gap-A `evict_local` path)
+///   was destroyed and then stranded in `Evicting` forever (prod aac4efab,
+///   15+ min). It MUST settle to HostLost too.
+///
+/// Any other flavor (a plain idle-evict that keeps failing) leaves the op
+/// terminally Failed and the session where it was — an operator-visible
+/// coord-side fault, not a settle that fabricates a lost host.
+const fn exhaustion_settles_host_lost(nominated: bool, quarantine: bool) -> bool {
+    nominated || quarantine
+}
+
 /// The evict verb: the idle-eviction / drain pipeline
 /// (`idle_evictor::run_evict_pipeline` — park or capture + destroy +
 /// mark-idle). Payload: `{"target": "idle"|"evacuating", "allow_park":
@@ -415,10 +440,13 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
         Err(e) => {
             // Retry budget: the attempt count lives on the op row (bumped
             // at every claim). Exhaustion falls back to HostLost for
-            // nominated evictions — NOT Active (would re-nominate
-            // forever), NOT Idle (lies: no durable snapshot), NOT Dead
-            // (destroys a healthy runtime over a coord-side failure) —
-            // exactly the retired scanner's classification (ADR 0034).
+            // nominated (and — #810 finding 2 — quarantine) evictions —
+            // NOT Active (would re-nominate forever), NOT Idle (lies: no
+            // durable snapshot), NOT Dead (destroys a healthy runtime over
+            // a coord-side failure) — exactly the retired scanner's
+            // classification (ADR 0034). The one lane the dead-host
+            // straggler sweep re-drives is HostLost, so a settled-but-failed
+            // eviction MUST land there or it strands with no re-driver.
             //
             // Quarantine flavor (ADR 0090, 2026-07-13 incident): a smaller
             // budget, and the fallback DESTROYS the sandbox first. The VM
@@ -475,7 +503,28 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
                         ),
                     }
                 }
-                if nominated {
+                // #810 finding 2 (the Evicting-convergence hole): the HostLost
+                // fallback flip must fire for the QUARANTINE flavor too, not
+                // just `nominated`. The quarantine arm just above DESTROYED the
+                // crippled VM precisely so — per its own comment — "the dead-host
+                // straggler sweep drives HostLost → Idle". But that sweep only
+                // lists HostLost rows (`list_host_lost_sessions`). Pre-fix the
+                // flip was gated on `nominated` alone, so a NON-nominated
+                // quarantine survivor (the #739/gap-A parked-survivor path:
+                // `evict_local` enqueued from the host heartbeat with
+                // `nominated=false`, ADR 0090) exhausted its 3-attempt budget,
+                // was destroyed, and then STRANDED in `Evicting` with no
+                // re-driver — the sweep never lists it and nothing else re-drives
+                // an `Evicting` row (prod session aac4efab sat 15+ min). Flipping
+                // to HostLost on exhaustion for `nominated || quarantine` closes
+                // the hole: nominated flips WITHOUT a destroy (the runtime may be
+                // healthy — the straggler sweep's ask-the-host reconcile settles
+                // it), quarantine flips AFTER the destroy above, and BOTH land in
+                // the one lane the straggler sweep converges to
+                // Idle/recoverable. A fenced-out failure here (a successor
+                // re-claimed the lane) is safe: the successor now owns the
+                // session's convergence. (See `exhaustion_settles_host_lost`.)
+                if exhaustion_settles_host_lost(nominated, quarantine) {
                     match crate::session_ops::transition_with_fence(
                         ctx.state,
                         ctx.op.session_id,
@@ -488,6 +537,8 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
                             tracing::warn!(
                                 session_id = %ctx.op.session_id,
                                 attempts = ctx.op.attempts,
+                                nominated,
+                                quarantine,
                                 error = %e,
                                 "evict op budget exhausted; session falls back to HostLost",
                             );
@@ -1153,6 +1204,31 @@ mod tests {
                 "{pick_err:?} must map to OpOutcome::Retry, the transient contract",
             );
         }
+    }
+
+    /// #810 finding 2 (the Evicting-convergence hole): the evict-budget
+    /// exhaustion arm must settle BOTH `nominated` and `quarantine` flavors
+    /// into `HostLost` — the one lane the dead-host straggler sweep re-drives.
+    /// The `(nominated=false, quarantine=true)` row is the regression: pre-#810
+    /// it was `false`, so a non-nominated quarantine survivor was destroyed and
+    /// then stranded in `Evicting` with no re-driver (prod aac4efab, 15+ min).
+    #[test]
+    fn budget_exhaustion_settles_host_lost_for_nominated_or_quarantine() {
+        assert!(
+            exhaustion_settles_host_lost(true, false),
+            "a nominated eviction settles to HostLost (cannot stay Active)"
+        );
+        assert!(
+            exhaustion_settles_host_lost(false, true),
+            "#810 finding 2: a quarantine survivor is destroyed then MUST settle \
+             to HostLost, else it strands in Evicting"
+        );
+        assert!(exhaustion_settles_host_lost(true, true));
+        assert!(
+            !exhaustion_settles_host_lost(false, false),
+            "a plain idle-evict that keeps failing is an operator-visible coord fault, \
+             not a settle that fabricates a lost host"
+        );
     }
 
     /// Moved with `failure_backoff` from the retired `outbox_delivery`
