@@ -143,7 +143,7 @@ describe("seedReviewerProfile", () => {
         capabilities: [PR_REVIEW_CAPABILITY],
         includeUserTokens: false,
         envVars: {},
-        skills: [],
+        skills: ["skills"],
         secrets: [],
         portExposures: [],
         isDefault: false,

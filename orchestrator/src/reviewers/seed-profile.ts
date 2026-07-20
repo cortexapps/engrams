@@ -39,7 +39,11 @@ export async function seedReviewerProfile(
         effort: defaultProfile.effort,
         includeUserTokens: false,
         envVars: {},
-        skills: [],
+        // The "skills" bundle ships the git-askpass helper
+        // (provides_askpass); without it the review session's forge broker
+        // token has no credential wiring and the workflow's clone fails with
+        // "could not read Username for 'https://github.com'".
+        skills: ["skills"],
         capabilities: [PR_REVIEW_CAPABILITY],
         network: DEFAULT_PROFILE_NETWORK,
         secrets: [],
