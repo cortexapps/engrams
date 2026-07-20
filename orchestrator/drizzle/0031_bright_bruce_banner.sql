@@ -1,0 +1,1 @@
+ALTER TABLE "task_session" ADD COLUMN "capabilities" jsonb;

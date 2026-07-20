@@ -1,0 +1,1 @@
+ALTER TABLE "review" ADD COLUMN "status_comment_id" text;

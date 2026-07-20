@@ -25,15 +25,15 @@ function headers(body: string, event: string) {
   };
 }
 
-function pullRequestBody() {
+function pullRequestBody(action = "opened", draft = false) {
   return JSON.stringify({
-    action: "opened",
+    action,
     number: 100,
     repository: { full_name: enrollment.repo },
     pull_request: {
       head: { sha: "head-sha" },
       base: { ref: "main" },
-      draft: false,
+      draft,
     },
   });
 }
@@ -52,14 +52,14 @@ function commentBody(
   });
 }
 
-function app(enrolled = true) {
+function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
   const dispatches: DispatchReviewInput[] = [];
   return {
     dispatches,
     app: makeGithubEventsRoute({
       webhookSecret: async () => SECRET,
       mentionHandle: "acme-reviewer",
-      enrollments: { get: async () => enrolled ? enrollment : null },
+      enrollments: { get: async () => enrolled ? enrollmentRow : null },
       dispatch: async (input) => {
         dispatches.push(input);
         return { enrolled: true, workflowId: "review:wf" };
@@ -67,6 +67,8 @@ function app(enrolled = true) {
     }),
   };
 }
+
+const manualEnrollment: EnrollmentRow = { ...enrollment, triggerMode: "manual" };
 
 describe("POST /api/v1/integrations/github/events", () => {
   test("rejects an over-cap content-length before signature verification", async () => {
@@ -141,6 +143,60 @@ describe("POST /api/v1/integrations/github/events", () => {
       idempotencyKey: "delivery-1",
       headSha: "head-sha",
     }]);
+  });
+
+  test("dispatches a synchronize (push) for auto enrollment", async () => {
+    const body = pullRequestBody("synchronize");
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.dispatches).toEqual([{
+      repo: enrollment.repo,
+      prNumber: 100,
+      trigger: "synchronize",
+      idempotencyKey: "delivery-1",
+      headSha: "head-sha",
+    }]);
+  });
+
+  test("does NOT auto-review a synchronize (push) under manual enrollment (#802)", async () => {
+    const body = pullRequestBody("synchronize");
+    const fixture = app(true, manualEnrollment);
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.dispatches).toEqual([]);
+  });
+
+  test("does NOT auto-review an opened PR under manual enrollment", async () => {
+    const body = pullRequestBody("opened");
+    const fixture = app(true, manualEnrollment);
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.dispatches).toEqual([]);
+  });
+
+  test("does NOT auto-review a draft PR even under auto enrollment", async () => {
+    const body = pullRequestBody("synchronize", true);
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.dispatches).toEqual([]);
   });
 
   test("dispatches a review command (mentioning the configured App handle) with its focus", async () => {

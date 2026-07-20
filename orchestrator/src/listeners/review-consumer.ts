@@ -20,6 +20,17 @@ export interface ReviewConsumerDeps {
   send: ReviewMailboxSend;
 }
 
+/** Whether a `run_completed` payload reports a failed harness run (`ok:false`).
+ *  A malformed or absent flag is treated as a clean run — the same tolerant
+ *  default the pre-`ok` behaviour had. */
+function runCompletedFailed(payloadJson: string): boolean {
+  try {
+    return (JSON.parse(payloadJson) as { ok?: unknown }).ok === false;
+  } catch {
+    return false;
+  }
+}
+
 export function makeReviewConsumer(deps: ReviewConsumerDeps): SessionConsumer {
   let binding: ReviewSessionBinding | null | undefined;
 
@@ -38,14 +49,18 @@ export function makeReviewConsumer(deps: ReviewConsumerDeps): SessionConsumer {
       return binding !== null;
     },
     async handle(event, ctx) {
-      // A successful harness run returns the reusable session to Idle instead
-      // of terminating it. `run_completed` is the curated event for that
-      // transition and backs up the authoritative in-band tool signal.
+      // A harness run returns the reusable session to Idle instead of
+      // terminating it. `run_completed` is the curated event for that
+      // transition and backs up the authoritative in-band tool signal. Its
+      // `ok` flag tells a clean turn (`ok:true`) apart from a run that ERRORED
+      // (`ok:false` — e.g. the agent could not authenticate); the workflow must
+      // never report a failed run as a "no findings" completion.
       if (event.kind !== "run_completed") return;
+      const runFailed = runCompletedFailed(event.payloadJson);
       const { reviewWorkflowId, role } = destination();
       await deps.send(
         reviewWorkflowId,
-        { kind: "session_idle", role },
+        { kind: "session_idle", role, ...(runFailed ? { runFailed: true } : {}) },
         REVIEW_TOPIC,
         `review:${ctx.sessionId}:idle`,
       );

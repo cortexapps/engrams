@@ -518,6 +518,10 @@ export async function createSessionForExistingTask(
         sessionId: created.sessionId,
         role: params.role,
         profileId: profile.id,
+        // Persist the effective granted capabilities so the tool-exec gate
+        // honors a capabilityOverride (review workers) rather than re-deriving
+        // from the profile, which may not carry them.
+        capabilities: sessionInput.capabilities ?? [],
       });
       if (params.registerListener === true) {
         await tx.insert(sessionListenerTable).values({
@@ -621,6 +625,9 @@ export async function createTaskWithSession(
         sessionId: created.sessionId,
         role: "primary",
         profileId: profile.id,
+        // See createSessionForExistingTask: persist the effective granted
+        // capabilities so the tool-exec gate honors overrides/extras.
+        capabilities: sessionInput.capabilities ?? [],
       });
       if (params.slackThreadWorkflowId !== undefined) {
         await tx.insert(slackSessionTable).values({

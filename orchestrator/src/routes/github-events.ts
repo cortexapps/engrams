@@ -82,10 +82,13 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
         );
         return c.body(null, 200);
       }
-      if (
-        (event.action === "opened" || event.action === "ready_for_review") &&
-        (enrollment.triggerMode !== "auto" || event.draft)
-      ) {
+      // Every remaining pull_request action (opened / synchronize /
+      // ready_for_review) is an AUTOMATIC trigger. It fires a review only when
+      // the repo is enrolled in auto mode and the PR isn't a draft; in manual
+      // (mention-only) mode all of them are ignored — a review comes from an
+      // @mention command instead. (synchronize was previously ungated, so a
+      // push to a manual-mode PR auto-reviewed — the #802 bug.)
+      if (enrollment.triggerMode !== "auto" || event.draft) {
         return c.body(null, 200);
       }
       await dispatch({

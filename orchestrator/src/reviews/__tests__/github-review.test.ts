@@ -9,6 +9,7 @@ import {
 import {
   buildInlineCommentBody,
   buildReviewSummary,
+  buildStatusComment,
   makeGithubReviewPoster,
 } from "../github-review.ts";
 import type { PolicyDecision } from "../policy-gate.ts";
@@ -210,6 +211,72 @@ describe("GithubReviewPoster", () => {
     expect(fake.calls).toHaveLength(2);
     expect(fake.calls[0]?.request.path).toContain("page=1");
     expect(fake.calls[1]?.request.path).toContain("page=2");
+  });
+
+  test("upsertStatusComment posts a fresh comment when no id is given", async () => {
+    const fake = fakeRunOp([response(201, { id: 555 })]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    expect(await poster.upsertStatusComment({
+      repo: "openai/engrams",
+      prNumber: 100,
+      body: "👀 acknowledged",
+    })).toEqual({ commentId: "555" });
+    expect(fake.calls[0]?.request).toMatchObject({
+      method: "POST",
+      path: "/repos/openai/engrams/issues/100/comments",
+    });
+  });
+
+  test("upsertStatusComment edits in place when the id is known", async () => {
+    const fake = fakeRunOp([response(200, { id: 555 })]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    expect(await poster.upsertStatusComment({
+      repo: "openai/engrams",
+      prNumber: 100,
+      commentId: "555",
+      body: "⏳ reviewing",
+    })).toEqual({ commentId: "555" });
+    expect(fake.calls[0]?.request).toMatchObject({
+      method: "PATCH",
+      path: "/repos/openai/engrams/issues/comments/555",
+    });
+  });
+
+  test("upsertStatusComment reposts when the sticky comment was deleted (404)", async () => {
+    const fake = fakeRunOp([
+      response(404, { message: "Not Found" }),
+      response(201, { id: 777 }),
+    ]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    expect(await poster.upsertStatusComment({
+      repo: "openai/engrams",
+      prNumber: 100,
+      commentId: "555",
+      body: "⏳ reviewing",
+    })).toEqual({ commentId: "777" });
+    expect(fake.calls).toHaveLength(2);
+    expect(fake.calls[0]?.request.method).toBe("PATCH");
+    expect(fake.calls[1]?.request.method).toBe("POST");
+  });
+
+  test("buildStatusComment renders each lifecycle phase with the hidden marker", () => {
+    const marker = "<!-- engrams-status:review-1 -->";
+    expect(buildStatusComment({ reviewId: "review-1", phase: "acknowledged" }))
+      .toBe(`👀 **engrams review** — acknowledged, queued.\n\n${marker}`);
+    expect(buildStatusComment({ reviewId: "review-1", phase: "verifying", count: 3 }))
+      .toContain("confirming 3 candidate findings…");
+    const posted = buildStatusComment({
+      reviewId: "review-1",
+      phase: "posted",
+      count: 1,
+      reviewUrl: "https://engrams.example/reviews",
+    });
+    expect(posted).toContain("1 finding posted.");
+    expect(posted).toContain("[View details](https://engrams.example/reviews)");
+    expect(posted.endsWith(marker)).toBe(true);
   });
 
   test("summary preserves demoted findings and ends with the marker", () => {
