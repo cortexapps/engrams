@@ -150,12 +150,16 @@ impl DevicePlane {
             .insert(id, DeviceSlot::fresh(device, lease, self.generation));
     }
 
-    /// The lowest `/dev/nbdN` ordinal (`N < capacity`) not currently owned by
-    /// any slot — a free device path for a new sandbox. `None` when the
-    /// universe is exhausted (the small-world capacity should preclude this).
+    /// The lowest `/dev/nbdN` ordinal (`N < capacity`) not owned by any
+    /// per-sandbox slot NOR held as a spare lease — a genuinely free device
+    /// path for a new sandbox. `None` when the universe is exhausted (the
+    /// small-world capacity should preclude this). Excluding the spare leases is
+    /// load-bearing: a spare `slot_claim` holds a real pool lease on its path,
+    /// so returning it here would make the subsequent `claim` fail.
     pub fn next_free_device(&self) -> Option<PathBuf> {
-        let in_use: std::collections::BTreeSet<PathBuf> =
+        let mut in_use: std::collections::BTreeSet<PathBuf> =
             self.slots.values().map(|s| s.nbd_device.clone()).collect();
+        in_use.extend(self.spare_leases.iter().map(|l| l.path().to_path_buf()));
         (0..self.nbd_capacity)
             .map(|n| PathBuf::from(format!("/dev/nbd{n}")))
             .find(|p| !in_use.contains(p))

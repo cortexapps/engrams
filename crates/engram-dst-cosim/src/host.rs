@@ -588,6 +588,13 @@ impl CosimHost {
     pub fn served_by_current(&self, id: SandboxId) -> bool {
         self.device.served_by_current(id)
     }
+    /// Does the host hold a LIVE RAM backend for this sandbox — i.e. is it
+    /// ACTIVELY serving the guest (not paused for a capture, not post-roll
+    /// pre-rehydrate)? The split-brain oracle keys on this: a paused/capturing
+    /// device is mid-lifecycle-transition, not actively double-serving.
+    pub fn has_live_backend(&self, id: SandboxId) -> bool {
+        self.sandboxes.get(&id).is_some_and(|s| s.backend.is_some())
+    }
     pub fn guest_holds_device(&self, id: SandboxId) -> bool {
         self.device.guest_holds_device(id)
     }

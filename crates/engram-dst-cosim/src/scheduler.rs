@@ -643,14 +643,77 @@ impl Cosim {
         Ok(())
     }
 
-    /// **Oracle — cross-boundary ownership agreement:** for every device this
-    /// host generation SERVES, the coordinator agrees it still owns the bound
-    /// session→sandbox (`sandbox_ownership_core`). A served survivor the
-    /// coordinator disowns is a split — the host would keep flushing a plane
-    /// the coordinator has re-homed. Terminal/absent sessions (legitimately
-    /// disowned) whose device is NOT served are exempt (the reconcile reaps
-    /// them separately).
+    /// **Oracle — cross-boundary ownership agreement (the split-brain guard):**
+    /// for every device this host generation SERVES that is bound to a
+    /// NON-TERMINAL session, the coordinator must agree it still owns the
+    /// session→sandbox (`sandbox_ownership_core`). A served plane whose live
+    /// session the coordinator has RE-HOMED to a different binding is the split
+    /// — the host would keep flushing a plane another binding now owns.
+    ///
+    /// A TERMINAL session's still-served device is deliberately NOT flagged
+    /// here: the coordinator ended the session (it was not re-homed), and the
+    /// device is a teardown-in-progress leftover the reconcile reaps. That
+    /// window is legitimate and transient; its COMPLETION is guaranteed
+    /// separately by [`assert_teardown_complete`](Self::assert_teardown_complete)
+    /// at quiescence. Scoping the split-brain check to non-terminal sessions
+    /// matches the invariant's intent (re-home, not teardown) — it does not
+    /// weaken it (RCA'd from the swarm's first firing, seed 7: a `ForceTerminal`
+    /// step left a served device before the reconcile reap ran).
     pub async fn assert_ownership_agreement(&self) -> Result<(), String> {
+        // Only ACTIVELY-serving planes (a live RAM backend) can double-serve /
+        // race a re-home. A paused (capture-in-flight) or post-roll device with
+        // no live backend is mid-lifecycle-transition — its teardown/rehydrate
+        // is checked at quiescence, not flagged here.
+        let active: Vec<SandboxId> = {
+            let host = self.world.host.lock().await;
+            host.device_slot_ids()
+                .into_iter()
+                .filter(|id| host.served_by_current(*id) && host.has_live_backend(*id))
+                .collect()
+        };
+        for sandbox in active {
+            let Some(session) = self.session_binding(sandbox) else {
+                continue; // a served device with no known session — freshly created, unbound
+            };
+            // A terminal session's device is teardown-in-progress (checked at
+            // quiescence), not a re-home split-brain.
+            if self
+                .session_state(session)
+                .await
+                .is_some_and(|s| s.is_terminal())
+            {
+                continue;
+            }
+            let owned = engram_coordinator::api::host_http::sandbox_ownership_core(
+                &self.world.state,
+                session,
+                sandbox,
+            )
+            .await
+            .unwrap_or(false);
+            if !owned {
+                return Err(format!(
+                    "ownership-agreement: host ACTIVELY serves sandbox {sandbox} (live backend) \
+                     bound to NON-TERMINAL session {session}, but the coordinator disowns it — a \
+                     served plane the coordinator has re-homed (split-brain)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// **Oracle — teardown / ownership completeness (quiescence only, the STRONG
+    /// form):** after the reconcile + finalize + straggler drain, EVERY device
+    /// the host still serves for a known session must be OWNED by the
+    /// coordinator. Transiently a leftover lingers — a terminal session's device
+    /// awaiting its reconcile reap, an evicted sandbox mid-finalize (coord
+    /// binding cleared by D5), a re-home window — and the every-step guard
+    /// exempts those non-actively-serving cases. But by quiescence every such
+    /// leftover MUST be resolved (the finalize destroyed it, the reconcile
+    /// reaped it, or the coord re-bound it); a served-yet-disowned device at
+    /// quiescence is a teardown-liveness hole (a plane that never converges).
+    /// This is the strong closure the every-step guard's exemptions rely on.
+    pub async fn assert_teardown_complete(&self) -> Result<(), String> {
         let served: Vec<SandboxId> = {
             let host = self.world.host.lock().await;
             host.device_slot_ids()
@@ -660,7 +723,7 @@ impl Cosim {
         };
         for sandbox in served {
             let Some(session) = self.session_binding(sandbox) else {
-                continue; // a served device with no known session — freshly created, unbound
+                continue;
             };
             let owned = engram_coordinator::api::host_http::sandbox_ownership_core(
                 &self.world.state,
@@ -671,9 +734,9 @@ impl Cosim {
             .unwrap_or(false);
             if !owned {
                 return Err(format!(
-                    "ownership-agreement: host generation serves sandbox {sandbox} bound to \
-                     session {session}, but the coordinator disowns it — a served plane the \
-                     coordinator has re-homed (split-brain)"
+                    "teardown-complete: at quiescence the host still SERVES sandbox {sandbox} \
+                     bound to session {session}, but the coordinator disowns it — a leftover plane \
+                     the reconcile/finalize drain never converged (a teardown-liveness hole)"
                 ));
             }
         }
