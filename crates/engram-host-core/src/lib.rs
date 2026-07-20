@@ -42,6 +42,7 @@ pub mod fs;
 pub mod nbd;
 pub mod reattach;
 pub mod shutdown;
+pub mod startup;
 pub mod survivor;
 
 pub use checkpoint::checkpoint_tail_admits_publish;
@@ -53,11 +54,15 @@ pub use device::DeviceSync;
 pub use effects::HostEffects;
 pub use finalize::{plan_finalize_retry, FinalizeRetry, FinalizeStage};
 pub use fs::{HostFs, TokioFs};
-pub use nbd::{NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
+pub use nbd::{ConnectedDevice, NbdConnectRequest, NbdKernel, NbdReconfigureRequest};
 pub use reattach::{
     first_seeded_probe, is_local_survivor_candidate, plan_reattach, probe_matches,
     resume_data_plane_served, sweep_verdict, DeviceHolder, PidLiveness, ReattachPlan, ReattachStep,
     SweepAction,
+};
+pub use startup::{
+    classify_startup_slot, classify_startup_slots, ReapList, SlotClass, StartupClassification,
+    StartupSlot,
 };
 pub use survivor::{
     plan_capture_disk_drain, plan_resume_attach, CaptureDrainPlan, ResumeAttachPlan,
