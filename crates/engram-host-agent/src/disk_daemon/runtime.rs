@@ -888,10 +888,6 @@ pub async fn reattach_manifest(
              rehydrate ref's manifest id",
         );
     }
-    // The adopt-before-RECONFIGURE ordering is a plan property; assert it so a
-    // future reorder trips loudly rather than reintroducing the 2026-07-16
-    // rolled-back-base read window.
-    debug_assert!(plan.seed_precedes_reconfigure());
     let backend =
         match ChunkedDiskBackend::from_blob(disk_manifest_ref, cache, store, threshold_bytes).await
         {
@@ -904,21 +900,84 @@ pub async fn reattach_manifest(
     let probe: Option<(usize, Vec<u8>)> =
         engram_host_core::first_seeded_probe(seed_dirty.as_deref())
             .map(|(idx, bytes)| (idx, bytes.to_vec()));
-    if let Some(chunks) = seed_dirty {
-        let count = chunks.len();
-        let bytes = backend.adopt_unflushed(chunks).await;
-        tracing::info!(
-            device = %slot.path().display(),
-            chunks = count,
-            bytes,
-            "rehydrate: adopted predecessor's shutdown-spool dirty chunks \
-             ahead of RECONFIGURE",
-        );
+    // Execute the PLAN's steps in the plan's own order (issue #810 finding
+    // 1a). The previous shape hand-ordered these calls and carried a
+    // `debug_assert!(plan.seed_precedes_reconfigure())` — a release no-op
+    // that checked the PLAN's internal order, not the driver's execution
+    // order, so a future driver reorder would have silently reintroduced
+    // the 2026-07-16 rolled-back-base read window. Iterating `plan.steps`
+    // makes the ordering structurally unbypassable (the ReapList lesson):
+    // the driver cannot reorder what it does not sequence.
+    // (The error is captured and returned ONCE below the loop — `slot` moves
+    // into the park-shaped `Err((slot, e))`, which the borrow checker rightly
+    // refuses inside a loop that reads `slot.path()` on later iterations.)
+    let mut seed_dirty = seed_dirty;
+    let mut handle = None;
+    let mut step_err: Option<NbdRuntimeError> = None;
+    'steps: for step in &plan.steps {
+        match step {
+            engram_host_core::ReattachStep::SeedDirtyTier => {
+                let chunks = seed_dirty.take().expect(
+                    "plan_reattach emits SeedDirtyTier iff a seed exists (host-core pinned)",
+                );
+                let count = chunks.len();
+                // #810: adoption is ATOMIC and fallible — one out-of-shape
+                // chunk refuses the whole spool (adopting a subset silently
+                // rolls back the missing chunk's acked write). Refusal parks
+                // the survivor with the spool preserved on disk.
+                let bytes = match backend.adopt_unflushed(chunks).await {
+                    Ok(b) => b,
+                    Err(e) => {
+                        step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
+                            "rehydrate: spool adoption refused; parking the survivor \
+                             rather than serving with rolled-back acked writes: {e}"
+                        ))));
+                        break 'steps;
+                    }
+                };
+                tracing::info!(
+                    device = %slot.path().display(),
+                    chunks = count,
+                    bytes,
+                    "rehydrate: adopted predecessor's shutdown-spool dirty chunks \
+                     ahead of RECONFIGURE",
+                );
+            }
+            engram_host_core::ReattachStep::Reconfigure => {
+                match reattach(backend.clone(), slot.path(), &plan.backend_id).await {
+                    Ok(h) => handle = Some(h),
+                    Err(e) => {
+                        step_err = Some(e);
+                        break 'steps;
+                    }
+                }
+                // #810 finding 1b (hygiene half): fresh CONNECT invalidates
+                // the reused minor's page cache (the 85e0298a cross-tenant
+                // class, documented at `attach_backend`) — but the reattach
+                // path never did, leaving the PREDECESSOR GENERATION's
+                // cached pages as exactly the stale view a surviving guest
+                // must never read. Same hard-error posture as CONNECT:
+                // serving without the invalidation risks silent corruption,
+                // strictly worse than a parked survivor.
+                let dev = slot.path().to_path_buf();
+                if let Err(e) = tokio::task::spawn_blocking(move || flush_block_device_cache(&dev))
+                    .await
+                    .map_err(|e| io::Error::other(format!("BLKFLSBUF task join: {e}")))
+                    .and_then(|r| r)
+                {
+                    step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
+                        "invalidate page cache (BLKFLSBUF) on reattached {}: {e}",
+                        slot.path().display()
+                    ))));
+                    break 'steps;
+                }
+            }
+        }
     }
-    let handle = match reattach(backend.clone(), slot.path(), &plan.backend_id).await {
-        Ok(h) => h,
-        Err(e) => return Err((slot, e)),
-    };
+    if let Some(e) = step_err {
+        return Err((slot, e));
+    }
+    let handle = handle.expect("plan_reattach always emits Reconfigure (host-core pinned)");
     // Verify-on-read rider (ADR 0098 P7): only when a spool was adopted, prove
     // the seeded acked bytes are readable at their offset after RECONFIGURE —
     // a single-chunk probe through the backend (an in-RAM dirty-tier read),

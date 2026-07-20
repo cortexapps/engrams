@@ -1293,7 +1293,14 @@ impl SimHost {
             if spool_ref.manifest_id == rebuild_ref.manifest_id
                 && spool_ref.version >= rebuild_ref.version
             {
-                backend.adopt_unflushed(chunks).await;
+                // #810: adoption is atomic-and-fallible in prod; the sim's
+                // spool chunks come from the REAL spool reader (shape-valid
+                // by construction), so a refusal here is a world-model bug —
+                // surface it as a rebuild failure, mirroring prod's park.
+                backend
+                    .adopt_unflushed(chunks)
+                    .await
+                    .map_err(|e| format!("sandbox {idx}: spool adoption refused: {e}"))?;
             }
             // Adopted or stale: the spool is consumed either way.
             spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
