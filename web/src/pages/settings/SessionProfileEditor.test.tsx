@@ -143,6 +143,23 @@ describe("SessionProfileEditor (create)", () => {
     expect(create.mock.calls[0][0]).toMatchObject({ designation: "pr_reviewer" });
   });
 
+  it("locks the workflow-overridden sections when the PR reviewer toggle is on (ADR 0100)", () => {
+    // The review workflow replaces capabilities/network/env/secrets per
+    // session (capabilityOverride + networkOverride + dropProfileSecretsAndEnv),
+    // so on the designated reviewer profile those sections must read as locked
+    // — an edit there silently does nothing.
+    render(<SessionProfileEditor mode="create" />);
+    expect(screen.queryAllByTestId("reviewer-locked")).toHaveLength(0);
+    fireEvent.click(screen.getByLabelText(/pr reviewer profile/i));
+    // Integrations + Network are always visible; env/secrets live behind the
+    // Advanced disclosure and gain the same wrapper there.
+    expect(screen.getAllByTestId("reviewer-locked").length).toBeGreaterThanOrEqual(2);
+    expect(screen.getAllByText(/locked for pr review sessions/i).length).toBeGreaterThanOrEqual(2);
+    // Unticking restores the editable sections.
+    fireEvent.click(screen.getByLabelText(/pr reviewer profile/i));
+    expect(screen.queryAllByTestId("reviewer-locked")).toHaveLength(0);
+  });
+
   it("toggling a skill includes it in the payload (ADR 0055)", async () => {
     render(<SessionProfileEditor mode="create" />);
     fireEvent.change(screen.getByLabelText(/profile name/i), {

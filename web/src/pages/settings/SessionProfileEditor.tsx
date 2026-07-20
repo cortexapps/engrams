@@ -164,6 +164,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const envRows = watch("envRows");
   const secretRows = watch("secretRows");
   const portExposures = watch("portExposures");
+  // ADR 0100: the PR-review workflow creates its sessions with a hardened
+  // override — capabilityOverride + networkOverride + dropProfileSecretsAndEnv
+  // (orchestrator/src/workflows/review-control-plane.ts) — so on the designated
+  // reviewer profile the integrations/network/env/secrets sections are dead
+  // config. Lock them with an explanation instead of letting an edit silently
+  // do nothing (a live prod debugging session was spent on exactly that).
+  const reviewerLocked = watch("designation");
   const networkDefault = watch("networkDefault");
   const allowHostsText = watch("allowHostsText");
   const allowPatternsText = watch("allowPatternsText");
@@ -596,89 +603,91 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             title="Integrations"
             sub="Enable an integration to bind its credential and open its egress — then choose exactly which powers sessions get."
           >
-            {connected.length === 0 ? (
-              <EmptyIntegrations />
-            ) : (
-              <div className="flex flex-col gap-3">
-                {connected.map((v) => {
-                  const grantedCount = v.capabilities.filter((c) =>
-                    capOn(v.provider, c.action),
-                  ).length;
-                  const on = grantedCount > 0;
-                  return (
-                    <div
-                      key={v.provider}
-                      className={`overflow-hidden rounded-md border ${on ? "border-ring/40" : "bg-background"}`}
-                    >
+            <ReviewerLocked locked={reviewerLocked} what="integration powers">
+              {connected.length === 0 ? (
+                <EmptyIntegrations />
+              ) : (
+                <div className="flex flex-col gap-3">
+                  {connected.map((v) => {
+                    const grantedCount = v.capabilities.filter((c) =>
+                      capOn(v.provider, c.action),
+                    ).length;
+                    const on = grantedCount > 0;
+                    return (
                       <div
-                        className={`flex items-center gap-3 px-3.5 py-3 ${on ? "bg-primary/[0.06]" : ""}`}
+                        key={v.provider}
+                        className={`overflow-hidden rounded-md border ${on ? "border-ring/40" : "bg-background"}`}
                       >
-                        <ProviderTile {...v.icon} name={v.name} size={32} />
-                        <div className="min-w-0 flex-1">
-                          <div className="text-[0.92rem] font-semibold">{v.name}</div>
-                          {on ? (
-                            <div className="flex flex-wrap items-center gap-2.5 text-[0.72rem] text-muted-foreground">
-                              <span className="inline-flex items-center gap-1">
-                                {v.credentialSource === "mint" ? (
-                                  <ShieldCheckIcon className="size-3 text-instrument-nominal" />
-                                ) : (
-                                  <LockIcon className="size-3 text-instrument-nominal" />
-                                )}
-                                {v.credentialSource === "mint"
-                                  ? `${v.name} token minted per session`
-                                  : "brokered at proxy"}
-                              </span>
-                              <span className="inline-flex items-center gap-1">
-                                <GlobeIcon className="size-3" />
-                                {v.hosts.join(", ")}
-                              </span>
-                            </div>
-                          ) : (
-                            <div className="truncate text-[0.78rem] text-muted-foreground">
-                              {v.blurb}
-                            </div>
-                          )}
+                        <div
+                          className={`flex items-center gap-3 px-3.5 py-3 ${on ? "bg-primary/[0.06]" : ""}`}
+                        >
+                          <ProviderTile {...v.icon} name={v.name} size={32} />
+                          <div className="min-w-0 flex-1">
+                            <div className="text-[0.92rem] font-semibold">{v.name}</div>
+                            {on ? (
+                              <div className="flex flex-wrap items-center gap-2.5 text-[0.72rem] text-muted-foreground">
+                                <span className="inline-flex items-center gap-1">
+                                  {v.credentialSource === "mint" ? (
+                                    <ShieldCheckIcon className="size-3 text-instrument-nominal" />
+                                  ) : (
+                                    <LockIcon className="size-3 text-instrument-nominal" />
+                                  )}
+                                  {v.credentialSource === "mint"
+                                    ? `${v.name} token minted per session`
+                                    : "brokered at proxy"}
+                                </span>
+                                <span className="inline-flex items-center gap-1">
+                                  <GlobeIcon className="size-3" />
+                                  {v.hosts.join(", ")}
+                                </span>
+                              </div>
+                            ) : (
+                              <div className="truncate text-[0.78rem] text-muted-foreground">
+                                {v.blurb}
+                              </div>
+                            )}
+                          </div>
+                          <div className="flex items-center gap-2.5">
+                            <Text
+                              variant="label"
+                              tone={on ? "inherit" : "muted"}
+                              className={`text-[0.62rem] ${on ? "text-instrument-nominal" : ""}`}
+                            >
+                              {on ? "Enabled" : "Off"}
+                            </Text>
+                            <Switch
+                              checked={on}
+                              aria-label={`Enable ${v.name}`}
+                              onCheckedChange={(c) => (c ? enableProvider(v) : disableProvider(v))}
+                            />
+                          </div>
                         </div>
-                        <div className="flex items-center gap-2.5">
-                          <Text
-                            variant="label"
-                            tone={on ? "inherit" : "muted"}
-                            className={`text-[0.62rem] ${on ? "text-instrument-nominal" : ""}`}
-                          >
-                            {on ? "Enabled" : "Off"}
-                          </Text>
-                          <Switch
-                            checked={on}
-                            aria-label={`Enable ${v.name}`}
-                            onCheckedChange={(c) => (c ? enableProvider(v) : disableProvider(v))}
-                          />
-                        </div>
+                        {on && (
+                          <div className="border-t">
+                            <PowerSelector
+                              view={v}
+                              isOn={(action) => capOn(v.provider, action)}
+                              onToggle={(action, value) => toggleCap(v.provider, action, value)}
+                            />
+                          </div>
+                        )}
                       </div>
-                      {on && (
-                        <div className="border-t">
-                          <PowerSelector
-                            view={v}
-                            isOn={(action) => capOn(v.provider, action)}
-                            onToggle={(action, value) => toggleCap(v.provider, action, value)}
-                          />
-                        </div>
-                      )}
-                    </div>
-                  );
-                })}
-                <Button
-                  asChild
-                  variant="ghost"
-                  size="sm"
-                  className="self-start text-muted-foreground"
-                >
-                  <Link to="/settings/integrations">
-                    <PlusIcon className="size-3.5" />
-                    Connect another integration
-                  </Link>
-                </Button>
-              </div>
-            )}
+                    );
+                  })}
+                  <Button
+                    asChild
+                    variant="ghost"
+                    size="sm"
+                    className="self-start text-muted-foreground"
+                  >
+                    <Link to="/settings/integrations">
+                      <PlusIcon className="size-3.5" />
+                      Connect another integration
+                    </Link>
+                  </Button>
+                </div>
+              )}
+            </ReviewerLocked>
           </Section>
 
           <Section
@@ -686,77 +695,81 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             title="Network"
             sub="Session egress policy. New profiles deny by default; add extra hosts only if a power can't."
           >
-            <div className="flex items-center gap-2.5 rounded-md border bg-background px-3.5 py-2.5">
-              <LockIcon className="size-4 shrink-0 text-instrument-nominal" />
-              <div className="flex-1 text-[0.82rem]">
-                <strong>{networkDefault === "allow" ? "Open egress." : "Automatic egress."}</strong>{" "}
-                <span className="text-muted-foreground">
-                  {networkDefault === "allow"
-                    ? "Hosts not matched below remain reachable."
-                    : policy.derivedHosts.length === 0
-                      ? "No powers granted — sessions are fully sandboxed."
-                      : `${policy.derivedHosts.length} host${policy.derivedHosts.length === 1 ? "" : "s"} opened by granted powers.`}
-                </span>
+            <ReviewerLocked locked={reviewerLocked} what="network policy">
+              <div className="flex items-center gap-2.5 rounded-md border bg-background px-3.5 py-2.5">
+                <LockIcon className="size-4 shrink-0 text-instrument-nominal" />
+                <div className="flex-1 text-[0.82rem]">
+                  <strong>
+                    {networkDefault === "allow" ? "Open egress." : "Automatic egress."}
+                  </strong>{" "}
+                  <span className="text-muted-foreground">
+                    {networkDefault === "allow"
+                      ? "Hosts not matched below remain reachable."
+                      : policy.derivedHosts.length === 0
+                        ? "No powers granted — sessions are fully sandboxed."
+                        : `${policy.derivedHosts.length} host${policy.derivedHosts.length === 1 ? "" : "s"} opened by granted powers.`}
+                  </span>
+                </div>
               </div>
-            </div>
-            {(policy.derivedHosts.length > 0 ||
-              policy.extraHosts.length > 0 ||
-              policy.extraPatterns.length > 0) && (
-              <div className="mt-2.5 flex flex-wrap gap-1.5">
-                {policy.derivedHosts.map((h) => (
-                  <HostChip key={h} host={h} derived />
-                ))}
-                {[...policy.extraHosts, ...policy.extraPatterns].map((h) => (
-                  <HostChip key={h} host={h} />
-                ))}
-              </div>
-            )}
-            <button
-              type="button"
-              onClick={() => setNetOpen((v) => !v)}
-              className="mt-3 inline-flex items-center gap-1.5 text-[0.78rem] text-muted-foreground hover:text-foreground"
-            >
-              <ChevronDownIcon
-                className={`size-3.5 transition-transform ${netOpen ? "rotate-180" : ""}`}
-              />
-              Add extra hosts
-            </button>
-            {netOpen && (
-              <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
-                <Controller
-                  control={control}
-                  name="allowHostsText"
-                  render={({ field }) => (
-                    <Field>
-                      <FieldLabel htmlFor="allow-hosts">Allowed hosts</FieldLabel>
-                      <Textarea
-                        {...field}
-                        id="allow-hosts"
-                        rows={3}
-                        placeholder={"db.internal\nregistry.npmjs.org"}
-                        className="font-mono text-sm"
-                      />
-                    </Field>
-                  )}
+              {(policy.derivedHosts.length > 0 ||
+                policy.extraHosts.length > 0 ||
+                policy.extraPatterns.length > 0) && (
+                <div className="mt-2.5 flex flex-wrap gap-1.5">
+                  {policy.derivedHosts.map((h) => (
+                    <HostChip key={h} host={h} derived />
+                  ))}
+                  {[...policy.extraHosts, ...policy.extraPatterns].map((h) => (
+                    <HostChip key={h} host={h} />
+                  ))}
+                </div>
+              )}
+              <button
+                type="button"
+                onClick={() => setNetOpen((v) => !v)}
+                className="mt-3 inline-flex items-center gap-1.5 text-[0.78rem] text-muted-foreground hover:text-foreground"
+              >
+                <ChevronDownIcon
+                  className={`size-3.5 transition-transform ${netOpen ? "rotate-180" : ""}`}
                 />
-                <Controller
-                  control={control}
-                  name="allowPatternsText"
-                  render={({ field }) => (
-                    <Field>
-                      <FieldLabel htmlFor="allow-patterns">Host patterns</FieldLabel>
-                      <Textarea
-                        {...field}
-                        id="allow-patterns"
-                        rows={3}
-                        placeholder={"*.githubusercontent.com\n*.pypi.org"}
-                        className="font-mono text-sm"
-                      />
-                    </Field>
-                  )}
-                />
-              </div>
-            )}
+                Add extra hosts
+              </button>
+              {netOpen && (
+                <div className="mt-2.5 grid gap-3 sm:grid-cols-2">
+                  <Controller
+                    control={control}
+                    name="allowHostsText"
+                    render={({ field }) => (
+                      <Field>
+                        <FieldLabel htmlFor="allow-hosts">Allowed hosts</FieldLabel>
+                        <Textarea
+                          {...field}
+                          id="allow-hosts"
+                          rows={3}
+                          placeholder={"db.internal\nregistry.npmjs.org"}
+                          className="font-mono text-sm"
+                        />
+                      </Field>
+                    )}
+                  />
+                  <Controller
+                    control={control}
+                    name="allowPatternsText"
+                    render={({ field }) => (
+                      <Field>
+                        <FieldLabel htmlFor="allow-patterns">Host patterns</FieldLabel>
+                        <Textarea
+                          {...field}
+                          id="allow-patterns"
+                          rows={3}
+                          placeholder={"*.githubusercontent.com\n*.pypi.org"}
+                          className="font-mono text-sm"
+                        />
+                      </Field>
+                    )}
+                  />
+                </div>
+              )}
+            </ReviewerLocked>
           </Section>
 
           {/* advanced — a disclosure card, de-emphasized beneath the spine */}
@@ -791,6 +804,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   }
                   portExposures={portExposures}
                   setPortExposures={(p) => setValue("portExposures", p, { shouldDirty: true })}
+                  reviewerLocked={reviewerLocked}
                 />
               </CardContent>
             )}
@@ -827,6 +841,42 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
         </Button>
       </div>
     </form>
+  );
+}
+
+/** ADR 0100: explains why a section is inert on the designated reviewer
+ *  profile, then renders its children inside a disabled fieldset. The review
+ *  workflow replaces these profile fields per session (capabilityOverride /
+ *  networkOverride / dropProfileSecretsAndEnv), so edits here would silently
+ *  do nothing — lock them and say so. */
+function ReviewerLocked({
+  locked,
+  what,
+  children,
+}: {
+  locked: boolean;
+  what: string;
+  children: React.ReactNode;
+}) {
+  if (!locked) return <>{children}</>;
+  return (
+    <div data-testid="reviewer-locked">
+      <div className="mb-3 flex items-start gap-2.5 rounded-md border border-instrument-caution/40 bg-instrument-caution/[0.07] px-3.5 py-2.5">
+        <LockIcon className="mt-0.5 size-4 shrink-0 text-instrument-caution" />
+        <div className="text-[0.82rem] leading-relaxed">
+          <strong>Locked for PR review sessions.</strong>{" "}
+          <span className="text-muted-foreground">
+            The review workflow replaces this profile&apos;s {what} with its own hardened policy —
+            read-only access to the repo under review, no profile secrets or env, and egress limited
+            to GitHub plus the harness&apos;s model API. Image, harness, model, effort, and skills
+            still apply.
+          </span>
+        </div>
+      </div>
+      <fieldset disabled className="pointer-events-none opacity-55" aria-disabled>
+        {children}
+      </fieldset>
+    </div>
   );
 }
 
@@ -888,6 +938,7 @@ function Advanced({
   setIncludeUserTokens,
   portExposures,
   setPortExposures,
+  reviewerLocked,
 }: {
   skillCatalog: Skill[];
   skills: string[];
@@ -901,6 +952,7 @@ function Advanced({
   setIncludeUserTokens: (b: boolean) => void;
   portExposures: number[];
   setPortExposures: (p: number[]) => void;
+  reviewerLocked: boolean;
 }) {
   const uploadSkill = useUploadSkill();
   const [skillName, setSkillName] = useState("");
@@ -1021,7 +1073,9 @@ function Advanced({
       <div>
         <Text variant="label">Environment variables</Text>
         <div className="mt-2">
-          <EnvVarsEditor rows={envRows} onChange={setEnvRows} />
+          <ReviewerLocked locked={reviewerLocked} what="environment variables">
+            <EnvVarsEditor rows={envRows} onChange={setEnvRows} />
+          </ReviewerLocked>
         </div>
       </div>
 
@@ -1098,11 +1152,13 @@ function Advanced({
           For values not tied to an integration (a DB URL, an internal token). Broker keeps them out
           of the sandbox.
         </p>
-        <ProfileSecretsEditor
-          rows={secretRows}
-          onChange={setSecretRows}
-          secretNames={orgSecretNames}
-        />
+        <ReviewerLocked locked={reviewerLocked} what="injected secrets">
+          <ProfileSecretsEditor
+            rows={secretRows}
+            onChange={setSecretRows}
+            secretNames={orgSecretNames}
+          />
+        </ReviewerLocked>
       </div>
 
       {/* user token */}
