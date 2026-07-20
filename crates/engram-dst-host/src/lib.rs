@@ -126,6 +126,7 @@
 //! and the reattached-source verdict table.
 
 pub mod coord_stub;
+pub mod device_plane;
 pub mod effects;
 pub mod fs_crash;
 pub mod invariants;
@@ -135,6 +136,7 @@ pub mod simfs;
 pub mod world;
 
 pub use coord_stub::{RecordedPublish, ScriptedResponse, SimCoordClient};
+pub use device_plane::{DevicePlane, DeviceSlot, ServeOutcome};
 pub use effects::{sim_effects, SeamEvent, SeamLog, SimDeviceSync, SimNbd};
 pub use fs_crash::{CrashFs, FsOp, ReadCorruption, ReadFault};
 pub use invariants::Violation;

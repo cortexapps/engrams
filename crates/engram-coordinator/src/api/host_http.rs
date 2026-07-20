@@ -225,21 +225,8 @@ pub async fn register(
     // coverage. Failure non-fatal: a host that doesn't get the
     // list runs blind for the survivors (same shape as pre-Phase-
     // B behaviour); operator can manually re-register or evac.
-    let rehydrate_sandboxes = match state
-        .services
-        .meta
-        .list_resident_sandboxes_on_host_with_disk_manifest(req.host_id)
-        .await
-    {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|(session_id, sandbox_id, manifest)| RehydrateSandboxRef {
-                session_id,
-                sandbox_id,
-                disk_manifest_id: manifest.as_ref().map(|m| m.manifest_id),
-                disk_manifest_version: manifest.as_ref().map(|m| m.version),
-            })
-            .collect(),
+    let rehydrate_sandboxes = match register_rehydrate_list_core(&state, req.host_id).await {
+        Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(
                 host_id = %req.host_id,
@@ -1643,6 +1630,34 @@ pub async fn live_manifest_publish(
 /// simulator (`engram-dst-cosim`) can drive the exact coordinator code
 /// path the host-agent's `CoordControlPlane::publish_live_manifest` hits.
 /// Zero behavior change.
+/// The store-level core of the [`register`] handler's rehydration list (ADR
+/// 0098 R-CoSim, the run_once pattern applied to handlers). Returns the
+/// VM-resident sandboxes PG has bound to `host_id` — every
+/// `reserves_host_memory` state (Active AND rung-parked Evicting survivors,
+/// per session 731df805) — with the effective disk manifest the host rebuilds
+/// from. The boundary simulator's register-rehydrate leg drives THIS exact
+/// listing, so the co-simulated host re-serves precisely the devices the real
+/// coordinator would name.
+pub async fn register_rehydrate_list_core(
+    state: &SharedState,
+    host_id: HostId,
+) -> Result<Vec<RehydrateSandboxRef>, ApiError> {
+    let rows = state
+        .services
+        .meta
+        .list_resident_sandboxes_on_host_with_disk_manifest(host_id)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(session_id, sandbox_id, manifest)| RehydrateSandboxRef {
+            session_id,
+            sandbox_id,
+            disk_manifest_id: manifest.as_ref().map(|m| m.manifest_id),
+            disk_manifest_version: manifest.as_ref().map(|m| m.version),
+        })
+        .collect())
+}
+
 pub async fn live_manifest_publish_core(
     state: &SharedState,
     host_id: HostId,
