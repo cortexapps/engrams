@@ -168,3 +168,12 @@ export const tools: ToolRegistry = createToolRegistry({
     now: () => new Date(),
   }),
 });
+
+/** Capability strings used to gate tools registered in this process. */
+export function toolCapabilities(registry: ToolRegistry = tools): Set<string> {
+  const capabilities = new Set<string>();
+  for (const tool of registry.all()) {
+    if (tool.capability != null) capabilities.add(tool.capability);
+  }
+  return capabilities;
+}

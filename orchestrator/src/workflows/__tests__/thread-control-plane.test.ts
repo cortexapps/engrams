@@ -34,6 +34,7 @@ const profileRow = (): ProfileRow => ({
   secrets: [],
   isDefault: true,
   portExposures: [],
+  designation: null,
   createdAt: new Date(0),
   updatedAt: new Date(0),
   deletedAt: null,

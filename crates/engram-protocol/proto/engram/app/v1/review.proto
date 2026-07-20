@@ -7,10 +7,58 @@ import "google/protobuf/timestamp.proto";
 // PR code review record (ADR 0100). Reviews are org-visible: a team
 // dashboard, not a personal list. Writes happen through review tool calls
 // and the review workflow, never through this service.
+//
+// Repo enrollment is org configuration: which repos engrams reviews, how
+// reviews trigger, and the autofix posture. Enrollment mutations are
+// admin-only; listing is org-visible like the reviews themselves.
 service ReviewService {
   rpc ListReviews(ListReviewsRequest) returns (ListReviewsResponse);
   rpc GetReview(GetReviewRequest) returns (GetReviewResponse);
+
+  rpc ListEnrollments(ListEnrollmentsRequest) returns (ListEnrollmentsResponse);
+  rpc UpsertEnrollment(UpsertEnrollmentRequest) returns (UpsertEnrollmentResponse);
+  rpc DeleteEnrollment(DeleteEnrollmentRequest) returns (DeleteEnrollmentResponse);
 }
+
+// A repo enrolled for PR review.
+message RepoEnrollment {
+  // "owner/name".
+  string repo = 1;
+  // auto | manual — whether pull_request.opened auto-triggers a review, or a
+  // review must be asked for (@engrams review / dispatch).
+  string trigger_mode = 2;
+  // auto | manual | off — whether posted findings route back to the authoring
+  // session for fixes.
+  string autofix = 3;
+  // Profile the review sessions run on; empty = the designated pr_reviewer
+  // profile.
+  optional string profile_id = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message ListEnrollmentsRequest {}
+
+message ListEnrollmentsResponse {
+  repeated RepoEnrollment enrollments = 1;
+}
+
+message UpsertEnrollmentRequest {
+  string repo = 1;
+  string trigger_mode = 2;
+  string autofix = 3;
+  optional string profile_id = 4;
+}
+
+message UpsertEnrollmentResponse {
+  RepoEnrollment enrollment = 1;
+}
+
+message DeleteEnrollmentRequest {
+  string repo = 1;
+}
+
+message DeleteEnrollmentResponse {}
 
 // One review pass over a PR at a pinned head_sha.
 message Review {
@@ -29,6 +77,11 @@ message Review {
   google.protobuf.Timestamp created_at = 11;
   google.protobuf.Timestamp updated_at = 12;
   FindingCounts finding_counts = 13;
+  // Worker sessions, stamped at kickoff so the UI can offer a live "watch" link
+  // while a phase runs. Empty until that phase starts; the session is deleted
+  // when its phase ends, so the id survives as the record of which session ran.
+  optional string finder_session_id = 14;
+  optional string verifier_session_id = 15;
 }
 
 // Per-severity finding counts for the list page.
@@ -79,6 +132,8 @@ message ReviewVerdict {
   // high | medium | low
   string confidence = 3;
   string reasoning = 4;
+  // The verifier session that recorded this judgment.
+  string session_id = 5;
 }
 
 message ListReviewsRequest {
@@ -98,4 +153,22 @@ message GetReviewResponse {
   Review review = 1;
   repeated ReviewFinding findings = 2;
   repeated ReviewVerdict verdicts = 3;
+  // The review's step-by-step activity log, oldest first (ADR 0100). Milestones
+  // the control plane records as it drives the review — queued, cloning the
+  // repo, reviewing, verifying, posted — so the UI can show progress inside a
+  // phase, not just the coarse status.
+  repeated ReviewEvent events = 4;
+}
+
+// One entry in a review's activity log.
+message ReviewEvent {
+  string id = 1;
+  string review_id = 2;
+  // Milestone kind, mapped to a human label in the UI: queued | finder_started
+  // | cloning | reviewing | verifier_started | verifying | posted | failed |
+  // halted.
+  string kind = 3;
+  // Optional human-readable detail (e.g. "3 candidate findings", "finder").
+  optional string detail = 4;
+  google.protobuf.Timestamp created_at = 5;
 }

@@ -6,7 +6,7 @@
  * fake. Drizzle-backed by default. Soft delete only (deleted_at).
  */
 
-import { and, eq, inArray, isNull } from "drizzle-orm";
+import { and, eq, inArray, isNull, ne } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import {
@@ -41,11 +41,14 @@ export interface ProfileRow {
   isDefault: boolean;
   // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
   portExposures: number[];
+  designation: string | null;
   createdAt: Date;
   updatedAt: Date;
   deletedAt: Date | null;
 }
 
+// `designation` is deliberately absent: update() spreads only ProfileInput into
+// its SET clause, so admin edits cannot clobber a system marker.
 export interface ProfileInput {
   name: string;
   description: string;
@@ -74,9 +77,13 @@ export interface ProfileStore {
   getActive(id: string): Promise<ProfileRow | null>;
   /** The org's active default profile (ADR 0060), or null if none is set. */
   getDefault(): Promise<ProfileRow | null>;
+  /** The active profile carrying this system designation, or null. */
+  getByDesignation(designation: string): Promise<ProfileRow | null>;
   /** Rows for the given ids (active or archived) — for snapshot enrichment. */
   getByIds(ids: string[]): Promise<ProfileRow[]>;
-  create(input: ProfileInput): Promise<ProfileRow>;
+  create(input: ProfileInput, designation?: string | null): Promise<ProfileRow>;
+  /** Assign or clear a system designation, keeping each value on at most one profile. */
+  setDesignation(id: string, designation: string | null): Promise<void>;
   /** Returns the updated row, or null if the id is absent / archived. */
   update(id: string, input: ProfileInput): Promise<ProfileRow | null>;
   /** Idempotent soft delete (sets deleted_at). */
@@ -101,6 +108,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     secrets: (r.secrets ?? []) as ProfileSecret[],
     isDefault: r.isDefault,
     portExposures: (r.portExposures ?? []) as number[],
+    designation: r.designation ?? null,
     createdAt: r.createdAt,
     updatedAt: r.updatedAt,
     deletedAt: r.deletedAt,
@@ -135,12 +143,20 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
     },
+    async getByDesignation(designation) {
+      const rows = await db
+        .select()
+        .from(profileTable)
+        .where(and(eq(profileTable.designation, designation), isNull(profileTable.deletedAt)))
+        .limit(1);
+      return rows[0] ? toRow(rows[0]) : null;
+    },
     async getByIds(ids) {
       if (ids.length === 0) return [];
       const rows = await db.select().from(profileTable).where(inArray(profileTable.id, ids));
       return rows.map(toRow);
     },
-    async create(input) {
+    async create(input, designation) {
       const id = crypto.randomUUID();
       // At-most-one default (ADR 0060): if this profile is the default, clear
       // any prior default in the same tx before inserting.
@@ -151,10 +167,25 @@ export function makeProfileStore(db: ReturnType<typeof getDb> = getDb()): Profil
             .set({ isDefault: false })
             .where(eq(profileTable.isDefault, true));
         }
-        await tx.insert(profileTable).values({ id, ...input });
+        await tx.insert(profileTable).values({ id, ...input, designation: designation ?? null });
       });
       const row = await this.get(id);
       return row!;
+    },
+    async setDesignation(id, designation) {
+      const updatedAt = new Date();
+      await db.transaction(async (tx) => {
+        if (designation !== null) {
+          await tx
+            .update(profileTable)
+            .set({ designation: null, updatedAt })
+            .where(and(eq(profileTable.designation, designation), ne(profileTable.id, id)));
+        }
+        await tx
+          .update(profileTable)
+          .set({ designation, updatedAt })
+          .where(eq(profileTable.id, id));
+      });
     },
     async update(id, input) {
       const existing = await this.getActive(id);

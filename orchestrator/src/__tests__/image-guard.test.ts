@@ -18,8 +18,8 @@ function storeWith(profiles: Partial<ProfileRow>[]): ProfileStore {
   })) as ProfileRow[];
   return {
     async list({ includeArchived }) { return rows.filter((r) => includeArchived || !r.deletedAt); },
-    async get() { return null; }, async getActive() { return null; }, async getDefault() { return null; }, async getByIds() { return []; },
-    async create() { throw new Error("unused"); }, async update() { return null; }, async softDelete() {},
+    async get() { return null; }, async getActive() { return null; }, async getDefault() { return null; }, async getByDesignation() { return null; }, async getByIds() { return []; },
+    async create() { throw new Error("unused"); }, async setDesignation() {}, async update() { return null; }, async softDelete() {},
   };
 }
 

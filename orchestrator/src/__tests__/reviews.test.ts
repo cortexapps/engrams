@@ -8,7 +8,13 @@ import {
 } from "@connectrpc/connect";
 
 import type {
+  EnrollmentInput,
+  EnrollmentRow,
+  EnrollmentStore,
+} from "../db/enrollments.ts";
+import type {
   ReviewDetail,
+  ReviewEventRow,
   ReviewFindingRow,
   ReviewListRow,
   ReviewRow,
@@ -34,6 +40,9 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     trigger: "dispatch",
     status: "verifying",
     githubReviewId: null,
+    statusCommentId: null,
+    finderSessionId: null,
+    verifierSessionId: null,
     summaryMd: "Finder summary",
     createdAt: CREATED_AT,
     updatedAt: UPDATED_AT,
@@ -83,7 +92,10 @@ interface FakeReviewStore extends ReviewStore {
   listCalls: Array<{ repo?: string }>;
 }
 
-function makeStore(detail: ReviewDetail | null): FakeReviewStore {
+function makeStore(
+  detail: ReviewDetail | null,
+  events: ReviewEventRow[] = [],
+): FakeReviewStore {
   const listCalls: Array<{ repo?: string }> = [];
   return {
     listCalls,
@@ -92,6 +104,10 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
     },
     async getReview(id) {
       return detail?.review.id === id ? detail : null;
+    },
+    async recordEvent() {},
+    async listEvents() {
+      return events;
     },
     async listReviews(opts) {
       listCalls.push(opts);
@@ -111,6 +127,9 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
     async getActiveReviewForTask() {
       return null;
     },
+    async getActiveReviewForPr() {
+      return null;
+    },
     async insertFinding() {
       throw new Error("unused");
     },
@@ -118,19 +137,65 @@ function makeStore(detail: ReviewDetail | null): FakeReviewStore {
       throw new Error("unused");
     },
     async setFinderSummary() {},
+    async setStatusCommentId() {},
+    async setReviewSessionId() {},
     async updateReviewStatus() {},
+    async updateFindingState() {},
+    async finalizeReview() {},
   };
 }
 
-function spawn(store: ReviewStore, authenticated = true) {
+function spawn(
+  store: ReviewStore,
+  authenticated = true,
+  role = "user",
+  enrollments?: EnrollmentStore,
+  profileExists = true,
+) {
   const transport = createRouterTransport((router) =>
     registerReviews(router, {
       getSession: async () =>
-        authenticated ? { user: { id: "review-user" } } : null,
+        authenticated ? { user: { id: "review-user", role } } : null,
       reviews: store,
+      ...(enrollments != null ? { enrollments } : {}),
+      profiles: {
+        get: async (id) => profileExists ? { id } : null,
+      },
     }),
   );
   return createClient(ReviewService, transport);
+}
+
+interface FakeEnrollmentStore extends EnrollmentStore {
+  upserts: EnrollmentInput[];
+  deletes: string[];
+}
+
+function makeEnrollmentStore(rows: EnrollmentRow[]): FakeEnrollmentStore {
+  const stored = new Map(rows.map((row) => [row.repo, row]));
+  const upserts: EnrollmentInput[] = [];
+  const deletes: string[] = [];
+  return {
+    upserts,
+    deletes,
+    async list() {
+      return [...stored.values()];
+    },
+    async get(repo) {
+      return stored.get(repo) ?? null;
+    },
+    async upsert(input) {
+      upserts.push(input);
+      const now = new Date("2026-07-17T12:00:00Z");
+      const row = { ...input, createdAt: now, updatedAt: now };
+      stored.set(input.repo, row);
+      return row;
+    },
+    async delete(repo) {
+      deletes.push(repo);
+      stored.delete(repo);
+    },
+  };
 }
 
 async function expectConnectError(
@@ -188,7 +253,32 @@ describe("ReviewService", () => {
       findingId: FINDING_ID,
       verdict: "confirmed",
       reasoning: "The failing path is reachable.",
+      sessionId: "verifier-session",
     });
+  });
+
+  test("GetReview surfaces the review activity log, oldest first", async () => {
+    const events: ReviewEventRow[] = [
+      {
+        id: "e1",
+        reviewId: REVIEW_ID,
+        kind: "queued",
+        detail: null,
+        createdAt: new Date("2026-07-17T10:00:00Z"),
+      },
+      {
+        id: "e2",
+        reviewId: REVIEW_ID,
+        kind: "cloning",
+        detail: "finder",
+        createdAt: new Date("2026-07-17T10:00:05Z"),
+      },
+    ];
+    const response = await spawn(makeStore(detail, events)).getReview({ id: REVIEW_ID });
+
+    expect(response.events.map((e) => e.kind)).toEqual(["queued", "cloning"]);
+    expect(response.events[1]).toMatchObject({ kind: "cloning", detail: "finder" });
+    expect(response.events[1]?.createdAt).toBeDefined();
   });
 
   test("GetReview returns NotFound for an unknown id", async () => {
@@ -203,5 +293,98 @@ describe("ReviewService", () => {
       spawn(makeStore(detail), false).listReviews({}),
       Code.Unauthenticated,
     );
+  });
+
+  test("members can list enrollments with mapped timestamps", async () => {
+    const createdAt = new Date("2026-07-17T10:00:00Z");
+    const updatedAt = new Date("2026-07-17T11:00:00Z");
+    const enrollments = makeEnrollmentStore([{
+      repo: "openai/engrams",
+      triggerMode: "auto",
+      autofix: "manual",
+      profileId: "profile-1",
+      createdAt,
+      updatedAt,
+    }]);
+    const response = await spawn(
+      makeStore(null),
+      true,
+      "user",
+      enrollments,
+    ).listEnrollments({});
+    expect(response.enrollments[0]).toMatchObject({
+      repo: "openai/engrams",
+      triggerMode: "auto",
+      autofix: "manual",
+      profileId: "profile-1",
+    });
+    expect(timestampDate(response.enrollments[0]!.createdAt!)).toEqual(createdAt);
+    expect(timestampDate(response.enrollments[0]!.updatedAt!)).toEqual(updatedAt);
+  });
+
+  test("only admins can upsert and delete enrollments", async () => {
+    const memberStore = makeEnrollmentStore([]);
+    const member = spawn(makeStore(null), true, "user", memberStore);
+    await expectConnectError(member.upsertEnrollment({
+      repo: "openai/engrams",
+      triggerMode: "manual",
+      autofix: "off",
+    }), Code.PermissionDenied);
+    await expectConnectError(
+      member.deleteEnrollment({ repo: "openai/engrams" }),
+      Code.PermissionDenied,
+    );
+
+    const adminStore = makeEnrollmentStore([]);
+    const admin = spawn(makeStore(null), true, "admin", adminStore);
+    const response = await admin.upsertEnrollment({
+      repo: "openai/engrams",
+      triggerMode: "auto",
+      autofix: "manual",
+      profileId: "profile-1",
+    });
+    expect(response.enrollment).toMatchObject({
+      repo: "openai/engrams",
+      triggerMode: "auto",
+      autofix: "manual",
+      profileId: "profile-1",
+    });
+    await admin.deleteEnrollment({ repo: "openai/engrams" });
+    expect(adminStore.deletes).toEqual(["openai/engrams"]);
+  });
+
+  test("rejects invalid enrollment enums", async () => {
+    const admin = spawn(
+      makeStore(null),
+      true,
+      "admin",
+      makeEnrollmentStore([]),
+    );
+    await expectConnectError(admin.upsertEnrollment({
+      repo: "openai/engrams",
+      triggerMode: "sometimes",
+      autofix: "off",
+    }), Code.InvalidArgument);
+    await expectConnectError(admin.upsertEnrollment({
+      repo: "openai/engrams",
+      triggerMode: "manual",
+      autofix: "always",
+    }), Code.InvalidArgument);
+  });
+
+  test("rejects an unknown enrollment profile_id", async () => {
+    const admin = spawn(
+      makeStore(null),
+      true,
+      "admin",
+      makeEnrollmentStore([]),
+      false,
+    );
+    await expectConnectError(admin.upsertEnrollment({
+      repo: "openai/engrams",
+      triggerMode: "manual",
+      autofix: "off",
+      profileId: "missing-profile",
+    }), Code.InvalidArgument);
   });
 });

@@ -12,6 +12,7 @@ import {
 import { getDb } from "./client.ts";
 import {
   review as reviewTable,
+  reviewEvent as eventTable,
   reviewFinding as findingTable,
   reviewVerdict as verdictTable,
 } from "./schema.ts";
@@ -36,6 +37,9 @@ export interface ReviewRow {
   trigger: string;
   status: string;
   githubReviewId: string | null;
+  statusCommentId: string | null;
+  finderSessionId: string | null;
+  verifierSessionId: string | null;
   summaryMd: string | null;
   createdAt: Date;
   updatedAt: Date;
@@ -99,15 +103,44 @@ export interface ReviewDetail {
   verdicts: ReviewVerdictRow[];
 }
 
+export interface ReviewEventRow {
+  id: string;
+  reviewId: string;
+  kind: string;
+  detail: string | null;
+  createdAt: Date;
+}
+
 export interface ReviewStore {
   createReview(input: CreateReviewInput): Promise<string>;
   getReview(id: string): Promise<ReviewDetail | null>;
   listReviews(opts: { repo?: string }): Promise<ReviewListRow[]>;
   getActiveReviewForTask(taskId: string): Promise<ReviewRow | null>;
+  getActiveReviewForPr(repo: string, prNumber: number): Promise<ReviewRow | null>;
   insertFinding(input: ReviewFindingInput): Promise<{ id: string; replayed: boolean }>;
   insertVerdict(input: ReviewVerdictInput): Promise<{ id: string; replayed: boolean }>;
+  recordEvent(reviewId: string, kind: string, detail?: string): Promise<void>;
+  listEvents(reviewId: string): Promise<ReviewEventRow[]>;
   setFinderSummary(reviewId: string, summaryMd: string): Promise<void>;
+  setStatusCommentId(reviewId: string, statusCommentId: string): Promise<void>;
+  setReviewSessionId(
+    reviewId: string,
+    role: "finder" | "verifier",
+    sessionId: string,
+  ): Promise<void>;
   updateReviewStatus(reviewId: string, status: string): Promise<void>;
+  updateFindingState(
+    findingId: string,
+    state: string,
+    opts?: { githubThreadId?: string; verdictReason?: string },
+  ): Promise<void>;
+  finalizeReview(reviewId: string, input: {
+    status: string;
+    summaryMd: string;
+    githubReviewId?: string;
+    headSha?: string;
+    baseSha?: string;
+  }): Promise<void>;
 }
 
 function toReviewRow(row: typeof reviewTable.$inferSelect): ReviewRow {
@@ -121,6 +154,9 @@ function toReviewRow(row: typeof reviewTable.$inferSelect): ReviewRow {
     trigger: row.trigger,
     status: row.status,
     githubReviewId: row.githubReviewId ?? null,
+    statusCommentId: row.statusCommentId ?? null,
+    finderSessionId: row.finderSessionId ?? null,
+    verifierSessionId: row.verifierSessionId ?? null,
     summaryMd: row.summaryMd ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
@@ -161,6 +197,16 @@ function toVerdictRow(row: typeof verdictTable.$inferSelect): ReviewVerdictRow {
     reasoning: row.reasoning,
     sessionId: row.sessionId,
     toolCallId: row.toolCallId,
+    createdAt: row.createdAt,
+  };
+}
+
+function toEventRow(row: typeof eventTable.$inferSelect): ReviewEventRow {
+  return {
+    id: row.id,
+    reviewId: row.reviewId,
+    kind: row.kind,
+    detail: row.detail ?? null,
     createdAt: row.createdAt,
   };
 }
@@ -259,6 +305,22 @@ export function makeReviewStore(
       return rows[0] ? toReviewRow(rows[0]) : null;
     },
 
+    async getActiveReviewForPr(repo, prNumber) {
+      const rows = await db
+        .select()
+        .from(reviewTable)
+        .where(
+          and(
+            eq(reviewTable.repo, repo),
+            eq(reviewTable.prNumber, prNumber),
+            inArray(reviewTable.status, ["queued", "finding", "verifying"]),
+          ),
+        )
+        .orderBy(desc(reviewTable.createdAt))
+        .limit(1);
+      return rows[0] ? toReviewRow(rows[0]) : null;
+    },
+
     async insertFinding(input) {
       const inserted = await db
         .insert(findingTable)
@@ -318,6 +380,23 @@ export function makeReviewStore(
       return { id: firstForFinding[0].id, replayed: true };
     },
 
+    async recordEvent(reviewId, kind, detail) {
+      await db.insert(eventTable).values({
+        reviewId,
+        kind,
+        ...(detail !== undefined ? { detail } : {}),
+      });
+    },
+
+    async listEvents(reviewId) {
+      const rows = await db
+        .select()
+        .from(eventTable)
+        .where(eq(eventTable.reviewId, reviewId))
+        .orderBy(eventTable.createdAt);
+      return rows.map(toEventRow);
+    },
+
     async setFinderSummary(reviewId, summaryMd) {
       await db
         .update(reviewTable)
@@ -325,10 +404,58 @@ export function makeReviewStore(
         .where(eq(reviewTable.id, reviewId));
     },
 
+    async setStatusCommentId(reviewId, statusCommentId) {
+      await db
+        .update(reviewTable)
+        .set({ statusCommentId, updatedAt: new Date() })
+        .where(eq(reviewTable.id, reviewId));
+    },
+
+    async setReviewSessionId(reviewId, role, sessionId) {
+      const column = role === "finder"
+        ? { finderSessionId: sessionId }
+        : { verifierSessionId: sessionId };
+      await db
+        .update(reviewTable)
+        .set({ ...column, updatedAt: new Date() })
+        .where(eq(reviewTable.id, reviewId));
+    },
+
     async updateReviewStatus(reviewId, status) {
       await db
         .update(reviewTable)
         .set({ status, updatedAt: new Date() })
+        .where(eq(reviewTable.id, reviewId));
+    },
+
+    async updateFindingState(findingId, state, opts) {
+      await db
+        .update(findingTable)
+        .set({
+          state,
+          ...(opts?.githubThreadId !== undefined
+            ? { githubThreadId: opts.githubThreadId }
+            : {}),
+          ...(opts?.verdictReason !== undefined
+            ? { verdictReason: opts.verdictReason }
+            : {}),
+        })
+        .where(eq(findingTable.id, findingId));
+    },
+
+    async finalizeReview(reviewId, input) {
+      await db
+        .update(reviewTable)
+        .set({
+          status: input.status,
+          summaryMd: input.summaryMd,
+          ...(input.githubReviewId !== undefined
+            ? { githubReviewId: input.githubReviewId }
+            : {}),
+          ...(input.headSha !== undefined ? { headSha: input.headSha } : {}),
+          ...(input.baseSha !== undefined ? { baseSha: input.baseSha } : {}),
+          updatedAt: new Date(),
+        })
         .where(eq(reviewTable.id, reviewId));
     },
   };
