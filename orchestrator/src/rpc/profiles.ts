@@ -368,6 +368,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
+      // Validate the designation BEFORE writing the row, so a bad designation
+      // rejects the whole request instead of leaving an orphan profile behind.
+      if (req.designation) assertDesignationValid(req.designation);
       let row = await store.create({
         name: req.name,
         description: req.description,
@@ -386,7 +389,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         portExposures: req.portExposures ?? [],
       });
       if (req.designation) {
-        assertDesignationValid(req.designation);
         await store.setDesignation(row.id, req.designation);
         row = (await store.get(row.id)) ?? row;
       }
@@ -412,6 +414,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
+      // Validate the designation BEFORE the update commits, so a bad designation
+      // rejects the request rather than half-saving the ordinary edits.
+      if (req.designation !== undefined) assertDesignationValid(req.designation);
       let row = await store.update(req.id, {
         name: req.name,
         description: req.description,
@@ -431,7 +436,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
       if (req.designation !== undefined) {
-        assertDesignationValid(req.designation);
         await store.setDesignation(req.id, req.designation || null);
         row = (await store.get(req.id)) ?? row;
       }

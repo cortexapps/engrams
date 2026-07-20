@@ -243,6 +243,21 @@ describe("ProfileService — auth + field filtering", () => {
     } finally { await s.close(); }
   });
 
+  test("admin CreateProfile with a bad designation persists no orphan profile", async () => {
+    const store = makeFakeStore();
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"), store, images: fakeImages(["img-1"]),
+    });
+    try {
+      await expectErr(s.client.createProfile({
+        name: "Reviewer", description: "", icon: "Bot", imageId: "img-1",
+        harness: "claude", includeUserTokens: false, envVars: {}, designation: "unknown",
+      }), Code.InvalidArgument);
+      // The designation is validated before the row is written, so nothing lands.
+      expect(await store.list({ includeArchived: true })).toHaveLength(0);
+    } finally { await s.close(); }
+  });
+
   // ADR 0055 P2: skills validated against builtins ∪ the upload catalog.
   test("admin CreateProfile with an unknown skill → InvalidArgument", async () => {
     const s = await spawn({

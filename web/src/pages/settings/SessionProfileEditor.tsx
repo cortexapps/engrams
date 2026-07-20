@@ -286,7 +286,6 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       model: optionId(vals.model) ?? undefined,
       effort: optionId(vals.effort) ?? undefined,
       isDefault: vals.isDefault,
-      designation: vals.designation ? "pr_reviewer" : "",
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
       capabilities: vals.capabilities,
@@ -299,12 +298,24 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       secrets: secretRowsToWire(vals.secretRows),
       portExposures: vals.portExposures,
     };
+    const designationValue = vals.designation ? "pr_reviewer" : "";
     try {
       if (mode === "edit" && editingId) {
-        await update.mutateAsync({ id: editingId, ...payload });
+        // `designation` is admin-only and role-transferring, so send it ONLY when
+        // the toggle actually changed from the loaded snapshot. Otherwise a stale
+        // editor tab would re-assert an out-of-date designation on an unrelated
+        // save and silently steal (or drop) the reviewer role. The field is
+        // optional on the wire; omitting it means the server leaves it untouched.
+        const hydratedDesignation = existing?.profile?.designation === "pr_reviewer";
+        const designationTouched = vals.designation !== hydratedDesignation;
+        await update.mutateAsync({
+          id: editingId,
+          ...payload,
+          ...(designationTouched ? { designation: designationValue } : {}),
+        });
         toast.success("Saved changes");
       } else {
-        await create.mutateAsync(payload);
+        await create.mutateAsync({ ...payload, designation: designationValue });
         toast.success(`Profile "${vals.name.trim()}" created`);
       }
       navigate({ to: "/settings/profiles" });
