@@ -128,6 +128,18 @@ describe("tool exec plain functions", () => {
     });
   });
 
+  test("handler-returned protocol errors bypass the declared success schema", async () => {
+    const f = fixture({
+      handler: () => ({ error: "no active review for this session" }),
+    });
+
+    await runAndSubmit(f);
+
+    expect(JSON.parse(f.completionCalls[0]!.resultJson)).toEqual({
+      error: "no active review for this session",
+    });
+  });
+
   test("missing session context is submitted as the exact protocol error envelope", async () => {
     const f = fixture();
     f.deps.resolveContext = async () => {

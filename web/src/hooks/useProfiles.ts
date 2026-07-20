@@ -17,13 +17,23 @@ export function useProfile(id: string | undefined) {
   return useQuery(getProfile, { id: id ?? "" }, { enabled: !!id });
 }
 
-/** Invalidate every listProfiles variant (archived + active) after a mutation. */
+/**
+ * Invalidate profile reads after a mutation: every listProfiles variant
+ * (archived + active) AND every getProfile(id) — otherwise an open editor keeps
+ * a stale snapshot and can silently re-assert an out-of-date designation.
+ */
 function useInvalidateProfiles() {
   const qc = useQueryClient();
-  return () =>
-    qc.invalidateQueries({
-      queryKey: createConnectQueryKey({ schema: listProfiles, cardinality: "finite" }),
-    });
+  return async () => {
+    await Promise.all([
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({ schema: listProfiles, cardinality: "finite" }),
+      }),
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({ schema: getProfile, cardinality: "finite" }),
+      }),
+    ]);
+  };
 }
 
 export function useCreateProfile() {

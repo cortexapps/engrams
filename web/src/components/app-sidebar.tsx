@@ -1,4 +1,4 @@
-import { Bandage, Server, SquareTerminal } from "lucide-react";
+import { Bandage, ScanSearch, Server, SquareTerminal } from "lucide-react";
 import { Link, useRouterState } from "@tanstack/react-router";
 import { useIsAdmin } from "../auth/AuthProvider";
 import { useOperatorHealth } from "../hooks/useOperatorHealth";
@@ -24,11 +24,12 @@ interface Dest extends NavItem {
   match: (p: string) => boolean;
 }
 
-// The top-level hats: Sessions is the developer surface; Kaizen gathers the
-// small frictions agents report while working; Operator gathers the whole
-// admin/infrastructure surface (fleet, storage, images, registries) behind its
-// own rail. Account + org config (Settings) lives in the avatar menu at the foot
-// of the rail, the one canonical entry point.
+// The top-level hats: Sessions is the developer surface; Reviews is the shared
+// PR review ledger; Kaizen gathers the small frictions agents report while
+// working; Operator gathers the whole admin/infrastructure surface (fleet,
+// storage, images, registries) behind its own rail. Account + org config
+// (Settings) lives in the avatar menu at the foot of the rail, the one canonical
+// entry point.
 //
 // Each hat's glyph is deliberately distinct from its section's landing item
 // (Sessions → "My sessions" = Layers; Kaizen → "Papercuts" = ListChecks;
@@ -41,6 +42,13 @@ const DESTS: Dest[] = [
     icon: SquareTerminal,
     adminOnly: false,
     match: (p) => p === "/" || p.startsWith("/sessions"),
+  },
+  {
+    to: "/reviews",
+    label: "Reviews",
+    icon: ScanSearch,
+    adminOnly: false,
+    match: (p) => p.startsWith("/reviews"),
   },
   {
     to: "/kaizen",

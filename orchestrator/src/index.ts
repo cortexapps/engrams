@@ -17,6 +17,8 @@ import integrationOpRoute from "./routes/integration-op.ts";
 import integrationOauthRoute from "./routes/integration-oauth.ts";
 import slackEventsRoute from "./routes/slack-events.ts";
 import slackInteractivityRoute from "./routes/slack-interactivity.ts";
+import githubEventsRoute from "./routes/github-events.ts";
+import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -28,11 +30,13 @@ import { registerPassthrough } from "./rpc/passthrough.ts";
 import { makeDisableImageGuard } from "./rpc/image-guard.ts";
 import { makeExternalToolCompletionGuard } from "./rpc/tool-completion-guard.ts";
 import { registerBuiltinTools } from "./tools/builtin.ts";
+import { registerReviewTools } from "./tools/review.ts";
 import { registerDevTools } from "./tools/dev-tools.ts";
 import { registerTasks } from "./rpc/tasks.ts";
 import { registerProfiles } from "./rpc/profiles.ts";
 import { registerPapercuts } from "./rpc/papercuts.ts";
 import { registerPrRefs } from "./rpc/pr-refs.ts";
+import { registerReviews } from "./rpc/reviews.ts";
 import { registerMountCatalog } from "./rpc/mount-catalog.ts";
 import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
@@ -40,6 +44,7 @@ import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
+import { sessions as controlPlaneSessions } from "./control-plane/client.ts";
 import type { ConnectRouter } from "@connectrpc/connect";
 // ADR 0060: embedded DBOS engine. Workflow modules (P1+) must be imported
 // ABOVE the initDbos() call below so their workflows/steps are registered
@@ -47,12 +52,19 @@ import type { ConnectRouter } from "@connectrpc/connect";
 // tool-execution workflows.
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
+import { setReviewControlPlane } from "./workflows/pr-review.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
+import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
+import { makeReviewStore } from "./db/reviews.ts";
+import { makeEnrollmentStore } from "./db/enrollments.ts";
+import { makeProfileStore } from "./db/profiles.ts";
 import { tools } from "./tools/registry.ts";
+import { renderReviewer } from "./reviewers/render.ts";
+import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
 
 const app = new Hono();
 
@@ -105,6 +117,10 @@ app.route("/", integrationOauthRoute);
 // verify every request with the SDK against the slack.signing_secret org secret.
 app.route("/", slackEventsRoute);
 app.route("/", slackInteractivityRoute);
+// ADR 0100: GitHub's signed webhook and the bearer-authenticated CI trigger
+// converge on the same durable per-PR workflow.
+app.route("/", githubEventsRoute);
+app.route("/", reviewsDispatchRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.
 const { app: shellApp, injectUpgrade } = makeShellRoute();
@@ -139,6 +155,9 @@ const server = buildServer(
 
     // Native PrRefService: durable task/session links to authored PRs (ADR 0100).
     registerPrRefs(router);
+
+    // Native ReviewService: org-visible durable PR review records (ADR 0100).
+    registerReviews(router);
 
     // Native ProfileService: orchestrator-owned session profiles (ADR 0053).
     registerProfiles(router);
@@ -194,9 +213,19 @@ const server = buildServer(
 // bind can start a workflow.
 setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
+setReviewControlPlane(makeReviewControlPlane({
+  sessions: controlPlaneSessions,
+  profiles: makeProfileStore(getDb()),
+  enrollments: makeEnrollmentStore(getDb()),
+  renderReviewer,
+}));
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
+registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
+void seedReviewerProfile(makeProfileStore(getDb()), log).catch((err) =>
+  log.error({ err }, "reviewer profile seed failed"),
+);
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 const listenerManager = makeProductionListenerManager();

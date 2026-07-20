@@ -127,16 +127,18 @@ import { extractApiKey } from "./api-key-header.ts";
  *      (401), which would mark the pod / backend perpetually unhealthy.
  *      /healthz only reports {ok, db}, so it is unauthenticated by design.
  *
- *   2. Inbound provider webhooks (ADR 0060). Slack POSTs carry no IAP
+ *   2. Inbound provider webhooks (ADR 0060/0100). Slack and GitHub POSTs carry
+ *      no IAP
  *      assertion and no session cookie — in prod they reach the orchestrator
  *      through a no-IAP GCLB backend (see deploy/helm values-iap overlay), so
  *      the fail-closed path would 401 them before the handler runs. These
  *      routes do NOT rely on the bridge for auth: each verifies the provider's
- *      own signature (Slack signing secret + 5-minute timestamp window via
- *      isValidSlackRequest) and rejects a bad signature with 401 itself. The
+ *      own signature (Slack signing secret + timestamp window, or GitHub's
+ *      X-Hub-Signature-256 HMAC) and rejects a bad signature with 401 itself. The
  *      bridge would only get in the way, so we exempt the exact webhook paths.
- *      The strings must stay in lockstep with the routes' `app.post(...)` paths
- *      (orchestrator/src/routes/slack-{events,interactivity}.ts).
+ *      The strings must stay in lockstep with the routes' `app.post(...)`
+ *      paths in orchestrator/src/routes/{slack-events,slack-interactivity,
+ *      github-events}.ts.
  *
  *   3. The device-authorization CLI endpoints (`engrams auth login`). The CLI
  *      requests a code and polls for the token from a bare terminal — no IAP
@@ -153,9 +155,15 @@ const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/healthz",
   "/api/v1/integrations/slack/events",
   "/api/v1/integrations/slack/interactivity",
+  "/api/v1/integrations/github/events",
   "/api/auth/device/code",
   "/api/auth/device/token",
 ]);
+
+/** Pure seam for exact-path public ingress tests (query strings are ignored). */
+export function isIapPublicPath(url: string): boolean {
+  return PUBLIC_PATHS.has(url.split("?", 1)[0] ?? "/");
+}
 
 // ---------------------------------------------------------------------------
 // Internal types
@@ -447,8 +455,7 @@ export async function iapBridge(
   // fail-closed path below would 401 them → the pod never goes Ready. Let the
   // allowlist through before any IAP logic. Checked even when IAP is inert so
   // the path is identical in dev and prod. See PUBLIC_PATHS for the rationale.
-  const path = (req.url ?? "/").split("?", 1)[0];
-  if (PUBLIC_PATHS.has(path)) {
+  if (isIapPublicPath(req.url ?? "/")) {
     next();
     return;
   }

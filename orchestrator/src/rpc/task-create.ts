@@ -32,6 +32,7 @@ import {
   slackSession as slackSessionTable,
   task as taskTable,
   taskSession as taskSessionTable,
+  type ProfileNetwork,
 } from "../db/schema.ts";
 import * as schema from "../db/schema.ts";
 import {
@@ -128,6 +129,16 @@ export interface SessionCompileDeps {
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** Per-session integration grants layered on top of the profile. These may
+   *  affect the bound capabilities and integration policy, but never the tool
+   *  manifest (for example, a scoped clone credential). */
+  extraCapabilities?: readonly string[];
+  /** Replace every profile/per-session capability with this exact set. */
+  capabilityOverride?: readonly string[];
+  /** Replace the profile's network policy for this session. */
+  networkOverride?: ProfileNetwork;
+  /** Exclude profile-defined secrets and harness env from this session. */
+  dropProfileSecretsAndEnv?: boolean;
   /** The task type ("chat" = human/interactive; anything else = programmatic,
    *  e.g. "slack_thread"). Drives the strict-by-run-type credential pick (ADR
    *  0063 B4): human → the harness's `user_env` (per-user token); programmatic →
@@ -226,12 +237,29 @@ export async function compileSessionCreateInput(
     }
   }
   const registry = await loadRegistry(deps.connectors);
-  const cliPlan = compileCliIntegrations(profile.capabilities, registry);
+  const capabilities = opts.capabilityOverride !== undefined
+    ? [...opts.capabilityOverride]
+    : [...new Set([
+      ...profile.capabilities,
+      ...(opts.extraCapabilities ?? []),
+    ])];
+  // A capability override is the complete session authority and therefore
+  // also owns its CLI/tool surface. Without one, preserve the narrower
+  // profile-owned surface: extra integration grants do not add model tools.
+  const surfacedCapabilities = opts.capabilityOverride !== undefined
+    ? capabilities
+    : profile.capabilities;
+  const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
-  const toolManifest = compileToolManifest(deps.toolRegistry ?? productionTools, profile.capabilities);
+  const toolManifest = compileToolManifest(
+    deps.toolRegistry ?? productionTools,
+    surfacedCapabilities,
+  );
   if (toolManifest.length > 0) harness.ENGRAM_TOOLS = JSON.stringify(toolManifest);
-  for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
+  if (!opts.dropProfileSecretsAndEnv) {
+    for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
+  }
   // ADR 0063: the selected model/effort map to env vars via the harness
   // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in env_vars).
   if (descriptor) {
@@ -281,9 +309,9 @@ export async function compileSessionCreateInput(
 
   // Per-session integration policy (caps + network + secrets), shipped only
   // when it carries content.
-  const policy = compileIntegrationPolicy(profile.capabilities, registry, {
-    network: profile.network,
-    secrets: profile.secrets,
+  const policy = compileIntegrationPolicy(capabilities, registry, {
+    network: opts.networkOverride ?? profile.network,
+    secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
   });
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
@@ -311,7 +339,7 @@ export async function compileSessionCreateInput(
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
-    ...(profile.capabilities.length > 0 ? { capabilities: profile.capabilities } : {}),
+    ...(capabilities.length > 0 ? { capabilities } : {}),
     ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
   };
 }
@@ -375,9 +403,146 @@ export interface CreateTaskParams {
   slackThreadWorkflowId?: string;
 }
 
+export interface CreateSessionForExistingTaskParams {
+  taskId: string;
+  profileId: string;
+  role: string;
+  ownerUserId?: string;
+  prompt?: string;
+  extraCapabilities?: readonly string[];
+  capabilityOverride?: readonly string[];
+  networkOverride?: ProfileNetwork;
+  dropProfileSecretsAndEnv?: boolean;
+  appendSystemPrompt?: string;
+  /** Register the session for terminal/event consumption in the same
+   * transaction as its task_session row. */
+  registerListener?: boolean;
+  /** Optional caller context; the existing task already owns its durable
+   *  source metadata, so this path does not insert or update it. */
+  source?: Record<string, unknown>;
+}
+
+export interface CreateSessionForExistingTaskDeps extends Omit<CreateTaskDeps, "profiles"> {
+  profiles: Pick<ProfileStore, "getActive">;
+}
+
 export interface CreatedTask {
   taskId: string;
   sessionId: string;
+}
+
+/** Make an already-persisted session discoverable by the listener scanner.
+ * Callers with consumer-specific bindings must persist those bindings first. */
+export async function registerSessionListener(
+  db: Db,
+  sessionId: string,
+): Promise<void> {
+  await db.insert(sessionListenerTable).values({ sessionId });
+}
+
+/**
+ * Create a session and attach it to an already-persisted task. Review phases
+ * use this path because their automation-owned `pr_review` task is created
+ * before any worker session exists. Callers opt into listener registration
+ * when their workflow needs terminal session state.
+ */
+export async function createSessionForExistingTask(
+  deps: CreateSessionForExistingTaskDeps,
+  params: CreateSessionForExistingTaskParams,
+): Promise<{ sessionId: string }> {
+  const profile = await deps.profiles.getActive(params.profileId);
+  if (!profile) {
+    throw new ConnectError("profile not found or archived", Code.NotFound);
+  }
+
+  let owner: { name: string; email: string } | undefined;
+  if (params.ownerUserId !== undefined) {
+    try {
+      const identity = await (deps.users ?? makeUserIdentityStore(deps.db)).getIdentity(
+        params.ownerUserId,
+      );
+      if (identity && !isServiceAccountEmail(identity.email)) owner = identity;
+    } catch (err) {
+      log.warn(
+        { userId: params.ownerUserId, err },
+        "task-create: owner identity lookup failed — booting without git attribution",
+      );
+    }
+  }
+
+  const sessionInput = await compileSessionCreateInput(
+    profile,
+    {
+      images: deps.images,
+      connectors: deps.connectors,
+      harnessCatalog: deps.harnessCatalog,
+      resolveUserToken: (envVar) =>
+        params.ownerUserId === undefined
+          ? Promise.resolve(null)
+          : deps.secrets.get(params.ownerUserId, envVar),
+      resolveAllUserTokens: () =>
+        params.ownerUserId === undefined
+          ? Promise.resolve({})
+          : deps.secrets.getAll(params.ownerUserId),
+    },
+    {
+      // An automation-owned review task has no human token; use the harness's
+      // programmatic credential while still creating the session promptless.
+      ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
+      ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
+      ...(params.capabilityOverride !== undefined
+        ? { capabilityOverride: params.capabilityOverride }
+        : {}),
+      ...(params.networkOverride !== undefined
+        ? { networkOverride: params.networkOverride }
+        : {}),
+      ...(params.dropProfileSecretsAndEnv !== undefined
+        ? { dropProfileSecretsAndEnv: params.dropProfileSecretsAndEnv }
+        : {}),
+      ...(params.appendSystemPrompt
+        ? { extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: params.appendSystemPrompt } }
+        : {}),
+      ...(owner ? { owner } : {}),
+    },
+  );
+
+  // When prompt is omitted (as it is for the finder), the session boots idle so
+  // deterministic bootstrap can finish before the separately checkpointed
+  // SendPrompt wakes it.
+  const created = await deps.sessions.createSession(sessionInput);
+  try {
+    await deps.db.transaction(async (tx) => {
+      await tx.insert(taskSessionTable).values({
+        taskId: params.taskId,
+        sessionId: created.sessionId,
+        role: params.role,
+        profileId: profile.id,
+        // Persist the effective granted capabilities so the tool-exec gate
+        // honors a capabilityOverride (review workers) rather than re-deriving
+        // from the profile, which may not carry them.
+        capabilities: sessionInput.capabilities ?? [],
+      });
+      if (params.registerListener === true) {
+        await tx.insert(sessionListenerTable).values({
+          sessionId: created.sessionId,
+        });
+      }
+    });
+  } catch (err) {
+    try {
+      await deps.sessions.deleteSession({ sessionId: created.sessionId });
+    } catch (delErr) {
+      log.error(
+        { sessionId: created.sessionId, err: delErr },
+        "task-create: failed to delete orphan session after task-session persist failure",
+      );
+    }
+    throw err;
+  }
+
+  evictOwnerCacheEntry(created.sessionId);
+  return { sessionId: created.sessionId };
 }
 
 /**
@@ -460,6 +625,9 @@ export async function createTaskWithSession(
         sessionId: created.sessionId,
         role: "primary",
         profileId: profile.id,
+        // See createSessionForExistingTask: persist the effective granted
+        // capabilities so the tool-exec gate honors overrides/extras.
+        capabilities: sessionInput.capabilities ?? [],
       });
       if (params.slackThreadWorkflowId !== undefined) {
         await tx.insert(slackSessionTable).values({

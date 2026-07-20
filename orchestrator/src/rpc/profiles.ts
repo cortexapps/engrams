@@ -45,6 +45,7 @@ import {
   type CustomConnectorSource,
 } from "../connectors/registry.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import { toolCapabilities as registeredToolCapabilities } from "../tools/registry.ts";
 
 /** Subset of ImageService client used here (catalog validation). */
 export interface ImagesClient {
@@ -77,6 +78,7 @@ export interface ProfileDeps {
   harnessCatalog?: HarnessCatalogClient;
   mountCatalog?: MountCatalogClient;
   connectors?: CustomConnectorSource;
+  toolCapabilities?: Set<string>;
 }
 
 function headersOf(ctx: HandlerContext): Headers {
@@ -117,6 +119,7 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     harness: row.harness ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    designation: row.designation ?? undefined,
     // ADR 0064: ports auto-exposed for this profile's sessions (member-visible —
     // describes config, not a secret, like skills).
     portExposures: row.portExposures,
@@ -127,6 +130,13 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
 }
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ALLOWED_DESIGNATIONS = new Set(["pr_reviewer"]);
+
+function assertDesignationValid(designation: string): void {
+  if (designation && !ALLOWED_DESIGNATIONS.has(designation)) {
+    throw new ConnectError("unknown designation", Code.InvalidArgument);
+  }
+}
 
 /** ADR 0057: map the proto network message (or undefined) to the stored shape. */
 function normalizeNetwork(
@@ -210,6 +220,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   // (tests) doesn't throw. loadRegistry degrades to built-in seeds if the read
   // fails.
   const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
+  // Resolve the production registry lazily: ProfileService is registered before
+  // startup registers all built-in tools.
+  const toolCapabilities = (): Set<string> =>
+    deps?.toolCapabilities ?? registeredToolCapabilities();
 
   /** Validate image_id against the live catalog; throw InvalidArgument if absent. */
   async function assertImageEnabled(imageId: string): Promise<void> {
@@ -279,15 +293,20 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   }
 
   /**
-   * ADR 0056 (B′): validate each capability is (1) a well-formed
-   * `provider:action[@resource]` string (mirrors
+   * ADR 0056 (B′): a capability may gate a registered built-in tool. Otherwise
+   * it must be (1) a well-formed `provider:action[@resource]` string (mirrors
    * engram_core::types::Capability::parse) and (2) actually *granted* by a
    * connector — the editor offers only what a connector grants. The coordinator
    * re-validates authoritatively at session-create; rejecting here keeps a
    * profile from ever storing a grant no connector backs.
    */
-  function assertCapabilitiesValid(capabilities: string[], registry: Map<string, Connector>): void {
+  function assertCapabilitiesValid(
+    capabilities: string[],
+    registry: Map<string, Connector>,
+    builtInToolCapabilities: Set<string>,
+  ): void {
     for (const c of capabilities) {
+      if (builtInToolCapabilities.has(c)) continue;
       const parsed = parseCapability(c);
       if (!parsed) {
         throw new ConnectError(
@@ -340,12 +359,19 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const effort = catalogOptionId(req.effort);
       const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
+      assertCapabilitiesValid(
+        req.capabilities ?? [],
+        await loadRegistry(connectors),
+        toolCapabilities(),
+      );
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      const row = await store.create({
+      // Validate the designation BEFORE writing the row, so a bad designation
+      // rejects the whole request instead of leaving an orphan profile behind.
+      if (req.designation) assertDesignationValid(req.designation);
+      let row = await store.create({
         name: req.name,
         description: req.description,
         icon: req.icon || "Bot",
@@ -362,6 +388,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         effort,
         portExposures: req.portExposures ?? [],
       });
+      if (req.designation) {
+        await store.setDesignation(row.id, req.designation);
+        row = (await store.get(row.id)) ?? row;
+      }
       return { profile: toProto(row, true) };
     },
 
@@ -375,12 +405,19 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const effort = catalogOptionId(req.effort);
       const harness = await assertHarnessValid(catalogOptionId(req.harness), model, effort);
       await assertSkillsValid(req.skills ?? []);
-      assertCapabilitiesValid(req.capabilities ?? [], await loadRegistry(connectors));
+      assertCapabilitiesValid(
+        req.capabilities ?? [],
+        await loadRegistry(connectors),
+        toolCapabilities(),
+      );
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      const row = await store.update(req.id, {
+      // Validate the designation BEFORE the update commits, so a bad designation
+      // rejects the request rather than half-saving the ordinary edits.
+      if (req.designation !== undefined) assertDesignationValid(req.designation);
+      let row = await store.update(req.id, {
         name: req.name,
         description: req.description,
         icon: req.icon || "Bot",
@@ -398,6 +435,10 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         portExposures: req.portExposures ?? [],
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
+      if (req.designation !== undefined) {
+        await store.setDesignation(req.id, req.designation || null);
+        row = (await store.get(req.id)) ?? row;
+      }
       return { profile: toProto(row, true) };
     },
 
@@ -405,6 +446,13 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const user = await requireUser(ctx, getSession);
       const ability = abilityFor(user);
       if (!ability.can("manage", "Profile")) throw new ConnectError("forbidden", Code.PermissionDenied);
+      const row = await store.get(req.id);
+      if (row?.designation != null) {
+        throw new ConnectError(
+          `cannot delete a system profile (designation: ${row.designation})`,
+          Code.FailedPrecondition,
+        );
+      }
       await store.softDelete(req.id);
       return {};
     },

@@ -1,0 +1,174 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// PR code review record (ADR 0100). Reviews are org-visible: a team
+// dashboard, not a personal list. Writes happen through review tool calls
+// and the review workflow, never through this service.
+//
+// Repo enrollment is org configuration: which repos engrams reviews, how
+// reviews trigger, and the autofix posture. Enrollment mutations are
+// admin-only; listing is org-visible like the reviews themselves.
+service ReviewService {
+  rpc ListReviews(ListReviewsRequest) returns (ListReviewsResponse);
+  rpc GetReview(GetReviewRequest) returns (GetReviewResponse);
+
+  rpc ListEnrollments(ListEnrollmentsRequest) returns (ListEnrollmentsResponse);
+  rpc UpsertEnrollment(UpsertEnrollmentRequest) returns (UpsertEnrollmentResponse);
+  rpc DeleteEnrollment(DeleteEnrollmentRequest) returns (DeleteEnrollmentResponse);
+}
+
+// A repo enrolled for PR review.
+message RepoEnrollment {
+  // "owner/name".
+  string repo = 1;
+  // auto | manual — whether pull_request.opened auto-triggers a review, or a
+  // review must be asked for (@engrams review / dispatch).
+  string trigger_mode = 2;
+  // auto | manual | off — whether posted findings route back to the authoring
+  // session for fixes.
+  string autofix = 3;
+  // Profile the review sessions run on; empty = the designated pr_reviewer
+  // profile.
+  optional string profile_id = 4;
+  google.protobuf.Timestamp created_at = 5;
+  google.protobuf.Timestamp updated_at = 6;
+}
+
+message ListEnrollmentsRequest {}
+
+message ListEnrollmentsResponse {
+  repeated RepoEnrollment enrollments = 1;
+}
+
+message UpsertEnrollmentRequest {
+  string repo = 1;
+  string trigger_mode = 2;
+  string autofix = 3;
+  optional string profile_id = 4;
+}
+
+message UpsertEnrollmentResponse {
+  RepoEnrollment enrollment = 1;
+}
+
+message DeleteEnrollmentRequest {
+  string repo = 1;
+}
+
+message DeleteEnrollmentResponse {}
+
+// One review pass over a PR at a pinned head_sha.
+message Review {
+  string id = 1;
+  string repo = 2;
+  int32 pr_number = 3;
+  string task_id = 4;
+  string head_sha = 5;
+  string base_sha = 6;
+  // What started this pass, e.g. "dispatch" | "command" | "opened" | "synchronize".
+  string trigger = 7;
+  // queued | finding | verifying | posted | failed | superseded
+  string status = 8;
+  optional string github_review_id = 9;
+  optional string summary_md = 10;
+  google.protobuf.Timestamp created_at = 11;
+  google.protobuf.Timestamp updated_at = 12;
+  FindingCounts finding_counts = 13;
+  // Worker sessions, stamped at kickoff so the UI can offer a live "watch" link
+  // while a phase runs. Empty until that phase starts; the session is deleted
+  // when its phase ends, so the id survives as the record of which session ran.
+  optional string finder_session_id = 14;
+  optional string verifier_session_id = 15;
+}
+
+// Per-severity finding counts for the list page.
+message FindingCounts {
+  int32 critical = 1;
+  int32 high = 2;
+  int32 medium = 3;
+  int32 low = 4;
+  int32 total = 5;
+}
+
+message ReviewFinding {
+  string id = 1;
+  string review_id = 2;
+  string path = 3;
+  optional int32 start_line = 4;
+  optional int32 end_line = 5;
+  // "LEFT" | "RIGHT" (GitHub diff side), when line-anchored.
+  optional string side = 6;
+  // security-privacy | stability-availability | data-integrity-integration |
+  // functional-correctness | performance-scalability | maintainability-quality
+  string category = 7;
+  // critical | high | medium | low
+  string severity = 8;
+  // high | medium | low
+  string confidence = 9;
+  string title = 10;
+  string body_md = 11;
+  optional string suggested_fix = 12;
+  // Files the finder actually read (the evidence gate).
+  repeated string evidence = 13;
+  // candidate | confirmed | suppressed_refuted | posted | ui_only |
+  // suppressed_by_config | superseded
+  string state = 14;
+  optional string verdict_reason = 15;
+  optional string github_thread_id = 16;
+  // addressed | still_open | no_longer_applies (incremental passes, P1)
+  optional string resolution = 17;
+  string session_id = 18;
+  google.protobuf.Timestamp created_at = 19;
+}
+
+// The verifier's judgment on one finding.
+message ReviewVerdict {
+  string finding_id = 1;
+  // confirmed | refuted
+  string verdict = 2;
+  // high | medium | low
+  string confidence = 3;
+  string reasoning = 4;
+  // The verifier session that recorded this judgment.
+  string session_id = 5;
+}
+
+message ListReviewsRequest {
+  // Optional filter, "owner/name".
+  optional string repo = 1;
+}
+
+message ListReviewsResponse {
+  repeated Review reviews = 1;
+}
+
+message GetReviewRequest {
+  string id = 1;
+}
+
+message GetReviewResponse {
+  Review review = 1;
+  repeated ReviewFinding findings = 2;
+  repeated ReviewVerdict verdicts = 3;
+  // The review's step-by-step activity log, oldest first (ADR 0100). Milestones
+  // the control plane records as it drives the review — queued, cloning the
+  // repo, reviewing, verifying, posted — so the UI can show progress inside a
+  // phase, not just the coarse status.
+  repeated ReviewEvent events = 4;
+}
+
+// One entry in a review's activity log.
+message ReviewEvent {
+  string id = 1;
+  string review_id = 2;
+  // Milestone kind, mapped to a human label in the UI: queued | finder_started
+  // | cloning | reviewing | verifier_started | verifying | posted | failed |
+  // halted.
+  string kind = 3;
+  // Optional human-readable detail (e.g. "3 candidate findings", "finder").
+  optional string detail = 4;
+  google.protobuf.Timestamp created_at = 5;
+}

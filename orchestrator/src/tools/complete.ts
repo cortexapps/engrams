@@ -17,7 +17,7 @@ export interface ToolCompletionDeps {
   now?: () => Date;
 }
 
-function isProtocolErrorResult(result: unknown): result is { error: string } {
+export function isProtocolErrorResult(result: unknown): result is { error: string } {
   if (typeof result !== "object" || result === null || Array.isArray(result)) return false;
   const record = result as Record<string, unknown>;
   return typeof record.error === "string" && Object.keys(record).length === 1;

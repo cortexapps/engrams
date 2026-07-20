@@ -7,6 +7,7 @@ import { profile, task, taskSession } from "../db/schema.ts";
 import { log as rootLog } from "../log.ts";
 import {
   completeRegisteredToolCall,
+  isProtocolErrorResult,
   type ToolCallCompleter,
 } from "./complete.ts";
 import {
@@ -51,7 +52,11 @@ export async function resolveToolContext(
       taskId: task.id,
       profileId: taskSession.profileId,
       userId: task.createdByUserId,
-      capabilities: profile.capabilities,
+      // The session's effective granted capabilities, persisted at create so an
+      // override (e.g. a review worker's clamped set) is honored. NULL on a
+      // legacy row → fall back to the profile's capabilities.
+      sessionCapabilities: taskSession.capabilities,
+      profileCapabilities: profile.capabilities,
     })
     .from(taskSession)
     .innerJoin(task, eq(taskSession.taskId, task.id))
@@ -65,7 +70,7 @@ export async function resolveToolContext(
     taskId: row.taskId,
     ...(row.profileId !== null ? { profileId: row.profileId } : {}),
     ...(row.userId !== null ? { userId: row.userId } : {}),
-    capabilities: row.capabilities ?? [],
+    capabilities: row.sessionCapabilities ?? row.profileCapabilities ?? [],
   };
 }
 
@@ -145,7 +150,9 @@ export async function executeToolCall(
     const parsedResult = tool.output.safeParse(rawResult);
     return {
       kind: "submit",
-      result: parsedResult.success
+      result: isProtocolErrorResult(rawResult)
+        ? rawResult
+        : parsedResult.success
         ? parsedResult.data
         : { error: `invalid result for tool ${tool.name}` },
     };
