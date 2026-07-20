@@ -90,17 +90,22 @@ web:
     hosts:
       - host: engram.REPLACE_DOMAIN
         paths:
-          # Slack external-trigger webhooks (ADR 0060). Exact-match so ONLY
-          # these two URLs are retargeted at the dedicated no-IAP webhook
-          # Service; the more-specific match wins in the URL map. They must
-          # precede the "/" rule. The orchestrator verifies the Slack signing
-          # secret itself (and its IAP bridge exempts these paths), so dropping
-          # IAP here is safe. `tpl`'d to the webhook Service fullname (resolved
-          # by web-ingress.yaml).
+          # Provider webhooks: Slack external triggers (ADR 0060) + the GitHub
+          # PR-review App (ADR 0100). Exact-match so ONLY these URLs are
+          # retargeted at the dedicated no-IAP webhook Service; the
+          # more-specific match wins in the URL map. They must precede the "/"
+          # rule. The orchestrator verifies each provider's own signature
+          # (Slack signing secret / GitHub X-Hub-Signature-256 HMAC) and its
+          # IAP bridge exempts these paths, so dropping IAP here is safe.
+          # `tpl`'d to the webhook Service fullname (resolved by
+          # web-ingress.yaml).
           - path: /api/v1/integrations/slack/events
             pathType: Exact
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           - path: /api/v1/integrations/slack/interactivity
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          - path: /api/v1/integrations/github/events
             pathType: Exact
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           # Everything else → web nginx (IAP-protected).
