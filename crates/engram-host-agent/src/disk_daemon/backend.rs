@@ -76,6 +76,14 @@ pub enum DiskBackendError {
         length: u64,
         total: u64,
     },
+    /// A spool chunk failed the adoption shape check (past `total_bytes`
+    /// or wider than `chunk_size`). The adoption is refused ATOMICALLY —
+    /// adopting the well-shaped subset would silently roll back the
+    /// out-of-shape chunk's acked write (issue #810: the 2026-07-20 roll
+    /// served rolled-back base exactly this way, caught only by
+    /// verify-on-read). The caller parks the survivor; the spool stays
+    /// on disk for diagnosis/retry.
+    AdoptShape { chunk_idx: usize, len: usize },
     /// A resolver-fetched chunk's byte length does not match the manifest
     /// slice width — serving it would read out of bounds. Hash-valid but
     /// short/long blobs (manifest corruption, a bad flush) land here as a
@@ -110,6 +118,12 @@ impl std::fmt::Display for DiskBackendError {
             } => write!(
                 f,
                 "chunk {chunk_idx} length {actual} does not match manifest width {expected}"
+            ),
+            Self::AdoptShape { chunk_idx, len } => write!(
+                f,
+                "spool adoption refused: chunk {chunk_idx} (len {len}) is out of shape for this \
+                 backend — adopting a partial spool would silently roll back acked writes \
+                 (the 85e0298a class); the whole spool is rejected and preserved on disk"
             ),
             Self::InvariantViolation(m) => write!(f, "invariant violation: {m}"),
         }
@@ -1108,24 +1122,33 @@ impl ChunkedDiskBackend {
     /// predecessor's exported chunks so its acked-but-un-uploaded
     /// writes survive the pod roll instead of being rolled back under
     /// the live guest. Pokes the threshold notify so an installed
-    /// flush scheduler uploads promptly. Returns adopted bytes;
-    /// out-of-range or oversized chunks are skipped loudly (a spool
-    /// from a different lineage must be rejected by the CALLER via the
-    /// spool meta — this is only a last-line shape check).
-    pub async fn adopt_unflushed(&self, chunks: Vec<(usize, Vec<u8>)>) -> u64 {
+    /// flush scheduler uploads promptly. Returns adopted bytes.
+    ///
+    /// ATOMIC: every chunk's shape is validated BEFORE anything lands in
+    /// the dirty tier, and one out-of-shape chunk rejects the whole
+    /// adoption (`AdoptShape`) with the tier untouched. The old behavior
+    /// (warn + skip the bad chunk, adopt the rest) silently rolled back
+    /// the skipped chunk's ACKED write — issue #810's trigger, surfaced
+    /// only by the verify-on-read last line. A spool from a different
+    /// lineage is still the CALLER's job to reject via the spool meta;
+    /// this is the last-line shape check, now loud instead of lossy.
+    pub async fn adopt_unflushed(
+        &self,
+        chunks: Vec<(usize, Vec<u8>)>,
+    ) -> Result<u64, DiskBackendError> {
+        for (idx, data) in &chunks {
+            let start = (*idx as u64).saturating_mul(self.chunk_size);
+            if start >= self.total_bytes || data.len() as u64 > self.chunk_size {
+                return Err(DiskBackendError::AdoptShape {
+                    chunk_idx: *idx,
+                    len: data.len(),
+                });
+            }
+        }
         let mut adopted = 0u64;
         {
             let mut dirty = self.dirty.lock().await;
             for (idx, data) in chunks {
-                let start = (idx as u64).saturating_mul(self.chunk_size);
-                if start >= self.total_bytes || data.len() as u64 > self.chunk_size {
-                    tracing::warn!(
-                        chunk_idx = idx,
-                        len = data.len(),
-                        "adopt_unflushed: skipping out-of-shape spool chunk",
-                    );
-                    continue;
-                }
                 adopted += data.len() as u64;
                 dirty.insert(idx, data);
             }
@@ -1133,7 +1156,7 @@ impl ChunkedDiskBackend {
         if adopted > 0 {
             self.threshold_notify.notify_one();
         }
-        adopted
+        Ok(adopted)
     }
 
     /// Flush dirty chunks to the chunk store and tick the manifest
@@ -2423,7 +2446,7 @@ mod tests {
                  pending-upload tier (chunk 2)",
             );
 
-            let adopted = backend2.adopt_unflushed(chunks).await;
+            let adopted = backend2.adopt_unflushed(chunks).await.unwrap();
             assert_eq!(adopted, 2 * chunk_size);
             (backend2, store, dir)
         };
@@ -2456,14 +2479,26 @@ mod tests {
         let backend =
             ChunkedDiskBackend::new(manifest_ref, &manifest, cache, store, u64::MAX).unwrap();
 
-        let adopted = backend
+        // #810: an out-of-shape chunk must reject the WHOLE adoption (a
+        // skipped chunk is a silently rolled-back acked write), leaving
+        // the dirty tier untouched — including any well-shaped siblings.
+        let err = backend
             .adopt_unflushed(vec![
+                (0, vec![0x33; 16]),                      // well-shaped sibling
                 (7, vec![0x11; 4096]),                    // past total_bytes
                 (0, vec![0x22; chunk_size as usize * 2]), // oversized
             ])
-            .await;
-        assert_eq!(adopted, 0, "out-of-shape chunks must be skipped");
-        assert_eq!(backend.dirty_chunks_count().await, 0);
+            .await
+            .expect_err("out-of-shape chunks must refuse the whole adoption");
+        assert!(matches!(
+            err,
+            DiskBackendError::AdoptShape { chunk_idx: 7, .. }
+        ));
+        assert_eq!(
+            backend.dirty_chunks_count().await,
+            0,
+            "atomic rejection: the well-shaped sibling must not have landed"
+        );
     }
 
     /// ADR 0099 H5 — the acked-write invariant across the whole
@@ -2551,7 +2586,7 @@ mod tests {
                     ChunkedDiskBackend::new(ManifestRef::new(), &manifest, cache, store, u64::MAX)
                         .unwrap();
                 dst.rebase_manifest_ref(exported_ref).await;
-                let adopted = dst.adopt_unflushed(chunks).await;
+                let adopted = dst.adopt_unflushed(chunks).await.unwrap();
                 assert_eq!(adopted, 2 * chunk_size);
                 let b0 = dst.read(0, chunk_size).await.unwrap();
                 assert!(b0.iter().all(|b| *b == 0x11), "acked dirty chunk recovered");
