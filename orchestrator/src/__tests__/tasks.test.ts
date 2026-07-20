@@ -44,6 +44,7 @@ import {
   task as taskTable,
   taskSession as taskSessionTable,
   profile as profileTable,
+  sessionListener as sessionListenerTable,
 } from "../db/schema.ts";
 import { eq, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
@@ -276,6 +277,7 @@ function makeFakeProfiles(opts?: {
       rows.set(r.id, r);
       return r;
     },
+    async setDesignation() {},
     async update() {
       return null;
     },
@@ -690,6 +692,7 @@ function listSessionRef(
     sessionId,
     role: "primary",
     profileId: null,
+    capabilities: null,
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
   };
 }
@@ -1189,6 +1192,11 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     if (createdTaskId && db) {
       await db.delete(taskTable).where(eq(taskTable.id, createdTaskId)).catch(() => {});
     }
+    // createTaskWithSession inserts a session_listeners row that the task
+    // delete-cascade does NOT cover (terminal listener rows are retained by
+    // design). Clean it up so the synthetic session id doesn't churn a live
+    // ListenerManager with "malformed session_id" on a shared dev DB.
+    await db!.delete(sessionListenerTable).where(eq(sessionListenerTable.sessionId, sessionId)).catch(() => {});
     await db!.delete(profileTable).where(eq(profileTable.id, PROFILE_ID)).catch(() => {});
     await srv?.close();
   });
@@ -1345,6 +1353,8 @@ describe("TaskService — rename (UpdateTask)", () => {
   afterAll(async () => {
     if (!dbReachable) return;
     if (taskId) await db!.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
+    // See the CRUD suite's afterAll: the session_listeners row isn't cascaded.
+    await db!.delete(sessionListenerTable).where(eq(sessionListenerTable.sessionId, sessionId)).catch(() => {});
     await db!.delete(profileTable).where(eq(profileTable.id, RENAME_PROFILE)).catch(() => {});
     await srvA?.close();
   });

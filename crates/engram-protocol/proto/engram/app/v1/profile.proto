@@ -69,6 +69,10 @@ message Profile {
   optional string effort = 18;
   // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
   repeated uint32 port_exposures = 19;
+  // ADR 0100: system-role marker (e.g. "pr_reviewer"). At most one active
+  // profile per designation (the store clears the prior when one is set); a
+  // designated profile cannot be deleted. Empty = an ordinary profile.
+  optional string designation = 20;
 }
 
 // ADR 0057: a profile's egress network allow-list. `default` is the posture for
@@ -147,6 +151,8 @@ message CreateProfileRequest {
   optional string effort = 14;
   // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
   repeated uint32 port_exposures = 15;
+  // ADR 0100: system-role marker (see Profile.designation). Admin-only.
+  optional string designation = 16;
 }
 
 message CreateProfileResponse {
@@ -176,6 +182,8 @@ message UpdateProfileRequest {
   optional string effort = 15;
   // ADR 0064: guest ports auto-exposed (private) for every session from this profile.
   repeated uint32 port_exposures = 16;
+  // ADR 0100: system-role marker (see Profile.designation). Admin-only.
+  optional string designation = 17;
 }
 
 message UpdateProfileResponse {

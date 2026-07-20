@@ -423,6 +423,89 @@ describe("compileSessionCreateInput", () => {
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
   });
+
+  test("session clamps replace capabilities/network and drop profile secrets/env", async () => {
+    const reviewCapability = "engram:pr_review";
+    const cloneCapability = "github:contents:read@openai/engrams";
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "review_tool",
+      description: "Allowed by the review clamp.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: reviewCapability,
+      handler: async () => ({ ok: true }),
+    });
+    toolRegistry.register({
+      name: "profile_write_tool",
+      description: "Must not survive the review clamp.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "github:pulls:write",
+      handler: async () => ({ ok: true }),
+    });
+
+    const inp = await compileSessionCreateInput(
+      profile({
+        capabilities: ["github:pulls:write"],
+        network: {
+          default: "allow",
+          allowHosts: ["profile.example.com"],
+          allowHostPatterns: ["*.profile.example.com"],
+        },
+        secrets: [{
+          ref: "PROFILE_PAT",
+          envVar: "PROFILE_PAT",
+          mode: "literal",
+          allowHosts: ["github.com"],
+          allowHostPatterns: [],
+        }],
+        envVars: {
+          PROFILE_ONLY: "must-drop",
+          ANTHROPIC_MODEL: "stale-profile-model",
+        },
+      }),
+      { ...deps(), toolRegistry },
+      {
+        capabilityOverride: [reviewCapability, cloneCapability],
+        extraCapabilities: ["github:issues:write"],
+        networkOverride: {
+          default: "deny",
+          allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+          allowHostPatterns: [],
+        },
+        dropProfileSecretsAndEnv: true,
+        extraHarnessEnv: { TRIGGER_ONLY: "kept" },
+      },
+    );
+
+    expect(inp.capabilities).toEqual([reviewCapability, cloneCapability]);
+    const policy = JSON.parse(inp.integrationPolicyJson!) as {
+      network: {
+        default: string;
+        allow_hosts: string[];
+        allow_host_patterns: string[];
+      };
+      secrets: unknown[];
+    };
+    expect(policy.network).toEqual({
+      default: "deny",
+      allow_hosts: ["github.com", "codeload.github.com", "api.github.com"],
+      allow_host_patterns: [],
+    });
+    expect(policy.secrets).toEqual([]);
+    expect(inp.harnessEnv?.PROFILE_ONLY).toBeUndefined();
+    expect(inp.harnessEnv).toMatchObject({
+      ANTHROPIC_MODEL: "claude-opus-4-8",
+      TRIGGER_ONLY: "kept",
+    });
+    const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
+    expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -751,7 +834,7 @@ describe("createTaskWithSession", () => {
 });
 
 describe("createSessionForExistingTask", () => {
-  test("creates promptlessly and inserts only the finder task_session row", async () => {
+  test("creates promptlessly and leaves listener registration off by default", async () => {
     const records: Record<string, unknown>[] = [];
     const sessions = fakeSessions();
 
@@ -767,11 +850,15 @@ describe("createSessionForExistingTask", () => {
     );
 
     expect(out).toEqual({ sessionId: "sess-1" });
+    // The effective granted set (profile caps + extras) is persisted on the
+    // task_session so the tool-exec gate honors it — the profile itself has no
+    // capabilities here, yet the session carries the extra grant.
     expect(records).toEqual([{
       taskId: "task-existing",
       sessionId: "sess-1",
       role: "finder",
       profileId: "p1",
+      capabilities: ["github:contents:read@openai/engrams"],
     }]);
     const request = sessions.createReqs[0] as {
       prompt?: string;
@@ -783,6 +870,105 @@ describe("createSessionForExistingTask", () => {
     expect(request.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
       `finder system prompt\n\n${PAPERCUT_SYSTEM_PROMPT}`,
     );
+  });
+
+  test("registers the listener in the same transaction when requested", async () => {
+    const records: Record<string, unknown>[] = [];
+
+    await createSessionForExistingTask(
+      createDeps(fakeSessions(), recordingDb(records)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "verifier",
+        registerListener: true,
+      },
+    );
+
+    expect(records).toEqual([
+      {
+        taskId: "task-existing",
+        sessionId: "sess-1",
+        role: "verifier",
+        profileId: "p1",
+        capabilities: [],
+      },
+      { sessionId: "sess-1" },
+    ]);
+  });
+
+  test("threads policy clamps into the existing-task session compiler", async () => {
+    const sessions = fakeSessions();
+    await createSessionForExistingTask(
+      createDeps(sessions, recordingDb([]), {
+        profileOver: {
+          capabilities: ["github:pulls:write"],
+          envVars: { PROFILE_PAT: "must-drop" },
+          network: {
+            default: "allow",
+            allowHosts: ["profile.example.com"],
+            allowHostPatterns: [],
+          },
+          secrets: [{
+            ref: "PROFILE_PAT",
+            envVar: "PROFILE_PAT",
+            mode: "literal",
+            allowHosts: ["github.com"],
+            allowHostPatterns: [],
+          }],
+        },
+      }),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "finder",
+        capabilityOverride: [
+          "engram:pr_review",
+          "github:contents:read@openai/engrams",
+        ],
+        networkOverride: {
+          default: "deny",
+          allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+          allowHostPatterns: [],
+        },
+        dropProfileSecretsAndEnv: true,
+      },
+    );
+
+    const request = sessions.createReqs[0] as {
+      capabilities?: string[];
+      harnessEnv?: Record<string, string>;
+      integrationPolicyJson?: string;
+    };
+    expect(request.capabilities).toEqual([
+      "engram:pr_review",
+      "github:contents:read@openai/engrams",
+    ]);
+    expect(request.harnessEnv?.PROFILE_PAT).toBeUndefined();
+    const policy = JSON.parse(request.integrationPolicyJson!) as {
+      network: { allow_hosts: string[] };
+      secrets: Array<{ secret_ref: string }>;
+    };
+    expect(policy.network.allow_hosts).toEqual([
+      "github.com",
+      "codeload.github.com",
+      "api.github.com",
+    ]);
+    expect(policy.secrets.some((secret) => secret.secret_ref === "PROFILE_PAT")).toBe(false);
+  });
+
+  test("compensates when requested listener registration fails", async () => {
+    const sessions = fakeSessions();
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], false, 2)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "verifier",
+        registerListener: true,
+      },
+    )).rejects.toThrow(/insert boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
   test("deletes the orphan session when task_session persistence fails", async () => {

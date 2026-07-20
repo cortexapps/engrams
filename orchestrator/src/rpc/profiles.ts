@@ -119,6 +119,7 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
     harness: row.harness ?? undefined,
     model: row.model ?? undefined,
     effort: row.effort ?? undefined,
+    designation: row.designation ?? undefined,
     // ADR 0064: ports auto-exposed for this profile's sessions (member-visible —
     // describes config, not a secret, like skills).
     portExposures: row.portExposures,
@@ -129,6 +130,13 @@ function toProto(row: ProfileRow, isAdmin: boolean): Profile {
 }
 
 const ENV_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+const ALLOWED_DESIGNATIONS = new Set(["pr_reviewer"]);
+
+function assertDesignationValid(designation: string): void {
+  if (designation && !ALLOWED_DESIGNATIONS.has(designation)) {
+    throw new ConnectError("unknown designation", Code.InvalidArgument);
+  }
+}
 
 /** ADR 0057: map the proto network message (or undefined) to the stored shape. */
 function normalizeNetwork(
@@ -360,7 +368,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      const row = await store.create({
+      let row = await store.create({
         name: req.name,
         description: req.description,
         icon: req.icon || "Bot",
@@ -377,6 +385,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         effort,
         portExposures: req.portExposures ?? [],
       });
+      if (req.designation) {
+        assertDesignationValid(req.designation);
+        await store.setDesignation(row.id, req.designation);
+        row = (await store.get(row.id)) ?? row;
+      }
       return { profile: toProto(row, true) };
     },
 
@@ -399,7 +412,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
       assertSecretsValid(secrets);
-      const row = await store.update(req.id, {
+      let row = await store.update(req.id, {
         name: req.name,
         description: req.description,
         icon: req.icon || "Bot",
@@ -417,6 +430,11 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         portExposures: req.portExposures ?? [],
       });
       if (!row) throw new ConnectError("not found", Code.NotFound);
+      if (req.designation !== undefined) {
+        assertDesignationValid(req.designation);
+        await store.setDesignation(req.id, req.designation || null);
+        row = (await store.get(req.id)) ?? row;
+      }
       return { profile: toProto(row, true) };
     },
 

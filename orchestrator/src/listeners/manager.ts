@@ -7,6 +7,7 @@ import { makeLeaseStore } from "./lease-store.ts";
 import type { LeaseStore } from "./lease-store.ts";
 import { SessionListener } from "./session-listener.ts";
 import { makeProductionPrLinkConsumer } from "./pr-link-consumer.ts";
+import { makeProductionReviewConsumer } from "./review-consumer.ts";
 import { makeProductionSlackConsumer } from "./slack-consumer.ts";
 import { makeProductionToolConsumer } from "./tool-consumer.ts";
 
@@ -158,6 +159,7 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionToolConsumer(),
           makeProductionPrLinkConsumer(),
           makeProductionSlackConsumer(),
+          makeProductionReviewConsumer(),
         ],
         readPage: readSessionEventsBounded,
         fetchStatus: async (id) => {

@@ -125,6 +125,10 @@ function makeProfiles(seed: ProfileRow[]): ProfileStore {
       rows.set(row.id, row);
       return row;
     },
+    async setDesignation(id, designation) {
+      const row = rows.get(id);
+      if (row) rows.set(id, { ...row, designation });
+    },
     async update(id, input) {
       const row = rows.get(id);
       if (!row || row.deletedAt != null) return null;
