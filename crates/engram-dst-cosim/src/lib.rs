@@ -55,9 +55,11 @@
 pub mod bridge;
 pub mod host;
 pub mod scheduler;
+pub mod swarm;
 pub mod world;
 
 pub use bridge::{CosimCoordControlPlane, CosimHostClient};
 pub use host::{CosimHost, CosimReconcileBackend, FinalizeTickOutcome, HostView, SharedHost};
 pub use scheduler::Cosim;
+pub use swarm::{run_seed, CosimSwarm, Profile, SeedOutcome, Step, SwarmReport};
 pub use world::{CosimWorld, COSIM_IMAGE};

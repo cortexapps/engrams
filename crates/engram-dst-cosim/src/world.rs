@@ -181,7 +181,13 @@ fn build_replica(
         host_id,
         Arc::new(CosimHostClient::new(host_id, host)) as Arc<dyn HostClient>,
     );
-    let blob_dir = std::env::temp_dir().join("engram-dst-cosim-blobs");
+    // The coordinator's blob tier is a per-world deterministic in-memory store
+    // (ADR 0098 determinism-audit item 6/7): the pre-swap process-global
+    // `temp_dir()/engram-dst-cosim-blobs` was SHARED across every SimWorld — a
+    // cross-world contamination + real-`tokio::fs`-latency clock-drift hazard
+    // (the #793/#799 class) fatal to a multi-seed swarm. One `MemBlobStorage`
+    // backs both `blob` and `chunk_store` (they are the coordinator's one bucket).
+    let coord_blob = Arc::new(engram_sim::MemBlobStorage::new());
     let services = Services {
         meta: meta.clone(),
         cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
@@ -195,12 +201,8 @@ fn build_replica(
             engram_oci::AnonymousResolver,
         ))),
         auth_resolver: Arc::new(engram_oci::AnonymousResolver),
-        blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
-            blob_dir.clone(),
-        )),
-        chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
-            engram_storage_local::LocalBlobStorage::new(blob_dir),
-        )),
+        blob: coord_blob.clone(),
+        chunk_store: engram_chunk_store::ChunkStore::new(coord_blob),
         materialize_dir: None,
         clock: clock.clone(),
         entropy: entropy.clone(),

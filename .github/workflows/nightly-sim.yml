@@ -215,3 +215,89 @@ jobs:
           else
             gh issue create --title "$title" --label sim-failure --body "$body"
           fi
+
+  cosim-swarm:
+    name: nightly boundary swarm (engram-dst-cosim, deep horizon)
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release-cosim
+      - name: Pick tonight's seed window
+        id: seeds
+        # Day-derived, non-overlapping windows (the same discipline as the two
+        # swarms above; the three sims' seed spaces are independent, so sharing
+        # the day formula is fine). 280 seeds/night: 200 chaos + 80 calm at 1500
+        # steps — sized BELOW the host swarm's 480-seed volume (the co-sim runs
+        # BOTH the coordinator and the host per step, a heavier per-step cost),
+        # at a comparable wall budget.
+        run: |
+          day=$(( $(date -u +%s) / 86400 ))
+          base=$(( day * 280 ))
+          chaos_start=$base
+          chaos_end=$(( base + 200 ))
+          calm_start=$chaos_end
+          calm_end=$(( base + 280 ))
+          echo "chaos=${chaos_start}..${chaos_end}" >> "$GITHUB_OUTPUT"
+          echo "calm=${calm_start}..${calm_end}" >> "$GITHUB_OUTPUT"
+          echo "UTC day ${day}: cosim chaos seeds ${chaos_start}..${chaos_end}, calm seeds ${calm_start}..${calm_end}, 1500 steps"
+      - name: chaos swarm (200 seeds x 1500 steps)
+        run: cargo run -p engram-dst-cosim --release --bin sim-cosim -- --seeds ${{ steps.seeds.outputs.chaos }} --steps 1500 --profile chaos --failure-report "$RUNNER_TEMP/cosim-chaos-report.md"
+      - name: calm swarm (80 seeds x 1500 steps)
+        if: ${{ !cancelled() }}
+        run: cargo run -p engram-dst-cosim --release --bin sim-cosim -- --seeds ${{ steps.seeds.outputs.calm }} --steps 1500 --profile calm --failure-report "$RUNNER_TEMP/cosim-calm-report.md"
+      - name: File a failure issue with repro steps
+        # Same dedup discipline as the sibling swarms: one open issue per oracle
+        # slug, repeats accumulate as comments. The "nightly cosim:" title prefix
+        # keeps boundary-swarm slugs from colliding with same-named coordinator/
+        # host invariants. A failure without a report is filed as a dedicated
+        # infra-error issue instead.
+        if: ${{ failure() }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          reports=""
+          for f in "$RUNNER_TEMP/cosim-chaos-report.md" "$RUNNER_TEMP/cosim-calm-report.md"; do
+            if [ -s "$f" ]; then
+              reports="${reports}$(cat "$f")"$'\n'
+            fi
+          done
+          if [ -z "$reports" ]; then
+            title="nightly cosim: infra failure (no failure report)"
+            body=$(printf '%s\n\n**Run:** %s\n**Commit:** `%s`\n' \
+              "The nightly job failed without producing a failure report, so this is an infra error — build break, runner death, or timeout — not an oracle violation." \
+              "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+              "${GITHUB_SHA}")
+            existing=$(gh issue list --state open --label sim-failure --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+            if [ -n "$existing" ]; then
+              echo "commenting on existing issue #$existing"
+              gh issue comment "$existing" --body "$body"
+            else
+              gh issue create --title "$title" --label sim-failure --body "$body"
+            fi
+            exit 0
+          fi
+          slug=$(printf '%s' "$reports" | sed -n 's/^<!-- sim-failure-slug: \(.*\) -->$/\1/p' | head -1)
+          slug=${slug:-oracle-violation}
+          title="nightly cosim: \`${slug}\` violated"
+          body=$(printf '%s\n\n%s\n\n---\n_Run: %s • commit %s • fix flow: replay locally at this commit (the printed `sim-cosim` replay line), fix, then pin the seed in a crates/engram-dst-cosim/tests regression (ADR 0098)._\n' \
+            "**Commit:** \`${GITHUB_SHA}\` — replay commands below assume \`git checkout ${GITHUB_SHA}\`." \
+            "$reports" \
+            "${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" \
+            "${GITHUB_SHA}")
+          existing=$(gh issue list --state open --label sim-failure --search "\"$title\" in:title" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            echo "commenting on existing issue #$existing"
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create --title "$title" --label sim-failure --body "$body"
+          fi
