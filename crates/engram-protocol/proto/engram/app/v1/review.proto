@@ -14,6 +14,11 @@ import "google/protobuf/timestamp.proto";
 service ReviewService {
   rpc ListReviews(ListReviewsRequest) returns (ListReviewsResponse);
   rpc GetReview(GetReviewRequest) returns (GetReviewResponse);
+  // Re-run a review from scratch. The review record is terminal (failed,
+  // halted, or posted); this dispatches a fresh pass over the PR's current
+  // head, minting a new review record and workflow epoch. The old record is
+  // left intact as history.
+  rpc RetryReview(RetryReviewRequest) returns (RetryReviewResponse);
 
   rpc ListEnrollments(ListEnrollmentsRequest) returns (ListEnrollmentsResponse);
   rpc UpsertEnrollment(UpsertEnrollmentRequest) returns (UpsertEnrollmentResponse);
@@ -147,6 +152,18 @@ message ListReviewsResponse {
 
 message GetReviewRequest {
   string id = 1;
+}
+
+// Re-run the review with the given id.
+message RetryReviewRequest {
+  string id = 1;
+}
+
+message RetryReviewResponse {
+  // The workflow driving the fresh review pass.
+  string workflow_id = 1;
+  // The new review record, when the dispatch created one.
+  optional string review_id = 2;
 }
 
 message GetReviewResponse {

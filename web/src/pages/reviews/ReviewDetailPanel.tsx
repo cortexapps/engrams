@@ -8,6 +8,8 @@ import {
   ExternalLink,
   GitBranch,
   GitPullRequestArrow,
+  Loader2,
+  RotateCcw,
   ScanSearch,
   ShieldCheck,
   Terminal,
@@ -20,10 +22,11 @@ import type {
   ReviewFinding,
   ReviewVerdict,
 } from "../../gen/engram/app/v1/review_pb";
-import { useReview } from "../../hooks/useReviews";
+import { useRetryReview, useReview } from "../../hooks/useReviews";
 import { errorMessage } from "../../lib/errors";
 import { cn } from "@/lib/utils";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
 
 const SEVERITY_ORDER: Record<string, number> = {
@@ -220,6 +223,34 @@ function FindingCard({
 
 const ACTIVE_STATUSES: ReadonlySet<string> = new Set(["queued", "finding", "verifying"]);
 
+// Re-run a terminal review. Dispatches a fresh pass over the PR's current head
+// (a new record + workflow epoch); the list refreshes so the new row appears.
+function RetryReviewButton({ review }: { review: Review }) {
+  const retry = useRetryReview();
+  return (
+    <div className="ml-auto flex items-center gap-2">
+      {retry.isError && (
+        <span className="text-xs text-destructive">
+          couldn’t retry — {errorMessage(retry.error)}
+        </span>
+      )}
+      <Button
+        variant="outline"
+        size="sm"
+        disabled={retry.isPending}
+        onClick={() => retry.mutate({ id: review.id })}
+      >
+        {retry.isPending ? (
+          <Loader2 className="size-3.5 animate-spin" aria-hidden />
+        ) : (
+          <RotateCcw className="size-3.5" aria-hidden />
+        )}
+        Retry review
+      </Button>
+    </div>
+  );
+}
+
 export function ReviewDetailPanel({ review }: { review: Review }) {
   const active = ACTIVE_STATUSES.has(review.status);
   const { data, isPending, error } = useReview(review.id, { active });
@@ -291,6 +322,7 @@ export function ReviewDetailPanel({ review }: { review: Review }) {
             live={review.status === "verifying"}
           />
         )}
+        {!active && <RetryReviewButton review={review} />}
       </div>
 
       <ReviewLog events={data?.events ?? []} active={active} />

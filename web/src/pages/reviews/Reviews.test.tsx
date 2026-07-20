@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { beforeEach, describe, it, expect, vi } from "vitest";
 import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderWithProviders } from "../../test-utils";
@@ -50,11 +50,35 @@ const detail = {
   ],
 };
 
+// A mutable status so a test can render a terminal review (retry is offered)
+// without re-mocking; defaults to the active "verifying" the other cases use.
+const view = { status: "verifying" };
+const retryMutate = vi.fn();
+
 vi.mock("../../hooks/useReviews", () => ({
-  useReviews: () => ({ data: { reviews: [review] }, isPending: false, error: null }),
-  useReview: () => ({ data: detail, isPending: false, error: null }),
+  useReviews: () => ({
+    data: { reviews: [{ ...review, status: view.status }] },
+    isPending: false,
+    error: null,
+  }),
+  useReview: () => ({
+    data: { ...detail, review: { ...review, status: view.status } },
+    isPending: false,
+    error: null,
+  }),
+  useRetryReview: () => ({
+    mutate: retryMutate,
+    isPending: false,
+    isError: false,
+    error: null,
+  }),
 }));
 vi.mock("../../hooks/useNow", () => ({ useNow: () => 0 }));
+
+beforeEach(() => {
+  view.status = "verifying";
+  retryMutate.mockClear();
+});
 
 describe("Reviews page", () => {
   it("shows the workflow stage for each review", async () => {
@@ -83,6 +107,27 @@ describe("Reviews page", () => {
     expect(finderLink.getAttribute("href")).toContain("/sessions/finder-sess-1");
     const verifierLink = screen.getByRole("link", { name: /verifier session/i });
     expect(verifierLink.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+  });
+
+  it("offers a retry on a terminal review and dispatches a fresh pass", async () => {
+    view.status = "failed";
+    renderWithProviders(<Reviews />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByText("cortexapps/engrams"));
+
+    const retry = await screen.findByRole("button", { name: /retry review/i });
+    await user.click(retry);
+    expect(retryMutate).toHaveBeenCalledWith({ id: "review-1" });
+  });
+
+  it("does not offer a retry while a review is still running", async () => {
+    // Default status is the active "verifying" — no retry button.
+    renderWithProviders(<Reviews />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByText("cortexapps/engrams"));
+
+    await screen.findByText("Unchecked value reaches the caller");
+    expect(screen.queryByRole("button", { name: /retry review/i })).toBeNull();
   });
 
   it("renders the review activity log with per-step milestones", async () => {
