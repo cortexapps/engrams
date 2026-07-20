@@ -56,8 +56,10 @@ use engram_core::traits::{Clock as _, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
+use engram_dst_host::device_plane::{DevicePlane, ServeOutcome};
 use engram_dst_host::SimFs;
 use engram_host_agent::disk_daemon::backend::ChunkedDiskBackend;
+use engram_host_agent::disk_daemon::{NbdSlot, NbdSlotAllocator};
 use engram_host_agent::eviction_finalize::{
     persist_disk_pending_chunks, run_eviction_finalize_attempt, DiskPendingRecord,
     EvictionFinalizeRecord, EvictionFinalizer, EvictionSandbox, FinalizeAttempt,
@@ -74,6 +76,11 @@ pub const CHUNK_SIZE: u64 = 4096;
 pub const NUM_CHUNKS: u64 = 8;
 /// Small redrive cap so a quarantine arm stays cheap (prod is 10).
 pub const FINALIZE_MAX_ATTEMPTS: u32 = 3;
+
+/// The NBD device universe for one co-simulated host — small (the small-world
+/// bounding, #784 rung 2): enough `/dev/nbdN` slots for every concurrent
+/// sandbox plus a couple of spares for the slot-accounting exercise.
+pub const DEVICE_CAPACITY: u32 = 8;
 
 /// Content bytes stamped with `tag` (first 8 bytes little-endian, tiled).
 pub(crate) fn synth_chunk(tag: u64) -> Vec<u8> {
@@ -127,7 +134,7 @@ pub(crate) async fn build_base_sandbox(
     store: Arc<ChunkStore>,
     cache_root: std::path::PathBuf,
     entropy: Arc<SimEntropy>,
-) -> (SandboxId, Arc<ChunkedDiskBackend>) {
+) -> (SandboxId, ManifestRef, Arc<ChunkedDiskBackend>) {
     let sandbox_id = SandboxId::from(entropy.uuid());
     let base_hash = store
         .put_chunk(&synth_chunk(0))
@@ -142,7 +149,7 @@ pub(crate) async fn build_base_sandbox(
         .await
         .expect("seed base manifest");
     let backend = build_backend(&store, &cache_root, &sandbox_id, base_ref).await;
-    (sandbox_id, Arc::new(backend))
+    (sandbox_id, base_ref, Arc::new(backend))
 }
 
 /// The reconcile-visible slice of host state (parking_lot-guarded so the
@@ -213,9 +220,13 @@ impl EvictionSandbox for CosimDestroyer {
 /// One sandbox on the host.
 struct CosimSandbox {
     session_id: Option<SessionId>,
+    /// The private base manifest the sandbox was created on — the ref a
+    /// post-roll rehydrate rebuilds the RAM backend from (rung 2: the survivor
+    /// re-serve leg reconstructs `ChunkedDiskBackend` off the durable pointer).
+    base_ref: ManifestRef,
     published_ref: Option<ManifestRef>,
-    /// The live RAM backend — `None` once paused for a finalize or
-    /// destroyed.
+    /// The live RAM backend — `None` once paused for a finalize, destroyed, or
+    /// (rung 2) dropped by a host-agent roll until the rehydrate re-serves it.
     backend: Option<Arc<ChunkedDiskBackend>>,
     /// The work cursor (an events-index stand-in): advanced by each guest
     /// write, captured at eviction time. The boundary oracle keys on it.
@@ -265,6 +276,16 @@ pub struct CosimHost {
     finalize_cursor: BTreeMap<SnapshotId, i64>,
     destroyer: Arc<CosimDestroyer>,
     next_tag: u64,
+    /// Rung 2 (#784): the REAL NBD slot/generation/park/un-pause device-plane
+    /// model, shared with `engram-dst-host` via
+    /// [`engram_dst_host::device_plane`], keyed by the coordinator-minted
+    /// [`SandboxId`]. Drives the roll → register-rehydrate → stale-sweep →
+    /// un-pause family co-simulated at the boundary.
+    pub device: DevicePlane,
+    /// Oracle memory (survives): sandboxes the stale-sweep PARKed because a
+    /// live guest still held the device (the `sweep-blocked-live-holder` set,
+    /// #806) — never severed, must be re-served.
+    sweep_parked_live: BTreeSet<SandboxId>,
 }
 
 impl CosimHost {
@@ -289,6 +310,8 @@ impl CosimHost {
             finalize_cursor: BTreeMap::new(),
             destroyer: Arc::new(CosimDestroyer::default()),
             next_tag: 0,
+            device: DevicePlane::new(DEVICE_CAPACITY),
+            sweep_parked_live: BTreeSet::new(),
         }
     }
 
@@ -329,18 +352,42 @@ impl CosimHost {
     pub fn cache_root(&self) -> std::path::PathBuf {
         self.fs.cache_dir().to_path_buf()
     }
+    /// The current-generation NBD slot pool handle (cloned) — the bridge claims
+    /// a new sandbox's device on THIS pool OUTSIDE the host lock, then commits
+    /// the slot under a brief lock (the same concurrency split the backend
+    /// build uses; see the module-level note).
+    pub fn device_pool(&self) -> Arc<NbdSlotAllocator> {
+        self.device.nbd_pool.clone()
+    }
+    /// A free `/dev/nbdN` path for a new sandbox (see
+    /// [`DevicePlane::next_free_device`]).
+    pub fn next_free_device(&self) -> std::path::PathBuf {
+        self.device
+            .next_free_device()
+            .expect("cosim device universe not exhausted (DEVICE_CAPACITY)")
+    }
 
-    /// Insert a pre-built sandbox (the sync half of the boot restore leg).
-    pub fn commit_created_sandbox(&mut self, id: SandboxId, backend: Arc<ChunkedDiskBackend>) {
+    /// Insert a pre-built sandbox (the sync half of the boot restore leg),
+    /// together with its pre-claimed NBD device slot.
+    pub fn commit_created_sandbox(
+        &mut self,
+        id: SandboxId,
+        base_ref: ManifestRef,
+        backend: Arc<ChunkedDiskBackend>,
+        device: std::path::PathBuf,
+        lease: NbdSlot,
+    ) {
         self.sandboxes.insert(
             id,
             CosimSandbox {
                 session_id: None,
+                base_ref,
                 published_ref: None,
                 backend: Some(backend),
                 cursor: 0,
             },
         );
+        self.device.insert_served_slot(id, device, lease);
         self.view.inner.lock().live.insert(id);
     }
 
@@ -403,6 +450,164 @@ impl CosimHost {
     /// Is a capture in flight for this sandbox (the capture lock)?
     pub fn capture_in_flight(&self, sandbox_id: SandboxId) -> bool {
         self.pending_finalizes.contains_key(&sandbox_id)
+    }
+
+    // ─────────── Rung 2: the NBD device-plane family (#784) ───────────
+    //
+    // All decisions run over the REAL host-core verdicts (`sweep_verdict` incl.
+    // the #806 holder table, `resume_data_plane_served`,
+    // `is_local_survivor_candidate`) and the REAL `NbdSlotAllocator`, via the
+    // shared `engram_dst_host::device_plane::DevicePlane`. Only the world
+    // bookkeeping (generation / served_by / parked / guest liveness) is sim.
+
+    /// A host-agent process ROLL: the successor comes up as a fresh generation.
+    /// The RAM disk backends die (rebuilt by the rehydrate); the FC VMs stay
+    /// resident survivors (`view.live` unchanged); the device plane rolls
+    /// (`served_by` clears, `kernel_owner` persists at the now-dead gen). A
+    /// sandbox mid-capture already has `backend == None` (paused for finalize),
+    /// so this leaves it untouched.
+    pub fn roll(&mut self) {
+        self.device.roll();
+        for s in self.sandboxes.values_mut() {
+            s.backend = None; // RAM died with the process
+        }
+    }
+
+    /// The register-time rehydrate sequence (ADR 0098 P7 / #739 / #784):
+    /// coord-list pass → local ChainHeadRecord pass → stale-binding sweep. The
+    /// `rehydrate_list` is the REAL coordinator listing
+    /// (`register_rehydrate_list_core`), passed in by the harness; the local
+    /// pass + sweep run over the pure predicates. `local_pass_enabled=false`
+    /// replays the pre-#739 ungated variant (proving the un-pause gate is the
+    /// last line).
+    pub async fn register_rehydrate(
+        &mut self,
+        rehydrate_list: &[SandboxId],
+        local_pass_enabled: bool,
+    ) -> Result<(), String> {
+        // 1. Coord-list pass: re-serve every LISTED resident survivor.
+        for &id in rehydrate_list {
+            if self.device.is_resident_survivor(id) {
+                self.serve_and_rebuild(id).await?;
+            }
+        }
+        // 2. Local ChainHeadRecord pass (#739): re-serve any live survivor the
+        //    coord list missed (live ∧ unserved ∧ session-bound).
+        if local_pass_enabled {
+            let ids: Vec<SandboxId> = self.device.slots.keys().copied().collect();
+            for id in ids {
+                let has_session = self.sandboxes.get(&id).and_then(|s| s.session_id).is_some();
+                if self.device.is_local_survivor_candidate(id, has_session) {
+                    self.serve_and_rebuild(id).await?;
+                }
+            }
+        }
+        // 3. Stale-binding sweep (REAL `sweep_verdict` incl. the #806 holder
+        //    table). A dead-owner device a live guest still holds is PARKed.
+        let parked = self.device.stale_sweep_tick();
+        self.sweep_parked_live.extend(parked);
+        Ok(())
+    }
+
+    /// Serve `id`'s device on the current generation (RECONFIGURE) and rebuild
+    /// its RAM backend if the roll dropped it. A capture-in-flight sandbox is
+    /// skipped (its VM is paused for the finalize).
+    async fn serve_and_rebuild(&mut self, id: SandboxId) -> Result<(), String> {
+        if self.capture_in_flight(id) {
+            return Ok(());
+        }
+        match self.device.serve(id).await? {
+            ServeOutcome::NewlyServed => self.ensure_backend(id).await,
+            ServeOutcome::AlreadyServed => Ok(()),
+        }
+    }
+
+    /// Rebuild `id`'s RAM backend from its durable pointer (last publish, else
+    /// base) if it is currently `None` — the post-roll survivor re-serve leg.
+    async fn ensure_backend(&mut self, id: SandboxId) -> Result<(), String> {
+        let needs = self.sandboxes.get(&id).is_some_and(|s| s.backend.is_none())
+            && !self.capture_in_flight(id);
+        if !needs {
+            return Ok(());
+        }
+        let manifest_ref = {
+            let s = self.sandboxes.get(&id).expect("sandbox present");
+            s.published_ref.unwrap_or(s.base_ref)
+        };
+        let backend = build_backend(&self.store, self.fs.cache_dir(), &id, manifest_ref).await;
+        if let Some(s) = self.sandboxes.get_mut(&id) {
+            s.backend = Some(Arc::new(backend));
+        }
+        Ok(())
+    }
+
+    /// Rung-2 PARK sandbox `id` (FC paused, VM resident, device still served) —
+    /// the 731df805 pre-condition.
+    pub fn park(&mut self, id: SandboxId) {
+        self.device.park(id);
+    }
+
+    /// Un-pause sandbox `id` over the REAL un-pause data-plane gate. Returns
+    /// `true` if un-paused, `false` if the gate fired (unserved plane).
+    pub fn unpause(&mut self, id: SandboxId) -> bool {
+        self.device.unpause(id)
+    }
+
+    /// Model the FC guest genuinely dying (#806): it no longer holds its device
+    /// node open, so a dead-owner sweep may legally DISCONNECT.
+    pub fn kill_guest(&mut self, id: SandboxId) {
+        self.device.kill_guest(id);
+    }
+
+    /// Run the stale-binding sweep independently (REAL `sweep_verdict`).
+    pub fn stale_sweep_tick(&mut self) {
+        let parked = self.device.stale_sweep_tick();
+        self.sweep_parked_live.extend(parked);
+    }
+
+    /// `try_claim` a spare device on the real allocator (slot-accounting).
+    pub async fn slot_claim(&mut self) {
+        // Spare device: the first free path ABOVE the sandbox devices.
+        if let Some(device) = self.device.next_free_device() {
+            self.device.slot_claim(device).await;
+        }
+    }
+
+    /// Release the oldest held spare lease (slot-accounting).
+    pub fn slot_populate_tick(&mut self) {
+        self.device.slot_populate_tick();
+    }
+
+    // ── Device-plane oracle/read accessors ──
+    pub fn device_generation(&self) -> u32 {
+        self.device.generation
+    }
+    pub fn is_parked(&self, id: SandboxId) -> bool {
+        self.device.is_parked(id)
+    }
+    pub fn served_by_current(&self, id: SandboxId) -> bool {
+        self.device.served_by_current(id)
+    }
+    pub fn guest_holds_device(&self, id: SandboxId) -> bool {
+        self.device.guest_holds_device(id)
+    }
+    pub fn kernel_owner(&self, id: SandboxId) -> Option<u32> {
+        self.device.kernel_owner(id)
+    }
+    pub fn device_slot_ids(&self) -> Vec<SandboxId> {
+        self.device.slots.keys().copied().collect()
+    }
+    /// The slot-accounting identity terms: `(free, warm, held, capacity)`.
+    pub async fn slot_accounting(&self) -> (usize, usize, usize, usize) {
+        let free = self.device.nbd_pool.free_count().await;
+        let warm = self.device.nbd_pool.warm_count().await;
+        let held = self.device.leases_held();
+        (free, warm, held, self.device.nbd_capacity as usize)
+    }
+    /// Oracle read: sandboxes the sweep PARKed because a live guest held the
+    /// device (#806) — never severed.
+    pub fn sweep_parked_live(&self) -> Vec<SandboxId> {
+        self.sweep_parked_live.iter().copied().collect()
     }
 
     /// A unit of guest work: write one real content-tagged chunk (advancing
@@ -565,6 +770,19 @@ impl CosimHost {
         }
     }
 
+    /// Test hook (#784 rung 2, the capture-lock release pin): delete the
+    /// in-flight finalize's node-durable staging dir so every redrive attempt
+    /// fails (the ENOENT class) and the REAL `run_eviction_finalize_attempt`
+    /// QUARANTINES after the redrive budget — proving the quarantine arm
+    /// releases the capture lock (`pending_finalizes` entry cleared), so
+    /// #783's teardown-reconcile capture-in-flight exemption can never become a
+    /// permanent reap-shield.
+    pub async fn sabotage_finalize_staging(&self, sandbox_id: SandboxId) {
+        if let Some(record) = self.in_flight.get(&sandbox_id) {
+            let _ = tokio::fs::remove_dir_all(&record.dest).await;
+        }
+    }
+
     /// Reconcile's local reap: cancel any in-flight finalize (the #570
     /// loss), drop the VM, record the destroy in the oracle log.
     fn reconcile_destroy(&mut self, sandbox_id: SandboxId) {
@@ -582,6 +800,11 @@ impl CosimHost {
 
     fn remove_sandbox(&mut self, sandbox_id: SandboxId) {
         self.sandboxes.remove(&sandbox_id);
+        // Drop the device slot too (its lease Drop releases the `/dev/nbdN`
+        // back to the pool). A terminal finalize / coordinator destroy tears
+        // the whole plane entry down.
+        self.device.remove_slot(sandbox_id);
+        self.sweep_parked_live.remove(&sandbox_id);
         let mut view = self.view.inner.lock();
         view.live.remove(&sandbox_id);
         view.bindings.remove(&sandbox_id);

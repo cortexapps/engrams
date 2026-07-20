@@ -24,8 +24,8 @@ use std::net::Ipv4Addr;
 
 use async_trait::async_trait;
 use engram_coordinator::api::host_http::{
-    live_manifest_publish_core, sandbox_owner_core, sandbox_ownership_core,
-    LiveManifestPublishOutcome as CoordPublishOutcome,
+    live_manifest_publish_core, register_rehydrate_list_core, sandbox_owner_core,
+    sandbox_ownership_core, LiveManifestPublishOutcome as CoordPublishOutcome,
     LiveManifestPublishRequest as CoordPublishReq,
 };
 use engram_coordinator::state::SharedState;
@@ -74,12 +74,27 @@ fn minimal_snapshot_metadata(id: SnapshotId) -> SnapshotMetadata {
 /// synchronous commit — NEVER across the async manifest build (the
 /// concurrency rule; see [`crate::host`]).
 async fn create_fresh_sandbox(host: &SharedHost) -> SandboxId {
-    let (store, cache_root, entropy) = {
+    let (store, cache_root, entropy, pool, device) = {
         let h = host.lock().await;
-        (h.store_handle(), h.cache_root(), h.entropy_handle())
+        (
+            h.store_handle(),
+            h.cache_root(),
+            h.entropy_handle(),
+            h.device_pool(),
+            h.next_free_device(),
+        )
     };
-    let (id, backend) = build_base_sandbox(store, cache_root, entropy).await;
-    host.lock().await.commit_created_sandbox(id, backend);
+    let (id, base_ref, backend) = build_base_sandbox(store, cache_root, entropy).await;
+    // Claim the sandbox's rootfs `/dev/nbdN` on the current-generation pool.
+    // Run-step-to-completion scheduling means no two creates race, so this
+    // free device is still free here (see the module concurrency note).
+    let lease = pool
+        .claim(&device)
+        .await
+        .expect("claim of the fresh sandbox's free device");
+    host.lock()
+        .await
+        .commit_created_sandbox(id, base_ref, backend, device, lease);
     id
 }
 
@@ -229,6 +244,21 @@ pub struct CosimCoordControlPlane {
 impl CosimCoordControlPlane {
     pub fn new(state: SharedState) -> Self {
         Self { state }
+    }
+
+    /// The REAL coordinator rehydrate listing for `host_id` (rung 2, #784):
+    /// the exact `register` handler core (`register_rehydrate_list_core`) the
+    /// host-agent reads on startup to learn which VM-resident survivors to
+    /// re-serve. The co-simulated host drives its register-rehydrate leg off
+    /// THIS list, so it re-serves precisely the devices the real coordinator
+    /// would name — including (or, on the pre-#739 bug, OMITTING) rung-parked
+    /// Evicting survivors. A coordinator error degrades to an empty list (the
+    /// host runs blind for survivors — the real non-fatal posture).
+    pub async fn rehydrate_list(&self, host_id: HostId) -> Vec<SandboxId> {
+        register_rehydrate_list_core(&self.state, host_id)
+            .await
+            .map(|rows| rows.into_iter().map(|r| r.sandbox_id).collect())
+            .unwrap_or_default()
     }
 }
 

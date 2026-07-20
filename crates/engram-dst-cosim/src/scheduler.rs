@@ -30,6 +30,12 @@ pub struct Cosim {
     pub world: CosimWorld,
     idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig,
     queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig,
+    /// The dead-host detector config (default) — drives the REAL
+    /// `host_lost_straggler_sweep` (#782/#777 arms) at the boundary.
+    dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig,
+    /// The straggler-sweep serving-strike ledger, owned across ticks like the
+    /// real detector loop (the #777 ask-the-host defer/strike history).
+    straggler_strikes: engram_coordinator::dead_host::StragglerStrikeMap,
     /// The reconcile strike ledger, owned across ticks like the real loop.
     strikes: HashMap<SandboxId, u32>,
     /// The sandbox each session was last bound to (captured before the D5
@@ -47,6 +53,8 @@ impl Cosim {
             world: CosimWorld::new(seed).await,
             idle_cfg: engram_coordinator::idle_detector::IdleDetectorConfig::default(),
             queue_cfg: engram_coordinator::queue_scanner::QueueScannerConfig::default(),
+            dead_host_cfg: engram_coordinator::dead_host::DeadHostConfig::default(),
+            straggler_strikes: engram_coordinator::dead_host::StragglerStrikeMap::new(),
             strikes: HashMap::new(),
             session_sandbox: BTreeMap::new(),
             evict_cursor: BTreeMap::new(),
@@ -296,6 +304,118 @@ impl Cosim {
         self.log(format!("reconcile_tick(honor={honor_capture_signal})"));
     }
 
+    // ─────────── Rung 2: the NBD device-plane family (#784) ───────────
+
+    /// A host-agent process ROLL: fresh generation, RAM disk backends drop, FC
+    /// survivors stay resident. Devices keep their (now-dead-generation) kernel
+    /// owner until the register-rehydrate re-serves or the sweep disconnects.
+    pub async fn roll_host(&mut self) {
+        self.world.host.lock().await.roll();
+        self.log("roll_host (new generation; survivors resident)");
+    }
+
+    /// The register-time rehydrate sequence driven against the REAL coordinator
+    /// listing (`register_rehydrate_list_core`): coord-list pass → local
+    /// ChainHeadRecord pass → stale-binding sweep. `local_pass` = the #739
+    /// defense-in-depth pass (safe default `true`; `false` is the adversarial
+    /// ungated variant proving the un-pause gate is the last line).
+    pub async fn register_rehydrate(&mut self, local_pass: bool) {
+        let list = self
+            .world
+            .coord_plane
+            .rehydrate_list(self.world.host_id)
+            .await;
+        let n = list.len();
+        let res = self
+            .world
+            .host
+            .lock()
+            .await
+            .register_rehydrate(&list, local_pass)
+            .await;
+        self.log(format!(
+            "register_rehydrate(local_pass={local_pass}) coord_listed={n} -> {res:?}"
+        ));
+    }
+
+    /// Model the VM genuinely departing (the host tears it down out of band) —
+    /// after this the host's `probe_sandbox` reports it not-alive.
+    pub async fn destroy_sandbox(&self, sandbox: SandboxId) {
+        self.world.host.lock().await.destroy(sandbox);
+    }
+
+    /// Run the stale-binding sweep independently (REAL `sweep_verdict`).
+    pub async fn stale_sweep(&mut self) {
+        self.world.host.lock().await.stale_sweep_tick();
+        self.log("stale_sweep");
+    }
+
+    /// Rung-2 PARK a session's sandbox (FC paused, VM resident, device served)
+    /// — the 731df805 pre-condition.
+    pub async fn park(&mut self, session_id: SessionId) {
+        if let Some(sandbox) = self.resolve_sandbox(session_id).await {
+            self.world.host.lock().await.park(sandbox);
+            self.log(format!("park {session_id} sandbox={sandbox}"));
+        }
+    }
+
+    /// Un-pause a session's sandbox over the REAL un-pause data-plane gate.
+    /// Returns whether the guest un-paused (`false` = the gate fired onto an
+    /// unserved plane — correct behavior, routed to recovery).
+    pub async fn unpause(&mut self, session_id: SessionId) -> bool {
+        let Some(sandbox) = self.resolve_sandbox(session_id).await else {
+            return false;
+        };
+        let ok = self.world.host.lock().await.unpause(sandbox);
+        self.log(format!("unpause {session_id} sandbox={sandbox} -> {ok}"));
+        ok
+    }
+
+    /// Model the FC guest for a session genuinely dying (#806): it no longer
+    /// holds its device node open, so a dead-owner sweep may legally DISCONNECT.
+    pub async fn kill_guest(&mut self, session_id: SessionId) {
+        if let Some(sandbox) = self.resolve_sandbox(session_id).await {
+            self.world.host.lock().await.kill_guest(sandbox);
+            self.log(format!("kill_guest {session_id} sandbox={sandbox}"));
+        }
+    }
+
+    /// One tick of the coordinator's REAL `host_lost_straggler_sweep` (#782 /
+    /// #777): for a bound HostLost row past the 60s min-age it probes the host
+    /// (`probe_sandbox → process_alive`, across the boundary) and DEFERS the
+    /// destroy while the VM is alive (banking a serving-strike) until the strike
+    /// cap, then destroys + settles. Owns the strike ledger across ticks like
+    /// the real detector loop.
+    pub async fn straggler_sweep_tick(&mut self) {
+        let _ = engram_coordinator::dead_host::host_lost_straggler_sweep(
+            &self.dead_host_cfg,
+            &self.world.state,
+            &mut self.straggler_strikes,
+        )
+        .await;
+        self.log("straggler_sweep_tick");
+    }
+
+    /// `try_claim` a spare NBD device (slot-accounting exercise).
+    pub async fn slot_claim(&mut self) {
+        self.world.host.lock().await.slot_claim().await;
+    }
+
+    /// Release the oldest held spare lease (slot-accounting exercise).
+    pub async fn slot_populate_tick(&mut self) {
+        self.world.host.lock().await.slot_populate_tick();
+    }
+
+    /// The sandbox a session is bound to — the coordinator row if present, else
+    /// the harness's last-known binding (survives a D5 unbind / a HostLost
+    /// clear).
+    async fn resolve_sandbox(&self, session_id: SessionId) -> Option<SandboxId> {
+        if let Some(sb) = self.sandbox_of(session_id).await {
+            return Some(sb);
+        }
+        self.session_sandbox.get(&session_id).copied()
+    }
+
     /// Drive one finalize attempt for every in-flight capture; on completion
     /// land the durable recoverable snapshot row (prod: the heartbeat
     /// reconcile).
@@ -324,6 +444,32 @@ impl Cosim {
                 ));
             }
         }
+    }
+
+    /// Begin an eviction finalize on a bound sandbox directly (the REAL
+    /// `snapshot_begin` capture leg) — for the capture-lock release pin.
+    pub async fn begin_finalize(
+        &mut self,
+        sandbox: SandboxId,
+    ) -> Result<engram_core::types::SnapshotId, String> {
+        self.world.host.lock().await.snapshot_begin(sandbox).await
+    }
+
+    /// Delete the in-flight finalize's staging dir so every redrive fails and
+    /// the finalize QUARANTINES (the capture-lock release pin, #784 rung 2).
+    pub async fn sabotage_finalize_staging(&self, sandbox: SandboxId) {
+        self.world
+            .host
+            .lock()
+            .await
+            .sabotage_finalize_staging(sandbox)
+            .await;
+    }
+
+    /// Drive ONE finalize redrive attempt for a sandbox and return its outcome
+    /// (the REAL `run_eviction_finalize_attempt`).
+    pub async fn finalize_tick(&mut self, sandbox: SandboxId) -> crate::host::FinalizeTickOutcome {
+        self.world.host.lock().await.finalize_tick(sandbox).await
     }
 
     /// Resume an `Idle` session back to `Active` (the real Resume op).
@@ -430,6 +576,116 @@ impl Cosim {
     /// survivor: its `PooledBackend` binding table died with the process).
     pub fn drop_local_binding(&self, sandbox: SandboxId) {
         self.world.view.drop_binding(sandbox);
+    }
+
+    // ─────────── Rung 2 device-plane reads + oracles (#784) ───────────
+
+    /// Is a session's sandbox parked (rung-2 evicting-shaped)?
+    pub async fn is_parked(&self, session_id: SessionId) -> bool {
+        match self.resolve_sandbox(session_id).await {
+            Some(sb) => self.world.host.lock().await.is_parked(sb),
+            None => false,
+        }
+    }
+
+    /// Is a session's sandbox device served by the current host generation?
+    pub async fn served_by_current(&self, session_id: SessionId) -> bool {
+        match self.resolve_sandbox(session_id).await {
+            Some(sb) => self.world.host.lock().await.served_by_current(sb),
+            None => false,
+        }
+    }
+
+    /// The host's current device-plane generation.
+    pub async fn device_generation(&self) -> u32 {
+        self.world.host.lock().await.device_generation()
+    }
+
+    /// Sandboxes the sweep PARKed because a live guest held the device (#806).
+    pub async fn sweep_parked_live(&self) -> Vec<SandboxId> {
+        self.world.host.lock().await.sweep_parked_live()
+    }
+
+    /// **Oracle — severed-live-holder (#806):** no device is left both
+    /// UNSERVED and UNBOUND (`kernel_owner == None`) while a live guest still
+    /// holds it open. A device in that state was severed out from under a
+    /// reading guest — the 731df805 EIO-on-live-guest corruption. Checked over
+    /// every device slot each quiescence.
+    pub async fn assert_no_severed_live_holder(&self) -> Result<(), String> {
+        let host = self.world.host.lock().await;
+        for id in host.device_slot_ids() {
+            let live = host.guest_holds_device(id);
+            let served = host.served_by_current(id);
+            let bound = host.kernel_owner(id).is_some();
+            if live && !served && !bound {
+                return Err(format!(
+                    "severed-live-holder (#806): sandbox {id}'s device is unserved AND unbound \
+                     (kernel_owner=None) while its guest still holds it open — a live guest's \
+                     data plane was severed (the 731df805 EIO class)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// **Oracle — slot-accounting (ADR 0098 P7 oracle #3):** the real
+    /// allocator's `free + warm + held == capacity` identity holds (no leaked
+    /// or double-counted `/dev/nbdN` slot).
+    pub async fn assert_slot_accounting(&self) -> Result<(), String> {
+        // Let any pending async lease-release settle before reading counters.
+        tokio::task::yield_now().await;
+        let (free, warm, held, capacity) = self.world.host.lock().await.slot_accounting().await;
+        if free + warm + held != capacity {
+            return Err(format!(
+                "slot-accounting: free({free}) + warm({warm}) + held({held}) != capacity({capacity})"
+            ));
+        }
+        Ok(())
+    }
+
+    /// **Oracle — cross-boundary ownership agreement:** for every device this
+    /// host generation SERVES, the coordinator agrees it still owns the bound
+    /// session→sandbox (`sandbox_ownership_core`). A served survivor the
+    /// coordinator disowns is a split — the host would keep flushing a plane
+    /// the coordinator has re-homed. Terminal/absent sessions (legitimately
+    /// disowned) whose device is NOT served are exempt (the reconcile reaps
+    /// them separately).
+    pub async fn assert_ownership_agreement(&self) -> Result<(), String> {
+        let served: Vec<SandboxId> = {
+            let host = self.world.host.lock().await;
+            host.device_slot_ids()
+                .into_iter()
+                .filter(|id| host.served_by_current(*id))
+                .collect()
+        };
+        for sandbox in served {
+            let Some(session) = self.session_binding(sandbox) else {
+                continue; // a served device with no known session — freshly created, unbound
+            };
+            let owned = engram_coordinator::api::host_http::sandbox_ownership_core(
+                &self.world.state,
+                session,
+                sandbox,
+            )
+            .await
+            .unwrap_or(false);
+            if !owned {
+                return Err(format!(
+                    "ownership-agreement: host generation serves sandbox {sandbox} bound to \
+                     session {session}, but the coordinator disowns it — a served plane the \
+                     coordinator has re-homed (split-brain)"
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// The harness's last-known session for a sandbox (survives a D5 unbind).
+    fn session_binding(&self, sandbox: SandboxId) -> Option<SessionId> {
+        self.session_sandbox
+            .iter()
+            .find(|(_, sb)| **sb == sandbox)
+            .map(|(s, _)| *s)
     }
 
     /// Force a session state transition (models the dead-host detector
