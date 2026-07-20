@@ -235,7 +235,18 @@ const REVIEW_CAPABILITIES = (repo: string): readonly string[] => [
 ];
 const REVIEW_NETWORK: ProfileNetwork = {
   default: "deny",
-  allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+  allowHosts: [
+    "github.com",
+    "codeload.github.com",
+    "api.github.com",
+    // The harness's own model API (+ its telemetry sidecar). Without these
+    // the deny-default net strangles the finder itself: the run dies with
+    // "API Error: Unable to connect to API (ConnectionRefused)" after the
+    // clone succeeds. The org-credential inject (ADR 0063 B4) only ships
+    // the ANTHROPIC_API_KEY value — egress still comes from this list.
+    "api.anthropic.com",
+    "statsig.anthropic.com",
+  ],
   allowHostPatterns: [],
 };
 

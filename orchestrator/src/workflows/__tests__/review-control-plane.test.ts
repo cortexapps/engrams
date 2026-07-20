@@ -383,7 +383,13 @@ describe("ReviewControlPlane", () => {
       ],
       networkOverride: {
         default: "deny",
-        allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+        allowHosts: [
+          "github.com",
+          "codeload.github.com",
+          "api.github.com",
+          "api.anthropic.com",
+          "statsig.anthropic.com",
+        ],
         allowHostPatterns: [],
       },
       dropProfileSecretsAndEnv: true,
@@ -504,7 +510,13 @@ describe("ReviewControlPlane", () => {
       ],
       networkOverride: {
         default: "deny",
-        allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+        allowHosts: [
+          "github.com",
+          "codeload.github.com",
+          "api.github.com",
+          "api.anthropic.com",
+          "statsig.anthropic.com",
+        ],
         allowHostPatterns: [],
       },
       dropProfileSecretsAndEnv: true,
