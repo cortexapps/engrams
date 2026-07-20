@@ -547,13 +547,14 @@ ladder, which is ~20 lines and fails soft.
 
 ### Scenario: a review session dies
 
-1. The finder (or verifier) session ends without its finish tool call.
-2. The workflow retries once with a fresh session — candidates already
-   submitted are in the database, so a verifier retry resumes the remaining
-   list rather than starting over.
-3. A second failure marks the review `failed`, posts a single "review
-   failed" PR comment, and surfaces the failure on the review page. Never
-   silently green.
+1. The finder (or verifier) session ends without its finish tool call, or its
+   harness run errors (idle + `run_failed`).
+2. The workflow marks the review `failed`, posts a single "review failed" PR
+   comment, and surfaces the failure on the review page. Never silently green.
+3. Re-running is an explicit action, not an in-workflow retry (see the
+   divergence note below): the `/reviews` **Retry** button (or the dispatch
+   endpoint) mints a fresh review record + workflow epoch over the PR's current
+   head. The failed row stays as history.
 
 ## Conversation on the PR
 
@@ -765,6 +766,31 @@ service → generated connectquery client → hook → page):
 6. **Multi-forge (GitLab)** via the same communication-policy seam.
 7. **A responder tier** — a slim no-clone profile for answering simple thread
    questions, if sweep volume makes full sessions measurably wasteful.
+
+## Implementation divergences
+
+- **The workflow body is a thin, hash-stable shell.** DBOS derives the
+  application version by hashing the *source of every registered workflow
+  function* (`computeAppVersion` → `origFunction.toString()`); a version bump
+  is not recovered for in-flight workflows stamped with the old hash, so a
+  redeploy that touches the body strands every review parked on `recv` (the
+  same failure mode ADR 0060's SlackThreadWorkflow hit). `PrReviewWorkflow` was
+  originally one ~340-line function with the whole state machine, logging, and
+  validation inline — every retry/deadline tweak rotated the hash. It is now a
+  tiny forwarder (`prReviewWorkflowImpl` → `runPrReview`); all evolving
+  orchestration lives in plain module functions that never enter the hash, the
+  same discipline as `ToolExecWorkflow` and `SlackThreadWorkflow`.
+- **No in-workflow retry (supersedes the "session dies" retry-once above).** A
+  dead/errored phase marks the review `failed` immediately. Re-running is an
+  explicit `ReviewService.RetryReview` RPC (the `/reviews` **Retry** button) or
+  the dispatch endpoint, both of which re-enter `dispatchReview` → a fresh
+  review record (a terminal review is not "active") + successor workflow epoch.
+  This removed the retry counters, the per-phase deadline-window counting (now
+  one `recv` window is the phase deadline), and `deleteFindingsForSession` (the
+  retry-only finding-dedup step), which is dropped from the control-plane seam.
+- **`RetryReview` authz.** Gated as `create` on the `Review` subject — any
+  authenticated member, mirroring "any member can trigger a review by command";
+  enrollment mutations stay admin-only.
 
 ## References
 

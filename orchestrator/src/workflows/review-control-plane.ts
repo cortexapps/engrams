@@ -117,8 +117,6 @@ export interface ReviewControlPlane {
     baseSha: string;
   }): Promise<void>;
   deleteReviewSession(sessionId: string): Promise<void>;
-  /** Drop a failed finder attempt's candidate findings before it is retried. */
-  deleteFindingsForSession(reviewId: string, sessionId: string): Promise<void>;
   postReviewResults(reviewId: string): Promise<void>;
   markReviewFailed(reviewId: string): Promise<void>;
   markReviewHalted(repo: string, prNumber: number): Promise<void>;
@@ -131,7 +129,6 @@ interface ReviewControlPlaneStore extends Pick<
   | "getActiveReviewForPr"
   | "updateReviewStatus"
   | "updateFindingState"
-  | "deleteFindingsForSession"
   | "finalizeReview"
   | "setStatusCommentId"
   | "setReviewSessionId"
@@ -663,10 +660,6 @@ export function makeReviewControlPlane(
         );
       }
       await reviewSessions().remove(sessionId);
-    },
-
-    async deleteFindingsForSession(reviewId, sessionId) {
-      await reviews().deleteFindingsForSession(reviewId, sessionId);
     },
 
     async postReviewResults(reviewId) {

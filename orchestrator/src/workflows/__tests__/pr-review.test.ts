@@ -70,7 +70,6 @@ function fakeControlPlane(
     bootstrapVerifierSession: async () => {},
     sendVerifierPrompt: async () => {},
     deleteReviewSession: async () => {},
-    deleteFindingsForSession: async () => {},
     postReviewResults: async () => {},
     markReviewFailed: async () => {},
     markReviewHalted: async () => {},
@@ -221,7 +220,7 @@ describe("PrReviewWorkflow", () => {
     expect(steps.steps.at(-1)).toBe("postReviewResults");
   });
 
-  test("a failed finder gets one fresh-session retry, then fails the review", async () => {
+  test("a failed finder session marks the review failed with no retry", async () => {
     let finderCreates = 0;
     let markedFailed = 0;
     const steps = runner();
@@ -234,6 +233,8 @@ describe("PrReviewWorkflow", () => {
       },
     });
 
+    // A second message is queued to prove the workflow returns after the first
+    // failure and never consumes it (no retry).
     await run(cp, [
       trigger,
       {
@@ -250,13 +251,13 @@ describe("PrReviewWorkflow", () => {
       },
     ], steps.step);
 
-    expect(finderCreates).toBe(2);
+    expect(finderCreates).toBe(1);
     expect(markedFailed).toBe(1);
-    expect(steps.steps.filter((name) => name === "createFinderSession")).toHaveLength(2);
-    expect(steps.steps.at(-1)).toBe("markReviewFailed");
+    expect(steps.steps.filter((name) => name === "createFinderSession")).toHaveLength(1);
+    expect(steps.steps.slice(-2)).toEqual(["deleteReviewSession", "markReviewFailed"]);
   });
 
-  test("a failed finder run (idle+runFailed) retries once then fails, never posting", async () => {
+  test("a failed finder run (idle+runFailed) marks failed, never posting", async () => {
     let finderCreates = 0;
     let markedFailed = 0;
     let posted = 0;
@@ -265,6 +266,8 @@ describe("PrReviewWorkflow", () => {
       createFinderSession: async () => ({
         sessionId: `finder-session-${++finderCreates}`,
       }),
+      // An empty review would post "no findings" on a CLEAN idle — prove the
+      // errored run never reaches that path.
       getReview: async () => ({ ...candidateDetail, findings: [] }),
       postReviewResults: async () => {
         posted++;
@@ -277,68 +280,13 @@ describe("PrReviewWorkflow", () => {
     await run(cp, [
       trigger,
       { kind: "session_idle", role: "finder", runFailed: true },
-      { kind: "session_idle", role: "finder", runFailed: true },
     ], steps.step);
 
-    // One retry (two finder sessions), then failed — and crucially never a
-    // "no findings" post despite the empty getReview.
-    expect(finderCreates).toBe(2);
+    expect(finderCreates).toBe(1);
     expect(markedFailed).toBe(1);
     expect(posted).toBe(0);
     expect(steps.steps).not.toContain("postReviewResults");
     expect(steps.steps.at(-1)).toBe("markReviewFailed");
-  });
-
-  test("a finder retry clears the failed attempt's candidate findings", async () => {
-    let finderCreates = 0;
-    const cleared: Array<[string, string]> = [];
-    const steps = runner();
-    const cp = fakeControlPlane({
-      createFinderSession: async () => ({
-        sessionId: `finder-session-${++finderCreates}`,
-      }),
-      deleteFindingsForSession: async (reviewId, sessionId) => {
-        cleared.push([reviewId, sessionId]);
-      },
-      // Second attempt succeeds cleanly with no candidates so the loop posts and ends.
-      getReview: async () => ({ ...candidateDetail, findings: [] }),
-    });
-
-    await run(cp, [
-      trigger,
-      { kind: "session_idle", role: "finder", runFailed: true },
-      { kind: "session_idle", role: "finder" },
-    ], steps.step);
-
-    // The first attempt's findings (finder-session-1) are dropped before the
-    // fresh attempt runs — never re-inserted as duplicates.
-    expect(cleared).toEqual([["review-1", "finder-session-1"]]);
-    expect(steps.steps).toContain("deleteFindingsForSession");
-  });
-
-  test("a verifier retry never clears findings", async () => {
-    const cleared: Array<[string, string]> = [];
-    let verifierCreates = 0;
-    const steps = runner();
-    const cp = fakeControlPlane({
-      createVerifierSession: async () => ({
-        sessionId: `verifier-session-${++verifierCreates}`,
-      }),
-      deleteFindingsForSession: async (reviewId, sessionId) => {
-        cleared.push([reviewId, sessionId]);
-      },
-    });
-
-    await run(cp, [
-      trigger,
-      { kind: "session_idle", role: "finder" },
-      { kind: "session_idle", role: "verifier", runFailed: true },
-      { kind: "session_idle", role: "verifier", runFailed: true },
-    ], steps.step);
-
-    // Findings belong to the finder; a verifier retry must not touch them.
-    expect(cleared).toEqual([]);
-    expect(steps.steps).not.toContain("deleteFindingsForSession");
   });
 
   test("a clean finder run with zero candidates still posts (idle without runFailed)", async () => {
@@ -439,7 +387,7 @@ describe("PrReviewWorkflow", () => {
     ]);
   });
 
-  test("a failed verifier gets one fresh-session retry, then fails the review", async () => {
+  test("a failed verifier session marks the review failed with no retry", async () => {
     let verifierCreates = 0;
     let markedFailed = 0;
     const steps = runner();
@@ -466,18 +414,13 @@ describe("PrReviewWorkflow", () => {
         sessionId: "verifier-session-1",
         outcome: "neutral",
       },
-      {
-        kind: "session_ended",
-        role: "verifier",
-        sessionId: "verifier-session-2",
-        outcome: "failed",
-      },
     ], steps.step);
 
-    expect(verifierCreates).toBe(2);
+    expect(verifierCreates).toBe(1);
     expect(markedFailed).toBe(1);
     expect(steps.steps.filter((name) => name === "createVerifierSession"))
-      .toHaveLength(2);
+      .toHaveLength(1);
+    expect(steps.steps.at(-1)).toBe("markReviewFailed");
   });
 
   test("stop marks the active review halted", async () => {
@@ -496,7 +439,7 @@ describe("PrReviewWorkflow", () => {
     expect(steps.steps.at(-1)).toBe("markReviewHalted");
   });
 
-  test("marks the review failed after two phase receive timeouts", async () => {
+  test("marks the review failed after a phase receive-window timeout", async () => {
     let markedFailed = 0;
     const deleted: string[] = [];
     const steps = runner();
@@ -509,7 +452,7 @@ describe("PrReviewWorkflow", () => {
       },
     });
 
-    await run(cp, [trigger, null, null], steps.step);
+    await run(cp, [trigger, null], steps.step);
 
     expect(deleted).toEqual(["finder-session"]);
     expect(markedFailed).toBe(1);

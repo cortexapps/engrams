@@ -71,7 +71,6 @@ function detail(findings: ReviewFindingRow[] = []): ReviewDetail {
 
 const reviewPostingNoops = {
   updateFindingState: async () => {},
-  deleteFindingsForSession: async () => {},
   finalizeReview: async () => {},
   setStatusCommentId: async () => {},
   setReviewSessionId: async () => {},
@@ -791,7 +790,6 @@ describe("ReviewControlPlane", () => {
         setStatusCommentId: async () => {},
         setReviewSessionId: async () => {},
         recordEvent: async () => {},
-        deleteFindingsForSession: async () => {},
         async updateFindingState(id, state, opts) {
           findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
         },
@@ -866,7 +864,6 @@ describe("ReviewControlPlane", () => {
         setStatusCommentId: async () => {},
         setReviewSessionId: async () => {},
         recordEvent: async () => {},
-        deleteFindingsForSession: async () => {},
         updateFindingState: async (id, state) => {
           findingStates.push([id, state]);
         },
