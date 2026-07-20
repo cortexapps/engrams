@@ -300,6 +300,21 @@ the `soft_invariant` field). Per-site dispositions:
    `engram_nbd_sweep_blocked_live_holder_total` counter carries the same signal
    to Prometheus). Should stay at/near zero — a firing is the gap-A recurrence
    counter until layers 2–4 land.
+9. **Added** (`soft_invariant!`, ADR 0098 §Phase 3 Wave 7b, #784 layers 2–3) —
+   the startup classification barrier (`PooledBackend::classify_startup_slots`)
+   fires `rehydrate-unknown-device` when the kernel-derived inventory
+   (`NbdKernel::connected_devices`) reconciled against the tracked records finds
+   a CONNECTED `/dev/nbdN` with a live (or unprovable) holder that NO record
+   accounts for — the #769 gap-A survivor, invisible to both the coordinator
+   rehydrate list and the #739 local pass (`SlotClass::QuarantinedUnknown`). The
+   device is left RECONNECTABLE (kernel-bound, kept out of new-claim circulation
+   by the `nbd_kernel_busy` probe) and NEVER handed to the destructive sweep (the
+   `ReapList` type makes that structurally impossible); a companion
+   `engram_nbd_rehydrate_unknown_device_total` counter carries the signal to
+   Prometheus. Distinct from site #8: THAT is the per-device sweep declining to
+   sever; THIS is the reconcile finding a device it cannot account for at all.
+   Should stay at zero — a firing means a survivor's records were lost upstream
+   and an operator/runbook must reconcile the device.
 
 ### H7 / H8 — Dispositions for the known flaky tests
 
