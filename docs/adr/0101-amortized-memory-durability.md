@@ -219,9 +219,41 @@ window.
 
 ## Commit chain
 
-- Phase A: PR #834 (serial-tail removal — merged)
-- Phase B: PR #835 (adaptive dirty epochs)
-- Phase C: the parked/evicting/idle split + the settle floor
-- Sim follow-ups: the op-mint quiescence oracle (the livelock-class pin the
-  2026-07-21 incident left open), adaptive-candidacy + probe-gate unit tests, and
-  the wildcard-match hygiene pass over `SessionState`
+- Phase A: PR #834 (serial-tail removal)
+- Phase B: PR #835 (adaptive dirty epochs; + the review fixes: clamp-panic
+  order-safety, the detached + per-sandbox-gated dead-guest probe, dead-code
+  retirement)
+- Phase C: PR #836 (the parked/evicting/idle split + the settle floor; + the
+  review fixes: the deliver-verb Parked arm, `ObservedEvict::EvictedSettling`,
+  and the key-agnostic grace-bounded scanner suppression)
+- Sim follow-ups: PR #837 (the op-mint quiescence oracle — the livelock-class
+  pin the 2026-07-21 incident left open — adaptive-candidacy + probe-gate unit
+  tests, and the wildcard-match hygiene pass over `SessionState`)
+
+## Production validation (2026-07-21, same-day deploy)
+
+All four PRs auto-rolled to the prod fleet (two coordinator replicas + the
+host DaemonSet) the same day. Observed:
+
+- **Legacy drain, clean.** Five pre-Phase-C parked sessions (spelled
+  `evicting` + `park_rung=2` under the old model) drained without manual
+  intervention: the new scanner minted capture retries (`allow_park: false`,
+  their stale terminal ops being far past the settle grace), the hosts
+  finalized, and the reconcile settle flipped them `idle`. Three whose hosts
+  rolled away mid-drain went honestly `host_lost` and the dead-host straggler
+  sweep settled them. At rest: **zero `evicting` rows** — versus the 8-hour
+  parked-as-evicting episodes (and the 2.5-day livelock) this ADR opened with.
+- **The settle is live**: `"eviction settled Idle: recoverable snapshot row
+  landed"` observed on both coordinator replicas — `idle` now factually means
+  the recoverable PG row exists.
+- **The honest lifecycle is live**: the first fresh nomination post-deploy
+  parked in **0.0s of `evicting`** and reads `parked`.
+- **Finalize cost**: the drain's own captures — the worst case, carrying hours
+  of parked dirt — averaged **~10.6s** against the 25–95s pre-ADR baseline.
+  Same-day interim (Phases A+B only), the adaptive cadence was already
+  checkpointing busy sessions every ~80s versus the fixed 600s.
+- **Pending a stable window**: the `engram_checkpoint_epoch_bytes/_seconds`
+  histograms (they emit from each sandbox's second capture on a pod, and the
+  fleet churned through the validation) — watch them center near the 256 MiB
+  target; if evict-time Full captures show up there, that is the trigger for
+  the deferred Full-off-eviction work.
