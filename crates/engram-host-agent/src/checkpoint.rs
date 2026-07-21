@@ -401,12 +401,46 @@ pub fn dirty_ranges(diff: &Path) -> std::io::Result<Vec<(u64, u64)>> {
 /// Config for the periodic driver.
 #[derive(Clone, Debug)]
 pub struct CheckpointConfig {
-    /// Capture cadence per sandbox — the relaxed *in-RAM* backstop (ADR 0043
-    /// P2a). `None` disables the periodic driver entirely
-    /// (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`); disk durability and the
-    /// event-driven memory checkpoints (drain / idle-evict / operator) are
-    /// unaffected either way.
+    /// The MAX epoch length — the age backstop every session-bound
+    /// sandbox is checkpointed at regardless of activity (the relaxed
+    /// *in-RAM* backstop, ADR 0043 P2a). `None` disables the periodic
+    /// driver entirely (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`); disk
+    /// durability and the event-driven memory checkpoints (drain /
+    /// idle-evict / operator) are unaffected either way.
     pub interval: Option<Duration>,
+    /// ADR 0101 B: the MIN epoch length — the adaptive controller never
+    /// checkpoints a sandbox more often than this, and it is the
+    /// driver's scheduling quantum. `ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS`.
+    pub min_interval: Duration,
+    /// ADR 0101 B: how much memory dirt one epoch should aim to carry.
+    /// The controller scales the next epoch so `dirty_bytes ≈ target` at
+    /// the last observed dirty rate. `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`.
+    pub target_epoch_bytes: u64,
+}
+
+/// ADR 0101 B: the next epoch length, from the last epoch's observed
+/// dirty rate. Aim for `target_epoch_bytes` of dirt per capture:
+/// `next = last_epoch × target / last_dirty`, clamped to
+/// `[min_interval, max_interval]`. No rate signal (first capture after
+/// a chain seed, a Full capture, a zero-dirty epoch) → the max
+/// backstop — an idle guest keeps the cheap ADR 0043 cadence; only a
+/// guest actually dirtying RAM earns short epochs. Pure — unit-tested
+/// directly, and the driver stays simulable (ADR 0098).
+pub fn next_epoch_after(
+    last_epoch: Duration,
+    last_dirty_bytes: Option<u64>,
+    min_interval: Duration,
+    max_interval: Duration,
+    target_epoch_bytes: u64,
+) -> Duration {
+    let Some(dirty) = last_dirty_bytes else {
+        return max_interval;
+    };
+    if dirty == 0 || last_epoch.is_zero() || target_epoch_bytes == 0 {
+        return max_interval;
+    }
+    let scaled = last_epoch.as_secs_f64() * (target_epoch_bytes as f64) / (dirty as f64);
+    Duration::from_secs_f64(scaled.clamp(min_interval.as_secs_f64(), max_interval.as_secs_f64()))
 }
 
 impl CheckpointConfig {
@@ -433,8 +467,23 @@ impl CheckpointConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(600);
+        // ADR 0101 B: Phase A made small diffs cheap (unchecked PUTs,
+        // same-hash skip, 96-way fan-out), so busy sessions can afford
+        // short epochs again — adaptively, not the old flat 60s that
+        // ADR 0043 P2a retired. 30s floor; 256 MiB dirt per epoch
+        // target (~1-6s of finalize work post-Phase-A).
+        let min_secs = std::env::var("ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let target_mb = std::env::var("ENGRAM_CHECKPOINT_TARGET_EPOCH_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256);
         Self {
             interval: (secs > 0).then(|| Duration::from_secs(secs)),
+            min_interval: Duration::from_secs(min_secs.max(1)),
+            target_epoch_bytes: target_mb * 1024 * 1024,
         }
     }
 }
@@ -450,82 +499,99 @@ pub fn spawn_checkpoint_driver(
     backend: Arc<crate::pooled_backend::PooledBackend>,
     cfg: CheckpointConfig,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let interval = cfg.interval?;
+    cfg.interval?;
     Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
+        // ADR 0101 B: tick at the MIN interval — the scheduling quantum.
+        // Which sandboxes are actually due is decided per-sandbox by the
+        // adaptive controller (`checkpoint_candidates_adaptive`), so an
+        // idle fleet still captures only every `interval` (the max
+        // backstop); the fast quantum exists so a busy sandbox's short
+        // epoch is honored. The candidate scan is a pure in-RAM map
+        // walk — waking it every `min_interval` costs nothing.
+        let mut tick = tokio::time::interval(cfg.min_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick: freshly-created sandboxes get
-        // their seed checkpoint one full interval in, by which point
-        // agentd is up (and the capture path's wait_agent_ready gate
-        // covers the stragglers).
+        // their seed checkpoint later, by which point agentd is up (and
+        // the capture path's wait_agent_ready gate covers stragglers).
         tick.tick().await;
         loop {
             tick.tick().await;
-            let due = backend.checkpoint_candidates(interval);
-            for (sandbox_id, session_id) in due {
-                // ADR 0038 B1: skip if a capture is already in flight —
-                // queuing this best-effort checkpoint behind another
-                // capture is what let one slow/hung capture gridlock the
-                // fleet. The next tick retries.
-                if backend.capture_in_flight(sandbox_id) {
-                    metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
-                    tracing::debug!(
+            run_checkpoint_pass(&backend, &cfg).await;
+        }
+    }))
+}
+
+/// One sleep-free pass of the periodic driver — the ADR 0098
+/// `spawn()`/`run_once()` split: the timer loop above is a thin
+/// wrapper, and this is the step tests (and the host simulator) drive
+/// directly.
+pub async fn run_checkpoint_pass(
+    backend: &Arc<crate::pooled_backend::PooledBackend>,
+    cfg: &CheckpointConfig,
+) {
+    let due = backend.checkpoint_candidates_adaptive(cfg);
+    for (sandbox_id, session_id) in due {
+        // ADR 0038 B1: skip if a capture is already in flight —
+        // queuing this best-effort checkpoint behind another
+        // capture is what let one slow/hung capture gridlock the
+        // fleet. The next tick retries.
+        if backend.capture_in_flight(sandbox_id) {
+            metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
+            tracing::debug!(
+                %sandbox_id,
+                %session_id,
+                "skipping periodic checkpoint; a capture is already in flight",
+            );
+            continue;
+        }
+        match backend.checkpoint_sandbox(sandbox_id).await {
+            Ok(metadata) => {
+                // A successful capture proves the control plane
+                // answers — clear any unreachable suspicion.
+                backend.clear_guest_unreachable(sandbox_id);
+                tracing::info!(
+                    %sandbox_id,
+                    %session_id,
+                    snapshot_id = %metadata.id,
+                    memory_manifest = ?metadata.memory_manifest,
+                    "periodic checkpoint complete",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %sandbox_id,
+                    %session_id,
+                    error = %e,
+                    "periodic checkpoint failed; retrying next tick",
+                );
+                // ADR 0091: a checkpoint failure was the ONLY signal a
+                // dead guest emitted, and it died here as a WARN while
+                // the session read `active` (campaign C1: 16+ min
+                // zombie). Confirm with the cheap control-socket probe
+                // — 3 tries, 2s apart, so a mid-restart FC can't be
+                // misclassified — and advertise via the heartbeat.
+                // Only socket-level probe results count: a BUSY guest
+                // fails a capture but still accept()s its API socket.
+                let mut dead_probes = 0u32;
+                for _ in 0..3 {
+                    match backend.probe_sandbox(sandbox_id).await {
+                        Ok(p) if p.control_alive == Some(false) => dead_probes += 1,
+                        _ => break,
+                    }
+                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                }
+                if dead_probes == 3 {
+                    tracing::error!(
                         %sandbox_id,
                         %session_id,
-                        "skipping periodic checkpoint; a capture is already in flight",
+                        "guest control plane is dead (3/3 socket probes refused); \
+                         advertising unreachable (ADR 0091)",
                     );
-                    continue;
-                }
-                match backend.checkpoint_sandbox(sandbox_id).await {
-                    Ok(metadata) => {
-                        // A successful capture proves the control plane
-                        // answers — clear any unreachable suspicion.
-                        backend.clear_guest_unreachable(sandbox_id);
-                        tracing::info!(
-                            %sandbox_id,
-                            %session_id,
-                            snapshot_id = %metadata.id,
-                            memory_manifest = ?metadata.memory_manifest,
-                            "periodic checkpoint complete",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            %sandbox_id,
-                            %session_id,
-                            error = %e,
-                            "periodic checkpoint failed; retrying next tick",
-                        );
-                        // ADR 0091: a checkpoint failure was the ONLY signal a
-                        // dead guest emitted, and it died here as a WARN while
-                        // the session read `active` (campaign C1: 16+ min
-                        // zombie). Confirm with the cheap control-socket probe
-                        // — 3 tries, 2s apart, so a mid-restart FC can't be
-                        // misclassified — and advertise via the heartbeat.
-                        // Only socket-level probe results count: a BUSY guest
-                        // fails a capture but still accept()s its API socket.
-                        let mut dead_probes = 0u32;
-                        for _ in 0..3 {
-                            match backend.probe_sandbox(sandbox_id).await {
-                                Ok(p) if p.control_alive == Some(false) => dead_probes += 1,
-                                _ => break,
-                            }
-                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                        }
-                        if dead_probes == 3 {
-                            tracing::error!(
-                                %sandbox_id,
-                                %session_id,
-                                "guest control plane is dead (3/3 socket probes refused); \
-                                 advertising unreachable (ADR 0091)",
-                            );
-                            backend.mark_guest_unreachable(sandbox_id, session_id);
-                        }
-                    }
+                    backend.mark_guest_unreachable(sandbox_id, session_id);
                 }
             }
         }
-    }))
+    }
 }
 
 #[cfg(test)]
@@ -533,6 +599,61 @@ mod tests {
     // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
     #![allow(clippy::disallowed_methods)]
     use super::*;
+
+    /// ADR 0101 B: the adaptive controller's math — proportional to the
+    /// observed dirty rate, clamped to [min, max], and falling back to
+    /// the max backstop whenever there is no usable rate signal.
+    #[test]
+    fn next_epoch_scales_with_dirty_rate_and_clamps() {
+        let min = Duration::from_secs(30);
+        let max = Duration::from_secs(600);
+        let target = 256 * 1024 * 1024u64;
+
+        // Exactly on target: keep the same epoch.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(120), Some(target), min, max, target),
+            Duration::from_secs(120),
+        );
+        // Half the target dirt → stretch the epoch 2×.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(120), Some(target / 2), min, max, target),
+            Duration::from_secs(240),
+        );
+        // A dirt firehose (32× target in one epoch) → clamped to the floor.
+        assert_eq!(
+            next_epoch_after(
+                Duration::from_secs(600),
+                Some(target * 32),
+                min,
+                max,
+                target
+            ),
+            min,
+        );
+        // Nearly idle → clamped to the max backstop.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), Some(1024), min, max, target),
+            max,
+        );
+        // No rate signal (Full capture / first epoch / zero dirty / zero
+        // target) → the max backstop, never the floor.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), None, min, max, target),
+            max
+        );
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), Some(0), min, max, target),
+            max,
+        );
+        assert_eq!(
+            next_epoch_after(Duration::ZERO, Some(target), min, max, target),
+            max
+        );
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), Some(target), min, max, 0),
+            max,
+        );
+    }
 
     fn record(id: SandboxId) -> ChainHeadRecord {
         ChainHeadRecord {
