@@ -697,6 +697,33 @@ describe("ReviewControlPlane", () => {
     expect(events).toEqual([[active.id, "reviewing", undefined]]);
   });
 
+  test("the finder range is THREE-dot (merge-base), never two-dot", async () => {
+    // baseSha is the base BRANCH's head, not the merge base — a two-dot
+    // range shows base-branch commits since the fork as phantom deletions
+    // in the PR (live: engrams#820 was reported as deleting a field that
+    // main gained after the branch forked).
+    const sessions = fakeSessions();
+    const cp = makeReviewControlPlane({
+      sessions,
+      reviews: {
+        ...reviewPostingNoops,
+        getActiveReviewForPr: async () => null,
+        getReview: async () => detail(),
+        createReview: async () => "unused",
+        updateReviewStatus: async () => {},
+      },
+    });
+    await cp.sendFinderPrompt("finder-session", {
+      reviewId: active.id,
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: "head-sha",
+      baseSha: "base-sha",
+    });
+    expect(sessions.promptCalls[0]?.text).toContain("base-sha...head-sha");
+    expect(sessions.promptCalls[0]?.text).not.toContain("base-sha..head-sha ");
+  });
+
   test("a retry finder session gets a DISTINCT prompt id", async () => {
     // The coordinator outbox is keyed globally by prompt_id with
     // ON CONFLICT DO NOTHING: if a retry session reuses the failed

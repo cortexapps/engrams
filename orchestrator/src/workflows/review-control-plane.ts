@@ -514,8 +514,16 @@ export function makeReviewControlPlane(
 
     async sendFinderPrompt(sessionId, input) {
       const name = repoName(input.repo);
+      // THREE-dot, deliberately: baseSha is the base BRANCH's current head
+      // (GitHub's `pull.base.sha`), not the merge base. When the base branch
+      // has advanced past the PR's fork point, a two-dot diff shows every
+      // commit main gained since the fork as phantom DELETIONS in the PR —
+      // the finder then reports removals the author never made (observed
+      // live on engrams#820: "this PR deletes HarnessDescriptor.egress",
+      // a field merged to main after the branch forked). Three-dot makes
+      // git resolve the true merge base from the full clone.
       const range = input.baseSha !== "" && input.headSha !== ""
-        ? `${input.baseSha}..${input.headSha}`
+        ? `${input.baseSha}...${input.headSha}`
         : "the PR diff";
       const prompt = [
         `Review ${input.repo} pull request #${input.prNumber}.`,
