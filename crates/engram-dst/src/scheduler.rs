@@ -1164,6 +1164,34 @@ impl Sim {
         if let Err(v) = self.model.check(&self.world) {
             return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
         }
+        // ADR 0101 C: op-mint quiescence — the livelock-class pin. The
+        // statuses above being stable is NOT enough: the ADR 0077×0090
+        // incident kept every status frozen and every op terminal while
+        // the scanner minted a fresh enqueue→skip op each tick for 2.5
+        // days. Snapshot the op high-water mark, run further FULL driver
+        // rounds against the settled world, and require that not a
+        // single new op row appears.
+        const QUIET_ROUNDS: usize = 3;
+        let op_high_water = invariants::op_mint_high_water(&self.world);
+        for _ in 0..QUIET_ROUNDS {
+            self.execute(Step::HostHeartbeats).await;
+            for r in 0..self.world.replicas.len() {
+                for kind in DRIVERS {
+                    self.execute(Step::Driver(r, kind)).await;
+                }
+            }
+            self.execute(Step::AdvanceTime(DRAIN_ADVANCE)).await;
+        }
+        if let Err(v) = invariants::check_no_ops_minted_since(&self.world, op_high_water) {
+            return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
+        }
+        // The quiet rounds must not have disturbed rest either.
+        if let Err(v) = invariants::check_quiescence(&self.world) {
+            return Err(format!(
+                "quiescence (post-quiet-rounds): {} — {}",
+                v.invariant, v.detail
+            ));
+        }
         let seed = self.report.seed;
         Ok(std::mem::replace(
             &mut self.report,

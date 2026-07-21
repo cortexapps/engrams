@@ -306,6 +306,12 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
         let stable = matches!(
             status,
             SessionState::Active
+                // ADR 0101 C: a parked VM at rest is the ladder working
+                // as designed (host has headroom; the reaper holds the
+                // park until pressure or the hard TTL). `Evicting` stays
+                // UNSTABLE on purpose: post-ADR-0101-C it means a
+                // descent's settle never landed — exactly a violation.
+                | SessionState::Parked
                 | SessionState::Idle
                 | SessionState::Completed
                 | SessionState::Failed
@@ -320,6 +326,53 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
         }
     }
     Ok(())
+}
+
+/// ADR 0101 C oracle (the livelock-class pin): the highest `session_ops`
+/// row id in the world — the op-mint high-water mark. The scheduler
+/// snapshots it at quiescence, runs further full driver rounds, and
+/// asserts it does not move: **a settled world mints no ops.** This is
+/// the property status-based quiescence cannot see — the ADR 0077×0090
+/// incident ran 2.5 days with every op row TERMINAL and every status
+/// frozen while the scanner minted a fresh enqueue→skip op each tick.
+pub fn op_mint_high_water(world: &SimWorld) -> i64 {
+    world.meta.with_db(|db| {
+        db.session_ops
+            .values()
+            .map(|op| op.id)
+            .max()
+            .unwrap_or_default()
+    })
+}
+
+/// The op-mint check paired with [`op_mint_high_water`]: fails if any op
+/// row was minted past the recorded high-water mark.
+pub fn check_no_ops_minted_since(world: &SimWorld, high_water: i64) -> Result<(), Violation> {
+    let offenders = world.meta.with_db(|db| {
+        db.session_ops
+            .values()
+            .filter(|op| op.id > high_water)
+            .map(|op| {
+                format!(
+                    "op {} ({:?}) for {} [{:?}]",
+                    op.id, op.kind, op.session_id, op.state
+                )
+            })
+            .collect::<Vec<_>>()
+    });
+    if offenders.is_empty() {
+        Ok(())
+    } else {
+        Err(Violation {
+            invariant: "quiescence-no-op-mint",
+            detail: format!(
+                "a settled world minted {} new op(s) across quiet driver rounds \
+                 (the enqueue/skip livelock class): {}",
+                offenders.len(),
+                offenders.join("; ")
+            ),
+        })
+    }
 }
 
 /// ADR 0098 oracle #8: at quiescence every sandbox on an UP host is
