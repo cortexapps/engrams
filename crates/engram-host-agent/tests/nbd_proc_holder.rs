@@ -176,17 +176,38 @@ async fn proc_scan_detects_open_fd_on_nbd_device_with_dead_server() {
         .expect("put manifest");
 
     // CONNECT + serve: a real netlink-bound /dev/nbdN with a live server.
+    //
+    // Bounded EBUSY retry: the preflight's R/W open+close fires a
+    // close-after-write uevent, and systemd-udevd transiently OPENS the
+    // device to probe it — the same block-device probing documented at
+    // the negative arm below. An open fd holds the kernel's nbd config
+    // ref, so a CONNECT landing inside that window is refused EBUSY
+    // ("nbdN already in use"). The old blind 20 × 200 ms clear loop
+    // absorbed that window by accident; absorb it deliberately, bounded,
+    // and only for EBUSY — any other attach error still fails loud.
     let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
-    let state = attach_manifest(
-        manifest_ref,
-        cache,
-        store,
-        &pool,
-        u64::MAX,
-        /*fork=*/ false,
-    )
-    .await
-    .expect("netlink CONNECT attach");
+    let attach_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let state = loop {
+        match attach_manifest(
+            manifest_ref,
+            cache.clone(),
+            store.clone(),
+            &pool,
+            u64::MAX,
+            /*fork=*/ false,
+        )
+        .await
+        {
+            Ok(state) => break state,
+            Err(e)
+                if format!("{e:?}").contains("ResourceBusy")
+                    && std::time::Instant::now() < attach_deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("netlink CONNECT attach: {e:?}"),
+        }
+    };
     let device = state.device_path().to_path_buf();
 
     // The "surviving FC guest": open ONE fd on the device node and hold it.
