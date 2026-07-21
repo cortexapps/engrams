@@ -467,7 +467,7 @@ orchestrator:
   # Drizzle migrations (orchestrator/drizzle/) MUST be applied to the
   # orchestrator's database before/at deploy. We run them as a pre-install /
   # pre-upgrade Helm Job (mirrors chart conventions: hooks, weights) that
-  # invokes `bunx drizzle-kit migrate` with ORCHESTRATOR_DATABASE_URL wired
+  # invokes `bun run migrate` with ORCHESTRATOR_DATABASE_URL wired
   # from the same Secret. Disable if you apply migrations out-of-band.
   migrations:
     enabled: true

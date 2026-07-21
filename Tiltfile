@@ -955,7 +955,7 @@ local_resource('orchestrator-migrate',
         '(PGPASSWORD=engram createdb -h localhost -p 5435 -U engram ' +
         'engram_orchestrator 2>/dev/null || true) && ' +
         'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
-        'bunx drizzle-kit migrate'
+        'bun x drizzle-kit migrate'
     ),
     resource_deps=['postgres'],
     labels=['setup'])

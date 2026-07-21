@@ -1,10 +1,10 @@
 {{- if and .Values.web.enabled .Values.orchestrator.migrations.enabled -}}
 # ADR 0051: apply the orchestrator's drizzle migrations (orchestrator/drizzle/)
 # to its OWN database (ORCHESTRATOR_DATABASE_URL — SEPARATE from the
-# coordinator's DB) BEFORE the Deployment rolls. Runs `bunx drizzle-kit migrate`
-# against drizzle.config.ts (which reads ORCHESTRATOR_DATABASE_URL). drizzle-kit
-# is a devDependency dropped by the image's `--production` install, so `bunx`
-# fetches it on demand inside the Job.
+# coordinator's DB) BEFORE the Deployment rolls. Runs the baked
+# `bun run migrate` entrypoint against ORCHESTRATOR_DATABASE_URL; unlike the dev
+# stack's `bun x drizzle-kit migrate`, this path needs no devDependency or npm
+# fetch inside the production migration Job.
 #
 # Helm pre-install + pre-upgrade hook: it runs and must succeed before the
 # release's other resources apply, so the new orchestrator never serves against
@@ -27,7 +27,7 @@ spec:
   # controller auto-GCs it 60s after it finishes regardless of helm, so no orphan
   # survives for the next deploy's before-hook-creation to trip over. (The
   # migrate itself is now a fast `bun run migrate` — the drizzle-orm migrator,
-  # not a cold `bunx drizzle-kit` npm fetch — so this is ordinary Job GC, no
+  # not a cold `bun x drizzle-kit` npm fetch — so this is ordinary Job GC, no
   # longer guarding a multi-minute stall.) DO NOT remove.
   ttlSecondsAfterFinished: 60
   backoffLimit: {{ .Values.orchestrator.migrations.backoffLimit }}
@@ -58,8 +58,8 @@ spec:
               drop: ["ALL"]
           workingDir: /app/orchestrator
           # Programmatic drizzle-orm migrator (src/db/migrate.ts), NOT the
-          # `bunx drizzle-kit migrate` CLI: drizzle-kit is a devDependency the
-          # production image strips (`bun install --production`), so bunx would
+          # `bun x drizzle-kit migrate` CLI: drizzle-kit is a devDependency the
+          # production image strips (`bun install --production`), so `bun x` would
           # refetch it (+ esbuild) from npm on EVERY deploy, on this hook's
           # critical path. `bun run migrate` uses the baked-in drizzle-orm + the
           # ./drizzle SQL folder — seconds, no npm fetch.
@@ -70,9 +70,8 @@ spec:
                 secretKeyRef:
                   name: {{ .Values.orchestrator.databaseSecret.existingSecret }}
                   key: {{ .Values.orchestrator.databaseSecret.urlKey }}
-            # bunx writes its on-demand drizzle-kit install under $HOME; the
-            # image FS is owned by root, so point HOME + caches at a writable
-            # emptyDir.
+            # Keep Bun's HOME/runtime cache writable under the non-root security
+            # context; the image filesystem is owned by root.
             - name: HOME
               value: /tmp
           volumeMounts:
