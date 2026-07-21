@@ -1095,6 +1095,22 @@ impl AppState {
     }
 }
 
+/// Serialize lifecycle events to the `(kind, payload)` wire pairs the
+/// atomic store methods (`fenced_transition_session_with_events`,
+/// `settle_evicted_session_idle`) append in-transaction.
+pub(crate) fn wire_events(
+    events: &[SessionEvent],
+) -> Result<Vec<(String, serde_json::Value)>, engram_core::MetaError> {
+    events
+        .iter()
+        .map(|e| {
+            serde_json::to_value(e)
+                .map(|payload| (e.kind().to_string(), payload))
+                .map_err(|e| engram_core::MetaError::Serialization(format!("event serialize: {e}")))
+        })
+        .collect()
+}
+
 /// ADR 0073: which outbox row (if any) does this event confirm?
 /// - `run_started{prompt_id}` / `prompt_queued{prompt_id}` — the
 ///   harness took ownership of the prompt (running it or holding it in
@@ -1102,7 +1118,7 @@ impl AppState {
 ///   harness itself does, and an edit/dequeue of a queued prompt keeps
 ///   its own confirmations).
 /// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
-fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
+pub(crate) fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {
             prompt_id: Some(pid),
@@ -2394,24 +2410,34 @@ pub(crate) mod tests {
             session_id: engram_core::SessionId,
             sandbox_id: engram_core::SandboxId,
             snapshot_id: engram_core::types::SnapshotId,
-        ) -> Result<bool, MetaError> {
+            events: &[(String, serde_json::Value)],
+        ) -> Result<Option<Vec<i64>>, MetaError> {
             let row_ok =
                 self.snapshots.lock().iter().any(|s| {
                     s.id == snapshot_id && s.session_id == Some(session_id) && s.recoverable
                 });
             if !row_ok {
-                return Ok(false);
+                return Ok(None);
             }
-            let mut session = self.session.lock();
-            if session.id != session_id
-                || session.status != SessionState::Evicting
-                || session.sandbox_id != Some(sandbox_id)
             {
-                return Ok(false);
+                let mut session = self.session.lock();
+                if session.id != session_id
+                    || session.status != SessionState::Evicting
+                    || session.sandbox_id != Some(sandbox_id)
+                {
+                    return Ok(None);
+                }
+                session.status = SessionState::Idle;
+                session.sandbox_id = None;
             }
-            session.status = SessionState::Idle;
-            session.sandbox_id = None;
-            Ok(true)
+            let mut indices = Vec::with_capacity(events.len());
+            for (kind, payload) in events {
+                indices.push(
+                    self.append_session_event(session_id, kind, payload.clone())
+                        .await?,
+                );
+            }
+            Ok(Some(indices))
         }
         async fn get_snapshot(
             &self,
@@ -2814,6 +2840,36 @@ pub(crate) mod tests {
                 return Ok(None);
             }
             self.transition_session(session_id, to).await.map(Some)
+        }
+
+        async fn fenced_transition_session_with_events(
+            &self,
+            session_id: SessionId,
+            epoch: i64,
+            to: engram_core::types::SessionState,
+            detach_sandbox: bool,
+            events: &[(String, serde_json::Value)],
+        ) -> Result<Option<(engram_core::types::SessionState, Vec<i64>)>, MetaError> {
+            // In-memory "transaction": the fence gates once, then the flip
+            // and the appends run back to back under the test's
+            // single-threaded driver — good enough for the unit tests'
+            // ordering assertions (the real atomicity is conformance-tested
+            // against SimMetadataStore + PostgresStore, ADR 0098 D4).
+            if self.ops.current_epoch(session_id) != epoch {
+                return Ok(None);
+            }
+            let prev = self.transition_session(session_id, to).await?;
+            if detach_sandbox {
+                self.session.lock().sandbox_id = None;
+            }
+            let mut indices = Vec::with_capacity(events.len());
+            for (kind, payload) in events {
+                indices.push(
+                    self.append_session_event(session_id, kind, payload.clone())
+                        .await?,
+                );
+            }
+            Ok(Some((prev, indices)))
         }
 
         async fn fenced_assign_sandbox(

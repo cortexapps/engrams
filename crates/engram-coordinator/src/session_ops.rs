@@ -221,6 +221,85 @@ pub(crate) async fn transition_with_fence(
     }
 }
 
+/// [`transition_with_fence`] that lands `events` ATOMICALLY with the
+/// transition (one store transaction). For transitions that make the
+/// session immediately claimable (eviction's Idle flip: "the instant the
+/// session is Idle it is resumable"), post-commit `emit_fenced` calls
+/// race the successor's claim and the transition's own facts
+/// (`evicted`, the final `status_changed`) get fenced out of the record
+/// — the e2e_resume event-loss flake. Appending them inside the
+/// transition makes a successor order strictly after.
+///
+/// The events must not be outbox-acking kinds (`outbox_ack_id` = None
+/// for lifecycle events); their only post-commit side effect is the
+/// in-process publish to live streams, done here with the committed
+/// indices.
+pub(crate) async fn transition_with_fence_emitting(
+    state: &SharedState,
+    session_id: SessionId,
+    fence: SessionFence,
+    to: SessionState,
+    detach_sandbox: bool,
+    events: Vec<crate::state::SessionEvent>,
+) -> Result<SessionState, engram_core::MetaError> {
+    debug_assert!(
+        events
+            .iter()
+            .all(|e| crate::state::outbox_ack_id(session_id, e).is_none()),
+        "transition_with_fence_emitting only handles the publish side effect; \
+         outbox-acking events must go through emit_fenced"
+    );
+    if fence.epoch == 0 {
+        // Unfenced interim path: plain transition, then plain appends —
+        // no fence exists to race, so the atomicity doesn't apply. (No
+        // unfenced caller detaches.)
+        debug_assert!(!detach_sandbox, "detach requires the fenced path");
+        let prev = state
+            .services
+            .meta
+            .transition_session(session_id, to)
+            .await?;
+        for event in events {
+            let _ = state.emit(session_id, event).await;
+        }
+        return Ok(prev);
+    }
+    let wire = crate::state::wire_events(&events)?;
+    match state
+        .services
+        .meta
+        .fenced_transition_session_with_events(
+            session_id,
+            fence.epoch as i64,
+            to,
+            detach_sandbox,
+            &wire,
+        )
+        .await?
+    {
+        Some((prev, indices)) => {
+            for (idx, event) in indices.into_iter().zip(events) {
+                state.events.publish(
+                    session_id,
+                    crate::state::IndexedEvent {
+                        idx,
+                        event,
+                        ephemeral: false,
+                    },
+                );
+            }
+            Ok(prev)
+        }
+        None => {
+            crate::metrics::note_fenced_write();
+            Err(engram_core::MetaError::Conflict(format!(
+                "fenced: session {session_id} was re-claimed by a successor op (epoch moved past {})",
+                fence.epoch,
+            )))
+        }
+    }
+}
+
 /// ADR 0079 interim: an inline op-log claim for lifecycle pipelines that
 /// have NOT yet migrated into verb bodies (the manual snapshot, the evac
 /// resume, the live teleport). Rides the same `session_ops` row + the

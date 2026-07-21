@@ -1007,39 +1007,46 @@ pub(crate) async fn run_evict_pipeline(
         return Ok(EvictOutcome::Fenced);
     }
 
-    // Step 3 (PG, Idle-before-destroy): clear sandbox_id on the
-    // session row — ADR 0047, this is the authoritative unbind (no
-    // in-memory registry to drop). Fenced; `host_id` is re-written
-    // unchanged (the fenced write sets both columns) to preserve the
-    // resume path's origin-affinity hint.
-    match state
-        .services
-        .meta
-        .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            crate::metrics::note_fenced_write();
-            return Ok(EvictOutcome::Fenced);
-        }
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "idle eviction: fenced_assign_sandbox(None) failed",
-            );
-        }
-    }
-    // Step 3c (PG, Idle-before-destroy): flip to the target. Once this
+    // Step 3 + 3c fused (PG, Idle-before-destroy): the authoritative
+    // unbind (ADR 0047 — no in-memory registry to drop; `host_id` is
+    // untouched so the resume path's origin-affinity hint survives)
+    // rides the SAME transaction as the flip, via `detach_sandbox`. A
+    // separate preceding detach left a partial-failure window: the flip
+    // rolls back, the detach has already committed, and the scanner's
+    // retry finds an `evicting` row with no bound sandbox — the
+    // HostLost fallback — instead of finishing to Idle (#844 review
+    // finding). Once this
     // commits, the reconciler will no-op on every subsequent
     // heartbeat for this session because the reconcile pass keys
     // on Active status only.
-    let prev = match crate::session_ops::transition_with_fence(
+    //
+    // The transition's own facts (`snapshot_taken`, `evicted`, the final
+    // `status_changed`) ride the SAME store transaction: the flip makes
+    // the session immediately claimable, so post-commit `emit_fenced`
+    // calls raced a successor's claim and the facts were silently fenced
+    // out of the record (the e2e_resume event-loss flake). `from` is
+    // `entry_status` by construction — our op claim excludes every other
+    // lifecycle writer, so under an unmoved epoch the state is exactly
+    // what we observed at entry (the debug assert pins this).
+    let prev = match crate::session_ops::transition_with_fence_emitting(
         state,
         session_id,
         ctx.fence(),
         target_state,
+        /*detach_sandbox=*/ true,
+        vec![
+            crate::state::SessionEvent::SnapshotTaken {
+                snapshot_id: metadata.id,
+                size_bytes: metadata.size_bytes,
+                at: now,
+            },
+            crate::state::SessionEvent::Evicted { at: now },
+            crate::state::SessionEvent::StatusChanged {
+                from: entry_status,
+                to: target_state,
+                at: now,
+            },
+        ],
     )
     .await
     {
@@ -1055,6 +1062,10 @@ pub(crate) async fn run_evict_pipeline(
             return Err(EvictError::Meta(e.to_string()));
         }
     };
+    debug_assert_eq!(
+        prev, entry_status,
+        "state moved under our op claim without an epoch bump"
+    );
     // The parking ladder leaves no trace in the terminal state — a
     // descent (or a plain eviction of a never-parked session, where this
     // is a no-op) clears the rung with the Idle flip.
@@ -1087,47 +1098,10 @@ pub(crate) async fn run_evict_pipeline(
     // ADR 0006: host-agent unregisters its local proxy entry as
     // part of `destroy`. No coordinator-side cleanup needed.
 
-    // Review finding #6: fenced emits. Ok(None) = a successor re-claimed
-    // between our committed transition and here — stop emitting silently
-    // (never compensate/abort from a fenced predecessor); the transition
-    // already committed under our epoch, so the eviction is done.
-    if let Err(e) = state
-        .emit_fenced(
-            session_id,
-            ctx.fence(),
-            SessionEvent::SnapshotTaken {
-                snapshot_id: metadata.id,
-                size_bytes: metadata.size_bytes,
-                at: now,
-            },
-        )
-        .await
-    {
-        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit SnapshotTaken").await;
-        return Err(EvictError::Emit(e.to_string()));
-    }
-    if let Err(e) = state
-        .emit_fenced(session_id, ctx.fence(), SessionEvent::Evicted { at: now })
-        .await
-    {
-        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit Evicted").await;
-        return Err(EvictError::Emit(e.to_string()));
-    }
-    if let Err(e) = state
-        .emit_fenced(
-            session_id,
-            ctx.fence(),
-            SessionEvent::StatusChanged {
-                from: prev,
-                to: target_state,
-                at: now,
-            },
-        )
-        .await
-    {
-        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit StatusChanged").await;
-        return Err(EvictError::Emit(e.to_string()));
-    }
+    // The lifecycle facts (`snapshot_taken`, `evicted`, `status_changed`)
+    // landed atomically with the Step 3c transition above — the old
+    // post-commit emit_fenced block (and its abort-after-commit error
+    // arms) is gone with the race it carried.
 
     // ADR 0016 A.1.1: success log. Pairs with the entry log so a
     // pipeline that flushes (host log) without committing (no PG
@@ -1272,7 +1246,6 @@ pub enum EvictError {
     Io(String),
     Sandbox(engram_core::SandboxError),
     Meta(String),
-    Emit(String),
 }
 
 impl std::fmt::Display for EvictError {
@@ -1281,7 +1254,6 @@ impl std::fmt::Display for EvictError {
             Self::Io(m) => write!(f, "idle evict io: {m}"),
             Self::Sandbox(e) => write!(f, "idle evict sandbox: {e}"),
             Self::Meta(m) => write!(f, "idle evict meta: {m}"),
-            Self::Emit(m) => write!(f, "idle evict event emit: {m}"),
         }
     }
 }
@@ -2220,14 +2192,18 @@ mod tests {
                 events_cursor: Some(0),
                 fc_snapshot_version: None,
             });
-        assert!(
-            state
-                .services
-                .meta
-                .settle_evicted_session_idle(session_id, sandbox_id, snapshot_id)
-                .await
-                .unwrap(),
-            "a recoverable row + matching binding must settle the session Idle",
+        let settle_events = vec![("evicted".to_string(), serde_json::json!({"at": "test"}))];
+        let indices = state
+            .services
+            .meta
+            .settle_evicted_session_idle(session_id, sandbox_id, snapshot_id, &settle_events)
+            .await
+            .unwrap()
+            .expect("a recoverable row + matching binding must settle the session Idle");
+        assert_eq!(
+            indices.len(),
+            1,
+            "the settle lands its lifecycle facts atomically",
         );
         assert_eq!(meta.session.lock().status, SessionState::Idle);
         assert_eq!(

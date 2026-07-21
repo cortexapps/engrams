@@ -1426,6 +1426,95 @@ impl MetadataStore for SimMetadataStore {
         Ok(Some(current))
     }
 
+    /// `fenced_transition_session` + event appends under ONE db lock —
+    /// the sim's transaction. Mirrors PostgresStore: fence check before
+    /// legality; on success the events land with consecutive indices and
+    /// per-event `session_events` notifications; on a stale epoch or an
+    /// illegal transition NOTHING lands (no state change, no events, no
+    /// notifications — pg_notify only fires on commit).
+    async fn fenced_transition_session_with_events(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        to: SessionState,
+        detach_sandbox: bool,
+        events: &[(String, serde_json::Value)],
+    ) -> Result<Option<(SessionState, Vec<i64>)>, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let row = db
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(MetaError::NotFound)?;
+        if row.current_epoch != epoch {
+            return Ok(None);
+        }
+        let current = row.session.status;
+        current
+            .try_transition_to(to)
+            .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        row.session.status = to;
+        row.session.last_active_at = now;
+        row.updated_at = now;
+        if detach_sandbox {
+            row.session.sandbox_id = None;
+        }
+        if to == SessionState::Evacuating {
+            row.evac_attempts = 0;
+        }
+        if to == SessionState::Evicting {
+            row.evict_attempts = 0;
+        }
+        if to == SessionState::Queued {
+            row.queued_at = Some(now);
+            row.queue_origin = Some(row.queue_origin.unwrap_or(QueueOrigin::Create));
+        }
+        let recovery_epoch = row.recovery_epoch;
+        let mut indices = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            // Per-iteration re-borrow: the session row and the event log
+            // are sibling fields of the same locked db, so the row borrow
+            // can't span the event push.
+            let row = db
+                .sessions
+                .get_mut(&session_id)
+                .expect("session row present under the same lock");
+            let idx = row.next_event_idx;
+            row.next_event_idx += 1;
+            row.last_event_at = Some(now);
+            indices.push(idx);
+            db.session_events
+                .entry(session_id)
+                .or_default()
+                .push(PersistedEvent {
+                    idx,
+                    kind: kind.clone(),
+                    payload: payload.clone(),
+                    created_at: now,
+                    recovery_epoch,
+                    rewound_at: None,
+                });
+        }
+        db.transition_log.push(super::TransitionLogEntry {
+            session: session_id,
+            from: current,
+            to,
+            exempt: false,
+        });
+        drop(db);
+        for idx in &indices {
+            self.notify(
+                "session_events",
+                format!("{{\"session_id\":\"{session_id}\",\"idx\":{idx}}}"),
+            );
+        }
+        if reserves(current) && !reserves(to) {
+            self.notify("placement_changed", "session_freed");
+        }
+        Ok(Some((current, indices)))
+    }
+
     /// `WHERE id=$1 AND current_epoch=$4`; bool = landed.
     async fn fenced_assign_sandbox(
         &self,
@@ -2560,8 +2649,10 @@ impl MetadataStore for SimMetadataStore {
         session_id: SessionId,
         sandbox_id: engram_core::SandboxId,
         snapshot_id: engram_core::types::SnapshotId,
-    ) -> Result<bool, MetaError> {
+        events: &[(String, serde_json::Value)],
+    ) -> Result<Option<Vec<i64>>, MetaError> {
         self.gate()?;
+        let now = self.now();
         let mut db = self.db.lock();
         // (PG stamps `updated_at`, a column the in-memory `Session`
         // doesn't carry — nothing to mirror here.)
@@ -2570,17 +2661,53 @@ impl MetadataStore for SimMetadataStore {
             .get(&snapshot_id)
             .is_some_and(|s| s.session_id == Some(session_id) && s.recoverable);
         if !row_recoverable {
-            return Ok(false);
+            return Ok(None);
         }
         let Some(r) = db.sessions.get_mut(&session_id) else {
-            return Ok(false);
+            return Ok(None);
         };
         if r.session.status != SessionState::Evicting || r.session.sandbox_id != Some(sandbox_id) {
-            return Ok(false);
+            return Ok(None);
         }
         r.session.status = SessionState::Idle;
         r.session.sandbox_id = None;
-        Ok(true)
+        // The settle's lifecycle facts land under the same db lock (the
+        // sim's transaction) — the settle is CAS-once, so a caller-side
+        // append after it had a crash window of permanent loss.
+        let recovery_epoch = r.recovery_epoch;
+        let mut indices = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            let r = db
+                .sessions
+                .get_mut(&session_id)
+                .expect("session row present under the same lock");
+            let idx = r.next_event_idx;
+            r.next_event_idx += 1;
+            r.last_event_at = Some(now);
+            indices.push(idx);
+            db.session_events
+                .entry(session_id)
+                .or_default()
+                .push(PersistedEvent {
+                    idx,
+                    kind: kind.clone(),
+                    payload: payload.clone(),
+                    created_at: now,
+                    recovery_epoch,
+                    rewound_at: None,
+                });
+        }
+        drop(db);
+        for idx in &indices {
+            self.notify(
+                "session_events",
+                format!("{{\"session_id\":\"{session_id}\",\"idx\":{idx}}}"),
+            );
+        }
+        // Parity with the retired D5 Idle flip: `evicting → idle` frees
+        // a memory-reserving state's budget — wake the queue scanner.
+        self.notify("placement_changed", "session_freed");
+        Ok(Some(indices))
     }
 
     async fn bump_evac_attempts(&self, session_id: SessionId) -> Result<u32, MetaError> {

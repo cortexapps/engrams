@@ -859,6 +859,100 @@ async fn fenced_transition(ctx: &Ctx) {
     assert_eq!(prev, Some(SessionState::Pending));
 }
 
+/// Atomic fenced transition + lifecycle events (the eviction event-loss
+/// fix): a stale epoch or an illegal transition commits NOTHING — no
+/// state flip, no events, no index burn; success lands the flip and the
+/// events in order with contiguous indices. Both stores must agree.
+async fn fenced_transition_with_events(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:fence-ev")).await.unwrap();
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    let epoch = op.epoch.unwrap();
+
+    // Anchor the index sequence with a plain append, and bind a sandbox
+    // so the success arm can prove the atomic detach.
+    let baseline = meta
+        .append_session_event(sid, "status_changed", serde_json::json!({"probe": true}))
+        .await
+        .unwrap();
+    let sb = engram_core::SandboxId::new();
+    meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
+    let events = vec![
+        ("evicted".to_string(), serde_json::json!({"at": "t0"})),
+        (
+            "status_changed".to_string(),
+            serde_json::json!({"to": "failed"}),
+        ),
+    ];
+
+    // Stale epoch: silent None, nothing lands.
+    assert!(meta
+        .fenced_transition_session_with_events(sid, epoch + 1, SessionState::Failed, true, &events)
+        .await
+        .unwrap()
+        .is_none());
+    // Illegal transition (Pending → Active): Conflict, nothing lands.
+    let err = meta
+        .fenced_transition_session_with_events(sid, epoch, SessionState::Active, true, &events)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)));
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().status,
+        SessionState::Pending,
+        "rejected calls must not flip state",
+    );
+    let leaked = meta
+        .list_session_events_since(sid, baseline, 100)
+        .await
+        .unwrap();
+    assert!(
+        leaked.is_empty(),
+        "rejected calls must append nothing: {leaked:?}",
+    );
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().sandbox_id,
+        Some(sb),
+        "rejected calls must not detach",
+    );
+
+    // Matching epoch: the flip and both events land together, indices
+    // contiguous with the baseline append.
+    let (prev, idxs) = meta
+        .fenced_transition_session_with_events(sid, epoch, SessionState::Failed, true, &events)
+        .await
+        .unwrap()
+        .expect("matching epoch must land");
+    assert_eq!(prev, SessionState::Pending);
+    assert_eq!(idxs, vec![baseline + 1, baseline + 2]);
+    let settled = meta.get_session(sid).await.unwrap();
+    assert_eq!(settled.status, SessionState::Failed);
+    assert_eq!(
+        settled.sandbox_id, None,
+        "detach_sandbox rides the same transaction as the flip",
+    );
+    let landed = meta
+        .list_session_events_since(sid, baseline, 100)
+        .await
+        .unwrap();
+    assert_eq!(landed.len(), 2, "exactly the two events: {landed:?}");
+    assert_eq!(
+        (landed[0].idx, landed[0].kind.as_str()),
+        (baseline + 1, "evicted")
+    );
+    assert_eq!(
+        (landed[1].idx, landed[1].kind.as_str()),
+        (baseline + 2, "status_changed"),
+    );
+    assert_eq!(landed[1].payload, serde_json::json!({"to": "failed"}));
+}
+
 /// #800: `enqueue_evacuating_session_resume` — the RESERVED evac-placement
 /// overflow CAS. Fenced `evacuating → queued` (resume-origin): matches only
 /// on `status='evacuating'` AND the op's epoch; a wrong epoch, a wrong
@@ -1592,12 +1686,25 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     assert!(meta.list_parked_sessions().await.unwrap().is_empty());
 
     let snap_id = SnapshotId::new();
+    // The atomic settle facts (see the trait doc: caller-side emits
+    // after a CAS-once settle had a crash window of permanent loss).
+    let settle_events = vec![
+        ("evicted".to_string(), serde_json::json!({"at": "t"})),
+        (
+            "status_changed".to_string(),
+            serde_json::json!({"to": "idle"}),
+        ),
+    ];
+    let ev_floor = meta
+        .append_session_event(sid, "status_changed", serde_json::json!({"probe": true}))
+        .await
+        .unwrap();
     // 1. No row yet → no settle.
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, snap_id)
+        meta.settle_evicted_session_idle(sid, sb, snap_id, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "no settle before the snapshot row exists"
     );
     // 2. A NON-recoverable row → no settle.
@@ -1606,10 +1713,10 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         .await
         .unwrap());
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, snap_id)
+        meta.settle_evicted_session_idle(sid, sb, snap_id, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "a non-recoverable row must not settle Idle"
     );
     // 3. A recoverable row for a DIFFERENT session → no settle.
@@ -1623,10 +1730,10 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         .await
         .unwrap());
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, other_snap)
+        meta.settle_evicted_session_idle(sid, sb, other_snap, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "another session's row must not settle this one"
     );
     // 4. The right row, but the WRONG sandbox (a rebound successor) → no
@@ -1639,29 +1746,51 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         .await
         .unwrap());
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, engram_core::SandboxId::new(), good_snap)
-            .await
-            .unwrap(),
+        meta.settle_evicted_session_idle(
+            sid,
+            engram_core::SandboxId::new(),
+            good_snap,
+            &settle_events
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "a stale advert against a rebound sandbox must not settle"
     );
     // 5. The exact triple → settle: idle + detached (host kept for
     //    resume affinity).
-    assert!(meta
-        .settle_evicted_session_idle(sid, sb, good_snap)
+    let idxs = meta
+        .settle_evicted_session_idle(sid, sb, good_snap, &settle_events)
         .await
-        .unwrap());
+        .unwrap()
+        .expect("the exact triple settles");
+    assert_eq!(
+        idxs,
+        vec![ev_floor + 1, ev_floor + 2],
+        "settle facts land atomically with contiguous indices",
+    );
     let s = meta.get_session(sid).await.unwrap();
     assert_eq!(s.status, SessionState::Idle);
     assert_eq!(s.sandbox_id, None, "the settle detaches the sandbox");
     assert_eq!(s.host_id, Some(host), "host affinity preserved");
     // 6. Idempotent: a re-advert's second settle is a clean no-op.
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, good_snap)
+        meta.settle_evicted_session_idle(sid, sb, good_snap, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "an already-settled session no-ops"
+    );
+    // Every no-op arm above (and the idempotent re-settle) appended
+    // NOTHING; only the one successful settle's two facts landed.
+    let landed = meta
+        .list_session_events_since(sid, ev_floor, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        landed.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        vec!["evicted", "status_changed"],
+        "exactly the settle's facts, exactly once: {landed:?}",
     );
 
     // Parked → HostLost is the host-death edge (never Idle: the parked
@@ -1723,6 +1852,10 @@ conformance!(
     super::op_latest_for_kind_reads_terminal_mints
 );
 conformance!(t_fenced_transition, super::fenced_transition);
+conformance!(
+    t_fenced_transition_with_events,
+    super::fenced_transition_with_events
+);
 conformance!(
     t_enqueue_evacuating_resume,
     super::enqueue_evacuating_resume

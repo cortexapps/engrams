@@ -863,6 +863,34 @@ pub async fn heartbeat(
                 if recoverable
                     && adv.kind == engram_protocol::heartbeat::CheckpointKind::EvictionFinal
                 {
+                    // The settle's lifecycle facts ride ITS transaction:
+                    // the settle is CAS-once (a re-advert after success is
+                    // a clean no-op), so facts emitted here afterwards had
+                    // a crash window in which they were lost forever —
+                    // the same event-loss class as the fenced
+                    // post-transition emits, crash-shaped. See the trait
+                    // doc on `settle_evicted_session_idle`.
+                    let now = state.services.clock.now_utc();
+                    let events = vec![
+                        SessionEvent::Evicted { at: now },
+                        SessionEvent::StatusChanged {
+                            from: SessionState::Evicting,
+                            to: SessionState::Idle,
+                            at: now,
+                        },
+                    ];
+                    let wire = match crate::state::wire_events(&events) {
+                        Ok(wire) => wire,
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %adv.session_id,
+                                error = %e,
+                                "eviction settle: event serialize failed; \
+                                 the host's re-advert retries it",
+                            );
+                            continue;
+                        }
+                    };
                     match state
                         .services
                         .meta
@@ -870,11 +898,11 @@ pub async fn heartbeat(
                             adv.session_id,
                             adv.sandbox_id,
                             adv.snapshot_id,
+                            &wire,
                         )
                         .await
                     {
-                        Ok(true) => {
-                            let now = state.services.clock.now_utc();
+                        Ok(Some(indices)) => {
                             // Best-effort rung clear (the park stamp is
                             // ascent/ledger metadata; lifecycle already
                             // settled above).
@@ -883,19 +911,16 @@ pub async fn heartbeat(
                                 .meta
                                 .set_session_park_rung(adv.session_id, 0, None)
                                 .await;
-                            let _ = state
-                                .emit(adv.session_id, SessionEvent::Evicted { at: now })
-                                .await;
-                            let _ = state
-                                .emit(
+                            for (idx, event) in indices.into_iter().zip(events) {
+                                state.events.publish(
                                     adv.session_id,
-                                    SessionEvent::StatusChanged {
-                                        from: SessionState::Evicting,
-                                        to: SessionState::Idle,
-                                        at: now,
+                                    crate::state::IndexedEvent {
+                                        idx,
+                                        event,
+                                        ephemeral: false,
                                     },
-                                )
-                                .await;
+                                );
+                            }
                             tracing::info!(
                                 session_id = %adv.session_id,
                                 snapshot_id = %adv.snapshot_id,
@@ -903,7 +928,7 @@ pub async fn heartbeat(
                                  (ADR 0101 C durability floor)",
                             );
                         }
-                        Ok(false) => {}
+                        Ok(None) => {}
                         Err(e) => {
                             tracing::warn!(
                                 session_id = %adv.session_id,
