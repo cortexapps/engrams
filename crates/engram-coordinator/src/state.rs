@@ -2847,6 +2847,7 @@ pub(crate) mod tests {
             session_id: SessionId,
             epoch: i64,
             to: engram_core::types::SessionState,
+            detach_sandbox: bool,
             events: &[(String, serde_json::Value)],
         ) -> Result<Option<(engram_core::types::SessionState, Vec<i64>)>, MetaError> {
             // In-memory "transaction": the fence gates once, then the flip
@@ -2858,6 +2859,9 @@ pub(crate) mod tests {
                 return Ok(None);
             }
             let prev = self.transition_session(session_id, to).await?;
+            if detach_sandbox {
+                self.session.lock().sandbox_id = None;
+            }
             let mut indices = Vec::with_capacity(events.len());
             for (kind, payload) in events {
                 indices.push(

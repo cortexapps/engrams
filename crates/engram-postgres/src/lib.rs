@@ -7046,6 +7046,7 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         epoch: i64,
         to: SessionState,
+        detach_sandbox: bool,
         events: &[(String, serde_json::Value)],
     ) -> Result<Option<(SessionState, Vec<i64>)>, MetaError> {
         // `fenced_transition_session` with the event appends folded into
@@ -7095,6 +7096,7 @@ impl MetadataStore for PostgresStore {
                SET status = $2,
                    last_active_at = $4,
                    updated_at = $4,
+                   sandbox_id = CASE WHEN $5 THEN NULL ELSE sandbox_id END,
                    evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
                    evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
                    queued_at = CASE WHEN $2 = 'queued' THEN $4 ELSE queued_at END,
@@ -7108,6 +7110,7 @@ impl MetadataStore for PostgresStore {
         .bind(to.as_str())
         .bind(epoch)
         .bind(now)
+        .bind(detach_sandbox)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?

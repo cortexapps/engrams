@@ -239,6 +239,7 @@ pub(crate) async fn transition_with_fence_emitting(
     session_id: SessionId,
     fence: SessionFence,
     to: SessionState,
+    detach_sandbox: bool,
     events: Vec<crate::state::SessionEvent>,
 ) -> Result<SessionState, engram_core::MetaError> {
     debug_assert!(
@@ -250,7 +251,9 @@ pub(crate) async fn transition_with_fence_emitting(
     );
     if fence.epoch == 0 {
         // Unfenced interim path: plain transition, then plain appends —
-        // no fence exists to race, so the atomicity doesn't apply.
+        // no fence exists to race, so the atomicity doesn't apply. (No
+        // unfenced caller detaches.)
+        debug_assert!(!detach_sandbox, "detach requires the fenced path");
         let prev = state
             .services
             .meta
@@ -265,7 +268,13 @@ pub(crate) async fn transition_with_fence_emitting(
     match state
         .services
         .meta
-        .fenced_transition_session_with_events(session_id, fence.epoch as i64, to, &wire)
+        .fenced_transition_session_with_events(
+            session_id,
+            fence.epoch as i64,
+            to,
+            detach_sandbox,
+            &wire,
+        )
         .await?
     {
         Some((prev, indices)) => {

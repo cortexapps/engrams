@@ -875,11 +875,14 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
     };
     let epoch = op.epoch.unwrap();
 
-    // Anchor the index sequence with a plain append.
+    // Anchor the index sequence with a plain append, and bind a sandbox
+    // so the success arm can prove the atomic detach.
     let baseline = meta
         .append_session_event(sid, "status_changed", serde_json::json!({"probe": true}))
         .await
         .unwrap();
+    let sb = engram_core::SandboxId::new();
+    meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
     let events = vec![
         ("evicted".to_string(), serde_json::json!({"at": "t0"})),
         (
@@ -890,13 +893,13 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
 
     // Stale epoch: silent None, nothing lands.
     assert!(meta
-        .fenced_transition_session_with_events(sid, epoch + 1, SessionState::Failed, &events)
+        .fenced_transition_session_with_events(sid, epoch + 1, SessionState::Failed, true, &events)
         .await
         .unwrap()
         .is_none());
     // Illegal transition (Pending → Active): Conflict, nothing lands.
     let err = meta
-        .fenced_transition_session_with_events(sid, epoch, SessionState::Active, &events)
+        .fenced_transition_session_with_events(sid, epoch, SessionState::Active, true, &events)
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)));
@@ -913,19 +916,26 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
         leaked.is_empty(),
         "rejected calls must append nothing: {leaked:?}",
     );
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().sandbox_id,
+        Some(sb),
+        "rejected calls must not detach",
+    );
 
     // Matching epoch: the flip and both events land together, indices
     // contiguous with the baseline append.
     let (prev, idxs) = meta
-        .fenced_transition_session_with_events(sid, epoch, SessionState::Failed, &events)
+        .fenced_transition_session_with_events(sid, epoch, SessionState::Failed, true, &events)
         .await
         .unwrap()
         .expect("matching epoch must land");
     assert_eq!(prev, SessionState::Pending);
     assert_eq!(idxs, vec![baseline + 1, baseline + 2]);
+    let settled = meta.get_session(sid).await.unwrap();
+    assert_eq!(settled.status, SessionState::Failed);
     assert_eq!(
-        meta.get_session(sid).await.unwrap().status,
-        SessionState::Failed
+        settled.sandbox_id, None,
+        "detach_sandbox rides the same transaction as the flip",
     );
     let landed = meta
         .list_session_events_since(sid, baseline, 100)

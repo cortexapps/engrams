@@ -1079,14 +1079,22 @@ pub trait MetadataStore: Send + Sync {
     /// `Ok(None)` = fenced (nothing committed). An illegal transition is
     /// `Err(Conflict)` (nothing committed). Callers own any post-commit
     /// side effects (in-process publish); `pg_notify` fires on commit.
+    ///
+    /// `detach_sandbox = true` also clears `sandbox_id` in the SAME
+    /// update (`host_id` untouched — resume affinity survives, as with
+    /// the settle). The eviction flip detaches; doing it in a separate
+    /// preceding write left a partial-failure window where the flip's
+    /// rollback stranded an `evicting` session with no bound sandbox —
+    /// which the scanner's retry resolves as HostLost instead of Idle.
     async fn fenced_transition_session_with_events(
         &self,
         session_id: SessionId,
         epoch: i64,
         to: crate::types::SessionState,
+        detach_sandbox: bool,
         events: &[(String, serde_json::Value)],
     ) -> Result<Option<(crate::types::SessionState, Vec<i64>)>, MetaError> {
-        let _ = (session_id, epoch, to, events);
+        let _ = (session_id, epoch, to, detach_sandbox, events);
         Err(MetaError::Serialization(
             "fenced writes not supported by this store".into(),
         ))

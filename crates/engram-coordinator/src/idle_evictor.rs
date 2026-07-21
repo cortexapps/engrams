@@ -1007,31 +1007,15 @@ pub(crate) async fn run_evict_pipeline(
         return Ok(EvictOutcome::Fenced);
     }
 
-    // Step 3 (PG, Idle-before-destroy): clear sandbox_id on the
-    // session row — ADR 0047, this is the authoritative unbind (no
-    // in-memory registry to drop). Fenced; `host_id` is re-written
-    // unchanged (the fenced write sets both columns) to preserve the
-    // resume path's origin-affinity hint.
-    match state
-        .services
-        .meta
-        .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => {
-            crate::metrics::note_fenced_write();
-            return Ok(EvictOutcome::Fenced);
-        }
-        Err(e) => {
-            tracing::warn!(
-                session_id = %session_id,
-                error = %e,
-                "idle eviction: fenced_assign_sandbox(None) failed",
-            );
-        }
-    }
-    // Step 3c (PG, Idle-before-destroy): flip to the target. Once this
+    // Step 3 + 3c fused (PG, Idle-before-destroy): the authoritative
+    // unbind (ADR 0047 — no in-memory registry to drop; `host_id` is
+    // untouched so the resume path's origin-affinity hint survives)
+    // rides the SAME transaction as the flip, via `detach_sandbox`. A
+    // separate preceding detach left a partial-failure window: the flip
+    // rolls back, the detach has already committed, and the scanner's
+    // retry finds an `evicting` row with no bound sandbox — the
+    // HostLost fallback — instead of finishing to Idle (#844 review
+    // finding). Once this
     // commits, the reconciler will no-op on every subsequent
     // heartbeat for this session because the reconcile pass keys
     // on Active status only.
@@ -1049,6 +1033,7 @@ pub(crate) async fn run_evict_pipeline(
         session_id,
         ctx.fence(),
         target_state,
+        /*detach_sandbox=*/ true,
         vec![
             crate::state::SessionEvent::SnapshotTaken {
                 snapshot_id: metadata.id,
@@ -1261,7 +1246,6 @@ pub enum EvictError {
     Io(String),
     Sandbox(engram_core::SandboxError),
     Meta(String),
-    Emit(String),
 }
 
 impl std::fmt::Display for EvictError {
@@ -1270,7 +1254,6 @@ impl std::fmt::Display for EvictError {
             Self::Io(m) => write!(f, "idle evict io: {m}"),
             Self::Sandbox(e) => write!(f, "idle evict sandbox: {e}"),
             Self::Meta(m) => write!(f, "idle evict meta: {m}"),
-            Self::Emit(m) => write!(f, "idle evict event emit: {m}"),
         }
     }
 }

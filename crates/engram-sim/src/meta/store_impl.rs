@@ -1437,6 +1437,7 @@ impl MetadataStore for SimMetadataStore {
         session_id: SessionId,
         epoch: i64,
         to: SessionState,
+        detach_sandbox: bool,
         events: &[(String, serde_json::Value)],
     ) -> Result<Option<(SessionState, Vec<i64>)>, MetaError> {
         self.gate()?;
@@ -1456,6 +1457,9 @@ impl MetadataStore for SimMetadataStore {
         row.session.status = to;
         row.session.last_active_at = now;
         row.updated_at = now;
+        if detach_sandbox {
+            row.session.sandbox_id = None;
+        }
         if to == SessionState::Evacuating {
             row.evac_attempts = 0;
         }
