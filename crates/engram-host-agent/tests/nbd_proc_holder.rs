@@ -41,6 +41,13 @@ use engram_host_core::DeviceHolder;
 use engram_storage_local::LocalBlobStorage;
 
 /// Clear any stale binding from a prior aborted run (idempotent).
+///
+/// Converges on the kernel's own signal instead of a blind fixed-count
+/// loop: an unconfigured nbd device reports `size` 0 in sysfs (the kernel
+/// clears it on disconnect), so a free device returns immediately and a
+/// bound one keeps disconnecting only until the kernel actually lets go.
+/// The old unconditional 20 × 200 ms loop cost 4 s per call (twice per
+/// test) even when the device was already free.
 fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     let Some(idx) = nbd_path
         .file_name()
@@ -50,7 +57,15 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     else {
         return;
     };
+    let device_free = || {
+        std::fs::read_to_string(format!("/sys/block/nbd{idx}/size"))
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+    };
     for _ in 0..20 {
+        if device_free() {
+            return;
+        }
         let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
@@ -127,7 +142,13 @@ fn preflight() -> Option<PathBuf> {
 #[ignore]
 async fn proc_scan_detects_open_fd_on_nbd_device_with_dead_server() {
     std::env::set_var("ENGRAM_NBD_KERNEL_TIMEOUT_SECS", "5");
-    std::env::set_var("ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS", "60");
+    // The dead-conn window only has to outlast the LiveHolder assertion,
+    // which runs microseconds after `abandon()` — but the teardown
+    // DISCONNECT parks until this window expires, so its length is pure
+    // test wall-time. 60 s here made this the slowest test in the NBD
+    // batch (~75 s); 5 s keeps a wide margin over the assertion window
+    // and caps the parked teardown at ~5 s.
+    std::env::set_var("ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS", "5");
 
     let nbd_path = match preflight() {
         Some(p) => p,
