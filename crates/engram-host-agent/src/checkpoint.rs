@@ -608,29 +608,37 @@ pub async fn run_checkpoint_pass(
                 // dead guests could eat the whole tick and starve the
                 // busy sandboxes' short epochs. Spawning is safe: the
                 // probe only reads the socket and flips the (idempotent)
-                // unreachable advert; a duplicate probe from the next
-                // tick converges to the same verdict, and a healed guest
-                // is cleared by its next successful capture above.
-                let backend = Arc::clone(backend);
-                tokio::spawn(async move {
-                    let mut dead_probes = 0u32;
-                    for _ in 0..3 {
-                        match backend.probe_sandbox(sandbox_id).await {
-                            Ok(p) if p.control_alive == Some(false) => dead_probes += 1,
-                            _ => break,
+                // unreachable advert, and a healed guest is cleared by
+                // its next successful capture above. Gated (review round
+                // 2): at most ONE probe per sandbox at a time — a
+                // still-failing sandbox is due EVERY tick (its
+                // last-capture stamp never advances), and a
+                // `min_interval` below the probe's ~6s lifetime would
+                // otherwise stack overlapping probes against exactly the
+                // guests least able to answer.
+                if backend.try_begin_dead_probe(sandbox_id) {
+                    let backend = Arc::clone(backend);
+                    tokio::spawn(async move {
+                        let mut dead_probes = 0u32;
+                        for _ in 0..3 {
+                            match backend.probe_sandbox(sandbox_id).await {
+                                Ok(p) if p.control_alive == Some(false) => dead_probes += 1,
+                                _ => break,
+                            }
+                            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                         }
-                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                    }
-                    if dead_probes == 3 {
-                        tracing::error!(
-                            %sandbox_id,
-                            %session_id,
-                            "guest control plane is dead (3/3 socket probes refused); \
-                             advertising unreachable (ADR 0091)",
-                        );
-                        backend.mark_guest_unreachable(sandbox_id, session_id);
-                    }
-                });
+                        if dead_probes == 3 {
+                            tracing::error!(
+                                %sandbox_id,
+                                %session_id,
+                                "guest control plane is dead (3/3 socket probes refused); \
+                                 advertising unreachable (ADR 0091)",
+                            );
+                            backend.mark_guest_unreachable(sandbox_id, session_id);
+                        }
+                        backend.end_dead_probe(sandbox_id);
+                    });
+                }
             }
         }
     }

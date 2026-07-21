@@ -454,6 +454,12 @@ pub struct PooledBackend {
     /// every heartbeat until cleared by a successful capture or destroy;
     /// the coordinator flips the session Active → Unreachable off it.
     unreachable_guests: Arc<DashMap<SandboxId, SessionId>>,
+    /// ADR 0091 probe gate (engrams review, #835): sandboxes with a
+    /// detached dead-guest confirmation probe currently in flight — at
+    /// most one probe per sandbox regardless of the driver's tick rate
+    /// (the ~6s probe outlives a sub-6s `min_interval` tick). Entry
+    /// removed when the probe finishes or the sandbox is destroyed.
+    dead_probe_inflight: Arc<DashMap<SandboxId, ()>>,
     /// ADR 0007: chunk-store-backed materialization. When set, the
     /// `bundle.json` on a cached image is the source of truth for
     /// the disk — chunks are fetched from `BlobStorage`, written to
@@ -1795,6 +1801,7 @@ impl PooledBackend {
             session_bindings: Arc::new(DashMap::new()),
             quarantined_survivors: Arc::new(DashMap::new()),
             unreachable_guests: Arc::new(DashMap::new()),
+            dead_probe_inflight: Arc::new(DashMap::new()),
             chunk_store: None,
             peer_health: crate::peer_fill::PeerHealth::new(),
             materialize_dir: None,
@@ -3418,6 +3425,19 @@ impl PooledBackend {
     /// ADR 0091: a successful capture (or destroy) clears the suspicion.
     pub fn clear_guest_unreachable(&self, sandbox_id: SandboxId) {
         self.unreachable_guests.remove(&sandbox_id);
+    }
+
+    /// ADR 0091 probe gate (engrams review, #835): claim the one
+    /// dead-guest-probe slot for `sandbox_id`. `true` = caller owns the
+    /// probe and MUST call [`Self::end_dead_probe`] when it finishes;
+    /// `false` = a probe is already in flight, skip spawning another.
+    pub fn try_begin_dead_probe(&self, sandbox_id: SandboxId) -> bool {
+        self.dead_probe_inflight.insert(sandbox_id, ()).is_none()
+    }
+
+    /// Release the probe slot claimed by [`Self::try_begin_dead_probe`].
+    pub fn end_dead_probe(&self, sandbox_id: SandboxId) {
+        self.dead_probe_inflight.remove(&sandbox_id);
     }
 
     /// ADR 0091: the heartbeat's unreachable-guest advert.
@@ -8216,6 +8236,7 @@ impl SandboxBackend for PooledBackend {
         // sandbox.
         let _ = self.last_snapshot_unix_ms.remove(&id);
         let _ = self.checkpoint_pacing.remove(&id);
+        let _ = self.dead_probe_inflight.remove(&id);
         // ADR 0028 Fix A: tear down the checkpoint chain. Durable RECORDS
         // deliberately survive destroy — an eviction's final checkpoint
         // must stay re-advertisable until the coord acks it (that's the
