@@ -1,0 +1,171 @@
+# ADR 0101: Amortized memory durability — epochs, an honest floor, an honest lifecycle
+
+- Status: Proposed
+- Date: 2026-07-21
+- Issues: prod investigation 2026-07-20/21 (this ADR's Context); ADR 0028 (eviction
+  durability), ADR 0034 (idle-eviction state machine), ADR 0045 D5 / issue #529
+  (host-owned finalize), ADR 0077 (created-park), ADR 0090 (ownership truth +
+  quarantine), ADR 0091 (honest lifecycle), ADR 0095 (peer fill)
+
+## Context
+
+Rung-2 durability — disk+memory snapshots for idle eviction and resume — is slow at
+every boundary, and the durability floor is weaker than it appears.
+
+**Measured in prod (2026-07-20/21):**
+
+- FC snapshot *create* (pause + diff-snap) is sub-second. The cost is finalize:
+  `engram_snapshot_finish_seconds{type=diff}` averaged 25s and 53s on the two fleet
+  hosts; one memory diff of 62,090 dirty 512 KiB ranges re-chunked for ~95s. Periodic
+  checkpoints (600s cadence) pay this repeatedly; the eviction path pays it again at
+  teardown. `engram_upload_budget_wait_seconds` ≈ 0 across ~13k acquisitions — the
+  bottleneck is serial structure and per-object round-trips, not bandwidth.
+- `evicting` conflates rung-2 park (VM paused in place) with actual descent. Over 7
+  days: episodes lasting minutes to hours, several exactly the 28,800s hard TTL, many
+  terminated by `host_lost` (a roll caught the eviction), and two sessions livelocked
+  in `evicting` (the ADR 0077 × ADR 0090 quarantine-park interplay) while the eviction
+  scanner re-found them every 10s.
+- Resume: 1.3–3.8s parked/warm-host, 11.7–45.8s cold cross-host. Coordinator overhead
+  is milliseconds; the time is host-side restore, and `state.bin` / sidecar / manifests
+  are fetched serially.
+- The floor: a session flips `idle` once the host fsyncs a **node-local**
+  `EvictionFinalizeRecord` (`eviction_finalize.rs` module docs: "nothing but node loss
+  can lose it" — i.e. node loss loses it). GCS publication trails in a background
+  finalizer. Node loss in that window silently falls back to a ≤10-min-old periodic
+  checkpoint.
+
+**Where the time goes (code):**
+
+1. The eviction-final disk leg uploads dirty chunks in a serial loop with checked
+   `put_chunk` (HEAD-before-PUT) — while the live NBD flush path is 32-way unchecked.
+2. Dirty chunks are written to NVMe `disk-pending/` and read back before upload on the
+   common path (a documented simplification of issue #529's bifurcated design).
+3. The finalize ladder `Captured → DiskUploaded → MemoryChunked → BlobsUploaded` runs
+   strictly serially; `state.bin`, sidecar, and aux bundles upload serially; resume
+   downloads them serially.
+4. The sparse memory re-chunk (`update_for_dirty_ranges_sparse`) issues a checked
+   `put_chunk` per rebuilt 512 KiB chunk: one HEAD + one PUT per chunk, 32-way. At 62k
+   ranges that is ~4k round-trip *rounds* — the 95s. Two structural wastes: (a) the
+   HEAD always misses for genuinely-new content, and (b) a rebuilt chunk whose hash
+   equals the parent manifest's hash needs **no** store I/O at all — it is already
+   durable by the parent-manifest-published invariant.
+5. Memory dirt accumulates for a full 600s epoch (or since the last evict), so the
+   boundary work is O(10 minutes of writes) — and a Full capture is O(guest RAM).
+
+## Decision
+
+Three phases. The unifying idea: **never bring 10 minutes of memory dirt to the
+eviction boundary, then make the boundary itself honest.**
+
+### Phase A — remove the serial tail (no semantics change)
+
+- `eviction_finalize::publish_disk_manifest`: bounded-concurrency (32)
+  `put_chunk_unchecked`, verifying each returned hash against the recorded hash.
+- Hot-path handoff: `snapshot_begin` passes the drained chunk bytes in memory to the
+  finalize job it spawns; `disk-pending/` remains write-only on the common path — a
+  crash-redrive journal (redrive still reads + re-verifies it). Staging writes fan out
+  (bounded) instead of write+fsync one file at a time.
+- Overlap the disk and memory legs when redriving from `Captured` (both are idempotent
+  publishes); persist the stage bumps in ladder order afterward, so persisted records
+  stay byte-compatible and redrive semantics are unchanged. Upload `state.bin`,
+  sidecar, and aux bundles concurrently in the blobs leg.
+- Sparse re-chunk: skip the store round-trip entirely when the rebuilt hash equals the
+  parent's hash (already durable via the published parent manifest); otherwise
+  `put_chunk_unchecked` (new-by-construction content — the HEAD always misses);
+  concurrency 32 → 96 (the host-global `UploadBudget`, default 96 permits, remains the
+  cross-workload arbiter).
+- Resume: fetch `state.bin` + sidecar concurrently; fetch the peer pre-pass's memory +
+  disk manifests concurrently.
+
+Expected: eviction disk leg from ~O(chunks × RTT) serial to ~seconds; the 95s-class
+memory leg to roughly a third of its time (HEAD elimination + same-hash skip + wider
+fan-out) — before Phase B shrinks its input.
+
+### Phase B — amortized memory durability (adaptive dirty epochs)
+
+- Drive the checkpoint cadence adaptively — dirty-bytes threshold and
+  pressure/cordon/roll signals, ~30–60s typical — instead of the fixed 600s. KVM
+  dirty-page tracking is already armed (`track_dirty_pages`); a Diff snapshot already
+  writes sparse dirty pages and resets the bitmap.
+- Pipeline each epoch's re-chunk → upload as chunks are produced, under the ADR 0091
+  per-sandbox capture guard. Eviction then captures only the open epoch: the memory
+  leg becomes O(seconds of writes).
+- **Invariant: no dirty-bitmap consumption without a durable epoch journal.** The Diff
+  consumes the bitmap; the epoch record (ranges covered, chained parent manifest
+  version) persists before the capture is treated as collected, and a failed
+  collection retries with its ranges still known-dirty (today's chain-poison → Full
+  fallback remains the backstop). If pause cost or the snapshot-file workflow becomes
+  the limiter, extend the owned FC fork (v1.16, ADR 0045 Phase B) with a narrow
+  dirty-bitmap export/ACK-advance endpoint (double-buffered epochs) — a fallback, not
+  the first step.
+- Full captures (chain seed / chain loss) stay O(RAM) but move off the eviction path
+  into their own scheduled operation.
+- Side effect: active-session RPO for host loss drops from ≤600s to ~epoch length.
+
+### Phase C — honest floor + honest lifecycle
+
+- Split `Evicting` per its two real meanings:
+  - **`parked`** — VM paused in place, sandbox bound, un-park ~1s. A real
+    `SessionState` variant (ADR 0034 discipline: `parse_session_state` every variant,
+    exhaustive matches). Park keeps the ADR 0091 capture-lock discipline. Host death
+    while `parked` → `host_lost`, never `idle`.
+  - **`evicting`** — an explicit, idempotent descent operation keyed
+    `(session_id, parked_at)` with bounded attempts and terminal states — replacing
+    the 10s re-scan loop that livelocks against ADR 0090 quarantine.
+  - **`idle`** — no live sandbox, resumable from a durable snapshot.
+- **Flip the floor: `idle` requires the snapshot closure verified in GCS and the PG
+  snapshot row present.** Affordable once Phases A+B make the final publish seconds.
+  The sandbox binding is not detached before it. This closes the node-loss window: the
+  user-visible boundary and the durability boundary become the same event.
+- Host dies mid-descent → `host_lost`, and recovery selects the last *published*
+  checkpoint — the same fallback as today, but surfaced honestly (ADR 0091
+  `CheckpointLag`), never silently.
+- The 8h hard TTL becomes an explicit `parked → evicting` nomination instead of a
+  state a session sits in.
+
+## Alternatives considered
+
+**Cluster-seal + GCS leak** (replicate dirty chunks to R peer hosts over the ADR 0095
+fabric as the durability floor; seal in PG; upload to GCS asynchronously). Rejected:
+
+- It does not touch the dominant cost — chunk *production* precedes replication, so
+  teardown stays ~95s until epochs shrink; and once epochs shrink, GCS itself is fast
+  enough and strictly more durable.
+- R=2 is not a credible floor here: observed failures are *correlated* (drain-gated
+  rolls, node-pool replacement — the ADR 0090 addendum records multi-session
+  unpublished-tail loss in one operational episode). A believable floor needs ≥3
+  replicas across zones, fsync'd SHA-verified receivers (peer-fill's 692 MiB/s was
+  measured with neither — it is explicitly a rebuildable cache, not durability), a
+  seal/residency schema, replica GC, and a leased leak worker. Large correctness
+  surface, bought for a window Phases A+B shrink to seconds.
+- Peer-fill remains what it is good at: the resume-latency tier.
+
+**UFFD-WP for continuous dirty tracking.** Deferred: KVM dirty logging already covers
+fresh and restored VMs with zero per-write user-space traps; UFFD-WP adds first-write
+fault latency to active sessions, O(RAM) re-protection per epoch, and a broader
+memory-backend integration. Revisit only if measurement shows pause/extract dominating.
+
+**Writing the UFFD handler's last-resort GCS fetches into the shared cache.**
+Rejected: it would break the ADR 0075 single-writer invariant precisely in the window
+(host-agent mid-roll) where the writer is unreachable; the fallback is bounded to that
+window.
+
+## Verification
+
+- Sim (ADR 0098 D4): new `MetadataStore` surface in Phase C (descent op, floor flip)
+  gets engram-sim scenarios against both stores; add a quiescence oracle asserting the
+  park × quarantine interplay converges (no unbounded enqueue/skip loops).
+- Crash-state (ADR 0099 H5): externally constructed torn epoch journals and per-leg
+  finalize records at every byte offset; assert tolerant recovery and the
+  no-bitmap-consumption-without-durable-journal invariant.
+- FC lane: minimal-size regressions for the parallel finalize and epoch capture, wired
+  into `ci.yml`'s `--test` list. No throughput-scale tests in CI.
+- Prod: re-measure `snapshot_finish_seconds`, evicting-episode durations, and the
+  resume distribution after each phase; new metrics for epoch bytes/age and
+  time-to-durable-idle.
+
+## Commit chain
+
+- Phase A: (this PR)
+- Phase B: —
+- Phase C: —
