@@ -89,7 +89,11 @@ pub(crate) async fn cow_state_core(
         (Some(h), Some(sb), SessionState::Active | SessionState::Created) => (h, sb),
         _ => {
             // No live sandbox for this session (Idle, HostLost,
-            // terminal, or still Pending).
+            // terminal, or still Pending). ADR 0101 C: `Parked` also
+            // lands here DELIBERATELY — the VM is alive but paused, so
+            // live COW telemetry would be a frozen reading; the UI's
+            // parked copy explains the tier without it, and telemetry
+            // resumes on wake. (Same treatment `Evicting` always got.)
             return Ok(None);
         }
     };

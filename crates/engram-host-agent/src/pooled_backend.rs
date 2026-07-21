@@ -9714,6 +9714,94 @@ mod tests {
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
 
+    /// ADR 0101 B: the adaptive candidacy glue over the pacing maps —
+    /// the pure controller (`next_epoch_after`) is tested in
+    /// `checkpoint.rs`; this pins the map-driven wiring around it: a
+    /// dirt-heavy sample earns the floor cadence, a trickle keeps the
+    /// backstop, a sample-less sandbox keeps the backstop, and a fresh
+    /// capture is never due.
+    #[tokio::test]
+    async fn adaptive_candidates_honor_pacing_and_backstop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        let pooled = PooledBackend::new(inner).with_checkpoint_dir(tmp.path().join("checkpoints"));
+        let cfg = crate::checkpoint::CheckpointConfig {
+            interval: Some(std::time::Duration::from_secs(600)),
+            min_interval: std::time::Duration::from_secs(30),
+            target_epoch_bytes: 256 * 1024 * 1024,
+        };
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+        let sample = |dirty: Option<u64>| EpochPacingSample {
+            dirty_bytes: dirty,
+            epoch: std::time::Duration::from_secs(60),
+        };
+        let bind = |age_secs: i64, pacing: Option<EpochPacingSample>| {
+            let sb = SandboxId::new();
+            let session = SessionId::new();
+            pooled.session_bindings.insert(sb, session);
+            pooled
+                .last_snapshot_unix_ms
+                .insert(sb, now_ms - age_secs * 1000);
+            if let Some(p) = pacing {
+                pooled.checkpoint_pacing.insert(sb, p);
+            }
+            sb
+        };
+
+        // Dirt-heavy (2× target in 60s) → floor cadence (30s): due at 40s.
+        let busy_due = bind(40, Some(sample(Some(2 * cfg.target_epoch_bytes))));
+        // Same rate but captured 10s ago → not due yet.
+        let busy_fresh = bind(10, Some(sample(Some(2 * cfg.target_epoch_bytes))));
+        // A trickle (1 KiB/epoch) → backstop cadence: not due at 40s.
+        let idle_trickle = bind(40, Some(sample(Some(1024))));
+        // No pacing sample → backstop: not due at 40s, due at 700s.
+        let unsampled_fresh = bind(40, None);
+        let unsampled_old = bind(700, None);
+
+        let due: std::collections::HashSet<SandboxId> = pooled
+            .checkpoint_candidates_adaptive(&cfg)
+            .into_iter()
+            .map(|(sb, _)| sb)
+            .collect();
+        assert!(
+            due.contains(&busy_due),
+            "dirt-heavy at 40s is due (30s floor)"
+        );
+        assert!(!due.contains(&busy_fresh), "fresh capture is never due");
+        assert!(
+            !due.contains(&idle_trickle),
+            "a trickle keeps the 600s backstop"
+        );
+        assert!(
+            !due.contains(&unsampled_fresh),
+            "no rate signal keeps the backstop"
+        );
+        assert!(due.contains(&unsampled_old), "the backstop still fires");
+    }
+
+    /// ADR 0091 probe gate (engrams review, #835 round 2): one probe
+    /// slot per sandbox — claim, re-claim refused, release, re-claim ok.
+    #[tokio::test]
+    async fn dead_probe_gate_is_one_slot_per_sandbox() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        let pooled = PooledBackend::new(inner);
+        let sb = SandboxId::new();
+        assert!(pooled.try_begin_dead_probe(sb));
+        assert!(!pooled.try_begin_dead_probe(sb), "second claim refused");
+        assert!(
+            pooled.try_begin_dead_probe(SandboxId::new()),
+            "other sandboxes unaffected"
+        );
+        pooled.end_dead_probe(sb);
+        assert!(pooled.try_begin_dead_probe(sb), "released slot reclaimable");
+    }
+
     /// Session 731df805 (2026-07-17): the local survivor-rehydrate
     /// candidate filter. Live + unserved + session-bound records are
     /// candidates regardless of what the coordinator's list said;

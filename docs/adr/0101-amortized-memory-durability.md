@@ -221,4 +221,7 @@ window.
 
 - Phase A: PR #834 (serial-tail removal — merged)
 - Phase B: PR #835 (adaptive dirty epochs)
-- Phase C: the parked/evicting/idle split + the settle floor (this PR)
+- Phase C: the parked/evicting/idle split + the settle floor
+- Sim follow-ups: the op-mint quiescence oracle (the livelock-class pin the
+  2026-07-21 incident left open), adaptive-candidacy + probe-gate unit tests, and
+  the wildcard-match hygiene pass over `SessionState`
