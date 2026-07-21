@@ -718,9 +718,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Generous vs the ~5-6 min steady state: a cold rust-cache (new
-    # shared-key, or a toolchain bump) pushes the first run past 20.
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/fc-setup
@@ -789,9 +787,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Generous vs the ~5-6 min steady state: a cold rust-cache (new
-    # shared-key, or a toolchain bump) pushes the first run past 20.
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/fc-setup
@@ -832,9 +828,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Generous vs the ~5-6 min steady state: a cold rust-cache (new
-    # shared-key, or a toolchain bump) pushes the first run past 20.
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/fc-setup
@@ -961,9 +955,7 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    # Generous vs the ~5-6 min steady state: a cold rust-cache (new
-    # shared-key, or a toolchain bump) pushes the first run past 20.
-    timeout-minutes: 30
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
       - uses: ./.github/actions/fc-setup
