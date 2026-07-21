@@ -323,6 +323,18 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
                 Err(e) => OpOutcome::Retry(format!("rung ascent: {e}")),
             }
         }
+        // ADR 0101 C: parked is a real state now — the VM is alive and
+        // paused in place; the same ascent machinery un-pauses it (~1s)
+        // and flips `Parked → Active`.
+        SessionState::Parked => {
+            match crate::api::snapshot::ascend_evicting_to_active(state, id, ctx.fence()).await {
+                Ok(true) => OpOutcome::Done,
+                Ok(false) => OpOutcome::Retry(
+                    "session is parked but the un-park did not land; retrying".into(),
+                ),
+                Err(e) => OpOutcome::Retry(format!("un-park ascent: {e}")),
+            }
+        }
         // ADR 0079 note: terminal-for-this-op rather than Retry — the
         // evac scanner relocates Evacuating sessions via its own inline
         // claim, and a retrying resume op would sit AHEAD of that claim
@@ -762,6 +774,21 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
                     Err(e) => return OpOutcome::Retry(format!("rung ascent: {e}")),
                 }
             }
+            // ADR 0101 C (engrams review, #836): `Parked` is the rung-2
+            // paused VM as a real state — the exact case the Evicting
+            // arm's inline ascent was built for, and the prompt path's
+            // ONLY wake-up (send_prompt_core enqueues Deliver directly,
+            // never ensure_active). We hold the one-running slot, so no
+            // descent is mid-capture; un-pause + flip Active inline —
+            // this is the "sending wakes it in about a second" the UI
+            // advertises.
+            SessionState::Parked => {
+                match crate::api::snapshot::ascend_evicting_to_active(state, id, ctx.fence()).await
+                {
+                    Ok(ascended) => ascended,
+                    Err(e) => return OpOutcome::Retry(format!("un-park ascent: {e}")),
+                }
+            }
             _ => false,
         };
         if !deliverable {
@@ -776,7 +803,10 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
             // outbox row is deliberately NOT deferred on this arm, so
             // the retry forwards the moment it runs.
             match session.status {
-                SessionState::Idle | SessionState::Created | SessionState::Evicting => {
+                SessionState::Idle
+                | SessionState::Created
+                | SessionState::Evicting
+                | SessionState::Parked => {
                     // Review finding #12: probe first — a resume op may
                     // already be queued behind us from a prior deliver
                     // retry. Without the guard, every backed-off deliver
@@ -1616,6 +1646,76 @@ mod tests {
                 .lock()
                 .contains(&"answer:legacy-call".to_string()),
             "a pre-flag-day answer row must be terminally retired"
+        );
+    }
+
+    /// ADR 0101 C (engrams review, #836): a Deliver op on a PARKED
+    /// session must wake it — inline ascent (un-pause + flip Active) or,
+    /// failing that, an enqueued Resume — never the bare "its scanner
+    /// owns recovery" retry: no scanner un-parks a session with a
+    /// pending delivery, so the prompt path IS the wake-up (the UI's
+    /// "sending wakes it in about a second"). The regression this pins:
+    /// a `_ => false` deliverable arm plus a fallback list without
+    /// `Parked` left the deliver op spinning until pressure or the 8h
+    /// TTL descended the session.
+    #[tokio::test]
+    async fn deliver_on_parked_wakes_or_enqueues_resume() {
+        use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+        let id = SessionId::new();
+        let mut session = idle_session(id);
+        session.status = SessionState::Parked;
+        session.park_rung = 2;
+        session.parked_at = Some(chrono::Utc::now());
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(session);
+        // Bind a real (process) sandbox so the ascent has something to
+        // un-pause.
+        let spec = SandboxSpec {
+            image: "deliver-parked-test".into(),
+            rootfs_source: None,
+            image_uri: None,
+            rootfs_manifest: None,
+            cpu: CpuLimit { vcpus: 1 },
+            memory: MemoryLimit { max_mib: 256 },
+            disk: DiskLimit { max_gib: 1 },
+            ttl: None,
+            env: Default::default(),
+            workdir: None,
+            network: Default::default(),
+            aux_ro_drives: Vec::new(),
+        };
+        let sandbox_id = state.services.host.create(spec).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(id, Some(sandbox_id))
+            .await
+            .unwrap();
+        state
+            .services
+            .meta
+            .outbox_enqueue(&outbox_prompt(id, "p-parked"))
+            .await
+            .unwrap();
+
+        let deliver = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(id, OpKind::Deliver, serde_json::json!({}), None, "test-pod")
+            .await
+            .expect("enqueue deliver")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        crate::session_ops::drive_claimed(&state, deliver).await;
+
+        let status = mini.session.lock().status;
+        let resume_enqueued = mini.ops.all().iter().any(|o| o.kind == OpKind::Resume);
+        assert!(
+            status == SessionState::Active || resume_enqueued,
+            "a parked session with a pending delivery must be woken (Active) or have a \
+             Resume queued; got status={status:?} with no resume op — the deliver verb \
+             is spinning against a state nothing else recovers",
         );
     }
 

@@ -1940,6 +1940,7 @@ describe("TaskService — session status → task status mapping", () => {
     ["pending", "working"],
     ["created", "working"],
     ["active", "working"],
+    ["parked", "working"],
     ["idle", "working"],
     ["evacuating", "working"],
     ["evicting", "working"],

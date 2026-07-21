@@ -2337,6 +2337,35 @@ pub(crate) mod tests {
             snapshots.push(snap);
             Ok(inserted)
         }
+
+        /// ADR 0101 C: mirrors the PG single-statement settle — status
+        /// CAS + sandbox match + recoverable-row EXISTS, all-or-nothing
+        /// (the D4-conformant twin lives in SimMetadataStore; this mock
+        /// keeps the same observable semantics for coordinator tests).
+        async fn settle_evicted_session_idle(
+            &self,
+            session_id: engram_core::SessionId,
+            sandbox_id: engram_core::SandboxId,
+            snapshot_id: engram_core::types::SnapshotId,
+        ) -> Result<bool, MetaError> {
+            let row_ok =
+                self.snapshots.lock().iter().any(|s| {
+                    s.id == snapshot_id && s.session_id == Some(session_id) && s.recoverable
+                });
+            if !row_ok {
+                return Ok(false);
+            }
+            let mut session = self.session.lock();
+            if session.id != session_id
+                || session.status != SessionState::Evicting
+                || session.sandbox_id != Some(sandbox_id)
+            {
+                return Ok(false);
+            }
+            session.status = SessionState::Idle;
+            session.sandbox_id = None;
+            Ok(true)
+        }
         async fn get_snapshot(
             &self,
             id: engram_core::types::SnapshotId,
@@ -2698,6 +2727,21 @@ pub(crate) mod tests {
             Ok(self.ops.running_for(session_id))
         }
 
+        /// ADR 0101 C: newest mint for `(session, kind)`, any state, any
+        /// key — mirrors PG's `ORDER BY id DESC LIMIT 1`.
+        async fn op_latest_for_kind(
+            &self,
+            session_id: SessionId,
+            kind: engram_core::types::session_op::OpKind,
+        ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+            Ok(self
+                .ops
+                .all()
+                .into_iter()
+                .filter(|o| o.session_id == session_id && o.kind == kind)
+                .max_by_key(|o| o.id))
+        }
+
         async fn op_get(
             &self,
             op_id: i64,
@@ -2799,6 +2843,15 @@ pub(crate) mod tests {
             if matches!(s.status, engram_core::types::SessionState::Evicting) {
                 let attempts = self.evict_attempts.lock().get(&s.id).copied().unwrap_or(0);
                 Ok(vec![(s, attempts)])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        async fn list_parked_sessions(&self) -> Result<Vec<Session>, MetaError> {
+            let s = self.session.lock().clone();
+            if matches!(s.status, engram_core::types::SessionState::Parked) {
+                Ok(vec![s])
             } else {
                 Ok(Vec::new())
             }

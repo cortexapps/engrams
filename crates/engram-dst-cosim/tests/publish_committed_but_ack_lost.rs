@@ -75,13 +75,17 @@ async fn lost_ack_retry_is_idempotent_and_a_stale_publish_is_dropped() {
         "the pointer advanced to v2"
     );
 
-    // Now the binding departs (the eviction D5 unbind clears sandbox_id).
+    // Now the binding departs — ADR 0101 C: the evict op leaves it bound;
+    // the finalize's recoverable row + settle is what detaches.
     sim.advance(3600).await;
     sim.evict_to_idle(session).await;
+    for _ in 0..=engram_dst_cosim::host::FINALIZE_MAX_ATTEMPTS {
+        sim.finalize_pending().await;
+    }
     assert_eq!(
         sim.sandbox_of(session).await,
         None,
-        "D5 cleared the binding"
+        "the eviction settle cleared the binding"
     );
 
     // A late/duplicated publish for the now-departed sandbox is dropped as

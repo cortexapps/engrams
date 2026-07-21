@@ -26,6 +26,10 @@
  *   active      — agentd reachable AND harness running (or
  *                 harness=none and agentd is ready). Only state in
  *                 which /exec, /shell, /prompt proceed.
+ *   parked      — VM paused in place on its host (ADR 0101): sandbox
+ *                 still bound, wake is ~1s. A prompt/resume un-parks
+ *                 it; pressure or the hard TTL descends it to a full
+ *                 eviction (evicting → idle).
  *   idle        — snapshotted; /resume rehydrates
  *   host_lost   — heartbeat-loss against the bound host. The
  *                 reconciler resolves this to `idle` (if a
@@ -45,6 +49,7 @@ export type SessionState =
   | "queued"
   | "created"
   | "active"
+  | "parked"
   | "idle"
   | "host_lost"
   | "evacuating"

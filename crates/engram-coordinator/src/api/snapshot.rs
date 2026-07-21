@@ -673,6 +673,17 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
             enqueue_and_observe_resume(state, id).await?;
             Ok(())
         }
+        // ADR 0101 C: parked-paused is a real state — the VM is alive
+        // and paused in place. Same shape as Evicting's rung ascent: the
+        // one-write cancel un-pauses in ms; a raced descent falls back
+        // to the queued resume.
+        SessionState::Parked => {
+            if try_cancel_nominated_eviction(state, id).await? {
+                return Ok(());
+            }
+            enqueue_and_observe_resume(state, id).await?;
+            Ok(())
+        }
         SessionState::Created => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
              Wait for the session to reach Active (subscribe to /sessions/:id/events) \
@@ -2117,7 +2128,10 @@ pub(crate) async fn evict_local_core(state: &SharedState, id: SessionId) -> Resu
     }
 
     match enqueue_and_observe_evict(state, id, /* allow_park = */ false).await? {
-        ObservedEvict::Idle => Ok(()),
+        // EvictedSettling carries the same durability guarantee the
+        // pre-ADR-0101-C Idle flip did (crash-durable finalize inputs);
+        // the Idle settle follows via the reconcile within seconds.
+        ObservedEvict::Idle | ObservedEvict::EvictedSettling => Ok(()),
         // allow_park = false makes this unreachable; honest error if the
         // verb ever changes shape underneath.
         ObservedEvict::ParkedPaused => Err(ApiError::Internal(
@@ -2129,10 +2143,16 @@ pub(crate) async fn evict_local_core(state: &SharedState, id: SessionId) -> Resu
 /// What the bounded observe saw the evict op land at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObservedEvict {
-    /// Full suspend: captured, destroyed, session at Idle.
+    /// Full suspend, fully settled: the recoverable row landed and the
+    /// reconcile flipped the session Idle.
     Idle,
-    /// ADR 0074 rung 2: the VM was paused in place (session Evicting,
-    /// `park_rung == 2`).
+    /// ADR 0101 C: the capture landed (the evict op is Done — the
+    /// host's finalize inputs are crash-durable, the same guarantee the
+    /// pre-C Idle flip gave) and the session is honestly `Evicting`
+    /// until the heartbeat reconcile records the recoverable row and
+    /// settles it Idle, typically within seconds.
+    EvictedSettling,
+    /// ADR 0074 rung 2: the VM was paused in place (session `Parked`).
     ParkedPaused,
 }
 
@@ -2167,9 +2187,9 @@ pub(crate) async fn enqueue_and_observe_evict(
         let session = state.services.meta.get_session(id).await?;
         match session.status {
             SessionState::Idle => return Ok(ObservedEvict::Idle),
-            SessionState::Evicting if session.park_rung == 2 => {
-                return Ok(ObservedEvict::ParkedPaused)
-            }
+            // ADR 0101 C: park lands at the real `Parked` state (the old
+            // `Evicting && park_rung == 2` compound is retired).
+            SessionState::Parked => return Ok(ObservedEvict::ParkedPaused),
             _ => {}
         }
         if let Some(op_id) = op_id {
@@ -2185,10 +2205,18 @@ pub(crate) async fn enqueue_and_observe_evict(
                             "eviction was cancelled (the user returned); session stays live".into(),
                         ));
                     }
-                    // Done without an Idle/parked status = the verb's
-                    // re-entry guard skipped (a concurrent op moved the
-                    // session first).
+                    // ADR 0101 C (engrams review, #836): a full evict's
+                    // op finishes at capture time with the session
+                    // honestly still `Evicting` — that IS success (the
+                    // pre-C Idle flip promised exactly the same
+                    // durability: crash-durable finalize inputs). The
+                    // reconcile settles Idle when the row lands. Done in
+                    // any OTHER state = the verb's re-entry guard
+                    // skipped (a concurrent op moved the session first).
                     OpState::Done => {
+                        if session.status == SessionState::Evicting {
+                            return Ok(ObservedEvict::EvictedSettling);
+                        }
                         return Err(ApiError::Conflict(format!(
                             "evict op completed as a no-op; session is {} — retry if still \
                              intended",

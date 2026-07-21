@@ -15,6 +15,7 @@ import { useLoadMoreSentinel } from "../../hooks/useLoadMoreSentinel";
 const PAGE_SIZE = 50;
 const SESSION_STATES: SessionState[] = [
   "active",
+  "parked",
   "idle",
   "pending",
   "queued",

@@ -1,6 +1,6 @@
 # ADR 0101: Amortized memory durability — epochs, an honest floor, an honest lifecycle
 
-- Status: Proposed
+- Status: Accepted (2026-07-21)
 - Date: 2026-07-21
 - Issues: prod investigation 2026-07-20/21 (this ADR's Context); ADR 0028 (eviction
   durability), ADR 0034 (idle-eviction state machine), ADR 0045 D5 / issue #529
@@ -145,6 +145,37 @@ fan-out) — before Phase B shrinks its input.
 - The 8h hard TTL becomes an explicit `parked → evicting` nomination instead of a
   state a session sits in.
 
+**As implemented (divergences, Phase C PR):**
+
+- `Parked` is a full `SessionState` variant (`Active → Evicting → Parked` at park;
+  `Parked → {Active, Evicting, HostLost, Dead, Completed}`), persisted as `'parked'`
+  (migration 0107 CHECK + partial index). `park_rung`/`parked_at` are KEPT as
+  ascent/ledger metadata — lifecycle identity moved to the status; retiring the rung
+  entirely is a follow-up cleanup, not this PR.
+- The floor flip is a fused store operation, `settle_evicted_session_idle(session,
+  sandbox, snapshot)`: one guarded UPDATE (status CAS + sandbox match + recoverable-row
+  EXISTS) run by the heartbeat reconcile right after `record_snapshot` lands the
+  eviction-final row. The evict op still finishes at capture (ADR 0079 finding #11 —
+  never hold the op lane for an upload); the session stays honestly `evicting` for the
+  seconds-long publication window, and the scanner's bounded attempts fall a
+  never-landing row to `HostLost`. New `MetadataStore` surface
+  (`list_parked_sessions`, `settle_evicted_session_idle`) carries D4 conformance
+  scenarios against both stores.
+- Closing the window also closed issue #570 structurally: the sandbox binding now
+  survives until the settle, so the teardown reconcile's ownership check keeps
+  answering "owned" for a mid-finalize VM even with the capture-in-flight signal
+  suppressed — re-pinned by the rewritten cosim twin
+  (`suppressed_signal_reconcile_cannot_reap_a_still_bound_capture`).
+- The descent transition (`Parked → Evicting`) commits BEFORE the descent op enqueues
+  — enqueue-first would recreate the skip-loop half of the ADR 0077×0090 livelock (a
+  state-guard Skip terminalizes the op, terminal rows leave the dedup index, fresh op
+  forever). A crash between the two self-corrects via the scanner's generic re-enqueue
+  (re-parks if pressure abated, descends if it persists).
+- Moving Full captures off the eviction path (park-until-chain-seeded) is deferred: it
+  needs nothing new structurally now that descent is explicit, and the prod fleet's
+  chains are diff-seeded in steady state; revisit if Full-at-evict shows up in the
+  time-to-durable-idle histograms.
+
 ## Alternatives considered
 
 **Cluster-seal + GCS leak** (replicate dirty chunks to R peer hosts over the ADR 0095
@@ -188,6 +219,9 @@ window.
 
 ## Commit chain
 
-- Phase A: (this PR)
-- Phase B: —
-- Phase C: —
+- Phase A: PR #834 (serial-tail removal — merged)
+- Phase B: PR #835 (adaptive dirty epochs)
+- Phase C: the parked/evicting/idle split + the settle floor
+- Sim follow-ups: the op-mint quiescence oracle (the livelock-class pin the
+  2026-07-21 incident left open), adaptive-candidacy + probe-gate unit tests, and
+  the wildcard-match hygiene pass over `SessionState`

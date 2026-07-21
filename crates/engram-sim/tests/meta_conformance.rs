@@ -700,6 +700,80 @@ async fn ops_pipeline(ctx: &Ctx) {
 
 /// Idempotency keys dedupe ACTIVE ops only — a terminal keyed row does
 /// not burn the key.
+/// ADR 0101 C (engrams review, #836 rounds 2+3): `op_latest_for_kind` —
+/// the newest mint of a kind for the session, ANY state, ANY key. Two
+/// properties are the point: TERMINAL rows stay visible (the dedup
+/// index forgets them by design; the eviction scanner must see "a
+/// capture already landed" without re-minting), and the read is
+/// KEY-AGNOSTIC (the three post-capture paths mint under three
+/// different keys — one of them under none at all).
+async fn op_latest_for_kind_reads_terminal_mints(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:oplatest")).await.unwrap();
+    assert!(
+        meta.op_latest_for_kind(sid, OpKind::Evict)
+            .await
+            .unwrap()
+            .is_none(),
+        "no mints → None"
+    );
+    // A KEYLESS mint (the admin/evict_local shape) — must be visible.
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    assert!(meta
+        .op_finish(op.id, op.epoch.unwrap(), OpState::Done, None)
+        .await
+        .unwrap());
+    let latest = meta
+        .op_latest_for_kind(sid, OpKind::Evict)
+        .await
+        .unwrap()
+        .expect("a terminal, keyless mint is visible — that is the method's point");
+    assert_eq!(latest.id, op.id);
+    assert_eq!(latest.state, OpState::Done);
+    assert!(
+        latest.finished_at.is_some(),
+        "finished_at stamps on finish (the scanner's grace check reads it)"
+    );
+    // A newer mint under a KEY (the descent shape) becomes the newest.
+    let EnqueueOutcome::Claimed(op2) = meta
+        .op_enqueue_and_claim(
+            sid,
+            OpKind::Evict,
+            serde_json::json!({}),
+            Some("evict-descend:42"),
+            "pod-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("descent mint claimed")
+    };
+    let latest = meta
+        .op_latest_for_kind(sid, OpKind::Evict)
+        .await
+        .unwrap()
+        .expect("still visible");
+    assert_eq!(latest.id, op2.id, "newest mint wins, key or no key");
+    // Kind + session isolation.
+    assert!(meta
+        .op_latest_for_kind(sid, OpKind::Resume)
+        .await
+        .unwrap()
+        .is_none());
+    let other = meta.create_session(spec("conf:oplatest-b")).await.unwrap();
+    assert!(meta
+        .op_latest_for_kind(other, OpKind::Evict)
+        .await
+        .unwrap()
+        .is_none());
+}
+
 async fn ops_idempotency(ctx: &Ctx) {
     let meta = &ctx.meta;
     let sid = meta.create_session(spec("conf:idem")).await.unwrap();
@@ -1392,7 +1466,159 @@ async fn teleport_target_flow(ctx: &Ctx) {
     assert!(meta.get_teleport_target(id).await.unwrap().is_none());
 }
 
+/// ADR 0101 C: the parked lifecycle + the durability-floor settle.
+/// `parked` is a real state (`list_parked_sessions` finds it, the
+/// eviction sweep does not), and `settle_evicted_session_idle` is a
+/// single guarded settle: it flips `evicting → idle` + detaches ONLY
+/// when the exact recoverable snapshot row exists and the exact sandbox
+/// is still bound — every other combination is a clean `false` no-op.
+async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let now = ctx.clock.now_utc();
+    let host = HostId::new();
+    meta.upsert_host(host_record(host, "conf-parked-h1", now))
+        .await
+        .unwrap();
+
+    let sid = meta.create_session(spec("conf:parked")).await.unwrap();
+    meta.assign_session_host(sid, Some(host)).await.unwrap();
+    let sb = engram_core::SandboxId::new();
+    meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
+    meta.transition_session(sid, SessionState::Created)
+        .await
+        .unwrap();
+    meta.transition_session(sid, SessionState::Active)
+        .await
+        .unwrap();
+    meta.transition_session(sid, SessionState::Evicting)
+        .await
+        .unwrap();
+    meta.transition_session(sid, SessionState::Parked)
+        .await
+        .unwrap();
+
+    // Parked is its own sweep — visible to the reaper's list, invisible
+    // to the eviction scanner's.
+    let parked = meta.list_parked_sessions().await.unwrap();
+    assert_eq!(parked.len(), 1, "parked session is listed");
+    assert_eq!(parked[0].id, sid);
+    assert!(
+        meta.list_evicting_sessions().await.unwrap().is_empty(),
+        "a parked session is NOT an evicting row (the livelock class)"
+    );
+
+    // Descend: Parked → Evicting (the explicit nomination edge).
+    meta.transition_session(sid, SessionState::Evicting)
+        .await
+        .unwrap();
+    assert!(meta.list_parked_sessions().await.unwrap().is_empty());
+
+    let snap_id = SnapshotId::new();
+    // 1. No row yet → no settle.
+    assert!(
+        !meta
+            .settle_evicted_session_idle(sid, sb, snap_id)
+            .await
+            .unwrap(),
+        "no settle before the snapshot row exists"
+    );
+    // 2. A NON-recoverable row → no settle.
+    assert!(meta
+        .record_snapshot(snapshot(snap_id, sid, now, false))
+        .await
+        .unwrap());
+    assert!(
+        !meta
+            .settle_evicted_session_idle(sid, sb, snap_id)
+            .await
+            .unwrap(),
+        "a non-recoverable row must not settle Idle"
+    );
+    // 3. A recoverable row for a DIFFERENT session → no settle.
+    let other = meta
+        .create_session(spec("conf:parked-other"))
+        .await
+        .unwrap();
+    let other_snap = SnapshotId::new();
+    assert!(meta
+        .record_snapshot(snapshot(other_snap, other, now, true))
+        .await
+        .unwrap());
+    assert!(
+        !meta
+            .settle_evicted_session_idle(sid, sb, other_snap)
+            .await
+            .unwrap(),
+        "another session's row must not settle this one"
+    );
+    // 4. The right row, but the WRONG sandbox (a rebound successor) → no
+    //    settle.
+    ctx.clock.advance(Duration::from_secs(1));
+    let later = ctx.clock.now_utc();
+    let good_snap = SnapshotId::new();
+    assert!(meta
+        .record_snapshot(snapshot(good_snap, sid, later, true))
+        .await
+        .unwrap());
+    assert!(
+        !meta
+            .settle_evicted_session_idle(sid, engram_core::SandboxId::new(), good_snap)
+            .await
+            .unwrap(),
+        "a stale advert against a rebound sandbox must not settle"
+    );
+    // 5. The exact triple → settle: idle + detached (host kept for
+    //    resume affinity).
+    assert!(meta
+        .settle_evicted_session_idle(sid, sb, good_snap)
+        .await
+        .unwrap());
+    let s = meta.get_session(sid).await.unwrap();
+    assert_eq!(s.status, SessionState::Idle);
+    assert_eq!(s.sandbox_id, None, "the settle detaches the sandbox");
+    assert_eq!(s.host_id, Some(host), "host affinity preserved");
+    // 6. Idempotent: a re-advert's second settle is a clean no-op.
+    assert!(
+        !meta
+            .settle_evicted_session_idle(sid, sb, good_snap)
+            .await
+            .unwrap(),
+        "an already-settled session no-ops"
+    );
+
+    // Parked → HostLost is the host-death edge (never Idle: the parked
+    // RAM died with the host).
+    let sid2 = meta.create_session(spec("conf:parked-lost")).await.unwrap();
+    meta.assign_session_host(sid2, Some(host)).await.unwrap();
+    meta.assign_session_sandbox(sid2, Some(engram_core::SandboxId::new()))
+        .await
+        .unwrap();
+    meta.transition_session(sid2, SessionState::Created)
+        .await
+        .unwrap();
+    meta.transition_session(sid2, SessionState::Active)
+        .await
+        .unwrap();
+    meta.transition_session(sid2, SessionState::Evicting)
+        .await
+        .unwrap();
+    meta.transition_session(sid2, SessionState::Parked)
+        .await
+        .unwrap();
+    meta.transition_session(sid2, SessionState::HostLost)
+        .await
+        .unwrap();
+    assert_eq!(
+        meta.get_session(sid2).await.unwrap().status,
+        SessionState::HostLost
+    );
+}
+
 conformance!(t_broker_token_flow, super::broker_token_flow);
+conformance!(
+    t_parked_lifecycle_and_eviction_settle,
+    super::parked_lifecycle_and_eviction_settle
+);
 conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
@@ -1414,6 +1640,10 @@ conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
 conformance!(t_ops_idempotency, super::ops_idempotency);
+conformance!(
+    t_op_latest_for_kind_reads_terminal_mints,
+    super::op_latest_for_kind_reads_terminal_mints
+);
 conformance!(t_fenced_transition, super::fenced_transition);
 conformance!(
     t_enqueue_evacuating_resume,

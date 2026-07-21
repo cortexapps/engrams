@@ -2356,6 +2356,62 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
+    /// ADR 0101 C: parked-session sweep, via the partial
+    /// `idx_sessions_parked` (0107).
+    async fn list_parked_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, status, host_id, sandbox_id,
+                   image_uri, mode,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   park_rung, parked_at,
+                   evict_attempts
+            FROM sessions
+            WHERE status = 'parked'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::session_from_row).collect()
+    }
+
+    /// ADR 0101 C: the durability-floor settle. One guarded UPDATE —
+    /// the status CAS, the sandbox match, and the recoverable-row
+    /// EXISTS all evaluate in the same statement, so a racing resume,
+    /// rebind, or delete makes this a clean no-op (`false`), never a
+    /// partial write. `host_id` is untouched (resume affinity);
+    /// `last_active_at` is untouched (it keys the eviction nomination).
+    async fn settle_evicted_session_idle(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'idle', sandbox_id = NULL, updated_at = $4
+             WHERE id = $1
+               AND status = 'evicting'
+               AND sandbox_id = $2
+               AND EXISTS (
+                   SELECT 1 FROM snapshots
+                    WHERE id = $3 AND session_id = $1 AND recoverable
+               )
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .bind(snapshot_id.as_uuid())
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() == 1)
+    }
+
     /// ADR 0034: atomic `+= 1 RETURNING`. The eviction scanner calls
     /// this before each pipeline attempt; when the returned count
     /// crosses the budget it falls back to HostLost.
@@ -6640,6 +6696,28 @@ impl MetadataStore for PostgresStore {
         );
         let row = sqlx::query(&q)
             .bind(session_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row::session_op_from_row(&r)).transpose()
+    }
+
+    /// ADR 0101 C: newest row (any state, any key) for `(session, kind)`
+    /// — ids are monotonic, so `ORDER BY id DESC LIMIT 1` is the latest
+    /// mint.
+    async fn op_latest_for_kind(
+        &self,
+        session_id: SessionId,
+        kind: engram_core::types::session_op::OpKind,
+    ) -> Result<Option<SessionOp>, MetaError> {
+        let q = format!(
+            "SELECT {OP_COLUMNS} FROM session_ops
+              WHERE session_id = $1 AND kind = $2
+              ORDER BY id DESC LIMIT 1"
+        );
+        let row = sqlx::query(&q)
+            .bind(session_id.as_uuid())
+            .bind(kind.as_str())
             .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?;

@@ -293,7 +293,10 @@ pub(crate) async fn evict_idle_core(
     // faithful stand-in for "the session went idle") and observe the op.
     let observed = crate::api::snapshot::enqueue_and_observe_evict(state, session_id, true).await?;
     let status = match observed {
-        crate::api::snapshot::ObservedEvict::ParkedPaused => "evicting (parked-paused, rung 2)",
+        crate::api::snapshot::ObservedEvict::ParkedPaused => "parked (paused in place)",
+        crate::api::snapshot::ObservedEvict::EvictedSettling => {
+            "evicting (capture landed; settling to idle via the heartbeat reconcile)"
+        }
         crate::api::snapshot::ObservedEvict::Idle => "idle",
     };
     tracing::info!(
