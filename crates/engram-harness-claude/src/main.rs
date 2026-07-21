@@ -958,10 +958,12 @@ mod adapter {
         }
 
         /// Return Claude's PreToolUse `allow` response with a Bash command
-        /// rooted in the harness-owned logical cwd. Foreground calls install
-        /// an EXIT trap that records their final physical cwd while preserving
-        /// the command's exit status. Background calls inherit the snapshot
-        /// but cannot race to move the foreground session later.
+        /// rooted in the harness-owned logical cwd. Foreground calls record
+        /// their final physical cwd on normal return and retain an EXIT-trap
+        /// fallback for commands that terminate the shell early. Recording on
+        /// the normal path means a command's own EXIT trap cannot suppress cwd
+        /// continuity. Background calls inherit the snapshot but cannot race
+        /// to move the foreground session later.
         pub(super) fn bash_allow_output(
             tool_input: &serde_json::Value,
             cwd: &Path,
@@ -985,11 +987,21 @@ mod adapter {
                 .unwrap_or(false);
 
             let mut wrapped = format!("cd -- {} && {{\n", shell_quote(cwd));
+            let record_cwd = format!("pwd -P >| {}", shell_quote(tracker));
             if !background {
-                let record_cwd = format!("pwd -P >| {}", shell_quote(tracker));
                 wrapped.push_str(&format!("trap {} EXIT\n", shell_quote_str(&record_cwd)));
             }
             wrapped.push_str(&command);
+            if !background {
+                // Most commands return here, so record independently of the
+                // current EXIT trap: user cleanup commonly replaces it. Keep
+                // the trap above as the early `exit`/`set -e` fallback. The
+                // explicit status handoff preserves the Bash tool result and
+                // still runs whichever EXIT trap is current.
+                wrapped.push_str("\n__engrams_bash_status=$?\n");
+                wrapped.push_str(&record_cwd);
+                wrapped.push_str("\nexit \"$__engrams_bash_status\"");
+            }
             wrapped.push_str("\n}");
             map.insert("command".to_string(), serde_json::Value::String(wrapped));
             allow_output(Some(updated_input))
@@ -5056,7 +5068,8 @@ mod adapter {
             assert!(command.contains("trap "));
             assert!(command.contains("pwd -P >| "));
             assert!(command.contains("/workspace/.engrams/bash-cwd"));
-            assert!(command.ends_with("cd nested && false\n}"));
+            assert!(command.contains("cd nested && false\n__engrams_bash_status=$?\n"));
+            assert!(command.ends_with("exit \"$__engrams_bash_status\"\n}"));
 
             let background = serde_json::json!({
                 "command": "pwd",
@@ -5141,6 +5154,43 @@ mod adapter {
                 std::fs::read_to_string(&tracker).unwrap().trim(),
                 child.to_string_lossy(),
                 "the EXIT trap must record cwd without masking command failure"
+            );
+
+            std::fs::remove_dir_all(&base).unwrap();
+        }
+
+        #[test]
+        fn bash_hook_records_cwd_when_command_replaces_exit_trap() {
+            let base = std::env::temp_dir()
+                .join(format!("engram-bash-cwd-own-trap-{}", uuid::Uuid::new_v4()));
+            let child = base.join("child");
+            let tracker = base.join("bash-cwd");
+            let marker = base.join("user-exit-trap-ran");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(&tracker, format!("{}\n", base.display())).unwrap();
+
+            let input = serde_json::json!({
+                "command": format!(
+                    "trap 'touch {}' EXIT; cd child; false",
+                    marker.display()
+                ),
+            });
+            let output = hook_bridge::bash_allow_output(&input, &base, &tracker);
+            let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap();
+            let result = std::process::Command::new("bash")
+                .arg("-c")
+                .arg(command)
+                .output()
+                .unwrap();
+
+            assert_eq!(result.status.code(), Some(1));
+            assert!(marker.exists(), "the command's EXIT trap must still run");
+            assert_eq!(
+                std::fs::read_to_string(&tracker).unwrap().trim(),
+                child.to_string_lossy(),
+                "the command's EXIT trap must not suppress cwd persistence"
             );
 
             std::fs::remove_dir_all(&base).unwrap();
