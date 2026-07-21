@@ -33,9 +33,10 @@
 //! genuinely alive for the test's duration, with real
 //! `start_time_jiffies`/`comm` read the same way the reattach pass does.
 //! `#[ignore]`'d (Linux-only: reads `/proc`) and wired into the
-//! `test-firecracker` CI lane's unprivileged `--test` list alongside this
-//! crate's other `#[ignore]`'d tests, though — unlike its siblings — it
-//! needs neither `/dev/kvm` nor the `firecracker` binary.
+//! `tests (linux)` CI lane — unlike its FC-crate siblings it needs
+//! neither `/dev/kvm` nor the `firecracker` binary, so it runs on every
+//! Rust-touching PR, not just the FC dep closure (ADR 0098:
+//! keep-the-FC-lane-minimal).
 
 #![cfg(target_os = "linux")]
 
