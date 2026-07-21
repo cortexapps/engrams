@@ -1919,8 +1919,9 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) =
             crate::state::tests::build_state_for_session(evicting_session(id));
-        // The nomination window has a LIVE VM — the ascent's liveness
-        // gate (ADR 0101 C settle-window fix) refuses phantom sandboxes.
+        // The nomination window has a LIVE VM and a cancellable queued
+        // evict — the ascent's two-gate check (ADR 0101 C settle-window
+        // fix) refuses phantom sandboxes and op-less Evicting rows.
         crate::state::tests::bind_live_sandbox(&state, &mini).await;
 
         let op = match state
@@ -1933,6 +1934,23 @@ mod tests {
             EnqueueOutcome::Claimed(op) => op,
             other => panic!("lane busy: {other:?}"),
         };
+        // The nomination evict queues BEHIND the running resume op —
+        // exactly the shape the verb's inline ascent cancels.
+        assert!(matches!(
+            state
+                .services
+                .meta
+                .op_enqueue_and_claim(
+                    id,
+                    OpKind::Evict,
+                    serde_json::json!({ "target": "idle", "allow_park": true, "nominated": false }),
+                    None,
+                    "test-pod",
+                )
+                .await
+                .expect("enqueue nomination evict"),
+            EnqueueOutcome::Queued(_)
+        ));
         let op_id = op.id;
         crate::session_ops::drive_claimed(&state, op).await;
 

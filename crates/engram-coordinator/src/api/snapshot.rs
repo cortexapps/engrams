@@ -742,8 +742,13 @@ pub(crate) async fn try_cancel_nominated_eviction(
     let meta = &state.services.meta;
     // Cancel any still-queued evict ops first (rung 1 proper). This also
     // frees the op lane so the short-lived ascent claim below can land
-    // (the exclusive claim requires no queued op).
-    let _ = meta.op_cancel_queued(id, OpKind::Evict).await;
+    // (the exclusive claim requires no queued op). The RESULT threads
+    // into the ascent: it is the causal half of the non-parked gate
+    // (cancelled-a-queued-evict = the eviction never ran).
+    let cancelled_nomination = meta
+        .op_cancel_queued(id, OpKind::Evict)
+        .await
+        .unwrap_or(false);
 
     // ADR 0079 (review finding #2): the ascent MUST run under a REAL op
     // claim, not the old `op_running_for == None` probe + unfenced
@@ -767,7 +772,9 @@ pub(crate) async fn try_cancel_nominated_eviction(
     .await
     {
         Ok(Some(claim)) => {
-            let res = ascend_evicting_to_active(state, id, claim.fence()).await;
+            let res =
+                ascend_evicting_to_active_with(state, id, claim.fence(), cancelled_nomination)
+                    .await;
             match &res {
                 Ok(_) => claim.finish(OpState::Done, None).await,
                 Err(e) => claim.finish(OpState::Failed, Some(&e.to_string())).await,
@@ -802,14 +809,34 @@ pub(crate) async fn ascend_evicting_to_active(
     id: SessionId,
     fence: SessionFence,
 ) -> Result<bool, ApiError> {
+    ascend_evicting_to_active_with(state, id, fence, false).await
+}
+
+/// [`ascend_evicting_to_active`] with the caller's own nomination-cancel
+/// result threaded in: [`try_cancel_nominated_eviction`] must cancel
+/// queued evicts BEFORE acquiring its short-lived claim (the exclusive
+/// claim needs a free lane), which would otherwise eat the causal
+/// evidence the non-parked gate below keys on.
+pub(crate) async fn ascend_evicting_to_active_with(
+    state: &SharedState,
+    id: SessionId,
+    fence: SessionFence,
+    caller_cancelled_nomination: bool,
+) -> Result<bool, ApiError> {
     use engram_core::types::session_op::OpKind;
     // The user is back: any queued evict op (nomination, rung descent)
-    // is stale. Idempotent with the caller's own cancel.
-    let _ = state
-        .services
-        .meta
-        .op_cancel_queued(id, OpKind::Evict)
-        .await;
+    // is stale. Idempotent with the caller's own cancel — and the
+    // RESULT is load-bearing for the non-parked arm below: cancelling a
+    // queued evict is the causal proof the eviction has NOT run (a
+    // capture that landed finishes its op — it never leaves a queued
+    // row behind).
+    let cancelled_nomination = caller_cancelled_nomination
+        || state
+            .services
+            .meta
+            .op_cancel_queued(id, OpKind::Evict)
+            .await
+            .unwrap_or(false);
     // ADR 0074 rung 2 (parked-paused ascent): if this session was parked
     // by PAUSING the VM in place (park_rung == 2), the sandbox is still
     // bound and alive — un-pause it BEFORE flipping the row back to
@@ -847,17 +874,41 @@ pub(crate) async fn ascend_evicting_to_active(
         // ADR 0101 C gave `Evicting` a THIRD shape beyond the nomination
         // window and the parked-paused VM: the post-capture SETTLE
         // window — the evict op already completed (capture landed, VM
-        // destroyed) and the session stays `Evicting` until the next
-        // heartbeat's eviction-final advert settles it Idle. Cancelling
-        // "the eviction" here is meaningless (it already happened), and
-        // flipping Active advertised a session over a destroyed sandbox
-        // — the e2e stack caught it on main the day Phase C landed: no
-        // `evicted` event, "sandbox not found" on the first exec, and
-        // the wedged row held its reservation until the fleet read as
-        // full. Ascend only on POSITIVE proof the VM is still alive;
-        // anything else (no binding, probe says gone, probe unreachable)
-        // returns false — the caller retries, the settle lands Idle
-        // within a heartbeat, and the normal snapshot resume takes over.
+        // destroyed or doomed) and the session stays `Evicting` until
+        // the next heartbeat's eviction-final advert settles it Idle.
+        // Cancelling "the eviction" here is meaningless (it already
+        // happened), and flipping Active advertised a session over a
+        // destroyed sandbox — the e2e stack caught it on main the day
+        // Phase C landed: no `evicted` event, "sandbox not found" on
+        // the first exec, and the wedged row held its reservation until
+        // the fleet read as full.
+        //
+        // Two gates, BOTH required (the probe alone raced the pipeline
+        // destroy: post-capture the FC process can still be momentarily
+        // alive — alive-but-doomed, PR #845 diagnostics run):
+        //
+        // 1. CAUSAL: this ascent (or its wire caller) actually
+        //    cancelled a QUEUED evict op. A capture that landed
+        //    finishes its op, so a cancellable queued row is proof the
+        //    eviction never ran and the VM was never touched. No row to
+        //    cancel → the Evicting state belongs to machinery that
+        //    already ran (settle window / crash-orphan the scanner
+        //    owns) → refuse.
+        // 2. LIVENESS: positive `probe_sandbox` proof, for the residual
+        //    shapes where a queued row exists over a dead VM (a
+        //    scanner-minted retry after a failed settle on a lost
+        //    host).
+        //
+        // Refusal is cheap: the caller retries, the settle lands Idle
+        // within a heartbeat, and the normal snapshot resume takes
+        // over.
+        if !cancelled_nomination {
+            tracing::info!(session_id = %id,
+                "ascent: no queued evict to cancel — the eviction already ran \
+                 (post-capture settle window / scanner-owned row); not \
+                 ascending, the settle lands Idle and the resume retries");
+            return Ok(false);
+        }
         let Some(sandbox_id) = row.as_ref().and_then(|r| r.sandbox_id) else {
             tracing::debug!(session_id = %id,
                 "ascent: evicting session has no bound sandbox; leaving it to the settle");
@@ -868,8 +919,8 @@ pub(crate) async fn ascend_evicting_to_active(
             Ok(p) => {
                 tracing::info!(session_id = %id, %sandbox_id,
                     known = p.known_to_backend, alive = p.process_alive,
-                    "ascent: evicting session's VM is gone (post-capture settle \
-                     window); not ascending — resume retries after the settle");
+                    "ascent: evicting session's VM is gone; not ascending — \
+                     resume retries after the settle/scanner");
                 return Ok(false);
             }
             Err(e) => {
@@ -2772,9 +2823,20 @@ mod evicting_gate_tests {
         let id = SessionId::new();
         let (state, mini, _local) =
             crate::state::tests::build_state_for_session(evicting_session(id));
-        // The nomination window has a LIVE VM (the ascent's liveness
-        // gate refuses phantom sandboxes — ADR 0101 C settle-window fix).
+        // The nomination window has a LIVE VM and a cancellable QUEUED
+        // evict (requeued-with-backoff shape, lane free) — the ascent's
+        // two-gate check (ADR 0101 C settle-window fix) refuses phantom
+        // sandboxes and op-less Evicting rows.
         crate::state::tests::bind_live_sandbox(&state, &mini).await;
+        let nom = mini
+            .ops
+            .seed_running(id, engram_core::types::session_op::OpKind::Evict);
+        assert!(mini.ops.requeue_with_backoff(
+            nom.id,
+            nom.epoch.expect("epoch"),
+            std::time::Duration::from_secs(3600),
+            "test: park the nomination as a queued row",
+        ));
 
         ensure_active(&state, id).await.expect("cancel path");
 
@@ -2989,31 +3051,37 @@ mod evicting_gate_tests {
         );
     }
 
-    /// Review finding #9: a direct /resume on an Evicting session with NO
-    /// running evict op (the nomination window, or a parked-paused VM
-    /// whose evict op is already Done) ASCENDS to Active — the resume op
-    /// holds the one-running slot, so Evicting can only be the cancelable
-    /// nomination/park case. It no longer Retry-forever-behind-a-
-    /// nonexistent-evict. (The genuine "an evict op is RUNNING" ordering
-    /// case stays a retryable conflict — see
-    /// `resume_queued_behind_evict_runs_after_it_settles`.)
+    /// ADR 0101 C settle window at the RPC boundary: a resume racing the
+    /// post-capture window (session `Evicting`, evict op already Done,
+    /// NO cancellable nomination, VM destroyed) must surface a RETRYABLE
+    /// conflict — never the pre-fix bogus ascent that flipped Active
+    /// over a destroyed sandbox (PR #845 diagnostics run: "sandbox not
+    /// found" on the next exec). The verb's Evicting arm refuses the
+    /// ascent (no queued evict to cancel) and retries behind the settle;
+    /// with no settle in this fixture, the observe times out into the
+    /// retryable 409 the wire caller polls on. (The nomination-window
+    /// ascent lives in `ensure_active_cancels_a_nominated_eviction_inline`
+    /// and `session_verbs::resume_verb_ascends_evicting_instead_of_retrying`.)
     #[tokio::test]
-    async fn resume_during_evicting_nomination_ascends_to_active() {
+    async fn resume_during_settle_window_is_retryable_never_a_bogus_ascent() {
         let id = SessionId::new();
-        let (state, mini, _local) =
+        let (state, _mini, _local) =
             crate::state::tests::build_state_for_session(evicting_session(id));
-        // The nomination window has a LIVE VM (the ascent's liveness
-        // gate refuses phantom sandboxes — ADR 0101 C settle-window fix).
-        crate::state::tests::bind_live_sandbox(&state, &mini).await;
+        // No sandbox in the backend, no queued evict op: the post-capture
+        // settle window exactly as the D5 pipeline leaves it.
 
-        enqueue_and_observe_resume_for(&state, id, Duration::from_secs(5))
+        let err = enqueue_and_observe_resume_for(&state, id, Duration::from_secs(2))
             .await
-            .expect("a nomination-window Evicting resume must ascend, not conflict");
+            .expect_err("a settle-window resume must not ascend");
+        assert!(
+            matches!(err, ApiError::Conflict(_)),
+            "retryable conflict expected, got: {err}",
+        );
         let after = state.services.meta.get_session(id).await.unwrap();
         assert_eq!(
             after.status,
-            SessionState::Active,
-            "the resume verb ascends the nomination back to Active",
+            SessionState::Evicting,
+            "the session stays Evicting for the settle — never Active over a dead VM",
         );
     }
 

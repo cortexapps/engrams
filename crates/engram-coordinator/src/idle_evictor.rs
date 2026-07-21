@@ -4029,14 +4029,25 @@ mod tests {
         meta.session.lock().host_id = Some(host_id);
         seed_host_with_free_ram(&meta, host_id, 60_000);
 
-        // The nomination window (VM alive, evict not yet run): the ascent
-        // must still work — this is the "user came back in time" fast
-        // path the probe gate must not break.
+        // The nomination window (VM alive, a cancellable QUEUED evict —
+        // here in its requeued-with-backoff shape, lane free): the
+        // ascent must still work — the "user came back in time" fast
+        // path the two-gate check must not break.
         assert_eq!(meta.session.lock().status, SessionState::Evicting);
+        let nom = meta.ops.seed_running(session_id, OpKind::Evict);
+        assert!(meta.ops.requeue_with_backoff(
+            nom.id,
+            nom.epoch.expect("epoch"),
+            std::time::Duration::from_secs(3600),
+            "test: park the nomination as a queued row",
+        ));
         let ascended = crate::api::snapshot::try_cancel_nominated_eviction(&state, session_id)
             .await
             .expect("ascent (live VM)");
-        assert!(ascended, "a live-VM nomination window still ascends");
+        assert!(
+            ascended,
+            "a live-VM nomination window (queued evict) still ascends"
+        );
         assert_eq!(meta.session.lock().status, SessionState::Active);
 
         // Now construct the settle window exactly as the D5 pipeline
