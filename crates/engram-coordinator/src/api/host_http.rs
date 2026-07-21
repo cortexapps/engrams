@@ -874,6 +874,19 @@ pub async fn heartbeat(
     // rows piled up behind one wedged evict in the 2026-07-13 incident).
     // Pre-ADR-0090, nothing consumed the host's WARN and the teardown
     // reconciler's orphan path SIGKILLed the VM.
+    //
+    // 2026-07-21 livelock incident: the active-state-scoped key is only
+    // safe because the enqueued op is guaranteed to CONVERGE. An op that
+    // settles Done as a fast no-op frees the key before the next
+    // heartbeat and turns this enqueue into a 5s-cadence infinite loop
+    // (session 8174b7aa: an ADR 0077 harness-failed park at `Created`
+    // skipped the evict guard in ~10ms, for 2.5 days / ~43k ops). The
+    // evict pipeline's quarantine arm (`quarantine_reap_unevictable`)
+    // now destroys the survivor — clearing the host's quarantine entry,
+    // i.e. this very advertise — whenever the session can't be evicted
+    // from its current state, so every enqueue here ends the loop it
+    // rides on. Keep that pairing in mind before adding states the
+    // pipeline may skip.
     for q in &hb.quarantined_survivors {
         match state.services.meta.get_session(q.session_id).await {
             Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
