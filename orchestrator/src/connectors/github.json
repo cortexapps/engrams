@@ -416,6 +416,11 @@
     {
       "grants": ["metadata:read", "contents:read", "pulls:read", "issues:read", "checks:read", "statuses:read", "actions:read", "deployments:read"],
       "match": { "operation": "query", "field": "rateLimit" }
+    },
+    {
+      "comment": "`gh` probes schema capabilities before commands like `gh pr checks` / `gh pr create` via aliased `__type(name: ...)` introspection queries (public schema metadata, no resource access) and hard-fails the command when the probe dies. Gate it under the same every-read-power set as `viewer`/`rateLimit`.",
+      "grants": ["metadata:read", "contents:read", "pulls:read", "issues:read", "checks:read", "statuses:read", "actions:read", "deployments:read"],
+      "match": { "operation": "query", "field": "__type" }
     }
   ],
   "cli": {

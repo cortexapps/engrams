@@ -214,6 +214,42 @@ credentials from the same provider and rendering template. It fails closed if
 static or cross-provider entries resolve the same header name to conflicting
 values. Unit and TLS e2e regressions cover both the coalescing and conflict cases.
 
+### Post-merge pitfall (fixed): keep-alive requests bypassed the gate + injection
+
+The interceptor gates, strips, and injects only the FIRST request on an
+intercepted TLS connection — after forwarding the rewritten prefix it streams
+both directions verbatim (`copy_bidirectional`). A keep-alive client's second
+request therefore reached the upstream ungated, still carrying the guest's
+placeholder credential; GitHub answers that with `401 Bad credentials`. Every
+multi-request `gh` command broke on request #2+ (`gh pr create`'s
+existing-PR pre-check, `gh pr checks`' schema feature-detection `__type`
+queries, `gh run list`'s workflows+runs pair), while single-request probes
+(`gh api`, `gh pr view`, `git push`) worked — which made it masquerade as a
+credential/mint bug (the pitfall above) long after that fix shipped. Two
+compounding tells from the 2026-07-21 prod diagnosis (session `af28cac4`):
+the same failing request alternated between EOF (fresh connection → policy
+reject of the uncovered `__type` field) and 401 (reused connection → GitHub
+saw the placeholder), and `gh` *caches* the 401 responses to its
+feature-detection queries in `~/.cache/gh`, so later invocations kept failing
+instantly even on fresh connections. Fixed: the proxy now forces
+`Connection: close` (and strips `Keep-Alive`/`Proxy-Connection`/`Upgrade`) on
+every intercepted request — the same rewrite the observe path always applied —
+so a compliant upstream answers once and closes, the client reconnects, and
+every request is gated + injected. This covers the substitution plane too (a
+reused connection's second request also skipped placeholder substitution).
+`Upgrade` is *stripped, never honored* (PR #846 security review): the header is
+guest-supplied, and a REST/GraphQL host that doesn't upgrade would ignore it
+and keep the connection persistent — letting a guest reopen the very bypass
+this fix closes by decorating request #1 with `Upgrade: websocket` +
+`Connection: Upgrade`. No intercepted (credential/observe) host speaks
+websockets; genuine websocket support would need an explicit per-policy opt-in
+plus a 101-aware tunnel, not trust in a client header. Residual (accepted): an
+upstream that *ignores* `Connection: close` leaves the tunnel open for
+ungated-but-uncredentialed requests; real API hosts honor it. Unit + TLS e2e
+regressions (`keep_alive_second_request_cannot_bypass_the_gate`,
+`force_close_strips_guest_supplied_upgrade`) pin the rewrite, the Upgrade
+strip, and the one-request-per-connection contract.
+
 ### Remaining operational gates (post-merge, not design opens)
 
 - Capture real `gh` GraphQL traffic (`GH_DEBUG=api` / mitmproxy) for the target

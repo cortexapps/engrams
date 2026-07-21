@@ -404,6 +404,240 @@ async fn injects_header_on_allowed_request() {
     );
 }
 
+// 2026-07-21 regression: the gate/inject/substitute passes see only the FIRST
+// request on an intercepted connection — everything after the buffered prefix
+// streams verbatim. A keep-alive client's second request therefore reached the
+// upstream ungated, carrying the guest's placeholder credential (GitHub
+// answered `401 Bad credentials`, breaking `gh pr create` / `gh pr checks` /
+// `gh run list`, which multiplex several requests over one connection). The
+// proxy must force `Connection: close` on every intercepted request so a
+// compliant upstream answers once and closes — the client reconnects and every
+// request gets gated + injected.
+#[tokio::test]
+async fn keep_alive_second_request_cannot_bypass_the_gate() {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    // The fake upstream honors `Connection: close`: one response, then EOF.
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let injects: Vec<&InjectEntry> = vec![&inj];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &injects,
+            &[],
+            SessionId::new(),
+            None,
+            None,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    tls_client
+        .write_all(
+            b"GET /api/v2/logs/events HTTP/1.1\r\nHost: fake-upstream\r\n\
+              Connection: keep-alive\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tls_client.flush().await.unwrap();
+
+    // Read the full first response (close-delimited by the upstream).
+    let mut resp = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match tls_client.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&tmp[..n]);
+                if resp.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(
+        String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK"),
+        "first request should succeed",
+    );
+
+    // Attempt request #2 on the same connection: a shape the policy rejects,
+    // carrying a guest-held credential header. It must never reach upstream —
+    // the tunnel is close-delimited, so the connection is dead by now.
+    let _ = tls_client
+        .write_all(
+            b"GET /api/v1/admin HTTP/1.1\r\nHost: fake-upstream\r\n\
+              DD-API-KEY: guest-placeholder\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+    let _ = tls_client.flush().await;
+    let mut post = [0u8; 256];
+    let n = tls_client.read(&mut post).await.unwrap_or(0);
+    assert_eq!(
+        n, 0,
+        "second keep-alive request must get EOF, not a response"
+    );
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+
+    let outcome = proxy_task.await.unwrap();
+    if let Err(e) = &outcome {
+        // The client deliberately writes request #2 into the torn-down tunnel;
+        // which teardown error that surfaces is a platform/timing coin flip
+        // (macOS: close_notify/UnexpectedEof, Linux: EPIPE/ECONNRESET). All of
+        // them mean the same thing this test asserts: the connection died.
+        let msg = format!("{e}");
+        if !msg.contains("close_notify")
+            && !msg.contains("UnexpectedEof")
+            && !msg.contains("Broken pipe")
+            && !msg.contains("Connection reset")
+        {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+
+    let seen = String::from_utf8(captured.lock().clone()).unwrap();
+    assert!(
+        seen.contains("Connection: close\r\n"),
+        "intercepted request must be rewritten to Connection: close; got: {seen}",
+    );
+    assert!(
+        !seen.to_ascii_lowercase().contains("keep-alive"),
+        "client keep-alive headers must be stripped; got: {seen}",
+    );
+    assert!(
+        seen.contains("DD-API-KEY: dd-secret-xyz\r\n"),
+        "first request still carries the injected credential; got: {seen}",
+    );
+    assert!(
+        !seen.contains("/api/v1/admin"),
+        "second request must never reach the upstream; got: {seen}",
+    );
+}
+
+// PR #846 security review: a guest can't reopen the keep-alive bypass by
+// decorating request #1 with `Upgrade: websocket` + `Connection: Upgrade`. A
+// REST/GraphQL upstream ignores the unsupported Upgrade and would keep the
+// connection persistent — but the proxy strips Upgrade and still forces
+// `Connection: close`, so request #2 dies exactly as in the plain keep-alive
+// case. (`fake_upstream` never speaks websockets — the attacker's upstream.)
+#[tokio::test]
+async fn guest_upgrade_header_cannot_reopen_the_bypass() {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let injects: Vec<&InjectEntry> = vec![&inj];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &injects,
+            &[],
+            SessionId::new(),
+            None,
+            None,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    // Request #1: gated shape, but the guest tries to keep the tunnel open with
+    // a websocket-upgrade dressing against a plain HTTP upstream.
+    tls_client
+        .write_all(
+            b"GET /api/v2/logs/events HTTP/1.1\r\nHost: fake-upstream\r\n\
+              Connection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tls_client.flush().await.unwrap();
+
+    let mut resp = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match tls_client.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&tmp[..n]);
+                if resp.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK"));
+
+    // Request #2: forbidden shape carrying a guest-held credential. The forced
+    // close means the connection is already dead — it must not reach upstream.
+    let _ = tls_client
+        .write_all(
+            b"GET /api/v1/admin HTTP/1.1\r\nHost: fake-upstream\r\n\
+              DD-API-KEY: guest-placeholder\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+    let _ = tls_client.flush().await;
+    let mut post = [0u8; 256];
+    let n = tls_client.read(&mut post).await.unwrap_or(0);
+    assert_eq!(n, 0, "second request must get EOF, not a response");
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+
+    let outcome = proxy_task.await.unwrap();
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify")
+            && !msg.contains("UnexpectedEof")
+            && !msg.contains("Broken pipe")
+            && !msg.contains("Connection reset")
+        {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+
+    let seen = String::from_utf8(captured.lock().clone()).unwrap();
+    assert!(
+        seen.contains("Connection: close\r\n"),
+        "Upgrade request must still be rewritten to Connection: close; got: {seen}",
+    );
+    assert!(
+        !seen.to_ascii_lowercase().contains("upgrade"),
+        "guest-supplied Upgrade must be stripped; got: {seen}",
+    );
+    assert!(
+        !seen.contains("/api/v1/admin"),
+        "second request must never reach the upstream; got: {seen}",
+    );
+}
+
 // ADR 0056: a request to an inject-gated host whose (method, path) matches
 // no policy is rejected — the secret is never injected and nothing reaches
 // upstream.
@@ -1074,6 +1308,29 @@ async fn graphql_allows_aliased_field() {
         }
     }
     assert!(String::from_utf8_lossy(&captured).contains("Authorization: Bearer tok-abc\r\n"));
+}
+
+// `gh`'s schema feature detection (run before `gh pr checks` / `gh pr create`)
+// sends aliased introspection queries like
+// `query PullRequest_fields{PullRequest: __type(name: "PullRequest"){...}}`.
+// A `__type` inject entry must cover them — including the aliased,
+// multi-field shape — or those commands die on the probe.
+#[tokio::test]
+async fn graphql_allows_aliased_type_introspection() {
+    let ca = ca();
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Query, "__type");
+    let req = graphql_post(&gql(
+        "query PullRequest_fields{PullRequest: __type(name: \"PullRequest\"){fields(includeDeprecated: true){name}},StatusCheckRollupContextConnection: __type(name: \"StatusCheckRollupContextConnection\"){fields(includeDeprecated: true){name}}}",
+    ));
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+    let seen = String::from_utf8_lossy(&captured);
+    assert!(seen.contains("Authorization: Bearer tok-abc\r\n"));
 }
 
 #[tokio::test]
