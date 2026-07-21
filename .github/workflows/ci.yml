@@ -1837,8 +1837,34 @@ jobs:
       - name: Dump tilt + stack logs on failure
         if: failure()
         run: |
-          echo "--- tilt.log (last 300 lines: coord + host-agent streams) ---"
-          tail -300 var/integration/tilt.log 2>/dev/null || true
+          # Full log minus the two DEBUG heartbeat spam lines that
+          # drown everything (the disagreement alarm fires 2/s for
+          # harness=none sessions); cap defensively at 20k lines.
+          echo "--- tilt.log (filtered, last 20000 lines) ---"
+          grep -vE "disagreement alarm|op deferred \(retryable\)" \
+            var/integration/tilt.log 2>/dev/null | tail -20000 || true
+          # The control-plane's end state: which sessions/ops are
+          # wedged and what they're holding.
+          echo "--- sessions table ---"
+          docker exec "$(docker ps -q --filter ancestor=postgres:16 | head -1)" \
+            psql -U engram -d engram -c \
+            "SELECT id, status, host_id IS NOT NULL AS bound_host, sandbox_id, \
+             park_rung, mem_budget_mib, evict_attempts, missing_strikes, \
+             created_at, last_active_at FROM sessions ORDER BY created_at" \
+            2>/dev/null || true
+          echo "--- session_ops (non-terminal) ---"
+          docker exec "$(docker ps -q --filter ancestor=postgres:16 | head -1)" \
+            psql -U engram -d engram -c \
+            "SELECT id, session_id, kind, state, attempts, not_before, claimed_by \
+             FROM session_ops WHERE state IN ('queued','running') ORDER BY id" \
+            2>/dev/null || true
+          echo "--- snapshots (latest 15) ---"
+          docker exec "$(docker ps -q --filter ancestor=postgres:16 | head -1)" \
+            psql -U engram -d engram -c \
+            "SELECT id, session_id, recoverable, disk_manifest_id IS NOT NULL AS has_disk, \
+             memory_manifest_id IS NOT NULL AS has_mem, created_at \
+             FROM snapshots ORDER BY created_at DESC LIMIT 15" \
+            2>/dev/null || true
 
       - name: Tear down stack
         if: always()
