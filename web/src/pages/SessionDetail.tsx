@@ -8,6 +8,7 @@ import { StatusGlyph } from "../components/Glyph";
 import { SessionThread } from "../components/session-thread/SessionThread";
 import { PageHeading } from "../components/page-heading";
 import { TitleEditForm } from "./sessions/TitleEditForm";
+import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
@@ -276,12 +277,17 @@ export function SessionDetail() {
           titleVariant={taskTitle ? "display" : "mono"}
           showRule={false}
           actions={
-            // Desktop reopens the pane via the edge rail; phones have no rail,
-            // so they get an explicit button.
-            <Button variant="outline" size="sm" className="md:hidden" onClick={() => openPane()}>
-              <SquareTerminal />
-              Panel
-            </Button>
+            <div className="flex items-center gap-2">
+              {/* Desktop reopens the pane via the edge rail; phones have no
+                  rail, so they get an explicit button. */}
+              <Button variant="outline" size="sm" className="md:hidden" onClick={() => openPane()}>
+                <SquareTerminal />
+                Panel
+              </Button>
+              {/* Only attributed sessions have a task to delete; synthetic
+                  admin rows (taskId null) hide the control. */}
+              {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
+            </div>
           }
         />
         {session && <SessionVitals session={session} profile={profile} durability={durability} />}
