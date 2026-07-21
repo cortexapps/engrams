@@ -1663,16 +1663,39 @@ async fn park_reaper_advance_one(
         return Ok(());
     };
 
-    // ADR 0101 C: descent is an EXPLICIT lifecycle move — flip
-    // `Parked → Evicting` BEFORE enqueueing, so the descent op's entry
-    // guard (which accepts nominated work only from `Evicting`) can
-    // never skip-loop against a still-`parked` row (enqueue-first was
-    // the ADR 0077×0090 livelock shape: a state-guard Skip terminalizes
-    // the op, terminal rows leave the dedup index, and the next tick
-    // mints a fresh op forever). Crash between this transition and the
-    // enqueue is self-correcting: the eviction scanner finds the
-    // op-less `Evicting` row and enqueues a generic evict, which
-    // re-parks if pressure has abated or descends if it persists.
+    descend_parked_session(state, &session, reason).await?;
+    Ok(())
+}
+
+/// ADR 0101 C: THE parked-descent primitive — flip `Parked → Evicting`
+/// BEFORE enqueueing, so the descent op's entry guard (which accepts
+/// nominated work only from `Evicting`) can never skip-loop against a
+/// still-`parked` row (enqueue-first was the ADR 0077×0090 livelock
+/// shape: a state-guard Skip terminalizes the op, terminal rows leave
+/// the dedup index, and the next tick mints a fresh op forever). Crash
+/// between the transition and the enqueue is self-correcting: the
+/// eviction scanner finds the op-less `Evicting` row and enqueues a
+/// generic evict, which re-parks if pressure has abated or descends if
+/// it persists.
+///
+/// Shared by the park reaper and the admin drain — the drain's first
+/// version enqueued a raw NON-nominated evict against the still-parked
+/// row, which the pipeline's entry guard skipped straight to `Done`
+/// while the drain reported "evacuating" (engrams review on PR #843):
+/// transition-first + `nominated: true` is a contract, so it lives in
+/// one place.
+///
+/// Returns `Ok(true)` when the descent is in flight after this call
+/// (fresh enqueue or an already-queued duplicate), `Ok(false)` when
+/// the `Parked → Evicting` flip raced (un-park ascent, delete, host
+/// death) — the fresh status owns the next move and nothing was
+/// enqueued.
+pub(crate) async fn descend_parked_session(
+    state: &SharedState,
+    session: &engram_core::types::Session,
+    reason: &'static str,
+) -> Result<bool, engram_core::MetaError> {
+    let session_id = session.id;
     match state
         .services
         .meta
@@ -1692,15 +1715,14 @@ async fn park_reaper_advance_one(
                 .await;
         }
         Err(e) => {
-            // Raced (un-park ascent, delete, host death) — the fresh
-            // status owns the next move; nothing to enqueue.
-            tracing::debug!(%session_id, error = %e,
-                "park reaper: Parked→Evicting descent transition raced; skipping");
-            return Ok(());
+            tracing::debug!(%session_id, error = %e, reason,
+                "parked descent: Parked→Evicting transition raced; skipping");
+            return Ok(false);
         }
     }
     // Key the descent to the park instant: at most one descent op per
-    // park, dedup'd across ticks and replicas.
+    // park, dedup'd across ticks, replicas, AND entry points (a drain
+    // racing the reaper collapses to one op).
     let key = format!(
         "evict-descend:{}",
         session
@@ -1722,9 +1744,9 @@ async fn park_reaper_advance_one(
     ) {
         ::metrics::counter!(crate::metrics::EVICTION_PARK_DESCEND_TOTAL, "reason" => reason)
             .increment(1);
-        tracing::info!(%session_id, reason, "park reaper: enqueued descent op (parked-paused → full eviction)");
+        tracing::info!(%session_id, reason, "enqueued descent op (parked-paused → full eviction)");
     }
-    Ok(())
+    Ok(true)
 }
 
 /// Marker that this module exists so unused-arg checkers don't
@@ -3962,6 +3984,76 @@ mod tests {
             SessionState::Idle,
             "memory pressure descends the park to a full eviction"
         );
+        assert_eq!(s.park_rung, 0, "rung cleared after descent");
+        assert!(
+            !state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "descent destroys the sandbox"
+        );
+        assert!(
+            !meta.snapshots.lock().is_empty(),
+            "descent captures a durable snapshot"
+        );
+    }
+
+    /// PR #843 review (engrams): the admin drain must descend a parked
+    /// session through the real contract — `Parked → Evicting` FIRST,
+    /// then the NOMINATED descent op (`descend_parked_session`) — not a
+    /// raw non-nominated enqueue, which the pipeline's entry guard
+    /// (`Active | Evicting` only) skips straight to `Done` while the
+    /// drain reports "evacuating". Drives `admin_drain_host_core`
+    /// against a rung-2 parked session end to end and asserts it lands
+    /// durable-Idle with the sandbox destroyed.
+    #[tokio::test]
+    async fn admin_drain_descends_a_parked_session_to_durable_idle() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+
+        // Park (rung 2, VM paused in place; status lands `Parked`).
+        let op = drive_evict(&state, session_id, true, false).await;
+        assert_eq!(op.state, OpState::Done);
+        assert_eq!(meta.session.lock().park_rung, 2, "parked-paused");
+        assert_eq!(meta.session.lock().status, SessionState::Parked);
+
+        wait_for_op_lane_free(&meta, session_id).await;
+        let resp = crate::api::admin::admin_drain_host_core(&state, host_id)
+            .await
+            .expect("drain");
+        assert_eq!(
+            resp.evacuating,
+            vec![session_id],
+            "the parked session is drain work, not an empty success"
+        );
+        assert!(resp.failures.is_empty(), "failures: {:?}", resp.failures);
+
+        {
+            let m = meta.clone();
+            wait_for("drained park descended to Idle", move || {
+                m.session.lock().status == SessionState::Idle
+            })
+            .await;
+        }
+        let s = meta.session.lock().clone();
         assert_eq!(s.park_rung, 0, "rung cleared after descent");
         assert!(
             !state

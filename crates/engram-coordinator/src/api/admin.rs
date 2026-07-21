@@ -457,7 +457,7 @@ pub struct DrainHostResponse {
     pub failures: Vec<DrainFailure>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DrainFailure {
     pub session_id: SessionId,
     pub error: String,
@@ -524,8 +524,11 @@ pub(crate) async fn admin_drain_host_core(
     // successfully with an empty list and the roll operator stalled on
     // `running_sandboxes == 0`):
     // - Active → the live-first move below.
-    // - Parked → the descent evict (Parked → Evicting → capture →
-    //   Idle); the paused VM cannot be live-teleported, and
+    // - Parked → the descent evict via `descend_parked_session`
+    //   (Parked → Evicting flip FIRST, then the nominated descent op —
+    //   the reaper's contract; a raw non-nominated enqueue against a
+    //   still-parked row is skipped by the pipeline's entry guard).
+    //   The paused VM cannot be live-teleported, and
     //   Parked → Evacuating is not a legal edge. Once Idle it resumes
     //   anywhere on demand — same operator outcome as an evacuation.
     // - Created / Unreachable / Evicting / Pending / Evacuating →
@@ -547,23 +550,40 @@ pub(crate) async fn admin_drain_host_core(
     let mut parked_evacuating: Vec<SessionId> = Vec::new();
     let mut parked_failures: Vec<DrainFailure> = Vec::new();
     for a in &parked {
-        match crate::session_ops::enqueue(
-            state,
-            a.session_id,
-            engram_core::types::session_op::OpKind::Evict,
-            serde_json::json!({ "target": "idle", "allow_park": false, "nominated": false }),
-            Some(&format!("drain-park:{}", a.sandbox_id)),
-        )
-        .await
-        {
-            Ok(_) => {
+        // Re-read the row: the descent needs `parked_at` (the dedup key)
+        // and the listing above is a snapshot — the session may have
+        // un-parked or died since.
+        let session = match state.services.meta.get_session(a.session_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                parked_failures.push(DrainFailure {
+                    session_id: a.session_id,
+                    error: format!("drain: parked descent: get_session: {e}"),
+                });
+                continue;
+            }
+        };
+        match crate::idle_evictor::descend_parked_session(state, &session, "admin_drain").await {
+            Ok(true) => {
                 tracing::info!(%host_id, session_id = %a.session_id, sandbox_id = %a.sandbox_id,
-                    "admin drain: parked session — enqueued descent evict (park → durable Idle)");
+                    "admin drain: parked session — descent initiated (Parked → Evicting → durable Idle)");
                 parked_evacuating.push(a.session_id);
+            }
+            Ok(false) => {
+                // The Parked → Evicting flip raced (un-park ascent,
+                // delete, host death): the fresh status owns the session
+                // and this drain wave did NOT descend it. Surface it so
+                // the operator re-runs the drain rather than trusting a
+                // silently-shrunk work list.
+                parked_failures.push(DrainFailure {
+                    session_id: a.session_id,
+                    error: "drain: parked descent raced a concurrent transition; re-run the drain"
+                        .to_string(),
+                });
             }
             Err(e) => parked_failures.push(DrainFailure {
                 session_id: a.session_id,
-                error: format!("drain: parked descent enqueue: {e}"),
+                error: format!("drain: parked descent: {e}"),
             }),
         }
     }
