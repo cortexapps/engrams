@@ -1649,7 +1649,8 @@ async fn snapshot_totals_aggregate(ctx: &Ctx) {
 /// ADR 0028 rung-1 rewind: `rewind_session_to_cursor` tombstones the
 /// guest-derived tail past the checkpoint cursor, EXCLUDES the
 /// coordinator-fact kinds (incl. `resume_started`, added with the
-/// resume-progress event), detects surviving outside-world side-effects,
+/// resume-progress event, and `durability_rollback`, ADR 0090), detects
+/// surviving outside-world side-effects,
 /// and bumps the recovery epoch only when something actually rolled back.
 /// Pins the D4 conformance obligation for the exclusion-list SQL change.
 async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
@@ -1702,14 +1703,27 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     meta.append_session_event(id, "harness_idle", serde_json::json!({}))
         .await
         .unwrap();
+    // ADR 0090: the durability-rollback marker is a coordinator fact that
+    // survives the very rewind it warns about — it must NOT tombstone.
+    meta.append_session_event(
+        id,
+        "durability_rollback",
+        serde_json::json!({
+            "sandbox_id": "sb-1",
+            "rewind_disk_manifest": {"manifest_id": "00000000-0000-0000-0000-000000000000", "version": 3},
+            "reason": "quarantined-survivor evict budget exhausted; VM destroyed"
+        }),
+    )
+    .await
+    .unwrap();
 
     // Rewind everything after the anchor.
     let summary = meta.rewind_session_to_cursor(id, cursor).await.unwrap();
 
     // Only the guest-derived events roll back (agent_message,
     // integration_asset, tool_call_started, file_shared = 4); the
-    // coordinator facts (prompt_received, resume_started, harness_idle) +
-    // the anchor status_changed survive.
+    // coordinator facts (prompt_received, resume_started, harness_idle,
+    // durability_rollback) + the anchor status_changed survive.
     assert_eq!(summary.rolled_back, 4, "rolled_back count");
     assert_eq!(summary.through_idx, cursor, "through_idx is the cursor");
     assert_eq!(summary.recovery_epoch, 1, "epoch bumped once");
@@ -1731,7 +1745,11 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     for e in &events {
         let excluded = matches!(
             e.kind.as_str(),
-            "prompt_received" | "resume_started" | "harness_idle" | "status_changed"
+            "prompt_received"
+                | "resume_started"
+                | "harness_idle"
+                | "status_changed"
+                | "durability_rollback"
         );
         assert_eq!(
             e.rewound_at.is_none(),

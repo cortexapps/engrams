@@ -4259,6 +4259,14 @@ impl MetadataStore for PostgresStore {
         // Per issue #527's Guardrails merge-coordination note: the two
         // sibling exclusion lists compose into one `AND kind NOT IN (...)`
         // predicate rather than stacking separate `AND kind <>` clauses.
+        //
+        // ADR 0090 (2026-07-20 durability-rollback incident): `durability_rollback`
+        // joins the exclusion set. It is the coordinator's own record that a
+        // quarantined-survivor destroy already rewound this session's disk to
+        // the last published manifest — a fact that stays true across the very
+        // rewind it warns about (the destroy happened; the writes are gone). It
+        // lands after the checkpoint cursor by construction, so tombstoning it
+        // would grey out the one durable, user-visible marker of the loss.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
@@ -4267,7 +4275,8 @@ impl MetadataStore for PostgresStore {
                AND kind NOT IN (
                    'status_changed', 'snapshot_taken', 'evicted',
                    'resumed', 'resume_started', 'recovered_from_checkpoint',
-                   'prompt_received', 'harness_idle', 'harness_parked'
+                   'prompt_received', 'harness_idle', 'harness_parked',
+                   'durability_rollback'
                )
             "#,
         )

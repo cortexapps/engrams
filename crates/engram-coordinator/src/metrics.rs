@@ -323,6 +323,16 @@ pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattac
 /// snapshot pipeline is persistently failing for some session.
 pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhausted_total";
 
+/// Counter (ADR 0090, 2026-07-20 durability-rollback incident). A
+/// quarantined-survivor eviction exhausted its retry budget, so the
+/// coordinator DESTROYED the crippled VM; the session's next resume then
+/// rewinds to the last published disk manifest, silently dropping any
+/// guest writes the host acked but never uploaded past it (the incident:
+/// 134/100/50 MiB tails). Pairs with the durable `durability_rollback`
+/// session_events row. MUST be ~0 — every increment is real, user-visible
+/// data loss, so alert on ANY sustained rise.
+pub const DURABILITY_ROLLBACK_TOTAL: &str = "engram_durability_rollback_total";
+
 /// Counter (#792, R4, ADR 0098 Phase 3). The recoverable-before-Idle
 /// guard fired: an idle-evict capture produced manifests but
 /// `verify_snapshot_recoverable`'s BlobStorage HEAD failed
