@@ -394,6 +394,97 @@ const fn exhaustion_settles_host_lost(nominated: bool, quarantine: bool) -> bool
     nominated || quarantine
 }
 
+/// ADR 0090 / 2026-07-20 durability-rollback incident: a quarantined
+/// survivor's eviction exhausted its retry budget. DESTROY the crippled VM
+/// (so the dead-host straggler sweep can drive HostLost → Idle and the
+/// user's next resume recovers) and, when the destroy lands, make the
+/// resulting data loss LOUD: that next resume rewinds to the last published
+/// disk manifest, silently dropping any guest writes the host acked but
+/// never uploaded past it.
+///
+/// On a successful destroy this appends a durable, coordinator-authoritative
+/// `durability_rollback` [`SessionEvent`] (surfaced on the web timeline and
+/// `engrams session log`, and excluded from `rewind_session_to_cursor`'s
+/// tombstone UPDATE so it outlives the very rewind it warns about) and bumps
+/// [`crate::metrics::DURABILITY_ROLLBACK_TOTAL`] for alerting. A destroy
+/// failure emits neither — recovery is re-driven and nothing was lost *yet*.
+/// `evict_err` is the terminal eviction error, threaded into the log + event
+/// reason for forensics.
+async fn reap_quarantined_survivor(ctx: &OpCtx<'_>, evict_err: &crate::idle_evictor::EvictError) {
+    let session_id = ctx.op.session_id;
+    let session = match ctx.state.services.meta.get_session(session_id).await {
+        Ok(s) => s,
+        Err(le) => {
+            tracing::warn!(
+                %session_id,
+                error = %le,
+                "quarantined-survivor exhaustion: session lookup failed",
+            );
+            return;
+        }
+    };
+    let Some(sandbox_id) = session.sandbox_id else {
+        return;
+    };
+    match ctx
+        .state
+        .services
+        .host
+        .destroy(sandbox_id, ctx.fence())
+        .await
+    {
+        Ok(()) => {
+            ::metrics::counter!(crate::metrics::DURABILITY_ROLLBACK_TOTAL).increment(1);
+            tracing::warn!(
+                %session_id,
+                %sandbox_id,
+                attempts = ctx.op.attempts,
+                rewind_disk_manifest = ?session.live_disk_manifest,
+                error = %evict_err,
+                "quarantined-survivor evict budget exhausted; destroyed the crippled VM \
+                 (the dead-host straggler sweep drives HostLost → Idle) — the next resume \
+                 rewinds to the last published disk manifest; acked-but-unuploaded guest \
+                 writes past it are LOST",
+            );
+            // Make the rollback durable + user-visible: a coordinator-fact
+            // event row alerting/UI/CLI can key on. `emit_fenced` no-ops
+            // (Ok(None)) if a successor re-claimed the lane — safe: that
+            // successor now owns the session's convergence.
+            let reason = format!(
+                "quarantined-survivor evict budget exhausted after {} attempts; VM destroyed \
+                 — next resume rewinds to the last published disk manifest",
+                ctx.op.attempts
+            );
+            if let Err(ee) = ctx
+                .state
+                .emit_fenced(
+                    session_id,
+                    ctx.fence(),
+                    SessionEvent::DurabilityRollback {
+                        sandbox_id,
+                        rewind_disk_manifest: session.live_disk_manifest,
+                        reason,
+                        at: ctx.state.services.clock.now_utc(),
+                    },
+                )
+                .await
+            {
+                tracing::warn!(
+                    %session_id,
+                    error = %ee,
+                    "durability_rollback event emit failed (rollback still happened)",
+                );
+            }
+        }
+        Err(de) => tracing::warn!(
+            %session_id,
+            %sandbox_id,
+            error = %de,
+            "quarantined-survivor destroy failed; the dead-host straggler sweep re-drives recovery",
+        ),
+    }
+}
+
 /// The evict verb: the idle-eviction / drain pipeline
 /// (`idle_evictor::run_evict_pipeline` — park or capture + destroy +
 /// mark-idle). Payload: `{"target": "idle"|"evacuating", "allow_park":
@@ -489,42 +580,7 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
             if ctx.op.attempts >= budget {
                 ::metrics::counter!(crate::metrics::EVICTION_BUDGET_EXHAUSTED_TOTAL).increment(1);
                 if quarantine {
-                    match ctx.state.services.meta.get_session(ctx.op.session_id).await {
-                        Ok(s) => {
-                            if let Some(sandbox_id) = s.sandbox_id {
-                                match ctx
-                                    .state
-                                    .services
-                                    .host
-                                    .destroy(sandbox_id, ctx.fence())
-                                    .await
-                                {
-                                    Ok(()) => tracing::warn!(
-                                        session_id = %ctx.op.session_id,
-                                        %sandbox_id,
-                                        attempts = ctx.op.attempts,
-                                        error = %e,
-                                        "quarantined-survivor evict budget exhausted; destroyed \
-                                         the crippled VM (the dead-host straggler sweep drives \
-                                         HostLost → Idle, \
-                                         resume rewinds to the last checkpoint)",
-                                    ),
-                                    Err(de) => tracing::warn!(
-                                        session_id = %ctx.op.session_id,
-                                        %sandbox_id,
-                                        error = %de,
-                                        "quarantined-survivor destroy failed; the dead-host \
-                                         straggler sweep re-drives recovery",
-                                    ),
-                                }
-                            }
-                        }
-                        Err(le) => tracing::warn!(
-                            session_id = %ctx.op.session_id,
-                            error = %le,
-                            "quarantined-survivor exhaustion: session lookup failed",
-                        ),
-                    }
+                    reap_quarantined_survivor(ctx, &e).await;
                 }
                 // #810 finding 2 (the Evicting-convergence hole): the HostLost
                 // fallback flip must fire for the QUARANTINE flavor too, not
@@ -1251,6 +1307,108 @@ mod tests {
             !exhaustion_settles_host_lost(false, false),
             "a plain idle-evict that keeps failing is an operator-visible coord fault, \
              not a settle that fabricates a lost host"
+        );
+    }
+
+    /// ADR 0090 / 2026-07-20 durability-rollback incident: when a
+    /// quarantined survivor's evict budget exhausts, the destroy of the
+    /// crippled VM must ALSO leave a durable, coordinator-authoritative
+    /// `durability_rollback` event carrying the sandbox + the disk manifest
+    /// the next resume will rewind to — so the silent acked-write loss is
+    /// LOUD (previously inferable only by hand-diffing spool logs). Drives
+    /// the real reaper against the in-proc backend + MiniMeta event log.
+    #[tokio::test]
+    async fn reap_quarantined_survivor_destroys_vm_and_emits_durability_rollback() {
+        use engram_core::types::manifest::ManifestRef;
+        use engram_core::{HostId, SandboxId};
+        use std::sync::Arc;
+
+        let id = SessionId::new();
+        let sandbox_id = SandboxId::new();
+        let host_id = HostId::new();
+        let manifest = ManifestRef {
+            manifest_id: uuid::Uuid::new_v4(),
+            version: 7,
+        };
+
+        let mut session = idle_session(id);
+        session.status = SessionState::Evicting;
+        session.host_id = Some(host_id);
+        session.sandbox_id = Some(sandbox_id);
+        session.live_disk_manifest = Some(manifest);
+        let (state, mini, _local) = crate::state::tests::build_state_for_session(session);
+
+        // Route destroy(sandbox_id) to a fresh in-proc backend (mode=all
+        // shape): register a host under a known id and pin the ownership row
+        // so the registry's `resolve_owner` fast-path returns this backend.
+        let backend_dir = tempfile::TempDir::new().unwrap();
+        let backend: Arc<dyn engram_core::traits::SandboxBackend> = Arc::new(
+            engram_sandbox_process::ProcessBackend::new(backend_dir.path().join("sandboxes")),
+        );
+        let client: Arc<dyn engram_core::traits::HostClient> =
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(backend));
+        state.host_registry.register(host_id, client);
+        state
+            .host_registry
+            .record_sandbox_owner(sandbox_id, host_id);
+
+        // A claimed Evict op gives us the fenced OpCtx the reaper reads.
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                id,
+                OpKind::Evict,
+                serde_json::json!({ "quarantine": true }),
+                None,
+                "test-pod",
+            )
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("lane busy: {other:?}"),
+        };
+        let ctx = crate::session_ops::OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.unwrap(),
+        };
+
+        let err = crate::idle_evictor::EvictError::Meta("capture timed out".into());
+        super::reap_quarantined_survivor(&ctx, &err).await;
+
+        let events = mini.events.lock();
+        let ev = events
+            .iter()
+            .find(|e| e.kind == "durability_rollback")
+            .expect("durability_rollback event appended after the destroy");
+        assert_eq!(
+            ev.payload["type"], "durability_rollback",
+            "serde tag matches kind()",
+        );
+        assert!(
+            ev.payload["sandbox_id"].is_string(),
+            "carries the destroyed sandbox id, got {:?}",
+            ev.payload["sandbox_id"],
+        );
+        assert_eq!(
+            ev.payload["rewind_disk_manifest"]["manifest_id"],
+            serde_json::json!(manifest.manifest_id.to_string()),
+            "carries the manifest id the next resume rewinds to",
+        );
+        assert_eq!(
+            ev.payload["rewind_disk_manifest"]["version"],
+            serde_json::json!(7),
+            "carries the manifest version",
+        );
+        assert!(
+            ev.payload["reason"]
+                .as_str()
+                .unwrap()
+                .contains("budget exhausted"),
+            "reason explains the rollback, got {:?}",
+            ev.payload["reason"],
         );
     }
 

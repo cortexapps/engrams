@@ -3634,6 +3634,9 @@ impl MetadataStore for SimMetadataStore {
 
         // Coordinator-fact kinds that survive a rewind (mirror the PG
         // `AND kind NOT IN (...)` predicate — keep in lockstep).
+        // ADR 0090: `durability_rollback` is a coordinator fact recording a
+        // completed quarantined-survivor disk rewind — it survives the rewind
+        // it warns about, so it joins the exclusion set (PG parity).
         const EXCLUDED: &[&str] = &[
             "status_changed",
             "snapshot_taken",
@@ -3644,6 +3647,7 @@ impl MetadataStore for SimMetadataStore {
             "prompt_received",
             "harness_idle",
             "harness_parked",
+            "durability_rollback",
         ];
 
         let (tombstoned, surviving_side_effects) = {

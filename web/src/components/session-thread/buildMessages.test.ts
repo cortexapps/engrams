@@ -397,6 +397,47 @@ describe("buildMessages — message/part shaping", () => {
     });
   });
 
+  // ADR 0090: the durability-rollback warning marker carries the manifest the
+  // resume rewound to (flattened to `<id>@v<n>`) plus the reason.
+  test("durability_rollback becomes a durability_rollback marker with the restored manifest", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "durability_rollback",
+          sandbox_id: "sb-9",
+          rewind_disk_manifest: { manifest_id: "abc", version: 4 },
+          reason: "quarantined-survivor evict budget exhausted; VM destroyed",
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    expect(customMarker(real(messages)[0]!)).toMatchObject({
+      kind: "durability_rollback",
+      manifest: "abc@v4",
+      reason: "quarantined-survivor evict budget exhausted; VM destroyed",
+    });
+  });
+
+  test("durability_rollback with no live publish carries a null manifest", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "durability_rollback",
+          sandbox_id: "sb-9",
+          rewind_disk_manifest: null,
+          reason: "budget exhausted",
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    expect(customMarker(real(messages)[0]!)).toMatchObject({
+      kind: "durability_rollback",
+      manifest: null,
+    });
+  });
+
   test("a system-role agent_message becomes a note system marker", () => {
     const { messages } = buildMessages(
       indexed([

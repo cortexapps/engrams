@@ -329,6 +329,33 @@ pub enum SessionEvent {
         cause: RecoveryCause,
         at: DateTime<Utc>,
     },
+    /// ADR 0090 (2026-07-20 durability-rollback incident): a
+    /// quarantined-survivor eviction exhausted its retry budget, so the
+    /// coordinator DESTROYED the structurally-crippled VM. The session then
+    /// converges HostLost → Idle and its NEXT resume rewinds to the last
+    /// published disk manifest — silently discarding any guest writes the
+    /// host acked but never uploaded past that manifest version (the
+    /// incident: 134/100/50 MiB tails across three sessions, previously
+    /// inferable only by hand-diffing host spool logs against manifest
+    /// versions). This event makes that data loss LOUD and durable so the
+    /// web timeline / CLI can surface it and alerting can key on it.
+    /// Coordinator-authoritative — it records a fact the destroy already
+    /// made true, so it survives the very rewind it warns about
+    /// (`rewind_session_to_cursor` EXCLUDES this kind from its tombstone
+    /// UPDATE, like the other control-plane facts).
+    DurabilityRollback {
+        /// The crippled sandbox the coordinator destroyed.
+        sandbox_id: SandboxId,
+        /// The last published disk manifest the next resume rewinds to
+        /// (the session's `live_disk_manifest`). `None` when the session
+        /// never got a live publish — the resume falls back to the
+        /// snapshot's disk lineage.
+        rewind_disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
+        /// Human-readable cause (e.g. "quarantined-survivor evict budget
+        /// exhausted; VM destroyed").
+        reason: String,
+        at: DateTime<Utc>,
+    },
 }
 
 /// ADR 0045 F1: why a rung-1 recovery rewound the transcript. Drives the
@@ -431,6 +458,7 @@ impl SessionEvent {
             Self::IntegrationAsset { .. } => "integration_asset",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
+            Self::DurabilityRollback { .. } => "durability_rollback",
         }
     }
 

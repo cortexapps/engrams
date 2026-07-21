@@ -129,6 +129,16 @@ export type SystemMarker =
       // ADR 0045 F1: planned operator relocation vs unplanned host failure.
       cause: "planned_relocation" | "host_failure_recovery" | "checkpoint_lag";
       at: string;
+    }
+  // ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
+  // eviction exhausted its budget; the coordinator destroyed the crippled VM
+  // and the next resume rewinds to the last published disk manifest, dropping
+  // guest writes acked-but-never-uploaded past it. A prominent warning marker.
+  | {
+      kind: "durability_rollback";
+      manifest: string | null;
+      reason: string;
+      at: string;
     };
 
 /** Footer carried in an assistant message's `metadata.custom.run` — the
@@ -827,6 +837,19 @@ export function buildMessages(
 
       case "harness_idle":
         active = null;
+        break;
+
+      // ADR 0090: the durability-rollback warning boundary. The next resume
+      // rewound the disk to `manifest`, dropping acked-but-unuploaded writes.
+      case "durability_rollback":
+        pushSystem(`dr:${idx}`, "guest disk was rolled back", {
+          kind: "durability_rollback",
+          manifest: ev.rewind_disk_manifest
+            ? `${ev.rewind_disk_manifest.manifest_id}@v${ev.rewind_disk_manifest.version}`
+            : null,
+          reason: ev.reason,
+          at: ev.at,
+        });
         break;
 
       // ADR 0054: the interactive question card. Ends the active assistant

@@ -58,6 +58,8 @@ export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
   "integration_asset",
   "file_shared",
   "recovered_from_checkpoint",
+  // ADR 0090: the durability-rollback warning marker.
+  "durability_rollback",
   // ADR 0054: historical interactive AskUserQuestion round-trip.
   "user_question",
   "question_answered",
