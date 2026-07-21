@@ -226,16 +226,15 @@ impl MetadataStore for SimMetadataStore {
     /// evacuating,evicting)` — queued and host_lost excluded.
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         self.gate()?;
-        use SessionState::*;
         let db = self.db.lock();
+        // PG twin: every non-terminal state except `host_lost` — the
+        // reserving set (so a new resident state like ADR 0101 C's
+        // `parked` can't drift out) plus `idle`.
         Ok(db
             .sessions
             .values()
             .filter(|r| {
-                matches!(
-                    r.session.status,
-                    Pending | Created | Active | Unreachable | Idle | Evacuating | Evicting
-                )
+                r.session.status.reserves_host_memory() || r.session.status == SessionState::Idle
             })
             .map(|r| r.session.clone())
             .collect())
@@ -3036,10 +3035,32 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
-    async fn delete_host(&self, _id: HostId) -> Result<DeleteHostOutcome, MetaError> {
-        panic!(
-            "SimMeta: delete_host not implemented — add it plus a conformance case (ADR 0098 D4)"
-        )
+    async fn delete_host(&self, id: HostId) -> Result<DeleteHostOutcome, MetaError> {
+        // PG twin: refuse while any RESIDENT session (the reserving set —
+        // a `parked` paused-in-place VM included) or non-terminal capture
+        // job is bound; otherwise detach stragglers and delete,
+        // idempotently.
+        self.gate()?;
+        let mut db = self.db.lock();
+        let bound = db
+            .sessions
+            .values()
+            .filter(|r| r.session.host_id == Some(id) && reserves(r.session.status))
+            .count()
+            + db.capture_jobs
+                .values()
+                .filter(|j| j.host_id == Some(id) && !j.stage.is_terminal())
+                .count();
+        if bound > 0 {
+            return Ok(DeleteHostOutcome::SessionsBound(bound as u64));
+        }
+        for r in db.sessions.values_mut() {
+            if r.session.host_id == Some(id) {
+                r.session.host_id = None;
+            }
+        }
+        db.hosts.remove(&id);
+        Ok(DeleteHostOutcome::Deleted)
     }
 
     async fn delete_org_secret(&self, _name: &str) -> Result<bool, MetaError> {
@@ -3205,12 +3226,12 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: latest_capture_job_for_enable not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
-    async fn list_active_assignments_with_budgets_on_host(
+    async fn list_resident_assignments_with_budgets_on_host(
         &self,
         host_id: HostId,
     ) -> Result<Vec<SandboxAssignment>, MetaError> {
-        // PG twin: Active + bound sessions on `host_id`, with their
-        // reservation budgets (COALESCE NULL → 0).
+        // PG twin: RESIDENT (memory-reserving) + bound sessions on
+        // `host_id`, with their reservation budgets (COALESCE NULL → 0).
         self.gate()?;
         let db = self.db.lock();
         Ok(db
@@ -3218,12 +3239,13 @@ impl MetadataStore for SimMetadataStore {
             .values()
             .filter(|r| {
                 r.session.host_id == Some(host_id)
-                    && r.session.status == SessionState::Active
+                    && r.session.status.reserves_host_memory()
                     && r.session.sandbox_id.is_some()
             })
             .map(|r| SandboxAssignment {
                 session_id: r.session.id,
                 sandbox_id: r.session.sandbox_id.expect("filtered"),
+                status: r.session.status,
                 mem_budget_mib: r.mem_budget_mib,
                 cpu_budget_vcpus: r.cpu_budget_vcpus,
             })
@@ -3231,10 +3253,10 @@ impl MetadataStore for SimMetadataStore {
     }
 
     /// The reconcile pass query: Active + bound sessions on `host_id`.
-    async fn list_active_sandbox_assignments_on_host(
+    async fn list_resident_sandbox_assignments_on_host(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
+    ) -> Result<Vec<(SessionId, SandboxId, SessionState)>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
         Ok(db
@@ -3242,10 +3264,16 @@ impl MetadataStore for SimMetadataStore {
             .values()
             .filter(|r| {
                 r.session.host_id == Some(host_id)
-                    && r.session.status == SessionState::Active
+                    && r.session.status.reserves_host_memory()
                     && r.session.sandbox_id.is_some()
             })
-            .map(|r| (r.session.id, r.session.sandbox_id.expect("filtered")))
+            .map(|r| {
+                (
+                    r.session.id,
+                    r.session.sandbox_id.expect("filtered"),
+                    r.session.status,
+                )
+            })
             .collect())
     }
 

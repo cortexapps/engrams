@@ -66,7 +66,7 @@ fn now_millis() -> i64 {
 /// M3 closes the loop:
 ///
 /// 1. **Strict invalidation** — the per-session HostLost transition
-///    sites (`reconcile`, `preemption_drain`) call
+///    sites (`reconcile`) call
 ///    [`HostRegistry::invalidate_sandbox`] before the DB-side state
 ///    flip, and [`HostRegistry::unregister`] now purges every
 ///    `sandbox_owner` row pointing at the dying host, not just the
@@ -209,7 +209,7 @@ impl HostRegistry {
 
     /// ADR 0015 M3: drop the cached owner for a single sandbox.
     /// Called from the per-session HostLost transition sites
-    /// (`reconcile::flip_missing`, `preemption_drain`) once the DB
+    /// (`reconcile::flip_missing`) once the DB
     /// has cleared `sessions.sandbox_id` — the order is
     /// "drop-cache-then-DB" on the in-memory side and
     /// "clear-DB-then-flip-status" on the persistence side, so any
@@ -229,7 +229,7 @@ impl HostRegistry {
 
     /// ADR 0018 commit 12d: enumerate every sandbox owned by `host_id`
     /// in the in-memory routing cache. Paired with PG-side
-    /// `list_active_sandbox_assignments_on_host` for the admin /drain
+    /// `list_resident_sandbox_assignments_on_host` for the admin /drain
     /// endpoint — PG is authoritative for "which sessions live here,"
     /// but the in-memory map carries the SandboxId we feed to the
     /// evict pipeline.

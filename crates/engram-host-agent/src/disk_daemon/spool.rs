@@ -153,6 +153,38 @@ pub async fn write_spool(
     Ok(bytes_total)
 }
 
+/// Read and verify ONLY the spool's sealed completeness marker for
+/// `sandbox_id` — no chunk bytes are touched. `Ok(None)` when there is
+/// no complete spool; `Err(InvalidData)` when a marker exists but fails
+/// the envelope (torn/bit-rotted/misdirected).
+///
+/// This is the local survivor-rehydrate pass's disk-lineage source
+/// (2026-07-21 61a03b7e incident): the marker's `manifest_ref` is the
+/// predecessor's actual chunked-DISK lineage, where the checkpoint
+/// `ChainHeadRecord` the pass previously reached for carries the MEMORY
+/// chain head — attaching that quarantined the survivor's device on
+/// `ManifestKind` mismatch and destroyed a healthy paused VM.
+pub async fn read_spool_meta(
+    fs: &dyn HostFs,
+    root: &Path,
+    sandbox_id: SandboxId,
+) -> io::Result<Option<SpoolMeta>> {
+    let dir = spool_dir(root, sandbox_id);
+    let meta_bytes = match fs.read(&dir.join("meta.json")).await {
+        Ok(b) => b,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    // R5: open the sealed marker (content hash + sandbox-id identity) BEFORE
+    // trusting it. A bit-flipped/misdirected marker is a loud InvalidData
+    // rollback — never a trusted lineage/digest.
+    let meta_body = crate::durable_envelope::open(&meta_bytes, &sandbox_id.to_string())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta: {e}")))?;
+    let meta: SpoolMeta = serde_json::from_slice(&meta_body)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta body: {e}")))?;
+    Ok(Some(meta))
+}
+
 /// Read the spool for `sandbox_id`. `Ok(None)` when there is no
 /// complete spool (no dir, or no `meta.json` — e.g. a crash mid-write).
 /// `Err` when a spool claims completeness but fails validation — a
@@ -172,18 +204,9 @@ pub async fn read_spool(
     sandbox_id: SandboxId,
 ) -> io::Result<Option<(SpoolMeta, Vec<(usize, Vec<u8>)>)>> {
     let dir = spool_dir(root, sandbox_id);
-    let meta_bytes = match fs.read(&dir.join("meta.json")).await {
-        Ok(b) => b,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
+    let Some(meta) = read_spool_meta(fs, root, sandbox_id).await? else {
+        return Ok(None);
     };
-    // R5: open the sealed marker (content hash + sandbox-id identity) BEFORE
-    // trusting it. A bit-flipped/misdirected marker is a loud InvalidData
-    // rollback — never a trusted lineage/digest.
-    let meta_body = crate::durable_envelope::open(&meta_bytes, &sandbox_id.to_string())
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta: {e}")))?;
-    let meta: SpoolMeta = serde_json::from_slice(&meta_body)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("spool meta body: {e}")))?;
 
     // Enumerate the on-disk chunk files by index. Foreign / unparsable
     // entries are IGNORED (a stray tmpfile must not wedge adoption of
@@ -299,6 +322,41 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// The local survivor-rehydrate pass's lineage probe (61a03b7e):
+    /// meta-only read returns the DISK manifest ref without touching
+    /// chunk bytes, reads absent as None, and refuses a torn marker.
+    #[tokio::test]
+    async fn meta_only_read_yields_lineage_and_rejects_torn_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sid = SandboxId::new();
+        assert!(read_spool_meta(&TokioFs, tmp.path(), sid)
+            .await
+            .unwrap()
+            .is_none());
+        write_spool(&TokioFs, tmp.path(), sid, refv(16), &[(0, vec![1u8; 8])])
+            .await
+            .unwrap();
+        let meta = read_spool_meta(&TokioFs, tmp.path(), sid)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(meta.manifest_ref(), refv(16));
+        // The meta-only probe must ALSO be usable when chunk files are
+        // gone (it never validates them — read_spool does).
+        std::fs::remove_file(tmp.path().join(sid.to_string()).join("chunk-0.bin")).unwrap();
+        assert!(read_spool_meta(&TokioFs, tmp.path(), sid)
+            .await
+            .unwrap()
+            .is_some());
+        // A torn/bit-rotted marker is a loud InvalidData, never a lineage.
+        let meta_path = tmp.path().join(sid.to_string()).join("meta.json");
+        let mut bytes = std::fs::read(&meta_path).unwrap();
+        let mid = bytes.len() / 2;
+        bytes.truncate(mid);
+        std::fs::write(&meta_path, &bytes).unwrap();
+        assert!(read_spool_meta(&TokioFs, tmp.path(), sid).await.is_err());
     }
 
     #[tokio::test]

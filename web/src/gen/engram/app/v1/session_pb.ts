@@ -96,9 +96,10 @@ export type Session = Message<"engram.app.v1.Session"> & {
   id: string;
 
   /**
-   * engram_core SessionState, snake_case: "pending" | "created" |
-   * "active" | "idle" | "host_lost" | "evacuating" | "evicting" |
-   * "failed" | "completed" | "dead".
+   * engram_core SessionState, snake_case: "pending" | "queued" |
+   * "created" | "active" | "unreachable" | "parked" | "idle" |
+   * "host_lost" | "evacuating" | "evicting" | "failed" |
+   * "completed" | "dead".
    *
    * @generated from field: string status = 2;
    */

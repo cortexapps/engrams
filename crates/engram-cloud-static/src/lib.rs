@@ -1,12 +1,12 @@
 //! Static-fleet cloud backend.
 //!
 //! Used for bare-metal, Hetzner, or any deployment where hosts are
-//! provisioned out-of-band. Preemption never fires; provisioning errors
-//! with `BackendError::NotSupported`.
+//! provisioned out-of-band. Provisioning errors with
+//! `BackendError::NotSupported`.
 
 use async_trait::async_trait;
-use engram_core::traits::cloud::{CloudBackend, PreemptionStream};
-use engram_core::types::host::{HostMetadata, HostSpec, PreemptionNotice};
+use engram_core::traits::cloud::CloudBackend;
+use engram_core::types::host::{HostMetadata, HostSpec};
 use engram_core::{BackendError, HostId};
 
 pub struct StaticCloud {
@@ -39,12 +39,6 @@ impl StaticCloud {
 
 #[async_trait]
 impl CloudBackend for StaticCloud {
-    fn preemption_signal(&self) -> PreemptionStream {
-        // Static hosts are never preempted by the cloud — return an
-        // immediately-finished stream.
-        Box::pin(futures::stream::empty::<PreemptionNotice>())
-    }
-
     async fn host_metadata(&self) -> Result<HostMetadata, BackendError> {
         Ok(HostMetadata {
             instance_id: self.hostname.clone(),
@@ -71,9 +65,6 @@ impl CloudBackend for StaticCloud {
 mod tests {
     use super::*;
     use engram_core::types::HostSpec;
-    use futures::StreamExt;
-    use std::time::Duration;
-    use tokio::time::timeout;
 
     #[tokio::test]
     async fn host_metadata_returns_supplied_hostname() {
@@ -85,28 +76,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn preemption_signal_is_immediately_finished() {
-        let cloud = StaticCloud::new("box-42");
-        let mut stream = cloud.preemption_signal();
-        // The static backend never preempts: the stream must yield None
-        // (terminate) rather than block. Bound it under a small timeout
-        // so a regression that returns a hanging stream gets caught.
-        let next = timeout(Duration::from_millis(50), stream.next())
-            .await
-            .expect("stream must terminate, not hang");
-        assert!(
-            next.is_none(),
-            "static stream must end without yielding a notice"
-        );
-    }
-
-    #[tokio::test]
     async fn provision_and_deprovision_are_unsupported() {
         let cloud = StaticCloud::new("box-42");
         let spec = HostSpec {
             machine_type: "x".into(),
             zone: "y".into(),
-            preemptible: false,
             disk_gb: 0,
             labels: vec![],
         };

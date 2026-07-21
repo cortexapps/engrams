@@ -439,6 +439,9 @@ pub struct QueuedSession {
 pub struct SandboxAssignment {
     pub session_id: SessionId,
     pub sandbox_id: SandboxId,
+    /// The session's status at listing time — the drain partitions on
+    /// this (Active → live-first move; Parked → descent evict).
+    pub status: SessionState,
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i32,
 }
@@ -732,25 +735,48 @@ mod tests {
         assert!(res.is_err(), "unknown variants must fail to deserialize");
     }
 
+    /// The lockstep guard the docs on [`SessionState::reserves_host_memory`]
+    /// and [`SessionState::host_memory_reserving_states`] promise: the
+    /// typed matcher (every in-memory residency decision) and the
+    /// string const (every SQL `status IN (…)` list, via
+    /// `reserving_states_sql`) must agree on every variant. This test
+    /// was CLAIMED by those docstrings long before it existed — the
+    /// 61a03b7e incident's PR routed all SQL through the const on the
+    /// strength of a guard nobody had written (engrams review on
+    /// PR #843). A drift between the two is now a test failure, not a
+    /// silent prod incident.
+    #[test]
+    fn reserving_states_match() {
+        for s in all_states() {
+            let in_const = SessionState::host_memory_reserving_states().contains(&s.as_str());
+            assert_eq!(
+                in_const,
+                s.reserves_host_memory(),
+                "{s:?}: const/matcher disagree on host-memory reservation"
+            );
+        }
+        // And the const carries no stale spellings all_states() can't
+        // account for (a renamed/removed variant would linger here
+        // silently — containment above only checks one direction).
+        assert_eq!(
+            SessionState::host_memory_reserving_states().len(),
+            all_states()
+                .iter()
+                .filter(|s| s.reserves_host_memory())
+                .count(),
+            "the const holds exactly the reserving variants, nothing stale"
+        );
+    }
+
     #[test]
     fn session_state_as_str_matches_serde_form() {
-        for s in [
-            SessionState::Pending,
-            SessionState::Queued,
-            SessionState::Created,
-            SessionState::Active,
-            SessionState::Parked,
-            SessionState::Idle,
-            SessionState::HostLost,
-            SessionState::Evacuating,
-            SessionState::Evicting,
-            SessionState::Completed,
-            SessionState::Failed,
-            SessionState::Dead,
-        ] {
+        for s in all_states() {
             let via_serde = serde_json::to_string(&s).unwrap();
             let trimmed = via_serde.trim_matches('"');
             assert_eq!(s.as_str(), trimmed, "as_str must match wire format");
+            // And the wire spelling parses back to the same variant.
+            let back: SessionState = serde_json::from_str(&via_serde).unwrap();
+            assert_eq!(back, s, "wire form must round-trip");
         }
     }
 
@@ -812,13 +838,23 @@ mod tests {
             (Parked, HostLost),
             (Parked, Dead),
             (Parked, Completed),
+            // ADR 0091: the dead/wedged-guest detour off Active —
+            // everything Active reaches, plus back to Active on heal.
+            // (These pairs were silently untested until 2026-07-21: the
+            // hand-spelled all-states array here omitted Unreachable, so
+            // the exhaustive product skipped every edge touching it —
+            // status-set audit finding 7. The array is now all_states().)
+            (Active, Unreachable),
+            (Unreachable, Active),
+            (Unreachable, Idle),
+            (Unreachable, HostLost),
+            (Unreachable, Evicting),
+            (Unreachable, Failed),
+            (Unreachable, Completed),
+            (Unreachable, Dead),
         ];
-        let all_states = [
-            Pending, Queued, Created, Active, Parked, Idle, HostLost, Evacuating, Evicting, Failed,
-            Completed, Dead,
-        ];
-        for &from in &all_states {
-            for &to in &all_states {
+        for from in all_states() {
+            for to in all_states() {
                 let want = allowed.contains(&(from, to));
                 assert_eq!(
                     from.can_transition_to(to),
@@ -840,9 +876,9 @@ mod tests {
         use SessionState::*;
         for terminal in [Failed, Completed, Dead] {
             assert!(terminal.is_terminal());
-            for target in [
-                Pending, Queued, Created, Active, Idle, HostLost, Evacuating, Evicting,
-            ] {
+            // ALL targets — a terminal state exits to nothing, other
+            // terminals and itself included.
+            for target in all_states() {
                 assert_eq!(
                     terminal.try_transition_to(target),
                     Err(IllegalTransition {
@@ -858,9 +894,7 @@ mod tests {
     fn terminal_target_is_legal_and_total() {
         use SessionState::*;
         // Every non-terminal state maps to a terminal via a LEGAL edge.
-        for &s in &[
-            Pending, Created, Active, Idle, HostLost, Evacuating, Evicting,
-        ] {
+        for s in all_states().into_iter().filter(|s| !s.is_terminal()) {
             let target = s
                 .terminal_target()
                 .expect("a non-terminal state must have a terminal_target");

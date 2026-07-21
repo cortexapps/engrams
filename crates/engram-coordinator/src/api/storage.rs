@@ -103,11 +103,11 @@ pub(crate) async fn storage_summary_core(
         let session_for: HashMap<SandboxId, SessionId> = state
             .services
             .meta
-            .list_active_sandbox_assignments_on_host(host_id)
+            .list_resident_sandbox_assignments_on_host(host_id)
             .await
             .unwrap_or_default()
             .into_iter()
-            .map(|(sid, sb)| (sb, sid))
+            .map(|(sid, sb, _)| (sb, sid))
             .collect();
 
         for record in records {

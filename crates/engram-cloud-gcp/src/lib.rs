@@ -1,17 +1,15 @@
 //! GCP CloudBackend.
 //!
-//! Polls the GCE metadata server (`metadata.google.internal`) for
-//! preemption notices on `instance/preempted` and `instance/maintenance-event`.
-//! Phase 4 lights this up; Phase 5 wires the drain handler.
+//! Reads host identity from the GCE metadata server
+//! (`metadata.google.internal`).
 
 pub mod gke;
 
 use std::time::Duration;
 
 use async_trait::async_trait;
-use chrono::Utc;
-use engram_core::traits::cloud::{CloudBackend, PreemptionStream};
-use engram_core::types::host::{HostMetadata, HostSpec, PreemptionNotice};
+use engram_core::traits::cloud::CloudBackend;
+use engram_core::types::host::{HostMetadata, HostSpec};
 use engram_core::{BackendError, HostId};
 use serde::{Deserialize, Serialize};
 
@@ -71,32 +69,6 @@ impl GcpCloud {
 
 #[async_trait]
 impl CloudBackend for GcpCloud {
-    fn preemption_signal(&self) -> PreemptionStream {
-        let this = self.clone();
-        let stream = async_stream::stream! {
-            // Poll the maintenance-event endpoint. When the value flips
-            // to TERMINATE_ON_HOST_MAINTENANCE we yield a notice and end.
-            loop {
-                match this.fetch("instance/maintenance-event").await {
-                    Ok(v) if v.contains("TERMINATE") => {
-                        yield PreemptionNotice {
-                            reason: format!("gce maintenance: {v}"),
-                            deadline_secs: Some(30),
-                            received_at: Utc::now(),
-                        };
-                        return;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        tracing::debug!("gcp metadata poll error: {e}");
-                    }
-                }
-                tokio::time::sleep(this.poll_interval).await;
-            }
-        };
-        Box::pin(stream)
-    }
-
     async fn host_metadata(&self) -> Result<HostMetadata, BackendError> {
         let name = self.fetch("instance/name").await.unwrap_or_default();
         let zone = self.fetch("instance/zone").await.unwrap_or_default();

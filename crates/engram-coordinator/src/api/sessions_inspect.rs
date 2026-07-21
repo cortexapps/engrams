@@ -176,7 +176,6 @@ mod tests {
     use crate::state::tests::MiniMeta;
     use crate::state::AppState;
     use crate::Services;
-    use engram_cloud_mock::MockCloud;
     use engram_core::traits::SandboxBackend;
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
@@ -200,7 +199,6 @@ mod tests {
         host_registry.register(engram_core::HostId::new(), local_host);
         let services = Services {
             meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
             host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(

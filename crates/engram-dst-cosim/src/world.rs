@@ -190,7 +190,6 @@ fn build_replica(
     let coord_blob = Arc::new(engram_sim::MemBlobStorage::new());
     let services = Services {
         meta: meta.clone(),
-        cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
         host: registry.clone() as Arc<dyn HostClient>,
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),

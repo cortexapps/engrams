@@ -1321,6 +1321,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
     let m_d = uuid::Uuid::from_u128(0xD);
     let m_e = uuid::Uuid::from_u128(0xE);
     let m_f = uuid::Uuid::from_u128(0xF);
+    let m_g = uuid::Uuid::from_u128(0x10);
 
     // Active + sandbox: live A@5 vs recoverable snap A@3 → same id,
     // live is newer → A@5.
@@ -1366,6 +1367,30 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap());
     meta.transition_session(s_parked, SessionState::Evicting)
+        .await
+        .unwrap();
+
+    // ADR 0101 C — a session at the `parked` STATUS (paused in place,
+    // sandbox bound). THE 2026-07-21 regression (session 61a03b7e): the
+    // hand-rolled SQL status list missed 'parked', the parked survivor
+    // vanished from the register-time rehydrate list after a host-agent
+    // roll, and the quarantine ladder destroyed its healthy paused VM
+    // (93 events rewound). Live G@3, no snapshots → G@3.
+    let s_c_parked = meta
+        .create_session(spec("conf:rehydrate-parked-status"))
+        .await
+        .unwrap();
+    let sb_c_parked = bind(s_c_parked, host).await;
+    meta.transition_session(s_c_parked, SessionState::Active)
+        .await
+        .unwrap();
+    meta.update_live_disk_manifest(s_c_parked, sb_c_parked, mref(m_g, 3))
+        .await
+        .unwrap();
+    meta.transition_session(s_c_parked, SessionState::Evicting)
+        .await
+        .unwrap();
+    meta.transition_session(s_c_parked, SessionState::Parked)
         .await
         .unwrap();
 
@@ -1418,6 +1443,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
     let mut expected = vec![
         (s_active, sb_active, Some(mref(m_a, 5))),
         (s_parked, sb_parked, Some(mref(m_d, 1))),
+        (s_c_parked, sb_c_parked, Some(mref(m_g, 3))),
         (s_created, sb_created, Some(mref(m_e, 1))),
     ];
     expected.sort_by_key(|(sid, _, _)| *sid);
@@ -1505,6 +1531,58 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     assert!(
         meta.list_evicting_sessions().await.unwrap().is_empty(),
         "a parked session is NOT an evicting row (the livelock class)"
+    );
+
+    // A parked VM is RESIDENT: paused in place, sandbox bound, memory
+    // held. Every residency-derived surface must see it (the 2026-07-21
+    // 61a03b7e incident: the PG literal lists missed 'parked', so the
+    // parked survivor was invisible to the register-time rehydrate list
+    // and its paused VM was destroyed after a host-agent roll).
+    assert!(
+        meta.list_active_sessions()
+            .await
+            .unwrap()
+            .iter()
+            .any(|s| s.id == sid),
+        "a parked session is in the non-terminal (active) set"
+    );
+    assert!(
+        meta.list_resident_sandboxes_on_host_with_disk_manifest(host)
+            .await
+            .unwrap()
+            .iter()
+            .any(|(s, sb2, _)| *s == sid && *sb2 == sb),
+        "a parked survivor is in the register-time rehydrate list"
+    );
+    assert!(
+        meta.per_host_reserved().await.unwrap().contains_key(&host),
+        "a parked session still counts toward its host's reservation aggregate"
+    );
+    // The reconcile pass's assignment listing (audit finding 3): a
+    // vanished parked VM must be strike-eligible, so the parked triple
+    // must be listed, status included.
+    assert_eq!(
+        meta.list_resident_sandbox_assignments_on_host(host)
+            .await
+            .unwrap(),
+        vec![(sid, sb, SessionState::Parked)],
+        "a parked survivor is in the reconcile assignment list"
+    );
+    // The admin-drain listing (audit finding 4): a host holding only a
+    // parked VM must not report an empty drain work-list.
+    let drain_rows = meta
+        .list_resident_assignments_with_budgets_on_host(host)
+        .await
+        .unwrap();
+    assert_eq!(drain_rows.len(), 1, "parked survivor is drain-visible");
+    assert_eq!(drain_rows[0].session_id, sid);
+    assert_eq!(drain_rows[0].status, SessionState::Parked);
+    assert!(
+        matches!(
+            meta.delete_host(host).await.unwrap(),
+            engram_core::types::session::DeleteHostOutcome::SessionsBound(1)
+        ),
+        "a parked session blocks host deletion"
     );
 
     // Descend: Parked → Evicting (the explicit nomination edge).

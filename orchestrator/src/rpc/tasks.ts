@@ -194,11 +194,13 @@ async function requireUser(
 /**
  * Map a control-plane session status string to a task status string.
  *
- * Session status ∈ { pending, created, active, parked, idle,
- *                    evacuating, evicting, completed, failed, dead, host_lost }
+ * Session status ∈ { pending, queued, created, active, unreachable, parked,
+ *                    idle, evacuating, evicting, completed, failed, dead,
+ *                    host_lost }
  *
  * Mapping (documented in module JSDoc above):
- *   pending | created | active | parked | idle | evacuating | evicting → working
+ *   pending | queued | created | active | unreachable | parked | idle |
+ *     evacuating | evicting → working
  *   completed → done
  *   failed | dead | host_lost → failed
  *   (anything else) → null (caller keeps persisted task status)
@@ -206,8 +208,13 @@ async function requireUser(
 function sessionStatusToTaskStatus(sessionStatus: string): string | null {
   switch (sessionStatus) {
     case "pending":
+    // Queued = waiting FIFO for capacity (ADR 0048) — in progress, not open.
+    case "queued":
     case "created":
     case "active":
+    // Unreachable = mid-recovery (ADR 0091) — the next prompt/resume
+    // restores from checkpoint; the task is still being worked.
+    case "unreachable":
     case "parked":
     case "idle":
     case "evacuating":

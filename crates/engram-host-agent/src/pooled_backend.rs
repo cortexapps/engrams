@@ -3585,18 +3585,66 @@ impl PooledBackend {
         let records = crate::checkpoint::ChainHeadRecord::load_all(store.dir()).await;
         let mut rehydrated = 0usize;
         let mut failed = 0usize;
-        for (session_id, sandbox_id, manifest_ref) in
+        for (session_id, sandbox_id, _chain_head) in
             local_survivor_candidates(records, &live, &served)
         {
+            // The candidate's ChainHeadRecord names the MEMORY chain head
+            // — never attachable as a disk. The only local durable source
+            // of the survivor's chunked-DISK lineage is the predecessor's
+            // shutdown-spool marker (2026-07-21 61a03b7e incident: passing
+            // the chain head here failed the reattach on ManifestKind,
+            // quarantined the device, DISCARDED the spooled acked writes
+            // as "foreign lineage", and the quarantine ladder destroyed
+            // the healthy paused VM — a 93-event rewind). No spool → skip
+            // WITHOUT claiming the slot: the device stays kernel-connected
+            // and reconnectable, and the coordinator's list (or the next
+            // registration) owns the re-serve.
+            let disk_ref = match &self.shutdown_spool_root() {
+                Some(root) => {
+                    match crate::disk_daemon::spool::read_spool_meta(
+                        self.host_fs.as_ref(),
+                        root,
+                        sandbox_id,
+                    )
+                    .await
+                    {
+                        Ok(Some(meta)) => Some(meta.manifest_ref()),
+                        Ok(None) => None,
+                        Err(e) => {
+                            tracing::error!(
+                                %sandbox_id,
+                                %session_id,
+                                error = %e,
+                                "local survivor rehydrate: spool marker unreadable; \
+                                 skipping (device left reconnectable for the \
+                                 coordinator's list)",
+                            );
+                            failed += 1;
+                            continue;
+                        }
+                    }
+                }
+                None => None,
+            };
+            let Some(disk_ref) = disk_ref else {
+                tracing::warn!(
+                    %sandbox_id,
+                    %session_id,
+                    "local survivor rehydrate: no local disk lineage (no shutdown \
+                     spool) — skipping; the device stays reconnectable and the \
+                     coordinator's rehydrate list owns the re-serve",
+                );
+                continue;
+            };
             match self
-                .rehydrate_sandbox(session_id, sandbox_id, manifest_ref)
+                .rehydrate_sandbox(session_id, sandbox_id, disk_ref)
                 .await
             {
                 Ok(true) => {
                     tracing::warn!(
                         %sandbox_id,
                         %session_id,
-                        manifest = %manifest_ref,
+                        manifest = %disk_ref,
                         "local survivor rehydrate: re-served an NBD device the \
                          coordinator's rehydrate list missed (coord-side gap — \
                          the device would otherwise have been left to the \
@@ -3606,7 +3654,7 @@ impl PooledBackend {
                 }
                 Ok(false) => {}
                 Err(e) => {
-                    tracing::warn!(
+                    tracing::error!(
                         %sandbox_id,
                         %session_id,
                         error = %e,
@@ -9298,18 +9346,31 @@ impl PooledBackend {
                     seed_dirty = Some(chunks);
                 }
                 Ok(Some((meta, _))) => {
-                    tracing::warn!(
-                        %sandbox_id,
-                        spool_manifest = %meta.manifest_ref(),
-                        coord_manifest = %disk_manifest,
-                        "shutdown spool is stale or from a foreign lineage; discarding",
-                    );
-                    let _ = crate::disk_daemon::spool::discard_spool(
-                        self.host_fs.as_ref(),
-                        root,
+                    // A spool that disagrees with the reference lineage is
+                    // an invariant-class surprise, not routine: the spool
+                    // is written by the predecessor's OWN flush backend at
+                    // shutdown, and sandbox ids never recur — the expected
+                    // divergence is only version-behind (stale coord
+                    // publish), which the adopt arm above already covers.
+                    // The 2026-07-21 61a03b7e incident hit this arm with a
+                    // WRONG-KIND reference (the memory chain head) and
+                    // discarded real acked writes as "foreign". Keep the
+                    // spool ON DISK — it is the only copy of acked guest
+                    // data; a later correctly-referenced attach can still
+                    // adopt it, and an operator can inspect it.
+                    engram_core::soft_invariant!(
+                        "shutdown-spool-lineage-mismatch",
+                        false,
+                        "sandbox {}: shutdown-spool lineage {} disagrees with the \
+                         reference disk manifest {} — spool PRESERVED on disk, not \
+                         adopted (it is the only copy of acked guest writes; a \
+                         correctly-referenced attach can still adopt it, an \
+                         operator can inspect it)",
                         sandbox_id,
-                    )
-                    .await;
+                        meta.manifest_ref(),
+                        disk_manifest,
+                    );
+                    ::metrics::counter!(crate::metrics::SPOOL_LINEAGE_MISMATCH_TOTAL).increment(1);
                 }
                 Ok(None) => {}
                 Err(e) => {

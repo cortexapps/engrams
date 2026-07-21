@@ -627,7 +627,6 @@ impl SimWorld {
         let blob = self.host_world.blob();
         let services = Services {
             meta: self.meta.clone(),
-            cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
             host: registry.clone() as Arc<dyn HostClient>,
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),

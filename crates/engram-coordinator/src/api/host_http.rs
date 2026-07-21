@@ -689,13 +689,19 @@ pub async fn heartbeat(
     // RUNNING but not ATTACHED count.
     if hb.running_sandboxes_known && !hb.running_sandboxes.is_empty() {
         let attached: std::collections::HashSet<_> = hb.harness_attached.iter().collect();
-        if let Ok(active) = state
+        if let Ok(resident) = state
             .services
             .meta
-            .list_active_sandbox_assignments_on_host(host_id)
+            .list_resident_sandbox_assignments_on_host(host_id)
             .await
         {
-            for (session_id, sandbox_id) in active {
+            // Active-only ON PURPOSE: a parked VM is paused, so "running
+            // but no attached harness" is its normal, healthy shape — it
+            // must not tick the disagreement alarm.
+            for (session_id, sandbox_id, _) in resident
+                .into_iter()
+                .filter(|(_, _, st)| *st == engram_core::types::SessionState::Active)
+            {
                 if hb.running_sandboxes.contains(&sandbox_id) && !attached.contains(&sandbox_id) {
                     ::metrics::counter!(crate::metrics::HARNESS_ATTACH_DISAGREEMENT_TOTAL)
                         .increment(1);
@@ -1896,7 +1902,6 @@ mod tests {
     use crate::state::tests::MiniMeta;
     use crate::state::AppState;
     use crate::Services;
-    use engram_cloud_mock::MockCloud;
     use engram_core::traits::SandboxBackend;
     use engram_core::types::session::SessionMode;
     use engram_core::types::Session;
@@ -1920,7 +1925,6 @@ mod tests {
         host_registry.register(engram_core::HostId::new(), local_host);
         let services = Services {
             meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
             host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
@@ -2042,7 +2046,7 @@ mod tests {
     /// flips regardless (the trait's no-op default), so a weaker
     /// "assert no flip" test would pass even if the persist/reconcile
     /// order were swapped back. `reconcile_probe_calls` counts entry
-    /// into `list_active_sandbox_assignments_on_host` — the call
+    /// into `list_resident_sandbox_assignments_on_host` — the call
     /// `Reconciler::reconcile_with_deps` makes on every tick it
     /// actually runs — so it distinguishes "reconcile ran and found
     /// nothing" from "reconcile never ran".

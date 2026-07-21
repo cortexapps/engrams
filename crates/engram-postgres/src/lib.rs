@@ -296,6 +296,26 @@ fn db_err<E: std::error::Error + Send + Sync + 'static>(e: E) -> MetaError {
     MetaError::Db(Box::new(e))
 }
 
+/// The `status IN (…)` body for the host-memory-reserving states, built
+/// from the ONE authoritative set,
+/// [`SessionState::host_memory_reserving_states`], instead of a
+/// hand-spelled literal per query.
+///
+/// Literal drift here is an incident class, not a hypothetical: ADR 0101
+/// Phase C added `parked` to the typed set, and the five hand-rolled SQL
+/// twins in this file all missed it — so a parked survivor was absent
+/// from the register-time rehydrate list, its NBD device was never
+/// re-served after a host-agent roll, and the quarantine ladder destroyed
+/// a healthy paused VM (session 61a03b7e, 2026-07-21: 93 events rewound).
+/// No query spells this list by hand any more.
+fn reserving_states_sql() -> String {
+    engram_core::types::session::SessionState::host_memory_reserving_states()
+        .iter()
+        .map(|s| format!("'{s}'"))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// ADR 0079: PG unique-violation (SQLSTATE 23505). The op-claim paths
 /// lean on the `session_ops_one_running` partial unique index for
 /// correctness — a racing second claimer fails its transaction here, and
@@ -579,9 +599,10 @@ async fn pick_host_2d(
     }
     // Reserved within the txn — sees the committed reservations of
     // placers that locked these hosts before us. The sessions branch is
-    // the SQL twin of `SessionState::host_memory_reserving_states()`;
+    // the SQL twin of `SessionState::host_memory_reserving_states()`
+    // (interpolated from the const — see `reserving_states_sql`);
     // the enable_jobs branch is ADR 0081's capture-VM reservation.
-    let res_rows = sqlx::query(
+    let res_sql = format!(
         r#"
         SELECT host_id,
                COALESCE(SUM(mem), 0)::BIGINT AS reserved_mib,
@@ -590,8 +611,7 @@ async fn pick_host_2d(
             SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
             FROM sessions
             WHERE host_id = ANY($1)
-              AND status IN ('pending','created','active','unreachable',
-                             'evacuating','evicting')
+              AND status IN ({reserving})
               -- R3 (#722): ONE reservation authority — a `pending` pinned to
               -- a host reserves its budget UNCONDITIONALLY, for exactly as
               -- long as it is `pending`. No wall-age / live-op exclusion: an
@@ -617,11 +637,13 @@ async fn pick_host_2d(
         ) reserved
         GROUP BY host_id
         "#,
-    )
-    .bind(cand)
-    .fetch_all(&mut **tx)
-    .await
-    .map_err(db_err)?;
+        reserving = reserving_states_sql(),
+    );
+    let res_rows = sqlx::query(&res_sql)
+        .bind(cand)
+        .fetch_all(&mut **tx)
+        .await
+        .map_err(db_err)?;
     for r in &res_rows {
         let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
         let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
@@ -1718,7 +1740,7 @@ impl MetadataStore for PostgresStore {
         // UNCONDITIONALLY until it leaves that state; no crash-orphan gate),
         // UNION the capturing enable jobs (ADR 0081) — summing BOTH budget
         // dimensions (ADR 0048).
-        let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
+        let sql = format!(
             r#"
             SELECT host_id,
                    COALESCE(SUM(mem), 0)::BIGINT,
@@ -1727,8 +1749,7 @@ impl MetadataStore for PostgresStore {
                 SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
                 FROM sessions
                 WHERE host_id IS NOT NULL
-                  AND status IN ('pending','created','active','unreachable',
-                                 'evacuating','evicting')
+                  AND status IN ({reserving})
                 UNION ALL
                 -- ADR 0084 (c): capturing VMs reserve on `capture_jobs`.
                 SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
@@ -1738,10 +1759,12 @@ impl MetadataStore for PostgresStore {
             ) reserved
             GROUP BY host_id
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+            reserving = reserving_states_sql(),
+        );
+        let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         Ok(rows
             .into_iter()
             .map(|(h, mem_mib, vcpus)| {
@@ -1857,7 +1880,7 @@ impl MetadataStore for PostgresStore {
                 },
             );
         }
-        let res_rows = sqlx::query(
+        let res_sql = format!(
             r#"
             SELECT host_id,
                    COALESCE(SUM(mem), 0)::BIGINT AS reserved_mib,
@@ -1866,8 +1889,7 @@ impl MetadataStore for PostgresStore {
                 SELECT host_id, mem_budget_mib AS mem, cpu_budget_vcpus::BIGINT AS cpu
                 FROM sessions
                 WHERE host_id = ANY($1)
-                  AND status IN ('pending','created','active','unreachable',
-                                 'evacuating','evicting')
+                  AND status IN ({reserving})
                   -- R3 (#722): a `pending` reserves UNCONDITIONALLY until it
                   -- leaves the reserving state — no wall-age / live-op gate.
                   -- The ADR 0079 backstop reclaims a true crash-orphan by a
@@ -1883,11 +1905,13 @@ impl MetadataStore for PostgresStore {
             ) reserved
             GROUP BY host_id
             "#,
-        )
-        .bind(&cand)
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+            reserving = reserving_states_sql(),
+        );
+        let res_rows = sqlx::query(&res_sql)
+            .bind(&cand)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         for r in &res_rows {
             let h: uuid::Uuid = sqlx::Row::try_get(r, "host_id").map_err(db_err)?;
             let mem: i64 = sqlx::Row::try_get(r, "reserved_mib").map_err(db_err)?;
@@ -1907,7 +1931,9 @@ impl MetadataStore for PostgresStore {
 
     async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
         // Every non-terminal state except `host_lost` (limbo pending the
-        // reconciler; its bindings are stale by definition).
+        // reconciler; its bindings are stale by definition) — spelled as
+        // the reserving set (from the const, so a new resident state can't
+        // drift out of this list) plus `idle`.
         // `evicting` matters most: it keeps `sandbox_id` BOUND while the
         // pipeline runs, so the eviction scanner re-picks a mid-eviction
         // session after a coord roll and its "sandbox no longer bound"
@@ -1916,22 +1942,25 @@ impl MetadataStore for PostgresStore {
         // `evicting` was missing, a roll mid-eviction dropped the session
         // from the active set, the scanner never re-picked it, and the
         // budget exhausted into a spurious HostLost with the VM still
-        // running (prod session 5cfb90b8, 2026-06-03).
-        let rows = sqlx::query(
+        // running (prod session 5cfb90b8, 2026-06-03). `parked` likewise
+        // holds a paused-in-place VM with its sandbox bound (ADR 0101 C).
+        let sql = format!(
             r#"
             SELECT id, status, host_id, sandbox_id,
                    image_uri, mode,
                    created_at, last_active_at,
                    live_disk_manifest_id, live_disk_manifest_version,
+                   park_rung, parked_at,
                    suggested_title
             FROM sessions
-            WHERE status IN ('pending','created','active','unreachable',
-                             'idle','evacuating','evicting')
+            WHERE status IN ({reserving},'idle')
             "#,
-        )
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+            reserving = reserving_states_sql(),
+        );
+        let rows = sqlx::query(&sql)
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         rows.iter().map(row::session_from_row).collect()
     }
 
@@ -1959,16 +1988,21 @@ impl MetadataStore for PostgresStore {
         // wins (mirrors `effective_resume_disk_manifest`'s
         // defensive branch).
         //
-        // The status list is the SQL twin of
-        // `SessionState::host_memory_reserving_states()`: every
-        // state whose VM is resident on the host, not just
-        // 'active'. A rung-parked 'evicting' session's paused VM
-        // survives a host-agent pod roll like any other survivor;
-        // filtering it out here left its NBD device unclaimed after
-        // the roll — the successor's stale-binding sweep shot the
-        // live rootfs and the un-pause resumed the guest onto a
-        // dead data plane (session 731df805, 2026-07-17).
-        let rows = sqlx::query(
+        // The status list IS `SessionState::host_memory_reserving_states()`
+        // (interpolated from the const): every state whose VM is
+        // resident on the host, not just 'active'. A rung-parked
+        // 'evicting' session's paused VM survives a host-agent pod
+        // roll like any other survivor; filtering it out here left
+        // its NBD device unclaimed after the roll — the successor's
+        // stale-binding sweep shot the live rootfs and the un-pause
+        // resumed the guest onto a dead data plane (session
+        // 731df805, 2026-07-17). The same omission recurred when ADR
+        // 0101 C introduced 'parked' and this list (then hand-rolled)
+        // missed it: the parked survivor fell to the local fallback
+        // pass, whose manifest-kind bug quarantined the device and
+        // the quarantine ladder destroyed the healthy paused VM
+        // (session 61a03b7e, 2026-07-21 — 93 events rewound).
+        let sql = format!(
             r#"
             WITH latest_snap AS (
                 SELECT DISTINCT ON (session_id)
@@ -1990,15 +2024,16 @@ impl MetadataStore for PostgresStore {
             FROM sessions s
             LEFT JOIN latest_snap ls ON ls.session_id = s.id
             WHERE s.host_id    = $1
-              AND s.status IN ('pending','created','active','unreachable',
-                               'evacuating','evicting')
+              AND s.status IN ({reserving})
               AND s.sandbox_id IS NOT NULL
             "#,
-        )
-        .bind(host_id.as_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+            reserving = reserving_states_sql(),
+        );
+        let rows = sqlx::query(&sql)
+            .bind(host_id.as_uuid())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let session: Uuid = r
@@ -2057,67 +2092,84 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
-    async fn list_active_sandbox_assignments_on_host(
+    async fn list_resident_sandbox_assignments_on_host(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
+    ) -> Result<Vec<(SessionId, SandboxId, SessionState)>, MetaError> {
         // ADR 0009 reconcile pass query. Per-host, every heartbeat:
         // ~50 sandboxes/host × 5s cadence × N hosts = trivial DB load.
-        // Indexed via `idx_sessions_host_status` (existing).
-        let rows = sqlx::query(
+        // Indexed via `idx_sessions_host_status` (existing). The status
+        // set is every RESIDENT (memory-reserving) state — a vanished
+        // parked VM must accrue missing strikes like any other
+        // (2026-07-21 status-set audit finding 3).
+        let sql = format!(
             r#"
-            SELECT id, sandbox_id
+            SELECT id, sandbox_id, status
             FROM sessions
             WHERE host_id = $1
-              AND status = 'active'
+              AND status IN ({reserving})
               AND sandbox_id IS NOT NULL
             "#,
-        )
-        .bind(host_id.as_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+            reserving = reserving_states_sql(),
+        );
+        let rows = sqlx::query(&sql)
+            .bind(host_id.as_uuid())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let session: Uuid = r
                 .try_get("id")
-                .map_err(|e| MetaError::Serialization(format!("active-assignments: id: {e}")))?;
+                .map_err(|e| MetaError::Serialization(format!("resident-assignments: id: {e}")))?;
             let sandbox: Uuid = r.try_get("sandbox_id").map_err(|e| {
-                MetaError::Serialization(format!("active-assignments: sandbox_id: {e}"))
+                MetaError::Serialization(format!("resident-assignments: sandbox_id: {e}"))
             })?;
-            out.push((SessionId::from(session), SandboxId::from(sandbox)));
+            let status: String = r.try_get("status").map_err(|e| {
+                MetaError::Serialization(format!("resident-assignments: status: {e}"))
+            })?;
+            out.push((
+                SessionId::from(session),
+                SandboxId::from(sandbox),
+                row::parse_session_state_for_lib(&status)?,
+            ));
         }
         Ok(out)
     }
 
-    async fn list_active_assignments_with_budgets_on_host(
+    async fn list_resident_assignments_with_budgets_on_host(
         &self,
         host_id: HostId,
     ) -> Result<Vec<engram_core::types::session::SandboxAssignment>, MetaError> {
-        let rows: Vec<(Uuid, Uuid, i64, i32)> = sqlx::query_as(
+        // Every RESIDENT state, not just 'active' — a host holding only
+        // parked VMs must not "drain" with an empty list (2026-07-21
+        // status-set audit finding 4).
+        let sql = format!(
             r#"
-            SELECT id, sandbox_id,
-                   COALESCE(mem_budget_mib, 0)::BIGINT,
-                   COALESCE(cpu_budget_vcpus, 0)
+            SELECT id, sandbox_id, status,
+                   COALESCE(mem_budget_mib, 0)::BIGINT AS mem,
+                   COALESCE(cpu_budget_vcpus, 0) AS cpu
             FROM sessions
-            WHERE host_id = $1 AND status = 'active' AND sandbox_id IS NOT NULL
+            WHERE host_id = $1 AND status IN ({reserving}) AND sandbox_id IS NOT NULL
             "#,
-        )
-        .bind(host_id.as_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(s, sb, mem, cpu)| engram_core::types::session::SandboxAssignment {
+            reserving = reserving_states_sql(),
+        );
+        let rows: Vec<(Uuid, Uuid, String, i64, i32)> = sqlx::query_as(&sql)
+            .bind(host_id.as_uuid())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(s, sb, st, mem, cpu)| {
+                Ok(engram_core::types::session::SandboxAssignment {
                     session_id: SessionId::from(s),
                     sandbox_id: SandboxId::from(sb),
+                    status: row::parse_session_state_for_lib(&st)?,
                     mem_budget_mib: mem,
                     cpu_budget_vcpus: cpu,
-                },
-            )
-            .collect())
+                })
+            })
+            .collect()
     }
 
     async fn delete_host(
@@ -2131,21 +2183,22 @@ impl MetadataStore for PostgresStore {
         // an in-flight base-snapshot capture binds the host the same way
         // (its VM is running there); count non-terminal `capture_jobs`
         // rows bound to this host in the same guard.
-        let bound: i64 = sqlx::query_scalar(
+        let bound_sql = format!(
             r#"
             SELECT (SELECT COUNT(*) FROM sessions
                      WHERE host_id = $1
-                       AND status IN ('pending','created','active','unreachable',
-                                      'evacuating','evicting'))::BIGINT
+                       AND status IN ({reserving}))::BIGINT
                  + (SELECT COUNT(*) FROM capture_jobs
                      WHERE host_id = $1
                        AND stage NOT IN ('done','failed'))::BIGINT
             "#,
-        )
-        .bind(id.as_uuid())
-        .fetch_one(&mut *tx)
-        .await
-        .map_err(db_err)?;
+            reserving = reserving_states_sql(),
+        );
+        let bound: i64 = sqlx::query_scalar(&bound_sql)
+            .bind(id.as_uuid())
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
         if bound > 0 {
             tx.rollback().await.map_err(db_err)?;
             return Ok(DeleteHostOutcome::SessionsBound(bound as u64));

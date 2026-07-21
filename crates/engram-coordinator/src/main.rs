@@ -2,14 +2,11 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use clap::Parser;
-use engram_cloud_gcp::GcpCloud;
-use engram_cloud_mock::MockCloud;
-use engram_cloud_static::StaticCloud;
 use engram_coordinator::{
-    config::{CloudBackendChoice, RunMode, SandboxBackendChoice},
+    config::{RunMode, SandboxBackendChoice},
     CoordinatorConfig, CoordinatorError, HostRegistry, Services,
 };
-use engram_core::traits::{CloudBackend, HostClient, SandboxBackend, SecretStore};
+use engram_core::traits::{HostClient, SandboxBackend, SecretStore};
 use engram_core::HostId;
 use engram_postgres::PostgresStore;
 use engram_secrets_dev::EnvSecretStore;
@@ -30,14 +27,6 @@ struct Cli {
         value_parser = RunMode::parse,
     )]
     mode: RunMode,
-
-    #[arg(
-        long,
-        env = "ENGRAM_CLOUD_BACKEND",
-        default_value = "static",
-        value_parser = CloudBackendChoice::parse,
-    )]
-    cloud_backend: CloudBackendChoice,
 
     /// Local-disk root for per-session snapshot directories and the
     /// image registry. Survives process restarts; not durable across
@@ -306,7 +295,6 @@ async fn main() -> Result<(), CoordinatorError> {
         bind_addr: cli.bind_addr.clone(),
         database_url: cli.database_url.clone(),
         mode: cli.mode,
-        cloud_backend: cli.cloud_backend,
         local_path: cli.local_path.clone(),
         sandbox_backend: cli.sandbox_backend,
         default_image_version: cli.default_image_version.clone(),
@@ -385,17 +373,6 @@ async fn main() -> Result<(), CoordinatorError> {
         engram_oci_auth::PgAuthResolver::new(meta_arc.clone(), kek.clone()),
     );
     let oci_client = Arc::new(engram_oci::OciClient::new(auth_resolver.clone()));
-
-    let cloud: Arc<dyn CloudBackend> = match cli.cloud_backend {
-        CloudBackendChoice::Static => Arc::new(
-            StaticCloud::detect()
-                .map_err(|e| CoordinatorError::Config(format!("static cloud: {e}")))?,
-        ),
-        CloudBackendChoice::Gcp => Arc::new(
-            GcpCloud::new().map_err(|e| CoordinatorError::Config(format!("gcp cloud: {e}")))?,
-        ),
-        CloudBackendChoice::Mock => Arc::new(MockCloud::new()),
-    };
 
     // ADR 0007 orphan-reap admin endpoint needs to know which local
     // dir an in-process host-agent materializes into. `--mode=all`
@@ -697,7 +674,6 @@ async fn main() -> Result<(), CoordinatorError> {
     host_registry.set_dialer(host_pool.clone());
     let services = Services {
         meta: meta_arc.clone(),
-        cloud,
         host: host_registry.clone() as Arc<dyn HostClient>,
         host_pool,
         secrets,

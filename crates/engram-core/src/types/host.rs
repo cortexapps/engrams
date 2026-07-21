@@ -436,19 +436,8 @@ pub fn host_cpu_budget(total_vcpus: u32) -> i64 {
 pub struct HostSpec {
     pub machine_type: String,
     pub zone: String,
-    pub preemptible: bool,
     pub disk_gb: u32,
     pub labels: Vec<(String, String)>,
-}
-
-/// Notice that the host running this process will be reclaimed soon.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct PreemptionNotice {
-    pub reason: String,
-    /// Approximate seconds until the instance is forcibly terminated.
-    /// `None` if the cloud doesn't surface a deadline.
-    pub deadline_secs: Option<u32>,
-    pub received_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

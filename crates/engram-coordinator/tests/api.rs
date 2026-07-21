@@ -16,7 +16,6 @@ use std::sync::Arc;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
-use engram_cloud_mock::MockCloud;
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::{HostRecord, HostStatus, SessionSpec, SessionState};
@@ -81,7 +80,6 @@ fn build_app_with_tokens(meta: Arc<SimMetadataStore>, tokens: Vec<String>) -> ax
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let services = Services {
         meta,
-        cloud: Arc::new(MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             ProcessBackend::new(sandbox_dir),
         ))),
@@ -138,7 +136,6 @@ async fn build_forge_app() -> (
     ));
     let services = Services {
         meta,
-        cloud: Arc::new(MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             ProcessBackend::new(sandbox_dir),
         ))),
@@ -310,7 +307,6 @@ impl TestFixture {
             Arc::new(engram_host_agent::pooled_backend::PooledBackend::new(raw));
         let services = Services {
             meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
             host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(backend)),
             secrets: Arc::new(secrets),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(

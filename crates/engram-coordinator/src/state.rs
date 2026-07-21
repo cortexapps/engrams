@@ -387,6 +387,17 @@ pub enum RecoveryCause {
     CheckpointLag,
 }
 
+impl RecoveryCause {
+    /// The serde wire spelling, for log fields and metric labels.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlannedRelocation => "planned_relocation",
+            Self::HostFailureRecovery => "host_failure_recovery",
+            Self::CheckpointLag => "checkpoint_lag",
+        }
+    }
+}
+
 /// ADR 0056: an [`SessionEvent::IntegrationAsset`] is either a durable noun
 /// (a PR, a shared file) that survives an ADR 0028 recovery rewind as a
 /// side-effect the platform can't undo, or a transient verb (a query the
@@ -1898,7 +1909,7 @@ pub(crate) mod tests {
         /// entirely on a persist failure, rather than just happening to
         /// flip nothing. Reset to false on use.
         pub(crate) fail_next_heartbeat_persist: PlMutex<bool>,
-        /// Counts `list_active_sandbox_assignments_on_host` calls — the
+        /// Counts `list_resident_sandbox_assignments_on_host` calls — the
         /// entry point `Reconciler::reconcile_with_deps` hits on every
         /// tick it actually runs. A no-op default `apply_missing_sandbox_strikes`
         /// (this mock doesn't override it) would make "no flip happened"
@@ -2002,7 +2013,6 @@ pub(crate) mod tests {
         use crate::host_registry::HostRegistry;
         use crate::state::AppState;
         use crate::Services;
-        use engram_cloud_mock::MockCloud;
         use engram_core::traits::SandboxBackend;
         use engram_secrets_dev::InMemorySecretStore;
 
@@ -2020,7 +2030,6 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("engram-blobs-test-{}", uuid::Uuid::new_v4()));
         let services = Services {
             meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
             host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
@@ -2290,15 +2299,22 @@ pub(crate) mod tests {
         /// every tick it actually runs, so the persist-before-reconcile
         /// regression test asserts on this counter. Behavior otherwise
         /// matches the default: this mock only ever tracks one session.
-        async fn list_active_sandbox_assignments_on_host(
+        async fn list_resident_sandbox_assignments_on_host(
             &self,
             host_id: HostId,
-        ) -> Result<Vec<(engram_core::SessionId, SandboxId)>, MetaError> {
+        ) -> Result<
+            Vec<(
+                engram_core::SessionId,
+                SandboxId,
+                engram_core::types::SessionState,
+            )>,
+            MetaError,
+        > {
             *self.reconcile_probe_calls.lock() += 1;
             let s = self.session.lock();
             Ok(match (s.status, s.host_id, s.sandbox_id) {
-                (engram_core::types::SessionState::Active, Some(h), Some(sb)) if h == host_id => {
-                    vec![(s.id, sb)]
+                (st, Some(h), Some(sb)) if h == host_id && st.reserves_host_memory() => {
+                    vec![(s.id, sb, st)]
                 }
                 _ => Vec::new(),
             })

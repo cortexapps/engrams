@@ -11,7 +11,6 @@ workspace = true
 
 [dependencies]
 engram-chunk-store.workspace = true
-engram-cloud-mock.workspace = true
 engram-coordinator.workspace = true
 engram-core.workspace = true
 engram-crypto.workspace = true

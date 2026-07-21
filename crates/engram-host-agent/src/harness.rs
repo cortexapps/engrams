@@ -34,7 +34,7 @@ use tokio::sync::{mpsc, oneshot};
 
 /// Default timeout for a `Checkpoint` command's ack. The harness gets
 /// this long to flush its transcript and reply; on miss the caller
-/// surfaces `HarnessError::CommandTimeout` and (in idle/preempt paths)
+/// surfaces `HarnessError::CommandTimeout` and (in idle paths)
 /// proceeds without the durability guarantee.
 pub const CHECKPOINT_ACK_TIMEOUT: Duration = Duration::from_secs(5);
 

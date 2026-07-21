@@ -694,23 +694,34 @@ mod tests {
     /// status CHECK constraint together.
     #[test]
     fn session_state_parses_every_variant() {
+        use SessionState::*;
+        // Exhaustiveness-guarded (ADR 0099 H4 convention): a new enum
+        // variant makes this match non-exhaustive — a compile error, not
+        // a silent parse-coverage gap. (`Unreachable` was silently
+        // missing from the previous hand-spelled list — status-set audit
+        // finding 7.)
+        match Pending {
+            Pending | Queued | Created | Active | Unreachable | Parked | Idle | HostLost
+            | Evacuating | Evicting | Failed | Completed | Dead => {}
+        }
         let variants = [
-            ("pending", SessionState::Pending),
-            ("queued", SessionState::Queued),
-            ("created", SessionState::Created),
-            ("active", SessionState::Active),
-            ("parked", SessionState::Parked),
-            ("idle", SessionState::Idle),
-            ("host_lost", SessionState::HostLost),
-            ("evacuating", SessionState::Evacuating),
-            ("evicting", SessionState::Evicting),
-            ("completed", SessionState::Completed),
-            ("failed", SessionState::Failed),
-            ("dead", SessionState::Dead),
+            Pending,
+            Queued,
+            Created,
+            Active,
+            Unreachable,
+            Parked,
+            Idle,
+            HostLost,
+            Evacuating,
+            Evicting,
+            Failed,
+            Completed,
+            Dead,
         ];
-        for (s, expected) in variants {
-            assert_eq!(parse_session_state(s).unwrap(), expected);
-            // Round-trip: the as_str() output must parse back.
+        for expected in variants {
+            // Round-trip: the as_str() wire spelling (what the
+            // coordinator persists) must parse back.
             assert_eq!(parse_session_state(expected.as_str()).unwrap(), expected);
         }
     }

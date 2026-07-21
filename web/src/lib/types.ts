@@ -26,6 +26,10 @@
  *   active      — agentd reachable AND harness running (or
  *                 harness=none and agentd is ready). Only state in
  *                 which /exec, /shell, /prompt proceed.
+ *   unreachable — the guest stopped answering on a live host (ADR
+ *                 0091). A prompt/resume triggers recovery: the dead
+ *                 sandbox is destroyed and the session resumes from
+ *                 its latest checkpoint.
  *   parked      — VM paused in place on its host (ADR 0101): sandbox
  *                 still bound, wake is ~1s. A prompt/resume un-parks
  *                 it; pressure or the hard TTL descends it to a full
@@ -44,11 +48,27 @@
  *   failed      — terminal (create failed mid-flight)
  *   dead        — terminal (chunked manifests gone or never were)
  */
+/**
+ * The RESIDENT states — a live VM occupying host memory (paused or
+ * running). TS twin of Rust `SessionState::host_memory_reserving_states()`
+ * (the SQL twins interpolate from that const; keep this set in lockstep).
+ */
+export const RESIDENT_SESSION_STATES: ReadonlySet<SessionState> = new Set<SessionState>([
+  "pending",
+  "created",
+  "active",
+  "unreachable",
+  "parked",
+  "evacuating",
+  "evicting",
+]);
+
 export type SessionState =
   | "pending"
   | "queued"
   | "created"
   | "active"
+  | "unreachable"
   | "parked"
   | "idle"
   | "host_lost"

@@ -621,7 +621,6 @@ mod tests {
     use crate::state::tests::MiniMeta;
     use crate::state::AppState;
     use crate::Services;
-    use engram_cloud_mock::MockCloud;
     use engram_core::traits::MetadataStore;
     use engram_core::types::session::SessionMode;
     use std::sync::Arc;
@@ -652,7 +651,6 @@ mod tests {
         ));
         let services = Services {
             meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
             host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(

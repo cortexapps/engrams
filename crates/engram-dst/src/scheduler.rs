@@ -767,10 +767,13 @@ impl Sim {
                 let bound = state
                     .services
                     .meta
-                    .list_active_sandbox_assignments_on_host(host_id)
+                    .list_resident_sandbox_assignments_on_host(host_id)
                     .await
                     .unwrap_or_default();
-                for (sid, _) in bound {
+                for (sid, _, st) in bound {
+                    if st != engram_core::types::SessionState::Active {
+                        continue;
+                    }
                     let now = state.services.clock.now_utc();
                     let snap: engram_core::types::snapshot::SnapshotRecord =
                         serde_json::from_value(serde_json::json!({
@@ -1031,10 +1034,13 @@ impl Sim {
                 let bound = state
                     .services
                     .meta
-                    .list_active_sandbox_assignments_on_host(host_id)
+                    .list_resident_sandbox_assignments_on_host(host_id)
                     .await
                     .unwrap_or_default();
-                for (sid, _) in bound {
+                for (sid, _, st) in bound {
+                    if st != engram_core::types::SessionState::Active {
+                        continue;
+                    }
                     if let Ok(EnqueueOutcome::Claimed(op)) =
                         engram_coordinator::session_ops::enqueue_claim(
                             &state,

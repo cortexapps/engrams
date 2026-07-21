@@ -485,13 +485,16 @@ pub enum HarnessCommand {
 }
 
 /// Why the host is asking for a checkpoint. Logged in `session_events`
-/// so operators can tell idle-driven from preemption-driven flushes.
+/// so operators can tell the flush flavors apart.
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum CheckpointReason {
     /// Host's idle TTL elapsed; we're about to hot-suspend.
     Idle,
-    /// Cloud preemption signal received; flush before VM dies.
+    /// RESERVED — the retired cloud-preemption drain (removed 2026-07-21;
+    /// the fleet runs no preemptible nodes). Never sent; kept only so the
+    /// wire indices of the variants below stay stable for baked in-guest
+    /// agentd binaries.
     Preempt,
     /// Operator invoked `POST /sessions/:id/checkpoint`.
     Manual,

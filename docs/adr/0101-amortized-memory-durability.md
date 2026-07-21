@@ -257,3 +257,52 @@ host DaemonSet) the same day. Observed:
   fleet churned through the validation) — watch them center near the 256 MiB
   target; if evict-time Full captures show up there, that is the trigger for
   the deferred Full-off-eviction work.
+
+## Incident addendum (2026-07-21): the parked-survivor rollback (session 61a03b7e)
+
+Hours after the Phase C deploy, a routine host-agent roll landed while a
+session sat freshly `parked` (rung-2, VM paused in place, memory not yet
+settled to the durability floor). The resume rewound **93 events** to a
+periodic checkpoint seven minutes old — on a healthy host, with every log line
+along the way at WARN or below. Two independent drift bugs plus one
+observability gap:
+
+1. **The reserving-states SQL drift (coordinator/postgres).** Phase C added
+   `parked` to `SessionState::host_memory_reserving_states()`, but FIVE
+   hand-rolled SQL literal twins of that list in `engram-postgres` never
+   picked it up — most fatally
+   `list_resident_sandboxes_on_host_with_disk_manifest`, so the register-time
+   rehydrate list omitted the parked survivor (the exact 731df805/#739 shape,
+   one state newer). Also affected: both placement reservation aggregates
+   (parked VMs held RAM the packer wasn't counting), the `delete_host` guard,
+   and `list_active_sessions`. The sim twins all used the typed predicate, so
+   the conformance suite could only have caught it with a parked-at-register
+   scenario — which didn't exist. **Fix**: the SQL lists are now interpolated
+   from the const (`reserving_states_sql()`), and the conformance suite pins a
+   parked session in all four surfaces against both stores.
+2. **The local fallback's manifest-kind bug (host-agent).** With the coord
+   list empty, the #739 local survivor pass fed the `ChainHeadRecord`'s
+   manifest — the MEMORY chain head — into the NBD disk rehydrate. That (a)
+   made the predecessor's legitimate shutdown spool look foreign-lineage and
+   DISCARDED the only copy of its acked writes, and (b) failed the reattach
+   with `ManifestKind` mismatch, quarantining the device. The ADR 0090
+   quarantine ladder then found the parked VM "unevictable" (its disk
+   unserved, so no capture possible), destroyed it, and settled `HostLost` —
+   converting a healthy pause into host-death semantics. **Fix**: the local
+   pass now resolves disk lineage from the shutdown-spool marker (meta-only
+   read; the only local durable disk-lineage source) and skips — without
+   claiming the slot — when there is none; a lineage-mismatched spool is now
+   PRESERVED under a `shutdown-spool-lineage-mismatch` soft-invariant +
+   counter instead of discarded.
+3. **Silence.** The destroy logged one WARN; the 93-event rewind logged INFO.
+   **Fix**: destroying a `Parked` quarantined survivor now fires the same
+   loud triple as the #829 budget-exhaustion arm (ERROR +
+   `engram_durability_rollback_total` + the durable `durability_rollback`
+   event), and `apply_rung1_rewind` WARNs and bumps
+   `engram_session_rewound_events_total{cause}` — `checkpoint_lag` on healthy
+   hosts is the alertable signature this incident had and nothing watched.
+
+The lesson for this ADR's ledger: **a new lifecycle state is a schema change
+for every hand-spelled status set in the system.** The typed enum was
+wildcard-audited in #837; the SQL literals were not. They now share one
+source.

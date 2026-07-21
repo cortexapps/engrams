@@ -28,7 +28,6 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use chrono::Utc;
-use engram_cloud_mock::MockCloud;
 use engram_coordinator::{grpc_app, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
 use engram_core::types::outbox::OutboxRow;
@@ -92,7 +91,6 @@ fn test_state(app_grpc_tokens: Vec<String>) -> (Arc<AppState>, Arc<SimMetadataSt
     };
     let services = Services {
         meta: meta.clone(),
-        cloud: Arc::new(MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             ProcessBackend::new(sandbox_dir),
         ))),

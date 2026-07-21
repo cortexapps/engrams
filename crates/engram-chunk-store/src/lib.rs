@@ -16,7 +16,7 @@
 //! - **Fast cross-host migration**: a host doesn't need to copy state
 //!   on migration; it just adopts a manifest and pages chunks in as
 //!   the VM touches them.
-//! - **Spot/preemption viable**: per-snapshot flush is "PUT only the
+//! - **Host-loss tolerant**: per-snapshot flush is "PUT only the
 //!   chunks that changed since the last manifest version" — fits in
 //!   30s windows even for many concurrent sessions.
 //!

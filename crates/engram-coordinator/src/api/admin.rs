@@ -457,7 +457,7 @@ pub struct DrainHostResponse {
     pub failures: Vec<DrainFailure>,
 }
 
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DrainFailure {
     pub session_id: SessionId,
     pub error: String,
@@ -512,19 +512,89 @@ pub(crate) async fn admin_drain_host_core(
     // `sandboxes_on_host` map is faster but can lag (post-restart
     // rehydration window). For drain we use PG so a fresh coord pod
     // can complete a drain initiated against a sibling.
-    let assignments = state
+    let all_assignments = state
         .services
         .meta
-        .list_active_assignments_with_budgets_on_host(host_id)
+        .list_resident_assignments_with_budgets_on_host(host_id)
         .await
         .map_err(|e| ApiError::Internal(format!("drain: list sessions on host: {e}")))?;
 
+    // Partition by residency flavor (2026-07-21 status-set audit
+    // finding 4 — a host holding only parked VMs used to "drain"
+    // successfully with an empty list and the roll operator stalled on
+    // `running_sandboxes == 0`):
+    // - Active → the live-first move below.
+    // - Parked → the descent evict via `descend_parked_session`
+    //   (Parked → Evicting flip FIRST, then the nominated descent op —
+    //   the reaper's contract; a raw non-nominated enqueue against a
+    //   still-parked row is skipped by the pipeline's entry guard).
+    //   The paused VM cannot be live-teleported, and
+    //   Parked → Evacuating is not a legal edge. Once Idle it resumes
+    //   anywhere on demand — same operator outcome as an evacuation.
+    // - Created / Unreachable / Evicting / Pending / Evacuating →
+    //   their own machinery (boot, unreachable-recovery via prompt/
+    //   resume, the eviction pipeline, the queue scanner, the evac
+    //   resumer) already converges them off a cordoned host; listing
+    //   them here would double-drive those ops.
+    let mut assignments = Vec::new();
+    let mut parked = Vec::new();
+    let mut skipped = 0usize;
+    for a in all_assignments {
+        match a.status {
+            engram_core::types::SessionState::Active => assignments.push(a),
+            engram_core::types::SessionState::Parked => parked.push(a),
+            _ => skipped += 1,
+        }
+    }
+
+    let mut parked_evacuating: Vec<SessionId> = Vec::new();
+    let mut parked_failures: Vec<DrainFailure> = Vec::new();
+    for a in &parked {
+        // Re-read the row: the descent needs `parked_at` (the dedup key)
+        // and the listing above is a snapshot — the session may have
+        // un-parked or died since.
+        let session = match state.services.meta.get_session(a.session_id).await {
+            Ok(s) => s,
+            Err(e) => {
+                parked_failures.push(DrainFailure {
+                    session_id: a.session_id,
+                    error: format!("drain: parked descent: get_session: {e}"),
+                });
+                continue;
+            }
+        };
+        match crate::idle_evictor::descend_parked_session(state, &session, "admin_drain").await {
+            Ok(true) => {
+                tracing::info!(%host_id, session_id = %a.session_id, sandbox_id = %a.sandbox_id,
+                    "admin drain: parked session — descent initiated (Parked → Evicting → durable Idle)");
+                parked_evacuating.push(a.session_id);
+            }
+            Ok(false) => {
+                // The Parked → Evicting flip raced (un-park ascent,
+                // delete, host death): the fresh status owns the session
+                // and this drain wave did NOT descend it. Surface it so
+                // the operator re-runs the drain rather than trusting a
+                // silently-shrunk work list.
+                parked_failures.push(DrainFailure {
+                    session_id: a.session_id,
+                    error: "drain: parked descent raced a concurrent transition; re-run the drain"
+                        .to_string(),
+                });
+            }
+            Err(e) => parked_failures.push(DrainFailure {
+                session_id: a.session_id,
+                error: format!("drain: parked descent: {e}"),
+            }),
+        }
+    }
+
     if assignments.is_empty() {
-        tracing::info!(%host_id, "admin drain: host cordoned; no Active sessions to evacuate");
+        tracing::info!(%host_id, parked = parked.len(), other_resident = skipped,
+            "admin drain: host cordoned; no Active sessions to evacuate");
         return Ok(DrainHostResponse {
             host_id,
-            evacuating: Vec::new(),
-            failures: Vec::new(),
+            evacuating: parked_evacuating,
+            failures: parked_failures,
         });
     }
 
@@ -735,9 +805,11 @@ pub(crate) async fn admin_drain_host_core(
     // the HTTP request is cancelled, this future is dropped — but the
     // spawned `driver` (and therefore its JoinSet of per-session verbs)
     // keeps running to completion, so no migration is aborted mid-move.
-    let (evacuating, failures) = driver.await.map_err(|join_err| {
+    let (mut evacuating, mut failures) = driver.await.map_err(|join_err| {
         ApiError::Internal(format!("drain: driver task panicked: {join_err}"))
     })?;
+    evacuating.extend(parked_evacuating);
+    failures.extend(parked_failures);
 
     tracing::info!(
         %host_id,
