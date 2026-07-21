@@ -1095,13 +1095,6 @@ impl AppState {
     }
 }
 
-/// ADR 0073: which outbox row (if any) does this event confirm?
-/// - `run_started{prompt_id}` / `prompt_queued{prompt_id}` — the
-///   harness took ownership of the prompt (running it or holding it in
-///   its type-ahead queue; the queue survives via the replay the
-///   harness itself does, and an edit/dequeue of a queued prompt keeps
-///   its own confirmations).
-/// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
 /// Serialize lifecycle events to the `(kind, payload)` wire pairs the
 /// atomic store methods (`fenced_transition_session_with_events`,
 /// `settle_evicted_session_idle`) append in-transaction.
@@ -1118,6 +1111,13 @@ pub(crate) fn wire_events(
         .collect()
 }
 
+/// ADR 0073: which outbox row (if any) does this event confirm?
+/// - `run_started{prompt_id}` / `prompt_queued{prompt_id}` — the
+///   harness took ownership of the prompt (running it or holding it in
+///   its type-ahead queue; the queue survives via the replay the
+///   harness itself does, and an edit/dequeue of a queued prompt keeps
+///   its own confirmations).
+/// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
 pub(crate) fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {

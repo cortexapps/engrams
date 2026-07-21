@@ -543,12 +543,25 @@ impl Cosim {
                 // flips now (the REAL store semantics; prod's heartbeat
                 // HTTP glue is e2e territory). Before the floor flip the
                 // D5 verb lied the session Idle at capture time.
+                // The settle's lifecycle facts ride its transaction (the
+                // crash-window fix) — the cosim drives the real store
+                // semantics, so it passes them the same way the
+                // reconcile does.
+                let settle_events = [
+                    ("evicted".to_string(), serde_json::json!({})),
+                    (
+                        "status_changed".to_string(),
+                        serde_json::json!({"to": "idle"}),
+                    ),
+                ];
                 let settled = self
                     .world
                     .meta
-                    .settle_evicted_session_idle(session_id, sandbox, snapshot_id)
+                    .settle_evicted_session_idle(session_id, sandbox, snapshot_id, &settle_events)
                     .await
-                    .unwrap_or(false);
+                    .ok()
+                    .flatten()
+                    .is_some();
                 self.log(format!(
                     "finalize completed {session_id} snapshot={snapshot_id} cursor={cursor} \
                      settled_idle={settled}"
