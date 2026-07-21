@@ -700,29 +700,26 @@ async fn ops_pipeline(ctx: &Ctx) {
 
 /// Idempotency keys dedupe ACTIVE ops only — a terminal keyed row does
 /// not burn the key.
-/// ADR 0101 C (engrams review, #836 round 2): `op_latest_for_key` — the
-/// newest mint for `(session, key)` in ANY state. Its whole point is
-/// that TERMINAL rows stay visible (the dedup index forgets them by
-/// design; the eviction scanner needs to see "this nomination already
-/// completed" without re-minting).
-async fn op_latest_for_key_reads_terminal_mints(ctx: &Ctx) {
+/// ADR 0101 C (engrams review, #836 rounds 2+3): `op_latest_for_kind` —
+/// the newest mint of a kind for the session, ANY state, ANY key. Two
+/// properties are the point: TERMINAL rows stay visible (the dedup
+/// index forgets them by design; the eviction scanner must see "a
+/// capture already landed" without re-minting), and the read is
+/// KEY-AGNOSTIC (the three post-capture paths mint under three
+/// different keys — one of them under none at all).
+async fn op_latest_for_kind_reads_terminal_mints(ctx: &Ctx) {
     let meta = &ctx.meta;
     let sid = meta.create_session(spec("conf:oplatest")).await.unwrap();
     assert!(
-        meta.op_latest_for_key(sid, "evict:1")
+        meta.op_latest_for_kind(sid, OpKind::Evict)
             .await
             .unwrap()
             .is_none(),
-        "unknown key → None"
+        "no mints → None"
     );
+    // A KEYLESS mint (the admin/evict_local shape) — must be visible.
     let EnqueueOutcome::Claimed(op) = meta
-        .op_enqueue_and_claim(
-            sid,
-            OpKind::Evict,
-            serde_json::json!({}),
-            Some("evict:1"),
-            "pod-a",
-        )
+        .op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "pod-a")
         .await
         .unwrap()
     else {
@@ -733,46 +730,45 @@ async fn op_latest_for_key_reads_terminal_mints(ctx: &Ctx) {
         .await
         .unwrap());
     let latest = meta
-        .op_latest_for_key(sid, "evict:1")
+        .op_latest_for_kind(sid, OpKind::Evict)
         .await
         .unwrap()
-        .expect("a terminal mint is visible — that is the method's point");
+        .expect("a terminal, keyless mint is visible — that is the method's point");
     assert_eq!(latest.id, op.id);
     assert_eq!(latest.state, OpState::Done);
     assert!(
         latest.finished_at.is_some(),
         "finished_at stamps on finish (the scanner's grace check reads it)"
     );
-    // A re-mint under the same key (terminal rows don't dedup) becomes
-    // the newest.
+    // A newer mint under a KEY (the descent shape) becomes the newest.
     let EnqueueOutcome::Claimed(op2) = meta
         .op_enqueue_and_claim(
             sid,
             OpKind::Evict,
             serde_json::json!({}),
-            Some("evict:1"),
+            Some("evict-descend:42"),
             "pod-a",
         )
         .await
         .unwrap()
     else {
-        panic!("re-mint claimed")
+        panic!("descent mint claimed")
     };
     let latest = meta
-        .op_latest_for_key(sid, "evict:1")
+        .op_latest_for_kind(sid, OpKind::Evict)
         .await
         .unwrap()
         .expect("still visible");
-    assert_eq!(latest.id, op2.id, "newest mint wins");
-    // Key + session isolation.
+    assert_eq!(latest.id, op2.id, "newest mint wins, key or no key");
+    // Kind + session isolation.
     assert!(meta
-        .op_latest_for_key(sid, "evict:2")
+        .op_latest_for_kind(sid, OpKind::Resume)
         .await
         .unwrap()
         .is_none());
     let other = meta.create_session(spec("conf:oplatest-b")).await.unwrap();
     assert!(meta
-        .op_latest_for_key(other, "evict:1")
+        .op_latest_for_kind(other, OpKind::Evict)
         .await
         .unwrap()
         .is_none());
@@ -1645,8 +1641,8 @@ conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
 conformance!(t_ops_idempotency, super::ops_idempotency);
 conformance!(
-    t_op_latest_for_key_reads_terminal_mints,
-    super::op_latest_for_key_reads_terminal_mints
+    t_op_latest_for_kind_reads_terminal_mints,
+    super::op_latest_for_kind_reads_terminal_mints
 );
 conformance!(t_fenced_transition, super::fenced_transition);
 conformance!(

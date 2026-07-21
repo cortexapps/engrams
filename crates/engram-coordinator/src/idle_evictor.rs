@@ -1428,59 +1428,81 @@ async fn scanner_advance_one(
     // normally ends that state).
     let key = format!("evict:{}", session.last_active_at.timestamp_millis());
 
-    // ADR 0101 C (engrams review, #836 round 2): a COMPLETED evict op for
-    // this same nomination means the capture already landed — the session
-    // is honestly `Evicting` for the publication window and the heartbeat
-    // reconcile's settle owns the tail. Terminal rows leave the dedup
-    // index by design, so without this check every tick would mint a
-    // fresh op that re-runs stop_browser/stop_ide + the (idempotent)
-    // snapshot_begin against the finalizing sandbox — the terminal-op
-    // churn shape the #837 op-mint oracle exists to condemn, transiently.
+    // ADR 0101 C (engrams review, #836 rounds 2+3): a COMPLETED evict op
+    // means the capture already landed — the session is honestly
+    // `Evicting` for the publication window and the heartbeat reconcile's
+    // settle owns the tail. Terminal rows leave the dedup index by
+    // design, so without this check every tick would mint a fresh op that
+    // re-runs stop_browser/stop_ide + the (idempotent) snapshot_begin
+    // against the finalizing sandbox — the terminal-op churn shape the
+    // #837 op-mint oracle exists to condemn, transiently. KEY-AGNOSTIC
+    // (round 3): the three post-capture paths mint under three different
+    // keys — this scanner's `evict:<last_active>`, the park reaper's
+    // `evict-descend:<parked_at>`, and the admin/evict_local path's none
+    // at all — so a key-scoped read protected only one of three.
+    //
     // The suppression is TIME-BOUNDED, not absolute: past the grace the
-    // scanner re-mints, which on a live host cheaply re-observes the
-    // idempotent capture (re-Done), and after a QUARANTINED finalize
-    // (pending cleared, upload wedged, host alive) retries the eviction
-    // end-to-end — preserving the wedged-upload → bounded-attempts →
-    // HostLost floor. A DEAD host is the dead-host detector's job either
-    // way (heartbeat loss → HostLost, independent of this sweep).
+    // scanner re-mints — but as a CAPTURE RETRY (`allow_park: false`).
+    // The stale-Done case means the settle never landed (a wedged or
+    // quarantined finalize); re-parking there would defeat the eviction
+    // the prior op already committed to (and against a lock-free
+    // quarantined survivor, `host.pause` can succeed — stranding a
+    // "parked" session whose durability upload failed). The capture
+    // retry preserves the wedged-upload → bounded-attempts → HostLost
+    // floor; a DEAD host is the dead-host detector's job either way.
+    let mut allow_park = true;
     if let Some(prior) = state
         .services
         .meta
-        .op_latest_for_key(session_id, &key)
+        .op_latest_for_kind(session_id, engram_core::types::session_op::OpKind::Evict)
         .await?
     {
-        if prior.kind == engram_core::types::session_op::OpKind::Evict
-            && prior.state == engram_core::types::session_op::OpState::Done
-        {
-            let within_grace = prior.finished_at.is_some_and(|t| {
-                state
-                    .services
-                    .clock
-                    .now_utc()
-                    .signed_duration_since(t)
-                    .to_std()
-                    .is_ok_and(|elapsed| elapsed < EVICT_SETTLE_GRACE)
-            });
-            if within_grace {
-                tracing::debug!(
-                    %session_id,
-                    "eviction scanner: capture landed (Done op for this nomination); \
-                     the reconcile settle owns the tail — not re-minting",
-                );
+        match prior.state {
+            // A pending evict already exists (e.g. the reaper's descent
+            // op, minted under its own key, not yet claimed) — a second
+            // mint is pure waste; the op lane serializes anyway.
+            engram_core::types::session_op::OpState::Queued => {
                 return Ok(());
             }
+            engram_core::types::session_op::OpState::Done => {
+                let within_grace = prior.finished_at.is_some_and(|t| {
+                    state
+                        .services
+                        .clock
+                        .now_utc()
+                        .signed_duration_since(t)
+                        .to_std()
+                        .is_ok_and(|elapsed| elapsed < EVICT_SETTLE_GRACE)
+                });
+                if within_grace {
+                    tracing::debug!(
+                        %session_id,
+                        "eviction scanner: capture landed (Done evict op); the reconcile \
+                         settle owns the tail — not re-minting",
+                    );
+                    return Ok(());
+                }
+                allow_park = false;
+            }
+            // Failed / Cancelled / Running: the pre-existing behavior
+            // (Running is already handled above; a burned key re-mints).
+            _ => {}
         }
     }
     let outcome = crate::session_ops::enqueue(
         state,
         session_id,
         engram_core::types::session_op::OpKind::Evict,
-        serde_json::json!({ "target": "idle", "allow_park": true, "nominated": true }),
+        serde_json::json!({ "target": "idle", "allow_park": allow_park, "nominated": true }),
         Some(&key),
     )
     .await?;
     if let engram_core::types::session_op::EnqueueOutcome::Claimed(_) = outcome {
-        tracing::info!(%session_id, "eviction scanner: enqueued evict op (claimed)");
+        tracing::info!(
+            %session_id,
+            allow_park,
+            "eviction scanner: enqueued evict op (claimed)"
+        );
     }
     Ok(())
 }
@@ -3605,6 +3627,63 @@ mod tests {
             ops_before,
             "within the settle grace the scanner must not re-mint an evict op \
              (the terminal-op/dedup churn shape)",
+        );
+    }
+
+    /// ADR 0101 C (engrams review, #836 round 3): the suppression must be
+    /// KEY-AGNOSTIC — the admin/evict_local path mints its evict op with
+    /// NO idempotency key, and the park-descent path mints under
+    /// `evict-descend:<parked_at>`; a key-scoped grace check protected
+    /// only the scanner's own nomination key and re-minted (with
+    /// `allow_park: true`!) for the other two paths' whole publication
+    /// window.
+    #[tokio::test]
+    async fn scanner_suppression_is_key_agnostic_for_admin_evicts() {
+        let session_id = engram_core::SessionId::new();
+        let mut session = evicting_session(session_id);
+        // Admin evicts enter at Active; finish_eviction_d5 transitions
+        // Active → Evicting itself. Start Active to mirror that shape.
+        session.status = SessionState::Active;
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // The admin shape: evict op with key = None (enqueue_and_observe_evict).
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": false }),
+                None,
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        crate::session_ops::drive_claimed(&state, op).await;
+        assert_eq!(
+            meta.session.lock().status,
+            SessionState::Evicting,
+            "admin capture landed; awaiting the reconcile settle",
+        );
+
+        let ops_before = meta.ops.all().len();
+        scanner_run_once(&state).await.expect("tick");
+        assert_eq!(
+            meta.ops.all().len(),
+            ops_before,
+            "the keyless admin evict's Done op must suppress the re-mint too",
         );
     }
 

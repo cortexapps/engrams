@@ -927,20 +927,23 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
-    /// ADR 0101 C (engrams review, #836): the NEWEST op row carrying this
-    /// idempotency key, in ANY state — the eviction scanner's
-    /// "did this nomination already complete?" read. Terminal rows leave
-    /// the dedup index by design, so this is the only way to see that a
-    /// Done evict op for the current nomination exists (the settle owns
-    /// the tail) without re-minting one. Default `None` keeps quiet mocks
-    /// conservative: an unaware store just re-enqueues, the pre-existing
-    /// behavior.
-    async fn op_latest_for_key(
+    /// ADR 0101 C (engrams review, #836): the NEWEST op row of this kind
+    /// for the session, in ANY state, REGARDLESS of idempotency key —
+    /// the eviction scanner's "did a capture already land?" read.
+    /// Key-agnostic on purpose (review round 3): the three paths that
+    /// leave a session `Evicting` post-capture mint under three
+    /// different keys (scanner `evict:<last_active>`, park-descent
+    /// `evict-descend:<parked_at>`, admin/evict_local no key at all),
+    /// and terminal rows leave the dedup index by design — so a
+    /// key-scoped read protected only one path of three. Default `None`
+    /// keeps quiet mocks conservative: an unaware store just
+    /// re-enqueues, the pre-existing behavior.
+    async fn op_latest_for_kind(
         &self,
         session_id: SessionId,
-        idempotency_key: &str,
+        kind: crate::types::session_op::OpKind,
     ) -> Result<Option<crate::types::session_op::SessionOp>, MetaError> {
-        let _ = (session_id, idempotency_key);
+        let _ = (session_id, kind);
         Ok(None)
     }
 
