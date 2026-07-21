@@ -232,16 +232,23 @@ reject of the uncovered `__type` field) and 401 (reused connection → GitHub
 saw the placeholder), and `gh` *caches* the 401 responses to its
 feature-detection queries in `~/.cache/gh`, so later invocations kept failing
 instantly even on fresh connections. Fixed: the proxy now forces
-`Connection: close` (and strips `Keep-Alive`/`Proxy-Connection`) on every
-intercepted request — the same rewrite the observe path always applied — so a
-compliant upstream answers once and closes, the client reconnects, and every
-request is gated + injected. `Upgrade` (websocket) requests are left
-untouched. This covers the substitution plane too (a reused connection's
-second request also skipped placeholder substitution). Residual (accepted): an
+`Connection: close` (and strips `Keep-Alive`/`Proxy-Connection`/`Upgrade`) on
+every intercepted request — the same rewrite the observe path always applied —
+so a compliant upstream answers once and closes, the client reconnects, and
+every request is gated + injected. This covers the substitution plane too (a
+reused connection's second request also skipped placeholder substitution).
+`Upgrade` is *stripped, never honored* (PR #846 security review): the header is
+guest-supplied, and a REST/GraphQL host that doesn't upgrade would ignore it
+and keep the connection persistent — letting a guest reopen the very bypass
+this fix closes by decorating request #1 with `Upgrade: websocket` +
+`Connection: Upgrade`. No intercepted (credential/observe) host speaks
+websockets; genuine websocket support would need an explicit per-policy opt-in
+plus a 101-aware tunnel, not trust in a client header. Residual (accepted): an
 upstream that *ignores* `Connection: close` leaves the tunnel open for
 ungated-but-uncredentialed requests; real API hosts honor it. Unit + TLS e2e
-regressions (`keep_alive_second_request_cannot_bypass_the_gate`) pin the
-rewrite and the one-request-per-connection contract.
+regressions (`keep_alive_second_request_cannot_bypass_the_gate`,
+`force_close_strips_guest_supplied_upgrade`) pin the rewrite, the Upgrade
+strip, and the one-request-per-connection contract.
 
 ### Remaining operational gates (post-merge, not design opens)
 

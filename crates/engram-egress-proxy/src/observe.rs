@@ -63,8 +63,14 @@ pub fn prepare_observed_request(prefix: Vec<u8>) -> Vec<u8> {
 /// guest's placeholder credential (GitHub answers that with `401 Bad
 /// credentials` — the `gh pr create`/`gh pr checks` regression, 2026-07-21).
 /// Closing after one response makes the client reconnect, so every request is
-/// gated and injected. An `Upgrade` request (websocket) is left untouched:
-/// post-upgrade traffic is one logical stream, not smuggle-able HTTP requests.
+/// gated and injected.
+///
+/// `Upgrade` is stripped, never honored (PR #846 security review): the header
+/// is guest-supplied, and an upstream that doesn't upgrade (any REST/GraphQL
+/// API host) would ignore it and keep the connection persistent — letting a
+/// guest reopen this exact bypass by decorating request #1. No intercepted
+/// (credential/observe) host speaks websockets; supporting one would need an
+/// explicit per-policy opt-in plus a 101-aware tunnel, not a client header.
 pub fn force_connection_close(prefix: Vec<u8>) -> Vec<u8> {
     rewrite_request_headers(prefix, false)
 }
@@ -85,15 +91,6 @@ fn rewrite_request_headers(prefix: Vec<u8>, strip_accept_encoding: bool) -> Vec<
         .unwrap_or(prefix.len());
     let header_region = &prefix[req_line_end..headers_end];
 
-    // Connection-upgrade guard: forcing close on a websocket handshake would
-    // break the stream it negotiates. Leave the request untouched.
-    if split_crlf(header_region)
-        .iter()
-        .any(|l| header_name_lower(l) == "upgrade")
-    {
-        return prefix;
-    }
-
     let mut out = Vec::with_capacity(prefix.len() + 24);
     out.extend_from_slice(&prefix[..req_line_end]);
     // Re-emit each existing header line except the connection-management ones
@@ -106,6 +103,7 @@ fn rewrite_request_headers(prefix: Vec<u8>, strip_accept_encoding: bool) -> Vec<
         if name_lower == "connection"
             || name_lower == "keep-alive"
             || name_lower == "proxy-connection"
+            || name_lower == "upgrade"
             || (strip_accept_encoding && name_lower == "accept-encoding")
         {
             continue;
@@ -430,13 +428,20 @@ mod tests {
         assert!(s.ends_with("\r\n\r\n"));
     }
 
+    // PR #846 security review: `Upgrade` is guest-supplied — honoring it would
+    // let the guest suppress the forced close (an upstream that doesn't
+    // upgrade keeps the connection persistent) and reopen the keep-alive
+    // bypass. It must be stripped and the close still forced.
     #[test]
-    fn force_close_leaves_upgrade_requests_untouched() {
+    fn force_close_strips_guest_supplied_upgrade() {
         let req =
             b"GET /socket HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
                 .to_vec();
-        let out = force_connection_close(req.clone());
-        assert_eq!(out, req);
+        let out = force_connection_close(req);
+        let s = String::from_utf8(out).unwrap();
+        assert!(!s.to_ascii_lowercase().contains("upgrade"));
+        assert_eq!(s.matches("Connection: close\r\n").count(), 1);
+        assert!(s.contains("Host: h\r\n"));
     }
 
     #[test]

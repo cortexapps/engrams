@@ -530,6 +530,114 @@ async fn keep_alive_second_request_cannot_bypass_the_gate() {
     );
 }
 
+// PR #846 security review: a guest can't reopen the keep-alive bypass by
+// decorating request #1 with `Upgrade: websocket` + `Connection: Upgrade`. A
+// REST/GraphQL upstream ignores the unsupported Upgrade and would keep the
+// connection persistent — but the proxy strips Upgrade and still forces
+// `Connection: close`, so request #2 dies exactly as in the plain keep-alive
+// case. (`fake_upstream` never speaks websockets — the attacker's upstream.)
+#[tokio::test]
+async fn guest_upgrade_header_cannot_reopen_the_bypass() {
+    let ca = ca();
+    let mint = Arc::new(CertMint::new(ca.clone()));
+    let server_cfg = build_server_config(mint);
+    let client_cfg = build_client_config();
+
+    let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
+
+    let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
+    let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
+    let proxy_task = tokio::spawn(async move {
+        let injects: Vec<&InjectEntry> = vec![&inj];
+        intercept::run(
+            proxy_from_client,
+            Vec::new(),
+            "fake-upstream",
+            upstream_addr.port(),
+            resolver,
+            &[],
+            &injects,
+            &[],
+            SessionId::new(),
+            None,
+            None,
+            server_cfg,
+            client_cfg,
+        )
+        .await
+    });
+
+    let mut tls_client = tls_client_to(&ca, client_to_proxy).await;
+    // Request #1: gated shape, but the guest tries to keep the tunnel open with
+    // a websocket-upgrade dressing against a plain HTTP upstream.
+    tls_client
+        .write_all(
+            b"GET /api/v2/logs/events HTTP/1.1\r\nHost: fake-upstream\r\n\
+              Connection: Upgrade\r\nUpgrade: websocket\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await
+        .unwrap();
+    tls_client.flush().await.unwrap();
+
+    let mut resp = Vec::new();
+    let mut tmp = [0u8; 1024];
+    loop {
+        match tls_client.read(&mut tmp).await {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                resp.extend_from_slice(&tmp[..n]);
+                if resp.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+        }
+    }
+    assert!(String::from_utf8_lossy(&resp).starts_with("HTTP/1.1 200 OK"));
+
+    // Request #2: forbidden shape carrying a guest-held credential. The forced
+    // close means the connection is already dead — it must not reach upstream.
+    let _ = tls_client
+        .write_all(
+            b"GET /api/v1/admin HTTP/1.1\r\nHost: fake-upstream\r\n\
+              DD-API-KEY: guest-placeholder\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+    let _ = tls_client.flush().await;
+    let mut post = [0u8; 256];
+    let n = tls_client.read(&mut post).await.unwrap_or(0);
+    assert_eq!(n, 0, "second request must get EOF, not a response");
+    let _ = tls_client.shutdown().await;
+    drop(tls_client);
+
+    let outcome = proxy_task.await.unwrap();
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify")
+            && !msg.contains("UnexpectedEof")
+            && !msg.contains("Broken pipe")
+            && !msg.contains("Connection reset")
+        {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+
+    let seen = String::from_utf8(captured.lock().clone()).unwrap();
+    assert!(
+        seen.contains("Connection: close\r\n"),
+        "Upgrade request must still be rewritten to Connection: close; got: {seen}",
+    );
+    assert!(
+        !seen.to_ascii_lowercase().contains("upgrade"),
+        "guest-supplied Upgrade must be stripped; got: {seen}",
+    );
+    assert!(
+        !seen.contains("/api/v1/admin"),
+        "second request must never reach the upstream; got: {seen}",
+    );
+}
+
 // ADR 0056: a request to an inject-gated host whose (method, path) matches
 // no policy is rejected — the secret is never injected and nothing reaches
 // upstream.
