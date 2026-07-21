@@ -63,10 +63,10 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
             .unwrap_or(false)
     };
     for _ in 0..20 {
+        let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
         if device_free() {
             return;
         }
-        let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
