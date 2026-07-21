@@ -433,14 +433,25 @@ pub fn next_epoch_after(
     max_interval: Duration,
     target_epoch_bytes: u64,
 ) -> Duration {
+    // Order-safe (engrams review, #835): `f64::clamp` PANICS when
+    // min > max, and nothing upstream forbids an operator setting
+    // `ENGRAM_CHECKPOINT_INTERVAL_SECS` below the 30s MIN default (a
+    // natural way to ask for more frequent checkpoints). This runs
+    // inside the un-awaited driver task, where a panic silently kills
+    // all periodic checkpoints for the host — degrade to the max bound
+    // instead (the operator lowered the ceiling; honor it). `from_env`
+    // also normalizes the pair, so this guard is belt-and-suspenders
+    // for direct-constructed configs.
+    let max = max_interval;
+    let min = min_interval.min(max);
     let Some(dirty) = last_dirty_bytes else {
-        return max_interval;
+        return max;
     };
     if dirty == 0 || last_epoch.is_zero() || target_epoch_bytes == 0 {
-        return max_interval;
+        return max;
     }
     let scaled = last_epoch.as_secs_f64() * (target_epoch_bytes as f64) / (dirty as f64);
-    Duration::from_secs_f64(scaled.clamp(min_interval.as_secs_f64(), max_interval.as_secs_f64()))
+    Duration::from_secs_f64(scaled.clamp(min.as_secs_f64(), max.as_secs_f64()))
 }
 
 impl CheckpointConfig {
@@ -480,9 +491,23 @@ impl CheckpointConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(256);
+        // Normalize a min > max pair (engrams review, #835): an operator
+        // lowering INTERVAL below the MIN default asked for a tighter
+        // ceiling — honor it rather than hand `next_epoch_after` an
+        // inverted clamp. Loud, because the MIN knob is being ignored.
+        let mut min_secs = min_secs.max(1);
+        if secs > 0 && min_secs > secs {
+            tracing::warn!(
+                min_secs,
+                interval_secs = secs,
+                "ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS exceeds ENGRAM_CHECKPOINT_INTERVAL_SECS; \
+                 clamping the floor to the ceiling",
+            );
+            min_secs = secs;
+        }
         Self {
             interval: (secs > 0).then(|| Duration::from_secs(secs)),
-            min_interval: Duration::from_secs(min_secs.max(1)),
+            min_interval: Duration::from_secs(min_secs),
             target_epoch_bytes: target_mb * 1024 * 1024,
         }
     }
@@ -524,7 +549,11 @@ pub fn spawn_checkpoint_driver(
 /// One sleep-free pass of the periodic driver — the ADR 0098
 /// `spawn()`/`run_once()` split: the timer loop above is a thin
 /// wrapper, and this is the step tests (and the host simulator) drive
-/// directly.
+/// directly. Genuinely sleep-free (engrams review, #835): the ADR 0091
+/// dead-guest confirmation probe (3 tries, 2s apart) is SPAWNED
+/// detached, not awaited inline — one unresponsive guest must not
+/// consume the `min_interval` quantum and head-of-line the honored
+/// short epochs of the busy sandboxes behind it.
 pub async fn run_checkpoint_pass(
     backend: &Arc<crate::pooled_backend::PooledBackend>,
     cfg: &CheckpointConfig,
@@ -572,23 +601,36 @@ pub async fn run_checkpoint_pass(
                 // misclassified — and advertise via the heartbeat.
                 // Only socket-level probe results count: a BUSY guest
                 // fails a capture but still accept()s its API socket.
-                let mut dead_probes = 0u32;
-                for _ in 0..3 {
-                    match backend.probe_sandbox(sandbox_id).await {
-                        Ok(p) if p.control_alive == Some(false) => dead_probes += 1,
-                        _ => break,
+                //
+                // Detached (engrams review, #835): the probe's up-to-6s
+                // of confirmation sleeps ran INLINE in this serial pass
+                // — with the quantum shrunk to `min_interval`, a few
+                // dead guests could eat the whole tick and starve the
+                // busy sandboxes' short epochs. Spawning is safe: the
+                // probe only reads the socket and flips the (idempotent)
+                // unreachable advert; a duplicate probe from the next
+                // tick converges to the same verdict, and a healed guest
+                // is cleared by its next successful capture above.
+                let backend = Arc::clone(backend);
+                tokio::spawn(async move {
+                    let mut dead_probes = 0u32;
+                    for _ in 0..3 {
+                        match backend.probe_sandbox(sandbox_id).await {
+                            Ok(p) if p.control_alive == Some(false) => dead_probes += 1,
+                            _ => break,
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
                     }
-                    tokio::time::sleep(std::time::Duration::from_secs(2)).await;
-                }
-                if dead_probes == 3 {
-                    tracing::error!(
-                        %sandbox_id,
-                        %session_id,
-                        "guest control plane is dead (3/3 socket probes refused); \
-                         advertising unreachable (ADR 0091)",
-                    );
-                    backend.mark_guest_unreachable(sandbox_id, session_id);
-                }
+                    if dead_probes == 3 {
+                        tracing::error!(
+                            %sandbox_id,
+                            %session_id,
+                            "guest control plane is dead (3/3 socket probes refused); \
+                             advertising unreachable (ADR 0091)",
+                        );
+                        backend.mark_guest_unreachable(sandbox_id, session_id);
+                    }
+                });
             }
         }
     }
@@ -634,6 +676,29 @@ mod tests {
         assert_eq!(
             next_epoch_after(Duration::from_secs(60), Some(1024), min, max, target),
             max,
+        );
+        // An inverted pair (operator lowered the ceiling below the MIN
+        // default) must degrade to the ceiling, never panic the driver
+        // task (engrams review, #835: f64::clamp panics on min > max).
+        assert_eq!(
+            next_epoch_after(
+                Duration::from_secs(600),
+                Some(target * 32),
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+                target
+            ),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            next_epoch_after(
+                Duration::from_secs(60),
+                None,
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+                target
+            ),
+            Duration::from_secs(10),
         );
         // No rate signal (Full capture / first epoch / zero dirty / zero
         // target) → the max backstop, never the floor.

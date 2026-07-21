@@ -3729,37 +3729,13 @@ impl PooledBackend {
             .await
     }
 
-    /// Sandboxes due for a periodic checkpoint: session-bound, and no
-    /// successful capture (of any flavor) within `interval`. Empty
-    /// when checkpointing is disabled.
-    pub fn checkpoint_candidates(
-        &self,
-        interval: std::time::Duration,
-    ) -> Vec<(SandboxId, SessionId)> {
-        if self.checkpoint_dir.is_none() {
-            return Vec::new();
-        }
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as i64)
-            .unwrap_or(0);
-        let interval_ms = interval.as_millis() as i64;
-        self.session_bindings
-            .iter()
-            .filter_map(|e| {
-                let id = *e.key();
-                let last = self.last_snapshot_unix_ms.get(&id).map(|v| *v).unwrap_or(0);
-                (now_ms - last >= interval_ms).then_some((id, *e.value()))
-            })
-            .collect()
-    }
-
-    /// ADR 0101 B: the adaptive flavor of [`Self::checkpoint_candidates`]
-    /// — each sandbox's due-interval comes from its last epoch's observed
+    /// ADR 0101 B: sandboxes due for a periodic checkpoint — each
+    /// sandbox's due-interval comes from its last epoch's observed
     /// dirty rate ([`crate::checkpoint::next_epoch_after`]), clamped to
     /// `[cfg.min_interval, cfg.interval]`. A sandbox with no pacing
     /// sample yet (fresh bind, chain seed pending, Full-only history)
-    /// keeps the max-interval backstop cadence.
+    /// keeps the max-interval backstop cadence. (The flat-interval
+    /// predecessor is retired — this is the only candidacy surface.)
     pub fn checkpoint_candidates_adaptive(
         &self,
         cfg: &crate::checkpoint::CheckpointConfig,
