@@ -1864,6 +1864,25 @@ impl MetadataStore for SimMetadataStore {
             .map(op_row_to_domain))
     }
 
+    /// ADR 0101 C: mirrors PG's `ORDER BY id DESC LIMIT 1` newest-mint
+    /// read over `(session, idempotency_key)`, any state.
+    async fn op_latest_for_key(
+        &self,
+        session_id: SessionId,
+        idempotency_key: &str,
+    ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .session_ops
+            .values()
+            .filter(|o| {
+                o.session_id == session_id && o.idempotency_key.as_deref() == Some(idempotency_key)
+            })
+            .max_by_key(|o| o.id)
+            .map(op_row_to_domain))
+    }
+
     async fn op_get(
         &self,
         op_id: i64,

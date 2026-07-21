@@ -230,6 +230,14 @@ fn quarantine_capture_timeout() -> std::time::Duration {
 /// are discarded anyway.
 const QUARANTINE_GUEST_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// ADR 0101 C: how long the eviction scanner trusts a COMPLETED evict
+/// op's capture before re-minting (see `scanner_advance_one`). The
+/// settle normally lands within one heartbeat (~5s) of the host-owned
+/// finalize finishing — with Phases A+B that whole tail is seconds —
+/// so 60s covers slow uploads without materially delaying the
+/// wedged-finalize retry path.
+const EVICT_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// ADR 0090 (2026-07-21 livelock incident): converge a QUARANTINE evict
 /// that found its session in a state the entry guard can't evict from
 /// while the session still binds the quarantined sandbox. Capture is
@@ -1419,6 +1427,50 @@ async fn scanner_advance_one(
     // after re-nomination — the ascent's Active transition is what
     // normally ends that state).
     let key = format!("evict:{}", session.last_active_at.timestamp_millis());
+
+    // ADR 0101 C (engrams review, #836 round 2): a COMPLETED evict op for
+    // this same nomination means the capture already landed — the session
+    // is honestly `Evicting` for the publication window and the heartbeat
+    // reconcile's settle owns the tail. Terminal rows leave the dedup
+    // index by design, so without this check every tick would mint a
+    // fresh op that re-runs stop_browser/stop_ide + the (idempotent)
+    // snapshot_begin against the finalizing sandbox — the terminal-op
+    // churn shape the #837 op-mint oracle exists to condemn, transiently.
+    // The suppression is TIME-BOUNDED, not absolute: past the grace the
+    // scanner re-mints, which on a live host cheaply re-observes the
+    // idempotent capture (re-Done), and after a QUARANTINED finalize
+    // (pending cleared, upload wedged, host alive) retries the eviction
+    // end-to-end — preserving the wedged-upload → bounded-attempts →
+    // HostLost floor. A DEAD host is the dead-host detector's job either
+    // way (heartbeat loss → HostLost, independent of this sweep).
+    if let Some(prior) = state
+        .services
+        .meta
+        .op_latest_for_key(session_id, &key)
+        .await?
+    {
+        if prior.kind == engram_core::types::session_op::OpKind::Evict
+            && prior.state == engram_core::types::session_op::OpState::Done
+        {
+            let within_grace = prior.finished_at.is_some_and(|t| {
+                state
+                    .services
+                    .clock
+                    .now_utc()
+                    .signed_duration_since(t)
+                    .to_std()
+                    .is_ok_and(|elapsed| elapsed < EVICT_SETTLE_GRACE)
+            });
+            if within_grace {
+                tracing::debug!(
+                    %session_id,
+                    "eviction scanner: capture landed (Done op for this nomination); \
+                     the reconcile settle owns the tail — not re-minting",
+                );
+                return Ok(());
+            }
+        }
+    }
     let outcome = crate::session_ops::enqueue(
         state,
         session_id,
@@ -1527,7 +1579,7 @@ async fn park_reaper_advance_one(
     // user's return is then an un-pause (ms) instead of a ~27s rebuild.
     let has_headroom = host_has_memory_headroom(state, session_id).await;
     // The absolute ceiling. The idle DETECTOR's hard TTL can't reach a
-    // parked session (it scans `Active` rows; a parked one is `Evicting`),
+    // parked session (it scans `Active` rows; a parked one is `Parked`),
     // so with the dwell clock retired the reaper owns the ceiling: an
     // abandoned park descends after the same hard TTL, measured from the
     // park instant (which trails the session's last event by the soft
@@ -3496,6 +3548,64 @@ mod tests {
                 stages_images: true,
                 capabilities: Default::default(),
             });
+    }
+
+    /// ADR 0101 C (engrams review, #836 round 2): once a nomination's
+    /// evict op is DONE (capture landed; the session honestly `Evicting`
+    /// for the publication window), the scanner must NOT re-mint an op —
+    /// the reconcile settle owns the tail. Terminal rows leave the dedup
+    /// index by design, so without the grace check every 10s tick minted
+    /// a fresh op that re-ran guest RPCs + snapshot_begin against the
+    /// finalizing sandbox for the whole window.
+    #[tokio::test]
+    async fn scanner_does_not_remint_after_capture_landed() {
+        let session_id = engram_core::SessionId::new();
+        let session = evicting_session(session_id);
+        let last_active_at = session.last_active_at;
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // Drive the nominated evict op under the SCANNER'S idempotency
+        // key — the D5 path completes it with the session left Evicting.
+        let key = format!("evict:{}", last_active_at.timestamp_millis());
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": true }),
+                Some(&key),
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        crate::session_ops::drive_claimed(&state, op).await;
+        assert_eq!(
+            meta.session.lock().status,
+            SessionState::Evicting,
+            "capture landed; awaiting the reconcile settle",
+        );
+
+        let ops_before = meta.ops.all().len();
+        scanner_run_once(&state).await.expect("tick");
+        assert_eq!(
+            meta.ops.all().len(),
+            ops_before,
+            "within the settle grace the scanner must not re-mint an evict op \
+             (the terminal-op/dedup churn shape)",
+        );
     }
 
     /// ADR 0074 rung 2 (parked-paused), ADR 0101 C shape: with host

@@ -6702,6 +6702,27 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::session_op_from_row(&r)).transpose()
     }
 
+    /// ADR 0101 C: newest row (any state) for `(session, key)` — ids are
+    /// monotonic, so `ORDER BY id DESC LIMIT 1` is the latest mint.
+    async fn op_latest_for_key(
+        &self,
+        session_id: SessionId,
+        idempotency_key: &str,
+    ) -> Result<Option<SessionOp>, MetaError> {
+        let q = format!(
+            "SELECT {OP_COLUMNS} FROM session_ops
+              WHERE session_id = $1 AND idempotency_key = $2
+              ORDER BY id DESC LIMIT 1"
+        );
+        let row = sqlx::query(&q)
+            .bind(session_id.as_uuid())
+            .bind(idempotency_key)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row::session_op_from_row(&r)).transpose()
+    }
+
     async fn op_get(&self, op_id: i64) -> Result<Option<SessionOp>, MetaError> {
         let q = format!("SELECT {OP_COLUMNS} FROM session_ops WHERE id = $1");
         let row = sqlx::query(&q)

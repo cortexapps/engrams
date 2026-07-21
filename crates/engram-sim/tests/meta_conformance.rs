@@ -700,6 +700,84 @@ async fn ops_pipeline(ctx: &Ctx) {
 
 /// Idempotency keys dedupe ACTIVE ops only — a terminal keyed row does
 /// not burn the key.
+/// ADR 0101 C (engrams review, #836 round 2): `op_latest_for_key` — the
+/// newest mint for `(session, key)` in ANY state. Its whole point is
+/// that TERMINAL rows stay visible (the dedup index forgets them by
+/// design; the eviction scanner needs to see "this nomination already
+/// completed" without re-minting).
+async fn op_latest_for_key_reads_terminal_mints(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:oplatest")).await.unwrap();
+    assert!(
+        meta.op_latest_for_key(sid, "evict:1")
+            .await
+            .unwrap()
+            .is_none(),
+        "unknown key → None"
+    );
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(
+            sid,
+            OpKind::Evict,
+            serde_json::json!({}),
+            Some("evict:1"),
+            "pod-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    assert!(meta
+        .op_finish(op.id, op.epoch.unwrap(), OpState::Done, None)
+        .await
+        .unwrap());
+    let latest = meta
+        .op_latest_for_key(sid, "evict:1")
+        .await
+        .unwrap()
+        .expect("a terminal mint is visible — that is the method's point");
+    assert_eq!(latest.id, op.id);
+    assert_eq!(latest.state, OpState::Done);
+    assert!(
+        latest.finished_at.is_some(),
+        "finished_at stamps on finish (the scanner's grace check reads it)"
+    );
+    // A re-mint under the same key (terminal rows don't dedup) becomes
+    // the newest.
+    let EnqueueOutcome::Claimed(op2) = meta
+        .op_enqueue_and_claim(
+            sid,
+            OpKind::Evict,
+            serde_json::json!({}),
+            Some("evict:1"),
+            "pod-a",
+        )
+        .await
+        .unwrap()
+    else {
+        panic!("re-mint claimed")
+    };
+    let latest = meta
+        .op_latest_for_key(sid, "evict:1")
+        .await
+        .unwrap()
+        .expect("still visible");
+    assert_eq!(latest.id, op2.id, "newest mint wins");
+    // Key + session isolation.
+    assert!(meta
+        .op_latest_for_key(sid, "evict:2")
+        .await
+        .unwrap()
+        .is_none());
+    let other = meta.create_session(spec("conf:oplatest-b")).await.unwrap();
+    assert!(meta
+        .op_latest_for_key(other, "evict:1")
+        .await
+        .unwrap()
+        .is_none());
+}
+
 async fn ops_idempotency(ctx: &Ctx) {
     let meta = &ctx.meta;
     let sid = meta.create_session(spec("conf:idem")).await.unwrap();
@@ -1566,6 +1644,10 @@ conformance!(t_queue_fifo, super::queue_fifo);
 conformance!(t_dead_host_lease, super::dead_host_lease);
 conformance!(t_ops_pipeline, super::ops_pipeline);
 conformance!(t_ops_idempotency, super::ops_idempotency);
+conformance!(
+    t_op_latest_for_key_reads_terminal_mints,
+    super::op_latest_for_key_reads_terminal_mints
+);
 conformance!(t_fenced_transition, super::fenced_transition);
 conformance!(
     t_enqueue_evacuating_resume,

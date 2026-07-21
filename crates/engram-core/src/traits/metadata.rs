@@ -927,6 +927,23 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// ADR 0101 C (engrams review, #836): the NEWEST op row carrying this
+    /// idempotency key, in ANY state — the eviction scanner's
+    /// "did this nomination already complete?" read. Terminal rows leave
+    /// the dedup index by design, so this is the only way to see that a
+    /// Done evict op for the current nomination exists (the settle owns
+    /// the tail) without re-minting one. Default `None` keeps quiet mocks
+    /// conservative: an unaware store just re-enqueues, the pre-existing
+    /// behavior.
+    async fn op_latest_for_key(
+        &self,
+        session_id: SessionId,
+        idempotency_key: &str,
+    ) -> Result<Option<crate::types::session_op::SessionOp>, MetaError> {
+        let _ = (session_id, idempotency_key);
+        Ok(None)
+    }
+
     /// The session's currently-running op, if any — the "is a resume in
     /// flight" visibility read (no `Resuming` FSM state; the op row IS
     /// the visibility).
