@@ -887,55 +887,7 @@ pub async fn heartbeat(
     // from its current state, so every enqueue here ends the loop it
     // rides on. Keep that pairing in mind before adding states the
     // pipeline may skip.
-    for q in &hb.quarantined_survivors {
-        match state.services.meta.get_session(q.session_id).await {
-            Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
-                match crate::session_ops::enqueue(
-                    &state,
-                    q.session_id,
-                    engram_core::types::session_op::OpKind::Evict,
-                    serde_json::json!({
-                        "target": "idle",
-                        "allow_park": false,
-                        "nominated": false,
-                        // Quarantine flavor: the survivor's disk is unserved, so
-                        // the evict verb bounds each capture attempt and, on
-                        // budget exhaustion, destroys the crippled VM + falls
-                        // back to HostLost (rewind-to-checkpoint is the designed
-                        // blast radius; an unbounded retry loop locking the
-                        // user out is not).
-                        "quarantine": true,
-                    }),
-                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
-                )
-                .await
-                {
-                    Ok(engram_core::types::session_op::EnqueueOutcome::Duplicate) => {}
-                    Ok(_) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            sandbox_id = %q.sandbox_id,
-                            "quarantined survivor advertised — enqueued evict_local \
-                             (capture + relocate; ADR 0090)",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            error = %e,
-                            "quarantined-survivor evict enqueue failed; retried next heartbeat",
-                        );
-                    }
-                }
-            }
-            // Session moved on (relocated / terminal) or unknown — the
-            // host's quarantine entry clears when the sandbox is
-            // destroyed; nothing to drive here.
-            _ => {}
-        }
-    }
+    quarantined_survivor_advertise_core(&state, host_id, &hb.quarantined_survivors).await;
 
     // ADR 0091: flip sessions whose guest control plane is dead. The
     // host re-advertises until a successful capture or destroy clears
@@ -1669,6 +1621,72 @@ pub async fn register_rehydrate_list_core(
             disk_manifest_version: manifest.as_ref().map(|m| m.version),
         })
         .collect())
+}
+
+/// The ADR 0090 quarantined-survivor advertise arm of the heartbeat,
+/// extracted per the run_once pattern so the boundary co-simulator
+/// (`engram-dst-cosim`) drives the REAL reaction to a host's quarantine
+/// advertise — the seam the 2026-07-21 8174b7aa livelock lived in (the
+/// cosim previously wrote host liveness straight to the store, so the
+/// advertise → enqueue → skip loop was structurally invisible to it).
+/// For each survivor the session still owns, enqueue the keyed
+/// quarantine `evict_local`; the pipeline's convergence guarantee (see
+/// the heartbeat handler's comment) is what keeps this 5s-cadence
+/// enqueue loop-free.
+pub async fn quarantined_survivor_advertise_core(
+    state: &SharedState,
+    host_id: HostId,
+    survivors: &[engram_protocol::heartbeat::QuarantinedSurvivor],
+) {
+    for q in survivors {
+        match state.services.meta.get_session(q.session_id).await {
+            Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
+                match crate::session_ops::enqueue(
+                    state,
+                    q.session_id,
+                    engram_core::types::session_op::OpKind::Evict,
+                    serde_json::json!({
+                        "target": "idle",
+                        "allow_park": false,
+                        "nominated": false,
+                        // Quarantine flavor: the survivor's disk is unserved, so
+                        // the evict verb bounds each capture attempt and, on
+                        // budget exhaustion, destroys the crippled VM + falls
+                        // back to HostLost (rewind-to-checkpoint is the designed
+                        // blast radius; an unbounded retry loop locking the
+                        // user out is not).
+                        "quarantine": true,
+                    }),
+                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
+                )
+                .await
+                {
+                    Ok(engram_core::types::session_op::EnqueueOutcome::Duplicate) => {}
+                    Ok(_) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            session_id = %q.session_id,
+                            sandbox_id = %q.sandbox_id,
+                            "quarantined survivor advertised — enqueued evict_local \
+                             (capture + relocate; ADR 0090)",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            session_id = %q.session_id,
+                            error = %e,
+                            "quarantined-survivor evict enqueue failed; retried next heartbeat",
+                        );
+                    }
+                }
+            }
+            // Session moved on (relocated / terminal) or unknown — the
+            // host's quarantine entry clears when the sandbox is
+            // destroyed; nothing to drive here.
+            _ => {}
+        }
+    }
 }
 
 pub async fn live_manifest_publish_core(

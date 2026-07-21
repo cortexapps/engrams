@@ -687,6 +687,11 @@ impl CosimHost {
     pub fn quarantined_unknown(&self) -> Vec<SandboxId> {
         self.quarantined_unknown.iter().copied().collect()
     }
+    /// The session a sandbox is bound to, as the HOST knows it — what the
+    /// real host-agent stamps into a `QuarantinedSurvivor` advertise.
+    pub fn session_of(&self, id: SandboxId) -> Option<SessionId> {
+        self.sandboxes.get(&id).and_then(|s| s.session_id)
+    }
     /// Oracle read (Wave 7b): is `id` a record-invisible resident survivor —
     /// live, unserved, dead-owner, no record — the gap-A precondition the barrier
     /// must have QUARANTINED (never left unclassified)?
