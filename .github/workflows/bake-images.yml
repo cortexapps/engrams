@@ -60,6 +60,11 @@ jobs:
       cli_tools: ${{ steps.lanes.outputs.cli_tools }}
       tf_or_helm: ${{ steps.lanes.outputs.tf_or_helm }}
       bundles: ${{ steps.lanes.outputs.bundles }}
+      # The node-assets image's OWN inputs (node-assets Dockerfile/fetch script,
+      # the FC fork, the RO bundles) — NARROWER than `images`. Gates
+      # publish-node-assets so a container-only change never rebakes node-assets
+      # and churns the host-fleet DaemonSet tag (2026-07-20 host-roll incident).
+      node_assets: ${{ steps.lanes.outputs.node_assets }}
       dev_image: ${{ steps.lanes.outputs.dev_image }}
       fc_fork: ${{ steps.lanes.outputs.fc_fork }}
     steps:
@@ -514,17 +519,27 @@ jobs:
   # ADR 0044 K2 / GAP 2 + ADR 0027: bake the node-assets image (firecracker +
   # the engram guest kernel + the RO session bundles) the engram-host-fleet
   # chart stages onto each K8s node via a host-agent pod init container. Stock
-  # K8s nodes carry none of these. Gated on the images lane (docker/ changes,
-  # incl. node-assets.Dockerfile / node-assets-fetch.sh) OR the bundles lane (a
-  # skills/browser change must reach the hosts) — and ordered AFTER
-  # publish-bundles so the bundle-*:main tags node-assets-fetch.sh pulls are
-  # this run's.
+  # K8s nodes carry none of these.
+  #
+  # Gated on the NARROW `node_assets` lane (the node-assets Dockerfile/fetch
+  # script, the FC fork, OR the bundles), NOT the coarse `images` lane. A
+  # coordinator/web/orchestrator source change trips `images` (rebake the
+  # container) but touches nothing this image carries — rebaking node-assets for
+  # it produces a byte-different, semantically-identical image under a fresh SHA
+  # tag, which the deploy pins into the host-fleet DaemonSet and rolls every FC
+  # host for nothing (2026-07-20: four host rolls in 90 min off three coord/web
+  # pushes, each re-running the risky survivor-rehydrate path). When node-assets
+  # is NOT rebaked at this SHA, engrams-internal's helm-deploy resolve_ref falls
+  # back to the last node-assets build's full-SHA tag (auditable, not floating),
+  # so the DaemonSet template is unchanged and the fleet does not roll.
+  #
+  # Ordered AFTER publish-bundles so the bundle-*:main tags node-assets-fetch.sh
+  # pulls are this run's.
   publish-node-assets:
     needs: [detect, publish-bundles, build-firecracker]
     if: |
       always() &&
-      (needs.detect.outputs.images == 'true'
-        || needs.detect.outputs.bundles == 'true'
+      (needs.detect.outputs.node_assets == 'true'
         || github.event_name == 'workflow_dispatch') &&
       needs.publish-bundles.result != 'failure' &&
       needs.publish-bundles.result != 'cancelled' &&
