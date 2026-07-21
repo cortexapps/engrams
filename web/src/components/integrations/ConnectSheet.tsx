@@ -39,6 +39,7 @@ import { humanizeAction, parseConnectorConfig } from "@/lib/connectorModel";
 import { ProviderTile } from "./ProviderTile";
 import { AccessTag, HostChip } from "./chips";
 import { SecretField } from "./SecretField";
+import { GithubSetupPanel } from "./GithubSetupPanel";
 import { OAuthConnectSheet } from "./OAuthConnectSheet";
 import type { ConnectorView } from "./useConnectorViews";
 
@@ -165,6 +166,7 @@ export function ConnectSheet({
         <div className="flex-1 overflow-y-auto p-5">
           {step === 0 && (
             <div className="flex flex-col gap-4">
+              {view.provider === "github" && <GithubSetupPanel view={view} />}
               <div className="flex gap-3 rounded-lg border bg-secondary p-3">
                 {isMint ? (
                   <ShieldCheckIcon className="mt-0.5 size-4 shrink-0 text-instrument-nominal" />
