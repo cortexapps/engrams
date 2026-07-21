@@ -3133,7 +3133,7 @@ pub trait MetadataStore: Send + Sync {
 
     /// ADR 0101 C: the durability-floor settle — atomically flip an
     /// `evicting` session to `idle` and detach its sandbox, GUARDED on
-    /// the recoverable snapshot row already existing. Returns `false`
+    /// the recoverable snapshot row already existing. Returns `None`
     /// (no-op) when the session is no longer `evicting`, its bound
     /// sandbox is not `sandbox_id` (a successor rebound), or the
     /// snapshot row is absent / not recoverable — the caller (the
@@ -3144,6 +3144,18 @@ pub trait MetadataStore: Send + Sync {
     /// Idle-on-capture flip is retired. `host_id` is preserved for
     /// resume affinity, mirroring the old detach.
     ///
+    /// `events` are `(kind, payload)` lifecycle facts (`evicted`, the
+    /// final `status_changed`) appended ATOMICALLY with the settle, in
+    /// order, with consecutive indices (returned on success). The settle
+    /// is CAS-once — a re-advert after a successful settle is a clean
+    /// no-op — so facts emitted by the caller AFTER the settle had a
+    /// crash window in which they were lost forever (the settle already
+    /// landed; no retry would ever re-emit them). Same event-loss class
+    /// as the fenced post-transition emits
+    /// ([`Self::fenced_transition_session_with_events`]), crash-shaped
+    /// instead of fence-shaped. Landing them in the settle's transaction
+    /// closes it: the facts exist iff the settle happened.
+    ///
     /// No silent default (ADR 0098 D4): a store that can be reached by
     /// the reconcile must implement the real semantics.
     async fn settle_evicted_session_idle(
@@ -3151,7 +3163,8 @@ pub trait MetadataStore: Send + Sync {
         _session_id: SessionId,
         _sandbox_id: SandboxId,
         _snapshot_id: SnapshotId,
-    ) -> Result<bool, MetaError> {
+        _events: &[(String, serde_json::Value)],
+    ) -> Result<Option<Vec<i64>>, MetaError> {
         unimplemented!(
             "settle_evicted_session_idle: PG-semantic method; mocks on the reconcile path must \
              implement it (ADR 0098 D4)"

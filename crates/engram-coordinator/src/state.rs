@@ -1102,6 +1102,22 @@ impl AppState {
 ///   harness itself does, and an edit/dequeue of a queued prompt keeps
 ///   its own confirmations).
 /// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
+/// Serialize lifecycle events to the `(kind, payload)` wire pairs the
+/// atomic store methods (`fenced_transition_session_with_events`,
+/// `settle_evicted_session_idle`) append in-transaction.
+pub(crate) fn wire_events(
+    events: &[SessionEvent],
+) -> Result<Vec<(String, serde_json::Value)>, engram_core::MetaError> {
+    events
+        .iter()
+        .map(|e| {
+            serde_json::to_value(e)
+                .map(|payload| (e.kind().to_string(), payload))
+                .map_err(|e| engram_core::MetaError::Serialization(format!("event serialize: {e}")))
+        })
+        .collect()
+}
+
 pub(crate) fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {
@@ -2394,24 +2410,34 @@ pub(crate) mod tests {
             session_id: engram_core::SessionId,
             sandbox_id: engram_core::SandboxId,
             snapshot_id: engram_core::types::SnapshotId,
-        ) -> Result<bool, MetaError> {
+            events: &[(String, serde_json::Value)],
+        ) -> Result<Option<Vec<i64>>, MetaError> {
             let row_ok =
                 self.snapshots.lock().iter().any(|s| {
                     s.id == snapshot_id && s.session_id == Some(session_id) && s.recoverable
                 });
             if !row_ok {
-                return Ok(false);
+                return Ok(None);
             }
-            let mut session = self.session.lock();
-            if session.id != session_id
-                || session.status != SessionState::Evicting
-                || session.sandbox_id != Some(sandbox_id)
             {
-                return Ok(false);
+                let mut session = self.session.lock();
+                if session.id != session_id
+                    || session.status != SessionState::Evicting
+                    || session.sandbox_id != Some(sandbox_id)
+                {
+                    return Ok(None);
+                }
+                session.status = SessionState::Idle;
+                session.sandbox_id = None;
             }
-            session.status = SessionState::Idle;
-            session.sandbox_id = None;
-            Ok(true)
+            let mut indices = Vec::with_capacity(events.len());
+            for (kind, payload) in events {
+                indices.push(
+                    self.append_session_event(session_id, kind, payload.clone())
+                        .await?,
+                );
+            }
+            Ok(Some(indices))
         }
         async fn get_snapshot(
             &self,

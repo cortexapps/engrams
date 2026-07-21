@@ -248,18 +248,6 @@ pub(crate) async fn transition_with_fence_emitting(
         "transition_with_fence_emitting only handles the publish side effect; \
          outbox-acking events must go through emit_fenced"
     );
-    let serialize = |events: &[crate::state::SessionEvent]| {
-        events
-            .iter()
-            .map(|e| {
-                serde_json::to_value(e)
-                    .map(|payload| (e.kind().to_string(), payload))
-                    .map_err(|e| {
-                        engram_core::MetaError::Serialization(format!("event serialize: {e}"))
-                    })
-            })
-            .collect::<Result<Vec<_>, _>>()
-    };
     if fence.epoch == 0 {
         // Unfenced interim path: plain transition, then plain appends —
         // no fence exists to race, so the atomicity doesn't apply.
@@ -273,7 +261,7 @@ pub(crate) async fn transition_with_fence_emitting(
         }
         return Ok(prev);
     }
-    let wire = serialize(&events)?;
+    let wire = crate::state::wire_events(&events)?;
     match state
         .services
         .meta

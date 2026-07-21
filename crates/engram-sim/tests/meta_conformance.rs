@@ -1676,12 +1676,25 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     assert!(meta.list_parked_sessions().await.unwrap().is_empty());
 
     let snap_id = SnapshotId::new();
+    // The atomic settle facts (see the trait doc: caller-side emits
+    // after a CAS-once settle had a crash window of permanent loss).
+    let settle_events = vec![
+        ("evicted".to_string(), serde_json::json!({"at": "t"})),
+        (
+            "status_changed".to_string(),
+            serde_json::json!({"to": "idle"}),
+        ),
+    ];
+    let ev_floor = meta
+        .append_session_event(sid, "status_changed", serde_json::json!({"probe": true}))
+        .await
+        .unwrap();
     // 1. No row yet → no settle.
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, snap_id)
+        meta.settle_evicted_session_idle(sid, sb, snap_id, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "no settle before the snapshot row exists"
     );
     // 2. A NON-recoverable row → no settle.
@@ -1690,10 +1703,10 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         .await
         .unwrap());
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, snap_id)
+        meta.settle_evicted_session_idle(sid, sb, snap_id, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "a non-recoverable row must not settle Idle"
     );
     // 3. A recoverable row for a DIFFERENT session → no settle.
@@ -1707,10 +1720,10 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         .await
         .unwrap());
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, other_snap)
+        meta.settle_evicted_session_idle(sid, sb, other_snap, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "another session's row must not settle this one"
     );
     // 4. The right row, but the WRONG sandbox (a rebound successor) → no
@@ -1723,29 +1736,51 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         .await
         .unwrap());
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, engram_core::SandboxId::new(), good_snap)
-            .await
-            .unwrap(),
+        meta.settle_evicted_session_idle(
+            sid,
+            engram_core::SandboxId::new(),
+            good_snap,
+            &settle_events
+        )
+        .await
+        .unwrap()
+        .is_none(),
         "a stale advert against a rebound sandbox must not settle"
     );
     // 5. The exact triple → settle: idle + detached (host kept for
     //    resume affinity).
-    assert!(meta
-        .settle_evicted_session_idle(sid, sb, good_snap)
+    let idxs = meta
+        .settle_evicted_session_idle(sid, sb, good_snap, &settle_events)
         .await
-        .unwrap());
+        .unwrap()
+        .expect("the exact triple settles");
+    assert_eq!(
+        idxs,
+        vec![ev_floor + 1, ev_floor + 2],
+        "settle facts land atomically with contiguous indices",
+    );
     let s = meta.get_session(sid).await.unwrap();
     assert_eq!(s.status, SessionState::Idle);
     assert_eq!(s.sandbox_id, None, "the settle detaches the sandbox");
     assert_eq!(s.host_id, Some(host), "host affinity preserved");
     // 6. Idempotent: a re-advert's second settle is a clean no-op.
     assert!(
-        !meta
-            .settle_evicted_session_idle(sid, sb, good_snap)
+        meta.settle_evicted_session_idle(sid, sb, good_snap, &settle_events)
             .await
-            .unwrap(),
+            .unwrap()
+            .is_none(),
         "an already-settled session no-ops"
+    );
+    // Every no-op arm above (and the idempotent re-settle) appended
+    // NOTHING; only the one successful settle's two facts landed.
+    let landed = meta
+        .list_session_events_since(sid, ev_floor, 100)
+        .await
+        .unwrap();
+    assert_eq!(
+        landed.iter().map(|e| e.kind.as_str()).collect::<Vec<_>>(),
+        vec!["evicted", "status_changed"],
+        "exactly the settle's facts, exactly once: {landed:?}",
     );
 
     // Parked → HostLost is the host-death edge (never Idle: the parked

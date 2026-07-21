@@ -2441,7 +2441,16 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         sandbox_id: SandboxId,
         snapshot_id: SnapshotId,
-    ) -> Result<bool, MetaError> {
+        events: &[(String, serde_json::Value)],
+    ) -> Result<Option<Vec<i64>>, MetaError> {
+        // One transaction: the guarded settle UPDATE (the CAS — it also
+        // row-locks the session for the appends below) plus the event
+        // appends. The settle is CAS-once, so events appended by the
+        // caller afterwards had a crash window of permanent loss; in-tx
+        // they exist iff the settle happened. `pg_notify` fires on
+        // commit only.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let now = self.clock.now_utc();
         let res = sqlx::query(
             r#"
             UPDATE sessions
@@ -2458,11 +2467,53 @@ impl MetadataStore for PostgresStore {
         .bind(session_id.as_uuid())
         .bind(sandbox_id.as_uuid())
         .bind(snapshot_id.as_uuid())
-        .bind(self.clock.now_utc())
-        .execute(&self.pool)
+        .bind(now)
+        .execute(&mut *tx)
         .await
         .map_err(db_err)?;
-        Ok(res.rows_affected() == 1)
+        if res.rows_affected() != 1 {
+            return Ok(None);
+        }
+        let mut indices = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            let row = sqlx::query(
+                r#"
+                WITH next AS (
+                    UPDATE sessions
+                       SET next_event_idx = next_event_idx + 1,
+                           updated_at = $4,
+                           last_event_at = $4
+                     WHERE id = $1
+                 RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
+                ),
+                inserted AS (
+                    INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
+                    SELECT $1, allocated_idx, $2, $3, recovery_epoch, $4 FROM next
+                    RETURNING idx
+                )
+                SELECT i.idx,
+                       pg_notify(
+                           'session_events',
+                           json_build_object('session_id', $1::text, 'idx', i.idx)::text
+                       )
+                  FROM inserted i
+                "#,
+            )
+            .bind(session_id.as_uuid())
+            .bind(kind)
+            .bind(payload)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            indices.push(sqlx::Row::try_get(&row, "idx").map_err(db_err)?);
+        }
+        tx.commit().await.map_err(db_err)?;
+        // The retired D5 Idle flip fired the queue-scanner wake on
+        // `evicting → idle` (a memory-reserving state freeing its
+        // budget); the settle inherits it.
+        self.notify_placement_changed("session_freed").await;
+        Ok(Some(indices))
     }
 
     /// ADR 0034: atomic `+= 1 RETURNING`. The eviction scanner calls

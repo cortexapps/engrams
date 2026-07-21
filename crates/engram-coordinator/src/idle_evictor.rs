@@ -2209,14 +2209,18 @@ mod tests {
                 events_cursor: Some(0),
                 fc_snapshot_version: None,
             });
-        assert!(
-            state
-                .services
-                .meta
-                .settle_evicted_session_idle(session_id, sandbox_id, snapshot_id)
-                .await
-                .unwrap(),
-            "a recoverable row + matching binding must settle the session Idle",
+        let settle_events = vec![("evicted".to_string(), serde_json::json!({"at": "test"}))];
+        let indices = state
+            .services
+            .meta
+            .settle_evicted_session_idle(session_id, sandbox_id, snapshot_id, &settle_events)
+            .await
+            .unwrap()
+            .expect("a recoverable row + matching binding must settle the session Idle");
+        assert_eq!(
+            indices.len(),
+            1,
+            "the settle lands its lifecycle facts atomically",
         );
         assert_eq!(meta.session.lock().status, SessionState::Idle);
         assert_eq!(
