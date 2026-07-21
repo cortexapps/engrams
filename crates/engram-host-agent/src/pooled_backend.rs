@@ -3617,6 +3617,20 @@ impl PooledBackend {
                 record_devices.insert(dev);
             }
         }
+        // Devices this process itself PARKED (a failed rehydrate's
+        // `slot.quarantine()`) are tracked records too. The three sources
+        // above all resolve through the live FC entry (`rootfs_device`),
+        // which a concurrent sandbox destroy can vacate between the park and
+        // this barrier — 2026-07-21: a rehydrate-failed survivor whose
+        // session completed two seconds later was reported as an UNKNOWN
+        // device demanding an operator, when this very process had parked it
+        // on purpose moments earlier. The allocator's parked set is
+        // device-keyed, so it survives the FC entry vanishing.
+        if let Some(pool) = self.nbd_pool.as_ref() {
+            for dev in pool.parked_devices() {
+                record_devices.insert(dev);
+            }
+        }
 
         let classification =
             crate::disk_daemon::classify_startup_inventory(kernel, &record_devices);

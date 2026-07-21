@@ -1027,6 +1027,26 @@ pub async fn reattach_manifest(
         }
     }
     if let Some(e) = step_err {
+        // A step can fail AFTER the RECONFIGURE handed the kernel our socket
+        // (today: the BLKFLSBUF invalidation). Dropping the handle would
+        // netlink-DISCONNECT the device — immediate EIO for the surviving
+        // guest the park exists to protect (2026-07-21: exactly this drop
+        // disconnected a parked survivor's device out from under its FC and
+        // then confused the startup classification barrier). Abandon the
+        // serve loop instead: the kernel observes a dead connection and
+        // re-parks guest I/O under `dead_conn_timeout`, keeping the survivor
+        // recoverable (a later rehydrate attempt or the evict_local → resume
+        // ladder). Nothing serves reads meanwhile, so the failed
+        // invalidation cannot leak stale pages to the guest.
+        if let Some(h) = handle {
+            tracing::warn!(
+                device = %slot.path().display(),
+                "reattach step failed after RECONFIGURE; abandoning the serve \
+                 loop in place (no netlink disconnect) so the kernel re-parks \
+                 guest I/O instead of EIO-ing the survivor",
+            );
+            h.abandon();
+        }
         return Err((slot, e));
     }
     let handle = handle.expect("plan_reattach always emits Reconfigure (host-core pinned)");
