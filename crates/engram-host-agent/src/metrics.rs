@@ -413,3 +413,14 @@ pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live
 /// `sweep_blocked_live_holder`: THAT is the per-device sweep declining to sever;
 /// THIS is the reconcile finding a device it cannot account for at all.
 pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_device_total";
+
+/// The rehydrate spool-adopt arm found a shutdown spool whose lineage disagrees
+/// with the reference disk manifest (fires alongside the
+/// `shutdown-spool-lineage-mismatch` soft-invariant). The spool is PRESERVED on
+/// disk but its acked writes are not served — the 2026-07-21 61a03b7e incident
+/// discarded such a spool because a wrong-kind reference (the MEMORY chain
+/// head) made a legitimate spool look foreign. Should stay at zero; non-zero
+/// means either a wrong-kind/wrong-lineage reference reached the attach path
+/// (a bug) or acked guest writes are sitting unserved (an operator must
+/// reconcile).
+pub const SPOOL_LINEAGE_MISMATCH_TOTAL: &str = "engram_nbd_spool_lineage_mismatch_total";
