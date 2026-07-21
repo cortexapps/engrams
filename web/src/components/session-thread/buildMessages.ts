@@ -13,6 +13,9 @@ import type {
 // composer on "working…" forever (a dead Stop button). `idle` covers the
 // snapshot/idle-evict case; the rest are terminal.
 export const INACTIVE_STATUSES: ReadonlySet<SessionState> = new Set<SessionState>([
+  // Parked = VM paused in place after the harness went idle (ADR 0101):
+  // no turn can be in flight inside a frozen guest.
+  "parked",
   "idle",
   "completed",
   "failed",

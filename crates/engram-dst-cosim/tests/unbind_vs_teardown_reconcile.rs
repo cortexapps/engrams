@@ -46,13 +46,21 @@ async fn into_mid_capture_window(sim: &mut Cosim) -> (SessionId, SandboxId) {
     sim.advance(3600).await;
     sim.evict_to_idle(session).await;
 
-    // Precondition of the window: Idle, unbound, capture still in flight.
+    // Precondition of the window, post-ADR-0101-C: the capture landed
+    // and the finalize is in flight, but the session is HONESTLY
+    // Evicting and still bound — the Idle-before-durable lie (#570's
+    // coordinator half) is structurally gone; only the host-side
+    // mid-capture reap half remains to guard against.
     assert_eq!(
         sim.session_state(session).await,
-        Some(engram_core::types::session::SessionState::Idle),
-        "D5 reached Idle"
+        Some(engram_core::types::session::SessionState::Evicting),
+        "capture landed; no Idle before the recoverable row (ADR 0101 C)"
     );
-    assert_eq!(sim.sandbox_of(session).await, None, "D5 cleared sandbox_id");
+    assert_eq!(
+        sim.sandbox_of(session).await,
+        Some(sandbox),
+        "the binding survives until the settle"
+    );
     assert!(
         sim.capture_in_flight(sandbox).await,
         "the eviction finalize is still in flight (capture lock held) — the #570 window"
@@ -65,47 +73,45 @@ async fn into_mid_capture_window(sim: &mut Cosim) -> (SessionId, SandboxId) {
     (session, sandbox)
 }
 
-/// RED: the pre-fix reconcile (never consults `capture_in_flight`) reaps the
-/// mid-capture VM, cancelling the finalize — no durable snapshot lands and
-/// the oracle fires.
+/// The historic RED twin, re-pinned for ADR 0101 C: the pre-#570-fix
+/// reconcile (never consults `capture_in_flight`) used to reap the
+/// mid-capture VM BECAUSE the D5 unbind had already cleared the binding —
+/// the ownership check answered "orphan". With the floor flip the binding
+/// SURVIVES until the settle, so even the signal-suppressed reconcile sees
+/// an owned VM and never strikes it: the #570 window is closed
+/// structurally, not just by the capture-signal patch. (Suppress the
+/// signal, run the pressure, and the finalize still completes durably.)
 #[tokio::test(start_paused = true)]
-async fn buggy_reconcile_reaps_mid_capture_and_loses_the_snapshot() {
+async fn suppressed_signal_reconcile_cannot_reap_a_still_bound_capture() {
     let mut sim = Cosim::new(0x570_0001).await;
     let (session, sandbox) = into_mid_capture_window(&mut sim).await;
 
-    // Teardown-reconcile with the signal SUPPRESSED (pre-fix behavior). Two
-    // ticks cross ORPHAN_STRIKES and reap the still-capturing VM.
+    // Teardown-reconcile with the capture signal SUPPRESSED (the pre-fix
+    // behavior that reproduced #570). Two ticks used to cross
+    // ORPHAN_STRIKES; now the surviving binding answers "owned" both times.
     sim.reconcile_tick(false).await;
     sim.reconcile_tick(false).await;
     assert!(
-        sim.reconcile_destroys().contains(&sandbox),
-        "the pre-fix reconcile destroyed the mid-capture sandbox (issue #570)"
+        !sim.reconcile_destroys().contains(&sandbox),
+        "ADR 0101 C: the surviving binding keeps the mid-capture VM owned — \
+         no orphan strikes even with the capture signal suppressed"
     );
     assert!(
-        !sim.capture_in_flight(sandbox).await,
-        "the destroy cancelled the in-flight finalize"
+        sim.capture_in_flight(sandbox).await,
+        "the finalize is untouched"
     );
 
-    // The host-owned finalize can no longer complete (its inputs were
-    // dropped). No snapshot row lands.
+    // The finalize completes; the durable row lands at the eviction cursor
+    // and the settle flips Idle.
     for _ in 0..=FINALIZE_MAX_ATTEMPTS {
         sim.finalize_pending().await;
     }
-
-    // The oracle FIRES: the newest recoverable snapshot is the stale
-    // cursor-3 checkpoint, below the cursor-5 eviction.
-    let verdict = sim.assert_idle_snapshot_durable(session);
-    assert!(
-        verdict.is_err(),
-        "issue #570 must reproduce: expected a durability violation, but the oracle passed \
-         (newest recoverable = {:?}, evicted at {:?})",
-        sim.newest_recoverable_cursor(session),
-        sim.evict_cursor(session),
-    );
+    sim.assert_idle_snapshot_durable(session)
+        .unwrap_or_else(|e| panic!("the closed window must keep the snapshot durable: {e}"));
     assert_eq!(
         sim.newest_recoverable_cursor(session),
-        Some(3),
-        "resume would rewind to the stale periodic checkpoint at cursor 3"
+        Some(5),
+        "no rewind: the eviction snapshot at cursor 5 is durable"
     );
 }
 

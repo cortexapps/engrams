@@ -236,9 +236,22 @@ impl Cosim {
             &key,
         )
         .await;
-        // Settle a backed-off capture retry.
+        // Settle a backed-off capture retry. ADR 0101 C: the op leaves
+        // the session honestly `Evicting` (capture landed, row not yet
+        // recorded) — Idle arrives only when `finalize_pending` completes
+        // the host-owned finalize and the settle flips it. Tests that
+        // want Idle drive `finalize_pending` explicitly, exactly like
+        // prod's upload + heartbeat cadence.
         for _ in 0..6 {
-            if self.session_state(session_id).await == Some(SessionState::Idle) {
+            let op_live = self
+                .world
+                .meta
+                .op_running_for(session_id)
+                .await
+                .ok()
+                .flatten()
+                .is_some();
+            if !op_live {
                 break;
             }
             self.advance(1).await;
@@ -525,8 +538,20 @@ impl Cosim {
                     self.world.clock_now(),
                 );
                 let _ = self.world.meta.record_snapshot(snap).await;
+                // ADR 0101 C: the reconcile settle — the recoverable row
+                // just landed, so the guarded `Evicting → Idle` + detach
+                // flips now (the REAL store semantics; prod's heartbeat
+                // HTTP glue is e2e territory). Before the floor flip the
+                // D5 verb lied the session Idle at capture time.
+                let settled = self
+                    .world
+                    .meta
+                    .settle_evicted_session_idle(session_id, sandbox, snapshot_id)
+                    .await
+                    .unwrap_or(false);
                 self.log(format!(
-                    "finalize completed {session_id} snapshot={snapshot_id} cursor={cursor}"
+                    "finalize completed {session_id} snapshot={snapshot_id} cursor={cursor} \
+                     settled_idle={settled}"
                 ));
             }
         }

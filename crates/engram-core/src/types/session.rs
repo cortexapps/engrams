@@ -52,9 +52,22 @@ pub enum SessionState {
     /// needed), and a healed probe flips back to `Active`. Pre-ADR, a
     /// dead guest read `active` indefinitely with every exec bouncing.
     Unreachable,
+    /// ADR 0101 C: the VM is PAUSED IN PLACE on its host — sandbox and
+    /// host stay bound, guest RAM stays resident (rung-2 park, ADR
+    /// 0074). Un-park is ~1s (resume the paused VM, no restore). This
+    /// used to be spelled `Evicting && park_rung == 2`, which conflated
+    /// "intentionally retained, cheap to wake" with "a descent is
+    /// underway" — sessions read `evicting` for up to the 8h hard TTL.
+    /// Descent (pressure / hard TTL / operator) is an explicit
+    /// `Parked → Evicting` nomination keyed by `parked_at`.
+    Parked,
     /// Sandbox has been evicted to a snapshot in BlobStorage. Resumes
     /// via `Idle → Created → Active` (the resume path re-runs the
-    /// create-shape transitions on the new sandbox).
+    /// create-shape transitions on the new sandbox). ADR 0101 C: `Idle`
+    /// is granted only once the snapshot's closure is verified durable
+    /// (the recoverable PG snapshot row, written by the heartbeat
+    /// reconcile after HEAD-checking the manifests) — never on the
+    /// host-local capture alone.
     Idle,
     /// Heartbeat-loss against the bound host. Non-terminal: the
     /// dead-host detector's second stage moves it onward —
@@ -127,6 +140,7 @@ impl SessionState {
                 | Self::Created
                 | Self::Active
                 | Self::Unreachable
+                | Self::Parked
                 | Self::Evacuating
                 | Self::Evicting
         )
@@ -141,6 +155,7 @@ impl SessionState {
             "created",
             "active",
             "unreachable",
+            "parked",
             "evacuating",
             "evicting",
         ]
@@ -153,6 +168,7 @@ impl SessionState {
             Self::Created => "created",
             Self::Active => "active",
             Self::Unreachable => "unreachable",
+            Self::Parked => "parked",
             Self::Idle => "idle",
             Self::HostLost => "host_lost",
             Self::Evacuating => "evacuating",
@@ -207,9 +223,20 @@ impl SessionState {
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
     ///              | Completed (user delete mid-evac)
+    /// Parked      -> Active (un-park: user returned; resume the paused
+    ///                 VM in place, ~1s — ADR 0101 C)
+    ///              | Evicting (descent nomination: pressure / hard TTL
+    ///                / operator, keyed by parked_at)
+    ///              | HostLost (host died while parked — RAM-resident
+    ///                state is gone; never Idle)
+    ///              | Dead | Completed
     /// Evicting    -> Active (ADR 0074 rung-1 cancel: the user came back
     ///                 before capture began; lease-guarded)
-    /// Evicting    -> Idle (eviction pipeline success)
+    /// Evicting    -> Parked (rung-2 park: VM paused in place instead of
+    ///                 captured — ADR 0101 C makes this a real state
+    ///                 instead of a park_rung stamp)
+    ///              | Idle (eviction pipeline success — ADR 0101 C: only
+    ///                once the recoverable PG snapshot row exists)
     ///              | HostLost (scanner exhausted retries; host died
     ///                mid-eviction via the dead-host sweep)
     ///              | Dead (chunks unreferenceable)
@@ -267,7 +294,12 @@ impl SessionState {
             // not begun (lease-guarded CAS; see
             // api::snapshot::try_cancel_nominated_eviction). The ONLY
             // new FSM edge in the 2026-07 overhaul.
-            Evicting => matches!(target, Active | Idle | HostLost | Dead | Completed),
+            Evicting => matches!(target, Active | Parked | Idle | HostLost | Dead | Completed),
+            // ADR 0101 C: a parked VM either wakes in place (Active),
+            // descends (Evicting), or is lost with its host (HostLost —
+            // its RAM-resident state died with the host, so Idle would
+            // lie about recoverability of the un-captured tail).
+            Parked => matches!(target, Active | Evicting | HostLost | Dead | Completed),
             Failed | Completed | Dead => false,
         }
     }
@@ -282,7 +314,7 @@ impl SessionState {
     pub fn terminal_target(&self) -> Option<Self> {
         use SessionState::*;
         let target = match self {
-            Active | Unreachable | Idle | HostLost | Evacuating | Evicting => Completed,
+            Active | Unreachable | Parked | Idle | HostLost | Evacuating | Evicting => Completed,
             // Queued never ran → Failed, alongside the other never-usable
             // early states.
             Pending | Queued | Created => Failed,
@@ -564,12 +596,12 @@ mod tests {
     /// `match` non-exhaustive — a compile error here, not a silent
     /// coverage gap in the walk properties below (the wire-proto
     /// strategy convention, ADR 0099 H4).
-    const fn all_states() -> [SessionState; 12] {
+    const fn all_states() -> [SessionState; 13] {
         use SessionState::*;
         // The match exists only for the exhaustiveness guarantee.
         match Pending {
-            Pending | Queued | Created | Active | Unreachable | Idle | HostLost | Evacuating
-            | Evicting | Failed | Completed | Dead => {}
+            Pending | Queued | Created | Active | Unreachable | Parked | Idle | HostLost
+            | Evacuating | Evicting | Failed | Completed | Dead => {}
         }
         [
             Pending,
@@ -577,6 +609,7 @@ mod tests {
             Created,
             Active,
             Unreachable,
+            Parked,
             Idle,
             HostLost,
             Evacuating,
@@ -706,6 +739,7 @@ mod tests {
             SessionState::Queued,
             SessionState::Created,
             SessionState::Active,
+            SessionState::Parked,
             SessionState::Idle,
             SessionState::HostLost,
             SessionState::Evacuating,
@@ -770,9 +804,17 @@ mod tests {
             (Evicting, HostLost),
             (Evicting, Dead),
             (Evicting, Completed),
+            // ADR 0101 C: the parked lifecycle — rung-2 park is a real
+            // state, not a park_rung stamp over Evicting.
+            (Evicting, Parked),
+            (Parked, Active),
+            (Parked, Evicting),
+            (Parked, HostLost),
+            (Parked, Dead),
+            (Parked, Completed),
         ];
         let all_states = [
-            Pending, Queued, Created, Active, Idle, HostLost, Evacuating, Evicting, Failed,
+            Pending, Queued, Created, Active, Parked, Idle, HostLost, Evacuating, Evicting, Failed,
             Completed, Dead,
         ];
         for &from in &all_states {

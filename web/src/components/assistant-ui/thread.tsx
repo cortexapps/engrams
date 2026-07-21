@@ -273,6 +273,7 @@ const COMPOSER_BANNER: Partial<Record<SessionState, string>> = {
 };
 
 const COMPOSER_HINT: Partial<Record<SessionState, string>> = {
+  parked: "Task is parked — sending wakes it in about a second.",
   idle: "Task is idle — sending will resume it.",
   created: "Task is still starting up — the harness will be ready in a moment.",
 };

@@ -2526,6 +2526,47 @@ impl MetadataStore for SimMetadataStore {
             .collect())
     }
 
+    async fn list_parked_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db
+            .sessions
+            .values()
+            .filter(|r| r.session.status == SessionState::Parked)
+            .map(|r| r.session.clone())
+            .collect())
+    }
+
+    /// ADR 0101 C: mirrors the PG single-statement settle — status CAS
+    /// + sandbox match + recoverable-row EXISTS, all-or-nothing.
+    async fn settle_evicted_session_idle(
+        &self,
+        session_id: SessionId,
+        sandbox_id: engram_core::SandboxId,
+        snapshot_id: engram_core::types::SnapshotId,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let mut db = self.db.lock();
+        // (PG stamps `updated_at`, a column the in-memory `Session`
+        // doesn't carry — nothing to mirror here.)
+        let row_recoverable = db
+            .snapshots
+            .get(&snapshot_id)
+            .is_some_and(|s| s.session_id == Some(session_id) && s.recoverable);
+        if !row_recoverable {
+            return Ok(false);
+        }
+        let Some(r) = db.sessions.get_mut(&session_id) else {
+            return Ok(false);
+        };
+        if r.session.status != SessionState::Evicting || r.session.sandbox_id != Some(sandbox_id) {
+            return Ok(false);
+        }
+        r.session.status = SessionState::Idle;
+        r.session.sandbox_id = None;
+        Ok(true)
+    }
+
     async fn bump_evac_attempts(&self, session_id: SessionId) -> Result<u32, MetaError> {
         self.gate()?;
         let mut db = self.db.lock();

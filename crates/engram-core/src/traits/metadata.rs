@@ -3051,6 +3051,41 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// ADR 0101 C: parked-session sweep — the scanner routes these to
+    /// the park reaper (pressure / hard-TTL descent candidacy). Same
+    /// default posture as [`Self::list_evicting_sessions`]; PG runs
+    /// the partial-indexed `WHERE status = 'parked'` query (0107).
+    async fn list_parked_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0101 C: the durability-floor settle — atomically flip an
+    /// `evicting` session to `idle` and detach its sandbox, GUARDED on
+    /// the recoverable snapshot row already existing. Returns `false`
+    /// (no-op) when the session is no longer `evicting`, its bound
+    /// sandbox is not `sandbox_id` (a successor rebound), or the
+    /// snapshot row is absent / not recoverable — the caller (the
+    /// heartbeat reconcile, right after `record_snapshot` lands the
+    /// eviction-final row) just retries on the next advert. This is
+    /// what makes `idle` mean "closure verified durable + PG row
+    /// present" instead of "the host wrote a local record" — the D5
+    /// Idle-on-capture flip is retired. `host_id` is preserved for
+    /// resume affinity, mirroring the old detach.
+    ///
+    /// No silent default (ADR 0098 D4): a store that can be reached by
+    /// the reconcile must implement the real semantics.
+    async fn settle_evicted_session_idle(
+        &self,
+        _session_id: SessionId,
+        _sandbox_id: SandboxId,
+        _snapshot_id: SnapshotId,
+    ) -> Result<bool, MetaError> {
+        unimplemented!(
+            "settle_evicted_session_idle: PG-semantic method; mocks on the reconcile path must \
+             implement it (ADR 0098 D4)"
+        )
+    }
+
     /// Atomically `evict_attempts = evict_attempts + 1 RETURNING
     /// evict_attempts`. The eviction scanner calls this before each
     /// pipeline attempt; past the budget it falls back to HostLost

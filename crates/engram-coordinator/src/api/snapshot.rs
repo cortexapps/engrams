@@ -673,6 +673,17 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
             enqueue_and_observe_resume(state, id).await?;
             Ok(())
         }
+        // ADR 0101 C: parked-paused is a real state — the VM is alive
+        // and paused in place. Same shape as Evicting's rung ascent: the
+        // one-write cancel un-pauses in ms; a raced descent falls back
+        // to the queued resume.
+        SessionState::Parked => {
+            if try_cancel_nominated_eviction(state, id).await? {
+                return Ok(());
+            }
+            enqueue_and_observe_resume(state, id).await?;
+            Ok(())
+        }
         SessionState::Created => Err(ApiError::Conflict(format!(
             "session is {} — agentd is not yet ready. \
              Wait for the session to reach Active (subscribe to /sessions/:id/events) \

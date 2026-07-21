@@ -29,7 +29,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::host::{HostCapacity, HostHeartbeat, HostMetadata, HostRecord, HostStatus};
-use engram_core::{HostId, SandboxId, SessionId};
+use engram_core::{HostId, SandboxId, SessionId, SessionState};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{EnabledImageRef, HostCapacityReport, ManifestDigest};
 use serde::{Deserialize, Serialize};
@@ -843,6 +843,70 @@ pub async fn heartbeat(
                             },
                         )
                         .await;
+                }
+                // ADR 0101 C: the durability-floor settle. The evict op
+                // no longer flips Idle at capture time — the session is
+                // honestly `evicting` until THIS reconcile records the
+                // recoverable row, then one guarded UPDATE detaches the
+                // sandbox and flips `Evicting → Idle`. Idempotent + CAS:
+                // a re-record, a session that already settled, a rebound
+                // successor sandbox, or a non-recoverable row all make it
+                // a clean `false` no-op. Runs on EVERY eviction-final
+                // advert (not just first landing): if the settle itself
+                // raced/failed once, the host's re-advert retries it.
+                if recoverable
+                    && adv.kind == engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+                {
+                    match state
+                        .services
+                        .meta
+                        .settle_evicted_session_idle(
+                            adv.session_id,
+                            adv.sandbox_id,
+                            adv.snapshot_id,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            let now = state.services.clock.now_utc();
+                            // Best-effort rung clear (the park stamp is
+                            // ascent/ledger metadata; lifecycle already
+                            // settled above).
+                            let _ = state
+                                .services
+                                .meta
+                                .set_session_park_rung(adv.session_id, 0, None)
+                                .await;
+                            let _ = state
+                                .emit(adv.session_id, SessionEvent::Evicted { at: now })
+                                .await;
+                            let _ = state
+                                .emit(
+                                    adv.session_id,
+                                    SessionEvent::StatusChanged {
+                                        from: SessionState::Evicting,
+                                        to: SessionState::Idle,
+                                        at: now,
+                                    },
+                                )
+                                .await;
+                            tracing::info!(
+                                session_id = %adv.session_id,
+                                snapshot_id = %adv.snapshot_id,
+                                "eviction settled Idle: recoverable snapshot row landed \
+                                 (ADR 0101 C durability floor)",
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %adv.session_id,
+                                snapshot_id = %adv.snapshot_id,
+                                error = %e,
+                                "eviction settle failed; the host's re-advert retries it",
+                            );
+                        }
+                    }
                 }
             }
             Err(e) => {

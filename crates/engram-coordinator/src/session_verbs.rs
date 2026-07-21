@@ -323,6 +323,18 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
                 Err(e) => OpOutcome::Retry(format!("rung ascent: {e}")),
             }
         }
+        // ADR 0101 C: parked is a real state now — the VM is alive and
+        // paused in place; the same ascent machinery un-pauses it (~1s)
+        // and flips `Parked → Active`.
+        SessionState::Parked => {
+            match crate::api::snapshot::ascend_evicting_to_active(state, id, ctx.fence()).await {
+                Ok(true) => OpOutcome::Done,
+                Ok(false) => OpOutcome::Retry(
+                    "session is parked but the un-park did not land; retrying".into(),
+                ),
+                Err(e) => OpOutcome::Retry(format!("un-park ascent: {e}")),
+            }
+        }
         // ADR 0079 note: terminal-for-this-op rather than Retry — the
         // evac scanner relocates Evacuating sessions via its own inline
         // claim, and a retrying resume op would sit AHEAD of that claim

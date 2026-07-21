@@ -32,27 +32,40 @@ async fn create_serve_evict_resume_roundtrip() {
     sim.periodic_checkpoint(session).await;
     sim.guest_work(session, 2).await;
 
-    // Go idle and evict via the real D5 fast path.
+    // Go idle and evict via the real D5 fast path. ADR 0101 C: the op
+    // leaves the session honestly Evicting — still bound — until the
+    // recoverable row lands.
     sim.advance(3600).await;
     sim.evict_to_idle(session).await;
     assert_eq!(
         sim.session_state(session).await,
-        Some(SessionState::Idle),
-        "eviction reaches Idle; trace={:?}",
+        Some(SessionState::Evicting),
+        "capture landed; no Idle before the recoverable row (ADR 0101 C); trace={:?}",
         sim.trace
     );
-    // D5 cleared the coordinator's binding.
     assert_eq!(
         sim.sandbox_of(session).await,
-        None,
-        "D5 clears sessions.sandbox_id"
+        Some(sandbox),
+        "the binding survives until the settle detaches it"
     );
 
     // The host-owned finalize completes → the durable recoverable snapshot
-    // lands (prod: via the heartbeat reconcile).
+    // lands and the settle flips Evicting → Idle + detaches (prod: via the
+    // heartbeat reconcile).
     for _ in 0..=FINALIZE_MAX_ATTEMPTS {
         sim.finalize_pending().await;
     }
+    assert_eq!(
+        sim.session_state(session).await,
+        Some(SessionState::Idle),
+        "the settle flips Idle once the row is durable; trace={:?}",
+        sim.trace
+    );
+    assert_eq!(
+        sim.sandbox_of(session).await,
+        None,
+        "the settle detaches sessions.sandbox_id"
+    );
     sim.assert_idle_snapshot_durable(session)
         .unwrap_or_else(|e| panic!("{e}\ntrace={:?}", sim.trace));
 
