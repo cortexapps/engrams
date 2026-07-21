@@ -216,28 +216,16 @@ where
     }
 }
 
-/// Poll until `path` (a Firecracker API socket) is ACCEPTING connections, or
-/// `timeout` elapses. Promoted from `boot.rs` so the raw-`spawn_firecracker`
-/// tests can drop their fixed post-spawn sleeps. 50ms ticks.
-///
-/// A real `connect()`, not `path.exists()`: the socket file appears at
-/// `bind()`, before `listen()` is accepting, so an existence poll can pass in
-/// the bind→listen window and the first API request then dies with
-/// ECONNREFUSED — exactly the `put_machine_config: Connection refused` flake
-/// that hit `aux_ro_drive_content_swap_under_snapshot_is_the_incident` on the
-/// suite-startup thundering herd (CI run 28974774202). Connect-polling also
-/// keeps retrying through an FC that bound and crashed, converting a
-/// first-request panic into this helper's own bounded timeout with a
-/// caller-visible `assert!` message.
 /// Sparse-aware clone of the cached test rootfs into a test-private path.
 ///
 /// The drop-in replacement for `tokio::fs::copy(&env.rootfs, dest)`: the
 /// fetch script (`fetch-fc-test-artifacts.sh`) digs holes in the cached
 /// ubuntu image's zeroed free space once, and `cp --sparse=always` then
 /// skips those holes via SEEK_DATA/SEEK_HOLE on both the read and write
-/// side — a fraction of the full-size copy every FC test used to pay
-/// (~20 call sites × a ~GB image, the dominant per-test fixed cost in the
-/// KVM lane). Guest-visible content is identical: holes read as zeros.
+/// side. The image is ~82% full (~53 MB of holes in 300 MB), so this
+/// trims — not eliminates — the copy the ~20 cloning call sites each
+/// pay, and spares the same I/O again on the `-j4` batch's shared disk.
+/// Guest-visible content is identical: holes read back as zeros.
 pub async fn clone_rootfs(src: &Path, dest: &Path) -> std::io::Result<()> {
     let status = tokio::process::Command::new("cp")
         .arg("--sparse=always")
@@ -256,6 +244,19 @@ pub async fn clone_rootfs(src: &Path, dest: &Path) -> std::io::Result<()> {
     }
 }
 
+/// Poll until `path` (a Firecracker API socket) is ACCEPTING connections, or
+/// `timeout` elapses. Promoted from `boot.rs` so the raw-`spawn_firecracker`
+/// tests can drop their fixed post-spawn sleeps. 50ms ticks.
+///
+/// A real `connect()`, not `path.exists()`: the socket file appears at
+/// `bind()`, before `listen()` is accepting, so an existence poll can pass in
+/// the bind→listen window and the first API request then dies with
+/// ECONNREFUSED — exactly the `put_machine_config: Connection refused` flake
+/// that hit `aux_ro_drive_content_swap_under_snapshot_is_the_incident` on the
+/// suite-startup thundering herd (CI run 28974774202). Connect-polling also
+/// keeps retrying through an FC that bound and crashed, converting a
+/// first-request panic into this helper's own bounded timeout with a
+/// caller-visible `assert!` message.
 pub async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     poll_until(timeout, Duration::from_millis(50), || {
         std::os::unix::net::UnixStream::connect(path).is_ok()
