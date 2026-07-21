@@ -1191,12 +1191,14 @@ pub(crate) async fn resolve_capture_env(
         let value = match &entry.value {
             CaptureEnvValue::Literal { value } => value.clone(),
             CaptureEnvValue::SecretRef { secret_ref } => {
-                let schema = engram_core::types::image::SecretSchema {
-                    r#ref: Some(secret_ref.clone()),
-                    required: true,
-                    ..Default::default()
-                };
-                match state.services.secrets.get(&ctx, secret_ref, &schema).await {
+                match super::sessions::resolve_explicit_secret_ref(
+                    state.services.secrets.as_ref(),
+                    &ctx,
+                    secret_ref,
+                    true,
+                )
+                .await
+                {
                     Ok(Some(v)) => v,
                     Ok(None) => {
                         return Err(ApiError::BadRequest(format!(
