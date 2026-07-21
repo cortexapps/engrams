@@ -68,6 +68,15 @@ pub struct DeviceSlot {
     /// AGAINST the kernel-derived inventory. `false` models record loss (#769 gap
     /// A) — a survivor invisible to the records, QUARANTINED not skipped.
     pub record_present: bool,
+    /// The allocator's quarantine-park (PR #828): THIS generation's rehydrate
+    /// failed for the device and `slot.quarantine()` registered it in the
+    /// allocator's parked set — a device-keyed record source that survives the
+    /// FC-derived record vanishing (the 2026-07-21 false
+    /// `rehydrate-unknown-device` alarm). Distinct from the rung-2 `parked`
+    /// flag (an FC-paused VM whose device is still served). Per-PROCESS state:
+    /// cleared by [`DevicePlane::roll`] — the successor's fresh allocator has
+    /// no memory of the predecessor's parks.
+    pub quarantine_parked: bool,
 }
 
 impl DeviceSlot {
@@ -82,6 +91,7 @@ impl DeviceSlot {
             parked: false,
             guest_holds_device: true,
             record_present: true,
+            quarantine_parked: false,
         }
     }
 }
@@ -192,6 +202,11 @@ impl DevicePlane {
         for slot in self.slots.values_mut() {
             slot.lease = None;
             slot.served_by = None;
+            // The allocator's parked set is in-process memory; the successor's
+            // fresh allocator has no record of the predecessor's quarantine
+            // parks (a park re-arms only if the successor's OWN rehydrate
+            // fails again).
+            slot.quarantine_parked = false;
         }
         self.spare_leases.clear();
         self.nbd_pool = NbdSlotAllocator::with_capacity(self.nbd_capacity, 0);
@@ -246,6 +261,18 @@ impl DevicePlane {
         }
     }
 
+    /// PR #828: model THIS generation's rehydrate failing for `id`'s device and
+    /// parking it (`slot.quarantine()` → the allocator's parked set). The
+    /// parked device is a TRACKED record for the classification barrier even
+    /// if every FC-derived record source subsequently vanishes (the 2026-07-21
+    /// false `rehydrate-unknown-device` alarm: a concurrent sandbox destroy
+    /// vacated `rootfs_device` between the park and the barrier).
+    pub fn quarantine_park(&mut self, id: SandboxId) {
+        if let Some(slot) = self.slots.get_mut(&id) {
+            slot.quarantine_parked = true;
+        }
+    }
+
     /// The operator/runbook reconcile: `id`'s record is restored so the next
     /// register re-serves the reconnectable device with zero loss.
     pub fn regain_record(&mut self, id: SandboxId) {
@@ -297,11 +324,13 @@ impl DevicePlane {
     /// the world state (owner liveness × the holder proof-of-death × whether a
     /// tracked record accounts for it) and partition into the four
     /// [`SlotClass`](engram_host_core::SlotClass)es. The device handle is the
-    /// [`SandboxId`]. `has_record` mirrors prod: a device is recorded only while
-    /// a live guest still holds it AND a record is present (`record_present &&
+    /// [`SandboxId`]. `has_record` mirrors prod: a device is recorded while a
+    /// live guest still holds it AND a record is present (`record_present &&
     /// guest_holds_device`) — a genuinely-gone guest's FC is not resident, so
     /// prod's `rootfs_device` reconcile can't map it and it is reap-eligible on
-    /// proof of death.
+    /// proof of death — OR while THIS generation quarantine-parked it (PR #828:
+    /// the allocator's parked set is device-keyed, so it keeps a
+    /// rehydrate-failed survivor tracked even after its FC entry vacates).
     pub fn classify_startup(&self) -> StartupClassification<SandboxId> {
         let gen = self.generation;
         let slots = self
@@ -318,7 +347,8 @@ impl DevicePlane {
                 } else {
                     DeviceHolder::NoHolder
                 };
-                let has_record = slot.record_present && slot.guest_holds_device;
+                let has_record =
+                    (slot.record_present && slot.guest_holds_device) || slot.quarantine_parked;
                 StartupSlot {
                     device: *id,
                     liveness,

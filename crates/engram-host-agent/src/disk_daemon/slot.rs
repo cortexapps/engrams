@@ -286,7 +286,17 @@ impl NbdSlot {
     /// reserved bit stays set permanently (until process restart). The
     /// rehydrate failure path uses this to park a survivor's live device
     /// out of circulation. See the `quarantined` field doc.
+    ///
+    /// The device is also registered in the allocator's parked set, so the
+    /// startup classification barrier counts it as a TRACKED record even if
+    /// every sandbox-derived record source has concurrently vanished (the
+    /// 2026-07-21 false `rehydrate-unknown-device` alarm).
     pub fn quarantine(mut self) {
+        self.allocator
+            .parked
+            .lock()
+            .expect("parked set lock poisoned")
+            .insert(self.path.clone());
         self.quarantined = true;
         // `self` drops here; the `quarantined` flag makes Drop a no-op,
         // leaving the reserved bit set so the slot is never re-handed-out.
@@ -428,6 +438,18 @@ pub struct NbdSlotAllocator {
     /// of the mutex for a lock-free `capacity()`.
     capacity: usize,
     free_check: FreeCheck,
+    /// Devices parked by [`NbdSlot::quarantine`] — the allocator's record
+    /// of `Parked` slots, which the reserved bitset alone cannot express
+    /// (a parked slot's bits are indistinguishable from a claimed one's).
+    /// The startup classification barrier reads this so a rehydrate-failed
+    /// survivor's device stays a TRACKED record: 2026-07-21, a park raced a
+    /// concurrent sandbox destroy, the FC-derived record set missed the
+    /// device, and the `rehydrate-unknown-device` invariant cried wolf over
+    /// a device this very process had just parked on purpose. A
+    /// `std::sync::Mutex` (not the pool's async one): touched only by the
+    /// sync `quarantine()` consume and the startup-time snapshot, never
+    /// held across an await.
+    parked: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl std::fmt::Debug for NbdSlotAllocator {
@@ -488,6 +510,7 @@ impl NbdSlotAllocator {
             warm_target,
             capacity,
             free_check,
+            parked: std::sync::Mutex::new(std::collections::HashSet::new()),
         });
         // The populator holds only a Weak ref so the allocator can drop
         // naturally (dropping the last Arc stops the populator on its
@@ -658,6 +681,20 @@ impl NbdSlotAllocator {
     /// Count of pre-validated slots currently sitting warm. Telemetry.
     pub async fn warm_count(&self) -> usize {
         self.warm.lock().await.len()
+    }
+
+    /// Devices parked by [`NbdSlot::quarantine`] this process lifetime.
+    /// The startup classification barrier folds these into its
+    /// tracked-record set: a parked survivor is a device this process
+    /// KNOWS about (it parked it on purpose), never an "unknown device"
+    /// for the `rehydrate-unknown-device` invariant.
+    pub fn parked_devices(&self) -> Vec<PathBuf> {
+        self.parked
+            .lock()
+            .expect("parked set lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -1045,6 +1082,15 @@ mod tests {
         assert!(
             pool.try_claim(Path::new("/dev/nbd0")).await.is_none(),
             "quarantined device must not be re-claimable"
+        );
+        // …and it must be a TRACKED record for the startup classification
+        // barrier (the 2026-07-21 false `rehydrate-unknown-device` alarm:
+        // a parked device whose sandbox-derived records vanished was
+        // reported as an unknown survivor needing an operator).
+        assert_eq!(
+            pool.parked_devices(),
+            vec![PathBuf::from("/dev/nbd0")],
+            "a quarantined device must appear in the allocator's parked set"
         );
     }
 
