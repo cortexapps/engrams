@@ -497,8 +497,16 @@ async fn keep_alive_second_request_cannot_bypass_the_gate() {
 
     let outcome = proxy_task.await.unwrap();
     if let Err(e) = &outcome {
+        // The client deliberately writes request #2 into the torn-down tunnel;
+        // which teardown error that surfaces is a platform/timing coin flip
+        // (macOS: close_notify/UnexpectedEof, Linux: EPIPE/ECONNRESET). All of
+        // them mean the same thing this test asserts: the connection died.
         let msg = format!("{e}");
-        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+        if !msg.contains("close_notify")
+            && !msg.contains("UnexpectedEof")
+            && !msg.contains("Broken pipe")
+            && !msg.contains("Connection reset")
+        {
             panic!("proxy returned unexpected error: {e}");
         }
     }
