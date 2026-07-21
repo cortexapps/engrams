@@ -66,7 +66,7 @@ export function SessionHarnessControls({
     "h-7 w-auto gap-1 rounded-md border-0 bg-accent/60 px-2 text-xs font-medium text-muted-foreground hover:bg-accent focus:ring-1";
 
   return (
-    <div className="flex items-center gap-1.5" data-testid="session-harness-controls">
+    <div className="flex flex-wrap items-center gap-1.5" data-testid="session-harness-controls">
       {showHarness && (
         <Select
           value={value.harness ?? INHERIT}
