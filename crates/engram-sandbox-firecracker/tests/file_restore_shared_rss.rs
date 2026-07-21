@@ -57,6 +57,14 @@ use common::fc_preflight;
 const SIBLINGS: usize = 3;
 const BLOB_MIB: u64 = 64;
 
+/// The fill-complete marker lands on the serial console (`console=ttyS0` →
+/// the jail's `firecracker.log`), so the host can poll for it instead of
+/// sleeping a fixed window before snapshotting. It fires after the blob is
+/// fully written — the pages the snapshot must capture are resident — and a
+/// failed fill simply never emits it, surfacing as the poll's bounded
+/// timeout + the RSS-floor assertion (the honest signal), same as before.
+const FILL_DONE_MARKER: &str = "SPIKE-FILL-DONE";
+
 /// Init baked into the rootfs: build the blob in tmpfs (guest RAM),
 /// then re-read it forever so restored siblings keep faulting the same
 /// guest-physical pages back in from memory.bin.
@@ -84,7 +92,35 @@ mount -t proc proc /proc 2>/dev/null || true\n\
 mount -t devtmpfs dev /dev 2>/dev/null || true\n\
 mount -t tmpfs -o size=128m tmpfs /tmp 2>/dev/null || true\n\
 head -c 67108864 /dev/urandom > /tmp/blob 2>/dev/null || true\n\
+echo SPIKE-FILL-DONE\n\
 while true; do md5sum /tmp/blob > /dev/null 2>&1 || true; sleep 1; done\n";
+
+/// Wait for the source guest's fill to complete (the console marker) —
+/// the readiness poll that replaced a fixed 8 s post-create sleep.
+async fn wait_for_fill(work: &Path, id: &impl std::fmt::Display) {
+    let log = work.join(id.to_string()).join("firecracker.log");
+    let contents =
+        common::wait_for_log_contains(&log, &[FILL_DONE_MARKER], Duration::from_secs(30)).await;
+    if !contents.contains(FILL_DONE_MARKER) {
+        dump_fc_logs(work);
+        panic!(
+            "guest never reported {FILL_DONE_MARKER} within 30s — boot or blob fill failed \
+             (see the dumped firecracker.log above for the guest console)"
+        );
+    }
+}
+
+/// Poll until every sibling has faulted its working set back in
+/// (rss > blob) — the settle poll that replaced a fixed 5 s sleep. On
+/// timeout we just fall through: the per-sibling RSS-floor assertions
+/// that follow produce the diagnostic failure, exactly as before.
+async fn settle_siblings(work: &Path, ids: &[impl std::fmt::Display]) {
+    let _ = common::poll_until(Duration::from_secs(30), Duration::from_millis(250), || {
+        ids.iter()
+            .all(|id| smaps_rollup(fc_pid_for(work, &id.to_string())).rss_kb > BLOB_MIB * 1024)
+    })
+    .await;
+}
 
 #[tokio::test]
 #[ignore = "requires Linux + KVM + firecracker + Docker; bakes a rootfs and boots microVMs"]
@@ -130,8 +166,7 @@ async fn file_backend_siblings_share_clean_pages() {
         aux_ro_drives: Vec::new(),
     };
     let source = backend.create(spec).await.expect("create");
-    // Boot + 64 MiB urandom fill + at least one read pass.
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    wait_for_fill(work.path(), &source).await;
     // If the guest didn't survive to be snapshotted, the FC API socket
     // is gone (panic=1 reboot=k → KVM reset → FC exits) and we'd get a
     // bare ECONNREFUSED. Surface the guest's own panic reason from
@@ -179,9 +214,9 @@ async fn file_backend_siblings_share_clean_pages() {
         vms.push(id);
     }
 
-    // Let each sibling's read loop sweep the blob a few times so the
-    // common working set is faulted in everywhere.
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    // Wait until every sibling has faulted the common working set back
+    // in (each read loop must sweep the blob at least once).
+    settle_siblings(work.path(), &vms).await;
 
     // ---- 4. Measure ----
     let mut total_rss = 0u64;
@@ -288,7 +323,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
         aux_ro_drives: Vec::new(),
     };
     let source = backend.create(spec).await.expect("create");
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    wait_for_fill(work.path(), &source).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
         Err(e) => {
@@ -355,7 +390,7 @@ async fn file_backend_base_create_shares_residency_memfile() {
         latencies_ms.push(ms);
         vms.push(id);
     }
-    tokio::time::sleep(Duration::from_secs(5)).await;
+    settle_siblings(work.path(), &vms).await;
 
     // ---- Measure density + latency ----
     let mut total_rss = 0u64;
@@ -482,7 +517,7 @@ async fn substrate_base_create_density_and_latency_parity() {
         aux_ro_drives: Vec::new(),
     };
     let source = backend.create(spec).await.expect("create");
-    tokio::time::sleep(Duration::from_secs(8)).await;
+    wait_for_fill(work.path(), &source).await;
     let metadata = match backend.snapshot(source).await {
         Ok(m) => m,
         Err(e) => {
@@ -576,8 +611,8 @@ async fn substrate_base_create_density_and_latency_parity() {
         // across the *aggregate* working set, so the post-loop guard below is on
         // Σrss (tolerates one straggler) rather than per-sibling. A real
         // fleet-wide "workload never ran" still trips it; see there.
-        for round in 0..12 {
-            tokio::time::sleep(Duration::from_secs(5)).await;
+        for round in 0..60 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
             let rss: Vec<u64> = vms
                 .iter()
                 .map(|id| smaps_rollup(fc_pid_for(work_path, &id.to_string())).rss_kb)
