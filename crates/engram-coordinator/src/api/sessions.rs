@@ -114,13 +114,11 @@ pub(crate) async fn resolve_policy_secrets(
     let Some(policy) = policy else {
         return (env, entries, transient_failures);
     };
-    let schema = engram_core::types::image::SecretSchema::default();
-    let resolved = futures::future::join_all(policy.secrets.iter().map(|s| {
-        let schema = &schema;
-        async move {
-            let result = state.services.secrets.get(ctx, &s.secret_ref, schema).await;
-            (s, result)
-        }
+    let resolved = futures::future::join_all(policy.secrets.iter().map(|s| async move {
+        let result =
+            resolve_explicit_secret_ref(state.services.secrets.as_ref(), ctx, &s.secret_ref, false)
+                .await;
+        (s, result)
     }))
     .await;
     for (s, result) in resolved {
@@ -141,6 +139,23 @@ pub(crate) async fn resolve_policy_secrets(
         install_policy_secret(&mut env, &mut entries, s, value, session);
     }
     (env, entries, transient_failures)
+}
+
+/// Resolve a persisted policy/capture ref through both supported lookup shapes:
+/// the ref remains the logical name for the org-secret backend, and is also
+/// carried in `SecretSchema.ref` for deployment backends such as GCP SM.
+pub(crate) async fn resolve_explicit_secret_ref(
+    secrets: &dyn engram_core::traits::SecretStore,
+    ctx: &SecretContext<'_>,
+    secret_ref: &str,
+    required: bool,
+) -> Result<Option<String>, engram_core::SecretError> {
+    let schema = engram_core::types::image::SecretSchema {
+        r#ref: Some(secret_ref.to_string()),
+        required,
+        ..Default::default()
+    };
+    secrets.get(ctx, secret_ref, &schema).await
 }
 
 /// Pure: install one resolved secret value into the env (`literal`) or as a
@@ -2139,6 +2154,40 @@ pub(crate) async fn resolve_harness(
 mod tests {
     use super::*;
     use engram_core::SandboxId;
+
+    struct ExplicitRefStore;
+
+    #[async_trait::async_trait]
+    impl engram_core::traits::SecretStore for ExplicitRefStore {
+        async fn get(
+            &self,
+            _ctx: &SecretContext<'_>,
+            name: &str,
+            schema: &engram_core::types::SecretSchema,
+        ) -> Result<Option<String>, engram_core::SecretError> {
+            assert_eq!(name, "gcp-sm://projects/p/secrets/cache/versions/latest");
+            assert_eq!(schema.r#ref.as_deref(), Some(name));
+            assert!(!schema.required);
+            Ok(Some("resolved-value".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_secret_resolution_passes_explicit_ref_to_backend() {
+        let ctx = SecretContext {
+            repo: "cortexapps/engrams",
+            image_tag: "dogfood",
+        };
+        let value = resolve_explicit_secret_ref(
+            &ExplicitRefStore,
+            &ctx,
+            "gcp-sm://projects/p/secrets/cache/versions/latest",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value.as_deref(), Some("resolved-value"));
+    }
 
     /// ADR 0055: memory is purely the image's `suggested_memory_mib` (or the
     /// default) — the base snapshot is sized once per image and skills bind via
