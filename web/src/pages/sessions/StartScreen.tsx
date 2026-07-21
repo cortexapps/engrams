@@ -305,7 +305,7 @@ export function StartScreen() {
           {/* The composer is the one focal object: a single raised surface whose
               focus ring belongs to the whole card, so the borderless textarea and
               the control row read as one input. */}
-          <div className="rounded-xl border bg-card shadow-sm transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/40">
+          <div className="@container/composer rounded-xl border bg-card shadow-sm transition-[color,box-shadow] focus-within:border-ring focus-within:ring-[3px] focus-within:ring-ring/40">
             <Textarea
               ref={composerRef}
               value={prompt}
@@ -316,54 +316,63 @@ export function StartScreen() {
               placeholder="Fix the flaky billing-gateway integration test and open a PR."
               className="max-h-[calc(10lh+1.125rem)] min-h-[5.25rem] resize-none overflow-y-auto border-0 bg-transparent px-4 pt-3.5 pb-1 text-[0.95rem] leading-relaxed shadow-none focus-visible:ring-0 md:text-[0.95rem] dark:bg-transparent"
             />
-            <div className="flex items-center gap-2 px-2.5 pt-1 pb-2.5">
-              <ProfileSwitcher
-                profiles={profiles}
-                selected={selected}
-                pending={profilesPending}
-                open={switcherOpen}
-                onOpenChange={setSwitcherOpen}
-                onSelect={(id) => {
-                  setSelectedId(id);
-                  setSwitcherOpen(false);
-                }}
-                isAdmin={isAdmin}
-                onManage={() => {
-                  setSwitcherOpen(false);
-                  navigate({ to: "/settings/profiles" });
-                }}
-              />
-              {/* The credential heads-up, kept terse: a lock beside the profile
-                  whose meaning lives in the tooltip, not a sentence in the flow.
-                  The harness's own credential always rides along; this
-                  toggle additionally carries your OTHER saved tokens. */}
-              {selected?.includeUserTokens && (
-                <TooltipProvider delayDuration={100}>
-                  <Tooltip>
-                    <TooltipTrigger asChild>
-                      <button
-                        type="button"
-                        aria-label="This profile also carries your other saved tokens into the sandbox"
-                        className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-instrument-caution transition-colors hover:bg-accent focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
-                      >
-                        <Lock className="size-3.5" />
-                      </button>
-                    </TooltipTrigger>
-                    <TooltipContent>
-                      This profile also carries your other saved tokens into the sandbox.
-                    </TooltipContent>
-                  </Tooltip>
-                </TooltipProvider>
-              )}
-              <SessionHarnessControls
-                harnesses={harnesses}
-                profileHarness={selected?.harness}
-                value={harnessOverride}
-                onChange={setHarnessOverride}
-                disabled={createTaskMutation.isPending}
-              />
+            {/* When the composer is at least @md wide (28rem), controls sit on
+                the left and Launch is pinned right, bottom-aligned so it's level
+                with the last control row. Narrower than that, the row becomes a
+                column: controls wrap on top and Launch stacks beneath them
+                (self-end keeps it right-aligned) instead of crowding the last
+                chip. Keyed off the composer's own width via @container, not the
+                viewport, since the sidebar/task-list steal width independently. */}
+            <div className="flex flex-col gap-2 px-2.5 pt-1 pb-2.5 @md/composer:flex-row @md/composer:items-end">
+              <div className="flex flex-wrap items-center gap-2 @md/composer:min-w-0 @md/composer:flex-1">
+                <ProfileSwitcher
+                  profiles={profiles}
+                  selected={selected}
+                  pending={profilesPending}
+                  open={switcherOpen}
+                  onOpenChange={setSwitcherOpen}
+                  onSelect={(id) => {
+                    setSelectedId(id);
+                    setSwitcherOpen(false);
+                  }}
+                  isAdmin={isAdmin}
+                  onManage={() => {
+                    setSwitcherOpen(false);
+                    navigate({ to: "/settings/profiles" });
+                  }}
+                />
+                {/* The credential heads-up, kept terse: a lock beside the profile
+                    whose meaning lives in the tooltip, not a sentence in the flow.
+                    The harness's own credential always rides along; this
+                    toggle additionally carries your OTHER saved tokens. */}
+                {selected?.includeUserTokens && (
+                  <TooltipProvider delayDuration={100}>
+                    <Tooltip>
+                      <TooltipTrigger asChild>
+                        <button
+                          type="button"
+                          aria-label="This profile also carries your other saved tokens into the sandbox"
+                          className="inline-flex size-7 shrink-0 items-center justify-center rounded-md text-instrument-caution transition-colors hover:bg-accent focus-visible:ring-[3px] focus-visible:ring-ring/50 focus-visible:outline-none"
+                        >
+                          <Lock className="size-3.5" />
+                        </button>
+                      </TooltipTrigger>
+                      <TooltipContent>
+                        This profile also carries your other saved tokens into the sandbox.
+                      </TooltipContent>
+                    </Tooltip>
+                  </TooltipProvider>
+                )}
+                <SessionHarnessControls
+                  harnesses={harnesses}
+                  profileHarness={selected?.harness}
+                  value={harnessOverride}
+                  onChange={setHarnessOverride}
+                  disabled={createTaskMutation.isPending}
+                />
+              </div>
               <Button
-                className="ml-auto"
+                className="shrink-0 self-end"
                 onClick={() => void launch()}
                 disabled={!canLaunch}
                 data-testid="launch-task"
