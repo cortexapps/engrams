@@ -201,6 +201,19 @@ with exactly one operation is accepted without `operationName`; only a genuinely
 view` / `gh pr create` / `gh pr list` (named op + leading fragment definition)
 shapes.
 
+### Post-merge pitfall (fixed): multi-field queries duplicated Authorization
+
+Set coverage returns every inject entry needed to cover a document's top-level
+fields. A query containing both `viewer` and `repository` therefore matched two
+GitHub entries carrying the same installation token, and the injection loop
+emitted two `Authorization` headers. GitHub rejects that malformed credential
+shape with `401 Bad credentials`, which broke `gh pr create` even though
+single-field GraphQL and REST requests succeeded. Injection now coalesces equal
+rendered values by case-insensitive header name, as well as separately minted
+credentials from the same provider and rendering template. It fails closed if
+static or cross-provider entries resolve the same header name to conflicting
+values. Unit and TLS e2e regressions cover both the coalescing and conflict cases.
+
 ### Remaining operational gates (post-merge, not design opens)
 
 - Capture real `gh` GraphQL traffic (`GH_DEBUG=api` / mitmproxy) for the target
