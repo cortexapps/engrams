@@ -306,3 +306,19 @@ The lesson for this ADR's ledger: **a new lifecycle state is a schema change
 for every hand-spelled status set in the system.** The typed enum was
 wildcard-audited in #837; the SQL literals were not. They now share one
 source.
+
+**Second same-day fallout (the settle-window ascent).** Phase C's honest
+`Evicting` gave the state a third shape nobody re-audited: post-capture,
+VM destroyed, settle pending. `ascend_evicting_to_active` (the ADR 0074
+rung-ascent) still assumed "Evicting = nomination window or parked-paused
+VM" and flipped such sessions straight to `Active` over a destroyed
+sandbox — a resume racing the ≤1-heartbeat settle window hit it every
+time (no `evicted` event, "sandbox not found" on first exec, the wedged
+row holding its reservation). The e2e stack suite caught it — but on
+main, the day Phase C landed: the #836/#838-#841 batch was admin-merged
+while their combined runs were red/cancelled, so the lane's verdict was
+never enforced (the exact admin-mass-merge failure mode AGENTS.md warns
+about). Fix: the ascent's non-parked arm now requires POSITIVE
+`probe_sandbox` proof of a live VM and otherwise returns "not ascended" —
+callers already retry, the settle lands Idle, and the normal snapshot
+resume takes over.

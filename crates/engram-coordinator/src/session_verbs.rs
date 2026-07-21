@@ -309,11 +309,14 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
         // (Evicting, park_rung=2, evict op already Done) must ascend — un-
         // pause in ms — not Retry-forever behind a nonexistent evict.
         // Because THIS resume op holds the one-running slot, no evict
-        // pipeline is mid-capture: Evicting is the nomination window or a
-        // parked-paused VM, exactly the deliver verb's inline-ascent case
-        // (ADR 0074 rungs 1/2). Ascend under our fence; only if the ascent
-        // doesn't land Active (a genuine mid-eviction we couldn't cancel)
-        // do we fall to the ordered-behind-evict Retry.
+        // pipeline is mid-capture: Evicting is the nomination window, a
+        // parked-paused VM, or (ADR 0101 C) the post-capture SETTLE
+        // window — the ascent itself distinguishes them (it probes VM
+        // liveness and refuses the settle window, where the VM is
+        // already destroyed). Ascend under our fence; on `false` (mid-
+        // eviction we couldn't cancel, or awaiting the settle) fall to
+        // the Retry — the settle lands Idle within a heartbeat and the
+        // next attempt resumes from the snapshot.
         SessionState::Evicting => {
             match crate::api::snapshot::ascend_evicting_to_active(state, id, ctx.fence()).await {
                 Ok(true) => OpOutcome::Done,
@@ -763,10 +766,13 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
             SessionState::Active => true,
             // ADR 0074 rungs 1+2, under the op: we HOLD the session's
             // one-running slot, so no evict pipeline is mid-capture —
-            // Evicting here is the nomination window or a parked-paused
-            // VM. Ascend inline (cancel queued evicts, un-pause a parked
-            // VM, flip Active) instead of burning a full evict+resume
-            // cycle on a session whose VM is alive.
+            // Evicting here is the nomination window, a parked-paused
+            // VM, or (ADR 0101 C) the post-capture settle window; the
+            // ascent probes VM liveness and refuses the last (false →
+            // the resume-enqueue arm below orders a resume behind the
+            // settle). Ascend inline (cancel queued evicts, un-pause a
+            // parked VM, flip Active) instead of burning a full
+            // evict+resume cycle on a session whose VM is alive.
             SessionState::Evicting => {
                 match crate::api::snapshot::ascend_evicting_to_active(state, id, ctx.fence()).await
                 {
@@ -1913,6 +1919,9 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) =
             crate::state::tests::build_state_for_session(evicting_session(id));
+        // The nomination window has a LIVE VM — the ascent's liveness
+        // gate (ADR 0101 C settle-window fix) refuses phantom sandboxes.
+        crate::state::tests::bind_live_sandbox(&state, &mini).await;
 
         let op = match state
             .services

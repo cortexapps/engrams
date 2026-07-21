@@ -4001,6 +4001,81 @@ mod tests {
         );
     }
 
+    /// ADR 0101 C's third `Evicting` shape — the post-capture settle
+    /// window (capture landed, VM DESTROYED, session honestly `Evicting`
+    /// until a later heartbeat's advert settles it Idle) — must NOT be
+    /// ascendable: pre-fix, a resume racing that window flipped the row
+    /// `Active` over a destroyed sandbox (main's e2e stack: no `evicted`
+    /// event, "sandbox not found" on first exec, the wedged row held its
+    /// reservation until the fleet read as full). The ascent now probes
+    /// VM liveness and refuses without positive proof.
+    #[tokio::test]
+    async fn ascent_refuses_the_post_capture_settle_window() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let session = evicting_session(session_id);
+        let (state, meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        let host_id = state
+            .host_registry
+            .host_of(sandbox_id)
+            .expect("sandbox routed");
+        meta.session.lock().host_id = Some(host_id);
+        seed_host_with_free_ram(&meta, host_id, 60_000);
+
+        // The nomination window (VM alive, evict not yet run): the ascent
+        // must still work — this is the "user came back in time" fast
+        // path the probe gate must not break.
+        assert_eq!(meta.session.lock().status, SessionState::Evicting);
+        let ascended = crate::api::snapshot::try_cancel_nominated_eviction(&state, session_id)
+            .await
+            .expect("ascent (live VM)");
+        assert!(ascended, "a live-VM nomination window still ascends");
+        assert_eq!(meta.session.lock().status, SessionState::Active);
+
+        // Now construct the settle window exactly as the D5 pipeline
+        // leaves it: status Evicting, sandbox still BOUND in PG, VM
+        // already destroyed on the host, no evict op running.
+        meta.session.lock().status = SessionState::Evicting;
+        state
+            .services
+            .host
+            .destroy(sandbox_id, engram_core::traits::SessionFence::unfenced())
+            .await
+            .expect("destroy");
+        assert!(
+            !state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the sandbox is gone (post-capture)"
+        );
+
+        wait_for_op_lane_free(&meta, session_id).await;
+        // The wire-path ascent (what a resume racing the settle runs).
+        let ascended = crate::api::snapshot::try_cancel_nominated_eviction(&state, session_id)
+            .await
+            .expect("ascent probe");
+        assert!(
+            !ascended,
+            "the post-capture settle window must not ascend to Active"
+        );
+        assert_eq!(
+            meta.session.lock().status,
+            SessionState::Evicting,
+            "session stays Evicting for the settle — never Active over a destroyed VM"
+        );
+    }
+
     /// PR #843 review (engrams): the admin drain must descend a parked
     /// session through the real contract — `Parked → Evicting` FIRST,
     /// then the NOMINATED descent op (`descend_parked_session`) — not a

@@ -843,6 +843,42 @@ pub(crate) async fn ascend_evicting_to_active(
             .fenced_set_session_park_rung(id, fence.epoch as i64, 0, None)
             .await;
         ::metrics::counter!(crate::metrics::EVICTION_UNPARKED_PAUSED_TOTAL).increment(1);
+    } else {
+        // ADR 0101 C gave `Evicting` a THIRD shape beyond the nomination
+        // window and the parked-paused VM: the post-capture SETTLE
+        // window — the evict op already completed (capture landed, VM
+        // destroyed) and the session stays `Evicting` until the next
+        // heartbeat's eviction-final advert settles it Idle. Cancelling
+        // "the eviction" here is meaningless (it already happened), and
+        // flipping Active advertised a session over a destroyed sandbox
+        // — the e2e stack caught it on main the day Phase C landed: no
+        // `evicted` event, "sandbox not found" on the first exec, and
+        // the wedged row held its reservation until the fleet read as
+        // full. Ascend only on POSITIVE proof the VM is still alive;
+        // anything else (no binding, probe says gone, probe unreachable)
+        // returns false — the caller retries, the settle lands Idle
+        // within a heartbeat, and the normal snapshot resume takes over.
+        let Some(sandbox_id) = row.as_ref().and_then(|r| r.sandbox_id) else {
+            tracing::debug!(session_id = %id,
+                "ascent: evicting session has no bound sandbox; leaving it to the settle");
+            return Ok(false);
+        };
+        match state.services.host.probe_sandbox(sandbox_id).await {
+            Ok(p) if p.known_to_backend && p.process_alive => {}
+            Ok(p) => {
+                tracing::info!(session_id = %id, %sandbox_id,
+                    known = p.known_to_backend, alive = p.process_alive,
+                    "ascent: evicting session's VM is gone (post-capture settle \
+                     window); not ascending — resume retries after the settle");
+                return Ok(false);
+            }
+            Err(e) => {
+                tracing::info!(session_id = %id, %sandbox_id, error = %e,
+                    "ascent: liveness probe failed; not ascending without proof \
+                     of a live VM — resume retries after the settle/scanner");
+                return Ok(false);
+            }
+        }
     }
     let result =
         match crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active)
@@ -2736,6 +2772,9 @@ mod evicting_gate_tests {
         let id = SessionId::new();
         let (state, mini, _local) =
             crate::state::tests::build_state_for_session(evicting_session(id));
+        // The nomination window has a LIVE VM (the ascent's liveness
+        // gate refuses phantom sandboxes — ADR 0101 C settle-window fix).
+        crate::state::tests::bind_live_sandbox(&state, &mini).await;
 
         ensure_active(&state, id).await.expect("cancel path");
 
@@ -2961,7 +3000,11 @@ mod evicting_gate_tests {
     #[tokio::test]
     async fn resume_during_evicting_nomination_ascends_to_active() {
         let id = SessionId::new();
-        let (state, _local) = build_state_for_session(evicting_session(id));
+        let (state, mini, _local) =
+            crate::state::tests::build_state_for_session(evicting_session(id));
+        // The nomination window has a LIVE VM (the ascent's liveness
+        // gate refuses phantom sandboxes — ADR 0101 C settle-window fix).
+        crate::state::tests::bind_live_sandbox(&state, &mini).await;
 
         enqueue_and_observe_resume_for(&state, id, Duration::from_secs(5))
             .await

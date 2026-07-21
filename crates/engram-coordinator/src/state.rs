@@ -2058,6 +2058,37 @@ pub(crate) mod tests {
         (state, meta, local)
     }
 
+    /// Create a REAL sandbox in the state's process backend and bind it
+    /// to the MiniMeta session. Nomination-window fixtures need this
+    /// since the ascent's liveness gate (ADR 0101 C settle-window fix):
+    /// an `Evicting` row whose bound sandbox does not exist in the
+    /// backend is the post-capture settle window and correctly refuses
+    /// to ascend — a fixture with a phantom `SandboxId::new()` models
+    /// THAT, not the live nomination window.
+    pub(crate) async fn bind_live_sandbox(
+        state: &crate::state::SharedState,
+        mini: &Arc<MiniMeta>,
+    ) -> engram_core::SandboxId {
+        use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit, SandboxSpec};
+        let spec = SandboxSpec {
+            image: "state-test".into(),
+            rootfs_source: None,
+            image_uri: None,
+            rootfs_manifest: None,
+            cpu: CpuLimit { vcpus: 1 },
+            memory: MemoryLimit { max_mib: 256 },
+            disk: DiskLimit { max_gib: 1 },
+            ttl: None,
+            env: Default::default(),
+            workdir: None,
+            network: Default::default(),
+            aux_ro_drives: Vec::new(),
+        };
+        let sb = state.services.host.create(spec).await.expect("create");
+        mini.session.lock().sandbox_id = Some(sb);
+        sb
+    }
+
     #[async_trait]
     impl MetadataStore for MiniMeta {
         /// ADR 0073: derive the idle-scan candidate from the mock's own
