@@ -31,6 +31,9 @@ const TRANSITIONAL_TASK_STATES = new Set([
   "pending",
   "queued",
   "created",
+  // Unreachable is mid-recovery the moment anything prompts/resumes it —
+  // keep the fast poll so the recovery transition is seen promptly.
+  "unreachable",
   "evacuating",
   "evicting",
   "host_lost",

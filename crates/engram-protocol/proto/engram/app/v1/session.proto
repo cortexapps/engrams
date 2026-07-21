@@ -112,9 +112,10 @@ message SessionListItem {
 // ISO-8601 strings, as on the JSON wire.
 message Session {
   string id = 1;
-  // engram_core SessionState, snake_case: "pending" | "created" |
-  // "active" | "idle" | "host_lost" | "evacuating" | "evicting" |
-  // "failed" | "completed" | "dead".
+  // engram_core SessionState, snake_case: "pending" | "queued" |
+  // "created" | "active" | "unreachable" | "parked" | "idle" |
+  // "host_lost" | "evacuating" | "evicting" | "failed" |
+  // "completed" | "dead".
   string status = 2;
   optional string host_id = 3;
   optional string sandbox_id = 4;

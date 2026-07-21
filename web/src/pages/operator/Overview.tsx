@@ -10,7 +10,7 @@ import { Gauge, type Tone, type Zone } from "../../components/gauge";
 import { Text } from "@/components/ui/text";
 import { cn } from "@/lib/utils";
 import { deriveHealthMetrics, operatorIssues, type HealthMetrics } from "../../operator-health";
-import type { SessionListItem } from "../../lib/types";
+import { RESIDENT_SESSION_STATES, type SessionListItem } from "../../lib/types";
 
 // The Operator cockpit: a read-only instrument cluster that answers "is the
 // platform healthy?" in one read, then hands off to the detail surfaces. The
@@ -50,7 +50,12 @@ export function Overview() {
   // as the rail signal. The rest are display-only extras the cockpit shows.
   const m = deriveHealthMetrics(h, storage);
   const ready = h.filter((x) => x.status === "ready").length;
-  const liveSandboxes = s.filter((x: SessionListItem) => x.status === "active").length;
+  // Resident = the VM exists and holds host RAM (parked/paused included) —
+  // an Active-only count read "0 live sandboxes" on a fleet full of parked
+  // VMs (status-set audit finding 8).
+  const liveSandboxes = s.filter((x: SessionListItem) =>
+    RESIDENT_SESSION_STATES.has(x.status),
+  ).length;
   const gcPending = storage?.gc_pending ?? 0;
 
   const verdict = computeVerdict(h.length === 0, m);

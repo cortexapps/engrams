@@ -62,6 +62,7 @@ function glyphFor(status: SessionState): string {
     case "evicting":
     case "evacuating":
       return "◑";
+    case "unreachable":
     case "host_lost":
       return "⚠";
     case "completed":
@@ -91,6 +92,7 @@ function toneFor(status: SessionState): string {
     case "completed":
     case "dead":
       return "var(--muted-foreground)";
+    case "unreachable":
     case "host_lost":
     case "failed":
       return "var(--destructive)";

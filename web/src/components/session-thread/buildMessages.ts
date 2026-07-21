@@ -16,6 +16,10 @@ export const INACTIVE_STATUSES: ReadonlySet<SessionState> = new Set<SessionState
   // Parked = VM paused in place after the harness went idle (ADR 0101):
   // no turn can be in flight inside a frozen guest.
   "parked",
+  // Unreachable = the guest is dead/wedged (ADR 0091): whatever turn was
+  // open died with it — without this the composer shows "working…" and a
+  // dead Stop button for a guest that can no longer answer.
+  "unreachable",
   "idle",
   "completed",
   "failed",

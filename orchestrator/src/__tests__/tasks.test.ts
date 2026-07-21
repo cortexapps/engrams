@@ -1938,8 +1938,10 @@ describe("TaskService — session status → task status mapping", () => {
   // These are pure logic tests; no DB or upstream needed.
   const cases: Array<[string, string]> = [
     ["pending", "working"],
+    ["queued", "working"],
     ["created", "working"],
     ["active", "working"],
+    ["unreachable", "working"],
     ["parked", "working"],
     ["idle", "working"],
     ["evacuating", "working"],
