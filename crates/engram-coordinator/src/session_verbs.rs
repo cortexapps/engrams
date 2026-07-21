@@ -205,7 +205,24 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
             )
             .await
             {
-                Ok(_) => OpOutcome::Done,
+                Ok(crate::api::snapshot::FinishResumeOutcome::Active) => OpOutcome::Done,
+                // 2026-07-21 livelock incident (prod 8174b7aa): a failed
+                // harness start parked the session at Created and this arm
+                // read `Ok(_) => Done` — the op "succeeded" while the
+                // session sat wedged with nothing owning it. Mirror
+                // `resume_from_created` (its ADR 0090 comment: "retryable,
+                // not a 200 — the resume op's backoff + budget own the
+                // retry"): Retry, so a transient start_agent flake heals
+                // in-op, the stale-binding case falls through to full
+                // dispatch after SHORTCUT_MAX_ATTEMPTS, and a truly dead
+                // harness terminates VISIBLY via the budget's
+                // Created → Failed flip instead of a silent Done.
+                Ok(crate::api::snapshot::FinishResumeOutcome::CreatedHarnessFailed(e)) => {
+                    OpOutcome::Retry(format!(
+                        "harness start failed after resume (session parked at \
+                         Created; will retry): {e}"
+                    ))
+                }
                 Err(e) => outcome_from_api_error(e),
             };
         }
@@ -434,6 +451,12 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
             OpOutcome::Done
         }
         Ok(crate::idle_evictor::EvictOutcome::CancelRequested) => OpOutcome::Cancelled,
+        // ADR 0090 (2026-07-21 livelock): the guard destroyed a
+        // quarantined survivor whose session couldn't be evicted (e.g.
+        // harness-failed park at Created) and settled it for its owning
+        // re-driver. The destroy cleared the host's quarantine entry, so
+        // the 5s advertise → enqueue loop ends with this op.
+        Ok(crate::idle_evictor::EvictOutcome::QuarantineReaped) => OpOutcome::Done,
         Ok(crate::idle_evictor::EvictOutcome::Fenced) => {
             OpOutcome::Failed("fenced mid-pipeline (successor re-claimed)".into())
         }

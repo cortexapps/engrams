@@ -59,6 +59,19 @@ pub enum EvictOutcome {
     /// nomination left it (`Evicting`, VM untouched); the canceller's
     /// `Active` transition owns the ascent.
     CancelRequested,
+    /// ADR 0090 (2026-07-21 livelock incident): a QUARANTINE-flavored op
+    /// found the session in a state the pipeline can't evict from
+    /// (e.g. `Created` after an ADR 0077 harness-failed park) while it
+    /// still binds the quarantined sandbox. A plain `Skipped` here
+    /// livelocks: the crippled VM keeps advertising every 5s heartbeat,
+    /// each advertise enqueues a fresh op (the idempotency key only
+    /// dedups queued/running rows), and each op skips in ~10ms — prod
+    /// session 8174b7aa looped for 2.5 days / ~43k ops. Instead the
+    /// guard CONVERGES: destroy the crippled VM (capture is impossible
+    /// by definition of quarantine — its disk is unserved; the destroy
+    /// clears the host's quarantine entry, ending the advertise loop)
+    /// and settle the session per its state (see the guard's match).
+    QuarantineReaped,
 }
 
 /// ADR 0074 rung-2 park bookkeeping, run after a successful `pause`:
@@ -199,6 +212,157 @@ fn quarantine_capture_timeout() -> std::time::Duration {
 /// are discarded anyway.
 const QUARANTINE_GUEST_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// ADR 0090 (2026-07-21 livelock incident): converge a QUARANTINE evict
+/// that found its session in a state the entry guard can't evict from
+/// while the session still binds the quarantined sandbox. Capture is
+/// impossible by definition of quarantine (the survivor's disk is
+/// unserved), so the only useful moves are destroying the crippled VM —
+/// which clears the host's quarantine entry and ends the 5s
+/// advertise → enqueue → skip loop — and settling the row in a lane its
+/// owning machinery re-drives. Wildcard-free over `SessionState` on
+/// purpose: a future state must pick its arm here, not inherit a silent
+/// skip that re-opens the loop.
+async fn quarantine_reap_unevictable(
+    ctx: &OpCtx<'_>,
+    session: &engram_core::types::Session,
+    sandbox_id: SandboxId,
+) -> Result<EvictOutcome, EvictError> {
+    let state = ctx.state;
+    let session_id = session.id;
+    match session.status {
+        // Unreachable from the caller (these are the entry-legal states);
+        // kept so the match stays total.
+        SessionState::Active | SessionState::Evicting => Ok(EvictOutcome::Skipped {
+            reason: "session no longer evictable (a concurrent op moved it first)",
+        }),
+        // In-flight placement/relocation lanes: the queue scanner / evac
+        // resumer own these rows, and destroying the VM under a mid-evac
+        // capture would race their machinery. Their own settle paths
+        // converge (evac falls back to Idle, queued rows re-place); if
+        // the binding survives that, the next advertise re-enters here.
+        SessionState::Pending | SessionState::Queued | SessionState::Evacuating => {
+            tracing::warn!(
+                session_id = %session_id,
+                %sandbox_id,
+                state = session.status.as_str(),
+                "quarantined survivor bound to an in-flight placement/relocation \
+                 lane; leaving convergence to its owning machinery",
+            );
+            Ok(EvictOutcome::Skipped {
+                reason: "quarantined survivor owned by in-flight placement/relocation",
+            })
+        }
+        // The livelock class. `Created` is the ADR 0077 harness-failed
+        // park (prod 8174b7aa: a resume's start_agent failed against the
+        // crippled VM, parked at Created, and no evict could ever run);
+        // `Unreachable` is its dead-guest cousin. Nothing user-visible
+        // ran in the VM (the harness never (re)started), so destroy it
+        // and settle HostLost — the one lane the dead-host straggler
+        // sweep re-drives to Idle/recoverable; the next prompt resumes
+        // from the last checkpoint (ADR 0090's designed blast radius).
+        SessionState::Created | SessionState::Unreachable => {
+            if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
+                // Leave the binding + state alone: the op's retry budget
+                // (and, on exhaustion, the verb's destroy-then-HostLost
+                // arm) own the re-drive at op-backoff cadence, not the
+                // 5s heartbeat's.
+                return Err(EvictError::Meta(format!(
+                    "quarantine reap: destroy of unevictable survivor failed: {e}"
+                )));
+            }
+            match crate::session_ops::transition_with_fence(
+                state,
+                session_id,
+                ctx.fence(),
+                SessionState::HostLost,
+            )
+            .await
+            {
+                Ok(prev) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %sandbox_id,
+                        from = prev.as_str(),
+                        "quarantined survivor was unevictable (harness-failed park / \
+                         dead guest); destroyed the crippled VM and settled HostLost \
+                         for the straggler sweep to recover",
+                    );
+                    let _ = state
+                        .emit_fenced(
+                            session_id,
+                            ctx.fence(),
+                            SessionEvent::StatusChanged {
+                                from: prev,
+                                to: SessionState::HostLost,
+                                at: state.services.clock.now_utc(),
+                            },
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    // The destroy landed (the advertise loop is dead);
+                    // a failed flip means a successor moved the session
+                    // first — it owns convergence from here.
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "quarantine reap: destroyed the survivor but the HostLost \
+                         flip did not land (a successor owns the session)",
+                    );
+                }
+            }
+            Ok(EvictOutcome::QuarantineReaped)
+        }
+        // Durable-or-settled rows: whatever is recoverable is already
+        // recorded (Idle implies a durable capture; HostLost is mid-
+        // recovery; terminals are terminal). The crippled VM is garbage —
+        // reap it and drop the stale binding so nothing (e.g. the resume
+        // crash-shortcut) latches a destroyed sandbox. No status change.
+        SessionState::Idle
+        | SessionState::HostLost
+        | SessionState::Failed
+        | SessionState::Completed
+        | SessionState::Dead => {
+            if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
+                return Err(EvictError::Meta(format!(
+                    "quarantine reap: destroy of settled-session survivor failed: {e}"
+                )));
+            }
+            match state
+                .services
+                .meta
+                .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::metrics::note_fenced_write();
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "quarantine reap: unbind fenced (successor re-claimed); \
+                         the destroy already ended the advertise loop",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "quarantine reap: unbind failed after destroy; the stale \
+                         binding resolves on the session's next lifecycle op",
+                    );
+                }
+            }
+            tracing::warn!(
+                session_id = %session_id,
+                %sandbox_id,
+                state = session.status.as_str(),
+                "reaped a quarantined survivor bound to a settled session",
+            );
+            Ok(EvictOutcome::QuarantineReaped)
+        }
+    }
+}
+
 /// memory-snapshot → destroy sequence the legacy `evict_session_to_state`
 /// ran, now driven under an op claim (the mutual exclusion; the
 /// `session_ops_one_running` index replaces the session lease) with
@@ -259,7 +423,25 @@ pub(crate) async fn run_evict_pipeline(
     } else {
         matches!(entry_status, SessionState::Active | SessionState::Evicting)
     };
+    let quarantine = ctx
+        .op
+        .payload
+        .get("quarantine")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !entry_legal {
+        // ADR 0090 (2026-07-21 livelock incident): a quarantine op must
+        // never settle as a plain skip while the session still binds the
+        // quarantined sandbox — the host re-advertises the survivor every
+        // 5s heartbeat, each advertise re-enqueues (the idempotency key
+        // only dedups queued/running rows), and each op would skip again
+        // in ~10ms, forever (prod session 8174b7aa: 2.5 days, ~43k ops).
+        // Converge instead: see [`quarantine_reap_unevictable`].
+        if quarantine {
+            if let Some(sandbox_id) = session.sandbox_id {
+                return quarantine_reap_unevictable(ctx, &session, sandbox_id).await;
+            }
+        }
         tracing::info!(
             session_id = %session_id,
             state = entry_status.as_str(),
@@ -400,12 +582,8 @@ pub(crate) async fn run_evict_pipeline(
     // to destroy + rewind. Covers BOTH capture flavors — `snapshot_begin`
     // (the normal prod-FC D5 path; adversarial-review finding: the first
     // cut bounded only the composed fallback) and composed `snapshot()`.
-    let quarantine = ctx
-        .op
-        .payload
-        .get("quarantine")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // (`quarantine` itself is read above the entry guard now — the
+    // 2026-07-21 livelock fix consumes it there too.)
     if target_state == SessionState::Idle {
         // ADR 0074 rung 2 (parked-paused): if the host has memory
         // headroom, PAUSE the VM in place instead of snapshot+destroy.
@@ -4122,6 +4300,251 @@ mod tests {
             EnqueueOutcome::Claimed(op) => op,
             other => panic!("expected Claimed, got {other:?}"),
         }
+    }
+
+    /// The heartbeat-shaped ADR 0090 quarantine `evict_local`
+    /// (non-nominated, no park) — the exact payload
+    /// `api::host_http` enqueues per quarantined-survivor advertise.
+    async fn claim_quarantine_evict_op(state: &SharedState, session_id: SessionId) -> SessionOp {
+        match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({
+                    "target": "idle", "allow_park": false,
+                    "nominated": false, "quarantine": true,
+                }),
+                None,
+                "test-pod",
+            )
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+    }
+
+    /// 2026-07-21 livelock incident (prod 8174b7aa): a quarantine evict
+    /// landing on an ADR 0077 harness-failed park (`Created`, still bound
+    /// to the quarantined survivor) used to settle `Skipped` in ~10ms —
+    /// the host re-advertised every 5s, each advertise re-enqueued, and
+    /// the loop ran for 2.5 days. The guard must CONVERGE instead:
+    /// destroy the crippled VM (clears the host's quarantine entry — the
+    /// advertise source) and settle `HostLost`, the one lane the dead-host
+    /// straggler sweep re-drives to Idle/recoverable.
+    #[tokio::test]
+    async fn quarantine_evict_on_created_park_reaps_and_settles_host_lost() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Created;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_quarantine_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, false).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::QuarantineReaped)),
+            "a quarantine op on an unevictable-but-bound session must reap, \
+             not skip (the skip is the livelock), got {out:?}",
+        );
+        assert!(
+            !state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the crippled VM must be destroyed — the destroy is what clears \
+             the host's quarantine entry and ends the 5s advertise loop",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::HostLost,
+            "the session settles HostLost so the straggler sweep re-drives \
+             it to Idle/recoverable (resume rewinds to the last checkpoint)",
+        );
+    }
+
+    /// The settled arm of the same fix: a quarantined survivor bound to a
+    /// session whose recoverable state is already durable (`Idle`) is pure
+    /// garbage — reap the VM and drop the stale binding (nothing may latch
+    /// a destroyed sandbox, e.g. the resume crash-shortcut), but do NOT
+    /// touch the status: Idle already means "resume from the durable
+    /// capture".
+    #[tokio::test]
+    async fn quarantine_evict_on_settled_idle_reaps_and_unbinds_without_status_change() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Idle;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_quarantine_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, false).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::QuarantineReaped)),
+            "got {out:?}"
+        );
+        assert!(
+            !state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the crippled VM is reaped",
+        );
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Idle,
+            "Idle already implies a durable capture — no status change",
+        );
+        assert_eq!(
+            after.sandbox_id, None,
+            "the stale binding is dropped so no later op latches a \
+             destroyed sandbox",
+        );
+    }
+
+    /// Mid-relocation lanes stay owned by their machinery: a quarantine op
+    /// finding the session `Evacuating` must NOT destroy the VM under the
+    /// evac capture — it skips, and the evac path's own settle (fallback
+    /// to Idle) converges.
+    #[tokio::test]
+    async fn quarantine_evict_on_evacuating_leaves_the_vm_to_the_evac_machinery() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Evacuating;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_quarantine_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, false).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::Skipped { .. })),
+            "got {out:?}"
+        );
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the VM must survive — the evac capture may be mid-flight",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Evacuating,
+        );
+    }
+
+    /// The NON-quarantine skip is unchanged: an ordinary evict landing on
+    /// a non-evictable state still no-ops without touching the VM (a
+    /// concurrent op owns the session; destroying here would be the
+    /// teardown-reconcile bug class).
+    #[tokio::test]
+    async fn plain_evict_on_created_still_skips_without_destroying() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Created;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, true).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::Skipped { .. })),
+            "got {out:?}"
+        );
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "a plain skip must never destroy — only the quarantine flavor \
+             carries the reap authority",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Created,
+        );
     }
 
     /// #792: a TRANSIENT BlobStorage-HEAD blip records `recoverable = false`
