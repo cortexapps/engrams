@@ -1336,12 +1336,26 @@ pub async fn apply_rung1_rewind(
     if summary.rolled_back == 0 {
         return; // checkpoint was the head — nothing rolled back.
     }
-    tracing::info!(
+    // A non-empty rewind is user-visible loss of transcript (the guest
+    // resumed behind events the user already saw). Expected to be small
+    // and rare — genuine host death between checkpoints. WARN + an
+    // alertable counter, labeled by cause, so a burst (or a large
+    // rolled_back) is visible without log spelunking: the 2026-07-21
+    // 61a03b7e incident rewound 93 events on a HEALTHY host and this
+    // path's INFO line was the only signal.
+    ::metrics::counter!(
+        crate::metrics::SESSION_REWOUND_EVENTS_TOTAL,
+        "cause" => cause.as_str(),
+    )
+    .increment(summary.rolled_back);
+    tracing::warn!(
         %session_id,
         rolled_back = summary.rolled_back,
         recovery_epoch = summary.recovery_epoch,
         surviving_side_effects = summary.surviving_side_effects.len(),
-        "rung-1 recovery rewound the transcript to the checkpoint cursor",
+        cause = cause.as_str(),
+        "rung-1 recovery rewound the transcript to the checkpoint cursor \
+         (user-visible events were rolled back)",
     );
     // The boundary event is the first of the new epoch — it appends
     // AFTER the tombstoned span (higher idx) and carries the new

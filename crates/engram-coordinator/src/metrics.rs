@@ -333,6 +333,17 @@ pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhaus
 /// data loss, so alert on ANY sustained rise.
 pub const DURABILITY_ROLLBACK_TOTAL: &str = "engram_durability_rollback_total";
 
+/// Counter of session_events ROWS rolled back by rung-1 recovery rewinds
+/// (`apply_rung1_rewind`), labeled `cause` ∈ {planned_relocation,
+/// host_failure_recovery, checkpoint_lag}. Each increment batch is a
+/// user-visible transcript rewind — the "resumed from an earlier
+/// checkpoint" boundary. Small, rare `host_failure_recovery` blips are
+/// the designed blast radius of real host death; `checkpoint_lag` (the
+/// checkpoint lagged live activity with NO host failure — 2026-07-21
+/// 61a03b7e: 93 events on a healthy host) and any large burst deserve an
+/// alert.
+pub const SESSION_REWOUND_EVENTS_TOTAL: &str = "engram_session_rewound_events_total";
+
 /// Counter (#792, R4, ADR 0098 Phase 3). The recoverable-before-Idle
 /// guard fired: an idle-evict capture produced manifests but
 /// `verify_snapshot_recoverable`'s BlobStorage HEAD failed

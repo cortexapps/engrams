@@ -387,6 +387,17 @@ pub enum RecoveryCause {
     CheckpointLag,
 }
 
+impl RecoveryCause {
+    /// The serde wire spelling, for log fields and metric labels.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlannedRelocation => "planned_relocation",
+            Self::HostFailureRecovery => "host_failure_recovery",
+            Self::CheckpointLag => "checkpoint_lag",
+        }
+    }
+}
+
 /// ADR 0056: an [`SessionEvent::IntegrationAsset`] is either a durable noun
 /// (a PR, a shared file) that survives an ADR 0028 recovery rewind as a
 /// side-effect the platform can't undo, or a transient verb (a query the

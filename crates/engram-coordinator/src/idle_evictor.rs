@@ -304,6 +304,42 @@ async fn quarantine_reap_unevictable(
                     "quarantine reap: destroy of unevictable survivor failed: {e}"
                 )));
             }
+            // A destroyed PARKED survivor is real, user-visible data loss
+            // (the paused VM held user work newer than the last durable
+            // checkpoint) — the same fact the budget-exhaustion arm
+            // records (PR #829), and it must be exactly as loud here:
+            // counter + durable `durability_rollback` row, emitted the
+            // moment the destroy lands, independent of the status flip
+            // (2026-07-21 61a03b7e: this arm destroyed a healthy parked
+            // VM — 93 events rewound — with a single WARN as the only
+            // trace). Created/Unreachable stay quiet: the harness never
+            // (re)started, so no user-visible work is being rolled back.
+            if session.status == SessionState::Parked {
+                ::metrics::counter!(crate::metrics::DURABILITY_ROLLBACK_TOTAL).increment(1);
+                tracing::error!(
+                    session_id = %session_id,
+                    %sandbox_id,
+                    rewind_disk_manifest = ?session.live_disk_manifest,
+                    "quarantined PARKED survivor destroyed — un-checkpointed user \
+                     work in the paused VM is LOST; the next resume rewinds to the \
+                     last durable checkpoint (CheckpointLag)",
+                );
+                let _ = state
+                    .emit_fenced(
+                        session_id,
+                        ctx.fence(),
+                        SessionEvent::DurabilityRollback {
+                            sandbox_id,
+                            rewind_disk_manifest: session.live_disk_manifest,
+                            reason: "quarantined parked survivor was unevictable \
+                                     (disk unserved); VM destroyed — resume rewinds \
+                                     to the last durable checkpoint"
+                                .to_string(),
+                            at: state.services.clock.now_utc(),
+                        },
+                    )
+                    .await;
+            }
             match crate::session_ops::transition_with_fence(
                 state,
                 session_id,
