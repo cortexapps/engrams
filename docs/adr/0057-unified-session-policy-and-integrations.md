@@ -202,6 +202,17 @@ config-driven mint ADR 0056 §9 deferred).
 
 ## Consequences and risks
 
+### Post-merge pitfall (fixed): profile refs skipped deployment-backed secrets
+
+Profile secret resolution originally passed `secret_ref` only as the logical
+`SecretStore::get` name and paired it with an empty `SecretSchema`. That works for
+the org-secret backend, which keys directly by name, but GCP Secret Manager needs
+the same `gcp-sm://...` URI in `SecretSchema.ref`; without it the backend treated
+the URI as a namespaced secret name and returned no value. The session still
+booted by design, silently missing its profile env vars. Policy and warm-capture
+resolution now share one explicit-ref helper that passes the ref in both forms,
+with a regression fake that asserts the backend receives the schema ref.
+
 - **Resume correctness improves**: persisting the full `SessionPolicy` removes today's
   silent manifest-edit-changes-live-session behavior. New wire fields are
   `#[serde(default)]` so in-flight policies decode.

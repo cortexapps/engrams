@@ -218,7 +218,7 @@ async fn main() -> Result<(), HostAgentError> {
     let cli = Cli::parse();
 
     // ADR 0070: dedicated-volume mountpoint gate. When the chart pairs
-    // `storage.dedicatedDevice` with `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT
+    // `storage.dedicatedDevices` with `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT
     // =true`, `work_dir` MUST resolve to a distinct filesystem from the
     // boot-disk reference path (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`
     // — bare metal only; the chart points this at a read-only hostPath
@@ -460,8 +460,13 @@ async fn main() -> Result<(), HostAgentError> {
                     })?;
                 // ADR 0061: VZ reads skill bundles from the same staged
                 // dir the host-agent reports its `current_bundles` from.
+                // ADR 0096 D6: pass the egress proxy/DNS ports into every
+                // guest — the init shim installs the in-guest DNAT
+                // redirect (soft steering; the proxy already binds
+                // 0.0.0.0, reachable at the VZ NAT gateway).
                 let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel)
-                    .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env());
+                    .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env())
+                    .with_egress_ports(cli.egress_proxy_port, cli.egress_dns_port);
                 fc_for_reattach = None;
                 // ADR 0007: attach the chunk store so `snapshot()` chunks
                 // the rootfs clone and reports the manifest ref. Without
@@ -533,15 +538,23 @@ async fn main() -> Result<(), HostAgentError> {
     // ADR 0075: spawn the substrate populate server now both halves
     // exist. The uffd base dir mirrors the FC config default (env
     // override first) so the tmpfs probe answers for the dir handlers
-    // actually use.
-    let _substrate_server = engram_host_agent::substrate_server::SubstrateServer::new(
-        chunk_cache.clone(),
-        std::sync::Arc::new(chunk_store.clone()),
-        engram_sandbox_firecracker::uffd_base_dir_from_env()
-            .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
-    )
-    .spawn(cli.work_dir.join("substrate.sock"))
-    .map_err(HostAgentError::Io)?;
+    // actually use. FC-only (ADR 0096): its sole client is the UFFD
+    // handler, which exists only on the Firecracker backend — on VZ the
+    // server just sat on a Linux-shaped `/dev/shm/engram` default that
+    // doesn't exist on macOS.
+    let _substrate_server = match cli.sandbox_backend {
+        BackendChoice::Firecracker => Some(
+            engram_host_agent::substrate_server::SubstrateServer::new(
+                chunk_cache.clone(),
+                std::sync::Arc::new(chunk_store.clone()),
+                engram_sandbox_firecracker::uffd_base_dir_from_env()
+                    .unwrap_or_else(|| std::path::PathBuf::from("/dev/shm/engram")),
+            )
+            .spawn(cli.work_dir.join("substrate.sock"))
+            .map_err(HostAgentError::Io)?,
+        ),
+        BackendChoice::Vz => None,
+    };
     let materialize_dir = cli.work_dir.join("chunked-rootfs");
 
     // OCI auth resolver. The standalone host-agent doesn't have
@@ -558,7 +571,7 @@ async fn main() -> Result<(), HostAgentError> {
         .coordinator_endpoint
         .clone()
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string());
-    let auth_coord_client = engram_host_agent::coord_client::CoordClient::new(
+    let auth_coord_client = engram_host_agent::coord_client::HttpCoordClient::new(
         coord_url_for_auth,
         cfg.coordinator_token.clone(),
     );
@@ -615,11 +628,17 @@ async fn main() -> Result<(), HostAgentError> {
     // ADR 0056 Phase 4: the egress proxy's observed-asset sink — forwards each
     // proxy-built IntegrationAsset to the coord (mirrors the harness-event
     // path). Best-effort fire-and-forget: spawn the POST, log on failure.
+    // ADR 0098 D1: wall clock is an injected world input. The binary
+    // constructs the production clock once and the observe sink reads the
+    // asset timestamp through it.
+    let observe_clock: Arc<dyn engram_core::traits::Clock> =
+        Arc::new(engram_core::traits::SystemClock::new());
     let observe_sink: engram_egress_proxy::ObserveSink = Arc::new(move |session_id, asset| {
-        let cc = engram_host_agent::coord_client::CoordClient::new(
+        let cc = engram_host_agent::coord_client::HttpCoordClient::new(
             observe_coord_url.clone(),
             observe_token.clone(),
         );
+        let observe_clock = observe_clock.clone();
         tokio::spawn(async move {
             let req = engram_host_agent::coord_client::IntegrationAssetReport {
                 provider: asset.provider,
@@ -627,7 +646,7 @@ async fn main() -> Result<(), HostAgentError> {
                 surface: asset.surface,
                 data: serde_json::Value::Object(asset.data),
                 fetchable_url: asset.fetchable_url,
-                at: chrono::Utc::now(),
+                at: observe_clock.now_utc(),
             };
             if let Err(e) = cc.integration_asset(session_id, &req).await {
                 tracing::debug!(%session_id, error = %e, "forward integration asset to coord failed");
@@ -639,7 +658,7 @@ async fn main() -> Result<(), HostAgentError> {
     // sink's coord bridge, but request/response since the proxy awaits it).
     let inject_refresher: Arc<dyn engram_egress_proxy::InjectRefresher> =
         Arc::new(engram_host_agent::egress::CoordInjectRefresher::new(
-            engram_host_agent::coord_client::CoordClient::new(refresh_coord_url, refresh_token),
+            engram_host_agent::coord_client::HttpCoordClient::new(refresh_coord_url, refresh_token),
             host_id,
         ));
     match build_host_egress(&cli, Some(observe_sink), Some(inject_refresher)).await {
@@ -813,7 +832,7 @@ const HOST_ROOT_REF_PATH_ENV_VAR: &str = "ENGRAM_HOST_ROOT_REF_PATH";
 /// (`ENGRAM_HOST_ROOT_REF_PATH`, default `/`) — i.e. a dedicated volume
 /// is actually mounted there, not just a directory on the boot disk.
 /// The chart sets `ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` only when
-/// `storage.dedicatedDevice` is configured, so this is a paired guard:
+/// `storage.dedicatedDevices` is configured, so this is a paired guard:
 /// "you told me to expect a dedicated volume; prove it's mounted before
 /// I start writing to it."
 ///
@@ -870,7 +889,7 @@ fn require_work_dir_mountpoint_or_exit(work_dir: &std::path::Path) -> Result<(),
         return Err(HostAgentError::Config(format!(
             "{WORK_DIR_REQUIRE_MOUNTPOINT_ENV_VAR}=true but {} is on the SAME filesystem as the \
              boot-disk reference path {} (st_dev {work_dev} == {root_dev}) — the dedicated \
-             volume isn't mounted there yet (or storage.dedicatedDevice is misconfigured). \
+             volume isn't mounted there yet (or storage.dedicatedDevices is misconfigured). \
              Refusing to start: coming up on the boot disk here would silently defeat the whole \
              point of the dedicated volume — cache/snapshot/memfile writes would count against \
              the SAME kubelet nodefs signal ADR 0070's headroom gauge and budget exist to keep \

@@ -23,10 +23,15 @@ sha2.workspace = true
 # HarnessSink type alias. No runtime dependency.
 tokio.workspace = true
 toml.workspace = true
+# ADR 0099 H6: the `tracing` FACADE only (soft_invariant! logs at error!).
+# No subscriber, no I/O — engram-core's no-I/O charter holds; the binary
+# crates install the subscriber.
+tracing.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+proptest.workspace = true
 # Bincode is the canonical wire-encoding for `CowState` /
 # `CowStateRecord` (carried inside the proto `bytes` field per
 # ADR 0013 / 0016). The round-trip tests exercise that wire shape;

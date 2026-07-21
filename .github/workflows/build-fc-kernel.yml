@@ -1,15 +1,20 @@
 name: Build FC guest kernel
 
-# Builds the engram Firecracker guest kernel (ADR 0025) and publishes
-# vmlinux as a GitHub release asset. The stock Firecracker-CI kernels strip
-# the netfilter stack; this rebuild adds nf_tables + the `raw` table so
-# Docker/compose run inside a sandbox (the engrams-on-engrams loop).
+# Builds the engram guest kernel (ADR 0025) for BOTH arches and publishes
+# the artifacts as GitHub release assets. The stock Firecracker-CI kernels
+# strip the netfilter stack; this rebuild adds nf_tables + the `raw` table
+# so Docker/compose run inside a sandbox (the engrams-on-engrams loop).
+#   - x86_64: `vmlinux-engram-*` — the prod FC guest kernel.
+#   - arm64:  `Image-engram-*` (ADR 0082/0096) — boots aarch64 Firecracker
+#     (colima dev rig) AND the macOS VZ backend (`just pull-kernel`), which
+#     retired the Kata kernel + the erofs bundle fork.
 #
 # Manual-only: the guest kernel changes rarely, and a change is a prod-wide
 # event (every FC host re-bakes + base snapshots re-capture). The consumers
 # pin the resulting tag/asset:
 #   - deploy/packer/provisioners/install-fc-kernel.sh  (prod FC-host bake)
 #   - crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh (dev/test)
+#   - crates/engram-sandbox-vz/scripts/pull-kernel.sh (macOS VZ dev, ADR 0096)
 #
 # Note: cortexapps/engrams is private, so the release asset is NOT anonymous;
 # consumers download it with a token (the host bake passes GH_TOKEN through).
@@ -24,7 +29,7 @@ on:
       kernel_rev:
         description: 'Engram build revision (bump when engram-docker.fragment changes)'
         required: false
-        default: '1'
+        default: '2'
 
 permissions:
   contents: write   # create the release + upload the asset
@@ -33,9 +38,20 @@ jobs:
   build:
     runs-on: ubuntu-24.04
     timeout-minutes: 60
+    strategy:
+      # Serialize so the two arch jobs can't race the
+      # release-create-if-absent step.
+      max-parallel: 1
+      matrix:
+        include:
+          - arch: x86_64
+            asset_prefix: vmlinux-engram
+          - arch: arm64
+            asset_prefix: Image-engram
     env:
       LINUX_VERSION: ${{ github.event.inputs.linux_version || '6.1.102' }}
-      KERNEL_REV: ${{ github.event.inputs.kernel_rev || '1' }}
+      KERNEL_REV: ${{ github.event.inputs.kernel_rev || '2' }}
+      ARCH: ${{ matrix.arch }}
     steps:
       - uses: actions/checkout@v6
 
@@ -44,15 +60,20 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential bc bison flex libelf-dev libssl-dev cpio kmod
+          # arm64 cross build additionally needs the cross gcc + pahole.
+          if [ "$ARCH" = "arm64" ]; then
+            sudo apt-get install -y --no-install-recommends \
+              gcc-aarch64-linux-gnu dwarves
+          fi
 
-      - name: Build vmlinux (base config + Docker fragment)
+      - name: Build kernel (base config + Docker fragment)
         run: bash deploy/kernel/build-fc-kernel.sh
 
       - name: Publish as a release asset
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          ASSET="vmlinux-engram-${LINUX_VERSION}-${KERNEL_REV}"
+          ASSET="${{ matrix.asset_prefix }}-${LINUX_VERSION}-${KERNEL_REV}"
           TAG="fc-kernel-${LINUX_VERSION}-${KERNEL_REV}"
           # Idempotent: create the release if absent, then clobber-upload the
           # asset + its checksum so a re-run replaces them.

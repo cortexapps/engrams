@@ -199,7 +199,10 @@ impl ImageReadiness {
         self.inner.read().contains(digest)
     }
 
-    fn mark_ready(&self, digest: ManifestDigest) {
+    /// `pub` for the peer-fill integration tests (which stand up a
+    /// serving host without a live supervisor); in production the
+    /// prefetch supervisor is the sole writer.
+    pub fn mark_ready(&self, digest: ManifestDigest) {
         self.inner.write().insert(digest);
     }
 
@@ -306,6 +309,17 @@ const RECHECK_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30)
 /// chunks. No ImageCache: the prefetch warms the base snapshot's
 /// chunks from the GCS chunk store and never reads the source OCI
 /// image (see [`prefetch_one`]).
+/// Digests with a prefetch task currently running — the reconcile
+/// loop's spawn guard. Without it, a not-ready image (first warm, or a
+/// recheck flip) got a NEW prefetch task every tick while the previous
+/// ones still ran; at dev-brain scale (24 GiB memfile, 44k chunks) the
+/// concurrent re-materializations chewed fs headroom until the cache's
+/// free-space floor started evicting freshly-landed chunks, which kept
+/// the recheck's still-warm probe false — the 2026-07-15 redo-loop
+/// storm (77k evictions / +15k GCS refetches in 11 min on an otherwise
+/// idle host).
+type InflightPrefetches = Arc<parking_lot::Mutex<HashSet<ManifestDigest>>>;
+
 pub fn spawn_supervisor(
     chunk_store: ChunkStore,
     chunk_cache: ChunkCache,
@@ -333,6 +347,11 @@ pub fn spawn_supervisor(
     let (tx, mut rx) = watch::channel(Vec::<EnabledImageRef>::new());
     let permits = concurrency_from_env();
     let semaphore = Arc::new(Semaphore::new(permits));
+    // ADR 0095: requester-side peer health cache — shared across every
+    // prefetch task so one dead seed is skipped fleet-wide on this host
+    // for the lost-window instead of once per image.
+    let peer_health = crate::peer_fill::PeerHealth::new();
+    let inflight: InflightPrefetches = Arc::new(parking_lot::Mutex::new(HashSet::new()));
     tracing::info!(
         permits,
         recheck_secs = RECHECK_INTERVAL.as_secs(),
@@ -373,12 +392,14 @@ pub fn spawn_supervisor(
                 chunk_store.clone(),
                 chunk_cache.clone(),
                 semaphore.clone(),
+                peer_health.clone(),
                 base_memfile_dir.as_ref(),
                 &mut memfiles,
                 pinned_manifests.clone(),
                 ram_ledger.clone(),
                 tracked_base_shm.clone(),
                 headroom_skipped.clone(),
+                inflight.clone(),
             )
             .await;
 
@@ -425,12 +446,14 @@ async fn reconcile(
     chunk_store: ChunkStore,
     chunk_cache: ChunkCache,
     semaphore: Arc<Semaphore>,
+    peer_health: Arc<crate::peer_fill::PeerHealth>,
     base_memfile_dir: Option<&SnapshotDirResolver>,
     memfiles: &mut HashMap<ManifestDigest, MemfileState>,
     pinned_manifests: PinnedManifests,
     ram_ledger: Arc<crate::ram_ledger::RamLedger>,
     tracked_base_shm: TrackedBaseShm,
     headroom_skipped: HeadroomSkipped,
+    inflight: InflightPrefetches,
 ) {
     let current = readiness.snapshot();
     let current: HashSet<ManifestDigest> = current.into_iter().collect();
@@ -595,14 +618,23 @@ async fn reconcile(
                     pin: None,
                 });
         }
+        // Spawn guard: one prefetch task per digest at a time. The
+        // reconcile tick fires every 30 s (and on every ack), while a
+        // large image's prefetch runs for minutes — unguarded, each
+        // tick stacked another full prefetch (see `InflightPrefetches`).
+        if !inflight.lock().insert(image.manifest_digest.clone()) {
+            continue;
+        }
         // Clone the whole ref into the task — it carries everything
         // prefetch_one needs (uri, digest, base-snapshot disk + memory
         // manifests). Two Strings + two Copy refs; cheap per reconcile.
         let image = image.clone();
+        let inflight = inflight.clone();
         let readiness = readiness.clone();
         let chunk_store = chunk_store.clone();
         let chunk_cache = chunk_cache.clone();
         let semaphore = semaphore.clone();
+        let peer_health = peer_health.clone();
         let pinned_manifests = pinned_manifests.clone();
         let ram_ledger = ram_ledger.clone();
         let tracked_base_shm = tracked_base_shm.clone();
@@ -613,6 +645,7 @@ async fn reconcile(
                 &chunk_store,
                 &chunk_cache,
                 &semaphore,
+                &peer_health,
                 base_memfile,
                 &ram_ledger,
             )
@@ -674,6 +707,10 @@ async fn reconcile(
                     );
                 }
             }
+            // Release the spawn guard on BOTH arms — the next tick may
+            // spawn a fresh attempt (Err), or the recheck may flip and
+            // legitimately re-prefetch later (Ok).
+            inflight.lock().remove(&image.manifest_digest);
         });
     }
 
@@ -797,11 +834,102 @@ struct WarmedManifest {
 /// read at session time. Both manifests are always present (the
 /// `enabled_images` columns are NOT NULL, migrations 0042/0043). Returns the
 /// chunk count + the deduped base-manifest hash set for pinning.
+/// ADR 0095: best-effort peer pre-pass. Bulk-pull a manifest's
+/// locally-missing chunks from a coordinator-hinted warm sibling (LAN,
+/// CRC32C landings) BEFORE the verifying per-chunk loop — which then
+/// finds them resident and completes only the remainder through GCS.
+/// Every failure mode degrades to that loop untouched:
+/// - no hints / all peers health-cached lost ⇒ no dial, pure GCS;
+/// - dial/stream failure ⇒ peer marked lost, try the one alternate
+///   hint (bounded: ≤2 peers × ≤2 pulls);
+/// - `RESOURCE_EXHAUSTED` backpressure ⇒ one jittered retry (the seed
+///   was busy, not dead), then GCS;
+/// - per-chunk `missing` ⇒ that chunk stays for the GCS loop.
+async fn peer_prepass(
+    image: &EnabledImageRef,
+    manifest: &Manifest,
+    chunk_cache: &ChunkCache,
+    peer_health: &Arc<crate::peer_fill::PeerHealth>,
+) {
+    use engram_protocol::grpc_client::PeerChunkScope;
+    if image.warm_peers.is_empty() {
+        return;
+    }
+    let missing_set = |cache: &ChunkCache, manifest: &Manifest| {
+        let cache = cache.clone();
+        let hashes: Vec<ChunkHash> = manifest.chunks.iter().map(|c| c.hash).collect();
+        async move {
+            let mut missing = Vec::new();
+            for h in hashes {
+                if !cache.contains(h).await {
+                    missing.push(h);
+                }
+            }
+            missing
+        }
+    };
+    let mut missing = missing_set(chunk_cache, manifest).await;
+    if missing.is_empty() {
+        return;
+    }
+    let scope = PeerChunkScope::BaseImage(image.manifest_digest.as_str().to_string());
+    for peer in image.warm_peers.iter().take(2) {
+        let started = crate::time_source::metrics_now();
+        let mut stats = crate::peer_fill::pull_chunks_from_peer(
+            &peer.addr,
+            scope.clone(),
+            &missing,
+            chunk_cache,
+            peer_health,
+        )
+        .await;
+        if stats.backpressure && !stats.failed {
+            // The seed's serve semaphore was full — busy, not dead. One
+            // jittered retry (pid-keyed so concurrent warmers spread),
+            // then whatever is left goes to GCS. Never a retry ladder.
+            let jitter_ms = 2_000 + (std::process::id() as u64 % 3_000);
+            tokio::time::sleep(std::time::Duration::from_millis(jitter_ms)).await;
+            missing = missing_set(chunk_cache, manifest).await;
+            if missing.is_empty() {
+                return;
+            }
+            stats = crate::peer_fill::pull_chunks_from_peer(
+                &peer.addr,
+                scope.clone(),
+                &missing,
+                chunk_cache,
+                peer_health,
+            )
+            .await;
+        }
+        tracing::info!(
+            image = %image.manifest_digest,
+            peer = %peer.addr,
+            landed = stats.landed,
+            landed_bytes = stats.landed_bytes,
+            missing_on_peer = stats.missing,
+            failed = stats.failed,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "peer pre-pass window complete",
+        );
+        if !stats.failed {
+            return; // success (or honest misses) — GCS loop mops up
+        }
+        // Peer lost mid-window: recompute what still needs pulling and
+        // try the alternate hint (if any).
+        missing = missing_set(chunk_cache, manifest).await;
+        if missing.is_empty() {
+            return;
+        }
+    }
+}
+
 async fn prefetch_one(
     image: &EnabledImageRef,
     chunk_store: &ChunkStore,
     chunk_cache: &ChunkCache,
     semaphore: &Arc<Semaphore>,
+    peer_health: &Arc<crate::peer_fill::PeerHealth>,
     // ADR 0022 Option A: when `Some`, after warming the memory chunks,
     // assemble them into the contiguous per-template base memfile at this
     // path so same-template base `session.create` siblings MAP_PRIVATE one
@@ -868,6 +996,9 @@ async fn prefetch_one(
         .await
         .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot disk: {e}")))?;
     record_hashes(&disk_manifest);
+    // ADR 0095: LAN peer pre-pass, then the verifying loop completes
+    // the remainder (and every chunk on a peer-less fleet) via GCS.
+    peer_prepass(image, &disk_manifest, chunk_cache, peer_health).await;
     let mut total =
         prefetch_manifest_chunks(disk_manifest, chunk_store, chunk_cache, semaphore).await?;
 
@@ -892,6 +1023,7 @@ async fn prefetch_one(
             .await
             .map_err(|e| PrefetchError::ManifestLoad(format!("base snapshot memory: {e}")))?;
         record_hashes(&memory_manifest);
+        peer_prepass(image, &memory_manifest, chunk_cache, peer_health).await;
         total +=
             prefetch_manifest_chunks(memory_manifest.clone(), chunk_store, chunk_cache, semaphore)
                 .await?;
@@ -1166,6 +1298,8 @@ impl std::error::Error for PrefetchError {}
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     // ADR 0022: pin a small (16 KiB) temp file resident — exercises the
@@ -1212,6 +1346,7 @@ mod tests {
                 version: 1,
             },
             base_snapshot_memory_manifest: None,
+            warm_peers: Vec::new(),
         }
     }
 
@@ -1340,6 +1475,7 @@ mod tests {
             base_snapshot_id,
             base_snapshot_disk_manifest: disk_ref,
             base_snapshot_memory_manifest: mem_ref,
+            warm_peers: Vec::new(),
         }
     }
 
@@ -1356,9 +1492,17 @@ mod tests {
             .join("memory.bin");
 
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
-        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()), &ledger)
-            .await
-            .unwrap();
+        prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            Some(dest.clone()),
+            &ledger,
+        )
+        .await
+        .unwrap();
 
         // The contiguous memfile materialized byte-faithfully at the path
         // a base session.create restore reads — this is the shared inode.
@@ -1371,9 +1515,17 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()), &ledger)
-            .await
-            .unwrap();
+        prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            Some(dest.clone()),
+            &ledger,
+        )
+        .await
+        .unwrap();
         let after = tokio::fs::metadata(&dest)
             .await
             .unwrap()
@@ -1400,9 +1552,17 @@ mod tests {
             .join("memory.bin");
 
         let img = image_ref(base_id, disk_ref, None);
-        prefetch_one(&img, &store, &cache, &sem, Some(dest.clone()), &ledger)
-            .await
-            .unwrap();
+        prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            Some(dest.clone()),
+            &ledger,
+        )
+        .await
+        .unwrap();
         assert!(
             tokio::fs::metadata(&dest).await.is_err(),
             "disk-only image must not materialize a memfile",
@@ -1433,9 +1593,17 @@ mod tests {
             .collect();
 
         let img = image_ref(base_id, disk_ref, Some(mem_ref));
-        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
-            .await
-            .unwrap();
+        let warmed = prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            None,
+            &ledger,
+        )
+        .await
+        .unwrap();
 
         // No duplicates in the returned batch.
         let got: HashSet<ChunkHash> = warmed.hashes.iter().copied().collect();
@@ -1484,12 +1652,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1516,12 +1686,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(!readiness.contains(&img.manifest_digest), "now unready");
@@ -1553,12 +1725,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1593,12 +1767,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -1634,12 +1810,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1662,12 +1840,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -1686,12 +1866,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             Arc::new(Semaphore::new(0)),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -1736,9 +1918,17 @@ mod tests {
         );
 
         // Fresh pre-warm: file written + reported.
-        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
-            .await
-            .unwrap();
+        let warmed = prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            None,
+            &ledger,
+        )
+        .await
+        .unwrap();
         assert_eq!(warmed.base_shm.as_deref(), Some(expected_path.as_path()));
         assert_eq!(
             std::fs::read(&expected_path).unwrap(),
@@ -1751,9 +1941,17 @@ mod tests {
             .unwrap()
             .modified()
             .unwrap();
-        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
-            .await
-            .unwrap();
+        let warmed = prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            None,
+            &ledger,
+        )
+        .await
+        .unwrap();
         assert_eq!(warmed.base_shm.as_deref(), Some(expected_path.as_path()));
         assert_eq!(
             std::fs::metadata(&expected_path)
@@ -1766,9 +1964,17 @@ mod tests {
 
         // Deleted out from under readiness (a sweep): re-prefetch re-warms.
         std::fs::remove_file(&expected_path).unwrap();
-        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
-            .await
-            .unwrap();
+        let warmed = prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            None,
+            &ledger,
+        )
+        .await
+        .unwrap();
         assert_eq!(warmed.base_shm.as_deref(), Some(expected_path.as_path()));
         assert_eq!(std::fs::read(&expected_path).unwrap(), mem_bytes);
 
@@ -1799,9 +2005,17 @@ mod tests {
         let expected_path =
             engram_sandbox_firecracker::uffd_base_path_in(base_dir.path(), &mem_ref);
 
-        let warmed = prefetch_one(&img, &store, &cache, &sem, None, &ledger)
-            .await
-            .unwrap();
+        let warmed = prefetch_one(
+            &img,
+            &store,
+            &cache,
+            &sem,
+            &crate::peer_fill::PeerHealth::new(),
+            None,
+            &ledger,
+        )
+        .await
+        .unwrap();
         assert_eq!(warmed.base_shm, None, "lazy: nothing tracked");
         assert!(!warmed.base_shm_headroom_skipped, "lazy is not a skip-debt");
         assert!(
@@ -1838,12 +2052,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1864,12 +2080,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             Arc::new(Semaphore::new(0)),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -1886,12 +2104,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1929,12 +2149,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -1961,12 +2183,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -1982,12 +2206,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             Arc::new(Semaphore::new(0)),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert!(
@@ -2026,12 +2252,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         for _ in 0..200 {
@@ -2067,12 +2295,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert_eq!(
@@ -2088,12 +2318,14 @@ mod tests {
             store.clone(),
             cache.clone(),
             sem.clone(),
+            crate::peer_fill::PeerHealth::new(),
             None,
             &mut memfiles,
             pinned.clone(),
             ledger.clone(),
             tracked.clone(),
             skipped.clone(),
+            Arc::new(parking_lot::Mutex::new(HashSet::new())),
         )
         .await;
         assert_eq!(

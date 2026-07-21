@@ -10,7 +10,8 @@
 //! `Retained<VZVirtualMachine>` carries.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use block2::RcBlock;
 use dispatch2::{DispatchQueue, DispatchRetained};
@@ -24,7 +25,7 @@ use objc2_virtualization::{
     VZSerialPortConfiguration, VZSocketDeviceConfiguration, VZStorageDeviceConfiguration,
     VZVirtioBlockDeviceConfiguration, VZVirtioConsoleDeviceSerialPortConfiguration,
     VZVirtioNetworkDeviceConfiguration, VZVirtioSocketDeviceConfiguration, VZVirtualMachine,
-    VZVirtualMachineConfiguration,
+    VZVirtualMachineConfiguration, VZVirtualMachineState,
 };
 
 use engram_core::types::sandbox::AuxRoDrive;
@@ -40,12 +41,30 @@ pub(crate) struct VmConfig {
     /// Linux kernel command line. Default points root at /dev/vda
     /// (the first virtio-block device) and routes the console to hvc0.
     pub kernel_cmdline: String,
-    /// ADR 0061: skill bundles to attach as read-only erofs virtio-blk
+    /// ADR 0061: skill bundles to attach as read-only squashfs virtio-blk
     /// drives. Only entries with `sha256 = Some` attach (sentinels are
     /// skipped); attach order is `/dev/vdb`, `/dev/vdc`, …
     pub aux_ro_drives: Vec<AuxRoDrive>,
-    /// Directory the erofs payloads live in (`<sha>.erofs`).
+    /// Directory the bundle payloads live in (`<sha>.squashfs`).
     pub bundle_dir: std::path::PathBuf,
+    /// ADR 0096 spike: pin the `VZGenericMachineIdentifier` (its
+    /// `dataRepresentation` bytes). Apple's machine-state save/restore
+    /// contract requires the restoring VM's identifier to MATCH the
+    /// saved one — and with no explicit platform (the `None` default,
+    /// today's behavior) every process gets a fresh random identifier,
+    /// which is the never-ruled-out cause of the historical
+    /// VZErrorRestore=12 that pushed VZ to clone+cold-boot (ADR 0003).
+    /// Produce fresh bytes with [`fresh_machine_identifier`], persist
+    /// them beside the saved state, and pass them back at restore.
+    pub machine_identifier: Option<Vec<u8>>,
+    /// ADR 0096 spike round 2: pin the virtio-net MAC address
+    /// (`"aa:bb:cc:dd:ee:ff"`). The framework default mints a RANDOM
+    /// `VZMACAddress` per configuration — a restore whose MAC differs
+    /// from the saved VM's fails with the same generic
+    /// VZErrorRestore=12 (documented on Apple's forums; the saved
+    /// state pins the whole effective device config, not just the
+    /// machine identifier). `None` keeps the random default.
+    pub mac_address: Option<String>,
 }
 
 impl VmConfig {
@@ -79,8 +98,8 @@ impl VmConfig {
             //     bake injects this at /sbin/engram-init.
             //   - `ip=dhcp` — Linux's IP_PNP path: kernel itself
             //     brings up eth0 and DHCPs for an address against
-            //     VZ's NAT before userspace runs. The Kata kernel
-            //     ships with CONFIG_IP_PNP_DHCP=y so this is free.
+            //     VZ's NAT before userspace runs. The owned engram
+            //     kernel ships CONFIG_IP_PNP_DHCP=y so this is free.
             //     Without it the rootfs would need iproute2 +
             //     dhclient just to get on the network — `node:20-slim`
             //     and the demo bakes carry neither, so the guest
@@ -92,7 +111,37 @@ impl VmConfig {
                 .into(),
             aux_ro_drives: Vec::new(),
             bundle_dir: std::path::PathBuf::new(),
+            machine_identifier: None,
+            mac_address: None,
         }
+    }
+
+    /// ADR 0096 spike: pin the platform machine identifier (see the
+    /// field docs).
+    pub fn with_machine_identifier(mut self, bytes: Vec<u8>) -> Self {
+        self.machine_identifier = Some(bytes);
+        self
+    }
+
+    /// ADR 0096 spike round 2: pin the virtio-net MAC (see the field
+    /// docs).
+    pub fn with_mac_address(mut self, mac: impl Into<String>) -> Self {
+        self.mac_address = Some(mac.into());
+        self
+    }
+
+    /// ADR 0096 D6: pass the host egress proxy + DNS ports to the guest
+    /// as `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline. Env-form
+    /// (UPPERCASE=value) so the kernel hands it to PID 1's environment
+    /// (a dotted param would be swallowed as a module option); the init
+    /// shim reads it and installs the in-guest DNAT redirect. `None` is
+    /// a no-op.
+    pub fn with_egress_ports(mut self, ports: Option<(u16, u16)>) -> Self {
+        if let Some((proxy, dns)) = ports {
+            self.kernel_cmdline
+                .push_str(&format!(" ENGRAM_EGRESS={proxy}:{dns}"));
+        }
+        self
     }
 
     /// ADR 0061: attach these skill bundles (resolved `AuxRoDrive`s) from
@@ -105,6 +154,18 @@ impl VmConfig {
         self.aux_ro_drives = drives;
         self.bundle_dir = bundle_dir;
         self
+    }
+}
+
+/// ADR 0096: mint fresh `VZGenericMachineIdentifier` bytes
+/// (its `dataRepresentation`). Persist beside a saved machine state
+/// and hand back via [`VmConfig::with_machine_identifier`] at restore.
+pub(crate) fn fresh_machine_identifier() -> Vec<u8> {
+    use objc2_virtualization::VZGenericMachineIdentifier;
+    // SAFETY: plain data object; no VM/queue involvement.
+    unsafe {
+        let mid = VZGenericMachineIdentifier::new();
+        mid.dataRepresentation().to_vec()
     }
 }
 
@@ -191,6 +252,62 @@ impl<T: Clone> Clone for Sendable<T> {
     }
 }
 
+// ---- VZVirtualMachineDelegate (crash detection, ADR 0096) ------------
+
+use vm_delegate::VmStopDelegate;
+
+mod vm_delegate {
+    use super::*;
+    use objc2::define_class;
+    use objc2::runtime::NSObjectProtocol;
+    use objc2::DefinedClass;
+    use objc2_foundation::NSObject;
+    use objc2_virtualization::VZVirtualMachineDelegate;
+
+    /// State held inside the delegate instance — the shared dead flag
+    /// the owning `VzVm` (and through it the backend's `list()` /
+    /// `probe_sandbox`) reads.
+    pub(crate) struct DelegateIvars {
+        pub(crate) dead: Arc<AtomicBool>,
+    }
+
+    define_class!(
+        #[unsafe(super(NSObject))]
+        #[name = "EngramVZVmStopDelegate"]
+        #[ivars = DelegateIvars]
+        pub(crate) struct VmStopDelegate;
+
+        unsafe impl NSObjectProtocol for VmStopDelegate {}
+
+        unsafe impl VZVirtualMachineDelegate for VmStopDelegate {
+            #[unsafe(method(guestDidStopVirtualMachine:))]
+            fn guest_did_stop(&self, _vm: &VZVirtualMachine) {
+                self.ivars().dead.store(true, Ordering::SeqCst);
+                tracing::warn!(
+                    "vz: guest stopped the VM (guestDidStopVirtualMachine) — marking dead"
+                );
+            }
+
+            #[unsafe(method(virtualMachine:didStopWithError:))]
+            fn did_stop_with_error(&self, _vm: &VZVirtualMachine, error: &NSError) {
+                self.ivars().dead.store(true, Ordering::SeqCst);
+                tracing::error!(
+                    error = %ns_error_message(error),
+                    "vz: VM stopped with error — marking dead"
+                );
+            }
+        }
+    );
+
+    impl VmStopDelegate {
+        pub(crate) fn new(dead: Arc<AtomicBool>) -> Retained<Self> {
+            let this = Self::alloc().set_ivars(DelegateIvars { dead });
+            // SAFETY: `init` returns a fully-initialised retained instance.
+            unsafe { objc2::msg_send![super(this), init] }
+        }
+    }
+}
+
 /// Owned VZ virtual machine.
 ///
 /// Holds the `Retained<VZVirtualMachine>` plus the per-VM
@@ -200,6 +317,15 @@ impl<T: Clone> Clone for Sendable<T> {
 pub(crate) struct VzVm {
     vm: Retained<VZVirtualMachine>,
     queue: DispatchRetained<DispatchQueue>,
+    /// ADR 0096 crash detection: set by the [`VmStopDelegate`] when the
+    /// guest stops the VM or VZ stops it with an error. `list()` filters
+    /// dead sandboxes so the ADR 0009 heartbeat reflects ground truth.
+    dead: Arc<AtomicBool>,
+    /// Kept retained for the VM's lifetime — `VZVirtualMachine.delegate`
+    /// is a WEAK ObjC property (the same trap as the vsock listener
+    /// delegates): dropping this deallocates the delegate and the stop
+    /// callbacks silently never fire.
+    _delegate: Retained<VmStopDelegate>,
 }
 
 // SAFETY: see `SendableVm` for the full argument. The `VzVm` itself
@@ -273,7 +399,42 @@ impl VzVm {
             )
         };
 
-        Ok(Self { vm, queue })
+        // ADR 0096 crash detection: attach a stop delegate BEFORE the
+        // caller starts the VM. `setDelegate:` must run on the VM's
+        // queue (Apple's threading contract); the serial queue orders
+        // this ahead of the later `start()` dispatch. The delegate does
+        // nothing but flip the dead flag + log — callbacks arrive on
+        // the VM queue and must never block.
+        let dead = Arc::new(AtomicBool::new(false));
+        let delegate = VmStopDelegate::new(dead.clone());
+        {
+            let vm = Sendable(vm.clone());
+            let delegate = Sendable(delegate.clone());
+            queue.exec_async(move || {
+                // Move the WHOLE wrappers in (edition-2021 disjoint
+                // capture would otherwise grab the bare Retained fields).
+                let (vm, delegate) = (vm, delegate);
+                // SAFETY: on the VM's queue; delegate outlives the VM
+                // (kept retained in `_delegate` — the property is weak).
+                unsafe {
+                    vm.0.setDelegate(Some(objc2::runtime::ProtocolObject::from_ref(&*delegate.0)));
+                }
+            });
+        }
+
+        Ok(Self {
+            vm,
+            queue,
+            dead,
+            _delegate: delegate,
+        })
+    }
+
+    /// ADR 0096: true once the stop delegate has fired — the guest
+    /// stopped the VM or VZ stopped it with an error. The backend's
+    /// `list()`/`probe_sandbox` key off this.
+    pub fn is_dead(&self) -> bool {
+        self.dead.load(Ordering::SeqCst)
     }
 
     /// Start the VM. Resolves once VZ's `startWithCompletionHandler`
@@ -297,10 +458,44 @@ impl VzVm {
         .await
     }
 
-    /// Pause the VM. Required before `save`. Used by snapshot
-    /// in task 29 — reachable but unused as of task 27.
-    #[allow(dead_code)]
+    /// Read the VM's current state (queue-dispatched — Apple's
+    /// threading contract puts every `VZVirtualMachine` access on the
+    /// VM's dispatch queue, property reads included). ADR 0096: the
+    /// idempotence guards below and `probe_sandbox`'s ground-truth
+    /// liveness check both key off this.
+    pub async fn state(&self) -> VZVirtualMachineState {
+        let (tx, rx) = oneshot::channel();
+        let vm = Sendable(self.vm.clone());
+        let tx = std::sync::Mutex::new(Some(tx));
+        self.queue.exec_async(move || {
+            // Move the WHOLE `Sendable` in — edition-2021 disjoint
+            // capture would otherwise capture only the `.0` field (a
+            // bare non-Send `Retained`), defeating the wrapper.
+            let vm = vm;
+            // SAFETY: vm is retained for the closure's lifetime and we
+            // are on the VM's dispatch queue.
+            let st = unsafe { vm.0.state() };
+            if let Some(tx) = tx.lock().expect("state oneshot mutex").take() {
+                let _ = tx.send(st);
+            }
+        });
+        // A dropped channel means the queue died mid-teardown; report
+        // Error rather than panicking a probe path.
+        rx.await.unwrap_or(VZVirtualMachineState::Error)
+    }
+
+    /// Pause the VM. Required before `save`; the external park path
+    /// (`SandboxBackend::pause`, ADR 0096) and `snapshot()` both use it.
+    ///
+    /// Idempotent: pausing an already-paused VM is a no-op `Ok(())` —
+    /// the trait's documented contract (matching FC), and load-bearing
+    /// for the park→snapshot descent: `snapshot()` pauses
+    /// unconditionally, and VZ would otherwise surface an
+    /// "invalid state transition" NSError on a parked VM.
     pub async fn pause(&self) -> Result<(), VzError> {
+        if self.state().await == VZVirtualMachineState::Paused {
+            return Ok(());
+        }
         self.dispatch_op("pause", |vm, completion| {
             // SAFETY: see `start`.
             unsafe { vm.pauseWithCompletionHandler(completion) }
@@ -308,9 +503,12 @@ impl VzVm {
         .await
     }
 
-    /// Resume from a paused state. Used by snapshot in task 29.
-    #[allow(dead_code)]
+    /// Resume from a paused state. Idempotent on an already-running VM
+    /// (see `pause`).
     pub async fn resume(&self) -> Result<(), VzError> {
+        if self.state().await == VZVirtualMachineState::Running {
+            return Ok(());
+        }
         self.dispatch_op("resume", |vm, completion| {
             // SAFETY: see `start`.
             unsafe { vm.resumeWithCompletionHandler(completion) }
@@ -320,7 +518,6 @@ impl VzVm {
 
     /// Save the paused VM's full state (memory + device state) to
     /// `dest`. VM must be in `.paused`. Used by snapshot in task 29.
-    #[allow(dead_code)]
     pub async fn save(&self, dest: &Path) -> Result<(), VzError> {
         let url = Sendable(nsurl_for_path(dest));
         self.dispatch_op_save_restore("save", move |vm, completion| {
@@ -335,7 +532,6 @@ impl VzVm {
     /// Restore from a save file. Must be called on a freshly-built
     /// VM with a configuration that matches the source. Used by
     /// snapshot in task 29.
-    #[allow(dead_code)]
     pub async fn restore(&self, src: &Path) -> Result<(), VzError> {
         let url = Sendable(nsurl_for_path(src));
         self.dispatch_op_save_restore("restore", move |vm, completion| {
@@ -358,7 +554,6 @@ impl VzVm {
     /// Same shape as `dispatch_op`, but tags the error variant as
     /// `SaveRestore` so the caller can distinguish snapshot failures
     /// from lifecycle failures. Used by snapshot in task 29.
-    #[allow(dead_code)]
     async fn dispatch_op_save_restore<F>(
         &self,
         op: &'static str,
@@ -419,12 +614,13 @@ impl VzVm {
 }
 
 /// ADR 0061: host path of a resolved skill generation for the VZ backend.
-/// Content-keyed `<bundle_dir>/<sha>.erofs` — VZ stages erofs where FC
-/// stages squashfs (the Kata VZ kernel has no CONFIG_SQUASHFS). The sha
-/// comes from the host's `current.json` stamp via the coordinator's
-/// resolved `AuxRoDrive.sha256`, so path and content never disagree.
-pub(crate) fn staged_erofs_path(bundle_dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
-    bundle_dir.join(format!("{sha}.erofs"))
+/// Content-keyed `<bundle_dir>/<sha>.squashfs` — the shared
+/// `AuxRoDrive::staged_file_name` format both backends stage (ADR 0096
+/// retired VZ's erofs fork along with the Kata kernel). The sha comes
+/// from the host's `current.json` stamp via the coordinator's resolved
+/// `AuxRoDrive.sha256`, so path and content never disagree.
+pub(crate) fn staged_bundle_path(bundle_dir: &std::path::Path, sha: &str) -> std::path::PathBuf {
+    bundle_dir.join(AuxRoDrive::staged_file_name(sha))
 }
 
 /// ADR 0062: order aux RO drives by ascending reserved slot for attach.
@@ -460,7 +656,7 @@ pub(crate) fn aux_drives_in_slot_order(drives: &[AuxRoDrive]) -> Vec<&AuxRoDrive
 /// virtio-console (single byte stream per port → head-of-line
 /// blocking when a persistent connection monopolises a port) back to
 /// virtio-vsock, which muxes any number of concurrent streams per
-/// port. The Kata guest kernel VZ boots (`just pull-kernel`) ships
+/// port. The guest kernel VZ boots (`just pull-kernel`) ships
 /// `CONFIG_VIRTIO_VSOCKETS=y` built-in, so the earlier "console is
 /// universally compiled in, vsock isn't" constraint no longer applies.
 /// The `vsock_bridge` attaches per-port listeners + dials after
@@ -488,6 +684,32 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         vz_cfg.setCPUCount(cfg.vcpus as objc2_foundation::NSUInteger);
         vz_cfg.setMemorySize((cfg.memory_mib as u64) * 1024 * 1024);
 
+        // ADR 0096 spike: pinned machine identifier. Save/restore
+        // requires the restoring VM's identifier to match the saved
+        // one; the implicit default platform mints a fresh random one
+        // per process. Only set when the caller opts in — `None`
+        // keeps today's behavior byte-for-byte.
+        if let Some(bytes) = &cfg.machine_identifier {
+            use objc2_virtualization::{
+                VZGenericMachineIdentifier, VZGenericPlatformConfiguration,
+            };
+            let data = objc2_foundation::NSData::with_bytes(bytes);
+            let mid = VZGenericMachineIdentifier::initWithDataRepresentation(
+                VZGenericMachineIdentifier::alloc(),
+                &data,
+            )
+            .ok_or_else(|| {
+                VzError::ConfigInvalid(
+                    "machine_identifier bytes did not parse as a VZGenericMachineIdentifier".into(),
+                )
+            })?;
+            let platform = VZGenericPlatformConfiguration::new();
+            platform.setMachineIdentifier(&mid);
+            let platform_super: Retained<objc2_virtualization::VZPlatformConfiguration> =
+                Retained::cast_unchecked(platform);
+            vz_cfg.setPlatform(&platform_super);
+        }
+
         // Storage devices, in attach order so `/dev/vda` is the
         // rootfs and (when present) `/dev/vdb` is the harness
         // substrate:
@@ -513,7 +735,7 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         );
         storage.push(Retained::cast_unchecked(block_dev));
 
-        // ADR 0061/0062: attach each resolved bundle as a read-only erofs
+        // ADR 0061/0062: attach each resolved bundle as a read-only squashfs
         // virtio-blk image. Order by ascending reserved slot (NOT the
         // coordinator's slice order, which pushes the harness last) so the
         // harness (slot 0) is attached first and the guest init shim mounts it
@@ -529,10 +751,10 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
             let Some(sha) = drive.sha256.as_deref() else {
                 continue;
             };
-            let path = staged_erofs_path(&cfg.bundle_dir, sha);
+            let path = staged_bundle_path(&cfg.bundle_dir, sha);
             if !path.exists() {
                 return Err(VzError::AttachmentFailed(format!(
-                    "skill bundle {} not staged at {} — run `just bundles-vz`",
+                    "skill bundle {} not staged at {} — run `just bundles-squashfs`",
                     drive.drive_id,
                     path.display()
                 )));
@@ -540,7 +762,7 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
             tracing::info!(
                 drive_id = %drive.drive_id,
                 path = %path.display(),
-                "vz: attaching aux erofs drive"
+                "vz: attaching aux bundle drive"
             );
             let url = nsurl_for_path(&path);
             let att = VZDiskImageStorageDeviceAttachment::initWithURL_readOnly_error(
@@ -571,6 +793,19 @@ fn build_configuration(cfg: &VmConfig) -> Result<Retained<VZVirtualMachineConfig
         let nat_super: Retained<objc2_virtualization::VZNetworkDeviceAttachment> =
             Retained::cast_unchecked(nat);
         net_dev.setAttachment(Some(&nat_super));
+        // ADR 0096 spike round 2: pin the MAC when asked — the default
+        // is a fresh random VZMACAddress per configuration, and a
+        // machine-state restore requires the restoring config's MAC to
+        // MATCH the saved VM's (mismatch = generic VZErrorRestore=12).
+        if let Some(mac) = &cfg.mac_address {
+            let mac_ns = NSString::from_str(mac);
+            let mac_addr = objc2_virtualization::VZMACAddress::initWithString(
+                objc2_virtualization::VZMACAddress::alloc(),
+                &mac_ns,
+            )
+            .ok_or_else(|| VzError::ConfigInvalid(format!("mac_address {mac:?} did not parse")))?;
+            net_dev.setMACAddress(&mac_addr);
+        }
         let net_dev_super: Retained<objc2_virtualization::VZNetworkDeviceConfiguration> =
             Retained::cast_unchecked(net_dev);
         let network_array: Retained<NSArray<objc2_virtualization::VZNetworkDeviceConfiguration>> =
@@ -708,9 +943,9 @@ mod tests {
     /// run = the plumbing works end-to-end *until* the entitlement
     /// check.
     #[test]
-    #[ignore = "requires a kernel + rootfs file present on disk; \
-                ignored by default. Run with --ignored on a host that \
-                has `just pull-kernel` + `just bake-demo` artifacts."]
+    #[ignore = "requires a kernel + rootfs FILE present on disk (any bytes — \
+                CI touches an empty /tmp/engram-vz-rootfs.ext4); run with \
+                --ignored after `just pull-kernel`."]
     fn config_validation_surfaces_clear_error_without_entitlement() {
         let kernel =
             std::path::PathBuf::from(std::env::var("ENGRAM_VZ_KERNEL_PATH").unwrap_or_else(|_| {
@@ -739,9 +974,9 @@ mod tests {
     }
 
     #[test]
-    fn staged_erofs_path_is_content_keyed() {
-        let p = super::staged_erofs_path(std::path::Path::new("/var/shared"), "abc123");
-        assert_eq!(p, std::path::PathBuf::from("/var/shared/abc123.erofs"));
+    fn staged_bundle_path_is_content_keyed() {
+        let p = super::staged_bundle_path(std::path::Path::new("/var/shared"), "abc123");
+        assert_eq!(p, std::path::PathBuf::from("/var/shared/abc123.squashfs"));
     }
 
     /// ADR 0062 regression: the coordinator builds `selected_mounts` as
@@ -818,6 +1053,342 @@ mod tests {
                 assert!(!msg.is_empty(), "AttachmentFailed must carry a message");
             }
             Err(other) => panic!("unexpected error from VzVm::new: {other}"),
+        }
+    }
+
+    /// ADR 0096 D7 spike: re-validate Apple's machine-state
+    /// save/restore for arm64 Linux guests on current macOS. ADR 0003
+    /// abandoned the API when restore returned an opaque
+    /// VZErrorRestore=12 (macOS-14 era, UTM #6654) and VZ has
+    /// clone+cold-boot snapshots since. The never-ruled-out cause: no
+    /// explicit platform config → a fresh random
+    /// `VZGenericMachineIdentifier` per process, which the restore
+    /// contract requires to MATCH the saved VM's.
+    ///
+    /// Boots the staged test rootfs with `init=/bin/sh` (an idle PID 1
+    /// — no bundles needed), pauses, saves, tears the VM down, rebuilds
+    /// an identical config with the SAME pinned identifier, restores,
+    /// resumes, and asserts the machine reports Running. Prints a loud
+    /// `SPIKE RESULT:` line either way — the outcome (with the macOS
+    /// version) belongs in snapshot.rs's header. If green, memory
+    /// snapshots / warm restore / honest park productize as their own
+    /// future ADR.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ADR 0096 spike: live save/restore probe — run via `just vz-e2e` artifacts \
+                (macOS + codesigned + kernel + ENGRAM_VZ_ROOTFS)"]
+    async fn machine_state_save_restore_spike() {
+        // Surface VzVm::new's validateSaveRestoreSupportWithError
+        // verdict (it names the offending device when unsupported).
+        let _ = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::DEBUG)
+            .try_init();
+        let home = std::env::var("HOME").unwrap_or_default();
+        let kernel = std::env::var("ENGRAM_VZ_KERNEL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(home).join(".cache/engram-vz-test/vmlinux-arm64")
+            });
+        let rootfs = match std::env::var("ENGRAM_VZ_ROOTFS") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                eprintln!("SKIP: ENGRAM_VZ_ROOTFS unset (run `just vz-e2e` once to stage it)");
+                return;
+            }
+        };
+        if !kernel.exists() || !rootfs.exists() {
+            eprintln!("SKIP: kernel/rootfs artifacts missing");
+            return;
+        }
+
+        let scratch = tempfile::tempdir().expect("scratch");
+        let rootfs_copy = scratch.path().join("rootfs.ext4");
+        crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+            .await
+            .expect("clone rootfs");
+        let state = scratch.path().join("machine.vzs");
+        let mid = fresh_machine_identifier();
+
+        let mk_cfg = || {
+            let mut c = VmConfig::new(&kernel, &rootfs_copy, 1024, 2)
+                .with_machine_identifier(mid.clone())
+                // Round 2: the saved state pins the WHOLE effective
+                // device config — a fresh random MAC on the restoring
+                // config is a documented VZErrorRestore=12 cause.
+                // Locally-administered, unicast.
+                .with_mac_address("0a:e2:96:00:00:01");
+            // Idle PID 1 — the ADR 0080 init shim would panic without
+            // its agentd bundle; the spike only probes VM mechanics.
+            c.kernel_cmdline =
+                "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw quiet init=/bin/sh".into();
+            c
+        };
+
+        let vm1 = match VzVm::new(mk_cfg()) {
+            Ok(vm) => vm,
+            Err(VzError::ConfigInvalid(msg)) => {
+                eprintln!("SKIP: unsigned test binary / config invalid: {msg}");
+                return;
+            }
+            Err(other) => panic!("VzVm::new: {other}"),
+        };
+        vm1.start().await.expect("start");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await; // let the kernel settle
+        assert_eq!(
+            vm1.state().await,
+            VZVirtualMachineState::Running,
+            "guest must be running before pause+save"
+        );
+        vm1.pause().await.expect("pause");
+        if let Err(e) = vm1.save(&state).await {
+            panic!("SPIKE RESULT: saveMachineStateToURL FAILED on this macOS: {e}");
+        }
+        vm1.stop().await.ok();
+        drop(vm1);
+
+        let vm2 = VzVm::new(mk_cfg()).expect("rebuild identical VM");
+        match vm2.restore(&state).await {
+            Ok(()) => {
+                vm2.resume().await.expect("resume restored VM");
+                assert_eq!(
+                    vm2.state().await,
+                    VZVirtualMachineState::Running,
+                    "restored VM must report Running after resume"
+                );
+                eprintln!(
+                    "SPIKE RESULT: machine-state save/restore WORKS on this macOS with a \
+                     pinned VZGenericMachineIdentifier + pinned MAC address — \
+                     productization unlocked (ADR 0096 D7)"
+                );
+                vm2.stop().await.ok();
+            }
+            Err(e) => {
+                panic!(
+                    "SPIKE RESULT: restoreMachineStateFromURL still fails on this macOS \
+                     (pinned machine id + MAC did not fix it): {e}"
+                );
+            }
+        }
+    }
+
+    /// Shared preflight for the round-3 spikes: kernel + rootfs or skip.
+    fn spike_artifacts() -> Option<(std::path::PathBuf, std::path::PathBuf)> {
+        let home = std::env::var("HOME").unwrap_or_default();
+        let kernel = std::env::var("ENGRAM_VZ_KERNEL_PATH")
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|_| {
+                std::path::PathBuf::from(home).join(".cache/engram-vz-test/vmlinux-arm64")
+            });
+        let rootfs = match std::env::var("ENGRAM_VZ_ROOTFS") {
+            Ok(p) => std::path::PathBuf::from(p),
+            Err(_) => {
+                eprintln!("SKIP: ENGRAM_VZ_ROOTFS unset (run `just vz-e2e` once to stage it)");
+                return None;
+            }
+        };
+        if !kernel.exists() || !rootfs.exists() {
+            eprintln!("SKIP: kernel/rootfs artifacts missing");
+            return None;
+        }
+        Some((kernel, rootfs))
+    }
+
+    fn spike_cfg(
+        kernel: &std::path::Path,
+        rootfs: &std::path::Path,
+        mid: Vec<u8>,
+        mac: &str,
+        memory_mib: u32,
+    ) -> VmConfig {
+        let mut c = VmConfig::new(kernel, rootfs, memory_mib, 2)
+            .with_machine_identifier(mid)
+            .with_mac_address(mac);
+        // Idle PID 1 — no bundles needed; the spikes probe VM mechanics.
+        c.kernel_cmdline =
+            "console=hvc0 tsc=reliable panic=0 root=/dev/vda rw quiet init=/bin/sh".into();
+        c
+    }
+
+    /// ADR 0096 D7 spike round 3, probes (a)+(c)+(d) — the design gates
+    /// for warm-restore productization:
+    ///   (a) does restore tolerate the rootfs living at a DIFFERENT path
+    ///       than at save time? (restore_impl clones to a fresh
+    ///       per-sandbox path, so this decides whether the manifest must
+    ///       carry the saved attachment path)
+    ///   (c) save duration + state-file size at a 1 GiB guest (bounds
+    ///       the snapshot() pause-window growth)
+    ///   (d) does the vsock bridge attach to a restored-but-still-PAUSED
+    ///       machine? (decides restore→bridge→resume vs
+    ///       restore→resume→bridge ordering)
+    ///
+    /// FINDINGS (2026-07-15, macOS 26 / Darwin 25.2) — recorded by
+    /// running this probe; see the SPIKE3 eprintln lines:
+    ///   (a) PASS — the rootfs path is NOT part of save/restore config
+    ///       identity; a clone at a different path restores fine.
+    ///   (c) see log line (sub-second expected on NVMe at 1 GiB).
+    ///   (d) PASS — listeners register on a paused machine, so the warm
+    ///       path orders restore → bridge → resume (no redial window).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ADR 0096 D7 spike r3: live probes — run via `just vz-e2e` artifacts"]
+    async fn machine_state_spike_round3_path_timing_ordering() {
+        let Some((kernel, rootfs)) = spike_artifacts() else {
+            return;
+        };
+        let scratch = tempfile::tempdir().expect("scratch");
+        let rootfs_a = scratch.path().join("a.rootfs.ext4");
+        crate::disk::clone_or_copy(&rootfs, &rootfs_a)
+            .await
+            .expect("clone rootfs");
+        let state = scratch.path().join("machine.vzs");
+        let mid = fresh_machine_identifier();
+        const MAC: &str = "0a:e2:96:00:00:02";
+
+        let vm1 = match VzVm::new(spike_cfg(&kernel, &rootfs_a, mid.clone(), MAC, 1024)) {
+            Ok(vm) => vm,
+            Err(VzError::ConfigInvalid(msg)) => {
+                eprintln!("SKIP: unsigned test binary / config invalid: {msg}");
+                return;
+            }
+            Err(other) => panic!("VzVm::new: {other}"),
+        };
+        vm1.start().await.expect("start");
+        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        vm1.pause().await.expect("pause");
+
+        // (c) timing + size at 1 GiB.
+        let t0 = std::time::Instant::now();
+        vm1.save(&state).await.expect("save");
+        let save_elapsed = t0.elapsed();
+        let size = std::fs::metadata(&state).expect("state file").len();
+        eprintln!(
+            "SPIKE3(c): save of a 1 GiB guest took {save_elapsed:?}, machine.vzs = {} MiB",
+            size / (1024 * 1024)
+        );
+        vm1.stop().await.ok();
+        drop(vm1);
+
+        // (a) restore with the rootfs at a DIFFERENT path.
+        let rootfs_b = scratch.path().join("b.rootfs.ext4");
+        crate::disk::clone_or_copy(&rootfs_a, &rootfs_b)
+            .await
+            .expect("clone to different path");
+        let vm2 = VzVm::new(spike_cfg(&kernel, &rootfs_b, mid.clone(), MAC, 1024))
+            .expect("rebuild VM at different rootfs path");
+        match vm2.restore(&state).await {
+            Ok(()) => eprintln!(
+                "SPIKE3(a): PASS — restore tolerates a rootfs at a different path \
+                 (no saved-attachment-path field needed in the manifest)"
+            ),
+            Err(e) => panic!(
+                "SPIKE3(a): FAIL — restore rejects a moved rootfs; the manifest must \
+                 pin the saved attachment path: {e}"
+            ),
+        }
+
+        // (d) bridge attach while still PAUSED (before resume).
+        let uds_base = scratch.path().join("spike3.vsock");
+        let bridge_paused = crate::vsock_bridge::VsockBridge::start(
+            vm2.raw_clone(),
+            vm2.queue_clone(),
+            uds_base,
+            None,
+            None,
+            None,
+        )
+        .await;
+        match &bridge_paused {
+            Ok(_) => eprintln!(
+                "SPIKE3(d): PASS — vsock listeners register on a restored-but-paused \
+                 machine; warm restore orders restore → bridge → resume"
+            ),
+            Err(e) => eprintln!(
+                "SPIKE3(d): listeners on a paused machine FAILED ({e}) — warm restore \
+                 must order restore → resume → bridge (self-healing redial window)"
+            ),
+        }
+
+        vm2.resume().await.expect("resume");
+        assert_eq!(vm2.state().await, VZVirtualMachineState::Running);
+        if let Ok((mut bridge, _conn)) = bridge_paused {
+            bridge.stop().await;
+        }
+        vm2.stop().await.ok();
+    }
+
+    /// ADR 0096 D7 spike round 3, probe (b): CROSS-PROCESS restore — the
+    /// real resume shape (save in one host-agent process, restore in the
+    /// next). Two-phase via env:
+    ///
+    /// ```sh
+    /// dir=$(mktemp -d)
+    /// ENGRAM_VZ_SPIKE_PHASE=save    ENGRAM_VZ_SPIKE_DIR=$dir cargo nextest run ... -E 'test(machine_state_spike_cross_process)' --run-ignored ignored-only
+    /// ENGRAM_VZ_SPIKE_PHASE=restore ENGRAM_VZ_SPIKE_DIR=$dir cargo nextest run ... -E 'test(machine_state_spike_cross_process)' --run-ignored ignored-only
+    /// ```
+    ///
+    /// Skips (never fails) when the phase env is unset, so it's inert in
+    /// the normal `--run-ignored` sweep. FINDING (2026-07-15, macOS 26):
+    /// PASS — same-user cross-process restore works (the keychain
+    /// protection is per-user, not per-process).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "ADR 0096 D7 spike r3(b): two-phase cross-process probe (env-driven)"]
+    async fn machine_state_spike_cross_process() {
+        let phase = match std::env::var("ENGRAM_VZ_SPIKE_PHASE") {
+            Ok(p) => p,
+            Err(_) => {
+                eprintln!("SKIP: ENGRAM_VZ_SPIKE_PHASE unset (two-phase probe; see doc)");
+                return;
+            }
+        };
+        let dir = std::path::PathBuf::from(
+            std::env::var("ENGRAM_VZ_SPIKE_DIR").expect("ENGRAM_VZ_SPIKE_DIR"),
+        );
+        let Some((kernel, rootfs)) = spike_artifacts() else {
+            return;
+        };
+        const MAC: &str = "0a:e2:96:00:00:03";
+        let rootfs_copy = dir.join("rootfs.ext4");
+        let state = dir.join("machine.vzs");
+        let mid_file = dir.join("machine-id.bin");
+
+        match phase.as_str() {
+            "save" => {
+                std::fs::create_dir_all(&dir).expect("spike dir");
+                crate::disk::clone_or_copy(&rootfs, &rootfs_copy)
+                    .await
+                    .expect("clone rootfs");
+                let mid = fresh_machine_identifier();
+                std::fs::write(&mid_file, &mid).expect("persist machine id");
+                let vm = match VzVm::new(spike_cfg(&kernel, &rootfs_copy, mid, MAC, 512)) {
+                    Ok(vm) => vm,
+                    Err(VzError::ConfigInvalid(msg)) => {
+                        eprintln!("SKIP: unsigned/config invalid: {msg}");
+                        return;
+                    }
+                    Err(other) => panic!("VzVm::new: {other}"),
+                };
+                vm.start().await.expect("start");
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                vm.pause().await.expect("pause");
+                vm.save(&state).await.expect("save");
+                vm.stop().await.ok();
+                eprintln!(
+                    "SPIKE3(b): save phase complete; run the restore phase in a fresh process"
+                );
+            }
+            "restore" => {
+                let mid = std::fs::read(&mid_file).expect("saved machine id");
+                let vm = VzVm::new(spike_cfg(&kernel, &rootfs_copy, mid, MAC, 512))
+                    .expect("rebuild VM in fresh process");
+                match vm.restore(&state).await {
+                    Ok(()) => {
+                        vm.resume().await.expect("resume");
+                        assert_eq!(vm.state().await, VZVirtualMachineState::Running);
+                        eprintln!("SPIKE3(b): PASS — cross-process (same-user) restore works");
+                        vm.stop().await.ok();
+                    }
+                    Err(e) => panic!("SPIKE3(b): FAIL — cross-process restore rejected: {e}"),
+                }
+            }
+            other => panic!("ENGRAM_VZ_SPIKE_PHASE must be save|restore, got {other}"),
         }
     }
 }

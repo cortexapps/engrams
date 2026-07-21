@@ -22,6 +22,9 @@
 //!     cargo test -p engram-coordinator --test placement_reservation_live_pg -- --ignored
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -37,18 +40,8 @@ use engram_core::types::{
 };
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set (run `just db-up`)");
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 fn zero_capacity() -> HostCapacity {

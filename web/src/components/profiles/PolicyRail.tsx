@@ -128,7 +128,7 @@ export function PolicyRail({
             ) : (
               <BanIcon className="size-3.5" />
             )}
-            {includeUserTokens ? "carries user token" : "no user token"}
+            {includeUserTokens ? "carries other tokens" : "harness token only"}
           </span>
         </div>
       </div>

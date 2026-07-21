@@ -8,6 +8,9 @@
 //! `ENGRAM_TEST_DATABASE_URL`. CI wires this into the
 //! Postgres-gated-ignored lane alongside `eviction_live_pg`.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
 use chrono::{Duration as ChronoDuration, Utc};
@@ -21,21 +24,8 @@ use engram_core::{SandboxId, SessionId, SnapshotId};
 use uuid::Uuid;
 
 async fn pg() -> Option<Arc<dyn MetadataStore>> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 async fn seed_active(meta: &Arc<dyn MetadataStore>) -> (SessionId, SandboxId) {
@@ -247,9 +237,6 @@ async fn prune_keeps_latest_and_window_drops_aged_history() {
         .expect("record other");
     // A template snapshot (session_id NULL) — exempt from checkpoint
     // retention regardless of age (the WHERE is `session_id IS NOT NULL`).
-    // Kept recent so the global `prune_orphan_base_snapshots` reaper (which
-    // CAN run concurrently against this shared DB under local parallel test
-    // runs; CI serializes the live-PG lane) doesn't collect it mid-test.
     let mut template = checkpoint_row(session_id, now - ChronoDuration::hours(1), None);
     template.session_id = None;
     meta.record_snapshot(template.clone())
@@ -303,8 +290,6 @@ async fn prune_keeps_latest_and_window_drops_aged_history() {
 /// by no `enabled_images.base_snapshot_id`) past the grace window is
 /// deleted; the current (referenced) base is kept even when old; a fresh
 /// orphan within grace is kept; session snapshots are never touched.
-/// Asserts only on its own row ids, so it tolerates rows other live-PG
-/// tests leave in the shared database.
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn prune_orphan_base_snapshots_reaps_superseded_only() {
@@ -535,7 +520,9 @@ async fn rung1_rewind_tombstones_epochs_and_surfaces_side_effects() {
 /// coordinator's own eviction/resume lifecycle events — `evicted`,
 /// `status_changed`, `snapshot_taken`, `resumed`,
 /// `recovered_from_checkpoint`. A clean evict→resume cycle appends
-/// exactly this family past the cursor; tombstoning them is what made
+/// exactly this family past the cursor. ADR 0091 also excludes the clean
+/// harness state markers (`harness_idle` and ADR 0089's `harness_parked`);
+/// tombstoning any of them is what made
 /// every resume look like a rewind even when nothing guest-derived was
 /// lost.
 #[tokio::test]
@@ -570,6 +557,8 @@ async fn rewind_is_kind_scoped_to_guest_derived_events() {
             "status_changed",
             serde_json::json!({"from": "idle", "to": "created"}),
         ),
+        ("harness_idle", serde_json::json!({})),
+        ("harness_parked", serde_json::json!({})),
     ] {
         meta.append_session_event(session_id, kind, payload)
             .await
@@ -622,7 +611,11 @@ async fn rewind_is_kind_scoped_to_guest_derived_events() {
             e.idx > cursor
                 && matches!(
                     e.kind.as_str(),
-                    "evicted" | "status_changed" | "snapshot_taken"
+                    "evicted"
+                        | "status_changed"
+                        | "snapshot_taken"
+                        | "harness_idle"
+                        | "harness_parked"
                 )
         })
         .any(|e| e.rewound_at.is_some());

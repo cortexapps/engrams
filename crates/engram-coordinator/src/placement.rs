@@ -348,6 +348,25 @@ pub fn host_is_schedulable(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) ->
             )
 }
 
+/// ADR 0095: a host that may SERVE chunks to a fleet peer — alive
+/// (Ready + heartbeat-fresh), wire-compatible, with a dialable addr.
+/// Deliberately NOT [`host_is_schedulable`]: a coordinator-cordoned
+/// host mid-drain is often the one host that HOLDS the bytes (the
+/// evacuation source; the resume source during a roll) and serving
+/// reads costs it nothing schedulability protects. Returns the addr on
+/// success so call sites can't forget the addr-present check.
+pub fn host_can_serve_chunks(h: &HostRecord, now: DateTime<Utc>, ttl: Duration) -> Option<&str> {
+    let fresh = now
+        .signed_duration_since(h.last_heartbeat_at)
+        .to_std()
+        .map_or(true, |age| age <= ttl);
+    if h.status == HostStatus::Ready && fresh && host_wire_version_ok(h) {
+        h.host_addr.as_deref()
+    } else {
+        None
+    }
+}
+
 fn host_passes_filters(
     h: &HostRecord,
     ctx: &ScheduleContext<'_>,
@@ -499,6 +518,33 @@ pub fn pick_from(
     now: DateTime<Utc>,
     ttl: Duration,
 ) -> Result<HostId, PickError> {
+    pick_from_2d(hosts, reserved, ctx, now, ttl, false)
+}
+
+/// The ranked 2D pick, with an explicit `require_fit` knob.
+///
+/// `require_fit=false` (the historical `pick_from` behavior) keeps the
+/// ADR 0046 capacity-SOFT last-resort fallback: when nothing fits both
+/// budgets, place on the first-ranked host anyway (a resume/evac never
+/// stranded on a blip). `require_fit=true` is the #800 RESERVED-placement
+/// mode: it drops that fallback and returns `NoCapacity` when no ranked host
+/// fits — the HARD reserved bound the create path already honors. The evac
+/// resumer uses it so a drain-driven relocation queues (honest overflow)
+/// rather than binding a measured-full survivor and driving Σ reserved >
+/// allocatable (the #722/#795 over-reservation class on the evac leg).
+///
+/// The named steering tiers (tier-0 snapshot affinity, tier-2 prefer) are
+/// unaffected: they already carry their own `ram_full`/`cpu_full` vetoes
+/// (`named_host_fit_veto`), so a full named host is vetoed and falls through
+/// to best-fit under BOTH modes; only the terminal fallback differs.
+pub fn pick_from_2d(
+    hosts: &[HostRecord],
+    reserved: &HashMap<HostId, ReservedBudget>,
+    ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
+    ttl: Duration,
+    require_fit: bool,
+) -> Result<HostId, PickError> {
     let ranked = rank_hosts(hosts, ctx, now, ttl);
     if ranked.hosts.is_empty() {
         return match ctx.required_image_digest.as_ref() {
@@ -580,7 +626,29 @@ pub fn pick_from(
     if let Some((_, id)) = best {
         return Ok(id);
     }
-    // 4. capacity-soft fallback.
+    // 4. No MEASURED host fits both budgets.
+    if require_fit {
+        // RESERVED mode (#800): honor the hard bound — but an UNMEASURED host
+        // (allocatable == 0: brand-new / dev / non-Linux) still counts as
+        // fitting, exactly the last-resort soft posture `placement_preview`,
+        // `reserve_placement`/`pick_host_2d`, and the sim's queue re-placement
+        // all take. Consistency matters: if the reserved evac pick returned
+        // NoCapacity here while the queue scanner's `placement_preview` said
+        // "fits" on the same unmeasured fleet, a queued evac would churn
+        // Queued↔Idle forever (the #795 livelock, reincarnated). So only a
+        // fleet where every MEASURED host is full AND no unmeasured host
+        // exists is a true no-fit that queues.
+        if let Some(&id) = ranked
+            .hosts
+            .iter()
+            .find(|&&id| free_mib_of(id).is_none() && cpu_fits(id))
+        {
+            return Ok(id);
+        }
+        return Err(PickError::NoCapacity);
+    }
+    // Otherwise: capacity-soft last-resort fallback (the pre-existing
+    // ADR 0046 resume/evac posture — place on the first-ranked host).
     Ok(ranked.hosts[0])
 }
 
@@ -704,9 +772,10 @@ pub async fn placement_preview(
     ctx: &ScheduleContext<'_>,
     mem_mib: i64,
     cpu_vcpus: i64,
+    now: DateTime<Utc>,
 ) -> Result<bool, PickError> {
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let ranked = rank_hosts(&hosts, ctx, Utc::now(), placement_ttl());
+    let ranked = rank_hosts(&hosts, ctx, now, placement_ttl());
     Ok(ranked.hosts.iter().any(|id| {
         let Some(h) = hosts.iter().find(|h| h.id == *id) else {
             return false;
@@ -735,12 +804,13 @@ pub async fn placement_preview(
 pub async fn candidates_for(
     meta: &dyn MetadataStore,
     ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
 ) -> Result<RankedCandidates, PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
         .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
-    Ok(rank_hosts(&hosts, ctx, Utc::now(), placement_ttl()))
+    Ok(rank_hosts(&hosts, ctx, now, placement_ttl()))
 }
 
 /// ADR 0068 (core-ops-batch correction pass): shared exclusion-visibility
@@ -764,6 +834,7 @@ pub async fn log_empty_candidates(
     meta: &dyn MetadataStore,
     ctx: &ScheduleContext<'_>,
     origin: &'static str,
+    now: DateTime<Utc>,
 ) {
     let hosts = match meta.list_active_hosts().await {
         Ok(hosts) => hosts,
@@ -773,7 +844,7 @@ pub async fn log_empty_candidates(
             return;
         }
     };
-    let summary = exclusion_summary(&hosts, ctx, Utc::now(), placement_ttl());
+    let summary = exclusion_summary(&hosts, ctx, now, placement_ttl());
     for (_host_id, reason) in &summary {
         ::metrics::counter!(
             crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
@@ -810,6 +881,7 @@ pub async fn log_reserve_no_fit(
     candidates: &[HostId],
     mem_budget_mib: i64,
     cpu_budget_vcpus: i32,
+    now: DateTime<Utc>,
 ) -> Vec<(HostId, String)> {
     let mut summary: Vec<(HostId, String)> = Vec::new();
     match meta
@@ -852,9 +924,7 @@ pub async fn log_reserve_no_fit(
             .into_iter()
             .filter(|h| !candidates.contains(&h.id))
             .collect();
-        for (host_id, reason) in
-            exclusion_summary(&non_candidates, ctx, Utc::now(), placement_ttl())
-        {
+        for (host_id, reason) in exclusion_summary(&non_candidates, ctx, now, placement_ttl()) {
             ::metrics::counter!(
                 crate::metrics::PLACEMENT_EXCLUDED_TOTAL,
                 "origin" => origin,
@@ -884,8 +954,9 @@ pub async fn pick_for_session(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
     ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
-    let result = pick_for_session_inner(meta, registry, ctx).await;
+    let result = pick_for_session_inner(meta, registry, ctx, now, false).await;
     let outcome = match &result {
         Ok(_) => "placed",
         Err(PickError::NoCapacity) => "no_capacity",
@@ -897,7 +968,42 @@ pub async fn pick_for_session(
     // ADR 0068: on NoCapacity ONLY, name why — kills the "no capacity
     // with free hosts" mystery mode.
     if matches!(result, Err(PickError::NoCapacity)) {
-        log_empty_candidates(meta, ctx, "resume").await;
+        log_empty_candidates(meta, ctx, "resume", now).await;
+    }
+    result
+}
+
+/// #800: the RESERVED evac/resume placement — [`pick_for_session`] with the
+/// capacity-soft fallback dropped. Returns `NoCapacity` when no schedulable
+/// host fits the session's 2D budget (rather than binding the first-ranked,
+/// possibly measured-full host), so the caller can QUEUE the session via the
+/// reserved queue path (the #795 resume precedent) and re-home it once
+/// capacity returns. The one commit point that mutates reservations stays
+/// the caller's rebind (`assign_session_host`); this makes the *decision*
+/// honor the hard bound. Emits the same K4 demand-pressure counter.
+pub async fn pick_for_session_reserved(
+    meta: &dyn MetadataStore,
+    registry: &HostRegistry,
+    ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
+) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
+    let result = pick_for_session_inner(meta, registry, ctx, now, true).await;
+    let outcome = match &result {
+        Ok(_) => "placed",
+        Err(PickError::NoCapacity) => "no_capacity",
+        Err(PickError::ImageNotReady(_)) => "image_not_ready",
+        Err(PickError::HostUnreachable(..)) => "host_unreachable",
+        Err(PickError::Internal(_)) => "internal",
+    };
+    ::metrics::counter!(crate::metrics::SESSION_PLACEMENT_TOTAL, "outcome" => outcome).increment(1);
+    // On NoCapacity, name the per-host exclusion reasons (present-but-full
+    // hosts show up via the ranked set; a fully-cordoned fleet via the
+    // empty-candidate summary) — the reserved NoCapacity is the QUEUE
+    // signal, not a mystery stall, but the visibility is still useful.
+    if matches!(result, Err(PickError::NoCapacity)) {
+        // `origin="resume"` — the bounded PLACEMENT_EXCLUDED_TOTAL vocabulary
+        // already scopes the resume/evac path under this label (metrics.rs).
+        log_empty_candidates(meta, ctx, "resume", now).await;
     }
     result
 }
@@ -906,9 +1012,11 @@ async fn pick_for_session_inner(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
     ctx: &ScheduleContext<'_>,
+    now: DateTime<Utc>,
+    require_fit: bool,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let id = pick_from(&hosts, &reserved, ctx, Utc::now(), placement_ttl())?;
+    let id = pick_from_2d(&hosts, &reserved, ctx, now, placement_ttl(), require_fit)?;
     let backend = registry
         .backend_for(id)
         .await
@@ -925,12 +1033,12 @@ pub async fn pick_specific_host(
     registry: &HostRegistry,
     host_id: HostId,
     exclude_host: Option<HostId>,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     if Some(host_id) == exclude_host {
         return Err(PickError::NoCapacity);
     }
     let (hosts, reserved) = hosts_and_reserved(meta).await?;
-    let now = Utc::now();
     let ttl = placement_ttl();
     let Some(h) = hosts.iter().find(|h| h.id == host_id) else {
         return Err(PickError::NoCapacity);
@@ -1039,6 +1147,7 @@ pub async fn capture_candidate_hosts(
     meta: &dyn MetadataStore,
     need: CaptureFootprint,
     required_fc_version: Option<&str>,
+    now: DateTime<Utc>,
 ) -> Result<Vec<HostId>, PickError> {
     let hosts = meta
         .list_active_hosts()
@@ -1053,7 +1162,7 @@ pub async fn capture_candidate_hosts(
         &live_capture_hosts,
         need,
         required_fc_version,
-        Utc::now(),
+        now,
         placement_ttl(),
     ))
 }
@@ -1071,12 +1180,12 @@ pub async fn capture_candidate_hosts(
 pub async fn pick_materialize_host(
     meta: &dyn MetadataStore,
     registry: &HostRegistry,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, Arc<dyn HostClient>), PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
         .map_err(|e| PickError::Internal(format!("list_active_hosts: {e}")))?;
-    let now = Utc::now();
     let ttl = placement_ttl();
     let id = hosts
         .iter()
@@ -1144,8 +1253,9 @@ pub async fn restore_for_session(
     ctx: &ScheduleContext<'_>,
     metadata: SnapshotMetadata,
     fence: SessionFence,
+    now: DateTime<Utc>,
 ) -> Result<(HostId, SandboxId), SandboxError> {
-    let (host_id, backend) = pick_for_session(meta, registry, ctx).await?;
+    let (host_id, backend) = pick_for_session(meta, registry, ctx, now).await?;
     let sandbox_id = backend.restore(metadata, fence).await?;
     registry.record_sandbox_owner(sandbox_id, host_id);
     Ok((host_id, sandbox_id))
@@ -1178,7 +1288,10 @@ pub fn host_counts_as_capacity(h: &HostRecord, now: DateTime<Utc>, ttl: Duration
 /// as schedulable capacity only per [`host_counts_as_capacity`] — so
 /// the demand signal can never read healthier than the candidate set
 /// placement actually ranks.
-pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, PickError> {
+pub async fn fleet_snapshot(
+    meta: &dyn MetadataStore,
+    now: DateTime<Utc>,
+) -> Result<FleetSnapshot, PickError> {
     let hosts = meta
         .list_active_hosts()
         .await
@@ -1187,7 +1300,6 @@ pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, P
         .per_host_reserved()
         .await
         .map_err(|e| PickError::Internal(format!("per_host_reserved: {e}")))?;
-    let now = Utc::now();
     let ttl = placement_ttl();
     let mut m = FleetSnapshot::default();
     for h in &hosts {
@@ -1216,6 +1328,8 @@ pub async fn fleet_snapshot(meta: &dyn MetadataStore) -> Result<FleetSnapshot, P
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_core::types::host::{HostCapacity, HostMetadata, HostUtilization};

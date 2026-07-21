@@ -29,6 +29,17 @@ Lanes:
                 job, which republishes the "golden" cli GHCR artifact
                 (cli-tools) that CI consumers pull instead of recompiling.
                 Same role publish-host-binaries plays for the FC-host bakes.
+  node_assets   the node-assets image (firecracker + guest kernel + the RO
+                session bundles) changed — docker/node-assets.Dockerfile /
+                docker/node-assets-fetch.sh (the FC/kernel pins + bundle staging)
+                OR the fc_fork lane OR the bundles lane. Gates the OSS
+                publish-node-assets job. DELIBERATELY NARROWER than `images`: a
+                coordinator/web/orchestrator change trips `images` (the container
+                bake) but touches NONE of node-assets' inputs, so it must NOT
+                rebake node-assets — a spurious rebake churns the SHA tag the
+                deploy pins into the host-fleet DaemonSet and rolls every FC host
+                for nothing (2026-07-20 incident: four host rolls in 90 min off
+                three coord/web-only pushes).
   tf_or_helm    deploy/terraform/ + deploy/helm/
   dev_image     dev-engrams dogfood rebake — images OR host_binaries OR
                 host_base OR the release closure of {engram-harness-claude}
@@ -50,6 +61,23 @@ from pathlib import Path
 
 # Binaries that bake into each artifact.
 FC_BINS = {"engram-host-agent", "engram-uffd-handler"}
+
+# ADR 0098 P9: the host-internal simulation lane. Gated on the release
+# closure of the sim binary's own crate — engram-dst-host pulls
+# engram-host-agent + engram-host-core + engram-sim + the chunk/storage
+# crates as NORMAL deps, so any change that can alter host-sim behavior
+# trips the lane, and nothing else does (disjoint from engram-dst's
+# coordinator closure by construction — the two sims share no sim crate
+# dep direction).
+HOST_SIM_BINS = {"engram-dst-host"}
+
+# ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator. Unlike
+# the two disjoint sims above, engram-dst-cosim deliberately spans BOTH
+# closures — it pulls engram-coordinator AND engram-host-agent/-core +
+# engram-dst-host + engram-sim as normal deps — so any change that can alter
+# either side's boundary behavior trips this lane. Its own release closure
+# is therefore the union that gates `test-cosim`.
+COSIM_BINS = {"engram-dst-cosim"}
 # engram-host-operator (ADR 0044 K3) bakes into its own container image; add
 # it so an operator-only crate change rebuilds the images lane.
 #
@@ -135,6 +163,15 @@ TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # agentd, a compiled crate OUTSIDE this path, which needs the explicit
 # agentd_changed closure term below.)
 BUNDLES_PATHS = ["deploy/bundles/"]
+# The node-assets image's OWN inputs (ADR 0044 K2): its Dockerfile and the fetch
+# script that pins the firecracker version + the engram guest-kernel release +
+# stages the RO bundles. The FC-fork binary (fc_fork lane) and the bundle
+# payloads (bundles lane) are folded into `node_assets` below. This is
+# INTENTIONALLY disjoint from a coordinator/web/orchestrator source change: those
+# trip `images` (rebake the container) but change nothing the node-assets image
+# carries, so they must not rebake it (a rebake churns the DaemonSet tag and
+# rolls the fleet for nothing — the 2026-07-20 host-roll-churn incident).
+NODE_ASSETS_PATHS = ["docker/node-assets.Dockerfile", "docker/node-assets-fetch.sh"]
 # ADR 0027: the `dev-engrams` dogfood session image runs the REAL `just dev`
 # (whole-repo build) inside a sandbox, so it's stale on essentially any source
 # change. We trip its rebake on the union of what it builds — the container +
@@ -173,7 +210,11 @@ E2E_PATHS = [
 # (`CI_SELF_PATHS`) forces ALL test lanes — the definition of "what runs"
 # changed, so re-run everything.
 CI_SELF_PATHS = [".github/workflows/ci.yml",
-                 ".github/workflows/ci-macos-vz.yml",
+                 # Local composite actions are workflow steps by another
+                 # name — editing one changes what the lanes run without
+                 # touching ci.yml (ci-macos-vz.yml was folded into
+                 # ci.yml; its old entry here was a dead path).
+                 ".github/actions/",
                  ".github/scripts/detect-rebake-lanes.py"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/"]
@@ -278,10 +319,13 @@ def main():
     harness = release_closure(meta, SESSION_HARNESS_BINS)
     agentd_closure = release_closure(meta, AGENTD_BINS)
     e2e_closure = release_closure(meta, E2E_BINS)
+    host_sim_closure = release_closure(meta, HOST_SIM_BINS)
+    cosim_closure = release_closure(meta, COSIM_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
-    # FC binary in the node-assets image, so it trips the images lane (which
-    # gates publish-node-assets → the operator's drain-gated host roll).
+    # FC binary in the node-assets image. It trips `images` so the notify job
+    # fires engrams-changed → helm-deploy (the deploy trigger), and it trips the
+    # narrower `node_assets` lane below so publish-node-assets actually rebakes.
     fc_fork = any_path(changed, FC_FORK_PATHS)
     images = bool(cc & cont) or any_path(changed, IMAGES_PATHS) or fc_fork
     host_binaries = bool(cc & fc) or any_path(changed, HOST_BINARIES_PATHS)
@@ -317,6 +361,21 @@ def main():
     # this term an agentd change ships nothing.
     agentd_changed = bool(cc & agentd_closure)
     bundles = any_path(changed, BUNDLES_PATHS) or harness_changed or agentd_changed
+    # The node-assets image bake gate. Its content is ONLY the pinned firecracker
+    # binary (fc_fork), the pinned guest kernel + FC-version pins (the fetch
+    # script), and the RO bundles (bundles) — NOTHING from the coordinator / web /
+    # orchestrator / host-agent source trees. Gate publish-node-assets on THIS,
+    # not on the coarse `images` lane, so a container-only change no longer
+    # rebakes node-assets under a fresh SHA tag (which the deploy pins into the
+    # host-fleet DaemonSet → a fleet-wide roll for no content change; the
+    # 2026-07-20 incident). A bake-workflow / detector change (BAKE_ALL_PATHS)
+    # re-bakes everything, node-assets included.
+    node_assets = (
+        fc_fork
+        or bundles
+        or any_path(changed, NODE_ASSETS_PATHS)
+        or any_path(changed, BAKE_ALL_PATHS)
+    )
     dev_image = (
         images
         or host_binaries
@@ -364,6 +423,11 @@ def main():
     test_cli = ci_self or proto or any_path(changed, CLI_PATHS)
     # buf only lints/breaking-checks/codegen-drifts the protos.
     test_buf = ci_self or proto
+    # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
+    test_host_sim = ci_self or bool(cc & host_sim_closure)
+    # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
+    # release closure.
+    test_cosim = ci_self or bool(cc & cosim_closure)
 
     # ── per-image bake selectivity ─────────────────────────────────────
     bake_all = any_path(changed, BAKE_ALL_PATHS)
@@ -392,12 +456,13 @@ def main():
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
     print(f"-> images={images} host_binaries={host_binaries} "
           f"host_base={host_base} host_image={host_image} cli_tools={cli_tools} "
-          f"tf_or_helm={tf_or_helm} bundles={bundles} dev_image={dev_image} "
-          f"fc_fork={fc_fork} e2e={e2e}",
+          f"tf_or_helm={tf_or_helm} bundles={bundles} node_assets={node_assets} "
+          f"dev_image={dev_image} fc_fork={fc_fork} e2e={e2e}",
           file=sys.stderr)
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
-          f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto}",
+          f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto} "
+          f"test_host_sim={test_host_sim} test_cosim={test_cosim}",
           file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
 
@@ -414,6 +479,7 @@ def main():
             f.write(f"cli_tools={b(cli_tools)}\n")
             f.write(f"tf_or_helm={b(tf_or_helm)}\n")
             f.write(f"bundles={b(bundles)}\n")
+            f.write(f"node_assets={b(node_assets)}\n")
             f.write(f"dev_image={b(dev_image)}\n")
             f.write(f"fc_fork={b(fc_fork)}\n")
             f.write(f"e2e={b(e2e)}\n")
@@ -425,6 +491,8 @@ def main():
             f.write(f"test_orchestrator={b(test_orchestrator)}\n")
             f.write(f"test_cli={b(test_cli)}\n")
             f.write(f"test_buf={b(test_buf)}\n")
+            f.write(f"test_host_sim={b(test_host_sim)}\n")
+            f.write(f"test_cosim={b(test_cosim)}\n")
             # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
             f.write(f"images_matrix={json.dumps(images_matrix)}\n")
 

@@ -1,0 +1,36 @@
+[package]
+name = "engram-dst"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The deterministic simulator (ADR 0098 D5): a seeded step scheduler driving the real coordinator drivers over engram-sim's substrate."
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+bytes.workspace = true
+chrono.workspace = true
+engram-chunk-store.workspace = true
+engram-cloud-mock.workspace = true
+engram-coordinator.workspace = true
+engram-core.workspace = true
+engram-crypto.workspace = true
+engram-harness-proto.workspace = true
+engram-oci.workspace = true
+engram-protocol.workspace = true
+engram-secrets-dev.workspace = true
+engram-sim.workspace = true
+async-trait.workspace = true
+parking_lot.workspace = true
+rand = { workspace = true }
+rand_chacha = { workspace = true }
+serde_json.workspace = true
+tokio.workspace = true
+tonic = { workspace = true }
+toml.workspace = true
+tower.workspace = true
+uuid.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }

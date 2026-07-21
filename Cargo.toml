@@ -5,6 +5,7 @@ members = [
     "crates/engram-protocol",
     "crates/engram-coordinator",
     "crates/engram-host-agent",
+    "crates/engram-host-core",
     "crates/engram-host-operator",
     "crates/engram-chunk-store",
     "crates/engram-rootfs-materializer",
@@ -33,6 +34,11 @@ members = [
     "crates/engram-git-dev",
     "crates/engram-git-github",
     "crates/engram-postgres",
+    "crates/engram-dst",
+    "crates/engram-dst-host",
+    "crates/engram-dst-cosim",
+    "crates/engram-sim",
+    "crates/engram-testkit",
     "crates/engram-egress-proxy",
     "crates/engram-crypto",
     "crates/engram-oci",
@@ -53,6 +59,12 @@ rust-version = "1.80"
 [workspace.lints.rust]
 unsafe_code = "forbid"
 
+[workspace.lints.clippy]
+# ADR 0098 D1: crates that carry a clippy.toml `disallowed-methods` list
+# (coordinator, postgres) get direct time/uuid calls denied; crates
+# without one have an empty list, so this is a no-op for them.
+disallowed_methods = "deny"
+
 [workspace.dependencies]
 # kubernetes — ADR 0044 K3 host-fleet rollout operator (engram-host-operator).
 # rustls (not openssl) to match reqwest's TLS choice; "latest" k8s-openapi
@@ -72,6 +84,12 @@ schemars = "0.8"
 engram-core = { path = "crates/engram-core" }
 engram-protocol = { path = "crates/engram-protocol" }
 engram-postgres = { path = "crates/engram-postgres" }
+engram-coordinator = { path = "crates/engram-coordinator" }
+engram-dst = { path = "crates/engram-dst" }
+engram-dst-host = { path = "crates/engram-dst-host" }
+engram-dst-cosim = { path = "crates/engram-dst-cosim" }
+engram-sim = { path = "crates/engram-sim" }
+engram-testkit = { path = "crates/engram-testkit" }
 engram-sandbox-firecracker = { path = "crates/engram-sandbox-firecracker" }
 engram-sandbox-vz = { path = "crates/engram-sandbox-vz" }
 engram-cloud-gcp = { path = "crates/engram-cloud-gcp" }
@@ -84,6 +102,7 @@ engram-migrate-proto = { path = "crates/engram-migrate-proto" }
 engram-substrate-proto = { path = "crates/engram-substrate-proto" }
 engram-transport = { path = "crates/engram-transport" }
 engram-host-agent = { path = "crates/engram-host-agent" }
+engram-host-core = { path = "crates/engram-host-core" }
 engram-sandbox-process = { path = "crates/engram-sandbox-process" }
 engram-session-bundles = { path = "crates/engram-session-bundles" }
 engram-mount-manifest = { path = "crates/engram-mount-manifest" }
@@ -178,6 +197,11 @@ tracing-opentelemetry = "0.29"
 # cli
 clap = { version = "4", features = ["derive", "env"] }
 
+# ADR 0095: hardware CRC32C (Castagnoli, SSE4.2/ARMv8) on peer-chunk
+# transport frames — the landing-path integrity check that replaces
+# sha256 there.
+crc32c = "0.6"
+
 # misc
 tar = "0.4"
 # ADR 0088 addendum: the zlib-rs backend is pure Rust with zlib-ng-class
@@ -221,6 +245,18 @@ url = "2"
 async-stream = "0.3"
 tokio-stream = { version = "0.1", features = ["sync"] }
 sha2 = "0.10"
+
+# property-based testing (ADR 0099 H3/H4). Dev-dependency only; the
+# persisted `proptest-regressions/` seeds turn every counterexample into a
+# checked-in deterministic regression test.
+proptest = "1"
+
+# ADR 0098 D5: the DST scheduler's seeded PRNG. ChaCha8 — portable,
+# seed-stable, documented stream layout (the standard DST choice); the
+# master seed forks per-component streams so adding a consumer doesn't
+# shift every other stream.
+rand = { version = "0.9", default-features = false, features = ["std"] }
+rand_chacha = "0.9"
 
 # tls + cert mint (host-side egress proxy)
 rustls = { version = "0.23", default-features = false, features = ["std", "tls12", "ring"] }

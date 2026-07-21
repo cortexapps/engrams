@@ -184,6 +184,20 @@ where
             write_msg(&mut writer, &WireResponse::Synced).await?;
             return Ok(());
         }
+        WireRequest::StepClock { unix_nanos } => {
+            // ADR 0096 D7: host-pushed clock step for guests without a
+            // PTP device (VZ warm restore wakes with a frozen clock).
+            // Policy (2s threshold) lives in clock::step_to.
+            let applied_offset_nanos = crate::clock::step_to(unix_nanos);
+            write_msg(
+                &mut writer,
+                &WireResponse::ClockStepped {
+                    applied_offset_nanos,
+                },
+            )
+            .await?;
+            return Ok(());
+        }
         WireRequest::StartShell { port } => {
             let port = port.unwrap_or(crate::shell::DEFAULT_TTYD_PORT);
             // The interactive shell inherits the same durable session env
@@ -1433,8 +1447,8 @@ mod tests {
         }
         // The response only pins that spawn() returned, not that the
         // detached child finished execing — poll for its marker.
-        let deadline = std::time::Instant::now() + Duration::from_secs(2);
-        while !marker.exists() && std::time::Instant::now() < deadline {
+        let deadline = crate::time_source::metrics_now() + Duration::from_secs(2);
+        while !marker.exists() && crate::time_source::metrics_now() < deadline {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         let state = std::fs::read_to_string(&marker).unwrap_or_default();

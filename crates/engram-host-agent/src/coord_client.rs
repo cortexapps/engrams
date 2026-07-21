@@ -13,7 +13,7 @@
 //!     /api/v1/hosts/:id/capture-jobs/:job_id/claim, called from the
 //!     heartbeat-ack loop for any unclaimed `capture_assignments` entry
 //!
-//! All share one pooled `reqwest::Client` carried by `CoordClient`.
+//! All share one pooled `reqwest::Client` carried by `HttpCoordClient`.
 //! HTTP/1.1 keep-alive is sufficient — these are low-frequency POSTs
 //! against the coord LB.
 
@@ -23,6 +23,12 @@ use chrono::{DateTime, Utc};
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_harness_proto::{
     ForgeRequest, ForgeResponse, HarnessEvent, UploadRequest, UploadResponse,
+};
+// ADR 0098 Phase 2: the coordinator control-plane seam + its portable
+// types live in engram-host-core. `HttpCoordClient` implements
+// `CoordControlPlane` below.
+use engram_host_core::{
+    CoordControlPlane, CoordError, LiveManifestPublishRequest, LiveManifestPublishResponse,
 };
 use engram_oci::{BasicCreds, OciError, RegistryAuthResolver};
 use engram_protocol::heartbeat::HostCapacityReport;
@@ -34,7 +40,7 @@ use tokio_util::io::ReaderStream;
 /// Persistent HTTP client to the coord. One per host-agent process;
 /// cheap to clone (`reqwest::Client` is `Arc` internally).
 #[derive(Clone)]
-pub struct CoordClient {
+pub struct HttpCoordClient {
     http: reqwest::Client,
     /// `http://coord-lb:8080`. The dialer's `coordinator_endpoint`
     /// trims the `/api/hosts/connect` suffix; we keep the bare
@@ -45,7 +51,7 @@ pub struct CoordClient {
     auth_token: String,
 }
 
-impl CoordClient {
+impl HttpCoordClient {
     /// `coord_url` must be `http://host[:port]` or `https://host[:port]`.
     /// ADR 0013 retired the WS dialer; ADR 0016 §A.1.4 retired the
     /// `ws://`/`wss://` compat shim once all TF configs migrated. A
@@ -80,7 +86,7 @@ impl CoordClient {
             // Surfaced on 2026-05-23 during the COW diagnostic
             // spot-check on session 96392fd3: the host's
             // idle-eviction POSTs failed with `transport error`
-            // while heartbeats on the same `CoordClient` succeeded.
+            // while heartbeats on the same `HttpCoordClient` succeeded.
             // Diagnosis: stale pool connection, exactly this class.
             .pool_idle_timeout(Some(Duration::from_secs(10)))
             .timeout(Duration::from_secs(30))
@@ -114,17 +120,14 @@ impl CoordClient {
     }
 
     /// POST /api/v1/hosts/register
-    pub async fn register(
-        &self,
-        req: &RegisterRequest,
-    ) -> Result<RegisterResponse, CoordClientError> {
+    pub async fn register(&self, req: &RegisterRequest) -> Result<RegisterResponse, CoordError> {
         let url = self.endpoint("/hosts/register");
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "register").await
     }
 
@@ -133,14 +136,14 @@ impl CoordClient {
         &self,
         host_id: HostId,
         req: &HeartbeatRequest,
-    ) -> Result<HeartbeatResponse, CoordClientError> {
+    ) -> Result<HeartbeatResponse, CoordError> {
         let url = self.endpoint(&format!("/hosts/{host_id}/heartbeat"));
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "heartbeat").await
     }
 
@@ -149,7 +152,7 @@ impl CoordClient {
         &self,
         host_id: HostId,
         registry_host: &str,
-    ) -> Result<ResolveRegistryAuthResponse, CoordClientError> {
+    ) -> Result<ResolveRegistryAuthResponse, CoordError> {
         let url = self.endpoint(&format!("/hosts/{host_id}/auth/resolve-registry"));
         let body = ResolveRegistryAuthRequest {
             registry_host: registry_host.to_string(),
@@ -159,7 +162,7 @@ impl CoordClient {
             .auth(builder, &body)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "resolve_registry_auth").await
     }
 
@@ -175,7 +178,7 @@ impl CoordClient {
         host_id: HostId,
         job_id: engram_core::types::CaptureJobId,
         epoch: i64,
-    ) -> Result<engram_core::types::capture_job::CaptureJobSpec, CoordClientError> {
+    ) -> Result<engram_core::types::capture_job::CaptureJobSpec, CoordError> {
         let url = self.endpoint(&format!("/hosts/{host_id}/capture-jobs/{job_id}/claim"));
         let body = ClaimCaptureJobRequest { epoch };
         let builder = self.http.post(&url);
@@ -183,7 +186,7 @@ impl CoordClient {
             .auth(builder, &body)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "claim_capture_job").await
     }
 
@@ -192,16 +195,16 @@ impl CoordClient {
         &self,
         session_id: SessionId,
         req: &HarnessEventRequest,
-    ) -> Result<(), CoordClientError> {
+    ) -> Result<(), CoordError> {
         let url = self.endpoint(&format!("/sessions/{session_id}/harness-events"));
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordClientError::Http {
+            return Err(CoordError::Http {
                 status: resp.status().as_u16(),
                 body: resp.text().await.unwrap_or_default(),
                 what: "harness_event",
@@ -221,16 +224,16 @@ impl CoordClient {
         &self,
         session_id: SessionId,
         req: &IntegrationAssetReport,
-    ) -> Result<(), CoordClientError> {
+    ) -> Result<(), CoordError> {
         let url = self.endpoint(&format!("/sessions/{session_id}/integration-asset"));
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordClientError::Http {
+            return Err(CoordError::Http {
                 status: resp.status().as_u16(),
                 body: resp.text().await.unwrap_or_default(),
                 what: "integration_asset",
@@ -253,7 +256,7 @@ impl CoordClient {
         host_id: HostId,
         session_id: SessionId,
         mint_provider: &str,
-    ) -> Result<RefreshInjectResponse, CoordClientError> {
+    ) -> Result<RefreshInjectResponse, CoordError> {
         let url = self.endpoint(&format!(
             "/hosts/{host_id}/sessions/{session_id}/inject/refresh"
         ));
@@ -265,7 +268,7 @@ impl CoordClient {
             .auth(builder, &req)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "refresh_inject").await
     }
 
@@ -278,14 +281,14 @@ impl CoordClient {
     /// failure surfaces as an `Err`; a forge-level failure (bad token,
     /// API error) comes back inside `ForgeResponse::Error` with a 200, so
     /// the guest helper always gets a usable reply.
-    pub async fn forge(&self, req: &ForgeRequest) -> Result<ForgeResponse, CoordClientError> {
+    pub async fn forge(&self, req: &ForgeRequest) -> Result<ForgeResponse, CoordError> {
         let url = self.endpoint("/hosts/forge");
         let builder = self.http.post(&url);
         let resp = self
             .auth(builder, req)
             .send()
             .await
-            .map_err(CoordClientError::Transport)?;
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "forge").await
     }
 
@@ -305,13 +308,13 @@ impl CoordClient {
         &self,
         header: &UploadRequest,
         body: R,
-    ) -> Result<UploadResponse, CoordClientError>
+    ) -> Result<UploadResponse, CoordError>
     where
         R: tokio::io::AsyncRead + Send + 'static,
     {
         let url = self.endpoint("/hosts/upload");
         let encoded = base64::engine::general_purpose::STANDARD.encode(
-            bincode::serialize(header).map_err(|e| CoordClientError::Decode {
+            bincode::serialize(header).map_err(|e| CoordError::Decode {
                 error: e.to_string(),
                 what: "upload_artifact header encode",
             })?,
@@ -329,10 +332,22 @@ impl CoordClient {
         if !self.auth_token.is_empty() {
             builder = builder.bearer_auth(&self.auth_token);
         }
-        let resp = builder.send().await.map_err(CoordClientError::Transport)?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         decode_json(resp, "upload_artifact").await
     }
+}
 
+/// The three decision-feeding coordinator calls the host-agent's
+/// lifecycle flows make (ADR 0098 Phase 2). Behind the
+/// [`CoordControlPlane`] seam so the host-internal simulator can supply an
+/// adversarial scripted stub; the bodies moved here wholesale from the
+/// inherent surface (no duplicate inherent copies — callers bring the
+/// trait into scope).
+#[async_trait]
+impl CoordControlPlane for HttpCoordClient {
     /// POST /api/v1/hosts/:id/live-manifest
     ///
     /// ADR 0016 Phase B: tells coord that the host just flushed
@@ -345,11 +360,11 @@ impl CoordClient {
     /// Publishes are tiny (sub-100-byte payload) and fast; the
     /// shared client's 30s default timeout is plenty. No per-request
     /// override here, unlike the eviction lane in A.1.5a.
-    pub async fn publish_live_manifest(
+    async fn publish_live_manifest(
         &self,
         host_id: HostId,
         req: &LiveManifestPublishRequest,
-    ) -> Result<LiveManifestPublishResponse, CoordClientError> {
+    ) -> Result<LiveManifestPublishResponse, CoordError> {
         let url = self.endpoint(&format!("/hosts/{host_id}/live-manifest"));
         let builder = self.http.post(&url);
         let resp = match self.auth(builder, req).send().await {
@@ -368,7 +383,7 @@ impl CoordClient {
                     error = %e,
                     "publish_live_manifest transport error",
                 );
-                return Err(CoordClientError::Transport(e));
+                return Err(CoordError::Transport(e.to_string()));
             }
         };
         decode_json(resp, "publish_live_manifest").await
@@ -380,12 +395,12 @@ impl CoordClient {
     /// never landed — abort the export, un-pause in place);
     /// `Ok(false)` = ownership moved on (destroy the stale frozen
     /// source); `Err` = coordinator unreachable (stay paused, retry).
-    pub async fn sandbox_ownership(
+    async fn sandbox_ownership(
         &self,
         host_id: HostId,
         session_id: engram_core::SessionId,
         sandbox_id: engram_core::SandboxId,
-    ) -> Result<bool, CoordClientError> {
+    ) -> Result<bool, CoordError> {
         let url = self.endpoint(&format!(
             "/hosts/{host_id}/sessions/{session_id}/sandboxes/{sandbox_id}/ownership"
         ));
@@ -397,15 +412,21 @@ impl CoordClient {
         if !self.auth_token.is_empty() {
             builder = builder.bearer_auth(&self.auth_token);
         }
-        let resp = builder.send().await.map_err(CoordClientError::Transport)?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         if !resp.status().is_success() {
-            return Err(CoordClientError::Http {
+            return Err(CoordError::Http {
                 status: resp.status().as_u16(),
                 body: resp.text().await.unwrap_or_default(),
                 what: "sandbox_ownership",
             });
         }
-        let body: Resp = resp.json().await.map_err(CoordClientError::Transport)?;
+        let body: Resp = resp
+            .json()
+            .await
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         Ok(body.owned)
     }
 
@@ -414,11 +435,11 @@ impl CoordClient {
     /// local binding table has no entry (fresh generation after a roll
     /// whose NBD rehydrate failed). Returns the owning session id so the
     /// caller can repopulate its binding table.
-    pub async fn sandbox_owner(
+    async fn sandbox_owner(
         &self,
         host_id: HostId,
         sandbox_id: engram_core::SandboxId,
-    ) -> Result<Option<engram_core::SessionId>, CoordClientError> {
+    ) -> Result<Option<engram_core::SessionId>, CoordError> {
         let url = self.endpoint(&format!("/hosts/{host_id}/sandboxes/{sandbox_id}/owner"));
         #[derive(serde::Deserialize)]
         struct Resp {
@@ -428,7 +449,10 @@ impl CoordClient {
         if !self.auth_token.is_empty() {
             builder = builder.bearer_auth(&self.auth_token);
         }
-        let resp = builder.send().await.map_err(CoordClientError::Transport)?;
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| CoordError::Transport(e.to_string()))?;
         let body: Resp = decode_json(resp, "sandbox_owner").await?;
         Ok(body.session_id)
     }
@@ -437,56 +461,19 @@ impl CoordClient {
 async fn decode_json<T: serde::de::DeserializeOwned>(
     resp: reqwest::Response,
     what: &'static str,
-) -> Result<T, CoordClientError> {
+) -> Result<T, CoordError> {
     let status = resp.status();
     if !status.is_success() {
-        return Err(CoordClientError::Http {
+        return Err(CoordError::Http {
             status: status.as_u16(),
             body: resp.text().await.unwrap_or_default(),
             what,
         });
     }
-    resp.json::<T>()
-        .await
-        .map_err(|e| CoordClientError::Decode {
-            error: e.to_string(),
-            what,
-        })
-}
-
-#[derive(Debug)]
-pub enum CoordClientError {
-    Transport(reqwest::Error),
-    Http {
-        status: u16,
-        body: String,
-        what: &'static str,
-    },
-    Decode {
-        error: String,
-        what: &'static str,
-    },
-}
-
-impl std::fmt::Display for CoordClientError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Transport(e) => write!(f, "transport error: {e}"),
-            Self::Http { status, body, what } => {
-                write!(f, "{what} returned HTTP {status}: {body}")
-            }
-            Self::Decode { error, what } => write!(f, "{what} JSON decode failed: {error}"),
-        }
-    }
-}
-
-impl std::error::Error for CoordClientError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Transport(e) => Some(e),
-            _ => None,
-        }
-    }
+    resp.json::<T>().await.map_err(|e| CoordError::Decode {
+        error: e.to_string(),
+        what,
+    })
 }
 
 // ---- payload types (mirror coord-side host_http.rs) ----
@@ -728,41 +715,20 @@ pub struct RefreshInjectResponse {
     pub expires_at: DateTime<Utc>,
 }
 
-// ---- ADR 0016 Phase B: live disk manifest publish ----
-
-#[derive(Serialize, Deserialize)]
-pub struct LiveManifestPublishRequest {
-    pub session_id: SessionId,
-    pub sandbox_id: SandboxId,
-    pub manifest_id: uuid::Uuid,
-    pub manifest_version: u64,
-}
-
-#[derive(Serialize, Deserialize)]
-pub struct LiveManifestPublishResponse {
-    /// `applied` → the UPDATE matched the row and chunk_generation
-    /// ticked. `stale` → `sessions.sandbox_id != publish.sandbox_id`
-    /// (destroyed or rebound); host should NOT retry.
-    pub outcome: LiveManifestPublishOutcome,
-}
-
-#[derive(Serialize, Deserialize, PartialEq, Eq, Debug, Clone, Copy)]
-#[serde(rename_all = "snake_case")]
-pub enum LiveManifestPublishOutcome {
-    Applied,
-    Stale,
-}
+// ADR 0016 Phase B live-manifest-publish types + the CoordError type
+// moved to `engram-host-core` (ADR 0098 Phase 2); imported at the top of
+// this module.
 
 /// `RegistryAuthResolver` impl that asks the coord for OCI creds
 /// over HTTP. Replaces the WS-based `WsAuthResolver` — same
 /// semantics, different transport. ADR 0013.
 pub struct HttpAuthResolver {
-    coord: CoordClient,
+    coord: HttpCoordClient,
     host_id: HostId,
 }
 
 impl HttpAuthResolver {
-    pub fn new(coord: CoordClient, host_id: HostId) -> Arc<Self> {
+    pub fn new(coord: HttpCoordClient, host_id: HostId) -> Arc<Self> {
         Arc::new(Self { coord, host_id })
     }
 }

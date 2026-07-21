@@ -74,8 +74,10 @@ test-pkg pkg *ARGS:
 # mounted so crates aren't re-downloaded, and a container-local
 # CARGO_TARGET_DIR keeps the macOS `target/` (a different target triple)
 # untouched. Uses `cargo test` (not nextest) so the container needs no extra
-# tooling. `rust:bookworm` tracks the latest stable, matching our pinned
-# `channel = "stable"`. Example: `just test-linux engram-harness-claude`.
+# cargo tooling; `jq` is installed on demand — the fake-codex test scripts
+# shell out to it, and `rust:bookworm` doesn't ship it. `rust:bookworm`
+# tracks the latest stable, matching our pinned `channel = "stable"`.
+# Example: `just test-linux engram-harness-claude`.
 test-linux pkg='engram-harness-claude' *ARGS:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -99,7 +101,7 @@ test-linux pkg='engram-harness-claude' *ARGS:
                 -w /work \
                 -e CARGO_TARGET_DIR=/lxtarget \
                 rust:bookworm \
-                bash -c "cargo test -p {{pkg}} {{ARGS}}" ;;
+                bash -c "command -v jq >/dev/null || (apt-get update -qq && apt-get install -y -qq jq); cargo test -p {{pkg}} {{ARGS}}" ;;
         *)
             echo "unsupported host: $(uname -s)" >&2; exit 1 ;;
     esac
@@ -174,7 +176,7 @@ migrate-orchestrator:
     cd orchestrator && bun install --silent && \
         (PGPASSWORD=engram createdb -h localhost -p 5435 -U engram engram_orchestrator 2>/dev/null || true) && \
         ORCHESTRATOR_DATABASE_URL=postgres://engram:engram@localhost:5435/engram_orchestrator \
-        bunx drizzle-kit migrate
+        bun x drizzle-kit migrate
 
 # Provision an orchestrator login (ADR 0051 better-auth). Prompts for
 # email / admin? / password, then creates the user through the running
@@ -335,16 +337,19 @@ fc-colima-provision profile='fc-dev':
 # snapshot/chunk GC once their owning sessions are gone; the warm-pool base
 # snapshot an enabled image clones from is preserved (re-captured on re-enable).
 #
-# Use it to reclaim disk or get a clean slate before a re-bake. Talks to the
-# coordinator app-gRPC via ENGRAM_APP_GRPC_ADDR / ENGRAM_APP_GRPC_TOKEN (dev
-# defaults below); the stack must be up.
+# Use it to reclaim disk or get a clean slate before a re-bake. Drives the
+# LOCAL orchestrator (:8787) via the `engrams` CLI (bun, cli/) with
+# ENGRAMS_API_KEY auth; the stack must be up.
 reap-sessions profile='' mac_docker_context='colima':
     #!/usr/bin/env bash
     set -euo pipefail
-    # The `engrams` CLI drives the orchestrator (the coordinator is internal);
-    # `just dev` seeds the admin credential into var/dev-api-key (Tilt's
-    # dev-api-key resource).
-    export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
+    # The `engrams` CLI drives the orchestrator (the coordinator is internal).
+    # The URL is HARDCODED to the local dev stack — the CLI's default host is
+    # prod, and a stray ENGRAMS_URL (or a stored prod login in hosts.json) must
+    # never point a reaper at it. Auth is ENGRAMS_API_KEY only: from the env,
+    # else var/dev-api-key (`just dev` seeds it via Tilt's dev-api-key
+    # resource); the env var also stops the CLI falling back to hosts.json.
+    export ENGRAMS_URL="http://localhost:8787"
     export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
     [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
     # fc-colima profile for the VM-side stages (3 bundles, 4 snapshots). The
@@ -502,7 +507,9 @@ reap-sessions profile='' mac_docker_context='colima':
 reap-bundles:
     #!/usr/bin/env bash
     set -euo pipefail
-    export ENGRAMS_URL="${ENGRAMS_URL:-http://localhost:8787}"
+    # Hardcoded local orchestrator + ENGRAMS_API_KEY auth — same rationale as
+    # reap-sessions: never let env/hosts.json aim a GC pass at prod.
+    export ENGRAMS_URL="http://localhost:8787"
     export ENGRAMS_API_KEY="${ENGRAMS_API_KEY:-$(cat var/dev-api-key 2>/dev/null || true)}"
     [ -n "$ENGRAMS_API_KEY" ] || { echo "no ENGRAMS_API_KEY and no var/dev-api-key — is the stack up (just dev)?" >&2; exit 1; }
     (cd cli && bun install --silent)
@@ -746,195 +753,6 @@ bundles-squashfs:
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 
-# ADR 0061: build + stage the skill bundles as CONTENT-ADDRESSED erofs
-# images (<sha256>.erofs + current.json stamp) under var/shared/ — the
-# VZ-backend analog of `bundles-squashfs`. The Kata VZ guest kernel has
-# CONFIG_EROFS_FS but no CONFIG_SQUASHFS, so macOS dev stages erofs. Each
-# bundle's unpacked tree (build.sh --stage) is packed with mkfs.erofs; the
-# stamp maps logical name -> sha of the .erofs file. Run the host-agent
-# with ENGRAM_BUNDLE_DIR=$PWD/var/shared (the Tiltfile does this) so VZ
-# dev sessions resolve/attach against it. Re-run after editing a skill —
-# the stamp repoints and the host-agent restart picks up the new gen.
-bundles-vz:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    command -v mkfs.erofs >/dev/null || {
-        echo "mkfs.erofs not found — 'brew install erofs-utils' or use 'nix develop'" >&2
-        exit 1
-    }
-    sha256_of() {
-        if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
-        else shasum -a 256 "$1" | cut -d' ' -f1; fi
-    }
-    # Reproducible erofs pack (the VZ analog of _pack.sh's SOURCE_DATE_EPOCH
-    # squashfs). mkfs.erofs embeds a RANDOM fs UUID + the wallclock build time by
-    # default, so the SAME tree packs to a DIFFERENT sha every run — which churns
-    # every bundle's content-address on each `just bundles-vz`, repoints
-    # current.json, restarts the host-agent, and strands base snapshots that
-    # pinned the prior generation ("bundle materialize: blob not found"). Pin the
-    # UUID, timestamp (-T0, --all-time is the default), and uid/gid (RO in-guest,
-    # so ownership is irrelevant) so identical content always yields the same sha.
-    # -b 4096: match the guest page size (macOS host pages are 16K, guest is 4K).
-    pack_erofs() {  # pack_erofs <out.erofs> <tree-dir>
-        mkfs.erofs -b 4096 -T 0 -U 00000000-0000-0000-0000-000000000000 \
-            --force-uid=0 --force-gid=0 "$1" "$2" >/dev/null
-    }
-    mkdir -p var/shared
-    stamp="{"
-    sep=""
-    # `sentinel` rides every reserved dyn slot at capture; skills/
-    # integrations-cli/browser/ide are catalog skills swapped in per session;
-    # guest-tools (ADR 0080 §D) carries the pinned static ttyd for the SHELL
-    # tab (reserved slot dyn_2 — the coord resolves it per fresh create).
-    # integrations-cli/browser/ide need Docker and are best-effort
-    # (skipped on failure), exactly as `just bundles` already degrades;
-    # guest-tools downloads the pinned ttyd release and degrades the same
-    # way offline (SHELL tab then needs an image-baked ttyd).
-    for name in sentinel skills integrations-cli browser ide guest-tools; do
-        # Stage under the repo (absolute, $HOME-rooted), NOT `mktemp -d`: the
-        # Docker-built bundles (integrations-cli/browser/ide) bind-mount this dir into the
-        # build container, and Docker Desktop on macOS does not share the
-        # /var/folders path `mktemp -d` returns — the container's writes never
-        # reach the host, silently producing an empty bundle. A path under the
-        # repo (in $HOME) is shared, so the bind mount propagates.
-        tree="$PWD/var/shared/.$name.stage"
-        rm -rf "$tree"; mkdir -p "$tree"
-        if ! "deploy/bundles/$name/build.sh" --stage "$tree"; then
-            echo "$name bundle stage failed; skipping (sessions degrade gracefully)" >&2
-            rm -rf "$tree"
-            continue
-        fi
-        out="var/shared/.$name.build.erofs"
-        rm -f "$out"
-        if ! pack_erofs "$out" "$tree"; then
-            echo "$name erofs pack failed; skipping" >&2
-            rm -rf "$tree" "$out"
-            continue
-        fi
-        rm -rf "$tree"
-        sha="$(sha256_of "$out")"
-        mv "$out" "var/shared/$sha.erofs"
-        stamp="$stamp$sep\"$name\": \"$sha\""
-        sep=", "
-    done
-    # ADR 0062: the built-in `claude` harness rides the stamp like a skill (key
-    # `harness-claude`, mounted on dyn_0, exec'd as /opt/engram/dyn/0/harness).
-    # Its tree — the engram-harness-claude entry binary + the pinned `claude` CLI
-    # + the committed harness.toml descriptor — is the ONE bundle not assembled by
-    # a build.sh: CI hands it in pre-built via ENGRAM_HARNESS_CLAUDE_TREE (the
-    # `bake-harness-claude-artifact` job's downloaded artifact). A local VZ
-    # `just dev` has no such artifact, so when the var is unset we build the tree
-    # HERE for the arm64 Kata guest (mirroring `bake-demo`'s cross-compile), then
-    # pack it exactly like FC's `bundles-squashfs` — only the format differs
-    # (erofs, not squashfs). Without this the fleet stamp never carries
-    # `harness-claude` and `POST /sessions` 400s with "built-in harness `claude`
-    # squashfs (`harness-claude`) is not staged on any host yet".
-    harness_tree="${ENGRAM_HARNESS_CLAUDE_TREE:-}"
-    if [ -z "$harness_tree" ]; then
-        # PINNED — keep in lockstep with ci.yml's bake-harness-claude-artifact:
-        # 2.1.185 is the newest CLI that still offers AskUserQuestion headlessly
-        # (cortexapps/engrams#431); bump deliberately and re-verify AUQ. The VZ
-        # guest is arm64 Linux (Kata kernel), so build the musl harness + fetch
-        # the linux-arm64 CLI for that arch (mirrors bake-demo's case).
-        CLAUDE_VERSION=2.1.185
-        case "$(uname -m)" in
-            arm64 | aarch64) htarget=aarch64-unknown-linux-musl; carch=linux-arm64 ;;
-            x86_64 | amd64)  htarget=x86_64-unknown-linux-musl;   carch=linux-x64  ;;
-            *) echo "harness-claude: unsupported arch $(uname -m); skipping" >&2; htarget="" ;;
-        esac
-        if [ -n "$htarget" ]; then
-            # Best-effort like the Docker bundles above: a cross-build/download
-            # failure (e.g. not in `nix develop`, no musl cross toolchain) warns
-            # and skips so `just dev` still comes up — just without built-in claude.
-            tree="$PWD/var/shared/.harness-claude.stage"
-            cache="var/shared/.cache/claude-$CLAUDE_VERSION-$carch"
-            ok=1
-            cargo build --release --target "$htarget" -p engram-harness-claude || ok=0
-            if [ "$ok" = 1 ] && [ ! -x "$cache" ]; then
-                mkdir -p "$(dirname "$cache")"
-                curl -fsSL --retry 3 \
-                    "https://downloads.claude.ai/claude-code-releases/$CLAUDE_VERSION/$carch/claude" \
-                    -o "$cache" && chmod +x "$cache" || ok=0
-            fi
-            if [ "$ok" = 1 ]; then
-                rm -rf "$tree"; mkdir -p "$tree"
-                cp -p "target/$htarget/release/engram-harness-claude" "$tree/harness"
-                cp -p "$cache" "$tree/claude"
-                cp -p deploy/harness-claude/harness.toml "$tree/harness.toml"
-                harness_tree="$tree"
-            else
-                echo "harness-claude local build failed; skipping (dev stack boots without the built-in claude)" >&2
-            fi
-        fi
-    fi
-    if [ -n "$harness_tree" ]; then
-        [ -x "$harness_tree/harness" ] || {
-            echo "harness tree $harness_tree is missing an executable 'harness' entry binary" >&2
-            exit 1
-        }
-        out="var/shared/.harness-claude.build.erofs"
-        rm -f "$out"
-        pack_erofs "$out" "$harness_tree"
-        sha="$(sha256_of "$out")"
-        mv "$out" "var/shared/$sha.erofs"
-        stamp="$stamp$sep\"harness-claude\": \"$sha\""
-        sep=", "
-        # Drop the locally-built stage tree (keep the download cache); CI's
-        # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
-        [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
-    fi
-    codex_tree="${ENGRAM_HARNESS_CODEX_TREE:-}"
-    if [ -z "$codex_tree" ]; then
-        tree="$PWD/var/shared/.harness-codex.stage"
-        if cargo build --release --target aarch64-unknown-linux-musl -p engram-harness-codex \
-            && deploy/harness-codex/stage.sh aarch64 \
-                target/aarch64-unknown-linux-musl/release/engram-harness-codex "$tree"; then
-            codex_tree="$tree"
-        else
-            echo "harness-codex local VZ build failed; skipping" >&2
-        fi
-    fi
-    if [ -n "$codex_tree" ]; then
-        [ -x "$codex_tree/harness" ] && [ -x "$codex_tree/codex" ] || {
-            echo "Codex harness tree must contain executable harness + codex" >&2
-            exit 1
-        }
-        out="var/shared/.harness-codex.build.erofs"
-        rm -f "$out"
-        pack_erofs "$out" "$codex_tree"
-        sha="$(sha256_of "$out")"
-        mv "$out" "var/shared/$sha.erofs"
-        stamp="$stamp$sep\"harness-codex\": \"$sha\""
-        sep=", "
-        [ "$codex_tree" = "$PWD/var/shared/.harness-codex.stage" ] && rm -rf "$codex_tree"
-    fi
-    # ADR 0080: the agentd bundle (reserved slot dyn_1) — MANDATORY: the
-    # stage-1 init execs agentd out of this mount, so a stamp without it
-    # boots nothing. The VZ guest is arm64 Linux (Kata kernel); build the
-    # musl agentd for that arch (ENGRAM_AGENTD_BIN overrides).
-    agentd_bin="${ENGRAM_AGENTD_BIN:-}"
-    if [ -z "$agentd_bin" ]; then
-        case "$(uname -m)" in
-            arm64 | aarch64) atarget=aarch64-unknown-linux-musl ;;
-            *)               atarget=x86_64-unknown-linux-musl ;;
-        esac
-        cargo build --release --target "$atarget" -p engram-agentd
-        agentd_bin="target/$atarget/release/engram-agentd"
-    fi
-    tree="$PWD/var/shared/.agentd.stage"
-    rm -rf "$tree"; mkdir -p "$tree"
-    install -m 0755 "$agentd_bin" "$tree/engram-agentd"
-    sha256_of "$tree/engram-agentd" > "$tree/agentd.sha256"
-    out="var/shared/.agentd.build.erofs"
-    rm -f "$out"
-    pack_erofs "$out" "$tree"
-    rm -rf "$tree"
-    sha="$(sha256_of "$out")"
-    mv "$out" "var/shared/$sha.erofs"
-    stamp="$stamp$sep\"agentd\": \"$sha\""
-    sep=", "
-    echo "$stamp}" > var/shared/current.json
-    cat var/shared/current.json
 
 # ------------------------------------------------------------------
 # Smoke / e2e helpers — run against a stack brought up by `just dev`
@@ -1013,14 +831,23 @@ bake repo dir='.':
 # cover every host now.
 # ------------------------------------------------------------------
 
-# Ad-hoc codesign the coordinator + the engram-sandbox-vz test
-# binaries with the com.apple.security.virtualization entitlement.
-# Without this, every VZ API call returns NSError "process doesn't
-# have the com.apple.security.virtualization entitlement" — see the
-# smoke test in crates/engram-sandbox-vz/src/vm.rs.
+# Ad-hoc codesign the engram-sandbox-vz test binaries with the
+# com.apple.security.virtualization entitlement. Without this, every
+# VZ API call returns NSError "process doesn't have the
+# com.apple.security.virtualization entitlement" — see the smoke test
+# in crates/engram-sandbox-vz/src/vm.rs.
+#
+# The build MUST be `cargo nextest run --no-run` — the exact
+# invocation shape `vz-test` runs with. A plain `cargo build -p a -p b
+# --tests` resolves features differently (AGENTS.md: `-p X -p Y`
+# invalidates the cache), so nextest would silently RECOMPILE fresh,
+# unsigned test binaries after we signed the stale ones — the live VZ
+# tests then die on the missing entitlement (ADR 0096).
 #
 # Idempotent: re-running on an already-signed binary is a no-op
-# beyond a few ms of cycle. `dev-vz` and `vz-test` depend on it.
+# beyond a few ms of cycle. `vz-test` and the Tiltfile depend on it
+# (the Tiltfile builds + signs `engram-host-agent` itself, atomically
+# with its own build — not here).
 #
 # We sign with the ad-hoc identity (`-`), which is enough for
 # locally-built dev binaries on Apple Silicon. CI does the same.
@@ -1030,15 +857,71 @@ vz-codesign:
     @if [ "$(uname -s)" != "Darwin" ]; then \
         echo "vz-codesign is macOS-only; skipping" >&2; exit 0; \
     fi
-    cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+    cargo nextest run -p engram-sandbox-vz --no-run
     bash crates/engram-sandbox-vz/scripts/codesign.sh debug
 
-# Run the engram-sandbox-vz crate's unit tests, including the live
-# VZ smoke test gated behind --ignored. Codesigns first so the
-# entitlement check passes when the test reaches into VZ.
+# Run the engram-sandbox-vz crate's unit tests, then the live VZ
+# tests gated behind #[ignore]. Codesigns first so the entitlement
+# check passes when the test reaches into VZ. (`--run-ignored
+# ignored-only` is nextest's native spelling; the old `-- --ignored`
+# worked only via libtest-compat emulation — CI already uses this.)
 vz-test: vz-codesign
     cargo nextest run -p engram-sandbox-vz
-    cargo nextest run -p engram-sandbox-vz -- --ignored
+    cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only
+
+# ADR 0096: stage the MINIMAL bundle set the live VZ e2e boots with —
+# agentd (hard: the init shim execs it out of its slot, ADR 0080),
+# guest-tools (the SHELL-tab ttyd the lifecycle e2e asserts), and the
+# sentinel — into var/vz-e2e/shared/ (content-addressed squashfs +
+# current.json, the exact layout `resolve_agentd_slot` reads). A
+# stripped-down `bundles-squashfs` (no harnesses, no Docker bundles)
+# so the e2e stages in seconds; the per-bundle build.sh scripts do
+# the reproducible mksquashfs pack themselves (deploy/bundles/_pack.sh,
+# SOURCE_DATE_EPOCH=0).
+vz-test-bundles:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    sha256_of() {
+        if command -v sha256sum >/dev/null; then sha256sum "$1" | cut -d' ' -f1;
+        else shasum -a 256 "$1" | cut -d' ' -f1; fi
+    }
+    out=var/vz-e2e/shared
+    mkdir -p "$out"
+    stamp="{"
+    sep=""
+    for name in sentinel guest-tools; do
+        img="$out/.$name.build.squashfs"
+        rm -f "$img"
+        "deploy/bundles/$name/build.sh" "$img" >/dev/null
+        sha="$(sha256_of "$img")"
+        mv "$img" "$out/$sha.squashfs"
+        stamp="$stamp$sep\"$name\": \"$sha\""
+        sep=", "
+    done
+    # agentd — always the arm64 musl build (the VZ guest is arm64 Linux).
+    cargo build --release --target aarch64-unknown-linux-musl -p engram-agentd
+    agentd_bin="target/aarch64-unknown-linux-musl/release/engram-agentd"
+    img="$out/.agentd.build.squashfs"
+    rm -f "$img"
+    deploy/bundles/agentd/build.sh "$agentd_bin" "$img" >/dev/null
+    sha="$(sha256_of "$img")"
+    mv "$img" "$out/$sha.squashfs"
+    stamp="$stamp$sep\"agentd\": \"$sha\""
+    echo "$stamp}" > "$out/current.json"
+    cat "$out/current.json"
+
+# ADR 0096: the ONE-COMMAND live VZ e2e. Stages everything from HEAD —
+# kernel, bundles, a fresh Docker-free rootfs (real init shim + mkext4),
+# codesigned test binaries — then boots real VMs through the whole
+# suite. Rebuilt every run, so the live loop can't silently rot the way
+# the old "point ENGRAM_VZ_ROOTFS at a stale bake" flow did.
+# ENGRAM_VZ_REQUIRE=1 turns any leftover preflight SKIP into a failure.
+vz-e2e: pull-kernel vz-test-bundles vz-codesign
+    bash crates/engram-sandbox-vz/scripts/make-test-rootfs.sh var/vz-e2e/rootfs.ext4
+    ENGRAM_VZ_ROOTFS="$PWD/var/vz-e2e/rootfs.ext4" \
+    ENGRAM_VZ_BUNDLE_DIR="$PWD/var/vz-e2e/shared" \
+    ENGRAM_VZ_REQUIRE=1 \
+        cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only -E 'test(e2e_vz)'
 
 # Hot-reload the coordinator on file changes. Requires `cargo watch`:
 #   cargo install cargo-watch
@@ -1080,6 +963,29 @@ dev-shell:
 # Drop everything in ./var/* (sandbox cwds + snapshots).
 clean-var:
     rm -rf ./var
+
+# ------------------------------------------------------------------
+# Deterministic simulation (ADR 0098). One seed replays one exact
+# interleaving; the swarm explores many. A failure prints the seed +
+# trace tail — replay it with `just sim SEED=<n>`.
+# ------------------------------------------------------------------
+
+# Replay a single seed (default profile: chaos).
+sim SEED STEPS='1500' PROFILE='chaos':
+    cargo run -p engram-dst --release --bin sim -- --seed {{SEED}} --steps {{STEPS}} --profile {{PROFILE}}
+
+# Seeded swarm over a range (`just sim-swarm 0..500`).
+sim-swarm SEEDS='0..200' STEPS='1500' PROFILE='chaos':
+    cargo run -p engram-dst --release --bin sim -- --seeds {{SEEDS}} --steps {{STEPS}} --profile {{PROFILE}}
+
+# Host-internal simulator (ADR 0098 Phase 2): replay a single seed against
+# the acked-write durability oracle over the portable disk/spool machinery.
+sim-host SEED STEPS='400' PROFILE='chaos':
+    cargo run -p engram-dst-host --release --bin sim-host -- --seed {{SEED}} --steps {{STEPS}} --profile {{PROFILE}}
+
+# Host-internal seeded swarm over a range (`just sim-host-swarm 0..50`).
+sim-host-swarm SEEDS='0..50' STEPS='400' PROFILE='chaos':
+    cargo run -p engram-dst-host --release --bin sim-host -- --seeds {{SEEDS}} --steps {{STEPS}} --profile {{PROFILE}}
 
 # ------------------------------------------------------------------
 # Web dashboard — read-only live view of the running coordinator.

@@ -28,7 +28,8 @@ use crate::types::cow_state::{CowState, CowStateRecord};
 use crate::types::egress::SessionEgressPolicy;
 use crate::types::port::PortTunnel;
 use crate::types::sandbox::{
-    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    AgentSpec, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec, WriteFileResult,
+    WriteFileSpec,
 };
 use crate::types::shell::ShellTunnel;
 use crate::types::snapshot::SnapshotMetadata;
@@ -130,6 +131,19 @@ pub trait HostClient: Send + Sync {
             stderr,
             exit_status,
         })
+    }
+
+    /// Write a batch of files into a running sandbox. Implementations report
+    /// file-level failures in the returned vector and reserve the outer error
+    /// for sandbox-level failures such as an unknown sandbox.
+    async fn write_files(
+        &self,
+        _id: SandboxId,
+        _files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this host doesn't support `write_files` yet".into(),
+        ))
     }
 
     async fn snapshot(
@@ -323,6 +337,7 @@ pub trait HostClient: Send + Sync {
         _platform_os: &str,
         _platform_arch: &str,
         _registry_auth: Option<crate::types::registry::ResolvedRegistryAuth>,
+        _min_disk_gib: u32,
         _progress: tokio::sync::mpsc::Sender<crate::types::MaterializeProgress>,
     ) -> Result<crate::types::MaterializedImage, SandboxError> {
         Err(SandboxError::InvalidSpec(
@@ -428,19 +443,14 @@ pub trait HostClient: Send + Sync {
         Ok(())
     }
 
-    /// ADR 0054: deliver a user's answer to a deferred AskUserQuestion to
-    /// the attached harness for `sandbox_id` (which stashes it and re-fires
-    /// the deferred tool via `--resume`). `answers` is keyed by question
-    /// text, each value the selected labels (1 for single-select, N for
-    /// multi-select) — the `BTreeMap` form of `engram_harness_proto::Answers`
-    /// (spelled out here to keep `engram-core` free of a harness-proto
-    /// dependency cycle). Default is a no-op for harness-less fakes; the
-    /// `HostRegistry`, gRPC client, and `LocalHostClient` override it.
-    async fn answer_question(
+    /// ADR 0089: deliver an opaque result for an orchestrator-registered
+    /// tool call to the attached harness. Default no-op for harness-less
+    /// fakes; real local and gRPC clients override it.
+    async fn tool_result(
         &self,
         _sandbox_id: SandboxId,
         _tool_call_id: String,
-        _answers: std::collections::BTreeMap<String, Vec<String>>,
+        _result_json: String,
     ) -> Result<(), SandboxError> {
         Ok(())
     }

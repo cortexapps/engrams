@@ -19,7 +19,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use dashmap::DashMap;
 use engram_core::traits::{HarnessDial, HostClient, MetadataStore, SessionFence};
-use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{
+    AgentSpec, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+};
 use engram_core::types::session::SessionState;
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{HostId, SandboxError, SandboxId, SessionId};
@@ -107,6 +109,10 @@ pub struct HostRegistry {
     /// the dead-host detector's 30s threshold, so the TTL only fires
     /// when *detection itself* is broken or paused.
     ttl: Duration,
+    /// ADR 0098 D1: wall clock for heartbeat-freshness decisions.
+    /// Defaults to `SystemClock` at construction; the simulation
+    /// harness swaps it when it builds the registry.
+    clock: Arc<dyn engram_core::traits::Clock>,
 }
 
 impl HostRegistry {
@@ -120,6 +126,7 @@ impl HostRegistry {
             meta,
             dialer: parking_lot::RwLock::new(None),
             ttl: crate::placement::placement_ttl(),
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
     }
 
@@ -140,6 +147,7 @@ impl HostRegistry {
             meta,
             dialer: parking_lot::RwLock::new(None),
             ttl,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
         }
     }
 
@@ -290,7 +298,9 @@ impl HostRegistry {
         let Some(row) = rows.into_iter().find(|r| r.id == host_id) else {
             return Err(SandboxError::HostLost);
         };
-        let fresh = chrono::Utc::now()
+        let fresh = self
+            .clock
+            .now_utc()
             .signed_duration_since(row.last_heartbeat_at)
             .to_std()
             .map_or(true, |age| age <= self.ttl);
@@ -449,7 +459,9 @@ impl HostRegistry {
         let Some(row) = rows.into_iter().find(|r| r.id == host_id) else {
             return Err(SandboxError::HostLost);
         };
-        let fresh = chrono::Utc::now()
+        let fresh = self
+            .clock
+            .now_utc()
             .signed_duration_since(row.last_heartbeat_at)
             .to_std()
             .map_or(true, |age| age <= self.ttl);
@@ -545,6 +557,31 @@ impl HostClient for HostRegistry {
                     tracing::debug!(
                         sandbox_id = %id, attempt, error = %msg,
                         "exec_stream transient Unavailable; retrying",
+                    );
+                    tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
+                }
+                other => return other,
+            }
+        }
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        // Unlike exec, WriteFiles is idempotent: retrying the whole batch after
+        // an Unavailable response merely replaces each file with the same bytes.
+        const MAX_ATTEMPTS: u32 = 3;
+        let mut attempt = 0;
+        loop {
+            attempt += 1;
+            let (_, backend) = self.resolve_owner(id).await?;
+            match backend.write_files(id, files.clone()).await {
+                Err(SandboxError::Unavailable(msg)) if attempt < MAX_ATTEMPTS => {
+                    tracing::debug!(
+                        sandbox_id = %id, attempt, error = %msg,
+                        "write_files transient Unavailable; retrying",
                     );
                     tokio::time::sleep(Duration::from_millis(100 * attempt as u64)).await;
                 }
@@ -730,10 +767,27 @@ impl HostClient for HostRegistry {
     async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
         // Aggregate across all connected hosts. Errors from any one
         // host are surfaced; partial results aren't reported in 3a.
+        //
+        // Snapshot the backends FIRST (cheap Arc clones), dropping every
+        // `hosts` shard guard, THEN await per host. Awaiting while a
+        // DashMap `iter()` guard is live holds that shard's RwLock across
+        // the suspension; a concurrent `register`/`unregister` that hashes
+        // to the same shard then blocks on it — a permanent deadlock on a
+        // SINGLE-THREADED executor (the DST sim), where the suspended
+        // iterator can never be polled to release the guard. (Shard
+        // assignment is `RandomState`-seeded and `available_parallelism`-
+        // sized, so the collision was a ~1% getrandom-/host-count-
+        // dependent hang — determinism-audit item 8.) Same rule
+        // `backend_of` documents: clone the Arc, never hold the entry
+        // across an `.await`.
+        let backends: Vec<Arc<dyn HostClient>> = self
+            .hosts
+            .iter()
+            .map(|e| e.value().backend.clone())
+            .collect();
         let mut all = Vec::new();
-        for entry in self.hosts.iter() {
-            let ids = entry.value().backend.list().await?;
-            all.extend(ids);
+        for backend in backends {
+            all.extend(backend.list().await?);
         }
         Ok(all)
     }
@@ -756,8 +810,17 @@ impl HostClient for HostRegistry {
         // connected host so whichever one had the binding clears it.
         // Each host's `unbind_session` is a no-op for unknown session
         // ids, so the broadcast is cheap.
-        for entry in self.hosts.iter() {
-            entry.value().backend.unbind_session(session_id).await;
+        //
+        // Snapshot backends FIRST so no `hosts` shard guard is held across
+        // the per-host `.await` (see `list` — the DashMap-guard-across-
+        // await deadlock on a single-threaded executor).
+        let backends: Vec<Arc<dyn HostClient>> = self
+            .hosts
+            .iter()
+            .map(|e| e.value().backend.clone())
+            .collect();
+        for backend in backends {
+            backend.unbind_session(session_id).await;
         }
     }
 
@@ -792,15 +855,15 @@ impl HostClient for HostRegistry {
         backend.dequeue_queued_prompt(sandbox_id, prompt_id).await
     }
 
-    async fn answer_question(
+    async fn tool_result(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
-        answers: std::collections::BTreeMap<String, Vec<String>>,
+        result_json: String,
     ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
         backend
-            .answer_question(sandbox_id, tool_call_id, answers)
+            .tool_result(sandbox_id, tool_call_id, result_json)
             .await
     }
 

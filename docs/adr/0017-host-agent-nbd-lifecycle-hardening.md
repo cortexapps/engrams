@@ -400,3 +400,155 @@ As of 2026-05-24, dev-vm still has `/dev/nbd1..5` bound to dead
 PIDs `4203, 5562, 6911, 9093, 10683`. They'll be cleaned on the
 next host-agent startup (now that Phase B is wired). No manual
 intervention required.
+
+---
+
+## Addendum (2026-07-17): acked-write durability across pod rolls + slot hygiene
+
+Session `85e0298a` (prod, 2026-07-16) surfaced guest-visible ext4
+corruption (`Corrupt inode bitmap`, `Structure needs cleaning`,
+EUCLEAN) traced to three acked-write-loss / stale-read windows in the
+NBD data plane. Fixed in the commit chain carrying this addendum:
+
+1. **SIGTERM deadline overrun rolled back acked writes.** NBD WRITEs
+   ack from the in-RAM dirty tier; the issue-#225 final flush is
+   budgeted (20 s) against `terminationGracePeriodSeconds`, and on
+   overrun the dirty tier died with the process — the successor
+   rehydrated from the last published manifest, silently rolling a
+   RUNNING guest's disk back (320–370 MiB per sandbox in the incident;
+   9 overruns fleet-wide that week). Fix: the abandon sweep now exports
+   every un-uploaded chunk (dirty ∪ pending-upload tiers) to a
+   **shutdown spool** under `<checkpoint_dir>/spool/<sandbox_id>/`
+   (hostPath, survives the roll), and the successor's
+   `rehydrate_sandbox` adopts a lineage-matching spool into the fresh
+   backend's dirty tier BEFORE the RECONFIGURE releases parked guest
+   I/O. The spool tolerates the store-ahead case (chunks + manifest
+   uploaded, coord publish lost) by attaching from the spool's newer
+   ref. Regression: `nbd_shutdown_final_flush.rs::
+   sigterm_overrun_spools_dirty_writes_and_successor_adopts_them`.
+
+2. **Host page cache is a hidden volatile write tier.** FC's drive is
+   buffered host I/O (`cache_type=Unsafe`), so guest-acked writes sit
+   in the host page cache for `/dev/nbdN`; during the pod-handoff
+   dead-connection window their writeback fails and the kernel drops
+   them (`lost async page write` — observed at both incident rolls).
+   Fix: the SIGTERM flush pass now `sync_all`s each survivor's device
+   FIRST (while our serve loop can still ack the writeback), pushing
+   that tier into the dirty map where the flush/spool can see it. The
+   full fix (O_DIRECT FC drives so device errors surface to the guest
+   instead of vanishing) needs the ADR 0045 FC fork and stays open.
+
+3. **NBD slot reuse leaked the previous tenant's page cache.** The
+   ADR 0049 allocator reuses `/dev/nbdN` minors with no invalidation
+   anywhere in release → acquire → attach; the kernel does not
+   reliably invalidate a bdev's page cache across
+   disconnect/reconnect, so a fresh tenant could read the PRIOR
+   tenant's cached pages — including pages whose writeback had failed
+   at that tenant's teardown. (The incident session attached to a slot
+   that had just absorbed a 13-minute failed-writeback storm and hit a
+   corrupt-bitmap CRC failure 17 minutes later, before any loss event
+   of its own; the post-copy migration path already carried a
+   `BLKFLSBUF` for exactly this class.) Fix: `attach_backend` now
+   BLKFLSBUFs every freshly CONNECTed device before the caller hands
+   it to FC; failure is a hard attach error (a failed create beats
+   silent cross-tenant corruption).
+
+4. **`claim` raced the populator's validation window.** `populate`
+   holds a slot RESERVED for the duration of its free-check; a busy
+   survivor device is reserve→check→unreserve cycled, so a one-shot
+   `claim` landing inside the window read "reserved, not warm" as "a
+   lease owns it" and returned `None` — the successor's rehydrate then
+   strands the survivor's disk until evict_local → resume (surfaced as
+   a CI flake of the spool regression test; the same race exists at
+   every prod successor startup). `claim` now retries across the
+   window; a genuine lease still returns `None` after the budget.
+
+Related fix in the same chain (engram-chunk-store): the cache sweep's
+`list_entries` walk aborted on any vanish-mid-walk `NotFound` stat —
+chronically, several times an hour on every busy host — so eviction
+never completed a pass and the cache blew far past its budget (424 GiB
+/ 77 % of the incident node's volume, an ENOSPC-corruption risk). The
+walk now skips vanished entries.
+
+Still open (follow-ups, not this chain): serve-loop outage
+post-checkpoint failed guest writes for 13 minutes on the incident
+node (root cause of the storm itself, distinct from the slot-reuse
+leak above); read-path integrity is verify-on-populate only (a corrupt
+NVMe cache file or RAM tier is served unverified and can be laundered
+into new dirty chunks via RMW); periodic checkpoints retry forever
+against a dead data plane instead of escalating.
+
+## Addendum (2026-07-17b): parked survivors were invisible to the register-time rehydrate
+
+Session `731df805` (dev-brain), same day the addendum above shipped:
+`git`/`node` segfaulting and rootfs EIO within a minute of a rung-2
+un-pause, "corruption" symptoms that looked like the acked-write-loss
+class but were not — the guest was **paused for the whole roll**, so
+none of the flush/spool windows applied. The actual chain:
+
+1. The session idled into the eviction ladder and parked at rung 2
+   (FC paused, VM resident), session status `evicting`, at 01:52.
+2. The host-agent pod rolled at 03:57 (deploying the addendum above,
+   as it happens). The predecessor detached; the successor
+   pidfd-reattached both parked FC processes and rehydrated their
+   chain heads from durable records — all correct.
+3. The coordinator's register response returned
+   `rehydrate_sandboxes = 0`: the backing query filtered
+   `status = 'active'`, and both resident VMs were `evicting`. So
+   `rehydrate_survivors` never ran, and nothing RECONFIGUREd
+   `/dev/nbd0`/`/dev/nbd1` onto the successor's serve sockets.
+4. The stale-binding sweep then found both devices free-in-pool and
+   kernel-bound to a dead pid — exactly its definition of stale — and
+   issued netlink `NBD_CMD_DISCONNECT` at the parked survivors' live
+   rootfs devices ("STILL bound" both times, because the FCs hold
+   them open; the devices were left zombied).
+5. At 04:48 the user returned; the eviction was cancelled at the
+   parking rung and the guest un-paused onto a dead data plane. Cold
+   reads → EIO/garbage (binaries paged in as junk → SIGSEGV); hot
+   guest-page-cache entries kept working, which is why the failure
+   looked selective and "flaky" from inside.
+
+Two structural fixes in this chain:
+
+1. **The rehydrate list now covers every VM-resident session.** The
+   query (renamed
+   `list_resident_sandboxes_on_host_with_disk_manifest`) filters on
+   the SQL twin of `SessionState::reserves_host_memory()` — the
+   existing "VM is resident on its host" predicate — instead of
+   `'active'` alone. Parked (`evicting`), `created`, `unreachable`,
+   and `evacuating` sandboxes all rehydrate; the same list also feeds
+   the survivor egress re-push, which had the same blind spot.
+   Conformance scenario `t_resident_sandboxes_rehydrate_list` (ADR
+   0098 D4) pins the semantics against both SimMetadataStore and live
+   Postgres, including the manifest max/snap-wins resolution.
+2. **The host no longer lets a coordinator-side gap decide whether a
+   resident VM keeps its disk.** `rehydrate_local_survivors` runs
+   after the coord-list pass and before the sweep: any live,
+   unserved sandbox with a durable `ChainHeadRecord` (which carries
+   sandbox_id, session_id, and the chain-head manifest — everything
+   `rehydrate_sandbox` needs) is claimed + RECONFIGUREd locally. The
+   coord list is now advisory for survivors, matching the design
+   stance that binding records on local disk are the recovery source
+   of truth (ADR 0073 posture, extended to the NBD data plane).
+
+Still open (follow-ups):
+
+- **Un-pause should gate on data-plane health.** The parking-rung
+  cancel path resumed the guest with no check that its rootfs device
+  is served by the current generation. A resume onto an unserved
+  device should fail fast into `evict_local → resume`
+  (snapshot-restore recovery) instead of running the guest against a
+  dead disk. Candidate `soft_invariant!` site: "vcpus released ⇒
+  sandbox present in `nbd_sandboxes`".
+- **Host-DST oracle (ADR 0098 P-series).** The full shape — park →
+  pod roll → register(list) → sweep → un-pause — is a
+  host-lifecycle scenario `engram-dst-host` should drive once the
+  disk-daemon seams land: invariant "a device kernel-bound on behalf
+  of a live sandbox is always claimed by the serving generation
+  before the stale sweep runs; `NBD_CMD_DISCONNECT` is never issued
+  at a device a live FC holds open."
+- The post-roll periodic checkpoints (v4–v6 of the incident session)
+  re-chunked against a backend with no live guest connection;
+  whether those diffs can publish a manifest that diverges from what
+  the guest observed needs a verify pass before the next such
+  incident trusts a post-roll chain.

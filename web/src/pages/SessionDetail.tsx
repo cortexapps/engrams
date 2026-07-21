@@ -1,6 +1,6 @@
 import { useParams } from "@tanstack/react-router";
 import { Fragment, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
-import { Activity, Code2, Globe, Pencil, SquareTerminal } from "lucide-react";
+import { Activity, Code2, GitPullRequestArrow, Globe, Pencil, SquareTerminal } from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
@@ -8,6 +8,7 @@ import { StatusGlyph } from "../components/Glyph";
 import { SessionThread } from "../components/session-thread/SessionThread";
 import { PageHeading } from "../components/page-heading";
 import { TitleEditForm } from "./sessions/TitleEditForm";
+import { DeleteSessionButton } from "./sessions/DeleteSessionButton";
 import { WorkPane, type PaneTabId } from "../components/WorkPane";
 import { statusLabel } from "./sessions/session-format";
 import { useTasks } from "../hooks/useTasks";
@@ -45,7 +46,13 @@ function readPanePref(): WorkPanePref {
     if (!raw) return DEFAULT_PANE_PREF;
     const p = JSON.parse(raw) as Partial<WorkPanePref>;
     return {
-      tab: p.tab === "browser" || p.tab === "ide" || p.tab === "diagnostics" ? p.tab : "shell",
+      tab:
+        p.tab === "browser" ||
+        p.tab === "ide" ||
+        p.tab === "side-effects" ||
+        p.tab === "diagnostics"
+          ? p.tab
+          : "shell",
       // Clamp within [pane minSize, 100 − transcript minSize] so a restored
       // width never collides with either panel's floor (react-resizable-panels
       // would otherwise clamp it and warn).
@@ -149,9 +156,12 @@ export function SessionDetail() {
 
   const openPane = (tab?: PaneTabId) => {
     if (tab) setPaneTab(tab);
-    if (isMobile) {
-      setPaneOpen(true);
-    } else {
+    // Set the logical state as well as resizing the desktop panel. On the
+    // first render useIsMobile has not settled yet; keeping this true means a
+    // browser-activity signal cannot be consumed by the temporary desktop
+    // branch and then disappear when the mobile sheet mounts.
+    setPaneOpen(true);
+    if (!isMobile) {
       // resize() un-collapses to an explicit width — reliable even on a fresh
       // load that started collapsed (expand() would only restore a remembered
       // size, which doesn't exist yet).
@@ -161,9 +171,8 @@ export function SessionDetail() {
 
   const collapsePane = () => {
     setExpanded(false);
-    if (isMobile) {
-      setPaneOpen(false);
-    } else {
+    setPaneOpen(false);
+    if (!isMobile) {
       paneRef.current?.collapse();
     }
   };
@@ -173,19 +182,14 @@ export function SessionDetail() {
     else transcriptRef.current?.collapse();
   };
 
-  // ADR 0065: when the AGENT boots the shared browser, surface it. The agent
-  // runs `playwright-cli` (whose wrapper brings the stack up via
-  // `engram-browser --ensure`), so the first such exec is our signal to open the
-  // pane on the BROWSER tab — the human then watches the agent drive the same
-  // Chrome live. Fires once (ref guard) and only when the browser capability is
-  // present; we don't reopen if the human subsequently collapses the pane.
+  // ADR 0097: the shared harness enriches a browser-driving Shell/Bash call
+  // into browser_activity with the same tool id. Surface the shared Chrome on
+  // the first such event, then respect a human collapse for the rest of this
+  // page lifetime.
   const autoOpenedBrowserRef = useRef(false);
   useEffect(() => {
     if (!browserEnabled || autoOpenedBrowserRef.current) return;
-    const agentBootedBrowser = events.some(
-      (ie) =>
-        ie.event.type === "exec_started" && ie.event.command.join(" ").includes("playwright-cli"),
-    );
+    const agentBootedBrowser = events.some((ie) => ie.event.type === "browser_activity");
     if (agentBootedBrowser) {
       autoOpenedBrowserRef.current = true;
       openPane("browser");
@@ -227,6 +231,7 @@ export function SessionDetail() {
     { id: "shell", label: "Shell", icon: SquareTerminal },
     ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
     ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    { id: "side-effects", label: "Side effects", icon: GitPullRequestArrow },
     { id: "diagnostics", label: "Diagnostics", icon: Activity },
   ];
 
@@ -272,12 +277,17 @@ export function SessionDetail() {
           titleVariant={taskTitle ? "display" : "mono"}
           showRule={false}
           actions={
-            // Desktop reopens the pane via the edge rail; phones have no rail,
-            // so they get an explicit button.
-            <Button variant="outline" size="sm" className="md:hidden" onClick={() => openPane()}>
-              <SquareTerminal />
-              Panel
-            </Button>
+            <div className="flex items-center gap-2">
+              {/* Desktop reopens the pane via the edge rail; phones have no
+                  rail, so they get an explicit button. */}
+              <Button variant="outline" size="sm" className="md:hidden" onClick={() => openPane()}>
+                <SquareTerminal />
+                Panel
+              </Button>
+              {/* Only attributed sessions have a task to delete; synthetic
+                  admin rows (taskId null) hide the control. */}
+              {taskId && <DeleteSessionButton taskId={taskId} title={taskTitle} />}
+            </div>
           }
         />
         {session && <SessionVitals session={session} profile={profile} durability={durability} />}
@@ -300,6 +310,7 @@ export function SessionDetail() {
               <SheetTitle className="sr-only">Session work pane</SheetTitle>
               <WorkPane
                 sessionId={id}
+                taskId={taskId}
                 session={session}
                 events={events}
                 open={paneOpen}
@@ -362,6 +373,7 @@ export function SessionDetail() {
             >
               <WorkPane
                 sessionId={id}
+                taskId={taskId}
                 session={session}
                 events={events}
                 open={paneOpen}

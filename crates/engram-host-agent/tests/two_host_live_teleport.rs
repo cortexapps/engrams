@@ -22,7 +22,8 @@
 //!
 //! Gated like the FC suite; wired into ci.yml's `test-firecracker` job.
 //! `ENGRAM_INTEG_TWO_HOSTS=0` skips (defaults on where the suite runs).
-
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
@@ -122,6 +123,7 @@ async fn serve(pooled: Arc<PooledBackend>) -> HostStack {
             inner,
             None,
             engram_host_agent::session_epochs::ephemeral(),
+            None,
         )
         .await;
     });

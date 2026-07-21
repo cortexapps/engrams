@@ -5,6 +5,7 @@
 
 import { describe, expect, test } from "vitest";
 import {
+  BROWSER_ACTIVITY_TOOL,
   buildMessages,
   FILE_CHANGE_TOOL,
   SHELL_TOOL,
@@ -230,7 +231,8 @@ describe("buildMessages — message/part shaping", () => {
     );
     const a = real(messages)[0]!;
     expect(a.status).toEqual({ type: "incomplete", reason: "cancelled" });
-    expect((a.metadata?.custom?.run as RunFooter).interrupted).toBe(true);
+    const run = a.metadata?.custom?.run as RunFooter | undefined;
+    expect(run?.interrupted).toBe(true);
   });
 
   test("an open run on an inactive session (idle-evicted mid-run) is not running", () => {
@@ -273,6 +275,45 @@ describe("buildMessages — message/part shaping", () => {
     // System messages keep a single text-part fallback (shape constraint).
     expect(msgs[0]!.content).toHaveLength(1);
     expect((msgs[0]!.content[0] as { type: string }).type).toBe("text");
+  });
+
+  test("the 'waking up' resume marker is transient: repeats collapse and activity clears it", () => {
+    const markOf = (m: { metadata?: { custom?: Record<string, unknown> } }) => {
+      const mk = customMarker(m);
+      return mk?.kind === "durability" ? mk.mark : undefined;
+    };
+    const waking = (evs: SessionEvent[]) =>
+      real(buildMessages(indexed(evs), SID).messages).filter((m) => markOf(m) === "waking");
+
+    // A retrying resume emits several ResumeStarted events; while still
+    // waking (no activity after), exactly ONE marker survives.
+    expect(
+      waking([
+        { type: "resume_started", at: AT },
+        { type: "resume_started", at: AT2 },
+      ]),
+    ).toHaveLength(1);
+
+    // run_started supersedes it — the session is producing output.
+    expect(
+      waking([
+        { type: "resume_started", at: AT },
+        { type: "resume_started", at: AT2 },
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT2 },
+      ]),
+    ).toHaveLength(0);
+
+    // resumed supersedes it too (a resume that completes before any run).
+    const afterResumed = buildMessages(
+      indexed([
+        { type: "resume_started", at: AT },
+        { type: "resumed", snapshot_id: "s", at: AT2 },
+      ]),
+      SID,
+    ).messages;
+    expect(real(afterResumed).filter((m) => markOf(m) === "waking")).toHaveLength(0);
+    // ...and the durable 'resumed' marker still renders.
+    expect(real(afterResumed).filter((m) => markOf(m) === "resumed")).toHaveLength(1);
   });
 
   test("integration_asset(forge/pull_request) becomes an integration_asset marker", () => {
@@ -353,6 +394,47 @@ describe("buildMessages — message/part shaping", () => {
       artifactId: "art1",
       mediaType: "image/png",
       caption: "a shot",
+    });
+  });
+
+  // ADR 0090: the durability-rollback warning marker carries the manifest the
+  // resume rewound to (flattened to `<id>@v<n>`) plus the reason.
+  test("durability_rollback becomes a durability_rollback marker with the restored manifest", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "durability_rollback",
+          sandbox_id: "sb-9",
+          rewind_disk_manifest: { manifest_id: "abc", version: 4 },
+          reason: "quarantined-survivor evict budget exhausted; VM destroyed",
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    expect(customMarker(real(messages)[0]!)).toMatchObject({
+      kind: "durability_rollback",
+      manifest: "abc@v4",
+      reason: "quarantined-survivor evict budget exhausted; VM destroyed",
+    });
+  });
+
+  test("durability_rollback with no live publish carries a null manifest", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "durability_rollback",
+          sandbox_id: "sb-9",
+          rewind_disk_manifest: null,
+          reason: "budget exhausted",
+          at: AT,
+        },
+      ]),
+      SID,
+    );
+    expect(customMarker(real(messages)[0]!)).toMatchObject({
+      kind: "durability_rollback",
+      manifest: null,
     });
   });
 
@@ -907,7 +989,12 @@ describe("buildMessages — ADR 0054 interactive AskUserQuestion", () => {
     const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
     expect(card.role).toBe("system");
     const marker = customMarker(card) as Extract<SystemMarker, { kind: "user_question" }>;
-    expect(marker).toMatchObject({ kind: "user_question", toolCallId: "t1", answers: null });
+    expect(marker).toMatchObject({
+      kind: "user_question",
+      toolCallId: "t1",
+      answers: null,
+      via: "legacy",
+    });
     expect(marker.questions).toEqual([Q]);
     // Awaiting input is NOT "working" — the composer must not show a spinner.
     expect(isRunning).toBe(false);
@@ -1049,6 +1136,225 @@ describe("buildMessages — ADR 0054 interactive AskUserQuestion", () => {
     // The resume run's own assistant reply still renders.
     expect(real(messages).some((m) => m.role === "assistant")).toBe(true);
   });
+
+  test("a generic ask_user_question request renders the same unanswered card", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-generic",
+          name: "ask_user_question",
+          args_json: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    expect(customMarker(card)).toMatchObject({
+      kind: "user_question",
+      toolCallId: "t-generic",
+      questions: [Q],
+      answers: null,
+      via: "generic",
+    });
+    expect(toolParts(messages)).toHaveLength(0);
+    expect(isRunning).toBe(false);
+  });
+
+  test("tool_result_submitted folds canonical answers onto the generic card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-generic",
+          name: "ask_user_question",
+          args_json: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "t-generic",
+          result_json: JSON.stringify({ "Which database?": ["Postgres"] }),
+          at: AT2,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+
+    const card = real(messages).find((m) => customMarker(m)?.kind === "user_question")!;
+    expect(customMarker(card)).toMatchObject({
+      toolCallId: "t-generic",
+      answers: { "Which database?": ["Postgres"] },
+      via: "generic",
+    });
+  });
+
+  test("#64389 multi-fire suppresses phantom AskUserQuestion starts but keeps the one real card", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "phantom-1",
+          tool_name: "AskUserQuestion",
+          args_summary: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "phantom-2",
+          tool_name: "AskUserQuestion",
+          args_summary: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "real-call",
+          tool_name: "AskUserQuestion",
+          args_summary: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "real-call",
+          name: "ask_user_question",
+          args_json: JSON.stringify({ questions: [Q] }),
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+
+    expect(toolParts(messages)).toHaveLength(0);
+    expect(real(messages).filter((m) => customMarker(m)?.kind === "user_question")).toHaveLength(1);
+  });
+
+  test("phantom suppression does not hide a legitimate in-flight ordinary tool", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "read-live",
+          tool_name: "Read",
+          args_summary: JSON.stringify({ file_path: "README.md" }),
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+
+    expect(toolParts(messages)).toEqual([
+      expect.objectContaining({ toolCallId: "read-live", toolName: "Read" }),
+    ]);
+  });
+
+  test("a prior generic request of the same name does not hide a later in-flight sync start", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "echo-old",
+          tool_name: "dev_echo",
+          args_summary: JSON.stringify({ text: "old" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "echo-old",
+          name: "dev_echo",
+          args_json: JSON.stringify({ text: "old" }),
+          at: AT,
+        },
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "echo-old",
+          result_json: JSON.stringify({ text: "old" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "echo-old",
+          tool_name: "dev_echo",
+          ok: true,
+          duration_ms: 1,
+          result_summary: "old",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT },
+        { type: "run_started", run_id: "r2", prompt_summary: null, at: AT2 },
+        {
+          type: "tool_call_started",
+          run_id: "r2",
+          tool_call_id: "echo-live",
+          tool_name: "dev_echo",
+          args_summary: JSON.stringify({ text: "live" }),
+          at: AT2,
+        },
+      ]),
+      SID,
+      "active",
+    );
+
+    expect(toolParts(messages)).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ toolCallId: "echo-live", toolName: "dev_echo" }),
+      ]),
+    );
+  });
+});
+
+describe("buildMessages — generic deferred tool waiting state", () => {
+  test("an unsubmitted generic call renders a pending tool row", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "approval-1",
+          name: "approve_deploy",
+          args_json: JSON.stringify({ environment: "production" }),
+          at: AT,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const parts = real(messages).flatMap((message) =>
+      typeof message.content === "string"
+        ? []
+        : message.content.filter((part) => part.type === "tool-call"),
+    );
+    expect(parts).toEqual([
+      expect.objectContaining({
+        type: "tool-call",
+        toolCallId: "approval-1",
+        toolName: "approve_deploy",
+        args: { environment: "production" },
+      }),
+    ]);
+    expect(parts[0]).not.toHaveProperty("result");
+  });
 });
 
 describe("buildMessages — ADR 0054 Flavor A file changes", () => {
@@ -1109,6 +1415,50 @@ describe("buildMessages — ADR 0054 Flavor A file changes", () => {
     const footer = real(messages).find((m) => m.role === "assistant")!.metadata?.custom
       ?.run as RunFooter;
     expect(footer.edits).toBe(1);
+  });
+
+  test("browser activity replaces its correlated Shell card and keeps the real outcome", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "browser_activity",
+          run_id: "r1",
+          tool_call_id: "tb",
+          intent: "Clicking Sign in",
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "tb",
+          tool_name: "Shell",
+          args_summary: 'ENGRAM_BROWSER_INTENT="Clicking Sign in" playwright-cli click e7',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "tb",
+          tool_name: "Shell",
+          ok: false,
+          duration_ms: 5,
+          result_summary: "element not found",
+          at: AT2,
+        },
+        { type: "run_completed", run_id: "r1", ok: false, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const tps = parts(messages);
+    expect(tps.some((p) => p.toolName === "Shell")).toBe(false);
+    const browser = tps.find((p) => p.toolName === BROWSER_ACTIVITY_TOOL)!;
+    expect(browser).toMatchObject({
+      toolCallId: "tb",
+      args: { intent: "Clicking Sign in" },
+      isError: true,
+    });
   });
 
   test("a write renders a file-change part carrying the content", () => {

@@ -519,6 +519,7 @@ fn parse_session_state(s: &str) -> Result<SessionState, MetaError> {
         "created" => SessionState::Created,
         "active" => SessionState::Active,
         "unreachable" => SessionState::Unreachable,
+        "parked" => SessionState::Parked,
         "idle" => SessionState::Idle,
         "host_lost" => SessionState::HostLost,
         "evacuating" => SessionState::Evacuating,
@@ -669,7 +670,7 @@ pub(crate) fn cold_base_from_row(row: &PgRow) -> Result<ColdBaseRow, MetaError> 
     })
 }
 
-fn parse_host_status(s: &str) -> Result<HostStatus, MetaError> {
+pub(crate) fn parse_host_status(s: &str) -> Result<HostStatus, MetaError> {
     Ok(match s {
         "ready" => HostStatus::Ready,
         "draining" => HostStatus::Draining,
@@ -698,6 +699,7 @@ mod tests {
             ("queued", SessionState::Queued),
             ("created", SessionState::Created),
             ("active", SessionState::Active),
+            ("parked", SessionState::Parked),
             ("idle", SessionState::Idle),
             ("host_lost", SessionState::HostLost),
             ("evacuating", SessionState::Evacuating),

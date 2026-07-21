@@ -15,7 +15,12 @@
  */
 
 import { expect, test, describe } from "bun:test";
-import { handleInbound, type StepRunner, type ThreadControlPlane } from "../slack-thread.ts";
+import {
+  closingSummary,
+  handleInbound,
+  type StepRunner,
+  type ThreadControlPlane,
+} from "../slack-thread.ts";
 import type { CommunicationPolicy, StartedSession } from "../communication-policy.ts";
 import type { SourceMention, ThreadInbox } from "../thread-inbox.ts";
 import type { CuratedEvent } from "../../control-plane/session-events.ts";
@@ -87,9 +92,9 @@ function recordingPolicy() {
 
 /** A control plane whose delivery methods are scriptable per test. */
 function recordingControlPlane() {
-  const calls: { sendPrompt: unknown[][]; answerQuestion: unknown[][] } = {
+  const calls: { sendPrompt: unknown[][]; completeToolCall: unknown[][] } = {
     sendPrompt: [],
-    answerQuestion: [],
+    completeToolCall: [],
   };
   const cp: ThreadControlPlane & { sendPromptImpl: () => Promise<void>; answerImpl: () => Promise<void> } = {
     resolveUser: async () => "u1",
@@ -99,8 +104,8 @@ function recordingControlPlane() {
       calls.sendPrompt.push([sessionId, prompt, promptId]);
       await cp.sendPromptImpl();
     },
-    answerQuestion: async (sessionId, toolCallId, answers) => {
-      calls.answerQuestion.push([sessionId, toolCallId, answers]);
+    completeToolCall: async (sessionId, toolCallId, answers) => {
+      calls.completeToolCall.push([sessionId, toolCallId, answers]);
       await cp.answerImpl();
     },
     sendPromptImpl: async () => {},
@@ -111,8 +116,10 @@ function recordingControlPlane() {
 
 const freshState = (m: SourceMention) => ({
   questionTs: new Map<string, string>(),
+  questionProtocols: new Map<string, "generic" | "legacy">(),
   assets: [],
   bubble: null,
+  lastAssistantText: null,
   currentMention: m,
 });
 
@@ -179,34 +186,52 @@ describe("handleInbound() — answer", () => {
     answer: { toolCallId: "tc", answers: { "Ship?": ["Yes"] } },
   };
 
-  test("happy path: answerQuestion is delivered, cursor unchanged", async () => {
+  test("a pre-upgrade question cannot be answered and posts a graceful notice", async () => {
     const { pol, calls } = recordingPolicy();
     const { cp, calls: cpCalls } = recordingControlPlane();
     const st = freshState(mention("100.0", "Ev0"));
 
     const next = await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
 
-    expect(cpCalls.answerQuestion).toEqual([["s1", "tc", { "Ship?": ["Yes"] }]]);
-    expect(calls.onDeliveryError).toHaveLength(0);
+    expect(cpCalls.completeToolCall).toHaveLength(0);
+    expect(calls.onDeliveryError).toEqual([
+      [st.currentMention, "This question predates an upgrade and can no longer be answered."],
+    ]);
     expect(next).toBe("180.0");
   });
 
-  test("answerQuestion failure is NON-FATAL: ⚠️ onDeliveryError, no throw", async () => {
-    const { pol, calls } = recordingPolicy();
-    const { cp } = recordingControlPlane();
-    cp.answerImpl = async () => {
-      throw new Error("sandbox not found");
-    };
-    const cur = mention("160.0", "Ev2");
-    const st = freshState(cur);
+  test("a generic question answer uses CompleteToolCall", async () => {
+    const { pol } = recordingPolicy();
+    const { cp, calls: cpCalls } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: {
+        idx: 1n,
+        kind: "tool_call_requested",
+        payloadJson: JSON.stringify({
+          run_id: "r1",
+          tool_call_id: "tc",
+          name: "ask_user_question",
+          args_json: JSON.stringify({
+            questions: [
+              {
+                question: "Ship?",
+                header: "Ship",
+                multiSelect: false,
+                options: [{ label: "Yes", description: "Deploy" }],
+              },
+            ],
+          }),
+        }),
+      },
+    });
 
-    const next = await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", answerMsg);
 
-    expect(calls.onDeliveryError).toHaveLength(1);
-    expect(calls.onDeliveryError[0][0]).toBe(cur); // reacts on the current turn's mention
-    expect(String(calls.onDeliveryError[0][1])).toContain("session");
-    expect(next).toBe("180.0");
+    expect(cpCalls.completeToolCall).toEqual([["s1", "tc", { "Ship?": ["Yes"] }]]);
   });
+
 });
 
 describe("handleInbound() — session event", () => {
@@ -243,5 +268,104 @@ describe("handleInbound() — session event", () => {
 
     expect(next).toBe("180.0");
     expect(calls.onDeliveryError).toHaveLength(0); // render drops are silent (logged only)
+  });
+
+  test("generic request posts a card and its submitted result locks that same card", async () => {
+    const { pol, calls } = recordingPolicy();
+    const { cp } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+    const request = ev(
+      "tool_call_requested",
+      JSON.stringify({
+        run_id: "r1",
+        tool_call_id: "tc-generic",
+        name: "ask_user_question",
+        args_json: JSON.stringify({
+          questions: [
+            {
+              question: "Ship?",
+              header: "Ship",
+              multiSelect: false,
+              options: [{ label: "Yes", description: "Deploy" }],
+            },
+          ],
+        }),
+      }),
+    );
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: request,
+    });
+    const submitted = ev(
+      "tool_result_submitted",
+      JSON.stringify({
+        tool_call_id: "tc-generic",
+        result_json: JSON.stringify({ "Ship?": ["Yes"] }),
+      }),
+    );
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: submitted,
+    });
+
+    expect(calls.onUserQuestion).toEqual([[st.currentMention, request]]);
+    expect(calls.onAnswered).toEqual([[st.currentMention, submitted, "q-ts"]]);
+    expect(st.questionProtocols.get("tc-generic")).toBe("generic");
+  });
+
+  test("legacy user_question and question_answered still post and lock a card", async () => {
+    const { pol, calls } = recordingPolicy();
+    const { cp } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+    const question = ev(
+      "user_question",
+      JSON.stringify({ tool_call_id: "tc-legacy", questions: [] }),
+    );
+    const answered = ev(
+      "question_answered",
+      JSON.stringify({ tool_call_id: "tc-legacy", answers: { "Ship?": ["Yes"] } }),
+    );
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: question,
+    });
+    await handleInbound(STEP, pol, cp, SESSION, st, "180.0", {
+      kind: "session_event",
+      event: answered,
+    });
+
+    expect(calls.onUserQuestion).toEqual([[st.currentMention, question]]);
+    expect(calls.onAnswered).toEqual([[st.currentMention, answered, "q-ts"]]);
+    expect(st.questionProtocols.get("tc-legacy")).toBe("legacy");
+  });
+});
+
+describe("Slack thread ingest-v2 state", () => {
+  test("closing summary comes from ThreadRender.lastAssistantText", async () => {
+    const { pol } = recordingPolicy();
+    const { cp } = recordingControlPlane();
+    const st = freshState(mention("100.0", "Ev0"));
+
+    await handleInbound(STEP, pol, cp, SESSION, st, "100.0", {
+      kind: "session_event",
+      event: {
+        idx: 1n,
+        kind: "agent_message",
+        payloadJson: JSON.stringify({ role: "assistant", text: "first" }),
+      },
+    });
+    await handleInbound(STEP, pol, cp, SESSION, st, "100.0", {
+      kind: "session_event",
+      event: {
+        idx: 2n,
+        kind: "agent_message",
+        payloadJson: JSON.stringify({ role: "assistant", text: "final answer" }),
+      },
+    });
+
+    expect(closingSummary(st)).toEqual({
+      lastMessage: "final answer",
+      assets: [],
+    });
   });
 });

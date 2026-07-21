@@ -201,6 +201,28 @@ describe("makeSlackPolicy()", () => {
     expect(JSON.stringify(calls.posts[0].blocks)).toContain("Ship it?");
   });
 
+  test("onUserQuestion posts canonical questions from a generic tool request", async () => {
+    const { client, calls } = fakeClient();
+    const payload = JSON.stringify({
+      run_id: "r1",
+      tool_call_id: "tc-generic",
+      name: "ask_user_question",
+      args_json: JSON.stringify({
+        questions: [
+          {
+            question: "Ship generically?",
+            header: "Ship",
+            multiSelect: false,
+            options: [{ label: "Yes", description: "Deploy now" }],
+          },
+        ],
+      }),
+    });
+    const ref = await policy(client).onUserQuestion(M, ev("tool_call_requested", payload));
+    expect(ref).toBe("posted-1");
+    expect(JSON.stringify(calls.posts[0].blocks)).toContain("Ship generically?");
+  });
+
   test("onAnswered updates the question message in place when a ref is known", async () => {
     const { client, calls } = fakeClient();
     await policy(client).onAnswered(
@@ -210,6 +232,24 @@ describe("makeSlackPolicy()", () => {
     );
     expect(calls.updates).toHaveLength(1);
     expect(calls.updates[0].ts).toBe("posted-1");
+    expect(JSON.stringify(calls.updates[0].blocks)).toContain("Yes");
+  });
+
+  test("onAnswered locks a generic card from tool_result_submitted", async () => {
+    const { client, calls } = fakeClient();
+    await policy(client).onAnswered(
+      M,
+      ev(
+        "tool_result_submitted",
+        JSON.stringify({
+          tool_call_id: "tc-generic",
+          result_json: JSON.stringify({ "Ship?": ["Yes"] }),
+        }),
+      ),
+      "posted-generic",
+    );
+    expect(calls.updates).toHaveLength(1);
+    expect(calls.updates[0].ts).toBe("posted-generic");
     expect(JSON.stringify(calls.updates[0].blocks)).toContain("Yes");
   });
 

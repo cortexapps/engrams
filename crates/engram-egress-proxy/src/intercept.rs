@@ -80,6 +80,7 @@ pub enum InterceptError {
     GraphqlRejected {
         reason: &'static str,
     },
+    InjectHeader(crate::inject::InjectHeaderError),
     InvalidServerName(String),
 }
 
@@ -105,6 +106,7 @@ impl std::fmt::Display for InterceptError {
                     "graphql request rejected by integration policy: {reason}"
                 )
             }
+            Self::InjectHeader(e) => write!(f, "credential injection rejected: {e}"),
             Self::InvalidServerName(s) => write!(f, "invalid SNI `{s}`"),
         }
     }
@@ -121,6 +123,12 @@ impl From<std::io::Error> for InterceptError {
 impl From<rustls::Error> for InterceptError {
     fn from(e: rustls::Error) -> Self {
         Self::Tls(e)
+    }
+}
+
+impl From<crate::inject::InjectHeaderError> for InterceptError {
+    fn from(e: crate::inject::InjectHeaderError) -> Self {
+        Self::InjectHeader(e)
     }
 }
 
@@ -395,7 +403,7 @@ where
                 e.refresh_if_stale(session_id, refresher).await;
             }
         }
-        prefix = inject::inject_headers(prefix, &matched);
+        prefix = inject::inject_headers(prefix, &matched)?;
     }
 
     if let Some(ph) = scan_for_violation(&prefix, sni, secrets) {

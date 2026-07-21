@@ -15,6 +15,9 @@
 //! `#[ignore]`'d by default; requires Postgres at
 //! `ENGRAM_TEST_DATABASE_URL`. Wired into ci.yml's Postgres-gated list.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -25,12 +28,8 @@ use engram_core::types::SessionState;
 use engram_core::SessionId;
 
 async fn connect() -> Option<Arc<engram_postgres::PostgresStore>> {
-    let url = std::env::var("ENGRAM_TEST_DATABASE_URL").ok()?;
-    let store = engram_postgres::PostgresStore::connect(&url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 async fn seed_session(meta: &Arc<engram_postgres::PostgresStore>) -> SessionId {

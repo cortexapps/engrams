@@ -10,8 +10,10 @@
  */
 
 import { expect, test, describe } from "bun:test";
+import { z } from "zod";
 import {
   compileSessionCreateInput,
+  createSessionForExistingTask,
   createTaskWithSession,
   truncatePrompt,
   type SessionCompileDeps,
@@ -28,6 +30,8 @@ import type {
 } from "../db/port-exposures.ts";
 import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
+import { createToolRegistry } from "../tools/registry.ts";
+import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -52,6 +56,7 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   secrets: [],
   isDefault: false,
   portExposures: [],
+  designation: null,
   createdAt: new Date(0),
   updatedAt: new Date(0),
   deletedAt: null,
@@ -78,11 +83,19 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
   }),
 });
 
-const deps = (token: string | null = null, images = [{ id: "img-1", imageUri: "uri-1" }]): SessionCompileDeps => ({
+// Default the user token to present ("tok") — a human (chat) run now BLOCKS when
+// the harness's declared user_env is unset, so tests exercising other
+// seams must have a token unless they specifically test the block.
+const deps = (
+  token: string | null = "tok",
+  images = [{ id: "img-1", imageUri: "uri-1" }],
+  allTokens: Record<string, string> = {},
+): SessionCompileDeps => ({
   images: { listEnabledImages: async () => ({ images }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
   harnessCatalog: fakeHarnessCatalog(),
   resolveUserToken: async () => token,
+  resolveAllUserTokens: async () => allTokens,
 });
 
 describe("truncatePrompt — default title from the prompt", () => {
@@ -125,18 +138,76 @@ describe("compileSessionCreateInput", () => {
     expect(inp.mode).toBe("agent");
   });
 
-  test("merges extraHarnessEnv last (e.g. ENGRAM_APPEND_SYSTEM_PROMPT)", async () => {
+  test("sets the papercut system prompt with no extra harness env", async () => {
+    const inp = await compileSessionCreateInput(profile(), deps());
+    expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(PAPERCUT_SYSTEM_PROMPT);
+  });
+
+  test("enables private browser image observations only with the browser skill", async () => {
+    const withBrowser = await compileSessionCreateInput(profile({ skills: ["browser"] }), deps());
+    expect(withBrowser.selectedSkills).toEqual(["browser"]);
+    expect(withBrowser.harnessEnv?.ENGRAM_BROWSER_VIEW_ENABLED).toBe("1");
+
+    const withoutBrowser = await compileSessionCreateInput(profile(), deps(), {
+      extraHarnessEnv: { ENGRAM_BROWSER_VIEW_ENABLED: "1" },
+    });
+    expect(withoutBrowser.harnessEnv?.ENGRAM_BROWSER_VIEW_ENABLED).toBeUndefined();
+  });
+
+  test("appends the papercut prompt after extraHarnessEnv's system prompt", async () => {
     const inp = await compileSessionCreateInput(profile({ envVars: { FOO: "bar" } }), deps(), {
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },
     });
-    expect(inp.harnessEnv).toMatchObject({ FOO: "bar", ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" });
+    expect(inp.harnessEnv).toMatchObject({
+      FOO: "bar",
+      ENGRAM_APPEND_SYSTEM_PROMPT: `be concise\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+    });
   });
 
-  test("user token injected only when includeUserTokens", async () => {
+  // The harness's declared user credential is MANDATORY for a human
+  // run — always injected, independent of includeUserTokens.
+  test("always injects the harness user_env for a human run, regardless of includeUserTokens", async () => {
     const off = await compileSessionCreateInput(profile({ includeUserTokens: false }), deps("tok"));
-    expect(off.harnessEnv?.[USER_ENV]).toBeUndefined();
+    expect(off.harnessEnv?.[USER_ENV]).toBe("tok");
     const on = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"));
     expect(on.harnessEnv?.[USER_ENV]).toBe("tok");
+  });
+
+  test("human auth is principal-authoritative over profile and trigger env values", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ envVars: { [USER_ENV]: "profile-token", [ORG_ENV]: "profile-org-token" } }),
+      deps("user-token"),
+      { extraHarnessEnv: { [USER_ENV]: "trigger-token", [ORG_ENV]: "trigger-org-token" } },
+    );
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("user-token");
+    expect(inp.harnessEnv?.[ORG_ENV]).toBeUndefined();
+  });
+
+  // Don't silently boot un-authed — block the create with the env-var
+  // name in the message (the client renders the descriptor's setup hint).
+  test("blocks a human run when the harness user credential is not set", async () => {
+    await expect(compileSessionCreateInput(profile(), deps(null))).rejects.toThrow(
+      /CLAUDE_CODE_OAUTH_TOKEN.*isn't set/s,
+    );
+  });
+
+  // includeUserTokens now means "also carry my OTHER saved tokens".
+  test("includeUserTokens additionally injects the user's OTHER saved tokens", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ includeUserTokens: true }),
+      deps("tok", undefined, { GH_TOKEN: "ghp", [USER_ENV]: "tok" }),
+    );
+    expect(inp.harnessEnv?.GH_TOKEN).toBe("ghp");
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
+  });
+
+  test("without includeUserTokens, other saved tokens are NOT injected (only the harness user_env)", async () => {
+    const inp = await compileSessionCreateInput(
+      profile({ includeUserTokens: false }),
+      deps("tok", undefined, { GH_TOKEN: "ghp" }),
+    );
+    expect(inp.harnessEnv?.GH_TOKEN).toBeUndefined();
+    expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
   });
 
   test("injects the user token under the harness's declared user_env, not a hardcoded name", async () => {
@@ -153,17 +224,20 @@ describe("compileSessionCreateInput", () => {
         }),
       },
       resolveUserToken: async (envVar) => (envVar === "OPENCODE_TOKEN" ? "tok-123" : null),
+      resolveAllUserTokens: async () => ({}),
     };
     const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), customDeps);
     expect(inp.harnessEnv?.OPENCODE_TOKEN).toBe("tok-123");
     expect(inp.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
   });
 
-  // ADR 0063 B4: strict-by-run-type credentials.
-  test("human (chat) task injects user_env and no org_env secret", async () => {
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      type: "chat",
-    });
+  // ADR 0063 B4 (amended): strict-by-principal credentials.
+  test("a human-owned task injects user_env and no org_env secret", async () => {
+    // The PRINCIPAL decides the credential, never the task type/surface: a
+    // Slack mention email-matched to a real engrams user rides that user's
+    // token exactly like the chat UI. (Under the old `type === "chat"` gate,
+    // Slack session e721311e booted credential-less — "Not logged in".)
+    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {});
     expect(inp.harnessEnv?.[USER_ENV]).toBe("tok");
     const policy = inp.integrationPolicyJson
       ? (JSON.parse(inp.integrationPolicyJson) as { secrets?: Array<{ env_var: string }> })
@@ -171,33 +245,23 @@ describe("compileSessionCreateInput", () => {
     expect((policy.secrets ?? []).some((s) => s.env_var === ORG_ENV)).toBe(false);
   });
 
-  test("programmatic task injects org_env into the policy, not the user token", async () => {
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      type: "slack_thread",
-    });
-    // No per-user token for a programmatic task — strict by run type.
+  test("a task from a SERVICE-ACCOUNT principal rides org_env (the CI smoke regression)", async () => {
+    // A `ci-<repo>` API key has no per-user harness token — the programmatic
+    // flag must pick the org-credential path or the harness boots
+    // credential-less ("not logged in", session 47723225).
+    const inp = await compileSessionCreateInput(
+      profile({
+        includeUserTokens: true,
+        envVars: { [USER_ENV]: "profile-user-token", [ORG_ENV]: "profile-org-token" },
+      }),
+      deps("tok"),
+      {
+        programmatic: true,
+        extraHarnessEnv: { [USER_ENV]: "trigger-user-token", [ORG_ENV]: "trigger-org-token" },
+      },
+    );
     expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
-    // The org secret rides the policy as a literal secret-inject (resolved host-side).
-    const policy = JSON.parse(inp.integrationPolicyJson!) as {
-      secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
-    };
-    expect((policy.secrets ?? []).find((s) => s.env_var === ORG_ENV)).toMatchObject({
-      secret_ref: ORG_ENV,
-      env_var: ORG_ENV,
-      mode: "literal",
-    });
-  });
-
-  test("a chat task from a SERVICE-ACCOUNT principal rides org_env (the CI smoke regression)", async () => {
-    // A `ci-<repo>` API key creates type:"chat" tasks (the only accepted
-    // type), but the service account has no per-user harness token — the
-    // programmatic flag must force the org-credential path or the harness
-    // boots credential-less ("not logged in", session 47723225).
-    const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), deps("tok"), {
-      type: "chat",
-      programmatic: true,
-    });
-    expect(inp.harnessEnv?.[USER_ENV]).toBeUndefined();
+    expect(inp.harnessEnv?.[ORG_ENV]).toBeUndefined();
     const policy = JSON.parse(inp.integrationPolicyJson!) as {
       secrets?: Array<{ secret_ref: string; env_var: string; mode: string }>;
     };
@@ -263,6 +327,185 @@ describe("compileSessionCreateInput", () => {
     expect(inp.harnessEnv?.ENGRAM_USER_EMAIL).toBeUndefined();
     expect(inp.harnessEnv?.ENGRAM_USER_NAME).toBeUndefined();
   });
+
+  test("injects ENGRAM_TOOLS with capability-gated and ungated manifest tools", async () => {
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "always_available",
+      description: "Available to every profile.",
+      input: z.object({ value: z.string() }),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      handler: async () => ({ ok: true }),
+    });
+    toolRegistry.register({
+      name: "save_memory",
+      description: "Save a note.",
+      input: z.object({ text: z.string() }),
+      output: z.object({ saved: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "memory:write",
+      handler: async () => ({ saved: true }),
+    });
+    toolRegistry.register({
+      name: "admin_only",
+      description: "Requires another capability.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "admin:tools",
+      handler: async () => ({ ok: true }),
+    });
+
+    const inp = await compileSessionCreateInput(
+      profile({ capabilities: ["memory:write"] }),
+      { ...deps(), toolRegistry },
+    );
+    const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
+    expect(manifest.map((tool) => tool.name)).toEqual(["always_available", "save_memory"]);
+  });
+
+  test("omits ENGRAM_TOOLS when no registered tool matches the profile", async () => {
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "save_memory",
+      description: "Save a note.",
+      input: z.object({ text: z.string() }),
+      output: z.object({ saved: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "memory:write",
+      handler: async () => ({ saved: true }),
+    });
+
+    const inp = await compileSessionCreateInput(profile(), { ...deps(), toolRegistry });
+    expect(inp.harnessEnv?.ENGRAM_TOOLS).toBeUndefined();
+  });
+
+  test("extra capabilities widen integration grants but never the tool manifest", async () => {
+    const cloneCapability = "github:contents:read@openai/engrams";
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "review_tool",
+      description: "Profile-granted review tool.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "engram:pr_review",
+      handler: async () => ({ ok: true }),
+    });
+    toolRegistry.register({
+      name: "must_not_leak",
+      description: "A tool gated only by the per-session integration grant.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: cloneCapability,
+      handler: async () => ({ ok: true }),
+    });
+
+    const inp = await compileSessionCreateInput(
+      profile({ capabilities: ["engram:pr_review"] }),
+      { ...deps(), toolRegistry },
+      { extraCapabilities: [cloneCapability, cloneCapability] },
+    );
+
+    expect(inp.capabilities).toEqual(["engram:pr_review", cloneCapability]);
+    const policy = JSON.parse(inp.integrationPolicyJson!) as {
+      injects?: Array<{ mint_provider: string }>;
+    };
+    expect(policy.injects?.some((entry) => entry.mint_provider === "github")).toBe(true);
+    const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
+    expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
+  });
+
+  test("session clamps replace capabilities/network and drop profile secrets/env", async () => {
+    const reviewCapability = "engram:pr_review";
+    const cloneCapability = "github:contents:read@openai/engrams";
+    const toolRegistry = createToolRegistry();
+    toolRegistry.register({
+      name: "review_tool",
+      description: "Allowed by the review clamp.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: reviewCapability,
+      handler: async () => ({ ok: true }),
+    });
+    toolRegistry.register({
+      name: "profile_write_tool",
+      description: "Must not survive the review clamp.",
+      input: z.object({}),
+      output: z.object({ ok: z.boolean() }),
+      handling: "handled",
+      execution: "sync",
+      capability: "github:pulls:write",
+      handler: async () => ({ ok: true }),
+    });
+
+    const inp = await compileSessionCreateInput(
+      profile({
+        capabilities: ["github:pulls:write"],
+        network: {
+          default: "allow",
+          allowHosts: ["profile.example.com"],
+          allowHostPatterns: ["*.profile.example.com"],
+        },
+        secrets: [{
+          ref: "PROFILE_PAT",
+          envVar: "PROFILE_PAT",
+          mode: "literal",
+          allowHosts: ["github.com"],
+          allowHostPatterns: [],
+        }],
+        envVars: {
+          PROFILE_ONLY: "must-drop",
+          ANTHROPIC_MODEL: "stale-profile-model",
+        },
+      }),
+      { ...deps(), toolRegistry },
+      {
+        capabilityOverride: [reviewCapability, cloneCapability],
+        extraCapabilities: ["github:issues:write"],
+        networkOverride: {
+          default: "deny",
+          allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+          allowHostPatterns: [],
+        },
+        dropProfileSecretsAndEnv: true,
+        extraHarnessEnv: { TRIGGER_ONLY: "kept" },
+      },
+    );
+
+    expect(inp.capabilities).toEqual([reviewCapability, cloneCapability]);
+    const policy = JSON.parse(inp.integrationPolicyJson!) as {
+      network: {
+        default: string;
+        allow_hosts: string[];
+        allow_host_patterns: string[];
+      };
+      secrets: unknown[];
+    };
+    expect(policy.network).toEqual({
+      default: "deny",
+      allow_hosts: ["github.com", "codeload.github.com", "api.github.com"],
+      allow_host_patterns: [],
+    });
+    expect(policy.secrets).toEqual([]);
+    expect(inp.harnessEnv?.PROFILE_ONLY).toBeUndefined();
+    expect(inp.harnessEnv).toMatchObject({
+      ANTHROPIC_MODEL: "claude-opus-4-8",
+      TRIGGER_ONLY: "kept",
+    });
+    const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
+    expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -324,13 +567,26 @@ function fakeSessions(): TaskSessionsClient & { createReqs: unknown[]; deletedId
   };
 }
 
-/** A fake DB that records each `.values()` payload in insert order (task first,
- *  task_session second), or throws from the transaction when `throwOnTx`. */
-function recordingDb(records: Record<string, unknown>[], throwOnTx = false): Db {
+/** A fake DB that records each `.values()` payload in insert order, or throws
+ * from the transaction / a selected insert to exercise compensation paths. */
+function recordingDb(
+  records: Record<string, unknown>[],
+  throwOnTx = false,
+  failInsertAt?: number,
+): Db {
   return {
     transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
       if (throwOnTx) throw new Error("db boom");
-      const tx = { insert: () => ({ values: async (v: Record<string, unknown>) => void records.push(v) }) };
+      let insertCount = 0;
+      const tx = {
+        insert: () => ({
+          values: async (v: Record<string, unknown>) => {
+            insertCount += 1;
+            if (insertCount === failInsertAt) throw new Error("insert boom");
+            records.push(v);
+          },
+        }),
+      };
       return fn(tx);
     },
   } as unknown as Db;
@@ -367,7 +623,8 @@ const createDeps = (
   connectors: { list: async () => [] },
   harnessCatalog: fakeHarnessCatalog(),
   sessions,
-  secrets: { get: async () => null },
+  // Token present by default so human (chat) creates don't hit the block.
+  secrets: { get: async () => "tok", getAll: async () => ({}) },
   db,
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
@@ -376,6 +633,16 @@ const createDeps = (
 });
 
 describe("createTaskWithSession", () => {
+  test("writes the per-session listener row in the task transaction", async () => {
+    const records: Record<string, unknown>[] = [];
+    await createTaskWithSession(
+      createDeps(fakeSessions(), recordingDb(records)),
+      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
+    );
+
+    expect(records[2]).toEqual({ sessionId: "sess-1" });
+  });
+
   test("persists task + primary task_session and folds extraHarnessEnv into the session", async () => {
     const records: Record<string, unknown>[] = [];
     const sessions = fakeSessions();
@@ -386,12 +653,13 @@ describe("createTaskWithSession", () => {
       profileId: "p1",
       source: { provider: "slack", team: "T1" },
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },
+      slackThreadWorkflowId: "thread-wf-1",
     });
 
     expect(out.sessionId).toBe("sess-1");
     expect(typeof out.taskId).toBe("string");
     expect((sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
-      "be concise",
+      `be concise\n\n${PAPERCUT_SYSTEM_PROMPT}`,
     );
     // records[0] = task, records[1] = primary task_session.
     expect(records[0]).toMatchObject({
@@ -401,6 +669,8 @@ describe("createTaskWithSession", () => {
       source: { provider: "slack", team: "T1" },
     });
     expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "p1" });
+    expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
+    expect(records[3]).toEqual({ sessionId: "sess-1" });
   });
 
   test("defaults source to {} and title to null", async () => {
@@ -426,6 +696,20 @@ describe("createTaskWithSession", () => {
     expect(sessions.createReqs).toHaveLength(0);
   });
 
+  // A human chat task with no user credential is blocked BEFORE any
+  // session is created (the block is in the compile step).
+  test("blocks a human chat task when the harness user credential is unset, creating no session", async () => {
+    const sessions = fakeSessions();
+    const deps: CreateTaskDeps = {
+      ...createDeps(sessions, recordingDb([])),
+      secrets: { get: async () => null, getAll: async () => ({}) },
+    };
+    await expect(
+      createTaskWithSession(deps, { type: "chat", ownerUserId: "u", profileId: "p1" }),
+    ).rejects.toThrow(/CLAUDE_CODE_OAUTH_TOKEN/);
+    expect(sessions.createReqs).toHaveLength(0);
+  });
+
   test("compensates by deleting the orphan session when the DB write fails", async () => {
     const sessions = fakeSessions();
     await expect(
@@ -435,6 +719,18 @@ describe("createTaskWithSession", () => {
         profileId: "p1",
       }),
     ).rejects.toThrow(/db boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
+  });
+
+  test("compensates when listener registration fails inside the task transaction", async () => {
+    const sessions = fakeSessions();
+    await expect(
+      createTaskWithSession(createDeps(sessions, recordingDb([], false, 3)), {
+        type: "chat",
+        ownerUserId: "u",
+        profileId: "p1",
+      }),
+    ).rejects.toThrow(/insert boom/);
     expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
@@ -531,8 +827,156 @@ describe("createTaskWithSession", () => {
 
     // Task still created + persisted despite the 3000 failure.
     expect(out.sessionId).toBe("sess-1");
-    expect(records).toHaveLength(2); // task + primary task_session
+    expect(records).toHaveLength(3); // task + primary task_session + listener
     // Both ports were attempted; 8080 succeeded after 3000 threw.
     expect(ports.calls.map((c) => c.port)).toEqual([3000, 8080]);
+  });
+});
+
+describe("createSessionForExistingTask", () => {
+  test("creates promptlessly and leaves listener registration off by default", async () => {
+    const records: Record<string, unknown>[] = [];
+    const sessions = fakeSessions();
+
+    const out = await createSessionForExistingTask(
+      createDeps(sessions, recordingDb(records)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "finder",
+        extraCapabilities: ["github:contents:read@openai/engrams"],
+        appendSystemPrompt: "finder system prompt",
+      },
+    );
+
+    expect(out).toEqual({ sessionId: "sess-1" });
+    // The effective granted set (profile caps + extras) is persisted on the
+    // task_session so the tool-exec gate honors it — the profile itself has no
+    // capabilities here, yet the session carries the extra grant.
+    expect(records).toEqual([{
+      taskId: "task-existing",
+      sessionId: "sess-1",
+      role: "finder",
+      profileId: "p1",
+      capabilities: ["github:contents:read@openai/engrams"],
+    }]);
+    const request = sessions.createReqs[0] as {
+      prompt?: string;
+      capabilities?: string[];
+      harnessEnv?: Record<string, string>;
+    };
+    expect(request.prompt).toBeUndefined();
+    expect(request.capabilities).toEqual(["github:contents:read@openai/engrams"]);
+    expect(request.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
+      `finder system prompt\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+    );
+  });
+
+  test("registers the listener in the same transaction when requested", async () => {
+    const records: Record<string, unknown>[] = [];
+
+    await createSessionForExistingTask(
+      createDeps(fakeSessions(), recordingDb(records)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "verifier",
+        registerListener: true,
+      },
+    );
+
+    expect(records).toEqual([
+      {
+        taskId: "task-existing",
+        sessionId: "sess-1",
+        role: "verifier",
+        profileId: "p1",
+        capabilities: [],
+      },
+      { sessionId: "sess-1" },
+    ]);
+  });
+
+  test("threads policy clamps into the existing-task session compiler", async () => {
+    const sessions = fakeSessions();
+    await createSessionForExistingTask(
+      createDeps(sessions, recordingDb([]), {
+        profileOver: {
+          capabilities: ["github:pulls:write"],
+          envVars: { PROFILE_PAT: "must-drop" },
+          network: {
+            default: "allow",
+            allowHosts: ["profile.example.com"],
+            allowHostPatterns: [],
+          },
+          secrets: [{
+            ref: "PROFILE_PAT",
+            envVar: "PROFILE_PAT",
+            mode: "literal",
+            allowHosts: ["github.com"],
+            allowHostPatterns: [],
+          }],
+        },
+      }),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "finder",
+        capabilityOverride: [
+          "engram:pr_review",
+          "github:contents:read@openai/engrams",
+        ],
+        networkOverride: {
+          default: "deny",
+          allowHosts: ["github.com", "codeload.github.com", "api.github.com"],
+          allowHostPatterns: [],
+        },
+        dropProfileSecretsAndEnv: true,
+      },
+    );
+
+    const request = sessions.createReqs[0] as {
+      capabilities?: string[];
+      harnessEnv?: Record<string, string>;
+      integrationPolicyJson?: string;
+    };
+    expect(request.capabilities).toEqual([
+      "engram:pr_review",
+      "github:contents:read@openai/engrams",
+    ]);
+    expect(request.harnessEnv?.PROFILE_PAT).toBeUndefined();
+    const policy = JSON.parse(request.integrationPolicyJson!) as {
+      network: { allow_hosts: string[] };
+      secrets: Array<{ secret_ref: string }>;
+    };
+    expect(policy.network.allow_hosts).toEqual([
+      "github.com",
+      "codeload.github.com",
+      "api.github.com",
+    ]);
+    expect(policy.secrets.some((secret) => secret.secret_ref === "PROFILE_PAT")).toBe(false);
+  });
+
+  test("compensates when requested listener registration fails", async () => {
+    const sessions = fakeSessions();
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], false, 2)),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "verifier",
+        registerListener: true,
+      },
+    )).rejects.toThrow(/insert boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
+  });
+
+  test("deletes the orphan session when task_session persistence fails", async () => {
+    const sessions = fakeSessions();
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([], true)),
+      { taskId: "task-existing", profileId: "p1", role: "finder" },
+    )).rejects.toThrow(/db boom/);
+    expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 });

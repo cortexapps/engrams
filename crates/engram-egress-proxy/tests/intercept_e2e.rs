@@ -10,6 +10,10 @@
 //!
 //! No real networking — everything is loopback.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a
+// decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::net::SocketAddr;
 use std::sync::Arc;
 
@@ -1028,6 +1032,30 @@ async fn graphql_denies_when_one_of_multiple_fields_unmapped() {
         "expected GraphqlRejected (uncovered field), got: {outcome:?}",
     );
     assert!(captured.is_empty());
+}
+
+#[tokio::test]
+async fn graphql_multi_field_query_injects_one_authorization_header() {
+    let ca = ca();
+    let viewer = graphql_inject_entry("tok-abc", GraphqlOperation::Query, "viewer");
+    let repository = graphql_inject_entry("tok-abc", GraphqlOperation::Query, "repository");
+    let req = graphql_post(&gql(
+        "query { viewer { login } repository(owner: \"o\", name: \"r\") { id } }",
+    ));
+    let (outcome, captured) = run_graphql_inject(ca, vec![viewer, repository], req).await;
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+    let seen = String::from_utf8_lossy(&captured);
+    assert_eq!(
+        seen.to_ascii_lowercase().matches("authorization:").count(),
+        1,
+        "multi-field GraphQL requests must emit one credential header; got: {seen}",
+    );
+    assert!(seen.contains("Authorization: Bearer tok-abc\r\n"));
 }
 
 #[tokio::test]

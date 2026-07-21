@@ -13,6 +13,9 @@ export interface HarnessEnvVar {
   envVar: string;
   /** The registered harnesses that ask for this env var. */
   harnesses: Array<{ name: string; label: string }>;
+  /** Free-text setup instructions from the harness descriptor (e.g. "Run
+   *  `claude setup-token`"), when one is declared. */
+  hint?: string;
   /** Whether the caller has a value sealed for it. */
   present: boolean;
 }

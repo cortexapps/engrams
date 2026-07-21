@@ -8,510 +8,76 @@
 //! contract — status codes, JSON error envelope, the routing table —
 //! while exercising real exec round-trips end-to-end.
 
-use std::collections::HashMap;
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use axum::body::Body;
 use axum::http::{Method, Request, StatusCode};
 use chrono::Utc;
 use engram_cloud_mock::MockCloud;
 use engram_coordinator::{api, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
-use engram_core::types::{
-    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
-};
-use engram_core::{HostId, MetaError, SessionId};
+use engram_core::types::{HostRecord, HostStatus, SessionSpec, SessionState};
+use engram_core::{HostId, SandboxId, SessionId};
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
+use engram_sim::{SimEntropy, SimMetadataStore};
 use http_body_util::BodyExt;
-use parking_lot::Mutex;
 use serde_json::{json, Value};
 use tower::ServiceExt;
 
-// ---------------------------------------------------------------------
-// MockMetadataStore — in-memory MetadataStore for end-to-end API tests.
-// Behaviour intentionally mirrors the Postgres impl's contracts (NotFound
-// when a row is missing, success on upsert, etc.).
-// ---------------------------------------------------------------------
+// ADR 0098 D4: the hand-rolled `MockMetadataStore` is retired onto the
+// conformance-tested `SimMetadataStore`. Sessions are staged through REAL
+// store calls; live-manifest publish outcomes are read back through the
+// session row + `chunk_generation()` (the retired mock exposed raw
+// HashMaps + an atomic).
 
-#[derive(Default)]
-struct MockMetadataStore {
-    sessions: Mutex<HashMap<SessionId, Session>>,
-    snapshots: Mutex<HashMap<SessionId, Vec<SnapshotRecord>>>,
-    /// ADR 0020: snapshots keyed by id, for `get_snapshot` — covers both
-    /// session captures and template/base snapshots (session_id = None),
-    /// which the per-session `snapshots` map can't hold.
-    snapshots_by_id: Mutex<HashMap<engram_core::types::SnapshotId, SnapshotRecord>>,
-    enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
-    events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
-    next_event_idx: Mutex<HashMap<SessionId, i64>>,
-    /// ADR 0016 Phase B: track `update_live_disk_manifest` writes so
-    /// the round-trip test can assert the row was updated.
-    live_disk_manifests: Mutex<HashMap<SessionId, engram_core::types::manifest::ManifestRef>>,
-    /// ADR 0016 Phase C: in-memory mirror of `chunk_generation` so
-    /// tests can assert the barrier ticked atomically with the
-    /// session-row write.
-    chunk_generation: std::sync::atomic::AtomicU64,
-    /// ADR 0047: placement reads host rows now — the fixture seeds the
-    /// test host here and `mark_host_ready_for` mutates its
-    /// `ready_images`.
-    hosts: Mutex<HashMap<HostId, HostRecord>>,
-    /// Issue #231: simulate `touch_host_heartbeat` failing (a saturated
-    /// coord PG pool). When set, the per-heartbeat persist returns an
-    /// error so the test can assert the handler now returns 5xx (and
-    /// no longer swallows the failure into a 200) — the regression that
-    /// staled a live host's `last_heartbeat_at` and orphaned its
-    /// sessions. Default `false` = persist succeeds.
-    heartbeat_persist_fails: std::sync::atomic::AtomicBool,
+fn sim_meta() -> Arc<SimMetadataStore> {
+    SimMetadataStore::new(
+        Arc::new(engram_core::traits::SystemClock::new()),
+        Arc::new(SimEntropy::seeded(0xA912)),
+    )
 }
 
-impl MockMetadataStore {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn arc() -> Arc<Self> {
-        Arc::new(Self::new())
-    }
-}
-
-#[async_trait]
-impl MetadataStore for MockMetadataStore {
-    async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
-        let id = SessionId::new();
-        let session = Session {
-            id,
-            status: SessionState::Pending,
-            host_id: None,
-            sandbox_id: None,
-            created_at: Utc::now(),
-            image: spec.image,
-            mode: spec.mode,
-            last_active_at: Utc::now(),
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-            suggested_title: None,
-        };
-        self.sessions.lock().insert(id, session);
-        Ok(id)
-    }
-
-    async fn transition_session_created(
-        &self,
-        session_id: SessionId,
-        sandbox_id: engram_core::SandboxId,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&session_id).ok_or(MetaError::NotFound)?;
-        s.status = SessionState::Created;
-        s.sandbox_id = Some(sandbox_id);
-        s.last_active_at = Utc::now();
-        Ok(())
-    }
-
-    async fn reserve_and_persist_create(
-        &self,
-        ws: engram_core::traits::SessionCreateWriteSet,
-        candidates: &[HostId],
-        _affinity_len: usize,
-    ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
-        // Mirrors the pre-refactor `reserve_placement` default (mocks don't
-        // model real 2D-fit capacity): place on the first candidate, or
-        // queue if there are none. Real atomicity is the Postgres impl's
-        // contract (covered by its own live-PG test), not this mock's.
-        let now = Utc::now();
-        let (status, host_id) = match candidates.first().copied() {
-            Some(host_id) => (SessionState::Pending, Some(host_id)),
-            None => (SessionState::Queued, None),
-        };
-        let session = Session {
-            id: ws.session_id,
-            status,
-            host_id,
-            sandbox_id: None,
-            created_at: now,
-            image: ws.spec.image,
-            mode: ws.spec.mode,
-            last_active_at: now,
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-            suggested_title: None,
-        };
-        self.sessions.lock().insert(ws.session_id, session);
-        Ok(match host_id {
-            Some(h) => engram_core::traits::CreateDisposition::Placed(h),
-            None => engram_core::traits::CreateDisposition::Queued,
+/// Stage an Active session bound to `sandbox` (host left unbound, as the
+/// FlushScheduler's live-manifest publisher sees the row) through legal
+/// FSM edges: create (Pending) → `transition_session_created` (Created +
+/// sandbox) → Active.
+async fn stage_active_bound(
+    meta: &Arc<SimMetadataStore>,
+    image: &str,
+    sandbox: SandboxId,
+) -> SessionId {
+    let id = meta
+        .create_session(SessionSpec {
+            image: image.into(),
+            mode: Default::default(),
         })
-    }
-
-    async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
-        self.sessions
-            .lock()
-            .get(&id)
-            .cloned()
-            .ok_or(MetaError::NotFound)
-    }
-
-    async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
-        Ok(self
-            .sessions
-            .lock()
-            .values()
-            .filter(|s| s.status.is_live())
-            .cloned()
-            .collect())
-    }
-
-    async fn transition_session(
-        &self,
-        id: SessionId,
-        target: SessionState,
-    ) -> Result<SessionState, MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        let prev = s.status;
-        prev.try_transition_to(target)
-            .map_err(|e| MetaError::Conflict(e.to_string()))?;
-        s.status = target;
-        s.last_active_at = Utc::now();
-        Ok(prev)
-    }
-
-    async fn assign_session_host(
-        &self,
-        id: SessionId,
-        host_id: Option<HostId>,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.host_id = host_id;
-        Ok(())
-    }
-
-    async fn assign_session_sandbox(
-        &self,
-        id: SessionId,
-        sandbox_id: Option<engram_core::SandboxId>,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.sandbox_id = sandbox_id;
-        // ADR 0016 Phase B: clear live manifest + bump generation on
-        // unbind, matching the PgMeta semantics.
-        if sandbox_id.is_none() && self.live_disk_manifests.lock().remove(&id).is_some() {
-            self.chunk_generation
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        Ok(())
-    }
-
-    // ADR 0016 Phase B: trait extension. Matches the PG / MiniMeta
-    // sandbox_id-guard semantics so the round-trip test verifies
-    // the handler routes Applied vs DroppedStale correctly.
-    async fn update_live_disk_manifest(
-        &self,
-        session_id: SessionId,
-        sandbox_id: engram_core::SandboxId,
-        manifest_ref: engram_core::types::manifest::ManifestRef,
-    ) -> Result<engram_core::traits::UpdateOutcome, MetaError> {
-        let bound = self
-            .sessions
-            .lock()
-            .get(&session_id)
-            .and_then(|s| s.sandbox_id);
-        if bound != Some(sandbox_id) {
-            return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
-        }
-        self.live_disk_manifests
-            .lock()
-            .insert(session_id, manifest_ref);
-        self.chunk_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(engram_core::traits::UpdateOutcome::Applied)
-    }
-
-    async fn chunk_generation(&self) -> Result<u64, MetaError> {
-        Ok(self
-            .chunk_generation
-            .load(std::sync::atomic::Ordering::SeqCst))
-    }
-
-    async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
-        self.hosts.lock().insert(host.id, host);
-        Ok(())
-    }
-
-    async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-        let mut rows: Vec<HostRecord> = self.hosts.lock().values().cloned().collect();
-        rows.sort_by_key(|h| h.id);
-        Ok(rows)
-    }
-
-    async fn set_host_status(&self, _id: HostId, _status: HostStatus) -> Result<(), MetaError> {
-        Ok(())
-    }
-
-    async fn touch_host_heartbeat(
-        &self,
-        _: HostId,
-        _: engram_core::types::host::HostHeartbeat,
-    ) -> Result<(), MetaError> {
-        if self
-            .heartbeat_persist_fails
-            .load(std::sync::atomic::Ordering::SeqCst)
-        {
-            // Issue #231: simulate a saturated PG pool dropping the
-            // per-tick persist.
-            return Err(MetaError::Db(Box::new(std::io::Error::other(
-                "simulated pool saturation",
-            ))));
-        }
-        Ok(())
-    }
-    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
-        match self.hosts.lock().get_mut(&id) {
-            Some(h) => {
-                h.cordoned = cordoned;
-                Ok(())
-            }
-            None => Err(MetaError::NotFound),
-        }
-    }
-
-    async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
-        // Mock doesn't track heartbeat timestamps; existing tests
-        // don't exercise the dead-host detector path.
-        Ok(Vec::new())
-    }
-
-    async fn mark_host_dead_and_orphan_sessions(
-        &self,
-        host_id: HostId,
-    ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
-        let mut g = self.sessions.lock();
-        let mut affected = Vec::new();
-        for s in g.values_mut() {
-            if s.host_id == Some(host_id) && !s.status.is_terminal() {
-                let prev = s.status;
-                s.host_id = None;
-                s.sandbox_id = None;
-                s.status = SessionState::HostLost;
-                s.last_active_at = Utc::now();
-                affected.push((s.id, prev));
-            }
-        }
-        Ok(affected)
-    }
-
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
-        // Keyed-by-id mirror covers template snapshots (session_id=None)
-        // that the per-session map can't hold; `get_snapshot` reads it.
-        let inserted = self
-            .snapshots_by_id
-            .lock()
-            .insert(snap.id, snap.clone())
-            .is_none();
-        if let Some(sid) = snap.session_id {
-            // Mirror the PG impl's UPSERT-by-id contract: re-recording the
-            // same snapshot id (e.g. issue #213's recoverable=false → flip
-            // to true after commit_snapshot) UPDATES the existing row in
-            // place rather than appending a duplicate. A blind push here
-            // would let the test see two rows for one snapshot and miss the
-            // promotion semantics.
-            let mut by_session = self.snapshots.lock();
-            let rows = by_session.entry(sid).or_default();
-            if let Some(existing) = rows.iter_mut().find(|r| r.id == snap.id) {
-                *existing = snap;
-            } else {
-                rows.push(snap);
-            }
-        }
-        Ok(inserted)
-    }
-
-    async fn get_snapshot(
-        &self,
-        id: engram_core::types::SnapshotId,
-    ) -> Result<Option<SnapshotRecord>, MetaError> {
-        Ok(self.snapshots_by_id.lock().get(&id).cloned())
-    }
-
-    async fn list_snapshots_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Vec<SnapshotRecord>, MetaError> {
-        Ok(self.snapshots.lock().get(&sid).cloned().unwrap_or_default())
-    }
-
-    async fn latest_snapshot_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Option<SnapshotRecord>, MetaError> {
-        Ok(self
-            .snapshots
-            .lock()
-            .get(&sid)
-            .and_then(|v| v.last().cloned()))
-    }
-
-    async fn append_session_event(
-        &self,
-        session_id: SessionId,
-        kind: &str,
-        payload: serde_json::Value,
-    ) -> Result<i64, MetaError> {
-        // Mirror Postgres semantics: refuse to log against a session
-        // we've never seen, allocate a monotonic per-session idx.
-        if !self.sessions.lock().contains_key(&session_id) {
-            return Err(MetaError::NotFound);
-        }
-        let mut counters = self.next_event_idx.lock();
-        let counter = counters.entry(session_id).or_insert(0);
-        let idx = *counter;
-        *counter += 1;
-        drop(counters);
-        let event = PersistedEvent {
-            idx,
-            kind: kind.to_string(),
-            payload,
-            created_at: Utc::now(),
-            recovery_epoch: 0,
-            rewound_at: None,
-        };
-        self.events
-            .lock()
-            .entry(session_id)
-            .or_default()
-            .push(event);
-        Ok(idx)
-    }
-
-    async fn list_session_events_since(
-        &self,
-        session_id: SessionId,
-        since: i64,
-        limit: i64,
-    ) -> Result<Vec<PersistedEvent>, MetaError> {
-        Ok(self
-            .events
-            .lock()
-            .get(&session_id)
-            .into_iter()
-            .flat_map(|v| v.iter().filter(|e| e.idx > since).cloned())
-            .take(limit.max(0) as usize)
-            .collect())
-    }
-    async fn insert_artifact(
-        &self,
-        _: uuid::Uuid,
-        _: SessionId,
-        _: &str,
-        _: &str,
-        _: i64,
-        _: Option<&str>,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn get_artifact(
-        &self,
-        _: SessionId,
-        _: uuid::Uuid,
-    ) -> Result<Option<engram_core::types::ArtifactRow>, MetaError> {
-        Ok(None)
-    }
-    async fn artifact_usage(&self, _: SessionId) -> Result<(i64, i64), MetaError> {
-        Ok((0, 0))
-    }
-    async fn upsert_registry_credential(
-        &self,
-        _: engram_core::types::RegistryCredential,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-    async fn list_registry_credentials(
-        &self,
-    ) -> Result<Vec<engram_core::types::RegistryCredential>, MetaError> {
-        Ok(Vec::new())
-    }
-    async fn registry_credential_for_host(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::RegistryCredential>, MetaError> {
-        Ok(None)
-    }
-    async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
-    // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
-    async fn upsert_enabled_image(
-        &self,
-        ei: engram_core::types::EnabledImage,
-    ) -> Result<(), MetaError> {
-        self.enabled.lock().insert(ei.image_uri.clone(), ei);
-        Ok(())
-    }
-    async fn list_enabled_images(
-        &self,
-    ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
-        Ok(self.enabled.lock().values().cloned().collect())
-    }
-    async fn get_enabled_image(
-        &self,
-        uri: &str,
-    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
-        Ok(self.enabled.lock().get(uri).cloned())
-    }
-    async fn get_enabled_image_any(
-        &self,
-        uri: &str,
-    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
-        // Mock doesn't model soft-delete state separately — same
-        // data as get_enabled_image. Real PG impl returns rows
-        // regardless of soft_deleted_at; tests that need to
-        // exercise that distinction should construct an
-        // EnabledImage with soft_deleted_at = Some(...) and verify
-        // their consumer's branch directly.
-        Ok(self.enabled.lock().get(uri).cloned())
-    }
-    async fn soft_delete_enabled_image(
-        &self,
-        uri: &str,
-    ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
-        match self.enabled.lock().remove(uri) {
-            Some(_) => Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled),
-            None => Err(MetaError::NotFound),
-        }
-    }
-    async fn delete_enabled_image(&self, uri: &str) -> Result<(), MetaError> {
-        self.enabled.lock().remove(uri);
-        Ok(())
-    }
-    async fn get_session_secrets(
-        &self,
-        _: SessionId,
-    ) -> Result<Option<engram_core::types::SessionSecrets>, MetaError> {
-        Ok(None)
-    }
-    async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
-        Ok(())
-    }
+        .await
+        .expect("create");
+    meta.transition_session_created(id, sandbox)
+        .await
+        .expect("created");
+    meta.transition_session(id, SessionState::Active)
+        .await
+        .expect("active");
+    id
 }
 
 // ---------------------------------------------------------------------
 // Fixture: build a fully-wired axum router against in-memory components.
 // ---------------------------------------------------------------------
 
-fn build_app(meta: Arc<MockMetadataStore>) -> axum::Router {
-    TestFixture::new(meta, InMemorySecretStore::new()).app
+async fn build_app(meta: Arc<SimMetadataStore>) -> axum::Router {
+    TestFixture::new(meta, InMemorySecretStore::new()).await.app
 }
 
 /// Like `build_app` but seeds the bearer-token allow-list. Used by the
 /// auth middleware tests; everything else relies on the default empty
 /// list (auth-disabled).
-fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> axum::Router {
+fn build_app_with_tokens(meta: Arc<SimMetadataStore>, tokens: Vec<String>) -> axum::Router {
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let services = Services {
         meta,
@@ -537,6 +103,8 @@ fn build_app_with_tokens(meta: Arc<MockMetadataStore>, tokens: Vec<String>) -> a
         )),
         host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -556,7 +124,7 @@ async fn build_forge_app() -> (
     SessionId,
     Arc<engram_git_dev::StaticGitHubIntegration>,
 ) {
-    let meta = Arc::new(MockMetadataStore::new());
+    let meta = sim_meta();
     let session_id = meta
         .create_session(engram_core::types::session::SessionSpec {
             image: "cortexapps/engrams:warm-bootstrap".to_string(),
@@ -592,6 +160,8 @@ async fn build_forge_app() -> (
         )),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -715,22 +285,17 @@ async fn forge_forward_runs_the_core_for_split_hosts() {
     );
 }
 
-/// Test fixture exposing the meta store so individual tests can
-/// populate images / secrets before exercising the API. The default
-/// `build_app` discards the handle (most tests don't care).
+/// Fully-wired axum router over in-memory components, exposing the
+/// pinned in-process host id (the heartbeat test targets it).
 struct TestFixture {
     app: axum::Router,
-    meta: Arc<MockMetadataStore>,
-    /// ADR 0015 M5: pinned to the single in-process host so test
-    /// helpers can flip its `ready_images` set in lockstep with
-    /// `seed_enabled` calls. Production hosts populate this from
-    /// the prefetch supervisor + heartbeat, but the in-test ProcessBackend
-    /// has no chunks to prefetch — we just declare it ready.
-    test_host_id: engram_core::HostId,
+    /// ADR 0015 M5: the single in-process host the fixture registers +
+    /// seeds a fresh Ready row for.
+    test_host_id: HostId,
 }
 
 impl TestFixture {
-    fn new(meta: Arc<MockMetadataStore>, secrets: InMemorySecretStore) -> Self {
+    async fn new(meta: Arc<SimMetadataStore>, secrets: InMemorySecretStore) -> Self {
         // Separate tempdirs for each on-disk component so they can't
         // accidentally collide. All leak (`keep()`) because the axum
         // router needs to outlive this function — the OS cleans up
@@ -765,155 +330,50 @@ impl TestFixture {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             default_image_version: "warm-bootstrap".into(),
             ..CoordinatorConfig::default()
         };
-        // ADR 0015 M5: build the registry explicitly so we can keep
-        // a handle to it and pin the host id we use to seed
-        // `ready_images` from `write_image`.
         let host_registry = Arc::new(engram_coordinator::HostRegistry::new(meta.clone()));
-        let test_host_id = engram_core::HostId::new();
+        let test_host_id = HostId::new();
         host_registry.register(test_host_id, services.host.clone());
-        // ADR 0047: placement reads host rows — seed a fresh, ready,
-        // schedulable row for the test host.
-        meta.hosts.lock().insert(
-            test_host_id,
-            engram_core::types::host::HostRecord {
-                id: test_host_id,
-                hostname: "api-test-host".into(),
-                cloud_metadata: Default::default(),
-                capacity: engram_core::types::HostCapacity {
-                    total_gb: 0,
-                    used_gb: 0,
-                    total_mib: 16_384,
-                    used_mib: 0,
-                    running_sandboxes: 0,
-                },
-                utilization: Default::default(),
-                status: HostStatus::Ready,
-                last_heartbeat_at: chrono::Utc::now(),
-                host_addr: None,
-                ready_images: Vec::new(),
-                current_bundles: Vec::new(),
-                cordoned: false,
-                total_vcpus: 0,
-                wire_version: 0,
-                stages_images: false,
-                capabilities: engram_core::types::host::HostCapabilities::default(),
+        // ADR 0047: placement + the heartbeat handler read host ROWS —
+        // seed a fresh, Ready row for the test host through the real
+        // upsert path.
+        meta.upsert_host(HostRecord {
+            id: test_host_id,
+            hostname: "api-test-host".into(),
+            cloud_metadata: Default::default(),
+            capacity: engram_core::types::HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 16_384,
+                used_mib: 0,
+                running_sandboxes: 0,
             },
-        );
+            utilization: Default::default(),
+            status: HostStatus::Ready,
+            last_heartbeat_at: Utc::now(),
+            host_addr: None,
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 0,
+            wire_version: 0,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
+        })
+        .await
+        .expect("seed test host row");
         let state = Arc::new(AppState::new_with_registry(cfg, services, host_registry));
-        let fx = Self {
+        Self {
             app: api::router(state),
-            meta: meta.clone(),
             test_host_id,
-        };
-        // Seed baseline images for the repos most tests use against
-        // `api_create_session`. Stage B1 made `image` resolve via
-        // `enabled_images`; every test that doesn't explicitly enable
-        // its own image needs one of these in the mock store to clear
-        // the lookup gate.
-        for repo in ["r", "warm/test", "cortex/api"] {
-            fx.write_image(repo, "warm-bootstrap", r#"name = "baseline""#);
-        }
-        fx
-    }
-
-    /// Seed an `enabled_images` row in the mock store. The `rootfs`
-    /// parameter is gone post-Stage-E — sandbox content flows from
-    /// the registry through the host-agent's cache, not from the
-    /// coordinator's filesystem. Tests retain `write_image` for
-    /// continuity; the body is a thin wrapper over `seed_enabled`.
-    ///
-    /// ADR 0015 M5: also marks the test host ready for the new
-    /// image's digest so the readiness gate in `pick_for_session`
-    /// lets the next session create through. Production hosts
-    /// populate this set via the prefetch supervisor; tests have
-    /// no chunks to fault so we just declare the host ready.
-    fn write_image(&self, repo: &str, tag: &str, config_toml: &str) {
-        let uri = format!("{repo}:{tag}");
-        let digest = seed_enabled(&self.meta, &uri, config_toml);
-        self.mark_host_ready_for(digest);
-    }
-
-    fn mark_host_ready_for(&self, digest: engram_protocol::heartbeat::ManifestDigest) {
-        // ADR 0047: readiness lives on the host ROW now.
-        let mut hosts = self.meta.hosts.lock();
-        let row = hosts
-            .get_mut(&self.test_host_id)
-            .expect("fixture seeds the test host row");
-        let d = digest.as_str().to_string();
-        if !row.ready_images.contains(&d) {
-            row.ready_images.push(d);
         }
     }
-}
-
-/// Seed an `enabled_images` row directly into the mock store. Tests
-/// that don't go through `TestFixture::write_image` (e.g. those wiring
-/// a custom backend) can use this to clear the strict image-resolution
-/// gate without spinning up the full fixture.
-fn seed_enabled(
-    store: &MockMetadataStore,
-    uri: &str,
-    config_toml: &str,
-) -> engram_protocol::heartbeat::ManifestDigest {
-    use std::hash::{Hash, Hasher};
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    uri.hash(&mut h);
-    let digest = format!("sha256:{:08x}", h.finish());
-    let now = chrono::Utc::now();
-    // ADR 0020: every enabled image has a base snapshot. Seed a template
-    // snapshot (session_id = None) and point the row at it, so the
-    // create→restore path resolves it via `get_snapshot`. ProcessBackend
-    // restore of a base snapshot with no captured artifact boots a fresh
-    // sandbox (see ProcessBackend::restore).
-    let base_snapshot_id = engram_core::types::SnapshotId::new();
-    store.snapshots_by_id.lock().insert(
-        base_snapshot_id,
-        SnapshotRecord {
-            id: base_snapshot_id,
-            session_id: None,
-            host_id: None,
-            image_version: uri.to_string(),
-            size_bytes: 0,
-            created_at: now,
-            last_accessed_at: now,
-            disk_manifest: None,
-            memory_manifest: None,
-            recoverable: true,
-            aux_bundles: vec![],
-            events_cursor: None,
-            fc_snapshot_version: None,
-        },
-    );
-    store.enabled.lock().insert(
-        uri.to_string(),
-        engram_core::types::EnabledImage {
-            id: uuid::Uuid::new_v4(),
-            image_uri: uri.to_string(),
-            image_config: toml::from_str(config_toml).expect("fixture config TOML parses"),
-            oci_defaults: Default::default(),
-            manifest_digest: digest.clone(),
-            disk_manifest: None,
-            base_snapshot_id: Some(base_snapshot_id),
-            base_snapshot_disk_manifest: Some(engram_core::types::manifest::ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 1,
-            }),
-            base_snapshot_memory_manifest: Some(engram_core::types::manifest::ManifestRef {
-                manifest_id: uuid::Uuid::new_v4(),
-                version: 1,
-            }),
-            last_refreshed_at: now,
-            created_at: now,
-            updated_at: None,
-            soft_deleted_at: None,
-        },
-    );
-    engram_protocol::heartbeat::ManifestDigest::new(&digest)
 }
 
 async fn body_json(body: Body) -> Value {
@@ -954,7 +414,7 @@ const INTERNAL_ROUTE: &str = "/api/v1/hosts/register";
 
 #[tokio::test]
 async fn auth_rejects_internal_request_without_authorization_header() {
-    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
+    let app = build_app_with_tokens(sim_meta(), vec!["alpha".into()]);
     let resp = app
         .oneshot(json_request(Method::POST, INTERNAL_ROUTE, json!({})))
         .await
@@ -966,7 +426,7 @@ async fn auth_rejects_internal_request_without_authorization_header() {
 
 #[tokio::test]
 async fn auth_rejects_wrong_token_on_internal_route() {
-    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
+    let app = build_app_with_tokens(sim_meta(), vec!["alpha".into()]);
     let resp = app
         .oneshot(
             Request::post(INTERNAL_ROUTE)
@@ -984,7 +444,7 @@ async fn auth_rejects_wrong_token_on_internal_route() {
 
 #[tokio::test]
 async fn auth_rejects_non_bearer_scheme_on_internal_route() {
-    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
+    let app = build_app_with_tokens(sim_meta(), vec!["alpha".into()]);
     let resp = app
         .oneshot(
             Request::post(INTERNAL_ROUTE)
@@ -1002,7 +462,7 @@ async fn auth_rejects_non_bearer_scheme_on_internal_route() {
 async fn auth_valid_bearer_passes_internal_gate() {
     // A valid token clears the bearer layer; the handler then runs (and may
     // reject the empty body) — the point is it is NOT 401.
-    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
+    let app = build_app_with_tokens(sim_meta(), vec!["alpha".into()]);
     let resp = app
         .oneshot(
             Request::post(INTERNAL_ROUTE)
@@ -1024,7 +484,7 @@ async fn auth_valid_bearer_passes_internal_gate() {
 async fn auth_lets_healthz_through_without_token() {
     // Liveness probes don't carry secrets — `/healthz` must stay
     // outside the auth layer even when auth is enabled.
-    let app = build_app_with_tokens(MockMetadataStore::arc(), vec!["alpha".into()]);
+    let app = build_app_with_tokens(sim_meta(), vec!["alpha".into()]);
     let resp = app
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
@@ -1034,7 +494,7 @@ async fn auth_lets_healthz_through_without_token() {
 
 #[tokio::test]
 async fn healthz_returns_ok_status_and_version() {
-    let app = build_app(MockMetadataStore::arc());
+    let app = build_app(sim_meta()).await;
     let resp = app
         .oneshot(Request::get("/healthz").body(Body::empty()).unwrap())
         .await
@@ -1074,7 +534,7 @@ async fn post(app: axum::Router, uri: &str, body: Value) -> axum::http::Response
 
 #[tokio::test]
 async fn unknown_route_returns_404() {
-    let app = build_app(MockMetadataStore::arc());
+    let app = build_app(sim_meta()).await;
     let resp = app
         .oneshot(Request::get("/nope").body(Body::empty()).unwrap())
         .await
@@ -1125,33 +585,11 @@ async fn unknown_route_returns_404() {
 
 #[tokio::test]
 async fn live_manifest_publish_round_trip_applied_and_stale() {
-    use std::sync::atomic::Ordering;
-
-    let meta = MockMetadataStore::arc();
-    // Seed an Active session with a bound sandbox.
-    let session_id = SessionId::new();
-    let sandbox_id = engram_core::SandboxId::new();
-    {
-        let mut sessions = meta.sessions.lock();
-        sessions.insert(
-            session_id,
-            Session {
-                id: session_id,
-                status: SessionState::Active,
-                host_id: None,
-                sandbox_id: Some(sandbox_id),
-                image: "test/repo:live-manifest".into(),
-                mode: engram_core::types::session::SessionMode::Agent,
-                created_at: Utc::now(),
-                last_active_at: Utc::now(),
-                live_disk_manifest: None,
-                park_rung: 0,
-                parked_at: None,
-                suggested_title: None,
-            },
-        );
-    }
-    let app = build_app(meta.clone());
+    let meta = sim_meta();
+    // Stage an Active session with a bound sandbox through real store calls.
+    let sandbox_id = SandboxId::new();
+    let session_id = stage_active_bound(&meta, "test/repo:live-manifest", sandbox_id).await;
+    let app = build_app(meta.clone()).await;
     let host_id = engram_core::HostId::new();
     let manifest_id = uuid::Uuid::new_v4();
 
@@ -1170,20 +608,20 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
     assert_eq!(resp.status(), StatusCode::OK);
     let body = body_json(resp.into_body()).await;
     assert_eq!(body["outcome"], "applied");
-    // The mock stored the published ref + bumped generation in the
-    // same logical TX as the row update.
+    // The store recorded the published ref on the session row + bumped
+    // the chunk generation in the same logical TX as the row update.
     let stored = meta
-        .live_disk_manifests
-        .lock()
-        .get(&session_id)
-        .copied()
+        .get_session(session_id)
+        .await
+        .expect("session")
+        .live_disk_manifest
         .expect("live manifest stored");
     assert_eq!(stored.manifest_id, manifest_id);
     assert_eq!(stored.version, 7);
-    assert_eq!(meta.chunk_generation.load(Ordering::SeqCst), 1);
+    assert_eq!(meta.chunk_generation().await.unwrap(), 1);
 
     // -- Stale path: wrong sandbox_id (simulates publish-after-rebind) --
-    let stale_sandbox = engram_core::SandboxId::new();
+    let stale_sandbox = SandboxId::new();
     let resp = post(
         app.clone(),
         &format!("/api/v1/hosts/{host_id}/live-manifest"),
@@ -1200,12 +638,12 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
     assert_eq!(body["outcome"], "stale");
     // Generation does NOT advance on stale; the prior Applied
     // value (version=7) is untouched.
-    assert_eq!(meta.chunk_generation.load(Ordering::SeqCst), 1);
+    assert_eq!(meta.chunk_generation().await.unwrap(), 1);
     let still_stored = meta
-        .live_disk_manifests
-        .lock()
-        .get(&session_id)
-        .copied()
+        .get_session(session_id)
+        .await
+        .expect("session")
+        .live_disk_manifest
         .expect("prior manifest still present");
     assert_eq!(still_stored.version, 7);
 }
@@ -1221,32 +659,10 @@ async fn live_manifest_publish_round_trip_applied_and_stale() {
 
 #[tokio::test]
 async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
-    use std::sync::atomic::Ordering;
-
-    let meta = MockMetadataStore::arc();
-    let session_id = SessionId::new();
-    let sandbox_id = engram_core::SandboxId::new();
-    {
-        let mut sessions = meta.sessions.lock();
-        sessions.insert(
-            session_id,
-            Session {
-                id: session_id,
-                status: SessionState::Active,
-                host_id: None,
-                sandbox_id: Some(sandbox_id),
-                image: "test/repo:unbind".into(),
-                mode: engram_core::types::session::SessionMode::Agent,
-                created_at: Utc::now(),
-                last_active_at: Utc::now(),
-                live_disk_manifest: None,
-                park_rung: 0,
-                parked_at: None,
-                suggested_title: None,
-            },
-        );
-    }
-    let app = build_app(meta.clone());
+    let meta = sim_meta();
+    let sandbox_id = SandboxId::new();
+    let session_id = stage_active_bound(&meta, "test/repo:unbind", sandbox_id).await;
+    let app = build_app(meta.clone()).await;
     let host_id = engram_core::HostId::new();
     let manifest_id = uuid::Uuid::new_v4();
 
@@ -1263,7 +679,7 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
     )
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    let gen_after_publish = meta.chunk_generation.load(Ordering::SeqCst);
+    let gen_after_publish = meta.chunk_generation().await.unwrap();
 
     // Direct trait call (no API endpoint for assign_session_sandbox).
     // ADR 0016 Phase B: this is the load-bearing eviction-race
@@ -1273,10 +689,15 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
     engram_core::traits::MetadataStore::assign_session_sandbox(meta.as_ref(), session_id, None)
         .await
         .unwrap();
-    assert!(meta.live_disk_manifests.lock().get(&session_id).is_none());
+    assert!(meta
+        .get_session(session_id)
+        .await
+        .expect("session")
+        .live_disk_manifest
+        .is_none());
     assert_eq!(
-        meta.chunk_generation.load(Ordering::SeqCst),
-        gen_after_publish + 1,
+        meta.chunk_generation().await.unwrap(),
+        gen_after_publish + 1
     );
 }
 
@@ -1289,8 +710,8 @@ async fn live_manifest_publish_unbind_clears_and_bumps_generation() {
 /// the host's loop backs off and the failure is visible.
 #[tokio::test]
 async fn heartbeat_persist_failure_returns_5xx_not_swallowed_200() {
-    let store = MockMetadataStore::arc();
-    let f = TestFixture::new(store.clone(), InMemorySecretStore::new());
+    let store = sim_meta();
+    let f = TestFixture::new(store.clone(), InMemorySecretStore::new()).await;
     let host_id = f.test_host_id;
     let app = f.app;
 
@@ -1298,12 +719,13 @@ async fn heartbeat_persist_failure_returns_5xx_not_swallowed_200() {
         "capacity": { "total_mib": 16384u64, "used_mib": 0u64, "running_sandboxes": 0u32 },
     });
 
-    // Persist fails (saturated pool) → the handler must return a 5xx,
-    // NOT a 200. This is the regression: pre-fix the error was only
-    // logged and the handler fell through to a 200 ack.
-    store
-        .heartbeat_persist_fails
-        .store(true, std::sync::atomic::Ordering::SeqCst);
+    // Persist fails (a saturated pool / PG outage) → the handler must
+    // return a 5xx, NOT a 200. This is the regression: pre-fix the error
+    // was only logged and the handler fell through to a 200 ack. The
+    // faithful store models this as a whole-store outage window (the
+    // retired mock had a per-method `touch_host_heartbeat` fail flag);
+    // either way the heartbeat handler's single persist errors.
+    store.set_outage(true);
     let resp = app
         .clone()
         .oneshot(json_request(
@@ -1322,9 +744,7 @@ async fn heartbeat_persist_failure_returns_5xx_not_swallowed_200() {
     // Control: with the persist healthy, the *same* request acks 200 —
     // proving the 5xx above is caused specifically by the persist
     // failure, not by an unrelated handler error.
-    store
-        .heartbeat_persist_fails
-        .store(false, std::sync::atomic::Ordering::SeqCst);
+    store.set_outage(false);
     let resp = app
         .oneshot(json_request(
             Method::POST,

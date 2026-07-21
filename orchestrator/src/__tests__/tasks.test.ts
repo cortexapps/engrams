@@ -36,6 +36,7 @@ import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
 // create path seals + injects the user token under this name (ADR 0063 B3).
 const USER_ENV = "CLAUDE_CODE_OAUTH_TOKEN";
 import { makeProfileStore } from "../db/profiles.ts";
+import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
 import { TaskService } from "../gen/engram/app/v1/task_pb.ts";
 import type { Session } from "../gen/engram/app/v1/session_pb.ts";
 import { checkDb, getDb } from "../db/client.ts";
@@ -43,6 +44,7 @@ import {
   task as taskTable,
   taskSession as taskSessionTable,
   profile as profileTable,
+  sessionListener as sessionListenerTable,
 } from "../db/schema.ts";
 import { eq, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
@@ -191,6 +193,28 @@ function makeFakeTokens(
   };
 }
 
+/**
+ * A permissive token store: every user resolves the harness `user_env` token, so
+ * a human (chat) create is never blocked on the mandatory-credential gate. Use
+ * this in create-path tests that aren't about the gate; use `makeFakeTokens({})`
+ * (empty) to exercise the block itself.
+ */
+function makeSeededTokens(): UserSecretStore {
+  return {
+    async put() {},
+    async getAll() {
+      return { [USER_ENV]: "sk-fixture" };
+    },
+    async get(_userId, envVarName) {
+      return envVarName === USER_ENV ? "sk-fixture" : null;
+    },
+    async has(_userId, envVarName) {
+      return envVarName === USER_ENV;
+    },
+    async delete() {},
+  };
+}
+
 // ---------------------------------------------------------------------------
 // Fake profile store + image catalog (ADR 0053)
 // ---------------------------------------------------------------------------
@@ -222,6 +246,7 @@ function makeFakeProfiles(opts?: {
     secrets: [],
     isDefault: false,
     portExposures: opts?.portExposures ?? [],
+    designation: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),
     deletedAt: null,
@@ -241,6 +266,9 @@ function makeFakeProfiles(opts?: {
     async getDefault() {
       return [...rows.values()].find((r) => r.isDefault && !r.deletedAt) ?? null;
     },
+    async getByDesignation(designation) {
+      return [...rows.values()].find((r) => r.designation === designation && !r.deletedAt) ?? null;
+    },
     async getByIds(ids) {
       return ids.map((i) => rows.get(i)).filter(Boolean) as ProfileRow[];
     },
@@ -249,6 +277,7 @@ function makeFakeProfiles(opts?: {
       rows.set(r.id, r);
       return r;
     },
+    async setDesignation() {},
     async update() {
       return null;
     },
@@ -522,6 +551,10 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   const fullDeps: TaskDeps = {
     harnessCatalog: fakeHarnessCatalog(),
     users: makeFakeUsers(),
+    // A human (chat) create BLOCKS when the acting user has no token for the
+    // harness's declared user_env, so default to a permissive token store; a
+    // test overrides `secrets` to exercise the block or a specific token.
+    secrets: makeSeededTokens(),
     ...deps,
   };
   const srv = buildServer(app, (router) => {
@@ -584,7 +617,7 @@ describe("TaskService — unauthenticated", () => {
     srv = await spawnServer({
       getSession: makeGetSession(null),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
     });
@@ -659,6 +692,7 @@ function listSessionRef(
     sessionId,
     role: "primary",
     profileId: null,
+    capabilities: null,
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
   };
 }
@@ -929,7 +963,7 @@ describe("TaskService — type validation", () => {
     srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
     });
@@ -949,7 +983,7 @@ describe("TaskService — type validation", () => {
     const srv2 = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: makeFakeSessions({ existing: [] }),
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
       db: okDb(),
@@ -971,7 +1005,7 @@ describe("TaskService — type validation", () => {
     const srv2 = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: makeFakeSessions({ existing: [] }),
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeFakeProfiles(), // profile.imageId defaults to "img-1"
       images: fakeImages([]), // empty catalog → img-1 not enabled
       db: okDb(),
@@ -1031,7 +1065,7 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
         const srv = await spawnServer({
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
-          secrets: makeFakeTokens(),
+          secrets: makeSeededTokens(),
           profiles: makeFakeProfiles(),
           images: fakeImages(),
           db,
@@ -1077,7 +1111,7 @@ describe("TaskService — member anti-enumeration (in-memory store)", () => {
         const srv = await spawnServer({
           getSession: makeGetSession(MEMBER_B),
           sessions: fakeSessions,
-          secrets: makeFakeTokens(),
+          secrets: makeSeededTokens(),
           profiles: makeFakeProfiles(),
           images: fakeImages(),
           db,
@@ -1144,7 +1178,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1158,6 +1192,11 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     if (createdTaskId && db) {
       await db.delete(taskTable).where(eq(taskTable.id, createdTaskId)).catch(() => {});
     }
+    // createTaskWithSession inserts a session_listeners row that the task
+    // delete-cascade does NOT cover (terminal listener rows are retained by
+    // design). Clean it up so the synthetic session id doesn't churn a live
+    // ListenerManager with "malformed session_id" on a shared dev DB.
+    await db!.delete(sessionListenerTable).where(eq(sessionListenerTable.sessionId, sessionId)).catch(() => {});
     await db!.delete(profileTable).where(eq(profileTable.id, PROFILE_ID)).catch(() => {});
     await srv?.close();
   });
@@ -1213,7 +1252,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     const srvB = await spawnServer({
       getSession: makeGetSession(MEMBER_B),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1295,7 +1334,7 @@ describe("TaskService — rename (UpdateTask)", () => {
     srvA = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1314,6 +1353,8 @@ describe("TaskService — rename (UpdateTask)", () => {
   afterAll(async () => {
     if (!dbReachable) return;
     if (taskId) await db!.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
+    // See the CRUD suite's afterAll: the session_listeners row isn't cascaded.
+    await db!.delete(sessionListenerTable).where(eq(sessionListenerTable.sessionId, sessionId)).catch(() => {});
     await db!.delete(profileTable).where(eq(profileTable.id, RENAME_PROFILE)).catch(() => {});
     await srvA?.close();
   });
@@ -1362,7 +1403,7 @@ describe("TaskService — rename (UpdateTask)", () => {
     const srvB = await spawnServer({
       getSession: makeGetSession(MEMBER_B),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1384,7 +1425,7 @@ describe("TaskService — rename (UpdateTask)", () => {
     const srvAdmin = await spawnServer({
       getSession: makeGetSession(ADMIN_ID, "admin"),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeSeededTokens(),
       profiles: makeProfileStore(db!),
       images: fakeImages(),
       db: db!,
@@ -1451,7 +1492,7 @@ describe("TaskService — admin list sees all + synthetic unattributed rows", ()
       const srv = await spawnServer({
         getSession: makeGetSession(ADMIN_ID, "admin"),
         sessions: fakeSessions,
-        secrets: makeFakeTokens(),
+        secrets: makeSeededTokens(),
         profiles: makeFakeProfiles(),
         images: fakeImages(),
         db,
@@ -1513,7 +1554,7 @@ describe("TaskService — member scoping: orphan sessions excluded from member L
       const srv = await spawnServer({
         getSession: makeGetSession(MEMBER_A),
         sessions: fakeSessions,
-        secrets: makeFakeTokens(),
+        secrets: makeSeededTokens(),
         profiles: makeFakeProfiles(),
         images: fakeImages(),
         db,
@@ -1574,7 +1615,7 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
       sessions: fakeSessions,
-      secrets: makeFakeTokens(),
+      secrets: makeFakeTokens({ [MEMBER_A]: "sk-comp" }),
       profiles: makeFakeProfiles(),
       images: fakeImages(),
       db: fakeDb,
@@ -1616,13 +1657,12 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
 });
 
 // ---------------------------------------------------------------------------
-// 6b. Harness env injection — include_user_tokens gate + env_vars precedence
-// (ADR 0053)
+// 6b. Harness env injection — principal-authoritative harness credential +
+// include_user_tokens carry for other credentials (ADR 0053/0063)
 //
-// The per-user Claude token rides CreateSession.harness_env as
-// { CLAUDE_CODE_OAUTH_TOKEN: <token> } ONLY when the profile sets
-// include_user_tokens. Profile env_vars override the user token on key
-// collision. No token + no env_vars → harness_env unset.
+// The selected harness's per-user Claude token ALWAYS rides a human session as
+// { CLAUDE_CODE_OAUTH_TOKEN: <token> } and wins on key collision. The profile's
+// include_user_tokens toggle only carries the user's OTHER saved credentials.
 // ---------------------------------------------------------------------------
 
 function oneCreatedSession(prefix: string): FakeSession {
@@ -1636,7 +1676,7 @@ function oneCreatedSession(prefix: string): FakeSession {
   };
 }
 
-describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0053)", () => {
+describe("TaskService — principal-authoritative harness credentials (ADR 0053/0063)", () => {
   test("include_user_tokens=true + token present → harness_env carries the token", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-tok")], existing: [] });
     const srv = await spawnServer({
@@ -1660,7 +1700,10 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     }
   });
 
-  test("include_user_tokens=false → token NOT injected even when present", async () => {
+  // The harness's declared user credential rides ALWAYS for a human
+  // run — independent of include_user_tokens (which now only gates the user's
+  // OTHER saved tokens).
+  test("include_user_tokens=false → the harness user_env is STILL injected", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-notok")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
@@ -1673,13 +1716,38 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
     try {
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
-      expect(fakeSessions.createReqs[0]?.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBeUndefined();
+      expect(fakeSessions.createReqs[0]?.harnessEnv?.CLAUDE_CODE_OAUTH_TOKEN).toBe(
+        "sk-ant-oat01-secret",
+      );
     } finally {
       await srv.close();
     }
   });
 
-  test("profile env_vars override the user token key", async () => {
+  // No token for the declared user_env → the create is blocked with
+  // FailedPrecondition instead of booting an un-authed session.
+  test("no token for the harness user_env → create blocked (FailedPrecondition)", async () => {
+    const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-block")], existing: [] });
+    const srv = await spawnServer({
+      getSession: makeGetSession(MEMBER_A),
+      sessions: fakeSessions,
+      secrets: makeFakeTokens(), // empty → MEMBER_A has no token
+      profiles: makeFakeProfiles({ includeUserTokens: false }),
+      images: fakeImages(),
+      db: okDb(),
+    });
+    try {
+      const client = makeClient(srv.serverUrl);
+      await expect(client.createTask({ type: "chat", profileId: PROFILE_ID })).rejects.toThrow(
+        /CLAUDE_CODE_OAUTH_TOKEN/,
+      );
+      expect(fakeSessions.createReqs).toHaveLength(0);
+    } finally {
+      await srv.close();
+    }
+  });
+
+  test("the required user token overrides the same key in profile env_vars", async () => {
     const fakeSessions = makeFakeSessions({ created: [oneCreatedSession("henv-override")], existing: [] });
     const srv = await spawnServer({
       getSession: makeGetSession(MEMBER_A),
@@ -1696,8 +1764,9 @@ describe("TaskService — harness_env injection (include_user_tokens gate, ADR 0
       const client = makeClient(srv.serverUrl);
       await client.createTask({ type: "chat", profileId: PROFILE_ID });
       expect(fakeSessions.createReqs[0]?.harnessEnv).toEqual({
-        CLAUDE_CODE_OAUTH_TOKEN: "admin-token",
+        CLAUDE_CODE_OAUTH_TOKEN: "user-token",
         ANTHROPIC_MODEL: "claude-opus-4-8",
+        ENGRAM_APPEND_SYSTEM_PROMPT: PAPERCUT_SYSTEM_PROMPT,
       });
     } finally {
       await srv.close();
@@ -1871,6 +1940,7 @@ describe("TaskService — session status → task status mapping", () => {
     ["pending", "working"],
     ["created", "working"],
     ["active", "working"],
+    ["parked", "working"],
     ["idle", "working"],
     ["evacuating", "working"],
     ["evicting", "working"],
@@ -1918,7 +1988,7 @@ describe("TaskService — session status → task status mapping", () => {
           const srv = await spawnServer({
             getSession: makeGetSession(MEMBER_A),
             sessions: fakeSessions,
-            secrets: makeFakeTokens(),
+            secrets: makeSeededTokens(),
             profiles: makeFakeProfiles(),
             images: fakeImages(),
             db,

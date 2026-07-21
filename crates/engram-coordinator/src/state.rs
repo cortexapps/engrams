@@ -4,7 +4,7 @@ use chrono::{DateTime, Utc};
 use dashmap::DashMap;
 use engram_core::types::{ExecRusage, SessionState};
 use engram_core::{HostId, SandboxId, SessionId, SnapshotId};
-use engram_harness_proto::{Answers, FileChange, HarnessEvent, Question};
+use engram_harness_proto::{FileChange, HarnessEvent};
 use engram_host_agent::harness::{EventSink, HarnessHub};
 use serde::{Deserialize, Serialize};
 use tokio::sync::broadcast;
@@ -51,6 +51,14 @@ pub enum SessionEvent {
         prompt_id: String,
         at: DateTime<Utc>,
     },
+    /// ADR 0089: the coordinator accepted a tool result for durable
+    /// delivery. This is intentionally visible before the harness consumes
+    /// it so surfaces can resolve pending UI immediately.
+    ToolResultSubmitted {
+        tool_call_id: String,
+        result_json: String,
+        at: DateTime<Utc>,
+    },
     /// `POST /sessions/:id/exec*` started a new command. `exec_id` is
     /// the sandbox-side identifier; downstream Stdout/Stderr/Exit
     /// events for this run carry the same value so multiplexed clients
@@ -87,6 +95,23 @@ pub enum SessionEvent {
     },
     Resumed {
         snapshot_id: SnapshotId,
+        at: DateTime<Utc>,
+    },
+    /// The coordinator began waking an idle/parked session back up (the
+    /// resume op claimed and started restoring). Emitted BEFORE the
+    /// multi-second restore + harness (re)attach, so a surface has
+    /// something to render the instant a user prompts an evicted session
+    /// instead of dead air until `StatusChanged{→Active}` lands (the
+    /// 2026-07-17 incident UX: prompt → 40 minutes of nothing visible).
+    /// Coordinator-authoritative — like `prompt_received`/`status_changed`
+    /// it stays true across an ADR-0028 recovery rewind (the coordinator
+    /// genuinely started the resume), so `rewind_session_to_cursor`
+    /// EXCLUDES it from the tombstone UPDATE; without that a
+    /// resume-with-rollback would grey the marker and inflate
+    /// `rolled_back` by one (the same class ADR 0091 fixed for
+    /// `harness_idle`). The web renders it as a transient "waking up…"
+    /// indicator that resolves when the run's first event arrives.
+    ResumeStarted {
         at: DateTime<Utc>,
     },
     /// Phase 4: harness-emitted events. Web UI and Slackbot
@@ -137,6 +162,25 @@ pub enum SessionEvent {
         result_summary: Option<String>,
         at: DateTime<Utc>,
     },
+    /// A native shell tool is driving the shared browser. Correlates to the
+    /// generic tool start/completion via `tool_call_id`; web clients replace
+    /// the raw shell card with a browser presenter.
+    HarnessBrowserActivity {
+        run_id: String,
+        tool_call_id: String,
+        intent: String,
+        at: DateTime<Utc>,
+    },
+    /// ADR 0089: an orchestrator-registered tool was invoked. The
+    /// coordinator preserves the JSON arguments verbatim and never parses
+    /// their tool-specific shape.
+    HarnessToolCallRequested {
+        run_id: String,
+        tool_call_id: String,
+        name: String,
+        args_json: String,
+        at: DateTime<Utc>,
+    },
     HarnessRunCompleted {
         run_id: String,
         ok: bool,
@@ -151,6 +195,12 @@ pub enum SessionEvent {
         at: DateTime<Utc>,
     },
     HarnessIdle {
+        at: DateTime<Utc>,
+    },
+    /// The harness has an open agent turn whose only outstanding work is
+    /// deferred external calls. Eviction-eligible like `HarnessIdle`, but the
+    /// turn remains open until a result arrives.
+    HarnessParked {
         at: DateTime<Utc>,
     },
     /// Phase 1b: a prompt arrived while a run was in flight and was
@@ -190,27 +240,6 @@ pub enum SessionEvent {
         run_id: String,
         message_id: String,
         chunk: String,
-        at: DateTime<Utc>,
-    },
-    /// ADR 0054: the agent called `AskUserQuestion` and the harness
-    /// deferred it — the durable "awaiting input" signal. The web renders
-    /// an interactive card and marks the session awaiting-input; it
-    /// survives eviction because it's in the log. `tool_call_id` correlates
-    /// defer → answer; the answer rides `AnswerQuestion` →
-    /// `HarnessQuestionAnswered` with the same id.
-    HarnessUserQuestion {
-        run_id: String,
-        tool_call_id: String,
-        questions: Vec<Question>,
-        at: DateTime<Utc>,
-    },
-    /// ADR 0054: the deferred question was answered — the harness holds the
-    /// answer and is feeding it back to the agent on the `--resume`
-    /// re-fire. Resolves the card and moves it out of awaiting-input.
-    HarnessQuestionAnswered {
-        run_id: String,
-        tool_call_id: String,
-        answers: Answers,
         at: DateTime<Utc>,
     },
     /// ADR 0054 Flavor A: the agent successfully changed a file via a
@@ -300,6 +329,33 @@ pub enum SessionEvent {
         cause: RecoveryCause,
         at: DateTime<Utc>,
     },
+    /// ADR 0090 (2026-07-20 durability-rollback incident): a
+    /// quarantined-survivor eviction exhausted its retry budget, so the
+    /// coordinator DESTROYED the structurally-crippled VM. The session then
+    /// converges HostLost → Idle and its NEXT resume rewinds to the last
+    /// published disk manifest — silently discarding any guest writes the
+    /// host acked but never uploaded past that manifest version (the
+    /// incident: 134/100/50 MiB tails across three sessions, previously
+    /// inferable only by hand-diffing host spool logs against manifest
+    /// versions). This event makes that data loss LOUD and durable so the
+    /// web timeline / CLI can surface it and alerting can key on it.
+    /// Coordinator-authoritative — it records a fact the destroy already
+    /// made true, so it survives the very rewind it warns about
+    /// (`rewind_session_to_cursor` EXCLUDES this kind from its tombstone
+    /// UPDATE, like the other control-plane facts).
+    DurabilityRollback {
+        /// The crippled sandbox the coordinator destroyed.
+        sandbox_id: SandboxId,
+        /// The last published disk manifest the next resume rewinds to
+        /// (the session's `live_disk_manifest`). `None` when the session
+        /// never got a live publish — the resume falls back to the
+        /// snapshot's disk lineage.
+        rewind_disk_manifest: Option<engram_core::types::manifest::ManifestRef>,
+        /// Human-readable cause (e.g. "quarantined-survivor evict budget
+        /// exhausted; VM destroyed").
+        reason: String,
+        at: DateTime<Utc>,
+    },
 }
 
 /// ADR 0045 F1: why a rung-1 recovery rewound the transcript. Drives the
@@ -373,6 +429,7 @@ impl SessionEvent {
         match self {
             Self::StatusChanged { .. } => "status_changed",
             Self::PromptReceived { .. } => "prompt_received",
+            Self::ToolResultSubmitted { .. } => "tool_result_submitted",
             Self::ExecStarted { .. } => "exec_started",
             Self::ExecCompleted { .. } => "exec_completed",
             Self::Stdout { .. } => "stdout",
@@ -380,25 +437,28 @@ impl SessionEvent {
             Self::SnapshotTaken { .. } => "snapshot_taken",
             Self::Evicted { .. } => "evicted",
             Self::Resumed { .. } => "resumed",
+            Self::ResumeStarted { .. } => "resume_started",
             Self::HarnessRunStarted { .. } => "run_started",
             Self::HarnessAgentMessage { .. } => "agent_message",
             Self::HarnessToolCallStarted { .. } => "tool_call_started",
             Self::HarnessToolCallCompleted { .. } => "tool_call_completed",
+            Self::HarnessBrowserActivity { .. } => "browser_activity",
+            Self::HarnessToolCallRequested { .. } => "tool_call_requested",
             Self::HarnessRunCompleted { .. } => "run_completed",
             Self::HarnessRunInterrupted { .. } => "run_interrupted",
             Self::HarnessIdle { .. } => "harness_idle",
+            Self::HarnessParked { .. } => "harness_parked",
             Self::HarnessPromptQueued { .. } => "prompt_queued",
             Self::HarnessPromptEdited { .. } => "prompt_edited",
             Self::HarnessPromptDequeued { .. } => "prompt_dequeued",
             Self::HarnessPromptSteered { .. } => "prompt_steered",
             Self::HarnessAgentMessageChunk { .. } => "agent_message_chunk",
-            Self::HarnessUserQuestion { .. } => "user_question",
-            Self::HarnessQuestionAnswered { .. } => "question_answered",
             Self::HarnessFileChanged { .. } => "file_changed",
             Self::HarnessTitleSuggested { .. } => "title_suggested",
             Self::IntegrationAsset { .. } => "integration_asset",
             Self::FileShared { .. } => "file_shared",
             Self::RecoveredFromCheckpoint { .. } => "recovered_from_checkpoint",
+            Self::DurabilityRollback { .. } => "durability_rollback",
         }
     }
 
@@ -460,11 +520,34 @@ impl SessionEvent {
                 result_summary,
                 at,
             },
+            HarnessEvent::BrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+            } => Self::HarnessBrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+                at,
+            },
+            HarnessEvent::ToolCallRequested {
+                run_id,
+                call_id,
+                name,
+                args_json,
+            } => Self::HarnessToolCallRequested {
+                run_id,
+                tool_call_id: call_id,
+                name,
+                args_json,
+                at,
+            },
             HarnessEvent::RunCompleted { run_id, ok } => {
                 Self::HarnessRunCompleted { run_id, ok, at }
             }
             HarnessEvent::RunInterrupted { run_id } => Self::HarnessRunInterrupted { run_id, at },
             HarnessEvent::Idle => Self::HarnessIdle { at },
+            HarnessEvent::Parked => Self::HarnessParked { at },
             HarnessEvent::PromptQueued { prompt_id, summary } => Self::HarnessPromptQueued {
                 prompt_id,
                 summary,
@@ -489,26 +572,6 @@ impl SessionEvent {
                 run_id,
                 message_id,
                 chunk,
-                at,
-            },
-            HarnessEvent::UserQuestion {
-                run_id,
-                tool_call_id,
-                questions,
-            } => Self::HarnessUserQuestion {
-                run_id,
-                tool_call_id,
-                questions,
-                at,
-            },
-            HarnessEvent::QuestionAnswered {
-                run_id,
-                tool_call_id,
-                answers,
-            } => Self::HarnessQuestionAnswered {
-                run_id,
-                tool_call_id,
-                answers,
                 at,
             },
             HarnessEvent::FileChanged {
@@ -799,18 +862,25 @@ impl AppState {
         let bindings = engram_host_agent::bindings::BindingStore::open(bindings_dir)
             .expect("open coordinator binding store");
         let harness_hub = Arc::new(HarnessHub::new(
-            harness_event_sink(events.clone(), services.meta.clone()),
+            harness_event_sink(
+                events.clone(),
+                services.meta.clone(),
+                services.clock.clone(),
+            ),
             bindings,
         ));
         let reconciler =
             crate::reconcile::Reconciler::new(crate::reconcile::grace_ticks_from_env());
+        let boot_bundles = Arc::new(crate::boot_bundle::BootBundleCache::new(
+            services.clock.clone(),
+        ));
         Self {
             cfg,
             services,
             events,
             host_registry,
             harness_hub,
-            boot_bundles: Arc::new(crate::boot_bundle::BootBundleCache::new()),
+            boot_bundles,
             // ADR 0073: local fast-path wake for the outbox delivery
             // driver (the PG NOTIFY covers cross-pod).
             outbox_wake: Arc::new(tokio::sync::Notify::new()),
@@ -904,13 +974,13 @@ impl AppState {
             .await?;
         // ADR 0073: ack any outbox row a DIRECTLY-EMITTED confirming event
         // retires. NOTE: the confirming events (`run_started`/`prompt_queued`/
-        // `question_answered`) are HARNESS events, and those ingest via
+        // `tool_call_completed`) are HARNESS events, and those ingest via
         // `harness_event_sink` → `append_session_event`, NOT this `emit` — so
         // they ack THERE (see the ack in `harness_event_sink`). This arm is the
         // defensive catch for any confirming event authored/replayed straight
         // through `emit`; a confirming event terminally retires the matching
         // outbox row, and unknown / already-acked ids are no-ops (at-least-once).
-        if let Some(ack_id) = outbox_ack_id(&event) {
+        if let Some(ack_id) = outbox_ack_id(session, &event) {
             match self.services.meta.outbox_ack(&ack_id).await {
                 Ok(true) => {
                     ::metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
@@ -921,6 +991,33 @@ impl AppState {
                 }
             }
         }
+        self.events.publish(
+            session,
+            IndexedEvent {
+                idx,
+                event,
+                ephemeral: false,
+            },
+        );
+        Ok(idx)
+    }
+
+    /// Persist an event and the durable command it announces in one metadata
+    /// transaction, then publish the committed event on the live bus.
+    pub async fn emit_with_outbox(
+        &self,
+        session: SessionId,
+        event: SessionEvent,
+        outbox: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<i64, crate::error::ApiError> {
+        let kind = event.kind();
+        let payload = serde_json::to_value(&event)
+            .map_err(|e| crate::error::ApiError::Internal(format!("event serialize: {e}")))?;
+        let idx = self
+            .services
+            .meta
+            .append_session_event_and_outbox(session, kind, payload, outbox)
+            .await?;
         self.events.publish(
             session,
             IndexedEvent {
@@ -964,7 +1061,7 @@ impl AppState {
                 return Ok(None);
             }
         };
-        if let Some(ack_id) = outbox_ack_id(&event) {
+        if let Some(ack_id) = outbox_ack_id(session, &event) {
             match self.services.meta.outbox_ack(&ack_id).await {
                 Ok(true) => {
                     ::metrics::counter!(crate::metrics::OUTBOX_ACKED_TOTAL).increment(1);
@@ -993,8 +1090,8 @@ impl AppState {
 ///   its type-ahead queue; the queue survives via the replay the
 ///   harness itself does, and an edit/dequeue of a queued prompt keeps
 ///   its own confirmations).
-/// - `question_answered{tool_call_id}` — the answer landed.
-fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
+/// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
+fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {
             prompt_id: Some(pid),
@@ -1002,9 +1099,9 @@ fn outbox_ack_id(event: &SessionEvent) -> Option<String> {
         } => Some(pid.clone()),
         SessionEvent::HarnessPromptQueued { prompt_id, .. } => Some(prompt_id.clone()),
         SessionEvent::HarnessPromptSteered { prompt_id, .. } => Some(prompt_id.clone()),
-        SessionEvent::HarnessQuestionAnswered { tool_call_id, .. } => {
-            Some(format!("answer:{tool_call_id}"))
-        }
+        SessionEvent::HarnessToolCallCompleted { tool_call_id, .. } => Some(
+            engram_core::types::outbox::tool_result_outbox_id(session_id, tool_call_id),
+        ),
         _ => None,
     }
 }
@@ -1021,7 +1118,8 @@ pub type SharedState = Arc<AppState>;
 /// `at` is the host's wall-clock at observation time, captured at
 /// the source and round-tripped through the WS. We forward it for
 /// future use (per-event timestamps on the persisted row); today the
-/// sink's `SessionEvent::from_harness` stamps its own `Utc::now()`
+/// sink's `SessionEvent::from_harness` stamps its own coordinator
+/// clock read (ADR 0098 D1: the injected `Clock`, not `Utc::now()`)
 /// because the persisted event row already has a `created_at`.
 pub async fn emit_harness_event(
     state: &SharedState,
@@ -1045,17 +1143,18 @@ pub async fn emit_harness_event(
 fn harness_event_sink(
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
+    clock: Arc<dyn engram_core::traits::Clock>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
-    // to drop a `harness_idle` that would land back-to-back with
-    // another `harness_idle`: the claude harness re-announces Idle on
-    // every reconnect (a protocol "ready for prompts" signal), so an
-    // evict/resume cycle on an already-idle session would otherwise
-    // append a redundant idle to the log on every cycle.
+    // to drop a `harness_idle` or `harness_parked` that would land
+    // back-to-back with the same kind: harnesses re-announce their
+    // waiting state on reconnect, so an evict/resume cycle would
+    // otherwise append a redundant marker to the log on every cycle.
     let last_kind: Arc<DashMap<SessionId, &'static str>> = Arc::new(DashMap::new());
     Arc::new(move |session_id, _sandbox_id, ev| {
         let events = events.clone();
         let meta = meta.clone();
+        let clock = clock.clone();
         let last_kind = last_kind.clone();
         Box::new(Box::pin(async move {
             // Forward every harness event into session_events for live
@@ -1063,7 +1162,7 @@ fn harness_event_sink(
             // auto-checkpoint branch this used to trigger on Idle /
             // RunCompleted; durability moved to hot+cold snapshots,
             // not git checkpoints.
-            let session_event = SessionEvent::from_harness(ev, Utc::now());
+            let session_event = SessionEvent::from_harness(ev, clock.now_utc());
             let kind = session_event.kind();
 
             // Issue #527 Phase 1: a run-started with a client prompt_id is
@@ -1085,7 +1184,7 @@ fn harness_event_sink(
 
             // ADR 0073 fix: harness events are the CONFIRMING events that retire
             // the durable outbox row (`run_started{prompt_id}` /
-            // `prompt_queued{prompt_id}` / `question_answered{tool_call_id}`),
+            // `prompt_queued{prompt_id}` / `tool_call_completed{tool_call_id}`),
             // but they ingest through THIS sink — NOT `AppState::emit`, where the
             // ack lived — so the ack never fired. An un-acked row is redelivered
             // forever: the delivery driver re-resumes the session and re-runs the
@@ -1094,7 +1193,7 @@ fn harness_event_sink(
             // the web can't render). Capture the ack id here (before
             // `session_event` moves into the published frame) and retire the row
             // after the append. Unknown / already-acked ids are no-ops.
-            let ack_id = outbox_ack_id(&session_event);
+            let ack_id = outbox_ack_id(session_id, &session_event);
 
             // Session titles: a harness-suggested title is materialized onto
             // `sessions.suggested_title` (in real time, at ingestion) so the
@@ -1109,14 +1208,14 @@ fn harness_event_sink(
                     None
                 };
 
-            // Drop a back-to-back duplicate `harness_idle`. The
+            // Drop a back-to-back duplicate waiting-state marker. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
             // already saw the event, so suppressing it here only
             // affects the persisted log + SSE bus.
-            if kind == "harness_idle"
+            if matches!(kind, "harness_idle" | "harness_parked")
                 && last_kind
                     .get(&session_id)
-                    .map(|v| *v == "harness_idle")
+                    .map(|v| *v == kind)
                     .unwrap_or(false)
             {
                 return;
@@ -1326,6 +1425,8 @@ fn strip_jsonb_nul(v: &mut serde_json::Value) -> bool {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 pub(crate) mod tests {
     use super::*;
 
@@ -1414,7 +1515,15 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn parked_maps_from_harness_with_stable_kind() {
+        let ev = SessionEvent::from_harness(HarnessEvent::Parked, chrono::Utc::now());
+        assert!(matches!(ev, SessionEvent::HarnessParked { .. }));
+        assert_eq!(ev.kind(), "harness_parked");
+    }
+
+    #[test]
     fn prompt_steered_maps_and_acks_by_prompt_id() {
+        let session_id = SessionId::new();
         let ev = SessionEvent::from_harness(
             HarnessEvent::PromptSteered {
                 prompt_id: "p-steer".into(),
@@ -1422,7 +1531,7 @@ pub(crate) mod tests {
             chrono::Utc::now(),
         );
         assert_eq!(ev.kind(), "prompt_steered");
-        assert_eq!(outbox_ack_id(&ev).as_deref(), Some("p-steer"));
+        assert_eq!(outbox_ack_id(session_id, &ev).as_deref(), Some("p-steer"));
     }
 
     #[test]
@@ -1477,48 +1586,90 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn user_question_and_answer_map_from_harness_with_stable_kinds() {
-        // ADR 0054: the interactive question/answer harness events map to
-        // coord SessionEvents under the stable `user_question` /
-        // `question_answered` kinds the SSE stream + web card key on.
-        let q = SessionEvent::from_harness(
-            HarnessEvent::UserQuestion {
+    fn generic_tool_events_have_stable_kinds_and_opaque_payloads() {
+        let args_json = r#" { "text": [1, true, null] } "#;
+        let requested = SessionEvent::from_harness(
+            HarnessEvent::ToolCallRequested {
                 run_id: "r1".into(),
-                tool_call_id: "toolu_1".into(),
-                questions: vec![],
+                call_id: "call_1".into(),
+                name: "save_memory".into(),
+                args_json: args_json.into(),
             },
             chrono::Utc::now(),
         );
-        match &q {
-            SessionEvent::HarnessUserQuestion { tool_call_id, .. } => {
-                assert_eq!(tool_call_id, "toolu_1")
-            }
-            other => panic!("expected HarnessUserQuestion, got {other:?}"),
-        }
-        assert_eq!(q.kind(), "user_question");
-
-        let mut answers = Answers::new();
-        answers.insert("Q?".into(), vec!["A".into()]);
-        let a = SessionEvent::from_harness(
-            HarnessEvent::QuestionAnswered {
-                run_id: "r1".into(),
-                tool_call_id: "toolu_1".into(),
-                answers,
-            },
-            chrono::Utc::now(),
-        );
-        match &a {
-            SessionEvent::HarnessQuestionAnswered {
+        match &requested {
+            SessionEvent::HarnessToolCallRequested {
+                run_id,
                 tool_call_id,
-                answers,
+                name,
+                args_json: mapped_args,
                 ..
             } => {
-                assert_eq!(tool_call_id, "toolu_1");
-                assert_eq!(answers.get("Q?"), Some(&vec!["A".to_string()]));
+                assert_eq!(run_id, "r1");
+                assert_eq!(tool_call_id, "call_1");
+                assert_eq!(name, "save_memory");
+                assert_eq!(mapped_args, args_json);
             }
-            other => panic!("expected HarnessQuestionAnswered, got {other:?}"),
+            other => panic!("expected HarnessToolCallRequested, got {other:?}"),
         }
-        assert_eq!(a.kind(), "question_answered");
+        assert_eq!(requested.kind(), "tool_call_requested");
+
+        let result_json = r#" { "saved": true } "#;
+        let submitted = SessionEvent::ToolResultSubmitted {
+            tool_call_id: "call_1".into(),
+            result_json: result_json.into(),
+            at: chrono::Utc::now(),
+        };
+        assert_eq!(submitted.kind(), "tool_result_submitted");
+        let json = serde_json::to_value(&submitted).expect("serialize submitted event");
+        assert_eq!(json["type"], "tool_result_submitted");
+        assert_eq!(json["tool_call_id"], "call_1");
+        assert_eq!(json["result_json"], result_json);
+    }
+
+    #[test]
+    fn tool_call_completed_acks_tool_result_outbox_row() {
+        let session_id = SessionId::new();
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::ToolCallCompleted {
+                run_id: "r1".into(),
+                tool_call_id: "call_1".into(),
+                tool_name: "save_memory".into(),
+                ok: true,
+                duration_ms: 1,
+                result_summary: None,
+            },
+            chrono::Utc::now(),
+        );
+        let expected = format!("tool_result:{session_id}:call_1");
+        assert_eq!(
+            outbox_ack_id(session_id, &ev).as_deref(),
+            Some(expected.as_str())
+        );
+    }
+
+    #[test]
+    fn browser_activity_maps_from_harness_with_correlation() {
+        let ev = SessionEvent::from_harness(
+            HarnessEvent::BrowserActivity {
+                run_id: "r1".into(),
+                tool_call_id: "tool-browser".into(),
+                intent: "Clicking Sign in".into(),
+            },
+            chrono::Utc::now(),
+        );
+        assert_eq!(ev.kind(), "browser_activity");
+        assert!(matches!(
+            ev,
+            SessionEvent::HarnessBrowserActivity {
+                run_id,
+                tool_call_id,
+                intent,
+                ..
+            } if run_id == "r1"
+                && tool_call_id == "tool-browser"
+                && intent == "Clicking Sign in"
+        ));
     }
 
     #[test]
@@ -1887,6 +2038,8 @@ pub(crate) mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),
@@ -2183,6 +2336,35 @@ pub(crate) mod tests {
             let inserted = !snapshots.iter().any(|s| s.id == snap.id);
             snapshots.push(snap);
             Ok(inserted)
+        }
+
+        /// ADR 0101 C: mirrors the PG single-statement settle — status
+        /// CAS + sandbox match + recoverable-row EXISTS, all-or-nothing
+        /// (the D4-conformant twin lives in SimMetadataStore; this mock
+        /// keeps the same observable semantics for coordinator tests).
+        async fn settle_evicted_session_idle(
+            &self,
+            session_id: engram_core::SessionId,
+            sandbox_id: engram_core::SandboxId,
+            snapshot_id: engram_core::types::SnapshotId,
+        ) -> Result<bool, MetaError> {
+            let row_ok =
+                self.snapshots.lock().iter().any(|s| {
+                    s.id == snapshot_id && s.session_id == Some(session_id) && s.recoverable
+                });
+            if !row_ok {
+                return Ok(false);
+            }
+            let mut session = self.session.lock();
+            if session.id != session_id
+                || session.status != SessionState::Evicting
+                || session.sandbox_id != Some(sandbox_id)
+            {
+                return Ok(false);
+            }
+            session.status = SessionState::Idle;
+            session.sandbox_id = None;
+            Ok(true)
         }
         async fn get_snapshot(
             &self,
@@ -2545,6 +2727,21 @@ pub(crate) mod tests {
             Ok(self.ops.running_for(session_id))
         }
 
+        /// ADR 0101 C: newest mint for `(session, kind)`, any state, any
+        /// key — mirrors PG's `ORDER BY id DESC LIMIT 1`.
+        async fn op_latest_for_kind(
+            &self,
+            session_id: SessionId,
+            kind: engram_core::types::session_op::OpKind,
+        ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
+            Ok(self
+                .ops
+                .all()
+                .into_iter()
+                .filter(|o| o.session_id == session_id && o.kind == kind)
+                .max_by_key(|o| o.id))
+        }
+
         async fn op_get(
             &self,
             op_id: i64,
@@ -2651,6 +2848,15 @@ pub(crate) mod tests {
             }
         }
 
+        async fn list_parked_sessions(&self) -> Result<Vec<Session>, MetaError> {
+            let s = self.session.lock().clone();
+            if matches!(s.status, engram_core::types::SessionState::Parked) {
+                Ok(vec![s])
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
         async fn bump_evict_attempts(
             &self,
             session_id: engram_core::SessionId,
@@ -2702,7 +2908,7 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn harness_event_sink_dedupes_back_to_back_idles() {
+    async fn harness_event_sink_dedupes_back_to_back_idles_and_parked() {
         // The claude harness re-emits Idle on every reconnect (e.g.
         // after an evict/resume cycle on an already-idle session).
         // Persisting each one would litter the timeline with redundant
@@ -2728,7 +2934,11 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus.clone(), meta.clone());
+        let sink = super::harness_event_sink(
+            bus.clone(),
+            meta.clone(),
+            Arc::new(engram_core::traits::SystemClock::new()),
+        );
 
         // Three back-to-back idles: only the first should land.
         for _ in 0..3 {
@@ -2764,6 +2974,38 @@ pub(crate) mod tests {
                 "harness_idle".to_string(),
             ],
         );
+
+        // Parked is also re-announced after reconnect while the agent's
+        // turn remains open. Consecutive markers collapse independently
+        // from Idle, while an intervening event permits the next marker.
+        for _ in 0..3 {
+            sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+        }
+        sink(
+            session_id,
+            sandbox_id,
+            HarnessEvent::RunStarted {
+                run_id: "run-2".into(),
+                prompt_summary: None,
+                prompt_id: None,
+            },
+        )
+        .await;
+        sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+        sink(session_id, sandbox_id, HarnessEvent::Parked).await;
+
+        let kinds: Vec<String> = mini.events.lock().iter().map(|e| e.kind.clone()).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                "harness_idle",
+                "run_started",
+                "harness_idle",
+                "harness_parked",
+                "run_started",
+                "harness_parked",
+            ],
+        );
     }
 
     /// Issue #527 Phase 1: a `run_started{prompt_id}` whose matching
@@ -2795,7 +3037,8 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink = super::harness_event_sink(bus, meta);
+        let sink =
+            super::harness_event_sink(bus, meta, Arc::new(engram_core::traits::SystemClock::new()));
 
         sink(
             session_id,
@@ -2869,7 +3112,11 @@ pub(crate) mod tests {
         let mini = Arc::new(MiniMeta::new(session));
         let meta: Arc<dyn MetadataStore> = mini.clone();
         let events = Arc::new(SessionEventBus::new(8));
-        let sink = harness_event_sink(events, meta);
+        let sink = harness_event_sink(
+            events,
+            meta,
+            Arc::new(engram_core::traits::SystemClock::new()),
+        );
         let sandbox_id = engram_core::SandboxId::new();
 
         // A run_started carrying the outbox row's prompt_id retires that row.

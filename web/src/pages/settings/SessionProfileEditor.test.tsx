@@ -3,6 +3,7 @@ import { render, screen, fireEvent, waitFor } from "@testing-library/react";
 import { SessionProfileEditor } from "./SessionProfileEditor";
 
 const profileHolder = vi.hoisted(() => ({ value: undefined as undefined | { profile: unknown } }));
+const paramsHolder = vi.hoisted(() => ({ value: {} as { id?: string } }));
 const create = vi.hoisted(() => vi.fn().mockResolvedValue({ profile: { id: "new" } }));
 const update = vi.hoisted(() => vi.fn().mockResolvedValue({ profile: { id: "p1" } }));
 vi.mock("../../hooks/useProfiles", () => ({
@@ -54,7 +55,7 @@ vi.mock("../../components/integrations/useConnectorViews", () => ({
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),
   useNavigate: () => vi.fn(),
-  useParams: () => ({}),
+  useParams: () => paramsHolder.value,
   Link: ({
     children,
     to: _to,
@@ -65,6 +66,7 @@ vi.mock("@tanstack/react-router", async (orig) => ({
 
 beforeEach(() => {
   profileHolder.value = undefined;
+  paramsHolder.value = {};
   create.mockClear();
   update.mockClear();
   uploadSkill.mockClear();
@@ -127,7 +129,18 @@ describe("SessionProfileEditor (create)", () => {
     fireEvent.change(screen.getByLabelText(/profile name/i), { target: { value: "Plain Agent" } });
     fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
     await waitFor(() => expect(create).toHaveBeenCalled());
-    expect(create.mock.calls[0][0]).toMatchObject({ isDefault: false });
+    expect(create.mock.calls[0][0]).toMatchObject({ isDefault: false, designation: "" });
+  });
+
+  it("maps the PR reviewer toggle to the reviewer designation", async () => {
+    render(<SessionProfileEditor mode="create" />);
+    fireEvent.change(screen.getByLabelText(/profile name/i), {
+      target: { value: "Review Agent" },
+    });
+    fireEvent.click(screen.getByLabelText(/pr reviewer profile/i));
+    fireEvent.click(screen.getByRole("button", { name: /create profile/i }));
+    await waitFor(() => expect(create).toHaveBeenCalled());
+    expect(create.mock.calls[0][0]).toMatchObject({ designation: "pr_reviewer" });
   });
 
   it("toggling a skill includes it in the payload (ADR 0055)", async () => {
@@ -184,7 +197,8 @@ describe("SessionProfileEditor (create)", () => {
 });
 
 describe("SessionProfileEditor (edit)", () => {
-  it("hydrates from the existing profile in edit mode", async () => {
+  it("round-trips every existing profile field on an unchanged save", async () => {
+    paramsHolder.value = { id: "p1" };
     profileHolder.value = {
       profile: {
         id: "p1",
@@ -192,19 +206,165 @@ describe("SessionProfileEditor (edit)", () => {
         description: "Node API",
         icon: "Server",
         imageId: "i1",
+        harness: "claude",
+        model: "opus",
+        effort: "high",
+        isDefault: true,
+        designation: "pr_reviewer",
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
-        capabilities: [],
-        skills: [],
+        capabilities: ["github:issues:read"],
+        skills: ["browser"],
+        network: {
+          default: "allow",
+          allowHosts: ["db.internal"],
+          allowHostPatterns: ["*.githubusercontent.com"],
+        },
+        secrets: [
+          {
+            ref: "db-password",
+            envVar: "DB_PASSWORD",
+            mode: "broker",
+            allowHosts: ["db.internal"],
+            allowHostPatterns: ["*.db.internal"],
+          },
+        ],
+        portExposures: [3000, 8080],
       },
     };
     render(<SessionProfileEditor mode="edit" />);
     const nameInput = await screen.findByLabelText(/profile name/i);
     await waitFor(() => expect((nameInput as HTMLInputElement).value).toBe("Backend Agent"));
+    await waitFor(() => {
+      expect(screen.getByTestId("harness-select").textContent).toContain("Claude Code");
+      expect(screen.getByTestId("model-select").textContent).toContain("Claude Opus 4.8");
+      expect(screen.getByTestId("effort-select").textContent).toContain("High");
+    });
+    expect(screen.getByTestId("icon-picker").textContent).toContain("Server");
+    expect(screen.getByTestId("image-select").textContent).toContain("registry/api:latest");
+    expect(screen.getByLabelText(/default profile/i).getAttribute("data-state")).toBe("checked");
+    expect(screen.getByLabelText(/pr reviewer profile/i).getAttribute("data-state")).toBe(
+      "checked",
+    );
+    expect((screen.getByLabelText(/allowed hosts/i) as HTMLTextAreaElement).value).toBe(
+      "db.internal",
+    );
+    expect((screen.getByLabelText(/host patterns/i) as HTMLTextAreaElement).value).toBe(
+      "*.githubusercontent.com",
+    );
     // env vars live under Advanced; opening it reveals the hydrated KEY input.
     fireEvent.click(screen.getByRole("button", { name: /advanced/i }));
     expect((screen.getByDisplayValue("ANTHROPIC_MODEL") as HTMLInputElement).value).toBe(
       "ANTHROPIC_MODEL",
     );
+    expect(screen.getByTestId("skill-browser").getAttribute("data-state")).toBe("checked");
+    expect(screen.getByTestId("port-chip-3000")).toBeTruthy();
+    expect(screen.getByTestId("port-chip-8080")).toBeTruthy();
+    expect(screen.getByText("db-password")).toBeTruthy();
+    expect(screen.getByDisplayValue("DB_PASSWORD")).toBeTruthy();
+    expect(
+      screen
+        .getByLabelText(/include the launching user's other saved tokens/i)
+        .getAttribute("data-state"),
+    ).toBe("checked");
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(update.mock.calls[0][0]).toMatchObject({
+      id: "p1",
+      name: "Backend Agent",
+      description: "Node API",
+      icon: "Server",
+      imageId: "i1",
+      harness: "claude",
+      model: "opus",
+      effort: "high",
+      isDefault: true,
+      includeUserTokens: true,
+      envVars: { ANTHROPIC_MODEL: "claude-x" },
+      capabilities: ["github:issues:read"],
+      skills: ["browser"],
+      network: {
+        default: "allow",
+        allowHosts: ["db.internal"],
+        allowHostPatterns: ["*.githubusercontent.com"],
+      },
+      secrets: [
+        {
+          ref: "db-password",
+          envVar: "DB_PASSWORD",
+          mode: "broker",
+          allowHosts: ["db.internal"],
+          allowHostPatterns: ["*.db.internal"],
+        },
+      ],
+      portExposures: [3000, 8080],
+    });
+    // An unchanged save must NOT re-send designation — otherwise a stale tab
+    // could silently steal or drop the reviewer role on an unrelated edit.
+    expect(update.mock.calls[0][0].designation).toBeUndefined();
+  });
+
+  it("sends designation only when the reviewer toggle is changed", async () => {
+    paramsHolder.value = { id: "p1" };
+    profileHolder.value = {
+      profile: {
+        id: "p1",
+        name: "Backend Agent",
+        description: "",
+        icon: "Bot",
+        imageId: "i1",
+        harness: "claude",
+        model: "opus",
+        effort: "high",
+        isDefault: false,
+        designation: "pr_reviewer",
+        includeUserTokens: false,
+        envVars: {},
+        capabilities: [],
+        skills: [],
+        network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+        secrets: [],
+        portExposures: [],
+      },
+    };
+    render(<SessionProfileEditor mode="edit" />);
+    await screen.findByDisplayValue("Backend Agent");
+    // Turn the reviewer toggle OFF, then save.
+    fireEvent.click(screen.getByLabelText(/pr reviewer profile/i));
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    // The toggle was flipped from on→off, so designation is sent as "" (clear).
+    expect(update.mock.calls[0][0].designation).toBe("");
+  });
+
+  it("normalizes legacy blank model and effort values on save", async () => {
+    paramsHolder.value = { id: "legacy" };
+    profileHolder.value = {
+      profile: {
+        id: "legacy",
+        name: "Legacy",
+        description: "",
+        icon: "Bot",
+        imageId: "i1",
+        harness: "claude",
+        model: "",
+        effort: "",
+        isDefault: false,
+        includeUserTokens: false,
+        envVars: {},
+        capabilities: [],
+        skills: [],
+        network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
+        secrets: [],
+        portExposures: [],
+      },
+    };
+    render(<SessionProfileEditor mode="edit" />);
+    await screen.findByDisplayValue("Legacy");
+    fireEvent.click(screen.getByRole("button", { name: /save changes/i }));
+    await waitFor(() => expect(update).toHaveBeenCalledOnce());
+    expect(update.mock.calls[0][0]).toMatchObject({ id: "legacy", harness: "claude" });
+    expect(update.mock.calls[0][0].model).toBeUndefined();
+    expect(update.mock.calls[0][0].effort).toBeUndefined();
   });
 });

@@ -42,12 +42,14 @@ export function SessionCowState({ sessionId }: { sessionId: string }) {
         ? "disk-tier diagnostic unavailable."
         : status === "active"
           ? "no chunked-disk tracking for this Active task — the host hasn’t wired the NBD pipeline, or its tracking didn’t survive the last restart."
-          : status === "idle" ||
-              status === "host_lost" ||
-              status === "evacuating" ||
-              status === "evicting"
-            ? `task is ${status.replace("_", " ")}; durability lives on the latest snapshot row.`
-            : `task is ${status.replace("_", " ")} (terminal) — no live disk tier.`;
+          : status === "parked"
+            ? "task is parked (VM paused in place) — its disk tier is live; durability continues on the checkpoint cadence."
+            : status === "idle" ||
+                status === "host_lost" ||
+                status === "evacuating" ||
+                status === "evicting"
+              ? `task is ${status.replace("_", " ")}; durability lives on the latest snapshot row.`
+              : `task is ${status.replace("_", " ")} (terminal) — no live disk tier.`;
     return <p className="text-sm text-muted-foreground italic">{message}</p>;
   }
 

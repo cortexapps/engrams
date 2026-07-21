@@ -7,6 +7,15 @@
 # See crates/engram-sandbox-vz/src/vm.rs for the smoke test that
 # detects unsigned binaries.
 #
+# Ordering contract (ADR 0096): the test binaries this signs MUST be
+# built with `cargo nextest run -p engram-sandbox-vz --no-run` (what
+# `just vz-codesign` does) — the same invocation shape the test runs
+# use, so nextest reuses these exact binaries. Any other build shape
+# (e.g. `cargo build -p a -p b --tests`) resolves features
+# differently, and nextest recompiles fresh, unsigned binaries AFTER
+# signing. The host-agent binary is signed here only opportunistically
+# when present; the Tiltfile owns its build+sign chain in dev.
+#
 # Usage: codesign.sh <profile>      (e.g. `codesign.sh debug`)
 #
 # Idempotent — re-running on already-signed binaries is fast:
@@ -77,8 +86,13 @@ fi
 shopt -s nullglob
 for T in target/"$PROFILE"/deps/engram_sandbox_vz-* target/"$PROFILE"/deps/e2e_vz-*; do
     if [ -x "$T" ] && [ -f "$T" ]; then
+        # `file` word order varies by build: macOS /usr/bin/file says
+        # "Mach-O 64-bit executable arm64", nix's file-5.45 says
+        # "Mach-O 64-bit arm64 executable, flags:<...>". Match both —
+        # the strict pattern silently signed NOTHING inside the nix
+        # dev shell (ADR 0096).
         case "$(file -b "$T")" in
-            "Mach-O 64-bit executable"*)
+            "Mach-O"*"executable"*)
                 sign_if_needed "$T"
                 examined=$((examined + 1))
                 ;;

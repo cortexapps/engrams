@@ -39,7 +39,7 @@ const FORGE_TOKEN_ENV: &str = "ENGRAM_FORGE_TOKEN";
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct ActivationReport {
     /// Skills that were activated (e.g. `"share-file"`, `"integrations"`,
-    /// `"show-your-work"`).
+    /// `"browser"`).
     pub activated: Vec<String>,
     /// Non-fatal problems (bundle absent/garbled, symlink failed). The caller
     /// logs these; none of them fail the session.
@@ -369,11 +369,11 @@ mod tests {
         let b = root.join(format!("opt/engram/dyn/{n}"));
         std::fs::create_dir_all(b.join("bin")).unwrap();
         std::fs::write(b.join("bin/playwright-cli"), "#!/bin/sh\n").unwrap();
-        std::fs::create_dir_all(b.join("skills/show-your-work")).unwrap();
-        std::fs::write(b.join("skills/show-your-work/SKILL.md"), "---\n").unwrap();
+        std::fs::create_dir_all(b.join("skills/browser")).unwrap();
+        std::fs::write(b.join("skills/browser/SKILL.md"), "---\n").unwrap();
         std::fs::write(
             b.join("mount.json"),
-            r#"{"kind":"skill","skills":[{"name":"show-your-work","bins":["bin/playwright-cli"]}]}"#,
+            r#"{"kind":"skill","skills":[{"name":"browser","bins":["bin/playwright-cli"]}]}"#,
         )
         .unwrap();
     }
@@ -553,28 +553,29 @@ mod tests {
     }
 
     #[test]
-    fn browser_slot_wires_show_your_work_and_playwright_cli() {
+    fn browser_slot_wires_one_skill_and_playwright_cli() {
         let dir = tempfile::tempdir().unwrap();
         stage_skills_slot(dir.path(), 0);
         stage_browser_slot(dir.path(), 1);
         let report = activate(dir.path(), &env(&[]));
-        assert!(report.activated.contains(&"show-your-work".to_string()));
+        assert!(report.activated.contains(&"browser".to_string()));
         let l = Layout::under(dir.path());
-        assert!(l.agents_skills.join("show-your-work").is_symlink());
+        assert!(l.agents_skills.join("browser").is_symlink());
         assert!(l.usr_local_bin.join("playwright-cli").is_symlink());
+        assert!(!l.usr_local_bin.join("agent-browser").exists());
         assert!(!dir.path().join("root/.mcp.json").exists());
     }
 
     #[test]
-    fn browser_only_with_forge_token_still_wires_show_your_work() {
+    fn browser_only_with_forge_token_still_wires_browser() {
         // A profile that selected only the browser skill (not the skills
         // bundle) + a forge token: no `provides_askpass` bundle is mounted, so
-        // there's nothing forge-gated to wire — show-your-work still works, no
+        // there's nothing forge-gated to wire — browser still works, no
         // failure. (The retired PR skill used to be the forge-gated entry here.)
         let dir = tempfile::tempdir().unwrap();
         stage_browser_slot(dir.path(), 0);
         let report = activate(dir.path(), &env(&[("ENGRAM_FORGE_TOKEN", "tok")]));
-        assert!(report.activated.contains(&"show-your-work".to_string()));
+        assert!(report.activated.contains(&"browser".to_string()));
     }
 
     #[test]
@@ -693,6 +694,6 @@ mod tests {
         assert_eq!(first.activated, second.activated);
         let l = Layout::under(dir.path());
         assert!(l.agents_skills.join("share-file").is_symlink());
-        assert!(l.agents_skills.join("show-your-work").is_symlink());
+        assert!(l.agents_skills.join("browser").is_symlink());
     }
 }

@@ -16,6 +16,11 @@ services:
   postgres:
     image: postgres:16
     restart: unless-stopped
+    # ADR 0099 H2: the live-PG test lane runs deeply parallel with a
+    # per-test database each (engram-testkit) — each test's store holds
+    # up to an 8-connection pool, so give headroom over the stock
+    # max_connections=100. Mirrors the CI `Start postgres` step.
+    command: ["postgres", "-c", "max_connections=300"]
     environment:
       POSTGRES_USER: engram
       POSTGRES_PASSWORD: engram
@@ -93,12 +98,19 @@ services:
       - "4443:4443"
     volumes:
       - engram-fake-gcs-data:/data
+    # `-filesystem-root /data` is the load-bearing flag: fake-gcs-server's
+    # storage backend defaults to /storage INSIDE the container — `-data`
+    # alone only SEEDS from the mounted volume at startup, so every
+    # container recreation silently discarded all blobs written since
+    # (2026-07-18: enabled_images pointed at vanished base-snapshot
+    # manifests; every session create failed "blob not found"). Rooting
+    # the backend at the volume makes writes actually durable.
     command: >
       -scheme http
       -host 0.0.0.0
       -port 4443
       -public-host localhost:4443
-      -data /data
+      -filesystem-root /data
 
   # Jaeger all-in-one — OTLP trace collector + UI for ADR 0019 cold-boot
   # tracing. The engram binaries export here when

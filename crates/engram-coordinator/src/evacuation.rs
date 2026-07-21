@@ -57,6 +57,15 @@ pub enum EvacError {
     /// with the image prefetched). Caller logs + retries later or
     /// routes to `HostLost → Dead`.
     NoTargetAvailable(PickError),
+    /// #800 (RESERVED evac placement): no survivor FITS the session's
+    /// reserved 2D budget. Distinct from `NoTargetAvailable` (a transient
+    /// pick failure the resumer retries against): this is the honest
+    /// hard-bound overflow — the caller QUEUES the session (`Evacuating →
+    /// Queued`, resume-origin) rather than binding a measured-full host,
+    /// and the queue scanner re-homes it once capacity returns. Not
+    /// structural (capacity does return), but also not a per-tick retry
+    /// (queueing hands ownership to the scanner).
+    NoCapacityQueue,
 }
 
 impl EvacError {
@@ -90,6 +99,10 @@ impl std::fmt::Display for EvacError {
                 )
             }
             Self::NoTargetAvailable(e) => write!(f, "no host could accept the relocate: {e:?}"),
+            Self::NoCapacityQueue => write!(
+                f,
+                "no survivor fits the session's reserved budget — queue instead of overcommit"
+            ),
         }
     }
 }
@@ -99,7 +112,8 @@ impl std::error::Error for EvacError {
         match self {
             Self::NoRecoverableState
             | Self::ColdBootUnavailable(_)
-            | Self::NoTargetAvailable(_) => None,
+            | Self::NoTargetAvailable(_)
+            | Self::NoCapacityQueue => None,
             Self::RestoreFailed(e) => Some(e),
             Self::Rebind(e) => Some(e),
         }
@@ -242,6 +256,18 @@ pub async fn evacuate_dead_source(
     // ADR 0079: the caller's op/claim epoch, stamped into the restore
     // RPC (the evac-resumer claim, the resume verb's disk-only path).
     fence: SessionFence,
+    // #800 (RESERVED evac placement): the session's reserved 2D budget
+    // `(mem_mib, cpu_vcpus)`, resolved from the enabled image
+    // (`resolve_cold_boot_spec`). `Some` feeds the HARD reserved pick — a
+    // relocation that fits no survivor returns `NoCapacityQueue` (the caller
+    // queues instead of overcommitting). `None` (image un-enabled / budget
+    // unresolvable) keeps the pre-#800 capacity-SOFT posture — never strand
+    // an evacuation on a spec-resolution blip (mirrors the resume verb's
+    // budget-unresolved fallback in `resume_from_fc_snapshot`).
+    budget: Option<(u32, u32)>,
+    // ADR 0098 D1: the caller's injected wall clock, used for the
+    // peer-hint heartbeat-staleness gate (`host_can_serve_chunks`).
+    now: chrono::DateTime<chrono::Utc>,
 ) -> Result<EvacReceipt, EvacError> {
     let session_id = session.id;
     let old_sandbox_id = session.sandbox_id;
@@ -304,8 +330,13 @@ pub async fn evacuate_dead_source(
         repo: image_repo,
         image_version: image_tag,
         snapshot_host: snapshot.as_ref().and_then(|s| s.host_id),
-        memory_mib: None,
-        cpu_budget_vcpus: None,
+        // #800: feed the reserved budget (was hard-coded `None`,
+        // capacity-blind — the ADR 0046 evac-leg gap). With it set, the
+        // tier-0 snapshot-host / tier-2 prefer vetoes AND best-fit all gate
+        // on the real 2D budget, and the HARD reserved pick can honestly
+        // report "nothing fits" instead of soft-binding a full survivor.
+        memory_mib: budget.map(|(mib, _)| mib),
+        cpu_budget_vcpus: budget.map(|(_, vcpus)| vcpus),
         // Target-selection: image-cache-warm preference is a future
         // refinement (defer when we add zone tagging to HostState).
         // Today we accept any host that can take the work, but never
@@ -345,12 +376,36 @@ pub async fn evacuate_dead_source(
     // exact host (still excluding the source); a bad pin retries then
     // falls back to Idle rather than silently landing elsewhere.
     let (target_host, target_backend) = match require_host {
-        Some(host) => {
-            crate::placement::pick_specific_host(meta.as_ref(), registry, host, session.host_id)
+        Some(host) => crate::placement::pick_specific_host(
+            meta.as_ref(),
+            registry,
+            host,
+            session.host_id,
+            now,
+        )
+        .await
+        .map_err(EvacError::NoTargetAvailable)?,
+        // #800 (RESERVED evac placement): the standard any-peer path honors
+        // the HARD reserved 2D bound when a budget is known — a relocation
+        // that fits no survivor returns `NoCapacity`, which we surface as
+        // `NoCapacityQueue` so the resumer QUEUES the session (resume-origin)
+        // instead of binding a measured-full host (the #722/#795
+        // over-reservation class, on the evac leg — issue #800). Other pick
+        // errors stay `NoTargetAvailable` (transient — the resumer retries).
+        // A `None` budget (image un-enabled / unresolvable) keeps the
+        // pre-#800 capacity-soft pick — never strand on a spec-resolution
+        // blip. (An operator teleport pin — the `Some(host)` arm above —
+        // stays capacity-soft by design; an explicit pin overrides ranking.)
+        None if budget.is_some() => {
+            match crate::placement::pick_for_session_reserved(meta.as_ref(), registry, &ctx, now)
                 .await
-                .map_err(EvacError::NoTargetAvailable)?
+            {
+                Ok(picked) => picked,
+                Err(PickError::NoCapacity) => return Err(EvacError::NoCapacityQueue),
+                Err(e) => return Err(EvacError::NoTargetAvailable(e)),
+            }
         }
-        None => crate::placement::pick_for_session(meta.as_ref(), registry, &ctx)
+        None => crate::placement::pick_for_session(meta.as_ref(), registry, &ctx, now)
             .await
             .map_err(EvacError::NoTargetAvailable)?,
     };
@@ -409,6 +464,27 @@ pub async fn evacuate_dead_source(
                 },
                 _ => None,
             };
+            // ADR 0095: the snapshot-rehome leg of an evacuation is
+            // exactly the peer-fill case — the capturing host is
+            // draining (cordoned) but ALIVE, one LAN hop away, with the
+            // whole divergent set on its NVMe. Hint it
+            // (`host_can_serve_chunks` deliberately ignores the
+            // cordon); a dead source degrades to the GCS path.
+            let peer_hints = match s.host_id {
+                Some(src) => match meta.list_active_hosts().await {
+                    Ok(hosts) => {
+                        let ttl = crate::placement::placement_ttl();
+                        hosts
+                            .iter()
+                            .find(|h| h.id == src)
+                            .and_then(|h| crate::placement::host_can_serve_chunks(h, now, ttl))
+                            .map(|addr| vec![addr.to_string()])
+                            .unwrap_or_default()
+                    }
+                    Err(_) => Vec::new(),
+                },
+                None => Vec::new(),
+            };
             let metadata = SnapshotMetadata {
                 migration_source: None,
                 id: s.id,
@@ -428,6 +504,8 @@ pub async fn evacuate_dead_source(
                 aux_bundles: s.aux_bundles.clone(),
                 // Issue #529: restore-side reconstruction, not a fresh capture.
                 paused_at: None,
+                // ADR 0095: assembled above — the draining source, or empty.
+                peer_hints,
             };
             target_backend
                 .restore(metadata, fence)
@@ -467,6 +545,8 @@ pub async fn evacuate_dead_source(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use async_trait::async_trait;
@@ -476,7 +556,6 @@ mod tests {
     use engram_core::types::snapshot::SnapshotMetadata;
     use engram_core::{HostId, SandboxId, SessionId};
     use parking_lot::Mutex as PlMutex;
-    use std::collections::HashMap;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     /// Records every call made against it; deterministic returns so
@@ -568,6 +647,7 @@ mod tests {
                 working_set_blob_key: None,
                 aux_bundles: vec![],
                 paused_at: None,
+                peer_hints: Vec::new(),
             })
         }
         async fn commit_snapshot(
@@ -654,313 +734,153 @@ mod tests {
     impl std::error::Error for SimpleErr {}
 
     /// Minimal MetadataStore that records every state-affecting call.
-    /// Stores one session row keyed by SessionId; the evac orchestration
-    /// reads it via `get_session` and updates via the assign_* /
-    /// transition_session calls.
-    #[derive(Default)]
-    struct FakeMeta {
-        sessions: PlMutex<HashMap<SessionId, Session>>,
-        sandbox_to_session: PlMutex<HashMap<SandboxId, (HostId, SessionState)>>,
-        /// ADR 0047: placement reads host rows — tests stage
-        /// schedulable hosts here via [`Self::add_ready_host`].
-        hosts: PlMutex<Vec<engram_core::types::host::HostRecord>>,
+    /// Stage a HostLost session through REAL store calls (ADR 0098:
+    /// FakeMeta retired onto SimMetadataStore) — create → bind →
+    /// Active → optional live-manifest publish → HostLost. Every hop
+    /// is a legal FSM edge, so the fixture can't stage a state the
+    /// production write paths couldn't reach.
+    async fn stage_hostlost_session(
+        meta: &Arc<engram_sim::SimMetadataStore>,
+        host: HostId,
+        sandbox: SandboxId,
+        live_disk: Option<ManifestRef>,
+    ) -> Session {
+        let id = meta
+            .create_session(engram_core::types::session::SessionSpec {
+                image: "ghcr.io/test/img:t".into(),
+                mode: SessionMode::Agent,
+            })
+            .await
+            .expect("create");
+        meta.assign_session_host(id, Some(host))
+            .await
+            .expect("host");
+        meta.transition_session_created(id, sandbox)
+            .await
+            .expect("created");
+        meta.transition_session(id, SessionState::Active)
+            .await
+            .expect("active");
+        if let Some(m) = live_disk {
+            let out = meta
+                .update_live_disk_manifest(id, sandbox, m)
+                .await
+                .expect("live manifest");
+            assert!(matches!(out, engram_core::traits::UpdateOutcome::Applied));
+        }
+        meta.transition_session(id, SessionState::HostLost)
+            .await
+            .expect("host_lost");
+        meta.get_session(id).await.expect("staged")
     }
 
-    impl FakeMeta {
-        /// Stage a fresh-heartbeat `ready` host row so the PG-read
-        /// picker can schedule onto the registered backend.
-        fn add_ready_host(&self, id: HostId) {
-            self.hosts
-                .lock()
-                .push(engram_core::types::host::HostRecord {
-                    id,
-                    hostname: format!("fake-{id}"),
-                    cloud_metadata: Default::default(),
-                    capacity: engram_core::types::host::HostCapacity {
-                        total_gb: 0,
-                        used_gb: 0,
-                        total_mib: 16_384,
-                        used_mib: 0,
-                        running_sandboxes: 0,
-                    },
-                    utilization: Default::default(),
-                    status: engram_core::types::host::HostStatus::Ready,
-                    last_heartbeat_at: chrono::Utc::now(),
-                    host_addr: None,
-                    ready_images: Vec::new(),
-                    current_bundles: Vec::new(),
-                    cordoned: false,
-                    total_vcpus: 0,
-                    wire_version: 0,
-                    stages_images: false,
-                    capabilities: engram_core::types::host::HostCapabilities::default(),
-                });
-        }
-
-        fn install_session(&self, sess: Session) {
-            if let (Some(_), Some(sb)) = (sess.host_id, sess.sandbox_id) {
-                self.sandbox_to_session
-                    .lock()
-                    .insert(sb, (sess.host_id.unwrap(), sess.status));
-            }
-            self.sessions.lock().insert(sess.id, sess);
-        }
-        fn session(&self, id: SessionId) -> Session {
-            self.sessions.lock().get(&id).cloned().unwrap()
-        }
+    fn sim_meta() -> Arc<engram_sim::SimMetadataStore> {
+        engram_sim::SimMetadataStore::new(
+            Arc::new(engram_core::traits::SystemClock::new()),
+            Arc::new(engram_sim::SimEntropy::seeded(0xE7AC)),
+        )
     }
 
-    #[async_trait]
-    impl MetadataStore for FakeMeta {
-        async fn create_session(
-            &self,
-            _: engram_core::types::session::SessionSpec,
-        ) -> Result<SessionId, MetaError> {
-            unreachable!()
-        }
-        async fn transition_session_created(
-            &self,
-            _: SessionId,
-            _: SandboxId,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn reserve_and_persist_create(
-            &self,
-            _: engram_core::traits::SessionCreateWriteSet,
-            _: &[HostId],
-            _: usize,
-        ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
-            unreachable!()
-        }
-        async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
-            self.sessions
-                .lock()
-                .get(&id)
-                .cloned()
-                .ok_or(MetaError::NotFound)
-        }
-        async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
-            Ok(self.sessions.lock().values().cloned().collect())
-        }
-        async fn transition_session(
-            &self,
-            id: SessionId,
-            target: SessionState,
-        ) -> Result<SessionState, MetaError> {
-            let mut guard = self.sessions.lock();
-            let s = guard.get_mut(&id).ok_or(MetaError::NotFound)?;
-            let prev = s.status;
-            s.status
-                .try_transition_to(target)
-                .map_err(|e| MetaError::Conflict(e.to_string()))?;
-            s.status = target;
-            Ok(prev)
-        }
-        async fn assign_session_host(
-            &self,
-            id: SessionId,
-            host_id: Option<HostId>,
-        ) -> Result<(), MetaError> {
-            self.sessions
-                .lock()
-                .get_mut(&id)
-                .ok_or(MetaError::NotFound)?
-                .host_id = host_id;
-            Ok(())
-        }
-        async fn assign_session_sandbox(
-            &self,
-            id: SessionId,
-            sandbox_id: Option<SandboxId>,
-        ) -> Result<(), MetaError> {
-            self.sessions
-                .lock()
-                .get_mut(&id)
-                .ok_or(MetaError::NotFound)?
-                .sandbox_id = sandbox_id;
-            Ok(())
-        }
-        async fn host_for_sandbox(
-            &self,
-            sandbox_id: SandboxId,
-        ) -> Result<Option<(HostId, SessionState)>, MetaError> {
-            Ok(self.sandbox_to_session.lock().get(&sandbox_id).copied())
-        }
-        async fn upsert_host(
-            &self,
-            _: engram_core::types::host::HostRecord,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn list_active_hosts(
-            &self,
-        ) -> Result<Vec<engram_core::types::host::HostRecord>, MetaError> {
-            Ok(self.hosts.lock().clone())
-        }
-        async fn set_host_status(
-            &self,
-            _: HostId,
-            _: engram_core::types::host::HostStatus,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn touch_host_heartbeat(
-            &self,
-            _: HostId,
-            _: engram_core::types::host::HostHeartbeat,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn set_host_cordoned(&self, _: HostId, _: bool) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn list_stale_hosts(
-            &self,
-            _: u64,
-        ) -> Result<Vec<engram_core::types::host::HostRecord>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn mark_host_dead_and_orphan_sessions(
-            &self,
-            _: HostId,
-        ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn record_snapshot(
-            &self,
-            _: engram_core::types::snapshot::SnapshotRecord,
-        ) -> Result<bool, MetaError> {
-            unreachable!()
-        }
-        async fn list_snapshots_for_session(
-            &self,
-            _: SessionId,
-        ) -> Result<Vec<engram_core::types::snapshot::SnapshotRecord>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn latest_snapshot_for_session(
-            &self,
-            _: SessionId,
-        ) -> Result<Option<engram_core::types::snapshot::SnapshotRecord>, MetaError> {
-            Ok(None)
-        }
-        async fn append_session_event(
-            &self,
-            _: SessionId,
-            _: &str,
-            _: serde_json::Value,
-        ) -> Result<i64, MetaError> {
-            Ok(0)
-        }
-        async fn list_session_events_since(
-            &self,
-            _: SessionId,
-            _: i64,
-            _: i64,
-        ) -> Result<Vec<engram_core::types::event::PersistedEvent>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn insert_artifact(
-            &self,
-            _: uuid::Uuid,
-            _: SessionId,
-            _: &str,
-            _: &str,
-            _: i64,
-            _: Option<&str>,
-        ) -> Result<(), MetaError> {
-            Ok(())
-        }
-        async fn get_artifact(
-            &self,
-            _: SessionId,
-            _: uuid::Uuid,
-        ) -> Result<Option<engram_core::types::ArtifactRow>, MetaError> {
-            Ok(None)
-        }
-        async fn artifact_usage(&self, _: SessionId) -> Result<(i64, i64), MetaError> {
-            Ok((0, 0))
-        }
-        async fn upsert_registry_credential(
-            &self,
-            _: engram_core::types::registry::RegistryCredential,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn list_registry_credentials(
-            &self,
-        ) -> Result<Vec<engram_core::types::registry::RegistryCredential>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn registry_credential_for_host(
-            &self,
-            _: &str,
-        ) -> Result<Option<engram_core::types::registry::RegistryCredential>, MetaError> {
-            Ok(None)
-        }
-        async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        // ADR 0021 P1.5a: the four harness-pack trait methods were retired with the registry.
-        async fn upsert_enabled_image(
-            &self,
-            _: engram_core::types::registry::EnabledImage,
-        ) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn list_enabled_images(
-            &self,
-        ) -> Result<Vec<engram_core::types::registry::EnabledImage>, MetaError> {
-            Ok(Vec::new())
-        }
-        async fn get_enabled_image(
-            &self,
-            _: &str,
-        ) -> Result<Option<engram_core::types::registry::EnabledImage>, MetaError> {
-            Ok(None)
-        }
-        async fn get_enabled_image_any(
-            &self,
-            _: &str,
-        ) -> Result<Option<engram_core::types::registry::EnabledImage>, MetaError> {
-            Ok(None)
-        }
-        async fn soft_delete_enabled_image(
-            &self,
-            _: &str,
-        ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
-            unreachable!()
-        }
-        async fn delete_enabled_image(&self, _: &str) -> Result<(), MetaError> {
-            unreachable!()
-        }
-        async fn get_session_secrets(
-            &self,
-            _: SessionId,
-        ) -> Result<Option<engram_core::types::registry::SessionSecrets>, MetaError> {
-            Ok(None)
-        }
-        async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
-            unreachable!()
-        }
+    /// Stage a fresh-heartbeat `ready` host row — deliberately
+    /// UNMEASURED (no utilization heartbeat), matching the retired
+    /// FakeMeta fixture: placement admits it via the last-resort
+    /// unmeasured tier, which is exactly the capacity-fallback path
+    /// these evac tests exercise.
+    async fn add_ready_host(meta: &Arc<engram_sim::SimMetadataStore>, id: HostId) {
+        let now = engram_core::traits::Clock::now_utc(&engram_core::traits::SystemClock::new());
+        meta.upsert_host(engram_core::types::host::HostRecord {
+            id,
+            hostname: format!("fake-{id}"),
+            cloud_metadata: Default::default(),
+            capacity: engram_core::types::host::HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 16_384,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: Default::default(),
+            status: engram_core::types::host::HostStatus::Ready,
+            last_heartbeat_at: now,
+            host_addr: None,
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 0,
+            wire_version: 0,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
+        })
+        .await
+        .expect("host row");
     }
 
-    fn make_session(host: HostId, sandbox: SandboxId, status: SessionState) -> Session {
-        Session {
-            id: SessionId::new(),
-            status,
-            host_id: Some(host),
-            sandbox_id: Some(sandbox),
-            image: "ghcr.io/test/img:t".into(),
-            mode: SessionMode::Agent,
-            created_at: chrono::Utc::now(),
-            last_active_at: chrono::Utc::now(),
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-            suggested_title: None,
-        }
+    /// #800: a MEASURED host — `allocatable_mib` set — so placement's 2D
+    /// fit actually gates (unlike `add_ready_host`'s unmeasured last-resort
+    /// tier). Used to exercise the RESERVED evac gate: an evac whose budget
+    /// exceeds `allocatable_mib` fits NO survivor and must queue.
+    async fn add_measured_host(
+        meta: &Arc<engram_sim::SimMetadataStore>,
+        id: HostId,
+        alloc_mib: u64,
+    ) {
+        let now = engram_core::traits::Clock::now_utc(&engram_core::traits::SystemClock::new());
+        meta.upsert_host(engram_core::types::host::HostRecord {
+            id,
+            hostname: format!("measured-{id}"),
+            cloud_metadata: Default::default(),
+            capacity: engram_core::types::host::HostCapacity {
+                total_gb: 0,
+                used_gb: 0,
+                total_mib: 16_384,
+                used_mib: 0,
+                running_sandboxes: 0,
+            },
+            utilization: engram_core::types::host::HostUtilization {
+                allocatable_mib: alloc_mib,
+                ..Default::default()
+            },
+            status: engram_core::types::host::HostStatus::Ready,
+            last_heartbeat_at: now,
+            host_addr: None,
+            ready_images: Vec::new(),
+            current_bundles: Vec::new(),
+            cordoned: false,
+            total_vcpus: 4,
+            wire_version: 0,
+            stages_images: false,
+            capabilities: engram_core::types::host::HostCapabilities::default(),
+        })
+        .await
+        .expect("measured host row");
+        // The sim carries `allocatable_mib` via the HEARTBEAT, not
+        // `upsert_host` (which defaults utilization for a fresh row) — so
+        // stamp a heartbeat to make the host genuinely MEASURED.
+        meta.touch_host_heartbeat(
+            id,
+            engram_core::types::host::HostHeartbeat {
+                status: engram_core::types::host::HostStatus::Ready,
+                capacity: engram_core::types::host::HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: 16_384,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: engram_core::types::host::HostUtilization {
+                    allocatable_mib: alloc_mib,
+                    ..Default::default()
+                },
+                ready_images: Vec::new(),
+                current_bundles: Vec::new(),
+                total_vcpus: 4,
+                wire_version: 0,
+                stages_images: false,
+                capabilities: engram_core::types::host::HostCapabilities::default(),
+            },
+        )
+        .await
+        .expect("measured heartbeat");
     }
 
     fn make_snapshot_for(
@@ -994,14 +914,14 @@ mod tests {
 
     /// Helper: build a HostRegistry + register one target host with
     /// fresh capacity. Returns (registry, target_host, target_backend).
-    fn build_registry_with_target(
-        meta: Arc<FakeMeta>,
+    async fn build_registry_with_target(
+        meta: Arc<engram_sim::SimMetadataStore>,
     ) -> (Arc<HostRegistry>, HostId, Arc<FakeBackend>) {
         let registry = Arc::new(HostRegistry::new(meta.clone()));
         let target_host = HostId::new();
         let target_be = Arc::new(FakeBackend::default());
         registry.register(target_host, target_be.clone());
-        meta.add_ready_host(target_host);
+        add_ready_host(&meta, target_host).await;
         // pick_for_session's capacity fallback path requires a fresh
         // host with no draining flag — register() sets defaults that
         // suffice.
@@ -1019,20 +939,24 @@ mod tests {
     /// `..._uses_live_disk_when_newer` — that encoded the bug.)
     #[tokio::test]
     async fn evac_dead_source_rung1_uses_checkpoint_disk_not_newer_live() {
-        let meta = Arc::new(FakeMeta::default());
+        let meta = sim_meta();
         let lineage = 0xABCD;
-        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        // Live disk is a strictly-newer version of the SAME lineage —
-        // exactly the case pick_evac_disk_manifest would prefer.
-        session.live_disk_manifest = Some(fake_manifest(lineage, 5));
+        let session = stage_hostlost_session(
+            &meta,
+            HostId::new(),
+            SandboxId::new(),
+            // Live disk is a strictly-newer version of the SAME lineage —
+            // exactly the case pick_evac_disk_manifest would prefer.
+            Some(fake_manifest(lineage, 5)),
+        )
+        .await;
         let session_id = session.id;
-        meta.install_session(session.clone());
 
         let checkpoint_disk = fake_manifest(lineage, 3);
         let memory = fake_manifest(lineage + 1, 1);
         let snapshot = make_snapshot_for(session_id, Some(checkpoint_disk), Some(memory));
 
-        let (registry, target_host, target_be) = build_registry_with_target(meta.clone());
+        let (registry, target_host, target_be) = build_registry_with_target(meta.clone()).await;
         let new_sandbox = SandboxId::new();
         target_be.set_restore_id(new_sandbox);
 
@@ -1045,6 +969,8 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
         )
         .await
         .expect("rung-1 happy path");
@@ -1069,7 +995,7 @@ mod tests {
             "rung-1 is a restore, never a cold-boot create",
         );
 
-        let updated = meta.session(session_id);
+        let updated = meta.get_session(session_id).await.expect("session");
         assert_eq!(updated.status, SessionState::Created);
         assert_eq!(updated.host_id, Some(target_host));
         assert_eq!(updated.sandbox_id, Some(new_sandbox));
@@ -1079,11 +1005,9 @@ mod tests {
     /// snapshot's disk + memory. Loss=None.
     #[tokio::test]
     async fn evac_dead_source_uses_snapshot_when_no_live_disk() {
-        let meta = Arc::new(FakeMeta::default());
-        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        session.live_disk_manifest = None;
+        let meta = sim_meta();
+        let session = stage_hostlost_session(&meta, HostId::new(), SandboxId::new(), None).await;
         let session_id = session.id;
-        meta.install_session(session.clone());
 
         let snapshot = make_snapshot_for(
             session_id,
@@ -1091,7 +1015,7 @@ mod tests {
             Some(fake_manifest(0x5678, 7)),
         );
 
-        let (registry, _target_host, target_be) = build_registry_with_target(meta.clone());
+        let (registry, _target_host, target_be) = build_registry_with_target(meta.clone()).await;
         target_be.set_restore_id(SandboxId::new());
 
         let receipt = evacuate_dead_source(
@@ -1103,6 +1027,8 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
         )
         .await
         .expect("snapshot-only happy path");
@@ -1117,14 +1043,15 @@ mod tests {
     /// pinned by host_registry's own prefer_host tests.)
     #[tokio::test]
     async fn evac_prefers_the_origin_host_when_passed() {
-        let meta = Arc::new(FakeMeta::default());
-        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        session.live_disk_manifest = None;
+        let meta = sim_meta();
+        let staged = stage_hostlost_session(&meta, HostId::new(), SandboxId::new(), None).await;
         // Mirrors resume_disk_only_cold_boot: host_id cleared (so the
         // origin is NOT excluded), origin threaded as prefer_host.
-        session.host_id = None;
+        meta.assign_session_host(staged.id, None)
+            .await
+            .expect("clear host");
+        let session = meta.get_session(staged.id).await.expect("staged");
         let session_id = session.id;
-        meta.install_session(session.clone());
         let snapshot = make_snapshot_for(
             session_id,
             Some(fake_manifest(0x1111, 1)),
@@ -1138,8 +1065,8 @@ mod tests {
         let other_be = Arc::new(FakeBackend::default());
         registry.register(other, other_be.clone());
         registry.register(origin, origin_be.clone());
-        meta.add_ready_host(other);
-        meta.add_ready_host(origin);
+        add_ready_host(&meta, other).await;
+        add_ready_host(&meta, origin).await;
         origin_be.set_restore_id(SandboxId::new());
         other_be.set_restore_id(SandboxId::new());
 
@@ -1152,6 +1079,8 @@ mod tests {
             None,
             Some(origin),
             SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
         )
         .await
         .expect("origin-affinity happy path");
@@ -1186,14 +1115,13 @@ mod tests {
     /// `restore()`. Loss=Memory{reason}.
     #[tokio::test]
     async fn evac_dead_source_disk_only_cold_boots_with_memory_loss() {
-        let meta = Arc::new(FakeMeta::default());
+        let meta = sim_meta();
         let live = fake_manifest(0xCAFE, 9);
-        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        session.live_disk_manifest = Some(live);
+        let session =
+            stage_hostlost_session(&meta, HostId::new(), SandboxId::new(), Some(live)).await;
         let session_id = session.id;
-        meta.install_session(session.clone());
 
-        let (registry, _target_host, target_be) = build_registry_with_target(meta.clone());
+        let (registry, _target_host, target_be) = build_registry_with_target(meta.clone()).await;
         let new_sandbox = SandboxId::new();
         target_be.set_restore_id(new_sandbox);
 
@@ -1206,6 +1134,8 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
         )
         .await
         .expect("disk-only cold-boot happy path");
@@ -1225,7 +1155,7 @@ mod tests {
         assert_eq!(spec.rootfs_manifest, Some(live));
 
         // PG was rebound through HostLost → Created.
-        let updated = meta.session(session_id);
+        let updated = meta.get_session(session_id).await.expect("session");
         assert_eq!(updated.status, SessionState::Created);
     }
 
@@ -1235,13 +1165,17 @@ mod tests {
     /// burning its budget.
     #[tokio::test]
     async fn evac_dead_source_disk_only_without_spec_is_structural() {
-        let meta = Arc::new(FakeMeta::default());
-        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        session.live_disk_manifest = Some(fake_manifest(0xCAFE, 9));
+        let meta = sim_meta();
+        let session = stage_hostlost_session(
+            &meta,
+            HostId::new(),
+            SandboxId::new(),
+            Some(fake_manifest(0xCAFE, 9)),
+        )
+        .await;
         let session_id = session.id;
-        meta.install_session(session.clone());
 
-        let (registry, _target_host, _target_be) = build_registry_with_target(meta.clone());
+        let (registry, _target_host, _target_be) = build_registry_with_target(meta.clone()).await;
 
         let result = evacuate_dead_source(
             &registry,
@@ -1252,26 +1186,29 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
         )
         .await;
         match &result {
             Err(e @ EvacError::ColdBootUnavailable(_)) => assert!(e.is_structural()),
             other => panic!("expected ColdBootUnavailable, got {other:?}"),
         }
-        assert_eq!(meta.session(session_id).status, SessionState::HostLost);
+        assert_eq!(
+            meta.get_session(session_id).await.expect("session").status,
+            SessionState::HostLost
+        );
     }
 
     /// Arm 4: no snapshot, no live_disk → NoRecoverableState. Caller
     /// (dead_host.rs) routes this to HostLost → Dead.
     #[tokio::test]
     async fn evac_dead_source_no_state_errors_no_recoverable() {
-        let meta = Arc::new(FakeMeta::default());
-        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        session.live_disk_manifest = None;
+        let meta = sim_meta();
+        let session = stage_hostlost_session(&meta, HostId::new(), SandboxId::new(), None).await;
         let session_id = session.id;
-        meta.install_session(session.clone());
 
-        let (registry, _target_host, _target_be) = build_registry_with_target(meta.clone());
+        let (registry, _target_host, _target_be) = build_registry_with_target(meta.clone()).await;
 
         let result = evacuate_dead_source(
             &registry,
@@ -1282,12 +1219,14 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoRecoverableState)));
 
         // PG untouched at HostLost.
-        let updated = meta.session(session_id);
+        let updated = meta.get_session(session_id).await.expect("session");
         assert_eq!(updated.status, SessionState::HostLost);
     }
 
@@ -1295,10 +1234,14 @@ mod tests {
     /// may retry.
     #[tokio::test]
     async fn evac_dead_source_no_target_returns_no_target_available() {
-        let meta = Arc::new(FakeMeta::default());
-        let mut session = make_session(HostId::new(), SandboxId::new(), SessionState::HostLost);
-        session.live_disk_manifest = Some(fake_manifest(0x1, 1));
-        meta.install_session(session.clone());
+        let meta = sim_meta();
+        let session = stage_hostlost_session(
+            &meta,
+            HostId::new(),
+            SandboxId::new(),
+            Some(fake_manifest(0x1, 1)),
+        )
+        .await;
 
         // Empty registry — no hosts to pick.
         let registry = Arc::new(HostRegistry::new(meta.clone()));
@@ -1312,9 +1255,76 @@ mod tests {
             None,
             None,
             SessionFence::unfenced(),
+            None, // #800: budget — tests keep the capacity-soft pick
+            chrono::Utc::now(),
         )
         .await;
         assert!(matches!(result, Err(EvacError::NoTargetAvailable(_))));
+    }
+
+    /// #800 (RESERVED evac placement): when the only survivor is
+    /// MEASURED-FULL for the session's budget, `evacuate_dead_source`
+    /// returns `NoCapacityQueue` (the resumer queues) instead of soft-binding
+    /// the full host and driving Σ reserved > allocatable. Non-vacuous: the
+    /// SAME host + a budget that FITS places normally, proving the gate fires
+    /// on real over-subscription, not always. Disk-only recovery keeps the
+    /// UFFD-capability gate out of the picture, isolating the capacity gate.
+    #[tokio::test]
+    async fn evac_reserved_queues_when_no_survivor_fits() {
+        let meta = sim_meta();
+        let session = stage_hostlost_session(
+            &meta,
+            HostId::new(),
+            SandboxId::new(),
+            Some(fake_manifest(0x5, 1)),
+        )
+        .await;
+
+        // One survivor, measured with 1024 MiB allocatable + a backend.
+        let registry = Arc::new(HostRegistry::new(meta.clone()));
+        let survivor = HostId::new();
+        let backend = Arc::new(FakeBackend::default());
+        registry.register(survivor, backend.clone());
+        add_measured_host(&meta, survivor, 1024).await;
+
+        // Budget larger than allocatable → fits NO survivor → NoCapacityQueue.
+        let result = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            None,
+            Some(test_cold_boot_spec()),
+            None,
+            None,
+            SessionFence::unfenced(),
+            Some((8192, 4)),
+            chrono::Utc::now(),
+        )
+        .await;
+        assert!(
+            matches!(result, Err(EvacError::NoCapacityQueue)),
+            "an over-budget evac must queue, not bind a measured-full host: {result:?}",
+        );
+
+        // Non-vacuity: a budget that FITS the SAME host places normally.
+        let new_sandbox = SandboxId::new();
+        backend.set_restore_id(new_sandbox);
+        let receipt = evacuate_dead_source(
+            &registry,
+            &(meta.clone() as Arc<dyn MetadataStore>),
+            session.clone(),
+            None,
+            Some(test_cold_boot_spec()),
+            None,
+            None,
+            SessionFence::unfenced(),
+            Some((512, 1)),
+            chrono::Utc::now(),
+        )
+        .await
+        .expect("a fitting budget must place");
+        assert_eq!(receipt.new_host_id, survivor);
+        assert_eq!(receipt.new_sandbox_id, new_sandbox);
     }
 
     /// pick_evac_disk_manifest semantics: same lineage → newer wins;

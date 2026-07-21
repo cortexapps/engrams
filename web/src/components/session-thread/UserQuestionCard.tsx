@@ -10,9 +10,9 @@ import { useQuestionActions } from "./question-actions";
 
 // ADR 0054: the interactive AskUserQuestion card. While unanswered it's a form
 // — one block per question, options as selectable rows (single-select behaves
-// like radios, multi-select toggles). On submit it POSTs via `answerQuestion`
-// (resuming the session) and locks into a read-only receipt; the authoritative
-// `question_answered` event arriving over SSE shows the same thing.
+// like radios, multi-select toggles). Generic cards submit through
+// CompleteToolCall and lock into a read-only receipt. Historical cards remain
+// renderable forever but unanswered ones are read-only after the wire break.
 
 type QuestionMarker = Extract<SystemMarker, { kind: "user_question" }>;
 
@@ -23,13 +23,14 @@ export function UserQuestionCard({ marker }: { marker: QuestionMarker }) {
   const { submitAnswer, answeredToolCallIds, sendBlocked } = useQuestionActions();
   const [selections, setSelections] = useState<Selections>({});
 
-  // `confirmed` = the authoritative `question_answered` event has landed.
+  // `confirmed` = the authoritative result/answered event has landed.
   // `pending` = we optimistically submitted but it hasn't round-tripped yet
   // (the VM may take seconds to resume and re-fire). Both show the receipt;
   // pending shows it greyed with a spinner, mirroring the optimistic
   // user-bubble pattern elsewhere.
   const confirmed = marker.answers != null;
-  const pending = !confirmed && answeredToolCallIds.has(marker.toolCallId);
+  const legacyReadOnly = marker.via === "legacy" && !confirmed;
+  const pending = !confirmed && !legacyReadOnly && answeredToolCallIds.has(marker.toolCallId);
   const answered = confirmed || pending;
   // The answers to render in the receipt: authoritative once confirmed, the
   // local picks while still pending, none while unanswered.
@@ -55,17 +56,23 @@ export function UserQuestionCard({ marker }: { marker: QuestionMarker }) {
   );
 
   const onSubmit = () => {
-    if (!complete || answered || sendBlocked) return;
+    if (!complete || answered || sendBlocked || legacyReadOnly) return;
     submitAnswer(marker.toolCallId, selections);
   };
 
   return (
-    <Card className={cn("py-0", !answered && "border-primary/40")}>
+    <Card className={cn("py-0", !answered && !legacyReadOnly && "border-primary/40")}>
       <CardContent className={cn("flex flex-col gap-4 p-4", pending && "opacity-60")}>
         <div className="flex items-center gap-2 text-xs text-muted-foreground">
           <MessageCircleQuestionIcon className="size-3.5 text-primary" />
           <Text as="span" variant="label" tone={answered ? "muted" : "primary"}>
-            {confirmed ? "answered" : pending ? "saving…" : "needs your input"}
+            {confirmed
+              ? "answered"
+              : pending
+                ? "saving…"
+                : legacyReadOnly
+                  ? "read-only question"
+                  : "needs your input"}
           </Text>
           {pending && <Loader2Icon className="size-3.5 animate-spin text-muted-foreground" />}
           <span className="ml-auto font-mono tabular-nums">{hms(marker.at)}</span>
@@ -116,6 +123,7 @@ export function UserQuestionCard({ marker }: { marker: QuestionMarker }) {
                         type="button"
                         role={q.multiSelect ? "checkbox" : "radio"}
                         aria-checked={selected}
+                        disabled={legacyReadOnly}
                         onClick={() => toggle(q.question, opt.label, q.multiSelect)}
                         className={cn(
                           "flex items-start gap-2.5 rounded-md border p-2.5 text-left transition-colors",
@@ -151,14 +159,22 @@ export function UserQuestionCard({ marker }: { marker: QuestionMarker }) {
 
         {!answered && (
           <div className="flex items-center gap-3">
-            <Button size="sm" disabled={!complete || sendBlocked} onClick={onSubmit}>
+            <Button
+              size="sm"
+              disabled={!complete || sendBlocked || legacyReadOnly}
+              onClick={onSubmit}
+            >
               Submit answer
             </Button>
-            {sendBlocked && (
+            {legacyReadOnly ? (
+              <span className="text-xs text-muted-foreground italic">
+                This question predates an upgrade and is read-only.
+              </span>
+            ) : sendBlocked ? (
               <span className="text-xs text-muted-foreground italic">
                 Session is no longer live — can't answer.
               </span>
-            )}
+            ) : null}
           </div>
         )}
       </CardContent>

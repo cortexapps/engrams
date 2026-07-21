@@ -15,6 +15,7 @@ use crate::types::ids::SandboxId;
 use crate::types::image::WarmConfig;
 use crate::types::sandbox::{
     AgentSpec, ExecEvent, ExecHandle, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    WriteFileResult, WriteFileSpec,
 };
 use crate::types::snapshot::SnapshotMetadata;
 
@@ -279,6 +280,18 @@ pub trait SandboxBackend: Send + Sync {
             stderr,
             exit_status,
         })
+    }
+
+    /// Write a batch of files into a running sandbox. Every file is attempted;
+    /// file-level failures are returned in place rather than aborting the batch.
+    async fn write_files(
+        &self,
+        _id: SandboxId,
+        _files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        Err(SandboxError::Unsupported(
+            "this backend doesn't support `write_files` yet".into(),
+        ))
     }
 
     /// ADR 0066: open a raw duplex byte stream to the in-guest `engram-agentd`
@@ -582,15 +595,15 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// The on-disk extension of this backend's staged bundle files
-    /// (`<bundle_dir>/<sha256>.<ext>`). FC packs squashfs; VZ packs erofs (its
-    /// Kata guest kernel has `CONFIG_EROFS_FS` but no `CONFIG_SQUASHFS`). The
+    /// (`<bundle_dir>/<sha256>.<ext>`). Both backends pack squashfs since
+    /// ADR 0096 (the owned VZ kernel has `CONFIG_SQUASHFS=y`, retiring the
+    /// ADR 0061 erofs fork that existed for the Kata kernel). The
     /// host-agent's `BundleStore` materializes/sweeps generations by this name,
     /// so it MUST match what the backend actually attaches (`bundle_dir` + this)
-    /// — otherwise a restore looks for `<sha>.squashfs`, misses the staged
-    /// `<sha>.erofs`, and faults to BlobStorage ("blob not found"). The blob
+    /// — a mismatch faults restores to BlobStorage ("blob not found"). The blob
     /// KEY (`AuxRoDrive::blob_key`) stays extension-free — BlobStorage is keyed
     /// by content sha, so only the local staged filename carries the extension.
-    /// Defaults to squashfs; VZ overrides to erofs.
+    /// The seam stays for a future backend with a different format.
     fn bundle_file_ext(&self) -> &'static str {
         "squashfs"
     }
@@ -707,6 +720,7 @@ pub trait SandboxBackend: Send + Sync {
         _platform_os: &str,
         _platform_arch: &str,
         _registry_auth: Option<crate::types::registry::ResolvedRegistryAuth>,
+        _min_disk_gib: u32,
         _progress: tokio::sync::mpsc::Sender<crate::types::MaterializeProgress>,
     ) -> Result<crate::types::MaterializedImage, SandboxError> {
         Err(SandboxError::InvalidSpec(

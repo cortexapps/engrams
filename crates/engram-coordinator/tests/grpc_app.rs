@@ -16,589 +16,60 @@
 //!   - FleetService list_hosts + get_storage_summary;
 //!   - ImageService list_enabled_images.
 //!
-//! The `MockMetadataStore` below is a self-contained copy of the fixture
-//! in `tests/api.rs` (the two test binaries can't import each other's
-//! mocks). It implements OUR base's full `MetadataStore` trait against
-//! in-memory `HashMap`s, so create/get/list/delete actually persist and
-//! the round-trip assertions are real.
+//! The metadata store is `engram_sim::SimMetadataStore` (ADR 0098 D4) —
+//! the conformance-tested in-memory `MetadataStore` — so create / get /
+//! list / delete round-trips (and the op-log-driven DeleteSession) are
+//! exercised against the same observable semantics PostgresStore has.
+
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use async_trait::async_trait;
 use chrono::Utc;
 use engram_cloud_mock::MockCloud;
 use engram_coordinator::{grpc_app, AppState, CoordinatorConfig, Services};
 use engram_core::traits::MetadataStore;
-use engram_core::types::{
-    HostRecord, HostStatus, PersistedEvent, Session, SessionSpec, SessionState, SnapshotRecord,
-};
-use engram_core::{HostId, MetaError, SessionId};
+use engram_core::types::outbox::OutboxRow;
+use engram_core::types::{SessionSpec, SessionState};
+use engram_core::SessionId;
 use engram_protocol::app;
+use engram_protocol::app::session_service_server::SessionService as _;
 use engram_sandbox_process::ProcessBackend;
 use engram_secrets_dev::InMemorySecretStore;
-use parking_lot::Mutex;
+use engram_sim::{SimEntropy, SimMetadataStore};
 
-// ---------------------------------------------------------------------
-// MockMetadataStore — in-memory MetadataStore for end-to-end gRPC tests.
-// A self-contained copy of tests/api.rs::MockMetadataStore (minus the
-// retired user_id field), tracking rows so create→get→list→delete
-// round-trips are exercised for real.
-// ---------------------------------------------------------------------
+// ADR 0098 D4: the hand-rolled `MockMetadataStore` (a self-contained copy
+// of tests/api.rs's) is retired onto the conformance-tested
+// `SimMetadataStore`. Sessions are staged through REAL store calls; the
+// event log and outbox are read back through the store's own state
+// (helpers below) rather than a mock's raw HashMaps.
 
-#[derive(Default)]
-struct MockMetadataStore {
-    sessions: Mutex<HashMap<SessionId, Session>>,
-    snapshots: Mutex<HashMap<SessionId, Vec<SnapshotRecord>>>,
-    snapshots_by_id: Mutex<HashMap<engram_core::types::SnapshotId, SnapshotRecord>>,
-    enabled: Mutex<HashMap<String, engram_core::types::EnabledImage>>,
-    events: Mutex<HashMap<SessionId, Vec<PersistedEvent>>>,
-    next_event_idx: Mutex<HashMap<SessionId, i64>>,
-    live_disk_manifests: Mutex<HashMap<SessionId, engram_core::types::manifest::ManifestRef>>,
-    chunk_generation: std::sync::atomic::AtomicU64,
-    hosts: Mutex<HashMap<HostId, HostRecord>>,
-    /// ADR 0079: DeleteSession (and any verb-riding RPC) drives the real
-    /// op executor — the reference in-memory op log makes that honest.
-    ops: engram_core::types::session_op::InMemoryOpLog,
+fn sim_meta() -> Arc<SimMetadataStore> {
+    SimMetadataStore::new(
+        Arc::new(engram_core::traits::SystemClock::new()),
+        Arc::new(SimEntropy::seeded(0x6A9C)),
+    )
 }
 
-impl MockMetadataStore {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn arc() -> Arc<Self> {
-        Arc::new(Self::new())
-    }
-}
-
-#[async_trait]
-impl MetadataStore for MockMetadataStore {
-    // ---- ADR 0079: delegate the op log to the reference mock ----
-    async fn op_enqueue_and_claim(
-        &self,
-        session_id: SessionId,
-        kind: engram_core::types::session_op::OpKind,
-        payload: serde_json::Value,
-        idempotency_key: Option<&str>,
-        claimed_by: &str,
-    ) -> Result<engram_core::types::session_op::EnqueueOutcome, MetaError> {
-        Ok(self
-            .ops
-            .enqueue_and_claim(session_id, kind, payload, idempotency_key, claimed_by))
-    }
-    async fn op_claim_head(
-        &self,
-        session_id: SessionId,
-        claimed_by: &str,
-    ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
-        Ok(self.ops.claim_head(session_id, claimed_by))
-    }
-    async fn op_record_step(&self, op_id: i64, epoch: i64, step: &str) -> Result<bool, MetaError> {
-        Ok(self.ops.record_step(op_id, epoch, step))
-    }
-    async fn op_finish(
-        &self,
-        op_id: i64,
-        epoch: i64,
-        state: engram_core::types::session_op::OpState,
-        error: Option<&str>,
-    ) -> Result<bool, MetaError> {
-        Ok(self.ops.finish(op_id, epoch, state, error))
-    }
-    async fn op_requeue_with_backoff(
-        &self,
-        op_id: i64,
-        epoch: i64,
-        backoff: std::time::Duration,
-        error: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(self.ops.requeue_with_backoff(op_id, epoch, backoff, error))
-    }
-    async fn op_cancel_queued(
-        &self,
-        session_id: SessionId,
-        kind: engram_core::types::session_op::OpKind,
-    ) -> Result<bool, MetaError> {
-        Ok(self.ops.cancel_queued(session_id, kind))
-    }
-    async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
-        Ok(self.ops.cancel_by_id(op_id))
-    }
-    async fn op_request_cancel_running(
-        &self,
-        session_id: SessionId,
-        kind: engram_core::types::session_op::OpKind,
-    ) -> Result<bool, MetaError> {
-        Ok(self.ops.request_cancel_running(session_id, kind))
-    }
-    async fn op_cancel_requested(&self, op_id: i64) -> Result<bool, MetaError> {
-        Ok(self.ops.cancel_requested(op_id))
-    }
-    async fn op_running_for(
-        &self,
-        session_id: SessionId,
-    ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
-        Ok(self.ops.running_for(session_id))
-    }
-    async fn op_get(
-        &self,
-        op_id: i64,
-    ) -> Result<Option<engram_core::types::session_op::SessionOp>, MetaError> {
-        Ok(self.ops.get(op_id))
-    }
-    async fn op_pending_exists(
-        &self,
-        session_id: SessionId,
-        kind: engram_core::types::session_op::OpKind,
-    ) -> Result<bool, MetaError> {
-        Ok(self.ops.pending_exists(session_id, kind))
-    }
-    async fn fenced_transition_session(
-        &self,
-        session_id: SessionId,
-        epoch: i64,
-        to: SessionState,
-    ) -> Result<Option<SessionState>, MetaError> {
-        if self.ops.current_epoch(session_id) != epoch {
-            return Ok(None);
-        }
-        self.transition_session(session_id, to).await.map(Some)
-    }
-    async fn fenced_assign_sandbox(
-        &self,
-        session_id: SessionId,
-        epoch: i64,
-        sandbox_id: Option<engram_core::SandboxId>,
-        host_id: Option<HostId>,
-    ) -> Result<bool, MetaError> {
-        if self.ops.current_epoch(session_id) != epoch {
-            return Ok(false);
-        }
-        self.assign_session_sandbox(session_id, sandbox_id).await?;
-        self.assign_session_host(session_id, host_id).await?;
-        Ok(true)
-    }
-
-    async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
-        let id = SessionId::new();
-        let session = Session {
-            id,
-            status: SessionState::Pending,
-            host_id: None,
-            sandbox_id: None,
-            created_at: Utc::now(),
-            image: spec.image,
-            mode: spec.mode,
-            last_active_at: Utc::now(),
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-            suggested_title: None,
-        };
-        self.sessions.lock().insert(id, session);
-        Ok(id)
-    }
-
-    async fn transition_session_created(
-        &self,
-        session_id: SessionId,
-        sandbox_id: engram_core::SandboxId,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&session_id).ok_or(MetaError::NotFound)?;
-        s.status = SessionState::Created;
-        s.sandbox_id = Some(sandbox_id);
-        s.last_active_at = Utc::now();
-        Ok(())
-    }
-
-    async fn reserve_and_persist_create(
-        &self,
-        ws: engram_core::traits::SessionCreateWriteSet,
-        candidates: &[HostId],
-        _affinity_len: usize,
-    ) -> Result<engram_core::traits::CreateDisposition, MetaError> {
-        // Mirrors the pre-refactor `reserve_placement` default (mocks don't
-        // model real 2D-fit capacity): place on the first candidate, or
-        // queue if there are none. Real atomicity is the Postgres impl's
-        // contract (covered by its own live-PG test), not this mock's.
-        let now = Utc::now();
-        let (status, host_id) = match candidates.first().copied() {
-            Some(host_id) => (SessionState::Pending, Some(host_id)),
-            None => (SessionState::Queued, None),
-        };
-        let session = Session {
-            id: ws.session_id,
-            status,
-            host_id,
-            sandbox_id: None,
-            created_at: now,
-            image: ws.spec.image,
-            mode: ws.spec.mode,
-            last_active_at: now,
-            live_disk_manifest: None,
-            park_rung: 0,
-            parked_at: None,
-            suggested_title: None,
-        };
-        self.sessions.lock().insert(ws.session_id, session);
-        Ok(match host_id {
-            Some(h) => engram_core::traits::CreateDisposition::Placed(h),
-            None => engram_core::traits::CreateDisposition::Queued,
-        })
-    }
-
-    async fn get_session(&self, id: SessionId) -> Result<Session, MetaError> {
-        self.sessions
-            .lock()
-            .get(&id)
-            .cloned()
-            .ok_or(MetaError::NotFound)
-    }
-
-    async fn list_active_sessions(&self) -> Result<Vec<Session>, MetaError> {
-        Ok(self
-            .sessions
-            .lock()
-            .values()
-            .filter(|s| s.status.is_live())
-            .cloned()
-            .collect())
-    }
-
-    async fn transition_session(
-        &self,
-        id: SessionId,
-        target: SessionState,
-    ) -> Result<SessionState, MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        let prev = s.status;
-        prev.try_transition_to(target)
-            .map_err(|e| MetaError::Conflict(e.to_string()))?;
-        s.status = target;
-        s.last_active_at = Utc::now();
-        Ok(prev)
-    }
-
-    async fn assign_session_host(
-        &self,
-        id: SessionId,
-        host_id: Option<HostId>,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.host_id = host_id;
-        Ok(())
-    }
-
-    async fn assign_session_sandbox(
-        &self,
-        id: SessionId,
-        sandbox_id: Option<engram_core::SandboxId>,
-    ) -> Result<(), MetaError> {
-        let mut g = self.sessions.lock();
-        let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
-        s.sandbox_id = sandbox_id;
-        if sandbox_id.is_none() && self.live_disk_manifests.lock().remove(&id).is_some() {
-            self.chunk_generation
-                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        }
-        Ok(())
-    }
-
-    async fn update_live_disk_manifest(
-        &self,
-        session_id: SessionId,
-        sandbox_id: engram_core::SandboxId,
-        manifest_ref: engram_core::types::manifest::ManifestRef,
-    ) -> Result<engram_core::traits::UpdateOutcome, MetaError> {
-        let bound = self
-            .sessions
-            .lock()
-            .get(&session_id)
-            .and_then(|s| s.sandbox_id);
-        if bound != Some(sandbox_id) {
-            return Ok(engram_core::traits::UpdateOutcome::DroppedStale);
-        }
-        self.live_disk_manifests
-            .lock()
-            .insert(session_id, manifest_ref);
-        self.chunk_generation
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Ok(engram_core::traits::UpdateOutcome::Applied)
-    }
-
-    async fn chunk_generation(&self) -> Result<u64, MetaError> {
-        Ok(self
-            .chunk_generation
-            .load(std::sync::atomic::Ordering::SeqCst))
-    }
-
-    async fn upsert_host(&self, host: HostRecord) -> Result<(), MetaError> {
-        self.hosts.lock().insert(host.id, host);
-        Ok(())
-    }
-
-    async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
-        let mut rows: Vec<HostRecord> = self.hosts.lock().values().cloned().collect();
-        rows.sort_by_key(|h| h.id);
-        Ok(rows)
-    }
-
-    async fn set_host_status(&self, _id: HostId, _status: HostStatus) -> Result<(), MetaError> {
-        Ok(())
-    }
-
-    async fn touch_host_heartbeat(
-        &self,
-        _: HostId,
-        _: engram_core::types::host::HostHeartbeat,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-
-    async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
-        match self.hosts.lock().get_mut(&id) {
-            Some(h) => {
-                h.cordoned = cordoned;
-                Ok(())
-            }
-            None => Err(MetaError::NotFound),
-        }
-    }
-
-    async fn list_stale_hosts(&self, _threshold_secs: u64) -> Result<Vec<HostRecord>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    async fn mark_host_dead_and_orphan_sessions(
-        &self,
-        host_id: HostId,
-    ) -> Result<Vec<(SessionId, SessionState)>, MetaError> {
-        let mut g = self.sessions.lock();
-        let mut affected = Vec::new();
-        for s in g.values_mut() {
-            if s.host_id == Some(host_id) && !s.status.is_terminal() {
-                let prev = s.status;
-                s.host_id = None;
-                s.sandbox_id = None;
-                s.status = SessionState::HostLost;
-                s.last_active_at = Utc::now();
-                affected.push((s.id, prev));
-            }
-        }
-        Ok(affected)
-    }
-
-    async fn record_snapshot(&self, snap: SnapshotRecord) -> Result<bool, MetaError> {
-        let inserted = self
-            .snapshots_by_id
-            .lock()
-            .insert(snap.id, snap.clone())
-            .is_none();
-        if let Some(sid) = snap.session_id {
-            let mut by_session = self.snapshots.lock();
-            let rows = by_session.entry(sid).or_default();
-            if let Some(existing) = rows.iter_mut().find(|r| r.id == snap.id) {
-                *existing = snap;
-            } else {
-                rows.push(snap);
-            }
-        }
-        Ok(inserted)
-    }
-
-    async fn get_snapshot(
-        &self,
-        id: engram_core::types::SnapshotId,
-    ) -> Result<Option<SnapshotRecord>, MetaError> {
-        Ok(self.snapshots_by_id.lock().get(&id).cloned())
-    }
-
-    async fn list_snapshots_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Vec<SnapshotRecord>, MetaError> {
-        Ok(self.snapshots.lock().get(&sid).cloned().unwrap_or_default())
-    }
-
-    async fn latest_snapshot_for_session(
-        &self,
-        sid: SessionId,
-    ) -> Result<Option<SnapshotRecord>, MetaError> {
-        Ok(self
-            .snapshots
-            .lock()
+/// Every persisted event for `sid` as `(kind, payload)` — the faithful
+/// store keeps them in its event log like PG does (the retired mock
+/// exposed a raw HashMap).
+fn session_events(meta: &SimMetadataStore, sid: SessionId) -> Vec<(String, serde_json::Value)> {
+    meta.with_db(|db| {
+        db.session_events
             .get(&sid)
-            .and_then(|v| v.last().cloned()))
-    }
-
-    async fn append_session_event(
-        &self,
-        session_id: SessionId,
-        kind: &str,
-        payload: serde_json::Value,
-    ) -> Result<i64, MetaError> {
-        if !self.sessions.lock().contains_key(&session_id) {
-            return Err(MetaError::NotFound);
-        }
-        let mut counters = self.next_event_idx.lock();
-        let counter = counters.entry(session_id).or_insert(0);
-        let idx = *counter;
-        *counter += 1;
-        drop(counters);
-        let event = PersistedEvent {
-            idx,
-            kind: kind.to_string(),
-            payload,
-            created_at: Utc::now(),
-            recovery_epoch: 0,
-            rewound_at: None,
-        };
-        self.events
-            .lock()
-            .entry(session_id)
-            .or_default()
-            .push(event);
-        Ok(idx)
-    }
-
-    async fn list_session_events_since(
-        &self,
-        session_id: SessionId,
-        since: i64,
-        limit: i64,
-    ) -> Result<Vec<PersistedEvent>, MetaError> {
-        Ok(self
-            .events
-            .lock()
-            .get(&session_id)
             .into_iter()
-            .flat_map(|v| v.iter().filter(|e| e.idx > since).cloned())
-            .take(limit.max(0) as usize)
-            .collect())
-    }
+            .flatten()
+            .map(|e| (e.kind.clone(), e.payload.clone()))
+            .collect()
+    })
+}
 
-    async fn insert_artifact(
-        &self,
-        _: uuid::Uuid,
-        _: SessionId,
-        _: &str,
-        _: &str,
-        _: i64,
-        _: Option<&str>,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-
-    async fn get_artifact(
-        &self,
-        _: SessionId,
-        _: uuid::Uuid,
-    ) -> Result<Option<engram_core::types::ArtifactRow>, MetaError> {
-        Ok(None)
-    }
-
-    async fn artifact_usage(&self, _: SessionId) -> Result<(i64, i64), MetaError> {
-        Ok((0, 0))
-    }
-
-    async fn upsert_registry_credential(
-        &self,
-        _: engram_core::types::RegistryCredential,
-    ) -> Result<(), MetaError> {
-        Ok(())
-    }
-
-    async fn list_registry_credentials(
-        &self,
-    ) -> Result<Vec<engram_core::types::RegistryCredential>, MetaError> {
-        Ok(Vec::new())
-    }
-
-    async fn registry_credential_for_host(
-        &self,
-        _: &str,
-    ) -> Result<Option<engram_core::types::RegistryCredential>, MetaError> {
-        Ok(None)
-    }
-
-    async fn delete_registry_credential(&self, _: &str) -> Result<(), MetaError> {
-        Ok(())
-    }
-
-    async fn upsert_enabled_image(
-        &self,
-        ei: engram_core::types::EnabledImage,
-    ) -> Result<(), MetaError> {
-        self.enabled.lock().insert(ei.image_uri.clone(), ei);
-        Ok(())
-    }
-
-    async fn list_enabled_images(
-        &self,
-    ) -> Result<Vec<engram_core::types::EnabledImage>, MetaError> {
-        Ok(self.enabled.lock().values().cloned().collect())
-    }
-
-    async fn get_enabled_image(
-        &self,
-        uri: &str,
-    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
-        Ok(self.enabled.lock().get(uri).cloned())
-    }
-
-    async fn get_enabled_image_any(
-        &self,
-        uri: &str,
-    ) -> Result<Option<engram_core::types::EnabledImage>, MetaError> {
-        Ok(self.enabled.lock().get(uri).cloned())
-    }
-
-    async fn soft_delete_enabled_image(
-        &self,
-        uri: &str,
-    ) -> Result<engram_core::traits::DisableEnabledImageOutcome, MetaError> {
-        match self.enabled.lock().remove(uri) {
-            Some(_) => Ok(engram_core::traits::DisableEnabledImageOutcome::Disabled),
-            None => Err(MetaError::NotFound),
-        }
-    }
-
-    async fn delete_enabled_image(&self, uri: &str) -> Result<(), MetaError> {
-        self.enabled.lock().remove(uri);
-        Ok(())
-    }
-
-    /// ADR 0080 cheap-edit path: replace `image_config` in place (the
-    /// mock analog of the PG `UPDATE … WHERE soft_deleted_at IS NULL`;
-    /// this map only holds live rows, so no extra filter is needed).
-    async fn update_enabled_image_config(
-        &self,
-        image_uri: &str,
-        config: &engram_core::types::image::ImageConfig,
-    ) -> Result<(), MetaError> {
-        match self.enabled.lock().get_mut(image_uri) {
-            Some(row) => {
-                row.image_config = config.clone();
-                Ok(())
-            }
-            None => Err(MetaError::NotFound),
-        }
-    }
-
-    async fn get_session_secrets(
-        &self,
-        _: SessionId,
-    ) -> Result<Option<engram_core::types::SessionSecrets>, MetaError> {
-        Ok(None)
-    }
-
-    async fn delete_session_secrets(&self, _: SessionId) -> Result<(), MetaError> {
-        Ok(())
-    }
+/// The outbox keyed by prompt_id (the store's own table).
+fn outbox_rows(meta: &SimMetadataStore) -> std::collections::BTreeMap<String, OutboxRow> {
+    meta.with_db(|db| db.outbox.clone())
 }
 
 // ---------------------------------------------------------------------
@@ -611,8 +82,8 @@ impl MetadataStore for MockMetadataStore {
 /// Token the test server is configured with — the happy-path credential.
 const TEST_TOKEN: &str = "test-app-grpc-token";
 
-fn test_state(app_grpc_tokens: Vec<String>) -> (Arc<AppState>, Arc<MockMetadataStore>) {
-    let meta = MockMetadataStore::arc();
+fn test_state(app_grpc_tokens: Vec<String>) -> (Arc<AppState>, Arc<SimMetadataStore>) {
+    let meta = sim_meta();
     let sandbox_dir = tempfile::tempdir().expect("sandbox tempdir").keep();
     let blob = || {
         Arc::new(engram_storage_local::LocalBlobStorage::new(
@@ -637,6 +108,8 @@ fn test_state(app_grpc_tokens: Vec<String>) -> (Arc<AppState>, Arc<MockMetadataS
         chunk_store: engram_chunk_store::ChunkStore::new(blob()),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     let cfg = CoordinatorConfig {
         default_image_version: "warm-bootstrap".into(),
@@ -690,6 +163,40 @@ fn bearer(
 /// `suggested_vcpus` is set because `ImageConfig::validate` requires it
 /// (ADR 0048), so an UpdateImage that round-trips this config validates
 /// AND diffs clean against the row (no phantom `resources` change).
+/// Stage `enabled_image(uri)` faithfully: `enabled_images.base_snapshot_id`
+/// is NOT NULL + FK to `snapshots` in PG (migration 0038) and SimMeta
+/// asserts it — record the session-less template base snapshot first
+/// (migration 0028), exactly as the enable pipeline does.
+async fn stage_enabled_image(meta: &dyn MetadataStore, uri: &str) {
+    let now = Utc::now();
+    let base_id = engram_core::SnapshotId::new();
+    meta.record_snapshot(engram_core::types::snapshot::SnapshotRecord {
+        id: base_id,
+        session_id: None,
+        host_id: None,
+        image_version: format!("{uri}#base"),
+        size_bytes: 0,
+        created_at: now,
+        last_accessed_at: now,
+        disk_manifest: None,
+        memory_manifest: None,
+        recoverable: true,
+        aux_bundles: Vec::new(),
+        events_cursor: None,
+        fc_snapshot_version: None,
+    })
+    .await
+    .expect("stage template base snapshot");
+    let mut img = enabled_image(uri);
+    img.base_snapshot_id = Some(base_id);
+    // Denormalized manifest pair: NOT NULL since migration 0043.
+    img.base_snapshot_disk_manifest = Some(engram_core::types::manifest::ManifestRef::new());
+    img.base_snapshot_memory_manifest = Some(engram_core::types::manifest::ManifestRef::new());
+    meta.upsert_enabled_image(img)
+        .await
+        .expect("seed enabled image");
+}
+
 fn enabled_image(uri: &str) -> engram_core::types::EnabledImage {
     let now = Utc::now();
     engram_core::types::EnabledImage {
@@ -945,6 +452,203 @@ async fn session_get_list_delete_round_trip() {
     server.abort();
 }
 
+fn complete_tool_call_service(state: Arc<AppState>) -> grpc_app::AppSessionService {
+    grpc_app::AppSessionService {
+        state,
+        auth: Arc::new(grpc_app::auth::BearerAuth::new(vec![TEST_TOKEN.into()])),
+    }
+}
+
+fn complete_tool_call_request(
+    message: app::CompleteToolCallRequest,
+) -> tonic::Request<app::CompleteToolCallRequest> {
+    let mut req = tonic::Request::new(message);
+    req.metadata_mut().insert(
+        "authorization",
+        format!("Bearer {TEST_TOKEN}")
+            .parse()
+            .expect("ascii header"),
+    );
+    req
+}
+
+#[tokio::test]
+async fn complete_tool_call_appends_submitted_event_and_enqueues_outbox() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    let service = complete_tool_call_service(state);
+
+    service
+        .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            session_id: session_id.to_string(),
+            tool_call_id: "call_1".into(),
+            result_json: r#" { "saved": true } "#.into(),
+        }))
+        .await
+        .expect("CompleteToolCall must succeed");
+
+    let events = session_events(&meta, session_id);
+    let submitted = events
+        .iter()
+        .find(|(kind, _)| kind == "tool_result_submitted")
+        .expect("tool_result_submitted event");
+    assert_eq!(submitted.1["tool_call_id"], "call_1");
+    assert_eq!(submitted.1["result_json"], r#" { "saved": true } "#);
+
+    let outbox = outbox_rows(&meta);
+    let outbox_id = engram_core::types::outbox::tool_result_outbox_id(session_id, "call_1");
+    let row = outbox.get(&outbox_id).expect("tool result outbox row");
+    assert_eq!(row.kind, engram_core::types::outbox::OutboxKind::ToolResult);
+    assert_eq!(row.payload["tool_call_id"], "call_1");
+    assert_eq!(row.payload["result_json"], r#" { "saved": true } "#);
+}
+
+#[tokio::test]
+async fn complete_tool_call_rejects_empty_tool_call_id() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    let service = complete_tool_call_service(state);
+
+    let err = service
+        .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            session_id: session_id.to_string(),
+            tool_call_id: String::new(),
+            result_json: "{}".into(),
+        }))
+        .await
+        .expect_err("empty tool_call_id must be rejected");
+    assert_eq!(err.code(), tonic::Code::InvalidArgument, "{err:?}");
+    assert!(outbox_rows(&meta).is_empty());
+}
+
+#[tokio::test]
+async fn complete_tool_call_rejects_terminal_session() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    for target in [
+        SessionState::Created,
+        SessionState::Active,
+        SessionState::Completed,
+    ] {
+        meta.transition_session(session_id, target)
+            .await
+            .expect("transition session");
+    }
+    let service = complete_tool_call_service(state);
+
+    let err = service
+        .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+            session_id: session_id.to_string(),
+            tool_call_id: "call_1".into(),
+            result_json: "{}".into(),
+        }))
+        .await
+        .expect_err("terminal session must be rejected");
+    assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{err:?}");
+    assert!(outbox_rows(&meta).is_empty());
+}
+
+#[tokio::test]
+async fn complete_tool_call_is_idempotent_on_tool_call_id() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+    let service = complete_tool_call_service(state);
+
+    // A genuine retry resends IDENTICAL bytes; the tool_call_id-derived
+    // prompt_id dedupes it to one outbox row. (The retired mock accepted a
+    // same-id retry carrying a DIFFERENT payload and let the first win; the
+    // faithful store — matching PostgresStore's ON CONFLICT + payload
+    // compare — rejects that as a Conflict, so this scenario resends the
+    // same payload, which is what a real retry does.)
+    for _ in 0..2 {
+        service
+            .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+                session_id: session_id.to_string(),
+                tool_call_id: "call_1".into(),
+                result_json: r#"{"saved":true}"#.into(),
+            }))
+            .await
+            .expect("identical CompleteToolCall retry must succeed");
+    }
+
+    let outbox = outbox_rows(&meta);
+    assert_eq!(outbox.len(), 1, "prompt_id uniqueness must dedupe retries");
+    let outbox_id = engram_core::types::outbox::tool_result_outbox_id(session_id, "call_1");
+    assert_eq!(
+        outbox[&outbox_id].payload["result_json"], r#"{"saved":true}"#,
+        "the deduped row carries the submitted result"
+    );
+}
+
+#[tokio::test]
+async fn complete_tool_call_namespaces_outbox_identity_by_session() {
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+    let first = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed first session");
+    let second = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".into(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed second session");
+    let service = complete_tool_call_service(state);
+
+    for session_id in [first, second] {
+        service
+            .complete_tool_call(complete_tool_call_request(app::CompleteToolCallRequest {
+                session_id: session_id.to_string(),
+                tool_call_id: "shared-call".into(),
+                result_json: r#"{"saved":true}"#.into(),
+            }))
+            .await
+            .expect("same call id in another session must succeed");
+    }
+
+    let outbox = outbox_rows(&meta);
+    assert!(
+        outbox.contains_key(&engram_core::types::outbox::tool_result_outbox_id(
+            first,
+            "shared-call"
+        ))
+    );
+    assert!(
+        outbox.contains_key(&engram_core::types::outbox::tool_result_outbox_id(
+            second,
+            "shared-call"
+        ))
+    );
+}
+
 /// GetSession with a malformed (non-UUID) session id maps to
 /// InvalidArgument; an unknown-but-valid UUID maps to NotFound. Replaces
 /// REST `get_session_returns_400_for_malformed_id` /
@@ -1089,9 +793,7 @@ async fn image_list_enabled_images_reflects_store() {
     }
 
     // Seed an enabled image and assert it surfaces over gRPC.
-    meta.upsert_enabled_image(enabled_image("localhost:5001/demo:warm"))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), "localhost:5001/demo:warm").await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;
@@ -1154,9 +856,7 @@ fn update_request(config: app::ImageConfig, allow_recapture: bool) -> app::Updat
 #[tokio::test]
 async fn image_update_cheap_edit_applies_in_place_without_job() {
     let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
-    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), UPDATE_URI).await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;
@@ -1207,9 +907,7 @@ async fn image_update_cheap_edit_applies_in_place_without_job() {
 #[tokio::test]
 async fn image_update_capture_affecting_diff_requires_allow_recapture() {
     let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
-    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), UPDATE_URI).await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;
@@ -1301,9 +999,7 @@ async fn image_update_unknown_uri_is_not_found() {
 #[tokio::test]
 async fn image_update_invalid_config_is_invalid_argument() {
     let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
-    meta.upsert_enabled_image(enabled_image(UPDATE_URI))
-        .await
-        .expect("seed enabled image");
+    stage_enabled_image(meta.as_ref(), UPDATE_URI).await;
 
     let (addr, server) = serve(state).await;
     let channel = dial(addr).await;

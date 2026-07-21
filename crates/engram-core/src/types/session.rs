@@ -52,9 +52,22 @@ pub enum SessionState {
     /// needed), and a healed probe flips back to `Active`. Pre-ADR, a
     /// dead guest read `active` indefinitely with every exec bouncing.
     Unreachable,
+    /// ADR 0101 C: the VM is PAUSED IN PLACE on its host — sandbox and
+    /// host stay bound, guest RAM stays resident (rung-2 park, ADR
+    /// 0074). Un-park is ~1s (resume the paused VM, no restore). This
+    /// used to be spelled `Evicting && park_rung == 2`, which conflated
+    /// "intentionally retained, cheap to wake" with "a descent is
+    /// underway" — sessions read `evicting` for up to the 8h hard TTL.
+    /// Descent (pressure / hard TTL / operator) is an explicit
+    /// `Parked → Evicting` nomination keyed by `parked_at`.
+    Parked,
     /// Sandbox has been evicted to a snapshot in BlobStorage. Resumes
     /// via `Idle → Created → Active` (the resume path re-runs the
-    /// create-shape transitions on the new sandbox).
+    /// create-shape transitions on the new sandbox). ADR 0101 C: `Idle`
+    /// is granted only once the snapshot's closure is verified durable
+    /// (the recoverable PG snapshot row, written by the heartbeat
+    /// reconcile after HEAD-checking the manifests) — never on the
+    /// host-local capture alone.
     Idle,
     /// Heartbeat-loss against the bound host. Non-terminal: the
     /// dead-host detector's second stage moves it onward —
@@ -127,6 +140,7 @@ impl SessionState {
                 | Self::Created
                 | Self::Active
                 | Self::Unreachable
+                | Self::Parked
                 | Self::Evacuating
                 | Self::Evicting
         )
@@ -141,6 +155,7 @@ impl SessionState {
             "created",
             "active",
             "unreachable",
+            "parked",
             "evacuating",
             "evicting",
         ]
@@ -153,6 +168,7 @@ impl SessionState {
             Self::Created => "created",
             Self::Active => "active",
             Self::Unreachable => "unreachable",
+            Self::Parked => "parked",
             Self::Idle => "idle",
             Self::HostLost => "host_lost",
             Self::Evacuating => "evacuating",
@@ -200,12 +216,27 @@ impl SessionState {
     ///                hit no capacity, ADR 0048)
     /// HostLost    -> Created | Idle | Dead | Completed
     /// Evacuating  -> Created (scanner resumes on peer)
+    ///              | Queued (RESERVED evac placement found no host that
+    ///                fits the session's budget; queue rather than bind a
+    ///                measured-full survivor — #800, resume-origin so the
+    ///                queue scanner re-homes it once capacity returns)
     ///              | Idle (scanner exhausted retries; user /resume)
     ///              | Dead (terminal; chunks gone)
     ///              | Completed (user delete mid-evac)
+    /// Parked      -> Active (un-park: user returned; resume the paused
+    ///                 VM in place, ~1s — ADR 0101 C)
+    ///              | Evicting (descent nomination: pressure / hard TTL
+    ///                / operator, keyed by parked_at)
+    ///              | HostLost (host died while parked — RAM-resident
+    ///                state is gone; never Idle)
+    ///              | Dead | Completed
     /// Evicting    -> Active (ADR 0074 rung-1 cancel: the user came back
     ///                 before capture began; lease-guarded)
-    /// Evicting    -> Idle (eviction pipeline success)
+    /// Evicting    -> Parked (rung-2 park: VM paused in place instead of
+    ///                 captured — ADR 0101 C makes this a real state
+    ///                 instead of a park_rung stamp)
+    ///              | Idle (eviction pipeline success — ADR 0101 C: only
+    ///                once the recoverable PG snapshot row exists)
     ///              | HostLost (scanner exhausted retries; host died
     ///                mid-eviction via the dead-host sweep)
     ///              | Dead (chunks unreferenceable)
@@ -252,13 +283,23 @@ impl SessionState {
             // create path and for the harness-failed resume arm.
             Idle => matches!(target, Active | Created | Dead | Completed | Queued),
             HostLost => matches!(target, Created | Idle | Dead | Completed),
-            Evacuating => matches!(target, Created | Idle | Dead | Completed),
+            // #800: `Queued` is the RESERVED evac placement's honest-overflow
+            // edge — when no survivor fits the session's budget, the evac
+            // resumer queues (resume-origin) instead of binding a
+            // measured-full host, and the queue scanner re-homes it once
+            // capacity returns (the #795 resume precedent, on the evac leg).
+            Evacuating => matches!(target, Created | Queued | Idle | Dead | Completed),
             // ADR 0074 rung 1: `Active` is the cancel edge — a returning
             // user's prompt un-nominates an eviction whose capture has
             // not begun (lease-guarded CAS; see
             // api::snapshot::try_cancel_nominated_eviction). The ONLY
             // new FSM edge in the 2026-07 overhaul.
-            Evicting => matches!(target, Active | Idle | HostLost | Dead | Completed),
+            Evicting => matches!(target, Active | Parked | Idle | HostLost | Dead | Completed),
+            // ADR 0101 C: a parked VM either wakes in place (Active),
+            // descends (Evicting), or is lost with its host (HostLost —
+            // its RAM-resident state died with the host, so Idle would
+            // lie about recoverability of the un-captured tail).
+            Parked => matches!(target, Active | Evicting | HostLost | Dead | Completed),
             Failed | Completed | Dead => false,
         }
     }
@@ -273,13 +314,18 @@ impl SessionState {
     pub fn terminal_target(&self) -> Option<Self> {
         use SessionState::*;
         let target = match self {
-            Active | Unreachable | Idle | HostLost | Evacuating | Evicting => Completed,
+            Active | Unreachable | Parked | Idle | HostLost | Evacuating | Evicting => Completed,
             // Queued never ran → Failed, alongside the other never-usable
             // early states.
             Pending | Queued | Created => Failed,
             Failed | Completed | Dead => return None,
         };
-        debug_assert!(
+        // ADR 0099 H6: cold path (forced-termination routing), so pay for
+        // the always-on `invariant!` — it upgrades the prior debug-assert
+        // to `#[track_caller]` provenance and fires in prod too, where a
+        // `terminal_target` that names an illegal edge would silently
+        // drive a session off the FSM.
+        crate::invariant!(
             self.can_transition_to(target),
             "terminal_target({self:?}) = {target:?} must be a legal transition",
         );
@@ -546,6 +592,113 @@ pub struct Session {
 mod tests {
     use super::*;
 
+    /// Every variant, exhaustiveness-guarded: a new variant makes this
+    /// `match` non-exhaustive — a compile error here, not a silent
+    /// coverage gap in the walk properties below (the wire-proto
+    /// strategy convention, ADR 0099 H4).
+    const fn all_states() -> [SessionState; 13] {
+        use SessionState::*;
+        // The match exists only for the exhaustiveness guarantee.
+        match Pending {
+            Pending | Queued | Created | Active | Unreachable | Parked | Idle | HostLost
+            | Evacuating | Evicting | Failed | Completed | Dead => {}
+        }
+        [
+            Pending,
+            Queued,
+            Created,
+            Active,
+            Unreachable,
+            Parked,
+            Idle,
+            HostLost,
+            Evacuating,
+            Evicting,
+            Failed,
+            Completed,
+            Dead,
+        ]
+    }
+
+    mod walk_props {
+        //! ADR 0099 H3 (folded from H6): SEQUENCE properties over the
+        //! legality table — the pairwise table is exhaustively tested
+        //! below; these check what random walks along legal edges can
+        //! and cannot reach.
+        use super::*;
+        use proptest::prelude::*;
+
+        fn arb_state() -> impl Strategy<Value = SessionState> {
+            proptest::sample::select(all_states().to_vec())
+        }
+
+        proptest! {
+            #![proptest_config(ProptestConfig {
+                cases: 96,
+                // In-crate unit test: source-relative persistence works;
+                // pin anyway so counterexamples land deterministically.
+                failure_persistence: Some(Box::new(
+                    proptest::test_runner::FileFailurePersistence::Direct(
+                        "proptest-regressions/session_walk.txt",
+                    ),
+                )),
+                ..ProptestConfig::default()
+            })]
+
+            /// A random walk along LEGAL edges never escapes a terminal
+            /// state: once Failed/Completed/Dead is reached, every
+            /// further candidate edge is rejected.
+            #[test]
+            fn walks_never_escape_terminal_states(
+                start in arb_state(),
+                steps in proptest::collection::vec(arb_state(), 1..32),
+            ) {
+                let mut cur = start;
+                for next in steps {
+                    let terminal = matches!(
+                        cur,
+                        SessionState::Failed | SessionState::Completed | SessionState::Dead
+                    );
+                    match cur.try_transition_to(next) {
+                        Ok(new) => {
+                            prop_assert!(!terminal, "escaped terminal {cur:?} -> {new:?}");
+                            prop_assert_eq!(new, next);
+                            cur = new;
+                        }
+                        Err(e) => {
+                            prop_assert_eq!(e.from, cur);
+                            prop_assert_eq!(e.to, next);
+                        }
+                    }
+                }
+            }
+
+            /// `terminal_target` always names a LEGAL edge from every
+            /// non-terminal state, and the walk it implies is one step
+            /// into a terminal state (no multi-hop teardown).
+            #[test]
+            fn terminal_target_is_a_legal_single_step(start in arb_state()) {
+                match start.terminal_target() {
+                    None => prop_assert!(matches!(
+                        start,
+                        SessionState::Failed | SessionState::Completed | SessionState::Dead
+                    )),
+                    Some(t) => {
+                        prop_assert!(start.can_transition_to(t));
+                        prop_assert!(t.terminal_target().is_none(), "target must be terminal");
+                    }
+                }
+            }
+
+            /// try/can agreement on arbitrary pairs (the dynamic twin of
+            /// the exhaustive table test).
+            #[test]
+            fn try_agrees_with_can(from in arb_state(), to in arb_state()) {
+                prop_assert_eq!(from.try_transition_to(to).is_ok(), from.can_transition_to(to));
+            }
+        }
+    }
+
     #[test]
     fn session_state_serializes_lowercase() {
         let payload = serde_json::to_value(SessionState::Active).unwrap();
@@ -586,6 +739,7 @@ mod tests {
             SessionState::Queued,
             SessionState::Created,
             SessionState::Active,
+            SessionState::Parked,
             SessionState::Idle,
             SessionState::HostLost,
             SessionState::Evacuating,
@@ -634,6 +788,8 @@ mod tests {
             (HostLost, Dead),
             (HostLost, Completed),
             (Evacuating, Created),
+            // #800: RESERVED evac placement queues instead of overcommitting.
+            (Evacuating, Queued),
             (Evacuating, Idle),
             (Evacuating, Dead),
             (Evacuating, Completed),
@@ -648,9 +804,17 @@ mod tests {
             (Evicting, HostLost),
             (Evicting, Dead),
             (Evicting, Completed),
+            // ADR 0101 C: the parked lifecycle — rung-2 park is a real
+            // state, not a park_rung stamp over Evicting.
+            (Evicting, Parked),
+            (Parked, Active),
+            (Parked, Evicting),
+            (Parked, HostLost),
+            (Parked, Dead),
+            (Parked, Completed),
         ];
         let all_states = [
-            Pending, Queued, Created, Active, Idle, HostLost, Evacuating, Evicting, Failed,
+            Pending, Queued, Created, Active, Parked, Idle, HostLost, Evacuating, Evicting, Failed,
             Completed, Dead,
         ];
         for &from in &all_states {

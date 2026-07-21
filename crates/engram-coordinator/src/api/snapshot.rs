@@ -17,7 +17,6 @@
 
 use std::time::Duration;
 
-use chrono::Utc;
 use engram_core::traits::storage::BlobStorage;
 use engram_core::traits::SessionFence;
 use engram_core::types::manifest::ManifestRef;
@@ -112,7 +111,10 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         .await
         .ok()
         .flatten();
-    let (mut agent, _harness_mount) = crate::api::sessions::resolve_harness(
+    // The harness egress is dropped alongside the mount: the resume path
+    // re-reads the session policy persisted at create, which already carries
+    // the merged harness egress (ADR 0063 addendum).
+    let (mut agent, _harness_mount, _harness_egress) = crate::api::sessions::resolve_harness(
         state,
         selected_harness.as_deref(),
         session.mode,
@@ -280,7 +282,7 @@ pub(crate) async fn snapshot_core(
                 let _ = st.services.host.stop_ide(sandbox_id).await;
                 let metadata = st.services.host.snapshot(sandbox_id, fence).await?;
 
-                let now = Utc::now();
+                let now = st.services.clock.now_utc();
                 // Record the host that wrote this snapshot to its local disk so
                 // the resume path's snapshot-affinity scheduler can route back to
                 // it (zero-cost hot-tier hit). ADR 0007: durability lives in the
@@ -543,7 +545,7 @@ async fn observe_resume_op(
     timeout: Duration,
 ) -> Result<ObservedResume, ApiError> {
     use engram_core::types::session_op::OpState;
-    let deadline = std::time::Instant::now() + timeout;
+    let deadline = state.services.clock.now_mono() + timeout;
     loop {
         if let Some(op_id) = op_id {
             if let Ok(Some(op)) = state.services.meta.op_get(op_id).await {
@@ -582,7 +584,7 @@ async fn observe_resume_op(
                 return Ok(ObservedResume::Active);
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if state.services.clock.now_mono() >= deadline {
             return Err(ApiError::Conflict(
                 "resume in flight (op enqueued); retry shortly".into(),
             ));
@@ -668,6 +670,17 @@ pub async fn ensure_active(state: &SharedState, id: SessionId) -> Result<(), Api
             // A running evict op owns the session: enqueue the resume —
             // it queues BEHIND the evict op (ordering by log, replacing
             // the retired ADR 0039 hold-then-poll) — and observe.
+            enqueue_and_observe_resume(state, id).await?;
+            Ok(())
+        }
+        // ADR 0101 C: parked-paused is a real state — the VM is alive
+        // and paused in place. Same shape as Evicting's rung ascent: the
+        // one-write cancel un-pauses in ms; a raced descent falls back
+        // to the queued resume.
+        SessionState::Parked => {
+            if try_cancel_nominated_eviction(state, id).await? {
+                return Ok(());
+            }
             enqueue_and_observe_resume(state, id).await?;
             Ok(())
         }
@@ -849,7 +862,7 @@ pub(crate) async fn ascend_evicting_to_active(
                         crate::state::SessionEvent::StatusChanged {
                             from: prev,
                             to: SessionState::Active,
-                            at: chrono::Utc::now(),
+                            at: state.services.clock.now_utc(),
                         },
                     )
                     .await;
@@ -935,6 +948,35 @@ pub(crate) async fn resume_from_idle(
 ) -> Result<SnapshotResponse, ApiError> {
     let state = ctx.state;
     let id = session.id;
+
+    // Tell surfaces we've started waking the session up, BEFORE the
+    // multi-second restore + harness (re)attach below — so a user who
+    // prompts an evicted session sees a "waking up…" marker immediately
+    // instead of dead air until the session flips Active (the 2026-07-17
+    // stall UX). Best-effort + fenced: a failed progress emit must never
+    // fail the resume, and it rides the op fence like every other
+    // resume-path event. Excluded from the ADR-0028 rewind tombstone (see
+    // `rewind_session_to_cursor`) so a resume-with-rollback doesn't grey
+    // it or inflate `rolled_back`.
+    //
+    // Emit only on the op's FIRST attempt (adversarial-review finding):
+    // this function re-enters on every retry of the same Resume op, and
+    // since the event is rewind-excluded, re-emitting would append a fresh
+    // permanent "waking up" marker per retry. One per op is enough for the
+    // signal; the web additionally collapses repeats across ops into a
+    // single transient indicator. `claim_head` bumps `attempts` to 1 on the
+    // first claim, so `attempts <= 1` is the first dispatch.
+    if ctx.op.attempts <= 1 {
+        let _ = state
+            .emit_fenced(
+                id,
+                ctx.fence(),
+                SessionEvent::ResumeStarted {
+                    at: state.services.clock.now_utc(),
+                },
+            )
+            .await;
+    }
 
     // ADR 0079 note: the issue-#210 residual-sandbox destroy that lived
     // here is DELETED. A crash between the restore and the bind now
@@ -1046,6 +1088,15 @@ async fn resume_disk_only_cold_boot(
         // never strands the resume.
         origin,
         ctx.fence(),
+        // #800: `None` keeps this user-initiated single /resume path on its
+        // pre-#800 capacity-soft placement. The reserved (queue-on-no-fit)
+        // bound is wired on the drain-driven EVAC-SCANNER leg (`evac_resumer`
+        // — the #800 over-reservation wave); the resume verb's own
+        // MEMORY-snapshot path already queues via `placement_preview`
+        // (#795). Widening the reserved bound to this disk-only resume arm
+        // is a separate follow-up, out of #800's scope.
+        None,
+        state.services.clock.now_utc(),
     )
     .await
     .map_err(|e| match &e {
@@ -1069,7 +1120,7 @@ async fn resume_disk_only_cold_boot(
             SessionEvent::StatusChanged {
                 from: SessionState::Idle,
                 to: SessionState::Created,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await;
@@ -1136,7 +1187,7 @@ async fn transition_to_dead_if_no_snapshot(
                     SessionEvent::StatusChanged {
                         from: prev,
                         to: SessionState::Dead,
-                        at: Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await;
@@ -1304,7 +1355,7 @@ pub async fn apply_rung1_rewind(
                 rolled_back: summary.rolled_back,
                 surviving_side_effects: summary.surviving_side_effects,
                 cause,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await;
@@ -1415,7 +1466,7 @@ pub async fn finish_resume_to_active(
                     SessionEvent::StatusChanged {
                         from: SessionState::Idle,
                         to: SessionState::Created,
-                        at: Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await;
@@ -1425,7 +1476,7 @@ pub async fn finish_resume_to_active(
     let prev_for_active =
         crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active).await?;
     if emit_status {
-        let now = Utc::now();
+        let now = state.services.clock.now_utc();
         // Review finding #6: fenced. Ok(None) (a successor re-claimed) is
         // not an error — the transition above committed under our epoch.
         state
@@ -1561,56 +1612,105 @@ async fn resume_from_fc_snapshot(
         prefer_bundles: record.aux_bundles.as_slice(),
     };
 
-    // ADR 0048 C7: if NO host can take this resume (the fleet is fully
-    // cordoned for a scale-down wave, or scaled to zero), QUEUE it
-    // (Idle → queued) instead of erroring. The queue scanner resumes it
-    // once capacity returns / the fleet scales up. Only triggers on an
-    // empty candidate set — a present-but-full fleet still soft-picks
-    // (the pre-existing ADR 0046 resume-isn't-reserved posture).
+    // ADR 0048 C7 → R3 (#722): if NO schedulable host FITS this resume's
+    // budget, QUEUE it (Idle → queued, resume origin) instead of placing.
+    // The queue scanner resumes it via the RESERVED `place_queued_session`
+    // once capacity returns / the fleet scales up.
+    //
+    // This closes the faithful-host #722 over-reservation. The pre-existing
+    // "resume-isn't-reserved posture" queued ONLY on an EMPTY candidate set
+    // (fully cordoned / scaled-to-zero) and let a present-but-FULL fleet
+    // soft-pick — `pick_from`'s capacity-soft fallback binds
+    // `ranked.hosts[0]` even when it is measured-full, over-committing that
+    // host. Under crash/partition churn a wave of forced resumes onto full
+    // survivors drove Σ reserved > allocatable (12/200 faithful chaos
+    // seeds, all `pick_from` SOFT-FALLBACK onto a free=0 host). Resume now
+    // honors the SAME hard reserved-budget bound as create: one authority.
+    // `placement_preview` is the HARD 2D fit check (ADR 0048 C8) — an
+    // unmeasured host still counts as fitting (dev / brand-new-host soft
+    // posture, matching `reserve_placement`), and it already returns
+    // `false` for an empty fleet, subsuming the old is_empty() gate. A
+    // budget we couldn't resolve (`None`) keeps the old soft pick — never
+    // strand a resume on a spec-resolution blip.
     if matches!(session.status, SessionState::Idle) {
-        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
-            Ok(c) if c.hosts.is_empty() => {
-                // ADR 0079 (0078 re-review finding #4): fenced, like every
-                // sibling write in this pipeline — an unfenced Idle→Queued
-                // here let a reclaimed-away zombie executor fork the state
-                // machine. `false` = the epoch moved (successor re-claimed)
-                // or the row left Idle under us: stop silently, no event
-                // (the `fenced:` Conflict convention — the verb's Retry
-                // re-reads the session and dispatches on its real state).
-                let queued = state
-                    .services
-                    .meta
-                    .enqueue_session_resume(id, op_ctx.epoch)
-                    .await
-                    .map_err(|e| ApiError::Internal(format!("enqueue_session_resume: {e}")))?;
-                if !queued {
-                    return Err(fenced_error());
+        let now = state.services.clock.now_utc();
+        let no_fitting_host = match (ctx.memory_mib, ctx.cpu_budget_vcpus) {
+            (Some(mib), Some(vcpus)) => {
+                // Budget resolved: HARD 2D fit. `placement_preview` also
+                // returns false for an empty/cordoned fleet (any() over no
+                // ranked hosts), so it subsumes the old is_empty() gate.
+                match crate::placement::placement_preview(
+                    state.services.meta.as_ref(),
+                    &ctx,
+                    i64::from(mib),
+                    i64::from(vcpus),
+                    now,
+                )
+                .await
+                {
+                    // Some host fits → proceed with the placement pick.
+                    Ok(true) => false,
+                    // No host fits (present-but-full, or empty/cordoned) → queue.
+                    Ok(false) => true,
+                    // Read error: don't queue blindly — fall through to the
+                    // restore attempt (which surfaces the real error).
+                    Err(e) => {
+                        tracing::warn!(%id, error = ?e,
+                            "resume: placement_preview failed; attempting restore");
+                        false
+                    }
                 }
-                let _ = state
-                    .emit_fenced(
-                        id,
-                        op_ctx.fence(),
-                        SessionEvent::StatusChanged {
-                            from: SessionState::Idle,
-                            to: SessionState::Queued,
-                            at: Utc::now(),
-                        },
-                    )
-                    .await;
-                tracing::info!(%id, "resume found no host capacity — queued (ADR 0048)");
-                return Ok(SnapshotResponse {
-                    session_id: id,
-                    snapshot_id: Some(record.id.to_string()),
-                    size_bytes: Some(record.size_bytes),
-                    note: "queued",
-                });
             }
-            Ok(_) => {} // a candidate exists — proceed with the soft pick
-            Err(e) => {
-                // Read error: don't queue blindly, fall through to the
-                // restore attempt (which surfaces the real error).
-                tracing::warn!(%id, error = ?e, "resume: candidates_for failed; attempting restore");
+            // Budget unresolved (image un-enabled, etc.): can't do a fit
+            // check, but the ORIGINAL ADR 0048 C7 gate still applies — queue
+            // when there is NO schedulable host at all rather than error out
+            // of `restore_for_session`.
+            _ => match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx, now)
+                .await
+            {
+                Ok(c) => c.hosts.is_empty(),
+                Err(e) => {
+                    tracing::warn!(%id, error = ?e,
+                        "resume: candidates_for failed; attempting restore");
+                    false
+                }
+            },
+        };
+        if no_fitting_host {
+            // ADR 0079 (0078 re-review finding #4): fenced, like every
+            // sibling write in this pipeline — an unfenced Idle→Queued
+            // here let a reclaimed-away zombie executor fork the state
+            // machine. `false` = the epoch moved (successor re-claimed)
+            // or the row left Idle under us: stop silently, no event
+            // (the `fenced:` Conflict convention — the verb's Retry
+            // re-reads the session and dispatches on its real state).
+            let queued = state
+                .services
+                .meta
+                .enqueue_session_resume(id, op_ctx.epoch)
+                .await
+                .map_err(|e| ApiError::Internal(format!("enqueue_session_resume: {e}")))?;
+            if !queued {
+                return Err(fenced_error());
             }
+            let _ = state
+                .emit_fenced(
+                    id,
+                    op_ctx.fence(),
+                    SessionEvent::StatusChanged {
+                        from: SessionState::Idle,
+                        to: SessionState::Queued,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+            tracing::info!(%id, "resume found no fitting host capacity — queued (ADR 0048/R3)");
+            return Ok(SnapshotResponse {
+                session_id: id,
+                snapshot_id: Some(record.id.to_string()),
+                size_bytes: Some(record.size_bytes),
+                note: "queued",
+            });
         }
     }
     // ADR 0016 Phase B commit 6: pick the newer of
@@ -1672,6 +1772,33 @@ async fn resume_from_fc_snapshot(
     // ADR 0045 D4: hand the host the image's base manifest so resumed
     // sessions share the per-image base shm with fresh creates.
     let base_memory_manifest = base_memory_manifest_for_image(state, &session.image).await;
+    // ADR 0095: peer-fill hint — if the snapshot host is alive and
+    // wire-compatible, tell the destination where the chunks are
+    // resident. Stamped unconditionally BEFORE placement (the pick
+    // happens inside restore_for_session): an affinity-host landing
+    // makes the destination's pre-pass a no-op stat walk, a cross-host
+    // landing pulls the divergent set over the LAN, and a dead/absent
+    // source leaves the hint empty ⇒ the pure-GCS path, unchanged.
+    // Best-effort by contract: any lookup failure degrades to no hint.
+    let peer_hints = match record.host_id {
+        Some(source) => match state.services.meta.list_active_hosts().await {
+            Ok(hosts) => {
+                let now = state.services.clock.now_utc();
+                let ttl = crate::placement::placement_ttl();
+                hosts
+                    .iter()
+                    .find(|h| h.id == source)
+                    .and_then(|h| crate::placement::host_can_serve_chunks(h, now, ttl))
+                    .map(|addr| vec![addr.to_string()])
+                    .unwrap_or_default()
+            }
+            Err(e) => {
+                tracing::debug!(%id, error = %e, "resume: host lookup for peer hint failed; no hint");
+                Vec::new()
+            }
+        },
+        None => Vec::new(),
+    };
     let restore_metadata = engram_core::types::snapshot::SnapshotMetadata {
         id: record.id,
         size_bytes: record.size_bytes,
@@ -1703,6 +1830,8 @@ async fn resume_from_fc_snapshot(
         aux_bundles: record.aux_bundles.clone(),
         // Issue #529: restore-side reconstruction, not a fresh capture.
         paused_at: None,
+        // ADR 0095: assembled above — the live snapshot host, or empty.
+        peer_hints,
     };
     // ADR 0079: the restore step boundary — a live VM exists from here.
     if !op_ctx.step("restore").await {
@@ -1714,6 +1843,7 @@ async fn resume_from_fc_snapshot(
         &ctx,
         restore_metadata,
         op_ctx.fence(),
+        state.services.clock.now_utc(),
     )
     .await
     {
@@ -1809,7 +1939,7 @@ async fn resume_from_fc_snapshot(
                     id,
                     SessionEvent::Resumed {
                         snapshot_id: record.id,
-                        at: Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await?;
@@ -1998,7 +2128,10 @@ pub(crate) async fn evict_local_core(state: &SharedState, id: SessionId) -> Resu
     }
 
     match enqueue_and_observe_evict(state, id, /* allow_park = */ false).await? {
-        ObservedEvict::Idle => Ok(()),
+        // EvictedSettling carries the same durability guarantee the
+        // pre-ADR-0101-C Idle flip did (crash-durable finalize inputs);
+        // the Idle settle follows via the reconcile within seconds.
+        ObservedEvict::Idle | ObservedEvict::EvictedSettling => Ok(()),
         // allow_park = false makes this unreachable; honest error if the
         // verb ever changes shape underneath.
         ObservedEvict::ParkedPaused => Err(ApiError::Internal(
@@ -2010,10 +2143,16 @@ pub(crate) async fn evict_local_core(state: &SharedState, id: SessionId) -> Resu
 /// What the bounded observe saw the evict op land at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ObservedEvict {
-    /// Full suspend: captured, destroyed, session at Idle.
+    /// Full suspend, fully settled: the recoverable row landed and the
+    /// reconcile flipped the session Idle.
     Idle,
-    /// ADR 0074 rung 2: the VM was paused in place (session Evicting,
-    /// `park_rung == 2`).
+    /// ADR 0101 C: the capture landed (the evict op is Done — the
+    /// host's finalize inputs are crash-durable, the same guarantee the
+    /// pre-C Idle flip gave) and the session is honestly `Evicting`
+    /// until the heartbeat reconcile records the recoverable row and
+    /// settles it Idle, typically within seconds.
+    EvictedSettling,
+    /// ADR 0074 rung 2: the VM was paused in place (session `Parked`).
     ParkedPaused,
 }
 
@@ -2041,16 +2180,16 @@ pub(crate) async fn enqueue_and_observe_evict(
         EnqueueOutcome::Claimed(op) | EnqueueOutcome::Queued(op) => Some(op.id),
         EnqueueOutcome::Duplicate => None,
     };
-    let deadline = std::time::Instant::now() + OP_OBSERVE_TIMEOUT;
+    let deadline = state.services.clock.now_mono() + OP_OBSERVE_TIMEOUT;
     loop {
         // Status settles first (mark_idle / the park bookkeeping land
         // before the op row finishes).
         let session = state.services.meta.get_session(id).await?;
         match session.status {
             SessionState::Idle => return Ok(ObservedEvict::Idle),
-            SessionState::Evicting if session.park_rung == 2 => {
-                return Ok(ObservedEvict::ParkedPaused)
-            }
+            // ADR 0101 C: park lands at the real `Parked` state (the old
+            // `Evicting && park_rung == 2` compound is retired).
+            SessionState::Parked => return Ok(ObservedEvict::ParkedPaused),
             _ => {}
         }
         if let Some(op_id) = op_id {
@@ -2066,10 +2205,18 @@ pub(crate) async fn enqueue_and_observe_evict(
                             "eviction was cancelled (the user returned); session stays live".into(),
                         ));
                     }
-                    // Done without an Idle/parked status = the verb's
-                    // re-entry guard skipped (a concurrent op moved the
-                    // session first).
+                    // ADR 0101 C (engrams review, #836): a full evict's
+                    // op finishes at capture time with the session
+                    // honestly still `Evicting` — that IS success (the
+                    // pre-C Idle flip promised exactly the same
+                    // durability: crash-durable finalize inputs). The
+                    // reconcile settles Idle when the row lands. Done in
+                    // any OTHER state = the verb's re-entry guard
+                    // skipped (a concurrent op moved the session first).
                     OpState::Done => {
+                        if session.status == SessionState::Evicting {
+                            return Ok(ObservedEvict::EvictedSettling);
+                        }
                         return Err(ApiError::Conflict(format!(
                             "evict op completed as a no-op; session is {} — retry if still \
                              intended",
@@ -2080,7 +2227,7 @@ pub(crate) async fn enqueue_and_observe_evict(
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if state.services.clock.now_mono() >= deadline {
             return Err(ApiError::Conflict(
                 "eviction in flight (op enqueued); retry shortly".into(),
             ));
@@ -2188,6 +2335,8 @@ async fn snapshot_artifacts_present(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod recoverable_tests {
     use super::*;
     use engram_storage_local::LocalBlobStorage;
@@ -2388,6 +2537,8 @@ mod recoverable_tests {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod effective_resume_disk_manifest_tests {
     use super::*;
     use engram_core::types::manifest::ManifestRef;
@@ -2529,8 +2680,11 @@ mod resume_placement_label_tests {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod evicting_gate_tests {
     use super::*;
+    use chrono::Utc;
     use engram_core::types::session::SessionMode;
     use tempfile::TempDir;
 
@@ -2988,8 +3142,11 @@ mod evicting_gate_tests {
 /// pipeline — a reclaimed-away zombie executor must not fork the state
 /// machine or land a stale StatusChanged event.
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod resume_queue_fence_tests {
     use super::*;
+    use chrono::Utc;
     use engram_core::types::session::SessionMode;
     use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState};
 

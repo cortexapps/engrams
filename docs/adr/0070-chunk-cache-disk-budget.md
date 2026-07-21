@@ -238,3 +238,27 @@ comment:
 - `engram-coordinator`'s `--mode=all` wiring comment (dev/e2e single-process path) still
   claimed the pre-this-ADR "defaults to 200 GiB" budget; updated to describe the
   disk-derived default and the `create_dir_all` side effect of `from_env_or_default`.
+
+## Addendum (2026-07-14): `dedicatedDevice` → `dedicatedDevices` (striped local NVMe)
+
+The engrams-internal nodepool follow-up (the part §4 declared out of scope) landed as
+2×375 GB GKE local-NVMe raw-block SSDs on the kvm pool, which need a RAID0 stripe before
+they can back `workDirHostPath`. The chart's single-device knob was subsumed by a list —
+`storage.dedicatedDevices` (clean break, no compat alias; nothing had set the scalar yet):
+
+- **one entry** — exactly the prior behavior (format-if-unformatted + mount);
+- **several entries** — node-prep first assembles them into `/dev/md/engram-work`
+  (`mdadm --assemble` for surviving superblocks, else `--create --level=0`), then
+  formats + mounts the array. `mdadm`, like `mkfs.ext4`/`blkid`/`mount` in this step,
+  resolves from the HOST's PATH via the nsenter — the same host-tool pattern GKE's own
+  documented raw-block RAID DaemonSet (`gke-daemonset-raid-disks.yaml`,
+  `registry.k8s.io/startup-script:v2`) relies on.
+- `mkfs.ext4` gained `-E nodiscard` (fresh local NVMe is already trimmed; the discard
+  pass only added node bring-up time).
+
+The mountpoint gate (`ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT` + `/mnt/host-root`) is
+unchanged and now keys off the list being non-empty. Local-SSD data does not survive
+node recreation; everything under the work dir is reconstructible (chunk cache refills
+from the blob store, bundles re-stage from node-assets on every pod start, HostId
+re-seeds from the node name), so an empty mount is a normal fresh-node state, not a
+migration concern.

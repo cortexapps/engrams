@@ -2,8 +2,9 @@
 //!
 //! Background task that polls for hosts whose `last_heartbeat_at` is
 //! older than the configured threshold and races other coordinator
-//! replicas (via Postgres advisory locks) for the right to evacuate
-//! each candidate. The winner:
+//! replicas — via a PG leasing row (`dead_host_inflight`,
+//! ADR 0098 D4; the repo convention: leasing row over advisory lock)
+//! — for the right to evacuate each candidate. The winner:
 //!
 //! 1. Atomically marks the host `Dead` in Postgres and transitions
 //!    every non-terminal session pointed at it to `HostLost` with
@@ -17,9 +18,9 @@
 //! 3. Emits per-session `StatusChanged` events for both transitions
 //!    using the honest `from` returned by the bulk + the
 //!    second-stage transition_session calls.
-//! 4. Fires `pg_notify('host_dead', host_id::text)` so other replicas
-//!    drop the host from their in-memory `HostRegistry` (handled in
-//!    `pg_listener`).
+//! 4. Broadcasts `host_dead` via `MetadataStore::notify_host_dead`
+//!    (Postgres: `pg_notify`) so other replicas drop the host from
+//!    their in-memory `HostRegistry` (handled in `pg_listener`).
 //! 5. Unregisters the host locally.
 //!
 //! Active execs running on the dead host don't need explicit
@@ -56,11 +57,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use chrono::Utc;
-use engram_core::traits::MetadataStore;
+use chrono::{DateTime, Utc};
+use engram_core::traits::{MetadataStore, SessionFence};
 use engram_core::types::SessionState;
-use engram_core::HostId;
-use sqlx::postgres::PgPool;
+use engram_core::{HostId, MetaError};
 
 use crate::state::{IndexedEvent, SessionEvent, SessionEventBus, SharedState};
 use engram_core::SessionId;
@@ -77,12 +77,9 @@ async fn emit_status_changed(
     session_id: SessionId,
     from: SessionState,
     to: SessionState,
+    now: DateTime<Utc>,
 ) {
-    let event = SessionEvent::StatusChanged {
-        from,
-        to,
-        at: Utc::now(),
-    };
+    let event = SessionEvent::StatusChanged { from, to, at: now };
     let kind = event.kind();
     let payload = match serde_json::to_value(&event) {
         Ok(p) => p,
@@ -138,6 +135,21 @@ pub struct DeadHostConfig {
     /// still gets evicted once it expires (with `min_probe_failures`
     /// long since accumulated).
     pub probe_rescue_grace: Duration,
+    /// An eviction lease older than this is presumed abandoned (the
+    /// claiming pod crashed mid-eviction) and may be taken over by any
+    /// replica. Comfortably larger than a full eviction pass; small
+    /// enough that a crashed pod delays a genuinely-dead host's
+    /// eviction by at most this long.
+    pub lease_stale_after: Duration,
+    /// Issue #777 "ask-the-host": how many consecutive sweep cycles the
+    /// straggler sweep will DEFER destroying a still-bound sandbox whose
+    /// host still reports it serving (a live VM under a HostLost row —
+    /// the >60s partition/desync window) before giving up and
+    /// destroying+settling anyway. The cap keeps the sweep convergent
+    /// (never parks forever, the #762/#769 wedge) while giving the
+    /// reattach machinery a bounded window to recover the live VM in
+    /// place. Default 3 (~3 sweep cycles).
+    pub straggler_serving_strike_cap: u32,
 }
 
 impl Default for DeadHostConfig {
@@ -147,22 +159,26 @@ impl Default for DeadHostConfig {
             stale_threshold: Duration::from_secs(30),
             min_probe_failures: 3,
             probe_rescue_grace: Duration::from_secs(120),
+            lease_stale_after: Duration::from_secs(180),
+            straggler_serving_strike_cap: 3,
         }
     }
 }
 
 /// Per-host probe history the detector keeps in memory. Per-replica
-/// (deliberately not persisted): with two replicas racing the advisory
-/// lock, each counts its own strikes, so eviction can take up to 2× the
+/// (deliberately not persisted): with two replicas racing the eviction
+/// lease, each counts its own strikes, so eviction can take up to 2× the
 /// strike window — a bounded, conservative error in the safe direction
 /// (never evicts EARLIER than a single replica would).
 #[derive(Clone, Copy, Debug, Default)]
-struct ProbeMemory {
+pub struct ProbeMemory {
     /// Consecutive failed probes, one per detector tick. Reset by any
     /// answered probe.
     consecutive_failures: u32,
-    /// When this host last answered a probe while its row was stale.
-    last_rescue: Option<std::time::Instant>,
+    /// When this host last answered a probe while its row was stale, as
+    /// a `Clock::now_mono()` mark (ADR 0098 D1: monotonic marks are
+    /// stored as `Duration`, not opaque `Instant`s).
+    last_rescue: Option<Duration>,
 }
 
 /// Pure verdict for the probe-failure path: is this failure enough
@@ -173,7 +189,7 @@ struct ProbeMemory {
 /// otherwise for the grace duration).
 fn probe_failure_permits_eviction(
     mem: &ProbeMemory,
-    now: std::time::Instant,
+    now: Duration,
     min_probe_failures: u32,
     probe_rescue_grace: Duration,
 ) -> bool {
@@ -181,7 +197,7 @@ fn probe_failure_permits_eviction(
         return false;
     }
     match mem.last_rescue {
-        Some(rescued_at) => now.duration_since(rescued_at) >= probe_rescue_grace,
+        Some(rescued_at) => now.saturating_sub(rescued_at) >= probe_rescue_grace,
         None => true,
     }
 }
@@ -189,8 +205,33 @@ fn probe_failure_permits_eviction(
 /// Spawn the detector as a background task. Returns a JoinHandle the
 /// caller can drop on shutdown. Runs forever; logs and continues on
 /// per-tick errors so a transient Postgres blip doesn't stop the loop.
-pub fn spawn(cfg: DeadHostConfig, pool: PgPool, state: SharedState) -> tokio::task::JoinHandle<()> {
+/// Per-host probe history, keyed by host id. Owned by the caller of
+/// [`run_once`] so strikes persist across sweeps.
+pub type ProbeMemoryMap = std::collections::HashMap<HostId, ProbeMemory>;
+
+/// Per-session serving-strike history for the straggler sweep (issue
+/// #777 "ask-the-host"), keyed by session id. Counts consecutive sweep
+/// cycles on which the host still reported a still-bound sandbox as
+/// serving, so the sweep can defer the destroy up to
+/// `straggler_serving_strike_cap` cycles before giving up. Owned by the
+/// caller of [`run_once`] so it persists across sweeps and pruned to the
+/// current HostLost set each cycle.
+///
+/// Per-replica and deliberately in-memory (the same choice as
+/// [`ProbeMemory`]): the running-sandbox SET is not persisted in PG, so
+/// there is no natural column to mirror; and this is a per-pod backstop,
+/// not cross-pod truth. With replicas racing, each counts its own strikes
+/// — a bounded, conservative error in the safe direction (it can only
+/// DELAY a destroy, never destroy a live VM earlier than a single replica
+/// would), and a settle by ANY replica ends the deferral for all via the
+/// #211 CAS + `Conflict`-idempotent transition.
+pub type StragglerStrikeMap = std::collections::BTreeMap<SessionId, u32>;
+
+pub fn spawn(cfg: DeadHostConfig, state: SharedState) -> tokio::task::JoinHandle<()> {
     tokio::spawn(async move {
+        // Same claimant identity convention as the enable scanner: the
+        // pod hostname, falling back for local/dev runs.
+        let claimant = std::env::var("HOSTNAME").unwrap_or_else(|_| "coord".into());
         let mut tick = tokio::time::interval(cfg.poll_interval);
         // Skip the immediate first tick — the coordinator just
         // started and no host has had time to be considered stale.
@@ -198,28 +239,43 @@ pub fn spawn(cfg: DeadHostConfig, pool: PgPool, state: SharedState) -> tokio::ta
         // Probe history across ticks (strikes + rescue grace); pruned
         // to the current candidate set each sweep, so a host whose
         // heartbeats recover starts its next staleness episode fresh.
-        let mut probe_memory: std::collections::HashMap<HostId, ProbeMemory> =
-            std::collections::HashMap::new();
+        let mut probe_memory = ProbeMemoryMap::new();
+        // Serving-strike history across ticks for the straggler sweep
+        // (issue #777 ask-the-host); pruned to the current HostLost set
+        // inside the sweep.
+        let mut straggler_strikes = StragglerStrikeMap::new();
         loop {
             tick.tick().await;
-            if let Err(e) = run_once(&cfg, &pool, &state, &mut probe_memory).await {
+            if let Err(e) = run_once(
+                &cfg,
+                &state,
+                &claimant,
+                &mut probe_memory,
+                &mut straggler_strikes,
+            )
+            .await
+            {
                 tracing::warn!(error = %e, "dead-host detector tick failed; will retry");
             }
         }
     })
 }
 
-async fn run_once(
+/// One detector sweep. `pub` so tests and the DST harness (engram-dst,
+/// ADR 0098 D5) drive it directly without the timer loop.
+pub async fn run_once(
     cfg: &DeadHostConfig,
-    pool: &PgPool,
     state: &SharedState,
-    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
+    claimant: &str,
+    probe_memory: &mut ProbeMemoryMap,
+    straggler_strikes: &mut StragglerStrikeMap,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let candidates = state
         .services
         .meta
         .list_stale_hosts(cfg.stale_threshold.as_secs())
         .await?;
+    host_lost_straggler_sweep(cfg, state, straggler_strikes).await?;
     // A host that stopped being a candidate recovered (its heartbeats
     // are landing again) — drop its strikes/rescue history.
     let ids: std::collections::HashSet<HostId> = candidates.iter().map(|h| h.id).collect();
@@ -233,10 +289,182 @@ async fn run_once(
     );
     for host in candidates {
         let host_addr = host.host_addr.clone();
-        if let Err(e) = evict_host(cfg, pool, state, host.id, host_addr, probe_memory).await {
+        if let Err(e) = evict_host(cfg, state, claimant, host.id, host_addr, probe_memory).await {
             tracing::warn!(host_id = %host.id, error = %e, "evict failed; another replica may have it");
         }
     }
+    Ok(())
+}
+
+/// Settle HostLost rows whose inline second-stage transition never ran
+/// or failed. This is deliberately a delayed backstop, not the normal
+/// HostLost path.
+///
+/// **Convergence (oracle #8's shape):** every arm terminates in a settle
+/// within bounded cycles. A row younger than the 60s min-age is skipped
+/// (a later cycle handles it); an unbound row settles immediately; a
+/// bound row whose host is gone/silent (probe fails / no backend) settles
+/// immediately; a bound row whose host still reports the sandbox SERVING
+/// is deferred at most `straggler_serving_strike_cap` cycles (the
+/// ask-the-host defer, #777) and then settles. No arm parks forever — the
+/// #762/#769 eternal-wedge is not reintroduced.
+pub async fn host_lost_straggler_sweep(
+    cfg: &DeadHostConfig,
+    state: &SharedState,
+    straggler_strikes: &mut StragglerStrikeMap,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let meta = &state.services.meta;
+    let sessions = meta.list_host_lost_sessions().await?;
+
+    // Prune serving-strike history to the rows still HostLost — a session
+    // that settled (or a competing replica settled) drops its strikes, so
+    // a fresh HostLost episode starts clean.
+    let host_lost_ids: std::collections::HashSet<SessionId> =
+        sessions.iter().map(|s| s.id).collect();
+    straggler_strikes.retain(|sid, _| host_lost_ids.contains(sid));
+
+    for session in sessions {
+        let now = state.services.clock.now_utc();
+        // Keep this sweep a backstop: flip_missing and evict_host normally
+        // settle HostLost inline. Only rows stranded for more than a tick's
+        // grace should be repaired here.
+        if now - session.last_active_at <= chrono::Duration::seconds(60) {
+            continue;
+        }
+
+        if let Some(sandbox_id) = session.sandbox_id {
+            // ADR 0098 Phase 3 / #777 "ask-the-host": before destroying a
+            // still-bound sandbox, consult HOST TRUTH. The running-sandbox
+            // SET is not persisted in PG (only a count + last_heartbeat_at),
+            // so we use the same direct probe reconcile's ADR 0068 belt uses
+            // — `probe_sandbox` → `process_alive`. A live-and-serving VM
+            // under a HostLost row is the >60s partition/desync window
+            // (#776 review): the reattach machinery may still recover it in
+            // place, so DEFER the destroy and bank a serving-strike rather
+            // than kill the live VM. Only a probe that FAILS (host gone /
+            // unreachable / `Unsupported` from an old host-agent), a
+            // process that is NOT alive, or the strike cap being reached
+            // proceeds to destroy — mirroring reconcile's "only an explicit
+            // process_alive == true rescues" asymmetry. No backend in the
+            // registry ⇒ the host is already gone ⇒ nothing to protect ⇒
+            // proceed.
+            let serving = match session
+                .host_id
+                .and_then(|host_id| state.host_registry.backend_of(host_id))
+            {
+                Some(backend) => {
+                    matches!(backend.probe_sandbox(sandbox_id).await, Ok(p) if p.process_alive)
+                }
+                None => false,
+            };
+            if serving {
+                let strikes = straggler_strikes.entry(session.id).or_default();
+                *strikes += 1;
+                if *strikes < cfg.straggler_serving_strike_cap {
+                    ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLER_DEFERRED_SERVING_TOTAL)
+                        .increment(1);
+                    tracing::warn!(
+                        session_id = %session.id,
+                        %sandbox_id,
+                        strikes = *strikes,
+                        cap = cfg.straggler_serving_strike_cap,
+                        "host-lost straggler: host still reports the sandbox SERVING — deferring \
+                         destroy+settle for the reattach machinery (ask-the-host, #777)",
+                    );
+                    continue;
+                }
+                tracing::warn!(
+                    session_id = %session.id,
+                    %sandbox_id,
+                    strikes = *strikes,
+                    "host-lost straggler: serving-strike cap reached — destroying and settling \
+                     (bounded convergence, #777)",
+                );
+            }
+            // Not serving, or the strike cap is reached: proceed to destroy
+            // + settle as before. Drop any strike history for this row.
+            straggler_strikes.remove(&session.id);
+
+            state.host_registry.invalidate_sandbox(sandbox_id);
+
+            if let Some(backend) = session
+                .host_id
+                .and_then(|host_id| state.host_registry.backend_of(host_id))
+            {
+                if let Err(e) = backend.destroy(sandbox_id, SessionFence::unfenced()).await {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session.id,
+                        %sandbox_id,
+                        "host-lost straggler destroy failed; continuing settlement",
+                    );
+                }
+            }
+
+            if let Err(e) = meta
+                .assign_session_sandbox_guarded(session.id, None, Some(Some(sandbox_id)), &[])
+                .await
+            {
+                if !matches!(e, MetaError::Conflict(_)) {
+                    tracing::warn!(
+                        error = %e,
+                        session_id = %session.id,
+                        "host-lost straggler sandbox clear failed",
+                    );
+                }
+                continue;
+            }
+        }
+
+        if session.host_id.is_some() {
+            if let Err(e) = meta.assign_session_host(session.id, None).await {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session.id,
+                    "host-lost straggler host clear failed",
+                );
+                continue;
+            }
+        }
+
+        let snapshot = match meta.latest_snapshot_for_session(session.id).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    session_id = %session.id,
+                    "host-lost straggler snapshot lookup failed",
+                );
+                continue;
+            }
+        };
+        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
+        let target = recovery_target(
+            has_recoverable_snapshot,
+            session.live_disk_manifest.is_some(),
+        );
+        note_unrecoverable_if_dead(target, snapshot.as_ref(), session.id);
+        match meta.transition_session(session.id, target).await {
+            Ok(prev) => {
+                emit_status_changed(meta, &state.events, session.id, prev, target, now).await;
+                ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLERS_SETTLED_TOTAL)
+                    .increment(1);
+                tracing::info!(
+                    session_id = %session.id,
+                    ?target,
+                    "host-lost straggler settled",
+                );
+            }
+            Err(MetaError::Conflict(_)) => {}
+            Err(e) => tracing::warn!(
+                error = %e,
+                session_id = %session.id,
+                ?target,
+                "host-lost straggler second-stage transition failed",
+            ),
+        }
+    }
+
     Ok(())
 }
 
@@ -258,24 +486,93 @@ async fn host_responds(client: &Arc<dyn engram_core::traits::HostClient>) -> boo
     client.ping().await.is_ok()
 }
 
-/// The dead-host detector's stage-2 routing decision (ADR 0045 Phase
-/// A). A session is recoverable — and routed to `Idle` for lazy
-/// `/resume` on next access — if it has a memory snapshot OR a live
-/// disk manifest (the latter still resumes via the cold-boot path).
-/// With nothing to recover from, it goes to `Dead`. The detector no
-/// longer routes into `Evacuating`; proactive relocation is operator
-/// drain only (ADR 0044 K3).
-fn recovery_target(has_snapshot: bool, has_live_manifest: bool) -> SessionState {
-    if has_snapshot || has_live_manifest {
+/// THE HostLost stage-2 routing predicate (ADR 0045 Phase A; unified in
+/// issue #777, ADR 0098 Phase 3 "honest-Dead"). A session is recoverable
+/// — routed to `Idle` for lazy `/resume` on next access — iff it has a
+/// **recoverable** memory snapshot OR a live disk manifest (the latter
+/// still resumes via the cold-boot path). With nothing recoverable it
+/// goes to `Dead` — never an `Idle` that lies about resumability.
+///
+/// `has_recoverable_snapshot` is the honest predicate: it is the latest
+/// snapshot's `recoverable` flag (the BlobStorage HEAD result at
+/// snapshot-take time), NOT the mere presence of a snapshot row. Before
+/// #777 the two dead-host sites keyed on `snapshot.is_some()`, disagreeing
+/// with `reconcile::flip_missing`, which already keyed on `recoverable`;
+/// the filtered predicate is now the one true stage-2 decision, shared by
+/// every site.
+///
+/// The detector no longer routes into `Evacuating`; proactive relocation
+/// is operator drain only (ADR 0044 K3).
+pub(crate) fn recovery_target(
+    has_recoverable_snapshot: bool,
+    has_live_manifest: bool,
+) -> SessionState {
+    if has_recoverable_snapshot || has_live_manifest {
         SessionState::Idle
     } else {
         SessionState::Dead
     }
 }
 
+/// The "snapshot rows exist but none is recoverable" signal (issue #777,
+/// ADR 0098 Phase 3 honest-Dead). When stage 2 routes a session to `Dead`
+/// while a snapshot row DID exist, the snapshot was un-recoverable (its
+/// BlobStorage HEAD failed at take-time) and there was no live disk
+/// manifest either. Emit a distinct warn + counter so a bad-capture
+/// pipeline stays visible instead of hiding behind a generic Dead — a
+/// no-op when the target is `Idle` (recoverable) or when there was no
+/// snapshot at all (a genuinely never-checkpointed session).
+pub(crate) fn note_unrecoverable_if_dead(
+    target: SessionState,
+    latest_snapshot: Option<&engram_core::types::snapshot::SnapshotRecord>,
+    session_id: SessionId,
+) {
+    if target == SessionState::Dead && latest_snapshot.is_some() {
+        ::metrics::counter!(crate::metrics::HOST_LOST_UNRECOVERABLE_SNAPSHOT_TOTAL).increment(1);
+        tracing::warn!(
+            session_id = %session_id,
+            "HostLost stage 2: snapshot row(s) exist but none is recoverable and no live disk \
+             manifest — routing to Dead (bad-capture signal, issue #777). Check snapshot \
+             durability (BlobStorage HEAD at capture time)",
+        );
+    }
+}
+
 async fn evict_host(
     cfg: &DeadHostConfig,
-    pool: &PgPool,
+    state: &SharedState,
+    claimant: &str,
+    host_id: HostId,
+    host_addr: Option<String>,
+    probe_memory: &mut std::collections::HashMap<HostId, ProbeMemory>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let meta = &state.services.meta;
+    if !meta
+        .try_acquire_dead_host_lease(host_id, claimant, cfg.lease_stale_after)
+        .await?
+    {
+        // Another coordinator replica holds a live lease on this host.
+        // It will do the eviction; we just skip.
+        tracing::debug!(host_id = %host_id, "eviction lease contested; skipping");
+        return Ok(());
+    }
+    // Run the eviction with the lease held, releasing on EVERY outcome
+    // (including errors — the lease is not a lock; a leaked row would
+    // only delay a retry by `lease_stale_after`, but there is no reason
+    // to pay that on a clean error path).
+    let result = evict_host_locked(cfg, state, host_id, host_addr, probe_memory).await;
+    if let Err(e) = meta.release_dead_host_lease(host_id, claimant).await {
+        tracing::warn!(
+            host_id = %host_id,
+            error = %e,
+            "dead-host lease release failed; stale takeover will reap it",
+        );
+    }
+    result
+}
+
+async fn evict_host_locked(
+    cfg: &DeadHostConfig,
     state: &SharedState,
     host_id: HostId,
     host_addr: Option<String>,
@@ -284,39 +581,16 @@ async fn evict_host(
     let meta = &state.services.meta;
     let host_registry = &state.host_registry;
     let events = &state.events;
-    // Pin a single connection so the advisory lock stays with us for
-    // the duration of the eviction. `pg_try_advisory_lock` is a
-    // session-scoped lock and auto-releases when the connection
-    // closes — so even if we panic mid-eviction, the lock doesn't
-    // strand the host.
-    let mut conn = pool.acquire().await?;
-    let lock_key: String = format!("dead-host:{host_id}");
 
-    let got: bool = sqlx::query_scalar("SELECT pg_try_advisory_lock(hashtext($1))")
-        .bind(&lock_key)
-        .fetch_one(&mut *conn)
-        .await?;
-    if !got {
-        // Another coordinator replica won the race for this host.
-        // It will do the eviction; we just skip.
-        tracing::debug!(host_id = %host_id, "advisory lock contested; skipping");
-        return Ok(());
-    }
-
-    // Re-check the host's status *after* taking the lock — another
+    // Re-check the host's status *after* taking the lease — another
     // replica that already won may have flipped it to Dead in the
     // window between our `list_stale_hosts` and now.
-    let status: Option<String> = sqlx::query_scalar("SELECT status FROM hosts WHERE id = $1")
-        .bind(host_id.as_uuid())
-        .fetch_optional(&mut *conn)
-        .await?
-        .flatten();
-    if matches!(status.as_deref(), Some("dead") | None) {
-        tracing::debug!(host_id = %host_id, "host already dead; releasing lock");
-        sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-            .bind(&lock_key)
-            .execute(&mut *conn)
-            .await?;
+    let status = meta.host_status(host_id).await?;
+    if matches!(
+        status,
+        Some(engram_core::types::host::HostStatus::Dead) | None
+    ) {
+        tracing::debug!(host_id = %host_id, "host already dead; skipping");
         return Ok(());
     }
 
@@ -330,34 +604,49 @@ async fn evict_host(
     // an operator catches the heartbeat-persistence fault instead of a
     // fleet section flapping mid-run.
     //
-    // We probe via the in-memory pool entry when present, otherwise we
-    // warm a fresh dial from the candidate's persisted `host_addr` (the
-    // cross-pod case: this pod never saw H register, so its registry is
-    // empty for H). No `host_addr` (pre-0013 row) ⇒ unprobeable ⇒ fall
-    // through to eviction, exactly as before this guard existed.
-    // `Some(answered)` = we had something to probe with (a dial that
-    // failed to warm counts as a FAILED probe — it's unreachability
-    // evidence, same as a failed Ping); `None` = unprobeable (pre-0013
-    // row with no `host_addr`) ⇒ fall through to eviction, exactly as
-    // before this guard existed.
-    let probe_outcome: Option<bool> = match state.services.host_pool.get(host_id) {
-        Ok(c) => {
-            let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
-            Some(host_responds(&client).await)
-        }
-        Err(_) => match host_addr {
-            Some(addr) => match state.services.host_pool.get_or_warm(host_id, addr).await {
-                Ok(c) => {
-                    let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
-                    Some(host_responds(&client).await)
-                }
-                Err(e) => {
-                    tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as a failed probe");
-                    Some(false)
-                }
+    // Probe via the client THIS pod already holds for the host — the same
+    // `host_registry` seam reconcile and the straggler sweep probe through
+    // (`backend_of`), not a second, lower-level channel cache. The primary
+    // #231 failure mode is exactly the one where THIS pod is healthy: a
+    // PEER pod's PG pool saturates and stops persisting H's
+    // `last_heartbeat_at`, staling the row, while this pod still receives
+    // H's heartbeats and so holds a live registry client — probing it is
+    // the most direct "is H actually gone?" test. (Before ADR 0098 Phase 3,
+    // this path went straight to `host_pool.get`, a seam the coordinator
+    // otherwise never uses for host RPCs and that the DST harness leaves
+    // unpopulated, so the probe silently never ran in-sim and a live-but-
+    // stale host was orphaned on mere heartbeat staleness — issue #787.)
+    //
+    // Only when the registry has nothing for H (the cross-pod case: this
+    // pod never saw H register) do we fall back to warming a fresh dial
+    // from the persisted `host_addr`. No client anywhere and no addr
+    // (pre-0013 row) ⇒ unprobeable ⇒ fall through to eviction, exactly as
+    // before this guard existed. `Some(answered)` = we had something to
+    // probe with (a dial that failed to warm counts as a FAILED probe —
+    // unreachability evidence, same as a failed Ping); `None` = unprobeable.
+    let probe_outcome: Option<bool> = if let Some(client) = state.host_registry.backend_of(host_id)
+    {
+        Some(host_responds(&client).await)
+    } else {
+        match state.services.host_pool.get(host_id) {
+            Ok(c) => {
+                let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
+                Some(host_responds(&client).await)
+            }
+            Err(_) => match host_addr {
+                Some(addr) => match state.services.host_pool.get_or_warm(host_id, addr).await {
+                    Ok(c) => {
+                        let client: Arc<dyn engram_core::traits::HostClient> = Arc::new(c);
+                        Some(host_responds(&client).await)
+                    }
+                    Err(e) => {
+                        tracing::debug!(host_id = %host_id, error = %e, "dead-host probe: could not warm a dial; treating as a failed probe");
+                        Some(false)
+                    }
+                },
+                None => None,
             },
-            None => None,
-        },
+        }
     };
     match probe_outcome {
         Some(true) => {
@@ -372,17 +661,13 @@ async fn evict_host(
                 host_id,
                 ProbeMemory {
                     consecutive_failures: 0,
-                    last_rescue: Some(std::time::Instant::now()),
+                    last_rescue: Some(state.services.clock.now_mono()),
                 },
             );
             tracing::warn!(
                 host_id = %host_id,
                 "stale row but live host — host answered Ping while last_heartbeat_at is stale; SKIPPING eviction. Check heartbeat persistence (coord PG pool saturation?) — see engram_heartbeat_persist_failures_total (issue #231)",
             );
-            sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-                .bind(&lock_key)
-                .execute(&mut *conn)
-                .await?;
             return Ok(());
         }
         Some(false) => {
@@ -393,7 +678,7 @@ async fn evict_host(
             // host rides it out.
             let mem = probe_memory.entry(host_id).or_default();
             mem.consecutive_failures = mem.consecutive_failures.saturating_add(1);
-            let now = std::time::Instant::now();
+            let now = state.services.clock.now_mono();
             if !probe_failure_permits_eviction(
                 mem,
                 now,
@@ -406,13 +691,9 @@ async fn evict_host(
                     min_strikes = cfg.min_probe_failures,
                     recently_rescued = mem
                         .last_rescue
-                        .is_some_and(|t| now.duration_since(t) < cfg.probe_rescue_grace),
+                        .is_some_and(|t| now.saturating_sub(t) < cfg.probe_rescue_grace),
                     "stale row + failed probe, but not enough evidence to orphan its sessions yet; deferring eviction to a later tick",
                 );
-                sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-                    .bind(&lock_key)
-                    .execute(&mut *conn)
-                    .await?;
                 return Ok(());
             }
         }
@@ -424,17 +705,22 @@ async fn evict_host(
     let affected = meta.mark_host_dead_and_orphan_sessions(host_id).await?;
 
     // Notify other replicas so they drop their HostRegistry entry.
-    sqlx::query("SELECT pg_notify('host_dead', $1)")
-        .bind(host_id.to_string())
-        .execute(&mut *conn)
-        .await?;
+    meta.notify_host_dead(host_id).await?;
 
     // Stage 1: emit StatusChanged{prev -> HostLost} for every session
     // the bulk touched. The `prev` came back from the UPDATE so the
     // `from` is honest (not a hand-encoded `Active` that would lie if
     // the session had been Idle).
     for (session_id, prev) in &affected {
-        emit_status_changed(meta, events, *session_id, *prev, SessionState::HostLost).await;
+        emit_status_changed(
+            meta,
+            events,
+            *session_id,
+            *prev,
+            SessionState::HostLost,
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
 
     // Stage 2: per-session recoverability-aware second transition.
@@ -446,13 +732,15 @@ async fn evict_host(
     // resume-from-idle wedge + deploy-storm cascade). Proactive
     // relocation now happens only via operator drain (ADR 0044 K3).
     //
-    // Decision matrix:
+    // Decision matrix (issue #777 honest-Dead: the snapshot column is the
+    // `recoverable` FLAG, not mere row presence — an un-recoverable
+    // snapshot is NOT resumable and must not route to a lying Idle):
     //
-    // | snapshot | live_manifest | next state | who recovers it          |
-    // |----------|---------------|------------|--------------------------|
-    // | Some     | _             | Idle       | user/exec /resume        |
-    // | None     | Some          | Idle       | /resume (disk-only cold) |
-    // | None     | None          | Dead       | (no recoverable state)   |
+    // | recoverable snap | live_manifest | next state | who recovers it          |
+    // |------------------|---------------|------------|--------------------------|
+    // | true             | _             | Idle       | user/exec /resume        |
+    // | false/none       | Some          | Idle       | /resume (disk-only cold) |
+    // | false/none       | None          | Dead       | (no recoverable state)   |
     //
     // Failures of any query/transition are logged and skipped; the
     // row stays at HostLost and a future reconcile pass (or
@@ -485,11 +773,21 @@ async fn evict_host(
             }
         };
 
-        let target = recovery_target(snapshot.is_some(), has_live_manifest);
+        let has_recoverable_snapshot = snapshot.as_ref().is_some_and(|s| s.recoverable);
+        let target = recovery_target(has_recoverable_snapshot, has_live_manifest);
+        note_unrecoverable_if_dead(target, snapshot.as_ref(), *session_id);
 
         match meta.transition_session(*session_id, target).await {
             Ok(prev) => {
-                emit_status_changed(meta, events, *session_id, prev, target).await;
+                emit_status_changed(
+                    meta,
+                    events,
+                    *session_id,
+                    prev,
+                    target,
+                    state.services.clock.now_utc(),
+                )
+                .await;
             }
             Err(e) => {
                 tracing::warn!(
@@ -509,11 +807,6 @@ async fn evict_host(
         "host marked dead; sessions moved through HostLost to Idle/Dead",
     );
 
-    sqlx::query("SELECT pg_advisory_unlock(hashtext($1))")
-        .bind(&lock_key)
-        .execute(&mut *conn)
-        .await?;
-
     Ok(())
 }
 
@@ -521,27 +814,29 @@ async fn evict_host(
 mod tests {
     use super::*;
 
-    // The detector's polling loop and advisory-lock dance are
-    // Postgres-specific and require a live database to test
-    // meaningfully. The trait-layer logic
+    // The detector's polling loop and lease dance need a
+    // MetadataStore with real lease semantics to test meaningfully
+    // (live Postgres, or engram-sim's SimMetadataStore). The trait-layer logic
     // (`mark_host_dead_and_orphan_sessions` semantics) is covered
     // by Mock-based tests in `tests/dead_host_mock.rs`. End-to-end
     // multi-replica behaviour is the live-Postgres test
     // (`#[ignore]`'d, gated behind dev-VM Docker compose).
 
-    // ADR 0045 Phase A: the stage-2 routing decision. A recoverable
-    // dead-host session goes to Idle (lazy /resume), never Evacuating
-    // (the reactive auto-evac is retired); only the no-state case is
-    // terminal.
+    // ADR 0045 Phase A + issue #777 honest-Dead: the stage-2 routing
+    // decision. A RECOVERABLE dead-host session goes to Idle (lazy
+    // /resume), never Evacuating (the reactive auto-evac is retired);
+    // only the no-recoverable-state case is terminal. The first arg is
+    // the snapshot's `recoverable` FLAG, not mere row presence — an
+    // un-recoverable snapshot alone is NOT resumable.
     #[test]
     fn recovery_target_routes_recoverable_to_idle_never_evacuating() {
-        // snapshot present → Idle (memory + disk resume).
+        // recoverable snapshot → Idle (memory + disk resume).
         assert_eq!(recovery_target(true, false), SessionState::Idle);
-        // disk-only (live manifest, no snapshot) → Idle (cold-boot resume).
+        // disk-only (live manifest, no recoverable snapshot) → Idle (cold-boot resume).
         assert_eq!(recovery_target(false, true), SessionState::Idle);
         // both present → Idle.
         assert_eq!(recovery_target(true, true), SessionState::Idle);
-        // nothing recoverable → Dead.
+        // nothing recoverable (no recoverable snapshot, no manifest) → Dead.
         assert_eq!(recovery_target(false, false), SessionState::Dead);
 
         // The reactive auto-evac target is gone: no input combination
@@ -688,15 +983,14 @@ mod tests {
     // is the gate that makes that impossible: a failed probe evicts
     // only with `min_probe_failures` consecutive strikes AND no rescue
     // within `probe_rescue_grace`.
-    use std::time::Instant;
-
     const MIN: u32 = 3;
     const GRACE: Duration = Duration::from_secs(120);
 
-    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Instant) {
-        // Anchor `now` far enough from the ProbeMemory's rescue instant
-        // that subtraction can't underflow.
-        let now = Instant::now() + GRACE * 10;
+    fn mem(failures: u32, rescued_ago: Option<Duration>) -> (ProbeMemory, Duration) {
+        // `now` is a monotonic mark (ADR 0098 D1: `Clock::now_mono()`
+        // returns a `Duration`). Anchor it far enough from the
+        // ProbeMemory's rescue mark that subtraction can't underflow.
+        let now = GRACE * 10;
         let m = ProbeMemory {
             consecutive_failures: failures,
             last_rescue: rescued_ago.map(|ago| now - ago),

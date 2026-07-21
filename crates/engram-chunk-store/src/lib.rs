@@ -51,6 +51,9 @@ pub mod region;
 pub mod resolver;
 pub mod snapshot_blob;
 pub mod store;
+#[cfg(test)]
+pub(crate) mod test_support;
+mod time_source;
 pub mod working_set;
 
 pub use bootstrap::{Bootstrap, BootstrapEntry, BOOTSTRAP_SCHEMA_VERSION};

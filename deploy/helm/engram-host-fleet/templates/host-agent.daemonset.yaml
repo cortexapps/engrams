@@ -102,6 +102,27 @@ spec:
           args:
             - |
               set -eu
+              {{- if .Values.storage.dedicatedDevices }}
+              # The dedicated work-dir fs must be mounted BEFORE we stage
+              # into it — but we cannot WAIT for it in-process: this
+              # container's /var/lib/engram is a hostPath bind frozen at
+              # container start (no mount propagation), so a mount landing
+              # later on the host is invisible here, and our writes would
+              # land on the boot-disk dir the mount then shadows (prod
+              # 2026-07-15: fresh-NVMe nodes came up with the bundle stamp
+              # shadowed, twice — an earlier in-process wait on
+              # /proc/mounts was vacuous because the bind itself matches).
+              # Instead: node-prep touches a marker INSIDE the dedicated
+              # fs right after mounting; if this bind can't see it, EXIT
+              # NON-ZERO so the kubelet restarts this init with backoff —
+              # each restart re-binds and re-checks current truth (the
+              # same crash-until-ready contract the main container's
+              # ENGRAM_WORK_DIR_REQUIRE_MOUNTPOINT gate provides).
+              if [ ! -e /var/lib/engram/.engram-node-prep-mounted ]; then
+                echo "[stage-node-assets] dedicated work-dir not mounted yet (no node-prep marker); exiting for kubelet retry" >&2
+                exit 1
+              fi
+              {{- end }}
               cp /assets/firecracker /opt/engram/firecracker
               cp /assets/vmlinux     /opt/engram/vmlinux
               chmod 0755 /opt/engram/firecracker
@@ -231,7 +252,7 @@ spec:
             # mount existed); a freshly-booted node loses the race.
             - {name: work, mountPath: /var/lib/engram, mountPropagation: HostToContainer}
             - {name: cgroup, mountPath: /sys/fs/cgroup}
-            {{- if .Values.storage.dedicatedDevice }}
+            {{- if .Values.storage.dedicatedDevices }}
             # ADR 0070 finding 1: read-only reference for the mountpoint
             # gate (ENGRAM_HOST_ROOT_REF_PATH, set in the configmap) —
             # the container's OWN `/` is its ephemeral image overlayfs,
@@ -252,6 +273,6 @@ spec:
           configMap:
             name: {{ required "otel.collector.configMap is required when the otel collector is enabled" .Values.otel.collector.configMap }}
         {{- end }}
-        {{- if .Values.storage.dedicatedDevice }}
+        {{- if .Values.storage.dedicatedDevices }}
         - {name: host-root, hostPath: {path: /, type: Directory}}
         {{- end }}

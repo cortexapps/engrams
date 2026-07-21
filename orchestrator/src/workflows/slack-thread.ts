@@ -11,12 +11,12 @@
  * Shape: the first `recv` is the initial @mention; ack pickup, resolve the
  * engrams user (unlinked → fail), pick the org default profile, gather the
  * thread into a prompt, create the task (carrying the policy's constant system
- * prompt), ack started, start the per-session pump, then a single recv
+ * prompt), ack started, bind the session listener, then a single recv
  * loop multiplexes session events ∪ trigger events off `THREAD_TOPIC`:
  *   - session_event   → route to the policy (question/answer-update/asset)
  *   - session_terminal → closing summary (ok) or failure, then exit
  *   - trigger_mention  → gather NEW context, SendPrompt (idempotent prompt_id)
- *   - trigger_answer   → AnswerQuestion
+ *   - trigger_answer   → CompleteToolCall (generic); legacy cards get an upgrade notice
  *
  * `questionTs` (tool_call_id → posted-question ref) is plain workflow-local
  * state: it is rebuilt deterministically on replay from the checkpointed
@@ -29,11 +29,12 @@ import {
   routeSessionEvent,
   summarizeAsset,
   type AssetSummary,
+  type ClosingSummary,
   type CommunicationPolicy,
+  type QuestionProtocol,
   type StartedSession,
 } from "./communication-policy.ts";
 import { THREAD_TOPIC, type ThreadInbox, type SourceMention } from "./thread-inbox.ts";
-import { sessionIngestWorkflow } from "./session-ingest.ts";
 
 const log = rootLog.child({ component: "slack" });
 
@@ -47,6 +48,8 @@ export interface CreateTaskInput {
   appendSystemPrompt: string;
   /** The trigger ref recorded on the persisted task (operator-visible). */
   source: Record<string, unknown>;
+  /** Stable DBOS mailbox id, persisted atomically before listener discovery. */
+  threadWorkflowId: string;
 }
 
 export interface ThreadControlPlane {
@@ -59,10 +62,11 @@ export interface ThreadControlPlane {
   createTask(input: CreateTaskInput): Promise<StartedSession>;
   /** Deliver a follow-up prompt; `promptId` is the dedupe key (Decision 9). */
   sendPrompt(sessionId: string, prompt: string, promptId: string): Promise<void>;
-  answerQuestion(
+  /** Complete an ADR 0089 session-handled tool through its registered schema. */
+  completeToolCall(
     sessionId: string,
     toolCallId: string,
-    answers: Record<string, string[]>,
+    result: Record<string, string[]>,
   ): Promise<void>;
 }
 
@@ -87,7 +91,7 @@ function requireControlPlane(): ThreadControlPlane {
 }
 
 /** Recv timeout (seconds). A timeout just re-loops — the session may be idle
- *  for a long time between events; the pump always sends the terminal. */
+ *  for a long time between events; the listener sends the terminal. */
 const RECV_TIMEOUT_S = 3_600;
 
 const NO_USER_MSG =
@@ -101,13 +105,15 @@ const SESSION_FAILED_MSG = "The session ended in failure.";
 // continue. See `TerminalOutcome` in session-events.ts.
 const SESSION_CLOSED_MSG = "This session is complete. Start a new session if you'd like to continue.";
 // Non-fatal: the thread stays alive after these so the user can retry.
-// ADR 0067: SendPrompt/AnswerQuestion now durably ENQUEUE on the
-// coordinator (202) — a resuming/idle session is no longer a delivery
-// failure, so there is no "mention me again" apology arm. These fire
+// ADR 0067: SendPrompt and CompleteToolCall durably
+// ENQUEUE on the coordinator (202) — a resuming/idle session is no longer a
+// delivery failure, so there is no "mention me again" apology arm. These fire
 // only for hard enqueue failures (session gone / coord unreachable).
 const DELIVER_FAIL_MSG =
   "I couldn't queue that for your session (it may have ended). Start a new session to continue.";
 const ANSWER_FAIL_MSG = "I couldn't record that answer — the session may have ended.";
+const LEGACY_QUESTION_MSG =
+  "This question predates an upgrade and can no longer be answered.";
 
 /** Run an effect as a checkpointed step. The workflow passes `DBOS.runStep`; a
  *  test passes a plain runner so the drain-loop control flow is unit-testable
@@ -124,6 +130,8 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   const m = first.mention;
 
   const step: StepRunner = (fn, name) => DBOS.runStep(fn, { name });
+  const threadWorkflowId = DBOS.workflowID;
+  if (!threadWorkflowId) throw new Error("Slack thread workflow ID is unavailable");
 
   await step(() => pol.onPickup(m), "onPickup");
 
@@ -158,6 +166,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
             channel: m.channel,
             threadRoot: m.threadRoot,
           },
+          threadWorkflowId,
         }),
       "createTask",
     );
@@ -171,12 +180,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
 
   await step(() => pol.onStarted(m, session), "onStarted");
 
-  // 2) Start the per-session pump; it sends curated events back to us.
-  await DBOS.startWorkflow(sessionIngestWorkflow, {
-    workflowID: `ingest:${session.id}`,
-  })({ sessionId: session.id, threadWfId: DBOS.workflowID! });
-
-  // 3) Drain loop — one recv multiplexes session events ∪ trigger events.
+  // 2) Drain loop — one recv multiplexes session events ∪ trigger events.
   // `st` is plain workflow-local render state, rebuilt deterministically on
   // replay from the checkpointed recv'd messages + step outputs (the bubble ts
   // is a checkpointed `onAssistantMessage` output; the accumulated text is
@@ -184,8 +188,10 @@ async function slackThreadWorkflowImpl(): Promise<void> {
   // driving the live turn, so the run lifecycle reacts on the right message.
   const st: ThreadRender = {
     questionTs: new Map<string, string>(),
+    questionProtocols: new Map<string, QuestionProtocol>(),
     assets: [],
     bubble: null,
+    lastAssistantText: null,
     currentMention: m,
   };
   let lastTs = ctx0.maxTs;
@@ -197,7 +203,7 @@ async function slackThreadWorkflowImpl(): Promise<void> {
     if (msg.kind === "session_terminal") {
       switch (msg.outcome) {
         case "completed": {
-          const summary = { lastMessage: msg.lastMessage ?? null, assets: st.assets };
+          const summary = closingSummary(st);
           await step(() => pol.onComplete(m, session, summary), "onComplete");
           break;
         }
@@ -226,7 +232,7 @@ type InboundTurn = Exclude<ThreadInbox, { kind: "session_terminal" }>;
  * Handle one non-terminal inbound message; return the (possibly advanced)
  * `lastTs` cursor. **Never throws** — that is the whole point:
  *
- * - An ENQUEUE failure (`sendPrompt` / `answerQuestion` — ADR 0067: these
+ * - An ENQUEUE failure (`sendPrompt` / `completeToolCall` — ADR 0067: these
  *   202-enqueue on the coordinator's durable outbox, so a resuming/idle
  *   session is never an error; only hard failures like a terminated
  *   session or an unreachable coord land here) is caught and surfaced via
@@ -282,10 +288,18 @@ export async function handleInbound(
       }
     }
     case "trigger_answer": {
+      const via = st.questionProtocols.get(msg.answer.toolCallId) ?? "legacy";
+      if (via === "legacy") {
+        await step(
+          () => pol.onDeliveryError(st.currentMention, LEGACY_QUESTION_MSG),
+          "onDeliveryError",
+        ).catch(() => {});
+        return lastTs;
+      }
       try {
         await step(
-          () => cp.answerQuestion(session.id, msg.answer.toolCallId, msg.answer.answers),
-          "answerQuestion",
+          () => cp.completeToolCall(session.id, msg.answer.toolCallId, msg.answer.answers),
+          "completeToolCall",
         );
       } catch (err) {
         log.error({ sessionId: session.id, err }, "slack: failed to enqueue answer — keeping the thread alive");
@@ -298,16 +312,26 @@ export async function handleInbound(
 
 /** Per-thread render state the drain loop threads through `dispatchSessionEvent`.
  *  All fields are workflow-local and replay-deterministic. */
-interface ThreadRender {
+export interface ThreadRender {
   /** tool_call_id → posted question `ts`, so an answer updates that message. */
   questionTs: Map<string, string>;
+  /** tool_call_id → originating protocol, which selects the completion RPC. */
+  questionProtocols: Map<string, QuestionProtocol>;
   /** Durable assets, accumulated for the closing recap. */
   assets: AssetSummary[];
   /** The active assistant message consecutive responses coalesce into, or null
    *  when the next response should open a fresh message. */
   bubble: { ts: string; text: string } | null;
+  /** Most recent individual assistant message, retained for closing summary. */
+  lastAssistantText: string | null;
   /** The mention driving the live turn — the run lifecycle reacts on it. */
   currentMention: SourceMention;
+}
+
+export function closingSummary(
+  st: Pick<ThreadRender, "lastAssistantText" | "assets">,
+): ClosingSummary {
+  return { lastMessage: st.lastAssistantText, assets: st.assets };
 }
 
 /** Cap an assistant bubble's accumulated text; past this a new response opens a
@@ -325,7 +349,7 @@ async function dispatchSessionEvent(
   st: ThreadRender,
   session: StartedSession,
 ): Promise<void> {
-  const effect = routeSessionEvent(msg.event);
+  const effect = routeSessionEvent(msg.event, st.questionProtocols);
   switch (effect.kind) {
     case "message": {
       if (!effect.text) break;
@@ -337,6 +361,7 @@ async function dispatchSessionEvent(
       const ref = append ? st.bubble!.ts : undefined;
       const ts = await step(() => pol.onAssistantMessage(m, text, ref), "onAssistantMessage");
       st.bubble = { ts, text };
+      st.lastAssistantText = effect.text;
       break;
     }
     case "working": {
@@ -352,7 +377,10 @@ async function dispatchSessionEvent(
     case "question": {
       st.bubble = null; // the question is its own message
       const ref = await step(() => pol.onUserQuestion(m, msg.event), "onUserQuestion");
-      if (effect.toolCallId) st.questionTs.set(effect.toolCallId, ref);
+      if (effect.toolCallId) {
+        st.questionTs.set(effect.toolCallId, ref);
+        st.questionProtocols.set(effect.toolCallId, effect.via);
+      }
       break;
     }
     case "answered": {

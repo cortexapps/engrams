@@ -31,11 +31,17 @@ import {
 import type { FC } from "react";
 import { ShellToolPart } from "@/components/session-thread/ShellToolPart";
 import { FileChangePart } from "@/components/session-thread/FileChangePart";
+import { BrowserActivityPart } from "@/components/session-thread/BrowserActivityPart";
 import { SystemMessage } from "@/components/session-thread/SystemMessage";
 import { RunFooter } from "@/components/session-thread/RunFooter";
-import { FILE_CHANGE_TOOL, SHELL_TOOL } from "@/components/session-thread/buildMessages";
+import {
+  BROWSER_ACTIVITY_TOOL,
+  FILE_CHANGE_TOOL,
+  SHELL_TOOL,
+} from "@/components/session-thread/buildMessages";
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
+import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -192,9 +198,11 @@ const AssistantMessage: FC = () => {
                   const Tool: ToolCallMessagePartComponent =
                     part.toolName === SHELL_TOOL
                       ? ShellToolPart
-                      : part.toolName === FILE_CHANGE_TOOL
-                        ? FileChangePart
-                        : ToolFallback;
+                      : part.toolName === BROWSER_ACTIVITY_TOOL
+                        ? BrowserActivityPart
+                        : part.toolName === FILE_CHANGE_TOOL
+                          ? FileChangePart
+                          : ToolFallback;
                   return <Tool {...part} />;
                 }
                 case "indicator":
@@ -265,6 +273,7 @@ const COMPOSER_BANNER: Partial<Record<SessionState, string>> = {
 };
 
 const COMPOSER_HINT: Partial<Record<SessionState, string>> = {
+  parked: "Task is parked — sending wakes it in about a second.",
   idle: "Task is idle — sending will resume it.",
   created: "Task is still starting up — the harness will be ready in a moment.",
 };
@@ -324,6 +333,9 @@ const Composer: FC = () => {
   const composer = useComposerRuntime();
   const text = useComposer((c) => c.text);
   const isEmpty = text.trim().length === 0;
+  // Slack-style toggle: when on, plain ↵ sends and ⇧↵ is the newline. See
+  // useEnterToSend + the composer settings toggle in ProfilePanel.
+  const [enterToSend] = useEnterToSend();
 
   if (banner) {
     return (
@@ -346,20 +358,22 @@ const Composer: FC = () => {
       <QueuedRail items={queued} onRemove={removeQueued} />
       <div className="flex w-full items-end gap-2 rounded-2xl border bg-background p-2 transition-shadow focus-within:ring-2 focus-within:ring-ring/20">
         <ComposerPrimitive.Input
-          // Enter inserts a newline; ⌘/Ctrl+Enter submits. This is a writing
-          // surface (multi-line prompts to a coding agent), not a chat
-          // one-liner, so newline is the cheap key. submitMode="none" leaves
-          // submit entirely to our keydown so it isn't run-gated.
+          // Default (Enter-to-send on, like Claude desktop): plain ↵ submits,
+          // ⇧↵ is the newline. With the preference off it reverts to the
+          // writing-surface model — Enter inserts a newline and ⌘/Ctrl+Enter
+          // submits. submitMode="none" leaves submit entirely to our keydown so
+          // it isn't run-gated.
           submitMode="none"
-          placeholder="Reply to the task…   (⌘↵ to send)"
+          placeholder={
+            enterToSend
+              ? "Reply to the task…   (↵ to send, ⇧↵ for newline)"
+              : "Reply to the task…   (⌘↵ to send)"
+          }
           className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/80"
           rows={1}
           aria-label="Message input"
           onKeyDown={(e) => {
-            // ⌘/Ctrl+↵ submits. Idle → starts a run; mid-run → the harness
-            // queues it (type-ahead). Driven here, not by the primitive, so it
-            // works while a run is in flight.
-            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+            if (isSubmitKey(e, enterToSend)) {
               e.preventDefault();
               const t = text.trim();
               if (t && !sendBlocked) {
@@ -408,6 +422,9 @@ const ComposerAction: FC = () => {
   const composer = useComposerRuntime();
   const text = useComposer((c) => c.text);
   const isEmpty = text.trim().length === 0;
+  const [enterToSend] = useEnterToSend();
+  // The button mirrors the active send chord: ↵ on its own vs ⌘↵.
+  const sendChord = enterToSend ? "↵" : "⌘↵";
 
   // Mouse-only users keep their Stop button: while a run is in flight AND the
   // composer is empty, show Stop. The instant the user types (intent = queue a
@@ -432,7 +449,7 @@ const ComposerAction: FC = () => {
 
   return (
     <TooltipIconButton
-      tooltip={isRunning ? "Queue (⌘↵)" : "Send (⌘↵)"}
+      tooltip={`${isRunning ? "Queue" : "Send"} (${sendChord})`}
       side="bottom"
       type="button"
       variant="default"
@@ -447,9 +464,11 @@ const ComposerAction: FC = () => {
         composer.setText("");
       }}
     >
-      <span aria-hidden className="leading-none">
-        ⌘
-      </span>
+      {!enterToSend && (
+        <span aria-hidden className="leading-none">
+          ⌘
+        </span>
+      )}
       <CornerDownLeftIcon className="size-3.5" />
     </TooltipIconButton>
   );

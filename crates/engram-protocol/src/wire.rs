@@ -96,7 +96,21 @@ use serde::{Deserialize, Serialize};
 // `Heartbeat.capture_job_reports`, `HeartbeatAck.capture_assignments`/
 // `acked_capture_jobs`. BuildBaseSnapshot RPC deletion rides this bump
 // (removed in the cutover commit).
-pub const WIRE_VERSION: u32 = 15;
+// v16 (ADR 0095): `SnapshotMetadata.peer_hints` — peer-fill seed addrs
+// for the restore destination (bincode field addition). The standing
+// `PeerChunkGet` RPC + the heartbeat-ack `warm_peers` field ride this
+// bump too (both are independently mixed-roll-safe — proto addition /
+// serde-default JSON — but the bump makes the deploy posture explicit:
+// a v16 coord never dispatches a peer-hinted restore to a v15 host,
+// whose bincode decode would fail loudly). Lockstep coord+host roll.
+// v17 (ADR 0100): `WriteFiles` coord↔host RPC and its bincode request /
+// response mirrors. Lockstep coord+host roll.
+// v18 (ADR 0093 addendum): `MaterializeImageRequest.min_disk_gib` — the
+// image's `suggested_disk_gib` now floors the packed ext4 size. Proto
+// field addition (mixed-roll-safe: an old host ignores it and packs
+// content-sized), bumped so the deploy posture is explicit — an enable
+// on a v17 host silently loses the floor.
+pub const WIRE_VERSION: u32 = 18;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic
@@ -136,7 +150,11 @@ pub fn parse_wire_skew_message(msg: &str) -> Option<(u32, u32)> {
 /// Defined here so the gRPC payload bincode roundtrips cleanly via
 /// a stable shape — pinning the wire schema means a future change to
 /// the in-process type doesn't silently change the wire format.
-#[derive(Clone, Debug, Serialize, Deserialize)]
+// `PartialEq`/`Eq`: not on the wire (derives don't touch byte layout, so the
+// `wire_golden` pins are unaffected and no `WIRE_VERSION` bump is needed) —
+// they let the ADR 0099 H3 `codec_roundtrip` suite assert encode→decode
+// identity structurally.
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WireExecRequest {
     pub command: Vec<String>,
     pub stdin: Option<Vec<u8>>,
@@ -168,10 +186,90 @@ impl WireExecRequest {
     }
 }
 
+/// Wire-friendly mirror of [`engram_core::types::sandbox::WriteFileSpec`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireWriteFileSpec {
+    pub path: String,
+    pub content: Vec<u8>,
+    pub mode: Option<u32>,
+}
+
+/// Stable coord↔host payload for a batched file write.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireWriteFilesRequest {
+    pub files: Vec<WireWriteFileSpec>,
+}
+
+impl WireWriteFilesRequest {
+    pub fn from_engine(files: Vec<engram_core::types::sandbox::WriteFileSpec>) -> Self {
+        Self {
+            files: files
+                .into_iter()
+                .map(|file| WireWriteFileSpec {
+                    path: file.path,
+                    content: file.content,
+                    mode: file.mode,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn into_engine(self) -> Vec<engram_core::types::sandbox::WriteFileSpec> {
+        self.files
+            .into_iter()
+            .map(|file| engram_core::types::sandbox::WriteFileSpec {
+                path: file.path,
+                content: file.content,
+                mode: file.mode,
+            })
+            .collect()
+    }
+}
+
+/// Wire-friendly mirror of [`engram_core::types::sandbox::WriteFileResult`].
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireWriteFileResult {
+    pub path: String,
+    pub ok: bool,
+    pub error: Option<String>,
+}
+
+/// Stable coord↔host response payload for a batched file write.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct WireWriteFilesResponse {
+    pub results: Vec<WireWriteFileResult>,
+}
+
+impl WireWriteFilesResponse {
+    pub fn from_engine(results: Vec<engram_core::types::sandbox::WriteFileResult>) -> Self {
+        Self {
+            results: results
+                .into_iter()
+                .map(|result| WireWriteFileResult {
+                    path: result.path,
+                    ok: result.ok,
+                    error: result.error,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn into_engine(self) -> Vec<engram_core::types::sandbox::WriteFileResult> {
+        self.results
+            .into_iter()
+            .map(|result| engram_core::types::sandbox::WriteFileResult {
+                path: result.path,
+                ok: result.ok,
+                error: result.error,
+            })
+            .collect()
+    }
+}
+
 /// Wire-side mirror of `engram_host_agent::orphan_reap::ReapStats`.
 /// Defined here so `engram-protocol` doesn't drag a dep on the
 /// host-agent crate.
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct WireReapStats {
     pub files_scanned: u64,
     pub files_deleted: u64,
@@ -202,6 +300,29 @@ mod tests {
         assert_eq!(recovered.env, original.env);
         assert_eq!(recovered.workdir, original.workdir);
         assert_eq!(recovered.timeout, original.timeout);
+    }
+
+    #[test]
+    fn wire_write_files_round_trips_through_engine_types() {
+        let files = vec![engram_core::types::sandbox::WriteFileSpec {
+            path: "/workspace/.review/instructions.md".into(),
+            content: b"review carefully".to_vec(),
+            mode: Some(0o640),
+        }];
+        let request = WireWriteFilesRequest::from_engine(files.clone());
+        let bytes = bincode::serialize(&request).unwrap();
+        let decoded: WireWriteFilesRequest = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.into_engine(), files);
+
+        let results = vec![engram_core::types::sandbox::WriteFileResult {
+            path: files[0].path.clone(),
+            ok: false,
+            error: Some("permission denied".into()),
+        }];
+        let response = WireWriteFilesResponse::from_engine(results.clone());
+        let bytes = bincode::serialize(&response).unwrap();
+        let decoded: WireWriteFilesResponse = bincode::deserialize(&bytes).unwrap();
+        assert_eq!(decoded.into_engine(), results);
     }
 
     #[test]

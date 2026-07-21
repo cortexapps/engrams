@@ -431,6 +431,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "bit-set"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "08807e080ed7f9d5433fa9b275196cfc35414f66a0c79d864dc51a0d825231a3"
+dependencies = [
+ "bit-vec",
+]
+
+[[package]]
+name = "bit-vec"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5e764a1d40d510daf35e07be9eb06e75770908c27d411ee6c92109c9840eaaf7"
+
+[[package]]
 name = "bitflags"
 version = "2.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1027,7 +1042,7 @@ dependencies = [
  "engram-telemetry",
  "engram-transport",
  "nix 0.29.0",
- "rustix",
+ "proptest",
  "serde",
  "tempfile",
  "tokio",
@@ -1046,10 +1061,12 @@ dependencies = [
  "engram-core",
  "engram-storage-gcs",
  "engram-storage-local",
+ "engram-testkit",
  "futures",
  "metrics",
  "nix 0.31.2",
  "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",
@@ -1137,9 +1154,11 @@ dependencies = [
  "engram-sandbox-process",
  "engram-secrets-dev",
  "engram-secrets-gcp",
+ "engram-sim",
  "engram-storage-gcs",
  "engram-storage-local",
  "engram-telemetry",
+ "engram-testkit",
  "flate2",
  "futures",
  "http-body-util",
@@ -1181,11 +1200,13 @@ dependencies = [
  "chrono",
  "futures",
  "futures-util",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",
  "tokio",
  "toml",
+ "tracing",
  "uuid",
  "workspace-hack",
 ]
@@ -1201,6 +1222,91 @@ dependencies = [
  "serde",
  "tokio",
  "tracing",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-dst"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "bytes",
+ "chrono",
+ "engram-chunk-store",
+ "engram-cloud-mock",
+ "engram-coordinator",
+ "engram-core",
+ "engram-crypto",
+ "engram-harness-proto",
+ "engram-oci",
+ "engram-protocol",
+ "engram-secrets-dev",
+ "engram-sim",
+ "parking_lot",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tonic",
+ "tower 0.5.3",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-dst-cosim"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "dashmap",
+ "engram-chunk-store",
+ "engram-cloud-mock",
+ "engram-coordinator",
+ "engram-core",
+ "engram-crypto",
+ "engram-dst-host",
+ "engram-host-agent",
+ "engram-host-core",
+ "engram-oci",
+ "engram-protocol",
+ "engram-secrets-dev",
+ "engram-sim",
+ "engram-storage-local",
+ "parking_lot",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "serde_json",
+ "tokio",
+ "toml",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
+name = "engram-dst-host"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "dashmap",
+ "engram-chunk-store",
+ "engram-core",
+ "engram-host-agent",
+ "engram-host-core",
+ "engram-sim",
+ "engram-storage-local",
+ "parking_lot",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "uuid",
  "workspace-hack",
 ]
 
@@ -1324,6 +1430,7 @@ dependencies = [
  "bincode",
  "chrono",
  "engram-core",
+ "proptest",
  "serde",
  "tokio",
  "uuid",
@@ -1337,6 +1444,9 @@ dependencies = [
  "engram-core",
  "engram-harness-proto",
  "engram-transport",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "workspace-hack",
@@ -1353,6 +1463,7 @@ dependencies = [
  "bytes",
  "chrono",
  "clap",
+ "crc32c",
  "dashmap",
  "engram-chunk-store",
  "engram-cloud-static",
@@ -1360,6 +1471,7 @@ dependencies = [
  "engram-egress-proxy",
  "engram-harness-noop",
  "engram-harness-proto",
+ "engram-host-core",
  "engram-migrate-proto",
  "engram-oci",
  "engram-protocol",
@@ -1401,6 +1513,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-host-core"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "engram-core",
+ "serde",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-host-operator"
 version = "0.1.0"
 dependencies = [
@@ -1428,6 +1554,7 @@ dependencies = [
  "bincode",
  "blake3",
  "lz4_flex",
+ "proptest",
  "serde",
  "workspace-hack",
 ]
@@ -1515,6 +1642,7 @@ dependencies = [
  "engram-core",
  "engram-telemetry",
  "futures",
+ "proptest",
  "prost",
  "serde",
  "serde_json",
@@ -1556,6 +1684,7 @@ dependencies = [
  "http",
  "mkext4",
  "parking_lot",
+ "proptest",
  "serde",
  "serde_json",
  "sha2",
@@ -1710,6 +1839,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-sim"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "chrono",
+ "engram-core",
+ "engram-postgres",
+ "engram-testkit",
+ "futures",
+ "parking_lot",
+ "serde_json",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-storage-gcs"
 version = "0.1.0"
 dependencies = [
@@ -1758,6 +1905,7 @@ dependencies = [
  "bincode",
  "engram-core",
  "nix 0.31.2",
+ "proptest",
  "serde",
  "tempfile",
  "workspace-hack",
@@ -1777,6 +1925,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-testkit"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "engram-core",
+ "engram-postgres",
+ "futures",
+ "sha2",
+ "sqlx",
+ "tokio",
+ "uuid",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-transport"
 version = "0.1.0"
 dependencies = [
@@ -1792,6 +1956,7 @@ name = "engram-uffd-handler"
 version = "0.1.0"
 dependencies = [
  "bytes",
+ "chrono",
  "engram-chunk-store",
  "engram-core",
  "engram-migrate-proto",
@@ -4023,6 +4188,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "proptest"
+version = "1.11.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4b45fcc2344c680f5025fe57779faef368840d0bd1f42f216291f0dc4ace4744"
+dependencies = [
+ "bit-set",
+ "bit-vec",
+ "bitflags",
+ "num-traits",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
+ "rand_xorshift",
+ "regex-syntax",
+ "rusty-fork",
+ "tempfile",
+ "unarray",
+]
+
+[[package]]
 name = "prost"
 version = "0.13.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4088,6 +4272,12 @@ dependencies = [
  "web-sys",
  "winapi",
 ]
+
+[[package]]
+name = "quick-error"
+version = "1.2.3"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a1d01941d82fa2ab50be1e79e6714289dd7cde78eba4c074bc5a4374f650dfe0"
 
 [[package]]
 name = "quinn"
@@ -4222,6 +4412,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "76afc826de14238e6e8c374ddcc1fa19e374fd8dd986b0d2af0d02377261d83c"
 dependencies = [
  "getrandom 0.3.4",
+]
+
+[[package]]
+name = "rand_xorshift"
+version = "0.4.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "513962919efc330f829edb2535844d1b912b0fbe2ca165d613e4e8788bb05a5a"
+dependencies = [
+ "rand_core 0.9.5",
 ]
 
 [[package]]
@@ -4542,6 +4741,18 @@ name = "rustversion"
 version = "1.0.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
+
+[[package]]
+name = "rusty-fork"
+version = "0.3.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cc6bf79ff24e648f6da1f8d1f011e9cac26491b619e6b9280f2b47f1774e6ee2"
+dependencies = [
+ "fnv",
+ "quick-error",
+ "tempfile",
+ "wait-timeout",
+]
 
 [[package]]
 name = "ryu"
@@ -5772,6 +5983,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 
 [[package]]
+name = "unarray"
+version = "0.1.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eaea85b334db583fe3274d12b4cd1880032beab409c0d774be044d4480ab9a94"
+
+[[package]]
 name = "unicase"
 version = "2.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -5931,6 +6148,15 @@ checksum = "6ba782755fc073877e567c2253c0be48e4aa9a254c232d36d3985dfae0bd5205"
 dependencies = [
  "libc",
  "nix 0.31.2",
+]
+
+[[package]]
+name = "wait-timeout"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "09ac3b126d3914f9849036f826e054cbabdc8519970b8998ddaf3b5bd3c65f11"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
@@ -6589,7 +6815,6 @@ dependencies = [
  "indexmap 2.14.0",
  "lazy_static",
  "libc",
- "linux-raw-sys",
  "log",
  "memchr",
  "nix 0.31.2",
@@ -6601,10 +6826,13 @@ dependencies = [
  "percent-encoding",
  "phf_shared",
  "pkcs8",
+ "ppv-lite86",
  "proc-macro2",
  "prost",
  "quote",
  "rand 0.8.6",
+ "rand 0.9.4",
+ "rand_chacha 0.9.0",
  "rand_core 0.6.4",
  "regex",
  "regex-automata",

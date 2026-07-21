@@ -133,7 +133,7 @@ pub struct AuxRoDrive {
     /// (`/opt/engram/dyn/<i>`); the mounted bundle's `mount.json` declares
     /// what to wire, so the path itself is generic (ADR 0055 §1/§7).
     pub guest_mount: PathBuf,
-    /// Filesystem type for the guest mount (`"squashfs"` | `"erofs"`).
+    /// Filesystem type for the guest mount (`"squashfs"` on both backends).
     pub fs_type: String,
     /// ADR 0035: content identity of the attached generation. `None` on the
     /// symbolic coord→host request ("attach whatever this host currently
@@ -397,6 +397,25 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
     pub timeout: Option<Duration>,
+}
+
+/// One file to write into a running sandbox.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteFileSpec {
+    pub path: String,
+    pub content: Vec<u8>,
+    /// Unix permission bits applied after writing. `None` leaves the
+    /// platform-created permissions unchanged.
+    pub mode: Option<u32>,
+}
+
+/// Per-file outcome from a batched [`SandboxBackend::write_files`](
+/// crate::traits::SandboxBackend::write_files) operation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WriteFileResult {
+    pub path: String,
+    pub ok: bool,
+    pub error: Option<String>,
 }
 
 /// Output event from a streaming `exec`. The stream is terminated by

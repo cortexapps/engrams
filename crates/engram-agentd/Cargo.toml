@@ -43,9 +43,6 @@ workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 # stub) nix is harmless.
 [target.'cfg(target_os = "linux")'.dependencies]
 nix = { version = "0.29", features = ["mount", "fs", "signal"] }
-# ADR 0092: harness spawn-priority boost — nix 0.29 has no setpriority
-# wrapper, rustix does (safe, no unsafe_code exemption needed).
-rustix = { version = "1", features = ["process"] }
 
 [dev-dependencies]
 tempfile = "3"
@@ -57,3 +54,5 @@ async-trait.workspace = true
 # virtual time skips every backoff sleep instantly instead of the test
 # actually waiting out ~8 doublings of a 1s-capped backoff.
 tokio = { workspace = true, features = ["test-util"] }
+# ADR 0099 H4: decode-never-panics property suites (tests/decode_never_panics.rs).
+proptest.workspace = true

@@ -27,7 +27,7 @@
 use std::collections::HashMap;
 use std::io;
 use std::process::Stdio;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
@@ -272,10 +272,10 @@ pub async fn start_shell(
 }
 
 async fn wait_until_ready(port: u16) -> io::Result<()> {
-    let deadline = Instant::now() + READY_DEADLINE;
+    let deadline = crate::time_source::metrics_now() + READY_DEADLINE;
     let mut backoff = READY_PROBE_START;
     let mut last_err: Option<io::Error> = None;
-    while Instant::now() < deadline {
+    while crate::time_source::metrics_now() < deadline {
         match probe_ready(port).await {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),

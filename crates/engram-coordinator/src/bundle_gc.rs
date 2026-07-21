@@ -19,7 +19,6 @@
 use std::collections::HashSet;
 use std::sync::Arc;
 
-use chrono::Utc;
 use engram_chunk_store::GcError;
 use engram_core::traits::{BlobStorage, MetadataStore};
 
@@ -40,11 +39,18 @@ pub struct BundleSweepReport {
 
 /// One bundle-GC sweep. Shares `ChunkGcConfig` (grace / restart
 /// budget) with the chunk sweep so operators tune one knob.
+///
+/// `clock` is the sweep's time source (ADR 0098 D1: time is an
+/// injected input). The promote cutoff reads it FRESH after the mark
+/// pass: candidates are stamped `first_seen_at DEFAULT now()` by PG
+/// during this same call, so a cutoff captured at sweep start would
+/// never see a same-sweep candidate as expired under zero grace.
 pub async fn run_one_bundle_sweep(
     meta: Arc<dyn MetadataStore>,
     blob: Arc<dyn BlobStorage>,
     cfg: &ChunkGcConfig,
     mode: SweepMode,
+    clock: &Arc<dyn engram_core::traits::Clock>,
 ) -> Result<BundleSweepReport, GcError> {
     let mut report = BundleSweepReport::default();
 
@@ -94,7 +100,7 @@ pub async fn run_one_bundle_sweep(
 
     // -------- promote pass (Full only) --------
     if mode == SweepMode::Full {
-        let cutoff = Utc::now()
+        let cutoff = clock.now_utc()
             - chrono::Duration::from_std(cfg.grace_period)
                 .unwrap_or_else(|_| chrono::Duration::seconds(86_400));
         let expired = meta

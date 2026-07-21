@@ -21,6 +21,9 @@
 //!     cargo test -p engram-coordinator --test snapshot_blob_gc_live_pg -- --ignored
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
@@ -34,19 +37,15 @@ use engram_core::types::session::{SessionMode, SessionSpec};
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::{SessionId, SnapshotId};
 
+/// ADR 0098 D1: the GC sweeps take an injected clock; live tests run on
+/// the real one.
+fn system_clock() -> std::sync::Arc<dyn engram_core::traits::Clock> {
+    std::sync::Arc::new(engram_core::traits::SystemClock::new())
+}
+
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set (run `just db-up`)");
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 /// Create a real session row so a session-bound snapshot satisfies the
@@ -183,14 +182,26 @@ async fn sweep_deletes_orphan_keeps_pinned_including_template() {
     }
 
     let cfg = zero_grace();
-    let r1 = run_one_snapshot_blob_sweep(meta.clone(), blob.clone(), &cfg, SweepMode::Full)
-        .await
-        .expect("sweep 1");
+    let r1 = run_one_snapshot_blob_sweep(
+        meta.clone(),
+        blob.clone(),
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("sweep 1");
     assert!(r1.candidates_marked >= 1, "orphan must be marked: {r1:?}");
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let r2 = run_one_snapshot_blob_sweep(meta.clone(), blob.clone(), &cfg, SweepMode::Full)
-        .await
-        .expect("sweep 2");
+    let r2 = run_one_snapshot_blob_sweep(
+        meta.clone(),
+        blob.clone(),
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("sweep 2");
     assert!(
         r1.promoted_deletes + r2.promoted_deletes >= 1,
         "orphan must promote within two zero-grace sweeps: {r1:?} {r2:?}"
@@ -235,9 +246,15 @@ async fn promote_skips_candidate_that_became_repinned() {
     // the same pin-by-row-existence; the FK would otherwise need a session.
     seed_snapshot_row_with_id(&meta, id, None).await;
 
-    let r = run_one_snapshot_blob_sweep(meta.clone(), blob.clone(), &zero_grace(), SweepMode::Full)
-        .await
-        .expect("sweep");
+    let r = run_one_snapshot_blob_sweep(
+        meta.clone(),
+        blob.clone(),
+        &zero_grace(),
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("sweep");
     assert!(
         r.promote_repinned_skips >= 1,
         "the re-pinned candidate must be skipped, not deleted: {r:?}"

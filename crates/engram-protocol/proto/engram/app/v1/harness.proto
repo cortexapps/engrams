@@ -67,6 +67,17 @@ message HarnessDescriptor {
   repeated HarnessOption effort = 5;
   // Human-readable one-liner for the admin Harnesses tab.
   optional string description = 6;
+  // ADR 0063 addendum: egress hosts the harness itself must reach (its model
+  // API / telemetry). Merged into the session's deny-default allowlist at
+  // create; surfaced so the UI's "Reaches" receipts show the true egress set.
+  HarnessEgress egress = 7;
+}
+
+// The harness.toml `[egress]` block: exact hostnames + `*.domain` patterns,
+// the same shapes as the profile network's allow lists.
+message HarnessEgress {
+  repeated string allow_hosts = 1;
+  repeated string allow_host_patterns = 2;
 }
 
 // Credential env-var names. A credential is one var, so these are single
@@ -78,6 +89,13 @@ message HarnessAuth {
   // Env var for the human/interactive credential (e.g. an OAuth token);
   // injected from the per-user token store on human runs.
   optional string user_env = 2;
+  // Free-text setup instructions for the org credential, shown to admins.
+  // Never a secret — safe on the wire.
+  optional string org_env_hint = 3;
+  // Free-text setup instructions for the human credential (e.g. "Run
+  // `claude setup-token`"), shown on the settings + create surfaces so a user
+  // knows how to obtain it. Never a secret.
+  optional string user_env_hint = 4;
 }
 
 // One model or effort option; env is the var(s) that select it.

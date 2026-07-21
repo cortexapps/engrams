@@ -88,6 +88,10 @@ export type SessionEvent =
     }
   | { type: "evicted"; at: string }
   | { type: "resumed"; snapshot_id: string; at: string }
+  // The coordinator started waking an idle/parked session back up, before
+  // the multi-second restore + harness reattach. Rendered as a transient
+  // "waking up…" indicator that resolves when the first run event lands.
+  | { type: "resume_started"; at: string }
   | {
       type: "run_started";
       run_id: string;
@@ -141,17 +145,40 @@ export type SessionEvent =
       result_summary: string | null;
       at: string;
     }
+  | {
+      type: "browser_activity";
+      run_id: string;
+      tool_call_id: string;
+      intent: string;
+      at: string;
+    }
+  // ADR 0089: an orchestrator-registered tool was invoked. `args_json` is
+  // deliberately opaque JSON text; tool-specific presenters parse it.
+  | {
+      type: "tool_call_requested";
+      run_id: string;
+      tool_call_id: string;
+      name: string;
+      args_json: string;
+      at: string;
+    }
+  // ADR 0089: the coordinator synchronously accepted a result for delivery.
+  // Surfaces resolve pending UI from this event without waiting for the harness.
+  | {
+      type: "tool_result_submitted";
+      tool_call_id: string;
+      result_json: string;
+      at: string;
+    }
   | { type: "run_completed"; run_id: string; ok: boolean; at: string }
   // ADR 0030: the in-flight run was stopped by an operator interrupt
   // (`POST /sessions/:id/interrupt`). The session stays alive; the
   // transcript renders an "interrupted" receipt and the run closes.
   | { type: "run_interrupted"; run_id: string; at: string }
   | { type: "harness_idle"; at: string }
-  // ADR 0054: the agent called `AskUserQuestion`; the harness deferred it
-  // (the turn ends so the VM can idle-evict) and emitted this durable
-  // "awaiting input" card. The web renders an interactive question form and
-  // POSTs the answer back via `SessionService.AnswerQuestion`, keyed on
-  // `tool_call_id` (Claude's tool_use_id). Survives eviction — it's in the log.
+  // ADR 0054 legacy read shape: pre-upgrade sessions may contain this durable
+  // question card. Unanswered cards are read-only after ADR 0089 P5d; answered
+  // cards still fold in their historical `question_answered` receipt.
   | {
       type: "user_question";
       run_id: string;
@@ -159,7 +186,7 @@ export type SessionEvent =
       questions: UserQuestion[];
       at: string;
     }
-  // ADR 0054: the deferred question was answered — the harness holds the
+  // ADR 0054 legacy read shape: the deferred question was answered — the harness held the
   // answer and is feeding it back on the `--resume` re-fire. Resolves the
   // card (same `tool_call_id`); `answers` is keyed by question text, values
   // are the selected option labels (1 for single-select, N for multi).
@@ -242,7 +269,22 @@ export type SessionEvent =
   // in the transcript — it drives the session's display title (materialized on
   // the task via the coordinator + the 1s ListTasks poll). Typed here so the
   // frame is a known kind, not an untyped passthrough.
-  | { type: "title_suggested"; title: string; at: string };
+  | { type: "title_suggested"; title: string; at: string }
+  // ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
+  // eviction exhausted its retry budget, so the coordinator destroyed the
+  // crippled VM. The session's next resume rewinds to the last published disk
+  // manifest, silently dropping guest writes the host acked but never uploaded
+  // past it. Coordinator-authoritative — survives the very rewind it warns
+  // about. Rendered as a prominent warning marker in the timeline.
+  | {
+      type: "durability_rollback";
+      sandbox_id: string;
+      // The `<manifest_id, version>` the next resume rewinds to; null when the
+      // session never got a live disk publish (falls back to the snapshot).
+      rewind_disk_manifest: { manifest_id: string; version: number } | null;
+      reason: string;
+      at: string;
+    };
 
 export type SessionEventKind = SessionEvent["type"];
 

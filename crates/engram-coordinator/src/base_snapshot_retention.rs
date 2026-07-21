@@ -58,30 +58,34 @@ pub fn spawn(cfg: BaseSnapshotRetentionConfig, state: SharedState) -> tokio::tas
         tick.tick().await;
         loop {
             tick.tick().await;
-            match state
-                .services
-                .meta
-                .prune_orphan_base_snapshots(
-                    chrono::Duration::from_std(cfg.grace)
-                        .unwrap_or_else(|_| chrono::Duration::hours(24)),
-                )
-                .await
-            {
-                Ok(deleted) if deleted.is_empty() => {}
-                Ok(deleted) => {
-                    // chunk-GC + snapshot-blob-GC reclaim the freed chunks
-                    // and portable blobs on their next ticks — we delete
-                    // only the PG rows here (see the module doc).
-                    tracing::info!(
-                        deleted = deleted.len(),
-                        grace_secs = cfg.grace.as_secs(),
-                        "base-snapshot retention sweep reaped orphaned image base snapshots",
-                    );
-                }
-                Err(e) => {
-                    tracing::warn!(error = %e, "base-snapshot retention sweep failed; will retry");
-                }
+            if let Err(e) = run_once(&cfg, &state).await {
+                tracing::warn!(error = %e, "base-snapshot retention sweep failed; will retry");
             }
         }
     })
+}
+
+/// Run one retention sweep. Production calls this from [`spawn`]; the
+/// deterministic simulator calls it directly without a timer loop.
+pub async fn run_once(
+    cfg: &BaseSnapshotRetentionConfig,
+    state: &SharedState,
+) -> Result<usize, engram_core::MetaError> {
+    let deleted = state
+        .services
+        .meta
+        .prune_orphan_base_snapshots(
+            chrono::Duration::from_std(cfg.grace).unwrap_or_else(|_| chrono::Duration::hours(24)),
+        )
+        .await?;
+    if !deleted.is_empty() {
+        // chunk-GC + snapshot-blob-GC reclaim the freed chunks and
+        // portable blobs on their next ticks; this only deletes PG rows.
+        tracing::info!(
+            deleted = deleted.len(),
+            grace_secs = cfg.grace.as_secs(),
+            "base-snapshot retention sweep reaped orphaned image base snapshots",
+        );
+    }
+    Ok(deleted.len())
 }

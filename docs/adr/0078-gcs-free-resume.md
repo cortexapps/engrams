@@ -1,6 +1,27 @@
 # 0078 — GCS-free resume: authoritative host-affinity + peer-first divergence fill
 
-Status: Proposed (2026-07-06)
+Status: Accepted (2026-07-14) — scoped to phases 1+2 (moves 1, 4, 5);
+phases 3–5 scope moved to [ADR 0095](0095-peer-fill-of-disk-chunks.md)
+
+Commit chain: phase 1 `be8f4161` (PR #586); phase 2 PR #587; phase-2
+re-review fixes PR #601. Prod-measured delta: affinity-local restore
+p50 0.61 s vs the 92 s GCS page-in class the §Problem opens with.
+
+**Scope note (2026-07-14).** This ADR is the record for what shipped:
+the write-through floor (moves 4+5) and authoritative host-affinity
+with the `local_snapshots` retirement (move 1). The unbuilt remainder
+does not stay open here — per the no-duplicate-open-ADRs rule it moved
+to ADR 0095, which generalizes move 2 (peer-first divergence fill) into
+a standing fleet chunk tier covering resume, new-host warmup, and
+enable prestage, and **supersedes this ADR's phase-3 design** (the
+brokered resume-export shape — Open/CloseResumeExport, sandbox-less
+registry entries, manifest allowlists — is not built; 0095 argues the
+replacement trust posture explicitly). Move 3 (evict-time prestage on
+drain) and rung-3 parked-local are **deferred, not moved**: with peer
+fill a resume off a live source is ~1–2 s, rolls drain via evacuation,
+and the fallback-reason counter this phase shipped
+(`engram_resume_affinity_fallback_total{reason="dead"}`) is the gate
+for revisiting them.
 
 Issue: #548 (2026-07 core-ops overhaul, Tier 2). Depends on #528
 (chunk-cache-disk-budget — merged #557; phase 2 imports its disk ceiling

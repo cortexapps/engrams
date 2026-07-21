@@ -145,7 +145,8 @@ pub async fn migrate_session_live(
     session_id: SessionId,
     target_host_id: HostId,
 ) -> Result<(), MigrateError> {
-    let t_total = std::time::Instant::now();
+    let clock = state.services.clock.clone();
+    let t_total = clock.now_mono();
     // Serialize against resumes / evictions / sibling migrations.
     let session = state
         .services
@@ -205,6 +206,7 @@ pub async fn migrate_session_live(
         &state.host_registry,
         target_host_id,
         session.host_id,
+        clock.now_utc(),
     )
     .await
     .map_err(|e| MigrateError::Fatal(format!("target host can't take the session: {e:?}")))?;
@@ -273,7 +275,7 @@ pub async fn migrate_session_live(
     };
 
     // ---- 1. Presetup on the source (NO pause — the guest runs) ----
-    let t_presetup = std::time::Instant::now();
+    let t_presetup = clock.now_mono();
     let presetup = match source_backend
         .migration_presetup(sandbox_id, claim.fence())
         .await
@@ -284,7 +286,7 @@ pub async fn migrate_session_live(
         }
         Err(e) => return Err(MigrateError::Fatal(format!("migration presetup: {e}"))),
     };
-    let presetup_ms = t_presetup.elapsed().as_millis();
+    let presetup_ms = clock.now_mono().saturating_sub(t_presetup).as_millis();
 
     // The page-server address: the source's advertised gRPC host with
     // the presetup's peer port (default 9102).
@@ -312,7 +314,7 @@ pub async fn migrate_session_live(
         // capture-time snapshot id the dest could collide on).
         id: engram_core::types::SnapshotId::new(),
         size_bytes: durable_row.as_ref().map(|r| r.size_bytes).unwrap_or(0),
-        created_at: chrono::Utc::now(),
+        created_at: clock.now_utc(),
         image_version: durable_row
             .as_ref()
             .map(|r| r.image_version.clone())
@@ -358,6 +360,8 @@ pub async fn migrate_session_live(
         // Issue #529: restore-side reconstruction, not a fresh capture —
         // no pause instant to carry.
         paused_at: None,
+        // ADR 0095: peer-fill hints are for ordinary resumes; a teleport dest pulls via its migration export.
+        peer_hints: Vec::new(),
     };
     // ADR 0019 / telemetry restoration (#526): `dest.restore` makes a
     // gRPC call to the target host-agent; the `TraceparentInjector`
@@ -404,13 +408,13 @@ pub async fn migrate_session_live(
             SessionEvent::StatusChanged {
                 from: SessionState::Active,
                 to: SessionState::Evacuating,
-                at: chrono::Utc::now(),
+                at: clock.now_utc(),
             },
         )
         .await;
 
     // ---- 4. THE BLACKOUT: vmstate-only capture + pagemap seal ----
-    let t_blackout = std::time::Instant::now();
+    let t_blackout = clock.now_mono();
     let capture = match source_backend
         .migration_capture_postcopy(sandbox_id, &presetup.export_id, claim.fence())
         .await
@@ -443,10 +447,10 @@ pub async fn migrate_session_live(
         }
     };
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "capture_postcopy")
-        .record(t_blackout.elapsed().as_secs_f64());
+        .record(clock.now_mono().saturating_sub(t_blackout).as_secs_f64());
 
     // ---- 5. Await the destination (load + resume) ----
-    let t_restore = std::time::Instant::now();
+    let t_restore = clock.now_mono();
     let new_sandbox_id = match restore_task.await {
         Ok(Ok(id)) => id,
         Ok(Err(e)) => {
@@ -492,14 +496,14 @@ pub async fn migrate_session_live(
             .await);
         }
     };
-    let restore_ms = t_restore.elapsed().as_millis();
+    let restore_ms = clock.now_mono().saturating_sub(t_restore).as_millis();
     // The guest is RUNNING on the dest from here (FC resumed inside
     // the load) — this is where the guest-observed blackout ends. The
     // rebind + harness rebuild below happen while the guest executes,
     // so folding them into `blackout_ms` (the old shape) overstated
     // the user-facing gap by the `finish_resume_to_active` wall.
-    let blackout_wall_ms = t_blackout.elapsed().as_millis() as u64;
-    let t_reactivate = std::time::Instant::now();
+    let blackout_wall_ms = clock.now_mono().saturating_sub(t_blackout).as_millis() as u64;
+    let t_reactivate = clock.now_mono();
 
     // ---- 6. The Committing persist + reactivate ----
     state.host_registry.invalidate_sandbox(sandbox_id);
@@ -593,7 +597,7 @@ pub async fn migrate_session_live(
             SessionEvent::StatusChanged {
                 from: SessionState::Evacuating,
                 to: SessionState::Active,
-                at: chrono::Utc::now(),
+                at: clock.now_utc(),
             },
         )
         .await;
@@ -632,7 +636,7 @@ pub async fn migrate_session_live(
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "restore")
         .record(restore_ms as f64 / 1000.0);
     metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "total")
-        .record(t_total.elapsed().as_secs_f64());
+        .record(clock.now_mono().saturating_sub(t_total).as_secs_f64());
     // PR 10 blackout decomposition: the legs that actually cost, so an
     // optimization targets the real hot leg. Source-measured (under the
     // freeze); the coordinator-side `blackout_ms` is the wall including
@@ -669,8 +673,8 @@ pub async fn migrate_session_live(
         scan_ms = capture.scan_ms,
         blackout_ms = blackout_wall_ms,
         restore_await_ms = restore_ms,
-        reactivate_ms = t_reactivate.elapsed().as_millis() as u64,
-        total_ms = t_total.elapsed().as_millis(),
+        reactivate_ms = clock.now_mono().saturating_sub(t_reactivate).as_millis() as u64,
+        total_ms = clock.now_mono().saturating_sub(t_total).as_millis(),
         "post-copy live teleport landed (ADR 0045 C2); drain + durability finalizing",
     );
 
@@ -717,7 +721,8 @@ pub async fn migrate_session_live(
                 .and_then(|v| v.parse::<u64>().ok())
                 .unwrap_or(2000),
         );
-        let t_drain = std::time::Instant::now();
+        let clock = state2.services.clock.clone();
+        let t_drain = clock.now_mono();
         let mut last_err: Option<engram_core::SandboxError> = None;
         let drain_outcome = 'retry: {
             for attempt in 0..DRAIN_RETRY_BUDGET {
@@ -766,7 +771,7 @@ pub async fn migrate_session_live(
                         // the budget so the whole retry stays well inside
                         // the source export TTL when started promptly.
                         if attempt + 1 < DRAIN_RETRY_BUDGET {
-                            tokio::time::sleep(drain_retry_base * (1 << attempt)).await;
+                            clock.sleep(drain_retry_base * (1 << attempt)).await;
                         }
                     }
                 }
@@ -790,7 +795,7 @@ pub async fn migrate_session_live(
                 ms,
             }) => {
                 metrics::histogram!(crate::metrics::MIGRATION_LEG_SECONDS, "leg" => "drain")
-                    .record(t_drain.elapsed().as_secs_f64());
+                    .record(clock.now_mono().saturating_sub(t_drain).as_secs_f64());
                 tracing::info!(
                     %session_id, pulled, alt_sourced, zero_chunks, ms,
                     "post-copy drain complete; releasing the source",
@@ -835,7 +840,7 @@ pub async fn migrate_session_live(
                         SessionEvent::StatusChanged {
                             from: SessionState::Active,
                             to: SessionState::Evacuating,
-                            at: chrono::Utc::now(),
+                            at: clock.now_utc(),
                         },
                     )
                     .await;
@@ -939,7 +944,7 @@ async fn parachute_or_kill(
             SessionEvent::StatusChanged {
                 from: SessionState::Evacuating,
                 to: SessionState::Failed,
-                at: chrono::Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await;
@@ -965,6 +970,8 @@ async fn walk_back_to_active(state: &SharedState, session_id: SessionId) -> bool
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -1036,6 +1043,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: tmp,

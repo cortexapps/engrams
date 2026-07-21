@@ -14,6 +14,9 @@
 //!     cargo test -p engram-coordinator --test bundle_gc_live_pg -- --ignored
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -26,22 +29,15 @@ use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::SnapshotId;
 use uuid::Uuid;
 
+/// ADR 0098 D1: the GC sweeps take an injected clock; live tests run on
+/// the real one.
+fn system_clock() -> std::sync::Arc<dyn engram_core::traits::Clock> {
+    std::sync::Arc::new(engram_core::traits::SystemClock::new())
+}
+
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!(
-                "skipping: ENGRAM_TEST_DATABASE_URL not set. Run with `just db-up` first; \
-                 default URL is postgres://engram:engram@localhost:5435/engram",
-            );
-            return None;
-        }
-    };
-    let store = engram_postgres::PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 /// Unique-per-run fake sha256 hex so concurrent CI runs don't trample.
@@ -171,17 +167,29 @@ async fn sweep_deletes_unpinned_after_grace_and_never_touches_pinned() {
         grace_period: Duration::from_secs(0),
         ..ChunkGcConfig::default()
     };
-    let report1 = run_one_bundle_sweep(meta.clone(), blob.clone(), &cfg, SweepMode::Full)
-        .await
-        .expect("sweep 1");
+    let report1 = run_one_bundle_sweep(
+        meta.clone(),
+        blob.clone(),
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("sweep 1");
     assert!(report1.candidates_marked >= 1);
     // With zero grace the candidate can promote within the same sweep
     // (first_seen_at < now by the time the promote pass runs); run a
     // second sweep to cover the row either way.
     tokio::time::sleep(Duration::from_millis(50)).await;
-    let report2 = run_one_bundle_sweep(meta.clone(), blob.clone(), &cfg, SweepMode::Full)
-        .await
-        .expect("sweep 2");
+    let report2 = run_one_bundle_sweep(
+        meta.clone(),
+        blob.clone(),
+        &cfg,
+        SweepMode::Full,
+        &system_clock(),
+    )
+    .await
+    .expect("sweep 2");
     assert!(
         report1.promoted_deletes + report2.promoted_deletes >= 1,
         "garbage generation should promote within two zero-grace sweeps: {report1:?} {report2:?}"
@@ -223,9 +231,15 @@ async fn dry_run_marks_nothing() {
         grace_period: Duration::from_secs(0),
         ..ChunkGcConfig::default()
     };
-    let report = run_one_bundle_sweep(meta.clone(), blob.clone(), &cfg, SweepMode::DryRun)
-        .await
-        .expect("dry run");
+    let report = run_one_bundle_sweep(
+        meta.clone(),
+        blob.clone(),
+        &cfg,
+        SweepMode::DryRun,
+        &system_clock(),
+    )
+    .await
+    .expect("dry run");
     assert!(report.candidates_marked >= 1);
     // Dry run neither parked a candidate nor deleted the blob.
     assert!(blob

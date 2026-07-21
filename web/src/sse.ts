@@ -30,6 +30,43 @@ export interface SseHandlers {
   onDelta?: (d: SessionDelta) => void;
 }
 
+/** Durable event discriminants this client subscribes to explicitly. */
+export const SESSION_EVENT_KINDS: readonly SessionEventKind[] = [
+  "status_changed",
+  "exec_started",
+  "exec_completed",
+  "stdout",
+  "stderr",
+  "snapshot_taken",
+  "evicted",
+  "resumed",
+  "resume_started",
+  "run_started",
+  "agent_message",
+  "tool_call_started",
+  "tool_call_completed",
+  "browser_activity",
+  "tool_call_requested",
+  "tool_result_submitted",
+  "run_completed",
+  "run_interrupted",
+  "harness_idle",
+  "prompt_queued",
+  "prompt_edited",
+  "prompt_dequeued",
+  "prompt_steered",
+  "integration_asset",
+  "file_shared",
+  "recovered_from_checkpoint",
+  // ADR 0090: the durability-rollback warning marker.
+  "durability_rollback",
+  // ADR 0054: historical interactive AskUserQuestion round-trip.
+  "user_question",
+  "question_answered",
+  // ADR 0054 Flavor A: rich file-change diffs.
+  "file_changed",
+];
+
 /**
  * Subscribe to `GET /api/v1/sessions/:id/events`. Returns a `close()` thunk.
  * `since` defaults to -1 (replay everything from the start of the log).
@@ -55,37 +92,7 @@ export function subscribeSession(sessionId: string, handlers: SseHandlers, since
   // Wire one listener per discriminant so EventSource doesn't deliver
   // them all through `onmessage` (which only catches frames with no
   // explicit `event:` field — namely keep-alives).
-  const kinds: SessionEventKind[] = [
-    "status_changed",
-    "exec_started",
-    "exec_completed",
-    "stdout",
-    "stderr",
-    "snapshot_taken",
-    "evicted",
-    "resumed",
-    "run_started",
-    "agent_message",
-    "tool_call_started",
-    "tool_call_completed",
-    "run_completed",
-    "run_interrupted",
-    "harness_idle",
-    "prompt_queued",
-    "prompt_edited",
-    "prompt_dequeued",
-    "prompt_steered",
-    "integration_asset",
-    "file_shared",
-    "recovered_from_checkpoint",
-    // ADR 0054: interactive AskUserQuestion round-trip.
-    "user_question",
-    "question_answered",
-    // ADR 0054 Flavor A: rich file-change diffs.
-    "file_changed",
-  ];
-
-  for (const kind of kinds) {
+  for (const kind of SESSION_EVENT_KINDS) {
     es.addEventListener(kind, (ev) => {
       const indexed = parseOrchestratorFrame((ev as MessageEvent).data, kind);
       if (indexed) handlers.onEvent(indexed);

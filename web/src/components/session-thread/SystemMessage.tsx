@@ -1,5 +1,6 @@
 import { useAuiState } from "@assistant-ui/react";
 import {
+  AlertTriangleIcon,
   CameraIcon,
   DownloadIcon,
   ExternalLinkIcon,
@@ -44,11 +45,53 @@ export function SystemMessage() {
       return <Artifact marker={marker} />;
     case "recovery":
       return <Recovery marker={marker} />;
+    case "durability_rollback":
+      return <DurabilityRollback marker={marker} />;
     case "user_question":
       return <UserQuestionCard marker={marker} />;
     case "note":
       return <Note text={fallback} />;
   }
+}
+
+// ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor
+// eviction exhausted its budget, so the coordinator destroyed the crippled VM.
+// The next resume rewound the guest disk to the last published manifest,
+// silently dropping any writes the host acked but never uploaded past it. This
+// is real data loss the platform can't recover — surfaced prominently, never
+// hidden.
+function DurabilityRollback({
+  marker,
+}: {
+  marker: Extract<SystemMarker, { kind: "durability_rollback" }>;
+}) {
+  return (
+    <Card className="border-destructive/50 bg-destructive/5 py-0">
+      <CardContent className="flex flex-col gap-1.5 p-4">
+        <div className="flex items-center gap-2 text-xs text-destructive">
+          <AlertTriangleIcon className="size-3.5" />
+          <Text as="span" variant="label">
+            guest disk rolled back — recent changes were lost
+          </Text>
+          <span className="ml-auto font-mono tabular-nums text-muted-foreground">
+            {hms(marker.at)}
+          </span>
+        </div>
+        <p className="text-sm text-muted-foreground">
+          A host failure forced this session to recover from its last durable disk snapshot.
+          Uploaded work is intact, but file changes made after the last snapshot could not be
+          recovered.
+        </p>
+        {marker.manifest && (
+          <div className="flex items-center gap-1.5 font-mono text-xs text-muted-foreground">
+            <Badge variant="outline" className="font-normal">
+              restored disk: {marker.manifest}
+            </Badge>
+          </div>
+        )}
+      </CardContent>
+    </Card>
+  );
 }
 
 // ADR 0028 A.log: the honest recovery boundary. Everything above (greyed)
@@ -93,7 +136,12 @@ function Recovery({ marker }: { marker: Extract<SystemMarker, { kind: "recovery"
 
 function Durability({ marker }: { marker: Extract<SystemMarker, { kind: "durability" }> }) {
   const Icon = marker.mark === "snapshot" ? CameraIcon : RotateCcwIcon;
-  const label = marker.mark === "snapshot" ? "snapshotted" : "resumed";
+  const label =
+    marker.mark === "snapshot"
+      ? "snapshotted"
+      : marker.mark === "waking"
+        ? "waking up…"
+        : "resumed";
   return (
     <div className="flex items-center justify-center gap-2 py-1 text-xs text-muted-foreground">
       <Icon className="size-3.5" />

@@ -22,7 +22,6 @@
 //! exec/exec_stream/SSE handlers): if status is `Idle`, enqueue-and-
 //! observe the resume op before routing.
 
-use chrono::Utc;
 use engram_core::traits::SandboxBackend;
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::types::SessionState;
@@ -60,6 +59,19 @@ pub enum EvictOutcome {
     /// nomination left it (`Evicting`, VM untouched); the canceller's
     /// `Active` transition owns the ascent.
     CancelRequested,
+    /// ADR 0090 (2026-07-21 livelock incident): a QUARANTINE-flavored op
+    /// found the session in a state the pipeline can't evict from
+    /// (e.g. `Created` after an ADR 0077 harness-failed park) while it
+    /// still binds the quarantined sandbox. A plain `Skipped` here
+    /// livelocks: the crippled VM keeps advertising every 5s heartbeat,
+    /// each advertise enqueues a fresh op (the idempotency key only
+    /// dedups queued/running rows), and each op skips in ~10ms — prod
+    /// session 8174b7aa looped for 2.5 days / ~43k ops. Instead the
+    /// guard CONVERGES: destroy the crippled VM (capture is impossible
+    /// by definition of quarantine — its disk is unserved; the destroy
+    /// clears the host's quarantine entry, ending the advertise loop)
+    /// and settle the session per its state (see the guard's match).
+    QuarantineReaped,
 }
 
 /// ADR 0074 rung-2 park bookkeeping, run after a successful `pause`:
@@ -76,6 +88,7 @@ async fn park_paused_bookkeeping(
     entry_status: SessionState,
 ) -> Result<(), engram_core::MetaError> {
     let state = ctx.state;
+    let now = state.services.clock.now_utc();
     // ADR 0079 (review finding #6): FENCED — a fenced-out predecessor must
     // not stamp park_rung=2 over a successor's fresh state. Ok(false) =
     // fenced; surface it as the `fenced:` Conflict the caller already maps
@@ -83,7 +96,7 @@ async fn park_paused_bookkeeping(
     if !state
         .services
         .meta
-        .fenced_set_session_park_rung(session_id, ctx.epoch, 2, Some(Utc::now()))
+        .fenced_set_session_park_rung(session_id, ctx.epoch, 2, Some(now))
         .await?
     {
         crate::metrics::note_fenced_write();
@@ -106,11 +119,29 @@ async fn park_paused_bookkeeping(
                 crate::state::SessionEvent::StatusChanged {
                     from: SessionState::Active,
                     to: SessionState::Evicting,
-                    at: Utc::now(),
+                    at: now,
                 },
             )
             .await;
     }
+    // ADR 0101 C: parked is a real state, not a rung stamp over
+    // Evicting — the paused-in-place VM reads `parked` (cheap to wake,
+    // intentionally retained); `evicting` is reserved for an actual
+    // descent in flight. The rung stamp above is kept as host-ledger /
+    // ascent metadata; lifecycle identity is the status.
+    crate::session_ops::transition_with_fence(state, session_id, ctx.fence(), SessionState::Parked)
+        .await?;
+    let _ = state
+        .emit_fenced(
+            session_id,
+            ctx.fence(),
+            crate::state::SessionEvent::StatusChanged {
+                from: SessionState::Evicting,
+                to: SessionState::Parked,
+                at: now,
+            },
+        )
+        .await;
     Ok(())
 }
 
@@ -199,6 +230,173 @@ fn quarantine_capture_timeout() -> std::time::Duration {
 /// are discarded anyway.
 const QUARANTINE_GUEST_RPC_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// ADR 0101 C: how long the eviction scanner trusts a COMPLETED evict
+/// op's capture before re-minting (see `scanner_advance_one`). The
+/// settle normally lands within one heartbeat (~5s) of the host-owned
+/// finalize finishing — with Phases A+B that whole tail is seconds —
+/// so 60s covers slow uploads without materially delaying the
+/// wedged-finalize retry path.
+const EVICT_SETTLE_GRACE: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// ADR 0090 (2026-07-21 livelock incident): converge a QUARANTINE evict
+/// that found its session in a state the entry guard can't evict from
+/// while the session still binds the quarantined sandbox. Capture is
+/// impossible by definition of quarantine (the survivor's disk is
+/// unserved), so the only useful moves are destroying the crippled VM —
+/// which clears the host's quarantine entry and ends the 5s
+/// advertise → enqueue → skip loop — and settling the row in a lane its
+/// owning machinery re-drives. Wildcard-free over `SessionState` on
+/// purpose: a future state must pick its arm here, not inherit a silent
+/// skip that re-opens the loop.
+async fn quarantine_reap_unevictable(
+    ctx: &OpCtx<'_>,
+    session: &engram_core::types::Session,
+    sandbox_id: SandboxId,
+) -> Result<EvictOutcome, EvictError> {
+    let state = ctx.state;
+    let session_id = session.id;
+    match session.status {
+        // Unreachable from the caller (these are the entry-legal states);
+        // kept so the match stays total.
+        SessionState::Active | SessionState::Evicting => Ok(EvictOutcome::Skipped {
+            reason: "session no longer evictable (a concurrent op moved it first)",
+        }),
+        // In-flight placement/relocation lanes: the queue scanner / evac
+        // resumer own these rows, and destroying the VM under a mid-evac
+        // capture would race their machinery. Their own settle paths
+        // converge (evac falls back to Idle, queued rows re-place); if
+        // the binding survives that, the next advertise re-enters here.
+        SessionState::Pending | SessionState::Queued | SessionState::Evacuating => {
+            tracing::warn!(
+                session_id = %session_id,
+                %sandbox_id,
+                state = session.status.as_str(),
+                "quarantined survivor bound to an in-flight placement/relocation \
+                 lane; leaving convergence to its owning machinery",
+            );
+            Ok(EvictOutcome::Skipped {
+                reason: "quarantined survivor owned by in-flight placement/relocation",
+            })
+        }
+        // The livelock class. `Created` is the ADR 0077 harness-failed
+        // park (prod 8174b7aa: a resume's start_agent failed against the
+        // crippled VM, parked at Created, and no evict could ever run);
+        // `Unreachable` is its dead-guest cousin. Nothing user-visible
+        // ran in the VM (the harness never (re)started), so destroy it
+        // and settle HostLost — the one lane the dead-host straggler
+        // sweep re-drives to Idle/recoverable; the next prompt resumes
+        // from the last checkpoint (ADR 0090's designed blast radius).
+        //
+        // ADR 0101 C: `Parked` joins this arm — a quarantined survivor's
+        // disk is unserved, so the paused VM can neither wake usefully
+        // nor descend (capture needs the data plane). Unlike
+        // Created/Unreachable the session DID run user work; destroying
+        // it loses the un-captured tail, exactly a host-death loss —
+        // HostLost is the honest settle (recovery from the last
+        // published checkpoint, surfaced as CheckpointLag on resume).
+        SessionState::Created | SessionState::Unreachable | SessionState::Parked => {
+            if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
+                // Leave the binding + state alone: the op's retry budget
+                // (and, on exhaustion, the verb's destroy-then-HostLost
+                // arm) own the re-drive at op-backoff cadence, not the
+                // 5s heartbeat's.
+                return Err(EvictError::Meta(format!(
+                    "quarantine reap: destroy of unevictable survivor failed: {e}"
+                )));
+            }
+            match crate::session_ops::transition_with_fence(
+                state,
+                session_id,
+                ctx.fence(),
+                SessionState::HostLost,
+            )
+            .await
+            {
+                Ok(prev) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        %sandbox_id,
+                        from = prev.as_str(),
+                        "quarantined survivor was unevictable (harness-failed park / \
+                         dead guest); destroyed the crippled VM and settled HostLost \
+                         for the straggler sweep to recover",
+                    );
+                    let _ = state
+                        .emit_fenced(
+                            session_id,
+                            ctx.fence(),
+                            SessionEvent::StatusChanged {
+                                from: prev,
+                                to: SessionState::HostLost,
+                                at: state.services.clock.now_utc(),
+                            },
+                        )
+                        .await;
+                }
+                Err(e) => {
+                    // The destroy landed (the advertise loop is dead);
+                    // a failed flip means a successor moved the session
+                    // first — it owns convergence from here.
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "quarantine reap: destroyed the survivor but the HostLost \
+                         flip did not land (a successor owns the session)",
+                    );
+                }
+            }
+            Ok(EvictOutcome::QuarantineReaped)
+        }
+        // Durable-or-settled rows: whatever is recoverable is already
+        // recorded (Idle implies a durable capture; HostLost is mid-
+        // recovery; terminals are terminal). The crippled VM is garbage —
+        // reap it and drop the stale binding so nothing (e.g. the resume
+        // crash-shortcut) latches a destroyed sandbox. No status change.
+        SessionState::Idle
+        | SessionState::HostLost
+        | SessionState::Failed
+        | SessionState::Completed
+        | SessionState::Dead => {
+            if let Err(e) = state.services.host.destroy(sandbox_id, ctx.fence()).await {
+                return Err(EvictError::Meta(format!(
+                    "quarantine reap: destroy of settled-session survivor failed: {e}"
+                )));
+            }
+            match state
+                .services
+                .meta
+                .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    crate::metrics::note_fenced_write();
+                    tracing::warn!(
+                        session_id = %session_id,
+                        "quarantine reap: unbind fenced (successor re-claimed); \
+                         the destroy already ended the advertise loop",
+                    );
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        session_id = %session_id,
+                        error = %e,
+                        "quarantine reap: unbind failed after destroy; the stale \
+                         binding resolves on the session's next lifecycle op",
+                    );
+                }
+            }
+            tracing::warn!(
+                session_id = %session_id,
+                %sandbox_id,
+                state = session.status.as_str(),
+                "reaped a quarantined survivor bound to a settled session",
+            );
+            Ok(EvictOutcome::QuarantineReaped)
+        }
+    }
+}
+
 /// memory-snapshot → destroy sequence the legacy `evict_session_to_state`
 /// ran, now driven under an op claim (the mutual exclusion; the
 /// `session_ops_one_running` index replaces the session lease) with
@@ -259,7 +457,25 @@ pub(crate) async fn run_evict_pipeline(
     } else {
         matches!(entry_status, SessionState::Active | SessionState::Evicting)
     };
+    let quarantine = ctx
+        .op
+        .payload
+        .get("quarantine")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !entry_legal {
+        // ADR 0090 (2026-07-21 livelock incident): a quarantine op must
+        // never settle as a plain skip while the session still binds the
+        // quarantined sandbox — the host re-advertises the survivor every
+        // 5s heartbeat, each advertise re-enqueues (the idempotency key
+        // only dedups queued/running rows), and each op would skip again
+        // in ~10ms, forever (prod session 8174b7aa: 2.5 days, ~43k ops).
+        // Converge instead: see [`quarantine_reap_unevictable`].
+        if quarantine {
+            if let Some(sandbox_id) = session.sandbox_id {
+                return quarantine_reap_unevictable(ctx, &session, sandbox_id).await;
+            }
+        }
         tracing::info!(
             session_id = %session_id,
             state = entry_status.as_str(),
@@ -298,7 +514,7 @@ pub(crate) async fn run_evict_pipeline(
                             SessionEvent::StatusChanged {
                                 from: prev,
                                 to: SessionState::HostLost,
-                                at: Utc::now(),
+                                at: state.services.clock.now_utc(),
                             },
                         )
                         .await;
@@ -400,12 +616,8 @@ pub(crate) async fn run_evict_pipeline(
     // to destroy + rewind. Covers BOTH capture flavors — `snapshot_begin`
     // (the normal prod-FC D5 path; adversarial-review finding: the first
     // cut bounded only the composed fallback) and composed `snapshot()`.
-    let quarantine = ctx
-        .op
-        .payload
-        .get("quarantine")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
+    // (`quarantine` itself is read above the entry guard now — the
+    // 2026-07-21 livelock fix consumes it there too.)
     if target_state == SessionState::Idle {
         // ADR 0074 rung 2 (parked-paused): if the host has memory
         // headroom, PAUSE the VM in place instead of snapshot+destroy.
@@ -523,7 +735,7 @@ pub(crate) async fn run_evict_pipeline(
         };
         match begin_res {
             Ok(snapshot_id) => {
-                return finish_eviction_d5(ctx, session_id, sandbox_id, snapshot_id, &session)
+                return finish_eviction_d5(ctx, session_id, sandbox_id, snapshot_id, entry_status)
                     .await;
             }
             Err(engram_core::SandboxError::InvalidSpec(reason)) => {
@@ -555,7 +767,7 @@ pub(crate) async fn run_evict_pipeline(
     };
 
     let host_id = state.host_registry.host_of(sandbox_id);
-    let now = Utc::now();
+    let now = state.services.clock.now_utc();
     // ADR 0028 A.log / issue #529: the event-log leg of the coherence
     // triple. Resolve the cursor from the host's EXACT pause instant
     // (`metadata.paused_at`, stamped in `SnapshotFinisher::finish`) when
@@ -641,6 +853,65 @@ pub(crate) async fn run_evict_pipeline(
             abort_inflight_snapshot(ctx, session_id, sandbox_id, "record_snapshot").await;
             return Err(EvictError::Meta(e.to_string()));
         }
+    }
+
+    // #792 (R4, ADR 0098 Phase 3): the recoverable-before-Idle guard. The
+    // capture produced manifests and we recorded the row, but the
+    // `verify_snapshot_recoverable` above does a live BlobStorage HEAD of
+    // each manifest — a TRANSIENT head blip stamps `recoverable = false` on
+    // a capture whose artifacts are actually durable. Landing the session
+    // `Idle` on that lie strands it un-resumable: the falsehood surfaces
+    // only at `/resume`, which then fails (→ `Dead` via the #782 honest
+    // predicate) after the user already tried to come back. Gate the
+    // terminal transition on the SAME honest predicate the dead-host
+    // stage-2 ladder uses (#782 `dead_host::recovery_target`): a capture
+    // with no recoverable snapshot AND no live disk manifest is not a safe
+    // basis for `Idle`.
+    //
+    // Scope is exactly the transient-blip class — `manifests_present &&
+    // !recoverable` means "the capture DID produce manifests but a HEAD
+    // failed." A manifest-LESS capture keeps its prior behavior on purpose:
+    // the dev backends (Process/VZ) and the pre-#791 sim fidelity gap
+    // produce no chunked manifests, #791 already closed the manifest-less
+    // case at the sim-fidelity layer, and gating it here would wedge those
+    // backends into an eternal retry. Only the idle path is gated (drain /
+    // `Evacuating` is out of #792's scope and routes differently).
+    //
+    // Recovery routes through the existing ladder — no new state or RPC:
+    // abort the still-in-flight snapshot and return a RETRYABLE error (do
+    // NOT commit, NOT flip `Idle`, NOT destroy the still-live VM). The op
+    // machinery redrives within the evict budget (`session_verbs::evict`);
+    // a transient blip clears on the fresh capture+verify → `Idle`
+    // recoverable. A PERSISTENTLY unrecoverable capture exhausts the budget
+    // and falls back (nominated) to `HostLost`, where the dead-host
+    // straggler sweep applies `recovery_target` and settles the session
+    // `Dead` WITH the distinct unrecoverable-snapshot signal
+    // (`note_unrecoverable_if_dead`) — never a lying `Idle`. The
+    // `recoverable = false` row recorded just above is precisely what lets
+    // that sweep emit the signal.
+    let manifests_present = metadata.disk_manifest.is_some() || metadata.memory_manifest.is_some();
+    if target_state == SessionState::Idle
+        && manifests_present
+        && !record.recoverable
+        && session.live_disk_manifest.is_none()
+    {
+        ::metrics::counter!(crate::metrics::EVICTION_UNRECOVERABLE_CAPTURE_GUARD_TOTAL)
+            .increment(1);
+        tracing::warn!(
+            session_id = %session_id,
+            sandbox_id = %sandbox_id,
+            snapshot_id = %record.id,
+            "idle eviction: capture recorded recoverable=false (manifests present but a \
+             BlobStorage HEAD failed) with no live disk manifest — refusing to land Idle on \
+             an un-resumable capture; aborting and retrying verification via the op budget",
+        );
+        abort_inflight_snapshot(ctx, session_id, sandbox_id, "recoverable-guard").await;
+        return Err(EvictError::Meta(format!(
+            "capture {} recorded recoverable=false (transient BlobStorage HEAD failure) with \
+             no live disk manifest; refusing to land Idle on an un-resumable capture — \
+             retrying verification within the evict op budget",
+            record.id,
+        )));
     }
 
     // ADR 0034 durability: commit the host's in-flight snapshot NOW —
@@ -835,120 +1106,99 @@ pub(crate) async fn run_evict_pipeline(
     Ok(EvictOutcome::Evacuated)
 }
 
-/// ADR 0045 D5 (rewritten for issue #529, then ADR 0079): the fast-path
-/// tail of an idle eviction. The capture has landed (`snapshot_begin`
-/// returned) and the finalize is a HOST-OWNED job: the host durably
-/// persisted its inputs before `snapshot_begin` returned, and it lands
-/// the snapshot row itself via the heartbeat reconcile
-/// (`api/host_http.rs::heartbeat`) — surviving this coordinator dying,
-/// restarting, or never seeing the upload complete.
+/// ADR 0045 D5 (rewritten for issue #529, ADR 0079, then ADR 0101 C):
+/// the fast-path tail of an idle eviction. The capture has landed
+/// (`snapshot_begin` returned) and the finalize is a HOST-OWNED job:
+/// the host durably persisted its inputs before `snapshot_begin`
+/// returned, and it lands the snapshot row itself via the heartbeat
+/// reconcile (`api/host_http.rs::heartbeat`) — surviving this
+/// coordinator dying, restarting, or never seeing the upload complete.
 ///
-/// This function marks the session Idle NOW (user-visible teardown ends
-/// here) and FINISHES THE EVICT OP immediately — it does NOT hold the
-/// session's one-running op lane for the upload (ADR 0079 review finding
-/// #11: an earlier draft watched the finalize row and blocked a queued
-/// resume/deliver for up to the upload's duration, reintroducing the
-/// evict-then-resume stall this epic exists to kill). The finalize is
-/// host-owned: the upload proceeds on the host, and the coordinator
-/// learns the durable snapshot row via the heartbeat reconcile
-/// (`api/host_http.rs::heartbeat`), independent of any op. The instant
-/// the session is Idle it is resumable; a resume that arrives before the
-/// row lands falls back to the prior periodic checkpoint (ADR 0028's
-/// documented-acceptable bounded loss), never waits on the upload.
+/// ADR 0101 C: this function no longer flips the session Idle — `idle`
+/// means "closure verified durable + recoverable PG row", and the
+/// reconcile that records that row performs the fused settle
+/// (`settle_evicted_session_idle`). The evict op still FINISHES here
+/// (ADR 0079 review finding #11: never hold the session's one-running
+/// op lane to watch an upload).
 async fn finish_eviction_d5(
     ctx: &OpCtx<'_>,
     session_id: SessionId,
     sandbox_id: SandboxId,
     snapshot_id: engram_core::types::SnapshotId,
-    session: &engram_core::types::Session,
+    entry_status: SessionState,
 ) -> Result<EvictOutcome, EvictError> {
-    let state = ctx.state;
-    let now = Utc::now();
-
     if !ctx.step("mark_idle").await {
         return Ok(EvictOutcome::Fenced);
     }
-    // Idle-before-durable: PG sandbox detach (the authoritative unbind,
-    // ADR 0047 — no in-memory registry), then state flip. Fenced;
-    // `host_id` is re-written unchanged to preserve resume affinity.
-    match state
-        .services
-        .meta
-        .fenced_assign_sandbox(session_id, ctx.epoch, None, session.host_id)
-        .await
-    {
-        Ok(true) => {}
-        Ok(false) => return Ok(EvictOutcome::Fenced),
-        Err(e) => {
-            tracing::warn!(session_id = %session_id, error = %e,
-                "D5 eviction: fenced_assign_sandbox(None) failed");
-        }
-    }
-    let prev = match crate::session_ops::transition_with_fence(
-        state,
-        session_id,
-        ctx.fence(),
-        SessionState::Idle,
-    )
-    .await
-    {
-        Ok(prev) => prev,
-        Err(engram_core::MetaError::Conflict(msg)) if msg.starts_with("fenced:") => {
-            return Ok(EvictOutcome::Fenced);
-        }
-        Err(e) => {
-            // Issue #529: the host's finalize artifacts are ALREADY
-            // durable (snapshot_begin returned) — there is nothing to
-            // abort or destroy here. The op's retry hits the idempotent
-            // `snapshot_begin` and re-observes the same pending job
-            // rather than re-capturing.
-            return Err(EvictError::Meta(e.to_string()));
-        }
-    };
-    if session.park_rung != 0 {
-        // Fenced (review finding #6).
-        let _ = state
-            .services
-            .meta
-            .fenced_set_session_park_rung(session_id, ctx.epoch, 0, None)
-            .await;
-    }
-    let _ = state
-        .emit_fenced(session_id, ctx.fence(), SessionEvent::Evicted { at: now })
-        .await;
-    let _ = state
-        .emit_fenced(
+    // An admin-path evict enters at `Active` (a nominated one already
+    // transitioned at nomination): make the descent visible BEFORE the
+    // op finishes, so the reconcile's `Evicting → Idle` settle has a CAS
+    // to land on. Fenced; a non-fenced failure means the session raced
+    // (delete / host death) — the settle then no-ops harmlessly and the
+    // raced state's own machinery converges.
+    if entry_status == SessionState::Active {
+        match crate::session_ops::transition_with_fence(
+            ctx.state,
             session_id,
             ctx.fence(),
-            SessionEvent::StatusChanged {
-                from: prev,
-                to: SessionState::Idle,
-                at: now,
-            },
+            SessionState::Evicting,
         )
-        .await;
+        .await
+        {
+            Ok(prev) => {
+                let _ = ctx
+                    .state
+                    .emit_fenced(
+                        session_id,
+                        ctx.fence(),
+                        SessionEvent::StatusChanged {
+                            from: prev,
+                            to: SessionState::Evicting,
+                            at: ctx.state.services.clock.now_utc(),
+                        },
+                    )
+                    .await;
+            }
+            Err(engram_core::MetaError::Conflict(msg)) if msg.starts_with("fenced:") => {
+                return Ok(EvictOutcome::Fenced);
+            }
+            Err(e) => {
+                tracing::warn!(session_id = %session_id, error = %e,
+                    "D5 eviction: Active→Evicting descent transition failed (raced); \
+                     the raced state's machinery owns convergence");
+            }
+        }
+    }
+    // ADR 0101 C: the Idle-before-durable flip is RETIRED. The capture
+    // landed (`snapshot_begin` returned — the host's finalize inputs
+    // are crash-durable on its node), but `idle` now means "the
+    // snapshot closure is verified durable": the heartbeat reconcile
+    // (`api/host_http.rs::heartbeat`) performs the fused
+    // detach + `Evicting → Idle` settle (`settle_evicted_session_idle`)
+    // the moment it records the recoverable eviction-final row — with
+    // Phases A+B that is seconds behind us, not the old ~25-95s. The op
+    // still FINISHES here (ADR 0079 finding #11: never hold the
+    // one-running op lane to watch an upload); the session simply stays
+    // `evicting` — honestly — for the short publication window, and a
+    // resume in that window queues behind the settle instead of
+    // silently rolling back to a stale checkpoint. If the host dies
+    // before the row lands, the scanner's bounded attempts fall the
+    // session to HostLost (recovery from the last published checkpoint,
+    // surfaced as ADR 0091 CheckpointLag) — the same floor as today,
+    // minus the silence.
     tracing::info!(
         session_id = %session_id,
         sandbox_id = %sandbox_id,
         snapshot_id = %snapshot_id,
-        "idle eviction: session Idle after capture; finalize is now a host-owned \
-         job (issue #529) — the row lands via the heartbeat reconcile",
+        "idle eviction: capture landed; session stays Evicting until the heartbeat \
+         reconcile records the recoverable snapshot row and settles it Idle (ADR 0101 C)",
     );
 
     // ADR 0079 (review finding #11): the evict op FINISHES here — the
-    // instant the session is durably Idle. The 900s inline finalize
-    // row-watch that used to live here HELD the session's one-running op
-    // lane for the whole upload, blocking any queued resume/deliver behind
-    // it (the very "evict-then-resume collision gone" property the op log
-    // is meant to deliver would fail on the full-evict path). The finalize
-    // is genuinely host-owned: the host durably persisted its inputs
-    // before `snapshot_begin` returned and lands the snapshot row itself
-    // via the heartbeat reconcile, surviving this coordinator dying — so
-    // there is nothing the coordinator must hold the lane to watch. A
-    // resume that arrives before the row lands falls back to the prior
-    // checkpoint (ADR 0028 — "the same blast radius as an active host
-    // death"), which is the accepted tradeoff for making the session
-    // resumable the INSTANT it's Idle.
+    // 900s inline finalize row-watch that once lived here HELD the
+    // session's one-running op lane for the whole upload, blocking any
+    // queued resume/deliver behind it. The settle is the reconcile's
+    // job now; this op has nothing left to hold the lane for.
     Ok(EvictOutcome::Evacuated)
 }
 
@@ -1065,13 +1315,26 @@ pub fn spawn_eviction_scanner(
 
 /// Single scanner tick. `pub(crate)` so tests can drive the scanner
 /// deterministically without `tokio::spawn`-ing the loop.
-pub(crate) async fn scanner_run_once(
+pub async fn scanner_run_once(
     state: &SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // ADR 0101 C: parked sessions are their own state now — the reaper
+    // owns their pressure / hard-TTL descent candidacy. They are no
+    // longer `Evicting` rows the scanner "finds" every tick forever
+    // (the 8h-in-evicting weirdness, and half of the ADR 0077×0090
+    // livelock surface).
+    let parked = state.services.meta.list_parked_sessions().await?;
+    for session in parked {
+        if let Err(e) = park_reaper_advance_one(state, session).await {
+            tracing::warn!(error = %e, "park reaper per-session advance failed");
+        }
+    }
+
     let candidates = state.services.meta.list_evicting_sessions().await?;
     // Queue-depth gauge even when 0 — a flatline at 0 is the healthy
     // signal; a climbing value means evictions arrive faster than
-    // pipelines complete.
+    // pipelines complete. (Parked sessions no longer count: parked is
+    // a resting state, not a backlog.)
     ::metrics::gauge!(crate::metrics::EVICTION_SCANNER_QUEUE).set(candidates.len() as f64);
     if candidates.is_empty() {
         return Ok(());
@@ -1081,15 +1344,6 @@ pub(crate) async fn scanner_run_once(
         "eviction scanner found Evicting sessions"
     );
     for (session, _attempts) in candidates {
-        // ADR 0074 rungs 2-3: a PARKED session (park_rung >= 2) is not a
-        // fresh eviction to enqueue — the reaper owns its dwell/pressure
-        // descent. Route it there.
-        if session.park_rung >= 2 {
-            if let Err(e) = park_reaper_advance_one(state, session).await {
-                tracing::warn!(error = %e, "park reaper per-session advance failed");
-            }
-            continue;
-        }
         if let Err(e) = scanner_advance_one(state, session).await {
             // Keep going — one wedged session shouldn't stall the
             // sweep.
@@ -1112,9 +1366,8 @@ async fn scanner_advance_one(
 
     // An Evicting row with no bound sandbox is structurally
     // inconsistent (nothing to evict): fall back to HostLost NOW rather
-    // than enqueue a guaranteed no-op. The existing HostLost machinery
-    // (dead-host second stage, host-side orphan reap, manual /resume)
-    // owns recovery from there, and HostLost is not Active so neither
+    // than enqueue a guaranteed no-op. The dead_host HostLost straggler
+    // sweep owns recovery from there, and HostLost is not Active so neither
     // detector re-nominates — the loop is broken by construction.
     // (The evict verb has the same fallback for a binding that vanishes
     // between this enqueue and its claim.)
@@ -1137,7 +1390,7 @@ async fn scanner_advance_one(
                         SessionEvent::StatusChanged {
                             from: prev,
                             to: SessionState::HostLost,
-                            at: Utc::now(),
+                            at: state.services.clock.now_utc(),
                         },
                     )
                     .await;
@@ -1174,16 +1427,82 @@ async fn scanner_advance_one(
     // after re-nomination — the ascent's Active transition is what
     // normally ends that state).
     let key = format!("evict:{}", session.last_active_at.timestamp_millis());
+
+    // ADR 0101 C (engrams review, #836 rounds 2+3): a COMPLETED evict op
+    // means the capture already landed — the session is honestly
+    // `Evicting` for the publication window and the heartbeat reconcile's
+    // settle owns the tail. Terminal rows leave the dedup index by
+    // design, so without this check every tick would mint a fresh op that
+    // re-runs stop_browser/stop_ide + the (idempotent) snapshot_begin
+    // against the finalizing sandbox — the terminal-op churn shape the
+    // #837 op-mint oracle exists to condemn, transiently. KEY-AGNOSTIC
+    // (round 3): the three post-capture paths mint under three different
+    // keys — this scanner's `evict:<last_active>`, the park reaper's
+    // `evict-descend:<parked_at>`, and the admin/evict_local path's none
+    // at all — so a key-scoped read protected only one of three.
+    //
+    // The suppression is TIME-BOUNDED, not absolute: past the grace the
+    // scanner re-mints — but as a CAPTURE RETRY (`allow_park: false`).
+    // The stale-Done case means the settle never landed (a wedged or
+    // quarantined finalize); re-parking there would defeat the eviction
+    // the prior op already committed to (and against a lock-free
+    // quarantined survivor, `host.pause` can succeed — stranding a
+    // "parked" session whose durability upload failed). The capture
+    // retry preserves the wedged-upload → bounded-attempts → HostLost
+    // floor; a DEAD host is the dead-host detector's job either way.
+    let mut allow_park = true;
+    if let Some(prior) = state
+        .services
+        .meta
+        .op_latest_for_kind(session_id, engram_core::types::session_op::OpKind::Evict)
+        .await?
+    {
+        match prior.state {
+            // A pending evict already exists (e.g. the reaper's descent
+            // op, minted under its own key, not yet claimed) — a second
+            // mint is pure waste; the op lane serializes anyway.
+            engram_core::types::session_op::OpState::Queued => {
+                return Ok(());
+            }
+            engram_core::types::session_op::OpState::Done => {
+                let within_grace = prior.finished_at.is_some_and(|t| {
+                    state
+                        .services
+                        .clock
+                        .now_utc()
+                        .signed_duration_since(t)
+                        .to_std()
+                        .is_ok_and(|elapsed| elapsed < EVICT_SETTLE_GRACE)
+                });
+                if within_grace {
+                    tracing::debug!(
+                        %session_id,
+                        "eviction scanner: capture landed (Done evict op); the reconcile \
+                         settle owns the tail — not re-minting",
+                    );
+                    return Ok(());
+                }
+                allow_park = false;
+            }
+            // Failed / Cancelled / Running: the pre-existing behavior
+            // (Running is already handled above; a burned key re-mints).
+            _ => {}
+        }
+    }
     let outcome = crate::session_ops::enqueue(
         state,
         session_id,
         engram_core::types::session_op::OpKind::Evict,
-        serde_json::json!({ "target": "idle", "allow_park": true, "nominated": true }),
+        serde_json::json!({ "target": "idle", "allow_park": allow_park, "nominated": true }),
         Some(&key),
     )
     .await?;
     if let engram_core::types::session_op::EnqueueOutcome::Claimed(_) = outcome {
-        tracing::info!(%session_id, "eviction scanner: enqueued evict op (claimed)");
+        tracing::info!(
+            %session_id,
+            allow_park,
+            "eviction scanner: enqueued evict op (claimed)"
+        );
     }
     Ok(())
 }
@@ -1236,14 +1555,38 @@ async fn park_reaper_advance_one(
     let session_id = session.id;
     let Some(_sandbox_id) = session.sandbox_id else {
         // A parked row with no bound sandbox is inconsistent (park
-        // implies a live VM). Clear the rung and let the normal scanner
-        // path fall it back to HostLost on the next tick.
-        tracing::warn!(%session_id, "park reaper: parked row has no sandbox; clearing rung");
+        // implies a live VM). ADR 0101 C: fall it to HostLost directly —
+        // a `parked` row is no longer in the eviction scanner's sweep,
+        // so there is no "next tick" that would repair it.
+        tracing::warn!(%session_id, "park reaper: parked row has no sandbox; falling to HostLost");
         let _ = state
             .services
             .meta
             .set_session_park_rung(session_id, 0, None)
             .await;
+        match state
+            .services
+            .meta
+            .transition_session(session_id, SessionState::HostLost)
+            .await
+        {
+            Ok(prev) => {
+                let _ = state
+                    .emit(
+                        session_id,
+                        crate::state::SessionEvent::StatusChanged {
+                            from: prev,
+                            to: SessionState::HostLost,
+                            at: state.services.clock.now_utc(),
+                        },
+                    )
+                    .await;
+            }
+            Err(e) => {
+                tracing::warn!(%session_id, error = %e,
+                    "park reaper: Parked→HostLost fallback failed (raced; retrying next tick)");
+            }
+        }
         return Ok(());
     };
 
@@ -1258,7 +1601,7 @@ async fn park_reaper_advance_one(
     // user's return is then an un-pause (ms) instead of a ~27s rebuild.
     let has_headroom = host_has_memory_headroom(state, session_id).await;
     // The absolute ceiling. The idle DETECTOR's hard TTL can't reach a
-    // parked session (it scans `Active` rows; a parked one is `Evicting`),
+    // parked session (it scans `Active` rows; a parked one is `Parked`),
     // so with the dwell clock retired the reaper owns the ceiling: an
     // abandoned park descends after the same hard TTL, measured from the
     // park instant (which trails the session's last event by the soft
@@ -1266,7 +1609,7 @@ async fn park_reaper_advance_one(
     let hard_cap = crate::idle_detector::IdleDetectorConfig::from_env().hard_ttl;
     let parked_for = session
         .parked_at
-        .map(|at| Utc::now().signed_duration_since(at))
+        .map(|at| state.services.clock.now_utc().signed_duration_since(at))
         .unwrap_or_else(chrono::Duration::zero);
     let hard_exceeded = parked_for.to_std().is_ok_and(|elapsed| elapsed >= hard_cap);
     // Operator escape hatch (off by default) — see `park_dwell_cap`.
@@ -1284,6 +1627,42 @@ async fn park_reaper_advance_one(
         return Ok(());
     };
 
+    // ADR 0101 C: descent is an EXPLICIT lifecycle move — flip
+    // `Parked → Evicting` BEFORE enqueueing, so the descent op's entry
+    // guard (which accepts nominated work only from `Evicting`) can
+    // never skip-loop against a still-`parked` row (enqueue-first was
+    // the ADR 0077×0090 livelock shape: a state-guard Skip terminalizes
+    // the op, terminal rows leave the dedup index, and the next tick
+    // mints a fresh op forever). Crash between this transition and the
+    // enqueue is self-correcting: the eviction scanner finds the
+    // op-less `Evicting` row and enqueues a generic evict, which
+    // re-parks if pressure has abated or descends if it persists.
+    match state
+        .services
+        .meta
+        .transition_session(session_id, SessionState::Evicting)
+        .await
+    {
+        Ok(prev) => {
+            let _ = state
+                .emit(
+                    session_id,
+                    crate::state::SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Evicting,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+        }
+        Err(e) => {
+            // Raced (un-park ascent, delete, host death) — the fresh
+            // status owns the next move; nothing to enqueue.
+            tracing::debug!(%session_id, error = %e,
+                "park reaper: Parked→Evicting descent transition raced; skipping");
+            return Ok(());
+        }
+    }
     // Key the descent to the park instant: at most one descent op per
     // park, dedup'd across ticks and replicas.
     let key = format!(
@@ -1318,6 +1697,8 @@ async fn park_reaper_advance_one(
 fn _backend_unused_check<B: SandboxBackend>(_: std::sync::Arc<B>) {}
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -1395,6 +1776,20 @@ mod tests {
         sandbox_root: &Path,
         backend: Arc<dyn SandboxBackend>,
     ) -> (SharedState, Arc<MiniMeta>) {
+        build_state_and_meta_with_backend_and_blob(session, sandbox_root, backend, None)
+    }
+
+    /// #792: variant that also injects the coordinator's `BlobStorage`, so
+    /// the recoverable-guard tests can script `head` faults
+    /// (`FaultyBlobStorage`) that drive `verify_snapshot_recoverable` to
+    /// `recoverable = false` on a manifest-bearing capture. `None` keeps the
+    /// default shared LocalBlobStorage.
+    fn build_state_and_meta_with_backend_and_blob(
+        session: Session,
+        sandbox_root: &Path,
+        backend: Arc<dyn SandboxBackend>,
+        blob: Option<Arc<dyn engram_core::traits::BlobStorage>>,
+    ) -> (SharedState, Arc<MiniMeta>) {
         let local_path = sandbox_root.join("local");
         std::fs::create_dir_all(&local_path).unwrap();
         let meta = Arc::new(MiniMeta::new(session));
@@ -1419,9 +1814,11 @@ mod tests {
                 engram_oci::AnonymousResolver,
             ))),
             auth_resolver: std::sync::Arc::new(engram_oci::AnonymousResolver),
-            blob: std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
-                std::env::temp_dir().join("engram-blobs-test"),
-            )),
+            blob: blob.unwrap_or_else(|| {
+                std::sync::Arc::new(engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-blobs-test"),
+                ))
+            }),
             chunk_store: engram_chunk_store::ChunkStore::new(std::sync::Arc::new(
                 engram_storage_local::LocalBlobStorage::new(
                     std::env::temp_dir().join("engram-blobs-test"),
@@ -1429,6 +1826,8 @@ mod tests {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path,
@@ -1695,9 +2094,20 @@ mod tests {
         assert_eq!(
             op.state,
             OpState::Done,
-            "the evict op finishes the instant the session is Idle, not after finalize",
+            "the evict op finishes the instant the capture lands, not after finalize",
         );
-        assert_eq!(meta.session.lock().status, SessionState::Idle);
+        // ADR 0101 C: the session stays HONESTLY Evicting until the
+        // recoverable snapshot row lands — Idle-at-capture is retired.
+        assert_eq!(
+            meta.session.lock().status,
+            SessionState::Evicting,
+            "no Idle before the recoverable snapshot row exists (ADR 0101 C floor)",
+        );
+        assert_eq!(
+            meta.session.lock().sandbox_id,
+            Some(sandbox_id),
+            "the sandbox stays bound until the settle detaches it",
+        );
         assert!(
             meta.snapshots.lock().is_empty(),
             "row-only-at-host-finalize: no snapshot row before the host lands it",
@@ -1730,6 +2140,44 @@ mod tests {
         assert!(
             matches!(resume, EnqueueOutcome::Claimed(_)),
             "a resume must claim the lane immediately after the evict op finishes; got {resume:?}",
+        );
+
+        // ADR 0101 C: the settle — once the host's recoverable row lands
+        // (the heartbeat reconcile's `record_snapshot`), one guarded
+        // store op flips `Evicting → Idle` and detaches. Simulated here
+        // by planting the row and calling the settle directly.
+        let snapshot_id = engram_core::types::SnapshotId::new();
+        meta.snapshots
+            .lock()
+            .push(engram_core::types::snapshot::SnapshotRecord {
+                id: snapshot_id,
+                session_id: Some(session_id),
+                host_id: None,
+                image_version: "test/repo:d5".into(),
+                size_bytes: 0,
+                created_at: chrono::Utc::now(),
+                last_accessed_at: chrono::Utc::now(),
+                disk_manifest: None,
+                memory_manifest: None,
+                recoverable: true,
+                aux_bundles: Vec::new(),
+                events_cursor: Some(0),
+                fc_snapshot_version: None,
+            });
+        assert!(
+            state
+                .services
+                .meta
+                .settle_evicted_session_idle(session_id, sandbox_id, snapshot_id)
+                .await
+                .unwrap(),
+            "a recoverable row + matching binding must settle the session Idle",
+        );
+        assert_eq!(meta.session.lock().status, SessionState::Idle);
+        assert_eq!(
+            meta.session.lock().sandbox_id,
+            None,
+            "the settle detaches the sandbox in the same guarded write",
         );
     }
 
@@ -2004,6 +2452,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -2230,6 +2680,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -2451,6 +2903,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -2782,6 +3236,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -3116,11 +3572,127 @@ mod tests {
             });
     }
 
-    /// ADR 0074 rung 2 (parked-paused): with host memory headroom, an
-    /// idle eviction PAUSES the VM in place instead of capturing —
-    /// session holds at Evicting, park_rung=2, sandbox alive, nothing
-    /// snapshotted. When the user returns, the cancel path un-pauses and
-    /// flips back to Active with the same live sandbox (no rebuild).
+    /// ADR 0101 C (engrams review, #836 round 2): once a nomination's
+    /// evict op is DONE (capture landed; the session honestly `Evicting`
+    /// for the publication window), the scanner must NOT re-mint an op —
+    /// the reconcile settle owns the tail. Terminal rows leave the dedup
+    /// index by design, so without the grace check every 10s tick minted
+    /// a fresh op that re-ran guest RPCs + snapshot_begin against the
+    /// finalizing sandbox for the whole window.
+    #[tokio::test]
+    async fn scanner_does_not_remint_after_capture_landed() {
+        let session_id = engram_core::SessionId::new();
+        let session = evicting_session(session_id);
+        let last_active_at = session.last_active_at;
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // Drive the nominated evict op under the SCANNER'S idempotency
+        // key — the D5 path completes it with the session left Evicting.
+        let key = format!("evict:{}", last_active_at.timestamp_millis());
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": true }),
+                Some(&key),
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        crate::session_ops::drive_claimed(&state, op).await;
+        assert_eq!(
+            meta.session.lock().status,
+            SessionState::Evicting,
+            "capture landed; awaiting the reconcile settle",
+        );
+
+        let ops_before = meta.ops.all().len();
+        scanner_run_once(&state).await.expect("tick");
+        assert_eq!(
+            meta.ops.all().len(),
+            ops_before,
+            "within the settle grace the scanner must not re-mint an evict op \
+             (the terminal-op/dedup churn shape)",
+        );
+    }
+
+    /// ADR 0101 C (engrams review, #836 round 3): the suppression must be
+    /// KEY-AGNOSTIC — the admin/evict_local path mints its evict op with
+    /// NO idempotency key, and the park-descent path mints under
+    /// `evict-descend:<parked_at>`; a key-scoped grace check protected
+    /// only the scanner's own nomination key and re-minted (with
+    /// `allow_park: true`!) for the other two paths' whole publication
+    /// window.
+    #[tokio::test]
+    async fn scanner_suppression_is_key_agnostic_for_admin_evicts() {
+        let session_id = engram_core::SessionId::new();
+        let mut session = evicting_session(session_id);
+        // Admin evicts enter at Active; finish_eviction_d5 transitions
+        // Active → Evicting itself. Start Active to mirror that shape.
+        session.status = SessionState::Active;
+        let sandbox_root = TempDir::new().unwrap();
+        let (state, meta, _stashed) = d5_state(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // The admin shape: evict op with key = None (enqueue_and_observe_evict).
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": false }),
+                None,
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy: {other:?}"),
+        };
+        crate::session_ops::drive_claimed(&state, op).await;
+        assert_eq!(
+            meta.session.lock().status,
+            SessionState::Evicting,
+            "admin capture landed; awaiting the reconcile settle",
+        );
+
+        let ops_before = meta.ops.all().len();
+        scanner_run_once(&state).await.expect("tick");
+        assert_eq!(
+            meta.ops.all().len(),
+            ops_before,
+            "the keyless admin evict's Done op must suppress the re-mint too",
+        );
+    }
+
+    /// ADR 0074 rung 2 (parked-paused), ADR 0101 C shape: with host
+    /// memory headroom, an idle eviction PAUSES the VM in place instead
+    /// of capturing — the session lands in the real `Parked` state
+    /// (park_rung=2 kept as ascent/ledger metadata), sandbox alive,
+    /// nothing snapshotted. When the user returns, the cancel path
+    /// un-pauses and flips back to Active with the same live sandbox.
     #[tokio::test]
     async fn parked_paused_with_headroom_then_ascends_on_cancel() {
         let session_id = engram_core::SessionId::new();
@@ -3144,7 +3716,11 @@ mod tests {
         let op = drive_evict(&state, session_id, true, false).await;
         assert_eq!(op.state, OpState::Done, "park completes the op early");
         let s = meta.session.lock().clone();
-        assert_eq!(s.status, SessionState::Evicting, "parked holds at Evicting");
+        assert_eq!(
+            s.status,
+            SessionState::Parked,
+            "parked is a real state (ADR 0101 C), not Evicting + rung stamp",
+        );
         assert_eq!(s.park_rung, 2);
         assert!(s.parked_at.is_some());
         assert!(
@@ -3233,7 +3809,7 @@ mod tests {
             s.park_rung, 2,
             "still parked — pressure, not a clock, reclaims a parked VM"
         );
-        assert_eq!(s.status, SessionState::Evicting, "still at rung 2");
+        assert_eq!(s.status, SessionState::Parked, "still parked (ADR 0101 C)");
         assert!(
             state
                 .services
@@ -3614,6 +4190,8 @@ mod tests {
             )),
             host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = crate::config::CoordinatorConfig {
             local_path,
@@ -3682,6 +4260,826 @@ mod tests {
             aborts.load(Ordering::SeqCst),
             1,
             "the in-flight host-side capture must be aborted on timeout",
+        );
+    }
+
+    /// The 2026-07-17 resume-stall incident (session 03e6535e): a verb
+    /// `await` that never returns (there, `host.start_agent` on a resume
+    /// `finish` step, on a dead rootfs device) keeps the op heartbeating
+    /// forever, so the stale-op reclaim can never fire and the op is pinned
+    /// until a deploy rolls the pod. `drive_one`'s wall-clock deadline
+    /// (`op_deadline`) is the backstop: a hung dispatch is cancelled and the
+    /// op REQUEUES with backoff — "executor alive but wedged" converges
+    /// without waiting on a pod roll. This drives the parked-paused (rung-2)
+    /// ascent, whose only host call is `resume`, and hangs it. Sibling of
+    /// `quarantine_evict_times_out_a_hanging_snapshot_begin` (which bounds a
+    /// DIFFERENT, capture-specific timeout); this one bounds the GENERAL op
+    /// executor.
+    #[tokio::test]
+    async fn resume_op_whose_host_call_wedges_is_requeued_by_the_op_deadline() {
+        // Process-local (nextest = process-per-test): a tiny global op
+        // deadline so the hang is bounded in ~1s of real time.
+        std::env::set_var("ENGRAM_OP_DEADLINE_SECS", "1");
+
+        // Forwards everything to a real inner host, but `resume` never
+        // returns — the wedged un-pause.
+        struct HangingResume {
+            inner: Arc<dyn engram_core::traits::HostClient>,
+        }
+        #[async_trait::async_trait]
+        impl engram_core::traits::HostClient for HangingResume {
+            async fn resume(
+                &self,
+                _sandbox_id: engram_core::SandboxId,
+                _fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                std::future::pending().await
+            }
+            async fn create(
+                &self,
+                spec: SandboxSpec,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.create(spec).await
+            }
+            async fn destroy(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.destroy(id, fence).await
+            }
+            async fn list(&self) -> Result<Vec<engram_core::SandboxId>, engram_core::SandboxError> {
+                self.inner.list().await
+            }
+            async fn probe_sandbox(
+                &self,
+                id: engram_core::SandboxId,
+            ) -> Result<engram_core::types::sandbox::SandboxProbe, engram_core::SandboxError>
+            {
+                self.inner.probe_sandbox(id).await
+            }
+            async fn exec_stream(
+                &self,
+                id: engram_core::SandboxId,
+                cmd: engram_core::types::sandbox::ExecRequest,
+            ) -> Result<engram_core::types::sandbox::ExecStream, engram_core::SandboxError>
+            {
+                self.inner.exec_stream(id, cmd).await
+            }
+            async fn snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<engram_core::types::snapshot::SnapshotMetadata, engram_core::SandboxError>
+            {
+                self.inner.snapshot(id, fence).await
+            }
+            async fn snapshot_begin(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<engram_core::types::SnapshotId, engram_core::SandboxError> {
+                self.inner.snapshot_begin(id, fence).await
+            }
+            async fn abort_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.abort_snapshot(id, fence).await
+            }
+            async fn commit_snapshot(
+                &self,
+                id: engram_core::SandboxId,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.commit_snapshot(id, fence).await
+            }
+            async fn restore(
+                &self,
+                metadata: engram_core::types::snapshot::SnapshotMetadata,
+                fence: SessionFence,
+            ) -> Result<engram_core::SandboxId, engram_core::SandboxError> {
+                self.inner.restore(metadata, fence).await
+            }
+            async fn start_agent(
+                &self,
+                id: engram_core::SandboxId,
+                agent: engram_core::types::sandbox::AgentSpec,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+                fence: SessionFence,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.start_agent(id, agent, policy, fence).await
+            }
+            async fn apply_egress_policy(
+                &self,
+                policy: engram_core::types::egress::SessionEgressPolicy,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.apply_egress_policy(policy).await
+            }
+            async fn guest_ip(&self, id: engram_core::SandboxId) -> Option<std::net::Ipv4Addr> {
+                self.inner.guest_ip(id).await
+            }
+            async fn bind_session(
+                &self,
+                session_id: engram_core::SessionId,
+                sandbox_id: engram_core::SandboxId,
+                binding_epoch: u64,
+            ) {
+                self.inner
+                    .bind_session(session_id, sandbox_id, binding_epoch)
+                    .await
+            }
+            async fn unbind_session(&self, session_id: engram_core::SessionId) {
+                self.inner.unbind_session(session_id).await
+            }
+            async fn send_prompt(
+                &self,
+                sandbox_id: engram_core::SandboxId,
+                prompt_id: String,
+                text: String,
+            ) -> Result<(), engram_core::SandboxError> {
+                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+            }
+        }
+
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let local_path = sandbox_root.path().join("local");
+        std::fs::create_dir_all(&local_path).unwrap();
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let meta = Arc::new(MiniMeta::new(evicting_session(session_id)));
+        let host_registry = Arc::new(HostRegistry::new(
+            meta.clone() as Arc<dyn engram_core::traits::MetadataStore>
+        ));
+        host_registry.register(
+            engram_core::HostId::new(),
+            Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(
+                backend.clone(),
+            )),
+        );
+        let hanging: Arc<dyn engram_core::traits::HostClient> = Arc::new(HangingResume {
+            inner: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
+        });
+        let services = Services {
+            meta: meta.clone(),
+            cloud: Arc::new(MockCloud::new()),
+            host: hanging,
+            secrets: Arc::new(InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: Arc::new(engram_storage_local::LocalBlobStorage::new(
+                std::env::temp_dir().join("engram-op-deadline-test"),
+            )),
+            chunk_store: engram_chunk_store::ChunkStore::new(Arc::new(
+                engram_storage_local::LocalBlobStorage::new(
+                    std::env::temp_dir().join("engram-op-deadline-test"),
+                ),
+            )),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
+        };
+        let cfg = crate::config::CoordinatorConfig {
+            local_path,
+            ..crate::config::CoordinatorConfig::default()
+        };
+        let state = Arc::new(crate::state::AppState::new_with_registry(
+            cfg,
+            services,
+            host_registry,
+        ));
+
+        // Create + bind a real sandbox so the rung-2 ascent's `resume`
+        // routes to our hanging host, and stamp park_rung=2 so the ascent
+        // takes the un-pause path.
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+        {
+            let mut s = meta.session.lock();
+            s.park_rung = 2;
+        }
+
+        let op = match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Resume,
+                serde_json::json!({}),
+                None,
+                "test-pod",
+            )
+            .await
+            .expect("enqueue+claim")
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("op lane busy at claim: {other:?}"),
+        };
+        let op_id = op.id;
+        crate::session_ops::drive_claimed(&state, op).await;
+
+        let row = state
+            .services
+            .meta
+            .op_get(op_id)
+            .await
+            .expect("op_get")
+            .expect("op row exists");
+        assert_eq!(
+            row.state,
+            OpState::Queued,
+            "a wedged resume attempt must requeue via the op deadline, not pin the op: {row:?}",
+        );
+        assert!(
+            row.error
+                .as_deref()
+                .unwrap_or("")
+                .contains("wall-clock deadline"),
+            "the op wall-clock deadline is what fired: {:?}",
+            row.error,
+        );
+    }
+
+    // =============== #792: recoverable-before-Idle guard ================
+
+    use bytes::Bytes;
+    use engram_core::traits::BlobStorage;
+    use engram_core::types::manifest::ManifestRef;
+    use engram_storage_local::LocalBlobStorage;
+    use engram_testkit::storage::{
+        FaultPlan, FaultyBlobStorage, HeadFault, HeadFaultKind, InjectedError, KeyMatch, When,
+    };
+
+    /// #792: a backend whose COMPOSED `snapshot()` returns metadata that
+    /// carries a disk manifest — unlike ProcessBackend, which is
+    /// manifest-less. That makes `verify_snapshot_recoverable` actually HEAD
+    /// a manifest key (the surface the recoverable-guard gates). It does NOT
+    /// implement `snapshot_begin` (inherits the InvalidSpec default), so the
+    /// coordinator takes the COMPOSED idle-evict path where the guard lives.
+    /// Everything else delegates to an inner ProcessBackend.
+    struct ManifestSnapshotBackend {
+        inner: Arc<dyn SandboxBackend>,
+        manifest: ManifestRef,
+    }
+
+    #[async_trait::async_trait]
+    impl SandboxBackend for ManifestSnapshotBackend {
+        async fn create(&self, spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            self.inner.create(spec).await
+        }
+        async fn destroy(&self, id: SandboxId) -> Result<(), SandboxError> {
+            self.inner.destroy(id).await
+        }
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            self.inner.list().await
+        }
+        async fn exec_stream(
+            &self,
+            id: SandboxId,
+            cmd: ExecRequest,
+        ) -> Result<engram_core::types::sandbox::ExecStream, SandboxError> {
+            self.inner.exec_stream(id, cmd).await
+        }
+        async fn snapshot(
+            &self,
+            id: SandboxId,
+        ) -> Result<engram_core::types::snapshot::SnapshotMetadata, SandboxError> {
+            let mut m = self.inner.snapshot(id).await?;
+            // Inject a disk manifest so the capture is "manifest-bearing":
+            // verify_snapshot_recoverable will HEAD this ref's storage key.
+            m.disk_manifest = Some(self.manifest);
+            Ok(m)
+        }
+        async fn restore(
+            &self,
+            metadata: engram_core::types::snapshot::SnapshotMetadata,
+        ) -> Result<SandboxId, SandboxError> {
+            self.inner.restore(metadata).await
+        }
+        fn snapshot_path_for(&self, id: engram_core::types::SnapshotId) -> std::path::PathBuf {
+            self.inner.snapshot_path_for(id)
+        }
+    }
+
+    /// A fresh LocalBlobStorage with `manifest`'s key pre-seeded (so a
+    /// non-faulted HEAD succeeds), wrapped in a FaultyBlobStorage running
+    /// `plan` — the rig for driving `verify_snapshot_recoverable` to a
+    /// scripted `recoverable = false` on a manifest-bearing capture.
+    async fn faulty_blob_with_manifest(
+        dir: std::path::PathBuf,
+        manifest: &ManifestRef,
+        plan: FaultPlan,
+    ) -> Arc<dyn BlobStorage> {
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir));
+        inner
+            .put(&manifest.storage_key(), Bytes::from_static(b"{}"))
+            .await
+            .expect("seed manifest blob");
+        Arc::new(FaultyBlobStorage::new(inner, plan))
+    }
+
+    /// Claim a nominated idle-evict op and hand back the row, so a test can
+    /// drive `run_evict_pipeline` directly (re-running the pipeline across a
+    /// transient blip without waiting out the op's requeue backoff). Mirrors
+    /// `drive_evict`'s claim.
+    async fn claim_evict_op(state: &SharedState, session_id: SessionId) -> SessionOp {
+        match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({ "target": "idle", "allow_park": false, "nominated": true }),
+                None,
+                "test-pod",
+            )
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+    }
+
+    /// The heartbeat-shaped ADR 0090 quarantine `evict_local`
+    /// (non-nominated, no park) — the exact payload
+    /// `api::host_http` enqueues per quarantined-survivor advertise.
+    async fn claim_quarantine_evict_op(state: &SharedState, session_id: SessionId) -> SessionOp {
+        match state
+            .services
+            .meta
+            .op_enqueue_and_claim(
+                session_id,
+                OpKind::Evict,
+                serde_json::json!({
+                    "target": "idle", "allow_park": false,
+                    "nominated": false, "quarantine": true,
+                }),
+                None,
+                "test-pod",
+            )
+            .await
+            .unwrap()
+        {
+            EnqueueOutcome::Claimed(op) => op,
+            other => panic!("expected Claimed, got {other:?}"),
+        }
+    }
+
+    /// 2026-07-21 livelock incident (prod 8174b7aa): a quarantine evict
+    /// landing on an ADR 0077 harness-failed park (`Created`, still bound
+    /// to the quarantined survivor) used to settle `Skipped` in ~10ms —
+    /// the host re-advertised every 5s, each advertise re-enqueued, and
+    /// the loop ran for 2.5 days. The guard must CONVERGE instead:
+    /// destroy the crippled VM (clears the host's quarantine entry — the
+    /// advertise source) and settle `HostLost`, the one lane the dead-host
+    /// straggler sweep re-drives to Idle/recoverable.
+    #[tokio::test]
+    async fn quarantine_evict_on_created_park_reaps_and_settles_host_lost() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Created;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_quarantine_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, false).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::QuarantineReaped)),
+            "a quarantine op on an unevictable-but-bound session must reap, \
+             not skip (the skip is the livelock), got {out:?}",
+        );
+        assert!(
+            !state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the crippled VM must be destroyed — the destroy is what clears \
+             the host's quarantine entry and ends the 5s advertise loop",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::HostLost,
+            "the session settles HostLost so the straggler sweep re-drives \
+             it to Idle/recoverable (resume rewinds to the last checkpoint)",
+        );
+    }
+
+    /// The settled arm of the same fix: a quarantined survivor bound to a
+    /// session whose recoverable state is already durable (`Idle`) is pure
+    /// garbage — reap the VM and drop the stale binding (nothing may latch
+    /// a destroyed sandbox, e.g. the resume crash-shortcut), but do NOT
+    /// touch the status: Idle already means "resume from the durable
+    /// capture".
+    #[tokio::test]
+    async fn quarantine_evict_on_settled_idle_reaps_and_unbinds_without_status_change() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Idle;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_quarantine_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, false).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::QuarantineReaped)),
+            "got {out:?}"
+        );
+        assert!(
+            !state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the crippled VM is reaped",
+        );
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::Idle,
+            "Idle already implies a durable capture — no status change",
+        );
+        assert_eq!(
+            after.sandbox_id, None,
+            "the stale binding is dropped so no later op latches a \
+             destroyed sandbox",
+        );
+    }
+
+    /// Mid-relocation lanes stay owned by their machinery: a quarantine op
+    /// finding the session `Evacuating` must NOT destroy the VM under the
+    /// evac capture — it skips, and the evac path's own settle (fallback
+    /// to Idle) converges.
+    #[tokio::test]
+    async fn quarantine_evict_on_evacuating_leaves_the_vm_to_the_evac_machinery() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Evacuating;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_quarantine_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, false).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::Skipped { .. })),
+            "got {out:?}"
+        );
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the VM must survive — the evac capture may be mid-flight",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Evacuating,
+        );
+    }
+
+    /// The NON-quarantine skip is unchanged: an ordinary evict landing on
+    /// a non-evictable state still no-ops without touching the VM (a
+    /// concurrent op owns the session; destroying here would be the
+    /// teardown-reconcile bug class).
+    #[tokio::test]
+    async fn plain_evict_on_created_still_skips_without_destroying() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let mut session = evicting_session(session_id);
+        session.status = SessionState::Created;
+        let (state, _meta) = build_state_and_meta(session, sandbox_root.path());
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_evict_op(&state, session_id).await;
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch: op.epoch.expect("claimed"),
+        };
+        let out = run_evict_pipeline(&ctx, SessionState::Idle, false, true).await;
+        assert!(
+            matches!(out, Ok(EvictOutcome::Skipped { .. })),
+            "got {out:?}"
+        );
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "a plain skip must never destroy — only the quarantine flavor \
+             carries the reap authority",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Created,
+        );
+    }
+
+    /// #792: a TRANSIENT BlobStorage-HEAD blip records `recoverable = false`
+    /// on a manifest-bearing capture whose artifacts are actually durable.
+    /// The recoverable-before-Idle guard must REFUSE to land Idle on that lie
+    /// (retryable error; session stays Evicting; the VM stays alive), and once
+    /// the blip clears on the redrive the fresh capture verifies recoverable
+    /// and the session lands Idle. Proves "fails once → retries → Idle
+    /// recoverable".
+    #[tokio::test]
+    async fn recoverable_guard_transient_head_blip_retries_then_lands_idle() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let manifest = ManifestRef::new();
+        // HEAD faults on the FIRST manifests/ lookup (attempt 1), then passes
+        // through to the seeded blob (attempt 2).
+        let plan = FaultPlan::new().with_head(HeadFault {
+            key: KeyMatch::Prefix("manifests/".into()),
+            when: When::Nth(1),
+            kind: HeadFaultKind::Error(InjectedError::Sdk("transient blob HEAD blip".into())),
+        });
+        let blob =
+            faulty_blob_with_manifest(sandbox_root.path().join("blobs"), &manifest, plan).await;
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ManifestSnapshotBackend {
+            inner: Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes"))),
+            manifest,
+        });
+        let (state, meta) = build_state_and_meta_with_backend_and_blob(
+            evicting_session(session_id),
+            sandbox_root.path(),
+            backend,
+            Some(blob),
+        );
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = claim_evict_op(&state, session_id).await;
+        let epoch = op.epoch.expect("claimed");
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch,
+        };
+
+        // Attempt 1: HEAD blips → recoverable=false → the guard refuses Idle.
+        let first = run_evict_pipeline(&ctx, SessionState::Idle, false, true).await;
+        assert!(
+            matches!(first, Err(EvictError::Meta(ref m)) if m.contains("recoverable=false")),
+            "the guard must return a retryable error on the transient blip, got {first:?}",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Evicting,
+            "the session must stay Evicting for the retry — never Idle on the lie",
+        );
+        assert!(
+            state
+                .services
+                .host
+                .list()
+                .await
+                .unwrap()
+                .contains(&sandbox_id),
+            "the live VM must NOT be destroyed while retrying verification",
+        );
+        assert!(
+            meta.snapshots.lock().iter().any(|s| !s.recoverable),
+            "the recoverable=false row IS recorded (it feeds the dead-host bad-capture signal)",
+        );
+
+        // Attempt 2 (the op redrive): the blip has cleared; HEAD now succeeds.
+        let second = run_evict_pipeline(&ctx, SessionState::Idle, false, true).await;
+        assert!(
+            matches!(second, Ok(EvictOutcome::Evacuated)),
+            "the retry lands the eviction once the capture verifies recoverable, got {second:?}",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Idle,
+            "the session lands Idle only once a recoverable capture backs it",
+        );
+        assert!(
+            meta.snapshots.lock().iter().any(|s| s.recoverable),
+            "a recoverable=true row now exists — a resume can honor it",
+        );
+    }
+
+    /// #792: a PERSISTENTLY unrecoverable capture (HEAD fails every attempt)
+    /// must never settle Idle-but-unresumable. The guard returns a retryable
+    /// error each attempt; once the evict op budget is exhausted the verb
+    /// falls the session back to HostLost — the existing honest terminal
+    /// route (the dead-host straggler sweep then settles it Dead WITH the
+    /// unrecoverable-snapshot signal against the recorded recoverable=false
+    /// row). Asserts: HostLost, never Idle.
+    #[tokio::test]
+    async fn recoverable_guard_persistent_failure_exhausts_budget_to_host_lost() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        let manifest = ManifestRef::new();
+        let plan = FaultPlan::new().with_head(HeadFault {
+            key: KeyMatch::Prefix("manifests/".into()),
+            when: When::Always,
+            kind: HeadFaultKind::Error(InjectedError::Sdk("persistent blob HEAD failure".into())),
+        });
+        let blob =
+            faulty_blob_with_manifest(sandbox_root.path().join("blobs"), &manifest, plan).await;
+        let backend: Arc<dyn SandboxBackend> = Arc::new(ManifestSnapshotBackend {
+            inner: Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes"))),
+            manifest,
+        });
+        let (state, meta) = build_state_and_meta_with_backend_and_blob(
+            evicting_session(session_id),
+            sandbox_root.path(),
+            backend,
+            Some(blob),
+        );
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        // Age the attempt count past EVICT_MAX_ATTEMPTS so this claim is the
+        // budget-exhausting one (mirrors evict_op_budget_exhaustion_*).
+        let mut op = claim_evict_op(&state, session_id).await;
+        op.attempts = 21;
+        let epoch = op.epoch.expect("claimed");
+        let ctx = OpCtx {
+            state: &state,
+            op: &op,
+            epoch,
+        };
+        let outcome = crate::session_verbs::dispatch(&ctx).await;
+        assert!(
+            matches!(outcome, crate::session_ops::OpOutcome::Failed(_)),
+            "budget exhaustion on a persistently-unrecoverable capture must be terminal (Failed)",
+        );
+
+        let after = state.services.meta.get_session(session_id).await.unwrap();
+        assert_eq!(
+            after.status,
+            SessionState::HostLost,
+            "the honest terminal route is HostLost (→ dead-host sweep → Dead), never a lying Idle",
+        );
+        assert_ne!(after.status, SessionState::Idle, "never Idle-unrecoverable");
+        assert!(
+            meta.snapshots.lock().iter().all(|s| !s.recoverable),
+            "only recoverable=false rows were recorded — the sweep's unrecoverable signal fires on them",
+        );
+    }
+
+    /// #792 scope: the recoverable-before-Idle guard is deliberately scoped
+    /// to MANIFEST-BEARING captures (the transient-HEAD-blip class). A
+    /// manifest-LESS capture (ProcessBackend, VZ, the pre-#791 sim gap) still
+    /// lands Idle even when every HEAD would fail — #791 closed the
+    /// manifest-less case at the sim-fidelity layer, and gating it here would
+    /// wedge the dev backends that never emit chunked manifests.
+    #[tokio::test]
+    async fn recoverable_guard_does_not_fire_for_a_manifestless_capture() {
+        let session_id = engram_core::SessionId::new();
+        let sandbox_root = TempDir::new().unwrap();
+        // HEAD always fails — but ProcessBackend's capture is manifest-less,
+        // so verify_snapshot_recoverable HEADs nothing (returns false without
+        // a blob call) and `manifests_present` is false → the guard is skipped.
+        let plan = FaultPlan::new().with_head(HeadFault {
+            key: KeyMatch::Any,
+            when: When::Always,
+            kind: HeadFaultKind::Error(InjectedError::Sdk("head down".into())),
+        });
+        let inner: Arc<dyn BlobStorage> =
+            Arc::new(LocalBlobStorage::new(sandbox_root.path().join("blobs")));
+        let blob: Arc<dyn BlobStorage> = Arc::new(FaultyBlobStorage::new(inner, plan));
+        let backend: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(sandbox_root.path().join("sandboxes")));
+        let (state, _meta) = build_state_and_meta_with_backend_and_blob(
+            evicting_session(session_id),
+            sandbox_root.path(),
+            backend,
+            Some(blob),
+        );
+        let sandbox_id = state.services.host.create(process_spec()).await.unwrap();
+        state
+            .services
+            .meta
+            .assign_session_sandbox(session_id, Some(sandbox_id))
+            .await
+            .unwrap();
+
+        let op = drive_evict(&state, session_id, false, true).await;
+        assert_eq!(
+            op.state,
+            OpState::Done,
+            "a manifest-less capture completes the evict op unchanged",
+        );
+        assert_eq!(
+            state
+                .services
+                .meta
+                .get_session(session_id)
+                .await
+                .unwrap()
+                .status,
+            SessionState::Idle,
+            "a manifest-less capture still lands Idle — the guard is scoped to manifest-bearing captures",
         );
     }
 }

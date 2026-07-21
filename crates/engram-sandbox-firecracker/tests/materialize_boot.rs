@@ -348,6 +348,7 @@ async fn materialize_and_boot() {
             Platform::LinuxAmd64,
             scratch.path(),
             &chunk_store,
+            0,
             None,
         )
         .await

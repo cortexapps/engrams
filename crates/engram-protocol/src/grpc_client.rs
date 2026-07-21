@@ -19,6 +19,7 @@ use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
 use engram_core::types::sandbox::{
     AgentSpec, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::{SandboxError, SandboxId, SessionId};
@@ -34,17 +35,30 @@ use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_port_message::Body as ProxyPortBody;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
-    AnswerHarnessQuestionRequest, ApplyEgressPolicyRequest, BindHarnessSessionRequest,
-    CreateSandboxRequest, DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty,
-    ExecStartRequest, FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest,
-    MaterializeImageRequest, MigrationExportRef, MigrationFetchRequest, MigrationItem,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest,
+    DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty, ExecStartRequest,
+    FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest, MaterializeImageRequest,
+    MigrationExportRef, MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest,
     ProxyPortData, ProxyPortMessage, ProxyPortOpen, ProxyShellBinary, ProxyShellClose,
     ProxyShellMessage, ProxyShellOpen, ProxyShellPing, ProxyShellPong, ProxyShellText,
     ReapMaterializeDirRequest, RestoreBaseForSessionRequest, RestoreRequest, SandboxIdMessage,
-    SendHarnessPromptRequest, StartAgentRequest, StringList, UnbindHarnessSessionRequest,
+    SendHarnessPromptRequest, SendHarnessToolResultRequest, StartAgentRequest,
+    UnbindHarnessSessionRequest, WriteFilesRequest,
 };
 
-use crate::wire::{WireExecRequest, WireReapStats};
+use crate::wire::{WireExecRequest, WireReapStats, WireWriteFilesRequest, WireWriteFilesResponse};
+
+/// ADR 0095: why a peer-chunk pull wants its hashes — the wire `scope`
+/// oneof on [`PeerChunkGetRequest`]. Observability + serve-side rate
+/// class, not authorization (see the proto comment).
+#[derive(Debug, Clone)]
+pub enum PeerChunkScope {
+    /// `"sha256:<hex>"` manifest digest of an enabled image (warmup /
+    /// prestage pulls).
+    BaseImage(String),
+    /// Divergence fill for a resume of this snapshot.
+    Snapshot(engram_core::types::ids::SnapshotId),
+}
 
 /// Per-request interceptor that injects coord-side request metadata on
 /// every outbound coord→host gRPC call:
@@ -81,8 +95,10 @@ impl Interceptor for TraceparentInjector {
 }
 
 /// Deadline applied (via the gRPC `grpc-timeout` header) to the
-/// snapshot-restore RPCs — `restore` (resume) and
-/// `restore_base_for_session` (cold-create-via-restore). Without it a
+/// snapshot-restore RPCs — `restore` (resume),
+/// `restore_base_for_session` (cold-create-via-restore), and
+/// `start_agent` (the harness (re)attach leg of the same resume
+/// pipeline, which shares the wedge modes). Without it a
 /// host that wedges mid-restore leaves the coord caller hung
 /// indefinitely (observed as a ~6-minute dead-host stall); the
 /// keepalive pings only catch a *silent* connection, not a peer that
@@ -131,23 +147,17 @@ impl GrpcHostClient {
     ///
     /// Every RPC carries the caller's `traceparent` via
     /// [`TraceparentInjector`] (ADR 0019 distributed tracing).
+    ///
+    /// The inbound decode cap is 32 MiB on every client (was an opt-in
+    /// for `ReapMaterializeDir`'s 16 MiB reply; ADR 0095's
+    /// `PeerChunkGet` frames — 4 MiB data + overhead — need past
+    /// tonic's 4 MiB default too, and the cap is just a limit check,
+    /// no allocation change).
     pub fn new(channel: Channel) -> Self {
         Self {
-            inner: HostServiceClient::with_interceptor(channel, TraceparentInjector),
+            inner: HostServiceClient::with_interceptor(channel, TraceparentInjector)
+                .max_decoding_message_size(32 * 1024 * 1024),
         }
-    }
-
-    /// Bump the inbound decode cap for `ReapMaterializeDir` (1M live
-    /// disk-manifest UUIDs ≈ 16 MiB on the wire). Other methods stay
-    /// at tonic's 4 MiB default; SandboxSpec / SnapshotMetadata are
-    /// well under that.
-    pub fn with_reap_decode_cap(mut self) -> Self {
-        // `max_decoding_message_size` is set per-client; tonic v0.12
-        // applies the cap to every response. We only need it for the
-        // `Reap` reply path, but the cost of raising it globally on
-        // this client is just a header value — no allocation change.
-        self.inner = self.inner.max_decoding_message_size(32 * 1024 * 1024);
-        self
     }
 
     /// Fire a no-op `Ping` to force TCP+H2 handshake on a freshly
@@ -426,6 +436,39 @@ impl GrpcHostClient {
         })
     }
 
+    /// ADR 0095: standing peer-chunk tier — batch-stream cache-resident
+    /// content-addressed chunks from a fleet peer. Host-to-host (the
+    /// host-agent's peer-fill client dials a sibling host-agent); the
+    /// coordinator never calls this. Frames come back in request order
+    /// per item with per-frame CRC32C; a `missing` frame is terminal for
+    /// its item and means "source it from GCS", never a peer fault.
+    pub async fn peer_chunk_get(
+        &self,
+        hashes: Vec<[u8; 32]>,
+        scope: PeerChunkScope,
+    ) -> Result<
+        futures::stream::BoxStream<'static, Result<PeerChunkFrame, SandboxError>>,
+        SandboxError,
+    > {
+        use crate::grpc::peer_chunk_get_request::Scope;
+        let req = PeerChunkGetRequest {
+            hashes: hashes.into_iter().map(|h| h.to_vec()).collect(),
+            scope: Some(match scope {
+                PeerChunkScope::BaseImage(digest) => Scope::BaseImageDigest(digest),
+                PeerChunkScope::Snapshot(id) => Scope::SnapshotId(id.as_uuid().as_bytes().to_vec()),
+            }),
+        };
+        let resp = self
+            .inner
+            .clone()
+            .peer_chunk_get(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        use futures::StreamExt;
+        Ok(resp.map(|frame| frame.map_err(grpc_to_sandbox_err)).boxed())
+    }
+
     /// ADR 0045 C1: pull an export's artifacts (destination host → source host).
     pub async fn migration_fetch(
         &self,
@@ -601,6 +644,7 @@ impl GrpcHostClient {
         platform_os: &str,
         platform_arch: &str,
         registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         use engram_core::types::{
@@ -612,6 +656,7 @@ impl GrpcHostClient {
             platform_os: platform_os.to_string(),
             platform_arch: platform_arch.to_string(),
             registry_auth_bincode: encode_bincode(&registry_auth, "Option<ResolvedRegistryAuth>")?,
+            min_disk_gib,
         };
         let mut stream = self
             .inner
@@ -802,24 +847,20 @@ impl GrpcHostClient {
         Ok(())
     }
 
-    pub async fn answer_harness_question(
+    pub async fn send_harness_tool_result(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
-        answers: std::collections::BTreeMap<String, Vec<String>>,
+        result_json: String,
     ) -> Result<(), SandboxError> {
-        let req = AnswerHarnessQuestionRequest {
+        let req = SendHarnessToolResultRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             tool_call_id,
-            // Canonical Answers → proto map<string, StringList>.
-            answers: answers
-                .into_iter()
-                .map(|(question, values)| (question, StringList { values }))
-                .collect(),
+            result_json,
         };
         self.inner
             .clone()
-            .answer_harness_question(req)
+            .send_harness_tool_result(req)
             .await
             .map_err(grpc_to_sandbox_err)?;
         Ok(())
@@ -877,13 +918,22 @@ impl GrpcHostClient {
         policy: SessionEgressPolicy,
         fence: SessionFence,
     ) -> Result<(), SandboxError> {
-        let req = StartAgentRequest {
+        let mut req = tonic::Request::new(StartAgentRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             agent_bincode: encode_bincode(&agent, "AgentSpec")?,
             policy_bincode: encode_bincode(&policy, "SessionEgressPolicy")?,
             session_id: fence.session_id.as_uuid().as_bytes().to_vec(),
             fencing_epoch: fence.epoch,
-        };
+        });
+        // Same deadline rationale as `restore` (see `restore_rpc_timeout`):
+        // the host-side SpawnHarness round-trip can wedge (guest page-in
+        // starvation, a dead rootfs device that never answers agentd), and
+        // without a `grpc-timeout` header the coordinator's resume `finish`
+        // step inherits the hang unbounded (prod 2026-07-17 session
+        // 03e6535e: a 34-minute stall ended only by a pod roll). The host
+        // reattach is idempotent, so a timed-out attempt that the op
+        // executor retries reconciles cleanly rather than double-spawning.
+        req.set_timeout(restore_rpc_timeout());
         self.inner
             .clone()
             .start_agent(req)
@@ -1136,6 +1186,30 @@ impl GrpcHostClient {
             exec_id,
             events: Box::pin(events) as Pin<Box<dyn Stream<Item = ExecEvent> + Send + 'static>>,
         })
+    }
+
+    /// Unary batched file write. The opaque bincode payload keeps the
+    /// coord↔host schema pinned independently of the in-process types.
+    pub async fn write_files(
+        &self,
+        sandbox_id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let wire = WireWriteFilesRequest::from_engine(files);
+        let req = WriteFilesRequest {
+            sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+            request_bincode: encode_bincode(&wire, "WireWriteFilesRequest")?,
+        };
+        let resp = self
+            .inner
+            .clone()
+            .write_files(req)
+            .await
+            .map_err(grpc_to_sandbox_err)?
+            .into_inner();
+        let wire: WireWriteFilesResponse =
+            decode_bincode(&resp.response_bincode, "WireWriteFilesResponse")?;
+        Ok(wire.into_engine())
     }
 
     /// ADR 0014 issue #6: open a bidi ProxyShell stream to the host.
@@ -1413,6 +1487,14 @@ impl HostClient for GrpcHostClient {
         self.exec_start(id, cmd).await
     }
 
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        Self::write_files(self, id, files).await
+    }
+
     async fn snapshot(
         &self,
         id: SandboxId,
@@ -1528,6 +1610,7 @@ impl HostClient for GrpcHostClient {
         platform_os: &str,
         platform_arch: &str,
         registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         Self::materialize_image(
@@ -1536,6 +1619,7 @@ impl HostClient for GrpcHostClient {
             platform_os,
             platform_arch,
             registry_auth,
+            min_disk_gib,
             progress,
         )
         .await
@@ -1612,13 +1696,13 @@ impl HostClient for GrpcHostClient {
             .await
     }
 
-    async fn answer_question(
+    async fn tool_result(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
-        answers: std::collections::BTreeMap<String, Vec<String>>,
+        result_json: String,
     ) -> Result<(), SandboxError> {
-        self.answer_harness_question(sandbox_id, tool_call_id, answers)
+        self.send_harness_tool_result(sandbox_id, tool_call_id, result_json)
             .await
     }
 

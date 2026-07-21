@@ -24,6 +24,29 @@
 use std::path::PathBuf;
 
 use engram_host_agent::disk_daemon::{recover_stuck_nbd_devices, NbdSlotAllocator};
+use engram_host_core::{classify_startup_slots, DeviceHolder, PidLiveness, ReapList, StartupSlot};
+
+/// Build the [`ReapList`] the destructive sweep now requires (ADR 0098 §Phase 3,
+/// Wave 7b, #784 layer 3) from a list of device paths, by driving them through
+/// the REAL classification barrier as terminal (dead owner, proof of death, no
+/// record) — the only class that reaches a reap. This is exactly how the prod
+/// register flow feeds `recover_stuck_nbd_devices`, so the test still exercises
+/// the classify → reap-only path end to end.
+fn reap_all(paths: &[PathBuf]) -> ReapList<PathBuf> {
+    classify_startup_slots(
+        paths
+            .iter()
+            .cloned()
+            .map(|device| StartupSlot {
+                device,
+                liveness: PidLiveness::Dead,
+                holder: DeviceHolder::NoHolder,
+                has_record: false,
+            })
+            .collect(),
+    )
+    .reap
+}
 
 #[tokio::test]
 async fn recovery_is_noop_for_unbound_devices() {
@@ -37,7 +60,7 @@ async fn recovery_is_noop_for_unbound_devices() {
         PathBuf::from("/dev/test-fake-nbd-recovery-0"),
         PathBuf::from("/dev/test-fake-nbd-recovery-1"),
     ];
-    let (probed, recovered, stuck) = recover_stuck_nbd_devices(&pool, &paths).await;
+    let (probed, recovered, stuck) = recover_stuck_nbd_devices(&pool, reap_all(&paths)).await;
     assert_eq!(probed, 0, "fake paths should not register as probed");
     assert_eq!(recovered, 0);
     assert_eq!(stuck, 0);
@@ -108,7 +131,7 @@ async fn recovery_clears_kernel_busy_device() {
     // path). A device kernel-busy under a DEAD pid is "free" to the
     // pool's reserved-bit accounting, so try_claim reserves it.
     let pool = NbdSlotAllocator::from_paths(paths.clone()).expect("build pool over stuck devices");
-    let (probed, recovered, _stuck) = recover_stuck_nbd_devices(&pool, &paths).await;
+    let (probed, recovered, _stuck) = recover_stuck_nbd_devices(&pool, reap_all(&paths)).await;
     assert_eq!(
         probed, initial_busy_count,
         "probed count must match the # of initially-busy devices"

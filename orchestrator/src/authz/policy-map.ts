@@ -40,6 +40,11 @@ export interface PolicyEntry {
  * FleetService: every method is admin-only.
  */
 export const POLICY: Record<string, PolicyEntry> = {
+  // ReviewService is native today; these entries keep its declared read
+  // policy explicit if it crosses the generic gate in a future split.
+  "ReviewService.ListReviews": { action: "read", subject: "Review" },
+  "ReviewService.GetReview": { action: "read", subject: "Review" },
+
   // ------------------------------------------------------------------
   // SessionService — session-scoped (member can access own sessions)
   // ------------------------------------------------------------------
@@ -70,9 +75,7 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
-  // ADR 0054: answering a deferred AskUserQuestion is the same owner-scoped
-  // "prompt" capability as sending one — both drive a session you own.
-  "SessionService.AnswerQuestion": {
+  "SessionService.CompleteToolCall": {
     action: "prompt",
     subject: "Session",
     sessionIdField: "sessionId",
@@ -106,6 +109,11 @@ export const POLICY: Record<string, PolicyEntry> = {
     sessionIdField: "sessionId",
   },
   "SessionService.Exec": {
+    action: "shell",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
+  "SessionService.WriteFiles": {
     action: "shell",
     subject: "Session",
     sessionIdField: "sessionId",

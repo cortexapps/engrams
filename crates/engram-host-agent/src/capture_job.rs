@@ -12,7 +12,7 @@
 //! This module makes capture a durable job instead: the coordinator
 //! dispatches `(job_id, epoch)` assignments over `HeartbeatAck.
 //! capture_assignments`; the host claims the full dispatch
-//! (`CoordClient::claim_capture_job`, the authed HTTP channel — secrets
+//! (`HttpCoordClient::claim_capture_job`, the authed HTTP channel — secrets
 //! ride only that response, never PG/heartbeat/the durable record below)
 //! and runs [`engram_core::traits::sandbox::SandboxBackend::
 //! build_base_snapshot`] UNCHANGED — this module is a layer ABOVE that
@@ -40,11 +40,13 @@ use std::sync::{Arc, Mutex};
 
 use dashmap::DashMap;
 use engram_core::traits::sandbox::SandboxBackend;
+use engram_core::traits::{Clock, SystemClock};
 use engram_core::types::capture_job::{CaptureJobSpec, CaptureJobStage};
 use engram_core::types::{
     CaptureJobAssignment, CaptureJobId, CaptureJobProgress, CaptureJobReport, CaptureProgress,
     CaptureTerminalReport, SandboxId,
 };
+use engram_host_core::TokioFs;
 use serde::{Deserialize, Serialize};
 
 /// The durable, on-disk shape of one capture job's host-side state —
@@ -69,21 +71,29 @@ impl CaptureJobRecord {
         crate::durable_record::record_path(dir, id)
     }
 
-    /// Durably persist (write + fsync via rename) into `dir`.
+    /// Durably persist (write + fsync via rename) into `dir`. Not yet
+    /// behind the fs seam — the capture-job flow extracts in a later P
+    /// (the seam lands with the flows that cross it).
     pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        crate::durable_record::persist(dir, self.job_id, self, "capture job record").await
+        crate::durable_record::persist(&TokioFs, dir, self.job_id, self, "capture job record").await
     }
 
     /// All records in `dir` (the heartbeat advert payload + rehydrate
     /// source). Unreadable/partial files are skipped with a warn — a
     /// torn write must not wedge the heartbeat loop.
     pub async fn load_all(dir: &Path) -> Vec<CaptureJobRecord> {
-        crate::durable_record::load_all(dir, "capture job record").await
+        crate::durable_record::load_all(&TokioFs, dir, "capture job record").await
     }
 
     /// Coord acked these — the PG rows own the references now.
     pub async fn delete_acked(dir: &Path, acked: &[CaptureJobId]) {
-        crate::durable_record::delete_acked(dir, acked.iter().copied(), "capture job record").await
+        crate::durable_record::delete_acked(
+            &TokioFs,
+            dir,
+            acked.iter().copied(),
+            "capture job record",
+        )
+        .await
     }
 }
 
@@ -136,16 +146,17 @@ fn capture_leg_name(progress: &CaptureProgress) -> String {
 fn advance_capture_legs(
     legs: &mut Vec<engram_core::types::WarmStageRecord>,
     name: String,
+    clock: &dyn Clock,
 ) -> Option<engram_core::types::WarmStageRecord> {
     if let Some(open) = legs.last() {
         if open.ended_at.is_none() && open.name == name {
             return None; // keepalive of the open leg
         }
     }
-    let closed = close_open_capture_leg(legs);
+    let closed = close_open_capture_leg(legs, clock);
     legs.push(engram_core::types::WarmStageRecord {
         name,
-        started_at: chrono::Utc::now(),
+        started_at: clock.now_utc(),
         ended_at: None,
         outcome: engram_core::types::WarmStageOutcome::Running,
     });
@@ -154,9 +165,10 @@ fn advance_capture_legs(
 
 fn close_open_capture_leg(
     legs: &mut [engram_core::types::WarmStageRecord],
+    clock: &dyn Clock,
 ) -> Option<engram_core::types::WarmStageRecord> {
     let open = legs.last_mut().filter(|l| l.ended_at.is_none())?;
-    open.ended_at = Some(chrono::Utc::now());
+    open.ended_at = Some(clock.now_utc());
     open.outcome = engram_core::types::WarmStageOutcome::Done;
     Some(open.clone())
 }
@@ -219,6 +231,9 @@ pub struct CaptureJobExecutor {
     /// and the host that actually ran the VMM is the authority for it,
     /// not the heartbeat-lagged `hosts.capabilities` row.
     fc_snapshot_version: Option<String>,
+    /// ADR 0098 D1: wall clock is an injected world input (the durable
+    /// capture-leg timeline timestamps). P1 wires the production clock.
+    clock: Arc<dyn Clock>,
 }
 
 impl CaptureJobExecutor {
@@ -234,6 +249,7 @@ impl CaptureJobExecutor {
             running: Mutex::new(HashMap::new()),
             self_ref: std::sync::OnceLock::new(),
             fc_snapshot_version,
+            clock: Arc::new(SystemClock::new()),
         });
         let _ = arc.self_ref.set(Arc::downgrade(&arc));
         arc
@@ -332,7 +348,7 @@ impl CaptureJobExecutor {
     }
 
     /// Whether the heartbeat-ack loop should call
-    /// `CoordClient::claim_capture_job` for `(job_id, epoch)`: `true`
+    /// `HttpCoordClient::claim_capture_job` for `(job_id, epoch)`: `true`
     /// unless this exact epoch is already running. A LOWER epoch than
     /// what's running is implicitly "no" too (the assignment is stale —
     /// the coordinator hasn't caught up to a reassignment this host
@@ -504,9 +520,11 @@ impl CaptureJobExecutor {
                     }
                 }
             }
-            if let Some(closed) =
-                advance_capture_legs(&mut capture_legs, capture_leg_name(&progress))
-            {
+            if let Some(closed) = advance_capture_legs(
+                &mut capture_legs,
+                capture_leg_name(&progress),
+                self.clock.as_ref(),
+            ) {
                 record_capture_leg(&closed);
             }
             if !progress.warm_stages.is_empty() {
@@ -575,7 +593,8 @@ impl CaptureJobExecutor {
         // and carries it as-is so the timeline shows where it died.
         let final_progress = {
             if matches!(terminal, CaptureTerminalReport::Done { .. }) {
-                if let Some(closed) = close_open_capture_leg(&mut capture_legs) {
+                if let Some(closed) = close_open_capture_leg(&mut capture_legs, self.clock.as_ref())
+                {
                     record_capture_leg(&closed);
                 }
             }
@@ -636,6 +655,8 @@ fn classify_sandbox_error(
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use async_trait::async_trait;
     use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
@@ -769,6 +790,7 @@ mod tests {
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 },
                 cold_base: None,
             })
@@ -973,6 +995,79 @@ mod tests {
         assert_eq!(reloaded[0].stage, CaptureJobStage::Failed);
     }
 
+    /// ADR 0099 H5 redrive-with-torn-state: a torn `.json` and a leftover
+    /// `.json.partial` sitting in the records dir at restart must NOT wedge
+    /// rehydrate — the torn files are skipped (with a warn) by the
+    /// torn-write-tolerant `load_all`, and the one valid non-terminal record
+    /// is still re-driven (survivor destroyed, record rewound terminal).
+    #[tokio::test]
+    async fn rehydrate_tolerates_torn_records_and_still_drives_the_valid_one() {
+        let backend = Arc::new(MockBackend {
+            create_calls: AtomicUsize::new(0),
+            destroy_calls: AtomicUsize::new(0),
+            last_destroyed: Mutex::new(None),
+        });
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("capture-jobs");
+
+        // The one valid record — a non-terminal survivor to be re-driven.
+        let job_id = CaptureJobId::new();
+        let sandbox_id = SandboxId::new();
+        CaptureJobRecord {
+            job_id,
+            epoch: 3,
+            stage: CaptureJobStage::Warming,
+            sandbox_id: Some(sandbox_id),
+            terminal: None,
+        }
+        .persist(&dir)
+        .await
+        .unwrap();
+
+        // A torn `.json` (a valid record's bytes truncated mid-write — the
+        // rename would never have published this) beside a leftover
+        // `.json.partial` (crashed before the rename). Both must be ignored.
+        let good = CaptureJobRecord {
+            job_id: CaptureJobId::new(),
+            epoch: 1,
+            stage: CaptureJobStage::Warming,
+            sandbox_id: Some(SandboxId::new()),
+            terminal: None,
+        };
+        let full = serde_json::to_vec_pretty(&good).unwrap();
+        tokio::fs::write(dir.join("torn.json"), &full[..full.len() / 2])
+            .await
+            .unwrap();
+        tokio::fs::write(dir.join("leftover.json.partial"), &full)
+            .await
+            .unwrap();
+
+        let executor = CaptureJobExecutor::new(backend.clone(), dir.clone(), None);
+        executor.rehydrate().await;
+
+        // The torn files never wedged startup: the valid survivor was
+        // destroyed and its record rewound to a retryable Failed terminal.
+        assert_eq!(
+            *backend.last_destroyed.lock().unwrap(),
+            Some(sandbox_id),
+            "rehydrate must still destroy the one valid survivor VM",
+        );
+        let reports = executor.current_reports();
+        assert_eq!(
+            reports.len(),
+            1,
+            "only the valid record yields a report; the torn files are skipped",
+        );
+        let reloaded = CaptureJobRecord::load_all(&dir).await;
+        assert_eq!(
+            reloaded.len(),
+            1,
+            "torn files stay unparseable; not resurrected"
+        );
+        assert_eq!(reloaded[0].job_id, job_id);
+        assert_eq!(reloaded[0].stage, CaptureJobStage::Failed);
+    }
+
     /// `ack` must drop both the in-memory report and the durable file.
     #[tokio::test]
     async fn ack_clears_report_and_durable_record() {
@@ -1062,7 +1157,12 @@ mod tests {
     }
 
     async fn wait_for_terminal(executor: &Arc<CaptureJobExecutor>, job_id: CaptureJobId) {
-        for _ in 0..200 {
+        // 10s deadline, not 1s: the job task runs on the shared runtime,
+        // and a loaded machine (first-build CI, a saturated dev VM) can
+        // starve it past a tight deadline — observed at 1.23s under a
+        // cold-cache workspace build. Healthy runs return in ~10ms; the
+        // deadline only bounds the pathological hang.
+        for _ in 0..2000 {
             if executor
                 .reports
                 .get(&job_id)

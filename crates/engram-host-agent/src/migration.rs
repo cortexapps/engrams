@@ -20,7 +20,7 @@ use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use dashmap::DashMap;
 use engram_chunk_store::manifest::ChunkHash;
@@ -82,7 +82,12 @@ pub struct MigrationExport {
     /// `MigrationFetch::DiskChunkAt`, re-queued into `dirty` on abort,
     /// dropped on commit (the dest drained them).
     pub disk_seal: Option<Arc<crate::disk_daemon::PostCopyDiskSeal>>,
-    pub created_at: Instant,
+    /// ADR 0098 P8: the TTL clock is the INJECTED monotonic clock
+    /// (`now_mono`), not a raw `Instant` — expiry DECIDES destroy/abort,
+    /// so it is decision-feeding time (D1), and the paused sim clock
+    /// drives it deterministically.
+    pub clock: Arc<dyn engram_core::traits::Clock>,
+    pub created_at: Duration,
     /// ADR 0045 C2: this export serves a post-copy move (the guest
     /// already resumed on the dest; this frozen source is a page
     /// server). FORBIDS the abort-unpause arm once `state_served` is
@@ -96,8 +101,9 @@ pub struct MigrationExport {
     /// session (`ttl_verdict` returns StayPaused, converging via the
     /// scanner within one cycle).
     pub state_served: Arc<AtomicBool>,
-    /// Last page/artifact-serving activity (the post-copy TTL clock).
-    pub last_activity: Arc<std::sync::Mutex<Instant>>,
+    /// Last page/artifact-serving activity (the export TTL clock), as a
+    /// `now_mono` reading.
+    pub last_activity: Arc<std::sync::Mutex<Duration>>,
     /// The sandbox's capture lock, held for the export's lifetime —
     /// this IS the checkpoint fence (the periodic driver's
     /// `capture_in_flight` try_lock keeps skipping).
@@ -105,9 +111,10 @@ pub struct MigrationExport {
 }
 
 impl MigrationExport {
-    /// Refresh the activity clock (every artifact/page serve).
+    /// Refresh the activity clock (every artifact/page serve) off the
+    /// injected monotonic clock.
     pub fn touch(&self) {
-        *self.last_activity.lock().expect("last_activity poisoned") = Instant::now();
+        *self.last_activity.lock().expect("last_activity poisoned") = self.clock.now_mono();
     }
 }
 
@@ -200,14 +207,48 @@ impl MigrationRegistry {
     /// live-teleport that was actively serving `migration_fetch`
     /// streams was spuriously aborted mid-read — issue #216 Gap 1.)
     pub fn expired(&self) -> Vec<SandboxId> {
-        self.by_sandbox
+        let mut expired = self
+            .by_sandbox
             .iter()
             .filter(|e| {
                 let anchor = *e.last_activity.lock().expect("last_activity poisoned");
-                anchor.elapsed() > EXPORT_TTL
+                e.clock.now_mono().saturating_sub(anchor) > EXPORT_TTL
             })
-            .map(|e| e.sandbox_id)
+            .map(|e| (e.export_id.clone(), e.sandbox_id))
+            .collect::<Vec<_>>();
+        // DashMap iteration order is nondeterministic; this list feeds decisions in both the
+        // prod sweep and host sim, so pin it by export_id (ADR 0098).
+        expired.sort_by(|a, b| a.0.cmp(&b.0));
+        expired
+            .into_iter()
+            .map(|(_, sandbox_id)| sandbox_id)
             .collect()
+    }
+
+    /// Refresh a sandbox's open export activity anchor (a serve landed).
+    /// `false` when no export is open.
+    pub fn touch(&self, sandbox_id: SandboxId) -> bool {
+        self.by_sandbox
+            .get(&sandbox_id)
+            .map(|e| {
+                e.touch();
+                true
+            })
+            .unwrap_or(false)
+    }
+
+    /// Raise a sandbox's open export split-brain flag (`state.bin` left
+    /// the host) and refresh its activity anchor. `false` when no export
+    /// is open.
+    pub fn mark_state_served(&self, sandbox_id: SandboxId) -> bool {
+        self.by_sandbox
+            .get(&sandbox_id)
+            .map(|e| {
+                e.state_served.store(true, Ordering::SeqCst);
+                e.touch();
+                true
+            })
+            .unwrap_or(false)
     }
 
     /// The split-brain flag for a sandbox's open export (TTL sweep
@@ -219,6 +260,12 @@ impl MigrationRegistry {
             .unwrap_or(false)
     }
 
+    // ADR 0098 D1 carve-out, reaffirmed P8: this mints an UNGUESSABLE single-use security
+    // token (the migration export id / peer token), not a simulation-visible
+    // identifier — the same rationale D1 uses to keep crypto key material on
+    // `OsRng` rather than the seeded `entropy`. Seeding it would make the
+    // token predictable, which is the opposite of the requirement.
+    #[allow(clippy::disallowed_methods)]
     pub fn mint_export_id() -> String {
         // 32 random bytes (two v4 UUIDs, OS RNG), hex — unguessable,
         // single-use.
@@ -329,6 +376,8 @@ fn constant_time_str_eq(a: &str, b: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
 
     #[test]
@@ -379,12 +428,38 @@ mod tests {
     /// for C1 too. We simulate by seeding `created_at` and the shared
     /// `last_activity` clock far in the past, then `touch()`ing: a C1
     /// export born >TTL ago but touched now must NOT be expired.
+    /// A settable-mono test clock: `SystemClock::now_mono` anchors at
+    /// construction, so a fresh test process cannot mint a "stale" mark by
+    /// subtraction (it saturates to zero). This fake advances explicitly.
+    #[derive(Debug)]
+    struct TestMonoClock(std::sync::Mutex<Duration>);
+
+    impl engram_core::traits::Clock for TestMonoClock {
+        fn now_utc(&self) -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::UNIX_EPOCH
+        }
+        fn now_mono(&self) -> Duration {
+            *self.0.lock().unwrap()
+        }
+        fn sleep(
+            &self,
+            dur: Duration,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+            Box::pin(tokio::time::sleep(dur))
+        }
+    }
+
     #[test]
     fn c1_export_ages_from_last_activity_not_creation() {
         let reg = MigrationRegistry::default();
         let id = SandboxId::new();
         let eid = MigrationRegistry::mint_export_id();
-        let stale = Instant::now() - (EXPORT_TTL + Duration::from_secs(60));
+        // The clock sits well past the TTL so a stale anchor is mintable.
+        let clock: Arc<dyn engram_core::traits::Clock> =
+            Arc::new(TestMonoClock(std::sync::Mutex::new(EXPORT_TTL * 3)));
+        let stale = clock
+            .now_mono()
+            .saturating_sub(EXPORT_TTL + Duration::from_secs(60));
         let last_activity = Arc::new(std::sync::Mutex::new(stale));
         let guard = std::sync::Arc::new(tokio::sync::Mutex::new(()))
             .try_lock_owned()
@@ -396,6 +471,7 @@ mod tests {
             allowed_chunks: HashSet::new(),
             disk_pending: None,
             disk_seal: None,
+            clock: clock.clone(),
             created_at: stale,
             // The bug specifically affected C1 (non-post-copy) exports.
             post_copy: false,
@@ -412,7 +488,7 @@ mod tests {
         // again even though `created_at` is ancient. (Pre-fix: C1 aged
         // on `created_at`, so this stayed expired → spurious mid-read
         // abort of a healthy >120 s teleport.)
-        *last_activity.lock().unwrap() = Instant::now();
+        *last_activity.lock().unwrap() = clock.now_mono();
         assert!(
             reg.expired().is_empty(),
             "a freshly-touched C1 export must NOT expire (issue #216 Gap 1)"
@@ -465,10 +541,13 @@ mod tests {
             allowed_chunks: HashSet::new(),
             disk_pending: None,
             disk_seal: None,
-            created_at: Instant::now(),
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            created_at: Duration::ZERO,
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
+                engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
+            )),
             capture_guard: guard,
         }));
         assert!(reg.validate(id, &eid));
@@ -486,10 +565,13 @@ mod tests {
             allowed_chunks: HashSet::new(),
             disk_pending: None,
             disk_seal: None,
-            created_at: Instant::now(),
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            created_at: Duration::ZERO,
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
+                engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
+            )),
             capture_guard: g2,
         }));
 
@@ -513,10 +595,13 @@ mod tests {
             allowed_chunks: HashSet::new(),
             disk_pending: None,
             disk_seal: None,
-            created_at: Instant::now(),
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            created_at: Duration::ZERO,
             post_copy: false,
             state_served: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            last_activity: std::sync::Arc::new(std::sync::Mutex::new(std::time::Instant::now())),
+            last_activity: std::sync::Arc::new(std::sync::Mutex::new(
+                engram_core::traits::Clock::now_mono(&engram_core::traits::SystemClock::new()),
+            )),
             capture_guard: guard,
         }
     }

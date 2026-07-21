@@ -204,7 +204,7 @@ pub async fn process_upload(
     };
 
     // Server-generated key — the guest never influences the storage path.
-    let artifact_id = uuid::Uuid::new_v4();
+    let artifact_id = state.services.entropy.uuid();
     let key = format!("artifacts/{session}/{}", artifact_id.simple());
 
     // Cap = min(per-file, remaining session budget).
@@ -291,7 +291,7 @@ pub async fn process_upload(
                 media_type: media_type.clone(),
                 size_bytes: size,
                 caption,
-                at: chrono::Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await

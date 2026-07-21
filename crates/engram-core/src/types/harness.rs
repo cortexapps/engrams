@@ -59,6 +59,32 @@ pub struct HarnessDescriptor {
     /// Optional effort/reasoning enum; same shape as `models`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort: Vec<HarnessOption>,
+
+    /// Egress hosts the harness *itself* must reach to function — its model
+    /// API and telemetry endpoints (ADR 0063 addendum). Concatenated into the
+    /// session's deny-default egress allowlist at create, so profiles never
+    /// enumerate LLM-provider hosts just to keep their selected harness alive.
+    #[serde(default, skip_serializing_if = "HarnessEgress::is_empty")]
+    pub egress: HarnessEgress,
+}
+
+/// The `[egress]` block: hosts the harness needs the session's egress proxy to
+/// allow. Same shapes as the profile network's `allow_hosts` /
+/// `allow_host_patterns` (exact hostnames / `*.domain` patterns).
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessEgress {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_hosts: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow_host_patterns: Vec<String>,
+}
+
+impl HarnessEgress {
+    pub fn is_empty(&self) -> bool {
+        self.allow_hosts.is_empty() && self.allow_host_patterns.is_empty()
+    }
 }
 
 /// Credential env-var names. A credential is one var, so these are plain
@@ -75,6 +101,17 @@ pub struct HarnessAuth {
     /// token). Injected from the per-user token store on human runs.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_env: Option<String>,
+
+    /// Free-text setup instructions for the org credential, surfaced to admins.
+    /// Not validated — human guidance, never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_env_hint: Option<String>,
+
+    /// Free-text setup instructions for the human credential (e.g. "Run
+    /// `claude setup-token`"), surfaced on the settings + create surfaces so a
+    /// user knows how to obtain it. Not validated, never a secret.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_env_hint: Option<String>,
 }
 
 /// One model or effort option. `env` is the set of env vars (with values) that
@@ -273,6 +310,47 @@ env = { MAX_THINKING_TOKENS = "32000" }
         assert_eq!(d.auth.user_env.as_deref(), Some("CLAUDE_CODE_OAUTH_TOKEN"));
         assert_eq!(d.models.len(), 2);
         assert_eq!(d.effort.len(), 1);
+    }
+
+    #[test]
+    fn parses_the_egress_block_and_defaults_empty() {
+        let src = r#"
+name = "x"
+[egress]
+allow_hosts = ["api.example.com", "telemetry.example.com"]
+allow_host_patterns = ["*.example.dev"]
+"#;
+        let d = HarnessDescriptor::parse(src).unwrap();
+        assert_eq!(
+            d.egress.allow_hosts,
+            vec!["api.example.com", "telemetry.example.com"]
+        );
+        assert_eq!(d.egress.allow_host_patterns, vec!["*.example.dev"]);
+
+        // Absent block → empty (older descriptors stay valid).
+        let d = HarnessDescriptor::parse(CLAUDE).unwrap();
+        assert!(d.egress.is_empty());
+    }
+
+    #[test]
+    fn parses_auth_hints() {
+        let src = r#"
+name = "x"
+[auth]
+user_env = "TOK"
+user_env_hint = "Run `claude setup-token`."
+org_env = "KEY"
+org_env_hint = "Set an org secret KEY."
+"#;
+        let d = HarnessDescriptor::parse(src).unwrap();
+        assert_eq!(
+            d.auth.user_env_hint.as_deref(),
+            Some("Run `claude setup-token`.")
+        );
+        assert_eq!(
+            d.auth.org_env_hint.as_deref(),
+            Some("Set an org secret KEY.")
+        );
     }
 
     #[test]

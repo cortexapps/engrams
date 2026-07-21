@@ -214,9 +214,9 @@ pub fn spawn(cfg: EnableScannerConfig, state: SharedState) -> tokio::task::JoinH
     })
 }
 
-/// Single scanner tick. `pub(crate)` so live-PG tests can drive the
-/// scanner deterministically without `tokio::spawn`-ing the loop.
-pub(crate) async fn run_once(
+/// Single scanner tick. Public so live-PG tests and the deterministic
+/// simulator can drive it without `tokio::spawn`-ing the timer loop.
+pub async fn run_once(
     cfg: &EnableScannerConfig,
     state: &SharedState,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -440,7 +440,12 @@ async fn advance_one(
             "image config for `{image_uri}`: {e}"
         ))))
     })?;
-    let mut row = new_enable_row(&image_uri, &job.image_config);
+    let mut row = new_enable_row(
+        &image_uri,
+        &job.image_config,
+        state.services.entropy.uuid(),
+        state.services.clock.now_utc(),
+    );
 
     // ---- materializing (host-side, ADR 0080 phase 3b) ----
     //
@@ -482,6 +487,7 @@ async fn advance_one(
             tokio::sync::mpsc::channel::<engram_core::types::MaterializeProgress>(64);
         let progress_consumer = {
             let meta = state.services.meta.clone();
+            let clock = state.services.clock.clone();
             let claimant = claimant.to_string();
             tokio::spawn(async move {
                 // ADR 0088 UI follow-up: the materialize stage timeline
@@ -492,7 +498,7 @@ async fn advance_one(
                 let mut stages: Vec<engram_core::types::WarmStageRecord> = Vec::new();
                 while let Some(frame) = progress_rx.recv().await {
                     if let Some(closed) =
-                        advance_materialize_stages(&mut stages, frame.stage, Utc::now())
+                        advance_materialize_stages(&mut stages, frame.stage, clock.now_utc())
                     {
                         record_materialize_stage(closed);
                     }
@@ -513,8 +519,16 @@ async fn advance_one(
                 stages
             })
         };
-        let materialize_result =
-            materialize_image_on_host(state, job_id, claimant, &image_uri, progress_tx).await;
+        let min_disk_gib = job.image_config.resources.suggested_disk_gib.unwrap_or(0);
+        let materialize_result = materialize_image_on_host(
+            state,
+            job_id,
+            claimant,
+            &image_uri,
+            min_disk_gib,
+            progress_tx,
+        )
+        .await;
         // `materialize_image_on_host` returning means every `Sender` clone
         // is dropped — awaiting the consumer guarantees the final frame is
         // persisted before we act on the result (same ordering property as
@@ -528,7 +542,7 @@ async fn advance_one(
         // marks where it died). Best-effort: a lost lease here surfaces on
         // the very next fenced state write.
         if let Some(open) = stages.last_mut().filter(|s| s.ended_at.is_none()) {
-            let ended = Utc::now();
+            let ended = state.services.clock.now_utc();
             open.ended_at = Some(ended);
             open.outcome = engram_core::types::WarmStageOutcome::Done;
             record_materialize_stage(ClosedMaterializeStage {
@@ -638,6 +652,7 @@ async fn advance_one(
                         state.services.meta.as_ref(),
                         footprint,
                         None,
+                        state.services.clock.now_utc(),
                     )
                     .await
                     {
@@ -791,8 +806,9 @@ async fn advance_one(
     };
 
     let digest = image_ref.manifest_digest.as_str().to_string();
-    let deadline = tokio::time::Instant::now() + cfg.prestage_timeout;
-    let wait_started = std::time::Instant::now();
+    let clock = &state.services.clock;
+    let deadline = clock.now_mono() + cfg.prestage_timeout;
+    let wait_started = clock.now_mono();
     // Last-known counts from a successful poll, surfaced in the TimedOut
     // outcome if the deadline is hit inside the error arm below (review
     // finding 2, PR #565) — a persistent `list_active_hosts` failure
@@ -808,38 +824,40 @@ async fn advance_one(
                 // of spinning forever — `run_once` drives claimed jobs
                 // sequentially, so a wedged wait here stalls every other
                 // claimed enable job too.
-                if tokio::time::Instant::now() >= deadline {
+                if clock.now_mono() >= deadline {
                     break PrestageOutcome::TimedOut {
                         staged: last_seen.0,
                         eligible: last_seen.1,
                     };
                 }
-                tokio::time::sleep(
-                    cfg.poll_interval
-                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-                )
-                .await;
+                clock
+                    .sleep(
+                        cfg.poll_interval
+                            .min(deadline.saturating_sub(clock.now_mono())),
+                    )
+                    .await;
                 continue;
             }
         };
         match eval_prestage(
             &hosts,
             &digest,
-            Utc::now(),
+            clock.now_utc(),
             crate::placement::placement_ttl(),
         ) {
             PrestageEval::Complete => break PrestageOutcome::Complete,
             PrestageEval::EmptyFleet => break PrestageOutcome::EmptyFleet,
             PrestageEval::Waiting { staged, eligible } => {
                 last_seen = (staged, eligible);
-                if tokio::time::Instant::now() >= deadline {
+                if clock.now_mono() >= deadline {
                     break PrestageOutcome::TimedOut { staged, eligible };
                 }
-                tokio::time::sleep(
-                    cfg.poll_interval
-                        .min(deadline.saturating_duration_since(tokio::time::Instant::now())),
-                )
-                .await;
+                clock
+                    .sleep(
+                        cfg.poll_interval
+                            .min(deadline.saturating_sub(clock.now_mono())),
+                    )
+                    .await;
             }
         }
     };
@@ -848,7 +866,7 @@ async fn advance_one(
         crate::metrics::ENABLE_PRESTAGE_SECONDS,
         "outcome" => prestage_outcome.metric_label(),
     )
-    .record(wait_started.elapsed().as_secs_f64());
+    .record(clock.now_mono().saturating_sub(wait_started).as_secs_f64());
 
     // Zero-staged timeout: transient (a fleet mid-roll, or every staging
     // host briefly unreachable) — retry under the attempts budget rather
@@ -868,13 +886,13 @@ async fn advance_one(
     // Record the per-host outcome map (audit / dashboard surface) — one
     // more hosts read so the map reflects the hosts as of stage-end, not
     // the last poll (a host that appeared mid-wait should show up here).
-    let waited_ms = wait_started.elapsed().as_millis() as u64;
+    let waited_ms = clock.now_mono().saturating_sub(wait_started).as_millis() as u64;
     match state.services.meta.list_active_hosts().await {
         Ok(hosts) => {
             let entries = prestage_host_outcomes(
                 &hosts,
                 &digest,
-                Utc::now(),
+                clock.now_utc(),
                 crate::placement::placement_ttl(),
                 waited_ms,
             );
@@ -982,7 +1000,7 @@ async fn capture_job_deadline_scan(cfg: &EnableScannerConfig, state: &SharedStat
             return;
         }
     };
-    let now = Utc::now();
+    let now = state.services.clock.now_utc();
     for row in candidates {
         if row.stage == CaptureJobStage::Warming {
             let warm_budget = row
@@ -1025,6 +1043,7 @@ async fn capture_job_deadline_scan(cfg: &EnableScannerConfig, state: &SharedStat
                 state.services.meta.as_ref(),
                 footprint,
                 None,
+                now,
             )
             .await
             {
@@ -1091,7 +1110,7 @@ async fn capture_job_capacity_scan(cfg: &EnableScannerConfig, state: &SharedStat
             return;
         }
     };
-    let now = Utc::now();
+    let now = state.services.clock.now_utc();
     for row in waiting {
         // Timeout FIRST (anchored on the DB-persisted `waiting_since`, not a
         // wall clock computed at process start — restart-proof).
@@ -1147,6 +1166,7 @@ async fn capture_job_capacity_scan(cfg: &EnableScannerConfig, state: &SharedStat
             state.services.meta.as_ref(),
             footprint,
             None,
+            now,
         )
         .await
         {
@@ -1341,6 +1361,8 @@ fn record_materialize_stage(closed: ClosedMaterializeStage) {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
 

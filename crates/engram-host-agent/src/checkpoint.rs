@@ -32,6 +32,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use engram_core::types::ids::{SandboxId, SessionId, SnapshotId};
 use engram_core::types::manifest::ManifestRef;
+use engram_host_core::{HostFs, TokioFs};
 use serde::{Deserialize, Serialize};
 
 /// Per-sandbox checkpoint chain state. Lives in
@@ -90,21 +91,24 @@ impl CheckpointRecord {
         crate::durable_record::record_path(dir, id)
     }
 
-    /// Durably persist (write + fsync via rename) into `dir`.
-    pub async fn persist(&self, dir: &Path) -> std::io::Result<()> {
-        crate::durable_record::persist(dir, self.snapshot_id, self, "checkpoint record").await
+    /// Durably persist (write + fsync via rename) into `dir`, through the
+    /// injected fs seam (ADR 0098 P5 — Flow D's terminal record crosses
+    /// it; other flows pass [`TokioFs`]).
+    pub async fn persist(&self, fs: &dyn HostFs, dir: &Path) -> std::io::Result<()> {
+        crate::durable_record::persist(fs, dir, self.snapshot_id, self, "checkpoint record").await
     }
 
     /// All un-acked records in `dir` (the heartbeat advert payload).
     /// Unreadable/partial files are skipped with a warn — a torn
     /// write must not wedge the heartbeat loop.
-    pub async fn load_all(dir: &Path) -> Vec<CheckpointRecord> {
-        crate::durable_record::load_all(dir, "checkpoint record").await
+    pub async fn load_all(fs: &dyn HostFs, dir: &Path) -> Vec<CheckpointRecord> {
+        crate::durable_record::load_all(fs, dir, "checkpoint record").await
     }
 
     /// Coord acked these — the PG rows own the references now.
-    pub async fn delete_acked(dir: &Path, acked: &[SnapshotId]) {
-        crate::durable_record::delete_acked(dir, acked.iter().copied(), "checkpoint record").await
+    pub async fn delete_acked(fs: &dyn HostFs, dir: &Path, acked: &[SnapshotId]) {
+        crate::durable_record::delete_acked(fs, dir, acked.iter().copied(), "checkpoint record")
+            .await
     }
 }
 
@@ -151,7 +155,12 @@ pub struct ChainHeadRecord {
     pub sandbox_id: SandboxId,
     /// The durably-published chain head at persist time.
     pub manifest_ref: ManifestRef,
-    /// Bound session, when known — diagnostic only.
+    /// Bound session, when known. Load-bearing since the local
+    /// survivor-rehydrate pass (session 731df805, 2026-07-17):
+    /// `PooledBackend::rehydrate_local_survivors` re-serves a live
+    /// survivor's NBD device under this session when the coordinator's
+    /// register-time list misses it. `None` (a record persisted before
+    /// the binding was known) exempts the sandbox from the local pass.
     pub session_id: Option<SessionId>,
     pub updated_at: DateTime<Utc>,
 }
@@ -169,19 +178,32 @@ impl ChainHeadRecord {
     pub async fn load(dir: &Path, id: SandboxId) -> Option<ChainHeadRecord> {
         let path = crate::durable_record::record_path(dir, id);
         let bytes = tokio::fs::read(&path).await.ok()?;
-        match serde_json::from_slice(&bytes) {
+        // R5: open the sealed envelope (content hash + sandbox-id identity); a
+        // torn/bit-rotted/misdirected record is treated as absent, same as the
+        // pre-envelope unparseable arm — the chain seeds Full next capture.
+        let body = match crate::durable_envelope::open(&bytes, &id.to_string()) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!(path = %path.display(), error = %e,
+                    "corrupt chain-head record; treating as absent");
+                return None;
+            }
+        };
+        match serde_json::from_slice(&body) {
             Ok(r) => Some(r),
             Err(e) => {
                 tracing::warn!(path = %path.display(), error = %e,
-                    "unparseable chain-head record; treating as absent");
+                    "unparseable chain-head record body; treating as absent");
                 None
             }
         }
     }
 
-    /// Every record in `dir` (the startup rehydrate/GC sweep).
+    /// Every record in `dir` (the startup rehydrate/GC sweep). Not yet
+    /// behind the fs seam — the chain-head flow extracts in a later P
+    /// (the seam lands with the flows that cross it).
     pub async fn load_all(dir: &Path) -> Vec<ChainHeadRecord> {
-        crate::durable_record::load_all(dir, "chain-head record").await
+        crate::durable_record::load_all(&TokioFs, dir, "chain-head record").await
     }
 }
 
@@ -301,13 +323,21 @@ impl ChainHeadStore {
         let dest = crate::durable_record::record_path(dir, record.sandbox_id);
         let nonce = PERSIST_NONCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let tmp = dest.with_extension(format!("json.partial.{nonce}"));
-        let bytes = serde_json::to_vec_pretty(&record)
+        // R5: seal the record under a content hash + the sandbox id, so its
+        // custom epoch-checked write matches the durable_record envelope its
+        // `load`/`load_all` now expect (chain-head persists here, not through
+        // durable_record::persist, for the epoch-fenced rename).
+        let body = serde_json::to_string_pretty(&record)
             .map_err(|e| std::io::Error::other(format!("serialize chain-head record: {e}")))?;
+        let bytes = crate::durable_envelope::seal(&record.sandbox_id.to_string(), &body);
         std::fs::write(&tmp, &bytes)?;
         std::fs::File::open(&tmp)?.sync_all()?;
         {
             let _g = st.io.lock().expect("chain-head io lock poisoned");
-            if st.epoch.load(std::sync::atomic::Ordering::SeqCst) != epoch0 {
+            if !engram_host_core::checkpoint_tail_admits_publish(
+                epoch0,
+                st.epoch.load(std::sync::atomic::Ordering::SeqCst),
+            ) {
                 // A newer invalidate fenced this persist off — its
                 // record describes a baseline an FC create has since
                 // consumed. Publishing it would be the resurrection
@@ -371,12 +401,57 @@ pub fn dirty_ranges(diff: &Path) -> std::io::Result<Vec<(u64, u64)>> {
 /// Config for the periodic driver.
 #[derive(Clone, Debug)]
 pub struct CheckpointConfig {
-    /// Capture cadence per sandbox — the relaxed *in-RAM* backstop (ADR 0043
-    /// P2a). `None` disables the periodic driver entirely
-    /// (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`); disk durability and the
-    /// event-driven memory checkpoints (drain / idle-evict / operator) are
-    /// unaffected either way.
+    /// The MAX epoch length — the age backstop every session-bound
+    /// sandbox is checkpointed at regardless of activity (the relaxed
+    /// *in-RAM* backstop, ADR 0043 P2a). `None` disables the periodic
+    /// driver entirely (`ENGRAM_CHECKPOINT_INTERVAL_SECS=0`); disk
+    /// durability and the event-driven memory checkpoints (drain /
+    /// idle-evict / operator) are unaffected either way.
     pub interval: Option<Duration>,
+    /// ADR 0101 B: the MIN epoch length — the adaptive controller never
+    /// checkpoints a sandbox more often than this, and it is the
+    /// driver's scheduling quantum. `ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS`.
+    pub min_interval: Duration,
+    /// ADR 0101 B: how much memory dirt one epoch should aim to carry.
+    /// The controller scales the next epoch so `dirty_bytes ≈ target` at
+    /// the last observed dirty rate. `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`.
+    pub target_epoch_bytes: u64,
+}
+
+/// ADR 0101 B: the next epoch length, from the last epoch's observed
+/// dirty rate. Aim for `target_epoch_bytes` of dirt per capture:
+/// `next = last_epoch × target / last_dirty`, clamped to
+/// `[min_interval, max_interval]`. No rate signal (first capture after
+/// a chain seed, a Full capture, a zero-dirty epoch) → the max
+/// backstop — an idle guest keeps the cheap ADR 0043 cadence; only a
+/// guest actually dirtying RAM earns short epochs. Pure — unit-tested
+/// directly, and the driver stays simulable (ADR 0098).
+pub fn next_epoch_after(
+    last_epoch: Duration,
+    last_dirty_bytes: Option<u64>,
+    min_interval: Duration,
+    max_interval: Duration,
+    target_epoch_bytes: u64,
+) -> Duration {
+    // Order-safe (engrams review, #835): `f64::clamp` PANICS when
+    // min > max, and nothing upstream forbids an operator setting
+    // `ENGRAM_CHECKPOINT_INTERVAL_SECS` below the 30s MIN default (a
+    // natural way to ask for more frequent checkpoints). This runs
+    // inside the un-awaited driver task, where a panic silently kills
+    // all periodic checkpoints for the host — degrade to the max bound
+    // instead (the operator lowered the ceiling; honor it). `from_env`
+    // also normalizes the pair, so this guard is belt-and-suspenders
+    // for direct-constructed configs.
+    let max = max_interval;
+    let min = min_interval.min(max);
+    let Some(dirty) = last_dirty_bytes else {
+        return max;
+    };
+    if dirty == 0 || last_epoch.is_zero() || target_epoch_bytes == 0 {
+        return max;
+    }
+    let scaled = last_epoch.as_secs_f64() * (target_epoch_bytes as f64) / (dirty as f64);
+    Duration::from_secs_f64(scaled.clamp(min.as_secs_f64(), max.as_secs_f64()))
 }
 
 impl CheckpointConfig {
@@ -403,8 +478,37 @@ impl CheckpointConfig {
             .ok()
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(600);
+        // ADR 0101 B: Phase A made small diffs cheap (unchecked PUTs,
+        // same-hash skip, 96-way fan-out), so busy sessions can afford
+        // short epochs again — adaptively, not the old flat 60s that
+        // ADR 0043 P2a retired. 30s floor; 256 MiB dirt per epoch
+        // target (~1-6s of finalize work post-Phase-A).
+        let min_secs = std::env::var("ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(30);
+        let target_mb = std::env::var("ENGRAM_CHECKPOINT_TARGET_EPOCH_MB")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(256);
+        // Normalize a min > max pair (engrams review, #835): an operator
+        // lowering INTERVAL below the MIN default asked for a tighter
+        // ceiling — honor it rather than hand `next_epoch_after` an
+        // inverted clamp. Loud, because the MIN knob is being ignored.
+        let mut min_secs = min_secs.max(1);
+        if secs > 0 && min_secs > secs {
+            tracing::warn!(
+                min_secs,
+                interval_secs = secs,
+                "ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS exceeds ENGRAM_CHECKPOINT_INTERVAL_SECS; \
+                 clamping the floor to the ceiling",
+            );
+            min_secs = secs;
+        }
         Self {
             interval: (secs > 0).then(|| Duration::from_secs(secs)),
+            min_interval: Duration::from_secs(min_secs),
+            target_epoch_bytes: target_mb * 1024 * 1024,
         }
     }
 }
@@ -420,60 +524,101 @@ pub fn spawn_checkpoint_driver(
     backend: Arc<crate::pooled_backend::PooledBackend>,
     cfg: CheckpointConfig,
 ) -> Option<tokio::task::JoinHandle<()>> {
-    let interval = cfg.interval?;
+    cfg.interval?;
     Some(tokio::spawn(async move {
-        let mut tick = tokio::time::interval(interval);
+        // ADR 0101 B: tick at the MIN interval — the scheduling quantum.
+        // Which sandboxes are actually due is decided per-sandbox by the
+        // adaptive controller (`checkpoint_candidates_adaptive`), so an
+        // idle fleet still captures only every `interval` (the max
+        // backstop); the fast quantum exists so a busy sandbox's short
+        // epoch is honored. The candidate scan is a pure in-RAM map
+        // walk — waking it every `min_interval` costs nothing.
+        let mut tick = tokio::time::interval(cfg.min_interval);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // Skip the immediate first tick: freshly-created sandboxes get
-        // their seed checkpoint one full interval in, by which point
-        // agentd is up (and the capture path's wait_agent_ready gate
-        // covers the stragglers).
+        // their seed checkpoint later, by which point agentd is up (and
+        // the capture path's wait_agent_ready gate covers stragglers).
         tick.tick().await;
         loop {
             tick.tick().await;
-            let due = backend.checkpoint_candidates(interval);
-            for (sandbox_id, session_id) in due {
-                // ADR 0038 B1: skip if a capture is already in flight —
-                // queuing this best-effort checkpoint behind another
-                // capture is what let one slow/hung capture gridlock the
-                // fleet. The next tick retries.
-                if backend.capture_in_flight(sandbox_id) {
-                    metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
-                    tracing::debug!(
-                        %sandbox_id,
-                        %session_id,
-                        "skipping periodic checkpoint; a capture is already in flight",
-                    );
-                    continue;
-                }
-                match backend.checkpoint_sandbox(sandbox_id).await {
-                    Ok(metadata) => {
-                        // A successful capture proves the control plane
-                        // answers — clear any unreachable suspicion.
-                        backend.clear_guest_unreachable(sandbox_id);
-                        tracing::info!(
-                            %sandbox_id,
-                            %session_id,
-                            snapshot_id = %metadata.id,
-                            memory_manifest = ?metadata.memory_manifest,
-                            "periodic checkpoint complete",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            %sandbox_id,
-                            %session_id,
-                            error = %e,
-                            "periodic checkpoint failed; retrying next tick",
-                        );
-                        // ADR 0091: a checkpoint failure was the ONLY signal a
-                        // dead guest emitted, and it died here as a WARN while
-                        // the session read `active` (campaign C1: 16+ min
-                        // zombie). Confirm with the cheap control-socket probe
-                        // — 3 tries, 2s apart, so a mid-restart FC can't be
-                        // misclassified — and advertise via the heartbeat.
-                        // Only socket-level probe results count: a BUSY guest
-                        // fails a capture but still accept()s its API socket.
+            run_checkpoint_pass(&backend, &cfg).await;
+        }
+    }))
+}
+
+/// One sleep-free pass of the periodic driver — the ADR 0098
+/// `spawn()`/`run_once()` split: the timer loop above is a thin
+/// wrapper, and this is the step tests (and the host simulator) drive
+/// directly. Genuinely sleep-free (engrams review, #835): the ADR 0091
+/// dead-guest confirmation probe (3 tries, 2s apart) is SPAWNED
+/// detached, not awaited inline — one unresponsive guest must not
+/// consume the `min_interval` quantum and head-of-line the honored
+/// short epochs of the busy sandboxes behind it.
+pub async fn run_checkpoint_pass(
+    backend: &Arc<crate::pooled_backend::PooledBackend>,
+    cfg: &CheckpointConfig,
+) {
+    let due = backend.checkpoint_candidates_adaptive(cfg);
+    for (sandbox_id, session_id) in due {
+        // ADR 0038 B1: skip if a capture is already in flight —
+        // queuing this best-effort checkpoint behind another
+        // capture is what let one slow/hung capture gridlock the
+        // fleet. The next tick retries.
+        if backend.capture_in_flight(sandbox_id) {
+            metrics::counter!(crate::metrics::CHECKPOINT_SKIPPED_TOTAL).increment(1);
+            tracing::debug!(
+                %sandbox_id,
+                %session_id,
+                "skipping periodic checkpoint; a capture is already in flight",
+            );
+            continue;
+        }
+        match backend.checkpoint_sandbox(sandbox_id).await {
+            Ok(metadata) => {
+                // A successful capture proves the control plane
+                // answers — clear any unreachable suspicion.
+                backend.clear_guest_unreachable(sandbox_id);
+                tracing::info!(
+                    %sandbox_id,
+                    %session_id,
+                    snapshot_id = %metadata.id,
+                    memory_manifest = ?metadata.memory_manifest,
+                    "periodic checkpoint complete",
+                );
+            }
+            Err(e) => {
+                tracing::warn!(
+                    %sandbox_id,
+                    %session_id,
+                    error = %e,
+                    "periodic checkpoint failed; retrying next tick",
+                );
+                // ADR 0091: a checkpoint failure was the ONLY signal a
+                // dead guest emitted, and it died here as a WARN while
+                // the session read `active` (campaign C1: 16+ min
+                // zombie). Confirm with the cheap control-socket probe
+                // — 3 tries, 2s apart, so a mid-restart FC can't be
+                // misclassified — and advertise via the heartbeat.
+                // Only socket-level probe results count: a BUSY guest
+                // fails a capture but still accept()s its API socket.
+                //
+                // Detached (engrams review, #835): the probe's up-to-6s
+                // of confirmation sleeps ran INLINE in this serial pass
+                // — with the quantum shrunk to `min_interval`, a few
+                // dead guests could eat the whole tick and starve the
+                // busy sandboxes' short epochs. Spawning is safe: the
+                // probe only reads the socket and flips the (idempotent)
+                // unreachable advert, and a healed guest is cleared by
+                // its next successful capture above. Gated (review round
+                // 2): at most ONE probe per sandbox at a time — a
+                // still-failing sandbox is due EVERY tick (its
+                // last-capture stamp never advances), and a
+                // `min_interval` below the probe's ~6s lifetime would
+                // otherwise stack overlapping probes against exactly the
+                // guests least able to answer.
+                if backend.try_begin_dead_probe(sandbox_id) {
+                    let backend = Arc::clone(backend);
+                    tokio::spawn(async move {
                         let mut dead_probes = 0u32;
                         for _ in 0..3 {
                             match backend.probe_sandbox(sandbox_id).await {
@@ -491,16 +636,97 @@ pub fn spawn_checkpoint_driver(
                             );
                             backend.mark_guest_unreachable(sandbox_id, session_id);
                         }
-                    }
+                        backend.end_dead_probe(sandbox_id);
+                    });
                 }
             }
         }
-    }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
+
+    /// ADR 0101 B: the adaptive controller's math — proportional to the
+    /// observed dirty rate, clamped to [min, max], and falling back to
+    /// the max backstop whenever there is no usable rate signal.
+    #[test]
+    fn next_epoch_scales_with_dirty_rate_and_clamps() {
+        let min = Duration::from_secs(30);
+        let max = Duration::from_secs(600);
+        let target = 256 * 1024 * 1024u64;
+
+        // Exactly on target: keep the same epoch.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(120), Some(target), min, max, target),
+            Duration::from_secs(120),
+        );
+        // Half the target dirt → stretch the epoch 2×.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(120), Some(target / 2), min, max, target),
+            Duration::from_secs(240),
+        );
+        // A dirt firehose (32× target in one epoch) → clamped to the floor.
+        assert_eq!(
+            next_epoch_after(
+                Duration::from_secs(600),
+                Some(target * 32),
+                min,
+                max,
+                target
+            ),
+            min,
+        );
+        // Nearly idle → clamped to the max backstop.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), Some(1024), min, max, target),
+            max,
+        );
+        // An inverted pair (operator lowered the ceiling below the MIN
+        // default) must degrade to the ceiling, never panic the driver
+        // task (engrams review, #835: f64::clamp panics on min > max).
+        assert_eq!(
+            next_epoch_after(
+                Duration::from_secs(600),
+                Some(target * 32),
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+                target
+            ),
+            Duration::from_secs(10),
+        );
+        assert_eq!(
+            next_epoch_after(
+                Duration::from_secs(60),
+                None,
+                Duration::from_secs(30),
+                Duration::from_secs(10),
+                target
+            ),
+            Duration::from_secs(10),
+        );
+        // No rate signal (Full capture / first epoch / zero dirty / zero
+        // target) → the max backstop, never the floor.
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), None, min, max, target),
+            max
+        );
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), Some(0), min, max, target),
+            max,
+        );
+        assert_eq!(
+            next_epoch_after(Duration::ZERO, Some(target), min, max, target),
+            max
+        );
+        assert_eq!(
+            next_epoch_after(Duration::from_secs(60), Some(target), min, max, 0),
+            max,
+        );
+    }
 
     fn record(id: SandboxId) -> ChainHeadRecord {
         ChainHeadRecord {

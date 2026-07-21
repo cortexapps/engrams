@@ -11,7 +11,14 @@
 //! round-trips green and then desyncs against a peer built from an older
 //! tree. The in-guest harness is baked into session images / base
 //! snapshots, so the host routinely speaks to a harness built from an
-//! older tree: that skew is real and long-lived.
+//! older tree: that skew is normally real and long-lived.
+//!
+//! **ADR 0089 P5d is the sanctioned exception:** deleting the bespoke
+//! question variants intentionally shifts positional bincode indices and
+//! regenerates the full corpus. This is a flag-day break: the guest image
+//! containing both production harnesses and the host fleet containing the
+//! host-agent/coordinator MUST be baked and deployed together. No old/new
+//! peer skew is supported across this break.
 //!
 //! This test pins the exact bytes (`golden/<name>.bin`) plus, for every
 //! enum, the `u32` variant index in `bytes[0..4]`. Reordering a variant
@@ -20,24 +27,25 @@
 //!
 //! ## Regenerating the corpus (only when you INTENTIONALLY evolve a type)
 //!
-//! Adding a *trailing* enum variant or a *trailing* struct field is the
-//! only wire-safe evolution. After such a change, regenerate:
+//! Except for an explicitly sanctioned flag-day break such as ADR 0089 P5d,
+//! adding a *trailing* enum variant or a *trailing* struct field is the only
+//! wire-safe evolution. After such a change, regenerate:
 //!
 //! ```text
 //!   cargo test -p engram-harness-proto --test wire_golden -- --ignored regen_golden
 //! ```
 //!
-//! then `git add` the changed `golden/*.bin` and review the diff: an
-//! EXISTING golden file changing bytes is a RED FLAG (you broke the wire
-//! for an old baked harness); only NEW files are expected. Reordering or
-//! inserting is never OK.
+//! then review the changed `golden/*.bin`: outside a sanctioned flag-day,
+//! an EXISTING golden changing bytes is a RED FLAG (you broke the wire for
+//! an old baked harness); only NEW files are expected. Reordering or inserting
+//! is never OK without the same explicit all-peer deployment coupling.
 
 use std::path::PathBuf;
 
 use engram_core::SessionId;
 use engram_harness_proto::{
-    AgentRole, Answers, CheckpointReason, EditHunk, FileChange, ForgeOp, ForgeResponse,
-    HarnessCommand, HarnessEvent, HarnessFrame, Question, QuestionOption, UploadOp, UploadResponse,
+    AgentRole, CheckpointReason, EditHunk, FileChange, ForgeOp, ForgeResponse, HarnessCommand,
+    HarnessEvent, HarnessFrame, UploadOp, UploadResponse,
 };
 use serde::Serialize;
 use uuid::Uuid;
@@ -140,6 +148,14 @@ fn ev_prompt_steered() -> HarnessEvent {
         prompt_id: "p1".into(),
     }
 }
+fn ev_tool_call_requested() -> HarnessEvent {
+    HarnessEvent::ToolCallRequested {
+        run_id: "r1".into(),
+        call_id: "call_1".into(),
+        name: "save_memory".into(),
+        args_json: r#"{"text":"remember this"}"#.into(),
+    }
+}
 fn ev_agent_message() -> HarnessEvent {
     HarnessEvent::AgentMessage {
         run_id: "r1".into(),
@@ -173,6 +189,13 @@ fn ev_tool_call_completed() -> HarnessEvent {
         result_summary: Some("done".into()),
     }
 }
+fn ev_browser_activity() -> HarnessEvent {
+    HarnessEvent::BrowserActivity {
+        run_id: "r1".into(),
+        tool_call_id: "t1".into(),
+        intent: "Clicking Sign in".into(),
+    }
+}
 fn ev_run_completed() -> HarnessEvent {
     HarnessEvent::RunCompleted {
         run_id: "r1".into(),
@@ -182,69 +205,6 @@ fn ev_run_completed() -> HarnessEvent {
 fn ev_run_interrupted() -> HarnessEvent {
     HarnessEvent::RunInterrupted {
         run_id: "r1".into(),
-    }
-}
-/// Two questions in one call (one multi-select, one single) — the
-/// finding-#8 shape. Pins the `Question`/`QuestionOption` field order.
-fn sample_questions() -> Vec<Question> {
-    vec![
-        Question {
-            question: "Which languages?".into(),
-            header: "Languages".into(),
-            multi_select: true,
-            options: vec![
-                QuestionOption {
-                    label: "Python".into(),
-                    description: "snek".into(),
-                },
-                QuestionOption {
-                    label: "Rust".into(),
-                    description: "crab".into(),
-                },
-            ],
-        },
-        Question {
-            question: "Which editor?".into(),
-            header: "Editor".into(),
-            multi_select: false,
-            options: vec![QuestionOption {
-                label: "VS Code".into(),
-                description: "the one".into(),
-            }],
-        },
-    ]
-}
-/// A **mixed-arity** answer map — a multi-element vec AND a 1-element vec
-/// in the same map. This is the regression guard: a future change to an
-/// untagged / `deserialize_any` encoding panics at decode and fails the
-/// golden here loudly (ADR 0054).
-fn sample_answers() -> Answers {
-    let mut m = Answers::new();
-    m.insert(
-        "Which languages?".into(),
-        vec!["Python".into(), "Rust".into()],
-    );
-    m.insert("Which editor?".into(), vec!["VS Code".into()]);
-    m
-}
-fn ev_user_question() -> HarnessEvent {
-    HarnessEvent::UserQuestion {
-        run_id: "r1".into(),
-        tool_call_id: "toolu_1".into(),
-        questions: sample_questions(),
-    }
-}
-fn ev_question_answered() -> HarnessEvent {
-    HarnessEvent::QuestionAnswered {
-        run_id: "r1".into(),
-        tool_call_id: "toolu_1".into(),
-        answers: sample_answers(),
-    }
-}
-fn cmd_answer_question() -> HarnessCommand {
-    HarnessCommand::AnswerQuestion {
-        tool_call_id: "toolu_1".into(),
-        answers: sample_answers(),
     }
 }
 /// An edit with two hunks — one replacement and one pure insertion (empty
@@ -290,7 +250,7 @@ fn ev_file_changed_patch() -> HarnessEvent {
     }
 }
 
-/// A harness-suggested title — pins `TitleSuggested` (index 14).
+/// A harness-suggested title — pins `TitleSuggested` (index 12).
 fn ev_title_suggested() -> HarnessEvent {
     HarnessEvent::TitleSuggested {
         title: "Fix the flaky test".into(),
@@ -322,6 +282,12 @@ fn cmd_dequeue_queued() -> HarnessCommand {
         prompt_id: "p1".into(),
     }
 }
+fn cmd_tool_result() -> HarnessCommand {
+    HarnessCommand::ToolResult {
+        call_id: "call_1".into(),
+        result_json: r#"{"saved":true}"#.into(),
+    }
+}
 
 // ---- tests -------------------------------------------------------------
 
@@ -349,13 +315,14 @@ fn harness_event_golden_and_variant_indices() {
     assert_golden("event_prompt_edited", &ev_prompt_edited());
     assert_golden("event_prompt_dequeued", &ev_prompt_dequeued());
     assert_golden("event_agent_message_chunk", &ev_agent_message_chunk());
-    assert_golden("event_user_question", &ev_user_question());
-    assert_golden("event_question_answered", &ev_question_answered());
     assert_golden("event_file_changed_edit", &ev_file_changed_edit());
     assert_golden("event_file_changed_write", &ev_file_changed_write());
     assert_golden("event_file_changed_patch", &ev_file_changed_patch());
     assert_golden("event_title_suggested", &ev_title_suggested());
     assert_golden("event_prompt_steered", &ev_prompt_steered());
+    assert_golden("event_tool_call_requested", &ev_tool_call_requested());
+    assert_golden("event_parked", &HarnessEvent::Parked);
+    assert_golden("event_browser_activity", &ev_browser_activity());
 
     assert_variant_index(&ev_run_started(), 0, "HarnessEvent::RunStarted");
     assert_variant_index(&ev_agent_message(), 1, "HarnessEvent::AgentMessage");
@@ -377,21 +344,21 @@ fn harness_event_golden_and_variant_indices() {
         10,
         "HarnessEvent::AgentMessageChunk",
     );
-    // ADR 0054 interactive events — APPENDED after AgentMessageChunk (11,12).
-    assert_variant_index(&ev_user_question(), 11, "HarnessEvent::UserQuestion");
+    // ADR 0089 P5d sanctioned flag-day break: deleting the bespoke question
+    // events shifts every later positional index by two. Both harnesses in the
+    // guest image and the host-agent/coordinator fleet deploy together.
+    assert_variant_index(&ev_file_changed_edit(), 11, "HarnessEvent::FileChanged");
+    assert_variant_index(&ev_file_changed_write(), 11, "HarnessEvent::FileChanged");
+    assert_variant_index(&ev_file_changed_patch(), 11, "HarnessEvent::FileChanged");
+    assert_variant_index(&ev_title_suggested(), 12, "HarnessEvent::TitleSuggested");
+    assert_variant_index(&ev_prompt_steered(), 13, "HarnessEvent::PromptSteered");
     assert_variant_index(
-        &ev_question_answered(),
-        12,
-        "HarnessEvent::QuestionAnswered",
+        &ev_tool_call_requested(),
+        14,
+        "HarnessEvent::ToolCallRequested",
     );
-    // ADR 0054 Flavor A file change — APPENDED after QuestionAnswered (13).
-    // Both `op` arms are the same enum variant, so both pin index 13.
-    assert_variant_index(&ev_file_changed_edit(), 13, "HarnessEvent::FileChanged");
-    assert_variant_index(&ev_file_changed_write(), 13, "HarnessEvent::FileChanged");
-    assert_variant_index(&ev_file_changed_patch(), 13, "HarnessEvent::FileChanged");
-    // Session titles — APPENDED after FileChanged (14).
-    assert_variant_index(&ev_title_suggested(), 14, "HarnessEvent::TitleSuggested");
-    assert_variant_index(&ev_prompt_steered(), 15, "HarnessEvent::PromptSteered");
+    assert_variant_index(&HarnessEvent::Parked, 15, "HarnessEvent::Parked");
+    assert_variant_index(&ev_browser_activity(), 16, "HarnessEvent::BrowserActivity");
 }
 
 #[test]
@@ -412,7 +379,7 @@ fn harness_command_golden_and_variant_indices() {
     assert_golden("command_interrupt", &HarnessCommand::Interrupt);
     assert_golden("command_edit_queued", &cmd_edit_queued());
     assert_golden("command_dequeue_queued", &cmd_dequeue_queued());
-    assert_golden("command_answer_question", &cmd_answer_question());
+    assert_golden("command_tool_result", &cmd_tool_result());
 
     assert_variant_index(&cmd_checkpoint(), 0, "HarnessCommand::Checkpoint");
     assert_variant_index(&cmd_shutdown(), 1, "HarnessCommand::Shutdown");
@@ -425,7 +392,9 @@ fn harness_command_golden_and_variant_indices() {
     // These pins are the post-0067 contract.
     assert_variant_index(&cmd_edit_queued(), 4, "HarnessCommand::EditQueued");
     assert_variant_index(&cmd_dequeue_queued(), 5, "HarnessCommand::DequeueQueued");
-    assert_variant_index(&cmd_answer_question(), 6, "HarnessCommand::AnswerQuestion");
+    // ADR 0089 P5d sanctioned flag-day break: AnswerQuestion was removed and
+    // ToolResult shifts 7→6. Guest harnesses and the host fleet deploy together.
+    assert_variant_index(&cmd_tool_result(), 6, "HarnessCommand::ToolResult");
 }
 
 #[test]
@@ -577,13 +546,14 @@ fn regen_golden() {
     write("event_prompt_edited", &ev_prompt_edited());
     write("event_prompt_dequeued", &ev_prompt_dequeued());
     write("event_agent_message_chunk", &ev_agent_message_chunk());
-    write("event_user_question", &ev_user_question());
-    write("event_question_answered", &ev_question_answered());
     write("event_file_changed_edit", &ev_file_changed_edit());
     write("event_file_changed_write", &ev_file_changed_write());
     write("event_file_changed_patch", &ev_file_changed_patch());
     write("event_title_suggested", &ev_title_suggested());
     write("event_prompt_steered", &ev_prompt_steered());
+    write("event_tool_call_requested", &ev_tool_call_requested());
+    write("event_parked", &HarnessEvent::Parked);
+    write("event_browser_activity", &ev_browser_activity());
 
     write("agent_role_assistant", &AgentRole::Assistant);
     write("agent_role_user", &AgentRole::User);
@@ -595,7 +565,7 @@ fn regen_golden() {
     write("command_interrupt", &HarnessCommand::Interrupt);
     write("command_edit_queued", &cmd_edit_queued());
     write("command_dequeue_queued", &cmd_dequeue_queued());
-    write("command_answer_question", &cmd_answer_question());
+    write("command_tool_result", &cmd_tool_result());
 
     write("checkpoint_reason_idle", &CheckpointReason::Idle);
     write("checkpoint_reason_preempt", &CheckpointReason::Preempt);

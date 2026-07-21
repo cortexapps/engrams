@@ -275,6 +275,23 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// Refresh `last_active_at` WITHOUT a state transition. The create_boot
+    /// retry path stamps this each attempt so an actively-retried `pending`
+    /// looks recently-active to the ADR 0079 pending-orphan backstop (whose
+    /// grace gates on `last_active_at`).
+    ///
+    /// R3 (#722): this is now largely REDUNDANT — placement no longer
+    /// excludes an aged pending from the reservation sum (a `pending`
+    /// reserves unconditionally), and the orphan backstop already skips a
+    /// session with a live (`queued`/`running`) create_boot op, which a
+    /// retrying boot always has. Kept as belt-and-suspenders freshness;
+    /// safe to retire in a followup (trait + both stores + conformance).
+    /// Default (mock): no-op.
+    async fn touch_session_activity(&self, session_id: SessionId) -> Result<(), MetaError> {
+        let _ = session_id;
+        Ok(())
+    }
+
     // ---- ADR 0048: session queue ----
 
     /// Park an `Idle` session that hit no capacity on resume back in the
@@ -287,6 +304,26 @@ pub trait MetadataStore: Send + Sync {
     /// moved (a successor re-claimed) — either way the caller must stop
     /// without emitting the Queued event. Default no-op: `false`.
     async fn enqueue_session_resume(&self, _id: SessionId, _epoch: i64) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
+    /// #800 (RESERVED evac placement): the `Evacuating` twin of
+    /// [`Self::enqueue_session_resume`]. When the evac resumer's reserved
+    /// placement finds NO survivor that fits the session's budget, it
+    /// queues the session (`evacuating → queued`, resume-origin) instead of
+    /// binding a measured-full host — the queue scanner then re-homes it
+    /// once capacity returns, honoring the hard reserved bound (the #795
+    /// resume precedent, on the evac leg). Gated on `status='evacuating'`
+    /// AND the evac op's fencing epoch (ADR 0079), same shape as the resume
+    /// enqueue: a reclaimed-away zombie evac executor must not fork the
+    /// state machine. Returns whether the flip landed: `false` = the row was
+    /// no longer `evacuating` (a peer relocated it) OR the epoch moved (a
+    /// successor re-claimed). Default no-op: `false`.
+    async fn enqueue_evacuating_session_resume(
+        &self,
+        _id: SessionId,
+        _epoch: i64,
+    ) -> Result<bool, MetaError> {
         Ok(false)
     }
 
@@ -503,9 +540,17 @@ pub trait MetadataStore: Send + Sync {
     }
 
     /// ADR 0016 Phase B commit 7 — restart-time rehydration source.
-    /// Returns one record per Active session bound to a sandbox on
-    /// `host_id`, including the effective disk manifest the host
-    /// should rebuild `ChunkedDiskBackend` from: the newer of
+    /// Returns one record per session with a VM resident on
+    /// `host_id` (any [`SessionState::reserves_host_memory`] state
+    /// with `sandbox_id` bound — NOT just `Active`: a rung-parked
+    /// `Evicting` session's paused VM survives a host-agent pod roll
+    /// exactly like an active one, and session 731df805 (2026-07-17)
+    /// showed what excluding it does — the successor pod's rehydrate
+    /// pass never re-claims the parked survivor's NBD device, the
+    /// stale-binding sweep then disconnects the live rootfs, and the
+    /// un-pause resumes the guest onto a dead data plane), including
+    /// the effective disk manifest the host should rebuild
+    /// `ChunkedDiskBackend` from: the newer of
     /// `sessions.live_disk_manifest_*` (last FlushScheduler publish)
     /// and the latest recoverable snapshot's `disk_manifest`.
     /// Same resolver semantic as `effective_resume_disk_manifest`
@@ -523,14 +568,14 @@ pub trait MetadataStore: Send + Sync {
     ///   chunked-disk tracking. Host skips rehydration (no
     ///   `attach_chunked_disk` to call).
     /// - The session's status changed mid-query (defensive).
-    async fn list_active_sandboxes_on_host_with_disk_manifest(
+    async fn list_resident_sandboxes_on_host_with_disk_manifest(
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SandboxId, Option<ManifestRef>)>, MetaError> {
         let all = self.list_active_sessions().await?;
         let mut out = Vec::new();
         for s in all {
-            if !matches!(s.status, SessionState::Active) {
+            if !s.status.reserves_host_memory() {
                 continue;
             }
             let (Some(h), Some(sb)) = (s.host_id, s.sandbox_id) else {
@@ -882,6 +927,26 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    /// ADR 0101 C (engrams review, #836): the NEWEST op row of this kind
+    /// for the session, in ANY state, REGARDLESS of idempotency key —
+    /// the eviction scanner's "did a capture already land?" read.
+    /// Key-agnostic on purpose (review round 3): the three paths that
+    /// leave a session `Evicting` post-capture mint under three
+    /// different keys (scanner `evict:<last_active>`, park-descent
+    /// `evict-descend:<parked_at>`, admin/evict_local no key at all),
+    /// and terminal rows leave the dedup index by design — so a
+    /// key-scoped read protected only one path of three. Default `None`
+    /// keeps quiet mocks conservative: an unaware store just
+    /// re-enqueues, the pre-existing behavior.
+    async fn op_latest_for_kind(
+        &self,
+        session_id: SessionId,
+        kind: crate::types::session_op::OpKind,
+    ) -> Result<Option<crate::types::session_op::SessionOp>, MetaError> {
+        let _ = (session_id, kind);
+        Ok(None)
+    }
+
     /// The session's currently-running op, if any — the "is a resume in
     /// flight" visibility read (no `Resuming` FSM state; the op row IS
     /// the visibility).
@@ -1002,6 +1067,22 @@ pub trait MetadataStore: Send + Sync {
     async fn outbox_enqueue(&self, row: &crate::types::outbox::OutboxRow) -> Result<(), MetaError> {
         let _ = row;
         Ok(())
+    }
+
+    /// Atomically append a visible lifecycle event and create the durable
+    /// command that event announces. Production stores must commit both or
+    /// neither so `tool_result_submitted` can never exist without a delivery
+    /// obligation. The default preserves simple mock-store behavior.
+    async fn append_session_event_and_outbox(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        payload: serde_json::Value,
+        row: &crate::types::outbox::OutboxRow,
+    ) -> Result<i64, MetaError> {
+        let idx = self.append_session_event(session_id, kind, payload).await?;
+        self.outbox_enqueue(row).await?;
+        Ok(idx)
     }
 
     /// Sessions with at least one due, un-acked row (`acked_at IS NULL
@@ -1318,6 +1399,58 @@ pub trait MetadataStore: Send + Sync {
         &self,
         host_id: HostId,
     ) -> Result<Vec<(SessionId, SessionState)>, MetaError>;
+
+    /// Current status of a single host row, `None` when no row exists.
+    /// The dead-host detector re-checks this after winning the eviction
+    /// lease — another replica may have flipped the host Dead in the
+    /// window since `list_stale_hosts`. Default (mock): no row.
+    async fn host_status(&self, host_id: HostId) -> Result<Option<HostStatus>, MetaError> {
+        let _ = host_id;
+        Ok(None)
+    }
+
+    /// ADR 0098 D4: cross-replica one-at-a-time guard for dead-host
+    /// eviction — a PG leasing row (`INSERT … ON CONFLICT`), replacing
+    /// the detector's session-scoped `pg_try_advisory_lock` (the repo
+    /// convention: leasing row over advisory lock). Returns `true` when
+    /// this claimant now holds the lease: either the row was free, or
+    /// the incumbent's `claimed_at` is older than `stale_after` (crash
+    /// takeover — a pod that died mid-eviction never unlocks anything).
+    /// Default (mock): always acquired — single-replica tests have no
+    /// contention.
+    async fn try_acquire_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+        stale_after: std::time::Duration,
+    ) -> Result<bool, MetaError> {
+        let _ = (host_id, claimant, stale_after);
+        Ok(true)
+    }
+
+    /// Release the dead-host eviction lease. Guarded on `claimant` so a
+    /// stale holder that was taken over cannot delete the new holder's
+    /// row. Idempotent — releasing a lease you no longer hold is a
+    /// no-op, not an error. Default (mock): no-op.
+    async fn release_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+    ) -> Result<(), MetaError> {
+        let _ = (host_id, claimant);
+        Ok(())
+    }
+
+    /// Broadcast "this host is dead" to every coordinator replica so
+    /// they drop their in-memory `HostRegistry` entry. Postgres:
+    /// `pg_notify('host_dead', host_id)`. Sim: recorded for the
+    /// scheduler to deliver (or drop) explicitly. Default (mock): no-op
+    /// — correctness must never depend on the notify arriving; the
+    /// reconcile pass repairs registries on its own cadence.
+    async fn notify_host_dead(&self, host_id: HostId) -> Result<(), MetaError> {
+        let _ = host_id;
+        Ok(())
+    }
 
     // ---- snapshots ----
     /// ADR 0077 phase 3: persist a session's RuntimeSpec (upsert). Written
@@ -2896,6 +3029,16 @@ pub trait MetadataStore: Send + Sync {
         Ok(Vec::new())
     }
 
+    /// Input to the dead-host driver's straggler sweep: `HostLost` rows
+    /// whose inline stage-2 transition never ran or failed. These arise
+    /// when eviction exhausts its retry budget or a coordinator replica
+    /// crashes between the two HostLost stages. Default `Ok(vec![])`
+    /// keeps in-memory mocks quiet; durable stores must implement the
+    /// listing explicitly.
+    async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        Ok(Vec::new())
+    }
+
     /// Atomically `evac_attempts = evac_attempts + 1 RETURNING
     /// evac_attempts`. Scanner calls this before each resume attempt;
     /// when the returned count exceeds the budget, scanner gives up
@@ -2926,6 +3069,41 @@ pub trait MetadataStore: Send + Sync {
     /// partial-indexed `WHERE status = 'evicting'` query.
     async fn list_evicting_sessions(&self) -> Result<Vec<(Session, u32)>, MetaError> {
         Ok(Vec::new())
+    }
+
+    /// ADR 0101 C: parked-session sweep — the scanner routes these to
+    /// the park reaper (pressure / hard-TTL descent candidacy). Same
+    /// default posture as [`Self::list_evicting_sessions`]; PG runs
+    /// the partial-indexed `WHERE status = 'parked'` query (0107).
+    async fn list_parked_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    /// ADR 0101 C: the durability-floor settle — atomically flip an
+    /// `evicting` session to `idle` and detach its sandbox, GUARDED on
+    /// the recoverable snapshot row already existing. Returns `false`
+    /// (no-op) when the session is no longer `evicting`, its bound
+    /// sandbox is not `sandbox_id` (a successor rebound), or the
+    /// snapshot row is absent / not recoverable — the caller (the
+    /// heartbeat reconcile, right after `record_snapshot` lands the
+    /// eviction-final row) just retries on the next advert. This is
+    /// what makes `idle` mean "closure verified durable + PG row
+    /// present" instead of "the host wrote a local record" — the D5
+    /// Idle-on-capture flip is retired. `host_id` is preserved for
+    /// resume affinity, mirroring the old detach.
+    ///
+    /// No silent default (ADR 0098 D4): a store that can be reached by
+    /// the reconcile must implement the real semantics.
+    async fn settle_evicted_session_idle(
+        &self,
+        _session_id: SessionId,
+        _sandbox_id: SandboxId,
+        _snapshot_id: SnapshotId,
+    ) -> Result<bool, MetaError> {
+        unimplemented!(
+            "settle_evicted_session_idle: PG-semantic method; mocks on the reconcile path must \
+             implement it (ADR 0098 D4)"
+        )
     }
 
     /// Atomically `evict_attempts = evict_attempts + 1 RETURNING

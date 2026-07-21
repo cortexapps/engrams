@@ -26,10 +26,10 @@
 //! `session_id`) lives on a thin wrapper that serializes as JSON.
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use chrono::{DateTime, Utc};
-use engram_core::traits::HostClient;
+use engram_core::traits::{Clock, HostClient, SystemClock};
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::HostId;
 use engram_core::SandboxError;
@@ -52,11 +52,16 @@ pub struct CowStateCache {
     /// locked.
     slots: dashmap::DashMap<HostId, Arc<Mutex<Slot>>>,
     ttl: Duration,
+    // ADR 0098 D1: freshness is measured against the injected clock's
+    // monotonic mark, not `std::time::Instant` (which keeps ticking on
+    // real wall time even under a paused simulation clock).
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Default)]
 struct Slot {
-    captured_at: Option<Instant>,
+    /// `Clock::now_mono()` mark taken when the slot was populated.
+    captured_at: Option<Duration>,
     records: Vec<CowStateRecord>,
 }
 
@@ -72,7 +77,14 @@ impl CowStateCache {
         Self {
             slots: dashmap::DashMap::new(),
             ttl,
+            clock: Arc::new(SystemClock::new()),
         }
+    }
+
+    /// Override the clock (ADR 0098 D1 simulation seam).
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
     }
 
     /// Fetch the cached records for `host_id`, refreshing via
@@ -101,7 +113,7 @@ impl CowStateCache {
         {
             let guard = slot.lock();
             if let Some(captured) = guard.captured_at {
-                if captured.elapsed() < self.ttl {
+                if self.clock.now_mono().saturating_sub(captured) < self.ttl {
                     return Ok(guard.records.clone());
                 }
             }
@@ -115,10 +127,10 @@ impl CowStateCache {
         // existed). Tie-break: if both have the same captured_at,
         // ours wins by virtue of being the one currently holding
         // the lock.
-        let now = Instant::now();
+        let now = self.clock.now_mono();
         let theirs_newer = guard
             .captured_at
-            .map(|t| t > now - self.ttl)
+            .map(|t| t > now.saturating_sub(self.ttl))
             .unwrap_or(false);
         if !theirs_newer {
             guard.captured_at = Some(now);

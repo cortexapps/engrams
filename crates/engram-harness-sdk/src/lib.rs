@@ -4,6 +4,11 @@
 //! owns the failure-prone Engram-facing half: dial/attach, reconnect across
 //! snapshot restores and host rolls, and at-least-once event delivery.
 
+pub mod browser_activity;
+pub mod browser_view;
+pub mod parked;
+pub mod questions;
+
 use std::collections::{HashSet, VecDeque};
 use std::process::ExitCode;
 use std::sync::{Arc, Mutex};
@@ -60,6 +65,14 @@ impl Default for Channels {
 }
 
 pub async fn emit(tx: &mpsc::Sender<HarnessEvent>, event: HarnessEvent) {
+    // Domain enrichment precedes the generic start so live clients never
+    // briefly render a raw Shell/Bash card before replacing it.
+    if let Some(activity) = browser_activity::from_tool_call(&event) {
+        if tx.send(activity).await.is_err() {
+            tracing::debug!("event channel closed; dropping event");
+            return;
+        }
+    }
     if tx.send(event).await.is_err() {
         tracing::debug!("event channel closed; dropping event");
     }
@@ -317,6 +330,25 @@ pub fn truncate_utf8(value: &str, max_bytes: usize) -> String {
 mod tests {
     use super::*;
     use engram_harness_proto::HarnessAttachAck;
+
+    #[tokio::test]
+    async fn emit_places_browser_enrichment_before_generic_tool_start() {
+        let (tx, mut rx) = mpsc::channel(2);
+        let start = HarnessEvent::ToolCallStarted {
+            run_id: "run-1".into(),
+            tool_call_id: "tool-1".into(),
+            tool_name: "Shell".into(),
+            args_summary: Some(
+                r#"ENGRAM_BROWSER_INTENT="Clicking Sign in" playwright-cli click e7"#.into(),
+            ),
+        };
+        emit(&tx, start.clone()).await;
+        assert!(matches!(
+            rx.recv().await,
+            Some(HarnessEvent::BrowserActivity { tool_call_id, .. }) if tool_call_id == "tool-1"
+        ));
+        assert_eq!(rx.recv().await, Some(start));
+    }
 
     #[test]
     fn prompt_queue_deduplicates_and_remains_editable() {

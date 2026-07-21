@@ -25,7 +25,9 @@ use engram_core::error::SandboxError;
 use engram_core::traits::{HarnessDial, HarnessSink, HostClient, SandboxBackend, SessionFence};
 use engram_core::types::cow_state::{CowState, CowStateRecord};
 use engram_core::types::egress::SessionEgressPolicy;
-use engram_core::types::sandbox::{AgentSpec, ExecRequest, ExecStream, SandboxSpec};
+use engram_core::types::sandbox::{
+    AgentSpec, ExecRequest, ExecStream, SandboxSpec, WriteFileResult, WriteFileSpec,
+};
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::types::{SandboxId, SessionId};
 
@@ -54,8 +56,10 @@ impl LocalHostClient {
         // exercise the attach path (tests / in-process glue), and an
         // ephemeral dir keeps the ADR 0073 validation code identical
         // rather than special-cased.
-        let dir =
-            std::env::temp_dir().join(format!("engram-noop-hub-bindings-{}", uuid::Uuid::new_v4()));
+        let dir = std::env::temp_dir().join(format!(
+            "engram-noop-hub-bindings-{}",
+            crate::time_source::unique_path_token()
+        ));
         let bindings = crate::bindings::BindingStore::open(dir)
             .expect("open ephemeral binding store for noop hub");
         let hub = Arc::new(HarnessHub::new(
@@ -112,6 +116,14 @@ impl HostClient for LocalHostClient {
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
         self.sandbox.exec_stream(id, cmd).await
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        self.sandbox.write_files(id, files).await
     }
 
     async fn snapshot(
@@ -259,6 +271,7 @@ impl HostClient for LocalHostClient {
         platform_os: &str,
         platform_arch: &str,
         registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         self.sandbox
@@ -267,6 +280,7 @@ impl HostClient for LocalHostClient {
                 platform_os,
                 platform_arch,
                 registry_auth,
+                min_disk_gib,
                 progress,
             )
             .await
@@ -382,14 +396,14 @@ impl HostClient for LocalHostClient {
             .map_err(harness_err_to_sandbox)
     }
 
-    async fn answer_question(
+    async fn tool_result(
         &self,
         sandbox_id: SandboxId,
         tool_call_id: String,
-        answers: std::collections::BTreeMap<String, Vec<String>>,
+        result_json: String,
     ) -> Result<(), SandboxError> {
         self.harness_hub
-            .answer_question(sandbox_id, tool_call_id, answers)
+            .tool_result(sandbox_id, tool_call_id, result_json)
             .await
             .map_err(harness_err_to_sandbox)
     }

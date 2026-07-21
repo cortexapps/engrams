@@ -15,7 +15,8 @@
 //!
 //! Required env:
 //!   ENGRAM_VZ_KERNEL_PATH   = arm64 vmlinux
-//!   ENGRAM_VZ_ROOTFS_PATH   = arm64 ext4 rootfs (any of our baked images)
+//!   ENGRAM_VZ_ROOTFS_PATH   = arm64 ext4 rootfs (a materialized session image
+//!                             or the `just vz-e2e` test rootfs)
 //!   ENGRAM_VZ_SCRATCH       = scratch dir for the state.bin
 //!
 //! Run: `cargo run -p engram-sandbox-vz --example snapshot_diag`

@@ -286,6 +286,13 @@ async fn main() -> Result<(), CoordinatorError> {
     // spans on shutdown (ADR 0019).
     let _telemetry = init_tracing();
 
+    // ADR 0098 D1: time/entropy are injected world inputs. Built once
+    // here so pre-`Services` boot code (host-row upsert, heartbeat
+    // loop) reads the same clock the rest of the coordinator gets.
+    let clock: Arc<dyn engram_core::traits::Clock> =
+        Arc::new(engram_core::traits::SystemClock::new());
+    let entropy: Arc<dyn engram_core::traits::Entropy> = Arc::new(engram_core::traits::OsEntropy);
+
     let cli = Cli::parse();
 
     // Bring up the metrics exporter early so any later init step
@@ -427,13 +434,17 @@ async fn main() -> Result<(), CoordinatorError> {
     // metrics.rs but previously never emitted.
     {
         let meta = meta_arc.clone();
+        let clock = clock.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(15));
             loop {
                 tick.tick().await;
                 // ADR 0047: counts from the hosts rows (replica-consistent).
                 // Leave gauges at their last value on a transient query error.
-                if let Ok(m) = engram_coordinator::placement::fleet_snapshot(meta.as_ref()).await {
+                if let Ok(m) =
+                    engram_coordinator::placement::fleet_snapshot(meta.as_ref(), clock.now_utc())
+                        .await
+                {
                     ::metrics::gauge!(engram_coordinator::metrics::HOSTS_READY)
                         .set(m.ready_hosts as f64);
                     ::metrics::gauge!(engram_coordinator::metrics::FLEET_SCHEDULABLE_HOSTS)
@@ -541,7 +552,7 @@ async fn main() -> Result<(), CoordinatorError> {
             },
             utilization: Default::default(),
             status: engram_core::types::host::HostStatus::Ready,
-            last_heartbeat_at: chrono::Utc::now(),
+            last_heartbeat_at: clock.now_utc(),
             host_addr: None,
             ready_images: Vec::new(),
             current_bundles: Vec::new(),
@@ -568,6 +579,7 @@ async fn main() -> Result<(), CoordinatorError> {
         // multi-host path uses the WS dialer's heartbeat loop for
         // this; --mode=all stamps the timestamp directly.
         let pg_for_hb = pg.clone();
+        let clock_for_hb = clock.clone();
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(std::time::Duration::from_secs(5));
             tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -586,7 +598,7 @@ async fn main() -> Result<(), CoordinatorError> {
                     },
                     utilization: Default::default(),
                     status: engram_core::types::host::HostStatus::Ready,
-                    last_heartbeat_at: chrono::Utc::now(),
+                    last_heartbeat_at: clock_for_hb.now_utc(),
                     host_addr: None,
                     ready_images: Vec::new(),
                     current_bundles: Vec::new(),
@@ -695,6 +707,8 @@ async fn main() -> Result<(), CoordinatorError> {
         blob,
         chunk_store,
         materialize_dir: coord_materialize_dir,
+        clock,
+        entropy,
     };
 
     // ADR 0057 C2: the broker carries the static mint-kind registry; engines are

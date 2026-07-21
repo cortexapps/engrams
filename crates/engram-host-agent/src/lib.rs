@@ -16,6 +16,9 @@ use std::sync::Arc;
 use engram_chunk_store::{ChunkCache, ChunkStore};
 use engram_core::traits::{CloudBackend, SandboxBackend};
 use engram_core::SandboxId;
+// ADR 0098 Phase 2: the teardown-reconcile / TTL-sweep / reattach-source
+// paths hold the coordinator via the `CoordControlPlane` seam.
+use engram_host_core::CoordControlPlane;
 
 use crate::image_cache::ImageCache;
 
@@ -29,8 +32,10 @@ pub mod capture_job;
 pub mod checkpoint;
 pub mod config;
 pub mod coord_client;
+pub mod device_sync;
 pub mod dirty_map;
 pub mod disk_daemon;
+pub mod durable_envelope;
 pub mod durable_record;
 pub mod egress;
 pub mod eviction_finalize;
@@ -39,6 +44,7 @@ pub mod harness;
 pub mod host_client;
 pub mod migrate_peer;
 pub mod migration;
+pub mod peer_fill;
 pub mod session_epochs;
 pub mod substrate_server;
 pub use host_client::LocalHostClient;
@@ -57,6 +63,7 @@ pub mod ram_ledger;
 pub mod resource;
 pub mod snapshot;
 pub mod teardown_reconcile;
+mod time_source;
 pub mod trace_scope;
 pub mod util;
 pub mod warm_progress;
@@ -302,10 +309,11 @@ impl HostAgent {
                 // task is owned by `p` (via
                 // `LiveManifestPublisherHandle`), so it dies with
                 // the host-agent process.
-                let publisher_coord = coord_client::CoordClient::new(
-                    coord_url.clone(),
-                    self.cfg.coordinator_token.clone(),
-                );
+                let publisher_coord: Arc<dyn CoordControlPlane> =
+                    Arc::new(coord_client::HttpCoordClient::new(
+                        coord_url.clone(),
+                        self.cfg.coordinator_token.clone(),
+                    ));
                 p = p.with_live_manifest_coord_publisher(publisher_coord, host_id);
                 // ADR 0028 Fix A: checkpoint chains (rolling memory
                 // images + durable records) live under the work dir.
@@ -374,10 +382,11 @@ impl HostAgent {
             // destroy / stay-paused per `migration::ttl_verdict`.
             {
                 let pooled_for_ttl = pooled.clone();
-                let coord_for_ttl = coord_client::CoordClient::new(
-                    coord_url.clone(),
-                    self.cfg.coordinator_token.clone(),
-                );
+                let coord_for_ttl: Arc<dyn CoordControlPlane> =
+                    Arc::new(coord_client::HttpCoordClient::new(
+                        coord_url.clone(),
+                        self.cfg.coordinator_token.clone(),
+                    ));
                 let host_id_for_ttl = host_id;
                 tokio::spawn(async move {
                     let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
@@ -473,101 +482,41 @@ impl HostAgent {
             // ADR 0047's sole authority), so a terminal/idle/rebound
             // session reliably answers "not owned".
             {
-                let pooled_for_reap = pooled.clone();
-                let capture_jobs_for_reap = capture_jobs.clone();
-                let coord_for_reap = coord_client::CoordClient::new(
-                    coord_url.clone(),
-                    self.cfg.coordinator_token.clone(),
-                );
+                // ADR 0098 P3: the tick body is now
+                // `teardown_reconcile::reconcile_once` (pure classify +
+                // focused backend seam, driven directly by the host-internal
+                // simulator). This wrapper keeps only the interval cadence +
+                // the caller-owned strike ledger; `reconcile_once` returns
+                // `Err` only when `list()` fails, which we log + skip exactly
+                // as the old inline `continue` did.
+                let reap_backend = Arc::new(teardown_reconcile::PooledReconcileBackend::new(
+                    pooled.clone(),
+                    capture_jobs.clone(),
+                ));
+                let coord_for_reap: Arc<dyn CoordControlPlane> =
+                    Arc::new(coord_client::HttpCoordClient::new(
+                        coord_url.clone(),
+                        self.cfg.coordinator_token.clone(),
+                    ));
                 let host_id_for_reap = host_id;
                 tokio::spawn(async move {
-                    use crate::teardown_reconcile::{
-                        orphan_strike, ORPHAN_STRIKES, RECONCILE_INTERVAL,
-                    };
-                    use engram_core::traits::sandbox::SandboxBackend as _;
+                    use crate::teardown_reconcile::{reconcile_once, RECONCILE_INTERVAL};
                     let mut strikes: std::collections::HashMap<SandboxId, u32> =
                         std::collections::HashMap::new();
                     let mut tick = tokio::time::interval(RECONCILE_INTERVAL);
                     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
                     loop {
                         tick.tick().await;
-                        let sandboxes = match pooled_for_reap.list().await {
-                            Ok(s) => s,
-                            Err(e) => {
-                                tracing::warn!(error = %e,
-                                    "teardown reconcile: list() failed; skipping tick");
-                                continue;
-                            }
-                        };
-                        let live: std::collections::HashSet<SandboxId> =
-                            sandboxes.iter().copied().collect();
-                        strikes.retain(|id, _| live.contains(id));
-                        for sandbox_id in sandboxes {
-                            // Migration sandboxes run their own ownership rules.
-                            if pooled_for_reap.migration_role(sandbox_id).is_some() {
-                                strikes.remove(&sandbox_id);
-                                continue;
-                            }
-                            // ADR 0084 P1b: base-snapshot capture VMs are host-local
-                            // + transient and NEVER session-owned by design;
-                            // reaping one as an "orphan" kills an in-flight capture
-                            // (a slow `[warm]` hook runs past the strike debounce).
-                            // Exempt while a live (non-terminal) `capture_jobs`
-                            // record says this sandbox belongs to it — the
-                            // executor destroys the VM itself once the job
-                            // finishes, at which point this predicate goes false
-                            // again (never a permanent exemption).
-                            if capture_jobs_for_reap.is_live_sandbox(sandbox_id) {
-                                strikes.remove(&sandbox_id);
-                                continue;
-                            }
-                            let session = pooled_for_reap.session_for_sandbox(sandbox_id);
-                            let orphan = match session {
-                                Some(sid) => match coord_for_reap
-                                    .sandbox_ownership(host_id_for_reap, sid, sandbox_id)
-                                    .await
-                                {
-                                    Ok(owned) => !owned,
-                                    // Coord unreachable → assume still owned; never
-                                    // reap on a transient control-plane blip.
-                                    Err(_) => false,
-                                },
-                                // ADR 0090: a missing LOCAL binding is not ownership
-                                // truth — a fresh generation whose NBD rehydrate
-                                // failed has no entry for a legitimately-owned,
-                                // pidfd-reattached survivor, and this arm's old
-                                // unconditional `true` SIGKILLed exactly such a VM
-                                // mid-build (2026-07-11 campaign). Ask the
-                                // coordinator; an owned answer also repairs the
-                                // local table. Only a coordinator-confirmed
-                                // "no session owns this" counts as an orphan.
-                                None => match coord_for_reap
-                                    .sandbox_owner(host_id_for_reap, sandbox_id)
-                                    .await
-                                {
-                                    Ok(Some(sid)) => {
-                                        tracing::info!(%sandbox_id, session_id = %sid,
-                                            "teardown reconcile: coordinator owns this \
-                                             sandbox; repopulating the local binding");
-                                        pooled_for_reap.record_session_binding(sandbox_id, sid);
-                                        false
-                                    }
-                                    Ok(None) => true,
-                                    // Coord unreachable → assume owned (same
-                                    // posture as the Some arm).
-                                    Err(_) => false,
-                                },
-                            };
-                            if orphan_strike(&mut strikes, sandbox_id, orphan, ORPHAN_STRIKES) {
-                                tracing::warn!(%sandbox_id, ?session,
-                                    "teardown reconcile: sandbox no longer owned by its session; destroying locally");
-                                if let Err(e) = pooled_for_reap.destroy(sandbox_id).await {
-                                    tracing::warn!(%sandbox_id, error = %e,
-                                        "teardown reconcile: local destroy failed; retrying next tick");
-                                } else {
-                                    strikes.remove(&sandbox_id);
-                                }
-                            }
+                        if let Err(e) = reconcile_once(
+                            &*reap_backend,
+                            &*coord_for_reap,
+                            host_id_for_reap,
+                            &mut strikes,
+                        )
+                        .await
+                        {
+                            tracing::warn!(error = %e,
+                                "teardown reconcile: list() failed; skipping tick");
                         }
                     }
                 });
@@ -602,10 +551,11 @@ impl HostAgent {
                             "reattached post-copy SOURCE: staying paused under the ownership rule (never self-resumes)");
                         pooled.note_migration_role(sandbox_id, Some(role));
                         let pooled_for_src = pooled.clone();
-                        let coord_for_src = coord_client::CoordClient::new(
-                            coord_url.clone(),
-                            self.cfg.coordinator_token.clone(),
-                        );
+                        let coord_for_src: Arc<dyn CoordControlPlane> =
+                            Arc::new(coord_client::HttpCoordClient::new(
+                                coord_url.clone(),
+                                self.cfg.coordinator_token.clone(),
+                            ));
                         let host_id_for_src = host_id;
                         tokio::spawn(async move {
                             use engram_core::traits::sandbox::SandboxBackend as _;
@@ -695,17 +645,22 @@ impl HostAgent {
             // back-to-back duplicate `harness_idle` de-dup at the
             // coord side already protects against the few extra
             // events that might land out-of-order across pods.
-            let coord_client_for_events = coord_client::CoordClient::new(
+            let coord_client_for_events = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
+            // ADR 0098 D1: the harness-event timestamp is read through the
+            // injected production clock, constructed once for this sink.
+            let events_clock: Arc<dyn engram_core::traits::Clock> =
+                Arc::new(engram_core::traits::SystemClock::new());
             let event_sink = crate::harness::event_sink_to(move |session_id, sandbox_id, ev| {
                 let cc = coord_client_for_events.clone();
+                let events_clock = events_clock.clone();
                 async move {
                     let req = coord_client::HarnessEventRequest {
                         sandbox_id,
                         event: ev,
-                        at: chrono::Utc::now(),
+                        at: events_clock.now_utc(),
                     };
                     if let Err(e) = cc.harness_event(session_id, &req).await {
                         tracing::debug!(
@@ -737,7 +692,7 @@ impl HostAgent {
             // POST it to `/api/hosts/forge`, write the `ForgeResponse`
             // back. Without this the FC forge accept loop has no sink and
             // drops every dial (guest sees "Broken pipe").
-            let coord_client_for_forge = coord_client::CoordClient::new(
+            let coord_client_for_forge = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
@@ -778,7 +733,7 @@ impl HostAgent {
             // off the vsock, then stream the raw body straight into a
             // streaming POST to `/api/hosts/upload`, and write the coord's
             // `UploadResponse` back to the guest.
-            let coord_client_for_upload = coord_client::CoordClient::new(
+            let coord_client_for_upload = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
@@ -829,9 +784,10 @@ impl HostAgent {
             // §3). On `list()` error, ship an empty list — the
             // 3-strike grace window (15s) absorbs transient errors
             // without flipping live sessions.
-            // Seed capacity once at startup from /proc/meminfo. Used
-            // by the scheduler's fit check — without this the coord
-            // sees `total_mib=0` and rejects every session.
+            // Seed capacity once at startup (/proc/meminfo on Linux,
+            // hw.memsize on macOS). Used by the scheduler's fit check —
+            // without this the coord sees `total_mib=0` and rejects
+            // every session, and rung-2 park never fires (ADR 0096).
             // TODO: `used_mib` accounting. Plumbing record_start /
             // record_stop hooks into the SandboxBackend is a follow-up;
             // until then the host always looks "fully available",
@@ -875,10 +831,10 @@ impl HostAgent {
                 }),
             };
 
-            // ADR 0013: per-process CoordClient for HTTP traffic
+            // ADR 0013: per-process HttpCoordClient for HTTP traffic
             // (register, heartbeat, registry-auth, harness-events,
             // idle-eviction).
-            let coord_client = coord_client::CoordClient::new(
+            let coord_client = coord_client::HttpCoordClient::new(
                 coord_url.clone(),
                 self.cfg.coordinator_token.clone(),
             );
@@ -984,6 +940,26 @@ impl HostAgent {
                                         &resp.rehydrate_sandboxes,
                                     )
                                     .await;
+                                    // Local-first backstop (session 731df805,
+                                    // 2026-07-17): the coord's list is derived
+                                    // from PG status and CAN be wrong — it
+                                    // omitted rung-parked survivors, nothing
+                                    // claimed their NBD devices, and the sweep
+                                    // below disconnected the live rootfs under
+                                    // the paused guests. Re-serve any live
+                                    // survivor the list missed from the durable
+                                    // chain-head records before the sweep
+                                    // snapshots the free pool.
+                                    let (local_rehydrated, local_failed) =
+                                        pooled_for_rehydrate.rehydrate_local_survivors().await;
+                                    if local_rehydrated + local_failed > 0 {
+                                        tracing::warn!(
+                                            rehydrated = local_rehydrated,
+                                            failed = local_failed,
+                                            "local survivor rehydrate pass acted on sandboxes \
+                                             the coordinator's rehydrate list missed",
+                                        );
+                                    }
                                     // ADR 0044 K2: stale-binding sweep AFTER
                                     // the survivors have claimed their slots
                                     // — only still-free devices are probed,
@@ -994,21 +970,35 @@ impl HostAgent {
                                     // killed a survivor's disk in prod
                                     // (2026-06-11, /dev/nbd4).
                                     if let Some(nbd_pool) = pooled_for_rehydrate.nbd_pool() {
-                                        // The sweep snapshots free paths,
-                                        // then claim-then-disconnects each
-                                        // candidate so a session that races
-                                        // the (slow, 100ms/device) sweep for
-                                        // the same slot can never have its
-                                        // live binding torn out. Detached so
+                                        // Wave 7b (#784 layers 2–3): the startup
+                                        // classification BARRIER. Before any
+                                        // destructive pass runs, reconcile the
+                                        // KERNEL-DERIVED inventory (connected
+                                        // `/dev/nbdN` × the holder scan) against
+                                        // the tracked records and classify every
+                                        // slot. A survivor invisible to the
+                                        // records is QUARANTINED + alerted
+                                        // (`rehydrate-unknown-device`), never
+                                        // skipped; the sweep then reaps ONLY the
+                                        // `TerminalSafeToReap` subset — the
+                                        // ordering contract enforced by the
+                                        // `ReapList` type, not a comment. The
+                                        // barrier subsumes the old free-paths
+                                        // snapshot (the reap set is a subset of
+                                        // it, kernel-proven stale). Detached so
                                         // register returns promptly; the
-                                        // claim is the correctness gate, not
-                                        // ordering.
-                                        let unclaimed = nbd_pool.free_paths().await;
-                                        tokio::spawn(async move {
-                                            disk_daemon::recover_stuck_nbd_devices(
-                                                &nbd_pool, &unclaimed,
+                                        // per-device claim inside the sweep is
+                                        // still the TOCTOU correctness gate.
+                                        let reap = pooled_for_rehydrate
+                                            .classify_startup_slots(
+                                                &disk_daemon::HostNbdKernel,
+                                                &resp.rehydrate_sandboxes,
                                             )
-                                            .await;
+                                            .await
+                                            .reap;
+                                        tokio::spawn(async move {
+                                            disk_daemon::recover_stuck_nbd_devices(&nbd_pool, reap)
+                                                .await;
                                         });
                                     }
                                 }
@@ -1038,6 +1028,30 @@ impl HostAgent {
                 }));
             }
 
+            // ADR 0095: shared "which images is this host ready to
+            // serve" view — written by the prefetch supervisor (spawned
+            // below), read by the heartbeat builder AND the peer-chunk
+            // serve arm's BaseImage scope check. Created here because
+            // the gRPC server needs it before the supervisor exists.
+            let readiness = image_prefetch::ImageReadiness::new();
+
+            // ADR 0095: the standing peer-chunk tier — serve state for
+            // the gRPC arm (cache-less hosts serve nothing and answer
+            // `unavailable`), plus the background scrubber that drains
+            // the unverified-origin backlog bulk peer pulls create.
+            let peer_serve = self
+                .chunk_cache
+                .clone()
+                .map(|cache| peer_fill::PeerServe::new(cache, readiness.clone()));
+            let _scrubber_task = self.chunk_cache.as_ref().map(|cache| {
+                let bps = std::env::var("ENGRAM_CHUNK_SCRUB_BPS")
+                    .ok()
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .filter(|&v| v > 0)
+                    .unwrap_or(256 * 1024 * 1024);
+                cache.spawn_scrubber(bps)
+            });
+
             // ADR 0013: boot the gRPC HostService server. The
             // coord's GrpcHostPool dials this address (populated
             // via /api/hosts/register) to dispatch coord→host
@@ -1046,6 +1060,7 @@ impl HostAgent {
             let grpc_task = self.cfg.grpc_listen_addr.map(|addr| {
                 let local_for_grpc = local_host.clone();
                 let admin_for_grpc = admin_handler.clone();
+                let peer_for_grpc = peer_serve.clone();
                 // ADR 0079: the per-session fencing-epoch high-water,
                 // durable under work_dir like the binding records.
                 let epochs = session_epochs::SessionEpochStore::open(
@@ -1053,8 +1068,14 @@ impl HostAgent {
                 )
                 .expect("open session epoch store under work_dir (ADR 0079)");
                 tokio::spawn(async move {
-                    if let Err(e) =
-                        grpc_server::boot(addr, local_for_grpc, admin_for_grpc, epochs).await
+                    if let Err(e) = grpc_server::boot(
+                        addr,
+                        local_for_grpc,
+                        admin_for_grpc,
+                        epochs,
+                        peer_for_grpc,
+                    )
+                    .await
                     {
                         tracing::error!(addr = %addr, error = %e, "gRPC server terminated with error");
                     }
@@ -1097,12 +1118,12 @@ impl HostAgent {
             // ADR 0015 M5: image-prefetch supervisor. Watches the
             // heartbeat-ack's `enabled_images` set and pulls the
             // chunked rootfs for any image not yet local on this
-            // host. Updates the shared `ImageReadiness` which the
-            // heartbeat builder reads to populate `ready_images`.
-            // Spawned only when chunk_store + image_cache are wired
-            // (production hosts; dev-process backend lacks both and
-            // simply never reports ready).
-            let readiness = image_prefetch::ImageReadiness::new();
+            // host. Updates the shared `ImageReadiness` (created above
+            // with the peer-serve state) which the heartbeat builder
+            // reads to populate `ready_images`. Spawned only when
+            // chunk_store + image_cache are wired (production hosts;
+            // dev-process backend lacks both and simply never reports
+            // ready).
             // The heartbeat's `stages_images` field (below) must exactly
             // track whether the supervisor spawn below actually happens —
             // derive both from the same pure gate rather than letting
@@ -1351,7 +1372,10 @@ impl HostAgent {
                     // durable checkpoint record until a coord acks it
                     // into PG. Empty when checkpointing is disabled.
                     let checkpoint_records = match pooled_for_heartbeat.checkpoint_records_dir() {
-                        Some(dir) => checkpoint::CheckpointRecord::load_all(&dir).await,
+                        Some(dir) => {
+                            checkpoint::CheckpointRecord::load_all(&engram_host_core::TokioFs, &dir)
+                                .await
+                        }
                         None => Vec::new(),
                     };
                     let checkpoints = checkpoint_records
@@ -1480,6 +1504,7 @@ impl HostAgent {
                             if !resp.acked_checkpoints.is_empty() {
                                 if let Some(dir) = pooled_for_heartbeat.checkpoint_records_dir() {
                                     checkpoint::CheckpointRecord::delete_acked(
+                                        &engram_host_core::TokioFs,
                                         &dir,
                                         &resp.acked_checkpoints,
                                     )
@@ -1641,18 +1666,23 @@ impl HostAgent {
                 // rehydrates from the current ref. It is budgeted against
                 // the pod's terminationGracePeriodSeconds (minus headroom
                 // for the abandon sweep + detach below); on overrun it
-                // logs the still-dirty survivors loudly and proceeds.
-                let flush_budget = std::time::Duration::from_secs_f64(
+                // logs the still-dirty survivors loudly and proceeds. The
+                // budget parse+default is the pure `plan_shutdown` decision
+                // (ADR 0098 P4, Flow A) so the simulator drives the same
+                // deadline arithmetic.
+                let plan = engram_host_core::plan_shutdown(
                     std::env::var("ENGRAM_SHUTDOWN_FLUSH_BUDGET_SECS")
                         .ok()
-                        .and_then(|v| v.parse::<f64>().ok())
-                        .filter(|v| *v > 0.0)
-                        .unwrap_or(20.0),
+                        .and_then(|v| v.parse::<f64>().ok()),
                 );
                 pooled
-                    .flush_nbd_data_planes_for_shutdown(flush_budget)
+                    .flush_nbd_data_planes_for_shutdown(plan.flush_deadline)
                     .await;
-                let abandoned = pooled.abandon_nbd_data_planes_for_shutdown();
+                // The abandon sweep also exports any still-un-uploaded
+                // dirty chunks to the node-local shutdown spool (2026-07-16
+                // session-85e0298a RCA) so the successor adopts them
+                // instead of rolling the live guest's disk back.
+                let abandoned = pooled.abandon_nbd_data_planes_for_shutdown().await;
                 if abandoned > 0 {
                     tracing::info!(
                         abandoned,
@@ -1685,7 +1715,7 @@ impl HostAgent {
 /// 1. NBD slot + ChunkedDiskBackend rebuilt from the effective
 ///    disk manifest (newer of `live_disk_manifest_*` and the
 ///    latest recoverable snapshot — picked server-side by
-///    `MetadataStore::list_active_sandboxes_on_host_with_disk_manifest`).
+///    `MetadataStore::list_resident_sandboxes_on_host_with_disk_manifest`).
 /// 2. NBD daemon spawned.
 /// 3. `nbd_sandboxes` entry installed.
 /// 4. FlushScheduler spawned with the (session_id, sandbox_id)

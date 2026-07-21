@@ -53,6 +53,10 @@ function glyphFor(status: SessionState): string {
       return "◐";
     case "active":
       return "●";
+    case "parked":
+      // Paused in place: alive (filled) but held — distinct from both
+      // the running ● and the snapshotted ◌.
+      return "◉";
     case "idle":
       return "◌";
     case "evicting":
@@ -77,6 +81,9 @@ function toneFor(status: SessionState): string {
     case "pending":
     case "queued":
     case "created":
+    // Parked: resting with a live VM — faded like idle (cheap to wake,
+    // not in trouble).
+    case "parked":
     // Transitional suspend/relocate: faded like idle — on their way there
     // (or back to active), not in trouble.
     case "evicting":

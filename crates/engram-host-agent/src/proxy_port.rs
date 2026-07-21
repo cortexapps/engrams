@@ -89,14 +89,14 @@ pub async fn open_tcp_tunnel_at(
 /// retry (same shape as the shell cold path, shorter deadline).
 async fn connect_cold(dial_ip: &str, port: u16) -> Result<TcpStream, SandboxError> {
     let addr = format!("{dial_ip}:{port}");
-    let deadline = std::time::Instant::now() + PORT_DIAL_DEADLINE;
+    let deadline = crate::time_source::metrics_now() + PORT_DIAL_DEADLINE;
     let mut backoff = PORT_BACKOFF_START;
     loop {
         match TcpStream::connect(&addr).await {
             Ok(s) => return Ok(s),
             Err(e) => {
                 let refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
-                if !refused || std::time::Instant::now() >= deadline {
+                if !refused || crate::time_source::metrics_now() >= deadline {
                     return Err(SandboxError::Vm(
                         format!("proxy_port connect {addr}: {e}").into(),
                     ));

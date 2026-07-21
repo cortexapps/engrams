@@ -29,7 +29,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::host::{HostCapacity, HostHeartbeat, HostMetadata, HostRecord, HostStatus};
-use engram_core::{HostId, SandboxId, SessionId};
+use engram_core::{HostId, SandboxId, SessionId, SessionState};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{EnabledImageRef, HostCapacityReport, ManifestDigest};
 use serde::{Deserialize, Serialize};
@@ -98,7 +98,7 @@ pub struct RegisterResponse {
 
 /// ADR 0016 Phase B commit 7: one entry in the rehydration list
 /// the host iterates at startup. Wire format mirrors the columns
-/// `MetadataStore::list_active_sandboxes_on_host_with_disk_manifest`
+/// `MetadataStore::list_resident_sandboxes_on_host_with_disk_manifest`
 /// returns; the host's startup hook rebuilds chunked-disk tracking
 /// from these.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -153,7 +153,7 @@ pub async fn register(
         // first heartbeat.
         utilization: Default::default(),
         status: HostStatus::Ready,
-        last_heartbeat_at: Utc::now(),
+        last_heartbeat_at: state.services.clock.now_utc(),
         host_addr: Some(req.host_addr.clone()),
         // ADR 0047: scheduling state arrives with the first heartbeat.
         // NOTE: `upsert_host` deliberately does not write `cordoned` —
@@ -213,29 +213,20 @@ pub async fn register(
     };
 
     // ADR 0016 Phase B commit 7: rehydration list. PG already
-    // knows which Active sessions are bound to this host (a host-
-    // agent restart drops `nbd_sandboxes` but PG persists the
-    // session→sandbox→host binding). Hand the list back so the
+    // knows which VM-resident sessions are bound to this host (a
+    // host-agent restart drops `nbd_sandboxes` but PG persists the
+    // session→sandbox→host binding). "Resident" = every
+    // `reserves_host_memory` state with a sandbox bound, NOT just
+    // Active: a rung-parked Evicting session's paused VM survives
+    // the pod roll too, and omitting it orphans its NBD device
+    // (session 731df805, 2026-07-17). Hand the list back so the
     // host can rebuild `ChunkedDiskBackend` + spawn the
     // FlushScheduler for each, restoring continuous-flush
     // coverage. Failure non-fatal: a host that doesn't get the
     // list runs blind for the survivors (same shape as pre-Phase-
     // B behaviour); operator can manually re-register or evac.
-    let rehydrate_sandboxes = match state
-        .services
-        .meta
-        .list_active_sandboxes_on_host_with_disk_manifest(req.host_id)
-        .await
-    {
-        Ok(rows) => rows
-            .into_iter()
-            .map(|(session_id, sandbox_id, manifest)| RehydrateSandboxRef {
-                session_id,
-                sandbox_id,
-                disk_manifest_id: manifest.as_ref().map(|m| m.manifest_id),
-                disk_manifest_version: manifest.as_ref().map(|m| m.version),
-            })
-            .collect(),
+    let rehydrate_sandboxes = match register_rehydrate_list_core(&state, req.host_id).await {
+        Ok(rows) => rows,
         Err(e) => {
             tracing::warn!(
                 host_id = %req.host_id,
@@ -377,7 +368,7 @@ pub async fn register(
     );
 
     Ok(Json(RegisterResponse {
-        server_time: Utc::now(),
+        server_time: state.services.clock.now_utc(),
         coord_wire_version: engram_protocol::WIRE_VERSION,
         enabled_images,
         rehydrate_sandboxes,
@@ -722,7 +713,7 @@ pub async fn heartbeat(
     // ADR 0015 M5: ship the coord's authoritative enabled-images
     // set so the host's prefetch loop drives from heartbeat alone.
     // Best-effort: a PG hiccup degrades to no-images for this tick.
-    let enabled_images = match state.services.meta.list_enabled_images().await {
+    let mut enabled_images = match state.services.meta.list_enabled_images().await {
         Ok(rows) => enabled_image_refs_from_rows(rows),
         Err(e) => {
             tracing::debug!(host_id = %host_id, error = %e, "list_enabled_images failed");
@@ -738,22 +729,47 @@ pub async fn heartbeat(
     // for this tick; the scanner's poll loop just sees one more empty
     // heartbeat and keeps waiting. A row that fails to deserialize (wire
     // skew mid-roll) is skipped + logged rather than failing the whole ack.
-    let prestage_images = match state.services.meta.list_prestaging_refs().await {
-        Ok(raw) => raw
-            .into_iter()
-            .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
-                Ok(r) => Some(r),
-                Err(e) => {
-                    tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
-                    None
-                }
-            })
-            .collect(),
-        Err(e) => {
-            tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
-            Vec::new()
+    let mut prestage_images: Vec<EnabledImageRef> =
+        match state.services.meta.list_prestaging_refs().await {
+            Ok(raw) => raw
+                .into_iter()
+                .filter_map(|v| match serde_json::from_value::<EnabledImageRef>(v) {
+                    Ok(r) => Some(r),
+                    Err(e) => {
+                        tracing::warn!(host_id = %host_id, error = %e, "prestage_ref failed to deserialize; skipping");
+                        None
+                    }
+                })
+                .collect(),
+            Err(e) => {
+                tracing::debug!(host_id = %host_id, error = %e, "list_prestaging_refs failed");
+                Vec::new()
+            }
+        };
+
+    // ADR 0095: stamp peer-fill seeds onto every image entry — fleet
+    // siblings whose `ready_images` already carry the digest, so the
+    // recipient's prefetch supervisor pulls the base chunk set over the
+    // LAN instead of N-hosts × GCS. Freshly assembled every ack (never
+    // persisted; seeds change as hosts warm/die). Best-effort, same
+    // posture as the lists themselves: a PG hiccup ⇒ no seeds ⇒ pure
+    // GCS, byte-identical to pre-0095. The capturing host of a fresh
+    // enable flips ready within one reconcile tick of the snapshot row
+    // landing (its prefetch is an all-local stat walk), so it becomes
+    // the prestage seed automatically, and hosts that finish warming
+    // join the seed set — a natural fan-out tree.
+    if !(enabled_images.is_empty() && prestage_images.is_empty()) {
+        match state.services.meta.list_active_hosts().await {
+            Ok(hosts) => {
+                let now = state.services.clock.now_utc();
+                attach_warm_peers(&mut enabled_images, &hosts, host_id, now);
+                attach_warm_peers(&mut prestage_images, &hosts, host_id, now);
+            }
+            Err(e) => {
+                tracing::debug!(host_id = %host_id, error = %e, "list_active_hosts failed; no warm peers this tick");
+            }
         }
-    };
+    }
 
     // ADR 0035 §5: the bundle pin set. NOT best-effort — an empty set
     // is an instruction to sweep, so a PG failure here must fail the
@@ -793,7 +809,7 @@ pub async fn heartbeat(
             image_version: adv.image_version.clone(),
             size_bytes: adv.size_bytes,
             created_at: adv.captured_at,
-            last_accessed_at: Utc::now(),
+            last_accessed_at: state.services.clock.now_utc(),
             disk_manifest: adv.disk_manifest,
             memory_manifest: adv.memory_manifest,
             recoverable,
@@ -823,10 +839,74 @@ pub async fn heartbeat(
                             SessionEvent::SnapshotTaken {
                                 snapshot_id: adv.snapshot_id,
                                 size_bytes: adv.size_bytes,
-                                at: Utc::now(),
+                                at: state.services.clock.now_utc(),
                             },
                         )
                         .await;
+                }
+                // ADR 0101 C: the durability-floor settle. The evict op
+                // no longer flips Idle at capture time — the session is
+                // honestly `evicting` until THIS reconcile records the
+                // recoverable row, then one guarded UPDATE detaches the
+                // sandbox and flips `Evicting → Idle`. Idempotent + CAS:
+                // a re-record, a session that already settled, a rebound
+                // successor sandbox, or a non-recoverable row all make it
+                // a clean `false` no-op. Runs on EVERY eviction-final
+                // advert (not just first landing): if the settle itself
+                // raced/failed once, the host's re-advert retries it.
+                if recoverable
+                    && adv.kind == engram_protocol::heartbeat::CheckpointKind::EvictionFinal
+                {
+                    match state
+                        .services
+                        .meta
+                        .settle_evicted_session_idle(
+                            adv.session_id,
+                            adv.sandbox_id,
+                            adv.snapshot_id,
+                        )
+                        .await
+                    {
+                        Ok(true) => {
+                            let now = state.services.clock.now_utc();
+                            // Best-effort rung clear (the park stamp is
+                            // ascent/ledger metadata; lifecycle already
+                            // settled above).
+                            let _ = state
+                                .services
+                                .meta
+                                .set_session_park_rung(adv.session_id, 0, None)
+                                .await;
+                            let _ = state
+                                .emit(adv.session_id, SessionEvent::Evicted { at: now })
+                                .await;
+                            let _ = state
+                                .emit(
+                                    adv.session_id,
+                                    SessionEvent::StatusChanged {
+                                        from: SessionState::Evicting,
+                                        to: SessionState::Idle,
+                                        at: now,
+                                    },
+                                )
+                                .await;
+                            tracing::info!(
+                                session_id = %adv.session_id,
+                                snapshot_id = %adv.snapshot_id,
+                                "eviction settled Idle: recoverable snapshot row landed \
+                                 (ADR 0101 C durability floor)",
+                            );
+                        }
+                        Ok(false) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                session_id = %adv.session_id,
+                                snapshot_id = %adv.snapshot_id,
+                                error = %e,
+                                "eviction settle failed; the host's re-advert retries it",
+                            );
+                        }
+                    }
                 }
             }
             Err(e) => {
@@ -858,55 +938,20 @@ pub async fn heartbeat(
     // rows piled up behind one wedged evict in the 2026-07-13 incident).
     // Pre-ADR-0090, nothing consumed the host's WARN and the teardown
     // reconciler's orphan path SIGKILLed the VM.
-    for q in &hb.quarantined_survivors {
-        match state.services.meta.get_session(q.session_id).await {
-            Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
-                match crate::session_ops::enqueue(
-                    &state,
-                    q.session_id,
-                    engram_core::types::session_op::OpKind::Evict,
-                    serde_json::json!({
-                        "target": "idle",
-                        "allow_park": false,
-                        "nominated": false,
-                        // Quarantine flavor: the survivor's disk is unserved, so
-                        // the evict verb bounds each capture attempt and, on
-                        // budget exhaustion, destroys the crippled VM + falls
-                        // back to HostLost (rewind-to-checkpoint is the designed
-                        // blast radius; an unbounded retry loop locking the
-                        // user out is not).
-                        "quarantine": true,
-                    }),
-                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
-                )
-                .await
-                {
-                    Ok(engram_core::types::session_op::EnqueueOutcome::Duplicate) => {}
-                    Ok(_) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            sandbox_id = %q.sandbox_id,
-                            "quarantined survivor advertised — enqueued evict_local \
-                             (capture + relocate; ADR 0090)",
-                        );
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            host_id = %host_id,
-                            session_id = %q.session_id,
-                            error = %e,
-                            "quarantined-survivor evict enqueue failed; retried next heartbeat",
-                        );
-                    }
-                }
-            }
-            // Session moved on (relocated / terminal) or unknown — the
-            // host's quarantine entry clears when the sandbox is
-            // destroyed; nothing to drive here.
-            _ => {}
-        }
-    }
+    //
+    // 2026-07-21 livelock incident: the active-state-scoped key is only
+    // safe because the enqueued op is guaranteed to CONVERGE. An op that
+    // settles Done as a fast no-op frees the key before the next
+    // heartbeat and turns this enqueue into a 5s-cadence infinite loop
+    // (session 8174b7aa: an ADR 0077 harness-failed park at `Created`
+    // skipped the evict guard in ~10ms, for 2.5 days / ~43k ops). The
+    // evict pipeline's quarantine arm (`quarantine_reap_unevictable`)
+    // now destroys the survivor — clearing the host's quarantine entry,
+    // i.e. this very advertise — whenever the session can't be evicted
+    // from its current state, so every enqueue here ends the loop it
+    // rides on. Keep that pairing in mind before adding states the
+    // pipeline may skip.
+    quarantined_survivor_advertise_core(&state, host_id, &hb.quarantined_survivors).await;
 
     // ADR 0091: flip sessions whose guest control plane is dead. The
     // host re-advertises until a successful capture or destroy clears
@@ -939,7 +984,7 @@ pub async fn heartbeat(
                                 crate::state::SessionEvent::StatusChanged {
                                     from: prev,
                                     to: engram_core::types::SessionState::Unreachable,
-                                    at: chrono::Utc::now(),
+                                    at: state.services.clock.now_utc(),
                                 },
                             )
                             .await;
@@ -1056,7 +1101,7 @@ pub async fn heartbeat(
     };
 
     Ok(Json(HeartbeatResponse {
-        server_time: Utc::now(),
+        server_time: state.services.clock.now_utc(),
         revoked_sessions: Vec::new(),
         enabled_images,
         prestage_images,
@@ -1166,7 +1211,65 @@ pub(crate) fn enabled_image_ref(row: &engram_core::types::EnabledImage) -> Optio
         base_snapshot_id,
         base_snapshot_disk_manifest,
         base_snapshot_memory_manifest: row.base_snapshot_memory_manifest,
+        warm_peers: Vec::new(),
     })
+}
+
+/// ADR 0095: how many peer-fill seeds ride each image entry. Two: one
+/// primary plus one alternate, so a requester's bounded second dial has
+/// somewhere to go without waiting a heartbeat tick.
+const WARM_PEER_SEEDS: usize = 2;
+
+/// ADR 0095: stamp `warm_peers` onto image entries — fleet siblings
+/// whose `ready_images` carry the digest, schedulable
+/// ([`crate::placement::host_is_schedulable`]: Ready, uncordoned,
+/// heartbeat-fresh, wire-compatible), with a dialable addr, excluding
+/// the recipient. Pure so it unit-tests without PG.
+///
+/// Seed spread: candidates rotate by a hash of (recipient, digest), so
+/// concurrent warmers fan out across the ready set instead of camping
+/// on one seed, and a given recipient keeps stable seeds across ticks
+/// (connection reuse) until the ready set changes.
+pub(crate) fn attach_warm_peers(
+    refs: &mut [EnabledImageRef],
+    hosts: &[engram_core::types::host::HostRecord],
+    recipient: engram_core::HostId,
+    now: chrono::DateTime<chrono::Utc>,
+) {
+    use std::hash::{Hash, Hasher};
+    let ttl = crate::placement::placement_ttl();
+    for r in refs.iter_mut() {
+        let mut candidates: Vec<(engram_core::HostId, &str)> = hosts
+            .iter()
+            .filter(|h| {
+                h.id != recipient
+                    && h.ready_images
+                        .iter()
+                        .any(|d| d == r.manifest_digest.as_str())
+            })
+            // `host_can_serve_chunks`, NOT `host_is_schedulable`: a
+            // cordoned host mid-drain still serves reads happily, and
+            // during a roll it's often the warmest seed available.
+            .filter_map(|h| crate::placement::host_can_serve_chunks(h, now, ttl).map(|a| (h.id, a)))
+            .collect();
+        if candidates.is_empty() {
+            r.warm_peers = Vec::new();
+            continue;
+        }
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        recipient.hash(&mut hasher);
+        r.manifest_digest.as_str().hash(&mut hasher);
+        let rot = (hasher.finish() as usize) % candidates.len();
+        candidates.rotate_left(rot);
+        r.warm_peers = candidates
+            .into_iter()
+            .take(WARM_PEER_SEEDS)
+            .map(|(host_id, addr)| engram_protocol::heartbeat::PeerRef {
+                host_id,
+                addr: addr.to_string(),
+            })
+            .collect();
+    }
 }
 
 // ---- POST /api/hosts/:id/auth/resolve-registry ----
@@ -1546,6 +1649,115 @@ pub async fn live_manifest_publish(
     Path(host_id): Path<HostId>,
     Json(req): Json<LiveManifestPublishRequest>,
 ) -> Result<Json<LiveManifestPublishResponse>, ApiError> {
+    let outcome = live_manifest_publish_core(&state, host_id, &req).await?;
+    Ok(Json(LiveManifestPublishResponse { outcome }))
+}
+
+/// The pure store-level core of [`live_manifest_publish`] (ADR 0098
+/// R-CoSim, the run_once pattern applied to handlers): the HTTP wrapper
+/// thins to extractor + JSON, this holds the real logic so the boundary
+/// simulator (`engram-dst-cosim`) can drive the exact coordinator code
+/// path the host-agent's `CoordControlPlane::publish_live_manifest` hits.
+/// Zero behavior change.
+/// The store-level core of the [`register`] handler's rehydration list (ADR
+/// 0098 R-CoSim, the run_once pattern applied to handlers). Returns the
+/// VM-resident sandboxes PG has bound to `host_id` — every
+/// `reserves_host_memory` state (Active AND rung-parked Evicting survivors,
+/// per session 731df805) — with the effective disk manifest the host rebuilds
+/// from. The boundary simulator's register-rehydrate leg drives THIS exact
+/// listing, so the co-simulated host re-serves precisely the devices the real
+/// coordinator would name.
+pub async fn register_rehydrate_list_core(
+    state: &SharedState,
+    host_id: HostId,
+) -> Result<Vec<RehydrateSandboxRef>, ApiError> {
+    let rows = state
+        .services
+        .meta
+        .list_resident_sandboxes_on_host_with_disk_manifest(host_id)
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(session_id, sandbox_id, manifest)| RehydrateSandboxRef {
+            session_id,
+            sandbox_id,
+            disk_manifest_id: manifest.as_ref().map(|m| m.manifest_id),
+            disk_manifest_version: manifest.as_ref().map(|m| m.version),
+        })
+        .collect())
+}
+
+/// The ADR 0090 quarantined-survivor advertise arm of the heartbeat,
+/// extracted per the run_once pattern so the boundary co-simulator
+/// (`engram-dst-cosim`) drives the REAL reaction to a host's quarantine
+/// advertise — the seam the 2026-07-21 8174b7aa livelock lived in (the
+/// cosim previously wrote host liveness straight to the store, so the
+/// advertise → enqueue → skip loop was structurally invisible to it).
+/// For each survivor the session still owns, enqueue the keyed
+/// quarantine `evict_local`; the pipeline's convergence guarantee (see
+/// the heartbeat handler's comment) is what keeps this 5s-cadence
+/// enqueue loop-free.
+pub async fn quarantined_survivor_advertise_core(
+    state: &SharedState,
+    host_id: HostId,
+    survivors: &[engram_protocol::heartbeat::QuarantinedSurvivor],
+) {
+    for q in survivors {
+        match state.services.meta.get_session(q.session_id).await {
+            Ok(s) if s.sandbox_id == Some(q.sandbox_id) => {
+                match crate::session_ops::enqueue(
+                    state,
+                    q.session_id,
+                    engram_core::types::session_op::OpKind::Evict,
+                    serde_json::json!({
+                        "target": "idle",
+                        "allow_park": false,
+                        "nominated": false,
+                        // Quarantine flavor: the survivor's disk is unserved, so
+                        // the evict verb bounds each capture attempt and, on
+                        // budget exhaustion, destroys the crippled VM + falls
+                        // back to HostLost (rewind-to-checkpoint is the designed
+                        // blast radius; an unbounded retry loop locking the
+                        // user out is not).
+                        "quarantine": true,
+                    }),
+                    Some(&format!("adr0090-quarantine:{}", q.sandbox_id)),
+                )
+                .await
+                {
+                    Ok(engram_core::types::session_op::EnqueueOutcome::Duplicate) => {}
+                    Ok(_) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            session_id = %q.session_id,
+                            sandbox_id = %q.sandbox_id,
+                            "quarantined survivor advertised — enqueued evict_local \
+                             (capture + relocate; ADR 0090)",
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            host_id = %host_id,
+                            session_id = %q.session_id,
+                            error = %e,
+                            "quarantined-survivor evict enqueue failed; retried next heartbeat",
+                        );
+                    }
+                }
+            }
+            // Session moved on (relocated / terminal) or unknown — the
+            // host's quarantine entry clears when the sandbox is
+            // destroyed; nothing to drive here.
+            _ => {}
+        }
+    }
+}
+
+pub async fn live_manifest_publish_core(
+    state: &SharedState,
+    host_id: HostId,
+    req: &LiveManifestPublishRequest,
+) -> Result<LiveManifestPublishOutcome, ApiError> {
     let manifest_ref = engram_core::types::manifest::ManifestRef {
         manifest_id: req.manifest_id,
         version: req.manifest_version,
@@ -1565,9 +1777,7 @@ pub async fn live_manifest_publish(
                 manifest_version = req.manifest_version,
                 "live_disk_manifest applied",
             );
-            Ok(Json(LiveManifestPublishResponse {
-                outcome: LiveManifestPublishOutcome::Applied,
-            }))
+            Ok(LiveManifestPublishOutcome::Applied)
         }
         engram_core::traits::UpdateOutcome::DroppedStale => {
             tracing::warn!(
@@ -1578,9 +1788,7 @@ pub async fn live_manifest_publish(
                 manifest_version = req.manifest_version,
                 "live_disk_manifest dropped as stale (sandbox_id mismatch)",
             );
-            Ok(Json(LiveManifestPublishResponse {
-                outcome: LiveManifestPublishOutcome::Stale,
-            }))
+            Ok(LiveManifestPublishOutcome::Stale)
         }
     }
 }
@@ -1612,6 +1820,19 @@ pub async fn sandbox_ownership(
     State(state): State<SharedState>,
     Path((_host_id, session_id, sandbox_id)): Path<(HostId, SessionId, SandboxId)>,
 ) -> Result<Json<SandboxOwnershipResponse>, ApiError> {
+    let owned = sandbox_ownership_core(&state, session_id, sandbox_id).await?;
+    Ok(Json(SandboxOwnershipResponse { owned }))
+}
+
+/// The store-level core of [`sandbox_ownership`] (ADR 0098 R-CoSim, the
+/// run_once pattern applied to handlers). Zero behavior change — the
+/// ADR 0092 non-terminal predicate lives here so the boundary simulator
+/// drives the exact ownership answer the host-agent's reconcile tick reads.
+pub async fn sandbox_ownership_core(
+    state: &SharedState,
+    session_id: SessionId,
+    sandbox_id: SandboxId,
+) -> Result<bool, ApiError> {
     // ADR 0092 hardening: a terminal row owns nothing, even if its
     // `sandbox_id` column still carries the binding — a create that
     // failed AFTER the VM spawned flips the session Failed and leans on
@@ -1619,12 +1840,11 @@ pub async fn sandbox_ownership(
     // `owned=true` here kept those orphans alive (and their guest
     // memory pinned) indefinitely. Mirrors `session_owning_sandbox`'s
     // non-terminal predicate.
-    let owned = match state.services.meta.get_session(session_id).await {
-        Ok(s) => s.sandbox_id == Some(sandbox_id) && !s.status.is_terminal(),
-        Err(engram_core::MetaError::NotFound) => false,
-        Err(e) => return Err(ApiError::Internal(format!("get_session: {e}"))),
-    };
-    Ok(Json(SandboxOwnershipResponse { owned }))
+    match state.services.meta.get_session(session_id).await {
+        Ok(s) => Ok(s.sandbox_id == Some(sandbox_id) && !s.status.is_terminal()),
+        Err(engram_core::MetaError::NotFound) => Ok(false),
+        Err(e) => Err(ApiError::Internal(format!("get_session: {e}"))),
+    }
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1642,13 +1862,23 @@ pub async fn sandbox_owner(
     State(state): State<SharedState>,
     Path((host_id, sandbox_id)): Path<(HostId, SandboxId)>,
 ) -> Result<Json<SandboxOwnerResponse>, ApiError> {
-    let session_id = state
+    let session_id = sandbox_owner_core(&state, host_id, sandbox_id).await?;
+    Ok(Json(SandboxOwnerResponse { session_id }))
+}
+
+/// The store-level core of [`sandbox_owner`] (ADR 0098 R-CoSim, the
+/// run_once pattern applied to handlers). Zero behavior change.
+pub async fn sandbox_owner_core(
+    state: &SharedState,
+    host_id: HostId,
+    sandbox_id: SandboxId,
+) -> Result<Option<SessionId>, ApiError> {
+    state
         .services
         .meta
         .session_owning_sandbox(host_id, sandbox_id)
         .await
-        .map_err(|e| ApiError::Internal(format!("session_owning_sandbox: {e}")))?;
-    Ok(Json(SandboxOwnerResponse { session_id }))
+        .map_err(|e| ApiError::Internal(format!("session_owning_sandbox: {e}")))
 }
 
 #[derive(serde::Serialize, serde::Deserialize)]
@@ -1657,6 +1887,8 @@ pub struct SandboxOwnerResponse {
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -1708,6 +1940,8 @@ mod tests {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),
@@ -1993,5 +2227,133 @@ mod tests {
             &Ok(Some(row(1, CaptureJobStage::Booting))),
             2
         ));
+    }
+
+    /// ADR 0095: `attach_warm_peers` seed-selection matrix.
+    mod warm_peers {
+        use super::*;
+        use chrono::Utc;
+        use engram_core::types::host::{
+            HostCapacity, HostMetadata, HostRecord, HostStatus, HostUtilization,
+        };
+        use engram_core::HostId;
+        use engram_protocol::heartbeat::ManifestDigest;
+
+        fn hid(id: u128) -> HostId {
+            HostId(uuid::Uuid::from_u128(id))
+        }
+
+        fn host(id: u128, ready: &[&str]) -> HostRecord {
+            HostRecord {
+                id: hid(id),
+                hostname: format!("h{id}"),
+                cloud_metadata: HostMetadata::default(),
+                capacity: HostCapacity {
+                    total_gb: 0,
+                    used_gb: 0,
+                    total_mib: 0,
+                    used_mib: 0,
+                    running_sandboxes: 0,
+                },
+                utilization: HostUtilization::default(),
+                status: HostStatus::Ready,
+                last_heartbeat_at: Utc::now(),
+                host_addr: Some(format!("http://10.0.0.{id}:9101")),
+                ready_images: ready.iter().map(|s| s.to_string()).collect(),
+                current_bundles: Vec::new(),
+                cordoned: false,
+                total_vcpus: 0,
+                wire_version: 0, // 0 = not-yet-reported, tolerated
+                stages_images: true,
+                capabilities: Default::default(),
+            }
+        }
+
+        fn image_ref(digest: &str) -> EnabledImageRef {
+            EnabledImageRef {
+                image_uri: "localhost/x:1".into(),
+                manifest_digest: ManifestDigest::new(digest.to_string()),
+                base_snapshot_id: engram_core::SnapshotId::new(),
+                base_snapshot_disk_manifest: engram_core::types::manifest::ManifestRef {
+                    manifest_id: uuid::Uuid::nil(),
+                    version: 1,
+                },
+                base_snapshot_memory_manifest: None,
+                warm_peers: Vec::new(),
+            }
+        }
+
+        const D: &str = "sha256:aaa";
+
+        #[test]
+        fn seeds_ready_holders_excluding_recipient_capped_at_two() {
+            let hosts = vec![
+                host(1, &[D]),
+                host(2, &[D]),
+                host(3, &[D]),
+                host(4, &["sha256:other"]),
+            ];
+            let mut refs = vec![image_ref(D)];
+            attach_warm_peers(&mut refs, &hosts, hid(1), Utc::now());
+            let peers = &refs[0].warm_peers;
+            assert_eq!(peers.len(), 2, "capped at {WARM_PEER_SEEDS}");
+            assert!(
+                peers.iter().all(|p| p.host_id != hid(1)),
+                "recipient must never seed itself"
+            );
+            assert!(
+                peers.iter().all(|p| p.host_id != hid(4)),
+                "a host without the digest must not seed it"
+            );
+        }
+
+        #[test]
+        fn cordoned_host_still_seeds_but_dead_and_skewed_do_not() {
+            let mut cordoned = host(2, &[D]);
+            cordoned.cordoned = true; // mid-drain: warmest seed there is
+            let mut dead = host(3, &[D]);
+            dead.last_heartbeat_at = Utc::now() - chrono::Duration::hours(1);
+            let mut skewed = host(4, &[D]);
+            skewed.wire_version = engram_protocol::WIRE_VERSION - 1;
+            let mut addrless = host(5, &[D]);
+            addrless.host_addr = None;
+            let hosts = vec![cordoned, dead, skewed, addrless];
+            let mut refs = vec![image_ref(D)];
+            attach_warm_peers(&mut refs, &hosts, hid(1), Utc::now());
+            let peers = &refs[0].warm_peers;
+            assert_eq!(
+                peers.iter().map(|p| p.host_id).collect::<Vec<_>>(),
+                vec![hid(2)],
+                "cordoned seeds; dead / wire-skewed / addr-less never do"
+            );
+        }
+
+        #[test]
+        fn no_candidates_means_empty_hints_never_self() {
+            let hosts = vec![host(1, &[D])]; // only the recipient itself
+            let mut refs = vec![image_ref(D)];
+            attach_warm_peers(&mut refs, &hosts, hid(1), Utc::now());
+            assert!(refs[0].warm_peers.is_empty());
+        }
+
+        #[test]
+        fn rotation_spreads_recipients_across_seeds() {
+            let hosts: Vec<HostRecord> = (2..=5).map(|i| host(i, &[D])).collect();
+            // Different recipients should not all camp on the same
+            // first seed. With 4 candidates and a hash rotation, at
+            // least two distinct primaries must appear across a set of
+            // recipients (deterministic given fixed UUIDs).
+            let primaries: std::collections::HashSet<_> = (10u128..30)
+                .map(|r| {
+                    let mut refs = vec![image_ref(D)];
+                    attach_warm_peers(&mut refs, &hosts, hid(r), Utc::now());
+                    refs[0].warm_peers[0].host_id
+                })
+                .collect();
+            assert!(
+                primaries.len() >= 2,
+                "hash rotation must spread primaries, got {primaries:?}"
+            );
+        }
     }
 }

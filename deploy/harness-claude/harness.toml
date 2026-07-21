@@ -16,12 +16,21 @@ description = "Anthropic's Claude Code agent. Needs an ANTHROPIC_API_KEY org sec
 # (--vsock-host / --connect, --session-id) are appended by the coordinator.
 exec = "harness"
 
+# Hosts the harness itself must reach (ADR 0063 addendum): its model API and
+# telemetry. Concatenated into the session's deny-default egress allowlist at
+# create — profiles never list these themselves.
+[egress]
+allow_hosts = ["api.anthropic.com", "statsig.anthropic.com"]
+
 [auth]
 # Programmatic / org credential (Slack triggers, cron, API) — resolved host-side
 # from an org secret named ANTHROPIC_API_KEY (ADR 0063 §4).
 org_env  = "ANTHROPIC_API_KEY"
+org_env_hint = "An admin sets an org secret named ANTHROPIC_API_KEY (an Anthropic API key). It authenticates programmatic runs — Slack, cron, and API-triggered sessions."
 # Human / interactive credential — the per-user Claude Code OAuth token.
 user_env = "CLAUDE_CODE_OAUTH_TOKEN"
+# Setup instructions shown on the settings + create surfaces.
+user_env_hint = "Run `claude setup-token` on your machine and paste the token it prints. It's required before you can start an interactive Claude session."
 
 [[models]]
 id      = "opus"

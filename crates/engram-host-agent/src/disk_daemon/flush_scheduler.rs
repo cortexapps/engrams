@@ -143,7 +143,7 @@ impl FlushSchedulerConfig {
 /// Decouples the scheduler from the host→coord wire shape. The
 /// no-op impl ([`NoOpLiveManifestPublisher`]) lets commit 2 land
 /// without coord plumbing; the real impl lands in commit 4 and
-/// closes over the `CoordClient`'s coalescing mpsc.
+/// closes over the `HttpCoordClient`'s coalescing mpsc.
 ///
 /// **`sandbox_id`, not `session_id`**: the publisher is responsible
 /// for resolving the session binding (via the host-agent's

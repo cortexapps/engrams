@@ -22,6 +22,14 @@
 //!   regardless of hysteresis, and blocks new image rolls until it finishes.
 //! - Otherwise **hold**.
 //!
+//! A timed-out image roll is a separate, durable availability-debt state
+//! (`fleet.engram.io/roll-stuck`, ADR 0044/0048 amendments). Its node still
+//! exists physically but cannot accept placement, so queued demand targets
+//! `desired_schedulable + stuck_rolls`. Once replacement capacity is Ready
+//! and the queue is empty, the same drain-gated named-node removal used by a
+//! scale-down wave retires the stuck node. A transiently joining node carries
+//! no marker and therefore never compounds scale-up.
+//!
 //! The actuation rides two seams — [`CoordApi`] (coordinator admin calls) and
 //! [`NodeOps`] (K8s node cordon + annotation) — so the executor is exercised
 //! against recording mocks without a cluster or a coordinator.
@@ -41,6 +49,7 @@ use crate::coord::{CoordClient, HostLoad, HostStatus};
 use crate::crd::HostFleetSpec;
 use crate::error::OperatorError;
 use crate::reconcile::PodInfo;
+use crate::reconcile::ROLL_STUCK_ANNOTATION;
 use crate::scaler::{desired_hosts, AutoscalePolicy};
 use crate::wave::{plan_wave, WaveHost, WavePolicy};
 
@@ -96,6 +105,9 @@ pub trait NodeOps: Send + Sync {
     async fn set_victim(&self, node: &str, fleet: Option<&str>) -> Result<(), OperatorError>;
     /// Every node currently annotated as a victim of `fleet`.
     async fn annotated_victims(&self, fleet: &str) -> Result<Vec<String>, OperatorError>;
+    /// Clear the durable timed-out-image-roll marker on `node` after the
+    /// named node has been safely removed.
+    async fn clear_roll_stuck(&self, node: &str) -> Result<(), OperatorError>;
 }
 
 /// Live K8s implementation of [`NodeOps`].
@@ -146,6 +158,17 @@ impl NodeOps for K8sNodeOps {
             .map(|n| n.name_any())
             .collect())
     }
+
+    async fn clear_roll_stuck(&self, node: &str) -> Result<(), OperatorError> {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        let patch = serde_json::json!({
+            "metadata": { "annotations": { ROLL_STUCK_ANNOTATION: serde_json::Value::Null } }
+        });
+        nodes
+            .patch(node, &PatchParams::default(), &Patch::Merge(patch))
+            .await?;
+        Ok(())
+    }
 }
 
 /// What [`step`] decided to do this reconcile. Pure output of [`plan_step`].
@@ -169,6 +192,8 @@ pub enum StepAction {
 #[derive(Clone, Copy, Debug)]
 pub struct StepInputs {
     pub desired: u32,
+    /// Grow-only cloud target after adding durable unavailable-capacity debt.
+    pub grow_target: u32,
     pub current: u32,
     pub physical: u32,
     pub queued_sessions: u64,
@@ -182,7 +207,7 @@ pub struct StepInputs {
 /// pressure aborts everything; otherwise an in-flight wave continues; a fresh
 /// wave needs hysteresis + a quiescent roll; else hold.
 pub fn plan_step(i: StepInputs) -> StepAction {
-    let scale_up = i.desired > i.physical;
+    let scale_up = i.grow_target > i.physical;
     if i.queued_sessions > 0 || scale_up {
         return if scale_up {
             StepAction::AbortAndGrow
@@ -207,9 +232,17 @@ pub fn plan_step(i: StepInputs) -> StepAction {
 /// Result of one autoscale step.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AutoscaleStatus {
-    /// A wave is still in flight (victims cordoned but not yet removed) — the
-    /// reconcile loop must NOT start an image roll and should requeue soon.
-    pub wave_in_flight: bool,
+    /// Queue/scale-up pressure, a scale-down wave, or stuck-roll remediation
+    /// is in flight. The reconcile loop must not start an image roll and
+    /// should requeue soon.
+    pub blocks_roll: bool,
+}
+
+/// K8s/roll state observed by one stateless autoscale reconcile.
+pub struct FleetObservation<'a> {
+    pub pods: &'a [PodInfo],
+    pub roll_idle: bool,
+    pub stuck_rolls: &'a [String],
 }
 
 /// Bundle of the actuation seams + wave knobs, passed to the drive helpers.
@@ -375,6 +408,58 @@ async fn drive_one(act: &WaveActuator<'_>, node: &str, host: HostId) -> DriveOut
     DriveOutcome::Removed
 }
 
+/// Retire durable image-roll failures after surge capacity is schedulable.
+/// This deliberately does NOT share the scale-down wave's timeout-release
+/// arm: a roll-stuck node has no viable host-agent successor, so uncordoning
+/// it would advertise broken capacity. Any drain/RPC failure leaves it
+/// cordoned + marked for a later retry.
+async fn repair_stuck_rolls(act: &WaveActuator<'_>, stuck: &[String]) -> u32 {
+    let mut remaining = stuck.len() as u32;
+    for node in stuck.iter().take(act.max_concurrent_drains as usize) {
+        if repair_stuck_roll(act, node).await {
+            remaining = remaining.saturating_sub(1);
+        }
+    }
+    remaining
+}
+
+async fn repair_stuck_roll(act: &WaveActuator<'_>, node: &str) -> bool {
+    let host = HostId::from_node_name(node);
+    if let Err(e) = act.coord.cordon(host).await {
+        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: coordinator cordon failed");
+        return false;
+    }
+    if let Err(e) = act.nodes.set_unschedulable(node, true).await {
+        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: K8s cordon failed");
+        return false;
+    }
+    if let Err(e) = act.coord.drain(host).await {
+        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: drain call failed");
+        return false;
+    }
+    if let Err(e) = gate_drain(act.coord, host, act.drain_timeout).await {
+        tracing::warn!(
+            %node,
+            %host,
+            error=%e,
+            "stuck-roll repair: drain gate did not complete; keeping node cordoned"
+        );
+        return false;
+    }
+    if let Err(e) = act.scaler.remove_node(act.node_pool, node).await {
+        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: remove_node failed");
+        return false;
+    }
+    if let Err(e) = act.coord.delete_host(host).await {
+        tracing::warn!(%node, %host, error=%e, "stuck-roll repair: delete_host failed; row will TTL out");
+    }
+    // The cloud removal normally deletes the Node object. Clear the marker
+    // best-effort for a slow kubelet deregistration; a NotFound is harmless.
+    let _ = act.nodes.clear_roll_stuck(node).await;
+    tracing::info!(%node, %host, "stuck-roll repair: drained + removed + deregistered");
+    true
+}
+
 /// Poll the coordinator's drain gate until the host reports
 /// `running_sandboxes == 0` AND no in-flight enable work (or it's
 /// deregistered), or the budget elapses.
@@ -390,13 +475,13 @@ async fn gate_drain(
     host: HostId,
     budget: Duration,
 ) -> Result<(), OperatorError> {
-    let deadline = tokio::time::Instant::now() + budget;
+    let deadline = crate::time_source::metrics_now_tokio() + budget;
     loop {
         match coord.host_status(host).await? {
             None => return Ok(()), // already deregistered
             Some(st) if st.running_sandboxes == 0 && !st.has_enable_work() => return Ok(()),
             Some(st) => {
-                if tokio::time::Instant::now() >= deadline {
+                if crate::time_source::metrics_now_tokio() >= deadline {
                     return Err(OperatorError::DrainTimeout {
                         host_id: host.to_string(),
                         remaining: st.running_sandboxes,
@@ -418,8 +503,7 @@ pub async fn step(
     scaledown_ticks: &std::sync::atomic::AtomicU32,
     coord: &dyn CoordApi,
     nodes: &dyn NodeOps,
-    pods: &[PodInfo],
-    roll_idle: bool,
+    observation: FleetObservation<'_>,
 ) -> Result<AutoscaleStatus, OperatorError> {
     let Some(a) = &spec.autoscaling else {
         return Ok(AutoscaleStatus::default());
@@ -433,7 +517,18 @@ pub async fn step(
     let demand = coord.fleet_demand().await?;
     let desired = desired_hosts(demand, policy);
     let current = demand.schedulable_hosts;
+    let pods = observation.pods;
+    let stuck_rolls = observation.stuck_rolls;
     let physical = pods.len() as u32;
+    // ADR 0044/0048 amendment: a timed-out image roll still exists in the
+    // managed pool and in the DaemonSet list, but cannot become schedulable.
+    // Add that durable debt to the schedulable target. A normal joining node
+    // has no marker, so repeated reconciles keep reasserting one idempotent
+    // target instead of ratcheting the pool upward.
+    let unavailable = stuck_rolls.len() as u32;
+    let grow_target = desired
+        .saturating_add(unavailable)
+        .min(a.max_hosts.max(a.min_hosts));
     // The annotation value keys wave-victims to THIS node pool (distinguishing
     // them from a manual cordon, and from another fleet's wave).
     let fleet_key = a.node_pool.as_str();
@@ -444,6 +539,7 @@ pub async fn step(
     let scale_down_target = a.scale_down.enabled()
         && desired < current
         && demand.queued_sessions == 0
+        && stuck_rolls.is_empty()
         && desired <= physical;
     let hysteresis_ready = if scale_down_target && !wave_in_flight {
         let ticks = scaledown_ticks.fetch_add(1, Ordering::Relaxed) + 1;
@@ -455,17 +551,18 @@ pub async fn step(
 
     let action = plan_step(StepInputs {
         desired,
+        grow_target,
         current,
         physical,
         queued_sessions: demand.queued_sessions,
         scale_down_enabled: a.scale_down.enabled(),
         hysteresis_ready,
-        roll_idle,
+        roll_idle: observation.roll_idle,
         wave_in_flight,
     });
     tracing::info!(
-        node_pool = %a.node_pool, current, physical, desired,
-        queued = demand.queued_sessions, wave_in_flight, ?action,
+        node_pool = %a.node_pool, current, physical, desired, grow_target,
+        unavailable, queued = demand.queued_sessions, wave_in_flight, ?action,
         "autoscale step"
     );
 
@@ -479,22 +576,46 @@ pub async fn step(
         drain_timeout: Duration::from_secs(spec.drain_timeout_seconds),
     };
 
-    match action {
-        StepAction::AbortAndGrow => {
-            if wave_in_flight {
-                abort_wave(&act, &annotated).await;
-            }
-            if desired > physical {
-                scaler.set_size(&a.node_pool, desired).await?;
-                tracing::info!(node_pool=%a.node_pool, desired, physical, "autoscale: grew pool");
-            }
-            Ok(AutoscaleStatus::default())
+    let pressure = matches!(action, StepAction::AbortAndGrow | StepAction::AbortOnly);
+    if (pressure || !stuck_rolls.is_empty()) && wave_in_flight {
+        abort_wave(&act, &annotated).await;
+    }
+    if grow_target > physical {
+        scaler.set_size(&a.node_pool, grow_target).await?;
+        tracing::info!(
+            node_pool=%a.node_pool,
+            desired,
+            grow_target,
+            physical,
+            unavailable,
+            "autoscale: grew pool (including unavailable-capacity debt)"
+        );
+    }
+
+    if !stuck_rolls.is_empty() {
+        // Do not compete with queued creates for the replacement capacity.
+        // Once the queue drains and the schedulable target is actually met,
+        // safely drain + remove the named broken node. Even if removal
+        // completes now, block the precomputed image-roll decision for this
+        // tick; the next reconcile must observe the new fleet first.
+        if demand.queued_sessions == 0 && current >= desired {
+            let remaining = repair_stuck_rolls(&act, stuck_rolls).await;
+            tracing::info!(
+                node_pool=%a.node_pool,
+                stuck = stuck_rolls.len(),
+                remaining,
+                "stuck-roll repair step"
+            );
         }
-        StepAction::AbortOnly => {
-            if wave_in_flight {
-                abort_wave(&act, &annotated).await;
-            }
-            Ok(AutoscaleStatus::default())
+        return Ok(AutoscaleStatus { blocks_roll: true });
+    }
+
+    match action {
+        StepAction::AbortAndGrow | StepAction::AbortOnly => {
+            // Queue/scale-up pressure owns the fleet this tick. Starting an
+            // image roll here would immediately take capacity back out while
+            // sessions are waiting or a new node is still joining.
+            Ok(AutoscaleStatus { blocks_roll: true })
         }
         StepAction::Hold => Ok(AutoscaleStatus::default()),
         StepAction::StartWave | StepAction::ContinueWave => {
@@ -518,7 +639,7 @@ pub async fn step(
             }
             let in_flight = drive_victims(&act, &decision.victims).await;
             Ok(AutoscaleStatus {
-                wave_in_flight: in_flight > 0,
+                blocks_roll: in_flight > 0,
             })
         }
     }
@@ -532,6 +653,7 @@ mod tests {
     fn inputs() -> StepInputs {
         StepInputs {
             desired: 5,
+            grow_target: 5,
             current: 5,
             physical: 5,
             queued_sessions: 0,
@@ -548,6 +670,7 @@ mod tests {
             queued_sessions: 3,
             wave_in_flight: true,
             desired: 5,
+            grow_target: 5,
             physical: 5,
             ..inputs()
         };
@@ -558,6 +681,7 @@ mod tests {
     fn scale_up_aborts_and_grows() {
         let i = StepInputs {
             desired: 8,
+            grow_target: 8,
             physical: 5,
             wave_in_flight: true,
             ..inputs()
@@ -569,6 +693,7 @@ mod tests {
     fn in_flight_wave_continues_regardless_of_hysteresis_and_roll() {
         let i = StepInputs {
             desired: 3,
+            grow_target: 3,
             current: 5,
             wave_in_flight: true,
             hysteresis_ready: false,
@@ -582,6 +707,7 @@ mod tests {
     fn fresh_wave_needs_hysteresis_and_a_quiescent_roll() {
         let base = StepInputs {
             desired: 3,
+            grow_target: 3,
             current: 5,
             wave_in_flight: false,
             ..inputs()
@@ -607,6 +733,7 @@ mod tests {
     fn scale_down_off_holds() {
         let i = StepInputs {
             desired: 3,
+            grow_target: 3,
             current: 5,
             scale_down_enabled: false,
             ..inputs()
@@ -619,11 +746,38 @@ mod tests {
         assert_eq!(plan_step(inputs()), StepAction::Hold);
     }
 
+    #[test]
+    fn unavailable_debt_grows_past_a_phantom_physical_host() {
+        let i = StepInputs {
+            desired: 3,
+            grow_target: 4,
+            current: 2,
+            physical: 3,
+            queued_sessions: 1,
+            ..inputs()
+        };
+        assert_eq!(plan_step(i), StepAction::AbortAndGrow);
+    }
+
+    #[test]
+    fn ordinary_joining_capacity_does_not_compound_growth() {
+        let i = StepInputs {
+            desired: 3,
+            grow_target: 3,
+            current: 2,
+            physical: 3,
+            queued_sessions: 0,
+            ..inputs()
+        };
+        assert_eq!(plan_step(i), StepAction::Hold);
+    }
+
     // ---- Recording-mock actuation tests ----
 
     #[derive(Default)]
     struct Rec {
         log: Mutex<Vec<String>>,
+        demand: Mutex<crate::scaler::FleetDemand>,
         /// host_id → running_sandboxes returned by host_status (one entry per
         /// call, popped front; empty → 0).
         drain_progress: Mutex<HashMap<HostId, std::collections::VecDeque<u32>>>,
@@ -644,7 +798,7 @@ mod tests {
     #[async_trait]
     impl CoordApi for Arc<Rec> {
         async fn fleet_demand(&self) -> Result<crate::scaler::FleetDemand, OperatorError> {
-            Ok(crate::scaler::FleetDemand::default())
+            Ok(*self.demand.lock().unwrap())
         }
         async fn list_hosts(&self) -> Result<Vec<HostLoad>, OperatorError> {
             Ok(vec![])
@@ -711,6 +865,10 @@ mod tests {
         async fn annotated_victims(&self, _fleet: &str) -> Result<Vec<String>, OperatorError> {
             Ok(self.annotated.lock().unwrap().clone())
         }
+        async fn clear_roll_stuck(&self, node: &str) -> Result<(), OperatorError> {
+            self.push(format!("roll_stuck {node}=None"));
+            Ok(())
+        }
     }
 
     struct RecScaler {
@@ -746,6 +904,132 @@ mod tests {
             max_concurrent_drains: drains,
             drain_timeout: Duration::from_millis(50),
         }
+    }
+
+    fn autoscale_spec() -> HostFleetSpec {
+        HostFleetSpec {
+            daemon_set: crate::crd::DaemonSetRef {
+                namespace: "engrams-hosts".into(),
+                name: "hf-host-agent".into(),
+            },
+            image: "host:new".into(),
+            node_assets_image: "assets:new".into(),
+            coordinator_url: "http://coord".into(),
+            capacity_floor: 2,
+            drain_timeout_seconds: 1,
+            enable_work_timeout_seconds: 0,
+            autoscaling: Some(crate::crd::AutoscalingSpec {
+                node_pool: "kvm".into(),
+                min_hosts: 2,
+                max_hosts: 6,
+                target_free_mib: 24_576,
+                scale_down: crate::scaler::ScaleDownMode::Off,
+                scale_down_hysteresis_ticks: 3,
+                max_shed_per_wave: 1,
+                max_concurrent_drains: 1,
+            }),
+        }
+    }
+
+    fn ready_pod(node: &str) -> PodInfo {
+        PodInfo {
+            name: format!("pod-{node}"),
+            node: node.into(),
+            host_image: "host:new".into(),
+            init_image: "assets:new".into(),
+            ready: true,
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_demand_surges_past_a_roll_stuck_physical_node() {
+        let rec = Arc::new(Rec::default());
+        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
+            schedulable_hosts: 2,
+            free_mib: 16_713,
+            total_mib: 131_072,
+            free_vcpus: 80,
+            total_vcpus: 80,
+            queued_sessions: 1,
+            queued_mib: 24_576,
+            queued_vcpus: 8,
+        };
+        let scaler = RecScaler { rec: rec.clone() };
+        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let pods = vec![ready_pod("a"), ready_pod("b"), ready_pod("stuck")];
+
+        let status = step(
+            &autoscale_spec(),
+            &scaler,
+            &ticks,
+            &rec,
+            &rec,
+            FleetObservation {
+                pods: &pods,
+                roll_idle: false,
+                stuck_rolls: &["stuck".into()],
+            },
+        )
+        .await
+        .expect("autoscale step");
+
+        assert!(status.blocks_roll, "queue pressure must block image rolls");
+        let log = rec.log();
+        assert!(
+            log.iter().any(|line| line == "set_size 4"),
+            "desired 3 schedulable + 1 stuck debt must surge to 4: {log:?}"
+        );
+        assert!(
+            !log.iter().any(|line| line.starts_with("drain ")),
+            "queued creates own replacement capacity before repair: {log:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn roll_stuck_node_is_drain_removed_after_capacity_recovers() {
+        let rec = Arc::new(Rec::default());
+        *rec.demand.lock().unwrap() = crate::scaler::FleetDemand {
+            schedulable_hosts: 3,
+            free_mib: 24_576,
+            total_mib: 196_608,
+            free_vcpus: 80,
+            total_vcpus: 120,
+            ..crate::scaler::FleetDemand::default()
+        };
+        let scaler = RecScaler { rec: rec.clone() };
+        let ticks = std::sync::atomic::AtomicU32::new(0);
+        let pods = vec![
+            ready_pod("a"),
+            ready_pod("b"),
+            ready_pod("replacement"),
+            ready_pod("stuck"),
+        ];
+
+        let status = step(
+            &autoscale_spec(),
+            &scaler,
+            &ticks,
+            &rec,
+            &rec,
+            FleetObservation {
+                pods: &pods,
+                roll_idle: false,
+                stuck_rolls: &["stuck".into()],
+            },
+        )
+        .await
+        .expect("autoscale step");
+
+        assert!(status.blocks_roll, "must re-observe after named removal");
+        let log = rec.log();
+        let position = |prefix: &str| {
+            log.iter()
+                .position(|line| line.starts_with(prefix))
+                .unwrap_or_else(|| panic!("missing {prefix:?} in {log:?}"))
+        };
+        assert!(position("drain ") < position("remove_node stuck"));
+        assert!(position("remove_node stuck") < position("delete_host "));
+        assert!(log.iter().any(|line| line == "roll_stuck stuck=None"));
     }
 
     #[tokio::test]

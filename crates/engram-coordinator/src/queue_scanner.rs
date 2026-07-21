@@ -48,13 +48,16 @@
 //! sweep (unlike `NoCapacity`, which stops the whole class), so a
 //! digest-mismatched head never blocks a same-class session behind it.
 //!
-//! One stop remains global: a resume-origin `NoCapacity` means
-//! `candidates_for` returned zero schedulable hosts fleet-wide (not a fit
-//! failure for one class — the fleet itself has no room), so it
-//! legitimately breaks the whole sweep. The timeout check is unchanged
-//! and still applies sweep-wide. (ADR 0079: the boot `JoinSet`, its
-//! concurrency bound, and the stale-pending crash recovery are gone —
-//! the create_boot op owns all three.)
+//! Resume-origin mirrors this per-class/global split (R3 #722): the check
+//! now does a HARD 2D fit (the same `placement_preview` the resume verb's
+//! own gate uses, so dequeue never churns Idle↔Queued on a full fleet). A
+//! present-but-full fleet is `NoFit` — stops only THIS class (a
+//! smaller-budget class may still place); zero schedulable hosts fleet-wide
+//! is `NoHost` — the one legitimate GLOBAL stop (no resume class can
+//! proceed). The timeout check is unchanged and still applies sweep-wide.
+//! (ADR 0079: the boot `JoinSet`, its concurrency bound, and the
+//! stale-pending crash recovery are gone — the create_boot op owns all
+//! three.)
 //!
 //! **Starvation, deliberately unaddressed:** oldest-head-first class
 //! ordering gives a starved big class the FIRST placement attempt every
@@ -270,7 +273,7 @@ pub async fn run_once(
         for q in class {
             // Timeouts are checked first so a stuck head is failed out
             // rather than blocking its class forever.
-            let now = Utc::now();
+            let now = state.services.clock.now_utc();
             if now
                 .signed_duration_since(q.queued_at)
                 .to_std()
@@ -301,7 +304,7 @@ pub async fn run_once(
                                 "origin" => "create",
                                 "outcome" => "placed",
                             )
-                            .record(wait_duration(&q).as_secs_f64());
+                            .record(wait_duration(now, &q).as_secs_f64());
                             summary.placed += 1;
                             enqueue_boot_op(state, &q, host_id).await;
                         }
@@ -326,22 +329,26 @@ pub async fn run_once(
                     }
                 }
                 QueueOrigin::Resume => {
-                    // Only dequeue when a host is actually available —
-                    // otherwise leave it queued (don't churn Idle↔Queued,
-                    // which would reset the timeout clock). Empty
-                    // candidates = no schedulable host fleet-wide (not a
-                    // per-class fit failure), so — unlike create's
-                    // NoCapacity — this is the one legitimate GLOBAL stop:
-                    // no class's resume can dequeue if the fleet has zero
-                    // schedulable hosts.
+                    // Only dequeue when a host actually FITS this session's
+                    // budget (R3 #722) — otherwise leave it queued (don't
+                    // churn Idle↔Queued, which would reset the timeout clock
+                    // AND, worse, leave the session stuck-Queued the instant
+                    // a host frees mid-churn). `NoFit` stops THIS class only
+                    // (strict FIFO, like create's NoCapacity — a
+                    // smaller-budget class may still place); `NoHost` (no
+                    // schedulable host fleet-wide) is the one legitimate
+                    // GLOBAL stop: no class's resume can dequeue.
                     match resume_has_capacity(state, &q).await {
-                        Some(true) => {
+                        ResumeCapacity::Fits => {
                             dequeue_resume(state, &q).await;
                         }
-                        Some(false) => {
+                        ResumeCapacity::NoFit => {
+                            break;
+                        }
+                        ResumeCapacity::NoHost => {
                             break 'classes;
                         }
-                        None => {
+                        ResumeCapacity::Error => {
                             summary.errored += 1;
                             continue; // transient read error; don't starve the rest
                         }
@@ -389,10 +396,10 @@ async fn enqueue_boot_op(state: &SharedState, q: &QueuedSession, host_id: engram
     }
 }
 
-/// Wall-clock elapsed since `q` was queued (never negative).
-fn wait_duration(q: &QueuedSession) -> Duration {
-    Utc::now()
-        .signed_duration_since(q.queued_at)
+/// Wall-clock elapsed since `q` was queued (never negative). `now` is
+/// hoisted from the caller's injected clock (ADR 0098 D1).
+fn wait_duration(now: chrono::DateTime<Utc>, q: &QueuedSession) -> Duration {
+    now.signed_duration_since(q.queued_at)
         .to_std()
         .unwrap_or_default()
 }
@@ -489,21 +496,31 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
         // current stamp, so there is no pinned generation to prefer.
         prefer_bundles: &[],
     };
-    let candidates =
-        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
-            Ok(c) => c,
-            Err(e) => {
-                tracing::warn!(session_id = %q.session.id, error = ?e,
+    let candidates = match crate::placement::candidates_for(
+        state.services.meta.as_ref(),
+        &ctx,
+        state.services.clock.now_utc(),
+    )
+    .await
+    {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(session_id = %q.session.id, error = ?e,
                 "queue-scanner: candidates_for failed");
-                return PlaceOutcome::Error;
-            }
-        };
+            return PlaceOutcome::Error;
+        }
+    };
     // ADR 0068 (core-ops-batch correction pass): an empty candidate set
     // here falls into `PlaceOutcome::NoCapacity` below with no visibility
     // into why — mirror the create/resume paths' exclusion-reason logging.
     if candidates.hosts.is_empty() {
-        crate::placement::log_empty_candidates(state.services.meta.as_ref(), &ctx, "queue_create")
-            .await;
+        crate::placement::log_empty_candidates(
+            state.services.meta.as_ref(),
+            &ctx,
+            "queue_create",
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
     match state
         .services
@@ -533,6 +550,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
                     &candidates.hosts,
                     q.mem_budget_mib,
                     q.cpu_budget_vcpus,
+                    state.services.clock.now_utc(),
                 )
                 .await;
             }
@@ -549,7 +567,7 @@ async fn place_create(state: &SharedState, q: &QueuedSession) -> PlaceOutcome {
 /// Is there a schedulable host for a resume-origin session? `Some(true)`
 /// = a candidate exists (resume's own soft placement will pick one),
 /// `Some(false)` = none (stay queued), `None` = transient read error.
-async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<bool> {
+async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> ResumeCapacity {
     let (repo, tag) = engram_core::types::session::split_image_ref(&q.session.image);
     // ADR 0036 amendment (issue #538): `required_image_digest` below is
     // deliberately `None`, NOT the create-path digest gate. This is the
@@ -593,29 +611,70 @@ async fn resume_has_capacity(state: &SharedState, q: &QueuedSession) -> Option<b
         // real pins); ordering is irrelevant to an emptiness test.
         prefer_bundles: &[],
     };
-    match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx).await {
-        Ok(c) => {
-            let has_capacity = !c.hosts.is_empty();
-            // ADR 0068 (core-ops-batch correction pass): `Some(false)` is
-            // the one legitimate GLOBAL stop in the sweep loop (see the
-            // caller's comment) — give it the same exclusion-reason
-            // visibility the other empty-candidate paths now have.
-            if !has_capacity {
-                crate::placement::log_empty_candidates(
-                    state.services.meta.as_ref(),
-                    &ctx,
-                    "queue_resume_precheck",
-                )
-                .await;
+    let now = state.services.clock.now_utc();
+    let candidates =
+        match crate::placement::candidates_for(state.services.meta.as_ref(), &ctx, now).await {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::warn!(session_id = %q.session.id, error = ?e,
+                "queue-scanner: resume candidates_for failed");
+                return ResumeCapacity::Error;
             }
-            Some(has_capacity)
-        }
+        };
+    if candidates.hosts.is_empty() {
+        // No schedulable host fleet-wide (fully cordoned / scaled to zero)
+        // — the one legitimate GLOBAL stop in the sweep loop. Same
+        // exclusion-reason visibility the other empty-candidate paths have.
+        crate::placement::log_empty_candidates(
+            state.services.meta.as_ref(),
+            &ctx,
+            "queue_resume_precheck",
+            now,
+        )
+        .await;
+        return ResumeCapacity::NoHost;
+    }
+    // R3 (#722): dequeue ONLY when this session's budget actually FITS —
+    // the SAME hard 2D check (`placement_preview`) the resume verb's own
+    // gate uses. The old soft `!hosts.is_empty()` dequeued whenever any
+    // host was schedulable; on a present-but-FULL fleet the resume verb
+    // then re-queued (no fit), churning Idle↔Queued every sweep and leaving
+    // a session stuck-Queued at a moment a host had just freed (the seed-142
+    // `quiescence-queued-with-capacity` regression). Aligning the check
+    // with the placement removes the churn: stay Queued until a host fits.
+    match crate::placement::placement_preview(
+        state.services.meta.as_ref(),
+        &ctx,
+        q.mem_budget_mib,
+        i64::from(q.cpu_budget_vcpus),
+        now,
+    )
+    .await
+    {
+        Ok(true) => ResumeCapacity::Fits,
+        Ok(false) => ResumeCapacity::NoFit,
         Err(e) => {
             tracing::warn!(session_id = %q.session.id, error = ?e,
-                "queue-scanner: resume candidates_for failed");
-            None
+                "queue-scanner: resume placement_preview failed");
+            ResumeCapacity::Error
         }
     }
+}
+
+/// The resume-origin re-queue check's verdict (R3 #722). Distinguishes a
+/// per-session capacity miss (stay queued, try other classes) from a
+/// fleet-wide stall (global stop) — the soft `Option<bool>` this replaced
+/// conflated them.
+enum ResumeCapacity {
+    /// A schedulable host FITS this session's budget — dequeue and resume.
+    Fits,
+    /// Hosts are schedulable but none fit THIS budget — stay queued; a
+    /// smaller-budget class may still place this sweep.
+    NoFit,
+    /// No schedulable host fleet-wide — no resume class can proceed.
+    NoHost,
+    /// Transient read error — skip this one, don't starve the rest.
+    Error,
 }
 
 /// Dequeue a resume-origin session: `Queued → Idle`, then enqueue the
@@ -637,7 +696,7 @@ async fn dequeue_resume(state: &SharedState, q: &QueuedSession) {
                 "origin" => "resume",
                 "outcome" => "placed",
             )
-            .record(wait_duration(q).as_secs_f64());
+            .record(wait_duration(state.services.clock.now_utc(), q).as_secs_f64());
         }
         Err(e) => {
             tracing::warn!(%session_id, error = %e,
@@ -704,7 +763,10 @@ async fn fail_queued_create_image_gone(state: &SharedState, q: &QueuedSession) -
 /// `queue_timeout` event; resume → back to `Idle` (durable, retryable).
 async fn time_out_session(state: &SharedState, q: &QueuedSession) {
     let session_id = q.session.id;
-    let waited = Utc::now()
+    let waited = state
+        .services
+        .clock
+        .now_utc()
         .signed_duration_since(q.queued_at)
         .num_seconds()
         .max(0);
@@ -740,7 +802,12 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
                 "waited_secs": waited,
                 "reason": "no host capacity became available in time",
             });
-            if let Ok(m) = crate::placement::fleet_snapshot(state.services.meta.as_ref()).await {
+            if let Ok(m) = crate::placement::fleet_snapshot(
+                state.services.meta.as_ref(),
+                state.services.clock.now_utc(),
+            )
+            .await
+            {
                 payload["fleet"] = serde_json::json!({
                     "schedulable_hosts": m.schedulable_hosts,
                     "free_mib": m.free_mib,
@@ -809,9 +876,10 @@ async fn sample_queue_metrics(state: &SharedState, queued: &[QueuedSession]) {
     // Age of the oldest queued row this tick — 0 when the queue is empty.
     // `queued` is already `queued_at ASC` (list_queued_sessions_fifo), so
     // the head is `queued[0]`.
+    let now = state.services.clock.now_utc();
     let head_age = queued
         .first()
-        .map(|q| wait_duration(q).as_secs_f64())
+        .map(|q| wait_duration(now, q).as_secs_f64())
         .unwrap_or(0.0);
     ::metrics::gauge!(crate::metrics::QUEUE_HEAD_AGE_SECONDS).set(head_age);
 }
@@ -823,7 +891,7 @@ async fn emit_from(state: &SharedState, id: SessionId, from: SessionState, to: S
             SessionEvent::StatusChanged {
                 from,
                 to,
-                at: Utc::now(),
+                at: state.services.clock.now_utc(),
             },
         )
         .await
@@ -834,6 +902,8 @@ async fn emit_from(state: &SharedState, id: SessionId, from: SessionState, to: S
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_core::types::session::{Session, SessionMode};

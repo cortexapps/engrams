@@ -238,6 +238,15 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
+/// ADR 0101 B: dirty bytes one diff epoch carried (the adaptive
+/// controller aims this at `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`) and the
+/// epoch's wall-clock length. Together they surface the controller's
+/// behavior: bytes far above target = the controller is floor-clamped
+/// (raise the target or lower the floor); epochs pinned at the max =
+/// idle sessions coasting on the backstop, as designed.
+pub const CHECKPOINT_EPOCH_BYTES: &str = "engram_checkpoint_epoch_bytes";
+pub const CHECKPOINT_EPOCH_SECONDS: &str = "engram_checkpoint_epoch_seconds";
+
 /// Incident 2026-07-10: a Diff capture failed AFTER Firecracker consumed
 /// (and reset) the KVM dirty-page bitmap, so its dirty set is
 /// unrecoverable and the sandbox's checkpoint chain was dropped — the
@@ -380,3 +389,27 @@ pub const BASE_SHM_PREWARM_SKIPPED_TOTAL: &str = "engram_base_shm_prewarm_skippe
 /// Counter (ADR 0075). Populate requests served by the substrate
 /// writer. Labels: outcome = already_local | populated | error.
 pub const SUBSTRATE_POPULATE_REQUESTS_TOTAL: &str = "engram_substrate_populate_requests_total";
+
+/// R6 (ADR 0098 §Phase 3, #784 layer 1 / #769 gap A): counter incremented
+/// each time the startup stale-binding sweep declined to DISCONNECT a
+/// dead-owner NBD device because a live process still holds the device node
+/// open (`sweep-blocked-live-holder`). The device is left RECONNECTABLE for a
+/// later re-serve pass. This should stay at/near zero in steady state; a
+/// non-zero value means a survivor's rehydrate was missed upstream (the
+/// gap-A recurrence counter) — the same signal as the `sweep-blocked-live-holder`
+/// soft-invariant, exported for alerting.
+pub const SWEEP_BLOCKED_LIVE_HOLDER_TOTAL: &str = "engram_nbd_sweep_blocked_live_holder_total";
+
+/// Wave 7b (ADR 0098 §Phase 3, #784 layers 2–3): counter incremented each time
+/// the startup classification barrier reconciled the kernel-derived NBD
+/// inventory against the tracked records and found a CONNECTED device whose live
+/// (or unprovable) holder no record could account for — the #769 gap-A survivor,
+/// invisible to both the coord-list and the #739 local pass
+/// ([`engram_host_core::SlotClass::QuarantinedUnknown`]). The device is parked
+/// (left kernel-bound, RECONNECTABLE) and this fires alongside the
+/// `rehydrate-unknown-device` soft-invariant. Should stay at zero in steady
+/// state; a non-zero value means a survivor's records were lost upstream and an
+/// operator/runbook must reconcile it. Distinct from
+/// `sweep_blocked_live_holder`: THAT is the per-device sweep declining to sever;
+/// THIS is the reconcile finding a device it cannot account for at all.
+pub const REHYDRATE_UNKNOWN_DEVICE_TOTAL: &str = "engram_nbd_rehydrate_unknown_device_total";

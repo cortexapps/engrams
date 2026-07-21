@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
+use engram_core::traits::{Clock, SystemClock};
 use engram_core::types::ids::{SessionId, SnapshotId};
 use parking_lot::RwLock;
 
@@ -27,6 +28,10 @@ pub struct LocalSnapshot {
 pub struct SnapshotManager {
     inner: Arc<RwLock<SnapshotInner>>,
     cap_bytes: u64,
+    /// ADR 0098 D1: wall clock is an injected world input (the LRU
+    /// `last_accessed_at` mark feeds eviction). P1 wires the production
+    /// clock; sim injection rides the flow-extraction PRs.
+    clock: Arc<dyn Clock>,
 }
 
 #[derive(Default)]
@@ -40,6 +45,7 @@ impl SnapshotManager {
         Self {
             inner: Arc::new(RwLock::new(SnapshotInner::default())),
             cap_bytes,
+            clock: Arc::new(SystemClock::new()),
         }
     }
 
@@ -59,7 +65,7 @@ impl SnapshotManager {
 
     pub fn touch(&self, id: SnapshotId) {
         if let Some(s) = self.inner.write().by_id.get_mut(&id) {
-            s.last_accessed_at = Utc::now();
+            s.last_accessed_at = self.clock.now_utc();
         }
     }
 
@@ -75,6 +81,8 @@ impl SnapshotManager {
 
 #[cfg(test)]
 mod tests {
+    // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+    #![allow(clippy::disallowed_methods)]
     use super::*;
     use chrono::Duration as ChronoDuration;
     use engram_core::SessionId;

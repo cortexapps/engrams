@@ -114,13 +114,11 @@ pub(crate) async fn resolve_policy_secrets(
     let Some(policy) = policy else {
         return (env, entries, transient_failures);
     };
-    let schema = engram_core::types::image::SecretSchema::default();
-    let resolved = futures::future::join_all(policy.secrets.iter().map(|s| {
-        let schema = &schema;
-        async move {
-            let result = state.services.secrets.get(ctx, &s.secret_ref, schema).await;
-            (s, result)
-        }
+    let resolved = futures::future::join_all(policy.secrets.iter().map(|s| async move {
+        let result =
+            resolve_explicit_secret_ref(state.services.secrets.as_ref(), ctx, &s.secret_ref, false)
+                .await;
+        (s, result)
     }))
     .await;
     for (s, result) in resolved {
@@ -141,6 +139,23 @@ pub(crate) async fn resolve_policy_secrets(
         install_policy_secret(&mut env, &mut entries, s, value, session);
     }
     (env, entries, transient_failures)
+}
+
+/// Resolve a persisted policy/capture ref through both supported lookup shapes:
+/// the ref remains the logical name for the org-secret backend, and is also
+/// carried in `SecretSchema.ref` for deployment backends such as GCP SM.
+pub(crate) async fn resolve_explicit_secret_ref(
+    secrets: &dyn engram_core::traits::SecretStore,
+    ctx: &SecretContext<'_>,
+    secret_ref: &str,
+    required: bool,
+) -> Result<Option<String>, engram_core::SecretError> {
+    let schema = engram_core::types::image::SecretSchema {
+        r#ref: Some(secret_ref.to_string()),
+        required,
+        ..Default::default()
+    };
+    secrets.get(ctx, secret_ref, &schema).await
 }
 
 /// Pure: install one resolved secret value into the env (`literal`) or as a
@@ -210,7 +225,7 @@ pub(crate) async fn seal_session_secrets(
         nonce: sealed.nonce.to_vec(),
         ciphertext: sealed.ciphertext,
         key_id: sealed.key_id,
-        created_at: chrono::Utc::now(),
+        created_at: state.services.clock.now_utc(),
     })
 }
 
@@ -683,13 +698,18 @@ pub(crate) async fn create_session_core(
     req: CreateSessionRequest,
     _owner: Option<String>,
 ) -> Result<CreateSessionResponse, ApiError> {
-    let start = std::time::Instant::now();
+    let start = state.services.clock.now_mono();
     let prepared = match prepare_from_grpc(state, identity_env, &req).await {
         Ok(p) => p,
         Err(e) => {
             let result = Err(e);
             record_create_metrics(
-                start.elapsed().as_secs_f64(),
+                state
+                    .services
+                    .clock
+                    .now_mono()
+                    .saturating_sub(start)
+                    .as_secs_f64(),
                 create_outcome(&result),
                 "unknown",
             );
@@ -701,7 +721,16 @@ pub(crate) async fn create_session_core(
         Ok(body) => body.kind,
         Err(_) => "unknown",
     };
-    record_create_metrics(start.elapsed().as_secs_f64(), create_outcome(&result), kind);
+    record_create_metrics(
+        state
+            .services
+            .clock
+            .now_mono()
+            .saturating_sub(start)
+            .as_secs_f64(),
+        create_outcome(&result),
+        kind,
+    );
     result
 }
 
@@ -722,11 +751,12 @@ pub(crate) async fn create_session_core(
 async fn boot_prepared(
     state: &SharedState,
     prepared: crate::session_boot::PreparedBoot,
-    // Issue #535 (observability): `create_session_core`'s entry instant, so
-    // the `coord_prepare` phase covers everything from the RPC landing
-    // through the write-set commit — the coordinator-owned serial prefix
-    // ahead of the (now-concurrent, host-side) restore work.
-    create_start: std::time::Instant,
+    // Issue #535 (observability): `create_session_core`'s entry mark (a
+    // `Clock::now_mono` duration, ADR 0098 D1), so the `coord_prepare`
+    // phase covers everything from the RPC landing through the write-set
+    // commit — the coordinator-owned serial prefix ahead of the
+    // (now-concurrent, host-side) restore work.
+    create_start: std::time::Duration,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         inputs,
@@ -793,16 +823,26 @@ async fn boot_prepared(
         // current stamp — nothing pinned yet to prefer.
         prefer_bundles: &[],
     };
-    let candidates = crate::placement::candidates_for(state.services.meta.as_ref(), &ctx)
-        .await
-        .map_err(engram_core::SandboxError::from)?;
+    let candidates = crate::placement::candidates_for(
+        state.services.meta.as_ref(),
+        &ctx,
+        state.services.clock.now_utc(),
+    )
+    .await
+    .map_err(engram_core::SandboxError::from)?;
     // ADR 0068 (core-ops-batch correction pass): this path used to fall
     // silently into the `Queued` disposition below with zero visibility
     // into why every host was excluded — the same "no capacity with free
     // hosts" mystery mode `pick_for_session` already fixed on the
     // resume/evac path. Mirror it here.
     if candidates.hosts.is_empty() {
-        crate::placement::log_empty_candidates(state.services.meta.as_ref(), &ctx, "create").await;
+        crate::placement::log_empty_candidates(
+            state.services.meta.as_ref(),
+            &ctx,
+            "create",
+            state.services.clock.now_utc(),
+        )
+        .await;
     }
 
     // -------- Seal secrets + serialize the policy BEFORE the transaction --------
@@ -890,7 +930,7 @@ async fn boot_prepared(
                     SessionEvent::StatusChanged {
                         from: SessionState::Pending,
                         to: SessionState::Queued,
-                        at: chrono::Utc::now(),
+                        at: state.services.clock.now_utc(),
                     },
                 )
                 .await
@@ -909,6 +949,7 @@ async fn boot_prepared(
                 &candidates.hosts,
                 memory_mib as i64,
                 cpu_budget_vcpus as i32,
+                state.services.clock.now_utc(),
             )
             .await;
             return Ok(CreateSessionResponse {
@@ -943,8 +984,14 @@ async fn boot_prepared(
     // Issue #535 (observability): `coord_prepare` ends HERE — everything
     // from `create_session_core` entry through the write-set commit, right
     // before the restore RPC dispatches inside the spawned task.
-    metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_prepare")
-        .record(create_start.elapsed().as_secs_f64());
+    metrics::histogram!(crate::metrics::SESSION_BOOT_SECONDS, "phase" => "coord_prepare").record(
+        state
+            .services
+            .clock
+            .now_mono()
+            .saturating_sub(create_start)
+            .as_secs_f64(),
+    );
     // ADR 0019 / telemetry restoration (#526): `tokio::spawn` severs the
     // tracing context — a span created inside this future would otherwise
     // become a new orphaned trace root instead of a child of
@@ -1046,7 +1093,11 @@ pub(crate) async fn prepare_from_grpc(
         req.mode,
         req.prompt.clone(),
         req.secrets.clone(),
-        SessionId::new(),
+        // ADR 0098 D1: mint from the INJECTED entropy (in prod this is
+        // `OsEntropy`, identical randomness; the deterministic simulator
+        // needs the id to be seed-derived). A raw `SessionId::new()` here
+        // was a determinism leak — the session id diverged every replay.
+        SessionId::from(state.services.entropy.uuid()),
         bundle,
         req.selected_skills.clone(),
         req.capabilities.clone(),
@@ -1474,7 +1525,7 @@ async fn prepare_inner(
     // ADR 0062: resolve the per-session harness from the catalog → the AgentSpec
     // the backend execs + the `dyn_0` mount carrying the current catalog
     // generation. `None` for a dev VM (no harness, dyn_0 stays sentinel).
-    let (agent, harness_mount) = match resolve_harness(
+    let (agent, harness_mount, harness_egress) = match resolve_harness(
         state,
         selected_harness.as_deref(),
         mode,
@@ -1484,9 +1535,17 @@ async fn prepare_inner(
     )
     .await?
     {
-        Some((spec, mount)) => (Some(spec), Some(mount)),
-        None => (None, None),
+        Some((spec, mount, egress)) => (Some(spec), Some(mount), egress),
+        None => (None, None, Default::default()),
     };
+
+    // ADR 0063 addendum: fold the selected harness's declared egress
+    // (`harness.toml [egress]` — its model API hosts) into the session policy
+    // BEFORE the boot network is read and the policy is persisted, so queued
+    // boots / resume / recovery all re-read the merged value. Profiles never
+    // list LLM-provider hosts themselves.
+    let integration_policy =
+        engram_core::types::merge_harness_egress(integration_policy, &harness_egress);
 
     // ADR 0057: egress network comes from the session policy (deny-all when the
     // session has no policy — e.g. a direct/CLI create), never the manifest.
@@ -1655,7 +1714,7 @@ pub(crate) async fn delete_session_core(
         EnqueueOutcome::Duplicate => None,
     };
 
-    let deadline = std::time::Instant::now() + DESTROY_OBSERVE_TIMEOUT;
+    let deadline = state.services.clock.now_mono() + DESTROY_OBSERVE_TIMEOUT;
     loop {
         // The terminal flip is the user-visible outcome; it lands before
         // the (best-effort, can-take-seconds) sandbox destroy finishes.
@@ -1685,7 +1744,7 @@ pub(crate) async fn delete_session_core(
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if state.services.clock.now_mono() >= deadline {
             return Err(ApiError::Conflict(
                 "session teardown in flight (destroy op enqueued behind an in-flight \
                  op); retry shortly"
@@ -1735,8 +1794,8 @@ pub(crate) async fn get_or_mint_broker_token(
     // winner's token so every replica injects the SAME value.
     let minted = format!(
         "{}{}",
-        uuid::Uuid::new_v4().simple(),
-        uuid::Uuid::new_v4().simple()
+        state.services.entropy.uuid().simple(),
+        state.services.entropy.uuid().simple()
     );
     let cipher = engram_crypto::CredCipher::new(state.services.kek.as_ref());
     let sealed = match cipher.seal(minted.as_bytes()).await {
@@ -1959,6 +2018,7 @@ pub(crate) async fn resolve_harness(
     Option<(
         engram_core::types::sandbox::AgentSpec,
         engram_core::types::sandbox::AuxRoDrive,
+        engram_core::types::harness::HarnessEgress,
     )>,
     ApiError,
 > {
@@ -2087,13 +2147,47 @@ pub(crate) async fn resolve_harness(
         fs_type: "squashfs".into(),
         sha256: Some(harness_sha),
     };
-    Ok(Some((agent, mount)))
+    Ok(Some((agent, mount, descriptor.egress)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use engram_core::SandboxId;
+
+    struct ExplicitRefStore;
+
+    #[async_trait::async_trait]
+    impl engram_core::traits::SecretStore for ExplicitRefStore {
+        async fn get(
+            &self,
+            _ctx: &SecretContext<'_>,
+            name: &str,
+            schema: &engram_core::types::SecretSchema,
+        ) -> Result<Option<String>, engram_core::SecretError> {
+            assert_eq!(name, "gcp-sm://projects/p/secrets/cache/versions/latest");
+            assert_eq!(schema.r#ref.as_deref(), Some(name));
+            assert!(!schema.required);
+            Ok(Some("resolved-value".into()))
+        }
+    }
+
+    #[tokio::test]
+    async fn profile_secret_resolution_passes_explicit_ref_to_backend() {
+        let ctx = SecretContext {
+            repo: "cortexapps/engrams",
+            image_tag: "dogfood",
+        };
+        let value = resolve_explicit_secret_ref(
+            &ExplicitRefStore,
+            &ctx,
+            "gcp-sm://projects/p/secrets/cache/versions/latest",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(value.as_deref(), Some("resolved-value"));
+    }
 
     /// ADR 0055: memory is purely the image's `suggested_memory_mib` (or the
     /// default) — the base snapshot is sized once per image and skills bind via

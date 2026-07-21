@@ -25,6 +25,9 @@
 //! `#[ignore]`'d by default; requires Postgres at
 //! `ENGRAM_TEST_DATABASE_URL` (CI's Postgres-gated lane runs it).
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -271,6 +274,7 @@ impl HostClient for FakeCaptureHost {
         platform_os: &str,
         platform_arch: &str,
         _registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         self.materializes.fetch_add(1, Ordering::SeqCst);
@@ -298,6 +302,7 @@ impl HostClient for FakeCaptureHost {
                 platform,
                 &self.scratch,
                 &self.chunk_store,
+                (min_disk_gib as u64) << 30,
                 Some(progress),
             )
             .await
@@ -393,6 +398,7 @@ fn spawn_capture_job_simulator(
                     working_set_blob_key: None,
                     aux_bundles: vec![],
                     paused_at: None,
+                    peer_hints: Vec::new(),
                 };
                 // ADR 0084 P3: `result_bincode` now encodes a
                 // `CaptureJobResult` (artifact + optional cold-base
@@ -433,38 +439,16 @@ fn spawn_capture_job_simulator(
 #[tokio::test]
 #[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
 async fn second_tag_with_identical_content_reuses_base_snapshot() {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set");
-            return;
-        }
-    };
     // ADR 0047: placement (the capture-host pick) reads the GLOBAL hosts
     // table, so this test cannot share a database with concurrent/previous
     // runs — a residual `Ready` host row from another run is a legal pick,
     // and since that run's fake capture host is gone the enable job sticks
-    // (poll timeout) or fails `HostUnreachable`. Give the test its own
-    // database, created off the configured URL (mirrors admin_evac_live_pg).
-    // Leaked test databases are fine: CI's Postgres is ephemeral.
-    let admin = sqlx::PgPool::connect(&database_url)
-        .await
-        .expect("connect postgres (admin)");
-    let db_name = format!("engram_test_{}", Uuid::new_v4().simple());
-    sqlx::query(&format!(r#"CREATE DATABASE "{db_name}""#))
-        .execute(&admin)
-        .await
-        .expect("create per-test database");
-    let base = database_url
-        .rsplit_once('/')
-        .map(|(b, _)| b)
-        .expect("database url has a path");
-    let test_url = format!("{base}/{db_name}");
-    let store = engram_postgres::PostgresStore::connect(&test_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    let meta: Arc<dyn MetadataStore> = Arc::new(store);
+    // (poll timeout) or fails `HostUnreachable`. ADR 0099 H1: clone a
+    // private database from the migrated template.
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
+    };
+    let meta: Arc<dyn MetadataStore> = Arc::new(db.store);
 
     // ---- fixture: a STANDARD docker image under two tags, shared layers ----
     let (addr, reg, _shutdown) = spawn_registry().await;
@@ -540,6 +524,8 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
         chunk_store: chunk_store.clone(),
         host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
         materialize_dir: None,
+        clock: Arc::new(engram_core::traits::SystemClock::new()),
+        entropy: Arc::new(engram_core::traits::OsEntropy),
     };
     // `AppState::new` would auto-register `services.host` (the
     // ProcessBackend stub, which can't materialize or capture) and

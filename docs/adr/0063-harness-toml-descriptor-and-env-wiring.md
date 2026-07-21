@@ -1,6 +1,6 @@
 # ADR 0063: harness.toml descriptor + harness-derived env wiring
 
-Status: 2026-06-30 — **Accepted** (control-plane half shipped; see the commit chain in §Phasing).
+Status: 2026-06-30 — **Accepted** (amended 2026-07-17; see §4 and the commit chain in §Phasing).
 Builds on **ADR 0062** (per-session harness selection — the infra half + the harness catalog
 this ADR consumes), **ADR 0051** (the TypeScript orchestration tier — the coordinator stays
 harness-agnostic; the orchestrator owns harness-specific naming), **ADR 0053** (session
@@ -116,21 +116,22 @@ descriptor.default_*` for model/effort), validates against the catalog, and sets
 the "Claude Code for planning, OpenCode + small model for execution" UX: same profile, per-launch
 override.
 
-### 4. Credential injection — strict by run type
+### 4. Credential injection — strict by principal
 
 The descriptor's two credential slots map to engrams' two credential tiers, chosen **strictly by
-run type** (mutually exclusive, no cross-fallback):
+principal** (mutually exclusive, no cross-fallback):
 
-- **Human / interactive** (chat UI, `task.type === "chat"`): inject the user's token under
-  `user_env`. The user-token store (`user_session_secrets`) is **already keyed by `(userId,
-  envVarName)`** — multi-harness user tokens (a Claude OAuth token *and*, say, an OpenAI key) need
+- **Human principal** (chat UI or an external trigger resolved to a real user): require and inject
+  the user's token under `user_env`. The user-token store (`user_session_secrets`) is **already
+  keyed by `(userId, envVarName)`** — multi-harness user tokens (a Claude OAuth token *and*, say,
+  an OpenAI key) need
   **no new table**, only a non-hardcoded env-var name. Storage routes generalize from
   `/me/claude-token` to `/me/harness-tokens[/:harness]` (resolving `user_env` from the
   descriptor), with a thin `/me/claude-token` shim kept for one release so
   `principal.has_claude_token` keeps working until the web migrates. The injection path resolves
   the name from `descriptor.auth.user_env` instead of the deleted `CLAUDE_OAUTH_ENV_VAR` constant.
 
-- **Programmatic** (Slack trigger, cron, API — `task.type !== "chat"`): inject the **org**
+- **Programmatic** (service-account principals — cron, CI/API keys): inject the **org**
   credential under `org_env`. **Critically, org-secret *values* never leave the coordinator (ADR
   0057)** — so the orchestrator cannot read `org_env` and place it in `harness_env`. Instead it
   appends an `IntegrationSecretJson { secret_ref: org_env, env_var: org_env, mode: "literal" }` to
@@ -139,17 +140,41 @@ run type** (mutually exclusive, no cross-fallback):
   org secret is named after the env var (an admin creates an org secret `ANTHROPIC_API_KEY` via the
   existing org-secret UI); an unresolvable ref is skipped + warn-logged and the session still boots.
 
-The single `task.type` discriminator guarantees a session never gets both credentials.
+The single programmatic discriminator guarantees a session never gets both credentials.
+
+*Amended 2026-07-14*: the discriminator is the **principal**, not `task.type`. The original
+`type === "chat"` gate booted Slack sessions credential-less ("Not logged in", session
+`e721311e`) even though the Slack mention was email-matched to a real engrams user whose token
+was on file and whose profile set `include_user_tokens`. A human owner now rides their own token
+on every surface (chat UI, Slack thread, …); only service-account creators
+(`ownerIsServiceAccount` → `programmatic`) take the `org_env` path. Cron remains programmatic by
+construction (service-account principal), so the original cron/CI behavior is unchanged.
+
+*Amended 2026-07-17*: declaring `user_env` makes that credential mandatory for a human run. The
+create is rejected before boot when the owner has not saved it; `include_user_tokens` now means
+"also carry my other saved credentials" and never gates the selected harness's own credential.
+The admin trust decision lives at harness registration/enablement: enabling a descriptor opts
+human sessions using that harness into automatic injection of its declared `user_env`.
+
+Harness auth names are principal-authoritative, not profile configuration. After all configurable
+env layers are merged, a human's per-user `user_env` is applied last and the selected harness's
+`org_env` is removed. For a programmatic principal, both auth names are removed from
+orchestrator-provided `harness_env`; `org_env` comes exclusively from the host-side org-secret
+policy. Thus profile/model/trigger env cannot supply or override either selected-harness
+credential, and the two credential tiers remain mutually exclusive.
 
 ### 5. Model + effort → env mapping
 
 After resolving the effective harness descriptor + model/effort ids, the compile path
 dict-merges `descriptor.model(id).env` and `descriptor.effort(id).env` into the harness-env map.
-**Precedence:** user-token / org-inject < CLI dummy < `profile.envVars` < **model env < effort
-env** < trigger extras — the explicit picker wins over any stale `ANTHROPIC_MODEL` left in a
-profile's `env_vars` (the migration intent; `EnvVarsEditor`'s "set the model here" hint is
-removed, since there is a model field now). The coordinator stays agnostic: one flat
-`harness_env`, injected verbatim and persisted for resume.
+**General-env precedence:** other carried user tokens < CLI dummy < `profile.envVars` < **model
+env < effort env** < git attribution < trigger extras — the explicit picker wins over any stale
+`ANTHROPIC_MODEL` left in a profile's `env_vars` (the migration intent; `EnvVarsEditor`'s "set the
+model here" hint is removed, since there is a model field now). The selected harness's auth names
+then follow §4's separate principal-authoritative rule: human `user_env` is applied last;
+programmatic `org_env` is resolved host-side and neither auth name may come from configurable
+`harness_env`. The coordinator stays harness-agnostic: it receives the resulting flat env plus the
+org-secret policy, and persists/resolves them through their existing paths.
 
 ### 6. Admin Harnesses tab
 
@@ -211,6 +236,46 @@ landed (incl. the A5 built-in-harness redesign) — B1/B2 validate against `List
   values stay coordinator-side).
 - The coordinator remains harness-agnostic (ADR 0051): it mounts the named bundle (ADR 0062) and
   injects the orchestrator-computed env verbatim.
+
+## Addendum (2026-07-20): `[egress]` — the harness declares its own network needs
+
+The first live ADR 0100 review run exposed a gap in the descriptor contract: the reviewer
+workflow's deny-default network override listed only the GitHub hosts, so the finder session
+cloned fine and then its claude harness died with `API Error: Unable to connect to API
+(ConnectionRefused)` — nothing allowed `api.anthropic.com`. The env contract said *how to
+authenticate* the harness but not *what it must reach*, leaving every profile/override to
+re-discover the LLM provider's hostnames by trial.
+
+The descriptor now carries that missing half:
+
+```toml
+[egress]
+allow_hosts         = ["api.anthropic.com", "statsig.anthropic.com"]  # claude
+allow_host_patterns = []                                              # optional
+```
+
+Semantics (`engram_core::types::merge_harness_egress`): at session create — after
+`resolve_harness`, before the session policy is read for the boot network or persisted — the
+selected harness's `[egress]` is concatenated into `IntegrationPolicy.network`:
+
+- deny-default policy → append the hosts/patterns not already present (exact-string dedupe);
+- allow-default policy → no-op (everything is already reachable);
+- absent policy (a deny-all direct/CLI create) → synthesize a minimal policy carrying just the
+  harness egress;
+- empty `[egress]` → no-op (a harness that declares nothing opts out).
+
+Merging **once at create-persist** is the point: ADR 0057 made the persisted session policy the
+single network source that queued boots, resume, and recovery all re-read, so no other path
+needs to know the feature exists. The coordinator stays harness-agnostic in the ADR 0051 sense —
+it reads a declared field; it hardcodes no provider hostnames. Profiles and per-session network
+overrides (e.g. ADR 0100's review network) now list only *task* egress; the harness's own
+API/telemetry hosts ride the descriptor.
+
+The proto projection (`HarnessDescriptor.egress`) carries the block to the UI so the egress
+receipts stay truthful: `derivePolicy` (the client-side mirror of the policy compilation) folds
+the selected harness's hosts into `reachable` with the same deny/allow semantics, which surfaces
+them in the composer's "Reaches" receipt, the profile editor's "Can reach" rail, and the profile
+cards' reach count.
 
 ## Alternatives considered
 

@@ -78,12 +78,15 @@ use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use dashmap::DashMap;
-use engram_agentd::{read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest};
+use engram_agentd::{
+    read_msg, write_msg, WireExecEvent, WireExecRequest, WireRequest, WireResponse,
+};
 use engram_core::traits::sandbox::{AgentRefresh, HarnessByteStream, SandboxBackend};
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
 use engram_core::types::sandbox::{
     AuxBundleRef, AuxRoDrive, ExecEvent, ExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    WriteFileResult, WriteFileSpec,
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
@@ -1528,6 +1531,30 @@ impl FirecrackerBackend {
         drive_exec_protocol(sandbox_id, reader, writer, cmd).await
     }
 
+    /// Drive agentd's existing `Upload` verb over a direct UDS. Public for
+    /// the protocol integration test; production uses the FC-vsock variant.
+    pub async fn write_files_via_agent_socket(
+        sandbox_id: SandboxId,
+        agent_socket: &Path,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let mut results = Vec::with_capacity(files.len());
+        for file in files {
+            let result = match UnixStream::connect(agent_socket).await {
+                Ok(conn) => upload_file_over_stream(conn, file).await,
+                Err(error) => write_file_failure(
+                    file.path,
+                    format!(
+                        "sandbox {sandbox_id}: connect to agent at {}: {error}",
+                        agent_socket.display()
+                    ),
+                ),
+            };
+            results.push(result);
+        }
+        Ok(results)
+    }
+
     /// Connect to the in-guest agent over Firecracker's vsock proxy.
     /// The host UDS at `vsock_uds_path` is multiplexed: every host→
     /// guest connection sends `CONNECT <port>\n` first and reads back
@@ -1543,6 +1570,26 @@ impl FirecrackerBackend {
         let conn = Self::connect_fc_vsock(vsock_uds_path, port).await?;
         let (reader, writer) = tokio::io::split(conn);
         drive_exec_protocol(sandbox_id, reader, writer, cmd).await
+    }
+
+    async fn write_files_via_fc_vsock(
+        sandbox_id: SandboxId,
+        vsock_uds_path: &Path,
+        port: u32,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let mut results = Vec::with_capacity(files.len());
+        for file in files {
+            let result = match Self::connect_fc_vsock(vsock_uds_path, port).await {
+                Ok(conn) => upload_file_over_stream(conn, file).await,
+                Err(error) => write_file_failure(
+                    file.path,
+                    format!("sandbox {sandbox_id}: connect to agentd vsock: {error}"),
+                ),
+            };
+            results.push(result);
+        }
+        Ok(results)
     }
 
     /// Open the host UDS at `vsock_uds_path`, write `CONNECT <port>\n`,
@@ -4183,6 +4230,41 @@ where
     })
 }
 
+async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    let path = file.path.clone();
+    let request = WireRequest::Upload {
+        path: file.path,
+        bytes: file.content,
+        mode: file.mode,
+    };
+    if let Err(error) = write_msg(&mut stream, &request).await {
+        return write_file_failure(path, format!("send Upload request: {error}"));
+    }
+    match read_msg::<_, WireResponse>(&mut stream).await {
+        Ok(WireResponse::UploadOk) => WriteFileResult {
+            path,
+            ok: true,
+            error: None,
+        },
+        Ok(WireResponse::Error { kind, message }) => {
+            write_file_failure(path, format!("agentd rejected Upload ({kind}): {message}"))
+        }
+        Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
+        Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
+    }
+}
+
+fn write_file_failure(path: String, error: String) -> WriteFileResult {
+    WriteFileResult {
+        path,
+        ok: false,
+        error: Some(error),
+    }
+}
+
 /// Wait until either:
 ///   - the API socket appears (success), OR
 ///   - the firecracker process exits (failure — surface its exit
@@ -4292,6 +4374,18 @@ impl SandboxBackend for FirecrackerBackend {
         // here, agentd genuinely went away after readiness signal —
         // surface the error rather than masking with retries.
         Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
+    }
+
+    async fn write_files(
+        &self,
+        id: SandboxId,
+        files: Vec<WriteFileSpec>,
+    ) -> Result<Vec<WriteFileResult>, SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        Self::write_files_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, files).await
     }
 
     /// ADR 0066: connect to the in-guest agentd relay listener on `port`
@@ -5381,12 +5475,25 @@ impl SandboxBackend for FirecrackerBackend {
         // impossible to distinguish from — and structurally harmless
         // either way.
         //
-        // Deliberately NO deadline on the round trip: prod has observed a
-        // 299 s handshake that eventually succeeded under guest CPU/IO
-        // starvation during UFFD/NBD page-in — a deadline would convert
-        // that slow-but-successful case into a hard failure. Starvation
-        // itself is a separate concern (prefault-admission-control, not
-        // this fold) to fix at the source.
+        // The round trip is bounded — per-attempt AND in total. The
+        // earlier shape carried NO deadline, keyed on a prod 299 s
+        // handshake that eventually succeeded under guest CPU/IO
+        // starvation during UFFD/NBD page-in. That reasoning let a single
+        // wedged exchange pin the caller unbounded: prod 2026-07-17
+        // (session 03e6535e) resumed a VM onto a dead rootfs device,
+        // agentd never answered the SpawnHarness read, and the
+        // coordinator's resume `finish` step hung for 34 minutes —
+        // bounded only by a deploy rolling the pod. Because SpawnHarness
+        // is reattach-idempotent (above), a timeout is just another
+        // retryable shape: the retry reconnects and `HarnessSupervisor::
+        // spawn` reattaches whatever the earlier attempt actually
+        // started. A genuinely starved guest that needs longer than the
+        // per-attempt budget now fails THIS attempt and is retried (fresh
+        // connect), and — once the guest is responsive — a later attempt
+        // reattaches in milliseconds. Slow success degrades to
+        // success-on-retry; a wedge stops being an unbounded hang.
+        // Starvation itself is still a separate concern
+        // (prefault-admission-control) to fix at the source.
         //
         // The true fix for the underlying muxer race lives in the
         // vendored FC fork (`third_party/firecracker`), not here — this
@@ -5394,6 +5501,20 @@ impl SandboxBackend for FirecrackerBackend {
         // from the host side (see `connect_fc_vsock`'s doc comment and
         // `harness_supervisor.rs`'s SIGUSR1 comment for why agentd can't
         // signal its own resume over an already-held vsock connection).
+        //
+        // Budgets: per-attempt 60 s bounds the single hung read (a
+        // healthy reattach answers in milliseconds; only a starved first
+        // spawn approaches it); total 210 s is a HARD cap on the retry
+        // ladder, under the coordinator's 240 s `start_agent` `grpc-timeout`
+        // (`restore_rpc_timeout`) so the host returns a typed error before
+        // the caller cancels the RPC out from under it. Each attempt is
+        // wrapped in `min(SPAWN_ATTEMPT_TIMEOUT, remaining_budget)` — a
+        // fixed per-attempt cap alone would let a 4th attempt begun near
+        // 180 s run to ~240 s and race the gRPC deadline (adversarial-review
+        // finding); the `min` keeps the WALL-CLOCK total ≤ 210 s.
+        const SPAWN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(60);
+        const SPAWN_TOTAL_BUDGET: Duration = Duration::from_secs(210);
+        let t_total = std::time::Instant::now();
         let max_attempts: u32 = 5;
         let mut attempt: u32 = 0;
         let resp: engram_agentd::WireResponse = loop {
@@ -5408,6 +5529,22 @@ impl SandboxBackend for FirecrackerBackend {
             // diagnosis below relies on (a slow CONNECT reading as a
             // starved guest that was actually just a late retry).
             let t_attempt = std::time::Instant::now();
+            // Cap this attempt at whatever remains of the total budget, so
+            // the loop's wall-clock can never exceed SPAWN_TOTAL_BUDGET
+            // (and thus stays under the caller's gRPC deadline). A hung
+            // attempt begun late no longer overshoots.
+            let remaining = SPAWN_TOTAL_BUDGET.saturating_sub(t_total.elapsed());
+            if remaining.is_zero() {
+                return Err(SandboxError::Vm(
+                    format!(
+                        "SpawnHarness exhausted its {SPAWN_TOTAL_BUDGET:?} total budget after \
+                         {} attempt(s)",
+                        attempt - 1,
+                    )
+                    .into(),
+                ));
+            }
+            let attempt_timeout = remaining.min(SPAWN_ATTEMPT_TIMEOUT);
             let inner = async {
                 let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
                 // ADR 0045 C1 tail diagnosis: split the handshake into
@@ -5435,24 +5572,55 @@ impl SandboxBackend for FirecrackerBackend {
                 // integration `-p` build failed.
                 Ok::<_, SandboxError>(resp)
             };
-            match tracing::Instrument::instrument(inner, span).await {
+            let outcome = match tokio::time::timeout(
+                attempt_timeout,
+                tracing::Instrument::instrument(inner, span),
+            )
+            .await
+            {
+                Ok(r) => r,
+                // A per-attempt deadline expiry reuses the retry ladder
+                // below (reattach-idempotent), distinguished by its
+                // message so `retryable` can admit it.
+                Err(_) => Err(SandboxError::Vm(
+                    format!(
+                        "SpawnHarness round-trip exceeded the per-attempt deadline \
+                         ({attempt_timeout:?})"
+                    )
+                    .into(),
+                )),
+            };
+            match outcome {
                 Ok(r) => break r,
                 Err(e) => {
-                    // Only retry EOF/RST-shaped errors — the muxer-settle
-                    // signature. Other failures (write failures, bincode
-                    // decode errors, protocol mismatches, connection
-                    // refused) are structural — retrying won't help, and
-                    // `Connection refused` in particular stays a
-                    // non-retryable, terminal class (the FC process
-                    // itself isn't accepting; out of scope for this fold).
+                    // Retry EOF/RST-shaped errors — the muxer-settle
+                    // signature — plus a per-attempt deadline expiry (a
+                    // wedged/starved read; the retry reconnects and
+                    // reattaches). Other failures (write failures,
+                    // bincode decode errors, protocol mismatches,
+                    // connection refused) are structural — retrying won't
+                    // help, and `Connection refused` in particular stays
+                    // a non-retryable, terminal class (the FC process
+                    // itself isn't accepting; out of scope for this
+                    // fold).
                     let msg = format!("{e}");
                     let retryable = msg.contains("early eof")
                         || msg.contains("unexpected end of file")
                         || msg.contains("connection reset")
-                        || msg.contains("broken pipe");
+                        || msg.contains("broken pipe")
+                        || msg.contains("per-attempt deadline");
+                    // Total-budget exhaustion is enforced at the top of the
+                    // loop (`remaining.is_zero()`) plus the per-attempt
+                    // `min` cap; here we only gate on retryability + the
+                    // attempt count.
                     if !retryable || attempt >= max_attempts {
                         return Err(SandboxError::Vm(
-                            format!("SpawnHarness failed after {attempt} attempt(s): {e}").into(),
+                            format!(
+                                "SpawnHarness failed after {attempt} attempt(s) \
+                                 ({:?} elapsed): {e}",
+                                t_total.elapsed(),
+                            )
+                            .into(),
                         ));
                     }
                     tracing::debug!(
@@ -6052,6 +6220,9 @@ impl FirecrackerBackend {
             // stamps it from `SnapshotCapture::paused_at` after this
             // returns (same layering as `memory_manifest` above).
             paused_at: None,
+            // ADR 0095: capture never stamps peer hints; the resume
+            // assembler does, coordinator-side.
+            peer_hints: Vec::new(),
         })
     }
 }
@@ -6439,6 +6610,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {
@@ -6555,6 +6727,7 @@ mod tests {
             working_set_blob_key: None,
             aux_bundles: vec![],
             paused_at: None,
+            peer_hints: Vec::new(),
         };
         match b.restore(metadata).await {
             Err(SandboxError::Snapshot(msg)) => {

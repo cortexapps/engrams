@@ -1,0 +1,204 @@
+# Shared setup for the four Firecracker KVM test jobs (test-fc-*).
+#
+# The FC lane was one ~14.5-min serial job; it is now four parallel
+# jobs whose test batches differ but whose setup is identical. This
+# composite owns that setup so the jobs stay ~10 lines each. Steps are
+# moved verbatim from the old `test-firecracker` job — per-step
+# rationale comments came with them.
+#
+# Composite constraints worth knowing:
+#   - Composite actions cannot read `secrets.*`; the caller passes
+#     `secrets.GITHUB_TOKEN` via the `gh-token` input. Mis-plumbing it
+#     does NOT fail loudly — the fork/kernel staging degrades to its
+#     "will skip" path and the fork-gated tests silently green-by-skip
+#     (see the `permissions:` note in ci.yml). Canary-check the logs
+#     for "staged forked firecracker @" after touching this wiring.
+#   - Every `run:` step needs an explicit `shell:`.
+#   - `$GITHUB_ENV` exports propagate to the calling job as usual.
+name: fc-setup
+description: >-
+  Toolchain, Firecracker binaries, kernel/rootfs artifacts, and test
+  binaries shared by the test-fc-* KVM jobs.
+
+inputs:
+  gh-token:
+    description: >-
+      GITHUB_TOKEN for the GHCR oras pull (forked firecracker) and the
+      private-release kernel download. Required — without it the
+      fork-gated tests silently skip.
+    required: true
+  rust-cache-shared-key:
+    description: >-
+      Swatinem/rust-cache shared-key. Distinct per calling job: each
+      batch compiles a different set of nextest test binaries, and
+      cache entries are immutable-on-first-write — one shared key
+      would leave every job but the first-saver recompiling its test
+      binaries each run.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        targets: x86_64-unknown-linux-musl
+    # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
+    # version *still* called the GH releases API to validate and
+    # 401'd with "Bad credentials" on a not-rare-enough fraction
+    # of runs. Ubuntu 24.04's protobuf-compiler ships 3.21.12,
+    # well above tonic-build/prost-build's minimum, and `apt`
+    # never hits the GH API — deterministic, ~2s.
+    - name: Install protoc
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+        protoc --version
+    - name: Setup mold linker
+      uses: rui314/setup-mold@v1
+    - uses: Swatinem/rust-cache@v2
+      with:
+        shared-key: ${{ inputs.rust-cache-shared-key }}
+    - uses: taiki-e/install-action@nextest
+    # `just` runs the `bundles-squashfs` recipe that stages the `browser`
+    # squashfs the e2e_vnc test mounts (ADR 0064).
+    - uses: taiki-e/install-action@just
+
+    # /dev/kvm is mode 0660 root:kvm by default on hosted runners;
+    # relax to 0666 so the runner user can boot microVMs without
+    # sudo. /dev/userfaultfd is the same story (FC 1.10+ opens it
+    # directly for UFFD-backed restore), with the additional
+    # `vm.unprivileged_userfaultfd=1` sysctl required so the
+    # non-root process can call userfaultfd(2).
+    - name: Relax KVM + UFFD permissions
+      shell: bash
+      run: |
+        sudo chmod 0666 /dev/kvm
+        sudo sysctl -w vm.unprivileged_userfaultfd=1
+        sudo chmod 0666 /dev/userfaultfd
+
+    # `musl-tools` is for the static agentd build the FC tests bake
+    # into the rootfs. `squashfs-tools` (mksquashfs) is for `just
+    # bundles-squashfs`, which stages the `browser` bundle the e2e_vnc
+    # test mounts (ADR 0064), and for the agentd-bundle staging in
+    # agentd_bundle_reexec/materialize_boot. `busybox-static` is the
+    # materialize_boot guest's entire userland (ADR 0080 phase 3b).
+    # ADR 0093: ext4 packing is pure Rust — no e2fsprogs. (debugfs for
+    # the nbd_chunked_disk inspection comes with the runner's distro.)
+    - name: Install build deps (musl-tools, squashfs-tools, busybox-static)
+      shell: bash
+      run: |
+        sudo apt-get update -qq
+        sudo apt-get install -y -qq musl-tools squashfs-tools busybox-static
+
+    # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
+    # so the existing FC suite + the stock<->fork compat test exercise the
+    # version we actually ship. The cached test artifacts (our engram 6.1.102
+    # guest kernel + the ubuntu-22.04 rootfs) are validated compatible with
+    # v1.16.0 (dev-vm: the compat test boots+snapshots+restores green).
+    - name: Install firecracker (v1.16.0)
+      shell: bash
+      env:
+        FC_VER: v1.16.0
+      run: |
+        curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" -o /tmp/fc.tgz
+        tar -xzf /tmp/fc.tgz -C /tmp
+        sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
+        firecracker --version
+
+    - uses: oras-project/setup-oras@v1
+
+    # ADR 0045 Phase B: stage both binaries for the stock<->fork
+    # snapshot-compat test (`stock_fork_snapshot_compat`). Stock = the
+    # v1.16.0 just installed; fork = the artifact build-firecracker published,
+    # keyed by the submodule's gitlink SHA (read from the tree — no submodule
+    # fetch). Graceful: if the fork artifact isn't published yet (e.g. a
+    # submodule-bump PR before its merge builds it), leave ENGRAM_FC_FORK_BIN
+    # unset and the compat test skips cleanly via compat_preflight().
+    - name: Stage stock + forked firecracker (compat test)
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+      run: |
+        set -euo pipefail
+        echo "ENGRAM_FC_STOCK_BIN=/usr/local/bin/firecracker" >> "$GITHUB_ENV"
+        FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
+        if [ -z "$FC_SHA" ]; then echo "no third_party/firecracker gitlink; compat test will skip"; exit 0; fi
+        if ! echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin; then
+          echo "oras login failed; compat test will skip"; exit 0
+        fi
+        mkdir -p "$HOME/fc-fork"
+        if oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
+          chmod +x "$HOME/fc-fork/firecracker"
+          echo "ENGRAM_FC_FORK_BIN=$HOME/fc-fork/firecracker" >> "$GITHUB_ENV"
+          echo "staged forked firecracker @ $FC_SHA"
+        else
+          echo "fork artifact firecracker:$FC_SHA not published yet; compat test will skip"
+        fi
+
+    # Cache the kernel + ubuntu rootfs in GH Actions cache. Both
+    # artifacts are version-pinned via fetch-fc-test-artifacts.sh
+    # (currently vmlinux-5.10.223 + ubuntu-22.04.ext4, ~1.9 GB
+    # total). Without the cache, every CI run pays a ~19 min
+    # download from `spec.ccfc.min` (Firecracker's S3 bucket).
+    #
+    # On Blacksmith runners, actions/cache@v4 transparently uses
+    # Blacksmith's colocated cache — see
+    # https://docs.blacksmith.sh/github-actions-runners/blacksmith-cache.
+    # No useblacksmith/* fork needed (those are archived). The
+    # cache key hashes the fetch script content, so bumping
+    # either URL (kernel or rootfs version) invalidates cleanly;
+    # `restore-keys` degrades that invalidation to an incremental
+    # re-fetch on top of the prior artifacts (the fetch script is
+    # idempotent per-file) instead of a full cold download.
+    - name: Cache FC kernel + rootfs artifacts
+      uses: actions/cache@v4
+      with:
+        path: ~/.cache/engram-fc-test
+        key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
+        restore-keys: |
+          fc-test-artifacts-
+
+    # Drop the cached kernel + ubuntu rootfs into ~/.cache/engram-fc-test
+    # and emit the `FC_TEST_KERNEL` / `FC_TEST_ROOTFS` env vars that
+    # `common::fc_preflight()` reads. Idempotent: on a cache hit
+    # this just re-emits the env exports without re-downloading.
+    - name: Fetch FC kernel + rootfs artifacts
+      # GH_TOKEN: the FC guest kernel is now a private release asset on this
+      # repo (ADR 0025); fetch-fc-test-artifacts.sh `gh release download`s it.
+      # The in-repo GITHUB_TOKEN can read this repo's own releases.
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.gh-token }}
+      run: |
+        bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
+          | sed 's/^export //' >> "$GITHUB_ENV"
+
+    # snapshot_uffd needs the host-side handler binary in
+    # `target/debug/` (the test resolves it relative to
+    # CARGO_MANIFEST_DIR); the host-agent PooledBackend suites use it
+    # for UFFD-backed restores. Cheap when the rust-cache is warm.
+    - name: Build engram-uffd-handler
+      shell: bash
+      run: cargo build -p engram-uffd-handler
+
+    # exec_real_vm + baked_harness_loopback bake static binaries into a
+    # rootfs at runtime and boot it; the binaries must be musl-static
+    # so they run against whatever libc the rootfs ships. proxy_e2e
+    # needs engram-harness-noop statically linked for the harness
+    # path it shares with baked_harness_loopback. (ADR 0015 M1 collapsed
+    # engram-bootstrap into engram-agentd; the standalone crate is
+    # gone.)
+    #
+    # engram-harness-claude is the real wrapper that the e2e_harness
+    # tests load into the harness substrate at `/claude/harness`.
+    - name: Build static musl binaries (agentd / noop / built-in harnesses)
+      shell: bash
+      run: |
+        cargo build \
+          -p engram-agentd \
+          -p engram-harness-noop \
+          -p engram-harness-claude \
+          -p engram-harness-codex \
+          --target x86_64-unknown-linux-musl \
+          --release

@@ -150,6 +150,7 @@ export interface TaskDeps {
   portExposures?: PortExposureStore;
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
+  /** Register a session for stream-listener scanner discovery. */
   db?: Db;
 }
 
@@ -193,11 +194,11 @@ async function requireUser(
 /**
  * Map a control-plane session status string to a task status string.
  *
- * Session status ∈ { pending, created, active, idle,
+ * Session status ∈ { pending, created, active, parked, idle,
  *                    evacuating, evicting, completed, failed, dead, host_lost }
  *
  * Mapping (documented in module JSDoc above):
- *   pending | created | active | idle | evacuating | evicting → working
+ *   pending | created | active | parked | idle | evacuating | evicting → working
  *   completed → done
  *   failed | dead | host_lost → failed
  *   (anything else) → null (caller keeps persisted task status)
@@ -207,6 +208,7 @@ function sessionStatusToTaskStatus(sessionStatus: string): string | null {
     case "pending":
     case "created":
     case "active":
+    case "parked":
     case "idle":
     case "evacuating":
     case "evicting":

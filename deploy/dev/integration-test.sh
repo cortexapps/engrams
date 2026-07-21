@@ -57,5 +57,5 @@ echo "    session deleted"
 trap - ERR
 echo ""
 echo "✓ integration smoke passed"
-echo "  session:      ${SESS_ELAPSED}s ($SESS_KIND)"
+echo "  session:      ${SESS_ELAPSED}s"
 echo "  (bake + enable + ready-wait timings printed by integration-bake-demo.sh above)"

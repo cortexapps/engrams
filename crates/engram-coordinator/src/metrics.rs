@@ -323,6 +323,28 @@ pub const HARNESS_INPLACE_REATTACH_TOTAL: &str = "engram_harness_inplace_reattac
 /// snapshot pipeline is persistently failing for some session.
 pub const EVICTION_BUDGET_EXHAUSTED_TOTAL: &str = "engram_eviction_budget_exhausted_total";
 
+/// Counter (ADR 0090, 2026-07-20 durability-rollback incident). A
+/// quarantined-survivor eviction exhausted its retry budget, so the
+/// coordinator DESTROYED the crippled VM; the session's next resume then
+/// rewinds to the last published disk manifest, silently dropping any
+/// guest writes the host acked but never uploaded past it (the incident:
+/// 134/100/50 MiB tails). Pairs with the durable `durability_rollback`
+/// session_events row. MUST be ~0 — every increment is real, user-visible
+/// data loss, so alert on ANY sustained rise.
+pub const DURABILITY_ROLLBACK_TOTAL: &str = "engram_durability_rollback_total";
+
+/// Counter (#792, R4, ADR 0098 Phase 3). The recoverable-before-Idle
+/// guard fired: an idle-evict capture produced manifests but
+/// `verify_snapshot_recoverable`'s BlobStorage HEAD failed
+/// (`recoverable = false`) with no live disk manifest, so the pipeline
+/// refused to land `Idle` and returned a retryable error. A transient
+/// blip clears on the op redrive; a persistently-high value means the
+/// snapshot pipeline (or the BlobStorage HEAD path) is genuinely failing
+/// and sessions are riding the budget out to the HostLost/Dead honest
+/// route.
+pub const EVICTION_UNRECOVERABLE_CAPTURE_GUARD_TOTAL: &str =
+    "engram_eviction_unrecoverable_capture_guard_total";
+
 /// Gauge (ADR 0034). Rows in `status='evicting'` observed by the
 /// eviction scanner at the top of each tick — its queue depth.
 /// Healthy steady-state drains to 0 between ticks; a climbing value
@@ -463,6 +485,33 @@ pub const RECONCILE_PROBE_RESCUES_TOTAL: &str = "engram_reconcile_probe_rescues_
 /// behavioral change from this issue — added alongside the reconcile
 /// rescue counter above so both rescue paths are graphable together.
 pub const DEAD_HOST_PROBE_RESCUES_TOTAL: &str = "engram_dead_host_probe_rescues_total";
+
+/// Counter (issue #762). `dead_host::host_lost_straggler_sweep`
+/// completed the delayed HostLost stage-2 transition for a row whose
+/// inline transition never ran or failed.
+pub const HOST_LOST_STRAGGLERS_SETTLED_TOTAL: &str = "engram_host_lost_stragglers_settled_total";
+
+/// Counter (issue #777, ADR 0098 Phase 3 honest-Dead). A HostLost
+/// stage-2 transition routed a session to `Dead` while a snapshot row
+/// DID exist — the snapshot was un-recoverable (its BlobStorage HEAD
+/// failed at take-time) and there was no live disk manifest either.
+/// Distinct from "no snapshot at all" so a bad-capture pipeline stays
+/// visible instead of hiding behind a generic Dead. Fired from every
+/// stage-2 site (`reconcile::flip_missing`, `dead_host::evict_host`,
+/// `dead_host::host_lost_straggler_sweep`).
+pub const HOST_LOST_UNRECOVERABLE_SNAPSHOT_TOTAL: &str =
+    "engram_host_lost_unrecoverable_snapshot_total";
+
+/// Counter (issue #777, ADR 0098 Phase 3 ask-the-host).
+/// `host_lost_straggler_sweep` was about to destroy a still-bound
+/// sandbox, probed the host, and found the VMM process ALIVE — so it
+/// DEFERRED the destroy+settle for the reattach machinery and banked a
+/// serving-strike instead. Sustained nonzero means live VMs are sitting
+/// under HostLost rows (a partition/desync parking bug upstream); the
+/// sweep no longer kills them on sight (removes the >60s-partition
+/// destroy-a-live-VM window of #762/#769).
+pub const HOST_LOST_STRAGGLER_DEFERRED_SERVING_TOTAL: &str =
+    "engram_host_lost_straggler_deferred_serving_total";
 
 /// Counter (ADR 0019 / telemetry restoration #526). Same-host vs
 /// cross-host resume split, emitted in `api/snapshot.rs::resume_from_fc_snapshot`

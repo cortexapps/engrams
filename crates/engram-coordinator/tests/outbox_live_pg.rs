@@ -16,22 +16,21 @@
 //! `#[ignore]`'d by default; requires Postgres at
 //! `ENGRAM_TEST_DATABASE_URL`. Wired into ci.yml's Postgres-gated list.
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use std::sync::Arc;
 use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
-use engram_core::types::outbox::{OutboxKind, OutboxRow};
+use engram_core::types::outbox::{tool_result_outbox_id, OutboxKind, OutboxRow};
 use engram_core::types::session::{SessionMode, SessionSpec};
 use engram_core::SessionId;
 
 async fn connect() -> Option<Arc<dyn MetadataStore>> {
-    let url = std::env::var("ENGRAM_TEST_DATABASE_URL").ok()?;
-    let store = engram_postgres::PostgresStore::connect(&url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(Arc::new(store))
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(Arc::new(db.store))
 }
 
 async fn seed_session(meta: &Arc<dyn MetadataStore>) -> SessionId {
@@ -49,6 +48,23 @@ fn prompt_row(session_id: SessionId, prompt_id: &str, text: &str) -> OutboxRow {
         session_id,
         kind: OutboxKind::Prompt,
         payload: serde_json::json!({ "text": text }),
+        created_at: Utc::now(),
+        attempts: 0,
+        not_before: Utc::now(),
+        delivered_at: None,
+        acked_at: None,
+    }
+}
+
+fn tool_result_row(session_id: SessionId, tool_call_id: &str) -> OutboxRow {
+    OutboxRow {
+        prompt_id: tool_result_outbox_id(session_id, tool_call_id),
+        session_id,
+        kind: OutboxKind::ToolResult,
+        payload: serde_json::json!({
+            "tool_call_id": tool_call_id,
+            "result_json": r#"{"ok":true}"#,
+        }),
         created_at: Utc::now(),
         attempts: 0,
         not_before: Utc::now(),
@@ -76,6 +92,99 @@ async fn enqueue_is_idempotent_on_prompt_id() {
         .expect("row due");
     assert_eq!(next.prompt_id, row.prompt_id);
     assert_eq!(next.payload["text"], "hello", "first write wins");
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn tool_result_event_and_outbox_commit_together() {
+    let Some(meta) = connect().await else { return };
+    let sid = seed_session(&meta).await;
+    let row = tool_result_row(sid, "call-1");
+
+    let idx = meta
+        .append_session_event_and_outbox(
+            sid,
+            "tool_result_submitted",
+            serde_json::json!({ "tool_call_id": "call-1" }),
+            &row,
+        )
+        .await
+        .expect("append event and outbox");
+
+    let events = meta
+        .list_session_events_since(sid, -1, 10)
+        .await
+        .expect("list events");
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].idx, idx);
+    assert_eq!(events[0].kind, "tool_result_submitted");
+    assert_eq!(
+        meta.outbox_next_due(sid)
+            .await
+            .expect("next due")
+            .expect("tool result row")
+            .prompt_id,
+        row.prompt_id,
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn outbox_identity_conflict_rolls_back_tool_result_event() {
+    let Some(meta) = connect().await else { return };
+    let owner_sid = seed_session(&meta).await;
+    let target_sid = seed_session(&meta).await;
+    let row = tool_result_row(target_sid, "call-1");
+
+    // Simulate a pre-existing globally keyed command owned by another session.
+    // The atomic completion path must reject it and leave no visible event.
+    meta.outbox_enqueue(&prompt_row(owner_sid, &row.prompt_id, "collision"))
+        .await
+        .expect("seed colliding command");
+    let result = meta
+        .append_session_event_and_outbox(
+            target_sid,
+            "tool_result_submitted",
+            serde_json::json!({ "tool_call_id": "call-1" }),
+            &row,
+        )
+        .await;
+    assert!(result.is_err(), "cross-session collision must be rejected");
+    assert!(
+        meta.list_session_events_since(target_sid, -1, 10)
+            .await
+            .expect("list target events")
+            .is_empty(),
+        "the event must roll back with the rejected outbox insert",
+    );
+}
+
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn conflicting_retry_payload_rolls_back_tool_result_event() {
+    let Some(meta) = connect().await else { return };
+    let sid = seed_session(&meta).await;
+    let row = tool_result_row(sid, "call-1");
+    meta.outbox_enqueue(&row).await.expect("seed first result");
+
+    let mut conflicting = row.clone();
+    conflicting.payload["result_json"] = serde_json::json!(r#"{"ok":false}"#);
+    let result = meta
+        .append_session_event_and_outbox(
+            sid,
+            "tool_result_submitted",
+            serde_json::json!({ "tool_call_id": "call-1" }),
+            &conflicting,
+        )
+        .await;
+    assert!(result.is_err(), "a conflicting retry must be rejected");
+    assert!(
+        meta.list_session_events_since(sid, -1, 10)
+            .await
+            .expect("list events")
+            .is_empty(),
+        "the rejected retry must not publish a misleading result event",
+    );
 }
 
 #[tokio::test]

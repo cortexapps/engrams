@@ -214,14 +214,16 @@ fn with_rewind_meta(mut payload: serde_json::Value, recovery_epoch: i64, rewound
 mod tests {
     use super::*;
     use crate::state::{IndexedEvent, SessionEvent};
-    use chrono::Utc;
+    use chrono::DateTime;
 
     fn chunk_event() -> SessionEvent {
         SessionEvent::HarnessAgentMessageChunk {
             run_id: "r1".into(),
             message_id: "m1".into(),
             chunk: "hi".into(),
-            at: Utc::now(),
+            // Fixed timestamp — these tests only exercise idx/kind
+            // plumbing, never the event's time (ADR 0098 D1).
+            at: DateTime::UNIX_EPOCH,
         }
     }
 
@@ -257,7 +259,9 @@ mod tests {
         // A normal persisted event still carries its real idx on the wire.
         let (idx, _kind, _payload) = merged_to_parts(MergedEvent::Live(IndexedEvent {
             idx: 7,
-            event: SessionEvent::HarnessIdle { at: Utc::now() },
+            event: SessionEvent::HarnessIdle {
+                at: DateTime::UNIX_EPOCH,
+            },
             ephemeral: false,
         }));
         assert_eq!(idx, Some(7));

@@ -14,6 +14,7 @@ import { expect, test, describe } from "bun:test";
 import type { ProfileRow, ProfileStore } from "../../db/profiles.ts";
 import type { ImagesClient } from "../../rpc/profiles.ts";
 import type { Db, HarnessCatalogClient } from "../../rpc/task-create.ts";
+import { PAPERCUT_SYSTEM_PROMPT } from "../../tools/papercut-prompt.ts";
 import { makeThreadControlPlane } from "../thread-control-plane.ts";
 
 const profileRow = (): ProfileRow => ({
@@ -33,6 +34,7 @@ const profileRow = (): ProfileRow => ({
   secrets: [],
   isDefault: true,
   portExposures: [],
+  designation: null,
   createdAt: new Date(0),
   updatedAt: new Date(0),
   deletedAt: null,
@@ -82,7 +84,7 @@ describe("makeThreadControlPlane", () => {
       images: fakeImages(),
       connectors: { list: async () => [] },
       harnessCatalog: fakeHarnessCatalog(),
-      secrets: { get: async () => null },
+      secrets: { get: async () => null, getAll: async () => ({}) },
       resolveUser: async () => "user-1",
       db: recordingDb(records),
       sessions: {
@@ -91,7 +93,6 @@ describe("makeThreadControlPlane", () => {
           return { sessionId: "sess-1" };
         },
         sendPrompt: async () => {},
-        answerQuestion: async () => {},
         deleteSession: async () => {},
       },
     });
@@ -102,9 +103,12 @@ describe("makeThreadControlPlane", () => {
       prompt: "hello",
       appendSystemPrompt: "You were triggered from Slack.",
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
+      threadWorkflowId: "thread-wf-1",
     });
 
-    expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe("You were triggered from Slack.");
+    expect(createdReq?.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
+      `You were triggered from Slack.\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+    );
     // records[0] = task, records[1] = primary task_session.
     expect(records[0]).toMatchObject({
       type: "slack_thread",
@@ -112,28 +116,35 @@ describe("makeThreadControlPlane", () => {
       source: { provider: "slack", team: "T1", channel: "C1", threadRoot: "100.0" },
     });
     expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "default-profile" });
+    expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
+    expect(records[3]).toEqual({ sessionId: "sess-1" });
     expect(started.id).toBe("sess-1");
     expect(started.webUrl).toContain("/sessions/sess-1");
   });
 
   test("getDefaultProfile + resolveUser delegate to their seams", async () => {
+    const completed: unknown[][] = [];
     const cp = makeThreadControlPlane({
       profiles: fakeProfiles(),
       images: fakeImages(),
       connectors: { list: async () => [] },
       harnessCatalog: fakeHarnessCatalog(),
-      secrets: { get: async () => null },
+      secrets: { get: async () => null, getAll: async () => ({}) },
       resolveUser: async (provider, ext) => (provider === "slack" && ext === "U1" ? "user-7" : null),
+      toolRegistry: {
+        complete: async (...args) => void completed.push(args),
+      },
       db: recordingDb([]),
       sessions: {
         createSession: async () => ({ sessionId: "s" }),
         sendPrompt: async () => {},
-        answerQuestion: async () => {},
         deleteSession: async () => {},
       },
     });
 
     expect((await cp.getDefaultProfile())?.id).toBe("default-profile");
     expect(await cp.resolveUser("slack", "U1")).toBe("user-7");
+    await cp.completeToolCall("s", "tc", { "Ship?": ["Yes"] });
+    expect(completed).toEqual([["s", "tc", { "Ship?": ["Yes"] }]]);
   });
 });

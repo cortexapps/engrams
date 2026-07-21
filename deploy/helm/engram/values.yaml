@@ -432,6 +432,13 @@ orchestrator:
     grpcUrl: ""    # e.g. http://<release>-coordinator:8080
     httpUrl: ""    # e.g. http://<release>-coordinator:8080
 
+  # GITHUB_APP_LOGIN — the PR-review GitHub App's bot login/slug (ADR 0100),
+  # the handle users @-mention on a PR to trigger a review (e.g.
+  # "acme-reviewer"; an optional leading "@" / trailing "[bot]" is accepted).
+  # Empty ⇒ the env var is omitted and @-mention commands are disabled; the
+  # dispatch API and auto-on-open triggers still work.
+  githubAppLogin: ""
+
   # The three REQUIRED env vars come from ONE Secret (keys below). The chart
   # never inlines them. `databaseSecret.url` MUST point at a SEPARATE database
   # (`engram_orchestrator`), NOT the coordinator's DB — the orchestrator owns
@@ -460,7 +467,7 @@ orchestrator:
   # Drizzle migrations (orchestrator/drizzle/) MUST be applied to the
   # orchestrator's database before/at deploy. We run them as a pre-install /
   # pre-upgrade Helm Job (mirrors chart conventions: hooks, weights) that
-  # invokes `bunx drizzle-kit migrate` with ORCHESTRATOR_DATABASE_URL wired
+  # invokes `bun run migrate` with ORCHESTRATOR_DATABASE_URL wired
   # from the same Secret. Disable if you apply migrations out-of-band.
   migrations:
     enabled: true

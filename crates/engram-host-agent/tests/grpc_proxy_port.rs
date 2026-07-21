@@ -6,6 +6,8 @@
 //! and that the `Open` sentinel (sandbox_id + port) is delivered to the
 //! host out-of-band — never leaked into the byte stream. Runs in-process
 //! (no VM, no netns), so it lives in the standard nextest lane.
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -121,6 +123,7 @@ async fn boot_grpc_server(host: Arc<FakeHost>) -> std::net::SocketAddr {
             host_dyn,
             None,
             engram_host_agent::session_epochs::ephemeral(),
+            None,
         )
         .await;
     });

@@ -89,7 +89,11 @@ pub(crate) async fn cow_state_core(
         (Some(h), Some(sb), SessionState::Active | SessionState::Created) => (h, sb),
         _ => {
             // No live sandbox for this session (Idle, HostLost,
-            // terminal, or still Pending).
+            // terminal, or still Pending). ADR 0101 C: `Parked` also
+            // lands here DELIBERATELY — the VM is alive but paused, so
+            // live COW telemetry would be a frozen reading; the UI's
+            // parked copy explains the tier without it, and telemetry
+            // resumes on wake. (Same treatment `Evicting` always got.)
             return Ok(None);
         }
     };
@@ -163,6 +167,8 @@ pub(crate) async fn checkpoints_core(
 }
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use crate::config::CoordinatorConfig;
@@ -214,6 +220,8 @@ mod tests {
             )),
             host_pool: std::sync::Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
             materialize_dir: None,
+            clock: Arc::new(engram_core::traits::SystemClock::new()),
+            entropy: Arc::new(engram_core::traits::OsEntropy),
         };
         let cfg = CoordinatorConfig {
             local_path: local.path().to_path_buf(),

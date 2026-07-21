@@ -36,7 +36,8 @@
 //! eval "$(bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)"
 //! cargo test -p engram-host-agent --test eviction_finalize_redrive -- --ignored --nocapture
 //! ```
-
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 mod common;
@@ -260,6 +261,27 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
             .with_checkpoint_dir(checkpoint_dir.clone()),
     );
     pooled_b.set_self_ref(&pooled_b);
+
+    // ADR 0099 H5 redrive-with-torn-state: plant crash debris in the
+    // finalize dir alongside the one real record BEFORE generation B
+    // re-drives — a `.json` truncated mid-write (the rename never published
+    // it) and a leftover `.json.partial` (crashed before the rename). The
+    // torn-write-tolerant `EvictionFinalizeRecord::load_all` must skip both
+    // with a warn and still re-drive the real record; a torn file must never
+    // wedge startup. (Crash *during* the write — a kill between fsync and
+    // rename — is out of scope here; ADR 0098 phase 2's SimFs owns byte-level
+    // in-flight injection. These are the only on-disk states a partial
+    // `persist` can leave, and both are constructed directly.)
+    {
+        let real = tokio::fs::read(&record_path).await.unwrap();
+        tokio::fs::write(finalize_dir.join("torn.json"), &real[..real.len() / 2])
+            .await
+            .unwrap();
+        tokio::fs::write(finalize_dir.join("leftover.json.partial"), &real)
+            .await
+            .unwrap();
+    }
+
     pooled_b.resume_pending_finalizes().await;
 
     // ---- 5. The durable CheckpointRecord lands regardless of which
@@ -272,7 +294,10 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
     })
     .await;
     let bytes = tokio::fs::read(&checkpoint_path).await.unwrap();
-    let checkpoint: CheckpointRecord = serde_json::from_slice(&bytes).unwrap();
+    // R5: the record is sealed in a content-hash envelope keyed on the
+    // snapshot id; open it before deserializing.
+    let body = engram_host_agent::durable_envelope::open(&bytes, &snapshot_id.to_string()).unwrap();
+    let checkpoint: CheckpointRecord = serde_json::from_slice(&body).unwrap();
     assert_eq!(checkpoint.session_id, session_id);
     assert_eq!(
         checkpoint.kind,
@@ -314,6 +339,7 @@ async fn eviction_finalize_survives_a_simulated_host_agent_death_mid_upload() {
         working_set_blob_key: None,
         aux_bundles: checkpoint.aux_bundles.clone(),
         paused_at: Some(checkpoint.paused_at),
+        peer_hints: Vec::new(),
     };
     let restored = pooled_b
         .restore(metadata)
@@ -389,7 +415,14 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
 }
 
 async fn wait_for<F: Fn() -> bool>(what: &str, f: F) {
-    for _ in 0..400 {
+    // 120s budget. This poll exits the moment the condition holds, so a
+    // generous deadline costs nothing on green runs — but the
+    // "checkpoint record after re-drive" wait races a REAL re-driven
+    // chunk+upload of the guest's memory, which blew a 20s budget twice
+    // in one day on contended 4-vcpu CI runners (2026-07-15, runs
+    // 29458713634 + 29461273841; both green on retry). Deadline sized
+    // to the slowest observed CI I/O, not the property.
+    for _ in 0..2400 {
         if f() {
             return;
         }

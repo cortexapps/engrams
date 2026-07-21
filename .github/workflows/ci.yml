@@ -1,7 +1,7 @@
 name: CI
 
-# Linux Rust + web/pnpm gate. The macOS / Apple-Silicon coverage
-# lives in ci-macos-vz.yml; together they form the full CI surface.
+# The single CI workflow: Linux Rust + web/pnpm + macOS/VZ + the e2e
+# stack all live here (the old ci-macos-vz.yml was folded in).
 #
 # Surfaces this workflow exercises:
 #   - lint:             cargo fmt --check, cargo clippy -D warnings,
@@ -16,18 +16,12 @@ name: CI
 #                       (catches breakage of the FC image bake chain).
 #                       engram-bootstrap was collapsed into
 #                       engram-agentd by ADR 0015 M1 (`75ba2df`).
-#   - test-firecracker: every `#[ignore]`'d FC integration test under
-#                       nested virt. Unprivileged set: boot, lifecycle,
-#                       snapshot, snapshot_uffd, exec_real_vm,
-#                       harness_loopback, multi_restore, restore_chain,
-#                       option_d_latency_bench, cross_host_restore.
-#                       ADR 0007 set: nbd_chunked_disk (Linux + nbd,
-#                       gated — see the step). (canonical_capture was
-#                       retired by ADR 0015 M5, `18be1ad`, when the
-#                       bake-time memory-snapshot path was removed.)
-#                       Root set under sudo for iptables + TAP + loop
-#                       mounts: host_startup, proxy_e2e, snapshot_net,
-#                       patch_drive_swap, option_d_warm_lease.
+#   - test-fc-*:        every `#[ignore]`'d FC integration test under
+#                       nested virt, split across four parallel KVM
+#                       jobs (unprivileged / pooled host-agent /
+#                       NBD + root net / true-e2e) that share setup
+#                       via .github/actions/fc-setup. See the block
+#                       comment above the jobs for the batch split.
 #   - web:              pnpm install + oxlint + tsc + vite build +
 #                       vitest
 #   - cli:              the `engrams` product CLI (cli/, Bun):
@@ -93,8 +87,8 @@ concurrency:
 
 # Default to read-only repo access. No job here writes to the repo
 # (no GH releases, no commit-back, no PR comments), so least
-# privilege. `packages: read` is load-bearing: the test-firecracker
-# job oras-pulls the forked firecracker artifact from GHCR — without
+# privilege. `packages: read` is load-bearing: the test-fc-* jobs
+# oras-pull the forked firecracker artifact from GHCR — without
 # it the pull is DENIED and every fork-gated FC test (the ADR 0045 R2
 # stock<->fork compat gate, the substrate suites, vmstate_only)
 # silently green-by-skips.
@@ -137,6 +131,8 @@ jobs:
       test_fc: ${{ steps.lanes.outputs.test_fc }}
       test_web: ${{ steps.lanes.outputs.test_web }}
       test_orchestrator: ${{ steps.lanes.outputs.test_orchestrator }}
+      test_host_sim: ${{ steps.lanes.outputs.test_host_sim }}
+      test_cosim: ${{ steps.lanes.outputs.test_cosim }}
       test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
     steps:
@@ -238,24 +234,12 @@ jobs:
     needs: detect
     if: needs.detect.outputs.test_rust == 'true'
     runs-on: blacksmith-4vcpu-ubuntu-2404
-    services:
-      postgres:
-        image: postgres:16
-        env:
-          POSTGRES_PASSWORD: engram
-          POSTGRES_DB: engram_test
-        ports: ["5432:5432"]
-        options: >-
-          --health-cmd pg_isready
-          --health-interval 10s
-          --health-timeout 5s
-          --health-retries 5
     env:
       DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
-      # Used by the `#[ignore]`'d ha_listener tests in
-      # crates/engram-coordinator/tests/ha_listener.rs. The tests run
-      # `store.migrate()` themselves before exercising NOTIFY/LISTEN,
-      # so a bare Postgres without engram migrations is fine.
+      # Admin URL for the Postgres-gated `#[ignore]`'d tests. ADR 0099 H1:
+      # engram-testkit clones every test its OWN database off this URL
+      # (template-cloned, pre-migrated), so a bare Postgres is fine — the
+      # role just needs CREATEDB (the `postgres` superuser here).
       ENGRAM_TEST_DATABASE_URL: postgres://postgres:engram@localhost:5432/engram_test
       # ADR 0007: the GCS round-trip test in engram-storage-gcs is
       # gated on these env vars (so it no-ops on hosts without the
@@ -288,6 +272,29 @@ jobs:
           shared-key: workspace-debug
       - name: Install nextest
         uses: taiki-e/install-action@nextest
+
+      # Postgres via plain `docker run` rather than `services:` for the
+      # same reason as fake-gcs-server below: service containers can't
+      # override the image's CMD, and the Postgres-gated lane runs deeply
+      # parallel (ADR 0099 H2) — each test's PostgresStore holds up to an
+      # 8-connection pool, so 16 concurrent tests need headroom over the
+      # stock max_connections=100.
+      - name: Start postgres
+        run: |
+          docker run -d --name engram-test-pg \
+            -e POSTGRES_PASSWORD=engram \
+            -e POSTGRES_DB=engram_test \
+            -p 5432:5432 \
+            postgres:16 \
+            -c max_connections=300
+          # -h 127.0.0.1 forces TCP: initdb's temporary bootstrap server
+          # listens on the unix socket only, so a socket-based pg_isready
+          # can report ready before the real server is up.
+          for _ in $(seq 1 30); do
+            docker exec engram-test-pg pg_isready -h 127.0.0.1 -U postgres && break
+            sleep 1
+          done
+          docker exec engram-test-pg pg_isready -h 127.0.0.1 -U postgres
 
       # GCS emulator for the cold-tier round-trip test. We can't use
       # `services:` here because github actions service containers
@@ -333,12 +340,14 @@ jobs:
       # from accidentally tripping firecracker tests that share the
       # `#[ignore]` bucket.
       #
-      # `--test-threads=1` is load-bearing: the two ha_listener tests
-      # both LISTEN on the `session_events` channel of the same
-      # Postgres database. Run in parallel they cross-talk — test B's
-      # listener catches test A's NOTIFY, the session_id assertion
-      # fires on the wrong row. Production has one listener per
-      # coordinator, so this is purely a test-harness artifact.
+      # ADR 0099 H2: every test clones its own database via
+      # engram-testkit (NOTIFY is per-database, so the old ha_listener
+      # cross-talk that forced `--test-threads=1` is structurally
+      # impossible). The tests are PG-IO-bound, so oversubscribe the
+      # 4 vcpus: 16 threads × worst-case ~17 connections per test
+      # (8-conn store pool + admin conn + a second pool in a few tests)
+      # stays under the max_connections=300 the `Start postgres` step
+      # provisions.
       - name: Postgres-gated ignored tests
         if: always()
         run: |
@@ -368,7 +377,21 @@ jobs:
             --test mount_catalog_live_pg \
             --run-ignored ignored-only \
             --no-fail-fast \
-            --test-threads=1
+            --test-threads=16
+
+      # ADR 0098 D4: the SimMetadataStore conformance suite's live-PG
+      # half. Every scenario runs against BOTH the in-memory sim store
+      # (normal workspace lane) and a real template-cloned database
+      # (here) — the defense against sim-fidelity drift. Same admin URL
+      # + per-test isolation as the step above.
+      - name: SimMetadataStore conformance (PG half)
+        if: always()
+        run: |
+          cargo nextest run \
+            -p engram-sim \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=16
 
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
@@ -542,7 +565,10 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          # Exact versions bypass setup-bun's GitHub tags API lookup. Besides
+          # making the toolchain reproducible, this keeps CI running during a
+          # degraded GitHub REST API (the lookup otherwise fails before tests).
+          bun-version: 1.3.14
       - name: bun install
         run: bun install --frozen-lockfile
       - name: bun typecheck
@@ -567,7 +593,7 @@ jobs:
       - uses: actions/checkout@v6
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
       - name: bun install
         run: bun install --frozen-lockfile
       - name: bun typecheck
@@ -671,199 +697,38 @@ jobs:
             echo "generated bindings not committed yet (ADR 0051 Tasks 4-5) — skipping codegen drift check"
           fi
 
-  test-firecracker:
-    name: tests (firecracker, Linux + KVM)
+  # ------------------------------------------------------------------
+  # The Firecracker KVM lane: every `#[ignore]`'d FC integration test
+  # under nested virt, split across four parallel jobs so the wall
+  # time is the longest batch (~5 min) instead of the sum (~14.5 min).
+  # Shared setup lives in .github/actions/fc-setup; each job runs one
+  # of the old serial batches. All four gate on the same `test_fc`
+  # detector flag (one lane parallelized, not four new lanes) and all
+  # four are in `ci-gate`'s needs — never required checks individually.
+  #
+  # Blacksmith exposes `/dev/kvm` via nested virtualization (see
+  # https://docs.blacksmith.sh/blacksmith-runners/overview). Mirrors
+  # the dev-vm bootstrap (engram-dev) — the canonical Linux + KVM
+  # env for Firecracker development. 4vCPU gives boot+lifecycle
+  # tests enough headroom to run microVMs without queuing.
+  # ------------------------------------------------------------------
+
+  test-fc-unprivileged:
+    name: tests (firecracker unprivileged, Linux + KVM)
     needs: detect
     if: needs.detect.outputs.test_fc == 'true'
-    # Blacksmith exposes `/dev/kvm` via nested virtualization (see
-    # https://docs.blacksmith.sh/blacksmith-runners/overview). Mirrors
-    # the dev-vm bootstrap (engram-dev) — the canonical Linux + KVM
-    # env for Firecracker development. 4vCPU gives boot+lifecycle
-    # tests enough headroom to run microVMs without queuing.
     runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/fc-setup
         with:
-          targets: x86_64-unknown-linux-musl
-      # Install protoc via apt: arduino/setup-protoc@v3 with a pinned
-      # version *still* called the GH releases API to validate and
-      # 401'd with "Bad credentials" on a not-rare-enough fraction
-      # of runs. Ubuntu 24.04's protobuf-compiler ships 3.21.12,
-      # well above tonic-build/prost-build's minimum, and `apt`
-      # never hits the GH API — deterministic, ~2s.
-      - name: Install protoc
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
-          protoc --version
-      - name: Setup mold linker
-        uses: rui314/setup-mold@v1
-      - uses: Swatinem/rust-cache@v2
-      - uses: taiki-e/install-action@nextest
-      # `just` runs the `bundles-squashfs` recipe that stages the `browser`
-      # squashfs the e2e_vnc test mounts (ADR 0064).
-      - uses: taiki-e/install-action@just
-
-      # /dev/kvm is mode 0660 root:kvm by default on hosted runners;
-      # relax to 0666 so the runner user can boot microVMs without
-      # sudo. /dev/userfaultfd is the same story (FC 1.10+ opens it
-      # directly for UFFD-backed restore), with the additional
-      # `vm.unprivileged_userfaultfd=1` sysctl required so the
-      # non-root process can call userfaultfd(2).
-      - name: Relax KVM + UFFD permissions
-        run: |
-          sudo chmod 0666 /dev/kvm
-          sudo sysctl -w vm.unprivileged_userfaultfd=1
-          sudo chmod 0666 /dev/userfaultfd
-
-      # `musl-tools` is for the static agentd build the FC tests bake
-      # into the rootfs. `squashfs-tools` (mksquashfs) is for `just
-      # bundles-squashfs`, which stages the `browser` bundle the e2e_vnc
-      # test mounts (ADR 0064), and for the agentd-bundle staging in
-      # agentd_bundle_reexec/materialize_boot. `busybox-static` is the
-      # materialize_boot guest's entire userland (ADR 0080 phase 3b).
-      # ADR 0093: ext4 packing is pure Rust — no e2fsprogs. (debugfs for
-      # the nbd_chunked_disk inspection comes with the runner's distro.)
-      - name: Install build deps (musl-tools, squashfs-tools, busybox-static)
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq musl-tools squashfs-tools busybox-static
-
-      # Stock firecracker — matches the deployed fork's upstream base (v1.16.0)
-      # so the existing FC suite + the stock<->fork compat test exercise the
-      # version we actually ship. The cached test artifacts (our engram 6.1.102
-      # guest kernel + the ubuntu-22.04 rootfs) are validated compatible with
-      # v1.16.0 (dev-vm: the compat test boots+snapshots+restores green).
-      - name: Install firecracker (v1.16.0)
-        env:
-          FC_VER: v1.16.0
-        run: |
-          curl -fL "https://github.com/firecracker-microvm/firecracker/releases/download/${FC_VER}/firecracker-${FC_VER}-x86_64.tgz" -o /tmp/fc.tgz
-          tar -xzf /tmp/fc.tgz -C /tmp
-          sudo install -m 0755 "/tmp/release-${FC_VER}-x86_64/firecracker-${FC_VER}-x86_64" /usr/local/bin/firecracker
-          firecracker --version
-
-      - uses: oras-project/setup-oras@v1
-
-      # ADR 0045 Phase B: stage both binaries for the stock<->fork
-      # snapshot-compat test (`stock_fork_snapshot_compat`). Stock = the
-      # v1.10.1 just installed; fork = the artifact build-firecracker published,
-      # keyed by the submodule's gitlink SHA (read from the tree — no submodule
-      # fetch). Graceful: if the fork artifact isn't published yet (e.g. a
-      # submodule-bump PR before its merge builds it), leave ENGRAM_FC_FORK_BIN
-      # unset and the compat test skips cleanly via compat_preflight().
-      - name: Stage stock + forked firecracker (compat test)
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-          echo "ENGRAM_FC_STOCK_BIN=/usr/local/bin/firecracker" >> "$GITHUB_ENV"
-          FC_SHA="$(git ls-tree HEAD third_party/firecracker | awk '{print $3}')"
-          if [ -z "$FC_SHA" ]; then echo "no third_party/firecracker gitlink; compat test will skip"; exit 0; fi
-          if ! echo "$GH_TOKEN" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin; then
-            echo "oras login failed; compat test will skip"; exit 0
-          fi
-          mkdir -p "$HOME/fc-fork"
-          if oras pull "ghcr.io/${{ github.repository }}/firecracker:$FC_SHA" --output "$HOME/fc-fork"; then
-            chmod +x "$HOME/fc-fork/firecracker"
-            echo "ENGRAM_FC_FORK_BIN=$HOME/fc-fork/firecracker" >> "$GITHUB_ENV"
-            echo "staged forked firecracker @ $FC_SHA"
-          else
-            echo "fork artifact firecracker:$FC_SHA not published yet; compat test will skip"
-          fi
-
-      # Cache the kernel + ubuntu rootfs in GH Actions cache. Both
-      # artifacts are version-pinned via fetch-fc-test-artifacts.sh
-      # (currently vmlinux-5.10.223 + ubuntu-22.04.ext4, ~1.9 GB
-      # total). Without the cache, every CI run pays a ~19 min
-      # download from `spec.ccfc.min` (Firecracker's S3 bucket).
-      #
-      # On Blacksmith runners, actions/cache@v4 transparently uses
-      # Blacksmith's colocated cache — see
-      # https://docs.blacksmith.sh/github-actions-runners/blacksmith-cache.
-      # No useblacksmith/* fork needed (those are archived). The
-      # cache key hashes the fetch script content, so bumping
-      # either URL (kernel or rootfs version) invalidates cleanly.
-      - name: Cache FC kernel + rootfs artifacts
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/engram-fc-test
-          key: fc-test-artifacts-${{ hashFiles('crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh') }}
-
-      # Drop the cached kernel + ubuntu rootfs into ~/.cache/engram-fc-test
-      # and emit the `FC_TEST_KERNEL` / `FC_TEST_ROOTFS` env vars that
-      # `common::fc_preflight()` reads. Idempotent: on a cache hit
-      # this just re-emits the env exports without re-downloading.
-      - name: Fetch FC kernel + rootfs artifacts
-        # GH_TOKEN: the FC guest kernel is now a private release asset on this
-        # repo (ADR 0025); fetch-fc-test-artifacts.sh `gh release download`s it.
-        # The in-repo GITHUB_TOKEN can read this repo's own releases.
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh \
-            | sed 's/^export //' >> "$GITHUB_ENV"
-
-      # snapshot_uffd needs the host-side handler binary in
-      # `target/debug/` (the test resolves it relative to
-      # CARGO_MANIFEST_DIR).
-      - name: Build engram-uffd-handler
-        run: cargo build -p engram-uffd-handler
-
-      # exec_real_vm + harness_loopback bake static binaries into a
-      # rootfs at runtime and boot it; the binaries must be musl-static
-      # so they run against whatever libc the rootfs ships. proxy_e2e
-      # needs engram-harness-noop statically linked for the harness
-      # path it shares with harness_loopback. (ADR 0015 M1 collapsed
-      # engram-bootstrap into engram-agentd; the standalone crate is
-      # gone.)
-      - name: Build static musl binaries (agentd / noop / built-in harnesses)
-        # engram-harness-claude is the real wrapper that the
-        # e2e_harness tests load into the harness substrate at
-        # `/claude/harness`. Building it here lets the same `target/`
-        # serve both the unprivileged tests and the root-required
-        # e2e_harness pair below — no second cargo build pass.
-        run: |
-          cargo build \
-            -p engram-agentd \
-            -p engram-harness-noop \
-            -p engram-harness-claude \
-            -p engram-harness-codex \
-            --target x86_64-unknown-linux-musl \
-            --release
-
-      # Cache the Claude Code CLI binary across CI runs. The
-      # e2e_harness tests download it from
-      # `downloads.claude.ai/claude-code-releases/latest`. Without
-      # caching every CI run pays a ~30s download + the upstream
-      # may rate-limit. Cache key is intentionally fuzzy (`latest`)
-      # since Anthropic's "latest" pointer floats; the test
-      # tolerates whatever version is in the cache and only
-      # re-downloads when the cache misses.
-      - name: Cache Claude Code CLI
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/engram-e2e-harness
-          # Refresh every ~week — gives some staleness so we
-          # eventually pick up new Claude CLI versions, but doesn't
-          # re-download on every run.
-          key: claude-code-cli-${{ github.run_id }}
-          restore-keys: |
-            claude-code-cli-
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          rust-cache-shared-key: fc-unpriv
 
       # Run the `#[ignore]`'d FC integration tests that don't need
-      # root: boot, lifecycle, snapshot, snapshot_uffd, exec_real_vm,
-      # harness_loopback. `--no-fail-fast` so a regression in one test
-      # doesn't hide regressions in others.
-      #
-      # `--test-threads=1` is load-bearing: each test creates its own
-      # `FirecrackerBackend`, whose vsock CID allocator restarts at 3
-      # (CIDs are host-global, so concurrent tests collide and the
-      # second VM hits "connect firecracker.sock: Connection refused"
-      # when it can't bind a CID). Production runs one backend per
-      # host so this isn't an issue there. Booting real microVMs is
-      # heavy enough that serial execution is fine.
+      # root. `--no-fail-fast` so a regression in one test doesn't
+      # hide regressions in others.
       #
       # We name the test binaries explicitly (rather than
       # `--run-ignored ignored-only`) because the root-required
@@ -916,9 +781,33 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=4
-          # ADR 0028 Fix A: the checkpoint-chain pipeline test lives in
-          # engram-host-agent (it exercises PooledBackend), same gating
-          # as the FC tests above (KVM + Docker + musl agentd).
+
+  test-fc-pooled:
+    name: tests (firecracker pooled host-agent, Linux + KVM)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/fc-setup
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          rust-cache-shared-key: fc-pooled
+
+      # ADR 0028 Fix A: the checkpoint-chain pipeline test lives in
+      # engram-host-agent (it exercises PooledBackend), same gating
+      # as the unprivileged FC tests (KVM + musl agentd).
+      #
+      # `--test-threads=1` is load-bearing here: PooledBackend owns
+      # host-global resources (the vsock CID allocator restarting at 3,
+      # the shared chunk store, per-host work dirs), so concurrent
+      # tests collide. Production runs one backend per host, which is
+      # why this isn't an issue there — and why splitting this batch
+      # across CI *jobs* (= separate hosts) is legal while `-jN`
+      # within one job is not.
+      - name: Firecracker `#[ignore]` tests (PooledBackend host-agent)
+        run: |
           cargo nextest run \
             -p engram-host-agent \
             --test checkpoint_chain \
@@ -933,6 +822,19 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
+
+  test-fc-nbd-net:
+    name: tests (firecracker NBD + root net, Linux + KVM)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/fc-setup
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          rust-cache-shared-key: fc-nbd-net
 
       # ADR 0007 Phase 4: NBD daemon serves chunked disks. The
       # `nbd_chunked_disk` integration test boots a real FC microVM
@@ -995,6 +897,9 @@ jobs:
             --test nbd_restore_cancel \
             --test nbd_shutdown_abandon_race \
             --test nbd_shutdown_final_flush \
+            --test nbd_verify_on_read \
+            --test nbd_proc_holder \
+            --test nbd_connected_inventory \
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
@@ -1023,9 +928,9 @@ jobs:
           # `aux_ro_drive` is NOT in this list: it self-isolates (raw FC
           # spawn, per-process tempdir + auto loop device, its own `sudo
           # mount`) and already runs in the unprivileged `--test-threads=4`
-          # batch above, so listing it here too was pure duplication on the
-          # serial path (~4 tests x ~20s). Dropped; ADR 0027 coverage is
-          # unchanged (same tests, still run, just once).
+          # batch (test-fc-unprivileged), so listing it here too was pure
+          # duplication on the serial path (~4 tests x ~20s). Dropped;
+          # ADR 0027 coverage is unchanged (same tests, still run, once).
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
             --test host_startup \
@@ -1038,18 +943,45 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-      # True-e2e tests (engram-host-agent crate): real bake + real
-      # FC microVM + PooledBackend + real proxy + (for harness)
-      # real Claude CLI + real api.anthropic.com 401 round-trip.
-      # These are the highest-fidelity tests we have for the
-      # cold-and-warm path the dashboard's SHELL tab + Claude
-      # harness use in prod.
-      #
-      # They reuse the same `target/` (debug builds, since the host
-      # binaries here don't need musl) and the same Claude CLI
-      # cache as the steps above. Net new runtime ~80s for the
-      # harness pair + ~70s for the shell pair, well within the
-      # existing FC job budget.
+      # Run after either success or failure so cache write doesn't
+      # trip on root-owned files.
+      - name: Restore ownership after sudo tests
+        if: always()
+        run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo ~/.docker 2>/dev/null || true
+
+  test-fc-e2e:
+    name: tests (firecracker true-e2e, Linux + KVM)
+    needs: detect
+    if: needs.detect.outputs.test_fc == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6
+      - uses: ./.github/actions/fc-setup
+        with:
+          gh-token: ${{ secrets.GITHUB_TOKEN }}
+          rust-cache-shared-key: fc-e2e
+
+      # Cache the Claude Code CLI binary across CI runs. The
+      # e2e_harness tests download it from
+      # `downloads.claude.ai/claude-code-releases/latest`. Without
+      # caching every CI run pays a ~30s download + the upstream
+      # may rate-limit. Cache key is intentionally fuzzy (`latest`)
+      # since Anthropic's "latest" pointer floats; the test
+      # tolerates whatever version is in the cache and only
+      # re-downloads when the cache misses.
+      - name: Cache Claude Code CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/engram-e2e-harness
+          # Refresh every ~week — gives some staleness so we
+          # eventually pick up new Claude CLI versions, but doesn't
+          # re-download on every run.
+          key: claude-code-cli-${{ github.run_id }}
+          restore-keys: |
+            claude-code-cli-
+
       # ADR 0064: stage the `browser` squashfs bundle the e2e_vnc test
       # mounts. `just bundles-squashfs` content-addresses every bundle
       # (<sha>.squashfs + current.json) under the repo's var/shared/ — the
@@ -1079,6 +1011,9 @@ jobs:
       # True-e2e tests (engram-host-agent crate): real bake + real
       # FC microVM + PooledBackend + real proxy + (for harness)
       # real Claude CLI + real api.anthropic.com 401 round-trip.
+      # These are the highest-fidelity tests we have for the
+      # cold-and-warm path the dashboard's SHELL tab + Claude
+      # harness use in prod.
       # ADR 0062: the harness is a per-session bundle mounted on dyn_0
       # (no longer baked into the rootfs); the CA rides the
       # `SpawnHarness` vsock RPC (2026-07 core-ops fold).
@@ -1092,8 +1027,9 @@ jobs:
             --run-ignored ignored-only \
             --no-fail-fast \
             --test-threads=1
-        # Run after either success or failure so cache write doesn't
-        # trip on root-owned files.
+
+      # Run after either success or failure so cache write doesn't
+      # trip on root-owned files.
       - name: Restore ownership after sudo tests
         if: always()
         run: |
@@ -1396,8 +1332,7 @@ jobs:
   # ------------------------------------------------------------------
   # Build the release binaries the e2e lane consumes. Separated so the
   # ~3min compile happens once and the e2e job downloads via the
-  # workflow artifact rather than rebuilding. Cache key shares with
-  # `test-firecracker` so deps are warm.
+  # workflow artifact rather than rebuilding.
   # ------------------------------------------------------------------
   artifacts-e2e-stack:
     name: build e2e binaries
@@ -1496,8 +1431,8 @@ jobs:
   # lanes are still independently required via `ci-gate`'s `needs:`, so
   # dropping them here doesn't weaken the overall gate — it just means
   # this lane no longer skips itself as a side effect of an unrelated
-  # lane skipping. `test-firecracker` is intentionally NOT in `needs:`
-  # — it tests the host-agent's PooledBackend in isolation; this lane
+  # lane skipping. The test-fc-* lanes are intentionally NOT in `needs:`
+  # — they test the host-agent's PooledBackend in isolation; this lane
   # tests the coord HTTP → gRPC → host-agent path. Orthogonal coverage;
   # running them in parallel saves ~6min on the critical path on
   # push-to-main and a flaky `proxy_e2e` doesn't suppress e2e-stack
@@ -1532,9 +1467,12 @@ jobs:
             two_hosts: ""
             expect_two_hosts: ""
             # Excludes the two-host evacuation test (the `teleport` variant runs it)
-            # and `e2e_claude_with_bogus_key…` — quarantined per #403 (consistently
-            # times out at 180s); re-add it to the filter when #403 is fixed. The
-            # tests are `#[ignore]`'d, so the filter (not the attribute) is the lever.
+            # and `e2e_claude_with_bogus_key…` — quarantined per #403. The
+            # CLI-version hypothesis is now RULED OUT: an un-quarantine attempt
+            # (2026-07-17, run 29557516643) timed out identically at 180s on the
+            # PINNED 2.1.185 — run_started never arrives after prompt delivery,
+            # so the fault is in the harness spawn/auth path, not a CLI message-
+            # shape drift. Fresh evidence on #403; re-add when actually fixed.
             nextest_filter: "test(/e2e_/) - test(e2e_two_host_evacuate_preserves_sentinel) - test(e2e_claude_with_bogus_key_surfaces_anthropic_auth_error)"
           - variant: teleport
             two_hosts: "1"
@@ -1626,8 +1564,8 @@ jobs:
           # cargo compile on this lane.
           shared-key: workspace-debug
 
-      # Same KVM + UFFD relax pattern test-firecracker uses (lines
-      # 308-312 above). Blacksmith runners ship /dev/kvm but the
+      # Same KVM + UFFD relax pattern the fc-setup composite uses.
+      # Blacksmith runners ship /dev/kvm but the
       # default perms exclude non-root user processes.
       - name: Relax KVM + UFFD permissions
         run: |
@@ -1717,7 +1655,7 @@ jobs:
       # under ENGRAM_SKIP_WEB=1) and the `engrams` CLI both run on bun.
       - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: latest
+          bun-version: 1.3.14
 
       # ADR 0027 → 0035 → 0055 → 0062: the e2e host-agent reads its RO bundles
       # from var/shared (Tiltfile sets ENGRAM_BUNDLE_DIR there), CONTENT-ADDRESSED
@@ -1779,7 +1717,7 @@ jobs:
           # masquerade). The Blacksmith runner doesn't NAT FC TAP
           # traffic to its outbound interface, so guests need to route
           # via the proxy. Mirrors what `e2e_harness.rs` in
-          # test-firecracker already does at the PooledBackend layer.
+          # test-fc-e2e already does at the PooledBackend layer.
           # (Host-b gets a distinct port in the two-host variant; see
           # the Tiltfile.)
           ENGRAM_EGRESS_PROXY_PORT: "14443"
@@ -1907,10 +1845,13 @@ jobs:
         uses: taiki-e/install-action@nextest
       - name: Install entitlements (verify file is well-formed plist)
         run: plutil -lint crates/engram-sandbox-vz/entitlements.plist
-      - name: Build coord + sandbox-vz tests
-        # cargo build --tests produces the binaries under target/debug/deps/
-        # that vz-codesign signs.
-        run: cargo build -p engram-coordinator -p engram-sandbox-vz --tests
+      - name: Build sandbox-vz test binaries (nextest shape)
+        # MUST be `cargo nextest run --no-run` — the same invocation shape the
+        # run steps use, so they reuse these exact binaries and the signatures
+        # below survive. A plain `cargo build -p a -p b --tests` resolves
+        # features differently and nextest would recompile fresh UNSIGNED
+        # binaries after codesign (ADR 0096).
+        run: cargo nextest run -p engram-sandbox-vz --no-run
       - name: Codesign with virtualization entitlement
         run: bash crates/engram-sandbox-vz/scripts/codesign.sh debug
       # `if: always()` from here so one VZ-test step's failure doesn't hide the
@@ -1924,19 +1865,57 @@ jobs:
       #    never boots a VM, but it *does* stat a kernel + rootfs file, skipping
       #    if either is missing — so the pulled kernel + the empty placeholder
       #    below let it actually run.
-      #  - the `e2e_vz_*` smokes DO boot a real VM, so they skip in CI: they need
-      #    a Docker-baked vsock rootfs passed via ENGRAM_VZ_ROOTFS (unset here),
-      #    which the macOS runner can't produce (ADR 0032). Those run locally as
-      #    a `just vz-test` pre-merge gate.
-      - name: Pull VZ kernel (Kata arm64)
+      #  - the `e2e_vz_*` smokes DO boot real VMs. ADR 0096 made them
+      #    self-staging (Docker-free rootfs via mkext4 + `just vz-e2e`), so
+      #    they run HERE whenever the runner's hypervisor is available —
+      #    probed explicitly below, since a hosted macOS runner may itself be
+      #    a VM without nested virtualization. When the probe passes,
+      #    ENGRAM_VZ_REQUIRE=1 turns any leftover preflight SKIP into a hard
+      #    failure (no more skip-and-green); when it fails, the skip is loud
+      #    in the log and `just vz-e2e` is the documented local pre-merge
+      #    gate (ADR 0096 D3).
+      - name: Cache VZ test artifacts (kernel + Alpine minirootfs)
         if: always()
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/engram-vz-test
+          key: vz-test-artifacts-${{ hashFiles('crates/engram-sandbox-vz/scripts/pull-kernel.sh', 'crates/engram-sandbox-vz/scripts/make-test-rootfs.sh') }}
+      - name: Pull VZ kernel (engram arm64 Image, ADR 0096)
+        if: always()
+        # GH_TOKEN: the kernel is a private release asset fetched via `gh`
+        # (same as the FC lane's fetch-fc-test-artifacts step).
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: bash crates/engram-sandbox-vz/scripts/pull-kernel.sh
       - name: Stage rootfs placeholder (for the non-booting config-validation test)
         if: always()
         run: touch /tmp/engram-vz-rootfs.ext4
-      - name: Run ignored VZ tests (config validation runs; e2e_vz smokes skip)
+      - name: Run ignored VZ tests (config validation; e2e_vz runs live below)
         if: always()
-        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast
+        run: cargo nextest run -p engram-sandbox-vz --run-ignored ignored-only --no-fail-fast -E 'not test(e2e_vz)'
+      - name: Probe nested virtualization
+        id: hv
+        if: always()
+        run: |
+          hv="$(sysctl -n kern.hv_support 2>/dev/null || echo 0)"
+          echo "hv=${hv}" >> "$GITHUB_OUTPUT"
+          echo "kern.hv_support=${hv}"
+      - name: Install live-e2e staging deps (just, squashfs-tools, musl cross cc)
+        if: always() && steps.hv.outputs.hv == '1'
+        run: |
+          brew install just squashfs messense/macos-cross-toolchains/aarch64-unknown-linux-musl
+          rustup target add aarch64-unknown-linux-musl
+      - name: Live VZ e2e (just vz-e2e — boots real VMs)
+        if: always() && steps.hv.outputs.hv == '1'
+        env:
+          # .cargo/config.toml names the nix devshell's aarch64-linux-musl-gcc;
+          # the brew tap installs aarch64-unknown-linux-musl-gcc. Env overrides
+          # the config linker for this step only.
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: aarch64-unknown-linux-musl-gcc
+          # vz-e2e depends on pull-kernel (a no-op when the step above
+          # cached it, but `gh` still needs the token on a cache miss).
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: just vz-e2e
       - name: Workspace check (catches downstream-of-VZ regressions)
         if: always()
         run: cargo check --workspace --all-targets
@@ -1966,6 +1945,114 @@ jobs:
   # the merge queue. Instead this gate ALWAYS runs, depends on EVERY lane (Linux +
   # macOS + the e2e stack), and is the one required check: it passes iff each lane
   # succeeded or was skipped, and fails on any `failure`/`cancelled`.
+  # ADR 0098 D7: the deterministic-simulation swarm. Fixed seed ranges
+  # (a CI failure is always locally reproducible: `just sim SEED=<n>`);
+  # the deep-horizon exploration arm is nightly-sim.yml. Runs whenever
+  # the Rust lanes run — the sim's dep closure is the coordinator itself.
+  test-sim:
+    name: simulation swarm (engram-dst)
+    needs: detect
+    if: needs.detect.outputs.test_rust == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release-sim
+      # R3 (#722): faithful hosts are the swarm default now — every seed
+      # exercises the schedulable, digest-gated `candidates_for` path the
+      # coordinator actually runs. `--faithful` is passed explicitly (it is
+      # also the binary default) so the swarm's intent is self-documenting.
+      - name: chaos swarm (200 seeds x 1500 steps, faithful hosts)
+        run: cargo run -p engram-dst --release --bin sim -- --faithful --seeds 0..200 --steps 1500 --profile chaos
+      - name: calm swarm (100 seeds x 1500 steps, faithful hosts)
+        run: cargo run -p engram-dst --release --bin sim -- --faithful --seeds 0..100 --steps 1500 --profile calm
+
+  # ADR 0098 P9: the HOST-INTERNAL deterministic-simulation swarm
+  # (engram-dst-host — Flows A-F over the real host-agent machinery on a
+  # per-run tempdir). Fixed seed windows (a failure is always locally
+  # reproducible: `just sim-host <n> <steps> <profile>`); the deep-horizon
+  # arm is nightly-sim.yml's host-swarm job. Gated on the sim binary's own
+  # release closure (detect's `test_host_sim`), which is disjoint from
+  # engram-dst's coordinator closure by construction.
+  test-host-sim:
+    name: host simulation swarm (engram-dst-host)
+    needs: detect
+    if: needs.detect.outputs.test_host_sim == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-release-host-sim
+      - name: replay-twice determinism self-check (seed 5, chaos)
+        # Two runs of one seed must produce byte-identical per-seed output
+        # (the bin's success lines are a pure function of the seed) — the
+        # cheapest whole-binary guard against a nondeterminism leak
+        # (BTreeMap discipline, entropy stream, paused-clock ordering).
+        run: |
+          cargo run -p engram-dst-host --release --bin sim-host -- --seed 5 --steps 800 --profile chaos > "$RUNNER_TEMP/replay-a.txt"
+          cargo run -p engram-dst-host --release --bin sim-host -- --seed 5 --steps 800 --profile chaos > "$RUNNER_TEMP/replay-b.txt"
+          diff "$RUNNER_TEMP/replay-a.txt" "$RUNNER_TEMP/replay-b.txt"
+      - name: chaos swarm (60 seeds x 1000 steps)
+        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds 0..60 --steps 1000 --profile chaos
+      - name: calm swarm (30 seeds x 1000 steps)
+        run: cargo run -p engram-dst-host --release --bin sim-host -- --seeds 0..30 --steps 1000 --profile calm
+
+  # ADR 0098 R-CoSim (rung 1): the coordinator↔host BOUNDARY simulator
+  # (engram-dst-cosim). Unlike test-sim / test-host-sim (swarm binaries over
+  # disjoint closures), this is a small set of DIRECTED pinned-seed scenarios
+  # — the real coordinator drivers and the real host-agent flows co-simulated
+  # over one shared clock — so it runs as `nextest`, not a swarm bin. Gated on
+  # the crate's own (deliberately spanning) release closure (detect's
+  # `test_cosim`).
+  test-cosim:
+    name: boundary simulation (engram-dst-cosim)
+    needs: detect
+    if: needs.detect.outputs.test_cosim == 'true'
+    runs-on: blacksmith-4vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install protoc
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends protobuf-compiler
+      - name: Setup mold linker
+        uses: rui314/setup-mold@v1
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: workspace-cosim
+      - name: Install nextest
+        uses: taiki-e/install-action@nextest
+      - name: directed boundary scenarios
+        run: cargo nextest run -p engram-dst-cosim
+      # The seeded boundary swarm (rung 2, #784). Sized honestly for the
+      # two-sided (coordinator + host) cost: a 40-seed x 600-step window in each
+      # profile measures ~1.2s/window locally (per-seed ~29ms), well under 5
+      # min even with the release build. The wide/deep windows run nightly
+      # (nightly-sim.yml `cosim-swarm`); this fixed window replays the same
+      # territory on every PR. Reproduce a failure locally with the printed
+      # replay line.
+      - name: chaos swarm (0..40 x 600)
+        run: cargo run -p engram-dst-cosim --release --bin sim-cosim -- --seeds 0..40 --steps 600 --profile chaos
+      - name: calm swarm (0..40 x 600)
+        run: cargo run -p engram-dst-cosim --release --bin sim-cosim -- --seeds 0..40 --steps 600 --profile calm
+
   ci-gate:
     name: CI Gate
     if: always()
@@ -1978,9 +2065,15 @@ jobs:
       - orchestrator
       - cli
       - buf
-      - test-firecracker
+      - test-fc-unprivileged
+      - test-fc-pooled
+      - test-fc-nbd-net
+      - test-fc-e2e
       - vz
       - test-macos
+      - test-sim
+      - test-host-sim
+      - test-cosim
       # The end-to-end coord lane + its upstream bake/artifact deps. Previously
       # omitted (e2e was non-required), which let a red e2e merge — now gated.
       - bake-harness-claude-artifact

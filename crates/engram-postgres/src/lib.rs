@@ -7,8 +7,11 @@
 //! `query!`/`query_as!` once CI provisions a Postgres service and we
 //! ship a `.sqlx/` cache.
 
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use engram_core::traits::clock::{Clock, Entropy, OsEntropy, SystemClock};
 use engram_core::traits::{
     CreateDisposition, DisableEnabledImageOutcome, MetadataStore, SessionCreateWriteSet,
 };
@@ -30,6 +33,16 @@ mod row;
 #[derive(Clone)]
 pub struct PostgresStore {
     pool: PgPool,
+    /// Time source (ADR 0098 D3). Every SQL `now()` in this crate became a
+    /// bind parameter fed from this clock, and every Rust-side wall-clock
+    /// read (`Utc::now()`) reads it too — so no time decision originates
+    /// inside Postgres and live-PG tests are time-controllable.
+    clock: Arc<dyn Clock>,
+    /// Entropy source (ADR 0098 D1/D3). The prod id-minting paths
+    /// (`create_session`, enable/capture job inserts) draw their `Uuid`s
+    /// here rather than calling `Uuid::new_v4()` directly, so the D4
+    /// conformance suite can seed them to match `SimMetadataStore`.
+    entropy: Arc<dyn Entropy>,
 }
 
 impl PostgresStore {
@@ -64,11 +77,35 @@ impl PostgresStore {
                 Err(e) => return Err(MetaError::Db(Box::new(e))),
             }
         };
-        Ok(Self { pool })
+        Ok(Self {
+            pool,
+            clock: Arc::new(SystemClock::new()),
+            entropy: Arc::new(OsEntropy),
+        })
     }
 
     pub fn from_pool(pool: PgPool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            clock: Arc::new(SystemClock::new()),
+            entropy: Arc::new(OsEntropy),
+        }
+    }
+
+    /// Inject a [`Clock`] (ADR 0098 D3/D4). Production takes the default
+    /// [`SystemClock`]; the D4 conformance suite and time-controlled
+    /// live-PG tests pass a fake so SQL-bound time is deterministic.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
+    /// Inject an [`Entropy`] (ADR 0098 D3/D4). Production takes the
+    /// default [`OsEntropy`]; the D4 conformance suite seeds it so the
+    /// ids this store mints replay to match `SimMetadataStore`.
+    pub fn with_entropy(mut self, entropy: Arc<dyn Entropy>) -> Self {
+        self.entropy = entropy;
+        self
     }
 
     pub fn pool(&self) -> &PgPool {
@@ -161,6 +198,7 @@ impl PostgresStore {
         idempotency_key: Option<&str>,
         claimed_by: Option<&str>,
     ) -> Result<EnqueueOutcome, MetaError> {
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // ON CONFLICT must name the partial-unique's predicate to arbitrate
         // on `session_ops_idem`; a NULL key row is never indexed, so it
@@ -226,7 +264,7 @@ impl PostgresStore {
             let stamp = format!(
                 "UPDATE session_ops
                     SET state = 'running', epoch = $2, claimed_by = $3,
-                        claimed_at = now(), heartbeat_at = now(),
+                        claimed_at = $4, heartbeat_at = $4,
                         attempts = attempts + 1
                   WHERE id = $1 AND state = 'queued'
                  RETURNING {OP_COLUMNS}"
@@ -235,6 +273,7 @@ impl PostgresStore {
                 .bind(op.id)
                 .bind(epoch)
                 .bind(claimant)
+                .bind(now)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -553,16 +592,18 @@ async fn pick_host_2d(
             WHERE host_id = ANY($1)
               AND status IN ('pending','created','active','unreachable',
                              'evacuating','evicting')
-              -- A `pending` row older than 10 min is a crash-orphaned
-              -- reservation (a boot never takes that long); don't let it
-              -- leak into the reserved figure and false-reject the host.
-              -- ADR 0048: gate on last_active_at, not created_at — a
-              -- session can sit `queued` for many minutes before
-              -- `place_queued_session` flips it to `pending` (bumping
-              -- last_active_at), and an old created_at would make that
-              -- fresh reservation look crash-orphaned and leak
-              -- (overcommit). reserve_and_persist_create sets both to NOW().
-              AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+              -- R3 (#722): ONE reservation authority — a `pending` pinned to
+              -- a host reserves its budget UNCONDITIONALLY, for exactly as
+              -- long as it is `pending`. No wall-age / live-op exclusion: an
+              -- aged crash-orphan physically holds its slot until it LEAVES
+              -- the reserving state, and the ADR 0079 pending-orphan backstop
+              -- reclaims it by a REAL `pending → failed` transition (the sole
+              -- reclaimer) — never by a placement-side exclusion. The old
+              -- 10-minute crash-orphan gate stopped counting an aged pending
+              -- while the backstop could still revive it, so a revival landed
+              -- on re-sold capacity (Σ reserved > allocatable). This predicate
+              -- now equals the unconditional placement-accounting oracle by
+              -- construction (engram-dst invariants.rs).
             UNION ALL
             -- ADR 0084 (c): a capture VM reserves like a session. The
             -- reservation lives on `capture_jobs` now (moved off
@@ -809,6 +850,7 @@ impl PostgresStore {
         // pin set before the row committed would miss the snapshot's
         // chunks; with the bump, the sweep's post-collection
         // generation read catches the divergence and restarts.
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // ADR 0079 (re-review findings #3/#4): the optional fence. When
         // `Some(epoch)`, gate the write on the session's `current_epoch`
@@ -868,7 +910,7 @@ impl PostgresStore {
                 -- eviction pipeline already stamped) must not blank out
                 -- an already-known capture-time FC snapshot version.
                 fc_snapshot_version     = COALESCE(EXCLUDED.fc_snapshot_version, snapshots.fc_snapshot_version),
-                updated_at              = NOW()
+                updated_at              = $16
             RETURNING (xmax = 0) AS inserted
             "#,
         )
@@ -890,6 +932,7 @@ impl PostgresStore {
         )
         .bind(snap.events_cursor)
         .bind(&snap.fc_snapshot_version)
+        .bind(now)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -972,8 +1015,8 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn create_session(&self, spec: SessionSpec) -> Result<SessionId, MetaError> {
-        let id = Uuid::new_v4();
-        let now = Utc::now();
+        let id = self.entropy.uuid();
+        let now = self.clock.now_utc();
         // ADR 0021 P1.3: `mode` is a flat text column now (migration
         // 0039); `SessionMode::as_str` renders the CHECK-valid value.
         let mode_text = spec.mode.as_str();
@@ -1015,12 +1058,13 @@ impl MetadataStore for PostgresStore {
         let res = sqlx::query(
             r#"
             UPDATE sessions
-               SET status = 'created', sandbox_id = $2, last_active_at = NOW()
+               SET status = 'created', sandbox_id = $2, last_active_at = $3
              WHERE id = $1 AND status = 'pending'
             "#,
         )
         .bind(session_id.as_uuid())
         .bind(sandbox_id.as_uuid())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1036,6 +1080,7 @@ impl MetadataStore for PostgresStore {
         candidates: &[HostId],
         affinity_len: usize,
     ) -> Result<CreateDisposition, MetaError> {
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
         // -------- pick a host (ADR 0046/0048 best-fit 2D), if any candidate --------
@@ -1060,7 +1105,6 @@ impl MetadataStore for PostgresStore {
         )
         .await?;
 
-        let now = Utc::now();
         let disposition = match picked {
             Some(host) => {
                 sqlx::query(
@@ -1136,13 +1180,14 @@ impl MetadataStore for PostgresStore {
             sqlx::query(
                 r#"
                 INSERT INTO session_runtime_specs (session_id, spec, updated_at)
-                VALUES ($1, $2, NOW())
+                VALUES ($1, $2, $3)
                 ON CONFLICT (session_id) DO UPDATE
-                  SET spec = EXCLUDED.spec, updated_at = NOW()
+                  SET spec = EXCLUDED.spec, updated_at = $3
                 "#,
             )
             .bind(ws.session_id.as_uuid())
             .bind(spec_json)
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -1230,11 +1275,12 @@ impl MetadataStore for PostgresStore {
         sqlx::query(
             "UPDATE sessions \
              SET teleport_target_host_id = $2, \
-                 teleport_target_set_at = CASE WHEN $2 IS NULL THEN NULL ELSE NOW() END \
+                 teleport_target_set_at = CASE WHEN $2 IS NULL THEN NULL ELSE $3 END \
              WHERE id = $1",
         )
         .bind(id.as_uuid())
         .bind(target.map(|h| h.as_uuid()))
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1331,13 +1377,13 @@ impl MetadataStore for PostgresStore {
         ) = sqlx::query_as(
             r#"
             INSERT INTO org_secrets (name, wrapped_dek, nonce, ciphertext, key_id, updated_at)
-            VALUES ($1, $2, $3, $4, $5, now())
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (name) DO UPDATE SET
                 wrapped_dek = EXCLUDED.wrapped_dek,
                 nonce       = EXCLUDED.nonce,
                 ciphertext  = EXCLUDED.ciphertext,
                 key_id      = EXCLUDED.key_id,
-                updated_at  = now()
+                updated_at  = $6
             RETURNING name, key_id, created_at, updated_at
             "#,
         )
@@ -1346,6 +1392,7 @@ impl MetadataStore for PostgresStore {
         .bind(&sealed.nonce)
         .bind(&sealed.ciphertext)
         .bind(&sealed.key_id)
+        .bind(self.clock.now_utc())
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)?;
@@ -1489,13 +1536,14 @@ impl MetadataStore for PostgresStore {
         let n = sqlx::query(
             r#"
             UPDATE sessions
-               SET status = 'queued', queued_at = NOW(), queue_origin = 'resume',
-                   last_active_at = NOW()
+               SET status = 'queued', queued_at = $3, queue_origin = 'resume',
+                   last_active_at = $3
              WHERE id = $1 AND status = 'idle' AND current_epoch = $2
             "#,
         )
         .bind(id.as_uuid())
         .bind(epoch)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -1509,6 +1557,41 @@ impl MetadataStore for PostgresStore {
             // advanced the row) has nothing new for the scanner to place;
             // waking every replica's scanner into a full sweep for it is
             // pure overhead.
+            self.notify_placement_changed("enqueued").await;
+        }
+        Ok(n > 0)
+    }
+
+    async fn enqueue_evacuating_session_resume(
+        &self,
+        id: SessionId,
+        epoch: i64,
+    ) -> Result<bool, MetaError> {
+        // #800: Evacuating → queued (resume origin), the RESERVED
+        // evac-placement overflow path. Same fenced-CAS shape as
+        // `enqueue_session_resume` above, but gated on `status='evacuating'`
+        // (the evac resumer's input state) instead of `'idle'`. The row
+        // keeps its `mem_budget_mib` / `cpu_budget_vcpus` from create, so
+        // the queue scanner's resume precheck fits it against the SAME hard
+        // 2D bound. A no-op (0 rows) means a peer already relocated the
+        // session or the epoch moved — the caller stops without emitting the
+        // Queued event.
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'queued', queued_at = $3, queue_origin = 'resume',
+                   last_active_at = $3
+             WHERE id = $1 AND status = 'evacuating' AND current_epoch = $2
+            "#,
+        )
+        .bind(id.as_uuid())
+        .bind(epoch)
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n > 0 {
             self.notify_placement_changed("enqueued").await;
         }
         Ok(n > 0)
@@ -1548,6 +1631,7 @@ impl MetadataStore for PostgresStore {
             return Ok(None);
         }
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Same FOR UPDATE serialization + 2D fit as every reserving placer
         // (shared `pick_host_2d`, ADR 0046/0048/0081).
@@ -1568,12 +1652,13 @@ impl MetadataStore for PostgresStore {
         let n = sqlx::query(
             r#"
             UPDATE sessions
-               SET status = 'pending', host_id = $2, last_active_at = NOW()
+               SET status = 'pending', host_id = $2, last_active_at = $3
              WHERE id = $1 AND status = 'queued'
             "#,
         )
         .bind(id.as_uuid())
         .bind(picked)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?
@@ -1629,9 +1714,10 @@ impl MetadataStore for PostgresStore {
         MetaError,
     > {
         // Same predicate as `pick_host_2d` / `fleet_free_mib` — the
-        // memory-reserving states, with crash-orphaned `pending` rows
-        // excluded, UNION the capturing enable jobs (ADR 0081) — summing
-        // BOTH budget dimensions (ADR 0048).
+        // memory-reserving states (R3 #722: a `pending` reserves
+        // UNCONDITIONALLY until it leaves that state; no crash-orphan gate),
+        // UNION the capturing enable jobs (ADR 0081) — summing BOTH budget
+        // dimensions (ADR 0048).
         let rows: Vec<(uuid::Uuid, i64, i64)> = sqlx::query_as(
             r#"
             SELECT host_id,
@@ -1643,12 +1729,6 @@ impl MetadataStore for PostgresStore {
                 WHERE host_id IS NOT NULL
                   AND status IN ('pending','created','active','unreachable',
                                  'evacuating','evicting')
-                  -- ADR 0048: gate on last_active_at, not created_at — a session
-                  -- can sit `queued` for many minutes before `place_queued_session`
-                  -- flips it to `pending` (bumping last_active_at), and an old
-                  -- created_at would make that fresh reservation look crash-orphaned
-                  -- and leak (overcommit). reserve_and_persist_create sets both to NOW().
-                  AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
                 UNION ALL
                 -- ADR 0084 (c): capturing VMs reserve on `capture_jobs`.
                 SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
@@ -1735,8 +1815,9 @@ impl MetadataStore for PostgresStore {
 
     /// Diagnostic twin of `pick_host_2d`, without the `FOR UPDATE`: same
     /// fit-map construction (same status/cordon predicate, same reserved
-    /// SUM incl. capture jobs and the 10-min crash-orphan gate), then the
-    /// pure [`classify_no_fit`]. Runs only on the no-capacity path.
+    /// SUM incl. capture jobs — R3 #722: a `pending` reserves
+    /// unconditionally, no crash-orphan gate), then the pure
+    /// [`classify_no_fit`]. Runs only on the no-capacity path.
     async fn placement_no_fit_details(
         &self,
         candidates: &[HostId],
@@ -1787,7 +1868,13 @@ impl MetadataStore for PostgresStore {
                 WHERE host_id = ANY($1)
                   AND status IN ('pending','created','active','unreachable',
                                  'evacuating','evicting')
-                  AND (status <> 'pending' OR last_active_at > NOW() - INTERVAL '10 minutes')
+                  -- R3 (#722): a `pending` reserves UNCONDITIONALLY until it
+                  -- leaves the reserving state — no wall-age / live-op gate.
+                  -- The ADR 0079 backstop reclaims a true crash-orphan by a
+                  -- real `pending → failed` transition (the sole reclaimer),
+                  -- so placement never re-sells a slot a revival could reclaim
+                  -- (Σ reserved > allocatable). Matches the unconditional
+                  -- placement-accounting oracle by construction.
                 UNION ALL
                 SELECT host_id, mem_budget_mib, cpu_budget_vcpus::BIGINT
                 FROM capture_jobs
@@ -1853,7 +1940,7 @@ impl MetadataStore for PostgresStore {
     /// manifest server-side (newer of live + latest recoverable
     /// snapshot). Avoids the N+1 query the trait default would
     /// produce.
-    async fn list_active_sandboxes_on_host_with_disk_manifest(
+    async fn list_resident_sandboxes_on_host_with_disk_manifest(
         &self,
         host_id: HostId,
     ) -> Result<
@@ -1866,11 +1953,21 @@ impl MetadataStore for PostgresStore {
     > {
         // CTE picks the LATEST recoverable snapshot per session
         // (one row per session_id, ordered by created_at DESC).
-        // The outer SELECT joins it with the active-on-host
-        // sessions and picks max(live, snapshot) version when both
-        // share the same manifest_id; if they differ, snapshot
+        // The outer SELECT joins it with the VM-resident sessions
+        // on this host and picks max(live, snapshot) version when
+        // both share the same manifest_id; if they differ, snapshot
         // wins (mirrors `effective_resume_disk_manifest`'s
         // defensive branch).
+        //
+        // The status list is the SQL twin of
+        // `SessionState::host_memory_reserving_states()`: every
+        // state whose VM is resident on the host, not just
+        // 'active'. A rung-parked 'evicting' session's paused VM
+        // survives a host-agent pod roll like any other survivor;
+        // filtering it out here left its NBD device unclaimed after
+        // the roll — the successor's stale-binding sweep shot the
+        // live rootfs and the un-pause resumed the guest onto a
+        // dead data plane (session 731df805, 2026-07-17).
         let rows = sqlx::query(
             r#"
             WITH latest_snap AS (
@@ -1893,7 +1990,8 @@ impl MetadataStore for PostgresStore {
             FROM sessions s
             LEFT JOIN latest_snap ls ON ls.session_id = s.id
             WHERE s.host_id    = $1
-              AND s.status     = 'active'
+              AND s.status IN ('pending','created','active','unreachable',
+                               'evacuating','evicting')
               AND s.sandbox_id IS NOT NULL
             "#,
         )
@@ -2110,19 +2208,33 @@ impl MetadataStore for PostgresStore {
         // clean. ADR 0034 mirrors this for Evicting/`evict_attempts`.
         // Folded into the same UPDATE that commits the state flip so
         // the counters and the state are always consistent.
+        //
+        // Entering Queued stamps the queue columns (ADR 0098 D4
+        // conformance finding): a bare `transition_session(_, Queued)`
+        // is FSM-legal but used to leave `queued_at`/`queue_origin`
+        // NULL, and `list_queued_sessions_fifo` then failed to DECODE
+        // the row — a scanner-breaking landmine for any future caller.
+        // `queued_at` re-stamps (a fresh enqueue moment is what FIFO
+        // wants); `queue_origin` keeps an existing origin and defaults
+        // to 'create' otherwise.
         sqlx::query(
             r#"
             UPDATE sessions
                SET status = $2,
-                   last_active_at = NOW(),
-                   updated_at = NOW(),
+                   last_active_at = $3,
+                   updated_at = $3,
                    evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
-                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
+                   queued_at = CASE WHEN $2 = 'queued' THEN $3 ELSE queued_at END,
+                   queue_origin = CASE WHEN $2 = 'queued'
+                                  THEN COALESCE(queue_origin, 'create')
+                                  ELSE queue_origin END
              WHERE id = $1
             "#,
         )
         .bind(id.as_uuid())
         .bind(target.as_str())
+        .bind(self.clock.now_utc())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -2164,6 +2276,28 @@ impl MetadataStore for PostgresStore {
                 .try_get("evac_attempts")
                 .map_err(|e| MetaError::Serialization(format!("evac_attempts: {e}")))?;
             out.push((session, attempts.max(0) as u32));
+        }
+        Ok(out)
+    }
+
+    async fn list_host_lost_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, status, host_id, sandbox_id,
+                   image_uri, mode,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   evac_attempts
+            FROM sessions
+            WHERE status = 'host_lost'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in &rows {
+            out.push(row::session_from_row(r)?);
         }
         Ok(out)
     }
@@ -2220,6 +2354,62 @@ impl MetadataStore for PostgresStore {
             out.push((session, attempts.max(0) as u32));
         }
         Ok(out)
+    }
+
+    /// ADR 0101 C: parked-session sweep, via the partial
+    /// `idx_sessions_parked` (0107).
+    async fn list_parked_sessions(&self) -> Result<Vec<Session>, MetaError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, status, host_id, sandbox_id,
+                   image_uri, mode,
+                   created_at, last_active_at,
+                   live_disk_manifest_id, live_disk_manifest_version,
+                   park_rung, parked_at,
+                   evict_attempts
+            FROM sessions
+            WHERE status = 'parked'
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?;
+        rows.iter().map(row::session_from_row).collect()
+    }
+
+    /// ADR 0101 C: the durability-floor settle. One guarded UPDATE —
+    /// the status CAS, the sandbox match, and the recoverable-row
+    /// EXISTS all evaluate in the same statement, so a racing resume,
+    /// rebind, or delete makes this a clean no-op (`false`), never a
+    /// partial write. `host_id` is untouched (resume affinity);
+    /// `last_active_at` is untouched (it keys the eviction nomination).
+    async fn settle_evicted_session_idle(
+        &self,
+        session_id: SessionId,
+        sandbox_id: SandboxId,
+        snapshot_id: SnapshotId,
+    ) -> Result<bool, MetaError> {
+        let res = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = 'idle', sandbox_id = NULL, updated_at = $4
+             WHERE id = $1
+               AND status = 'evicting'
+               AND sandbox_id = $2
+               AND EXISTS (
+                   SELECT 1 FROM snapshots
+                    WHERE id = $3 AND session_id = $1 AND recoverable
+               )
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(sandbox_id.as_uuid())
+        .bind(snapshot_id.as_uuid())
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected() == 1)
     }
 
     /// ADR 0034: atomic `+= 1 RETURNING`. The eviction scanner calls
@@ -2381,10 +2571,11 @@ impl MetadataStore for PostgresStore {
             WHERE s.status = 'active' AND s.sandbox_id IS NOT NULL
             GROUP BY s.id, s.sandbox_id, s.created_at
             HAVING COALESCE(MAX(e.created_at), s.created_at)
-                   < NOW() - ($1::bigint * INTERVAL '1 second')
+                   < $2 - ($1::bigint * INTERVAL '1 second')
             "#,
         )
         .bind(idle_for_secs)
+        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2420,12 +2611,13 @@ impl MetadataStore for PostgresStore {
         // consecutive and must not bleed into the new binding's grace.
         let n = sqlx::query(
             r#"
-            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = NOW() WHERE id = $1
+            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = $4 WHERE id = $1
             "#,
         )
         .bind(id.as_uuid())
         .bind(host_id.as_uuid())
         .bind(sandbox_id.as_uuid())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2443,11 +2635,12 @@ impl MetadataStore for PostgresStore {
     ) -> Result<(), MetaError> {
         let n = sqlx::query(
             r#"
-            UPDATE sessions SET host_id = $2, updated_at = NOW() WHERE id = $1
+            UPDATE sessions SET host_id = $2, updated_at = $3 WHERE id = $1
             "#,
         )
         .bind(id.as_uuid())
         .bind(host_id.map(|h| h.as_uuid()))
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2486,11 +2679,115 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn append_session_event_and_outbox(
+        &self,
+        session_id: SessionId,
+        kind: &str,
+        payload: serde_json::Value,
+        outbox: &engram_core::types::outbox::OutboxRow,
+    ) -> Result<i64, MetaError> {
+        if outbox.session_id != session_id {
+            return Err(MetaError::Serialization(
+                "event/outbox session ids do not match".into(),
+            ));
+        }
+
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO session_outbox
+                (prompt_id, session_id, kind, payload, created_at, not_before)
+            VALUES ($1, $2, $3, $4, $5, $6)
+            ON CONFLICT (prompt_id) DO NOTHING
+            RETURNING prompt_id
+            "#,
+        )
+        .bind(&outbox.prompt_id)
+        .bind(session_id.as_uuid())
+        .bind(outbox.kind.as_str())
+        .bind(&outbox.payload)
+        .bind(outbox.created_at)
+        .bind(outbox.not_before)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .is_some();
+
+        if !inserted {
+            let existing = sqlx::query(
+                "SELECT session_id, kind, payload FROM session_outbox WHERE prompt_id = $1",
+            )
+            .bind(&outbox.prompt_id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(db_err)?
+            .ok_or_else(|| {
+                MetaError::Conflict(format!(
+                    "outbox id {} disappeared during completion",
+                    outbox.prompt_id
+                ))
+            })?;
+            let existing_session: uuid::Uuid = existing.try_get("session_id").map_err(db_err)?;
+            let existing_kind: String = existing.try_get("kind").map_err(db_err)?;
+            let existing_payload: serde_json::Value =
+                existing.try_get("payload").map_err(db_err)?;
+            if existing_session != session_id.as_uuid()
+                || existing_kind != outbox.kind.as_str()
+                || existing_payload != outbox.payload
+            {
+                return Err(MetaError::Conflict(format!(
+                    "outbox id {} belongs to another command",
+                    outbox.prompt_id
+                )));
+            }
+        }
+
+        let event = sqlx::query(
+            r#"
+            WITH next AS (
+                UPDATE sessions
+                   SET next_event_idx = next_event_idx + 1,
+                       updated_at = $4,
+                       last_event_at = $4
+                 WHERE id = $1
+             RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
+            ),
+            inserted AS (
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch, $4 FROM next
+                RETURNING idx
+            )
+            SELECT idx FROM inserted
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind)
+        .bind(payload)
+        .bind(self.clock.now_utc())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
+        let idx: i64 = event.try_get("idx").map_err(db_err)?;
+
+        sqlx::query("SELECT pg_notify('session_events', $1), pg_notify('session_outbox', $2)")
+            .bind(
+                serde_json::json!({ "session_id": session_id.to_string(), "idx": idx }).to_string(),
+            )
+            .bind(session_id.to_string())
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+        tx.commit().await.map_err(db_err)?;
+        Ok(idx)
+    }
+
     async fn outbox_due_sessions(&self) -> Result<Vec<SessionId>, MetaError> {
         let rows = sqlx::query(
             "SELECT DISTINCT session_id FROM session_outbox
-             WHERE acked_at IS NULL AND not_before <= now()",
+             WHERE acked_at IS NULL AND not_before <= $1",
         )
+        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2510,11 +2807,12 @@ impl MetadataStore for PostgresStore {
             "SELECT prompt_id, session_id, kind, payload, created_at, attempts,
                     not_before, delivered_at, acked_at
              FROM session_outbox
-             WHERE session_id = $1 AND acked_at IS NULL AND not_before <= now()
+             WHERE session_id = $1 AND acked_at IS NULL AND not_before <= $2
              ORDER BY created_at ASC
              LIMIT 1",
         )
         .bind(session_id.as_uuid())
+        .bind(self.clock.now_utc())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2528,13 +2826,14 @@ impl MetadataStore for PostgresStore {
     ) -> Result<(), MetaError> {
         sqlx::query(
             "UPDATE session_outbox
-             SET delivered_at = now(),
+             SET delivered_at = $3,
                  attempts = attempts + 1,
-                 not_before = now() + make_interval(secs => $2)
+                 not_before = $3 + make_interval(secs => $2)
              WHERE prompt_id = $1 AND acked_at IS NULL",
         )
         .bind(prompt_id)
         .bind(ack_timeout.as_secs_f64())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2553,12 +2852,13 @@ impl MetadataStore for PostgresStore {
         // backoff forever and read as attempts=0 in every investigation.)
         sqlx::query(
             "UPDATE session_outbox
-             SET not_before = now() + make_interval(secs => $2),
+             SET not_before = $3 + make_interval(secs => $2),
                  attempts = attempts + 1
              WHERE prompt_id = $1 AND acked_at IS NULL",
         )
         .bind(prompt_id)
         .bind(delay.as_secs_f64())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2567,10 +2867,11 @@ impl MetadataStore for PostgresStore {
 
     async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
         let res = sqlx::query(
-            "UPDATE session_outbox SET acked_at = now()
+            "UPDATE session_outbox SET acked_at = $2
              WHERE prompt_id = $1 AND acked_at IS NULL",
         )
         .bind(prompt_id)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -2675,13 +2976,15 @@ impl MetadataStore for PostgresStore {
         // new host is strike 3, dismantling a healthy VM). The strike
         // column is keyed by session id alone, so re-keying the
         // sandbox must explicitly clear it here.
+        let now = self.clock.now_utc();
         let n = if sandbox_id.is_some() {
             sqlx::query(
-                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = NOW() \
+                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3 \
                  WHERE id = $1",
             )
             .bind(id.as_uuid())
             .bind(sandbox_id.map(|s| s.as_uuid()))
+            .bind(now)
             .execute(&self.pool)
             .await
             .map_err(db_err)?
@@ -2698,10 +3001,11 @@ impl MetadataStore for PostgresStore {
                         live_disk_manifest_id      = NULL,
                         live_disk_manifest_version = NULL,
                         live_disk_manifest_at      = NULL,
-                        updated_at                 = NOW()
+                        updated_at                 = $2
                   WHERE id = $1",
             )
             .bind(id.as_uuid())
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?
@@ -2755,6 +3059,7 @@ impl MetadataStore for PostgresStore {
             .map(|s| s.as_str().to_string())
             .collect();
         let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
+        let now = self.clock.now_utc();
 
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Lock + verify the row under the guard. SELECT ... FOR UPDATE so
@@ -2788,11 +3093,12 @@ impl MetadataStore for PostgresStore {
         // breaks the reconcile strike streak's consecutiveness.
         if sandbox_id.is_some() {
             sqlx::query(
-                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = NOW() \
+                "UPDATE sessions SET sandbox_id = $2, missing_strikes = 0, updated_at = $3 \
                  WHERE id = $1",
             )
             .bind(id.as_uuid())
             .bind(sandbox_id.map(|s| s.as_uuid()))
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -2804,10 +3110,11 @@ impl MetadataStore for PostgresStore {
                         live_disk_manifest_id      = NULL,
                         live_disk_manifest_version = NULL,
                         live_disk_manifest_at      = NULL,
-                        updated_at                 = NOW()
+                        updated_at                 = $2
                   WHERE id = $1",
             )
             .bind(id.as_uuid())
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?
@@ -2839,7 +3146,7 @@ impl MetadataStore for PostgresStore {
         let expected_uuid = expected_current.map(|o| o.map(|s| s.as_uuid()));
         let n = sqlx::query(
             r#"
-            UPDATE sessions SET host_id = $2, updated_at = NOW()
+            UPDATE sessions SET host_id = $2, updated_at = $6
             WHERE id = $1
               AND ($3::text[] IS NULL OR status = ANY($3))
               AND ($4::boolean IS FALSE OR sandbox_id IS NOT DISTINCT FROM $5)
@@ -2854,6 +3161,7 @@ impl MetadataStore for PostgresStore {
         })
         .bind(expected_uuid.is_some())
         .bind(expected_uuid.flatten())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2881,7 +3189,7 @@ impl MetadataStore for PostgresStore {
         // reconcile strike streak (see `assign_session_sandbox`).
         let n = sqlx::query(
             r#"
-            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = NOW()
+            UPDATE sessions SET host_id = $2, sandbox_id = $3, missing_strikes = 0, updated_at = $7
             WHERE id = $1
               AND ($4::text[] IS NULL OR status = ANY($4))
               AND ($5::boolean IS FALSE OR sandbox_id IS NOT DISTINCT FROM $6)
@@ -2897,6 +3205,7 @@ impl MetadataStore for PostgresStore {
         })
         .bind(expected_uuid.is_some())
         .bind(expected_uuid.flatten())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -2953,7 +3262,7 @@ impl MetadataStore for PostgresStore {
                                running_sandboxes_count,
                                last_heartbeat_at, status, host_addr,
                                capabilities, created_at)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, NOW())
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT (id) DO UPDATE SET
                 hostname                = EXCLUDED.hostname,
                 cloud_metadata          = EXCLUDED.cloud_metadata,
@@ -2966,7 +3275,7 @@ impl MetadataStore for PostgresStore {
                 status                  = EXCLUDED.status,
                 host_addr               = COALESCE(EXCLUDED.host_addr, hosts.host_addr),
                 capabilities            = EXCLUDED.capabilities,
-                updated_at              = NOW()
+                updated_at              = $13
             "#,
         )
         .bind(host.id.as_uuid())
@@ -2981,6 +3290,7 @@ impl MetadataStore for PostgresStore {
         .bind(host.status.as_str())
         .bind(host.host_addr.as_deref())
         .bind(capabilities)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3021,9 +3331,10 @@ impl MetadataStore for PostgresStore {
     }
 
     async fn set_host_status(&self, id: HostId, status: HostStatus) -> Result<(), MetaError> {
-        let n = sqlx::query(r#"UPDATE hosts SET status = $2, updated_at = NOW() WHERE id = $1"#)
+        let n = sqlx::query(r#"UPDATE hosts SET status = $2, updated_at = $3 WHERE id = $1"#)
             .bind(id.as_uuid())
             .bind(status.as_str())
+            .bind(self.clock.now_utc())
             .execute(&self.pool)
             .await
             .map_err(db_err)?
@@ -3087,8 +3398,8 @@ impl MetadataStore for PostgresStore {
                       util_running_pss_mib = $18,
                       capabilities = $19,
                       stages_images = $20,
-                      last_heartbeat_at = NOW(),
-                      updated_at = NOW()
+                      last_heartbeat_at = $21,
+                      updated_at = $21
                 WHERE id = $1"#,
         )
         .bind(id.as_uuid())
@@ -3113,6 +3424,7 @@ impl MetadataStore for PostgresStore {
         .bind(hb.utilization.running_pss_mib as i64)
         .bind(capabilities)
         .bind(hb.stages_images)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?
@@ -3126,9 +3438,10 @@ impl MetadataStore for PostgresStore {
     async fn set_host_cordoned(&self, id: HostId, cordoned: bool) -> Result<(), MetaError> {
         // ADR 0047: the coordinator-owned cordon bit. Heartbeats never
         // write this column, so the flip sticks until explicit uncordon.
-        let n = sqlx::query(r#"UPDATE hosts SET cordoned = $2, updated_at = NOW() WHERE id = $1"#)
+        let n = sqlx::query(r#"UPDATE hosts SET cordoned = $2, updated_at = $3 WHERE id = $1"#)
             .bind(id.as_uuid())
             .bind(cordoned)
+            .bind(self.clock.now_utc())
             .execute(&self.pool)
             .await
             .map_err(db_err)?
@@ -3175,12 +3488,13 @@ impl MetadataStore for PostgresStore {
              WHERE status = 'ready'
                AND (
                      (NOT cordoned
-                      AND last_heartbeat_at < NOW() - make_interval(secs => $1::bigint))
-                  OR last_heartbeat_at < NOW() - make_interval(secs => $1::bigint * 10)
+                      AND last_heartbeat_at < $2 - make_interval(secs => $1::bigint))
+                  OR last_heartbeat_at < $2 - make_interval(secs => $1::bigint * 10)
                )
             "#,
         )
         .bind(threshold_secs as i64)
+        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3202,10 +3516,12 @@ impl MetadataStore for PostgresStore {
         // same UPDATE via a CTE so we don't race with a concurrent
         // transition_session on the same row — the row is locked for
         // the duration of this transaction.
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
-        sqlx::query(r#"UPDATE hosts SET status = 'dead', updated_at = NOW() WHERE id = $1"#)
+        sqlx::query(r#"UPDATE hosts SET status = 'dead', updated_at = $2 WHERE id = $1"#)
             .bind(host_id.as_uuid())
+            .bind(now)
             .execute(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -3223,13 +3539,14 @@ impl MetadataStore for PostgresStore {
                SET host_id    = NULL,
                    sandbox_id = NULL,
                    status     = 'host_lost',
-                   last_active_at = NOW()
+                   last_active_at = $2
               FROM prior p
              WHERE s.id = p.id
             RETURNING s.id, p.prev_status
             "#,
         )
         .bind(host_id.as_uuid())
+        .bind(now)
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -3246,6 +3563,79 @@ impl MetadataStore for PostgresStore {
             .collect::<Result<Vec<_>, MetaError>>()
     }
 
+    async fn touch_session_activity(&self, session_id: SessionId) -> Result<(), MetaError> {
+        sqlx::query("UPDATE sessions SET last_active_at = $2 WHERE id = $1")
+            .bind(session_id.as_uuid())
+            .bind(self.clock.now_utc())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn host_status(&self, host_id: HostId) -> Result<Option<HostStatus>, MetaError> {
+        let raw: Option<String> = sqlx::query_scalar("SELECT status FROM hosts WHERE id = $1")
+            .bind(host_id.as_uuid())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        raw.map(|s| row::parse_host_status(&s)).transpose()
+    }
+
+    async fn try_acquire_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+        stale_after: std::time::Duration,
+    ) -> Result<bool, MetaError> {
+        let now = self.clock.now_utc();
+        let stale_cutoff = now
+            - chrono::Duration::from_std(stale_after)
+                .unwrap_or_else(|_| chrono::Duration::seconds(180));
+        // Free row: insert wins. Held row: the DO UPDATE fires only when
+        // the incumbent's claim has gone stale (crash takeover); a live
+        // incumbent means no row comes back and we lost the race.
+        let won: Option<String> = sqlx::query_scalar(
+            "INSERT INTO dead_host_inflight (host_id, claimed_by, claimed_at)
+             VALUES ($1, $2, $3)
+             ON CONFLICT (host_id) DO UPDATE
+                 SET claimed_by = EXCLUDED.claimed_by, claimed_at = EXCLUDED.claimed_at
+                 WHERE dead_host_inflight.claimed_at < $4
+             RETURNING claimed_by",
+        )
+        .bind(host_id.as_uuid())
+        .bind(claimant)
+        .bind(now)
+        .bind(stale_cutoff)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(won.is_some())
+    }
+
+    async fn release_dead_host_lease(
+        &self,
+        host_id: HostId,
+        claimant: &str,
+    ) -> Result<(), MetaError> {
+        sqlx::query("DELETE FROM dead_host_inflight WHERE host_id = $1 AND claimed_by = $2")
+            .bind(host_id.as_uuid())
+            .bind(claimant)
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
+    async fn notify_host_dead(&self, host_id: HostId) -> Result<(), MetaError> {
+        sqlx::query("SELECT pg_notify('host_dead', $1)")
+            .bind(host_id.to_string())
+            .execute(&self.pool)
+            .await
+            .map_err(db_err)?;
+        Ok(())
+    }
+
     async fn put_session_runtime_spec(
         &self,
         session_id: SessionId,
@@ -3255,12 +3645,13 @@ impl MetadataStore for PostgresStore {
             .map_err(|e| MetaError::Serialization(format!("runtime_spec encode: {e}")))?;
         sqlx::query(
             "INSERT INTO session_runtime_specs (session_id, spec, updated_at)
-             VALUES ($1, $2, NOW())
+             VALUES ($1, $2, $3)
              ON CONFLICT (session_id) DO UPDATE
-               SET spec = EXCLUDED.spec, updated_at = NOW()",
+               SET spec = EXCLUDED.spec, updated_at = $3",
         )
         .bind(session_id.as_uuid())
         .bind(json)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3346,7 +3737,7 @@ impl MetadataStore for PostgresStore {
             r#"
             DELETE FROM snapshots s
             WHERE s.session_id IS NOT NULL
-              AND s.created_at < NOW() - $1::interval
+              AND s.created_at < $2 - $1::interval
               AND s.id NOT IN (
                   SELECT DISTINCT ON (session_id) id
                   FROM snapshots
@@ -3361,6 +3752,7 @@ impl MetadataStore for PostgresStore {
             days: 0,
             microseconds: retention.num_microseconds().unwrap_or(i64::MAX),
         })
+        .bind(self.clock.now_utc())
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -3400,7 +3792,7 @@ impl MetadataStore for PostgresStore {
             r#"
             DELETE FROM snapshots s
             WHERE s.session_id IS NULL
-              AND s.created_at < NOW() - $1::interval
+              AND s.created_at < $2 - $1::interval
               AND s.id NOT IN (
                   SELECT base_snapshot_id
                   FROM enabled_images
@@ -3414,6 +3806,7 @@ impl MetadataStore for PostgresStore {
             days: 0,
             microseconds: grace.num_microseconds().unwrap_or(i64::MAX),
         })
+        .bind(self.clock.now_utc())
         .fetch_all(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -3592,17 +3985,17 @@ impl MetadataStore for PostgresStore {
             WITH next AS (
                 UPDATE sessions
                    SET next_event_idx = next_event_idx + 1,
-                       updated_at = NOW(),
+                       updated_at = $4,
                        -- Track A: honest activity clock, bumped on every
                        -- event append (unlike last_active_at, which only
                        -- moves on state transitions).
-                       last_event_at = NOW()
+                       last_event_at = $4
                  WHERE id = $1
              RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
             ),
             inserted AS (
-                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch)
-                SELECT $1, allocated_idx, $2, $3, recovery_epoch FROM next
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch, $4 FROM next
                 RETURNING idx
             )
             SELECT i.idx,
@@ -3616,6 +4009,7 @@ impl MetadataStore for PostgresStore {
         .bind(session_id.as_uuid())
         .bind(kind)
         .bind(payload)
+        .bind(self.clock.now_utc())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?
@@ -3640,14 +4034,14 @@ impl MetadataStore for PostgresStore {
             WITH next AS (
                 UPDATE sessions
                    SET next_event_idx = next_event_idx + 1,
-                       updated_at = NOW(),
-                       last_event_at = NOW()
+                       updated_at = $5,
+                       last_event_at = $5
                  WHERE id = $1 AND current_epoch = $4
              RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
             ),
             inserted AS (
-                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch)
-                SELECT $1, allocated_idx, $2, $3, recovery_epoch FROM next
+                INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
+                SELECT $1, allocated_idx, $2, $3, recovery_epoch, $5 FROM next
                 RETURNING idx
             )
             SELECT i.idx,
@@ -3662,6 +4056,7 @@ impl MetadataStore for PostgresStore {
         .bind(kind)
         .bind(payload)
         .bind(epoch)
+        .bind(self.clock.now_utc())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3775,13 +4170,17 @@ impl MetadataStore for PostgresStore {
         // rejected SendPrompt reusing the same `prompt_id` — see PR #556
         // review finding #3) rather than a happy-path guarantee.
         //
-        // PR #556 review finding #1: `NOW() - created_at` is computed here,
-        // PG-side, in the same query as the row read — a single clock, so
-        // there's no coordinator-vs-Postgres (or cross-replica) skew to
-        // bias or drop samples.
+        // ADR 0098 D3: `now` is now the coordinator clock (a bound
+        // parameter), and `created_at` is the same coordinator clock
+        // stamped at append time (`append_session_event` binds it too), so
+        // both ends read one injected clock — the single-clock property PR
+        // #556 wanted, now sourced from `services.clock` instead of PG.
+        // (Cross-replica reads still see whichever replica stamped the
+        // append; production SystemClocks are NTP-bounded, and this is a
+        // telemetry sample, not a decision gate.)
         let row = sqlx::query(
             r#"
-            SELECT EXTRACT(EPOCH FROM (NOW() - created_at))::float8 AS secs_ago
+            SELECT EXTRACT(EPOCH FROM ($3::timestamptz - created_at))::float8 AS secs_ago
               FROM session_events
              WHERE session_id = $1 AND kind = 'prompt_received' AND payload->>'prompt_id' = $2
              ORDER BY idx DESC
@@ -3790,6 +4189,7 @@ impl MetadataStore for PostgresStore {
         )
         .bind(session_id.as_uuid())
         .bind(prompt_id)
+        .bind(self.clock.now_utc())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -3802,6 +4202,7 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         events_cursor: i64,
     ) -> Result<engram_core::types::event::RewindSummary, MetaError> {
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
 
         // Surviving side-effects: outside-world actions in the
@@ -3877,7 +4278,8 @@ impl MetadataStore for PostgresStore {
 
         // Tombstone the rolled-back span (audit-preserving) and count it.
         // Issue #529: exclude coordinator-fact kinds — `status_changed`,
-        // `snapshot_taken`, `evicted`, `resumed`, `recovered_from_checkpoint`.
+        // `snapshot_taken`, `evicted`, `resumed`, `resume_started`,
+        // `recovered_from_checkpoint`.
         // Those are control-plane bookkeeping the coordinator itself
         // appended around the eviction/resume boundary; they stay true
         // regardless of what the guest remembers, so rewinding them was
@@ -3887,15 +4289,17 @@ impl MetadataStore for PostgresStore {
         // user_question, question_answered, file_changed, file_shared,
         // integration_asset, …) still rewinds.
         //
-        // ADR 0091: `harness_idle` joins the exclusion list. It is the
-        // idle detector's nomination input — "the harness finished its
-        // turn and is waiting" — a fact that stays true across a clean
-        // evict/resume (the resumed harness IS idle until the next
-        // prompt), and it lands after the eviction checkpoint's cursor
-        // by construction (idle → 5 min TTL → capture cut at pause
-        // time). Rewinding it made EVERY clean cycle report
+        // ADR 0091: `harness_idle` and ADR 0089's `harness_parked` join
+        // the exclusion list. They are the idle detector's nomination
+        // inputs — either "the harness finished its turn and is waiting"
+        // or "the open turn is waiting only on deferred external work" —
+        // facts that stay true across a clean evict/resume (the resumed
+        // session remains idle or parked until the next prompt/result),
+        // and they land after the eviction checkpoint's cursor by
+        // construction (waiting marker → 5 min TTL → capture cut at pause
+        // time). Rewinding them made EVERY clean cycle report
         // `rolled_back: 1` under a `host_failure_recovery` banner
-        // (2026-07-11 campaign, every observed resume). With it
+        // (2026-07-11 campaign, every observed resume). With them
         // excluded, a clean resume tombstones nothing and
         // `apply_rung1_rewind`'s zero-rows early-return emits no
         // recovery event at all — the honest outcome.
@@ -3911,20 +4315,30 @@ impl MetadataStore for PostgresStore {
         // Per issue #527's Guardrails merge-coordination note: the two
         // sibling exclusion lists compose into one `AND kind NOT IN (...)`
         // predicate rather than stacking separate `AND kind <>` clauses.
+        //
+        // ADR 0090 (2026-07-20 durability-rollback incident): `durability_rollback`
+        // joins the exclusion set. It is the coordinator's own record that a
+        // quarantined-survivor destroy already rewound this session's disk to
+        // the last published manifest — a fact that stays true across the very
+        // rewind it warns about (the destroy happened; the writes are gone). It
+        // lands after the checkpoint cursor by construction, so tombstoning it
+        // would grey out the one durable, user-visible marker of the loss.
         let tombstoned = sqlx::query(
             r#"
             UPDATE session_events
-               SET rewound_at = NOW()
+               SET rewound_at = $3
              WHERE session_id = $1 AND idx > $2 AND rewound_at IS NULL
                AND kind NOT IN (
                    'status_changed', 'snapshot_taken', 'evicted',
-                   'resumed', 'recovered_from_checkpoint', 'prompt_received',
-                   'harness_idle'
+                   'resumed', 'resume_started', 'recovered_from_checkpoint',
+                   'prompt_received', 'harness_idle', 'harness_parked',
+                   'durability_rollback'
                )
             "#,
         )
         .bind(session_id.as_uuid())
         .bind(events_cursor)
+        .bind(now)
         .execute(&mut *tx)
         .await
         .map_err(db_err)?
@@ -3943,10 +4357,11 @@ impl MetadataStore for PostgresStore {
 
         // Bump the epoch so events appended after this segment cleanly.
         let epoch_row = sqlx::query(
-            "UPDATE sessions SET recovery_epoch = recovery_epoch + 1, updated_at = NOW() \
+            "UPDATE sessions SET recovery_epoch = recovery_epoch + 1, updated_at = $2 \
              WHERE id = $1 RETURNING recovery_epoch",
         )
         .bind(session_id.as_uuid())
+        .bind(now)
         .fetch_one(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -4053,7 +4468,7 @@ impl MetadataStore for PostgresStore {
             ON CONFLICT (registry_host) DO UPDATE SET
                 auth_kind   = EXCLUDED.auth_kind,
                 auth_config = EXCLUDED.auth_config,
-                updated_at  = NOW()
+                updated_at  = $6
             "#,
         )
         .bind(cred.id)
@@ -4061,6 +4476,7 @@ impl MetadataStore for PostgresStore {
         .bind(auth_kind)
         .bind(auth_config)
         .bind(cred.created_at)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4157,7 +4573,7 @@ impl MetadataStore for PostgresStore {
                 base_snapshot_memory_manifest_id      = EXCLUDED.base_snapshot_memory_manifest_id,
                 base_snapshot_memory_manifest_version = EXCLUDED.base_snapshot_memory_manifest_version,
                 last_refreshed_at     = EXCLUDED.last_refreshed_at,
-                updated_at            = NOW(),
+                updated_at            = $15,
                 -- ADR 0021 P1.8: enabling an image always "undeletes" any
                 -- prior soft-delete on the same image_uri. Operator who
                 -- disabled v1.0.0 then re-enables it gets a live row again,
@@ -4182,6 +4598,7 @@ impl MetadataStore for PostgresStore {
         .bind(image.base_snapshot_memory_manifest.map(|m| m.version as i64))
         .bind(image.last_refreshed_at)
         .bind(image.created_at)
+        .bind(self.clock.now_utc())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -4216,11 +4633,12 @@ impl MetadataStore for PostgresStore {
         // replica's boot-bundle cache drops its copy immediately.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let res = sqlx::query(
-            "UPDATE enabled_images SET image_config = $2, updated_at = NOW() \
+            "UPDATE enabled_images SET image_config = $2, updated_at = $3 \
              WHERE image_uri = $1 AND soft_deleted_at IS NULL",
         )
         .bind(image_uri)
         .bind(sqlx::types::Json(config))
+        .bind(self.clock.now_utc())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -4383,10 +4801,11 @@ impl MetadataStore for PostgresStore {
         // future GC that treats them as candidates.)
         sqlx::query(
             "UPDATE enabled_images \
-             SET soft_deleted_at = NOW(), updated_at = NOW() \
+             SET soft_deleted_at = $2, updated_at = $2 \
              WHERE image_uri = $1",
         )
         .bind(image_uri)
+        .bind(self.clock.now_utc())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -4506,7 +4925,7 @@ impl MetadataStore for PostgresStore {
             RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
             "#,
         )
-        .bind(Uuid::new_v4())
+        .bind(self.entropy.uuid())
         .bind(image_uri)
         .bind(manifest_digest)
         .bind(sqlx::types::Json(image_config))
@@ -4547,7 +4966,7 @@ impl MetadataStore for PostgresStore {
                     RETURNING id, image_uri, manifest_digest, state, chunks_total, chunks_done, attempts, error, image_config, force_recapture, capture_phase, warm_stage, warm_stage_started_at, warm_stages, materialize_stages, materialize_host_id, output_tail, prestage_hosts, created_at, updated_at
                     "#,
                 )
-                .bind(Uuid::new_v4())
+                .bind(self.entropy.uuid())
                 .bind(image_uri)
                 .bind(manifest_digest)
                 .bind(sqlx::types::Json(image_config))
@@ -4610,11 +5029,11 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             r#"
             UPDATE enable_jobs
-               SET claimed_by = $1, claimed_at = NOW(), updated_at = NOW()
+               SET claimed_by = $1, claimed_at = $4, updated_at = $4
              WHERE id IN (
                    SELECT id FROM enable_jobs
                     WHERE state NOT IN ('ready', 'failed')
-                      AND (claimed_at IS NULL OR claimed_at < NOW() - make_interval(secs => $2))
+                      AND (claimed_at IS NULL OR claimed_at < $4 - make_interval(secs => $2))
                     ORDER BY created_at
                     LIMIT $3
                       FOR UPDATE SKIP LOCKED
@@ -4625,6 +5044,7 @@ impl MetadataStore for PostgresStore {
         .bind(claimant)
         .bind(lease_secs as f64)
         .bind(limit as i64)
+        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4649,8 +5069,8 @@ impl MetadataStore for PostgresStore {
             UPDATE enable_jobs
                SET chunks_done = $3,
                    chunks_total = COALESCE($4, chunks_total),
-                   claimed_at = NOW(),
-                   updated_at = NOW()
+                   claimed_at = $5,
+                   updated_at = $5
              WHERE id = $1 AND claimed_by = $2
             "#,
         )
@@ -4658,6 +5078,7 @@ impl MetadataStore for PostgresStore {
         .bind(claimant)
         .bind(chunks_done as i32)
         .bind(chunks_total.map(|v| v as i32))
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4703,8 +5124,8 @@ impl MetadataStore for PostgresStore {
                    materialize_stages = $4,
                    chunks_done = COALESCE($5, chunks_done),
                    chunks_total = COALESCE($6, chunks_total),
-                   claimed_at = NOW(),
-                   updated_at = NOW()
+                   claimed_at = $7,
+                   updated_at = $7
              WHERE id = $1 AND claimed_by = $2
             "#,
         )
@@ -4714,6 +5135,7 @@ impl MetadataStore for PostgresStore {
         .bind(stages_json)
         .bind(chunks_done)
         .bind(chunks_total)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4733,13 +5155,14 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE enable_jobs
                SET materialize_host_id = $3,
-                   updated_at = NOW()
+                   updated_at = $4
              WHERE id = $1 AND claimed_by = $2
             "#,
         )
         .bind(id)
         .bind(claimant)
         .bind(host.as_uuid())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4766,11 +5189,12 @@ impl MetadataStore for PostgresStore {
              WHERE state = 'materializing'
                AND materialize_host_id IS NOT NULL
                AND claimed_at IS NOT NULL
-               AND claimed_at > NOW() - make_interval(secs => $1)
+               AND claimed_at > $2 - make_interval(secs => $1)
              GROUP BY materialize_host_id
             "#,
         )
         .bind(materialize_lease.as_secs_f64())
+        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4814,14 +5238,15 @@ impl MetadataStore for PostgresStore {
                SET state = $3,
                    error = CASE WHEN $3 = 'failed' THEN error ELSE NULL END,
                    claimed_by = CASE WHEN $3 IN ('ready', 'failed') THEN NULL ELSE claimed_by END,
-                   claimed_at = CASE WHEN $3 IN ('ready', 'failed') THEN NULL ELSE NOW() END,
-                   updated_at = NOW()
+                   claimed_at = CASE WHEN $3 IN ('ready', 'failed') THEN NULL ELSE $4 END,
+                   updated_at = $4
              WHERE id = $1 AND claimed_by = $2
             "#,
         )
         .bind(id)
         .bind(claimant)
         .bind(state.as_str())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4865,7 +5290,7 @@ impl MetadataStore for PostgresStore {
                    -- ADR 0084 (c): no capture reservation to release here —
                    -- it lives on `capture_jobs` and drops out of every
                    -- reserved-SUM implicitly once that row goes terminal.
-                   updated_at = NOW()
+                   updated_at = $6
              WHERE id = $1 AND claimed_by = $2
             RETURNING attempts, state
             "#,
@@ -4875,6 +5300,7 @@ impl MetadataStore for PostgresStore {
         .bind(error)
         .bind(max_attempts as i32)
         .bind(force_terminal)
+        .bind(self.clock.now_utc())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4901,7 +5327,7 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE enable_jobs
                SET state = 'pending', attempts = 0, error = NULL,
-                   claimed_by = NULL, claimed_at = NULL, updated_at = NOW(),
+                   claimed_by = NULL, claimed_at = NULL, updated_at = $2,
                    capture_phase = NULL, warm_stage = NULL,
                    warm_stage_started_at = NULL, warm_stages = NULL,
                    output_tail = NULL,
@@ -4920,6 +5346,7 @@ impl MetadataStore for PostgresStore {
             "#,
         )
         .bind(id)
+        .bind(self.clock.now_utc())
         .fetch_optional(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4965,12 +5392,13 @@ impl MetadataStore for PostgresStore {
         let res = sqlx::query(
             r#"
             UPDATE enable_jobs
-               SET claimed_by = NULL, claimed_at = NULL, updated_at = NOW()
+               SET claimed_by = NULL, claimed_at = NULL, updated_at = $3
              WHERE id = $1 AND claimed_by = $2
             "#,
         )
         .bind(id)
         .bind(claimant)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -4995,14 +5423,15 @@ impl MetadataStore for PostgresStore {
             UPDATE enable_jobs
                SET state = 'prestaging',
                    prestage_ref = $3,
-                   claimed_at = NOW(),
-                   updated_at = NOW()
+                   claimed_at = $4,
+                   updated_at = $4
              WHERE id = $1 AND claimed_by = $2
             "#,
         )
         .bind(id)
         .bind(claimant)
         .bind(prestage_ref)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -5026,14 +5455,15 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE enable_jobs
                SET prestage_hosts = $3,
-                   claimed_at = NOW(),
-                   updated_at = NOW()
+                   claimed_at = $4,
+                   updated_at = $4
              WHERE id = $1 AND claimed_by = $2
             "#,
         )
         .bind(id)
         .bind(claimant)
         .bind(outcomes)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -5078,10 +5508,15 @@ impl MetadataStore for PostgresStore {
             image_config, oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress, \
             last_progress_at, attempts, retryable, error, error_stage, fc_snapshot_version, \
             result_bincode, created_at, updated_at";
+        // ADR 0098 D3: stamp waiting_since AND the columns that otherwise
+        // default to PG `now()` (stage_started_at / last_progress_at —
+        // both compared by `expire_capture_job_stages` — plus created_at /
+        // updated_at) from the injected clock, so a fresh capture row is
+        // fully coordinator-clock-stamped and time-controllable.
         let insert_sql = format!(
             r#"
-            INSERT INTO capture_jobs (id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config, oci_defaults, mem_budget_mib, cpu_budget_vcpus, waiting_since)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
+            INSERT INTO capture_jobs (id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config, oci_defaults, mem_budget_mib, cpu_budget_vcpus, waiting_since, stage_started_at, last_progress_at, created_at, updated_at)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $10, $10, $10, $10)
             ON CONFLICT (enable_job_id) WHERE stage NOT IN ('done', 'failed')
             DO NOTHING
             RETURNING {COLUMNS}
@@ -5095,7 +5530,7 @@ impl MetadataStore for PostgresStore {
             "#
         );
         let inserted = sqlx::query(&insert_sql)
-            .bind(Uuid::new_v4())
+            .bind(self.entropy.uuid())
             .bind(row.enable_job_id)
             .bind(&row.image_uri)
             .bind(&row.manifest_digest)
@@ -5104,6 +5539,7 @@ impl MetadataStore for PostgresStore {
             .bind(sqlx::types::Json(&row.oci_defaults))
             .bind(row.mem_budget_mib)
             .bind(row.cpu_budget_vcpus)
+            .bind(self.clock.now_utc())
             .fetch_optional(&self.pool)
             .await
             .map_err(db_err)?;
@@ -5122,7 +5558,7 @@ impl MetadataStore for PostgresStore {
             // `create_or_get_enable_job`.
             None => {
                 let r = sqlx::query(&insert_sql)
-                    .bind(Uuid::new_v4())
+                    .bind(self.entropy.uuid())
                     .bind(row.enable_job_id)
                     .bind(&row.image_uri)
                     .bind(&row.manifest_digest)
@@ -5131,6 +5567,7 @@ impl MetadataStore for PostgresStore {
                     .bind(sqlx::types::Json(&row.oci_defaults))
                     .bind(row.mem_budget_mib)
                     .bind(row.cpu_budget_vcpus)
+                    .bind(self.clock.now_utc())
                     .fetch_optional(&self.pool)
                     .await
                     .map_err(db_err)?
@@ -5234,14 +5671,14 @@ impl MetadataStore for PostgresStore {
             UPDATE capture_jobs
                SET stage = $3,
                    stage_progress = $4,
-                   stage_started_at = CASE WHEN stage <> $3 THEN NOW() ELSE stage_started_at END,
-                   last_progress_at = NOW(),
+                   stage_started_at = CASE WHEN stage <> $3 THEN $10 ELSE stage_started_at END,
+                   last_progress_at = $10,
                    fc_snapshot_version = COALESCE($5, fc_snapshot_version),
                    retryable = COALESCE($6, retryable),
                    error = COALESCE($7, error),
                    error_stage = COALESCE($8, error_stage),
                    result_bincode = COALESCE($9, result_bincode),
-                   updated_at = NOW()
+                   updated_at = $10
              WHERE id = $1 AND epoch = $2 AND stage NOT IN ('done', 'failed')
             "#,
         )
@@ -5254,6 +5691,7 @@ impl MetadataStore for PostgresStore {
         .bind(error)
         .bind(error_stage)
         .bind(result_bincode)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -5282,7 +5720,7 @@ impl MetadataStore for PostgresStore {
                    warm_stage = COALESCE($3, warm_stage),
                    output_tail = COALESCE($4, output_tail),
                    warm_stages = COALESCE($5, warm_stages),
-                   updated_at = NOW()
+                   updated_at = $6
              WHERE id = $1
             "#,
         )
@@ -5291,6 +5729,7 @@ impl MetadataStore for PostgresStore {
         .bind(warm_stage)
         .bind(output_tail)
         .bind(warm_stages)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -5310,6 +5749,7 @@ impl MetadataStore for PostgresStore {
         // placeable; a row already bound is returned unchanged (no
         // double-reserve).
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let cur: Option<(Option<uuid::Uuid>, i64, i32)> = sqlx::query_as(
             r#"SELECT host_id, mem_budget_mib, cpu_budget_vcpus
@@ -5338,10 +5778,10 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE capture_jobs
                SET host_id = $2,
-                   waiting_since = CASE WHEN $2 IS NULL THEN COALESCE(waiting_since, NOW()) ELSE NULL END,
-                   stage_started_at = CASE WHEN $2 IS NULL THEN stage_started_at ELSE NOW() END,
-                   last_progress_at = CASE WHEN $2 IS NULL THEN last_progress_at ELSE NOW() END,
-                   updated_at = NOW()
+                   waiting_since = CASE WHEN $2 IS NULL THEN COALESCE(waiting_since, $3) ELSE NULL END,
+                   stage_started_at = CASE WHEN $2 IS NULL THEN stage_started_at ELSE $3 END,
+                   last_progress_at = CASE WHEN $2 IS NULL THEN last_progress_at ELSE $3 END,
+                   updated_at = $3
              WHERE id = $1 AND host_id IS NULL AND stage NOT IN ('done', 'failed')
             RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                       oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
@@ -5351,6 +5791,7 @@ impl MetadataStore for PostgresStore {
         )
         .bind(id.as_uuid())
         .bind(picked)
+        .bind(now)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -5371,6 +5812,7 @@ impl MetadataStore for PostgresStore {
         // fences/tears down the abandoned attempt (host-side
         // `cancel_absent`); `attempts + 1` counts the real re-attempt.
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let budgets: Option<(i64, i32)> = sqlx::query_as(
             r#"SELECT mem_budget_mib, cpu_budget_vcpus
@@ -5392,14 +5834,14 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE capture_jobs
                SET host_id = $3,
-                   waiting_since = CASE WHEN $3 IS NULL THEN COALESCE(waiting_since, NOW()) ELSE NULL END,
+                   waiting_since = CASE WHEN $3 IS NULL THEN COALESCE(waiting_since, $4) ELSE NULL END,
                    epoch = epoch + 1,
                    attempts = attempts + 1,
                    stage = 'assigned',
-                   stage_started_at = NOW(),
-                   last_progress_at = NOW(),
+                   stage_started_at = $4,
+                   last_progress_at = $4,
                    stage_progress = NULL,
-                   updated_at = NOW()
+                   updated_at = $4
              WHERE id = $1 AND epoch = $2 AND stage NOT IN ('done', 'failed')
             RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                       oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
@@ -5410,6 +5852,7 @@ impl MetadataStore for PostgresStore {
         .bind(id.as_uuid())
         .bind(expected_epoch)
         .bind(picked)
+        .bind(now)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -5436,6 +5879,7 @@ impl MetadataStore for PostgresStore {
         // `host_id = NULL` (waiting). Per-attempt fields are cleared and
         // timestamps reset to mirror a fresh `insert_capture_job` row.
         let cand: Vec<uuid::Uuid> = candidates.iter().map(|h| h.as_uuid()).collect();
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let budgets: Option<(i64, i32)> = sqlx::query_as(
             r#"SELECT mem_budget_mib, cpu_budget_vcpus
@@ -5458,19 +5902,19 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE capture_jobs
                SET host_id = $3,
-                   waiting_since = CASE WHEN $3 IS NULL THEN COALESCE(waiting_since, NOW()) ELSE NULL END,
+                   waiting_since = CASE WHEN $3 IS NULL THEN COALESCE(waiting_since, $5) ELSE NULL END,
                    epoch = epoch + 1,
                    attempts = attempts + 1,
                    stage = 'assigned',
-                   stage_started_at = NOW(),
-                   last_progress_at = NOW(),
+                   stage_started_at = $5,
+                   last_progress_at = $5,
                    stage_progress = NULL,
                    error = NULL,
                    error_stage = NULL,
                    retryable = NULL,
                    result_bincode = NULL,
                    fc_snapshot_version = NULL,
-                   updated_at = NOW()
+                   updated_at = $5
              WHERE id = $1 AND epoch = $2 AND stage = 'failed' AND retryable AND attempts < $4
             RETURNING id, enable_job_id, image_uri, manifest_digest, disk_manifest, image_config,
                       oci_defaults, host_id, mem_budget_mib, cpu_budget_vcpus, waiting_since, epoch, stage, stage_started_at, stage_progress,
@@ -5482,6 +5926,7 @@ impl MetadataStore for PostgresStore {
         .bind(expected_epoch)
         .bind(picked)
         .bind(i64::from(max_attempts))
+        .bind(now)
         .fetch_optional(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -5515,7 +5960,7 @@ impl MetadataStore for PostgresStore {
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
-        let now = Utc::now();
+        let now = self.clock.now_utc();
         let mut out = Vec::new();
         for r in &rows {
             let job = row::capture_job_from_row(r)?;
@@ -5599,9 +6044,10 @@ impl MetadataStore for PostgresStore {
         // A plain write, not fenced by claimant — stamped once the job
         // has already reached a terminal enable-job state, so there's no
         // in-flight lease left to race against.
-        sqlx::query("UPDATE enable_jobs SET reuse_outcome = $2, updated_at = NOW() WHERE id = $1")
+        sqlx::query("UPDATE enable_jobs SET reuse_outcome = $2, updated_at = $3 WHERE id = $1")
             .bind(enable_job_id)
             .bind(outcome)
+            .bind(self.clock.now_utc())
             .execute(&self.pool)
             .await
             .map_err(db_err)?;
@@ -5908,6 +6354,7 @@ impl MetadataStore for PostgresStore {
         // free. Inline claims are never idempotency-keyed. A racing peer
         // claim trips the `session_ops_one_running` unique on the stamp
         // and aborts here → mapped to `None` (busy), still no orphan row.
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let insert = format!(
             "INSERT INTO session_ops (session_id, kind, payload)
@@ -5952,7 +6399,7 @@ impl MetadataStore for PostgresStore {
         let stamp = format!(
             "UPDATE session_ops
                 SET state = 'running', epoch = $2, claimed_by = $3,
-                    claimed_at = now(), heartbeat_at = now(),
+                    claimed_at = $4, heartbeat_at = $4,
                     attempts = attempts + 1
               WHERE id = $1 AND state = 'queued'
              RETURNING {OP_COLUMNS}"
@@ -5961,6 +6408,7 @@ impl MetadataStore for PostgresStore {
             .bind(op.id)
             .bind(epoch)
             .bind(claimed_by)
+            .bind(now)
             .fetch_one(&mut *tx)
             .await
         {
@@ -5985,6 +6433,7 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         claimed_by: &str,
     ) -> Result<Option<SessionOp>, MetaError> {
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // Head = smallest queued id, due. SKIP LOCKED keeps a race with
         // a peer's claim (or a concurrent enqueue_and_claim) cheap: if
@@ -5993,12 +6442,13 @@ impl MetadataStore for PostgresStore {
         let head = format!(
             "SELECT {OP_COLUMNS} FROM session_ops
               WHERE session_id = $1 AND state = 'queued'
-                AND (not_before IS NULL OR not_before <= now())
+                AND (not_before IS NULL OR not_before <= $2)
               ORDER BY id ASC LIMIT 1
               FOR UPDATE SKIP LOCKED"
         );
         let Some(row) = sqlx::query(&head)
             .bind(session_id.as_uuid())
+            .bind(now)
             .fetch_optional(&mut *tx)
             .await
             .map_err(db_err)?
@@ -6030,7 +6480,7 @@ impl MetadataStore for PostgresStore {
         let stamp = format!(
             "UPDATE session_ops
                 SET state = 'running', epoch = $2, claimed_by = $3,
-                    claimed_at = now(), heartbeat_at = now(),
+                    claimed_at = $4, heartbeat_at = $4,
                     attempts = attempts + 1
               WHERE id = $1 AND state = 'queued'
              RETURNING {OP_COLUMNS}"
@@ -6039,6 +6489,7 @@ impl MetadataStore for PostgresStore {
             .bind(op.id)
             .bind(epoch)
             .bind(claimed_by)
+            .bind(now)
             .fetch_one(&mut *tx)
             .await
         {
@@ -6059,11 +6510,12 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             "SELECT DISTINCT session_id FROM session_ops
               WHERE state = 'queued'
-                AND (not_before IS NULL OR not_before <= now())
+                AND (not_before IS NULL OR not_before <= $1)
                 AND NOT EXISTS (SELECT 1 FROM session_ops r
                                  WHERE r.session_id = session_ops.session_id
                                    AND r.state = 'running')",
         )
+        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6077,12 +6529,13 @@ impl MetadataStore for PostgresStore {
 
     async fn op_record_step(&self, op_id: i64, epoch: i64, step: &str) -> Result<bool, MetaError> {
         let res = sqlx::query(
-            "UPDATE session_ops SET step = $3, heartbeat_at = now()
+            "UPDATE session_ops SET step = $3, heartbeat_at = $4
               WHERE id = $1 AND epoch = $2 AND state = 'running'",
         )
         .bind(op_id)
         .bind(epoch)
         .bind(step)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6093,11 +6546,12 @@ impl MetadataStore for PostgresStore {
         // Bump ONLY heartbeat_at — NOT step (the within-step liveness beat
         // must not clobber the crash-resume marker). Fenced.
         let res = sqlx::query(
-            "UPDATE session_ops SET heartbeat_at = now()
+            "UPDATE session_ops SET heartbeat_at = $3
               WHERE id = $1 AND epoch = $2 AND state = 'running'",
         )
         .bind(op_id)
         .bind(epoch)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6112,13 +6566,14 @@ impl MetadataStore for PostgresStore {
         error: Option<&str>,
     ) -> Result<bool, MetaError> {
         let res = sqlx::query(
-            "UPDATE session_ops SET state = $3, error = $4, finished_at = now()
+            "UPDATE session_ops SET state = $3, error = $4, finished_at = $5
               WHERE id = $1 AND epoch = $2 AND state = 'running'",
         )
         .bind(op_id)
         .bind(epoch)
         .bind(state.as_str())
         .bind(error)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6138,7 +6593,7 @@ impl MetadataStore for PostgresStore {
         let res = sqlx::query(
             "UPDATE session_ops
                 SET state = 'queued',
-                    not_before = now() + make_interval(secs => $3),
+                    not_before = $5 + make_interval(secs => $3),
                     error = $4,
                     epoch = NULL, claimed_by = NULL, heartbeat_at = NULL
               WHERE id = $1 AND epoch = $2 AND state = 'running'",
@@ -6147,6 +6602,7 @@ impl MetadataStore for PostgresStore {
         .bind(epoch)
         .bind(backoff.as_secs_f64())
         .bind(error)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6161,11 +6617,12 @@ impl MetadataStore for PostgresStore {
         // Every queued op of the kind — a cancelled verb has no business
         // running later from a duplicate row further down the queue.
         let res = sqlx::query(
-            "UPDATE session_ops SET state = 'cancelled', finished_at = now()
+            "UPDATE session_ops SET state = 'cancelled', finished_at = $3
               WHERE session_id = $1 AND kind = $2 AND state = 'queued'",
         )
         .bind(session_id.as_uuid())
         .bind(kind.as_str())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6182,12 +6639,13 @@ impl MetadataStore for PostgresStore {
         // NOTIFY so any replica's executor wakes even if the completion
         // re-drive already passed.
         let res = sqlx::query(
-            "UPDATE session_ops SET not_before = now()
+            "UPDATE session_ops SET not_before = $3
               WHERE session_id = $1 AND kind = $2 AND state = 'queued'
-                AND not_before > now()",
+                AND not_before > $3",
         )
         .bind(session_id.as_uuid())
         .bind(kind.as_str())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6244,6 +6702,28 @@ impl MetadataStore for PostgresStore {
         row.map(|r| row::session_op_from_row(&r)).transpose()
     }
 
+    /// ADR 0101 C: newest row (any state, any key) for `(session, kind)`
+    /// — ids are monotonic, so `ORDER BY id DESC LIMIT 1` is the latest
+    /// mint.
+    async fn op_latest_for_kind(
+        &self,
+        session_id: SessionId,
+        kind: engram_core::types::session_op::OpKind,
+    ) -> Result<Option<SessionOp>, MetaError> {
+        let q = format!(
+            "SELECT {OP_COLUMNS} FROM session_ops
+              WHERE session_id = $1 AND kind = $2
+              ORDER BY id DESC LIMIT 1"
+        );
+        let row = sqlx::query(&q)
+            .bind(session_id.as_uuid())
+            .bind(kind.as_str())
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?;
+        row.map(|r| row::session_op_from_row(&r)).transpose()
+    }
+
     async fn op_get(&self, op_id: i64) -> Result<Option<SessionOp>, MetaError> {
         let q = format!("SELECT {OP_COLUMNS} FROM session_ops WHERE id = $1");
         let row = sqlx::query(&q)
@@ -6256,10 +6736,11 @@ impl MetadataStore for PostgresStore {
 
     async fn op_cancel_by_id(&self, op_id: i64) -> Result<bool, MetaError> {
         let res = sqlx::query(
-            "UPDATE session_ops SET state = 'cancelled', finished_at = now()
+            "UPDATE session_ops SET state = 'cancelled', finished_at = $2
               WHERE id = $1 AND state = 'queued'",
         )
         .bind(op_id)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6291,7 +6772,7 @@ impl MetadataStore for PostgresStore {
         let rows = sqlx::query(
             "SELECT s.id FROM sessions s
               WHERE s.status = 'pending'
-                AND s.last_active_at < now() - make_interval(secs => $1)
+                AND s.last_active_at < $2 - make_interval(secs => $1)
                 AND NOT EXISTS (
                     SELECT 1 FROM session_ops o
                      WHERE o.session_id = s.id
@@ -6300,6 +6781,7 @@ impl MetadataStore for PostgresStore {
                 )",
         )
         .bind(older_than.as_secs_f64())
+        .bind(self.clock.now_utc())
         .fetch_all(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6316,6 +6798,7 @@ impl MetadataStore for PostgresStore {
         stale: std::time::Duration,
         claimed_by: &str,
     ) -> Result<Vec<SessionOp>, MetaError> {
+        let now = self.clock.now_utc();
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         // SKIP LOCKED: a row a peer sweep is mid-reclaiming is theirs.
         // State stays 'running' through the re-stamp, so the one_running
@@ -6323,12 +6806,13 @@ impl MetadataStore for PostgresStore {
         let select = format!(
             "SELECT {OP_COLUMNS} FROM session_ops
               WHERE state = 'running'
-                AND heartbeat_at < now() - make_interval(secs => $1)
+                AND heartbeat_at < $2 - make_interval(secs => $1)
               ORDER BY id ASC
               FOR UPDATE SKIP LOCKED"
         );
         let rows = sqlx::query(&select)
             .bind(stale.as_secs_f64())
+            .bind(now)
             .fetch_all(&mut *tx)
             .await
             .map_err(db_err)?;
@@ -6347,8 +6831,8 @@ impl MetadataStore for PostgresStore {
             .map_err(db_err)?;
             let stamp = format!(
                 "UPDATE session_ops
-                    SET epoch = $2, claimed_by = $3, claimed_at = now(),
-                        heartbeat_at = now(), attempts = attempts + 1
+                    SET epoch = $2, claimed_by = $3, claimed_at = $4,
+                        heartbeat_at = $4, attempts = attempts + 1
                   WHERE id = $1
                  RETURNING {OP_COLUMNS}"
             );
@@ -6356,6 +6840,7 @@ impl MetadataStore for PostgresStore {
                 .bind(op.id)
                 .bind(epoch)
                 .bind(claimed_by)
+                .bind(now)
                 .fetch_one(&mut *tx)
                 .await
                 .map_err(db_err)?;
@@ -6421,16 +6906,21 @@ impl MetadataStore for PostgresStore {
             r#"
             UPDATE sessions
                SET status = $2,
-                   last_active_at = NOW(),
-                   updated_at = NOW(),
+                   last_active_at = $4,
+                   updated_at = $4,
                    evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
-                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
+                   queued_at = CASE WHEN $2 = 'queued' THEN $4 ELSE queued_at END,
+                   queue_origin = CASE WHEN $2 = 'queued'
+                                  THEN COALESCE(queue_origin, 'create')
+                                  ELSE queue_origin END
              WHERE id = $1 AND current_epoch = $3
             "#,
         )
         .bind(session_id.as_uuid())
         .bind(to.as_str())
         .bind(epoch)
+        .bind(self.clock.now_utc())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?
@@ -6456,13 +6946,14 @@ impl MetadataStore for PostgresStore {
     ) -> Result<bool, MetaError> {
         let res = sqlx::query(
             "UPDATE sessions
-                SET sandbox_id = $2, host_id = $3, last_active_at = now(), updated_at = now()
+                SET sandbox_id = $2, host_id = $3, last_active_at = $5, updated_at = $5
               WHERE id = $1 AND current_epoch = $4",
         )
         .bind(session_id.as_uuid())
         .bind(sandbox_id.map(|s| s.as_uuid()))
         .bind(host_id.map(|h| h.as_uuid()))
         .bind(epoch)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6493,7 +6984,7 @@ impl MetadataStore for PostgresStore {
             "UPDATE sessions
                 SET live_disk_manifest_id      = $3,
                     live_disk_manifest_version = $4,
-                    live_disk_manifest_at      = now()
+                    live_disk_manifest_at      = $5
               WHERE id         = $1
                 AND sandbox_id = $2",
         )
@@ -6501,6 +6992,7 @@ impl MetadataStore for PostgresStore {
         .bind(sandbox_id.as_uuid())
         .bind(manifest_ref.manifest_id)
         .bind(manifest_ref.version as i64)
+        .bind(self.clock.now_utc())
         .execute(&mut *tx)
         .await
         .map_err(db_err)?
@@ -6716,11 +7208,12 @@ impl MetadataStore for PostgresStore {
     /// not when it was last re-seen.
     async fn upsert_chunk_gc_candidate(&self, hash: [u8; 32]) -> Result<(), MetaError> {
         sqlx::query(
-            "INSERT INTO chunk_gc_candidates (content_hash)
-             VALUES ($1)
-             ON CONFLICT (content_hash) DO UPDATE SET last_seen_at = now()",
+            "INSERT INTO chunk_gc_candidates (content_hash, first_seen_at, last_seen_at)
+             VALUES ($1, $2, $2)
+             ON CONFLICT (content_hash) DO UPDATE SET last_seen_at = $2",
         )
         .bind(hash.as_slice())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -6986,10 +7479,11 @@ impl MetadataStore for PostgresStore {
     /// row was deleted.
     async fn soft_delete_skill(&self, name: &str) -> Result<bool, MetaError> {
         let res = sqlx::query(
-            "UPDATE mount_catalog SET deleted_at = now()
+            "UPDATE mount_catalog SET deleted_at = $2
                WHERE name = $1 AND deleted_at IS NULL",
         )
         .bind(name)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -7059,10 +7553,11 @@ impl MetadataStore for PostgresStore {
     /// pin set (`bundle_pin_set`) and the bundle GC reclaims it once unpinned.
     async fn soft_delete_harness(&self, name: &str) -> Result<bool, MetaError> {
         let res = sqlx::query(
-            "UPDATE harness_catalog SET deleted_at = now()
+            "UPDATE harness_catalog SET deleted_at = $2
                WHERE name = $1 AND deleted_at IS NULL",
         )
         .bind(name)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -7073,11 +7568,12 @@ impl MetadataStore for PostgresStore {
     /// flavor of `upsert_chunk_gc_candidate`).
     async fn upsert_bundle_gc_candidate(&self, sha256: &str) -> Result<(), MetaError> {
         sqlx::query(
-            "INSERT INTO bundle_gc_candidates (sha256)
-             VALUES ($1)
-             ON CONFLICT (sha256) DO UPDATE SET last_seen_at = now()",
+            "INSERT INTO bundle_gc_candidates (sha256, first_seen_at, last_seen_at)
+             VALUES ($1, $2, $2)
+             ON CONFLICT (sha256) DO UPDATE SET last_seen_at = $2",
         )
         .bind(sha256)
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;
@@ -7143,11 +7639,12 @@ impl MetadataStore for PostgresStore {
         id: engram_core::types::SnapshotId,
     ) -> Result<(), MetaError> {
         sqlx::query(
-            "INSERT INTO snapshot_blob_gc_candidates (snapshot_id)
-             VALUES ($1)
-             ON CONFLICT (snapshot_id) DO UPDATE SET last_seen_at = now()",
+            "INSERT INTO snapshot_blob_gc_candidates (snapshot_id, first_seen_at, last_seen_at)
+             VALUES ($1, $2, $2)
+             ON CONFLICT (snapshot_id) DO UPDATE SET last_seen_at = $2",
         )
         .bind(id.as_uuid())
+        .bind(self.clock.now_utc())
         .execute(&self.pool)
         .await
         .map_err(db_err)?;

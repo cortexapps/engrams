@@ -15,7 +15,7 @@
  * does not require them for queries but they document the FK graph).
  */
 
-import { relations } from "drizzle-orm";
+import { relations, sql } from "drizzle-orm";
 import {
   pgTable,
   text,
@@ -27,6 +27,8 @@ import {
   index,
   uniqueIndex,
   customType,
+  bigint,
+  uuid,
 } from "drizzle-orm/pg-core";
 
 /** Raw binary column (Postgres `bytea`). node-postgres maps `bytea` ⇄ Buffer. */
@@ -72,6 +74,12 @@ export const taskSession = pgTable(
     // Nullable for pre-feature / out-of-band sessions. Profiles are only ever
     // soft-deleted, so the target always exists; ON DELETE is moot.
     profileId: text("profile_id").references(() => profile.id),
+    // The session's EFFECTIVE granted capabilities at create time (profile caps,
+    // or a capabilityOverride/extraCapabilities set — e.g. a review worker's
+    // clamped `engram:pr_review` + repo-scoped read). The tool-exec gate reads
+    // these so an override is honored; NULL means a legacy row → fall back to
+    // the profile's capabilities.
+    capabilities: jsonb("capabilities").$type<string[]>(),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -79,6 +87,266 @@ export const taskSession = pgTable(
     index("task_session_session_idx").on(t.sessionId), // the authz join (ADR §6) hits this
   ],
 );
+
+// ---------------------------------------------------------------------------
+// Generic tool protocol pending-call ledger (ADR 0089 P1)
+// ---------------------------------------------------------------------------
+
+/** Durable lifecycle bookkeeping for generic tool calls. The coordinator event
+ *  log remains the wire source of truth; this orchestrator-owned projection
+ *  supports external-completion policy and stale session-call watchdogs. */
+export const pendingToolCall = pgTable(
+  "pending_tool_calls",
+  {
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    toolName: text("tool_name").notNull(),
+    handling: text("handling").notNull(),
+    requestedAt: timestamp("requested_at", { withTimezone: true }).notNull(),
+    submittedAt: timestamp("submitted_at", { withTimezone: true }),
+    completedAt: timestamp("completed_at", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("pending_tool_calls_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
+    index("pending_tool_calls_session_idx").on(t.sessionId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Papercuts
+// ---------------------------------------------------------------------------
+
+/** Small, concrete sources of friction reported by agents while they work. */
+export const papercut = pgTable(
+  "papercuts",
+  {
+    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    summary: text("summary").notNull(),
+    description: text("description").notNull(),
+    category: text("category").notNull(),
+    severity: text("severity"),
+    tags: jsonb("tags").$type<string[]>().default([]),
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id"),
+    taskId: text("task_id"),
+    profileId: text("profile_id"),
+    userId: text("user_id"),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("papercuts_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
+    index("papercuts_created_at_idx").on(t.createdAt),
+    index("papercuts_archived_at_idx").on(t.archivedAt),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Pull request references (ADR 0100)
+// ---------------------------------------------------------------------------
+
+/** Durable link from a PR observed in a session to the task that authored it. */
+export const prRef = pgTable(
+  "pr_ref",
+  {
+    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    repo: text("repo").notNull(),
+    prNumber: integer("pr_number").notNull(),
+    authoringTaskId: text("authoring_task_id").references(() => task.id, {
+      onDelete: "set null",
+    }),
+    sessionId: text("session_id").notNull(),
+    title: text("title").notNull(),
+    url: text("url").notNull(),
+    headBranch: text("head_branch").notNull(),
+    baseBranch: text("base_branch").notNull(),
+    observedAt: timestamp("observed_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [
+    uniqueIndex("pr_ref_repo_pr_number_unique").on(t.repo, t.prNumber),
+    index("pr_ref_authoring_task_idx").on(t.authoringTaskId),
+    index("pr_ref_session_idx").on(t.sessionId),
+  ],
+);
+
+// ---------------------------------------------------------------------------
+// Pull request reviews (ADR 0100)
+// ---------------------------------------------------------------------------
+
+/** One durable review pass over a pull request at a pinned head SHA. */
+export const review = pgTable(
+  "review",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    repo: text("repo").notNull(),
+    prNumber: integer("pr_number").notNull(),
+    taskId: text("task_id")
+      .notNull()
+      .references(() => task.id),
+    headSha: text("head_sha").notNull(),
+    baseSha: text("base_sha").notNull(),
+    trigger: text("trigger").notNull(),
+    status: text("status").notNull().default("queued"), // queued|finding|verifying|posted|failed|superseded|halted
+    githubReviewId: text("github_review_id"),
+    // The sticky GitHub issue-comment we post on pickup and edit in place
+    // through the lifecycle (👀 → ⏳ → ✅). Null until the first ack lands.
+    statusCommentId: text("status_comment_id"),
+    // The worker sessions, stamped at kickoff so the UI can offer a live
+    // "watch" link while the phase runs. The session is deleted when its phase
+    // ends, but the id is kept as the durable record of which session ran.
+    finderSessionId: text("finder_session_id"),
+    verifierSessionId: text("verifier_session_id"),
+    summaryMd: text("summary_md"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("review_repo_pr_number_idx").on(t.repo, t.prNumber),
+    index("review_task_idx").on(t.taskId),
+  ],
+);
+
+/** A finder-reported candidate and its durable lifecycle state. */
+export const reviewFinding = pgTable(
+  "review_finding",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reviewId: uuid("review_id")
+      .notNull()
+      .references(() => review.id, { onDelete: "cascade" }),
+    path: text("path").notNull(),
+    startLine: integer("start_line"),
+    endLine: integer("end_line"),
+    side: text("side"),
+    category: text("category").notNull(),
+    severity: text("severity").notNull(),
+    confidence: text("confidence").notNull(),
+    title: text("title").notNull(),
+    bodyMd: text("body_md").notNull(),
+    suggestedFix: text("suggested_fix"),
+    evidence: jsonb("evidence").$type<string[]>().notNull().default([]),
+    // candidate|confirmed|suppressed_refuted|posted|ui_only|suppressed_by_config|superseded
+    state: text("state").notNull().default("candidate"),
+    verdictReason: text("verdict_reason"),
+    githubThreadId: text("github_thread_id"),
+    resolution: text("resolution"),
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("review_finding_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
+    index("review_finding_review_idx").on(t.reviewId),
+  ],
+);
+
+/** The first verifier judgment recorded for a finding. */
+export const reviewVerdict = pgTable(
+  "review_verdict",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    findingId: uuid("finding_id")
+      .notNull()
+      .references(() => reviewFinding.id, { onDelete: "cascade" }),
+    verdict: text("verdict").notNull(), // confirmed|refuted
+    confidence: text("confidence").notNull(),
+    reasoning: text("reasoning").notNull(),
+    sessionId: text("session_id").notNull(),
+    toolCallId: text("tool_call_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("review_verdict_session_tool_call_unique").on(
+      t.sessionId,
+      t.toolCallId,
+    ),
+    uniqueIndex("review_verdict_finding_unique").on(t.findingId),
+  ],
+);
+
+/** A review's step-by-step activity log (ADR 0100). Append-only milestones the
+ *  control plane records as it drives the review, so the UI can show progress
+ *  inside a phase ("cloning repo", "reviewing") — not just the coarse status.
+ *  The worker sessions are deleted per phase, so this outlives them. */
+export const reviewEvent = pgTable(
+  "review_event",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    reviewId: uuid("review_id")
+      .notNull()
+      .references(() => review.id, { onDelete: "cascade" }),
+    // queued|finder_started|cloning|reviewing|verifier_started|verifying|posted|failed|halted
+    kind: text("kind").notNull(),
+    detail: text("detail"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [index("review_event_review_idx").on(t.reviewId, t.createdAt)],
+);
+
+/** Per-repository PR-review enrollment. The text fields are constrained by
+ * ReviewService to triggerMode: auto|manual and autofix: auto|manual|off. */
+export const reviewEnrollment = pgTable("review_enrollment", {
+  repo: text("repo").primaryKey(), // "owner/name"
+  triggerMode: text("trigger_mode").notNull().default("manual"), // auto|manual
+  autofix: text("autofix").notNull().default("off"), // auto|manual|off
+  profileId: text("profile_id").references(() => profile.id),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true })
+    .notNull()
+    .defaultNow()
+    .$onUpdate(() => new Date()),
+});
+
+// ---------------------------------------------------------------------------
+// Stream-fed session listeners (ingest v2)
+// ---------------------------------------------------------------------------
+
+/** Desired listener rows also serve as cross-process leases. Terminal rows are
+ * retained so a completed session is never accidentally listened to again. */
+export const sessionListener = pgTable("session_listeners", {
+  sessionId: text("session_id").primaryKey(),
+  owner: text("owner"),
+  leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+  terminalAt: timestamp("terminal_at", { withTimezone: true }),
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
+
+/** Durable progress is independent for each consumer of a session event log. */
+export const consumerCursor = pgTable(
+  "consumer_cursors",
+  {
+    sessionId: text("session_id").notNull(),
+    consumer: text("consumer").notNull(),
+    lastIdx: bigint("last_idx", { mode: "bigint" }).notNull(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.sessionId, t.consumer] })],
+);
+
+/** Slack-backed sessions route listener output into their owning thread
+ * workflow mailbox. Absence means the Slack consumer does not apply. */
+export const slackSession = pgTable("slack_session", {
+  sessionId: text("session_id").primaryKey(),
+  threadWfId: text("thread_wf_id").notNull(),
+});
+
+/** Review worker sessions route terminal state into their owning review
+ * workflow mailbox. Absence means the review consumer does not apply. */
+export const reviewSession = pgTable("review_session", {
+  sessionId: text("session_id").primaryKey(),
+  reviewWorkflowId: text("review_workflow_id").notNull(),
+  role: text("role").notNull(), // finder|verifier
+  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+});
 
 // ---------------------------------------------------------------------------
 // Session profiles (ADR 0053)
@@ -113,52 +381,64 @@ export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   allowHostPatterns: [],
 };
 
-export const profile = pgTable("profile", {
-  id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
-  name: text("name").notNull(),
-  description: text("description").notNull().default(""),
-  icon: text("icon").notNull().default("Bot"), // lucide icon name
-  imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
-  // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
-  // this profile's sessions run, with default model + effort (catalog option
-  // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
-  // "inherit deployment default" semantics were superseded; existing rows were
-  // backfilled to `claude`). model/effort stay nullable → the harness
-  // descriptor's defaults. All overridable per session.
-  harness: text("harness").notNull(),
-  model: text("model"),
-  effort: text("effort"),
-  includeUserTokens: boolean("include_user_tokens").notNull().default(false),
-  envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
-  // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
-  // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
-  // mounts at session create. Empty = base session (no skills).
-  skills: jsonb("skills").$type<string[]>().notNull().default([]),
-  // ADR 0056: integration capabilities ("provider:action[@resource]") this
-  // profile's sessions are granted. Passed to the coordinator at session create
-  // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
-  // no third-party integration access.
-  capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
-  // ADR 0057: egress network allow-list (deny by default) + secrets this
-  // profile's sessions get, lifted off the image manifest. Additive in B1;
-  // compiled into the per-session SessionPolicy + consumed at boot in B2.
-  network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
-  secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
-  // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
-  // its session with this. At most one active default; the store clears the
-  // prior when one is set.
-  isDefault: boolean("is_default").notNull().default(false),
-  // ADR 0064: guest ports auto-exposed (private) for every session from this
-  // profile. The orchestrator mints one private port_exposure per declared port
-  // at session create (best-effort). Empty = no auto-exposed ports.
-  portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
-  createdAt: timestamp("created_at").notNull().defaultNow(),
-  updatedAt: timestamp("updated_at")
-    .notNull()
-    .defaultNow()
-    .$onUpdate(() => new Date()),
-  deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
-});
+export const profile = pgTable(
+  "profile",
+  {
+    id: text("id").primaryKey(), // uuid string (crypto.randomUUID())
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    icon: text("icon").notNull().default("Bot"), // lucide icon name
+    imageId: text("image_id").notNull(), // logical ref → enabled_images.id (§3)
+    // ADR 0062/0063: the default harness (a HarnessCatalogService catalog name)
+    // this profile's sessions run, with default model + effort (catalog option
+    // ids). `harness` is REQUIRED — a profile always names a concrete harness (the
+    // "inherit deployment default" semantics were superseded; existing rows were
+    // backfilled to `claude`). model/effort stay nullable → the harness
+    // descriptor's defaults. All overridable per session.
+    harness: text("harness").notNull(),
+    model: text("model"),
+    effort: text("effort"),
+    includeUserTokens: boolean("include_user_tokens").notNull().default(false),
+    envVars: jsonb("env_vars").notNull().default({}), // { KEY: VALUE }
+    // ADR 0055: dynamic skill bundle names this profile's sessions mount (e.g.
+    // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
+    // mounts at session create. Empty = base session (no skills).
+    skills: jsonb("skills").$type<string[]>().notNull().default([]),
+    // ADR 0056: integration capabilities ("provider:action[@resource]") this
+    // profile's sessions are granted. Passed to the coordinator at session create
+    // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
+    // no third-party integration access.
+    capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
+    // ADR 0057: egress network allow-list (deny by default) + secrets this
+    // profile's sessions get, lifted off the image manifest. Additive in B1;
+    // compiled into the per-session SessionPolicy + consumed at boot in B2.
+    network: jsonb("network").$type<ProfileNetwork>().notNull().default(DEFAULT_PROFILE_NETWORK),
+    secrets: jsonb("secrets").$type<ProfileSecret[]>().notNull().default([]),
+    // ADR 0060: the org's default profile — a trigger (no UI to pick one) launches
+    // its session with this. At most one active default; the store clears the
+    // prior when one is set.
+    isDefault: boolean("is_default").notNull().default(false),
+    // ADR 0064: guest ports auto-exposed (private) for every session from this
+    // profile. The orchestrator mints one private port_exposure per declared port
+    // at session create (best-effort). Empty = no auto-exposed ports.
+    portExposures: jsonb("port_exposures").$type<number[]>().notNull().default([]),
+    // System marker (ADR 0100): at most one profile per value; the review
+    // workflow finds its profile by this marker, and designated profiles cannot
+    // be deleted.
+    designation: text("designation"),
+    createdAt: timestamp("created_at").notNull().defaultNow(),
+    updatedAt: timestamp("updated_at")
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+    deletedAt: timestamp("deleted_at"), // null = active; soft delete only (§4)
+  },
+  (t) => [
+    uniqueIndex("profile_designation_unique")
+      .on(t.designation)
+      .where(sql`designation is not null`),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // Connector catalog (ADR 0057 C1)

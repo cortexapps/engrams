@@ -257,14 +257,14 @@ where
 
 /// Dial `127.0.0.1:port`, retrying connection-refused within [`DIAL_DEADLINE`].
 async fn dial_loopback(port: u16) -> std::io::Result<TcpStream> {
-    let deadline = std::time::Instant::now() + DIAL_DEADLINE;
+    let deadline = crate::time_source::metrics_now() + DIAL_DEADLINE;
     let mut backoff = BACKOFF_START;
     loop {
         match TcpStream::connect(("127.0.0.1", port)).await {
             Ok(s) => return Ok(s),
             Err(e) => {
                 let refused = e.kind() == std::io::ErrorKind::ConnectionRefused;
-                if !refused || std::time::Instant::now() >= deadline {
+                if !refused || crate::time_source::metrics_now() >= deadline {
                     return Err(e);
                 }
                 tokio::time::sleep(backoff).await;

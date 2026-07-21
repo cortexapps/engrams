@@ -200,12 +200,13 @@ if kernel_key:
 # `just dev` normally brings up its own fake-gcs-server (compose,
 # profile `local-gcs`). But if another environment already has a
 # fake-gcs-server bound at STORAGE_EMULATOR_HOST, starting a second one
-# just collides on :4443 and the whole stack cascades to failure —
-# seed-buckets and the coordinator both resource_dep on it. So probe
-# the endpoint at parse time: if something answers, treat it as
-# external — skip our own container and point everything at the
-# existing one. Set ENGRAM_USE_EXTERNAL_GCS=1 to force this without the
-# probe (e.g. if the probe gives a false negative).
+# just collides on :4443 and the cold-tier setup cascades to failure.
+# seed-buckets resource_deps on it; the coordinator merely points its
+# GCS client at the endpoint and is deliberately not readiness-gated on
+# either resource. So probe the endpoint at parse time: if something
+# answers, treat it as external — skip our own container and point
+# everything at the existing one. Set ENGRAM_USE_EXTERNAL_GCS=1 to
+# force this without the probe (e.g. if the probe gives a false negative).
 # ----------------------------------------------------------------
 storage_emulator_host = env_or('STORAGE_EMULATOR_HOST', 'http://localhost:4443')
 gcs_external = env_or('ENGRAM_USE_EXTERNAL_GCS', '') in ('1', 'true', 'yes')
@@ -265,7 +266,7 @@ dc_resource('jaeger',
 # runtime resource.)
 #
 # ADR 0062: the image bakes NO harness — the built-in `claude` rides the
-# fleet `current_bundles` stamp (`just bundles-squashfs` / `bundles-vz`) and
+# fleet `current_bundles` stamp (`just bundles-squashfs`, both backends) and
 # is selected per session. `just bake-demo` just bakes deploy/demo/.
 # ----------------------------------------------------------------
 
@@ -276,6 +277,12 @@ dc_resource('jaeger',
 # the bucket already exists, and ensures it does if it doesn't. When the
 # emulator is external it has no Tilt resource to gate on, so the dep is
 # dropped; otherwise it waits on our own container.
+#
+# Nothing in the control plane resource_deps on this one-shot. GCS client
+# construction is local and does not contact the emulator or inspect the
+# bucket, so a broken cold-tier setup must not block the coordinator,
+# orchestrator, or web development loops. Operations that actually need
+# blob storage still fail at their point of use until seeding succeeds.
 local_resource('seed-buckets',
     cmd=(
         'STORAGE_EMULATOR_HOST=' + storage_emulator_host + ' ' +
@@ -385,10 +392,11 @@ else:
 local_resource('coordinator',
     serve_cmd=coord_serve_cmd,
     serve_env=coord_env,
-    # fake-gcs-server is only a Tilt resource when we run our own; when
-    # it's external, seed-buckets (also gated below) carries the GCS dep.
-    resource_deps=(['postgres', 'registry', 'jaeger', 'seed-buckets'] +
-        ([] if gcs_external else ['fake-gcs-server'])),
+    # Blob setup is intentionally absent: GCS client construction does not
+    # contact the emulator or bucket. Keep the control plane available when
+    # fake-gcs-server/seed-buckets is unhealthy; only blob-using operations
+    # need those resources. Bundles independently gate the host-agent below.
+    resource_deps=['postgres', 'registry', 'jaeger'],
     # Tilt's HTTP probe opens a fresh loopback TCP connection per
     # tick AND issues an HTTP request that makes the server log it.
     # On macOS the closed sockets sit in TIME_WAIT for 2*MSL=30s
@@ -488,7 +496,7 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
         'ENGRAM_SANDBOX_WORK_DIR': work_dir,
         'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
         # ADR 0061/0055: where the host-agent reads the bundle generation
-        # stamp (current.json) + staged <sha>.{erofs,squashfs} files. The
+        # stamp (current.json) + staged <sha>.squashfs files. The
         # `bundles` resource below stages them here before this resource
         # starts (resource_deps). Without this, bundle_dir_from_env() falls
         # back to the Linux fleet path /var/lib/engram/shared (absent on
@@ -760,13 +768,16 @@ def host_agent_resource(name, grpc_port, metrics_port, work_dir, nbd_csv, egress
 # a current.json stamp) under var/shared BEFORE the host-agent boots, so
 # it reports `current_bundles` and the coordinator can resolve enabled
 # skills (else `POST /sessions` 400s with "skill `skills` is unknown").
-# The fs format follows the backend: VZ's Kata kernel mounts erofs, FC
-# mounts squashfs. Re-running this (a skill edit under deploy/bundles)
+# One fs format for both backends since ADR 0096: squashfs (the owned VZ
+# kernel has CONFIG_SQUASHFS=y; the erofs fork is retired).
+# Re-running this (a skill edit under deploy/bundles)
 # rewrites current.json, which restarts the host-agent (its `deps` below)
 # so it re-reads the stamp — new sessions pick the edit up.
 _bundle_dir = os.path.abspath('var/shared')
 if dev_split:
-    _bundles_recipe = 'bundles-vz' if sandbox_backend == 'vz' else 'bundles-squashfs'
+    # ADR 0096: both backends stage squashfs — the owned VZ kernel has
+    # CONFIG_SQUASHFS=y, so the erofs fork (bundles-vz) is retired.
+    _bundles_recipe = 'bundles-squashfs'
     _bundles_cmd = 'just ' + _bundles_recipe
     # On the fc-colima path this resource auto-retriggered forever. The build
     # is content-deterministic and never modifies deploy/bundles (verified:
@@ -901,6 +912,11 @@ orchestrator_env = {
     'CONTROL_PLANE_GRPC_URL': 'http://127.0.0.1:50061',
     'CONTROL_PLANE_HTTP_URL': 'http://127.0.0.1:8090',
     'ORCHESTRATOR_PORT': '8787',
+    # ADR 0100: the review GitHub App's handle (its bot slug) that users
+    # @-mention on a PR to trigger a review. Set GITHUB_APP_LOGIN to your App's
+    # slug (e.g. "acme-reviewer"); empty → @-mention commands are disabled (the
+    # dispatch API + auto-on-open triggers still work).
+    'GITHUB_APP_LOGIN': env_or('GITHUB_APP_LOGIN', 'engrams-local-test[bot]'),
     # Public origin the BROWSER uses (the web dev server) — NOT the orchestrator's
     # own :8787. better-auth's session cookie is scoped here, /api is proxied here
     # (vite.config.ts), and the OAuth redirect + Slack session links are built from
@@ -919,6 +935,9 @@ orchestrator_env = {
     # to .env at parse time (above). Required — the orchestrator refuses to
     # boot without it, which is correct: a missing .env KEK is a real misconfig.
     'ENGRAM_KEK_MASTER_KEY': env_or('ENGRAM_KEK_MASTER_KEY', ''),
+    # ADR 0089: register the dev-only smoke tools (dev_echo / dev_echo_deferred)
+    # so live scenario A/C verification works against the local stack.
+    'ENGRAM_DEV_TOOLS': '1',
 }
 
 skip_web = env_or('ENGRAM_SKIP_WEB', '') in ('1', 'true', 'yes')
@@ -936,7 +955,7 @@ local_resource('orchestrator-migrate',
         '(PGPASSWORD=engram createdb -h localhost -p 5435 -U engram ' +
         'engram_orchestrator 2>/dev/null || true) && ' +
         'ORCHESTRATOR_DATABASE_URL=' + orchestrator_db_url + ' ' +
-        'bunx drizzle-kit migrate'
+        'bun x drizzle-kit migrate'
     ),
     resource_deps=['postgres'],
     labels=['setup'])

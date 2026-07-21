@@ -131,10 +131,8 @@ service HostService {
   // consumed it (single writer).
   rpc EditHarnessQueuedPrompt(EditHarnessQueuedPromptRequest) returns (Empty);
   rpc DequeueHarnessQueuedPrompt(DequeueHarnessQueuedPromptRequest) returns (Empty);
-  // ADR 0054: deliver a user's answer to a deferred AskUserQuestion to the
-  // attached harness (which stashes it and re-fires the deferred tool via
-  // `--resume`).
-  rpc AnswerHarnessQuestion(AnswerHarnessQuestionRequest) returns (Empty);
+  // ADR 0089: deliver an opaque result for an orchestrator-registered tool.
+  rpc SendHarnessToolResult(SendHarnessToolResultRequest) returns (Empty);
   // ADR 0030: operator interrupt. Stop the in-flight run on the
   // attached harness (it SIGINTs its current `claude` child and
   // returns to Idle); the session stays alive and resumable.
@@ -199,6 +197,10 @@ service HostService {
   // immediately funnels into `update_live_disk_manifest`.
   rpc FlushSandbox(SandboxIdMessage) returns (FlushSandboxResponse);
 
+  // ADR 0100: write a batch of files through the existing in-guest agentd
+  // Upload verb. Per-file failures are carried in the response payload.
+  rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
+
   // ---- streaming ----
   rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
 
@@ -240,6 +242,21 @@ service HostService {
   // these on host register / first heartbeat to keep the warm-path
   // RPC latency budget intact.
   rpc Ping(Empty) returns (Empty);
+
+  // ADR 0095: the standing peer-chunk tier. Host-to-host: any host-agent
+  // serves cache-RESIDENT content-addressed chunks by sha256 to any fleet
+  // peer, batch-streamed back-to-back (zero per-object round trips). This
+  // is NOT MigrationFetch: no export registry, no StateBin/seal artifacts,
+  // no allowlist — durable chunks are hash-capability inside the fleet
+  // boundary (every host already holds GCS creds for all of them; the ADR
+  // argues the posture). A locally-missing hash streams a `missing`
+  // marker and the requester falls to GCS — a peer can never induce a
+  // GCS read on the serving host. Backpressure: RESOURCE_EXHAUSTED when
+  // the serve semaphore is full (requester sends that batch to GCS
+  // without marking the peer lost). Frames carry CRC32C; the requester
+  // lands bulk pulls unverified-origin and a background scrubber
+  // re-hashes them off the critical path (ADR 0095 §Integrity).
+  rpc PeerChunkGet(PeerChunkGetRequest) returns (stream PeerChunkFrame);
 
   // ADR 0068 probe-before-host_lost: ground-truth sandbox liveness,
   // for `reconcile::flip_missing` to check BEFORE flipping a session to
@@ -459,6 +476,45 @@ message MigrationFrame {
   bool last = 4;
 }
 
+// --- ADR 0095: PeerChunkGet ---
+
+message PeerChunkGetRequest {
+  // 32-byte raw sha256 chunk hashes, in the order frames refer to them
+  // by index. Batch semantics: thousands per request is the intended
+  // shape (one request per pull window per stream).
+  repeated bytes hashes = 1;
+  // Why the requester wants these — observability + serve-side rate
+  // class, not authorization (hash-capability + resident-only is the
+  // gate). BaseImage is validated against the serving host's
+  // ready∪prestaging digests and rejected on mismatch; Snapshot is
+  // counted as-is (the serving host has no authoritative local index
+  // of snapshot ids — the coordinator only hints requesters at the
+  // host that captured it).
+  oneof scope {
+    // "sha256:<hex>" manifest digest of an enabled image.
+    string base_image_digest = 2;
+    // 16-byte snapshot UUID (divergence fill for a resume).
+    bytes snapshot_id = 3;
+  }
+}
+
+message PeerChunkFrame {
+  // Index into PeerChunkGetRequest.hashes.
+  uint32 item_idx = 1;
+  uint64 offset = 2;
+  bytes data = 3;
+  // Last frame for this item.
+  bool last = 4;
+  // Terminal single-frame marker: this hash is not cache-resident (or
+  // not yet verified for onward serving) on this host. The requester
+  // sources it from GCS; an honest miss never marks the peer lost.
+  bool missing = 5;
+  // CRC32C (Castagnoli) of `data`. Hardware-accelerated on both ends;
+  // catches wire/framing corruption without paying sha256 on the
+  // landing path (ADR 0095 §Integrity).
+  uint32 crc32c = 6;
+}
+
 message SnapshotBeginResponse {
   // Correlates Begin with the eventual Wait result; also proves the
   // capture itself (pause + FC create) succeeded before the coordinator
@@ -503,6 +559,11 @@ message MaterializeImageRequest {
   // An empty buffer decodes as `None`: anonymous, or the host's ambient
   // resolver (GCP workload identity via the coord-backed HTTP resolver).
   bytes registry_auth_bincode = 4;
+  // Floor for the packed ext4's size in GiB (`0` = content-sized), from
+  // the image's `resources.suggested_disk_gib` — gives sessions working
+  // room beyond the packer's content-relative headroom. Zero-fill padding
+  // chunks are elided from manifests, so the floor costs ~nothing at rest.
+  uint32 min_disk_gib = 5;
 }
 
 // One progress frame of an in-flight materialize. `stage` is
@@ -614,19 +675,10 @@ message DequeueHarnessQueuedPromptRequest {
   string prompt_id = 2;
 }
 
-message AnswerHarnessQuestionRequest {
+message SendHarnessToolResultRequest {
   bytes sandbox_id = 1; // 16-byte UUID
-  // Claude's tool_use_id of the deferred AskUserQuestion.
   string tool_call_id = 2;
-  // Selected labels keyed by question text. Always a list (1 for
-  // single-select, N for multi-select); proto3 map values can't be
-  // `repeated`, so each is wrapped in StringList.
-  map<string, StringList> answers = 3;
-}
-
-// A list of strings, for use as a proto3 map value.
-message StringList {
-  repeated string values = 1;
+  string result_json = 3;
 }
 
 message InterruptHarnessRequest {
@@ -668,6 +720,19 @@ message ReapMaterializeDirRequest {
 message ReapMaterializeDirResponse {
   // bincode-encoded `engram_protocol::wire::WireReapStats`.
   bytes stats_bincode = 1;
+}
+
+// --- WriteFiles ---
+
+message WriteFilesRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  // bincode-encoded `engram_protocol::wire::WireWriteFilesRequest`.
+  bytes request_bincode = 2;
+}
+
+message WriteFilesResponse {
+  // bincode-encoded `engram_protocol::wire::WireWriteFilesResponse`.
+  bytes response_bincode = 1;
 }
 
 // --- ExecStart (server-streaming) ---
@@ -829,4 +894,3 @@ message FlushSandboxResponse {
   // non-empty encodes `Some(ManifestRef { manifest_id, version })`.
   bytes manifest_ref_bincode = 1;
 }
-

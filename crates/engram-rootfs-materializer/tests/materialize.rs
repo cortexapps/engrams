@@ -399,6 +399,7 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
             Platform::LinuxArm64,
             scratch.path(),
             &chunk_store,
+            0,
             Some(ptx),
         )
         .await
@@ -461,6 +462,7 @@ async fn materialize_is_deterministic_and_scrubs_scratch() {
             Platform::LinuxArm64,
             scratch.path(),
             &chunk_store,
+            0,
             None,
         )
         .await
@@ -494,6 +496,7 @@ async fn materialize_scrubs_scratch_on_error() {
             Platform::LinuxArm64,
             scratch.path(),
             &chunk_store,
+            0,
             None,
         )
         .await
@@ -503,6 +506,47 @@ async fn materialize_scrubs_scratch_on_error() {
         std::fs::read_dir(scratch.path()).unwrap().next().is_none(),
         "scratch must be scrubbed on the error path too"
     );
+}
+
+/// ADR 0093 addendum: `min_fs_size_bytes` floors the packed ext4 so
+/// `suggested_disk_gib` grants real workspace. Sized to the property
+/// (256 MiB, not GiB): the floor lands verbatim in `ext4_size_bytes`,
+/// the padding is zero-elided in the manifest (chunk bytes stay far
+/// below the fs size), and the padded image still checksum-verifies.
+#[tokio::test]
+async fn materialize_honors_the_min_fs_size_floor() {
+    const FLOOR: u64 = 256 * 1024 * 1024;
+    let fx = publish_fixture(None).await;
+    let store_dir = tempfile::tempdir().unwrap();
+    let chunk_store = engram_chunk_store::ChunkStore::new(Arc::new(
+        engram_storage_local::LocalBlobStorage::new(store_dir.path().to_path_buf()),
+    ));
+    let scratch = tempfile::tempdir().unwrap();
+
+    let out = materializer()
+        .materialize(
+            &fx.uri,
+            Platform::LinuxArm64,
+            scratch.path(),
+            &chunk_store,
+            FLOOR,
+            None,
+        )
+        .await
+        .expect("materialize with a floor");
+    assert_eq!(out.ext4_size_bytes, FLOOR);
+
+    let manifest = chunk_store.get_manifest(out.disk_manifest).await.unwrap();
+    assert_eq!(manifest.total_bytes, FLOOR);
+    let stored =
+        manifest.chunks.len() as u64 * engram_chunk_store::manifest::DEFAULT_DISK_CHUNK_SIZE;
+    assert!(
+        stored < FLOOR / 2,
+        "zero padding must be elided from the manifest (~{stored} stored of {FLOOR})"
+    );
+    // The padded image reassembles and verifies clean (zero-fill gaps
+    // round-trip through the store).
+    image_from_store(&chunk_store, out.disk_manifest).await;
 }
 
 // ---------------------------------------------------------------
@@ -612,6 +656,7 @@ async fn pipelined_layers_apply_in_order() {
             Platform::LinuxArm64,
             scratch.path(),
             &chunk_store,
+            0,
             None,
         )
         .await
@@ -676,6 +721,7 @@ async fn mid_pull_failure_fails_and_scrubs() {
             Platform::LinuxArm64,
             scratch.path(),
             &chunk_store,
+            0,
             None,
         )
         .await
@@ -712,6 +758,7 @@ async fn single_layer_small_image_fast_path() {
             Platform::LinuxArm64,
             scratch.path(),
             &chunk_store,
+            0,
             None,
         )
         .await

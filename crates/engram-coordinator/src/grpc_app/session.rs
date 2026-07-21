@@ -145,25 +145,22 @@ impl app::session_service_server::SessionService for AppSessionService {
         }))
     }
 
-    async fn answer_question(
+    async fn complete_tool_call(
         &self,
-        req: Request<app::AnswerQuestionRequest>,
-    ) -> Result<Response<app::AnswerQuestionResponse>, Status> {
+        req: Request<app::CompleteToolCallRequest>,
+    ) -> Result<Response<app::CompleteToolCallResponse>, Status> {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        // ADR 0054: unwrap the proto StringList map back into the canonical
-        // Answers (BTreeMap<String, Vec<String>>).
-        let answers: engram_harness_proto::Answers = r
-            .answers
-            .into_iter()
-            .map(|(question, list)| (question, list.values))
-            .collect();
-        let note =
-            crate::api::prompt::answer_question_core(&self.state, id, r.tool_call_id, answers)
-                .await
-                .map_err(into_status)?;
-        Ok(Response::new(app::AnswerQuestionResponse {
+        let note = crate::api::prompt::complete_tool_call_core(
+            &self.state,
+            id,
+            r.tool_call_id,
+            r.result_json,
+        )
+        .await
+        .map_err(into_status)?;
+        Ok(Response::new(app::CompleteToolCallResponse {
             session_id: id.to_string(),
             note: note.to_string(),
         }))
@@ -348,6 +345,22 @@ impl app::session_service_server::SessionService for AppSessionService {
         });
 
         Ok(Response::new(Box::pin(started.chain(body))))
+    }
+
+    async fn write_files(
+        &self,
+        req: Request<app::WriteFilesRequest>,
+    ) -> Result<Response<app::WriteFilesResponse>, Status> {
+        self.auth.check(&req)?;
+        let r = req.into_inner();
+        let id = parse_session_id(&r.session_id)?;
+        let files = super::convert::write_files_request_from_proto(r);
+        let results = crate::api::write_files::write_files_core(&self.state, id, files)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(
+            super::convert::write_files_response_to_proto(results),
+        ))
     }
 
     async fn get_log(

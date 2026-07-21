@@ -80,7 +80,8 @@ impl Drop for SessionShellPin {
 }
 
 async fn stamp(state: &SharedState, session_id: SessionId, ttl: Duration) {
-    let until = chrono::Utc::now() + chrono::Duration::from_std(ttl).unwrap_or_default();
+    let until =
+        state.services.clock.now_utc() + chrono::Duration::from_std(ttl).unwrap_or_default();
     if let Err(e) = state.services.meta.stamp_shell_pin(session_id, until).await {
         tracing::warn!(%session_id, error = %e, "shell pin stamp failed");
     }

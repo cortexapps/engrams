@@ -32,7 +32,8 @@
 //! eval "$(bash crates/engram-sandbox-firecracker/scripts/fetch-fc-test-artifacts.sh)"
 //! cargo test -p engram-host-agent --test e2e_harness -- --ignored --nocapture --test-threads=1
 //! ```
-
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
 #![cfg(target_os = "linux")]
 
 use std::collections::HashMap;
@@ -564,7 +565,18 @@ async fn drive_harness(
             // so neither branch matches and the assertion still catches
             // it. That's the property worth keeping.
             let lower = text.to_lowercase();
-            let reached_api_401 = text.contains("401") && lower.contains("bearer");
+            // A bogus token yields a 401 from Anthropic. The body is
+            // usually "invalid bearer / x-api-key", but the upstream
+            // occasionally tears down the response socket right after the
+            // status line, so the CLI renders "API Error: 401 The socket
+            // connection was closed unexpectedly" (observed in CI). Both
+            // are genuine 401 responses that PROVE the egress round-trip
+            // reached the API — the load-bearing signal is the
+            // "API Error: <status>" shape itself, which a chain break
+            // (DNS/TLS/connect) never produces. So accept a 401 whenever
+            // it arrives as an API error, not only the bearer-worded body.
+            let reached_api_401 =
+                text.contains("401") && (lower.contains("bearer") || lower.contains("api error"));
             let reached_api_transient = lower.contains("api error")
                 && [
                     "500",

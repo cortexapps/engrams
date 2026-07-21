@@ -212,6 +212,11 @@ pub(crate) async fn materialize_image_on_host(
     job_id: uuid::Uuid,
     claimant: &str,
     image_uri: &str,
+    // ADR 0093 addendum: the image's `resources.suggested_disk_gib`,
+    // forwarded as the packed ext4's size floor (`0` = content-sized) so
+    // the knob actually grants sessions working room. Zero-fill padding
+    // chunks are elided from manifests, so the floor is ~free at rest.
+    min_disk_gib: u32,
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
     // ADR 0084 / ADR 0081: materialize boots no VM — it just pulls +
@@ -219,15 +224,18 @@ pub(crate) async fn materialize_image_on_host(
     // footprint, RAM reservation, or anti-affinity. `pick_materialize_host`
     // is the ADR 0078 disk-floor-only picker; the CAPTURE stage uses the
     // reserving `place_capture_job` path instead.
-    let (host_id, host) =
-        crate::placement::pick_materialize_host(state.services.meta.as_ref(), &state.host_registry)
-            .await
-            .map_err(|e| {
-                ApiError::Unavailable(format!(
-                    "no host is available to materialize this image ({e:?}). \
+    let (host_id, host) = crate::placement::pick_materialize_host(
+        state.services.meta.as_ref(),
+        &state.host_registry,
+        state.services.clock.now_utc(),
+    )
+    .await
+    .map_err(|e| {
+        ApiError::Unavailable(format!(
+            "no host is available to materialize this image ({e:?}). \
                      Register a disk-healthy host and retry the enable."
-                ))
-            })?;
+        ))
+    })?;
     // ADR 0088: stamp the durable materialize placement BEFORE the
     // streaming RPC starts, so the host-operator's roll gate can never
     // observe work running on a host it thinks is idle. Fenced by the
@@ -253,41 +261,52 @@ pub(crate) async fn materialize_image_on_host(
         static_auth = registry_auth.is_some(),
         "materializing image on host for enable",
     );
-    host.materialize_image(image_uri, "linux", arch, registry_auth, progress)
-        .await
-        .map_err(|e| match e {
-            engram_core::SandboxError::MaterializeFailed(failure) => ApiError::MaterializeFailed {
-                kind: failure.kind,
-                message: format!(
-                    "materialize `{image_uri}` on host {host_id} failed: {}",
-                    failure.message
-                ),
-            },
-            // Same retryable transport classes as the capture RPC
-            // (ADR 0050 C / issue #229): re-pick a host next attempt.
-            engram_core::SandboxError::Unavailable(msg) => ApiError::Unavailable(format!(
-                "materialize `{image_uri}` could not reach host {host_id}: {msg}"
-            )),
-            engram_core::SandboxError::WireSkew { host: hw, coord } => {
-                ApiError::Unavailable(format!(
-                    "materialize `{image_uri}` hit a WIRE_VERSION skew against host {host_id} \
+    host.materialize_image(
+        image_uri,
+        "linux",
+        arch,
+        registry_auth,
+        min_disk_gib,
+        progress,
+    )
+    .await
+    .map_err(|e| match e {
+        engram_core::SandboxError::MaterializeFailed(failure) => ApiError::MaterializeFailed {
+            kind: failure.kind,
+            message: format!(
+                "materialize `{image_uri}` on host {host_id} failed: {}",
+                failure.message
+            ),
+        },
+        // Same retryable transport classes as the capture RPC
+        // (ADR 0050 C / issue #229): re-pick a host next attempt.
+        engram_core::SandboxError::Unavailable(msg) => ApiError::Unavailable(format!(
+            "materialize `{image_uri}` could not reach host {host_id}: {msg}"
+        )),
+        engram_core::SandboxError::WireSkew { host: hw, coord } => ApiError::Unavailable(format!(
+            "materialize `{image_uri}` hit a WIRE_VERSION skew against host {host_id} \
                      (host={hw}, coord={coord})"
-                ))
-            }
-            other => ApiError::Internal(format!(
-                "materialize `{image_uri}` on host {host_id} failed: {other}"
-            )),
-        })
+        )),
+        other => ApiError::Internal(format!(
+            "materialize `{image_uri}` on host {host_id} failed: {other}"
+        )),
+    })
 }
 
 /// Build the `EnabledImage` row skeleton for one enable job — the
 /// materialize + capture stages stamp
 /// `disk_manifest`/`oci_defaults`/`manifest_digest` and the
 /// base-snapshot refs onto it before the ready-time upsert.
-pub(crate) fn new_enable_row(image_uri: &str, config: &ImageConfig) -> EnabledImage {
-    let now = Utc::now();
+/// `id`/`now` are hoisted from the caller's injected entropy/clock
+/// (ADR 0098 D1).
+pub(crate) fn new_enable_row(
+    image_uri: &str,
+    config: &ImageConfig,
+    id: Uuid,
+    now: chrono::DateTime<Utc>,
+) -> EnabledImage {
     EnabledImage {
-        id: Uuid::new_v4(),
+        id,
         image_uri: image_uri.to_string(),
         image_config: config.clone(),
         // Stamped from the MaterializeImage result (the Dockerfile
@@ -885,15 +904,19 @@ pub(crate) async fn ensure_capture_job(
     // time (the claim handler resolves the cold-base candidate fresh per
     // attempt — ADR 0084 §B5 "known gap").
     let footprint = capture_footprint_for(state, disk_manifest_ref, &config).await;
-    let candidates =
-        crate::placement::capture_candidate_hosts(state.services.meta.as_ref(), footprint, None)
-            .await
-            .map_err(|e| {
-                ApiError::Internal(format!(
-                    "capture candidate hosts for `{}`: {e:?}",
-                    row.image_uri
-                ))
-            })?;
+    let candidates = crate::placement::capture_candidate_hosts(
+        state.services.meta.as_ref(),
+        footprint,
+        None,
+        state.services.clock.now_utc(),
+    )
+    .await
+    .map_err(|e| {
+        ApiError::Internal(format!(
+            "capture candidate hosts for `{}`: {e:?}",
+            row.image_uri
+        ))
+    })?;
     let placed = place_capture_job_preferring_materialize_host(
         state.services.meta.as_ref(),
         inserted.id,
@@ -1083,7 +1106,7 @@ pub(crate) async fn finalize_capture_job(
         }
     };
 
-    let now = Utc::now();
+    let now = state.services.clock.now_utc();
     // Record the snapshot row (session_id = NULL — a template artifact,
     // not a session capture). The caller stamps the returned id onto the
     // enabled_images row's NOT NULL base_snapshot_id and upserts it only
@@ -1168,12 +1191,14 @@ pub(crate) async fn resolve_capture_env(
         let value = match &entry.value {
             CaptureEnvValue::Literal { value } => value.clone(),
             CaptureEnvValue::SecretRef { secret_ref } => {
-                let schema = engram_core::types::image::SecretSchema {
-                    r#ref: Some(secret_ref.clone()),
-                    required: true,
-                    ..Default::default()
-                };
-                match state.services.secrets.get(&ctx, secret_ref, &schema).await {
+                match super::sessions::resolve_explicit_secret_ref(
+                    state.services.secrets.as_ref(),
+                    &ctx,
+                    secret_ref,
+                    true,
+                )
+                .await
+                {
                     Ok(Some(v)) => v,
                     Ok(None) => {
                         return Err(ApiError::BadRequest(format!(
@@ -1208,6 +1233,8 @@ pub(crate) async fn resolve_capture_env(
 // ever holding image bytes.
 
 #[cfg(test)]
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#[allow(clippy::disallowed_methods)]
 mod tests {
     use super::*;
     use engram_chunk_store::{ManifestKind, ManifestRef};

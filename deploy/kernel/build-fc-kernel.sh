@@ -27,7 +27,7 @@ set -euo pipefail
 
 # --- pins (keep RELEASE_TAG / ASSET in sync with the consumers) ---
 LINUX_VERSION="${LINUX_VERSION:-6.1.102}"
-KERNEL_REV="${KERNEL_REV:-1}"                    # engram build revision; bump on fragment/base change
+KERNEL_REV="${KERNEL_REV:-2}"                    # engram build revision; bump on fragment/base change
 
 # ARCH selects the kernel build target: x86_64 (default, byte-for-byte
 # unchanged behavior for existing callers/CI) or arm64 (ADR 0082).
@@ -119,6 +119,8 @@ require() {
 # VIRTIO_BALLOON: the ADR 0088 addendum's capture-time seed shrink inflates a
 # balloon before the cold-base dump; a guest without the driver silently
 # degrades every warm enable back to a dense multi-GiB seed upload.
+# CHECKPOINT_RESTORE: required by CRIU, including the CRIU engine bundled with
+# JDK CRaC. Both vendored Firecracker base configs disable it.
 for c in \
   CONFIG_NF_TABLES CONFIG_NFT_COMPAT CONFIG_NFT_NAT \
   CONFIG_IP_NF_RAW CONFIG_IP6_NF_NAT CONFIG_IP6_NF_RAW \
@@ -128,7 +130,8 @@ for c in \
   CONFIG_IP_PNP CONFIG_EXT4_FS \
   CONFIG_FUSE_FS \
   CONFIG_NAMESPACES CONFIG_USER_NS CONFIG_PID_NS CONFIG_NET_NS \
-  CONFIG_SECCOMP CONFIG_SECCOMP_FILTER ; do
+  CONFIG_SECCOMP CONFIG_SECCOMP_FILTER \
+  CONFIG_CHECKPOINT_RESTORE ; do
   require "$c"
 done
 echo "    all required symbols present"

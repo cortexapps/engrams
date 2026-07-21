@@ -18,6 +18,9 @@
 //!     cargo test -p engram-coordinator --test host_status_transition_live_pg -- --ignored
 //! ```
 
+// tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
+#![allow(clippy::disallowed_methods)]
+
 use chrono::Utc;
 use engram_core::traits::MetadataStore;
 use engram_core::types::host::{
@@ -27,18 +30,8 @@ use engram_core::types::HostId;
 use engram_postgres::PostgresStore;
 
 async fn connect() -> Option<PostgresStore> {
-    let database_url = match std::env::var("ENGRAM_TEST_DATABASE_URL") {
-        Ok(v) => v,
-        Err(_) => {
-            eprintln!("skipping: ENGRAM_TEST_DATABASE_URL not set (run `just db-up`)");
-            return None;
-        }
-    };
-    let store = PostgresStore::connect(&database_url)
-        .await
-        .expect("connect postgres");
-    store.migrate().await.expect("migrate");
-    Some(store)
+    let db = engram_testkit::pg::fresh_db().await?;
+    Some(db.store)
 }
 
 fn host(id: HostId, hostname: &str, addr: &str) -> HostRecord {

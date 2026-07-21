@@ -9,7 +9,11 @@ import {
   useQuery as useTanstackQuery,
   useQueryClient,
 } from "@tanstack/react-query";
-import { listTasks, updateTask } from "../gen/engram/app/v1/task-TaskService_connectquery";
+import {
+  deleteTask,
+  listTasks,
+  updateTask,
+} from "../gen/engram/app/v1/task-TaskService_connectquery";
 import type { SessionListItem } from "../lib/types";
 import type { Task } from "../gen/engram/app/v1/task_pb";
 import { authClient } from "../lib/auth-client";
@@ -125,6 +129,23 @@ export function useUpdateTask() {
     // infinite: the list surfaces paginate with useInfiniteQuery (ADR 0087),
     // and a finite-only invalidation would leave their titles stale until the
     // next ambient poll.
+    onSuccess: () =>
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({ schema: listTasks, cardinality: undefined }),
+      }),
+  });
+}
+
+/**
+ * Delete a task and tear down its sessions. DeleteTask calls DeleteSession for
+ * each task_session row (the racy-idempotent teardown; ADR 0051/0079) and then
+ * removes the task row, so the deleted work drops out of every list surface.
+ * Invalidates the whole ListTasks key family (finite AND infinite, per
+ * useUpdateTask's note) so the list re-renders without the removed row.
+ */
+export function useDeleteTask() {
+  const qc = useQueryClient();
+  return useMutation(deleteTask, {
     onSuccess: () =>
       qc.invalidateQueries({
         queryKey: createConnectQueryKey({ schema: listTasks, cardinality: undefined }),

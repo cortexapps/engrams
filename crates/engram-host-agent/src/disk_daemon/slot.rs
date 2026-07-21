@@ -189,6 +189,75 @@ fn device_is_free(slot: u32) -> bool {
 /// tests so the allocator is exercisable off-Linux).
 type FreeCheck = Arc<dyn Fn(u32) -> bool + Send + Sync>;
 
+/// The explicit lifecycle of one `/dev/nbdN` slot (ADR 0098 Phase 2, P7).
+///
+/// The allocator tracks a slot's state IMPLICITLY across three
+/// representations — the `reserved` bitset, the `warm` queue, and possession
+/// of an [`NbdSlot`] handle (+ its `quarantined` flag). The allocator is
+/// already portable and tested, so this enum + transition table do NOT rewire
+/// it; they make the implicit FSM auditable (the slot-accounting oracle in the
+/// host-internal simulator asserts against these states):
+///
+/// | State | Implicit representation |
+/// |---|---|
+/// | [`Free`](SlotState::Free) | `reserved == false`, not in the warm queue |
+/// | [`Warm`](SlotState::Warm) | `reserved == true`, present in the warm queue (validated, ready) |
+/// | [`Claimed`](SlotState::Claimed) | `reserved == true`, not warm, a live [`NbdSlot`] handle exists |
+/// | [`Parked`](SlotState::Parked) | `reserved == true`, not warm, a `quarantine()`d handle dropped (bit never cleared) |
+///
+/// The populator's transient validation window — `reserved == true` but
+/// neither warm nor leased, between `Inner::reserve_next` and `unreserve` — is
+/// deliberately NOT a distinct state: it is a `Free` slot mid-transition to
+/// `Warm` (or back to `Free`), and [`NbdSlotAllocator::claim`]'s retry loop
+/// exists solely to survive it (a survivor grab treats
+/// "reserved-but-not-warm-and-no-lease" as retryable, never terminal).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum SlotState {
+    /// Not reserved, not warm — available for the populator or a direct claim.
+    Free,
+    /// Reserved and validated, waiting in the warm queue for an `acquire`.
+    Warm,
+    /// Reserved and leased out (a live `NbdSlot` handle is serving a sandbox).
+    Claimed,
+    /// Reserved and quarantined (a survivor whose rehydrate failed) — held out
+    /// of circulation until the evict_local → resume ladder recovers it.
+    Parked,
+}
+
+impl SlotState {
+    /// Every state (exhaustiveness guard: a new variant is a compile error at
+    /// the array literal and forces a decision in [`Self::can_transition_to`]).
+    pub const ALL: [SlotState; 4] = [
+        SlotState::Free,
+        SlotState::Warm,
+        SlotState::Claimed,
+        SlotState::Parked,
+    ];
+
+    /// Whether the allocator can move a slot `self → to`. The legal edges,
+    /// each mapped to the concrete allocator action:
+    ///
+    /// - `Free → Warm` — the populator validates a free slot and warms it.
+    /// - `Free → Claimed` — `claim`/`try_claim` reserves a free device
+    ///   directly (survivor grab / sweep), skipping the warm queue.
+    /// - `Warm → Claimed` — `acquire`/`claim` pulls a validated slot out of
+    ///   the warm queue.
+    /// - `Claimed → Free` — the lease drops normally (`release` clears the
+    ///   reserved bit).
+    /// - `Claimed → Parked` — the lease is `quarantine()`d (bit stays set).
+    ///
+    /// [`Parked`](SlotState::Parked) is terminal: only a process restart
+    /// clears the reserved bit. `Warm → Free` never happens (the populator
+    /// never un-warms a validated slot; it only advances to `Claimed`).
+    pub fn can_transition_to(self, to: SlotState) -> bool {
+        use SlotState::{Claimed, Free, Parked, Warm};
+        matches!(
+            (self, to),
+            (Free, Warm) | (Free, Claimed) | (Warm, Claimed) | (Claimed, Free) | (Claimed, Parked)
+        )
+    }
+}
+
 /// Lease handle for one `/dev/nbdN` slot. Auto-returns the slot to the
 /// allocator on `Drop` — a sandbox holds one for the lifetime of its
 /// NBD daemon, and the lease's drop releases the slot back into the
@@ -217,7 +286,17 @@ impl NbdSlot {
     /// reserved bit stays set permanently (until process restart). The
     /// rehydrate failure path uses this to park a survivor's live device
     /// out of circulation. See the `quarantined` field doc.
+    ///
+    /// The device is also registered in the allocator's parked set, so the
+    /// startup classification barrier counts it as a TRACKED record even if
+    /// every sandbox-derived record source has concurrently vanished (the
+    /// 2026-07-21 false `rehydrate-unknown-device` alarm).
     pub fn quarantine(mut self) {
+        self.allocator
+            .parked
+            .lock()
+            .expect("parked set lock poisoned")
+            .insert(self.path.clone());
         self.quarantined = true;
         // `self` drops here; the `quarantined` flag makes Drop a no-op,
         // leaving the reserved bit set so the slot is never re-handed-out.
@@ -338,6 +417,14 @@ impl Inner {
             }
         }
     }
+
+    /// Whether `slot` is part of this pool at all — the fast-`None`
+    /// gate for [`NbdSlotAllocator::claim`], so its retry budget is
+    /// only ever spent on transiently-reserved members, never on
+    /// devices outside the universe.
+    fn in_universe(&self, slot: u32) -> bool {
+        self.pos_of.contains_key(&slot)
+    }
 }
 
 /// Pool of `/dev/nbdN` device slots with a warm-pool front. Cheap to
@@ -351,6 +438,18 @@ pub struct NbdSlotAllocator {
     /// of the mutex for a lock-free `capacity()`.
     capacity: usize,
     free_check: FreeCheck,
+    /// Devices parked by [`NbdSlot::quarantine`] — the allocator's record
+    /// of `Parked` slots, which the reserved bitset alone cannot express
+    /// (a parked slot's bits are indistinguishable from a claimed one's).
+    /// The startup classification barrier reads this so a rehydrate-failed
+    /// survivor's device stays a TRACKED record: 2026-07-21, a park raced a
+    /// concurrent sandbox destroy, the FC-derived record set missed the
+    /// device, and the `rehydrate-unknown-device` invariant cried wolf over
+    /// a device this very process had just parked on purpose. A
+    /// `std::sync::Mutex` (not the pool's async one): touched only by the
+    /// sync `quarantine()` consume and the startup-time snapshot, never
+    /// held across an await.
+    parked: std::sync::Mutex<std::collections::HashSet<PathBuf>>,
 }
 
 impl std::fmt::Debug for NbdSlotAllocator {
@@ -411,6 +510,7 @@ impl NbdSlotAllocator {
             warm_target,
             capacity,
             free_check,
+            parked: std::sync::Mutex::new(std::collections::HashSet::new()),
         });
         // The populator holds only a Weak ref so the allocator can drop
         // naturally (dropping the last Arc stops the populator on its
@@ -450,33 +550,60 @@ impl NbdSlotAllocator {
     /// Deliberately skips the free-check: a survivor's device is busy
     /// BY DESIGN.
     ///
-    /// `None` if the device isn't in this pool, or is already reserved
+    /// `None` if the device isn't in this pool, or is durably reserved
     /// by another lease (pulling it out of the warm pool if it happens
     /// to be sitting there pre-validated).
+    ///
+    /// RETRIES across the populator's validation window: `populate`
+    /// holds a slot RESERVED for the duration of its free-check before
+    /// either warming it (free) or un-reserving it (busy — the survivor
+    /// case). A one-shot claim landing inside that window saw
+    /// "reserved" + "not warm" and wrongly concluded the device was
+    /// leased — observed as a flaky survivor rehydrate (CI 2026-07-17:
+    /// `rehydrate_sandbox` returned false 44 ms into a successor's
+    /// startup, i.e. during the pool's very first populate pass; in
+    /// prod the same race intermittently strands a survivor's disk
+    /// until the evict_local → resume ladder). A genuine lease stays
+    /// reserved past the whole retry budget and still returns `None`;
+    /// the validation window is a sysfs read and resolves within the
+    /// first retry or two.
     pub async fn claim(self: &Arc<Self>, path: &Path) -> Option<NbdSlot> {
+        const CLAIM_RETRIES: u32 = 20;
+        const CLAIM_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(25);
         let slot = parse_nbd_index(path)?;
-        let mut inner = self.inner.lock().await;
-        if inner.reserve_specific(slot) {
-            return Some(NbdSlot {
-                slot,
-                path: slot_path(slot),
-                allocator: self.clone(),
-                quarantined: false,
-            });
+        if !self.inner.lock().await.in_universe(slot) {
+            return None;
         }
-        // Already reserved — it may be sitting warm (validated free,
-        // not yet handed out). Pull it from the warm pool and hand it
-        // out, keeping the reserved bit set.
-        drop(inner);
-        let mut warm = self.warm.lock().await;
-        let pos = warm.iter().position(|&s| s == slot)?;
-        warm.remove(pos);
-        Some(NbdSlot {
-            slot,
-            path: slot_path(slot),
-            allocator: self.clone(),
-            quarantined: false,
-        })
+        for attempt in 0..CLAIM_RETRIES {
+            if attempt > 0 {
+                tokio::time::sleep(CLAIM_RETRY_DELAY).await;
+            }
+            {
+                let mut inner = self.inner.lock().await;
+                if inner.reserve_specific(slot) {
+                    return Some(NbdSlot {
+                        slot,
+                        path: slot_path(slot),
+                        allocator: self.clone(),
+                        quarantined: false,
+                    });
+                }
+            }
+            // Already reserved — it may be sitting warm (validated free,
+            // not yet handed out). Pull it from the warm pool and hand it
+            // out, keeping the reserved bit set.
+            let mut warm = self.warm.lock().await;
+            if let Some(pos) = warm.iter().position(|&s| s == slot) {
+                warm.remove(pos);
+                return Some(NbdSlot {
+                    slot,
+                    path: slot_path(slot),
+                    allocator: self.clone(),
+                    quarantined: false,
+                });
+            }
+        }
+        None
     }
 
     /// Try to claim a SPECIFIC device that the caller believes to be
@@ -554,6 +681,20 @@ impl NbdSlotAllocator {
     /// Count of pre-validated slots currently sitting warm. Telemetry.
     pub async fn warm_count(&self) -> usize {
         self.warm.lock().await.len()
+    }
+
+    /// Devices parked by [`NbdSlot::quarantine`] this process lifetime.
+    /// The startup classification barrier folds these into its
+    /// tracked-record set: a parked survivor is a device this process
+    /// KNOWS about (it parked it on purpose), never an "unknown device"
+    /// for the `rehydrate-unknown-device` invariant.
+    pub fn parked_devices(&self) -> Vec<PathBuf> {
+        self.parked
+            .lock()
+            .expect("parked set lock poisoned")
+            .iter()
+            .cloned()
+            .collect()
     }
 }
 
@@ -666,6 +807,43 @@ mod tests {
     use std::collections::HashSet;
     use std::time::Duration;
 
+    /// ADR 0098 P7: the auditable slot FSM. The legal edges match the
+    /// allocator's concrete actions; `Parked` is terminal, and `Warm → Free`
+    /// (a populator un-warming a validated slot) is never legal.
+    #[test]
+    fn slot_state_transition_table_matches_the_allocator() {
+        use SlotState::{Claimed, Free, Parked, Warm};
+        let legal = [
+            (Free, Warm),      // populator warms
+            (Free, Claimed),   // direct claim / try_claim on a free device
+            (Warm, Claimed),   // acquire pulls from the warm queue
+            (Claimed, Free),   // normal lease drop → release
+            (Claimed, Parked), // quarantine() a survivor's device
+        ];
+        for from in SlotState::ALL {
+            for to in SlotState::ALL {
+                let expect = legal.contains(&(from, to));
+                assert_eq!(
+                    from.can_transition_to(to),
+                    expect,
+                    "unexpected verdict for {from:?} → {to:?}",
+                );
+            }
+        }
+        // Parked is terminal — no out-edge (only a process restart clears it).
+        assert!(
+            SlotState::ALL
+                .iter()
+                .all(|to| !Parked.can_transition_to(*to)),
+            "Parked must be terminal",
+        );
+        // A warm slot never regresses to Free.
+        assert!(
+            !Warm.can_transition_to(Free),
+            "the populator never un-warms"
+        );
+    }
+
     /// Build a test pool over `0..n` with an injectable busy-set so the
     /// allocator is exercisable off-Linux (no real `/sys`).
     fn test_pool(
@@ -692,6 +870,42 @@ mod tests {
             "warm pool never reached {want} (got {})",
             pool.warm_count().await
         );
+    }
+
+    /// CI 2026-07-17 flake → real race: `populate` holds a slot
+    /// RESERVED while its free-check runs; a busy (survivor) device is
+    /// reserve→check→unreserve cycled forever, and a one-shot `claim`
+    /// landing inside the check window read "reserved, not warm" as "a
+    /// lease owns it" and returned `None` — a successor's survivor
+    /// rehydrate then strands the disk. With a single-slot pool and a
+    /// deliberately SLOW busy-reporting free-check, the window
+    /// dominates the timeline, so a non-retrying claim loses almost
+    /// surely; the retrying claim must still win.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn claim_wins_against_the_populators_validation_window() {
+        let busy = Arc::new(std::sync::Mutex::new(HashSet::from([0u32])));
+        let check_busy = busy.clone();
+        let pool = NbdSlotAllocator::build(
+            vec![0],
+            1,
+            Arc::new(move |slot| {
+                // Hold the reserved-for-validation window open ~20 ms
+                // per populate pass (prod: a sysfs read, sub-ms — the
+                // exaggeration makes the pre-fix loss deterministic).
+                std::thread::sleep(Duration::from_millis(20));
+                !check_busy.lock().unwrap().contains(&slot)
+            }),
+        );
+        // Let the populator get INTO a validation pass before claiming.
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let claimed = pool.claim(&slot_path(0)).await;
+        assert!(
+            claimed.is_some(),
+            "a claim racing the populator's validation window must retry \
+             through it, not report the survivor's device as leased",
+        );
+        // And a device outside the universe still fast-fails.
+        assert!(pool.claim(&slot_path(7)).await.is_none());
     }
 
     #[tokio::test]
@@ -868,6 +1082,15 @@ mod tests {
         assert!(
             pool.try_claim(Path::new("/dev/nbd0")).await.is_none(),
             "quarantined device must not be re-claimable"
+        );
+        // …and it must be a TRACKED record for the startup classification
+        // barrier (the 2026-07-21 false `rehydrate-unknown-device` alarm:
+        // a parked device whose sandbox-derived records vanished was
+        // reported as an unknown survivor needing an operator).
+        assert_eq!(
+            pool.parked_devices(),
+            vec![PathBuf::from("/dev/nbd0")],
+            "a quarantined device must appear in the allocator's parked set"
         );
     }
 
