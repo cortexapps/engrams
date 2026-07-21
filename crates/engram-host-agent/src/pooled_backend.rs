@@ -454,6 +454,12 @@ pub struct PooledBackend {
     /// every heartbeat until cleared by a successful capture or destroy;
     /// the coordinator flips the session Active → Unreachable off it.
     unreachable_guests: Arc<DashMap<SandboxId, SessionId>>,
+    /// ADR 0091 probe gate (engrams review, #835): sandboxes with a
+    /// detached dead-guest confirmation probe currently in flight — at
+    /// most one probe per sandbox regardless of the driver's tick rate
+    /// (the ~6s probe outlives a sub-6s `min_interval` tick). Entry
+    /// removed when the probe finishes or the sandbox is destroyed.
+    dead_probe_inflight: Arc<DashMap<SandboxId, ()>>,
     /// ADR 0007: chunk-store-backed materialization. When set, the
     /// `bundle.json` on a cached image is the source of truth for
     /// the disk — chunks are fetched from `BlobStorage`, written to
@@ -565,6 +571,11 @@ pub struct PooledBackend {
     /// Cleared on `destroy(sandbox_id)` so the entry doesn't
     /// outlive its sandbox.
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
+    /// ADR 0101 B: per-sandbox pacing sample from the last completed
+    /// capture (diff dirty bytes + epoch length) — the adaptive
+    /// checkpoint controller's input. Written by the snapshot post
+    /// phase, cleared on destroy alongside `last_snapshot_unix_ms`.
+    checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
     /// ADR 0016 Phase B: continuous-flush scheduler config + the
     /// publisher impl the scheduler hands its outcomes to. Cloned
     /// into every cold-create / resume / restart-rehydration site
@@ -1790,6 +1801,7 @@ impl PooledBackend {
             session_bindings: Arc::new(DashMap::new()),
             quarantined_survivors: Arc::new(DashMap::new()),
             unreachable_guests: Arc::new(DashMap::new()),
+            dead_probe_inflight: Arc::new(DashMap::new()),
             chunk_store: None,
             peer_health: crate::peer_fill::PeerHealth::new(),
             materialize_dir: None,
@@ -1804,6 +1816,7 @@ impl PooledBackend {
             nbd_sandboxes: Arc::new(DashMap::new()),
             inflight_snapshots: Arc::new(DashMap::new()),
             last_snapshot_unix_ms: Arc::new(DashMap::new()),
+            checkpoint_pacing: Arc::new(DashMap::new()),
             // ADR 0016 Phase B: scheduler defaults come from env at
             // host-agent startup; the builder method
             // `with_flush_scheduler` can override.
@@ -1966,6 +1979,7 @@ impl PooledBackend {
             bundle_file_ext: self.bundle_file_ext(),
             inflight_snapshots: self.inflight_snapshots.clone(),
             last_snapshot_unix_ms: self.last_snapshot_unix_ms.clone(),
+            checkpoint_pacing: self.checkpoint_pacing.clone(),
             checkpoint_chains: self.checkpoint_chains.clone(),
             checkpoint_dir: self.checkpoint_dir.clone(),
             chain_heads: self.chain_heads.clone(),
@@ -3413,6 +3427,19 @@ impl PooledBackend {
         self.unreachable_guests.remove(&sandbox_id);
     }
 
+    /// ADR 0091 probe gate (engrams review, #835): claim the one
+    /// dead-guest-probe slot for `sandbox_id`. `true` = caller owns the
+    /// probe and MUST call [`Self::end_dead_probe`] when it finishes;
+    /// `false` = a probe is already in flight, skip spawning another.
+    pub fn try_begin_dead_probe(&self, sandbox_id: SandboxId) -> bool {
+        self.dead_probe_inflight.insert(sandbox_id, ()).is_none()
+    }
+
+    /// Release the probe slot claimed by [`Self::try_begin_dead_probe`].
+    pub fn end_dead_probe(&self, sandbox_id: SandboxId) {
+        self.dead_probe_inflight.remove(&sandbox_id);
+    }
+
     /// ADR 0091: the heartbeat's unreachable-guest advert.
     pub fn unreachable_guests(&self) -> Vec<(SandboxId, SessionId)> {
         self.unreachable_guests
@@ -3722,13 +3749,20 @@ impl PooledBackend {
             .await
     }
 
-    /// Sandboxes due for a periodic checkpoint: session-bound, and no
-    /// successful capture (of any flavor) within `interval`. Empty
-    /// when checkpointing is disabled.
-    pub fn checkpoint_candidates(
+    /// ADR 0101 B: sandboxes due for a periodic checkpoint — each
+    /// sandbox's due-interval comes from its last epoch's observed
+    /// dirty rate ([`crate::checkpoint::next_epoch_after`]), clamped to
+    /// `[cfg.min_interval, cfg.interval]`. A sandbox with no pacing
+    /// sample yet (fresh bind, chain seed pending, Full-only history)
+    /// keeps the max-interval backstop cadence. (The flat-interval
+    /// predecessor is retired — this is the only candidacy surface.)
+    pub fn checkpoint_candidates_adaptive(
         &self,
-        interval: std::time::Duration,
+        cfg: &crate::checkpoint::CheckpointConfig,
     ) -> Vec<(SandboxId, SessionId)> {
+        let Some(max_interval) = cfg.interval else {
+            return Vec::new();
+        };
         if self.checkpoint_dir.is_none() {
             return Vec::new();
         }
@@ -3736,13 +3770,22 @@ impl PooledBackend {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as i64)
             .unwrap_or(0);
-        let interval_ms = interval.as_millis() as i64;
         self.session_bindings
             .iter()
             .filter_map(|e| {
                 let id = *e.key();
                 let last = self.last_snapshot_unix_ms.get(&id).map(|v| *v).unwrap_or(0);
-                (now_ms - last >= interval_ms).then_some((id, *e.value()))
+                let due_after = match self.checkpoint_pacing.get(&id).map(|v| *v) {
+                    Some(s) => crate::checkpoint::next_epoch_after(
+                        s.epoch,
+                        s.dirty_bytes,
+                        cfg.min_interval,
+                        max_interval,
+                        cfg.target_epoch_bytes,
+                    ),
+                    None => max_interval,
+                };
+                (now_ms - last >= due_after.as_millis() as i64).then_some((id, *e.value()))
             })
             .collect()
     }
@@ -5357,6 +5400,10 @@ pub(crate) struct SnapshotFinisher {
     bundle_file_ext: &'static str,
     inflight_snapshots: Arc<DashMap<SandboxId, engram_core::types::SnapshotId>>,
     last_snapshot_unix_ms: Arc<DashMap<SandboxId, i64>>,
+    /// ADR 0101 B: last completed epoch's pacing sample, written by the
+    /// diff arm of the post phase; read by the adaptive checkpoint
+    /// controller (`checkpoint_candidates_adaptive`).
+    checkpoint_pacing: Arc<DashMap<SandboxId, EpochPacingSample>>,
     checkpoint_chains: Arc<DashMap<SandboxId, crate::checkpoint::CheckpointChain>>,
     checkpoint_dir: Option<PathBuf>,
     chain_heads: Option<Arc<crate::checkpoint::ChainHeadStore>>,
@@ -5364,6 +5411,17 @@ pub(crate) struct SnapshotFinisher {
     /// ADR 0098 D1: cloned from the owning `PooledBackend` — the chain-head
     /// record's `updated_at` reads through the injected clock.
     clock: Arc<dyn engram_core::traits::Clock>,
+}
+
+/// ADR 0101 B: what the last capture observed about a sandbox's memory
+/// dirty rate — the adaptive checkpoint controller's only input.
+/// `dirty_bytes: None` means the capture carried no rate signal (a Full
+/// capture, or a diff-less flavor) — the controller then falls back to
+/// the max-interval backstop.
+#[derive(Clone, Copy, Debug)]
+pub struct EpochPacingSample {
+    pub dirty_bytes: Option<u64>,
+    pub epoch: std::time::Duration,
 }
 
 impl SnapshotFinisher {
@@ -5386,6 +5444,9 @@ impl SnapshotFinisher {
         // Filled by the diff branch below; consumed by the chain
         // advance after the post-processing block succeeds.
         let mut next_manifest_for_chain: Option<engram_chunk_store::Manifest> = None;
+        // ADR 0101 B: set by the diff arm below; `None` for Full /
+        // diff-less flavors (no rate signal — see `EpochPacingSample`).
+        let mut epoch_dirty_bytes: Option<u64> = None;
 
         // ADR 0014 cleanup hygiene: from here on, FC has materialised
         // state.bin + memory.bin in `dest` (4+ GiB). Any failure in
@@ -5478,6 +5539,9 @@ impl SnapshotFinisher {
                 let diff_path = dest.join("memory.diff");
                 let ranges = crate::checkpoint::dirty_ranges(&diff_path)
                     .map_err(|e| SandboxError::Snapshot(format!("dirty ranges: {e}")))?;
+                // ADR 0101 B: the diff's dirty extent sum is the epoch's
+                // rate signal for the adaptive checkpoint controller.
+                epoch_dirty_bytes = Some(ranges.iter().map(|(_, len)| *len).sum());
                 let next = chunk_store
                     .update_for_dirty_ranges_sparse(prev_manifest, &diff_path, &ranges)
                     .await
@@ -5616,7 +5680,28 @@ impl SnapshotFinisher {
                     .duration_since(std::time::UNIX_EPOCH)
                     .map(|d| d.as_millis() as i64)
                     .unwrap_or(0);
-                self.last_snapshot_unix_ms.insert(id, now_ms);
+                let prev_ms = self.last_snapshot_unix_ms.insert(id, now_ms);
+                // ADR 0101 B: pacing sample for the adaptive checkpoint
+                // controller — the epoch is the gap since the previous
+                // successful capture (any flavor; that's what the dirty
+                // set accumulated over). First capture has no epoch, so
+                // no sample: the controller keeps the backstop cadence.
+                if let Some(prev_ms) = prev_ms.filter(|p| *p > 0 && *p <= now_ms) {
+                    let epoch = std::time::Duration::from_millis((now_ms - prev_ms) as u64);
+                    self.checkpoint_pacing.insert(
+                        id,
+                        EpochPacingSample {
+                            dirty_bytes: epoch_dirty_bytes,
+                            epoch,
+                        },
+                    );
+                    if let Some(dirty) = epoch_dirty_bytes {
+                        metrics::histogram!(crate::metrics::CHECKPOINT_EPOCH_BYTES)
+                            .record(dirty as f64);
+                        metrics::histogram!(crate::metrics::CHECKPOINT_EPOCH_SECONDS)
+                            .record(epoch.as_secs_f64());
+                    }
+                }
                 // ADR 0028 Fix A: seed/advance the rolling chain +
                 // persist the durable host-owned record. Best-effort
                 // beyond the capture: a seed failure means the next
@@ -8150,6 +8235,8 @@ impl SandboxBackend for PooledBackend {
         // snapshot timestamp) — same shape as a brand-new
         // sandbox.
         let _ = self.last_snapshot_unix_ms.remove(&id);
+        let _ = self.checkpoint_pacing.remove(&id);
+        let _ = self.dead_probe_inflight.remove(&id);
         // ADR 0028 Fix A: tear down the checkpoint chain. Durable RECORDS
         // deliberately survive destroy — an eviction's final checkpoint
         // must stay re-advertisable until the coord acks it (that's the

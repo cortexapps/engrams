@@ -102,6 +102,28 @@ fan-out) — before Phase B shrinks its input.
   into their own scheduled operation.
 - Side effect: active-session RPO for host loss drops from ≤600s to ~epoch length.
 
+**As implemented (divergences, Phase B PR):**
+
+- The rate signal is the **last epoch's own diff-extent sum** (recorded per sandbox as
+  an `EpochPacingSample` in the snapshot post phase) — no new pre-capture dirty-count
+  API needed. The controller (`checkpoint::next_epoch_after`, pure + unit-tested) aims
+  each epoch at `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB` (256 MiB default) of dirt:
+  `next = last_epoch × target / dirty`, clamped to
+  `[ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS (30), ENGRAM_CHECKPOINT_INTERVAL_SECS (600)]`.
+  No signal (first epoch, Full capture, zero dirt) → the max backstop, so idle
+  sessions keep exactly the ADR 0043 economics; only sessions actively dirtying RAM
+  earn short epochs.
+- The driver got the ADR 0098 `spawn()`/`run_once()` split
+  (`checkpoint::run_checkpoint_pass`) it previously lacked; the timer quantum is
+  `min_interval`, candidacy is per-sandbox adaptive.
+- The bitmap-consumption invariant is satisfied by the **existing** structure — FC's
+  Diff writes `memory.diff` before the bitmap is considered consumed, and every
+  failure path poisons the chain so the next capture is Full — rather than by a new
+  journal format. A separate epoch journal only becomes necessary with the FC-fork
+  export endpoint, and lands with it if ever needed.
+- Moving Full captures off the eviction path is deferred to Phase C: it requires the
+  explicit descent operation (park-until-seeded), which is Phase C machinery.
+
 ### Phase C — honest floor + honest lifecycle
 
 - Split `Evicting` per its two real meanings:

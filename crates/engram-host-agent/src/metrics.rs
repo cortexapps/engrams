@@ -238,6 +238,15 @@ pub const SNAPSHOT_CAPTURE_LOCK_WAIT_SECONDS: &str = "engram_snapshot_capture_lo
 /// after deploy would mean the skip path isn't exercised.
 pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 
+/// ADR 0101 B: dirty bytes one diff epoch carried (the adaptive
+/// controller aims this at `ENGRAM_CHECKPOINT_TARGET_EPOCH_MB`) and the
+/// epoch's wall-clock length. Together they surface the controller's
+/// behavior: bytes far above target = the controller is floor-clamped
+/// (raise the target or lower the floor); epochs pinned at the max =
+/// idle sessions coasting on the backstop, as designed.
+pub const CHECKPOINT_EPOCH_BYTES: &str = "engram_checkpoint_epoch_bytes";
+pub const CHECKPOINT_EPOCH_SECONDS: &str = "engram_checkpoint_epoch_seconds";
+
 /// Incident 2026-07-10: a Diff capture failed AFTER Firecracker consumed
 /// (and reset) the KVM dirty-page bitmap, so its dirty set is
 /// unrecoverable and the sandbox's checkpoint chain was dropped — the
