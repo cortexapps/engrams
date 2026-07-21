@@ -1824,7 +1824,14 @@ impl FirecrackerBackend {
 
         // Race the socket appearing against the process exiting. If
         // firecracker dies during startup, surface that with the log.
-        if let Err(e) = wait_for_socket(&socket, Duration::from_secs(5), &mut child).await {
+        if let Err(e) = wait_for_socket(
+            &socket,
+            Duration::from_secs(5),
+            &mut child,
+            SocketProbe::Accepting,
+        )
+        .await
+        {
             let _ = child.kill().await;
             let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
             return Err(vm_err(format!(
@@ -2041,7 +2048,14 @@ impl FirecrackerBackend {
             Some(_) => jail_dir.join(UFFD_CONTROL_SOCK_FILE),
             None => uffd_uds.to_path_buf(),
         };
-        if let Err(e) = wait_for_socket(&spawn_gate, Duration::from_secs(5), &mut child).await {
+        if let Err(e) = wait_for_socket(
+            &spawn_gate,
+            Duration::from_secs(5),
+            &mut child,
+            SocketProbe::Exists,
+        )
+        .await
+        {
             let _ = child.kill().await;
             let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
             return Err(vm_err(format!(
@@ -3988,11 +4002,34 @@ async fn kill_fc(child: &mut Option<Child>, pid: Option<u32>, id: SandboxId) {
     }
 }
 
-/// Poll `kill(pid, 0)` until ESRCH or timeout. Returns Ok(()) on
-/// exit, error on timeout. 50 ms poll interval — fast enough that
-/// destroy doesn't perceive lag, slow enough that we don't burn
-/// CPU in a tight loop.
+/// Poll until `pid` is dead — ESRCH, or a zombie — or timeout.
+/// Returns Ok(()) on death, error on timeout. 50 ms poll interval —
+/// fast enough that destroy doesn't perceive lag, slow enough that
+/// we don't burn CPU in a tight loop.
+///
+/// A reaped-but-uncollected zombie counts as dead: it can never run
+/// again and holds no resources beyond the pid slot, and only its
+/// PARENT can clear that slot — which, for the pid-only (reattached)
+/// sandboxes this wait serves, is by definition not us. `kill(pid, 0)`
+/// still succeeds on a zombie, so without the state check an
+/// in-process detach/reattach (the FC test harness spawns generation A
+/// and B in one process, leaving the SIGKILLed FC as our own unreaped
+/// child) waits out the full budget; production host-agents restart as
+/// fresh processes, whose killed reattachees are reaped by init and
+/// exit via plain ESRCH.
 async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> {
+    fn is_zombie(pid: u32) -> bool {
+        // State char follows the last `)` in /proc/<pid>/stat (comm may
+        // itself contain parens).
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.trim_start().chars().next())
+            })
+            .is_some_and(|state| state == 'Z')
+    }
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         // SAFETY: kill(pid, 0) inspects-but-doesn't-mutate; see
@@ -4003,6 +4040,8 @@ async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> 
             if errno == libc::ESRCH {
                 return Ok(());
             }
+        } else if is_zombie(pid) {
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(std::io::Error::new(
@@ -4265,24 +4304,56 @@ fn write_file_failure(path: String, error: String) -> WriteFileResult {
     }
 }
 
+/// How [`wait_for_socket`] decides the spawned process's socket is ready.
+#[derive(Clone, Copy)]
+enum SocketProbe {
+    /// The socket file exists. For sockets whose owner `accept()`s a
+    /// single meaningful connection (the uffd handler's UDS: FC connects
+    /// once and the handler receives the UFFD fd via SCM_RIGHTS) — a
+    /// probe `connect()` there would consume the owner's accept.
+    Exists,
+    /// A real `connect()` succeeds. For the FC API socket: FC creates
+    /// the file at `bind()`, BEFORE `listen()` is accepting, so an
+    /// existence poll can return inside the bind→listen window and the
+    /// first API request then dies with ECONNREFUSED — the
+    /// suite-startup thundering-herd flake (tests/common's
+    /// `wait_for_socket` was converted for the same incident, CI runs
+    /// 28974774202 / 29844837408; the production path kept the
+    /// existence poll and kept flaking). The API server tolerates the
+    /// probe connection being dropped.
+    Accepting,
+}
+
 /// Wait until either:
-///   - the API socket appears (success), OR
-///   - the firecracker process exits (failure — surface its exit
-///     status), OR
+///   - the socket is ready per `probe` (success), OR
+///   - the spawned process exits (failure — surface its exit status), OR
 ///   - `budget` elapses (timeout).
-async fn wait_for_socket(path: &Path, budget: Duration, child: &mut Child) -> Result<(), String> {
+async fn wait_for_socket(
+    path: &Path,
+    budget: Duration,
+    child: &mut Child,
+    probe: SocketProbe,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if path.exists() {
+        let ready = match probe {
+            SocketProbe::Exists => path.exists(),
+            SocketProbe::Accepting => tokio::net::UnixStream::connect(path).await.is_ok(),
+        };
+        if ready {
             return Ok(());
         }
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("firecracker exited early with status {status}"));
+            return Err(format!("spawned process exited early with status {status}"));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "socket {} did not appear within {:?}",
+                "socket {} not ready ({}) within {:?}",
                 path.display(),
+                match probe {
+                    SocketProbe::Exists => "does not exist",
+                    SocketProbe::Accepting => "not accepting connections",
+                },
                 budget
             ));
         }

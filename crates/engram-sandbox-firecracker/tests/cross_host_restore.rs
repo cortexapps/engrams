@@ -57,7 +57,7 @@ async fn restore_succeeds_with_different_work_dir_than_source() {
     let shared = tempfile::tempdir().expect("shared rootfs dir");
 
     let local_rootfs = shared.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs");
 

@@ -159,7 +159,7 @@ async fn snapshot_restore_round_trips_per_vm_network() {
     // reopens it on load_snapshot, so the file must still exist at
     // restore time. Mirrors the snapshot.rs pattern.
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 

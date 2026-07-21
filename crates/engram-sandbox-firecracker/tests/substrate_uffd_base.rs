@@ -94,7 +94,7 @@ async fn substrate_base_shm_restore_round_trips_and_shares() {
 
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 
@@ -335,7 +335,7 @@ async fn capture_of_substrate_vm_round_trips_and_diffs() {
 
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 

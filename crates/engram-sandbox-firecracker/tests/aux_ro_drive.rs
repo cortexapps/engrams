@@ -165,7 +165,7 @@ async fn reserved_slots_n_drives_boot_snapshot_restore() {
     }
 
     let rootfs = work.join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &rootfs)
+    common::clone_rootfs(&env.rootfs, &rootfs)
         .await
         .expect("copy rootfs");
     install_init_script(&rootfs, work).await;
@@ -250,7 +250,7 @@ async fn run_scenario(env: &common::FcEnv, mutation: Mutation, expected_post_res
 
     // ── prepare rootfs copy with init.experiment ──
     let rootfs = work.join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &rootfs)
+    common::clone_rootfs(&env.rootfs, &rootfs)
         .await
         .expect("copy rootfs");
     install_init_script(&rootfs, work).await;

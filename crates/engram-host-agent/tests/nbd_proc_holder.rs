@@ -41,6 +41,13 @@ use engram_host_core::DeviceHolder;
 use engram_storage_local::LocalBlobStorage;
 
 /// Clear any stale binding from a prior aborted run (idempotent).
+///
+/// Converges on the kernel's own signal instead of a blind fixed-count
+/// loop: an unconfigured nbd device reports `size` 0 in sysfs (the kernel
+/// clears it on disconnect), so a free device returns immediately and a
+/// bound one keeps disconnecting only until the kernel actually lets go.
+/// The old unconditional 20 × 200 ms loop cost 4 s per call (twice per
+/// test) even when the device was already free.
 fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     let Some(idx) = nbd_path
         .file_name()
@@ -50,8 +57,16 @@ fn clear_stale_nbd_binding(nbd_path: &std::path::Path) {
     else {
         return;
     };
+    let device_free = || {
+        std::fs::read_to_string(format!("/sys/block/nbd{idx}/size"))
+            .map(|s| s.trim() == "0")
+            .unwrap_or(false)
+    };
     for _ in 0..20 {
         let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(idx);
+        if device_free() {
+            return;
+        }
         std::thread::sleep(std::time::Duration::from_millis(200));
     }
 }
@@ -127,7 +142,13 @@ fn preflight() -> Option<PathBuf> {
 #[ignore]
 async fn proc_scan_detects_open_fd_on_nbd_device_with_dead_server() {
     std::env::set_var("ENGRAM_NBD_KERNEL_TIMEOUT_SECS", "5");
-    std::env::set_var("ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS", "60");
+    // The dead-conn window only has to outlast the LiveHolder assertion,
+    // which runs microseconds after `abandon()` — but the teardown
+    // DISCONNECT parks until this window expires, so its length is pure
+    // test wall-time. 60 s here made this the slowest test in the NBD
+    // batch (~75 s); 5 s keeps a wide margin over the assertion window
+    // and caps the parked teardown at ~5 s.
+    std::env::set_var("ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS", "5");
 
     let nbd_path = match preflight() {
         Some(p) => p,
@@ -155,17 +176,38 @@ async fn proc_scan_detects_open_fd_on_nbd_device_with_dead_server() {
         .expect("put manifest");
 
     // CONNECT + serve: a real netlink-bound /dev/nbdN with a live server.
+    //
+    // Bounded EBUSY retry: the preflight's R/W open+close fires a
+    // close-after-write uevent, and systemd-udevd transiently OPENS the
+    // device to probe it — the same block-device probing documented at
+    // the negative arm below. An open fd holds the kernel's nbd config
+    // ref, so a CONNECT landing inside that window is refused EBUSY
+    // ("nbdN already in use"). The old blind 20 × 200 ms clear loop
+    // absorbed that window by accident; absorb it deliberately, bounded,
+    // and only for EBUSY — any other attach error still fails loud.
     let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
-    let state = attach_manifest(
-        manifest_ref,
-        cache,
-        store,
-        &pool,
-        u64::MAX,
-        /*fork=*/ false,
-    )
-    .await
-    .expect("netlink CONNECT attach");
+    let attach_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let state = loop {
+        match attach_manifest(
+            manifest_ref,
+            cache.clone(),
+            store.clone(),
+            &pool,
+            u64::MAX,
+            /*fork=*/ false,
+        )
+        .await
+        {
+            Ok(state) => break state,
+            Err(e)
+                if format!("{e:?}").contains("ResourceBusy")
+                    && std::time::Instant::now() < attach_deadline =>
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+            Err(e) => panic!("netlink CONNECT attach: {e:?}"),
+        }
+    };
     let device = state.device_path().to_path_buf();
 
     // The "surviving FC guest": open ONE fd on the device node and hold it.

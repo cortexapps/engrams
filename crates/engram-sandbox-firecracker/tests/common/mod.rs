@@ -216,6 +216,34 @@ where
     }
 }
 
+/// Sparse-aware clone of the cached test rootfs into a test-private path.
+///
+/// The drop-in replacement for `tokio::fs::copy(&env.rootfs, dest)`: the
+/// fetch script (`fetch-fc-test-artifacts.sh`) digs holes in the cached
+/// ubuntu image's zeroed free space once, and `cp --sparse=always` then
+/// skips those holes via SEEK_DATA/SEEK_HOLE on both the read and write
+/// side. The image is ~82% full (~53 MB of holes in 300 MB), so this
+/// trims — not eliminates — the copy the ~20 cloning call sites each
+/// pay, and spares the same I/O again on the `-j4` batch's shared disk.
+/// Guest-visible content is identical: holes read back as zeros.
+pub async fn clone_rootfs(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let status = tokio::process::Command::new("cp")
+        .arg("--sparse=always")
+        .arg(src)
+        .arg(dest)
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "cp --sparse=always {} {} exited with {status}",
+            src.display(),
+            dest.display()
+        )))
+    }
+}
+
 /// Poll until `path` (a Firecracker API socket) is ACCEPTING connections, or
 /// `timeout` elapses. Promoted from `boot.rs` so the raw-`spawn_firecracker`
 /// tests can drop their fixed post-spawn sleeps. 50ms ticks.
