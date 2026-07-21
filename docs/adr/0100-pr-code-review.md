@@ -547,13 +547,14 @@ ladder, which is ~20 lines and fails soft.
 
 ### Scenario: a review session dies
 
-1. The finder (or verifier) session ends without its finish tool call.
-2. The workflow retries once with a fresh session — candidates already
-   submitted are in the database, so a verifier retry resumes the remaining
-   list rather than starting over.
-3. A second failure marks the review `failed`, posts a single "review
-   failed" PR comment, and surfaces the failure on the review page. Never
-   silently green.
+1. The finder (or verifier) session ends without its finish tool call, or its
+   harness run errors (idle + `run_failed`).
+2. The workflow marks the review `failed`, posts a single "review failed" PR
+   comment, and surfaces the failure on the review page. Never silently green.
+3. Re-running is an explicit action, not an in-workflow retry (see the
+   divergence note below): the `/reviews` **Retry** button (or the dispatch
+   endpoint) mints a fresh review record + workflow epoch over the PR's current
+   head. The failed row stays as history.
 
 ## Conversation on the PR
 
@@ -765,6 +766,47 @@ service → generated connectquery client → hook → page):
 6. **Multi-forge (GitLab)** via the same communication-policy seam.
 7. **A responder tier** — a slim no-clone profile for answering simple thread
    questions, if sweep volume makes full sessions measurably wasteful.
+
+## Implementation divergences
+
+- **The operation graph stays inline in the registered function.** DBOS derives
+  the application version from registered workflow function source
+  (`computeAppVersion` → `origFunction.toString()`, which does **not** recurse
+  into module-level helpers) and replays an in-flight workflow only against code
+  of its own version. So the recv loop and the order + names of every `step(...)`
+  call live inline in `prReviewWorkflowImpl`: a change to the graph rotates the
+  version, and DBOS version-gates replay rather than running a recovered review
+  through a changed graph (which would raise `DBOSUnexpectedStepError` or take a
+  wrong branch). The heavy work stays behind the injected `ReviewControlPlane` —
+  the `ToolExecWorkflow` shape (graph in the body, logic in the functions the
+  steps call; a completed step is memoized on replay, so its internals evolve
+  freely). An earlier revision hoisted the graph into plain module functions for
+  a "hash-stable" thin shell; that was reverted after review — it moved
+  replay-sensitive control flow *out* from under versioning, so a later
+  helper-only edit would ship under an unchanged version and be replayed against
+  a changed graph. (This leaves the standing computed-hash trade-off: a graph
+  change rotates the version and strands in-flight reviews until drained — the
+  broader fix is explicit `applicationVersion` / DBOS patching, tracked
+  separately.) The step vocabulary is kept deliberately coarse so the body reads
+  as a short sequence of high-level steps: each terminal or phase-boundary action
+  is one control-plane step that folds in the worker teardown — `failReview` /
+  `haltReview` (best-effort teardown + status change, with the reason recorded on
+  the activity log), `concludeFinderPhase` (retire the finder + report its
+  candidate count), and `postReviewResults` (retire the verifier + post). Phase
+  *setup* stays three granular steps (create/bootstrap/prompt) on purpose — those
+  are distinct, expensive, non-idempotent checkpoints, and collapsing them would
+  re-create sessions or re-clone on crash recovery.
+- **No in-workflow retry (supersedes the "session dies" retry-once above).** A
+  dead/errored phase marks the review `failed` immediately. Re-running is an
+  explicit `ReviewService.RetryReview` RPC (the `/reviews` **Retry** button) or
+  the dispatch endpoint, both of which re-enter `dispatchReview` → a fresh
+  review record (a terminal review is not "active") + successor workflow epoch.
+  This removed the retry counters, the per-phase deadline-window counting (now
+  one `recv` window is the phase deadline), and `deleteFindingsForSession` (the
+  retry-only finding-dedup step), which is dropped from the control-plane seam.
+- **`RetryReview` authz.** Gated as `create` on the `Review` subject — any
+  authenticated member, mirroring "any member can trigger a review by command";
+  enrollment mutations stay admin-only.
 
 ## References
 

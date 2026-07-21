@@ -23,6 +23,10 @@ import type {
 } from "../db/reviews.ts";
 import { ReviewService } from "../gen/engram/app/v1/review_pb.ts";
 import { registerReviews } from "../rpc/reviews.ts";
+import type {
+  DispatchReviewInput,
+  DispatchReviewResult,
+} from "../workflows/dispatch-review.ts";
 
 const REVIEW_ID = "00000000-0000-4000-8000-000000000001";
 const FINDING_ID = "00000000-0000-4000-8000-000000000002";
@@ -155,6 +159,7 @@ function spawn(
   role = "user",
   enrollments?: EnrollmentStore,
   profileExists = true,
+  dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>,
 ) {
   const transport = createRouterTransport((router) =>
     registerReviews(router, {
@@ -165,6 +170,7 @@ function spawn(
       profiles: {
         get: async (id) => profileExists ? { id } : null,
       },
+      ...(dispatch != null ? { dispatch, randomUUID: () => "idem-1" } : {}),
     }),
   );
   return createClient(ReviewService, transport);
@@ -296,6 +302,61 @@ describe("ReviewService", () => {
     await expectConnectError(
       spawn(makeStore(detail), false).listReviews({}),
       Code.Unauthenticated,
+    );
+  });
+
+  test("RetryReview dispatches a fresh pass for the review's PR", async () => {
+    const calls: DispatchReviewInput[] = [];
+    const dispatch = async (
+      input: DispatchReviewInput,
+    ): Promise<DispatchReviewResult> => {
+      calls.push(input);
+      return { enrolled: true, workflowId: "wf-2", reviewId: "review-2" };
+    };
+    const store = makeStore({
+      ...detail,
+      review: reviewRow({ status: "failed" }),
+    });
+    const response = await spawn(store, true, "user", undefined, true, dispatch)
+      .retryReview({ id: REVIEW_ID });
+
+    expect(response.workflowId).toBe("wf-2");
+    expect(response.reviewId).toBe("review-2");
+    expect(calls).toEqual([{
+      repo: "openai/engrams",
+      prNumber: 100,
+      trigger: "retry",
+      idempotencyKey: "idem-1",
+    }]);
+  });
+
+  test("RetryReview requires authentication", async () => {
+    await expectConnectError(
+      spawn(makeStore(detail), false).retryReview({ id: REVIEW_ID }),
+      Code.Unauthenticated,
+    );
+  });
+
+  test("RetryReview returns NotFound for an unknown review", async () => {
+    const dispatch = async (): Promise<DispatchReviewResult> => ({
+      enrolled: true,
+      workflowId: "wf",
+    });
+    await expectConnectError(
+      spawn(makeStore(null), true, "user", undefined, true, dispatch)
+        .retryReview({ id: REVIEW_ID }),
+      Code.NotFound,
+    );
+  });
+
+  test("RetryReview fails when the repo is no longer enrolled", async () => {
+    const dispatch = async (): Promise<DispatchReviewResult> => ({
+      enrolled: false,
+    });
+    await expectConnectError(
+      spawn(makeStore(detail), true, "user", undefined, true, dispatch)
+        .retryReview({ id: REVIEW_ID }),
+      Code.FailedPrecondition,
     );
   });
 

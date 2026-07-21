@@ -94,7 +94,12 @@ export interface ReviewControlPlane {
     baseSha: string;
     focus?: string;
   }): Promise<void>;
-  getReview(reviewId: string): Promise<ReviewDetail | null>;
+  /** Retire the finder worker (best-effort) and report how many candidate
+   *  findings it left, as one durable step. */
+  concludeFinderPhase(
+    reviewId: string,
+    opts?: { sessionId?: string },
+  ): Promise<{ candidateCount: number }>;
   createVerifierSession(input: {
     reviewId: string;
     taskId: string;
@@ -116,12 +121,20 @@ export interface ReviewControlPlane {
     headSha: string;
     baseSha: string;
   }): Promise<void>;
-  deleteReviewSession(sessionId: string): Promise<void>;
-  /** Drop a failed finder attempt's candidate findings before it is retried. */
-  deleteFindingsForSession(reviewId: string, sessionId: string): Promise<void>;
-  postReviewResults(reviewId: string): Promise<void>;
-  markReviewFailed(reviewId: string): Promise<void>;
-  markReviewHalted(repo: string, prNumber: number): Promise<void>;
+  /** Post the review results. Retires the verifier worker first (best-effort)
+   *  when a session id is given, so a stray worker never blocks the post. */
+  postReviewResults(
+    reviewId: string,
+    opts?: { sessionId?: string },
+  ): Promise<void>;
+  /** Tear down the given worker (best-effort) and mark the review failed, as one
+   *  durable step. `reason` is recorded on the activity log for the UI. */
+  failReview(
+    reviewId: string,
+    opts?: { sessionId?: string; reason?: string },
+  ): Promise<void>;
+  /** Tear down the given worker (best-effort) and mark the review halted. */
+  haltReview(reviewId: string, opts?: { sessionId?: string }): Promise<void>;
 }
 
 interface ReviewControlPlaneStore extends Pick<
@@ -131,7 +144,6 @@ interface ReviewControlPlaneStore extends Pick<
   | "getActiveReviewForPr"
   | "updateReviewStatus"
   | "updateFindingState"
-  | "deleteFindingsForSession"
   | "finalizeReview"
   | "setStatusCommentId"
   | "setReviewSessionId"
@@ -407,6 +419,34 @@ export function makeReviewControlPlane(
       log.error({ reviewId, kind, err }, "review event record failed (best-effort)");
     }
   };
+  // Delete a worker's coordinator session and forget its binding. Tolerates an
+  // already-absent session (a prior partial teardown) so it is safe to retry.
+  const removeWorkerSession = async (sessionId: string): Promise<void> => {
+    try {
+      await sessions.deleteSession({ sessionId });
+    } catch (err) {
+      if (!(err instanceof ConnectError) || err.code !== Code.NotFound) {
+        throw err;
+      }
+      log.info(
+        { sessionId },
+        "review worker session was already absent during cleanup",
+      );
+    }
+    await reviewSessions().remove(sessionId);
+  };
+  // Best-effort cleanup for the terminal paths: a worker that will not tear down
+  // must never block the review from settling into failed/halted.
+  const cleanupWorkerSession = async (
+    sessionId: string | undefined,
+  ): Promise<void> => {
+    if (sessionId === undefined) return;
+    try {
+      await removeWorkerSession(sessionId);
+    } catch (err) {
+      log.error({ sessionId, err }, "review worker cleanup failed");
+    }
+  };
   const createExistingSession = deps.createSessionForExistingTask ?? ((params) => {
     const database = db();
     return createSessionForExistingTask(
@@ -549,8 +589,14 @@ export function makeReviewControlPlane(
       await ackStatus(input.reviewId, "finding");
     },
 
-    async getReview(reviewId) {
-      return reviews().getReview(reviewId);
+    async concludeFinderPhase(reviewId, opts = {}) {
+      await cleanupWorkerSession(opts.sessionId);
+      const detail = await reviews().getReview(reviewId);
+      if (!detail) throw new Error(`review not found: ${reviewId}`);
+      const candidateCount = detail.findings.filter(
+        (finding) => finding.state === "candidate",
+      ).length;
+      return { candidateCount };
     },
 
     async createVerifierSession(input) {
@@ -666,26 +712,8 @@ export function makeReviewControlPlane(
       await ackStatus(input.reviewId, "verifying", candidateCount);
     },
 
-    async deleteReviewSession(sessionId) {
-      try {
-        await sessions.deleteSession({ sessionId });
-      } catch (err) {
-        if (!(err instanceof ConnectError) || err.code !== Code.NotFound) {
-          throw err;
-        }
-        log.info(
-          { sessionId },
-          "review worker session was already absent during cleanup",
-        );
-      }
-      await reviewSessions().remove(sessionId);
-    },
-
-    async deleteFindingsForSession(reviewId, sessionId) {
-      await reviews().deleteFindingsForSession(reviewId, sessionId);
-    },
-
-    async postReviewResults(reviewId) {
+    async postReviewResults(reviewId, opts = {}) {
+      await cleanupWorkerSession(opts.sessionId);
       const detail = await reviews().getReview(reviewId);
       if (!detail) throw new Error(`review not found: ${reviewId}`);
 
@@ -796,19 +824,18 @@ export function makeReviewControlPlane(
       await ackStatus(reviewId, "posted", surfaced);
     },
 
-    async markReviewFailed(reviewId) {
+    async failReview(reviewId, opts = {}) {
+      await cleanupWorkerSession(opts.sessionId);
       await reviews().updateReviewStatus(reviewId, "failed");
-      await recordEvent(reviewId, "failed");
+      await recordEvent(reviewId, "failed", opts.reason);
       await ackStatus(reviewId, "failed");
     },
 
-    async markReviewHalted(repo, prNumber) {
-      const active = await reviews().getActiveReviewForPr(repo, prNumber);
-      if (active) {
-        await reviews().updateReviewStatus(active.id, "halted");
-        await recordEvent(active.id, "halted");
-        await ackStatus(active.id, "halted");
-      }
+    async haltReview(reviewId, opts = {}) {
+      await cleanupWorkerSession(opts.sessionId);
+      await reviews().updateReviewStatus(reviewId, "halted");
+      await recordEvent(reviewId, "halted");
+      await ackStatus(reviewId, "halted");
     },
   };
 }

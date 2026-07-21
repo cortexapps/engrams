@@ -33,6 +33,11 @@ import {
   type ReviewFinding as ReviewFindingProto,
   type ReviewVerdict as ReviewVerdictProto,
 } from "../gen/engram/app/v1/review_pb.ts";
+import {
+  dispatchReview,
+  type DispatchReviewInput,
+  type DispatchReviewResult,
+} from "../workflows/dispatch-review.ts";
 
 export type GetSession = (
   headers: Headers,
@@ -46,6 +51,8 @@ export interface ReviewDeps {
   enrollments?: EnrollmentStore;
   profiles?: { get(id: string): Promise<{ id: string } | null> };
   db?: ReturnType<typeof getDb>;
+  dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>;
+  randomUUID?: () => string;
 }
 
 async function requireUser(
@@ -180,6 +187,10 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   let profileStore = deps?.profiles;
   const profiles = (): { get(id: string): Promise<{ id: string } | null> } =>
     (profileStore ??= makeProfileStore(deps?.db ?? getDb()));
+  const dispatch = deps?.dispatch
+    ?? ((input: DispatchReviewInput) =>
+      dispatchReview({ enrollments: enrollments() }, input));
+  const randomUUID = deps?.randomUUID ?? (() => crypto.randomUUID());
 
   router.service(ReviewService, {
     async listReviews(req, ctx) {
@@ -199,6 +210,36 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
         findings: detail.findings.map(findingToProto),
         verdicts: detail.verdicts.map(verdictToProto),
         events: events.map(eventToProto),
+      };
+    },
+
+    async retryReview(req, ctx) {
+      const user = await requireUser(ctx, getSession);
+      if (!abilityFor(user).can("create", "Review")) {
+        throw new ConnectError("forbidden", Code.PermissionDenied);
+      }
+      const id = req.id?.trim();
+      if (!id) {
+        throw new ConnectError("review id is required", Code.InvalidArgument);
+      }
+      const detail = await reviews().getReview(id);
+      if (!detail) throw new ConnectError("not found", Code.NotFound);
+      const { repo, prNumber } = detail.review;
+      // A fresh dispatch mints a new review record (a terminal review is not
+      // "active") and a successor workflow epoch, re-reviewing the PR's current
+      // head. The old record stays as history.
+      const result = await dispatch({
+        repo,
+        prNumber,
+        trigger: "retry",
+        idempotencyKey: randomUUID(),
+      });
+      if (!result.enrolled || !result.workflowId) {
+        throw new ConnectError("repo is not enrolled", Code.FailedPrecondition);
+      }
+      return {
+        workflowId: result.workflowId,
+        ...(result.reviewId != null ? { reviewId: result.reviewId } : {}),
       };
     },
 

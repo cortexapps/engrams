@@ -79,8 +79,10 @@ export function abilityFor(user: AbilityUser): AppAbility {
   // readable; register/delete are admin-only (manage("all") below).
   can("read", "Harness");
 
-  // PR reviews are an org-visible team dashboard (ADR 0100).
-  can("read", "Review");
+  // PR reviews are an org-visible team dashboard (ADR 0100). Any member can
+  // read them, and re-run one (create a fresh pass) the same way they can
+  // trigger a review by command; enrollment config stays admin-only.
+  can(["read", "create"], "Review");
 
   // Admin override.
   if (user.role === "admin") can("manage", "all");

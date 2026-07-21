@@ -1,6 +1,11 @@
-import { useQuery } from "@connectrpc/connect-query";
+import { createConnectQueryKey, useMutation, useQuery } from "@connectrpc/connect-query";
+import { useQueryClient } from "@tanstack/react-query";
 
-import { getReview, listReviews } from "../gen/engram/app/v1/review-ReviewService_connectquery";
+import {
+  getReview,
+  listReviews,
+  retryReview,
+} from "../gen/engram/app/v1/review-ReviewService_connectquery";
 
 export function useReviews(repo?: string) {
   // Poll modestly so the stage and the "watch live" link advance on their own
@@ -28,4 +33,20 @@ export function useReview(
       ...(opts.active ? { refetchInterval: 2_500 } : {}),
     },
   );
+}
+
+/** Re-run a terminal review from scratch. Dispatches a fresh pass (a new review
+ *  record + workflow epoch) and refreshes the list so the new row appears. */
+export function useRetryReview() {
+  const qc = useQueryClient();
+  return useMutation(retryReview, {
+    onSuccess: () => {
+      qc.invalidateQueries({
+        queryKey: createConnectQueryKey({
+          schema: listReviews,
+          cardinality: "finite",
+        }),
+      });
+    },
+  });
 }
