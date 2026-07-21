@@ -393,6 +393,41 @@ jobs:
             --no-fail-fast \
             --test-threads=16
 
+      # Relocated from the KVM lane (ADR 0098: keep the FC lane minimal —
+      # one test per kernel assumption). probe_sandbox_desync needs only
+      # `/proc` + the on-disk sandbox manifest: it constructs the
+      # map-vs-process desync with a plain process, no KVM, no firecracker
+      # binary (its module docs spell this out). Runs here so every
+      # Rust-touching PR exercises it, not just the FC dep closure.
+      - name: FC probe_sandbox desync tests (no KVM)
+        if: always()
+        run: |
+          cargo nextest run \
+            -p engram-sandbox-firecracker \
+            --test probe_sandbox_desync \
+            --run-ignored ignored-only \
+            --no-fail-fast
+
+      # Relocated from the KVM lane for the same reason: host_startup
+      # asserts iptables RULE ORDERING — it needs CAP_NET_ADMIN (sudo),
+      # not /dev/kvm. LAST in the job on purpose: it applies and removes
+      # real netfilter rules (each test brackets itself with cleanup()),
+      # and the docker-backed postgres/fake-gcs containers above ride
+      # this host's iptables — nothing else may run concurrently with it.
+      - name: FC host_startup iptables tests (root, no KVM)
+        if: always()
+        run: |
+          sudo -E env "PATH=$PATH" cargo nextest run \
+            -p engram-sandbox-firecracker \
+            --test host_startup \
+            --run-ignored ignored-only \
+            --no-fail-fast \
+            --test-threads=1
+      - name: Restore ownership after sudo tests
+        if: always()
+        run: |
+          sudo chown -R "$USER":"$USER" target/ ~/.cargo 2>/dev/null || true
+
   cross-musl-linux:
     name: cross-compile linux-musl artifacts
     needs: detect
@@ -732,7 +767,7 @@ jobs:
       #
       # We name the test binaries explicitly (rather than
       # `--run-ignored ignored-only`) because the root-required
-      # tests (host_startup, proxy_e2e) live in the same crate and
+      # tests (snapshot_net, proxy_e2e) live in the same crate and
       # would otherwise be invoked here only to short-circuit via
       # their `require_root()` SKIP path — leaving the gap silent.
       - name: Firecracker `#[ignore]` tests (unprivileged)
@@ -757,7 +792,6 @@ jobs:
             --test boot \
             --test lifecycle \
             --test reattach_detach \
-            --test probe_sandbox_desync \
             --test snapshot \
             --test snapshot_uffd \
             --test exec_real_vm \
@@ -904,19 +938,19 @@ jobs:
             --no-fail-fast \
             --test-threads=1
 
-      # Root-required tests: host_startup applies real iptables rules,
-      # proxy_e2e provisions a TAP device and runs the full
-      # guest→TAP→REDIRECT→proxy→upstream chain, snapshot_net asserts
-      # that snapshot/restore re-provisions the per-VM TAP + /30
-      # under the original name (Gap 1 of the FC parity work). All
-      # three need CAP_NET_ADMIN, which on Blacksmith runners means
-      # sudo. We `-E` to keep the cargo / rustc env (CARGO_HOME,
+      # Root-required tests: proxy_e2e provisions a TAP device and runs
+      # the full guest→TAP→REDIRECT→proxy→upstream chain, snapshot_net
+      # asserts that snapshot/restore re-provisions the per-VM TAP + /30
+      # under the original name (Gap 1 of the FC parity work). All need
+      # CAP_NET_ADMIN, which on Blacksmith runners means sudo.
+      # (host_startup — iptables ordering, root but no KVM — moved to the
+      # `tests (linux)` lane per ADR 0098's keep-the-FC-lane-minimal.) We `-E` to keep the cargo / rustc env (CARGO_HOME,
       # RUSTUP_HOME, PATH) so the binary can be found, and chown back
       # at the end so the rust-cache action can read /target without
       # permission errors. Docker buildx scratchpad (~/.docker/buildx)
       # also gets touched by proxy_e2e's image bake; cleanup includes
       # it.
-      - name: Firecracker `#[ignore]` tests (root — host_startup, snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain, proxy_e2e)
+      - name: Firecracker `#[ignore]` tests (root — snapshot_net, patch_drive_swap, netns_isolation, warm_proxy_chain, proxy_e2e)
         run: |
           # ADR 0021 P1.6: `proxy_e2e` came back in the e2e
           # resurrection — baked-in harness path, CA delivered via
@@ -933,7 +967,6 @@ jobs:
           # ADR 0027 coverage is unchanged (same tests, still run, once).
           sudo -E env "PATH=$PATH" cargo nextest run \
             -p engram-sandbox-firecracker \
-            --test host_startup \
             --test snapshot_net \
             --test patch_drive_swap \
             --test netns_isolation \
