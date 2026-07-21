@@ -229,7 +229,7 @@ impl HostRegistry {
 
     /// ADR 0018 commit 12d: enumerate every sandbox owned by `host_id`
     /// in the in-memory routing cache. Paired with PG-side
-    /// `list_active_sandbox_assignments_on_host` for the admin /drain
+    /// `list_resident_sandbox_assignments_on_host` for the admin /drain
     /// endpoint — PG is authoritative for "which sessions live here,"
     /// but the in-memory map carries the SandboxId we feed to the
     /// evict pipeline.

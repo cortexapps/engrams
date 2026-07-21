@@ -1558,6 +1558,25 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
         meta.per_host_reserved().await.unwrap().contains_key(&host),
         "a parked session still counts toward its host's reservation aggregate"
     );
+    // The reconcile pass's assignment listing (audit finding 3): a
+    // vanished parked VM must be strike-eligible, so the parked triple
+    // must be listed, status included.
+    assert_eq!(
+        meta.list_resident_sandbox_assignments_on_host(host)
+            .await
+            .unwrap(),
+        vec![(sid, sb, SessionState::Parked)],
+        "a parked survivor is in the reconcile assignment list"
+    );
+    // The admin-drain listing (audit finding 4): a host holding only a
+    // parked VM must not report an empty drain work-list.
+    let drain_rows = meta
+        .list_resident_assignments_with_budgets_on_host(host)
+        .await
+        .unwrap();
+    assert_eq!(drain_rows.len(), 1, "parked survivor is drain-visible");
+    assert_eq!(drain_rows[0].session_id, sid);
+    assert_eq!(drain_rows[0].status, SessionState::Parked);
     assert!(
         matches!(
             meta.delete_host(host).await.unwrap(),

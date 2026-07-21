@@ -1909,7 +1909,7 @@ pub(crate) mod tests {
         /// entirely on a persist failure, rather than just happening to
         /// flip nothing. Reset to false on use.
         pub(crate) fail_next_heartbeat_persist: PlMutex<bool>,
-        /// Counts `list_active_sandbox_assignments_on_host` calls — the
+        /// Counts `list_resident_sandbox_assignments_on_host` calls — the
         /// entry point `Reconciler::reconcile_with_deps` hits on every
         /// tick it actually runs. A no-op default `apply_missing_sandbox_strikes`
         /// (this mock doesn't override it) would make "no flip happened"
@@ -2299,15 +2299,22 @@ pub(crate) mod tests {
         /// every tick it actually runs, so the persist-before-reconcile
         /// regression test asserts on this counter. Behavior otherwise
         /// matches the default: this mock only ever tracks one session.
-        async fn list_active_sandbox_assignments_on_host(
+        async fn list_resident_sandbox_assignments_on_host(
             &self,
             host_id: HostId,
-        ) -> Result<Vec<(engram_core::SessionId, SandboxId)>, MetaError> {
+        ) -> Result<
+            Vec<(
+                engram_core::SessionId,
+                SandboxId,
+                engram_core::types::SessionState,
+            )>,
+            MetaError,
+        > {
             *self.reconcile_probe_calls.lock() += 1;
             let s = self.session.lock();
             Ok(match (s.status, s.host_id, s.sandbox_id) {
-                (engram_core::types::SessionState::Active, Some(h), Some(sb)) if h == host_id => {
-                    vec![(s.id, sb)]
+                (st, Some(h), Some(sb)) if h == host_id && st.reserves_host_memory() => {
+                    vec![(s.id, sb, st)]
                 }
                 _ => Vec::new(),
             })

@@ -2092,67 +2092,84 @@ impl MetadataStore for PostgresStore {
         Ok(out)
     }
 
-    async fn list_active_sandbox_assignments_on_host(
+    async fn list_resident_sandbox_assignments_on_host(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
+    ) -> Result<Vec<(SessionId, SandboxId, SessionState)>, MetaError> {
         // ADR 0009 reconcile pass query. Per-host, every heartbeat:
         // ~50 sandboxes/host × 5s cadence × N hosts = trivial DB load.
-        // Indexed via `idx_sessions_host_status` (existing).
-        let rows = sqlx::query(
+        // Indexed via `idx_sessions_host_status` (existing). The status
+        // set is every RESIDENT (memory-reserving) state — a vanished
+        // parked VM must accrue missing strikes like any other
+        // (2026-07-21 status-set audit finding 3).
+        let sql = format!(
             r#"
-            SELECT id, sandbox_id
+            SELECT id, sandbox_id, status
             FROM sessions
             WHERE host_id = $1
-              AND status = 'active'
+              AND status IN ({reserving})
               AND sandbox_id IS NOT NULL
             "#,
-        )
-        .bind(host_id.as_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
+            reserving = reserving_states_sql(),
+        );
+        let rows = sqlx::query(&sql)
+            .bind(host_id.as_uuid())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
         let mut out = Vec::with_capacity(rows.len());
         for r in rows {
             let session: Uuid = r
                 .try_get("id")
-                .map_err(|e| MetaError::Serialization(format!("active-assignments: id: {e}")))?;
+                .map_err(|e| MetaError::Serialization(format!("resident-assignments: id: {e}")))?;
             let sandbox: Uuid = r.try_get("sandbox_id").map_err(|e| {
-                MetaError::Serialization(format!("active-assignments: sandbox_id: {e}"))
+                MetaError::Serialization(format!("resident-assignments: sandbox_id: {e}"))
             })?;
-            out.push((SessionId::from(session), SandboxId::from(sandbox)));
+            let status: String = r.try_get("status").map_err(|e| {
+                MetaError::Serialization(format!("resident-assignments: status: {e}"))
+            })?;
+            out.push((
+                SessionId::from(session),
+                SandboxId::from(sandbox),
+                row::parse_session_state_for_lib(&status)?,
+            ));
         }
         Ok(out)
     }
 
-    async fn list_active_assignments_with_budgets_on_host(
+    async fn list_resident_assignments_with_budgets_on_host(
         &self,
         host_id: HostId,
     ) -> Result<Vec<engram_core::types::session::SandboxAssignment>, MetaError> {
-        let rows: Vec<(Uuid, Uuid, i64, i32)> = sqlx::query_as(
+        // Every RESIDENT state, not just 'active' — a host holding only
+        // parked VMs must not "drain" with an empty list (2026-07-21
+        // status-set audit finding 4).
+        let sql = format!(
             r#"
-            SELECT id, sandbox_id,
-                   COALESCE(mem_budget_mib, 0)::BIGINT,
-                   COALESCE(cpu_budget_vcpus, 0)
+            SELECT id, sandbox_id, status,
+                   COALESCE(mem_budget_mib, 0)::BIGINT AS mem,
+                   COALESCE(cpu_budget_vcpus, 0) AS cpu
             FROM sessions
-            WHERE host_id = $1 AND status = 'active' AND sandbox_id IS NOT NULL
+            WHERE host_id = $1 AND status IN ({reserving}) AND sandbox_id IS NOT NULL
             "#,
-        )
-        .bind(host_id.as_uuid())
-        .fetch_all(&self.pool)
-        .await
-        .map_err(db_err)?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(s, sb, mem, cpu)| engram_core::types::session::SandboxAssignment {
+            reserving = reserving_states_sql(),
+        );
+        let rows: Vec<(Uuid, Uuid, String, i64, i32)> = sqlx::query_as(&sql)
+            .bind(host_id.as_uuid())
+            .fetch_all(&self.pool)
+            .await
+            .map_err(db_err)?;
+        rows.into_iter()
+            .map(|(s, sb, st, mem, cpu)| {
+                Ok(engram_core::types::session::SandboxAssignment {
                     session_id: SessionId::from(s),
                     sandbox_id: SandboxId::from(sb),
+                    status: row::parse_session_state_for_lib(&st)?,
                     mem_budget_mib: mem,
                     cpu_budget_vcpus: cpu,
-                },
-            )
-            .collect())
+                })
+            })
+            .collect()
     }
 
     async fn delete_host(

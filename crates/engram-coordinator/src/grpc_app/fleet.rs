@@ -149,11 +149,14 @@ impl app::fleet_service_server::FleetService for AppFleetService {
             .state
             .services
             .meta
-            .list_active_sandbox_assignments_on_host(host_id)
+            .list_resident_sandbox_assignments_on_host(host_id)
             .await
             .map_err(|e| into_status(crate::error::ApiError::from(e)))?;
         let session_for: std::collections::HashMap<engram_core::SandboxId, engram_core::SessionId> =
-            assignments.into_iter().map(|(sid, sb)| (sb, sid)).collect();
+            assignments
+                .into_iter()
+                .map(|(sid, sb, _)| (sb, sid))
+                .collect();
         let mut sessions = Vec::with_capacity(records.len());
         for record in records {
             let session_id = session_for.get(&record.sandbox_id).copied();

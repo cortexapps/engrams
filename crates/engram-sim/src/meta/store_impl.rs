@@ -3226,12 +3226,12 @@ impl MetadataStore for SimMetadataStore {
         panic!("SimMeta: latest_capture_job_for_enable not implemented — add it plus a conformance case (ADR 0098 D4)")
     }
 
-    async fn list_active_assignments_with_budgets_on_host(
+    async fn list_resident_assignments_with_budgets_on_host(
         &self,
         host_id: HostId,
     ) -> Result<Vec<SandboxAssignment>, MetaError> {
-        // PG twin: Active + bound sessions on `host_id`, with their
-        // reservation budgets (COALESCE NULL → 0).
+        // PG twin: RESIDENT (memory-reserving) + bound sessions on
+        // `host_id`, with their reservation budgets (COALESCE NULL → 0).
         self.gate()?;
         let db = self.db.lock();
         Ok(db
@@ -3239,12 +3239,13 @@ impl MetadataStore for SimMetadataStore {
             .values()
             .filter(|r| {
                 r.session.host_id == Some(host_id)
-                    && r.session.status == SessionState::Active
+                    && r.session.status.reserves_host_memory()
                     && r.session.sandbox_id.is_some()
             })
             .map(|r| SandboxAssignment {
                 session_id: r.session.id,
                 sandbox_id: r.session.sandbox_id.expect("filtered"),
+                status: r.session.status,
                 mem_budget_mib: r.mem_budget_mib,
                 cpu_budget_vcpus: r.cpu_budget_vcpus,
             })
@@ -3252,10 +3253,10 @@ impl MetadataStore for SimMetadataStore {
     }
 
     /// The reconcile pass query: Active + bound sessions on `host_id`.
-    async fn list_active_sandbox_assignments_on_host(
+    async fn list_resident_sandbox_assignments_on_host(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
+    ) -> Result<Vec<(SessionId, SandboxId, SessionState)>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
         Ok(db
@@ -3263,10 +3264,16 @@ impl MetadataStore for SimMetadataStore {
             .values()
             .filter(|r| {
                 r.session.host_id == Some(host_id)
-                    && r.session.status == SessionState::Active
+                    && r.session.status.reserves_host_memory()
                     && r.session.sandbox_id.is_some()
             })
-            .map(|r| (r.session.id, r.session.sandbox_id.expect("filtered")))
+            .map(|r| {
+                (
+                    r.session.id,
+                    r.session.sandbox_id.expect("filtered"),
+                    r.session.status,
+                )
+            })
             .collect())
     }
 

@@ -477,38 +477,51 @@ pub trait MetadataStore: Send + Sync {
         Ok(std::collections::HashMap::new())
     }
 
-    /// ADR 0009 reconcile pass: enumerate the `(session_id,
-    /// sandbox_id)` pairs for every `status='active'` session
-    /// assigned to `host_id` whose `sandbox_id` is populated. The
-    /// reconcile pass intersects this against the host's
-    /// heartbeat-reported `running_sandboxes`. Missing-from-host
-    /// → strike counter increments; N strikes → flip per ADR §3.
+    /// ADR 0009 reconcile pass: enumerate the `(session_id, sandbox_id,
+    /// status)` triples for every RESIDENT session (any
+    /// `reserves_host_memory` state — a paused `parked` VM is exactly as
+    /// resident as an `active` one) assigned to `host_id` whose
+    /// `sandbox_id` is populated. The reconcile pass intersects this
+    /// against the host's heartbeat-reported `running_sandboxes` (which
+    /// is the backend's whole live set, not just Active). Missing-from-
+    /// host → strike counter increments; N strikes → flip per ADR §3.
+    /// Was `status='active'`-only until 2026-07-21 (status-set audit
+    /// finding 3): a vanished parked VM accrued no strikes and never
+    /// flipped HostLost. Callers that genuinely want Active-only (the
+    /// harness-attach disagreement metric) filter on the status.
     ///
     /// Default impl scans `list_active_sessions()` and filters in
     /// memory — fine for in-memory test mocks. Postgres overrides
     /// with an indexed `WHERE (host_id, status)` query so the
     /// per-heartbeat cost stays O(sandboxes-on-host), not
     /// O(total-active-sessions).
-    async fn list_active_sandbox_assignments_on_host(
+    async fn list_resident_sandbox_assignments_on_host(
         &self,
         host_id: HostId,
-    ) -> Result<Vec<(SessionId, SandboxId)>, MetaError> {
+    ) -> Result<Vec<(SessionId, SandboxId, SessionState)>, MetaError> {
         let all = self.list_active_sessions().await?;
         Ok(all
             .into_iter()
             .filter_map(|s| match (s.status, s.host_id, s.sandbox_id) {
-                (SessionState::Active, Some(h), Some(sb)) if h == host_id => Some((s.id, sb)),
+                (st, Some(h), Some(sb)) if h == host_id && st.reserves_host_memory() => {
+                    Some((s.id, sb, st))
+                }
                 _ => None,
             })
             .collect())
     }
 
-    /// ADR 0048 C8: the Active assignments on `host_id` WITH their
-    /// reservation budgets, for the drain don't-strand guard (it must
-    /// pre-check that some survivor fits each session's budgets before
-    /// starting a move). Default impl scans `list_active_sessions` (mocks
-    /// carry no budgets → 0, which the guard treats as "no constraint").
-    async fn list_active_assignments_with_budgets_on_host(
+    /// ADR 0048 C8: the RESIDENT assignments on `host_id` WITH their
+    /// reservation budgets, for the admin drain (the don't-strand guard
+    /// pre-checks that some survivor fits each session's budgets before
+    /// starting a move; the drain partitions on `status` — Active gets
+    /// the live-first move, Parked gets the descent evict). Was
+    /// Active-only until 2026-07-21 (status-set audit finding 4): a host
+    /// holding only parked VMs "drained" with an empty list and the roll
+    /// operator stalled on `running_sandboxes == 0`. Default impl scans
+    /// `list_active_sessions` (mocks carry no budgets → 0, which the
+    /// guard treats as "no constraint").
+    async fn list_resident_assignments_with_budgets_on_host(
         &self,
         host_id: HostId,
     ) -> Result<Vec<SandboxAssignment>, MetaError> {
@@ -516,10 +529,11 @@ pub trait MetadataStore: Send + Sync {
         Ok(all
             .into_iter()
             .filter_map(|s| match (s.status, s.host_id, s.sandbox_id) {
-                (SessionState::Active, Some(h), Some(sb)) if h == host_id => {
+                (st, Some(h), Some(sb)) if h == host_id && st.reserves_host_memory() => {
                     Some(SandboxAssignment {
                         session_id: s.id,
                         sandbox_id: sb,
+                        status: st,
                         mem_budget_mib: 0,
                         cpu_budget_vcpus: 0,
                     })

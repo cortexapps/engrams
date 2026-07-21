@@ -439,6 +439,9 @@ pub struct QueuedSession {
 pub struct SandboxAssignment {
     pub session_id: SessionId,
     pub sandbox_id: SandboxId,
+    /// The session's status at listing time — the drain partitions on
+    /// this (Active → live-first move; Parked → descent evict).
+    pub status: SessionState,
     pub mem_budget_mib: i64,
     pub cpu_budget_vcpus: i32,
 }

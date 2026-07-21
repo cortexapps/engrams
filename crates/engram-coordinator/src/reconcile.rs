@@ -133,8 +133,16 @@ impl Reconciler {
         running_sandboxes: &[SandboxId],
     ) -> Vec<SessionId> {
         let running: HashSet<SandboxId> = running_sandboxes.iter().copied().collect();
-        let assignments = match meta.list_active_sandbox_assignments_on_host(host_id).await {
-            Ok(v) => v,
+        // RESIDENT assignments — every memory-reserving state, so a
+        // vanished parked VM accrues strikes exactly like an active one
+        // (2026-07-21 status-set audit finding 3; the heartbeat's
+        // `running_sandboxes` is the backend's whole live set, parked
+        // included, so presence keeps resetting their strikes).
+        let assignments: Vec<(SessionId, SandboxId)> = match meta
+            .list_resident_sandbox_assignments_on_host(host_id)
+            .await
+        {
+            Ok(v) => v.into_iter().map(|(sid, sb, _status)| (sid, sb)).collect(),
             Err(e) => {
                 tracing::warn!(host_id = %host_id, error = %e, "reconcile: meta query failed; skipping tick");
                 return Vec::new();

@@ -803,10 +803,19 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
             // outbox row is deliberately NOT deferred on this arm, so
             // the retry forwards the moment it runs.
             match session.status {
+                // `Unreachable` belongs here, not with the scanner-owned
+                // states: NO scanner drives `Unreachable` anywhere — the
+                // Resume verb is its only recovery (destroy the dead
+                // sandbox → unbind → Idle → resume from checkpoint, ADR
+                // 0091), and this arm is what mints that Resume. Before
+                // 2026-07-21 it fell to the wildcard below and a prompt to
+                // an unreachable session retried forever without ever
+                // starting recovery (status-set audit finding 1).
                 SessionState::Idle
                 | SessionState::Created
                 | SessionState::Evicting
-                | SessionState::Parked => {
+                | SessionState::Parked
+                | SessionState::Unreachable => {
                     // Review finding #12: probe first — a resume op may
                     // already be queued behind us from a prior deliver
                     // retry. Without the guard, every backed-off deliver
