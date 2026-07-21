@@ -1157,7 +1157,12 @@ mod tests {
     }
 
     async fn wait_for_terminal(executor: &Arc<CaptureJobExecutor>, job_id: CaptureJobId) {
-        for _ in 0..200 {
+        // 10s deadline, not 1s: the job task runs on the shared runtime,
+        // and a loaded machine (first-build CI, a saturated dev VM) can
+        // starve it past a tight deadline — observed at 1.23s under a
+        // cold-cache workspace build. Healthy runs return in ~10ms; the
+        // deadline only bounds the pathological hang.
+        for _ in 0..2000 {
             if executor
                 .reports
                 .get(&job_id)
