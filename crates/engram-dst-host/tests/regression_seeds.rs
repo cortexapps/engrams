@@ -1103,6 +1103,77 @@ async fn gap_a_record_invisible_survivor_is_quarantined_not_severed_then_recover
         .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }
 
+/// PR #828 (the 2026-07-21 incident's second alert): a survivor THIS
+/// generation quarantine-parked (its rehydrate failed → `slot.quarantine()` →
+/// the allocator's parked set) stays a TRACKED record for the classification
+/// barrier even after its FC-derived record vacates (the concurrent session
+/// completion that raced the barrier in prod) — classified a known
+/// reconnectable survivor, never `QuarantinedUnknown`, so the operator-alerting
+/// `rehydrate-unknown-device` invariant cannot fire over a device this very
+/// process parked on purpose. Fail-without: drop the parked-set term from
+/// `classify_startup`'s `has_record` and the first assertion fails (the
+/// pre-#828 behavior).
+#[tokio::test(start_paused = true)]
+async fn quarantine_parked_survivor_stays_tracked_never_unknown() {
+    let mut host = scenario_host(0, 3).await;
+    let sandbox_id = host.sandboxes[0].sandbox_id;
+    // An acked write the survivor must keep through the whole episode.
+    host.guest_write(0, 2).await.unwrap();
+
+    // Rung-2 park, then the roll (the incident survivor was a parked session
+    // the coord list omitted — the 731df805 shape).
+    host.park(0);
+    host.crash_process().await.unwrap();
+
+    // The successor's OWN rehydrate pass fails for this device and parks it
+    // (the failed attempt is folded into this transition), then the FC-derived
+    // record vacates out from under it.
+    host.quarantine_park(0);
+    host.lose_record(0);
+
+    host.register_rehydrate(false, true).await.unwrap();
+    assert!(
+        !host.quarantined_unknown.contains(&sandbox_id),
+        "a quarantine-parked device is a TRACKED record — the barrier must not \
+         classify it QuarantinedUnknown",
+    );
+    assert!(
+        host.sandboxes[0]
+            .kernel_owner
+            .is_some_and(|g| g < host.generation),
+        "the parked survivor's device stays RECONNECTABLE (kernel binding intact)",
+    );
+    assert_eq!(
+        host.sandboxes[0].served_by, None,
+        "parked means parked: nothing re-serves the device this generation",
+    );
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+
+    // Recovery: the park is per-process allocator state, so the NEXT roll
+    // starts with a fresh allocator (the park does not outlive the process
+    // that made it — mirroring prod, where a later generation re-served the
+    // incident device's slot cleanly). With the record reconciled, the
+    // register pass re-serves the reconnectable device with zero loss.
+    host.crash_process().await.unwrap();
+    host.regain_record(0);
+    host.register_rehydrate(true, true).await.unwrap();
+    assert_eq!(
+        host.sandboxes[0].served_by,
+        Some(host.generation),
+        "the reconciled record lets the next generation re-serve the device",
+    );
+    assert!(
+        host.unpause(0),
+        "the un-pause serves the live re-served plane"
+    );
+    host.guest_read(0, 2).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
+}
+
 /// Scheduler-driven slot accounting (ADR 0098 P7): interleave `SlotClaim`
 /// (Free → Claimed via the real `try_claim`) and `SlotPopulateTick`
 /// (Claimed → Free via the lease `Drop`/`release`) over the REAL allocator,

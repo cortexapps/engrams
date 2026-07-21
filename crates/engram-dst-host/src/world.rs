@@ -273,11 +273,20 @@ pub struct SandboxSlot {
     /// record — a survivor whose records were lost upstream (#769 gap A) — is
     /// QUARANTINED, never silently skipped. `false` models that record loss.
     /// Mirrors prod, where the record set is built from `rootfs_device` over the
-    /// resident-and-recorded sandboxes: a device is "recorded" only while a live
+    /// resident-and-recorded sandboxes: a device is "recorded" while a live
     /// guest still holds it (`record_present && guest_holds_device` — a
     /// genuinely-gone guest's FC is not resident, so `rootfs_device` returns
-    /// `None` and the device is reap-eligible on proof of death).
+    /// `None` and the device is reap-eligible on proof of death) — OR while
+    /// this generation quarantine-parked it (`quarantine_parked` below).
     pub record_present: bool,
+    /// The allocator's quarantine-park (PR #828): THIS generation's rehydrate
+    /// failed for the device and `slot.quarantine()` registered it in the
+    /// allocator's parked set — a device-keyed record source that keeps the
+    /// survivor TRACKED even after its FC-derived record vacates (the
+    /// 2026-07-21 false `rehydrate-unknown-device` alarm). Distinct from the
+    /// rung-2 `parked` flag. Per-PROCESS state: cleared on roll — the
+    /// successor's fresh allocator has no memory of the predecessor's parks.
+    pub quarantine_parked: bool,
 }
 
 impl SandboxSlot {
@@ -503,6 +512,7 @@ impl SimHost {
                 // A fresh sandbox has a tracked record (coord ownership + a
                 // chain-head record); record loss is a seeded/faulted event.
                 record_present: true,
+                quarantine_parked: false,
             });
         }
 
@@ -873,9 +883,12 @@ impl SimHost {
         for slot in &mut self.sandboxes {
             // Drop the dead generation's lease (the old pool is discarded; its
             // async release is unobservable). served_by clears; kernel_owner +
-            // parked persist.
+            // parked persist. quarantine_parked CLEARS — the allocator's
+            // parked set is in-process memory, and the successor's fresh
+            // allocator has no record of the predecessor's parks.
             slot.lease = None;
             slot.served_by = None;
+            slot.quarantine_parked = false;
         }
         self.spare_leases.clear();
         // The successor builds a fresh pool (all devices free — it discovers
@@ -1001,10 +1014,13 @@ impl SimHost {
     /// from the world state (owner liveness × the holder proof-of-death × whether
     /// a tracked record accounts for it) and partition into the four classes. The
     /// device handle is the slot INDEX. `has_record` mirrors prod: a device is
-    /// recorded only while a live guest still holds it AND a record is present
+    /// recorded while a live guest still holds it AND a record is present
     /// (`record_present && guest_holds_device`) — a genuinely-gone guest's FC is
     /// not resident, so prod's `rootfs_device` reconcile can't map it, and it is
-    /// reap-eligible on proof of death.
+    /// reap-eligible on proof of death — OR while THIS generation
+    /// quarantine-parked it (PR #828: the allocator's parked set is
+    /// device-keyed, so a rehydrate-failed survivor stays tracked even after
+    /// its FC entry vacates).
     pub fn classify_startup(&self) -> engram_host_core::StartupClassification<usize> {
         let gen = self.generation;
         let slots = self
@@ -1026,7 +1042,8 @@ impl SimHost {
                 } else {
                     engram_host_core::DeviceHolder::NoHolder
                 };
-                let has_record = slot.record_present && slot.guest_holds_device;
+                let has_record =
+                    (slot.record_present && slot.guest_holds_device) || slot.quarantine_parked;
                 engram_host_core::StartupSlot {
                     device: idx,
                     liveness,
@@ -1077,6 +1094,21 @@ impl SimHost {
     pub fn lose_record(&mut self, idx: usize) {
         if let Some(slot) = self.sandboxes.get_mut(idx) {
             slot.record_present = false;
+        }
+    }
+
+    /// PR #828: model THIS generation's rehydrate failing for sandbox `idx`'s
+    /// device and parking it (`slot.quarantine()` → the allocator's parked
+    /// set). The parked device stays a TRACKED record for the classification
+    /// barrier even if every FC-derived record source subsequently vanishes —
+    /// the 2026-07-21 incident: a concurrent sandbox destroy vacated
+    /// `rootfs_device` between the park and the barrier, and the barrier fired
+    /// the operator-alerting `rehydrate-unknown-device` invariant over a
+    /// device this very process had parked on purpose. A no-op on an
+    /// out-of-range index.
+    pub fn quarantine_park(&mut self, idx: usize) {
+        if let Some(slot) = self.sandboxes.get_mut(idx) {
+            slot.quarantine_parked = true;
         }
     }
 
