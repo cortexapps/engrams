@@ -133,16 +133,31 @@ impl Reconciler {
         running_sandboxes: &[SandboxId],
     ) -> Vec<SessionId> {
         let running: HashSet<SandboxId> = running_sandboxes.iter().copied().collect();
-        // RESIDENT assignments — every memory-reserving state, so a
-        // vanished parked VM accrues strikes exactly like an active one
-        // (2026-07-21 status-set audit finding 3; the heartbeat's
-        // `running_sandboxes` is the backend's whole live set, parked
-        // included, so presence keeps resetting their strikes).
+        // Strike accounting applies ONLY to states whose VM must be
+        // RUNNING on the host right now: `Active`, `Parked` (a
+        // paused-in-place FC process still appears in the heartbeat's
+        // `running_sandboxes`; a vanished one must accrue strikes —
+        // 2026-07-21 status-set audit finding 3), and `Unreachable`
+        // (process alive, guest wedged). The OTHER resident states have
+        // LEGITIMATE no-VM windows the strike counter must not race:
+        // `Pending`/`Created` bind `sandbox_id` in PG before the VM
+        // boots (and a resume restores for seconds under `Created`),
+        // `Evacuating` is mid-move, and `Evicting` destroys the sandbox
+        // after capture and stays `Evicting` until a LATER heartbeat's
+        // settle records Idle (ADR 0101 C) — striking that window flips
+        // the session HostLost instead of Idle and swallows the
+        // `evicted` event (the e2e stack caught exactly this when the
+        // first version of this change strike-checked every resident
+        // state).
         let assignments: Vec<(SessionId, SandboxId)> = match meta
             .list_resident_sandbox_assignments_on_host(host_id)
             .await
         {
-            Ok(v) => v.into_iter().map(|(sid, sb, _status)| (sid, sb)).collect(),
+            Ok(v) => v
+                .into_iter()
+                .filter(|(_, _, status)| strike_eligible(*status))
+                .map(|(sid, sb, _status)| (sid, sb))
+                .collect(),
             Err(e) => {
                 tracing::warn!(host_id = %host_id, error = %e, "reconcile: meta query failed; skipping tick");
                 return Vec::new();
@@ -202,6 +217,16 @@ impl Reconciler {
 /// Returns `true` if the session was actually flipped to `host_lost`,
 /// `false` if it was rescued (ADR 0068 probe-before-host_lost) or
 /// short-circuited (already terminal / get_session failed).
+/// The pure strike-eligibility predicate over the resident listing
+/// (see the block comment at its call site in
+/// [`Reconciler::reconcile_with_deps`] for the per-state rationale).
+/// Kept wildcard-free-adjacent via the exhaustive test
+/// `strike_eligibility_is_deliberate_per_state`.
+pub(crate) fn strike_eligible(status: engram_core::types::SessionState) -> bool {
+    use engram_core::types::SessionState::*;
+    matches!(status, Active | Parked | Unreachable)
+}
+
 async fn flip_missing(
     meta: &dyn MetadataStore,
     events: &SessionEventBus,
@@ -562,5 +587,54 @@ mod tests {
     #[test]
     fn default_grace_is_three() {
         assert_eq!(DEFAULT_GRACE_TICKS, 3);
+    }
+
+    /// Strike eligibility is a DELIBERATE per-state decision, pinned
+    /// wildcard-free so a new `SessionState` variant is a compile error
+    /// here, not a silent inherit. The e2e stack caught the cost of
+    /// getting this wrong in both directions: Active-only missed
+    /// vanished parked VMs (61a03b7e audit finding 3); every-resident
+    /// struck the ADR 0101 C post-capture `Evicting` window and flipped
+    /// clean evictions to HostLost.
+    #[test]
+    fn strike_eligibility_is_deliberate_per_state() {
+        use engram_core::types::SessionState::*;
+        let all = [
+            Pending,
+            Queued,
+            Created,
+            Active,
+            Unreachable,
+            Parked,
+            Idle,
+            HostLost,
+            Evacuating,
+            Evicting,
+            Failed,
+            Completed,
+            Dead,
+        ];
+        // Exhaustiveness guard: extend `all` AND pick an arm below when
+        // adding a variant.
+        match Pending {
+            Pending | Queued | Created | Active | Unreachable | Parked | Idle | HostLost
+            | Evacuating | Evicting | Failed | Completed | Dead => {}
+        }
+        for s in all {
+            let expected = match s {
+                // The VM must be running NOW — absence is evidence.
+                Active | Parked | Unreachable => true,
+                // Legitimate no-VM windows (mid-boot / mid-restore /
+                // mid-move / post-capture-awaiting-settle) or no VM at
+                // all — absence is expected, never a strike.
+                Pending | Queued | Created | Evacuating | Evicting | Idle | HostLost | Failed
+                | Completed | Dead => false,
+            };
+            assert_eq!(
+                strike_eligible(s),
+                expected,
+                "{s:?}: strike eligibility drifted"
+            );
+        }
     }
 }

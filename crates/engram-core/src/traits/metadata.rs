@@ -483,12 +483,18 @@ pub trait MetadataStore: Send + Sync {
     /// resident as an `active` one) assigned to `host_id` whose
     /// `sandbox_id` is populated. The reconcile pass intersects this
     /// against the host's heartbeat-reported `running_sandboxes` (which
-    /// is the backend's whole live set, not just Active). Missing-from-
-    /// host → strike counter increments; N strikes → flip per ADR §3.
-    /// Was `status='active'`-only until 2026-07-21 (status-set audit
+    /// is the backend's whole live set, not just Active). Was
+    /// `status='active'`-only until 2026-07-21 (status-set audit
     /// finding 3): a vanished parked VM accrued no strikes and never
-    /// flipped HostLost. Callers that genuinely want Active-only (the
-    /// harness-attach disagreement metric) filter on the status.
+    /// flipped HostLost.
+    ///
+    /// The listing is the full resident set; each caller filters to the
+    /// statuses its own semantics need — reconcile strikes only
+    /// `Active | Parked | Unreachable` (`reconcile::strike_eligible`;
+    /// the other resident states have legitimate no-VM windows, e.g.
+    /// the ADR 0101 C post-capture `Evicting` settle window), the
+    /// harness-attach disagreement metric filters to `Active`, and the
+    /// storage/fleet labeling maps take everything.
     ///
     /// Default impl scans `list_active_sessions()` and filters in
     /// memory — fine for in-memory test mocks. Postgres overrides
