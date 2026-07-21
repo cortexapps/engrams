@@ -896,7 +896,7 @@ pub async fn reattach_manifest(
         };
     // Verify-on-read probe target (ADR 0098 P7 rider): the first seeded chunk,
     // captured BEFORE `adopt_unflushed` consumes the seed vec. `None` unless a
-    // spool was adopted, so a clean rehydrate pays nothing.
+    // spool was adopted (and non-empty), so a clean rehydrate pays nothing.
     let probe: Option<(usize, Vec<u8>)> =
         engram_host_core::first_seeded_probe(seed_dirty.as_deref())
             .map(|(idx, bytes)| (idx, bytes.to_vec()));
@@ -943,6 +943,58 @@ pub async fn reattach_manifest(
                      ahead of RECONFIGURE",
                 );
             }
+            engram_host_core::ReattachStep::VerifySeed => {
+                // Verify-on-read (ADR 0098 P7 rider): prove the seeded acked
+                // bytes are readable at their offset through the backend the
+                // RECONFIGURE below is about to hand the kernel — a
+                // single-chunk probe (an in-RAM dirty-tier read), NOT a
+                // full-disk scan (latency is non-negotiable). This step runs
+                // strictly BEFORE Reconfigure: the kernel releases the
+                // guest's parked I/O the instant it adopts our socket, so a
+                // post-RECONFIGURE probe races the live guest's own writes to
+                // the probed (hottest) chunk — the 2026-07-21 incident parked
+                // and destroyed a healthy, actively-writing survivor on every
+                // host roll this way, rewinding the very acked writes the
+                // spool preserved. A mismatch here means the adoption did not
+                // land in the backend about to be served; park the survivor
+                // with the KERNEL CONFIG UNTOUCHED (still dead-parked), so a
+                // later rehydrate attempt can still recover the device. The
+                // device-plane O_DIRECT check is the FC regression lane's job.
+                let Some((idx, expected)) = probe.as_ref() else {
+                    // An adopted-but-empty spool seeds nothing to verify.
+                    continue;
+                };
+                let idx = *idx;
+                let chunk_size = backend.chunk_size();
+                let offset = idx as u64 * chunk_size;
+                // Clamp the read to the device extent: the final chunk (or a
+                // device smaller than one chunk — e.g. the 4 MiB test images)
+                // is shorter than chunk_size, and reading a full chunk_size
+                // there overruns total_bytes and errors. `probe_matches` is a
+                // prefix compare, so a full (possibly-partial) chunk read is
+                // enough to prove the seeded bytes would be served.
+                let read_len = chunk_size.min(backend.total_bytes().saturating_sub(offset));
+                match backend.read(offset, read_len).await {
+                    Ok(bytes) if engram_host_core::probe_matches(&bytes, expected) => {}
+                    Ok(_) => {
+                        step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
+                            "verify-on-read: {} backend read of seeded chunk {idx} did \
+                             not return the adopted acked bytes (seed failed to land); \
+                             parking the survivor with the kernel config untouched",
+                            slot.path().display(),
+                        ))));
+                        break 'steps;
+                    }
+                    Err(e) => {
+                        step_err = Some(NbdRuntimeError::Io(io::Error::other(format!(
+                            "verify-on-read: {} readback of seeded chunk {idx} failed \
+                             before RECONFIGURE: {e}",
+                            slot.path().display(),
+                        ))));
+                        break 'steps;
+                    }
+                }
+            }
             engram_host_core::ReattachStep::Reconfigure => {
                 match reattach(backend.clone(), slot.path(), &plan.backend_id).await {
                     Ok(h) => handle = Some(h),
@@ -978,46 +1030,6 @@ pub async fn reattach_manifest(
         return Err((slot, e));
     }
     let handle = handle.expect("plan_reattach always emits Reconfigure (host-core pinned)");
-    // Verify-on-read rider (ADR 0098 P7): only when a spool was adopted, prove
-    // the seeded acked bytes are readable at their offset after RECONFIGURE —
-    // a single-chunk probe through the backend (an in-RAM dirty-tier read),
-    // NOT a full-disk scan (latency is non-negotiable). A mismatch/read-error
-    // means the rehydrate would serve the wrong bytes; return the slot for
-    // park rather than hand FC a silently-corrupt disk. The device-plane
-    // O_DIRECT check is the FC regression lane's job.
-    if let Some((idx, expected)) = probe {
-        let chunk_size = backend.chunk_size();
-        let offset = idx as u64 * chunk_size;
-        // Clamp the read to the device extent: the final chunk (or a device
-        // smaller than one chunk — e.g. the 4 MiB test images) is shorter than
-        // chunk_size, and reading a full chunk_size there overruns
-        // total_bytes and errors. `probe_matches` is a prefix compare, so a
-        // full (possibly-partial) chunk read is enough to prove the seeded
-        // bytes are served.
-        let read_len = chunk_size.min(backend.total_bytes().saturating_sub(offset));
-        match backend.read(offset, read_len).await {
-            Ok(bytes) if engram_host_core::probe_matches(&bytes, &expected) => {}
-            Ok(_) => {
-                let device = slot.path().display().to_string();
-                return Err((
-                    slot,
-                    NbdRuntimeError::Io(io::Error::other(format!(
-                        "verify-on-read: {device} served chunk {idx} did not match the seeded \
-                         acked bytes after RECONFIGURE (rolled-back base?)"
-                    ))),
-                ));
-            }
-            Err(e) => {
-                let device = slot.path().display().to_string();
-                return Err((
-                    slot,
-                    NbdRuntimeError::Io(io::Error::other(format!(
-                        "verify-on-read: {device} chunk {idx} readback failed after RECONFIGURE: {e}"
-                    ))),
-                ));
-            }
-        }
-    }
     Ok(NbdSandboxState {
         scheduler: None,
         backend,

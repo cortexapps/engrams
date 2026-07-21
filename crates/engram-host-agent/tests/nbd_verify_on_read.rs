@@ -132,6 +132,43 @@ fn pread_direct(path: &std::path::Path, offset: u64, len: usize) -> std::io::Res
     Ok(out)
 }
 
+/// O_DIRECT pwrite so the write travels the NBD wire (and PARKS under
+/// `dead_conn_timeout` when the device has no server — the queued-guest-write
+/// state a pod roll leaves behind). Offset/len 4096-aligned.
+fn pwrite_direct(path: &std::path::Path, offset: u64, data: &[u8]) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::fs::OpenOptionsExt;
+    assert_eq!(offset % 4096, 0);
+    assert_eq!(data.len() % 4096, 0);
+    let f = std::fs::OpenOptions::new()
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)?;
+    let layout = std::alloc::Layout::from_size_align(data.len(), 4096).unwrap();
+    // SAFETY: non-zero layout; fully initialized from `data` before the
+    // pwrite; freed at the end of the function.
+    let buf = unsafe { std::alloc::alloc(layout) };
+    assert!(!buf.is_null());
+    unsafe { std::ptr::copy_nonoverlapping(data.as_ptr(), buf, data.len()) };
+    let rc = unsafe {
+        libc::pwrite(
+            f.as_raw_fd(),
+            buf as *const libc::c_void,
+            data.len(),
+            offset as libc::off_t,
+        )
+    };
+    let result = if rc == data.len() as isize {
+        Ok(())
+    } else if rc < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        Err(std::io::Error::other(format!("short pwrite: {rc}")))
+    };
+    unsafe { std::alloc::dealloc(buf, layout) };
+    result
+}
+
 /// A 16-byte stamp repeated across a block, so a read decodes which write
 /// produced it (base vs the acked seed).
 fn stamp(tag: u64) -> [u8; 16] {
@@ -319,6 +356,167 @@ async fn reattach_verify_on_read_serves_seeded_acked_bytes_not_base() {
         &base_read[..16],
         &stamp(BASE_TAG),
         "an un-seeded chunk must still serve base content (no seed smear)",
+    );
+
+    // Clean teardown so the device is free for the next run.
+    drop(state2);
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    clear_stale_nbd_binding(&device);
+}
+
+/// 2026-07-21 incident regression: a surviving guest with QUEUED WRITES
+/// (parked under `dead_conn_timeout` across the pod roll) floods them in the
+/// instant the RECONFIGURE adopts the fresh socket — and the hottest chunks
+/// are exactly the spooled ones. The old post-RECONFIGURE verify-on-read
+/// probe read the guest's fresh write back, mis-read it as a rolled-back
+/// base, and parked a HEALTHY survivor (→ quarantine → evict-budget
+/// exhaustion → destroy → rewind: acked-write loss manufactured by the guard
+/// itself; four-for-four across the night's host rolls). The probe now runs
+/// at the `VerifySeed` step, strictly before the RECONFIGURE, so a racing
+/// guest write can never fail the reattach.
+///
+/// Under the old code this test fails with high probability (the released
+/// write patches the dirty tier while the driver is still in BLKFLSBUF,
+/// ahead of the probe); under the fixed code it passes deterministically —
+/// the probe completes before the kernel ever releases the write.
+#[tokio::test]
+#[ignore]
+async fn reattach_survives_guest_write_racing_reconfigure() {
+    std::env::set_var("ENGRAM_NBD_KERNEL_TIMEOUT_SECS", "5");
+    std::env::set_var("ENGRAM_NBD_DEAD_CONN_TIMEOUT_SECS", "60");
+
+    let nbd_path = match preflight() {
+        Some(p) => p,
+        None => return,
+    };
+    let work = tempfile::tempdir().expect("tempdir");
+
+    const BASE_TAG: u64 = 0;
+    const ACKED_TAG: u64 = 0xAC_1D_ED;
+    const GUEST_TAG: u64 = 0x60E5_7EAD; // the live guest's post-resume write
+    let image = work.path().join("disk.img");
+    let mut bytes = vec![0u8; 256 * 1024];
+    for block in bytes.chunks_mut(4096) {
+        block[..16].copy_from_slice(&stamp(BASE_TAG));
+    }
+    std::fs::write(&image, &bytes).expect("write image");
+
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
+    let store = Arc::new(ChunkStore::new(blob));
+    let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
+    cache_cfg.budget_bytes = 64 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+    let manifest = store
+        .chunk_file(&image, ManifestKind::Disk, Some(64 * 1024))
+        .await
+        .expect("chunk image");
+    let manifest_ref = ManifestRef::new();
+    store
+        .put_manifest(manifest_ref, &manifest)
+        .await
+        .expect("put manifest");
+
+    // Generation one: CONNECT + serve, then "pod roll" (abandon, no
+    // disconnect — the kernel keeps the device configured, dead-conn parked).
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let state = attach_manifest(
+        manifest_ref,
+        cache.clone(),
+        store.clone(),
+        &pool,
+        u64::MAX,
+        /*fork=*/ false,
+    )
+    .await
+    .expect("netlink CONNECT attach");
+    let device = state.device_path().to_path_buf();
+    let chunk_size = state.backend.chunk_size();
+    let seed_idx = 1usize;
+    let seeded_off = seed_idx as u64 * chunk_size;
+    let mut acked_chunk = vec![0u8; chunk_size as usize];
+    for block in acked_chunk.chunks_mut(4096) {
+        block[..16].copy_from_slice(&stamp(ACKED_TAG));
+    }
+    let seed_dirty = vec![(seed_idx, acked_chunk)];
+    let engram_host_agent::disk_daemon::NbdSandboxState {
+        scheduler: _,
+        backend: _gen1_backend,
+        handle,
+        slot,
+    } = state;
+    handle.abandon();
+    drop(slot);
+
+    // Park an O_DIRECT WRITE of GUEST_TAG at the SEEDED chunk's offset during
+    // the dead window — the queued guest write the RECONFIGURE will release
+    // onto the probed chunk (the prod race shape). Same park-detection settle
+    // loop as the read variant above.
+    let mut guest_block = vec![0u8; 4096];
+    guest_block[..16].copy_from_slice(&stamp(GUEST_TAG));
+    let parked_write = {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        loop {
+            let device_for_write = device.clone();
+            let block = guest_block.clone();
+            let probe = tokio::task::spawn_blocking(move || {
+                pwrite_direct(&device_for_write, seeded_off, &block)
+            });
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            if !probe.is_finished() {
+                break probe; // parked under dead_conn_timeout
+            }
+            let _ = probe.await;
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the write never parked under dead_conn_timeout within 20s",
+            );
+        }
+    };
+
+    // Generation two: the rehydrate. With the parked write racing the
+    // RECONFIGURE, the reattach (and its pre-RECONFIGURE verify probe) must
+    // still succeed — this is the incident's exact failure point.
+    let pool2 = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool2");
+    let slot2 = pool2.claim(&device).await.expect("claim survivor device");
+    let state2 = reattach_manifest(
+        manifest_ref,
+        cache,
+        store,
+        slot2,
+        u64::MAX,
+        Some(seed_dirty),
+    )
+    .await
+    .expect("a guest write racing the RECONFIGURE must not fail the rehydrate");
+
+    // The released write must complete against the fresh serve socket…
+    tokio::time::timeout(Duration::from_secs(30), parked_write)
+        .await
+        .expect("the parked write must complete after RECONFIGURE")
+        .expect("join")
+        .expect("parked guest write result");
+
+    // …and newest-wins: the guest's write supersedes the seed on its block,
+    // while the rest of the seeded chunk keeps the acked bytes.
+    let guest_read = state2
+        .backend
+        .read(seeded_off, 4096)
+        .await
+        .expect("read guest-written block");
+    assert_eq!(
+        &guest_read[..16],
+        &stamp(GUEST_TAG),
+        "the guest's post-RECONFIGURE write must supersede the seeded bytes",
+    );
+    let acked_read = state2
+        .backend
+        .read(seeded_off + 4096, 4096)
+        .await
+        .expect("read seed remainder");
+    assert_eq!(
+        &acked_read[..16],
+        &stamp(ACKED_TAG),
+        "the un-overwritten remainder of the seeded chunk keeps the acked bytes",
     );
 
     // Clean teardown so the device is free for the next run.

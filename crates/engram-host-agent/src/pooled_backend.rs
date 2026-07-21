@@ -9192,10 +9192,11 @@ impl PooledBackend {
         {
             Ok(state) => state,
             Err((slot, e)) => {
-                // RECONFIGURE refused — most likely a device configured by
-                // a pre-netlink host-agent generation (the one-roll
-                // transition window) or an identifier mismatch. The
-                // survivor's disk stays dead; the evict_local → resume
+                // Reattach refused — a RECONFIGURE failure (a device
+                // configured by a pre-netlink host-agent generation, or an
+                // identifier mismatch), or the pre-RECONFIGURE verify-on-read
+                // finding the adopted spool bytes missing from the backend.
+                // The survivor's disk stays dead; the evict_local → resume
                 // ladder recovers the session.
                 //
                 // PARK the slot rather than letting it drop back into the
@@ -9209,7 +9210,7 @@ impl PooledBackend {
                     %sandbox_id,
                     device = %device.display(),
                     error = %e,
-                    "rehydrate RECONFIGURE failed; parking the survivor's NBD slot \
+                    "rehydrate reattach failed; parking the survivor's NBD slot \
                      (quarantined, kept out of the pool) to protect a possibly-live \
                      device; recover via evict_local → resume",
                 );
@@ -9222,7 +9223,7 @@ impl PooledBackend {
                 self.quarantined_survivors.insert(sandbox_id, session_id);
                 return Err(SandboxError::Vm(
                     format!(
-                        "rehydrate nbd reconfigure at {}: {e} \
+                        "rehydrate nbd reattach at {}: {e} \
                          (survivor disk unserved; slot quarantined; recover via \
                          evict_local → resume)",
                         device.display()
