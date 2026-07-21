@@ -271,6 +271,7 @@ impl HostClient for LocalHostClient {
         platform_os: &str,
         platform_arch: &str,
         registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         self.sandbox
@@ -279,6 +280,7 @@ impl HostClient for LocalHostClient {
                 platform_os,
                 platform_arch,
                 registry_auth,
+                min_disk_gib,
                 progress,
             )
             .await

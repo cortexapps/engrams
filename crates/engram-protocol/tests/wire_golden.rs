@@ -456,8 +456,12 @@ fn wire_version_pinned() {
     // coord never dispatches a peer-hinted restore to a v15 host).
     // 16 -> 17: ADR 0100 — the coord↔host WriteFiles RPC carries new
     // WireWriteFilesRequest/WireWriteFilesResponse bincode mirrors.
+    // 17 -> 18: ADR 0093 addendum — `MaterializeImageRequest.min_disk_gib`
+    // (the image's `suggested_disk_gib` now floors the packed ext4 size).
+    // Proto-native scalar only; no bincode payload changed, so every
+    // golden is byte-identical.
     assert_eq!(
-        WIRE_VERSION, 17,
+        WIRE_VERSION, 18,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

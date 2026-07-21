@@ -136,6 +136,7 @@ pub async fn run(
     platform_os: &str,
     platform_arch: &str,
     registry_auth: Option<ResolvedRegistryAuth>,
+    min_disk_gib: u32,
     progress: tokio::sync::mpsc::Sender<MaterializeProgress>,
 ) -> Result<MaterializedImage, SandboxError> {
     // ---- platform validation (fail loud on a mismatch) ----
@@ -256,8 +257,16 @@ pub async fn run(
             init_script: None,
         },
     );
+    let min_fs_size_bytes = (min_disk_gib as u64) << 30;
     let result = materializer
-        .materialize(image_uri, platform, scratch, chunk_store, Some(stage_tx))
+        .materialize(
+            image_uri,
+            platform,
+            scratch,
+            chunk_store,
+            min_fs_size_bytes,
+            Some(stage_tx),
+        )
         .await;
     // Await the keepalive so our clone of `progress` is dropped before
     // we return — the RPC handler relies on the progress channel

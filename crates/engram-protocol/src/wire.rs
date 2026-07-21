@@ -105,7 +105,12 @@ use serde::{Deserialize, Serialize};
 // whose bincode decode would fail loudly). Lockstep coord+host roll.
 // v17 (ADR 0100): `WriteFiles` coord↔host RPC and its bincode request /
 // response mirrors. Lockstep coord+host roll.
-pub const WIRE_VERSION: u32 = 17;
+// v18 (ADR 0093 addendum): `MaterializeImageRequest.min_disk_gib` — the
+// image's `suggested_disk_gib` now floors the packed ext4 size. Proto
+// field addition (mixed-roll-safe: an old host ignores it and packs
+// content-sized), bumped so the deploy posture is explicit — an enable
+// on a v17 host silently loses the floor.
+pub const WIRE_VERSION: u32 = 18;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

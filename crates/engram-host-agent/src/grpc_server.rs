@@ -746,6 +746,7 @@ impl HostService for HostServiceImpl {
                         &inner.platform_os,
                         &inner.platform_arch,
                         registry_auth,
+                        inner.min_disk_gib,
                         progress_tx,
                     )
                     .await

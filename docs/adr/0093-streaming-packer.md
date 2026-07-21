@@ -190,3 +190,30 @@ tar→mkext4 namespace adapter` → `materializer: wire the streaming
 pack` → `gates: one-time legacy A/B` → `retire e2fsprogs/mke2fs
 everywhere` → `unset the mke2fs-era knobs` → `ADR 0093 close (this
 commit)`.
+
+## Addendum (2026-07-20): `suggested_disk_gib` floors the packed ext4
+
+The packer sized every image purely to content —
+`recommended_size = max(2×content, content+128 MiB)` — which made the
+image's `resources.suggested_disk_gib` a **dead knob** for workspace: it
+fed host placement (`DiskLimit`, the 2D packing bound) but nothing ever
+grew the filesystem (there is no in-guest resize path), so a slim image's
+sessions got only content-relative headroom no matter what the resources
+declared. Found live (ADR 0100): the PR-review finder on the 16-"GiB"
+demo image died mid-clone of a large repo with `No space left on
+device`, and bumping the setting to 100 changed nothing.
+
+Now `suggested_disk_gib` ALSO floors the packed ext4 at enable-time
+materialization: `MaterializeImageRequest.min_disk_gib` (wire v18)
+carries the enable job's `image_config.resources.suggested_disk_gib` to
+the host, and `NamespaceBuilder::seal` takes
+`size = max(recommended_size(content), floor)`. The floor is ~free at
+rest — padding is zero-filled and zero chunks are elided from manifests
+(a 16 GiB fs over 3 GiB of content stores ~3 GiB of chunks) — and
+deterministic (size is a pure function of content + config). Costs that
+do scale with the floor: enable-time chunk hashing walks the full fs
+size, and restored-session writes into padding become real chunks like
+any other write. Changing the value changes the disk manifest, so a bump
+takes effect on the next refresh/enable (re-capture), never on live
+sessions — and mixed-roll, a v17 host ignores the field and packs
+content-sized (hence the explicit wire bump).

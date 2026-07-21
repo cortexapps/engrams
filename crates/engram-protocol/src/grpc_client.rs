@@ -644,6 +644,7 @@ impl GrpcHostClient {
         platform_os: &str,
         platform_arch: &str,
         registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         use engram_core::types::{
@@ -655,6 +656,7 @@ impl GrpcHostClient {
             platform_os: platform_os.to_string(),
             platform_arch: platform_arch.to_string(),
             registry_auth_bincode: encode_bincode(&registry_auth, "Option<ResolvedRegistryAuth>")?,
+            min_disk_gib,
         };
         let mut stream = self
             .inner
@@ -1608,6 +1610,7 @@ impl HostClient for GrpcHostClient {
         platform_os: &str,
         platform_arch: &str,
         registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         Self::materialize_image(
@@ -1616,6 +1619,7 @@ impl HostClient for GrpcHostClient {
             platform_os,
             platform_arch,
             registry_auth,
+            min_disk_gib,
             progress,
         )
         .await

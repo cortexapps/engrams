@@ -274,6 +274,7 @@ impl HostClient for FakeCaptureHost {
         platform_os: &str,
         platform_arch: &str,
         _registry_auth: Option<engram_core::types::registry::ResolvedRegistryAuth>,
+        min_disk_gib: u32,
         progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
     ) -> Result<engram_core::types::MaterializedImage, SandboxError> {
         self.materializes.fetch_add(1, Ordering::SeqCst);
@@ -301,6 +302,7 @@ impl HostClient for FakeCaptureHost {
                 platform,
                 &self.scratch,
                 &self.chunk_store,
+                (min_disk_gib as u64) << 30,
                 Some(progress),
             )
             .await

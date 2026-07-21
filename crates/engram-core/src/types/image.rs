@@ -424,6 +424,13 @@ pub struct ResourceHints {
     /// placement reserves it against the host's
     /// `total_vcpus × overcommit` budget so packing has a CPU bound.
     pub suggested_vcpus: Option<u32>,
+    /// The session's disk budget in GiB. Feeds host placement
+    /// (`DiskLimit`, the 2D packing bound) AND — ADR 0093 addendum —
+    /// floors the packed ext4's size at enable-time materialization, so
+    /// sessions actually get this much filesystem (the packer's default
+    /// is content-sized: `max(2×content, content+128 MiB)`). Changing it
+    /// changes the disk manifest, so a bump takes effect on the next
+    /// refresh/enable (re-capture), not on live sessions.
     pub suggested_disk_gib: Option<u32>,
 }
 

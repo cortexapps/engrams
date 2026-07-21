@@ -212,6 +212,11 @@ pub(crate) async fn materialize_image_on_host(
     job_id: uuid::Uuid,
     claimant: &str,
     image_uri: &str,
+    // ADR 0093 addendum: the image's `resources.suggested_disk_gib`,
+    // forwarded as the packed ext4's size floor (`0` = content-sized) so
+    // the knob actually grants sessions working room. Zero-fill padding
+    // chunks are elided from manifests, so the floor is ~free at rest.
+    min_disk_gib: u32,
     progress: tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>,
 ) -> Result<engram_core::types::MaterializedImage, ApiError> {
     // ADR 0084 / ADR 0081: materialize boots no VM — it just pulls +
@@ -256,31 +261,36 @@ pub(crate) async fn materialize_image_on_host(
         static_auth = registry_auth.is_some(),
         "materializing image on host for enable",
     );
-    host.materialize_image(image_uri, "linux", arch, registry_auth, progress)
-        .await
-        .map_err(|e| match e {
-            engram_core::SandboxError::MaterializeFailed(failure) => ApiError::MaterializeFailed {
-                kind: failure.kind,
-                message: format!(
-                    "materialize `{image_uri}` on host {host_id} failed: {}",
-                    failure.message
-                ),
-            },
-            // Same retryable transport classes as the capture RPC
-            // (ADR 0050 C / issue #229): re-pick a host next attempt.
-            engram_core::SandboxError::Unavailable(msg) => ApiError::Unavailable(format!(
-                "materialize `{image_uri}` could not reach host {host_id}: {msg}"
-            )),
-            engram_core::SandboxError::WireSkew { host: hw, coord } => {
-                ApiError::Unavailable(format!(
-                    "materialize `{image_uri}` hit a WIRE_VERSION skew against host {host_id} \
+    host.materialize_image(
+        image_uri,
+        "linux",
+        arch,
+        registry_auth,
+        min_disk_gib,
+        progress,
+    )
+    .await
+    .map_err(|e| match e {
+        engram_core::SandboxError::MaterializeFailed(failure) => ApiError::MaterializeFailed {
+            kind: failure.kind,
+            message: format!(
+                "materialize `{image_uri}` on host {host_id} failed: {}",
+                failure.message
+            ),
+        },
+        // Same retryable transport classes as the capture RPC
+        // (ADR 0050 C / issue #229): re-pick a host next attempt.
+        engram_core::SandboxError::Unavailable(msg) => ApiError::Unavailable(format!(
+            "materialize `{image_uri}` could not reach host {host_id}: {msg}"
+        )),
+        engram_core::SandboxError::WireSkew { host: hw, coord } => ApiError::Unavailable(format!(
+            "materialize `{image_uri}` hit a WIRE_VERSION skew against host {host_id} \
                      (host={hw}, coord={coord})"
-                ))
-            }
-            other => ApiError::Internal(format!(
-                "materialize `{image_uri}` on host {host_id} failed: {other}"
-            )),
-        })
+        )),
+        other => ApiError::Internal(format!(
+            "materialize `{image_uri}` on host {host_id} failed: {other}"
+        )),
+    })
 }
 
 /// Build the `EnabledImage` row skeleton for one enable job — the
