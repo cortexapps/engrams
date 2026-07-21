@@ -85,6 +85,15 @@ const DEFAULT_MAX_ATTEMPTS: u32 = 10;
 /// The disk manifest publish's own version-conflict retry budget —
 /// mirrors `ChunkedDiskBackend::flush_upload`'s `MAX_FLUSH_RETRIES`.
 const MAX_MANIFEST_PUBLISH_RETRIES: u32 = 32;
+/// ADR 0101 A: upload fan-out for the eviction-final disk publish —
+/// the NBD flush path's width (`DISK_FLUSH_UPLOAD_CONCURRENCY`); the
+/// host-global `UploadBudget` stays the cross-workload arbiter.
+const DISK_PUBLISH_CONCURRENCY: usize = 32;
+/// ADR 0101 A: fan-out for staging the drained chunks to
+/// `disk-pending/` — independent files whose write→fsync→rename cost
+/// is fsync-dominated; 16-way keeps the NVMe queue fed on the
+/// `snapshot_begin` critical path.
+const DISK_STAGE_CONCURRENCY: usize = 16;
 
 pub(crate) fn max_attempts() -> u32 {
     std::env::var("ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS")
@@ -294,20 +303,44 @@ pub async fn persist_disk_pending_chunks(
     dest: &Path,
     chunks: &[(usize, ChunkHash, Bytes)],
 ) -> std::io::Result<()> {
+    use futures::stream::{StreamExt, TryStreamExt};
     if chunks.is_empty() {
         return Ok(());
     }
     let dir = dest.join("disk-pending");
     tokio::fs::create_dir_all(&dir).await?;
-    for (idx, hash, bytes) in chunks {
+    // ADR 0101 A: fanned out — each chunk's own write→fsync→rename
+    // ordering is preserved per file; only cross-file order relaxes,
+    // which the redrive never depended on (it re-reads by recorded
+    // index+hash). This runs on the eviction critical path (before
+    // `snapshot_begin` returns), so the fsync serialization was
+    // user-visible teardown time.
+    async fn stage_one(
+        dir: PathBuf,
+        idx: usize,
+        hash: ChunkHash,
+        bytes: Bytes,
+    ) -> std::io::Result<()> {
         let path = dir.join(format!("{idx}.{}", hash.to_hex()));
         let tmp = dir.join(format!("{idx}.{}.partial", hash.to_hex()));
-        tokio::fs::write(&tmp, bytes).await?;
+        tokio::fs::write(&tmp, &bytes).await?;
         let f = tokio::fs::OpenOptions::new().read(true).open(&tmp).await?;
         f.sync_all().await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        tokio::fs::rename(&tmp, &path).await
     }
-    Ok(())
+    // Owned items (a `Bytes` clone is a refcount bump), collected with a
+    // plain loop — any closure over `&tuple` living inside the spawned
+    // 'static finalize future trips rustc's FnOnce-not-general-enough
+    // limitation (rust-lang/rust#102211).
+    let mut items: Vec<(usize, ChunkHash, Bytes)> = Vec::with_capacity(chunks.len());
+    for (idx, hash, bytes) in chunks {
+        items.push((*idx, *hash, bytes.clone()));
+    }
+    futures::stream::iter(items)
+        .map(|(idx, hash, bytes)| stage_one(dir.clone(), idx, hash, bytes))
+        .buffer_unordered(DISK_STAGE_CONCURRENCY)
+        .try_collect::<()>()
+        .await
 }
 
 async fn read_disk_pending_chunks(
@@ -352,18 +385,44 @@ async fn publish_disk_manifest(
     chunks: &[(usize, ChunkHash, Bytes)],
 ) -> Result<ManifestRef, SandboxError> {
     // Idempotent content-addressed puts — safe to redo on a redrive that
-    // crashed after some (but not all) chunks landed.
-    for (_, recorded_hash, bytes) in chunks {
-        let returned_hash = chunk_store.put_chunk(bytes).await.map_err(|e| {
-            SandboxError::Snapshot(format!("eviction finalize disk chunk upload: {e}"))
-        })?;
-        if returned_hash != *recorded_hash {
-            return Err(SandboxError::Snapshot(format!(
-                "eviction finalize disk chunk upload returned hash {returned_hash}, not recorded \
-                 hash {recorded_hash}; the manifest would reference a chunk that does not exist \
-                 under the recorded hash"
-            )));
+    // crashed after some (but not all) chunks landed. ADR 0101 A: fanned
+    // out at the NBD flush path's width and UNCHECKED — the dirty set is
+    // freshly re-chunked, so the old per-chunk dedup HEAD was a
+    // guaranteed-miss round trip. `put_chunk_unchecked` recomputes the
+    // hash from the bytes it uploads, so the recorded-hash comparison
+    // keeps the corruption check the checked path provided.
+    {
+        use futures::stream::{StreamExt, TryStreamExt};
+        async fn put_one(
+            chunk_store: ChunkStore,
+            recorded_hash: ChunkHash,
+            bytes: Bytes,
+        ) -> Result<(), SandboxError> {
+            let returned_hash = chunk_store.put_chunk_unchecked(&bytes).await.map_err(|e| {
+                SandboxError::Snapshot(format!("eviction finalize disk chunk upload: {e}"))
+            })?;
+            if returned_hash != recorded_hash {
+                return Err(SandboxError::Snapshot(format!(
+                    "eviction finalize disk chunk upload returned hash {returned_hash}, not \
+                     recorded hash {recorded_hash}; the manifest would reference a chunk that \
+                     does not exist under the recorded hash"
+                )));
+            }
+            Ok(())
         }
+        // Owned items (Bytes clone = refcount bump; ChunkStore clone =
+        // Arc bumps) — see `persist_disk_pending_chunks` for why a
+        // closure over `&tuple` can't live inside the spawned finalize
+        // task.
+        let mut items: Vec<(ChunkHash, Bytes)> = Vec::with_capacity(chunks.len());
+        for (_, recorded_hash, bytes) in chunks {
+            items.push((*recorded_hash, bytes.clone()));
+        }
+        futures::stream::iter(items)
+            .map(|(recorded_hash, bytes)| put_one(chunk_store.clone(), recorded_hash, bytes))
+            .buffer_unordered(DISK_PUBLISH_CONCURRENCY)
+            .try_collect::<()>()
+            .await?;
     }
 
     let base = chunk_store.get_manifest(base_manifest).await.map_err(|e| {
@@ -443,83 +502,89 @@ async fn publish_disk_manifest(
     }
 }
 
-async fn run_disk_leg(
+/// The disk leg's publish work — pure (no stage/record mutation):
+/// resolve the disk manifest ref this capture carries. `hot_chunks` is
+/// the same-process fast path (ADR 0101 A): `snapshot_begin` hands the
+/// drained bytes it just staged, so the common path skips the NVMe
+/// read-back and `disk-pending/` serves purely as the crash-redrive
+/// journal. A redrive (fresh process — no hot bytes — or a mismatch
+/// against the record) falls back to reading + re-verifying the journal.
+async fn disk_leg_work(
     f: &EvictionFinalizer,
-    record: &mut EvictionFinalizeRecord,
-) -> Result<(), SandboxError> {
-    if record.stage != FinalizeStage::Captured {
-        return Ok(());
-    }
+    record: &EvictionFinalizeRecord,
+    hot_chunks: Option<&[(usize, ChunkHash, Bytes)]>,
+) -> Result<Option<ManifestRef>, SandboxError> {
     let start = crate::time_source::metrics_now();
-    match (&f.chunk_store, &record.disk_pending) {
+    let resolved = match (&f.chunk_store, &record.disk_pending) {
         (_, None) => {
             // No NBD disk tier at capture — nothing to carry (matches
             // `finish()`'s behavior: `metadata.disk_manifest` stays
             // whatever the bare backend produced, i.e. `None`, when
             // `nbd_pending_flush` was `None`).
+            None
         }
         (None, Some(pending)) => {
             // Defensive: chunk store vanished between snapshot_begin and
             // now (shouldn't happen — gated at snapshot_begin). Carry the
             // base forward unchanged rather than losing the disk tier.
-            record.disk_manifest = Some(pending.base_manifest);
+            Some(pending.base_manifest)
         }
         (Some(_), Some(pending)) if pending.chunks.is_empty() => {
             // NBD attached but nothing dirty — carry forward unchanged,
             // mirroring `flush_upload`'s empty-dirty-set short-circuit.
-            record.disk_manifest = Some(pending.base_manifest);
+            Some(pending.base_manifest)
         }
         (Some(chunk_store), Some(pending)) => {
-            let chunks =
-                read_disk_pending_chunks(f.fs.as_ref(), &record.dest, &pending.chunks).await?;
+            // The hot bytes are trusted only when they match the durable
+            // record exactly (same indices, same hashes, in order) —
+            // anything else means they belong to a different capture
+            // generation, and the journal is the truth.
+            let hot = hot_chunks.filter(|hot| {
+                hot.len() == pending.chunks.len()
+                    && hot
+                        .iter()
+                        .zip(&pending.chunks)
+                        .all(|((hi, hh, _), (ri, rh))| hi == ri && hh == rh)
+            });
+            let owned;
+            let chunks: &[(usize, ChunkHash, Bytes)] = match hot {
+                Some(hot) => hot,
+                None => {
+                    owned = read_disk_pending_chunks(f.fs.as_ref(), &record.dest, &pending.chunks)
+                        .await?;
+                    &owned
+                }
+            };
             let published = publish_disk_manifest(
                 chunk_store,
                 pending.base_manifest,
                 pending.chunk_size,
                 pending.total_bytes,
-                &chunks,
+                chunks,
             )
             .await?;
-            record.disk_manifest = Some(published);
+            Some(published)
         }
-    }
-    // Persist the stage bump (with the resolved `disk_manifest` ref)
-    // BEFORE deleting `disk-pending/` — findings 1/3: deleting first made
-    // a crash between delete and persist indistinguishable from "nothing
-    // dirty this round" on redrive (`read_disk_pending_chunks` ENOENTs,
-    // quarantining a snapshot whose manifest may already be durably
-    // published). A failed persist here must not leave `record.stage`
-    // mutated in RAM out from under the on-disk truth, so roll it back on
-    // error — the next attempt re-observes `Captured` and safely redoes
-    // the (idempotent, content-addressed) publish above.
-    let prev_stage = record.stage;
-    record.stage = FinalizeStage::DiskUploaded;
-    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
-        record.stage = prev_stage;
-        return Err(SandboxError::Snapshot(format!(
-            "persist finalize record: {e}"
-        )));
-    }
-    let pending_dir = record.dest.join("disk-pending");
-    let _ = f.fs.remove_dir(&pending_dir).await;
+    };
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "disk")
         .record(start.elapsed().as_secs_f64());
-    Ok(())
+    Ok(resolved)
 }
 
-async fn run_memory_leg(
+/// The memory leg's publish work — pure (no stage/record mutation):
+/// re-chunk + publish the memory manifest and patch the FC sidecar.
+/// Returns the published ref (`None` = diff-less capture / chunk store
+/// disabled) and the consumed input file to best-effort-delete once the
+/// stage bump is durable (finding 1). Idempotent from any point: the
+/// manifest targets the deterministic `next_ref`, so a redo of an
+/// already-published attempt lands in the `VersionConflict` success arm.
+async fn memory_leg_work(
     f: &EvictionFinalizer,
-    record: &mut EvictionFinalizeRecord,
-) -> Result<(), SandboxError> {
-    if record.stage != FinalizeStage::DiskUploaded {
-        return Ok(());
-    }
+    record: &EvictionFinalizeRecord,
+) -> Result<(Option<ManifestRef>, Option<PathBuf>), SandboxError> {
     let start = crate::time_source::metrics_now();
-    // The input file to best-effort-delete AFTER the stage bump is
-    // durable (finding 1). `None` when this attempt didn't consume a
-    // fresh on-disk input (nothing to clean up, or the chunk_store leg
-    // is disabled).
     let mut consumed: Option<PathBuf> = None;
+    let mut memory_manifest: Option<ManifestRef> = None;
     if let Some(chunk_store) = f.chunk_store.as_ref() {
         let manifest_ref = if let Some(prev_ref) = record.chain_prev_ref {
             let diff_path = record.dest.join("memory.diff");
@@ -543,7 +608,7 @@ async fn run_memory_leg(
                     // always target the deterministic `next_ref`, so a
                     // conflict here can only mean a prior attempt already
                     // published this exact content (a crash between that
-                    // `put_manifest` and this leg's stage-bump persist).
+                    // `put_manifest` and the stage-bump persist).
                     // That's idempotent success, not a real race.
                     Err(engram_chunk_store::ChunkStoreError::VersionConflict {
                         attempted, ..
@@ -557,10 +622,10 @@ async fn run_memory_leg(
                 consumed = Some(diff_path);
                 Some(next_ref)
             } else {
-                // No diff on disk and the stage is still `DiskUploaded`
-                // (the guard above already skips this leg once the stage
-                // bump persists) — nothing dirty this round; matches
-                // `finish()`'s behavior for a diff-less capture.
+                // No diff on disk and the memory stage hasn't persisted
+                // (the caller's ladder guard skips this leg once it has)
+                // — nothing dirty this round; matches `finish()`'s
+                // behavior for a diff-less capture.
                 None
             }
         } else {
@@ -587,35 +652,12 @@ async fn run_memory_leg(
                 Some(record.session_id),
             )
             .await?;
-            record.memory_manifest = Some(mref);
+            memory_manifest = Some(mref);
         }
-    }
-    // Persist the stage bump (with `memory_manifest`) BEFORE deleting the
-    // consumed input (finding 1) — same durability-ordering fix as the
-    // disk leg. Roll back the in-RAM mutation on a failed persist so a
-    // subsequent retry doesn't believe this stage is durable when it
-    // isn't (it re-observes `DiskUploaded` and safely redoes the
-    // idempotent work above).
-    let prev_stage = record.stage;
-    let prev_memory_manifest = record.memory_manifest;
-    record.stage = FinalizeStage::MemoryChunked;
-    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
-        record.stage = prev_stage;
-        record.memory_manifest = prev_memory_manifest;
-        return Err(SandboxError::Snapshot(format!(
-            "persist finalize record: {e}"
-        )));
-    }
-    // Only now — durably recorded — delete the consumed input. A crash
-    // here just leaks the already-consumed source file; the manifest ref
-    // is already durable and the stage guard skips this leg on redrive,
-    // so it's never re-read.
-    if let Some(p) = consumed {
-        let _ = f.fs.remove_file(&p).await;
     }
     metrics::histogram!(crate::metrics::EVICTION_FINALIZE_STAGE_SECONDS, "stage" => "memory")
         .record(start.elapsed().as_secs_f64());
-    Ok(())
+    Ok((memory_manifest, consumed))
 }
 
 async fn run_blobs_leg(
@@ -636,16 +678,21 @@ async fn run_blobs_leg(
             let state_key = engram_chunk_store::snapshot_blob::state_blob_key(record.snapshot_id);
             let sidecar_key =
                 engram_chunk_store::snapshot_blob::sidecar_blob_key(record.snapshot_id);
-            engram_chunk_store::snapshot_blob::upload_file(blob.as_ref(), &state_key, &state_path)
-                .await
-                .map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
-            engram_chunk_store::snapshot_blob::upload_file(
-                blob.as_ref(),
-                &sidecar_key,
-                &sidecar_path,
-            )
-            .await
-            .map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
+            // ADR 0101 A: independent blob objects — upload concurrently.
+            let (state_res, sidecar_res) = tokio::join!(
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &state_key,
+                    &state_path
+                ),
+                engram_chunk_store::snapshot_blob::upload_file(
+                    blob.as_ref(),
+                    &sidecar_key,
+                    &sidecar_path
+                )
+            );
+            state_res.map_err(|e| SandboxError::Snapshot(format!("upload state.bin: {e}")))?;
+            sidecar_res.map_err(|e| SandboxError::Snapshot(format!("upload sidecar.json: {e}")))?;
         }
         if !record.aux_bundles.is_empty() {
             crate::bundles::BundleStore::new(blob.clone(), f.bundle_dir.clone(), f.bundle_file_ext)
@@ -725,6 +772,61 @@ async fn run_terminal(
     Ok(())
 }
 
+/// Persist the `DiskUploaded` bump (with the resolved ref), rolling
+/// back the in-RAM mutations on a failed persist so a retry never
+/// believes an un-persisted stage is durable — it re-observes
+/// `Captured` and safely redoes the idempotent publish (findings 1/3).
+/// Only after the bump is durable is `disk-pending/` deleted: deleting
+/// first made a crash between delete and persist indistinguishable
+/// from "nothing dirty this round" on redrive.
+async fn persist_disk_bump(
+    f: &EvictionFinalizer,
+    record: &mut EvictionFinalizeRecord,
+    disk_manifest: Option<ManifestRef>,
+) -> Result<(), SandboxError> {
+    let prev_stage = record.stage;
+    let prev_disk_manifest = record.disk_manifest;
+    record.disk_manifest = disk_manifest;
+    record.stage = FinalizeStage::DiskUploaded;
+    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
+        record.stage = prev_stage;
+        record.disk_manifest = prev_disk_manifest;
+        return Err(SandboxError::Snapshot(format!(
+            "persist finalize record: {e}"
+        )));
+    }
+    let pending_dir = record.dest.join("disk-pending");
+    let _ = f.fs.remove_dir(&pending_dir).await;
+    Ok(())
+}
+
+/// Persist the `MemoryChunked` bump — same rollback-on-failed-persist
+/// discipline as [`persist_disk_bump`]; the consumed input file is
+/// deleted only once the bump is durable (a crash after the persist
+/// just leaks an already-consumed source file, never re-read).
+async fn persist_memory_bump(
+    f: &EvictionFinalizer,
+    record: &mut EvictionFinalizeRecord,
+    memory_manifest: Option<ManifestRef>,
+    consumed: Option<PathBuf>,
+) -> Result<(), SandboxError> {
+    let prev_stage = record.stage;
+    let prev_memory_manifest = record.memory_manifest;
+    record.memory_manifest = memory_manifest;
+    record.stage = FinalizeStage::MemoryChunked;
+    if let Err(e) = record.persist(f.fs.as_ref(), &f.finalize_dir()).await {
+        record.stage = prev_stage;
+        record.memory_manifest = prev_memory_manifest;
+        return Err(SandboxError::Snapshot(format!(
+            "persist finalize record: {e}"
+        )));
+    }
+    if let Some(p) = consumed {
+        let _ = f.fs.remove_file(&p).await;
+    }
+    Ok(())
+}
+
 /// One sleep-free pass over the legs — `pub` so the host-internal
 /// simulator drives the REAL leg bodies step-by-step (ADR 0098 P5); the
 /// backoff/quarantine verdict between passes is
@@ -734,8 +836,40 @@ pub async fn run_eviction_finalize_once(
     f: &EvictionFinalizer,
     record: &mut EvictionFinalizeRecord,
 ) -> Result<(), SandboxError> {
-    run_disk_leg(f, record).await?;
-    run_memory_leg(f, record).await?;
+    run_eviction_finalize_once_hot(f, record, None).await
+}
+
+/// ADR 0101 A: the disk and memory legs are independent idempotent
+/// publishes — overlap them when both are still pending. The durable
+/// ladder (`Captured → DiskUploaded → MemoryChunked`) is preserved by
+/// persisting the bumps in order AFTER the join, so persisted records
+/// (and redrive semantics) are byte-identical to the serial shape.
+/// Failure note: if the disk leg fails while memory succeeded, no bump
+/// persists and the retry re-runs both — the memory redo lands in its
+/// deterministic-ref `VersionConflict` arm (idempotent success), at the
+/// cost of one wasted re-chunk on that already-failing path.
+async fn run_eviction_finalize_once_hot(
+    f: &EvictionFinalizer,
+    record: &mut EvictionFinalizeRecord,
+    hot_disk: Option<&[(usize, ChunkHash, Bytes)]>,
+) -> Result<(), SandboxError> {
+    match record.stage {
+        FinalizeStage::Captured => {
+            let (disk_res, mem_res) = tokio::join!(
+                disk_leg_work(f, record, hot_disk),
+                memory_leg_work(f, record)
+            );
+            let disk_manifest = disk_res?;
+            let (memory_manifest, consumed) = mem_res?;
+            persist_disk_bump(f, record, disk_manifest).await?;
+            persist_memory_bump(f, record, memory_manifest, consumed).await?;
+        }
+        FinalizeStage::DiskUploaded => {
+            let (memory_manifest, consumed) = memory_leg_work(f, record).await?;
+            persist_memory_bump(f, record, memory_manifest, consumed).await?;
+        }
+        _ => {}
+    }
     run_blobs_leg(f, record).await?;
     run_terminal(f, record).await?;
     Ok(())
@@ -767,7 +901,19 @@ pub async fn run_eviction_finalize_attempt(
     f: &EvictionFinalizer,
     record: &mut EvictionFinalizeRecord,
 ) -> FinalizeAttempt {
-    match run_eviction_finalize_once(f, record).await {
+    run_eviction_finalize_attempt_hot(f, record, None).await
+}
+
+/// [`run_eviction_finalize_attempt`] with the ADR 0101 A same-process
+/// hot disk bytes (see [`disk_leg_work`]). The sim and startup redrive
+/// use the plain flavor (`None` — a fresh process has no hot bytes by
+/// definition); only `snapshot_begin`'s spawn threads them through.
+async fn run_eviction_finalize_attempt_hot(
+    f: &EvictionFinalizer,
+    record: &mut EvictionFinalizeRecord,
+    hot_disk: Option<&[(usize, ChunkHash, Bytes)]>,
+) -> FinalizeAttempt {
+    match run_eviction_finalize_once_hot(f, record, hot_disk).await {
         Ok(()) => FinalizeAttempt::Completed,
         Err(e) => {
             record.attempts += 1;
@@ -814,11 +960,20 @@ pub(crate) async fn run_eviction_finalize(
     f: EvictionFinalizer,
     mut record: EvictionFinalizeRecord,
     _capture_guard: tokio::sync::OwnedMutexGuard<()>,
+    mut hot_disk: Option<Vec<(usize, ChunkHash, Bytes)>>,
 ) {
     loop {
-        match run_eviction_finalize_attempt(&f, &mut record).await {
+        match run_eviction_finalize_attempt_hot(&f, &mut record, hot_disk.as_deref()).await {
             FinalizeAttempt::Completed | FinalizeAttempt::Quarantined => return,
-            FinalizeAttempt::RetryAfter(backoff) => tokio::time::sleep(backoff).await,
+            FinalizeAttempt::RetryAfter(backoff) => {
+                if record.stage != FinalizeStage::Captured {
+                    // The disk bump persisted — the drained bytes served
+                    // their purpose; free them rather than pinning the
+                    // dirty set in RAM across retry backoffs.
+                    hot_disk = None;
+                }
+                tokio::time::sleep(backoff).await;
+            }
         }
     }
 }
@@ -931,6 +1086,134 @@ mod tests {
             .get_manifest(base_ref.next_version())
             .await
             .is_err());
+    }
+
+    fn record_with_one_staged_chunk(
+        dest: PathBuf,
+        base_ref: ManifestRef,
+        recorded_hash: ChunkHash,
+    ) -> EvictionFinalizeRecord {
+        EvictionFinalizeRecord {
+            snapshot_id: SnapshotId::new(),
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            image_version: "test".to_owned(),
+            size_bytes: 0,
+            paused_at: DateTime::<Utc>::UNIX_EPOCH,
+            captured_at: DateTime::<Utc>::UNIX_EPOCH,
+            dest,
+            chain_prev_ref: None,
+            disk_pending: Some(DiskPendingRecord {
+                base_manifest: base_ref,
+                chunk_size: 4096,
+                total_bytes: 4096,
+                chunks: vec![(0, recorded_hash)],
+            }),
+            aux_bundles: Vec::new(),
+            stage: FinalizeStage::Captured,
+            attempts: 0,
+            disk_manifest: None,
+            memory_manifest: None,
+        }
+    }
+
+    fn finalizer_over(
+        chunk_store: &ChunkStore,
+        tmp: &Path,
+        record: &EvictionFinalizeRecord,
+    ) -> EvictionFinalizer {
+        let pending_finalizes = Arc::new(DashMap::new());
+        pending_finalizes.insert(record.sandbox_id, record.snapshot_id);
+        EvictionFinalizer::new(
+            Some(chunk_store.clone()),
+            None,
+            tmp.join("bundles"),
+            "tar",
+            tmp.join("checkpoints"),
+            pending_finalizes,
+            Arc::new(NoopDestroyer),
+            Arc::new(engram_host_core::TokioFs),
+            2,
+        )
+    }
+
+    /// ADR 0101 A: the hot-bytes fast path — `snapshot_begin` hands the
+    /// drained chunk bytes to the finalize job in memory, so the common
+    /// path never reads `disk-pending/` back (it is purely the
+    /// crash-redrive journal). Proven by corrupting the staged journal:
+    /// with matching hot bytes the finalize must complete and publish
+    /// the recorded hash without touching the corrupted files.
+    #[tokio::test]
+    async fn hot_disk_bytes_bypass_the_staged_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (chunk_store, base_ref) = disk_store_with_empty_base(tmp.path()).await;
+        let dest = tmp.path().join("capture");
+        let bytes = Bytes::from(vec![0xaa; 4096]);
+        let recorded_hash = ChunkHash::of(&bytes);
+        persist_disk_pending_chunks(&dest, &[(0, recorded_hash, bytes.clone())])
+            .await
+            .expect("stage disk chunk");
+        let staged_path = dest
+            .join("disk-pending")
+            .join(format!("0.{}", recorded_hash.to_hex()));
+        tokio::fs::write(&staged_path, vec![0xbb; 4096])
+            .await
+            .expect("corrupt staged chunk");
+
+        let mut record = record_with_one_staged_chunk(dest, base_ref, recorded_hash);
+        let finalizer = finalizer_over(&chunk_store, tmp.path(), &record);
+
+        let hot = vec![(0usize, recorded_hash, bytes)];
+        assert!(matches!(
+            run_eviction_finalize_attempt_hot(&finalizer, &mut record, Some(&hot)).await,
+            FinalizeAttempt::Completed
+        ));
+        let published = chunk_store
+            .get_manifest(base_ref.next_version())
+            .await
+            .expect("manifest published from the hot bytes");
+        assert_eq!(published.chunks.len(), 1);
+        assert_eq!(published.chunks[0].hash, recorded_hash);
+    }
+
+    /// ADR 0101 A: hot bytes that don't match the durable record (a
+    /// different capture generation than the journal) are ignored — the
+    /// journal is the truth, and the finalize reads + re-verifies it.
+    #[tokio::test]
+    async fn mismatched_hot_bytes_fall_back_to_the_journal() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (chunk_store, base_ref) = disk_store_with_empty_base(tmp.path()).await;
+        let dest = tmp.path().join("capture");
+        let bytes = Bytes::from(vec![0xaa; 4096]);
+        let recorded_hash = ChunkHash::of(&bytes);
+        persist_disk_pending_chunks(&dest, &[(0, recorded_hash, bytes)])
+            .await
+            .expect("stage disk chunk");
+
+        let mut record = record_with_one_staged_chunk(dest, base_ref, recorded_hash);
+        let finalizer = finalizer_over(&chunk_store, tmp.path(), &record);
+
+        // Hot bytes whose hash list disagrees with the record — must be
+        // rejected by the trust filter, not uploaded.
+        let bogus = Bytes::from(vec![0xcc; 4096]);
+        let hot = vec![(0usize, ChunkHash::of(&bogus), bogus)];
+        assert!(matches!(
+            run_eviction_finalize_attempt_hot(&finalizer, &mut record, Some(&hot)).await,
+            FinalizeAttempt::Completed
+        ));
+        let published = chunk_store
+            .get_manifest(base_ref.next_version())
+            .await
+            .expect("manifest published from the journal");
+        assert_eq!(
+            published.chunks[0].hash, recorded_hash,
+            "the journal's recorded chunk (not the bogus hot bytes) is what published",
+        );
+        assert_eq!(
+            chunk_store.get_chunk(recorded_hash).await.unwrap(),
+            Bytes::from(vec![0xaa; 4096]),
+            "the durable chunk bytes came from the journal",
+        );
     }
 
     #[tokio::test]

@@ -2075,7 +2075,9 @@ impl PooledBackend {
             let f = finalizer.clone();
             tokio::spawn(async move {
                 let guard = capture_lock.lock_owned().await;
-                crate::eviction_finalize::run_eviction_finalize(f, record, guard).await;
+                // Startup redrive: a fresh process has no hot disk bytes
+                // by definition — the disk leg reads the journal.
+                crate::eviction_finalize::run_eviction_finalize(f, record, guard, None).await;
             });
         }
     }
@@ -2516,14 +2518,34 @@ impl PooledBackend {
         else {
             return;
         };
+        // ADR 0101 A: fetch the two manifests concurrently; `want` still
+        // extends memory-first (the wake-up set lives there — see the
+        // no-hot-first note above).
+        async fn fetch_manifest(
+            store: engram_chunk_store::ChunkStore,
+            manifest_ref: Option<engram_core::types::manifest::ManifestRef>,
+        ) -> Result<
+            Option<engram_chunk_store::manifest::Manifest>,
+            (
+                engram_core::types::manifest::ManifestRef,
+                engram_chunk_store::ChunkStoreError,
+            ),
+        > {
+            match manifest_ref {
+                None => Ok(None),
+                Some(r) => store.get_manifest(r).await.map(Some).map_err(|e| (r, e)),
+            }
+        }
+        let (mem_res, disk_res) = tokio::join!(
+            fetch_manifest(store.clone(), metadata.memory_manifest),
+            fetch_manifest(store.clone(), metadata.disk_manifest)
+        );
         let mut want: Vec<engram_chunk_store::manifest::ChunkHash> = Vec::new();
-        for manifest_ref in [metadata.memory_manifest, metadata.disk_manifest]
-            .into_iter()
-            .flatten()
-        {
-            match store.get_manifest(manifest_ref).await {
-                Ok(m) => want.extend(m.chunks.iter().map(|c| c.hash)),
-                Err(e) => {
+        for res in [mem_res, disk_res] {
+            match res {
+                Ok(Some(m)) => want.extend(m.chunks.iter().map(|c| c.hash)),
+                Ok(None) => {}
+                Err((manifest_ref, e)) => {
                     tracing::warn!(
                         ?manifest_ref,
                         error = %e,
@@ -4822,36 +4844,48 @@ async fn materialize_state_if_missing(
     fs::create_dir_all(src).await.map_err(|e| {
         SandboxError::Snapshot(format!("create snapshot dir {}: {e}", src.display()))
     })?;
+    // ADR 0101 A: the two artifacts are independent blob objects — fetch
+    // concurrently (a cold cross-host resume previously paid the two
+    // downloads back-to-back on its critical path).
     let state_path = src.join("state.bin");
-    if let Some(key) = state_blob_key {
-        if fs::metadata(&state_path).await.is_err() {
-            engram_chunk_store::snapshot_blob::download_file(blob, key, &state_path)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!("download state.bin from {key}: {e}"))
-                })?;
-            tracing::info!(
-                path = %state_path.display(),
-                key = key,
-                "materialised state.bin from BlobStorage",
-            );
-        }
-    }
     let sidecar_path = src.join("manifest.json");
-    if let Some(key) = sidecar_blob_key {
-        if fs::metadata(&sidecar_path).await.is_err() {
-            engram_chunk_store::snapshot_blob::download_file(blob, key, &sidecar_path)
-                .await
-                .map_err(|e| {
-                    SandboxError::Snapshot(format!("download sidecar.json from {key}: {e}"))
-                })?;
-            tracing::info!(
-                path = %sidecar_path.display(),
-                key = key,
-                "materialised sidecar.json from BlobStorage",
-            );
+    let state_fut = async {
+        if let Some(key) = state_blob_key {
+            if fs::metadata(&state_path).await.is_err() {
+                engram_chunk_store::snapshot_blob::download_file(blob, key, &state_path)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Snapshot(format!("download state.bin from {key}: {e}"))
+                    })?;
+                tracing::info!(
+                    path = %state_path.display(),
+                    key = key,
+                    "materialised state.bin from BlobStorage",
+                );
+            }
         }
-    }
+        Ok::<(), SandboxError>(())
+    };
+    let sidecar_fut = async {
+        if let Some(key) = sidecar_blob_key {
+            if fs::metadata(&sidecar_path).await.is_err() {
+                engram_chunk_store::snapshot_blob::download_file(blob, key, &sidecar_path)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Snapshot(format!("download sidecar.json from {key}: {e}"))
+                    })?;
+                tracing::info!(
+                    path = %sidecar_path.display(),
+                    key = key,
+                    "materialised sidecar.json from BlobStorage",
+                );
+            }
+        }
+        Ok::<(), SandboxError>(())
+    };
+    let (state_res, sidecar_res) = tokio::join!(state_fut, sidecar_fut);
+    state_res?;
+    sidecar_res?;
     Ok(())
 }
 
@@ -6533,7 +6567,10 @@ impl SandboxBackend for PooledBackend {
         // about to be destroyed, so there is no live reader left for its
         // rebase side effect to matter to.
         #[cfg(target_os = "linux")]
-        let disk_pending_record = match (unwind.disk_backend.take(), unwind.disk_pending.take()) {
+        let (disk_pending_record, hot_disk_chunks) = match (
+            unwind.disk_backend.take(),
+            unwind.disk_pending.take(),
+        ) {
             (Some(backend), Some(pending)) => {
                 let base_manifest = backend.manifest_ref().await;
                 let chunk_size = backend.chunk_size();
@@ -6572,17 +6609,24 @@ impl SandboxBackend for PooledBackend {
                         "persist disk-pending chunks: {e}"
                     )));
                 }
-                Some(crate::eviction_finalize::DiskPendingRecord {
+                let record = Some(crate::eviction_finalize::DiskPendingRecord {
                     base_manifest,
                     chunk_size,
                     total_bytes,
                     chunks: chunks.iter().map(|(idx, hash, _)| (*idx, *hash)).collect(),
-                })
+                });
+                // ADR 0101 A: hand the drained bytes to the finalize job
+                // in memory — `disk-pending/` above is the crash-redrive
+                // journal, not the common read path.
+                (record, Some(chunks))
             }
-            _ => None,
+            _ => (None, None),
         };
         #[cfg(not(target_os = "linux"))]
-        let disk_pending_record: Option<crate::eviction_finalize::DiskPendingRecord> = None;
+        let (disk_pending_record, hot_disk_chunks): (
+            Option<crate::eviction_finalize::DiskPendingRecord>,
+            Option<Vec<(usize, engram_chunk_store::manifest::ChunkHash, bytes::Bytes)>>,
+        ) = (None, None);
 
         // Ownership of the capture's recovery state transfers to the
         // finalize record + the spawned job from here — the same
@@ -6659,7 +6703,13 @@ impl SandboxBackend for PooledBackend {
             // bookkeeping is not concurrent-safe per sandbox) — same
             // guarantee the pre-#529 shape gave, now held for the whole
             // (re-drivable) job instead of just one process's attempt.
-            crate::eviction_finalize::run_eviction_finalize(finalizer, record, capture_guard).await;
+            crate::eviction_finalize::run_eviction_finalize(
+                finalizer,
+                record,
+                capture_guard,
+                hot_disk_chunks,
+            )
+            .await;
         });
         Ok(snapshot_id)
     }

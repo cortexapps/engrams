@@ -32,10 +32,14 @@ use crate::store::ChunkStore;
 /// the sparse re-chunk path (`update_for_dirty_ranges_sparse`).
 /// Chunk puts are content-addressed/idempotent and keyed by offset, so
 /// they're order-independent — we fan them out instead of awaiting one
-/// at a time (~16 ms/chunk serial). 32 sits well under a 10 Gbps host
-/// NIC's saturation at the 512 KiB memory / 16 MiB disk chunk sizes and
-/// below GCS per-object rate limits (mirrors the prefetch bound).
-const SPARSE_RECHUNK_CONCURRENCY: usize = 32;
+/// at a time (~16 ms/chunk serial). ADR 0101 A: raised 32 → 96 — prod
+/// showed a 62k-range memory diff spending ~95 s here, gated purely on
+/// per-object round-trip rounds (`upload_budget_wait` ≈ 0, NIC idle at
+/// 512 KiB chunks). 96 matches the host-global `UploadBudget`'s default
+/// permit count, which stays the cross-workload arbiter; GCS object-write
+/// rate limits are per object name, not per bucket, so distinct-chunk
+/// fan-out at this width is safe.
+const SPARSE_RECHUNK_CONCURRENCY: usize = 96;
 
 /// Where the wall-clock of a [`ChunkStore::chunk_file_into`] run went.
 /// The 2026-07-13 incident's full memory re-chunk was invisible in
@@ -435,7 +439,35 @@ impl ChunkStore {
                             cache.put_no_evict(hash, &slice).await?;
                             hash
                         }
-                        None => store.put_chunk(&slice).await?,
+                        None => {
+                            let hash = crate::manifest::ChunkHash::of(&slice);
+                            if prev_hash == Some(hash) {
+                                // Rebuilt to identical content: already
+                                // durable — the parent manifest referencing
+                                // this hash published only after its chunks
+                                // did (ADR 0007), so both the dedup HEAD and
+                                // the PUT are pure waste. KVM dirty tracking
+                                // over-reports (a page rewritten with the
+                                // same bytes is still "dirty"), so this arm
+                                // is common, not exotic. (ADR 0101 A. The
+                                // migration flavor's cache-only chunks are
+                                // owned by its durability catch-up either
+                                // way — this skip doesn't change that.)
+                                metrics::counter!(
+                                    "engram_chunk_put_total",
+                                    "mode" => "sparse", "outcome" => "unchanged"
+                                )
+                                .increment(1);
+                            } else {
+                                // Changed content is new by construction
+                                // (the hash moved), so the dedup HEAD would
+                                // always miss — unchecked PUT, the ADR 0078
+                                // move-5 posture the NBD flush path already
+                                // uses.
+                                store.put_chunk_unchecked_prehashed(hash, &slice).await?;
+                            }
+                            hash
+                        }
                     };
                     Ok((offset, Some(ChunkRef { offset, hash })))
                 }
@@ -772,16 +804,74 @@ mod tests {
     /// materialization) queue ~1 GiB per operation.
     #[test]
     fn rechunk_channel_capacity_is_byte_bounded() {
-        // 512 KiB memory chunks: budget allows 128, clamped to 64 —
-        // deep read-ahead, ≤ 32 MiB queued.
-        assert_eq!(
-            super::rechunk_channel_capacity(512 * 1024),
-            SPARSE_RECHUNK_CONCURRENCY * 2
-        );
+        // 512 KiB memory chunks: the 64 MiB byte budget binds (128
+        // chunks) — since ADR 0101 A raised SPARSE_RECHUNK_CONCURRENCY
+        // to 96, the 2× clamp (192) no longer does. Deep read-ahead,
+        // ≤ 64 MiB queued.
+        assert_eq!(super::rechunk_channel_capacity(512 * 1024), 128);
+        assert!(super::rechunk_channel_capacity(512 * 1024) <= SPARSE_RECHUNK_CONCURRENCY * 2);
         // 16 MiB disk chunks: 4 × 16 MiB = the 64 MiB budget.
         assert_eq!(super::rechunk_channel_capacity(16 * 1024 * 1024), 4);
         // A chunk bigger than the whole budget still gets a slot.
         assert_eq!(super::rechunk_channel_capacity(256 * 1024 * 1024), 1);
+    }
+
+    /// ADR 0101 A: the sparse re-chunk's store-I/O discipline — a dirty
+    /// range rewritten with IDENTICAL content performs NO store
+    /// round-trips (the chunk is already durable via the published
+    /// parent manifest), and changed content goes out as ONE unchecked
+    /// PUT (no dedup HEAD — it's new by construction). This is the
+    /// prod-95s path: KVM dirty tracking over-reports, so the unchanged
+    /// arm is common.
+    #[tokio::test]
+    async fn sparse_rechunk_unchanged_skips_store_io_and_changed_is_head_free() {
+        let dir = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(dir.path().join("blob")));
+        let counting = crate::test_support::CountingBlob::wrap(inner);
+        let s = ChunkStore::new(counting.clone());
+
+        let cs = 512 * 1024u64;
+        // Two-chunk source: chunk 0 will stay identical, chunk 1 changes.
+        let mut data = vec![1u8; (2 * cs) as usize];
+        data[cs as usize..].fill(2);
+        let src = dir.path().join("mem.bin");
+        fs::write(&src, &data).await.unwrap();
+        let prev = s
+            .chunk_file(&src, ManifestKind::Memory, Some(cs))
+            .await
+            .unwrap();
+        let prev_chunk0 = prev.chunks.iter().find(|c| c.offset == 0).unwrap().hash;
+
+        // The "diff" covers BOTH chunks — chunk 0 with the same bytes,
+        // chunk 1 with new bytes.
+        data[cs as usize..].fill(3);
+        let diff = dir.path().join("mem.diff");
+        fs::write(&diff, &data).await.unwrap();
+
+        let heads_before = counting.exists_count();
+        let puts_before = counting.put_count();
+        let next = s
+            .update_for_dirty_ranges_sparse(&prev, &diff, &[(0, 2 * cs)])
+            .await
+            .unwrap();
+        assert_eq!(
+            counting.exists_count(),
+            heads_before,
+            "no dedup HEADs on the sparse re-chunk path",
+        );
+        assert_eq!(
+            counting.put_count() - puts_before,
+            1,
+            "exactly the changed chunk uploads; the unchanged one is skipped",
+        );
+        let next_chunk0 = next.chunks.iter().find(|c| c.offset == 0).unwrap().hash;
+        let next_chunk1 = next.chunks.iter().find(|c| c.offset == cs).unwrap().hash;
+        assert_eq!(next_chunk0, prev_chunk0, "unchanged chunk keeps its hash");
+        assert_eq!(
+            s.get_chunk(next_chunk1).await.unwrap().as_ref(),
+            &data[cs as usize..],
+            "the changed chunk's bytes are durably fetchable",
+        );
     }
 
     /// `ChunkFileStats` accounting matches the manifest the same call
