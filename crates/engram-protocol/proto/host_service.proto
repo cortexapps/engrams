@@ -559,6 +559,11 @@ message MaterializeImageRequest {
   // An empty buffer decodes as `None`: anonymous, or the host's ambient
   // resolver (GCP workload identity via the coord-backed HTTP resolver).
   bytes registry_auth_bincode = 4;
+  // Floor for the packed ext4's size in GiB (`0` = content-sized), from
+  // the image's `resources.suggested_disk_gib` — gives sessions working
+  // room beyond the packer's content-relative headroom. Zero-fill padding
+  // chunks are elided from manifests, so the floor costs ~nothing at rest.
+  uint32 min_disk_gib = 5;
 }
 
 // One progress frame of an in-flight materialize. `stage` is

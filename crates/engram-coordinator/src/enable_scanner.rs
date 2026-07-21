@@ -519,8 +519,16 @@ async fn advance_one(
                 stages
             })
         };
-        let materialize_result =
-            materialize_image_on_host(state, job_id, claimant, &image_uri, progress_tx).await;
+        let min_disk_gib = job.image_config.resources.suggested_disk_gib.unwrap_or(0);
+        let materialize_result = materialize_image_on_host(
+            state,
+            job_id,
+            claimant,
+            &image_uri,
+            min_disk_gib,
+            progress_tx,
+        )
+        .await;
         // `materialize_image_on_host` returning means every `Sender` clone
         // is dropped — awaiting the consumer guarantees the final frame is
         // persisted before we act on the result (same ordering property as

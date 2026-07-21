@@ -337,6 +337,7 @@ pub trait HostClient: Send + Sync {
         _platform_os: &str,
         _platform_arch: &str,
         _registry_auth: Option<crate::types::registry::ResolvedRegistryAuth>,
+        _min_disk_gib: u32,
         _progress: tokio::sync::mpsc::Sender<crate::types::MaterializeProgress>,
     ) -> Result<crate::types::MaterializedImage, SandboxError> {
         Err(SandboxError::InvalidSpec(

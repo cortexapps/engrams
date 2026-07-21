@@ -916,9 +916,17 @@ impl NamespaceBuilder {
 
     /// Replay survivors into mkext4 in declaration order, seal, and
     /// return the frozen layout + the per-layer fill plan.
-    pub fn seal(self) -> Result<SealedImage, FlattenError> {
+    ///
+    /// `min_fs_size_bytes` floors the ext4 size (`0` = content-sized):
+    /// the image's `resources.suggested_disk_gib`, so an image can
+    /// declare working room beyond `recommended_size`'s content-relative
+    /// headroom. Cheap by construction — the padding is zero-filled and
+    /// zero chunks are elided from manifests, so a 16 GiB fs holding
+    /// 3 GiB of content still stores ~3 GiB of chunks. Determinism is
+    /// unaffected: the size is a pure function of (content, config).
+    pub fn seal(self, min_fs_size_bytes: u64) -> Result<SealedImage, FlattenError> {
         let (entry_count, tree_bytes) = self.sizing();
-        let size_bytes = crate::ext4::recommended_size(tree_bytes);
+        let size_bytes = crate::ext4::recommended_size(tree_bytes).max(min_fs_size_bytes);
         let inode_count = crate::ext4::inode_count_for(entry_count, size_bytes);
 
         let mut opts = Options::new(
@@ -1180,7 +1188,7 @@ pub fn pack_tree(root: &std::path::Path, out: &std::path::Path) -> Result<u64, F
             }
         }
     }
-    let sealed = ns.seal()?;
+    let sealed = ns.seal(0)?;
     let image_len = sealed.image_len();
     let mut sink = mkext4::sink::FileSink::create(out, image_len).map_err(FlattenError::Io)?;
     let mut w = sealed.begin(&mut sink)?;
@@ -1380,7 +1388,7 @@ mod tests {
             ns.declare_layer(&l[..]).unwrap();
         }
         tweak(&mut ns);
-        let sealed = ns.seal().unwrap();
+        let sealed = ns.seal(0).unwrap();
         let mut sink = mkext4::sink::VecSink::default();
         let mut w = sealed.layout.writer(&mut sink).unwrap();
         for (i, l) in layers.iter().enumerate() {
@@ -1685,5 +1693,35 @@ mod tests {
     fn content_change_changes_image() {
         let mk = |body: &[u8]| vec![LayerBuilder::new().file("f", 0o644, body).build()];
         assert_ne!(build_image(&mk(b"aaaa")), build_image(&mk(b"aaab")));
+    }
+
+    /// ADR 0093 addendum: `seal(min_fs_size_bytes)` floors the ext4 size
+    /// so `suggested_disk_gib` grants real working room; a floor at or
+    /// below `recommended_size` is a no-op (content sizing wins).
+    #[test]
+    fn seal_honors_a_min_size_floor() {
+        let layers = [LayerBuilder::new().file("f", 0o644, b"hello").build()];
+        let content_sized = {
+            let mut ns = NamespaceBuilder::new();
+            ns.declare_layer(&layers[0][..]).unwrap();
+            ns.seal(0).unwrap().image_len()
+        };
+
+        const GIB: u64 = 1 << 30;
+        let floored = {
+            let mut ns = NamespaceBuilder::new();
+            ns.declare_layer(&layers[0][..]).unwrap();
+            ns.seal(GIB).unwrap().image_len()
+        };
+        assert!(content_sized < GIB, "fixture must be tiny: {content_sized}");
+        assert_eq!(floored, GIB);
+
+        // A floor below the content-derived size changes nothing.
+        let noop = {
+            let mut ns = NamespaceBuilder::new();
+            ns.declare_layer(&layers[0][..]).unwrap();
+            ns.seal(1).unwrap().image_len()
+        };
+        assert_eq!(noop, content_sized);
     }
 }

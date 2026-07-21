@@ -206,12 +206,15 @@ impl Materializer {
     /// keepalive cadence (≤30 s) is the CALLER's job (it re-sends the
     /// last frame). Consumers must tolerate repeated frames for the
     /// same stage. `None` = silent (tests, the bake).
+    /// `min_fs_size_bytes` floors the packed ext4's size (`0` =
+    /// content-sized) — see [`stream_pack::NamespaceBuilder::seal`].
     pub async fn materialize(
         &self,
         image_uri: &str,
         platform: Platform,
         scratch_dir: &Path,
         chunk_store: &ChunkStore,
+        min_fs_size_bytes: u64,
         progress: Option<tokio::sync::mpsc::Sender<engram_core::types::MaterializeProgress>>,
     ) -> Result<Materialized, MaterializeError> {
         use engram_core::types::{MaterializeProgress, MaterializeStage};
@@ -357,7 +360,7 @@ impl Materializer {
         // Reported as `Pack` on the wire (4-stage vocabulary).
         report(MaterializeStage::Pack, None);
         let seal_started = std::time::Instant::now();
-        let sealed = tokio::task::spawn_blocking(move || ns.seal())
+        let sealed = tokio::task::spawn_blocking(move || ns.seal(min_fs_size_bytes))
             .await
             .map_err(|e| {
                 MaterializeError::Io(std::io::Error::other(format!("seal task: {e}")))
