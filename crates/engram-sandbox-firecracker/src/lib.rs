@@ -3988,11 +3988,34 @@ async fn kill_fc(child: &mut Option<Child>, pid: Option<u32>, id: SandboxId) {
     }
 }
 
-/// Poll `kill(pid, 0)` until ESRCH or timeout. Returns Ok(()) on
-/// exit, error on timeout. 50 ms poll interval — fast enough that
-/// destroy doesn't perceive lag, slow enough that we don't burn
-/// CPU in a tight loop.
+/// Poll until `pid` is dead — ESRCH, or a zombie — or timeout.
+/// Returns Ok(()) on death, error on timeout. 50 ms poll interval —
+/// fast enough that destroy doesn't perceive lag, slow enough that
+/// we don't burn CPU in a tight loop.
+///
+/// A reaped-but-uncollected zombie counts as dead: it can never run
+/// again and holds no resources beyond the pid slot, and only its
+/// PARENT can clear that slot — which, for the pid-only (reattached)
+/// sandboxes this wait serves, is by definition not us. `kill(pid, 0)`
+/// still succeeds on a zombie, so without the state check an
+/// in-process detach/reattach (the FC test harness spawns generation A
+/// and B in one process, leaving the SIGKILLed FC as our own unreaped
+/// child) waits out the full budget; production host-agents restart as
+/// fresh processes, whose killed reattachees are reaped by init and
+/// exit via plain ESRCH.
 async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> {
+    fn is_zombie(pid: u32) -> bool {
+        // State char follows the last `)` in /proc/<pid>/stat (comm may
+        // itself contain parens).
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| {
+                s.rsplit(')')
+                    .next()
+                    .and_then(|rest| rest.trim_start().chars().next())
+            })
+            .is_some_and(|state| state == 'Z')
+    }
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
         // SAFETY: kill(pid, 0) inspects-but-doesn't-mutate; see
@@ -4003,6 +4026,8 @@ async fn wait_for_pid_death(pid: u32, timeout: Duration) -> std::io::Result<()> 
             if errno == libc::ESRCH {
                 return Ok(());
             }
+        } else if is_zombie(pid) {
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(std::io::Error::new(
