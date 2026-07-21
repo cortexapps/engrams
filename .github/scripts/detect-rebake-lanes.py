@@ -210,7 +210,11 @@ E2E_PATHS = [
 # (`CI_SELF_PATHS`) forces ALL test lanes — the definition of "what runs"
 # changed, so re-run everything.
 CI_SELF_PATHS = [".github/workflows/ci.yml",
-                 ".github/workflows/ci-macos-vz.yml",
+                 # Local composite actions are workflow steps by another
+                 # name — editing one changes what the lanes run without
+                 # touching ci.yml (ci-macos-vz.yml was folded into
+                 # ci.yml; its old entry here was a dead path).
+                 ".github/actions/",
                  ".github/scripts/detect-rebake-lanes.py"]
 PROTO_PATHS = ["crates/engram-protocol/proto/", "buf.gen.yaml"]
 WEB_PATHS = ["web/"]
