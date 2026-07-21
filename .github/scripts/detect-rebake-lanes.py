@@ -29,6 +29,17 @@ Lanes:
                 job, which republishes the "golden" cli GHCR artifact
                 (cli-tools) that CI consumers pull instead of recompiling.
                 Same role publish-host-binaries plays for the FC-host bakes.
+  node_assets   the node-assets image (firecracker + guest kernel + the RO
+                session bundles) changed — docker/node-assets.Dockerfile /
+                docker/node-assets-fetch.sh (the FC/kernel pins + bundle staging)
+                OR the fc_fork lane OR the bundles lane. Gates the OSS
+                publish-node-assets job. DELIBERATELY NARROWER than `images`: a
+                coordinator/web/orchestrator change trips `images` (the container
+                bake) but touches NONE of node-assets' inputs, so it must NOT
+                rebake node-assets — a spurious rebake churns the SHA tag the
+                deploy pins into the host-fleet DaemonSet and rolls every FC host
+                for nothing (2026-07-20 incident: four host rolls in 90 min off
+                three coord/web-only pushes).
   tf_or_helm    deploy/terraform/ + deploy/helm/
   dev_image     dev-engrams dogfood rebake — images OR host_binaries OR
                 host_base OR the release closure of {engram-harness-claude}
@@ -152,6 +163,15 @@ TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # agentd, a compiled crate OUTSIDE this path, which needs the explicit
 # agentd_changed closure term below.)
 BUNDLES_PATHS = ["deploy/bundles/"]
+# The node-assets image's OWN inputs (ADR 0044 K2): its Dockerfile and the fetch
+# script that pins the firecracker version + the engram guest-kernel release +
+# stages the RO bundles. The FC-fork binary (fc_fork lane) and the bundle
+# payloads (bundles lane) are folded into `node_assets` below. This is
+# INTENTIONALLY disjoint from a coordinator/web/orchestrator source change: those
+# trip `images` (rebake the container) but change nothing the node-assets image
+# carries, so they must not rebake it (a rebake churns the DaemonSet tag and
+# rolls the fleet for nothing — the 2026-07-20 host-roll-churn incident).
+NODE_ASSETS_PATHS = ["docker/node-assets.Dockerfile", "docker/node-assets-fetch.sh"]
 # ADR 0027: the `dev-engrams` dogfood session image runs the REAL `just dev`
 # (whole-repo build) inside a sandbox, so it's stale on essentially any source
 # change. We trip its rebake on the union of what it builds — the container +
@@ -299,8 +319,9 @@ def main():
     cosim_closure = release_closure(meta, COSIM_BINS)
 
     # ADR 0045 Phase B: a Firecracker-fork bump (submodule pointer) restages the
-    # FC binary in the node-assets image, so it trips the images lane (which
-    # gates publish-node-assets → the operator's drain-gated host roll).
+    # FC binary in the node-assets image. It trips `images` so the notify job
+    # fires engrams-changed → helm-deploy (the deploy trigger), and it trips the
+    # narrower `node_assets` lane below so publish-node-assets actually rebakes.
     fc_fork = any_path(changed, FC_FORK_PATHS)
     images = bool(cc & cont) or any_path(changed, IMAGES_PATHS) or fc_fork
     host_binaries = bool(cc & fc) or any_path(changed, HOST_BINARIES_PATHS)
@@ -336,6 +357,21 @@ def main():
     # this term an agentd change ships nothing.
     agentd_changed = bool(cc & agentd_closure)
     bundles = any_path(changed, BUNDLES_PATHS) or harness_changed or agentd_changed
+    # The node-assets image bake gate. Its content is ONLY the pinned firecracker
+    # binary (fc_fork), the pinned guest kernel + FC-version pins (the fetch
+    # script), and the RO bundles (bundles) — NOTHING from the coordinator / web /
+    # orchestrator / host-agent source trees. Gate publish-node-assets on THIS,
+    # not on the coarse `images` lane, so a container-only change no longer
+    # rebakes node-assets under a fresh SHA tag (which the deploy pins into the
+    # host-fleet DaemonSet → a fleet-wide roll for no content change; the
+    # 2026-07-20 incident). A bake-workflow / detector change (BAKE_ALL_PATHS)
+    # re-bakes everything, node-assets included.
+    node_assets = (
+        fc_fork
+        or bundles
+        or any_path(changed, NODE_ASSETS_PATHS)
+        or any_path(changed, BAKE_ALL_PATHS)
+    )
     dev_image = (
         images
         or host_binaries
@@ -416,8 +452,8 @@ def main():
     print(f"changed crates: {sorted(cc)}", file=sys.stderr)
     print(f"-> images={images} host_binaries={host_binaries} "
           f"host_base={host_base} host_image={host_image} cli_tools={cli_tools} "
-          f"tf_or_helm={tf_or_helm} bundles={bundles} dev_image={dev_image} "
-          f"fc_fork={fc_fork} e2e={e2e}",
+          f"tf_or_helm={tf_or_helm} bundles={bundles} node_assets={node_assets} "
+          f"dev_image={dev_image} fc_fork={fc_fork} e2e={e2e}",
           file=sys.stderr)
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
@@ -439,6 +475,7 @@ def main():
             f.write(f"cli_tools={b(cli_tools)}\n")
             f.write(f"tf_or_helm={b(tf_or_helm)}\n")
             f.write(f"bundles={b(bundles)}\n")
+            f.write(f"node_assets={b(node_assets)}\n")
             f.write(f"dev_image={b(dev_image)}\n")
             f.write(f"fc_fork={b(fc_fork)}\n")
             f.write(f"e2e={b(e2e)}\n")
