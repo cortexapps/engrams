@@ -171,6 +171,46 @@ impl IntegrationPolicy {
     }
 }
 
+/// ADR 0063 addendum: concatenate the selected harness's declared egress
+/// (`harness.toml [egress]`) into the session policy's network, so the harness
+/// can always reach its own model API without every profile re-listing
+/// LLM-provider hosts. Applied ONCE at session create, before the policy is
+/// persisted — every later consumer (queued boot, resume, recovery) re-reads
+/// the merged policy.
+///
+/// Semantics:
+/// - empty egress → policy unchanged (harnesses that declare nothing opt out);
+/// - allow-default network → unchanged (everything is already reachable);
+/// - deny-default → append the harness hosts/patterns not already present;
+/// - absent policy (deny-all session, e.g. a direct/CLI create) → synthesize a
+///   minimal policy carrying just the harness egress.
+pub fn merge_harness_egress(
+    policy: Option<IntegrationPolicy>,
+    egress: &crate::types::harness::HarnessEgress,
+) -> Option<IntegrationPolicy> {
+    if egress.is_empty() {
+        return policy;
+    }
+    let mut policy = policy.unwrap_or_default();
+    if matches!(
+        policy.network.default,
+        crate::types::image::NetworkDefault::Allow
+    ) {
+        return Some(policy);
+    }
+    for host in &egress.allow_hosts {
+        if !policy.network.allow_hosts.contains(host) {
+            policy.network.allow_hosts.push(host.clone());
+        }
+    }
+    for pattern in &egress.allow_host_patterns {
+        if !policy.network.allow_host_patterns.contains(pattern) {
+            policy.network.allow_host_patterns.push(pattern.clone());
+        }
+    }
+    Some(policy)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -319,5 +359,68 @@ mod tests {
         assert!(p.secrets.is_empty());
         assert!(p.network.allow_hosts.is_empty());
         assert_eq!(p.network.default, crate::types::image::NetworkDefault::Deny);
+    }
+
+    fn egress(hosts: &[&str], patterns: &[&str]) -> crate::types::harness::HarnessEgress {
+        crate::types::harness::HarnessEgress {
+            allow_hosts: hosts.iter().map(|s| s.to_string()).collect(),
+            allow_host_patterns: patterns.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn merge_harness_egress_appends_and_dedupes_on_deny() {
+        let policy = IntegrationPolicy {
+            network: crate::types::image::NetworkPolicy {
+                default: crate::types::image::NetworkDefault::Deny,
+                allow_hosts: vec!["github.com".into(), "api.anthropic.com".into()],
+                allow_host_patterns: vec![],
+            },
+            ..Default::default()
+        };
+        let merged = merge_harness_egress(
+            Some(policy),
+            &egress(
+                &["api.anthropic.com", "statsig.anthropic.com"],
+                &["*.example.dev"],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            merged.network.allow_hosts,
+            vec!["github.com", "api.anthropic.com", "statsig.anthropic.com"]
+        );
+        assert_eq!(merged.network.allow_host_patterns, vec!["*.example.dev"]);
+    }
+
+    #[test]
+    fn merge_harness_egress_is_a_noop_on_allow_default_and_empty_egress() {
+        let allow = IntegrationPolicy {
+            network: crate::types::image::NetworkPolicy {
+                default: crate::types::image::NetworkDefault::Allow,
+                allow_hosts: vec![],
+                allow_host_patterns: vec![],
+            },
+            ..Default::default()
+        };
+        let merged =
+            merge_harness_egress(Some(allow.clone()), &egress(&["api.anthropic.com"], &[]))
+                .unwrap();
+        assert_eq!(merged, allow);
+
+        // Empty egress leaves an absent policy absent.
+        assert_eq!(merge_harness_egress(None, &egress(&[], &[])), None);
+    }
+
+    #[test]
+    fn merge_harness_egress_synthesizes_a_policy_when_absent() {
+        let merged = merge_harness_egress(None, &egress(&["api.anthropic.com"], &[])).unwrap();
+        assert_eq!(
+            merged.network.default,
+            crate::types::image::NetworkDefault::Deny
+        );
+        assert_eq!(merged.network.allow_hosts, vec!["api.anthropic.com"]);
+        assert!(merged.injects.is_empty());
+        assert!(merged.secrets.is_empty());
     }
 }

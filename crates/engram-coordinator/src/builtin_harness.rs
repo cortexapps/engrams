@@ -69,6 +69,13 @@ mod tests {
         assert_eq!(d.name, "claude");
         assert_eq!(d.exec_path(), "harness");
         assert_eq!(b.stamp_key, "harness-claude");
+        // ADR 0063 addendum: the harness declares its own model-API egress —
+        // sessions merge these into their allowlist at create. An empty block
+        // here would strangle every deny-default session's harness.
+        assert_eq!(
+            d.egress.allow_hosts,
+            vec!["api.anthropic.com", "statsig.anthropic.com"]
+        );
         // A built-in is never in the catalog: the name is resolved from here.
         assert!(builtin("definitely-not-a-builtin").is_none());
     }
@@ -80,6 +87,7 @@ mod tests {
         assert_eq!(d.name, "codex");
         assert_eq!(d.auth.user_env.as_deref(), Some("CODEX_ACCESS_TOKEN"));
         assert_eq!(d.auth.org_env.as_deref(), Some("CODEX_API_KEY"));
+        assert_eq!(d.egress.allow_hosts, vec!["api.openai.com", "chatgpt.com"]);
         assert_eq!(b.stamp_key, "harness-codex");
     }
 }

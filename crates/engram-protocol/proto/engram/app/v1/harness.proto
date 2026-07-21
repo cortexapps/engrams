@@ -67,6 +67,17 @@ message HarnessDescriptor {
   repeated HarnessOption effort = 5;
   // Human-readable one-liner for the admin Harnesses tab.
   optional string description = 6;
+  // ADR 0063 addendum: egress hosts the harness itself must reach (its model
+  // API / telemetry). Merged into the session's deny-default allowlist at
+  // create; surfaced so the UI's "Reaches" receipts show the true egress set.
+  HarnessEgress egress = 7;
+}
+
+// The harness.toml `[egress]` block: exact hostnames + `*.domain` patterns,
+// the same shapes as the profile network's allow lists.
+message HarnessEgress {
+  repeated string allow_hosts = 1;
+  repeated string allow_host_patterns = 2;
 }
 
 // Credential env-var names. A credential is one var, so these are single

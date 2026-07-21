@@ -20,6 +20,7 @@ import {
 
 import { useProfiles, useDeleteProfile } from "../../hooks/useProfiles";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
+import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import {
   useConnectorViews,
   type ConnectorView,
@@ -52,6 +53,8 @@ interface ProfileLike {
   archived: boolean;
   capabilities: string[];
   network?: { default: string; allowHosts: string[]; allowHostPatterns: string[] };
+  /** Default harness (catalog name) — resolves the harness's own egress hosts. */
+  harness?: string | null;
 }
 
 function Meta({ icon, text, caution }: { icon: React.ReactNode; text: string; caution?: boolean }) {
@@ -76,6 +79,11 @@ function Row({
   imageName: string;
   onArchive?: (id: string) => void;
 }) {
+  // ADR 0063 addendum: the profile's harness opens its own model-API hosts
+  // (merged server-side at create); include them so the card's reach count
+  // matches what a session actually gets. The query is deduped across rows.
+  const { data: harnesses } = useHarnessCatalog(true);
+  const harnessEgress = harnesses?.find((h) => h.name === p.harness)?.descriptor?.egress;
   const policy = derivePolicy(
     {
       capabilities: p.capabilities ?? [],
@@ -87,6 +95,10 @@ function Row({
       secrets: [],
     },
     views,
+    {
+      allowHosts: harnessEgress?.allowHosts ?? [],
+      allowHostPatterns: harnessEgress?.allowHostPatterns ?? [],
+    },
   );
 
   const inner = (

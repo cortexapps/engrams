@@ -249,8 +249,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
           secrets: secretRows.map((r) => ({ ref: r.ref, envVar: r.envVar, mode: r.mode })),
         },
         views,
+        // ADR 0063 addendum: the draft's harness opens its own model-API hosts
+        // (merged server-side at create) — show them in "Can reach".
+        {
+          allowHosts: harnessDescriptor?.egress?.allowHosts ?? [],
+          allowHostPatterns: harnessDescriptor?.egress?.allowHostPatterns ?? [],
+        },
       ),
-    [capabilities, network, secretRows, views],
+    [capabilities, network, secretRows, views, harnessDescriptor],
   );
   const connected = views.filter((v) => v.status === "connected");
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;

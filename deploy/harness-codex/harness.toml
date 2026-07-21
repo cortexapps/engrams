@@ -3,6 +3,11 @@ label = "Codex"
 description = "OpenAI Codex coding agent. Human runs use a ChatGPT-backed access token; programmatic runs use an organization API key."
 exec = "harness"
 
+# Hosts the harness itself must reach (ADR 0063 addendum): api.openai.com for
+# API-key runs, chatgpt.com for ChatGPT-token runs.
+[egress]
+allow_hosts = ["api.openai.com", "chatgpt.com"]
+
 [auth]
 org_env = "CODEX_API_KEY"
 org_env_hint = "An admin sets an org secret named CODEX_API_KEY (an OpenAI API key). It authenticates programmatic runs — Slack, cron, and API-triggered sessions."

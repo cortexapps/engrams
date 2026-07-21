@@ -1510,7 +1510,7 @@ async fn prepare_inner(
     // ADR 0062: resolve the per-session harness from the catalog → the AgentSpec
     // the backend execs + the `dyn_0` mount carrying the current catalog
     // generation. `None` for a dev VM (no harness, dyn_0 stays sentinel).
-    let (agent, harness_mount) = match resolve_harness(
+    let (agent, harness_mount, harness_egress) = match resolve_harness(
         state,
         selected_harness.as_deref(),
         mode,
@@ -1520,9 +1520,17 @@ async fn prepare_inner(
     )
     .await?
     {
-        Some((spec, mount)) => (Some(spec), Some(mount)),
-        None => (None, None),
+        Some((spec, mount, egress)) => (Some(spec), Some(mount), egress),
+        None => (None, None, Default::default()),
     };
+
+    // ADR 0063 addendum: fold the selected harness's declared egress
+    // (`harness.toml [egress]` — its model API hosts) into the session policy
+    // BEFORE the boot network is read and the policy is persisted, so queued
+    // boots / resume / recovery all re-read the merged value. Profiles never
+    // list LLM-provider hosts themselves.
+    let integration_policy =
+        engram_core::types::merge_harness_egress(integration_policy, &harness_egress);
 
     // ADR 0057: egress network comes from the session policy (deny-all when the
     // session has no policy — e.g. a direct/CLI create), never the manifest.
@@ -1995,6 +2003,7 @@ pub(crate) async fn resolve_harness(
     Option<(
         engram_core::types::sandbox::AgentSpec,
         engram_core::types::sandbox::AuxRoDrive,
+        engram_core::types::harness::HarnessEgress,
     )>,
     ApiError,
 > {
@@ -2123,7 +2132,7 @@ pub(crate) async fn resolve_harness(
         fs_type: "squashfs".into(),
         sha256: Some(harness_sha),
     };
-    Ok(Some((agent, mount)))
+    Ok(Some((agent, mount, descriptor.egress)))
 }
 
 #[cfg(test)]
