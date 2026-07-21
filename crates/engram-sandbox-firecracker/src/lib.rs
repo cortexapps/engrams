@@ -1824,7 +1824,14 @@ impl FirecrackerBackend {
 
         // Race the socket appearing against the process exiting. If
         // firecracker dies during startup, surface that with the log.
-        if let Err(e) = wait_for_socket(&socket, Duration::from_secs(5), &mut child).await {
+        if let Err(e) = wait_for_socket(
+            &socket,
+            Duration::from_secs(5),
+            &mut child,
+            SocketProbe::Accepting,
+        )
+        .await
+        {
             let _ = child.kill().await;
             let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
             return Err(vm_err(format!(
@@ -2041,7 +2048,14 @@ impl FirecrackerBackend {
             Some(_) => jail_dir.join(UFFD_CONTROL_SOCK_FILE),
             None => uffd_uds.to_path_buf(),
         };
-        if let Err(e) = wait_for_socket(&spawn_gate, Duration::from_secs(5), &mut child).await {
+        if let Err(e) = wait_for_socket(
+            &spawn_gate,
+            Duration::from_secs(5),
+            &mut child,
+            SocketProbe::Exists,
+        )
+        .await
+        {
             let _ = child.kill().await;
             let log_tail = read_tail(&log_path, 4096).await.unwrap_or_default();
             return Err(vm_err(format!(
@@ -4290,24 +4304,56 @@ fn write_file_failure(path: String, error: String) -> WriteFileResult {
     }
 }
 
+/// How [`wait_for_socket`] decides the spawned process's socket is ready.
+#[derive(Clone, Copy)]
+enum SocketProbe {
+    /// The socket file exists. For sockets whose owner `accept()`s a
+    /// single meaningful connection (the uffd handler's UDS: FC connects
+    /// once and the handler receives the UFFD fd via SCM_RIGHTS) — a
+    /// probe `connect()` there would consume the owner's accept.
+    Exists,
+    /// A real `connect()` succeeds. For the FC API socket: FC creates
+    /// the file at `bind()`, BEFORE `listen()` is accepting, so an
+    /// existence poll can return inside the bind→listen window and the
+    /// first API request then dies with ECONNREFUSED — the
+    /// suite-startup thundering-herd flake (tests/common's
+    /// `wait_for_socket` was converted for the same incident, CI runs
+    /// 28974774202 / 29844837408; the production path kept the
+    /// existence poll and kept flaking). The API server tolerates the
+    /// probe connection being dropped.
+    Accepting,
+}
+
 /// Wait until either:
-///   - the API socket appears (success), OR
-///   - the firecracker process exits (failure — surface its exit
-///     status), OR
+///   - the socket is ready per `probe` (success), OR
+///   - the spawned process exits (failure — surface its exit status), OR
 ///   - `budget` elapses (timeout).
-async fn wait_for_socket(path: &Path, budget: Duration, child: &mut Child) -> Result<(), String> {
+async fn wait_for_socket(
+    path: &Path,
+    budget: Duration,
+    child: &mut Child,
+    probe: SocketProbe,
+) -> Result<(), String> {
     let deadline = tokio::time::Instant::now() + budget;
     loop {
-        if path.exists() {
+        let ready = match probe {
+            SocketProbe::Exists => path.exists(),
+            SocketProbe::Accepting => tokio::net::UnixStream::connect(path).await.is_ok(),
+        };
+        if ready {
             return Ok(());
         }
         if let Ok(Some(status)) = child.try_wait() {
-            return Err(format!("firecracker exited early with status {status}"));
+            return Err(format!("spawned process exited early with status {status}"));
         }
         if tokio::time::Instant::now() >= deadline {
             return Err(format!(
-                "socket {} did not appear within {:?}",
+                "socket {} not ready ({}) within {:?}",
                 path.display(),
+                match probe {
+                    SocketProbe::Exists => "does not exist",
+                    SocketProbe::Accepting => "not accepting connections",
+                },
                 budget
             ));
         }
