@@ -1194,6 +1194,29 @@ async fn graphql_allows_aliased_field() {
     assert!(String::from_utf8_lossy(&captured).contains("Authorization: Bearer tok-abc\r\n"));
 }
 
+// `gh`'s schema feature detection (run before `gh pr checks` / `gh pr create`)
+// sends aliased introspection queries like
+// `query PullRequest_fields{PullRequest: __type(name: "PullRequest"){...}}`.
+// A `__type` inject entry must cover them — including the aliased,
+// multi-field shape — or those commands die on the probe.
+#[tokio::test]
+async fn graphql_allows_aliased_type_introspection() {
+    let ca = ca();
+    let inj = graphql_inject_entry("tok-abc", GraphqlOperation::Query, "__type");
+    let req = graphql_post(&gql(
+        "query PullRequest_fields{PullRequest: __type(name: \"PullRequest\"){fields(includeDeprecated: true){name}},StatusCheckRollupContextConnection: __type(name: \"StatusCheckRollupContextConnection\"){fields(includeDeprecated: true){name}}}",
+    ));
+    let (outcome, captured) = run_graphql_inject(ca, vec![inj], req).await;
+    if let Err(e) = &outcome {
+        let msg = format!("{e}");
+        if !msg.contains("close_notify") && !msg.contains("UnexpectedEof") {
+            panic!("proxy returned unexpected error: {e}");
+        }
+    }
+    let seen = String::from_utf8_lossy(&captured);
+    assert!(seen.contains("Authorization: Bearer tok-abc\r\n"));
+}
+
 #[tokio::test]
 async fn graphql_allows_mapped_query_and_anonymous_shorthand() {
     let ca = ca();
