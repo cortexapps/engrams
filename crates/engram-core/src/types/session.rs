@@ -735,6 +735,39 @@ mod tests {
         assert!(res.is_err(), "unknown variants must fail to deserialize");
     }
 
+    /// The lockstep guard the docs on [`SessionState::reserves_host_memory`]
+    /// and [`SessionState::host_memory_reserving_states`] promise: the
+    /// typed matcher (every in-memory residency decision) and the
+    /// string const (every SQL `status IN (…)` list, via
+    /// `reserving_states_sql`) must agree on every variant. This test
+    /// was CLAIMED by those docstrings long before it existed — the
+    /// 61a03b7e incident's PR routed all SQL through the const on the
+    /// strength of a guard nobody had written (engrams review on
+    /// PR #843). A drift between the two is now a test failure, not a
+    /// silent prod incident.
+    #[test]
+    fn reserving_states_match() {
+        for s in all_states() {
+            let in_const = SessionState::host_memory_reserving_states().contains(&s.as_str());
+            assert_eq!(
+                in_const,
+                s.reserves_host_memory(),
+                "{s:?}: const/matcher disagree on host-memory reservation"
+            );
+        }
+        // And the const carries no stale spellings all_states() can't
+        // account for (a renamed/removed variant would linger here
+        // silently — containment above only checks one direction).
+        assert_eq!(
+            SessionState::host_memory_reserving_states().len(),
+            all_states()
+                .iter()
+                .filter(|s| s.reserves_host_memory())
+                .count(),
+            "the const holds exactly the reserving variants, nothing stale"
+        );
+    }
+
     #[test]
     fn session_state_as_str_matches_serde_form() {
         for s in all_states() {
