@@ -129,7 +129,7 @@ plane), the budget exhausted, and the coordinator destroyed the VMs — dropping
 hand-diffing host-agent spool logs against manifest versions: nothing durable
 or user-visible recorded it, and no metric counted it.
 
-Decision: the destroy point now emits a durable, coordinator-authoritative
+Decision: the exhaustion arm now emits a durable, coordinator-authoritative
 `SessionEvent::DurabilityRollback` (`sandbox_id`, the `ManifestRef` the resume
 rewinds to, and a human-readable `reason`) and increments the
 `engram_durability_rollback_total` counter. The event is excluded from
@@ -137,10 +137,25 @@ rewinds to, and a human-readable `reason`) and increments the
 facts — so it outlives the very rewind it warns about; the web timeline renders
 it as a destructive warning card and `engrams session log` shows it inline.
 Alerting keys on the counter (it must be ~0 — every increment is real,
-user-visible data loss). The destroy-and-emit logic moved into a
-`reap_quarantined_survivor` helper so the emit + payload are unit-testable
-against the in-proc backend, and the exclusion-set SQL change carries the ADR
-0098 D4 conformance obligation (extended `rewind_excludes_coordinator_facts`).
+user-visible data loss). The logic lives in a `reap_quarantined_survivor`
+helper so the emit + payload are unit-testable against the in-proc backend, and
+the exclusion-set SQL change carries the ADR 0098 D4 conformance obligation
+(extended `rewind_excludes_coordinator_facts`).
+
+**The rollback is decided at exhaustion, not at destroy time** (PR #829 review
+finding). Once the exhaustion branch is taken the session settles `HostLost`
+(`exhaustion_settles_host_lost`), and the next resume rewinds to the last
+published manifest *unconditionally* — whether *this* attempt's `destroy` lands
+or the dead-host straggler sweep re-destroys the sandbox and drives
+`HostLost → Idle` later. The sweep only ever emits `status_changed` and never
+re-invokes the reap, so an earlier draft that emitted only inside the
+successful-`destroy` arm left a hole: a transient reap-destroy failure that the
+sweep later completed performed the exact rollback *silently*. The reap
+therefore emits the event + counter FIRST, at exhaustion, independent of the
+destroy outcome; the `reason` string is outcome-neutral ("VM destroy
+initiated") because either the reap or the sweep finishes the mechanics. A
+destroy failure here is not a reprieve — the loss is already fact — so it is
+logged and left to the sweep.
 
 This does not change the recovery *mechanism* — the write loss was always
 possible on this path; the addendum only makes it observable instead of silent.
