@@ -458,11 +458,18 @@ where
         return Ok(());
     }
 
+    // The gate/inject/substitute passes above saw only THIS request; anything
+    // the client sends after the buffered prefix streams verbatim below. Force
+    // `Connection: close` so a keep-alive client can't ride request #2 through
+    // ungated with the guest's placeholder credential (see
+    // `observe::force_connection_close`).
+    prefix = observe::force_connection_close(prefix);
     upstream_tls.write_all(&prefix).await?;
     upstream_tls.flush().await?;
 
     // Stream the rest in both directions; client→upstream is
-    // bytes-after-prefix (no further substitution), upstream→client
+    // bytes-after-prefix (no further substitution — a request body mid-stream
+    // is fine, a second request dies with the connection), upstream→client
     // is everything.
     tokio::io::copy_bidirectional(&mut client_tls, &mut upstream_tls).await?;
 

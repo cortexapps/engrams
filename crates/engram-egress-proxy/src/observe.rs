@@ -52,6 +52,24 @@ pub struct ParsedResponse {
 /// so the observation completes without keep-alive bookkeeping). Operates on the
 /// HTTP/1.1 header block; the body + `Content-Length` are untouched. ADR §5.
 pub fn prepare_observed_request(prefix: Vec<u8>) -> Vec<u8> {
+    rewrite_request_headers(prefix, true)
+}
+
+/// Force `Connection: close` on an intercepted request WITHOUT touching
+/// `Accept-Encoding`. The gate/inject/substitute passes in `intercept::run`
+/// see only the FIRST request on a connection — everything after the buffered
+/// prefix streams verbatim (`copy_bidirectional`). A keep-alive client's
+/// second request would therefore reach the upstream ungated and carrying the
+/// guest's placeholder credential (GitHub answers that with `401 Bad
+/// credentials` — the `gh pr create`/`gh pr checks` regression, 2026-07-21).
+/// Closing after one response makes the client reconnect, so every request is
+/// gated and injected. An `Upgrade` request (websocket) is left untouched:
+/// post-upgrade traffic is one logical stream, not smuggle-able HTTP requests.
+pub fn force_connection_close(prefix: Vec<u8>) -> Vec<u8> {
+    rewrite_request_headers(prefix, false)
+}
+
+fn rewrite_request_headers(prefix: Vec<u8>, strip_accept_encoding: bool) -> Vec<u8> {
     // Header block ends at the first CRLFCRLF; if absent (body not yet fully
     // buffered), rewrite up to whatever headers we have — the terminator will
     // arrive on the wire and our inserted `Connection: close` still lands in the
@@ -65,17 +83,31 @@ pub fn prepare_observed_request(prefix: Vec<u8>) -> Vec<u8> {
         .position(|w| w == b"\r\n\r\n")
         .map(|p| p + 2) // include the CRLF terminating the last header
         .unwrap_or(prefix.len());
+    let header_region = &prefix[req_line_end..headers_end];
+
+    // Connection-upgrade guard: forcing close on a websocket handshake would
+    // break the stream it negotiates. Leave the request untouched.
+    if split_crlf(header_region)
+        .iter()
+        .any(|l| header_name_lower(l) == "upgrade")
+    {
+        return prefix;
+    }
 
     let mut out = Vec::with_capacity(prefix.len() + 24);
     out.extend_from_slice(&prefix[..req_line_end]);
-    // Re-emit each existing header line except Accept-Encoding / Connection.
-    let header_region = &prefix[req_line_end..headers_end];
+    // Re-emit each existing header line except the connection-management ones
+    // (and Accept-Encoding when the caller needs an identity body to parse).
     for line in split_crlf(header_region) {
         if line.is_empty() {
             continue;
         }
         let name_lower = header_name_lower(line);
-        if name_lower == "accept-encoding" || name_lower == "connection" {
+        if name_lower == "connection"
+            || name_lower == "keep-alive"
+            || name_lower == "proxy-connection"
+            || (strip_accept_encoding && name_lower == "accept-encoding")
+        {
             continue;
         }
         out.extend_from_slice(line);
@@ -384,6 +416,27 @@ mod tests {
         assert!(s.contains("Host: api.github.com\r\n"));
         assert!(s.ends_with("\r\n\r\n{}")); // body + Content-Length preserved
         assert!(s.contains("Content-Length: 2\r\n"));
+    }
+
+    #[test]
+    fn force_close_keeps_accept_encoding_and_drops_keepalive_headers() {
+        let req = b"GET /repos/x HTTP/1.1\r\nHost: api.github.com\r\nAccept-Encoding: gzip\r\nConnection: keep-alive\r\nKeep-Alive: timeout=5\r\nProxy-Connection: keep-alive\r\n\r\n".to_vec();
+        let out = force_connection_close(req);
+        let s = String::from_utf8(out).unwrap();
+        assert!(s.contains("Accept-Encoding: gzip\r\n"));
+        assert!(!s.to_ascii_lowercase().contains("keep-alive"));
+        assert!(!s.to_ascii_lowercase().contains("proxy-connection"));
+        assert_eq!(s.matches("Connection: close\r\n").count(), 1);
+        assert!(s.ends_with("\r\n\r\n"));
+    }
+
+    #[test]
+    fn force_close_leaves_upgrade_requests_untouched() {
+        let req =
+            b"GET /socket HTTP/1.1\r\nHost: h\r\nConnection: Upgrade\r\nUpgrade: websocket\r\n\r\n"
+                .to_vec();
+        let out = force_connection_close(req.clone());
+        assert_eq!(out, req);
     }
 
     #[test]
