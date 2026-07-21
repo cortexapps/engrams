@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use engram_core::traits::{BlobStorage, CloudBackend, HostClient, MetadataStore, SecretStore};
+use engram_core::traits::{BlobStorage, HostClient, MetadataStore, SecretStore};
 
 pub mod api;
 pub mod base_snapshot_retention;
@@ -38,7 +38,6 @@ pub mod org_secrets;
 pub mod outbox_delivery;
 pub mod pg_listener;
 pub mod placement;
-pub mod preemption_drain;
 pub mod queue_scanner;
 pub mod reconcile;
 pub mod scheduler;
@@ -62,7 +61,6 @@ pub use state::AppState;
 /// passed by `Arc<AppState>` into the axum router.
 pub struct Services {
     pub meta: Arc<dyn MetadataStore>,
-    pub cloud: Arc<dyn CloudBackend>,
     pub host: Arc<dyn HostClient>,
     /// ADR 0013: coord-side gRPC channel pool keyed by `HostId`.
     /// Populated on host registration (POST `/api/hosts/register`)
@@ -319,14 +317,6 @@ pub async fn run_with_registry_and_local(
     // from the run state machine (a run-scoped event with no open run, or a
     // stuck-open run) — and recovers it with a non-destructive harness
     // re-handshake, escalating to the eviction lane if the nudges don't take.
-
-    // Phase 4 Track D: preemption best-effort drain. Subscribes to
-    // `cloud.preemption_signal()` (engram-cloud-gcp polls the GCE
-    // metadata server, MockCloud's `trigger_preemption` for tests)
-    // and on notice fans out across all active sessions on this
-    // host: workspace checkpoint → destroy → mark Dead.
-    // Caller-driven recovery via `POST /sessions/:id/resume`.
-    let _preemption_drain = preemption_drain::spawn(state.clone());
 
     // ADR 0009 §1-§3: in-process reconcile driver. In `--mode=all`
     // (single-process coord+host) and `--mode=host` test fixtures

@@ -5,7 +5,6 @@ pub struct CoordinatorConfig {
     pub bind_addr: String,
     pub database_url: String,
     pub mode: RunMode,
-    pub cloud_backend: CloudBackendChoice,
     /// Local-disk root for snapshot dirs and the image registry.
     /// Per-host; not durable across host loss (cross-host durability
     /// for sessions is git, not local snapshots).
@@ -68,7 +67,6 @@ impl Default for CoordinatorConfig {
             bind_addr: "0.0.0.0:8080".into(),
             database_url: "postgres://engram:engram@localhost:5432/engram".into(),
             mode: RunMode::Coordinator,
-            cloud_backend: CloudBackendChoice::Static,
             local_path: PathBuf::from("./var/engram"),
             sandbox_backend: SandboxBackendChoice::Firecracker,
             default_image_version: "warm-bootstrap".into(),
@@ -103,24 +101,6 @@ impl RunMode {
             "coordinator" => Ok(Self::Coordinator),
             "all" => Ok(Self::All),
             other => Err(format!("invalid mode: {other}")),
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CloudBackendChoice {
-    Static,
-    Gcp,
-    Mock,
-}
-
-impl CloudBackendChoice {
-    pub fn parse(s: &str) -> Result<Self, String> {
-        match s {
-            "static" => Ok(Self::Static),
-            "gcp" => Ok(Self::Gcp),
-            "mock" => Ok(Self::Mock),
-            other => Err(format!("invalid cloud backend: {other}")),
         }
     }
 }
@@ -188,24 +168,6 @@ mod tests {
     }
 
     #[test]
-    fn cloud_backend_parse_rejects_typos() {
-        assert_eq!(
-            CloudBackendChoice::parse("static").unwrap(),
-            CloudBackendChoice::Static
-        );
-        assert_eq!(
-            CloudBackendChoice::parse("gcp").unwrap(),
-            CloudBackendChoice::Gcp
-        );
-        assert_eq!(
-            CloudBackendChoice::parse("mock").unwrap(),
-            CloudBackendChoice::Mock
-        );
-        assert!(CloudBackendChoice::parse("aws").is_err());
-        assert!(CloudBackendChoice::parse("").is_err());
-    }
-
-    #[test]
     fn sandbox_backend_parse_rejects_unknown() {
         assert_eq!(
             SandboxBackendChoice::parse("firecracker").unwrap(),
@@ -235,7 +197,6 @@ mod tests {
     fn default_config_uses_static_local_coordinator() {
         let cfg = CoordinatorConfig::default();
         assert_eq!(cfg.mode, RunMode::Coordinator);
-        assert_eq!(cfg.cloud_backend, CloudBackendChoice::Static);
         assert_eq!(cfg.bind_addr, "0.0.0.0:8080");
         assert!(cfg.database_url.ends_with(":5432/engram"));
     }

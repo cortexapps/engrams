@@ -1,7 +1,7 @@
 //! Trait surfaces that implementation crates fill in.
 //!
 //! Pluggability seams:
-//! - [`CloudBackend`] — preemption signals, host metadata, optional autoscaling.
+//! - [`CloudBackend`] — host metadata, optional autoscaling.
 //! - [`MetadataStore`] — Postgres-backed authoritative session/host/snapshot index.
 //! - [`SandboxBackend`] — local VMM driver (Firecracker / VZ / Process).
 //! - [`HostClient`] — the coord↔host boundary; one impl wraps a local
@@ -24,7 +24,7 @@ pub mod secrets;
 pub mod storage;
 
 pub use clock::{Clock, Entropy, OsEntropy, SystemClock};
-pub use cloud::{CloudBackend, PreemptionStream};
+pub use cloud::CloudBackend;
 pub use host_client::{HostClient, SessionFence};
 pub use integration::{
     default_inject_header, CredentialHint, InjectHeader, Integration, MintFieldKind,

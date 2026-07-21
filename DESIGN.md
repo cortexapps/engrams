@@ -56,7 +56,7 @@ A self-hosted, open-source orchestrator for ephemeral AI agent sandboxes. Engram
 
 We want a Modal-style sandbox-as-a-service for AI coding agents (think Stripe's Minions, Ramp's Inspect) — but **open-source and self-hostable**, so any organization can run their own without vendor lock-in.
 
-The unsolved gap: existing open-source primitives (Firecracker, Cloud Hypervisor, libkrun, E2B's infra repo) give you per-VM mechanics. Nobody ships the **orchestration layer above the VM** in a clean, portable way: chunked-OCI image distribution, snapshot tiering, multi-host scheduling, cloud-backend abstraction, spot/preemptible eviction handling. Engram fills that gap, on top of Firecracker.
+The unsolved gap: existing open-source primitives (Firecracker, Cloud Hypervisor, libkrun, E2B's infra repo) give you per-VM mechanics. Nobody ships the **orchestration layer above the VM** in a clean, portable way: chunked-OCI image distribution, snapshot tiering, multi-host scheduling, cloud-backend abstraction, host-loss-tolerant eviction handling. Engram fills that gap, on top of Firecracker.
 
 Cortex (our org) runs on GCP. Other adopters will run on AWS, Hetzner, k8s, or bare metal. Engram is built **GCP-first but cloud-agnostic**: all cloud-specific surfaces live behind traits with stub implementations for non-GCP backends shipped from day one.
 
@@ -70,7 +70,7 @@ The architecture comes out of an extended design discussion that explored: Strip
 2. **Snapshot-evict mechanic** for time-sharing host RAM across more sessions than fit at once.
 3. **Pluggable cloud backend** so the project ports cleanly between GCP, AWS, Hetzner, and self-hosted bare metal.
 4. **Pluggable storage backend** (GCS, S3, MinIO, local) for snapshot durability.
-5. **Spot/preemptible-tolerant** by default — eviction = forced snapshot + resume elsewhere, not data loss.
+5. **Host-loss-tolerant** by default — eviction = forced snapshot + resume elsewhere, not data loss. (The fleet runs on standard nodes; the old spot/preemption drain was removed 2026-07-21.)
 6. **Recoverable from host loss** without losing user work — the cold tier (`BlobStorage`) survives host loss, disk-pressure flushing, and operator drains (ADR 0005). Sessions die only when both snapshot tiers are gone.
 7. **Single-binary single-host** mode for trivial deployment; **multi-host** mode when scale demands.
 8. **Open-source, Apache-2.0**, idiomatic Rust, well-tested, contributable.
@@ -137,7 +137,7 @@ Snapshot store has **two tiers** (ADR 0005). **Hot tier** lives on each host's l
   - `engram-sandbox-firecracker` — Linux + KVM. Production. Firecracker's HTTP-over-Unix-socket API + UFFD-backed memory restore.
   - `engram-sandbox-vz` — macOS Apple Silicon. Apple Virtualization.framework via `objc2-virtualization` bindings. APFS clone-based snapshots. Mac dev with real microVM isolation. (ADR 0003.)
   - `engram-sandbox-process` — anywhere. Subprocesses, no isolation. Fastest iteration loop for orchestration-layer work.
-- Maintains the chunked-OCI image cache + tiered chunk resolver (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back, preemption signal handler. Heartbeats `(capacity, utilization, draining)` to the coordinator.
+- Maintains the chunked-OCI image cache + tiered chunk resolver (host-side `PooledBackend` wrapper, agnostic of which `SandboxBackend` is wrapped), `HarnessHub` TCP listener for in-VM harness adapters dialing back. Heartbeats `(capacity, utilization, draining)` to the coordinator.
 - **`engram-agentd`**: in-VM exec daemon + harness supervisor (PID 1 after the init shim). Length-prefixed bincode over the configured transport. Verbs: `Exec` (streaming), `Stat`, `Upload`, `Download`, `StartShell`, `Ping`, `Shutdown`, `SpawnHarness`. First-frame token handshake (server side) gates non-trivial verbs. Owns the harness child process; each `SpawnHarness` kills the previous child and exec's a fresh one — clean re-spawn point on resume. On startup, dials the host's per-sandbox ready UDS so the host can block on `accept()` rather than poll for "is the in-VM listener bound."
 - **`engram-transport`**: backend-agnostic transport trait. `VsockTransport` (FC) and `ConsoleTransport` (VZ); chosen at runtime via `ENGRAM_TRANSPORT` set by the stage-1 init shim (injected by the materializer, ADR 0080).
 - **`engram-rootfs-materializer`**: host-side OCI→rootfs materializer (ADR 0080). Pulls a standard OCI/Docker image, applies whiteout-aware layer semantics to an in-memory namespace, declares the stage-1 `/sbin/engram-init` shim (the only engrams-owned file baked in), seals a deterministic pure-Rust ext4 layout (`mkext4`, ADR 0093), and streams the fill directly into chunked `BlobStorage` — no tree, no image file. Driven by the `MaterializeImage` host RPC at enable/rebase time — agentd, the harness, and ttyd are *not* injected; they ride host-staged bundle slots.
@@ -190,7 +190,6 @@ Git is **not** in this table. Agents that want their work to land in a remote do
 - Host-side `PooledBackend` wrapper composes the chunked-OCI image cache, tiered chunk resolver, egress proxy, and NBD pool onto any `SandboxBackend` (FC / VZ / process). Each session-create resolves the image's rootfs through the cache (NVMe → BlobStorage → OCI registry; ADR 0008) before delegating to the underlying backend. The `PooledBackend` is what the host-agent's `LocalHostClient` wraps as its `SandboxBackend` inner; `LocalHostClient` itself adds harness routing (`bind_session`/`unbind_session`/`send_prompt`) by referencing a shared `HarnessHub` (ADR 0011).
 - Drive sandbox lifecycle through `SandboxBackend` (`create`/`destroy`/`exec_stream`/`snapshot`/`restore`/`start_agent`/`set_harness_sink`); harness routing through `HarnessHub` (`bind_session`/`unbind_session`/`send_prompt`/`accept_via_session_lookup`). The hub's `EventSink` ships every per-session event over the WS as `NotifyKind::HarnessEvent`; the coord's read loop re-emits those into its in-proc hub so SSE subscribers see the same stream as mode=all.
 - Run snapshot manager (host-local; see below).
-- Subscribe to `cloud.preemption_signal()`; on notice fan out best-effort `checkpoint_session` to live sandboxes in parallel with a 25s deadline (Phase 4 Track D).
 - Run the `HarnessHub` TCP listener: in-VM harness adapters dial back via `engram-transport` (vsock or virtio-console) → host-side TCP forwarding → `session_events` ingestion.
 - Enforce per-VM resource limits via the production backend (Firecracker enforces RAM/CPU/disk at the VMM boundary; the dev backend ignores them with a documented caveat).
 - Heartbeat coordinator with capacity + local snapshots.
@@ -247,10 +246,6 @@ Four traits define the cloud/storage/sandbox seams. Each ships at least one impl
 ```rust
 #[async_trait]
 pub trait CloudBackend: Send + Sync {
-    /// Subscribe to preemption/eviction notices for the host this is running on.
-    /// Returns a stream of PreemptionNotice events (typically a single event).
-    fn preemption_signal(&self) -> BoxStream<'static, PreemptionNotice>;
-
     /// Get host metadata (instance ID, zone, machine type) for self-identification.
     async fn host_metadata(&self) -> Result<HostMetadata, BackendError>;
 
@@ -263,10 +258,9 @@ pub trait CloudBackend: Send + Sync {
 }
 ```
 
-**v1 implementations**:
-- `engram-cloud-gcp`: GCE metadata server polling for preemption (ACPI G2 Soft Off + metadata flag), Compute Engine API for provision/deprovision.
-- `engram-cloud-static`: no-op preemption signal, returns hostname for metadata, errors on provision (used for Hetzner / bare metal where hosts are static).
-- `engram-cloud-mock`: testing only.
+**Implementations**:
+- `engram-cloud-gcp`: GCE metadata server for host identity; `gke` module implements `NodePoolScaler` (ADR 0044 K4).
+- `engram-cloud-static`: returns hostname for metadata, errors on provision (used for Hetzner / bare metal where hosts are static).
 
 **v2+**: `engram-cloud-aws` (Spot eviction via IMDS), `engram-cloud-hetzner` (Cloud API).
 
@@ -429,7 +423,7 @@ Defined in `engram-protocol` with serde. The discriminant is `type` (tagged enum
 | `HostRegistered` | `{ host_id, server_time, sessions_already_assigned }` | response to `Hello` |
 | `AssignSession` | `{ session_id, repo, image_version, restore_from_blob? }` | new session routed here |
 | `RevokeSession` | `{ session_id, upload_snapshot }` | session migrating to another host or terminating |
-| `Drain` | `{ deadline_secs }` | preemption or operator drain — refuse new work |
+| `Drain` | `{ deadline_secs }` | operator drain — refuse new work |
 | `Ping` | `{ id }` | health check |
 
 These shapes are already roughly in `engram-protocol::heartbeat` and `engram-protocol::scheduling` — the WS work is wiring them onto a transport, not redesigning them.
@@ -884,7 +878,7 @@ Each phase has its own verification, summarized:
 | 4 ✅ | Same orchestration runs against the same coord backend whether the host is FC, VZ, or process. Per-run git checkpoint pushes; idle-evict + auto-resume; `engram session fork` from a Dead session. ADRs 0001 + 0002. |
 | 4.5 ✅ | macOS Apple Silicon: `just pull-kernel && just bake-demo && just dev` (auto-detects VZ). Cold boot <1s; full lifecycle (`harness_idle → snapshot_taken → evicted → idle → resumed → active`) end-to-end. ADR 0003. |
 | 5 | `docker build && docker push` a plain OCI image (ADR 0080), then `engram image enable --uri <uri> --config <toml>`; verify the enable job materializes the rootfs host-side and the image lands enabled, and that new sessions pick it up without disrupting in-flight sessions. |
-| 6 | Run on GCE Spot. Trigger preemption via `gcloud compute instances simulate-maintenance-event`, verify the host-agent's preemption handler fires `checkpoint_session` for each live sandbox before the VM dies. Sessions land `Dead`; calling system forks the workspace to continue. Production hardening (TLS, auth, broker proxy, jailer) all green. |
+| 6 | ~~Run on GCE Spot~~ RETIRED 2026-07-21: the fleet runs standard (non-preemptible) GKE nodes and the preemption drain was removed — host loss is handled by the checkpoint/HostLost recovery machinery (ADR 0028/0101) instead. Production hardening (TLS, auth, broker proxy, jailer) all green. |
 | 7 | Load test with locust/k6: 100 concurrent sessions. Chaos test: kill coordinator, kill hosts, kill Postgres briefly. Web app + Slack bot consume `/events` SSE in real time. |
 
 End-to-end smoke test for v1 (Phase 1+2):

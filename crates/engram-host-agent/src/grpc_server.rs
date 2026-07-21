@@ -123,9 +123,6 @@ impl HostServiceImpl {
     /// - the rung-1/2 ascent from the wire (`ensure_active` →
     ///   `try_cancel_nominated_eviction` → `ascend_evicting_to_active`),
     ///   which un-pauses only after proving no op is running.
-    /// - `preemption_drain`'s shutdown destroys — best-effort teardown
-    ///   of sandboxes on a host that is going away; nothing
-    ///   epoch-protected is written.
     /// - the admin in-place `pause`/`resume` debug endpoints
     ///   (`api/admin.rs`) — operator tools, no lifecycle writes.
     ///

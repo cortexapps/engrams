@@ -510,7 +510,6 @@ async fn second_tag_with_identical_content_reuses_base_snapshot() {
 
     let services = engram_coordinator::Services {
         meta: meta.clone(),
-        cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             engram_sandbox_process::ProcessBackend::new(blob_dir.path().join("sandboxes")),
         ))),

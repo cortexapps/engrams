@@ -475,7 +475,6 @@ async fn build_app_state(
     meta: Arc<dyn MetadataStore>,
     database_url: &str,
 ) -> Arc<engram_coordinator::AppState> {
-    use engram_cloud_mock::MockCloud;
     use engram_coordinator::{AppState, CoordinatorConfig, HostRegistry, Services};
 
     let work_dir = tempfile::tempdir().expect("work dir").keep();
@@ -486,7 +485,6 @@ async fn build_app_state(
 
     let services = Services {
         meta: meta.clone(),
-        cloud: Arc::new(MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(pooled)),
         secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
         kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(

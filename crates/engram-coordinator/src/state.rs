@@ -2013,7 +2013,6 @@ pub(crate) mod tests {
         use crate::host_registry::HostRegistry;
         use crate::state::AppState;
         use crate::Services;
-        use engram_cloud_mock::MockCloud;
         use engram_core::traits::SandboxBackend;
         use engram_secrets_dev::InMemorySecretStore;
 
@@ -2031,7 +2030,6 @@ pub(crate) mod tests {
             std::env::temp_dir().join(format!("engram-blobs-test-{}", uuid::Uuid::new_v4()));
         let services = Services {
             meta: meta.clone(),
-            cloud: Arc::new(MockCloud::new()),
             host: host_registry.clone() as Arc<dyn engram_core::traits::HostClient>,
             secrets: Arc::new(InMemorySecretStore::new()),
             kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(

@@ -62,7 +62,6 @@ async fn build_state(
     let chunk_store = engram_chunk_store::ChunkStore::new(blob.clone());
     let services = engram_coordinator::Services {
         meta: meta.clone(),
-        cloud: Arc::new(engram_cloud_mock::MockCloud::new()),
         host: Arc::new(engram_host_agent::LocalHostClient::with_noop_hub(Arc::new(
             engram_sandbox_process::ProcessBackend::new(tmp.path().join("sandboxes")),
         ))),

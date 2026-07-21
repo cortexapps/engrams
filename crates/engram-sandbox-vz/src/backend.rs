@@ -223,7 +223,7 @@ impl VzBackend {
     /// Attach a chunk store. Once set, every `snapshot()` chunks
     /// the rootfs clone into the store and the returned metadata
     /// carries the `disk_manifest` ref. Required for cross-host
-    /// resume / spot-preemption migration.
+    /// resume / host-roll migration.
     pub fn with_chunk_store(mut self, chunk_store: engram_chunk_store::ChunkStore) -> Self {
         self.chunk_store = Some(chunk_store);
         self

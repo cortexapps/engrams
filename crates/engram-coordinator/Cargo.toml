@@ -27,9 +27,6 @@ engram-host-agent.workspace = true
 # ADR 0023: ProcessBackend is now an operator-selectable (guarded) backend,
 # not just a test fixture — promoted from dev-dependencies.
 engram-sandbox-process.workspace = true
-engram-cloud-static.workspace = true
-engram-cloud-gcp.workspace = true
-engram-cloud-mock.workspace = true
 engram-harness-proto.workspace = true
 engram-secrets-dev.workspace = true
 engram-secrets-gcp.workspace = true
