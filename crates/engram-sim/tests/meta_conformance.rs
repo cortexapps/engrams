@@ -859,6 +859,90 @@ async fn fenced_transition(ctx: &Ctx) {
     assert_eq!(prev, Some(SessionState::Pending));
 }
 
+/// Atomic fenced transition + lifecycle events (the eviction event-loss
+/// fix): a stale epoch or an illegal transition commits NOTHING — no
+/// state flip, no events, no index burn; success lands the flip and the
+/// events in order with contiguous indices. Both stores must agree.
+async fn fenced_transition_with_events(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let sid = meta.create_session(spec("conf:fence-ev")).await.unwrap();
+    let EnqueueOutcome::Claimed(op) = meta
+        .op_enqueue_and_claim(sid, OpKind::Evict, serde_json::json!({}), None, "pod-a")
+        .await
+        .unwrap()
+    else {
+        panic!("claimed")
+    };
+    let epoch = op.epoch.unwrap();
+
+    // Anchor the index sequence with a plain append.
+    let baseline = meta
+        .append_session_event(sid, "status_changed", serde_json::json!({"probe": true}))
+        .await
+        .unwrap();
+    let events = vec![
+        ("evicted".to_string(), serde_json::json!({"at": "t0"})),
+        (
+            "status_changed".to_string(),
+            serde_json::json!({"to": "failed"}),
+        ),
+    ];
+
+    // Stale epoch: silent None, nothing lands.
+    assert!(meta
+        .fenced_transition_session_with_events(sid, epoch + 1, SessionState::Failed, &events)
+        .await
+        .unwrap()
+        .is_none());
+    // Illegal transition (Pending → Active): Conflict, nothing lands.
+    let err = meta
+        .fenced_transition_session_with_events(sid, epoch, SessionState::Active, &events)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)));
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().status,
+        SessionState::Pending,
+        "rejected calls must not flip state",
+    );
+    let leaked = meta
+        .list_session_events_since(sid, baseline, 100)
+        .await
+        .unwrap();
+    assert!(
+        leaked.is_empty(),
+        "rejected calls must append nothing: {leaked:?}",
+    );
+
+    // Matching epoch: the flip and both events land together, indices
+    // contiguous with the baseline append.
+    let (prev, idxs) = meta
+        .fenced_transition_session_with_events(sid, epoch, SessionState::Failed, &events)
+        .await
+        .unwrap()
+        .expect("matching epoch must land");
+    assert_eq!(prev, SessionState::Pending);
+    assert_eq!(idxs, vec![baseline + 1, baseline + 2]);
+    assert_eq!(
+        meta.get_session(sid).await.unwrap().status,
+        SessionState::Failed
+    );
+    let landed = meta
+        .list_session_events_since(sid, baseline, 100)
+        .await
+        .unwrap();
+    assert_eq!(landed.len(), 2, "exactly the two events: {landed:?}");
+    assert_eq!(
+        (landed[0].idx, landed[0].kind.as_str()),
+        (baseline + 1, "evicted")
+    );
+    assert_eq!(
+        (landed[1].idx, landed[1].kind.as_str()),
+        (baseline + 2, "status_changed"),
+    );
+    assert_eq!(landed[1].payload, serde_json::json!({"to": "failed"}));
+}
+
 /// #800: `enqueue_evacuating_session_resume` — the RESERVED evac-placement
 /// overflow CAS. Fenced `evacuating → queued` (resume-origin): matches only
 /// on `status='evacuating'` AND the op's epoch; a wrong epoch, a wrong
@@ -1723,6 +1807,10 @@ conformance!(
     super::op_latest_for_kind_reads_terminal_mints
 );
 conformance!(t_fenced_transition, super::fenced_transition);
+conformance!(
+    t_fenced_transition_with_events,
+    super::fenced_transition_with_events
+);
 conformance!(
     t_enqueue_evacuating_resume,
     super::enqueue_evacuating_resume

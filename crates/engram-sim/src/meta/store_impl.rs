@@ -1426,6 +1426,91 @@ impl MetadataStore for SimMetadataStore {
         Ok(Some(current))
     }
 
+    /// `fenced_transition_session` + event appends under ONE db lock —
+    /// the sim's transaction. Mirrors PostgresStore: fence check before
+    /// legality; on success the events land with consecutive indices and
+    /// per-event `session_events` notifications; on a stale epoch or an
+    /// illegal transition NOTHING lands (no state change, no events, no
+    /// notifications — pg_notify only fires on commit).
+    async fn fenced_transition_session_with_events(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        to: SessionState,
+        events: &[(String, serde_json::Value)],
+    ) -> Result<Option<(SessionState, Vec<i64>)>, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let row = db
+            .sessions
+            .get_mut(&session_id)
+            .ok_or(MetaError::NotFound)?;
+        if row.current_epoch != epoch {
+            return Ok(None);
+        }
+        let current = row.session.status;
+        current
+            .try_transition_to(to)
+            .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        row.session.status = to;
+        row.session.last_active_at = now;
+        row.updated_at = now;
+        if to == SessionState::Evacuating {
+            row.evac_attempts = 0;
+        }
+        if to == SessionState::Evicting {
+            row.evict_attempts = 0;
+        }
+        if to == SessionState::Queued {
+            row.queued_at = Some(now);
+            row.queue_origin = Some(row.queue_origin.unwrap_or(QueueOrigin::Create));
+        }
+        let recovery_epoch = row.recovery_epoch;
+        let mut indices = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            // Per-iteration re-borrow: the session row and the event log
+            // are sibling fields of the same locked db, so the row borrow
+            // can't span the event push.
+            let row = db
+                .sessions
+                .get_mut(&session_id)
+                .expect("session row present under the same lock");
+            let idx = row.next_event_idx;
+            row.next_event_idx += 1;
+            row.last_event_at = Some(now);
+            indices.push(idx);
+            db.session_events
+                .entry(session_id)
+                .or_default()
+                .push(PersistedEvent {
+                    idx,
+                    kind: kind.clone(),
+                    payload: payload.clone(),
+                    created_at: now,
+                    recovery_epoch,
+                    rewound_at: None,
+                });
+        }
+        db.transition_log.push(super::TransitionLogEntry {
+            session: session_id,
+            from: current,
+            to,
+            exempt: false,
+        });
+        drop(db);
+        for idx in &indices {
+            self.notify(
+                "session_events",
+                format!("{{\"session_id\":\"{session_id}\",\"idx\":{idx}}}"),
+            );
+        }
+        if reserves(current) && !reserves(to) {
+            self.notify("placement_changed", "session_freed");
+        }
+        Ok(Some((current, indices)))
+    }
+
     /// `WHERE id=$1 AND current_epoch=$4`; bool = landed.
     async fn fenced_assign_sandbox(
         &self,

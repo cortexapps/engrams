@@ -6990,6 +6990,121 @@ impl MetadataStore for PostgresStore {
         Ok(Some(current))
     }
 
+    async fn fenced_transition_session_with_events(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        to: SessionState,
+        events: &[(String, serde_json::Value)],
+    ) -> Result<Option<(SessionState, Vec<i64>)>, MetaError> {
+        // `fenced_transition_session` with the event appends folded into
+        // the SAME transaction (see the trait doc for the event-loss race
+        // this closes). The FOR UPDATE row lock spans the fence check, the
+        // status flip, and every idx allocation, so the appended events
+        // are contiguous and no successor can interleave; the in-SQL
+        // pg_notify calls fire only on COMMIT, so subscribers never hear
+        // about a rolled-back transition.
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let row =
+            sqlx::query("SELECT status, current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
+                .bind(session_id.as_uuid())
+                .fetch_optional(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .ok_or(MetaError::NotFound)?;
+        // Fence check BEFORE legality — same rationale as
+        // `fenced_transition_session` (ADR 0079 review finding #3).
+        let stored_epoch: i64 = row.try_get("current_epoch").map_err(|e| {
+            MetaError::Serialization(format!(
+                "fenced_transition_session_with_events: read epoch: {e}"
+            ))
+        })?;
+        if stored_epoch != epoch {
+            return Ok(None);
+        }
+        let current_raw: String = row.try_get("status").map_err(|e| {
+            MetaError::Serialization(format!(
+                "fenced_transition_session_with_events: read current: {e}"
+            ))
+        })?;
+        let current = row::parse_session_state_for_lib(&current_raw)?;
+        current.try_transition_to(to).map_err(|e| {
+            tracing::warn!(
+                session_id = %session_id,
+                from = %current.as_str(),
+                to = %to.as_str(),
+                "rejected illegal session state transition (fenced-with-events path)"
+            );
+            MetaError::Conflict(e.to_string())
+        })?;
+        let now = self.clock.now_utc();
+        let n = sqlx::query(
+            r#"
+            UPDATE sessions
+               SET status = $2,
+                   last_active_at = $4,
+                   updated_at = $4,
+                   evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
+                   evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
+                   queued_at = CASE WHEN $2 = 'queued' THEN $4 ELSE queued_at END,
+                   queue_origin = CASE WHEN $2 = 'queued'
+                                  THEN COALESCE(queue_origin, 'create')
+                                  ELSE queue_origin END
+             WHERE id = $1 AND current_epoch = $3
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(to.as_str())
+        .bind(epoch)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        if n == 0 {
+            return Ok(None);
+        }
+        let mut indices = Vec::with_capacity(events.len());
+        for (kind, payload) in events {
+            let row = sqlx::query(
+                r#"
+                WITH next AS (
+                    UPDATE sessions
+                       SET next_event_idx = next_event_idx + 1,
+                           updated_at = $4,
+                           last_event_at = $4
+                     WHERE id = $1
+                 RETURNING next_event_idx - 1 AS allocated_idx, recovery_epoch
+                ),
+                inserted AS (
+                    INSERT INTO session_events (session_id, idx, kind, payload, recovery_epoch, created_at)
+                    SELECT $1, allocated_idx, $2, $3, recovery_epoch, $4 FROM next
+                    RETURNING idx
+                )
+                SELECT i.idx,
+                       pg_notify(
+                           'session_events',
+                           json_build_object('session_id', $1::text, 'idx', i.idx)::text
+                       )
+                  FROM inserted i
+                "#,
+            )
+            .bind(session_id.as_uuid())
+            .bind(kind)
+            .bind(payload)
+            .bind(now)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            indices.push(sqlx::Row::try_get(&row, "idx").map_err(db_err)?);
+        }
+        tx.commit().await.map_err(db_err)?;
+        if current.reserves_host_memory() && !to.reserves_host_memory() {
+            self.notify_placement_changed("session_freed").await;
+        }
+        Ok(Some((current, indices)))
+    }
+
     async fn fenced_assign_sandbox(
         &self,
         session_id: SessionId,

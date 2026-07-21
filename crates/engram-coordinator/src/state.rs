@@ -1102,7 +1102,7 @@ impl AppState {
 ///   harness itself does, and an edit/dequeue of a queued prompt keeps
 ///   its own confirmations).
 /// - `tool_call_completed{tool_call_id}` — a generic tool result landed.
-fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
+pub(crate) fn outbox_ack_id(session_id: SessionId, event: &SessionEvent) -> Option<String> {
     match event {
         SessionEvent::HarnessRunStarted {
             prompt_id: Some(pid),
@@ -2814,6 +2814,32 @@ pub(crate) mod tests {
                 return Ok(None);
             }
             self.transition_session(session_id, to).await.map(Some)
+        }
+
+        async fn fenced_transition_session_with_events(
+            &self,
+            session_id: SessionId,
+            epoch: i64,
+            to: engram_core::types::SessionState,
+            events: &[(String, serde_json::Value)],
+        ) -> Result<Option<(engram_core::types::SessionState, Vec<i64>)>, MetaError> {
+            // In-memory "transaction": the fence gates once, then the flip
+            // and the appends run back to back under the test's
+            // single-threaded driver — good enough for the unit tests'
+            // ordering assertions (the real atomicity is conformance-tested
+            // against SimMetadataStore + PostgresStore, ADR 0098 D4).
+            if self.ops.current_epoch(session_id) != epoch {
+                return Ok(None);
+            }
+            let prev = self.transition_session(session_id, to).await?;
+            let mut indices = Vec::with_capacity(events.len());
+            for (kind, payload) in events {
+                indices.push(
+                    self.append_session_event(session_id, kind, payload.clone())
+                        .await?,
+                );
+            }
+            Ok(Some((prev, indices)))
         }
 
         async fn fenced_assign_sandbox(

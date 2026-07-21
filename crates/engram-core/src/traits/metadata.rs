@@ -1060,6 +1060,38 @@ pub trait MetadataStore: Send + Sync {
         ))
     }
 
+    /// [`fenced_transition_session`] plus lifecycle-event appends, in ONE
+    /// store transaction under the same epoch predicate — all-or-nothing.
+    ///
+    /// Why it exists (the e2e_resume event-loss race): a transition that
+    /// makes the session immediately claimable (eviction's Idle flip —
+    /// "the instant the session is Idle it is resumable", ADR 0079/0101)
+    /// followed by separate post-commit `append_session_event_fenced`
+    /// calls leaves a window where a successor claims the session between
+    /// the commit and the appends, the epoch moves, and the transition's
+    /// own facts (`evicted`, `status_changed`) are silently fenced out of
+    /// the record. Appending them in the transition's transaction makes a
+    /// successor order strictly after — the facts always land iff the
+    /// transition lands.
+    ///
+    /// `events` are `(kind, payload)` pairs appended in order with
+    /// consecutive indices. Returns `(previous_state, event_indices)`;
+    /// `Ok(None)` = fenced (nothing committed). An illegal transition is
+    /// `Err(Conflict)` (nothing committed). Callers own any post-commit
+    /// side effects (in-process publish); `pg_notify` fires on commit.
+    async fn fenced_transition_session_with_events(
+        &self,
+        session_id: SessionId,
+        epoch: i64,
+        to: crate::types::SessionState,
+        events: &[(String, serde_json::Value)],
+    ) -> Result<Option<(crate::types::SessionState, Vec<i64>)>, MetaError> {
+        let _ = (session_id, epoch, to, events);
+        Err(MetaError::Serialization(
+            "fenced writes not supported by this store".into(),
+        ))
+    }
+
     /// Fenced sandbox (re)bind — subsumes `rebind_session_guarded`'s
     /// bespoke expected-state list with the one epoch predicate.
     async fn fenced_assign_sandbox(

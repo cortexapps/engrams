@@ -1035,11 +1035,33 @@ pub(crate) async fn run_evict_pipeline(
     // commits, the reconciler will no-op on every subsequent
     // heartbeat for this session because the reconcile pass keys
     // on Active status only.
-    let prev = match crate::session_ops::transition_with_fence(
+    //
+    // The transition's own facts (`snapshot_taken`, `evicted`, the final
+    // `status_changed`) ride the SAME store transaction: the flip makes
+    // the session immediately claimable, so post-commit `emit_fenced`
+    // calls raced a successor's claim and the facts were silently fenced
+    // out of the record (the e2e_resume event-loss flake). `from` is
+    // `entry_status` by construction — our op claim excludes every other
+    // lifecycle writer, so under an unmoved epoch the state is exactly
+    // what we observed at entry (the debug assert pins this).
+    let prev = match crate::session_ops::transition_with_fence_emitting(
         state,
         session_id,
         ctx.fence(),
         target_state,
+        vec![
+            crate::state::SessionEvent::SnapshotTaken {
+                snapshot_id: metadata.id,
+                size_bytes: metadata.size_bytes,
+                at: now,
+            },
+            crate::state::SessionEvent::Evicted { at: now },
+            crate::state::SessionEvent::StatusChanged {
+                from: entry_status,
+                to: target_state,
+                at: now,
+            },
+        ],
     )
     .await
     {
@@ -1055,6 +1077,10 @@ pub(crate) async fn run_evict_pipeline(
             return Err(EvictError::Meta(e.to_string()));
         }
     };
+    debug_assert_eq!(
+        prev, entry_status,
+        "state moved under our op claim without an epoch bump"
+    );
     // The parking ladder leaves no trace in the terminal state — a
     // descent (or a plain eviction of a never-parked session, where this
     // is a no-op) clears the rung with the Idle flip.
@@ -1087,47 +1113,10 @@ pub(crate) async fn run_evict_pipeline(
     // ADR 0006: host-agent unregisters its local proxy entry as
     // part of `destroy`. No coordinator-side cleanup needed.
 
-    // Review finding #6: fenced emits. Ok(None) = a successor re-claimed
-    // between our committed transition and here — stop emitting silently
-    // (never compensate/abort from a fenced predecessor); the transition
-    // already committed under our epoch, so the eviction is done.
-    if let Err(e) = state
-        .emit_fenced(
-            session_id,
-            ctx.fence(),
-            SessionEvent::SnapshotTaken {
-                snapshot_id: metadata.id,
-                size_bytes: metadata.size_bytes,
-                at: now,
-            },
-        )
-        .await
-    {
-        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit SnapshotTaken").await;
-        return Err(EvictError::Emit(e.to_string()));
-    }
-    if let Err(e) = state
-        .emit_fenced(session_id, ctx.fence(), SessionEvent::Evicted { at: now })
-        .await
-    {
-        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit Evicted").await;
-        return Err(EvictError::Emit(e.to_string()));
-    }
-    if let Err(e) = state
-        .emit_fenced(
-            session_id,
-            ctx.fence(),
-            SessionEvent::StatusChanged {
-                from: prev,
-                to: target_state,
-                at: now,
-            },
-        )
-        .await
-    {
-        abort_inflight_snapshot(ctx, session_id, sandbox_id, "emit StatusChanged").await;
-        return Err(EvictError::Emit(e.to_string()));
-    }
+    // The lifecycle facts (`snapshot_taken`, `evicted`, `status_changed`)
+    // landed atomically with the Step 3c transition above — the old
+    // post-commit emit_fenced block (and its abort-after-commit error
+    // arms) is gone with the race it carried.
 
     // ADR 0016 A.1.1: success log. Pairs with the entry log so a
     // pipeline that flushes (host log) without committing (no PG
