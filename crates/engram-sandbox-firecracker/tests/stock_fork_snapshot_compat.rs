@@ -48,7 +48,7 @@ async fn round_trip(
     // at restore. See tests/snapshot.rs for the full rationale.
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 

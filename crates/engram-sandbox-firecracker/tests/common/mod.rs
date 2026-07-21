@@ -229,6 +229,33 @@ where
 /// keeps retrying through an FC that bound and crashed, converting a
 /// first-request panic into this helper's own bounded timeout with a
 /// caller-visible `assert!` message.
+/// Sparse-aware clone of the cached test rootfs into a test-private path.
+///
+/// The drop-in replacement for `tokio::fs::copy(&env.rootfs, dest)`: the
+/// fetch script (`fetch-fc-test-artifacts.sh`) digs holes in the cached
+/// ubuntu image's zeroed free space once, and `cp --sparse=always` then
+/// skips those holes via SEEK_DATA/SEEK_HOLE on both the read and write
+/// side — a fraction of the full-size copy every FC test used to pay
+/// (~20 call sites × a ~GB image, the dominant per-test fixed cost in the
+/// KVM lane). Guest-visible content is identical: holes read as zeros.
+pub async fn clone_rootfs(src: &Path, dest: &Path) -> std::io::Result<()> {
+    let status = tokio::process::Command::new("cp")
+        .arg("--sparse=always")
+        .arg(src)
+        .arg(dest)
+        .status()
+        .await?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(std::io::Error::other(format!(
+            "cp --sparse=always {} {} exited with {status}",
+            src.display(),
+            dest.display()
+        )))
+    }
+}
+
 pub async fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     poll_until(timeout, Duration::from_millis(50), || {
         std::os::unix::net::UnixStream::connect(path).is_ok()

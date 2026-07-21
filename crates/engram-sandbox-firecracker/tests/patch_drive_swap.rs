@@ -113,7 +113,7 @@ async fn run_swap_scenario(env: &common::FcEnv, pre_snapshot_reads: bool) {
 
     // ── prepare rootfs copy with init.experiment ──
     let rootfs = work.join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &rootfs)
+    common::clone_rootfs(&env.rootfs, &rootfs)
         .await
         .expect("copy rootfs");
     install_init_script(&rootfs, work, pre_snapshot_reads).await;

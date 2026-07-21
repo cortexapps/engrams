@@ -36,7 +36,7 @@ async fn snapshot_then_restore_round_trips_microvm() {
     // load_snapshot, so the file must still be there at restore time.
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 
@@ -163,7 +163,7 @@ async fn balloon_inflate_shrinks_full_memory_dump() {
     };
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 

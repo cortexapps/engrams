@@ -73,7 +73,7 @@ async fn vmstate_only_writes_state_skips_memory_and_stock_rejects_it() {
     {
         let work = tempfile::tempdir().expect("tempdir");
         let local_rootfs = work.path().join("rootfs.ext4");
-        tokio::fs::copy(&env.rootfs, &local_rootfs)
+        common::clone_rootfs(&env.rootfs, &local_rootfs)
             .await
             .expect("clone rootfs");
 
@@ -118,7 +118,7 @@ async fn vmstate_only_writes_state_skips_memory_and_stock_rejects_it() {
     {
         let work = tempfile::tempdir().expect("tempdir");
         let local_rootfs = work.path().join("rootfs.ext4");
-        tokio::fs::copy(&env.rootfs, &local_rootfs)
+        common::clone_rootfs(&env.rootfs, &local_rootfs)
             .await
             .expect("clone rootfs");
 

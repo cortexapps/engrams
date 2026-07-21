@@ -154,7 +154,19 @@ const VERIFY_GRACE: Duration = Duration::from_secs(6);
 /// because CI's NBD step self-skips on Blacksmith).
 fn prepare_verified_rootfs(work: &std::path::Path, rootfs_src: &std::path::Path) -> PathBuf {
     let img = work.join("verified-rootfs.ext4");
-    std::fs::copy(rootfs_src, &img).expect("copy rootfs");
+    // Sparse-aware clone: the fetch script digs holes in the cached image's
+    // zeroed free space, and `--sparse=always` skips them on both the read
+    // and write side (same trick as the FC crate's `common::clone_rootfs`).
+    let status = std::process::Command::new("cp")
+        .arg("--sparse=always")
+        .arg(rootfs_src)
+        .arg(&img)
+        .status()
+        .expect("spawn cp");
+    assert!(
+        status.success(),
+        "cp --sparse=always rootfs failed: {status}"
+    );
     let marker = work.join("marker.txt");
     std::fs::write(&marker, format!("{SENTINEL}\n")).expect("write marker");
     // PATH is explicit because the kernel execs init with an empty

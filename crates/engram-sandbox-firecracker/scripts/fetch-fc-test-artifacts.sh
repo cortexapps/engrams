@@ -47,6 +47,18 @@ if [ ! -s "$ROOTFS" ]; then
   mv "$ROOTFS.tmp" "$ROOTFS"
 fi
 
+# Punch holes where the image is all-zero (idempotent, ~1s). The ext4 image
+# ships with substantial zeroed free space; a holey cache copy lets the
+# per-test `cp --sparse=always` clones (tests/common `clone_rootfs`) skip the
+# holes via SEEK_DATA/SEEK_HOLE on both the read and the write side — each of
+# the ~20 FC tests that clones this image stops paying a full-size copy.
+# Guest-visible content is unchanged (holes read back as the zeros they were).
+# Best-effort: without fallocate the copies still work, just unsparsified.
+if command -v fallocate >/dev/null 2>&1; then
+  fallocate --dig-holes "$ROOTFS" 2>/dev/null \
+    || echo "note: fallocate --dig-holes unsupported here; rootfs stays dense" >&2
+fi
+
 # Print export lines on stdout (anything diagnostic went to stderr above).
 echo "export FC_TEST_KERNEL=$KERNEL"
 echo "export FC_TEST_ROOTFS=$ROOTFS"

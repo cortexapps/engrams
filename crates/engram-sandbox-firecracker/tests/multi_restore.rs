@@ -59,7 +59,7 @@ async fn serial_restore_from_one_canonical_n_times() {
 
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 
@@ -152,7 +152,7 @@ async fn concurrent_restores_from_one_snapshot_rekey_vsock() {
 
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 
@@ -255,7 +255,7 @@ async fn overlapping_restores_from_one_base_dont_collide_on_rootfs_symlink() {
 
     let work = tempfile::tempdir().expect("tempdir");
     let local_rootfs = work.path().join("rootfs.ext4");
-    tokio::fs::copy(&env.rootfs, &local_rootfs)
+    common::clone_rootfs(&env.rootfs, &local_rootfs)
         .await
         .expect("clone rootfs into tempdir");
 
