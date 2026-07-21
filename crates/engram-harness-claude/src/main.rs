@@ -76,6 +76,10 @@ mod adapter {
     /// before spawning claude; the hook reaches it via `ENGRAM_HOOK_SOCK`.
     pub const HOOK_SOCK_FILE: &str = "/workspace/.engrams/hook.sock";
     pub const HOOK_SETTINGS_FILE: &str = "/workspace/.engrams/claude-settings.json";
+    /// Harness-owned logical cwd for Claude's Bash tool. Unlike the CLI's
+    /// private `/tmp/claude-*-cwd` tracker, this survives a Claude or harness
+    /// respawn in the session workspace.
+    pub const BASH_CWD_FILE: &str = "/workspace/.engrams/bash-cwd";
     pub const MCP_CONFIG_FILE: &str = "/workspace/.engrams/mcp-config.json";
     pub const MCP_SOCK_FILE: &str = "/workspace/.engrams/mcp.sock";
 
@@ -832,7 +836,8 @@ mod adapter {
     /// stdout.
     pub mod hook_bridge {
         use super::hook_server::HookVerdict;
-        use super::{Answers, BufReader, Question};
+        use super::{Answers, BufReader, Question, BASH_CWD_FILE};
+        use std::path::{Path, PathBuf};
         use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
         use tokio::net::UnixStream;
 
@@ -845,6 +850,23 @@ mod adapter {
             let v: serde_json::Value =
                 serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
             let tool_name = v.get("tool_name").and_then(|s| s.as_str()).unwrap_or("");
+
+            // Claude's own process-local cwd tracker has regressed across CLI
+            // releases. Make the session cwd a harness guarantee by rewriting
+            // Bash input through the same supported updatedInput surface used
+            // for AskUserQuestion answers.
+            if tool_name == "Bash" {
+                let tool_input = v
+                    .get("tool_input")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null);
+                let cwd = tracked_bash_cwd(Path::new(BASH_CWD_FILE));
+                println!(
+                    "{}",
+                    bash_allow_output(&tool_input, &cwd, Path::new(BASH_CWD_FILE))
+                );
+                return std::process::ExitCode::SUCCESS;
+            }
 
             // Ordinary built-ins (including ToolSearch) → allow. Manifest MCP
             // tools MUST round-trip so the main process can apply their sync /
@@ -919,10 +941,84 @@ mod adapter {
             std::process::ExitCode::SUCCESS
         }
 
+        /// Resolve only an existing absolute directory. A corrupt/stale
+        /// tracker must never become generated shell input.
+        pub(super) fn tracked_bash_cwd(tracker: &Path) -> PathBuf {
+            let tracked = std::fs::read_to_string(tracker).ok().and_then(|raw| {
+                let path = PathBuf::from(raw.trim_end_matches(['\r', '\n']));
+                (path.is_absolute() && path.is_dir()).then_some(path)
+            });
+            tracked
+                .or_else(|| {
+                    std::env::current_dir()
+                        .ok()
+                        .filter(|path| path.is_absolute() && path.is_dir())
+                })
+                .unwrap_or_else(|| PathBuf::from("/workspace"))
+        }
+
+        /// Return Claude's PreToolUse `allow` response with a Bash command
+        /// rooted in the harness-owned logical cwd. Foreground calls install
+        /// an EXIT trap that records their final physical cwd while preserving
+        /// the command's exit status. Background calls inherit the snapshot
+        /// but cannot race to move the foreground session later.
+        pub(super) fn bash_allow_output(
+            tool_input: &serde_json::Value,
+            cwd: &Path,
+            tracker: &Path,
+        ) -> serde_json::Value {
+            let mut updated_input = tool_input.clone();
+            let Some(map) = updated_input.as_object_mut() else {
+                return allow_output(None);
+            };
+            let Some(command) = map
+                .get("command")
+                .and_then(|value| value.as_str())
+                .map(str::to_owned)
+            else {
+                return allow_output(None);
+            };
+            let background = map
+                .get("run_in_background")
+                .or_else(|| map.get("runInBackground"))
+                .and_then(|value| value.as_bool())
+                .unwrap_or(false);
+
+            let mut wrapped = format!("cd -- {} && {{\n", shell_quote(cwd));
+            if !background {
+                let record_cwd = format!("pwd -P >| {}", shell_quote(tracker));
+                wrapped.push_str(&format!("trap {} EXIT\n", shell_quote_str(&record_cwd)));
+            }
+            wrapped.push_str(&command);
+            wrapped.push_str("\n}");
+            map.insert("command".to_string(), serde_json::Value::String(wrapped));
+            allow_output(Some(updated_input))
+        }
+
+        fn allow_output(updated_input: Option<serde_json::Value>) -> serde_json::Value {
+            let mut specific = serde_json::json!({
+                "hookEventName": "PreToolUse",
+                "permissionDecision": "allow",
+            });
+            if let Some(updated_input) = updated_input {
+                specific
+                    .as_object_mut()
+                    .expect("hook output is an object")
+                    .insert("updatedInput".to_string(), updated_input);
+            }
+            serde_json::json!({"hookSpecificOutput": specific})
+        }
+
+        fn shell_quote(path: &Path) -> String {
+            shell_quote_str(&path.to_string_lossy())
+        }
+
+        fn shell_quote_str(value: &str) -> String {
+            format!("'{}'", value.replace('\'', "'\"'\"'"))
+        }
+
         fn print_allow() {
-            println!(
-                r#"{{"hookSpecificOutput":{{"hookEventName":"PreToolUse","permissionDecision":"allow"}}}}"#
-            );
+            println!("{}", allow_output(None));
         }
         fn print_defer() {
             println!(
@@ -1402,9 +1498,31 @@ mod adapter {
             }
         });
         let _ = tokio::fs::create_dir_all("/workspace/.engrams").await;
+        if let Err(e) = initialize_bash_cwd().await {
+            tracing::warn!(error = %e, "couldn't initialize harness Bash cwd tracker");
+        }
         if let Err(e) = tokio::fs::write(HOOK_SETTINGS_FILE, settings.to_string()).await {
             tracing::warn!(error = %e, "couldn't write claude hook settings");
         }
+    }
+
+    /// Seed the logical cwd once per session workspace. A valid existing
+    /// tracker belongs to the current sandbox and survives harness / Claude
+    /// respawns; an invalid or deleted path is repaired before spawn.
+    async fn initialize_bash_cwd() -> std::io::Result<()> {
+        let existing = tokio::fs::read_to_string(BASH_CWD_FILE)
+            .await
+            .ok()
+            .map(|raw| PathBuf::from(raw.trim_end_matches(['\r', '\n'])))
+            .filter(|path| path.is_absolute() && path.is_dir());
+        if existing.is_some() {
+            return Ok(());
+        }
+        let cwd = std::env::current_dir()
+            .ok()
+            .filter(|path| path.is_absolute() && path.is_dir())
+            .unwrap_or_else(|| PathBuf::from("/workspace"));
+        tokio::fs::write(BASH_CWD_FILE, format!("{}\n", cwd.display())).await
     }
 
     /// Write claude's strict MCP config when the manifest contains at least
@@ -4918,6 +5036,114 @@ mod adapter {
                 output["hookSpecificOutput"]["permissionDecisionReason"],
                 "bridge unavailable"
             );
+        }
+
+        #[test]
+        fn bash_hook_rewrites_foreground_and_background_without_losing_input() {
+            let cwd = Path::new("/workspace/repo with 'quote'");
+            let tracker = Path::new("/workspace/.engrams/bash-cwd");
+            let foreground = serde_json::json!({
+                "command": "cd nested && false",
+                "description": "exercise cwd",
+                "timeout": 1234,
+            });
+            let output = hook_bridge::bash_allow_output(&foreground, cwd, tracker);
+            let updated = &output["hookSpecificOutput"]["updatedInput"];
+            let command = updated["command"].as_str().unwrap();
+            assert_eq!(updated["description"], "exercise cwd");
+            assert_eq!(updated["timeout"], 1234);
+            assert!(command.starts_with("cd -- '/workspace/repo with '\"'\"'quote'\"'\"'' && {\n"));
+            assert!(command.contains("trap "));
+            assert!(command.contains("pwd -P >| "));
+            assert!(command.contains("/workspace/.engrams/bash-cwd"));
+            assert!(command.ends_with("cd nested && false\n}"));
+
+            let background = serde_json::json!({
+                "command": "pwd",
+                "run_in_background": true,
+            });
+            let output = hook_bridge::bash_allow_output(&background, cwd, tracker);
+            let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+                .as_str()
+                .unwrap();
+            assert!(command.starts_with("cd -- "));
+            assert!(!command.contains("trap "));
+            assert!(!command.contains("bash-cwd"));
+        }
+
+        #[test]
+        fn bash_cwd_tracker_rejects_relative_and_deleted_paths() {
+            let tracker = std::env::temp_dir()
+                .join(format!("engram-invalid-bash-cwd-{}", uuid::Uuid::new_v4()));
+            let fallback = std::env::current_dir().unwrap();
+
+            std::fs::write(&tracker, "relative/repo\n").unwrap();
+            assert_eq!(hook_bridge::tracked_bash_cwd(&tracker), fallback);
+
+            std::fs::write(&tracker, "/path/that/does/not/exist\n").unwrap();
+            assert_eq!(hook_bridge::tracked_bash_cwd(&tracker), fallback);
+
+            std::fs::remove_file(&tracker).unwrap();
+        }
+
+        #[test]
+        fn bash_hook_carries_cwd_across_shells_and_background_cannot_move_it() {
+            let base = std::env::temp_dir()
+                .join(format!("engram-bash-cwd-'quote'-{}", uuid::Uuid::new_v4()));
+            let child = base.join("child with 'quote'");
+            let tracker = base.join("bash-cwd");
+            std::fs::create_dir_all(&child).unwrap();
+            std::fs::write(&tracker, format!("{}\n", base.display())).unwrap();
+
+            let run = |input: serde_json::Value| {
+                let cwd = hook_bridge::tracked_bash_cwd(&tracker);
+                let output = hook_bridge::bash_allow_output(&input, &cwd, &tracker);
+                let command = output["hookSpecificOutput"]["updatedInput"]["command"]
+                    .as_str()
+                    .unwrap();
+                std::process::Command::new("bash")
+                    .arg("-c")
+                    .arg(command)
+                    .output()
+                    .unwrap()
+            };
+
+            let changed = run(serde_json::json!({
+                "command": "cd \"child with 'quote'\"",
+            }));
+            assert!(changed.status.success());
+            assert_eq!(
+                std::fs::read_to_string(&tracker).unwrap().trim(),
+                child.to_string_lossy()
+            );
+
+            let observed = run(serde_json::json!({"command": "pwd -P"}));
+            assert!(observed.status.success());
+            assert_eq!(
+                String::from_utf8(observed.stdout).unwrap().trim(),
+                child.to_string_lossy()
+            );
+
+            let background = run(serde_json::json!({
+                "command": "cd ..",
+                "run_in_background": true,
+            }));
+            assert!(background.status.success());
+            assert_eq!(
+                std::fs::read_to_string(&tracker).unwrap().trim(),
+                child.to_string_lossy(),
+                "a completed background-shaped call must not move foreground cwd"
+            );
+
+            let failed = run(serde_json::json!({"command": "exit 23"}));
+            assert_eq!(failed.status.code(), Some(23));
+            assert_eq!(
+                std::fs::read_to_string(&tracker).unwrap().trim(),
+                child.to_string_lossy(),
+                "the EXIT trap must record cwd without masking command failure"
+            );
+
+            std::fs::remove_dir_all(&base).unwrap();
         }
 
         #[tokio::test]
