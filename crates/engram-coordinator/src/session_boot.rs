@@ -680,7 +680,6 @@ pub(crate) async fn resolve_inject_entries(
         repo: &repo,
         image_tag: &image_tag,
     };
-    let schema = engram_core::types::image::SecretSchema::default();
     // ADR 0056 amendment: mint entries scope their token to the session's bound
     // capabilities. Fetch them once, only when a mint entry is actually present.
     let caps = if policy.injects.iter().any(|i| !i.mint_provider.is_empty()) {
@@ -738,11 +737,13 @@ pub(crate) async fn resolve_inject_entries(
             }
         } else {
             // Static secret: value from the SecretStore, header from the config.
-            let secret = match state
-                .services
-                .secrets
-                .get(&ctx, &inj.secret_ref, &schema)
-                .await
+            let secret = match crate::api::sessions::resolve_explicit_secret_ref(
+                state.services.secrets.as_ref(),
+                &ctx,
+                &inj.secret_ref,
+                false,
+            )
+            .await
             {
                 Ok(Some(v)) => v,
                 Ok(None) => {
