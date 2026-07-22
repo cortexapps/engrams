@@ -2,6 +2,7 @@ import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
 import type { EnrollmentRow } from "../db/enrollments.ts";
+import type { DispatchWebhookInput } from "../automations/dispatch.ts";
 import type { DispatchReviewInput } from "../workflows/dispatch-review.ts";
 import { makeGithubEventsRoute } from "../routes/github-events.ts";
 
@@ -54,8 +55,10 @@ function commentBody(
 
 function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
   const dispatches: DispatchReviewInput[] = [];
+  const automationDispatches: DispatchWebhookInput[] = [];
   return {
     dispatches,
+    automationDispatches,
     app: makeGithubEventsRoute({
       webhookSecret: async () => SECRET,
       mentionHandle: "acme-reviewer",
@@ -64,6 +67,10 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
         dispatches.push(input);
         return { enrolled: true, workflowId: "review:wf" };
       },
+      automationDispatch: async (input) => {
+        automationDispatches.push(input);
+      },
+      now: () => new Date("2026-07-22T12:00:00Z"),
     }),
   };
 }
@@ -113,6 +120,36 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
     expect(res.status).toBe(200);
     expect(fixture.dispatches).toEqual([]);
+    expect(fixture.automationDispatches).toHaveLength(1);
+  });
+
+  test("forwards an event ignored by the PR-review classifier to automations", async () => {
+    const body = JSON.stringify({
+      action: "opened",
+      issue: { number: 7, title: "Broken" },
+      repository: { full_name: enrollment.repo },
+      token: "must-not-persist",
+    });
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "issues"),
+    });
+    expect(res.status).toBe(200);
+    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.automationDispatches).toEqual([{
+      registrationId: "github-app",
+      registration: null,
+      eventKey: "issues.opened",
+      deliveryId: "delivery-1",
+      payload: {
+        action: "opened",
+        issue: { number: 7, title: "Broken" },
+        repository: { full_name: enrollment.repo },
+      },
+      receivedAt: new Date("2026-07-22T12:00:00Z"),
+    }]);
   });
 
   test("drops un-enrolled repos", async () => {
