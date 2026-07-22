@@ -86,7 +86,17 @@ function fakeStore(seed?: {
       const row = automations.get(id);
       return row && !row.archivedAt ? row : null;
     },
-    async listActiveForWebhookRegistration(registrationId) {
+    async listBoundToWebhookRegistration(registrationId) {
+      return [...automations.values()]
+        .filter(
+          (row) =>
+            !row.archivedAt &&
+            row.trigger.kind === "webhook" &&
+            row.trigger.registrationId === registrationId,
+        )
+        .sort((a, b) => a.id.localeCompare(b.id));
+    },
+    async listEnabledForWebhookRegistration(registrationId) {
       return [...automations.values()]
         .filter(
           (row) =>
@@ -463,6 +473,21 @@ describe("WebhookRegistrationService", () => {
       expect(error.message).toContain(
         `cannot delete webhook registration "generic": 1 non-archived automation(s) reference it (${created.automation!.id})`,
       );
+    }
+    expect(await store.getRegistration("generic")).not.toBeNull();
+    expect(deletedSecrets).toEqual([]);
+
+    // The prod-validation regression (2026-07-22): a DISABLED automation still
+    // references its registration — disabling pauses firing, it does not
+    // release the binding. Deletion must still refuse.
+    await automations.setAutomationEnabled({ id: created.automation!.id, enabled: false });
+    try {
+      await registrations.deleteWebhookRegistration({ id: "generic" });
+      throw new Error("expected FailedPrecondition for the disabled automation");
+    } catch (error) {
+      expect(error).toBeInstanceOf(ConnectError);
+      if (!(error instanceof ConnectError)) throw error;
+      expect(error.code).toBe(Code.FailedPrecondition);
     }
     expect(await store.getRegistration("generic")).not.toBeNull();
     expect(deletedSecrets).toEqual([]);
