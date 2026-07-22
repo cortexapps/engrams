@@ -256,7 +256,13 @@ host DaemonSet) the same day. Observed:
   histograms (they emit from each sandbox's second capture on a pod, and the
   fleet churned through the validation) — watch them center near the 256 MiB
   target; if evict-time Full captures show up there, that is the trigger for
-  the deferred Full-off-eviction work.
+  the deferred Full-off-eviction work. Divergence found at the 12-hour mark:
+  both shipped without explicit buckets, so `_seconds` (observations 250–1100s)
+  landed 100% in +Inf under the exporter's default sub-30s buckets and
+  `_bytes` rendered as a per-host summary whose quantiles can't be aggregated
+  fleet-wide — the watch was impossible as deployed. Fixed by installing
+  explicit buckets (seconds spanning the pacing clamp band, bytes centered on
+  the 256 MiB target with a 0 bucket for no-dirt backstop epochs).
 
 ## Incident addendum (2026-07-21): the parked-survivor rollback (session 61a03b7e)
 

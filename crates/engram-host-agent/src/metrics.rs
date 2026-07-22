@@ -50,6 +50,47 @@ pub fn init(addr: SocketAddr) {
             .expect("install capture histogram buckets");
     }
 
+    // ADR 0101 B: epoch age lives in the pacing clamp band
+    // [ENGRAM_CHECKPOINT_MIN_INTERVAL_SECS 30, ENGRAM_CHECKPOINT_INTERVAL_SECS
+    // 600], stretching above the backstop by capture time — under the
+    // default sub-30 s `_seconds` buckets every sample landed in +Inf.
+    let epoch_seconds_buckets = &[
+        30.0, 60.0, 90.0, 120.0, 180.0, 240.0, 300.0, 420.0, 600.0, 750.0, 900.0, 1200.0, 1800.0,
+    ];
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(CHECKPOINT_EPOCH_SECONDS.to_string()),
+            epoch_seconds_buckets,
+        )
+        .expect("install epoch-seconds histogram buckets");
+    // Epoch bytes gets fine resolution around the 256 MiB
+    // ENGRAM_CHECKPOINT_TARGET_EPOCH_MB so "is the controller centering
+    // on target" is answerable fleet-wide — an unbucketed histogram
+    // renders as a Prometheus summary, whose per-host quantiles can't
+    // be aggregated. The 0 bucket splits out the no-dirt epochs idle
+    // sessions coast through on the backstop.
+    const MIB: f64 = 1024.0 * 1024.0;
+    let epoch_bytes_buckets = &[
+        0.0,
+        16.0 * MIB,
+        64.0 * MIB,
+        128.0 * MIB,
+        192.0 * MIB,
+        256.0 * MIB,
+        320.0 * MIB,
+        384.0 * MIB,
+        512.0 * MIB,
+        1024.0 * MIB,
+        4096.0 * MIB,
+        16384.0 * MIB,
+    ];
+    builder = builder
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(CHECKPOINT_EPOCH_BYTES.to_string()),
+            epoch_bytes_buckets,
+        )
+        .expect("install epoch-bytes histogram buckets");
+
     match builder.install() {
         Ok(()) => {
             tracing::info!(%addr, "host-agent metrics exporter listening");
@@ -243,7 +284,12 @@ pub const CHECKPOINT_SKIPPED_TOTAL: &str = "engram_checkpoint_skipped_total";
 /// epoch's wall-clock length. Together they surface the controller's
 /// behavior: bytes far above target = the controller is floor-clamped
 /// (raise the target or lower the floor); epochs pinned at the max =
-/// idle sessions coasting on the backstop, as designed.
+/// idle sessions coasting on the backstop, as designed. Both are
+/// histograms with explicit buckets installed in [`init`] — seconds
+/// spans the pacing clamp band, bytes centers on the 256 MiB target
+/// (the 2026-07-21 deploy shipped without them: seconds was all-+Inf
+/// under the default 30 s ceiling, bytes rendered as an
+/// unaggregatable per-host summary).
 pub const CHECKPOINT_EPOCH_BYTES: &str = "engram_checkpoint_epoch_bytes";
 pub const CHECKPOINT_EPOCH_SECONDS: &str = "engram_checkpoint_epoch_seconds";
 
