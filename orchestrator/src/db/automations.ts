@@ -1,9 +1,11 @@
-import { and, desc, eq, isNull, sql } from "drizzle-orm";
+import { and, asc, desc, eq, isNull, lte, sql } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import {
   automation as automationTable,
   automationRun as automationRunTable,
+  task as taskTable,
+  taskSession as taskSessionTable,
   webhookRegistration as webhookRegistrationTable,
   webhookSample as webhookSampleTable,
   type AutomationAction,
@@ -102,6 +104,59 @@ export interface AutomationStore {
   listObservedEventKeys(registrationId: string): Promise<string[]>;
 }
 
+export interface DueCronAutomation extends AutomationRow {
+  trigger: Extract<AutomationTrigger, { kind: "cron" }>;
+  nextFireAt: Date;
+}
+
+export interface CronRunClaim {
+  /** A terminal row proves DBOS already ran this occurrence. It is returned so
+   * a scheduler recovering after start-before-advance can finish the CAS. */
+  kind: "claimed" | "terminal";
+  run: AutomationRunRow;
+}
+
+export interface AutomationCronStore {
+  listDueCron(now: Date, limit?: number): Promise<DueCronAutomation[]>;
+  claimCronOccurrence(input: {
+    automationId: string;
+    scheduledFor: Date;
+    leaseOwner: string;
+    leaseExpiresAt: Date;
+    now: Date;
+  }): Promise<CronRunClaim | null>;
+  markRunSkipped(runId: string, reason: string): Promise<void>;
+  advanceCronSchedule(input: {
+    automationId: string;
+    scheduledFor: Date;
+    nextFireAt: Date;
+    fired: boolean;
+    now: Date;
+  }): Promise<boolean>;
+}
+
+export interface AutomationWorkflowStore {
+  ensureRun(input: {
+    id: string;
+    automationId: string;
+    trigger: AutomationRunTrigger;
+    scheduledFor: Date | null;
+  }): Promise<AutomationRunRow>;
+  getRun(id: string): Promise<AutomationRunRow | null>;
+  getAutomation(id: string): Promise<AutomationRow | null>;
+  recordRendered(runId: string, prompt: string, title: string | null): Promise<void>;
+  ensureAutomationTask(input: {
+    runId: string;
+    automationId: string;
+    title: string | null;
+    source: Record<string, unknown>;
+  }): Promise<string>;
+  getAutomationTaskSession(runId: string): Promise<string | null>;
+  markRunRenderFailed(runId: string, error: string): Promise<void>;
+  markRunLaunchFailed(runId: string, error: string): Promise<void>;
+  markRunLaunched(runId: string, taskId: string, sessionId: string): Promise<void>;
+}
+
 function automationRow(row: typeof automationTable.$inferSelect): AutomationRow {
   return {
     ...row,
@@ -142,7 +197,7 @@ function sampleRow(row: typeof webhookSampleTable.$inferSelect): WebhookSampleRo
 
 export function makeAutomationStore(
   db: ReturnType<typeof getDb> = getDb(),
-): AutomationStore {
+): AutomationStore & AutomationCronStore & AutomationWorkflowStore {
   return {
     async list({ includeArchived }) {
       const rows = includeArchived
@@ -233,6 +288,221 @@ export function makeAutomationStore(
         .orderBy(desc(automationRunTable.createdAt))
         .limit(limit);
       return rows.map(runRow);
+    },
+
+    async listDueCron(now, limit = 100) {
+      const rows = await db
+        .select()
+        .from(automationTable)
+        .where(
+          and(
+            eq(automationTable.enabled, true),
+            isNull(automationTable.archivedAt),
+            sql`${automationTable.trigger}->>'kind' = 'cron'`,
+            lte(automationTable.nextFireAt, now),
+          ),
+        )
+        .orderBy(asc(automationTable.nextFireAt), asc(automationTable.id))
+        .limit(limit);
+      return rows.map((raw) => {
+        const row = automationRow(raw);
+        if (row.trigger.kind !== "cron" || row.nextFireAt === null) {
+          throw new Error(`due automation ${row.id} did not contain a cron occurrence`);
+        }
+        return { ...row, trigger: row.trigger, nextFireAt: row.nextFireAt };
+      });
+    },
+
+    async claimCronOccurrence(input) {
+      const trigger: AutomationRunTrigger = { source: "cron" };
+      const inserted = await db
+        .insert(automationRunTable)
+        .values({
+          id: crypto.randomUUID(),
+          automationId: input.automationId,
+          trigger,
+          scheduledFor: input.scheduledFor,
+          leaseOwner: input.leaseOwner,
+          leaseExpiresAt: input.leaseExpiresAt,
+        })
+        .onConflictDoNothing()
+        .returning();
+      if (inserted[0]) return { kind: "claimed", run: runRow(inserted[0]) };
+
+      // The expiry value is the compare-and-swap: after one contender updates
+      // it, PostgreSQL re-evaluates this predicate for the next waiter.
+      const reacquired = await db
+        .update(automationRunTable)
+        .set({
+          leaseOwner: input.leaseOwner,
+          leaseExpiresAt: input.leaseExpiresAt,
+        })
+        .where(
+          and(
+            eq(automationRunTable.automationId, input.automationId),
+            eq(automationRunTable.scheduledFor, input.scheduledFor),
+            eq(automationRunTable.status, "pending"),
+            lte(automationRunTable.leaseExpiresAt, input.now),
+          ),
+        )
+        .returning();
+      if (reacquired[0]) return { kind: "claimed", run: runRow(reacquired[0]) };
+
+      const [existing] = await db
+        .select()
+        .from(automationRunTable)
+        .where(
+          and(
+            eq(automationRunTable.automationId, input.automationId),
+            eq(automationRunTable.scheduledFor, input.scheduledFor),
+          ),
+        )
+        .limit(1);
+      if (!existing || existing.status === "pending") return null;
+      return { kind: "terminal", run: runRow(existing) };
+    },
+
+    async markRunSkipped(runId, reason) {
+      await db
+        .update(automationRunTable)
+        .set({
+          status: "skipped",
+          error: reason,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        })
+        .where(and(eq(automationRunTable.id, runId), eq(automationRunTable.status, "pending")));
+    },
+
+    async advanceCronSchedule(input) {
+      const rows = await db
+        .update(automationTable)
+        .set({
+          nextFireAt: input.nextFireAt,
+          ...(input.fired ? { lastFiredAt: input.scheduledFor } : {}),
+          updatedAt: input.now,
+        })
+        .where(
+          and(
+            eq(automationTable.id, input.automationId),
+            eq(automationTable.enabled, true),
+            isNull(automationTable.archivedAt),
+            eq(automationTable.nextFireAt, input.scheduledFor),
+          ),
+        )
+        .returning({ id: automationTable.id });
+      return rows.length > 0;
+    },
+
+    async ensureRun(input) {
+      await db
+        .insert(automationRunTable)
+        .values({
+          id: input.id,
+          automationId: input.automationId,
+          trigger: input.trigger,
+          scheduledFor: input.scheduledFor,
+        })
+        .onConflictDoNothing()
+        .returning();
+      const row = await this.getRun(input.id);
+      if (!row) throw new Error(`automation run ${input.id} disappeared after insert`);
+      if (row.automationId !== input.automationId) {
+        throw new Error(`automation run ${input.id} belongs to a different automation`);
+      }
+      return row;
+    },
+
+    async getRun(id) {
+      const [row] = await db
+        .select()
+        .from(automationRunTable)
+        .where(eq(automationRunTable.id, id))
+        .limit(1);
+      return row ? runRow(row) : null;
+    },
+
+    async getAutomation(id) {
+      return this.get(id);
+    },
+
+    async recordRendered(runId, prompt, title) {
+      await db
+        .update(automationRunTable)
+        .set({ renderedPrompt: prompt, renderedTitle: title })
+        .where(and(eq(automationRunTable.id, runId), eq(automationRunTable.status, "pending")));
+    },
+
+    async ensureAutomationTask(input) {
+      // A stable task id makes a retried DBOS launch step reuse the task row.
+      const taskId = `automation:${input.runId}`;
+      await db.transaction(async (tx) => {
+        await tx
+          .insert(taskTable)
+          .values({
+            id: taskId,
+            type: "automation",
+            title: input.title,
+            status: "working",
+            createdByUserId: null,
+            source: input.source,
+          })
+          .onConflictDoNothing();
+        await tx
+          .update(automationRunTable)
+          .set({ taskId })
+          .where(
+            and(
+              eq(automationRunTable.id, input.runId),
+              eq(automationRunTable.automationId, input.automationId),
+              eq(automationRunTable.status, "pending"),
+            ),
+          );
+      });
+      return taskId;
+    },
+
+    async getAutomationTaskSession(runId) {
+      const [row] = await db
+        .select({ sessionId: taskSessionTable.sessionId })
+        .from(automationRunTable)
+        .innerJoin(taskSessionTable, eq(taskSessionTable.taskId, automationRunTable.taskId))
+        .where(
+          and(
+            eq(automationRunTable.id, runId),
+            eq(taskSessionTable.role, "primary"),
+          ),
+        )
+        .limit(1);
+      return row?.sessionId ?? null;
+    },
+
+    async markRunRenderFailed(runId, error) {
+      await db
+        .update(automationRunTable)
+        .set({ status: "render_failed", error, leaseOwner: null, leaseExpiresAt: null })
+        .where(and(eq(automationRunTable.id, runId), eq(automationRunTable.status, "pending")));
+    },
+
+    async markRunLaunchFailed(runId, error) {
+      await db
+        .update(automationRunTable)
+        .set({ status: "launch_failed", error, leaseOwner: null, leaseExpiresAt: null })
+        .where(and(eq(automationRunTable.id, runId), eq(automationRunTable.status, "pending")));
+    },
+
+    async markRunLaunched(runId, taskId, sessionId) {
+      await db
+        .update(automationRunTable)
+        .set({
+          status: "launched",
+          taskId,
+          sessionId,
+          error: null,
+          leaseOwner: null,
+          leaseExpiresAt: null,
+        })
+        .where(and(eq(automationRunTable.id, runId), eq(automationRunTable.status, "pending")));
     },
 
     async createRegistration(input) {

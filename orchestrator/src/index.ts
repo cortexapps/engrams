@@ -58,6 +58,7 @@ import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
+import { makeProductionAutomationScheduler } from "./automations/scheduler.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
@@ -236,6 +237,8 @@ if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
 const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
+const automationScheduler = makeProductionAutomationScheduler();
+await automationScheduler.start();
 
 server.listen(config.port, "0.0.0.0", () => {
   log.info({ port: config.port }, "orchestrator listening");
@@ -247,6 +250,7 @@ process.on("SIGTERM", () => {
   server.close(async (err) => {
     // Quiesce DBOS (stops queue/recovery loops, closes the system-DB pool)
     // after the HTTP server stops accepting connections.
+    await automationScheduler.stop();
     await listenerManager.stop();
     await shutdownDbos();
     if (err) {
