@@ -54,10 +54,11 @@ export interface SessionListenerDeps {
    * already in a terminal status finishes immediately — its event log may
    * predate terminal status_changed events. */
   fetchStatus?(sessionId: string, signal?: AbortSignal): Promise<string>;
-  /** Sleep for `ms`. If `signal` aborts first, clear the underlying timer and
-   * leave the promise unsettled (the caller has already lost interest) — this
-   * lets `#guarded` cancel its deadline timer the instant its RPC settles
-   * early, rather than leaking a pending timer for the full deadline. */
+  /** Sleep for `ms`, resolving early if `signal` aborts (clearing the underlying
+   * timer). This is the interruptible-wait primitive the listener keys off the
+   * stop signal, and it also lets `#guarded` cancel its deadline timer the
+   * instant its RPC settles — so no full-length timer lingers and no waiter has
+   * to race a session-lifetime promise. */
   sleep(ms: number, signal?: AbortSignal): Promise<void>;
   queueCapacity?: number;
   /** Deadline for one coordinator RPC; default RPC_DEADLINE_MS. */
@@ -91,20 +92,18 @@ interface CatchUpResult {
 export class SessionListener {
   readonly #deps: SessionListenerDeps;
   readonly #context: { sessionId: string };
-  readonly #stopped: Promise<void>;
-  /** `#stopped` mapped to the race sentinel once, so the bounded-rate callers
-   * that race it (`#guarded`, one per coordinator RPC) don't each allocate a
-   * fresh `.then` closure. Note this does NOT make racing it free: `Promise.race`
-   * still appends a reaction to `#stopped` on every call, and those reactions
-   * live until `#stopped` settles at session stop. It is therefore safe only on
-   * bounded-rate paths — never race it per wire frame; the hot frame loop checks
-   * the `#stopRequested` flag on wake instead. */
-  readonly #stoppedRace: Promise<"stopped">;
+  /** Aborted once, at stop. Waiters key off this signal (via the cancellable
+   * `sleep` seam) or the `#stopRequested` flag — never by racing a
+   * session-lifetime promise. `Promise.race` on such a promise retains a
+   * reaction per call until it settles, so on any recurring path (the frame
+   * loop, the heartbeat tick, the per-page catch-up/recovery loops) those
+   * reactions accumulate for the whole session. An AbortSignal's listeners are
+   * removed when they fire or are cleared, so nothing piles up. */
+  readonly #stopController = new AbortController();
   readonly #rpcDeadlineMs: number;
   readonly #probeIntervalMs: number;
   readonly #staleGraceMs: number;
   readonly #now: () => number;
-  #resolveStopped!: () => void;
   #stopRequested = false;
   #stream: OpenedSessionStream | null = null;
   #running: Promise<void> | null = null;
@@ -122,10 +121,6 @@ export class SessionListener {
     this.#staleGraceMs = deps.staleGraceMs ?? STALE_GRACE_TTL_FACTOR * deps.ttlMs;
     this.#now = deps.now ?? Date.now;
     this.#lastLiveAt = this.#now();
-    this.#stopped = new Promise<void>((resolve) => {
-      this.#resolveStopped = resolve;
-    });
-    this.#stoppedRace = this.#stopped.then(() => "stopped" as const);
   }
 
   run(): Promise<void> {
@@ -141,7 +136,7 @@ export class SessionListener {
   #requestStop(): void {
     if (this.#stopRequested) return;
     this.#stopRequested = true;
-    this.#resolveStopped();
+    this.#stopController.abort();
     this.#stream?.close();
     for (const state of this.#states) {
       for (const wake of state.spaceWaiters.splice(0)) wake();
@@ -332,12 +327,11 @@ export class SessionListener {
               probeTimer ??= this.#deps.sleep(this.#probeIntervalMs).then(() => "probe" as const);
               // Race a FRESH per-iteration wake (resolved by the pull's one-shot
               // reaction), never the long-lived pull itself — see the note on
-              // issuePull above. Deliberately NOT racing #stopped either: it is
-              // session-lifetime, so racing it per iteration would leak the same
-              // way. #requestStop() closes the stream, which settles the pull;
-              // the probe timer (≤ probeIntervalMs) bounds the pathological
-              // parked-dial case — exactly when the lease is being abandoned. We
-              // re-check the #stopRequested flag on every wake.
+              // issuePull above. No stop arm either: #requestStop() closes the
+              // stream, which settles the pull, and the probe timer
+              // (≤ probeIntervalMs) bounds the pathological parked-dial case —
+              // exactly when the lease is being abandoned. We re-check the
+              // #stopRequested flag on every wake.
               const pullReady = new Promise<"pull">((resolve) => {
                 wakePull = () => resolve("pull");
               });
@@ -448,18 +442,33 @@ export class SessionListener {
   /** Run one coordinator RPC with a deadline. The transport can orphan a call
    * forever (issue #704: Bun's node:http2 never settles a call queued on a
    * half-open dial), so no coordinator await may run bare: on deadline the
-   * call is aborted and the failure takes the ordinary retry path. */
+   * call is aborted and the failure takes the ordinary retry path. Stop is
+   * raced too, so a wedged RPC whose deadline somehow never fires is still
+   * interrupted the moment the heartbeat abandons the lease.
+   *
+   * Both the deadline and the stop wake are PER-CALL and torn down when the
+   * call settles: `#guarded` runs once per coordinator RPC — per page in the
+   * unbounded catch-up/recovery loops — so racing a session-lifetime promise
+   * here would retain a reaction per page for the whole session. The stop
+   * listener is removed in `finally` (or fires once); the deadline timer is
+   * cancelled via the sleep seam so a fast read leaves nothing pending. */
   async #guarded<T>(
     what: string,
     start: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     const controller = new AbortController();
-    // Separate signal for the deadline timer: aborting it clears the timer
-    // (via the sleep seam) the moment the RPC settles, so a fast read does not
-    // leave a full-deadline timer pending — bursty during start-of-session
-    // catch-up otherwise.
     const deadline = new AbortController();
+    const stopSignal = this.#stopController.signal;
     const work = start(controller.signal);
+    let onStop: (() => void) | undefined;
+    const stopped = new Promise<"stopped">((resolve) => {
+      if (stopSignal.aborted) {
+        resolve("stopped");
+        return;
+      }
+      onStop = () => resolve("stopped");
+      stopSignal.addEventListener("abort", onStop, { once: true });
+    });
     try {
       const outcome = await Promise.race([
         work.then(
@@ -467,7 +476,7 @@ export class SessionListener {
           (err: unknown) => ({ ok: false as const, err }),
         ),
         this.#deps.sleep(this.#rpcDeadlineMs, deadline.signal).then(() => "deadline" as const),
-        this.#stoppedRace,
+        stopped,
       ]);
       if (typeof outcome === "string") {
         controller.abort();
@@ -481,6 +490,7 @@ export class SessionListener {
       if (!outcome.ok) throw outcome.err;
       return outcome.value;
     } finally {
+      if (onStop) stopSignal.removeEventListener("abort", onStop);
       deadline.abort();
     }
   }
@@ -592,10 +602,9 @@ export class SessionListener {
             state.queue.length >= (this.#deps.queueCapacity ?? DEFAULT_QUEUE_CAPACITY) &&
             !this.#stopRequested
           ) {
-            await Promise.race([
-              new Promise<void>((resolve) => state.spaceWaiters.push(resolve)),
-              this.#stopped,
-            ]);
+            // #requestStop() wakes every space-waiter, so this resolves on stop
+            // too — no need to race a session-lifetime stop promise here.
+            await new Promise<void>((resolve) => state.spaceWaiters.push(resolve));
           }
           if (this.#stopRequested) return;
           this.#enqueue(state, event);
@@ -728,11 +737,14 @@ export class SessionListener {
     );
   }
 
+  /** Sleep, waking early if stop is requested. Returns true if the full delay
+   * elapsed, false if stop cut it short — the caller's signal to bail out. The
+   * cancellable sleep seam wakes on the stop signal, so this doesn't race (and
+   * accumulate a reaction on) any session-lifetime promise even though it runs
+   * every heartbeat tick and every retry backoff. */
   async #sleepOrStop(ms: number): Promise<boolean> {
-    const result = await Promise.race([
-      this.#deps.sleep(ms).then(() => true),
-      this.#stopped.then(() => false),
-    ]);
-    return result;
+    if (this.#stopRequested) return false;
+    await this.#deps.sleep(ms, this.#stopController.signal);
+    return !this.#stopRequested;
   }
 }

@@ -99,6 +99,25 @@ async function listener(
   consumers: SessionConsumer[],
   cursorStore: CursorStore = makeInMemoryCursorStore(),
 ): Promise<SessionListener> {
+  // Wrap whatever sleep the test injects so it honors the abort signal like the
+  // production seam (resolve early on abort), delegating timing to the raw
+  // sleep. Signal-less calls (the probe timer) pass through unchanged.
+  const rawSleep = overrides.sleep ?? never;
+  const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+    if (!signal) return rawSleep(ms);
+    if (signal.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", done);
+        resolve();
+      };
+      void rawSleep(ms).then(done);
+      signal.addEventListener("abort", done, { once: true });
+    });
+  };
   return new SessionListener({
     sessionId: "session-1",
     owner: "owner-1",
@@ -108,8 +127,8 @@ async function listener(
     consumers,
     readPage: async (_sessionId, after) => page([], after),
     openStream: async () => opened([], { waitAtEnd: true }),
-    sleep: never,
     ...overrides,
+    sleep,
   });
 }
 

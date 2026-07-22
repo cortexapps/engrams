@@ -184,15 +184,24 @@ export function makeProductionListenerManager(): ListenerManager {
             close: () => abort.abort(),
           };
         },
-        sleep: (ms, signal) =>
-          signal
-            ? new Promise<void>((resolve) => {
-                const timer = setTimeout(resolve, ms);
-                signal.addEventListener("abort", () => clearTimeout(timer), {
-                  once: true,
-                });
-              })
-            : Bun.sleep(ms),
+        sleep: (ms, signal) => {
+          if (!signal) return Bun.sleep(ms);
+          if (signal.aborted) return Promise.resolve();
+          return new Promise<void>((resolve) => {
+            const onAbort = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            // Remove the abort listener when the timer wins, so a recurring
+            // caller on a long-lived signal (e.g. the heartbeat's stop signal)
+            // doesn't accumulate listeners.
+            const timer = setTimeout(() => {
+              signal.removeEventListener("abort", onAbort);
+              resolve();
+            }, ms);
+            signal.addEventListener("abort", onAbort, { once: true });
+          });
+        },
       });
       return {
         start: () => listener.run(),
