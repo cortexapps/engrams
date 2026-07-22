@@ -21,7 +21,7 @@ export interface AutomationWebhookStore {
     receivedAt: Date;
     retain: number;
   }): Promise<void>;
-  listActiveForWebhookRegistration(registrationId: string): Promise<AutomationRow[]>;
+  listEnabledForWebhookRegistration(registrationId: string): Promise<AutomationRow[]>;
 }
 
 export interface AutomationWebhookStarter {
@@ -81,7 +81,7 @@ export async function dispatchWebhookOccurrence(
     });
   }
 
-  const matches = (await store.listActiveForWebhookRegistration(input.registrationId))
+  const matches = (await store.listEnabledForWebhookRegistration(input.registrationId))
     .filter((automation) => {
       if (automation.trigger.kind !== "webhook") return false;
       return automation.trigger.events.includes(input.eventKey)
