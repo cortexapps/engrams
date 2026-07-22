@@ -19,6 +19,13 @@ const DEFAULT_QUEUE_CAPACITY = 1_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 30_000;
 const ERROR_EVERY_ATTEMPTS = 10;
+/** A connection that delivered at least one frame AND stayed open this long is
+ * "healthy": a later drop resets the reconnect backoff so the next attempt is
+ * prompt. A connection that flaps faster than this — or never delivers a frame
+ * (a wedged dial detected by the probe) — does NOT reset, so deliver-then-drop
+ * and dial-wedge failure modes climb toward RETRY_MAX_MS instead of hammering
+ * the coordinator at the RETRY_INITIAL_MS floor. */
+const HEALTHY_STREAM_MS = RETRY_MAX_MS;
 /** Deadline for one coordinator RPC (status probe, catch-up read, stream probe
  * read, recovery read). The transport can orphan a call forever — Bun's
  * node:http2 never settles a call queued on a half-open dial (issue #704) — so
@@ -226,6 +233,11 @@ export class SessionListener {
     let reconnectAttempt = 0;
     let statusProbed = false;
     while (!this.#stopRequested) {
+      // Per-connection, read in the catch to decide whether to reset the
+      // backoff: only a connection that delivered a frame and stayed open a
+      // healthy while did (a rapid flap or a wedged dial must keep climbing).
+      let connectedAt: number | null = null;
+      let deliveredFrame = false;
       try {
         if (!statusProbed && this.#deps.fetchStatus) {
           const fetchStatus = this.#deps.fetchStatus;
@@ -266,6 +278,7 @@ export class SessionListener {
         // abort would reach nothing.
         const opened = await this.#deps.openStream(this.#deps.sessionId, lastSeen);
         this.#stream = opened;
+        connectedAt = this.#now();
         log.info(
           { sessionId: this.#deps.sessionId, since: String(lastSeen) },
           "listener stream connected",
@@ -356,7 +369,7 @@ export class SessionListener {
             this.#touchLive();
             sawLogAhead = false;
             frameSinceProbe = true; // re-arm decision deferred to the next firing
-            reconnectAttempt = 0;
+            deliveredFrame = true; // gates the backoff reset in the catch below
             if (frame.idx === undefined) {
               lagged = true;
               break;
@@ -386,7 +399,10 @@ export class SessionListener {
         }
         if (this.#stopRequested) return;
         if (lagged) {
-          reconnectAttempt = 0;
+          // Falling behind the buffer is flow control, not a coordinator
+          // failure: catch up immediately. Only clear the drop backoff if the
+          // connection had actually been healthy first.
+          if (this.#streamWasHealthy(connectedAt, deliveredFrame)) reconnectAttempt = 0;
           continue;
         }
         throw new Error("coordinator event stream closed");
@@ -417,6 +433,12 @@ export class SessionListener {
           );
           return;
         }
+        if (this.#streamWasHealthy(connectedAt, deliveredFrame)) {
+          // The connection was healthy (delivered a frame, open a good while)
+          // before it dropped, so start the backoff fresh rather than punishing
+          // a one-off drop. A flap or a wedged dial fails this test and climbs.
+          reconnectAttempt = 0;
+        }
         reconnectAttempt++;
         const delayMs = Math.min(
           RETRY_MAX_MS,
@@ -437,6 +459,18 @@ export class SessionListener {
 
   #touchLive(): void {
     this.#lastLiveAt = this.#now();
+  }
+
+  /** Whether the just-dropped connection counts as healthy for backoff purposes:
+   * it delivered at least one frame (so it was a working stream, not a wedged
+   * dial) and stayed open at least HEALTHY_STREAM_MS (so it was not flapping).
+   * Only such a drop resets the reconnect backoff. */
+  #streamWasHealthy(connectedAt: number | null, deliveredFrame: boolean): boolean {
+    return (
+      deliveredFrame &&
+      connectedAt !== null &&
+      this.#now() - connectedAt >= HEALTHY_STREAM_MS
+    );
   }
 
   /** Run one coordinator RPC with a deadline. The transport can orphan a call

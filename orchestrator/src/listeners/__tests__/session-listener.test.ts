@@ -544,6 +544,72 @@ describe("SessionListener", () => {
     expect(rec.terminals).toEqual(["completed"]);
   });
 
+  test("a deliver-then-drop stream climbs the reconnect backoff instead of resetting per frame", async () => {
+    const rec = recordingConsumer();
+    const backoffs: number[] = [];
+    let opens = 0;
+    const subject = await listener({
+      probeIntervalMs: 900_000,
+      now: () => 0, // every connection has zero duration — never counts as healthy
+      readPage: async (_sessionId, after) => page([], after), // empty catch-up
+      openStream: async () => {
+        opens++;
+        if (opens > 4) return opened([], { waitAtEnd: true }); // stop dropping, park
+        return opened([event(BigInt(opens))], { throwAfter: 1 }); // one frame, then drop
+      },
+      sleep: async (ms) => {
+        if (ms === 900_000 || ms === 15_000 || ms === 10_000) return void (await never()); // probe + heartbeat park
+        backoffs.push(ms); // reconnect backoff; resolve at once so the retry proceeds
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => backoffs.length === 4);
+    await subject.stop();
+    await running;
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([1n, 2n, 3n, 4n]);
+    // Climbs; the per-frame reset regression would hold every delay at 250.
+    expect(backoffs).toEqual([250, 500, 1_000, 2_000]);
+  });
+
+  test("a drop after a sustained healthy connection resets the reconnect backoff", async () => {
+    const backoffs: number[] = [];
+    let opens = 0;
+    let currentOpen = 0;
+    let clock = 0;
+    const rec = recordingConsumer({
+      handle: async () => {
+        // Make only the 4th connection "healthy": advance the clock past
+        // HEALTHY_STREAM_MS while it is open, so its drop resets the backoff.
+        if (currentOpen === 4) clock += 60_000;
+      },
+    });
+    const subject = await listener({
+      probeIntervalMs: 900_000,
+      now: () => clock,
+      readPage: async (_sessionId, after) => page([], after),
+      openStream: async () => {
+        currentOpen = ++opens;
+        if (opens > 4) return opened([], { waitAtEnd: true });
+        return opened([event(BigInt(opens))], { throwAfter: 1 });
+      },
+      sleep: async (ms) => {
+        if (ms === 900_000 || ms === 15_000 || ms === 10_000) return void (await never());
+        backoffs.push(ms);
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => backoffs.length === 4);
+    await subject.stop();
+    await running;
+
+    // Connections 1–3 flap (zero-duration) and climb; connection 4 stayed open
+    // a healthy while, so its drop resets the backoff back to the floor.
+    expect(backoffs).toEqual([250, 500, 1_000, 250]);
+  });
+
   test("an idx-less lag frame closes the stream and catches up without loss", async () => {
     const rec = recordingConsumer();
     const after: bigint[] = [];
