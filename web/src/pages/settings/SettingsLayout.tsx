@@ -8,6 +8,7 @@ import {
   IdCard,
   Cpu,
   GitPullRequestArrow,
+  RadioTower,
 } from "lucide-react";
 import { Link, Outlet, useRouterState } from "@tanstack/react-router";
 import { useAbility } from "../../auth/AuthProvider";
@@ -38,6 +39,7 @@ const ORG: NavItem[] = [
   { to: "/settings/integrations", label: "Integrations", icon: Plug },
   { to: "/settings/harnesses", label: "Harnesses", icon: Cpu },
   { to: "/settings/profiles", label: "Profiles", icon: IdCard },
+  { to: "/settings/automations", label: "Automations", icon: RadioTower },
   { to: "/settings/reviewed-repos", label: "Reviewed repos", icon: GitPullRequestArrow },
 ];
 
