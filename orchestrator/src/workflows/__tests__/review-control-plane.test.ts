@@ -567,12 +567,13 @@ describe("ReviewControlPlane", () => {
       reviewId: active.id,
       repo: active.repo,
       headSha: active.headSha,
+      prNumber: active.prNumber,
       enabledCategories: ["functional-correctness"],
     });
 
     expect(sessions.execCalls).toEqual([{
       sessionId: "finder-session",
-      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams checkout ${active.headSha}`,
+      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams fetch origin refs/pull/${active.prNumber}/head && git -C /workspace/engrams checkout ${active.headSha}`,
     }]);
     expect(sessions.writeCalls).toHaveLength(1);
     expect(sessions.writeCalls[0]?.files.map((file) => file.path)).toEqual([
@@ -590,10 +591,10 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({ sessions });
 
     await expect(
-      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: "openai/engrams; rm -rf /", headSha: "" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: "openai/engrams; rm -rf /", headSha: "", prNumber: active.prNumber }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     await expect(
-      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: active.repo, headSha: "$(touch pwned)" }),
+      cp.bootstrapFinderSession("finder-session", { reviewId: active.id, repo: active.repo, headSha: "$(touch pwned)", prNumber: active.prNumber }),
     ).rejects.toBeInstanceOf(ReviewSetupError);
     // Nothing was executed for the rejected inputs.
     expect(sessions.execCalls).toEqual([]);
@@ -607,6 +608,7 @@ describe("ReviewControlPlane", () => {
       reviewId: active.id,
       repo: active.repo,
       headSha: "",
+      prNumber: active.prNumber,
     })).rejects.toThrow(/clone denied/);
 
     const writeFailure = makeReviewControlPlane({
@@ -616,6 +618,7 @@ describe("ReviewControlPlane", () => {
       reviewId: active.id,
       repo: active.repo,
       headSha: "",
+      prNumber: active.prNumber,
     })).rejects.toThrow(/disk full/);
   });
 
@@ -639,11 +642,12 @@ describe("ReviewControlPlane", () => {
       reviewId: active.id,
       repo: active.repo,
       headSha: active.headSha,
+      prNumber: active.prNumber,
     });
 
     expect(sessions.execCalls[0]).toEqual({
       sessionId: "verifier-session",
-      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams checkout ${active.headSha}`,
+      command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams fetch origin refs/pull/${active.prNumber}/head && git -C /workspace/engrams checkout ${active.headSha}`,
     });
     const files = sessions.writeCalls[0]?.files ?? [];
     expect(files.map((file) => file.path)).toEqual([

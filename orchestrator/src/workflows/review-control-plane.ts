@@ -83,6 +83,7 @@ export interface ReviewControlPlane {
     reviewId: string;
     repo: string;
     headSha: string;
+    prNumber: number;
     enabledCategories?: readonly ReviewCategory[];
     orgInstructions?: string;
   }): Promise<void>;
@@ -111,6 +112,7 @@ export interface ReviewControlPlane {
     repo: string;
     headSha: string;
     reviewId: string;
+    prNumber: number;
     enabledCategories?: readonly ReviewCategory[];
     orgInstructions?: string;
   }): Promise<void>;
@@ -269,6 +271,7 @@ async function cloneRepo(
   sessionId: string,
   repo: string,
   headSha: string,
+  prNumber: number,
   phase: string,
 ): Promise<void> {
   const name = repoName(repo);
@@ -278,7 +281,18 @@ async function cloneRepo(
   const workspace = `/workspace/${name}`;
   let command = `rm -rf ${workspace} && git clone https://github.com/${repo}.git ${workspace}`;
   if (headSha !== "") {
-    command += ` && git -C ${workspace} checkout ${headSha}`;
+    // A plain clone only has the base repo's branch tips. The pinned head SHA
+    // can live on a fork, a force-pushed/rebased branch, or a branch deleted on
+    // merge (a squash-merged PR's head never lands on the base branch), so a
+    // bare `checkout <sha>` fails with "reference is not a tree". GitHub
+    // advertises refs/pull/<n>/head on the base repo for every PR (forks
+    // included); fetch it so the exact commit and its ancestry are present.
+    if (!Number.isInteger(prNumber) || prNumber <= 0) {
+      throw new ReviewSetupError(`invalid PR number: ${prNumber}`);
+    }
+    command +=
+      ` && git -C ${workspace} fetch origin refs/pull/${prNumber}/head` +
+      ` && git -C ${workspace} checkout ${headSha}`;
   }
 
   const { exitStatus, stderr } = await runExec(sessions, sessionId, command);
@@ -578,7 +592,7 @@ export function makeReviewControlPlane(
 
     async bootstrapFinderSession(sessionId, input) {
       await recordEvent(input.reviewId, "cloning", "finder");
-      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "finder");
+      await cloneRepo(sessions, sessionId, input.repo, input.headSha, input.prNumber, "finder");
 
       const encoder = new TextEncoder();
       const files = renderReviewer({
@@ -688,7 +702,7 @@ export function makeReviewControlPlane(
 
     async bootstrapVerifierSession(sessionId, input) {
       await recordEvent(input.reviewId, "cloning", "verifier");
-      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "verifier");
+      await cloneRepo(sessions, sessionId, input.repo, input.headSha, input.prNumber, "verifier");
 
       const review = await reviews().getReview(input.reviewId);
       if (!review) {
