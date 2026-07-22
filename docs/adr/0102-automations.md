@@ -1,8 +1,10 @@
 # ADR 0102: Automations — triggers that launch sessions
 
-Status: 2026-07-22 — **Proposed.** This ADR opens the Automations v1 phase
-chain. The design is approved; implementation, production validation, and the
-final commit chain will be recorded here before it moves to Accepted.
+Status: 2026-07-22 — **Accepted.** Shipped end to end and validated against
+production the same day (see §Implementation record): cron fires, generic
+signed webhooks, GitHub App forwarding, strict rendering with redaction, and
+occurrence-level idempotency were each exercised on the live stack before
+this flip.
 
 Builds on ADR 0051 (the TypeScript orchestration tier and its
 webhook → task → durable-workflow → session boundary), ADR 0056 (generic
@@ -386,6 +388,66 @@ event matching, cron/timezone computation, lease races, deterministic duplicate
 behavior after SUCCESS and ERROR, null-owner/org-credential selection, and
 render-failure-launches-nothing. The e2e stack covers both a signed synthetic
 webhook and a near-future cron occurrence through task + session creation.
+
+## Implementation record (2026-07-22)
+
+**PR chain** (each phase one PR, adversarially reviewed before push):
+
+- #859 — this ADR (Proposed).
+- #860 — schema, strict LiquidJS templating, connector webhook facet,
+  `AutomationService` + `WebhookRegistrationService` (review finding fixed
+  pre-push: registration deletion originally orphaned bound automations).
+- #861 — lease-claimed cron scheduler + `AutomationRunWorkflow`.
+- #863 — `/settings/automations` UI (editor, sample-backed variable picker,
+  TestRender preview, one-time secret display, run history).
+- #864 — bounded body reader, verification strategies, generic
+  `/api/v1/hooks/:id` ingress, exact IAP matcher, GitHub `github-app`
+  forwarding, e2e stack scenarios.
+- #866 — post-validation fix (below). engrams-internal #103 — the
+  `/api/v1/hooks/` Prefix ingress rule.
+
+**Divergences from the proposal, discovered while building:**
+
+- The `automation_run` row itself is the cron occurrence lease (partial
+  unique index on `(automation_id, scheduled_for)` + lease columns) — simpler
+  than the separate lease table §4 sketched, same crash-recovery semantics.
+- The `github-app` system registration has no PG row, so sample persistence
+  is skipped for it; GitHub's curated facet aliases carry the variable
+  picker until the end-state system-registration rows exist.
+- Redacted payloads must be plain prototype-full objects: Drizzle's entity
+  check dereferences `Object.getPrototypeOf(value)` on inserted fields, so
+  the original null-prototype redaction maps made the sample insert throw
+  (caught by the e2e stack lane, which the unit lane cannot catch — the
+  insert only runs against live PG). Pollution-vector keys are dropped
+  outright instead.
+- CI lessons now encoded in tests: nextest runs test binaries with cwd = the
+  crate root (the Tilt-seeded api key resolves via `CARGO_MANIFEST_DIR`);
+  Connect's proto3 JSON omits empty repeated fields (a missing `runs` array
+  is "no runs yet", not an error); an e2e cron automation must be disabled
+  the moment its wait resolves or its refires starve the shared stack of
+  host capacity.
+
+**Production validation** (all on the live GCP stack): a `* * * * *` cron
+automation fired once on schedule and launched a real session through a full
+agent run; a generic registration accepted a signed delivery (tampered
+signature 401), rendered `event.raw` interpolation plus the labeled event
+context with secret keys redacted, and three identical deliveries produced
+exactly one run; a real GitHub `pull_request.opened` delivery through the
+installed App launched a run with curated aliases rendered while a draft PR
+correctly bypassed PR review; `TestRender` rendered a captured sample
+through the public API. Validation also caught one regression in the wild —
+phase 4 had reused the deletion-guard query for dispatch and tightened it to
+`enabled = true`, so a *disabled* (paused, still bound) automation no longer
+blocked registration deletion and the cascade destroyed its samples. #866
+split the query into `listBoundToWebhookRegistration` (guard) and
+`listEnabledForWebhookRegistration` (dispatch), with the prod repro pinned
+as a regression test and the fix re-verified against production after the
+roll.
+
+**Known deployment gap:** the installed GitHub App subscribes only to the
+PR-review event set, so `issues.*` events are never delivered — enabling
+Issues permission + event subscription on the App is an org-admin action,
+tracked as a follow-up.
 
 ## Follow-ups (designed-for, not built)
 
