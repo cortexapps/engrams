@@ -626,3 +626,217 @@ async fn sigterm_overrun_spools_dirty_writes_and_successor_adopts_them() {
     tokio::time::sleep(Duration::from_millis(100)).await;
     let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(index);
 }
+
+/// 2026-07-21 session-af28cac4 regression: a SIGTERM final flush that
+/// OVERRUNS its deadline must be ABORTED and reaped before
+/// `flush_nbd_data_planes_for_shutdown` returns — never left running
+/// detached. Dropping the join future alone leaves the `tokio::spawn`'d
+/// flush alive: it finishes its upload AFTER the abandon sweep's spool
+/// export has snapshotted the dirty/pending tiers and read the manifest
+/// head, then rebases + publishes the next version to coord. The spool on
+/// disk is now stamped one version BEHIND the ref coord hands the
+/// successor, the `shutdown-spool-lineage-mismatch` gate refuses it, and
+/// the live guest's acked writes are rolled back under it (in prod: spool
+/// v367 vs published v368, 49 chunks / 822 MiB preserved-but-not-adopted).
+///
+/// Rig: park the final flush at the post-upload/pre-publish seam (the
+/// prod shape was a 318 MiB GCS upload still in flight at the 20 s
+/// budget), let the deadline overrun, run the abandon sweep, THEN release
+/// the seam. On fixed code the flush task is already dead: nothing may
+/// advance the manifest or reach coord after the deadline, and the spool
+/// stamp equals the head the export saw.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires Linux + modprobe nbd + writable /dev/nbd0 (root)"]
+async fn sigterm_overrun_aborts_inflight_flush_so_the_spool_stamp_cannot_go_stale() {
+    let nbd_path = match preflight() {
+        Some(p) => p,
+        None => return,
+    };
+    let index = nbd_index(&nbd_path);
+
+    let work = tempfile::tempdir().expect("tempdir");
+    let checkpoints = work.path().join("checkpoints");
+
+    let chunk_size = 4 * 1024 * 1024usize;
+    let image = work.path().join("disk.img");
+    std::fs::write(&image, vec![0u8; chunk_size]).expect("write image");
+
+    let blob: Arc<dyn BlobStorage> = Arc::new(LocalBlobStorage::new(work.path().join("blob")));
+    let store = ChunkStore::new(blob);
+    let manifest = store
+        .chunk_file(&image, ManifestKind::Disk, None)
+        .await
+        .expect("chunk image");
+    let disk_ref = ManifestRef::new();
+    store
+        .put_manifest(disk_ref, &manifest)
+        .await
+        .expect("put manifest");
+
+    let mut cache_cfg = ChunkCacheConfig::new(work.path().join("chunk-cache"));
+    cache_cfg.budget_bytes = 64 * 1024 * 1024;
+    let cache = ChunkCache::new(cache_cfg);
+
+    let snapshot_id = engram_core::SnapshotId::new();
+    let staging_root = work.path().join("fc-snaps");
+    let snap_dir = staging_root.join(snapshot_id.to_string());
+    std::fs::create_dir_all(&snap_dir).expect("snap dir");
+    let sidecar = serde_json::json!({
+        "sandbox_id": uuid::Uuid::new_v4(),
+        "created_at": chrono::Utc::now(),
+        "spec": {
+            "image": "t", "rootfs_source": null, "image_uri": null,
+            "harness_pack_uri": null, "cpu": {"vcpus": 1},
+            "memory": {"max_mib": 64}, "disk": {"max_gib": 1},
+            "ttl": null, "env": {}, "workdir": null,
+            "harness_substrate": null, "network": {}
+        },
+        "format": "fc"
+    });
+    std::fs::write(
+        snap_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&sidecar).unwrap(),
+    )
+    .expect("write sidecar");
+    std::fs::write(snap_dir.join("state.bin"), b"state").expect("write state");
+
+    let restored_id = SandboxId::new();
+    let inner: Arc<dyn SandboxBackend> = Arc::new(ImmediateInner {
+        staging_root,
+        restored_id,
+        rootfs_dev: None,
+    });
+
+    // Mock coord: the pre-fix failure mode is a publish landing AFTER the
+    // deadline — record every publish so the test can assert none arrive.
+    let (tx, mut rx) = mpsc::unbounded_channel::<RecordedPublish>();
+    let app = Router::new()
+        .route(
+            "/api/v1/hosts/:host_id/live-manifest",
+            post(live_manifest_handler),
+        )
+        .with_state(tx);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock coord");
+    let coord_addr = listener.local_addr().expect("addr");
+    let coord_server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let pool = NbdSlotAllocator::from_paths(vec![nbd_path.clone()]).expect("pool");
+    let host_id = engram_core::HostId::new();
+    let coord: Arc<dyn engram_host_core::CoordControlPlane> =
+        Arc::new(HttpCoordClient::new(format!("http://{coord_addr}"), None));
+
+    let pooled = Arc::new(
+        PooledBackend::new(inner)
+            .with_chunk_store(store.clone(), work.path().join("mat"))
+            .with_chunk_cache(cache)
+            .with_nbd_pool(pool)
+            .with_checkpoint_dir(checkpoints.clone())
+            .with_live_manifest_coord_publisher(coord, host_id),
+    );
+
+    let metadata = SnapshotMetadata {
+        id: snapshot_id,
+        size_bytes: chunk_size as u64,
+        created_at: chrono::Utc::now(),
+        image_version: "t".into(),
+        disk_manifest: Some(disk_ref),
+        memory_manifest: None,
+        base_memory_manifest: None,
+        migration_source: None,
+        source_sandbox_id: None,
+        state_blob_key: None,
+        sidecar_blob_key: None,
+        rootfs_blob_key: None,
+        working_set_blob_key: None,
+        aux_bundles: vec![],
+        paused_at: None,
+        peer_hints: Vec::new(),
+    };
+    let restored = pooled.restore(metadata).await.expect("restore");
+    assert_eq!(restored, restored_id);
+
+    let session_id = SessionId::new();
+    pooled.__test_bind_session(restored_id, session_id);
+
+    let backend = pooled
+        .__test_nbd_backend(restored_id)
+        .expect("live backend for survivor");
+    let marker = vec![0xEFu8; chunk_size];
+    backend.write(0, &marker).await.expect("dirty write");
+    let pre_flush_ref = backend.manifest_ref().await;
+
+    // Park the final flush after its upload, before the publish/rebase —
+    // guaranteeing it cannot finish inside the deadline.
+    let (arrived, proceed) = backend.arm_flush_seam(
+        engram_host_agent::disk_daemon::backend::FlushSeamPoint::PostUploadPrePublish,
+    );
+
+    pooled
+        .flush_nbd_data_planes_for_shutdown(Duration::from_secs(2))
+        .await;
+
+    // The overrun must have been a parked IN-FLIGHT flush, not one that
+    // never started (`arrived` holds a permit once the seam fired).
+    tokio::time::timeout(Duration::from_secs(1), arrived.notified())
+        .await
+        .expect("rig failure: the final flush never reached the parked seam");
+
+    // Prod ordering: the abandon sweep exports the spool next.
+    let abandoned = pooled.abandon_nbd_data_planes_for_shutdown().await;
+    assert_eq!(abandoned, 1);
+
+    // Release the seam. On fixed code the flush task was aborted + reaped
+    // before `flush_nbd_data_planes_for_shutdown` returned, so this is a
+    // no-op. The pre-fix detached task resumes HERE: it publishes the next
+    // manifest version, rebases the backend, and tells coord — stranding
+    // the just-written spool one version behind.
+    proceed.notify_one();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let spool_root = checkpoints.join("spool");
+    let (spool_meta, spooled) = engram_host_agent::disk_daemon::spool::read_spool(
+        &engram_host_core::TokioFs,
+        &spool_root,
+        restored_id,
+    )
+    .await
+    .expect("spool readable")
+    .expect("overrun abandon must write a spool");
+    assert_eq!(spooled.len(), 1, "one un-published chunk rides the spool");
+    assert_eq!(
+        &spooled[0].1[..],
+        &marker[..],
+        "the spool must carry the acked marker bytes",
+    );
+
+    // Nothing may advance past the spool's stamp after the deadline.
+    assert_eq!(
+        backend.manifest_ref().await,
+        pre_flush_ref,
+        "af28cac4 RCA: an aborted final flush must not rebase the manifest \
+         after the deadline — a post-deadline rebase is the detached task \
+         still running",
+    );
+    assert_eq!(
+        spool_meta.manifest_ref(),
+        pre_flush_ref,
+        "the spool stamp must equal the head the export saw",
+    );
+    assert!(
+        rx.try_recv().is_err(),
+        "af28cac4 RCA: an aborted final flush must not publish to coord \
+         after the deadline — a post-deadline publish strands the spool \
+         stamp BEHIND coord's ref, and the successor's \
+         shutdown-spool-lineage-mismatch gate then refuses the only copy \
+         of the guest's acked writes",
+    );
+
+    drop(pooled);
+    coord_server.abort();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let _ = engram_host_agent::disk_daemon::nbd_netlink::disconnect_device(index);
+}
