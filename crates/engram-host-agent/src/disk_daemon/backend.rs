@@ -853,6 +853,31 @@ impl ChunkedDiskBackend {
             .sum()
     }
 
+    /// Total un-uploaded bytes across BOTH local tiers (dirty +
+    /// pending). The SIGTERM overrun straggler log uses this rather
+    /// than [`Self::dirty_bytes`]: an aborted final flush leaves its
+    /// drained chunks in `pending_uploads`, which are exactly as
+    /// un-uploaded as dirty ones. A chunk present in both tiers (a
+    /// guest re-write after a drain) is counted twice — acceptable for
+    /// a visibility log's upper bound, not for accounting.
+    pub async fn unflushed_bytes(&self) -> u64 {
+        let dirty: u64 = self
+            .dirty
+            .lock()
+            .await
+            .values()
+            .map(|v| v.len() as u64)
+            .sum();
+        let pending: u64 = self
+            .pending_uploads
+            .lock()
+            .await
+            .values()
+            .map(|(_hash, bytes)| bytes.len() as u64)
+            .sum();
+        dirty + pending
+    }
+
     /// Unix-millis timestamp of the most recent successful `flush()`
     /// completion (any outcome, including zero-chunk flushes — the
     /// signal is "we last verified durability at time T", not "we
@@ -1104,6 +1129,17 @@ impl ChunkedDiskBackend {
     /// afterwards already covers it — nothing is ever missed, at worst
     /// a chunk is exported redundantly (adoption re-uploads idempotent
     /// content-addressed bytes).
+    ///
+    /// The copy order buys SELF-consistency only, not consistency with
+    /// the coordinator: a racing flush that rebases + publishes AFTER
+    /// our ref read leaves the export stamped one version BEHIND the
+    /// ref coord holds, and the successor's lineage gate refuses a
+    /// behind-stamped spool (2026-07-21 session-af28cac4 RCA — acked
+    /// writes rolled back under a live guest). The SIGTERM path
+    /// therefore aborts + reaps every in-flight final-flush task before
+    /// the abandon sweep calls this (see
+    /// `flush_nbd_data_planes_for_shutdown`); the copy order stays as
+    /// defense-in-depth.
     pub async fn export_unflushed(&self) -> (ManifestRef, Vec<(usize, Vec<u8>)>) {
         let mut chunks: HashMap<usize, Vec<u8>> = self.dirty.lock().await.clone();
         {

@@ -3985,10 +3985,13 @@ impl PooledBackend {
     /// sweep still runs afterward to leave the kernel-side devices
     /// alive for the successor. The whole pass is budgeted against
     /// `deadline` (derived from the pod's `terminationGracePeriodSeconds`
-    /// minus headroom). Any sandbox not flushed within the budget is
-    /// logged LOUDLY with its id + dirty byte count so the (now bounded)
-    /// loss is at least visible — it is then abandoned dirty by the
-    /// following sweep, exactly as before this fix.
+    /// minus headroom). Any sandbox not flushed within the budget has its
+    /// flush task ABORTED and reaped before this returns — never left
+    /// running detached, where it would race the abandon sweep's spool
+    /// export and stamp the spool with a stale manifest head (2026-07-21
+    /// session-af28cac4 RCA) — and is logged LOUDLY with its id + dirty
+    /// byte count so the (now bounded) GCS-durability gap is visible; it
+    /// is then abandoned dirty by the following sweep, which spools it.
     ///
     /// The synchronous coord publish is deliberate: the normal flush
     /// path publishes via the async `live_manifest_publisher`, whose
@@ -4026,166 +4029,198 @@ impl PooledBackend {
             "SIGTERM: final disk-flush pass over surviving NBD data planes",
         );
 
-        // Fan out one flush future per sandbox; each resolves the
+        // Fan out one flush task per sandbox; each resolves the
         // session binding + does the synchronous coord publish itself.
         // Budget the WHOLE fan-out against `deadline` — a single
         // tokio::time::timeout around the join handles the per-sandbox
-        // parallelism + the global cap in one place.
+        // parallelism + the global cap in one place. The JoinHandles
+        // deliberately live OUTSIDE the timed future: on overrun the
+        // tasks must be ABORTED, not merely no-longer-awaited (see the
+        // overrun arm below).
         let publish = self.shutdown_manifest_publish.clone();
         let session_bindings = self.session_bindings.clone();
-        let flush_all = async move {
-            let mut tasks = Vec::with_capacity(entries.len());
-            for (sandbox_id, backend, device) in entries {
-                let publish = publish.clone();
-                let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
-                tasks.push(tokio::spawn(async move {
-                    // 2026-07-16 RCA: FC's drive is buffered host I/O with
-                    // cache_type=Unsafe, so guest-acked writes can still be
-                    // sitting in the HOST page cache for /dev/nbdN — a tier
-                    // the dirty-map flush below never sees, and one the
-                    // pod-handoff dead-connection window can silently drop
-                    // (`lost async page write`). Force it down into the
-                    // daemon's dirty tier NOW, while our serve loop is
-                    // still alive to ack the writeback (the checkpoint path
-                    // does the same). Routed through the DeviceSync seam
-                    // (ADR 0098 P4) — a spawn_blocking open+sync_all; a
-                    // join/sync failure is warn-and-proceed. O_DIRECT here
-                    // is a no-op (see `device_sync`), so the sync path is
-                    // unchanged.
-                    if let Err(e) = crate::device_sync::HostDeviceSync
-                        .sync_device(&device)
-                        .await
-                    {
+        let mut tasks = Vec::with_capacity(entries.len());
+        for (sandbox_id, backend, device) in entries {
+            let publish = publish.clone();
+            let session_id = session_bindings.get(&sandbox_id).map(|e| *e);
+            tasks.push(tokio::spawn(async move {
+                // 2026-07-16 RCA: FC's drive is buffered host I/O with
+                // cache_type=Unsafe, so guest-acked writes can still be
+                // sitting in the HOST page cache for /dev/nbdN — a tier
+                // the dirty-map flush below never sees, and one the
+                // pod-handoff dead-connection window can silently drop
+                // (`lost async page write`). Force it down into the
+                // daemon's dirty tier NOW, while our serve loop is
+                // still alive to ack the writeback (the checkpoint path
+                // does the same). Routed through the DeviceSync seam
+                // (ADR 0098 P4) — a spawn_blocking open+sync_all; a
+                // join/sync failure is warn-and-proceed. O_DIRECT here
+                // is a no-op (see `device_sync`), so the sync path is
+                // unchanged.
+                if let Err(e) = crate::device_sync::HostDeviceSync
+                    .sync_device(&device)
+                    .await
+                {
+                    tracing::warn!(
+                        %sandbox_id,
+                        device = %device.display(),
+                        error = %e,
+                        "SIGTERM final flush: host page-cache sync of the NBD \
+                         device failed; proceeding (pages left behind will ride \
+                         the kernel's dead-conn parking to the successor)",
+                    );
+                }
+                // Quiesce the virtio → kernel-NBD → daemon pipeline so
+                // the flush captures the just-acked disk state, then
+                // drain + upload + rebase. `flush` no-ops (zero chunks)
+                // when the dirty tier is empty — cheap for quiescent
+                // survivors.
+                backend.wait_idle().await;
+                // ADR 0098 P4: the per-survivor disposition is the pure
+                // `classify_survivor` decision; the driver only sequences
+                // the effects off its verdict.
+                let bound_publish = publish.zip(session_id);
+                let outcome = match backend.flush().await {
+                    Ok(o) => o,
+                    Err(e) => {
+                        // FlushProbe::FlushError ⇒ RelyOnSpool: the abandon
+                        // sweep's spool export is the durability backstop.
                         tracing::warn!(
                             %sandbox_id,
-                            device = %device.display(),
                             error = %e,
-                            "SIGTERM final flush: host page-cache sync of the NBD \
-                             device failed; proceeding (pages left behind will ride \
-                             the kernel's dead-conn parking to the successor)",
-                        );
-                    }
-                    // Quiesce the virtio → kernel-NBD → daemon pipeline so
-                    // the flush captures the just-acked disk state, then
-                    // drain + upload + rebase. `flush` no-ops (zero chunks)
-                    // when the dirty tier is empty — cheap for quiescent
-                    // survivors.
-                    backend.wait_idle().await;
-                    // ADR 0098 P4: the per-survivor disposition is the pure
-                    // `classify_survivor` decision; the driver only sequences
-                    // the effects off its verdict.
-                    let bound_publish = publish.zip(session_id);
-                    let outcome = match backend.flush().await {
-                        Ok(o) => o,
-                        Err(e) => {
-                            // FlushProbe::FlushError ⇒ RelyOnSpool: the abandon
-                            // sweep's spool export is the durability backstop.
-                            tracing::warn!(
-                                %sandbox_id,
-                                error = %e,
-                                "SIGTERM final flush failed; survivor's un-uploaded \
-                                 writes ride the shutdown spool to the successor",
-                            );
-                            return;
-                        }
-                    };
-                    let action = engram_host_core::classify_survivor(
-                        engram_host_core::FlushProbe::Flushed {
-                            chunks_flushed: outcome.chunks_flushed,
-                            bound: bound_publish.is_some(),
-                        },
-                    );
-                    match action {
-                        // Already clean — nothing new to publish.
-                        engram_host_core::SurvivorAction::SkipClean => return,
-                        // Unreachable for a `Flushed` probe (only `FlushError`
-                        // maps to RelyOnSpool, and that returned above); keep
-                        // the arm so the match stays exhaustive.
-                        engram_host_core::SurvivorAction::RelyOnSpool => return,
-                        engram_host_core::SurvivorAction::DurableNoPublish
-                        | engram_host_core::SurvivorAction::Publish => {}
-                    }
-                    tracing::info!(
-                        %sandbox_id,
-                        chunks = outcome.chunks_flushed,
-                        bytes = outcome.bytes_uploaded,
-                        manifest_version = outcome.manifest_ref.version,
-                        "SIGTERM final flush uploaded survivor's dirty chunks",
-                    );
-                    // Synchronously publish so the successor rehydrates
-                    // from the just-uploaded ref instead of the stale one.
-                    let Some(((coord, host_id), session_id)) = bound_publish else {
-                        // DurableNoPublish: no coord wired, or the sandbox
-                        // isn't bound to a session yet (warm-pool /
-                        // pre-start_agent window). The chunks are durable in
-                        // GCS regardless; the publish is what we cannot do here.
-                        tracing::debug!(
-                            %sandbox_id,
-                            "SIGTERM final flush: chunks durable in GCS but no \
-                             coord publish (unbound sandbox or no publisher)",
+                            "SIGTERM final flush failed; survivor's un-uploaded \
+                             writes ride the shutdown spool to the successor",
                         );
                         return;
-                    };
-                    let req = engram_host_core::LiveManifestPublishRequest {
-                        session_id,
-                        sandbox_id,
-                        manifest_id: outcome.manifest_ref.manifest_id,
-                        manifest_version: outcome.manifest_ref.version,
-                    };
-                    match coord.publish_live_manifest(host_id, &req).await {
-                        Ok(_) => tracing::info!(
-                            %sandbox_id,
-                            %session_id,
-                            manifest_version = outcome.manifest_ref.version,
-                            "SIGTERM final flush: live_disk_manifest published to coord",
-                        ),
-                        // A publish failure falls back to the same RelyOnSpool
-                        // posture: the shutdown spool's store-ahead ref covers
-                        // a same-node successor.
-                        Err(e) => tracing::warn!(
-                            %sandbox_id,
-                            %session_id,
-                            error = %e,
-                            "SIGTERM final flush: chunks uploaded to GCS but coord \
-                             publish failed; the shutdown spool's store-ahead ref \
-                             covers a same-node successor",
-                        ),
                     }
-                }));
-            }
-            for t in tasks {
+                };
+                let action =
+                    engram_host_core::classify_survivor(engram_host_core::FlushProbe::Flushed {
+                        chunks_flushed: outcome.chunks_flushed,
+                        bound: bound_publish.is_some(),
+                    });
+                match action {
+                    // Already clean — nothing new to publish.
+                    engram_host_core::SurvivorAction::SkipClean => return,
+                    // Unreachable for a `Flushed` probe (only `FlushError`
+                    // maps to RelyOnSpool, and that returned above); keep
+                    // the arm so the match stays exhaustive.
+                    engram_host_core::SurvivorAction::RelyOnSpool => return,
+                    engram_host_core::SurvivorAction::DurableNoPublish
+                    | engram_host_core::SurvivorAction::Publish => {}
+                }
+                tracing::info!(
+                    %sandbox_id,
+                    chunks = outcome.chunks_flushed,
+                    bytes = outcome.bytes_uploaded,
+                    manifest_version = outcome.manifest_ref.version,
+                    "SIGTERM final flush uploaded survivor's dirty chunks",
+                );
+                // Synchronously publish so the successor rehydrates
+                // from the just-uploaded ref instead of the stale one.
+                let Some(((coord, host_id), session_id)) = bound_publish else {
+                    // DurableNoPublish: no coord wired, or the sandbox
+                    // isn't bound to a session yet (warm-pool /
+                    // pre-start_agent window). The chunks are durable in
+                    // GCS regardless; the publish is what we cannot do here.
+                    tracing::debug!(
+                        %sandbox_id,
+                        "SIGTERM final flush: chunks durable in GCS but no \
+                         coord publish (unbound sandbox or no publisher)",
+                    );
+                    return;
+                };
+                let req = engram_host_core::LiveManifestPublishRequest {
+                    session_id,
+                    sandbox_id,
+                    manifest_id: outcome.manifest_ref.manifest_id,
+                    manifest_version: outcome.manifest_ref.version,
+                };
+                match coord.publish_live_manifest(host_id, &req).await {
+                    Ok(_) => tracing::info!(
+                        %sandbox_id,
+                        %session_id,
+                        manifest_version = outcome.manifest_ref.version,
+                        "SIGTERM final flush: live_disk_manifest published to coord",
+                    ),
+                    // A publish failure falls back to the same RelyOnSpool
+                    // posture: the shutdown spool's store-ahead ref covers
+                    // a same-node successor.
+                    Err(e) => tracing::warn!(
+                        %sandbox_id,
+                        %session_id,
+                        error = %e,
+                        "SIGTERM final flush: chunks uploaded to GCS but coord \
+                         publish failed; the shutdown spool's store-ahead ref \
+                         covers a same-node successor",
+                    ),
+                }
+            }));
+        }
+        let join_all = async {
+            for t in tasks.iter_mut() {
                 let _ = t.await;
             }
         };
 
-        if tokio::time::timeout(deadline, flush_all).await.is_err() {
-            // Deadline overrun: some survivors were not GCS-flushed in
-            // time. This is no longer a data-loss event: the abandon
-            // sweep that runs next exports every still-dirty tier to the
-            // node-local shutdown spool (2026-07-16 RCA), and the
-            // successor adopts it. Log the stragglers so the GCS-side
-            // durability gap on this node stays visible.
+        let overran = tokio::time::timeout(deadline, join_all).await.is_err();
+        if overran {
+            // Deadline overrun: ABORT the in-flight flush tasks and reap
+            // each one before returning, so the abandon sweep that runs
+            // next can never race a still-live flush. Dropping the join
+            // future alone left the tokio::spawn'd flushes running
+            // DETACHED (2026-07-21 session-af28cac4 RCA): a detached
+            // final flush rebased + published v368 while the sweep's
+            // spool export had already snapshotted the dirty tier and
+            // then stamped the spool with the pre-rebase v367 head — the
+            // successor refused the behind-stamped spool per the
+            // `shutdown-spool-lineage-mismatch` gate and rolled the live
+            // guest's acked writes back under it. Aborting is safe at
+            // every await point in the flush pipeline: the manifest-ref
+            // rebase precedes the pending-tier drop, so a killed flush
+            // at worst leaves chunks to be exported redundantly
+            // (content-addressed, idempotent) or a store-ahead manifest
+            // the adopt gate's `>=` arm already covers. The almost-done
+            // upload's progress is forfeit — acceptable: those bytes
+            // ride the spool instead, which is what the post-deadline
+            // grace headroom exists for.
+            for t in &tasks {
+                t.abort();
+            }
+            for t in tasks.iter_mut() {
+                let _ = t.await;
+            }
+            // Some survivors were not GCS-flushed in time. This is not a
+            // data-loss event: the abandon sweep that runs next exports
+            // every still-dirty tier to the node-local shutdown spool
+            // (2026-07-16 RCA), and the successor adopts it. Log the
+            // stragglers so the GCS-side durability gap on this node
+            // stays visible.
             // INVARIANT (see `nbd_sandboxes`): snapshot id+backend Arcs out
             // of the map, then `.await` on the owned Arcs — never hold a
-            // DashMap guard across the `dirty_bytes` await.
+            // DashMap guard across the `unflushed_bytes` await.
             let stragglers: Vec<(SandboxId, Arc<crate::disk_daemon::ChunkedDiskBackend>)> = self
                 .nbd_sandboxes
                 .iter()
                 .map(|e| (*e.key(), e.value().backend.clone()))
                 .collect();
             for (sandbox_id, backend) in stragglers {
-                let dirty = backend.dirty_bytes().await;
+                // `unflushed_bytes`, not `dirty_bytes`: an aborted flush
+                // that got past its drain left the chunks in
+                // `pending_uploads` — just as un-uploaded, and exactly
+                // the bytes the spool is about to carry.
+                let unflushed = backend.unflushed_bytes().await;
                 // ADR 0098 P4: `is_straggler` is the pure deadline-overrun
                 // decision (still-dirty at the deadline ⇒ loud, the spool
                 // catches it).
-                if engram_host_core::is_straggler(dirty) {
+                if engram_host_core::is_straggler(unflushed) {
                     tracing::warn!(
                         %sandbox_id,
-                        dirty_bytes = dirty,
+                        unflushed_bytes = unflushed,
                         deadline_secs = deadline.as_secs_f64(),
                         "SIGTERM final flush DEADLINE OVERRUN: survivor still has \
-                         un-uploaded dirty bytes; they will be preserved in the \
-                         shutdown spool for the successor to adopt",
+                         un-uploaded (dirty + pending) bytes; the aborted flush's \
+                         work rides the shutdown spool for the successor to adopt",
                     );
                 }
             }
