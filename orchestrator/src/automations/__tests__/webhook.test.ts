@@ -112,6 +112,18 @@ describe("webhook payload redaction", () => {
       a: { b: "[REDACTED: depth limit]" },
     });
   });
+
+  test("output is a plain prototype-full object with pollution keys dropped", () => {
+    // Drizzle's entity check dereferences Object.getPrototypeOf(value) on
+    // every inserted field; a null-prototype payload map made the webhook
+    // sample insert throw and the ingress 500 (caught by the e2e stack lane).
+    const hostile = JSON.parse('{"__proto__":{"polluted":1},"constructor":{"x":1},"ok":{"deep":true}}');
+    const redacted = redactWebhookPayload(hostile);
+    expect(Object.getPrototypeOf(redacted)).toBe(Object.prototype);
+    expect(Object.getPrototypeOf(redacted["ok"])).toBe(Object.prototype);
+    expect(Object.keys(redacted)).toEqual(["ok"]);
+    expect(({} as Record<string, unknown>)["polluted"]).toBeUndefined();
+  });
 });
 
 describe("webhook filter semantics", () => {

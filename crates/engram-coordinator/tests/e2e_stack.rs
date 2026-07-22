@@ -893,7 +893,22 @@ impl OrchestratorDriver {
             .to_string()
     }
 
-    async fn wait_for_launched_run(&self, automation_id: &str, timeout: Duration) -> Value {
+    async fn set_automation_enabled(&self, automation_id: &str, enabled: bool) {
+        self.rpc(
+            "AutomationService",
+            "SetAutomationEnabled",
+            json!({ "id": automation_id, "enabled": enabled }),
+        )
+        .await;
+    }
+
+    /// Returns Err instead of panicking so callers can disable the automation
+    /// (stopping further fires against the shared stack) before failing.
+    async fn wait_for_launched_run(
+        &self,
+        automation_id: &str,
+        timeout: Duration,
+    ) -> Result<Value, String> {
         let deadline = tokio::time::Instant::now() + timeout;
         loop {
             let response = self
@@ -903,23 +918,26 @@ impl OrchestratorDriver {
                     json!({ "automationId": automation_id, "limit": 10 }),
                 )
                 .await;
-            for run in response["runs"]
-                .as_array()
-                .expect("ListAutomationRuns response runs")
-            {
+            // Connect's proto3 JSON omits an empty repeated field entirely, so
+            // a missing `runs` before the first fire is normal, not an error.
+            static EMPTY: Vec<Value> = Vec::new();
+            for run in response["runs"].as_array().unwrap_or(&EMPTY) {
                 match run["status"].as_str() {
-                    Some("launched") => return run.clone(),
+                    Some("launched") => return Ok(run.clone()),
                     Some("render_failed" | "launch_failed" | "skipped") => {
-                        panic!("automation {automation_id} terminated without launch: {run}")
+                        return Err(format!(
+                            "automation {automation_id} terminated without launch: {run}"
+                        ));
                     }
                     _ => {}
                 }
             }
-            assert!(
-                tokio::time::Instant::now() < deadline,
-                "automation {automation_id} did not launch within {}s",
-                timeout.as_secs()
-            );
+            if tokio::time::Instant::now() >= deadline {
+                return Err(format!(
+                    "automation {automation_id} did not launch within {}s",
+                    timeout.as_secs()
+                ));
+            }
             tokio::time::sleep(Duration::from_secs(1)).await;
         }
     }
@@ -1047,9 +1065,13 @@ async fn e2e_automation_webhook_launches_session() {
     orchestrator
         .post_generic_hook(&registration_id, secret, r#"{"incident":{"id":42}}"#)
         .await;
-    let run = orchestrator
+    let waited = orchestrator
         .wait_for_launched_run(&automation_id, DEFAULT_TIMEOUT)
         .await;
+    orchestrator
+        .set_automation_enabled(&automation_id, false)
+        .await;
+    let run = waited.unwrap_or_else(|error| panic!("{error}"));
     assert_eq!(run["renderedPrompt"], "Webhook incident 42");
     let session_id = orchestrator.assert_task_session(&run).await;
     coordinator.delete(session_id).await;
@@ -1081,9 +1103,17 @@ async fn e2e_automation_cron_launches_session() {
         )
         .await;
 
-    let run = orchestrator
+    // A */5s cron refires for as long as it stays enabled: disable it the
+    // moment the wait resolves — success or not — or the leftover automation
+    // keeps launching sessions and starves every later test of host capacity
+    // (exactly what happened on the first CI run of this test).
+    let waited = orchestrator
         .wait_for_launched_run(&automation_id, DEFAULT_TIMEOUT)
         .await;
+    orchestrator
+        .set_automation_enabled(&automation_id, false)
+        .await;
+    let run = waited.unwrap_or_else(|error| panic!("{error}"));
     let scheduled_for = run["scheduledFor"]
         .as_str()
         .expect("cron automation run scheduledFor");

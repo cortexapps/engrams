@@ -19,6 +19,7 @@ import { checkDb, getDb } from "../db/client.ts";
 import { task, taskSession, profile } from "../db/schema.ts";
 import { webhookRegistration } from "../db/schema.ts";
 import { makeAutomationStore } from "../db/automations.ts";
+import { redactWebhookPayload } from "../automations/webhook.ts";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { buildServer } from "../server.ts";
@@ -159,7 +160,10 @@ describe("live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
           await store.recordWebhookSample({
             registrationId,
             eventKey: "incident.opened",
-            payload: { sequence: i },
+            // Route through the real redactor: its output shape (not a
+            // hand-built literal) is what the ingress actually inserts, and
+            // its former null-prototype maps broke this insert (e2e 500).
+            payload: redactWebhookPayload({ sequence: i, token: "drop-me" }),
             receivedAt: new Date(1_700_000_000_000 + i),
             retain: 20,
           });

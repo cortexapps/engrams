@@ -142,8 +142,13 @@ export function redactWebhookPayload(
     if (typeof current !== "object" || current === null) return current;
     if (depth >= maxDepth) return "[REDACTED: depth limit]";
     if (Array.isArray(current)) return current.map((item) => visit(item, depth + 1));
-    const output: Record<string, unknown> = Object.create(null);
+    // Plain (prototype-full) objects: the redacted payload is persisted via
+    // Drizzle, whose entity check dereferences Object.getPrototypeOf(value)
+    // and throws on null-prototype maps. Pollution-vector keys are dropped
+    // outright instead, so no attacker key can ever become a prototype.
+    const output: Record<string, unknown> = {};
     for (const [key, child] of Object.entries(current)) {
+      if (UNSAFE_PATH_SEGMENTS.has(key)) continue;
       if (!isSecretKey(key)) output[key] = visit(child, depth + 1);
     }
     return output;
