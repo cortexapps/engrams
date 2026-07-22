@@ -18,6 +18,7 @@ import integrationOauthRoute from "./routes/integration-oauth.ts";
 import slackEventsRoute from "./routes/slack-events.ts";
 import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import githubEventsRoute from "./routes/github-events.ts";
+import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
 // Side-effect import: registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
@@ -122,6 +123,9 @@ app.route("/", slackInteractivityRoute);
 // ADR 0100: GitHub's signed webhook and the bearer-authenticated CI trigger
 // converge on the same durable per-PR workflow.
 app.route("/", githubEventsRoute);
+// ADR 0102: dynamically registered webhooks verify their own registration
+// secret and dispatch one-shot AutomationRunWorkflow occurrences.
+app.route("/", hooksRoute);
 app.route("/", reviewsDispatchRoute);
 
 // ADR 0051 Task 21: Shell WebSocket route.

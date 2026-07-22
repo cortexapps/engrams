@@ -51,6 +51,7 @@ import {
   renderAutomationTemplate,
   validateAutomationTemplate,
 } from "../automations/template.ts";
+import { SYSTEM_GITHUB_REGISTRATION_ID } from "../automations/webhook.ts";
 
 export type GetSession = (
   headers: Headers,
@@ -77,6 +78,29 @@ const DEFAULT_LIST_LIMIT = 50;
 const MAX_LIST_LIMIT = 200;
 const MAX_WEBHOOK_EVENTS = 200;
 const MAX_EVENT_KEY_LENGTH = 160;
+const MAX_WEBHOOK_FILTER_PATHS = 100;
+const MAX_WEBHOOK_FILTER_PATH_LENGTH = 512;
+const WEBHOOK_FILTER_PATH_RE = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+const UNSAFE_FILTER_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
+
+function assertWebhookFilter(filter: Record<string, unknown>): void {
+  const paths = Object.keys(filter);
+  if (paths.length > MAX_WEBHOOK_FILTER_PATHS) {
+    throw new ConnectError(
+      `webhook filter may contain at most ${MAX_WEBHOOK_FILTER_PATHS} paths`,
+      Code.InvalidArgument,
+    );
+  }
+  if (paths.some((path) =>
+    path.length > MAX_WEBHOOK_FILTER_PATH_LENGTH
+    || !WEBHOOK_FILTER_PATH_RE.test(path)
+    || path.split(".").some((segment) => UNSAFE_FILTER_PATH_SEGMENTS.has(segment)))) {
+    throw new ConnectError(
+      "webhook filter keys must be safe dotted payload paths",
+      Code.InvalidArgument,
+    );
+  }
+}
 
 async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<string> {
   const session = await getSession(ctx.requestHeader);
@@ -179,6 +203,7 @@ function parseTrigger(value: ProtoAutomationTrigger | undefined): AutomationTrig
       const filter = value.trigger.value.filterJson
         ? parseObjectJson(value.trigger.value.filterJson, "webhook filter_json")
         : undefined;
+      if (filter) assertWebhookFilter(filter);
       return {
         kind: "webhook",
         registrationId,
@@ -373,7 +398,10 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     let nextFireAt: Date | null = null;
     if (trigger.kind === "cron") {
       nextFireAt = nextCronFire(trigger.schedule, trigger.timezone, now());
-    } else if (!(await store.getRegistration(trigger.registrationId))) {
+    } else if (
+      trigger.registrationId !== SYSTEM_GITHUB_REGISTRATION_ID
+      && !(await store.getRegistration(trigger.registrationId))
+    ) {
       throw new ConnectError("webhook registration not found", Code.InvalidArgument);
     }
 

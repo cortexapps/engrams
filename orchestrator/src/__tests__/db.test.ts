@@ -17,6 +17,8 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
 import { checkDb, getDb } from "../db/client.ts";
 import { task, taskSession, profile } from "../db/schema.ts";
+import { webhookRegistration } from "../db/schema.ts";
+import { makeAutomationStore } from "../db/automations.ts";
 import { eq } from "drizzle-orm";
 import { Hono } from "hono";
 import { buildServer } from "../server.ts";
@@ -135,6 +137,41 @@ describe("live DB (requires ORCHESTRATOR_DATABASE_URL)", () => {
         .from(taskSession)
         .where(eq(taskSession.taskId, testTaskId + "-ts"));
       expect(afterCascade).toHaveLength(0);
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "webhook sample insert prunes to the newest 20 in the same store write",
+    async () => {
+      const db = getDb();
+      const registrationId = `sample-retention-${Date.now()}`;
+      await db.insert(webhookRegistration).values({
+        id: registrationId,
+        name: "Sample retention test",
+        verification: {
+          scheme: "generic_hmac_sha256",
+          secretRef: `webhook.${registrationId}.secret`,
+        },
+      });
+      try {
+        const store = makeAutomationStore(db);
+        for (let i = 0; i < 25; i++) {
+          await store.recordWebhookSample({
+            registrationId,
+            eventKey: "incident.opened",
+            payload: { sequence: i },
+            receivedAt: new Date(1_700_000_000_000 + i),
+            retain: 20,
+          });
+        }
+        const retained = await store.listSamples(registrationId, "incident.opened", 100);
+        expect(retained).toHaveLength(20);
+        expect(retained.map((sample) => sample.payload.sequence)).toEqual(
+          Array.from({ length: 20 }, (_, index) => 24 - index),
+        );
+      } finally {
+        await db.delete(webhookRegistration).where(eq(webhookRegistration.id, registrationId));
+      }
     },
   );
 });

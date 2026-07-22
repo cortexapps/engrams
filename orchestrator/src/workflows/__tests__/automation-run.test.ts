@@ -190,6 +190,51 @@ describe("AutomationRunWorkflow", () => {
       sessionId: "session-1",
     });
   });
+
+  test("a webhook run renders declarative connector aliases from its redacted payload", async () => {
+    const webhookInput: AutomationRunWorkflowInput = {
+      automationId: "automation-1",
+      runId: "webhook-run",
+      trigger: {
+        source: "webhook",
+        eventKey: "issues.opened",
+        deliveryId: "delivery-1",
+        payload: { issue: { title: "Broken build" } },
+      },
+      receivedAt: NOW.toISOString(),
+    };
+    const f = fixture("Triage ${{ event.issue.title }}");
+    const webhookAutomation = automation("Triage ${{ event.issue.title }}");
+    webhookAutomation.trigger = {
+      kind: "webhook",
+      registrationId: "github-app",
+      events: ["issues.opened"],
+    };
+    const store: AutomationWorkflowStore = {
+      ...f.store,
+      async getAutomation() {
+        return webhookAutomation;
+      },
+    };
+    let preparedPrompt = "";
+
+    await automationRunWorkflowImpl(webhookInput, {
+      store,
+      step: immediateSteps().step,
+      aliases: async (registrationId) => {
+        expect(registrationId).toBe("github-app");
+        return [{ path: "issue.title", alias: "issue.title" }];
+      },
+      taskCreator: {
+        async create(_input, prepared) {
+          preparedPrompt = prepared.prompt;
+          return { taskId: "task-1", sessionId: "session-1" };
+        },
+      },
+    });
+
+    expect(preparedPrompt).toContain("Triage Broken build");
+  });
 });
 
 describe("automation task creator", () => {

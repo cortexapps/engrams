@@ -151,6 +151,7 @@ function makeReqRes(options: {
   url?: string;
   apiKey?: string;
   authorization?: string;
+  method?: string;
 }): {
   req: IncomingMessage;
   res: ServerResponse & { _status?: number; _headers?: Record<string, string>; _body?: string };
@@ -168,7 +169,7 @@ function makeReqRes(options: {
   // test below), which would mask the 401/cookie assertions these tests make.
   const req = {
     headers,
-    method: "GET",
+    method: options.method ?? "GET",
     url: options.url ?? "/api/protected",
   } as unknown as IncomingMessage;
 
@@ -458,6 +459,40 @@ describe("IAP bridge — missing/invalid assertion → 401", () => {
 
     expect(nextCalled).toBe(false);
     expect(statusCode()).toBe(401);
+  });
+
+  test("one valid hook slug is exempt only for POST, with query strings stripped", async () => {
+    for (const url of [
+      "/api/v1/hooks/a",
+      "/api/v1/hooks/my-registration-1?delivery=42",
+      `/api/v1/hooks/${"a".repeat(63)}`,
+    ]) {
+      let nextCalled = false;
+      const { req, res, statusCode } = makeReqRes({ url, method: "POST" });
+      await iapBridge(req, res, () => { nextCalled = true; });
+      expect(nextCalled).toBe(true);
+      expect(statusCode()).toBe(200);
+    }
+  });
+
+  test("hook subpaths, invalid slugs, and non-POST methods remain blocked", async () => {
+    const blocked = [
+      { method: "GET", url: "/api/v1/hooks/my-hook" },
+      { method: "PUT", url: "/api/v1/hooks/my-hook" },
+      { method: "POST", url: "/api/v1/hooks/my-hook/extra" },
+      { method: "POST", url: "/api/v1/hooks/UPPER" },
+      { method: "POST", url: "/api/v1/hooks/-leading" },
+      { method: "POST", url: "/api/v1/hooks/trailing-" },
+      { method: "POST", url: `/api/v1/hooks/${"a".repeat(64)}` },
+      { method: "POST", url: "/api/v1/hooks/a%2Fb" },
+    ];
+    for (const request of blocked) {
+      let nextCalled = false;
+      const { req, res, statusCode } = makeReqRes(request);
+      await iapBridge(req, res, () => { nextCalled = true; });
+      expect(nextCalled).toBe(false);
+      expect(statusCode()).toBe(401);
+    }
   });
 });
 
