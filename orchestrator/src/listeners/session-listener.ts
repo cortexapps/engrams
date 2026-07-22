@@ -54,7 +54,11 @@ export interface SessionListenerDeps {
    * already in a terminal status finishes immediately — its event log may
    * predate terminal status_changed events. */
   fetchStatus?(sessionId: string, signal?: AbortSignal): Promise<string>;
-  sleep(ms: number): Promise<void>;
+  /** Sleep for `ms`. If `signal` aborts first, clear the underlying timer and
+   * leave the promise unsettled (the caller has already lost interest) — this
+   * lets `#guarded` cancel its deadline timer the instant its RPC settles
+   * early, rather than leaking a pending timer for the full deadline. */
+  sleep(ms: number, signal?: AbortSignal): Promise<void>;
   queueCapacity?: number;
   /** Deadline for one coordinator RPC; default RPC_DEADLINE_MS. */
   rpcDeadlineMs?: number;
@@ -277,15 +281,20 @@ export class SessionListener {
         // without a periodic liveness read against the durable log.
         const iterator = opened.events[Symbol.asyncIterator]();
         let pending: Promise<IteratorResult<WireEvent, unknown>> | null = null;
-        // The probe timer restarts on every delivered frame: a stream that is
-        // delivering already proves liveness via #touchLive, so it never issues
-        // a probe read. Only a silent stream leaves the timer running, and a
-        // stalled one leaves it running across two firings with no frame in
-        // between (sawLogAhead persists) — which condemns it and forces a
-        // reconnect. Idle sessions (no frames, log at cursor) still probe every
-        // interval, which is what keeps their lease alive.
+        // One probe timer, re-armed only when it actually fires — never torn
+        // down and rebuilt per frame (that would allocate a fresh uncancellable
+        // timer on the hot streaming path for every wire frame). A delivered
+        // frame just sets frameSinceProbe; when the timer fires we consult that
+        // flag: a stream that delivered this interval is demonstrably live
+        // (#touchLive already ran), so we skip the probe read and start a fresh
+        // interval. Only a silent stream reaches the read, and a stalled one
+        // reads on two consecutive firings with no frame between (sawLogAhead
+        // persists) — which condemns it. Idle sessions (no frames, log at
+        // cursor) still probe every interval, which is what keeps their lease
+        // alive.
         let probeTimer: Promise<"probe"> | null = null;
         let sawLogAhead = false;
+        let frameSinceProbe = false;
         try {
           for (;;) {
             pending ??= iterator.next();
@@ -300,7 +309,11 @@ export class SessionListener {
             ]);
             if (winner === "stopped") return;
             if (winner === "probe") {
-              probeTimer = null;
+              probeTimer = null; // fired: the next iteration re-arms it
+              if (frameSinceProbe) {
+                frameSinceProbe = false;
+                continue; // delivered this interval — no probe read needed
+              }
               sawLogAhead = await this.#probeQuietStream(lastSeen, sawLogAhead);
               continue;
             }
@@ -311,7 +324,7 @@ export class SessionListener {
             if (this.#stopRequested) return;
             this.#touchLive();
             sawLogAhead = false;
-            probeTimer = null; // a delivering stream needs no liveness probe
+            frameSinceProbe = true; // re-arm decision deferred to the next firing
             reconnectAttempt = 0;
             if (frame.idx === undefined) {
               lagged = true;
@@ -403,26 +416,35 @@ export class SessionListener {
     start: (signal: AbortSignal) => Promise<T>,
   ): Promise<T> {
     const controller = new AbortController();
+    // Separate signal for the deadline timer: aborting it clears the timer
+    // (via the sleep seam) the moment the RPC settles, so a fast read does not
+    // leave a full-deadline timer pending — bursty during start-of-session
+    // catch-up otherwise.
+    const deadline = new AbortController();
     const work = start(controller.signal);
-    const outcome = await Promise.race([
-      work.then(
-        (value) => ({ ok: true as const, value }),
-        (err: unknown) => ({ ok: false as const, err }),
-      ),
-      this.#deps.sleep(this.#rpcDeadlineMs).then(() => "deadline" as const),
-      this.#stoppedRace,
-    ]);
-    if (typeof outcome === "string") {
-      controller.abort();
-      void work.catch(() => {});
-      throw new Error(
-        outcome === "deadline"
-          ? `coordinator rpc exceeded its ${this.#rpcDeadlineMs}ms deadline: ${what}`
-          : "listener stopped",
-      );
+    try {
+      const outcome = await Promise.race([
+        work.then(
+          (value) => ({ ok: true as const, value }),
+          (err: unknown) => ({ ok: false as const, err }),
+        ),
+        this.#deps.sleep(this.#rpcDeadlineMs, deadline.signal).then(() => "deadline" as const),
+        this.#stoppedRace,
+      ]);
+      if (typeof outcome === "string") {
+        controller.abort();
+        void work.catch(() => {});
+        throw new Error(
+          outcome === "deadline"
+            ? `coordinator rpc exceeded its ${this.#rpcDeadlineMs}ms deadline: ${what}`
+            : "listener stopped",
+        );
+      }
+      if (!outcome.ok) throw outcome.err;
+      return outcome.value;
+    } finally {
+      deadline.abort();
     }
-    if (!outcome.ok) throw outcome.err;
-    return outcome.value;
   }
 
   /** The stream produced nothing for a whole probe interval. One bounded read

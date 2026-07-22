@@ -388,10 +388,10 @@ describe("SessionListener", () => {
     expect(rec.terminals).toEqual([]);
   });
 
-  test("an actively delivering stream re-arms its probe timer per frame and never probes the log", async () => {
+  test("an actively delivering stream arms the probe timer once and issues no probe reads", async () => {
     const rec = recordingConsumer();
     let reads = 0; // readPage calls: catch-up only — a probe read would add more
-    let probeArmings = 0; // sleep(probeIntervalMs) calls: one re-arm per frame
+    let probeArmings = 0; // sleep(probeIntervalMs) calls: must be one, not per-frame
     const subject = await listener({
       probeIntervalMs: 77_777,
       readPage: async (_sessionId, after) => {
@@ -402,8 +402,8 @@ describe("SessionListener", () => {
         opened([event(0n), event(1n), event(2n), terminal(3n)]),
       sleep: async (ms) => {
         if (ms === 77_777) probeArmings++;
-        // The probe timer never fires: every delivered frame re-arms it, so a
-        // delivering stream proves liveness via frames and issues no probe read.
+        // The probe timer never fires; frames win every race. A per-frame
+        // re-arm would allocate a fresh timer for each of the four frames.
         await never();
       },
     }, [rec.consumer]);
@@ -413,7 +413,45 @@ describe("SessionListener", () => {
     expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n, 2n]);
     expect(rec.terminals).toEqual(["completed"]);
     expect(reads).toBe(1); // just the initial catch-up — no probe reads
-    expect(probeArmings).toBe(4); // re-armed once per delivered frame, not armed once
+    expect(probeArmings).toBe(1); // armed once at stream open, not per frame
+  });
+
+  test("a probe that fires after a delivered frame skips the read, then reads once quiet", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let probeArmings = 0;
+    let releaseFirstProbe: (() => void) | undefined;
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        return page([], after); // log stays at the cursor: genuinely idle once quiet
+      },
+      openStream: async () => opened([event(0n)], { waitAtEnd: true }),
+      sleep: async (ms) => {
+        if (ms !== 77_777) return void (await never());
+        probeArmings++;
+        // Arm #1 (armed at stream open) parks until the test releases it, so
+        // frame 0 is delivered first; it then fires with a frame in the
+        // interval → the read is skipped. Arm #2 fires immediately with no
+        // frame since → one real probe read. Arm #3 parks.
+        if (probeArmings === 1) {
+          await new Promise<void>((resolve) => (releaseFirstProbe = resolve));
+        } else if (probeArmings >= 3) {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => rec.events.length === 1); // frame 0 delivered
+    releaseFirstProbe!(); // fire the timer that was armed before frame 0
+    await waitFor(() => reads === 2); // catch-up + exactly one post-frame probe read
+    await subject.stop();
+    await running;
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n]);
+    expect(reads).toBe(2); // the frame-covered firing skipped its read
   });
 
   test("an idx-less lag frame closes the stream and catches up without loss", async () => {

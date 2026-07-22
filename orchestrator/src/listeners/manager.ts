@@ -184,7 +184,15 @@ export function makeProductionListenerManager(): ListenerManager {
             close: () => abort.abort(),
           };
         },
-        sleep: (ms) => Bun.sleep(ms),
+        sleep: (ms, signal) =>
+          signal
+            ? new Promise<void>((resolve) => {
+                const timer = setTimeout(resolve, ms);
+                signal.addEventListener("abort", () => clearTimeout(timer), {
+                  once: true,
+                });
+              })
+            : Bun.sleep(ms),
       });
       return {
         start: () => listener.run(),
