@@ -779,8 +779,12 @@ impl OrchestratorDriver {
             .ok()
             .filter(|value| !value.trim().is_empty())
             .unwrap_or_else(|| {
-                std::fs::read_to_string("var/dev-api-key")
-                    .expect("read Tilt-seeded var/dev-api-key for orchestrator e2e")
+                // Tilt seeds this at the WORKSPACE root; nextest runs test
+                // binaries with cwd = the crate root, so resolve from the
+                // manifest dir rather than the working directory.
+                let path = concat!(env!("CARGO_MANIFEST_DIR"), "/../../var/dev-api-key");
+                std::fs::read_to_string(path)
+                    .unwrap_or_else(|e| panic!("read Tilt-seeded {path} for orchestrator e2e: {e}"))
                     .trim()
                     .to_string()
             });
