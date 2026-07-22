@@ -51,6 +51,8 @@ import { IntegrationDetail } from "./components/integrations/IntegrationDetail";
 import { TokensPanel } from "./components/settings/TokensPanel";
 import { SessionProfiles } from "./pages/settings/SessionProfiles";
 import { SessionProfileEditor } from "./pages/settings/SessionProfileEditor";
+import { Automations } from "./pages/settings/Automations";
+import { AutomationEditor } from "./pages/settings/AutomationEditor";
 
 export interface RouterContext {
   /** Null when the session has resolved but no user is signed in.
@@ -310,6 +312,24 @@ const profileEditRoute = createRoute({
   beforeLoad: requireAdmin,
   component: () => <SessionProfileEditor mode="edit" />,
 });
+const automationsRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "automations",
+  beforeLoad: requireAdmin,
+  component: Automations,
+});
+const automationsNewRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "automations/new",
+  beforeLoad: requireAdmin,
+  component: () => <AutomationEditor mode="create" />,
+});
+const automationEditRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "automations/$id",
+  beforeLoad: requireAdmin,
+  component: () => <AutomationEditor mode="edit" />,
+});
 
 export const routeTree = rootRoute.addChildren([
   // /login — bare page, no app chrome
@@ -347,6 +367,9 @@ export const routeTree = rootRoute.addChildren([
       profilesRoute,
       profilesNewRoute,
       profileEditRoute,
+      automationsRoute,
+      automationsNewRoute,
+      automationEditRoute,
     ]),
   ]),
 ]);
