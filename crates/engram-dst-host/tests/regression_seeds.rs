@@ -15,6 +15,7 @@ use engram_dst_host::{
     decode_tag, invariants, synth_chunk, CrashFs, Profile, ScriptedResponse, Sim, SimHost,
     CHUNK_SIZE, SIM_FINALIZE_MAX_ATTEMPTS,
 };
+use engram_host_agent::disk_daemon::backend::FlushSeamPoint;
 use engram_host_agent::disk_daemon::spool;
 use engram_host_core::TokioFs;
 
@@ -435,6 +436,134 @@ fn insert_after_abandon_stage_is_routed_to_abandon_in_place() {
     assert!(
         ladder[first_closed..].iter().all(|s| !admits_new_plane(*s)),
         "once closed, the gate stays closed for the rest of the ladder",
+    );
+}
+
+/// af28cac4 (2026-07-21) — the FIXED ordering, at every seam point. The
+/// SIGTERM deadline overruns while a REAL flush is IN FLIGHT (parked
+/// mid-pipeline); the fixed driver aborts + reaps it BEFORE the abandon
+/// sweep's spool export, so the spool is stamped AT the head and carries
+/// the newest acked writes (including the one written mid-shutdown at the
+/// prod seam). The successor adopts and recovers everything — asserted
+/// SHARPER than the tolerant floor oracle: the newest acked tag survives,
+/// not merely the published floor. The post-restart flush also exercises
+/// the PreRebase leftover (a store-ahead manifest the aborted flush
+/// published to the store) recovering through the REAL version-conflict
+/// retry.
+#[tokio::test(start_paused = true)]
+async fn sigterm_inflight_flush_abort_keeps_the_spool_adoptable_at_every_seam() {
+    for seam in 0..3u8 {
+        let mut host = scenario_host(0xAF28_0000 + seam as u64, 1).await;
+        host.sigterm_flush_parked(0, seam)
+            .await
+            .unwrap_or_else(|e| panic!("seam {seam}: {e}"));
+        host.restart().await.unwrap();
+        invariants::check(&host)
+            .await
+            .unwrap_or_else(|v| panic!("seam {seam}: {} — {}", v.invariant, v.detail));
+        let latest = host
+            .ledger
+            .latest_by_chunk()
+            .get(&(0, 1))
+            .expect("chunk 1 was written")
+            .content_tag;
+        let backend = host.sandboxes[0].backend.clone().unwrap();
+        let bytes = backend.read(CHUNK_SIZE, CHUNK_SIZE).await.unwrap();
+        assert_eq!(
+            decode_tag(&bytes),
+            latest,
+            "seam {seam}: the successor must serve the NEWEST acked write, not a \
+             floor-rollback — the aborted-flush spool carries it",
+        );
+        host.guest_read(0, 1).await.unwrap();
+        // PreRebase leftovers (a store-ahead manifest nothing references)
+        // must not wedge the next flush: the version-conflict retry
+        // re-targets latest+1.
+        host.flush_tick(0).await.unwrap();
+        host.guest_read(0, 1).await.unwrap();
+    }
+}
+
+/// af28cac4 (2026-07-21) — the PRE-FIX interleaving, driven literally, is
+/// now representable AND self-catching. The abandon sweep's export runs
+/// while the final flush is parked post-upload/pre-publish; the flush then
+/// completes DETACHED past the deadline and its publish lands — the spool
+/// on disk is stamped one version BEHIND the durable pointer while holding
+/// the only copy of an acked write above the published floor. The
+/// successor's rebuild refuses the behind-stamped spool per the lineage
+/// gate, and the stale-refusal oracle must flag the refusal as the
+/// acked-write rollback it is (in prod: spool v367 vs published v368,
+/// 49 chunks / 822 MiB preserved-but-not-adopted under a live guest).
+#[tokio::test(start_paused = true)]
+async fn detached_flush_publish_after_spool_export_is_caught_at_rebuild() {
+    let mut host = scenario_host(0xAF28_CAC4, 1).await;
+
+    // A published floor: tag1 lands durably.
+    host.guest_write(0, 1).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+
+    // tag2 dirty; the SIGTERM final flush drains it and parks pre-publish
+    // (the prod shape: a 318 MiB upload still in flight at the deadline).
+    host.guest_write(0, 1).await.unwrap();
+    let backend = host.sandboxes[0].backend.clone().unwrap();
+    let (arrived, proceed) = backend.arm_flush_seam(FlushSeamPoint::PostUploadPrePublish);
+    let flush = tokio::spawn({
+        let b = backend.clone();
+        async move { b.flush().await }
+    });
+    arrived.notified().await;
+
+    // The guest keeps writing during the shutdown window: tag3 is ACKED.
+    host.guest_write(0, 1).await.unwrap();
+    let tag3 = host
+        .ledger
+        .latest_by_chunk()
+        .get(&(0, 1))
+        .unwrap()
+        .content_tag;
+
+    // PRE-FIX ordering: the export runs while the flush is still parked —
+    // the spool carries tag3, stamped at the PRE-rebase head.
+    let stamped_at = backend.manifest_ref().await;
+    host.spool_export(0).await.unwrap();
+
+    // The detached task resumes past the deadline; rebase + publish land.
+    proceed.notify_one();
+    flush
+        .await
+        .expect("flush task join")
+        .expect("detached flush completes");
+    host.detached_flush_publish(0).await.unwrap();
+    let published = host.sandboxes[0].published_ref.unwrap();
+    assert!(
+        stamped_at.version < published.version,
+        "the incident state: the spool stamp ({stamped_at}) must be BEHIND the \
+         published ref ({published})",
+    );
+    let sid = host.sandboxes[0].sandbox_id;
+    let (meta, chunks) = spool::read_spool(&TokioFs, host.fs.spool_dir(), sid)
+        .await
+        .unwrap()
+        .expect("the behind-stamped spool is standing");
+    assert_eq!(meta.manifest_ref(), stamped_at);
+    assert!(
+        chunks
+            .iter()
+            .any(|(idx, bytes)| *idx == 1 && decode_tag(bytes) == tag3),
+        "the spool holds the only copy of acked tag3",
+    );
+
+    // The roll. The successor's rebuild refuses the behind-stamped spool —
+    // and the stale-refusal oracle catches that the refusal drops the only
+    // copy of acked tag3 (the floor is tag2).
+    host.sandboxes[0].backend = None;
+    let err = host
+        .restart()
+        .await
+        .expect_err("the rebuild must flag the af28cac4 rollback, not silently discard");
+    assert!(
+        err.contains("above the published floor"),
+        "unexpected rebuild error: {err}",
     );
 }
 

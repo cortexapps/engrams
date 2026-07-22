@@ -48,6 +48,22 @@
 //! (P4's static `CrashPoint` catalogue + post-hoc crash-state construction
 //! were superseded by P5's real seam interception — see below.)
 //!
+//! The af28cac4 wave (2026-07-21) closed [`Sigterm`](Step::Sigterm)'s
+//! fidelity gap: its overrun was BINARY (the final flush completes before
+//! the export, or never runs), which could not represent the incident's
+//! third state — the flush IN FLIGHT at the deadline, completing detached
+//! AFTER the spool export and stranding the spool's stamp behind the
+//! published ref. [`SigtermFlushParkedAt`](Step::SigtermFlushParkedAt)
+//! parks a REAL flush at a seeded P6 seam point, aborts + reaps it before
+//! the export (the fixed driver's contract), and asserts the
+//! spool-coherence obligations inline at every seam; `rebuild` gains the
+//! stale-refusal oracle (a refused same-lineage spool must never hold the
+//! only copy of an acked write above the published floor). The pre-fix
+//! interleaving is pinned self-catching by the
+//! `detached_flush_publish_after_spool_export_is_caught_at_rebuild` seed;
+//! the literal tokio task-detachment race stays FC-lane
+//! (`nbd_shutdown_final_flush.rs`).
+//!
 //! # P4.5 (oracle honesty — the durability pipeline, not omniscient recovery)
 //!
 //! The acked-write oracle ([`invariants`]) is sharpened from "every acked write

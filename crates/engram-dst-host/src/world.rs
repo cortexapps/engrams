@@ -1333,6 +1333,33 @@ impl SimHost {
                     .adopt_unflushed(chunks)
                     .await
                     .map_err(|e| format!("sandbox {idx}: spool adoption refused: {e}"))?;
+            } else {
+                // Stale refusal (an older divergence than the durable tier).
+                // ORACLE (af28cac4, 2026-07-21): refusing is only SAFE when
+                // the durable tier already covers every spooled write — true
+                // for a legitimately-superseded spool (a later flush /
+                // eviction finalize published past it) by tag monotonicity.
+                // A refused spool holding a tag ABOVE the published floor
+                // means something published AROUND a live export — the
+                // detached-final-flush race, where the spool was stamped
+                // before a racing publish landed — and discarding it rolls
+                // an acked write back under the live guest. Loud, never a
+                // silent discard of the only newer copy.
+                for (chunk_idx, bytes) in &chunks {
+                    let tag = decode_tag(bytes);
+                    let floor = self
+                        .ledger
+                        .handed_off_tag(idx, *chunk_idx as u64)
+                        .unwrap_or(0);
+                    if tag > floor {
+                        return Err(format!(
+                            "sandbox {idx}: stale-refused spool (stamped {spool_ref}, durable \
+                             {rebuild_ref}) holds chunk {chunk_idx} tag {tag} above the \
+                             published floor {floor} — refusing it rolls back an acked write \
+                             whose only copy was the spool (the af28cac4 detached-flush race)"
+                        ));
+                    }
+                }
             }
             // Adopted or stale: the spool is consumed either way.
             spool::discard_spool(fs.as_ref(), self.fs.spool_dir(), sandbox_id)
@@ -1465,6 +1492,156 @@ impl SimHost {
         // Detached stage: RAM dies. Flow B: SIGTERM is a roll (the successor
         // pidfd-reattaches).
         self.die_abruptly();
+        Ok(())
+    }
+
+    /// The af28cac4 (2026-07-21) SIGTERM shape: the deadline overruns while
+    /// sandbox `idx`'s final flush is IN FLIGHT — a REAL `flush()` parked
+    /// mid-pipeline at the seeded seam point — and the FIXED driver ABORTS +
+    /// reaps it before the abandon sweep's spool export
+    /// (`flush_nbd_data_planes_for_shutdown`'s overrun arm). The [`sigterm`]
+    /// step's binary overrun (flush completes-before-export or never runs)
+    /// could not represent this third state; the incident lived exactly
+    /// there: pre-fix, the timeout only dropped the JOIN future, the
+    /// detached flush completed AFTER the export and published a version
+    /// the just-written spool's stamp predates, and the successor's lineage
+    /// gate refused the only copy of the acked writes.
+    ///
+    /// `seam % 3` selects the abort point — the abort-safety sweep: the fix's
+    /// argument is that an abort at ANY pipeline instant leaves the export
+    /// coherent, so every point must satisfy the same two obligations,
+    /// asserted inline:
+    /// * the abort left the manifest head unmoved (no post-deadline rebase);
+    /// * the exported spool's stamp equals the head — never behind.
+    ///
+    /// At [`FlushSeamPoint::PostUploadPrePublish`] (the prod point: a 318 MiB
+    /// upload mid-flight at the 20 s budget) the guest also keeps writing
+    /// mid-shutdown, as prod's did (dirty grew 318 → 822 MiB); the export
+    /// must carry that newest acked write. The ladder then completes (every
+    /// survivor spools, RAM dies) exactly like [`sigterm`]'s overrun arm; a
+    /// later `Restart` adopts the spools and the acked-write oracle checks
+    /// recovery. At [`FlushSeamPoint::PreRebase`] the aborted flush leaves a
+    /// store-ahead manifest; the successor's next flush recovers through the
+    /// REAL version-conflict retry.
+    ///
+    /// [`sigterm`]: Self::sigterm
+    pub async fn sigterm_flush_parked(&mut self, idx: usize, seam: u8) -> Result<(), String> {
+        // When the target can't park a flush (mid-finalize / migrating /
+        // crashed), fall back to the plain overrun ladder so the step is
+        // still a SIGTERM (the dispatcher marks the process crashed).
+        let parkable = idx < self.sandboxes.len()
+            && !self.finalize_pending(idx)
+            && !self.sandboxes[idx].migrating
+            && self.sandboxes[idx].backend.is_some();
+        if !parkable {
+            return self.sigterm(Some(0.5)).await; // 0.5 s < SIM_FLUSH_COST → overrun
+        }
+        let backend = self.sandboxes[idx].backend.clone().expect("guarded above");
+        // Guarantee a non-empty pipeline so the parked seam fires (chunk 1,
+        // like flush_fence_abort).
+        self.guest_write(idx, 1).await?;
+        if backend.dirty_bytes().await == 0 {
+            return self.sigterm(Some(0.5)).await;
+        }
+        let point = match seam % 3 {
+            0 => FlushSeamPoint::DirtyPendingHandoff,
+            1 => FlushSeamPoint::PostUploadPrePublish,
+            _ => FlushSeamPoint::PreRebase,
+        };
+        // The ladder's device-sync leg runs first (seam-recorded ordering).
+        self.effects
+            .device
+            .sync_device(&Self::device_path(idx))
+            .await
+            .map_err(|e| format!("sigterm parked device sync sandbox {idx}: {e}"))?;
+        let pre_ref = backend.manifest_ref().await;
+        let (arrived, proceed) = backend.arm_flush_seam(point);
+        let flush_backend = backend.clone();
+        let flush = tokio::spawn(async move { flush_backend.flush().await });
+        arrived.notified().await;
+        // The guest keeps writing during the shutdown window. Only at
+        // PostUploadPrePublish: the parked task holds no backend locks
+        // there (DirtyPendingHandoff holds dirty+pending, PreRebase holds
+        // state — an inline write could deadlock the single-threaded
+        // runtime against them).
+        if matches!(point, FlushSeamPoint::PostUploadPrePublish) {
+            self.guest_write(idx, 1).await?;
+        }
+        // Deadline overrun: the FIXED driver aborts + reaps the in-flight
+        // flush BEFORE the abandon sweep exports. Deterministic: the task
+        // is parked at the seam's Notify on a single-threaded runtime, so
+        // it never resumes past the park.
+        flush.abort();
+        let _ = flush.await;
+        drop(proceed);
+        // Obligation 1: no post-deadline rebase escaped the abort.
+        let head = backend.manifest_ref().await;
+        if head != pre_ref {
+            return Err(format!(
+                "sigterm parked-flush: sandbox {idx} manifest advanced {pre_ref} -> {head} \
+                 after the deadline abort — the af28cac4 detached-flush race"
+            ));
+        }
+        // Abandon + SpoolExport stage for every survivor (the ladder's
+        // always-runs leg).
+        for i in 0..self.sandboxes.len() {
+            self.spool_export(i).await?;
+        }
+        // Obligation 2: the target's spool stamp equals the head it
+        // diverges from — never behind. (The af28cac4 spool was stamped
+        // v367 under a published v368; the successor refused the only copy
+        // of the acked writes and rolled the live guest back.)
+        let (meta, _chunks) = spool::read_spool(
+            self.effects.fs.as_ref(),
+            self.fs.spool_dir(),
+            self.sandboxes[idx].sandbox_id,
+        )
+        .await
+        .map_err(|e| format!("sigterm parked-flush spool read sandbox {idx}: {e}"))?
+        .ok_or_else(|| format!("sigterm parked-flush: sandbox {idx} left no spool"))?;
+        if meta.manifest_ref() != head {
+            return Err(format!(
+                "sigterm parked-flush: sandbox {idx} spool stamped {} under head {head} — a \
+                 behind-stamped spool is refused at adoption and rolls back acked writes \
+                 (af28cac4)",
+                meta.manifest_ref(),
+            ));
+        }
+        // Detached stage: RAM dies (the roll); the successor restarts +
+        // adopts.
+        self.die_abruptly();
+        Ok(())
+    }
+
+    /// Seed-only: the PRE-FIX detached final-flush publish. Models the
+    /// 2026-07-21 af28cac4 hazard's second half — the flush task the timeout
+    /// left running detached completes AFTER the abandon sweep's spool
+    /// export and its coordinator publish LANDS: the durable pointer + the
+    /// ledger floor advance to the flush's manifest while the already-written
+    /// spool (stamped at the pre-flush head, holding newer acked writes)
+    /// stays on disk. Unlike [`note_flush_published`](Self::note_flush_published)
+    /// it does NOT discard the spool — the prod detached task never touched
+    /// the spool; discarding it here would erase exactly the stranded state
+    /// the regression seed exists to drive into `rebuild`'s stale-refusal
+    /// oracle.
+    pub async fn detached_flush_publish(&mut self, idx: usize) -> Result<(), String> {
+        let Some(backend) = self.sandboxes[idx].backend.clone() else {
+            return Ok(());
+        };
+        let published = backend.manifest_ref().await;
+        self.sandboxes[idx].published_ref = Some(published);
+        self.mark_flush_published(idx, published).await?;
+        let req = LiveManifestPublishRequest {
+            session_id: self.sandboxes[idx].session_id,
+            sandbox_id: self.sandboxes[idx].sandbox_id,
+            manifest_id: published.manifest_id,
+            manifest_version: published.version,
+        };
+        self.effects
+            .coord
+            .publish_live_manifest(self.host_id, &req)
+            .await
+            .map_err(|e| format!("detached publish sandbox {idx}: {e}"))?;
         Ok(())
     }
 
