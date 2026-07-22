@@ -41,10 +41,11 @@ Lanes:
                 for nothing (2026-07-20 incident: four host rolls in 90 min off
                 three coord/web-only pushes).
   tf_or_helm    deploy/terraform/ + deploy/helm/
-  dev_image     dev-engrams dogfood rebake — images OR host_binaries OR
-                host_base OR the release closure of {engram-harness-claude}
-                (baked into the image, not pulled at runtime) OR the
-                dev-orchestration inputs. Fires `engrams-dev-image-changed`.
+
+(The dev-engrams dogfood image is no longer a lane here: engrams-internal
+bakes + refreshes it on a workday-hourly schedule against OSS main — the same
+model as its dev-brain image — so the `engrams-dev-image-changed` dispatch is
+retired.)
 
 `Cargo.lock` / root `Cargo.toml` / this script / the bake workflow are
 conservative triggers for the host_binaries lane.
@@ -98,8 +99,7 @@ CONTAINER_BINS = {
 # image — it rides the fleet `current_bundles` stamp (the
 # `bake-harness-claude-artifact` job publishes the harness-claude artifact;
 # node-assets stages it onto hosts). A change to the harness binary (or
-# anything in its release closure) must republish that artifact + re-bake the
-# dev_image lane (whose `just dev` stages the harness from source). It is in
+# anything in its release closure) must republish that artifact. It is in
 # NEITHER the container nor the host closure, so without this lane a
 # harness-only change shipped nothing (the bug this gate fixes).
 SESSION_HARNESS_BINS = {"engram-harness-claude", "engram-harness-codex"}
@@ -172,12 +172,6 @@ BUNDLES_PATHS = ["deploy/bundles/"]
 # carries, so they must not rebake it (a rebake churns the DaemonSet tag and
 # rolls the fleet for nothing — the 2026-07-20 host-roll-churn incident).
 NODE_ASSETS_PATHS = ["docker/node-assets.Dockerfile", "docker/node-assets-fetch.sh"]
-# ADR 0027: the `dev-engrams` dogfood session image runs the REAL `just dev`
-# (whole-repo build) inside a sandbox, so it's stale on essentially any source
-# change. We trip its rebake on the union of what it builds — the container +
-# host source closures (computed below) plus the dev-orchestration inputs
-# here. Doc/TF-only pushes don't rebake it.
-DEV_IMAGE_PATHS = ["justfile", "flake.nix", "flake.lock", "Tiltfile", "deploy/dev/", "cli/"]
 # ADR 0045 Phase B: the vendored Firecracker fork (a submodule + the `.gitmodules`
 # gitlink). Bumping the submodule pointer (the daily auto-rebase, or a manual
 # port) changes the FC *binary* the node-assets image stages, so it must rebuild
@@ -341,21 +335,15 @@ def main():
                  or any_path(changed, PROTO_PATHS)
                  or any_path(changed, BAKE_ALL_PATHS))
     tf_or_helm = any_path(changed, TF_HELM_PATHS)
-    # The dogfood image builds the whole repo via `just dev`, so it's stale on
-    # any source the container/host bakes consume, plus the dev-orchestration
-    # inputs. It ALSO bakes in the builtin claude harness, so a harness-only
-    # change (in neither container nor host closure) must rebake it too —
-    # without this term, a harness change shipped nothing. NOT tripped by
-    # doc/TF/helm-only pushes.
     harness_changed = bool(cc & harness) or any_path(changed, HARNESS_PATHS)
-    # A harness-source change must ALSO republish the `bundle-harness-claude`
+    # A harness-source change must republish the `bundle-harness-claude`
     # artifact: publish-bundles builds it from the engram-harness-claude tree
     # (ADR 0062), and node-assets stages it onto the fleet. Without this term a
-    # harness change rebakes only the host-agent/dev_image and the fleet keeps
+    # harness change rebaked only the host-agent image and the fleet kept
     # staging the STALE harness bundle against a freshly-rolled host-agent — the
     # exact break that wedged harness attach after the #542 wire-10 roll (the
-    # comment at SESSION_HARNESS_BINS promised this republish but only the
-    # dev_image half was ever wired).
+    # comment at SESSION_HARNESS_BINS promised this republish but it was never
+    # wired).
     # ADR 0080: an agentd-source change republishes `bundle-agentd` — the
     # bundle IS the delivery vehicle (no image carries agentd), so without
     # this term an agentd change ships nothing.
@@ -375,13 +363,6 @@ def main():
         or bundles
         or any_path(changed, NODE_ASSETS_PATHS)
         or any_path(changed, BAKE_ALL_PATHS)
-    )
-    dev_image = (
-        images
-        or host_binaries
-        or host_base
-        or harness_changed
-        or any_path(changed, DEV_IMAGE_PATHS)
     )
     # The expensive, non-required e2e lane: run it when any binary it builds
     # moved or any of its non-crate inputs changed. Skipping it on
@@ -457,7 +438,7 @@ def main():
     print(f"-> images={images} host_binaries={host_binaries} "
           f"host_base={host_base} host_image={host_image} cli_tools={cli_tools} "
           f"tf_or_helm={tf_or_helm} bundles={bundles} node_assets={node_assets} "
-          f"dev_image={dev_image} fc_fork={fc_fork} e2e={e2e}",
+          f"fc_fork={fc_fork} e2e={e2e}",
           file=sys.stderr)
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
@@ -480,7 +461,6 @@ def main():
             f.write(f"tf_or_helm={b(tf_or_helm)}\n")
             f.write(f"bundles={b(bundles)}\n")
             f.write(f"node_assets={b(node_assets)}\n")
-            f.write(f"dev_image={b(dev_image)}\n")
             f.write(f"fc_fork={b(fc_fork)}\n")
             f.write(f"e2e={b(e2e)}\n")
             # PR test lanes (ci.yml + ci-macos-vz.yml gate on these).
