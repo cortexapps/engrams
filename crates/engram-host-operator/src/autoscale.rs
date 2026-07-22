@@ -108,6 +108,17 @@ pub trait NodeOps: Send + Sync {
     /// Clear the durable timed-out-image-roll marker on `node` after the
     /// named node has been safely removed.
     async fn clear_roll_stuck(&self, node: &str) -> Result<(), OperatorError>;
+
+    /// The K8s Node object's `creationTimestamp`, for the node-ready
+    /// bring-up histogram. Defaulted to `None` so the recording test
+    /// mocks don't have to model it — a missing Node just skips the
+    /// sample.
+    async fn node_created_at(
+        &self,
+        _node: &str,
+    ) -> Result<Option<std::time::SystemTime>, OperatorError> {
+        Ok(None)
+    }
 }
 
 /// Live K8s implementation of [`NodeOps`].
@@ -168,6 +179,85 @@ impl NodeOps for K8sNodeOps {
             .patch(node, &PatchParams::default(), &Patch::Merge(patch))
             .await?;
         Ok(())
+    }
+
+    async fn node_created_at(
+        &self,
+        node: &str,
+    ) -> Result<Option<std::time::SystemTime>, OperatorError> {
+        let nodes: Api<Node> = Api::all(self.client.clone());
+        Ok(nodes
+            .get_opt(node)
+            .await?
+            .and_then(|n| n.metadata.creation_timestamp)
+            .map(|t| t.0.into()))
+    }
+}
+
+/// Cross-tick memory for the node-ready histogram: the set of host ids
+/// already observed registered with the coordinator. `None` until the
+/// first observation — the first tick seeds the set WITHOUT emitting, so
+/// an operator restart never reports pre-existing hosts as fresh joins.
+#[derive(Default)]
+pub struct NodeReadyTracker(std::sync::Mutex<Option<std::collections::HashSet<HostId>>>);
+
+impl NodeReadyTracker {
+    /// One observation of the registered-host set. Returns the hosts that
+    /// are new since the previous observation — EMPTY on the very first
+    /// call, which seeds the set instead (so an operator restart never
+    /// reports pre-existing hosts as fresh joins). Pure state transition,
+    /// split out from the async emission for direct unit testing.
+    fn observe(&self, registered: std::collections::HashSet<HostId>) -> Vec<HostId> {
+        let mut guard = self.0.lock().expect("node-ready tracker poisoned");
+        match guard.as_mut() {
+            None => {
+                *guard = Some(registered);
+                Vec::new()
+            }
+            Some(seen) => {
+                let fresh = registered.difference(seen).copied().collect();
+                *seen = registered;
+                fresh
+            }
+        }
+    }
+}
+
+/// Emit `engram_node_ready_seconds` for every host newly visible in the
+/// coordinator's list: K8s Node creation → registration, the whole
+/// bring-up pipeline (instance create + kubelet join + assets staging +
+/// register). Best-effort — a missing Node object skips the sample.
+async fn track_node_ready(
+    tracker: &NodeReadyTracker,
+    nodes: &dyn NodeOps,
+    pods: &[PodInfo],
+    hosts: &[HostLoad],
+) {
+    // The lock is confined to `observe` — never held across the async
+    // Node lookups below.
+    let fresh = tracker.observe(hosts.iter().map(|h| h.id).collect());
+    for host in fresh {
+        let Some(pod) = pods
+            .iter()
+            .find(|p| HostId::from_node_name(&p.node) == host)
+        else {
+            continue;
+        };
+        match nodes.node_created_at(&pod.node).await {
+            Ok(Some(created)) => {
+                if let Ok(age) = crate::time_source::metrics_wall_now().duration_since(created) {
+                    ::metrics::histogram!(crate::metrics::NODE_READY_SECONDS)
+                        .record(age.as_secs_f64());
+                    tracing::info!(node = %pod.node, %host, age_secs = age.as_secs(),
+                        "node bring-up complete: host registered");
+                }
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(node = %pod.node, error = %e,
+                    "node-ready sample skipped: Node lookup failed");
+            }
+        }
     }
 }
 
@@ -306,7 +396,13 @@ async fn abort_wave(act: &WaveActuator<'_>, victims: &[String]) {
         }
         .await;
         match r {
-            Ok(()) => tracing::info!(%node, %host, "wave abort: uncordoned + de-annotated victim"),
+            Ok(()) => {
+                ::metrics::counter!(
+                    crate::metrics::AUTOSCALE_VICTIMS_RELEASED_TOTAL, "reason" => "abort"
+                )
+                .increment(1);
+                tracing::info!(%node, %host, "wave abort: uncordoned + de-annotated victim")
+            }
             Err(e) => {
                 tracing::warn!(%node, %host, error=%e, "wave abort: failed to release victim")
             }
@@ -383,6 +479,10 @@ async fn drive_one(act: &WaveActuator<'_>, node: &str, host: HostId) -> DriveOut
             let _ = act.coord.uncordon(host).await;
             let _ = act.nodes.set_unschedulable(node, false).await;
             let _ = act.nodes.set_victim(node, None).await;
+            ::metrics::counter!(
+                crate::metrics::AUTOSCALE_VICTIMS_RELEASED_TOTAL, "reason" => "drain_timeout"
+            )
+            .increment(1);
             return DriveOutcome::Released;
         }
         Err(e) => {
@@ -404,6 +504,7 @@ async fn drive_one(act: &WaveActuator<'_>, node: &str, host: HostId) -> DriveOut
     // Clear the annotation defensively (the Node object usually vanishes with
     // the instance, but a slow kubelet deregistration could leave it).
     let _ = act.nodes.set_victim(node, None).await;
+    ::metrics::counter!(crate::metrics::AUTOSCALE_VICTIMS_REMOVED_TOTAL).increment(1);
     tracing::info!(%node, %host, "wave: victim drained + removed + deregistered");
     DriveOutcome::Removed
 }
@@ -456,6 +557,7 @@ async fn repair_stuck_roll(act: &WaveActuator<'_>, node: &str) -> bool {
     // The cloud removal normally deletes the Node object. Clear the marker
     // best-effort for a slow kubelet deregistration; a NotFound is harmless.
     let _ = act.nodes.clear_roll_stuck(node).await;
+    ::metrics::counter!(crate::metrics::AUTOSCALE_STUCK_ROLL_REPAIRS_TOTAL).increment(1);
     tracing::info!(%node, %host, "stuck-roll repair: drained + removed + deregistered");
     true
 }
@@ -501,6 +603,7 @@ pub async fn step(
     spec: &HostFleetSpec,
     scaler: &dyn NodePoolScaler,
     scaledown_ticks: &std::sync::atomic::AtomicU32,
+    node_ready: &NodeReadyTracker,
     coord: &dyn CoordApi,
     nodes: &dyn NodeOps,
     observation: FleetObservation<'_>,
@@ -535,6 +638,25 @@ pub async fn step(
     let annotated = nodes.annotated_victims(fleet_key).await?;
     let wave_in_flight = !annotated.is_empty();
 
+    // Fetched once per tick: the node-ready tracker consumes it here and
+    // the wave arm below reuses it (it used to fetch its own copy).
+    let hosts = coord.list_hosts().await?;
+    track_node_ready(node_ready, nodes, pods, &hosts).await;
+
+    for (kind, v) in [
+        ("desired", desired),
+        ("schedulable", current),
+        ("physical", physical),
+        ("grow_target", grow_target),
+    ] {
+        ::metrics::gauge!(crate::metrics::AUTOSCALE_HOSTS, "kind" => kind).set(v as f64);
+    }
+    ::metrics::gauge!(crate::metrics::AUTOSCALE_WAVE_IN_FLIGHT).set(if wave_in_flight {
+        1.0
+    } else {
+        0.0
+    });
+
     // Hysteresis: accumulate only while a fresh scale-down target persists.
     let scale_down_target = a.scale_down.enabled()
         && desired < current
@@ -565,6 +687,15 @@ pub async fn step(
         unavailable, queued = demand.queued_sessions, wave_in_flight, ?action,
         "autoscale step"
     );
+    let action_label = match action {
+        StepAction::Hold => "hold",
+        StepAction::StartWave => "start_wave",
+        StepAction::ContinueWave => "continue_wave",
+        StepAction::AbortAndGrow => "abort_and_grow",
+        StepAction::AbortOnly => "abort_only",
+    };
+    ::metrics::counter!(crate::metrics::AUTOSCALE_STEP_ACTIONS_TOTAL, "action" => action_label)
+        .increment(1);
 
     let act = WaveActuator {
         coord,
@@ -582,6 +713,7 @@ pub async fn step(
     }
     if grow_target > physical {
         scaler.set_size(&a.node_pool, grow_target).await?;
+        ::metrics::counter!(crate::metrics::AUTOSCALE_GROWS_TOTAL).increment(1);
         tracing::info!(
             node_pool=%a.node_pool,
             desired,
@@ -619,7 +751,6 @@ pub async fn step(
         }
         StepAction::Hold => Ok(AutoscaleStatus::default()),
         StepAction::StartWave | StepAction::ContinueWave => {
-            let hosts = coord.list_hosts().await?;
             let wave_hosts = assemble_wave_hosts(pods, &hosts, &annotated);
             let wpolicy = WavePolicy {
                 mode: a.scale_down,
@@ -662,6 +793,31 @@ mod tests {
             roll_idle: true,
             wave_in_flight: false,
         }
+    }
+
+    #[test]
+    fn node_ready_tracker_seeds_silently_then_reports_fresh() {
+        let t = NodeReadyTracker::default();
+        let a = HostId::from_node_name("gke-engrams-kvm-a");
+        let b = HostId::from_node_name("gke-engrams-kvm-b");
+        // First observation seeds without reporting (operator restart must
+        // not emit stale bring-up samples for pre-existing hosts).
+        assert!(t.observe([a].into_iter().collect()).is_empty());
+        // A host new since the seed is reported exactly once.
+        assert_eq!(t.observe([a, b].into_iter().collect()), vec![b]);
+        assert!(t.observe([a, b].into_iter().collect()).is_empty());
+    }
+
+    #[test]
+    fn node_ready_tracker_reports_rejoin_after_departure() {
+        let t = NodeReadyTracker::default();
+        let a = HostId::from_node_name("gke-engrams-kvm-a");
+        let b = HostId::from_node_name("gke-engrams-kvm-b");
+        assert!(t.observe([a, b].into_iter().collect()).is_empty());
+        // b departs (scale-down)…
+        assert!(t.observe([a].into_iter().collect()).is_empty());
+        // …and a same-named node rejoining is a fresh bring-up again.
+        assert_eq!(t.observe([a, b].into_iter().collect()), vec![b]);
     }
 
     #[test]
@@ -962,6 +1118,7 @@ mod tests {
             &autoscale_spec(),
             &scaler,
             &ticks,
+            &NodeReadyTracker::default(),
             &rec,
             &rec,
             FleetObservation {
@@ -1009,6 +1166,7 @@ mod tests {
             &autoscale_spec(),
             &scaler,
             &ticks,
+            &NodeReadyTracker::default(),
             &rec,
             &rec,
             FleetObservation {

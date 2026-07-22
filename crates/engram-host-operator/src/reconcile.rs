@@ -60,6 +60,9 @@ pub struct Ctx {
     /// ADR 0045 Phase E: consecutive reconciles the scale-down decision has
     /// held, for anti-flap hysteresis. Reset to 0 on any hold/scale-up tick.
     pub scaledown_ticks: AtomicU32,
+    /// Cross-tick memory for the `engram_node_ready_seconds` bring-up
+    /// histogram (hosts already seen registered with the coordinator).
+    pub node_ready: crate::autoscale::NodeReadyTracker,
 }
 
 /// A host-agent pod distilled to the fields the planner needs.
@@ -202,6 +205,7 @@ pub async fn reconcile(hf: Arc<HostFleet>, ctx: Arc<Ctx>) -> Result<Action, Oper
         }
         RollDecision::RollNode { node, pod } => {
             roll_node(client, spec, &node, &pod, recovery_key).await?;
+            ::metrics::counter!(crate::metrics::ROLL_NODES_TOTAL).increment(1);
             Ok(Action::requeue(Duration::from_secs(5)))
         }
     }
@@ -236,6 +240,7 @@ async fn run_autoscale(
         spec,
         ctx.scaler.as_ref(),
         &ctx.scaledown_ticks,
+        &ctx.node_ready,
         &coord,
         &nodes,
         crate::autoscale::FleetObservation {

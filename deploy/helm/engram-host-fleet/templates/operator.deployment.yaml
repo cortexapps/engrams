@@ -48,6 +48,13 @@ spec:
         - name: operator
           image: "{{ .Values.operator.image.repository }}:{{ .Values.operator.image.tag }}"
           imagePullPolicy: {{ .Values.operator.image.pullPolicy }}
+          ports:
+            # Autoscaler/wave/roll metrics (ENGRAM_OPERATOR_METRICS_ADDR
+            # defaults to 0.0.0.0:9102). Scraped by the operator
+            # PodMonitoring when metrics.podMonitoring is enabled.
+            - name: metrics
+              containerPort: 9102
+              protocol: TCP
           env:
             - name: RUST_LOG
               value: {{ .Values.operator.logLevel | quote }}

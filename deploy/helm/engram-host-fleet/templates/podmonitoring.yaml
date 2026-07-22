@@ -36,4 +36,24 @@ spec:
     - port: metrics
       interval: {{ .Values.metrics.podMonitoring.interval | quote }}
       path: /metrics
+{{- if .Values.operator.enabled }}
+---
+# The rollout/autoscale operator's metrics (:9102 — autoscale decisions,
+# shed-wave outcomes, node bring-up time). Same gate + interval as the
+# host-agent scrape above, additionally gated on the operator existing.
+apiVersion: monitoring.googleapis.com/v1
+kind: PodMonitoring
+metadata:
+  name: {{ include "hostfleet.operator.fullname" . }}
+  labels:
+    {{- include "hostfleet.operator.labels" . | nindent 4 }}
+spec:
+  selector:
+    matchLabels:
+      {{- include "hostfleet.operator.selectorLabels" . | nindent 6 }}
+  endpoints:
+    - port: metrics
+      interval: {{ .Values.metrics.podMonitoring.interval | quote }}
+      path: /metrics
+{{- end }}
 {{- end -}}
