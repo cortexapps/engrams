@@ -1,5 +1,6 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 import { eq } from "drizzle-orm";
+import type { z } from "zod";
 
 import { sessions } from "../control-plane/client.ts";
 import { getDb } from "../db/client.ts";
@@ -22,6 +23,29 @@ import {
 } from "./registry.ts";
 
 const log = rootLog.child({ component: "tool-exec" });
+
+// Keep a rejected-args explanation bounded: a pathological or prompt-injected
+// call must not turn a validation failure into a huge tool result. Enough
+// issues to name the offending fields, each one short enough to be actionable.
+const MAX_ARG_ISSUES = 8;
+const MAX_ARG_ISSUE_LEN = 200;
+
+/** Render a Zod validation failure as a compact, field-named explanation so the
+ *  model can fix the call — e.g. `evidence: Invalid input: expected array,
+ *  received string`. Naming the field and expected shape is the whole point;
+ *  an opaque "invalid arguments" costs a guess-and-retry round trip. */
+function describeArgIssues(error: z.ZodError): string {
+  const issues = error.issues.slice(0, MAX_ARG_ISSUES).map((issue) => {
+    const field = issue.path.length > 0
+      ? issue.path.map((segment) => String(segment)).join(".")
+      : "(root)";
+    return `${field}: ${issue.message}`.slice(0, MAX_ARG_ISSUE_LEN);
+  });
+  if (error.issues.length > MAX_ARG_ISSUES) {
+    issues.push(`(+${error.issues.length - MAX_ARG_ISSUES} more)`);
+  }
+  return issues.join("; ");
+}
 
 export interface ToolExecInput {
   sessionId: string;
@@ -131,7 +155,11 @@ export async function executeToolCall(
     if (!parsedArgs.success) {
       return {
         kind: "submit",
-        result: { error: `invalid arguments for tool ${tool.name}` },
+        result: {
+          error: `invalid arguments for tool ${tool.name}: ${
+            describeArgIssues(parsedArgs.error)
+          }`,
+        },
       };
     }
 
