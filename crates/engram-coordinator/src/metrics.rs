@@ -86,8 +86,26 @@ pub fn init(addr: SocketAddr) {
         1.0, 5.0, 10.0, 20.0, 30.0, 60.0, 120.0, 300.0, 600.0, 1200.0, 1800.0,
     ];
 
+    // Teleport legs span both latency regimes at once: the blackout_*
+    // legs are the ~330ms guest-observed SLO (need sub-second
+    // resolution around it), while total/drain/capture_postcopy can run
+    // minutes on a fat session. Under the default 30s-capped `_seconds`
+    // buckets every long leg collapsed into +Inf (found during the
+    // 2026-07-22 prod-ops dashboard build — same disease as the #850
+    // epoch-histogram fix). One spread covers both regimes; the extra
+    // sub-second points sit exactly around the blackout SLO.
+    let migration_leg_buckets = &[
+        0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0, 2.5, 5.0, 15.0, 30.0, 60.0, 120.0, 300.0, 600.0,
+        1800.0,
+    ];
+
     let builder = PrometheusBuilder::new()
         .with_http_listener(addr)
+        .set_buckets_for_metric(
+            metrics_exporter_prometheus::Matcher::Full(MIGRATION_LEG_SECONDS.to_string()),
+            migration_leg_buckets,
+        )
+        .expect("install migration-leg histogram buckets")
         .set_buckets_for_metric(
             metrics_exporter_prometheus::Matcher::Full(EVICTION_PIPELINE_SECONDS.to_string()),
             eviction_buckets,
