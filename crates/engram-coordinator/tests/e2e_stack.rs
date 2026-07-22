@@ -45,7 +45,8 @@ use engram_protocol::app;
 use engram_protocol::app::fleet_service_client::FleetServiceClient;
 use engram_protocol::app::image_service_client::ImageServiceClient;
 use engram_protocol::app::session_service_client::SessionServiceClient;
-use serde_json::Value;
+use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use tonic::codegen::InterceptedService;
 use tonic::transport::Channel;
 
@@ -760,7 +761,335 @@ struct FlushResult {
     manifest_version: Option<u64>,
 }
 
+/// Minimal Connect-JSON driver for orchestrator-native RPCs. These services
+/// are intentionally absent from the coordinator's Rust proto build, so the
+/// e2e stack exercises their real public HTTP surface instead of inventing a
+/// second typed client.
+struct OrchestratorDriver {
+    base_url: String,
+    api_key: String,
+    http: reqwest::Client,
+}
+
+impl OrchestratorDriver {
+    fn from_env() -> Self {
+        let base_url = std::env::var("ENGRAM_E2E_ORCHESTRATOR_URL")
+            .unwrap_or_else(|_| "http://127.0.0.1:8787".to_string());
+        let api_key = std::env::var("ENGRAMS_API_KEY")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| {
+                std::fs::read_to_string("var/dev-api-key")
+                    .expect("read Tilt-seeded var/dev-api-key for orchestrator e2e")
+                    .trim()
+                    .to_string()
+            });
+        Self {
+            base_url,
+            api_key,
+            http: reqwest::Client::new(),
+        }
+    }
+
+    async fn rpc(&self, service: &str, method: &str, body: Value) -> Value {
+        let url = format!("{}/rpc/engram.app.v1.{service}/{method}", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("connect-protocol-version", "1")
+            .header("x-api-key", &self.api_key)
+            .json(&body)
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("POST {url}: {error}"));
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .unwrap_or_else(|error| panic!("read {url} response: {error}"));
+        assert!(
+            status.is_success(),
+            "orchestrator RPC {service}/{method} failed {status}: {text}"
+        );
+        serde_json::from_str(&text)
+            .unwrap_or_else(|error| panic!("decode {service}/{method} JSON {text:?}: {error}"))
+    }
+
+    async fn put_org_secret(&self, name: &str, value: &str) {
+        self.rpc(
+            "OrgSecretService",
+            "PutSecret",
+            json!({ "name": name, "value": value }),
+        )
+        .await;
+    }
+
+    async fn create_automation_profile(&self, image_id: &str, suffix: &str) -> String {
+        let response = self
+            .rpc(
+                "ProfileService",
+                "CreateProfile",
+                json!({
+                    "name": format!("Automation e2e {suffix}"),
+                    "description": "Ephemeral e2e automation profile",
+                    "icon": "Bot",
+                    "imageId": image_id,
+                    "includeUserTokens": false,
+                    "envVars": {},
+                    "skills": [],
+                    "capabilities": [],
+                    "network": {
+                        "default": "deny",
+                        "allowHosts": [],
+                        "allowHostPatterns": []
+                    },
+                    "secrets": [],
+                    "isDefault": false,
+                    "harness": "claude",
+                    "portExposures": []
+                }),
+            )
+            .await;
+        response["profile"]["id"]
+            .as_str()
+            .expect("CreateProfile response profile.id")
+            .to_string()
+    }
+
+    async fn create_automation(
+        &self,
+        name: &str,
+        trigger: Value,
+        profile_id: &str,
+        prompt: &str,
+    ) -> String {
+        let response = self
+            .rpc(
+                "AutomationService",
+                "CreateAutomation",
+                json!({
+                    "name": name,
+                    "description": "e2e",
+                    "enabled": true,
+                    "trigger": trigger,
+                    "action": {
+                        "createTask": {
+                            "profileId": profile_id,
+                            "promptTemplate": prompt,
+                            "includeEventContext": false
+                        }
+                    }
+                }),
+            )
+            .await;
+        response["automation"]["id"]
+            .as_str()
+            .expect("CreateAutomation response automation.id")
+            .to_string()
+    }
+
+    async fn wait_for_launched_run(&self, automation_id: &str, timeout: Duration) -> Value {
+        let deadline = tokio::time::Instant::now() + timeout;
+        loop {
+            let response = self
+                .rpc(
+                    "AutomationService",
+                    "ListAutomationRuns",
+                    json!({ "automationId": automation_id, "limit": 10 }),
+                )
+                .await;
+            for run in response["runs"]
+                .as_array()
+                .expect("ListAutomationRuns response runs")
+            {
+                match run["status"].as_str() {
+                    Some("launched") => return run.clone(),
+                    Some("render_failed" | "launch_failed" | "skipped") => {
+                        panic!("automation {automation_id} terminated without launch: {run}")
+                    }
+                    _ => {}
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "automation {automation_id} did not launch within {}s",
+                timeout.as_secs()
+            );
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    }
+
+    async fn assert_task_session(&self, run: &Value) -> SessionId {
+        let task_id = run["taskId"]
+            .as_str()
+            .expect("launched automation run taskId");
+        let session_id = run["sessionId"]
+            .as_str()
+            .expect("launched automation run sessionId");
+        let response = self
+            .rpc("TaskService", "GetTask", json!({ "taskId": task_id }))
+            .await;
+        assert_eq!(response["task"]["type"], "automation");
+        assert!(
+            response["task"]["sessions"]
+                .as_array()
+                .expect("GetTask task.sessions")
+                .iter()
+                .any(|session| session["sessionId"] == session_id),
+            "automation task {task_id} did not contain session {session_id}: {response}"
+        );
+        session_id
+            .parse()
+            .expect("automation sessionId is a SessionId")
+    }
+
+    async fn post_generic_hook(&self, registration_id: &str, secret: &str, body: &str) {
+        let signature = hmac_sha256_hex(secret.as_bytes(), body.as_bytes());
+        let url = format!("{}/api/v1/hooks/{registration_id}", self.base_url);
+        let response = self
+            .http
+            .post(&url)
+            .header("content-type", "application/json")
+            .header("x-engrams-event", "incident.opened")
+            .header("x-engrams-delivery", format!("delivery-{registration_id}"))
+            .header("x-engrams-signature-256", format!("sha256={signature}"))
+            .body(body.to_string())
+            .send()
+            .await
+            .unwrap_or_else(|error| panic!("POST {url}: {error}"));
+        assert_eq!(
+            response.status(),
+            reqwest::StatusCode::OK,
+            "generic automation webhook should be acknowledged"
+        );
+    }
+}
+
+fn hmac_sha256_hex(key: &[u8], body: &[u8]) -> String {
+    const BLOCK: usize = 64;
+    let mut normalized = [0_u8; BLOCK];
+    if key.len() > BLOCK {
+        normalized[..32].copy_from_slice(&Sha256::digest(key));
+    } else {
+        normalized[..key.len()].copy_from_slice(key);
+    }
+    let mut inner_pad = [0x36_u8; BLOCK];
+    let mut outer_pad = [0x5c_u8; BLOCK];
+    for index in 0..BLOCK {
+        inner_pad[index] ^= normalized[index];
+        outer_pad[index] ^= normalized[index];
+    }
+    let mut inner = Sha256::new();
+    inner.update(inner_pad);
+    inner.update(body);
+    let inner_digest = inner.finalize();
+    let mut outer = Sha256::new();
+    outer.update(outer_pad);
+    outer.update(inner_digest);
+    outer
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
 // ---------- Tests ----------
+
+#[tokio::test]
+#[ignore = "requires the live prod-shape stack with orchestrator + seeded admin key"]
+async fn e2e_automation_webhook_launches_session() {
+    let mut coordinator = Driver::from_env().await;
+    let orchestrator = OrchestratorDriver::from_env();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    orchestrator
+        .put_org_secret("ANTHROPIC_API_KEY", "sk-bogus-automation-e2e")
+        .await;
+    let image = coordinator
+        .enabled_image_summary(&Driver::image_uri())
+        .await;
+    let profile_id = orchestrator
+        .create_automation_profile(&image.id, &suffix)
+        .await;
+    let registration_id = format!("e2e-hook-{suffix}");
+    let registration = orchestrator
+        .rpc(
+            "WebhookRegistrationService",
+            "CreateWebhookRegistration",
+            json!({
+                "id": registration_id,
+                "name": format!("Webhook e2e {suffix}"),
+                "verificationScheme": "generic_hmac_sha256"
+            }),
+        )
+        .await;
+    let secret = registration["secret"]
+        .as_str()
+        .expect("CreateWebhookRegistration response secret");
+    let automation_id = orchestrator
+        .create_automation(
+            &format!("Webhook e2e {suffix}"),
+            json!({
+                "webhook": {
+                    "registrationId": registration_id,
+                    "events": ["incident.opened"]
+                }
+            }),
+            &profile_id,
+            "Webhook incident ${{ event.raw.incident.id }}",
+        )
+        .await;
+
+    orchestrator
+        .post_generic_hook(&registration_id, secret, r#"{"incident":{"id":42}}"#)
+        .await;
+    let run = orchestrator
+        .wait_for_launched_run(&automation_id, DEFAULT_TIMEOUT)
+        .await;
+    assert_eq!(run["renderedPrompt"], "Webhook incident 42");
+    let session_id = orchestrator.assert_task_session(&run).await;
+    coordinator.delete(session_id).await;
+}
+
+#[tokio::test]
+#[ignore = "requires the live prod-shape stack with orchestrator scheduler + seeded admin key"]
+async fn e2e_automation_cron_launches_session() {
+    let mut coordinator = Driver::from_env().await;
+    let orchestrator = OrchestratorDriver::from_env();
+    let suffix = uuid::Uuid::new_v4().simple().to_string();
+    orchestrator
+        .put_org_secret("ANTHROPIC_API_KEY", "sk-bogus-automation-e2e")
+        .await;
+    let image = coordinator
+        .enabled_image_summary(&Driver::image_uri())
+        .await;
+    let profile_id = orchestrator
+        .create_automation_profile(&image.id, &suffix)
+        .await;
+    // Croner accepts a seconds field. The next occurrence is at most five
+    // seconds away; the scanner's 15-second period remains the dominant wait.
+    let automation_id = orchestrator
+        .create_automation(
+            &format!("Cron e2e {suffix}"),
+            json!({ "cron": { "schedule": "*/5 * * * * *", "timezone": "UTC" } }),
+            &profile_id,
+            "Cron fired at ${{ trigger.scheduled_for }}",
+        )
+        .await;
+
+    let run = orchestrator
+        .wait_for_launched_run(&automation_id, DEFAULT_TIMEOUT)
+        .await;
+    let scheduled_for = run["scheduledFor"]
+        .as_str()
+        .expect("cron automation run scheduledFor");
+    assert_eq!(
+        run["renderedPrompt"],
+        format!("Cron fired at {scheduled_for}")
+    );
+    let session_id = orchestrator.assert_task_session(&run).await;
+    coordinator.delete(session_id).await;
+}
 
 #[tokio::test]
 #[ignore = "requires ENGRAM_E2E_GRPC_ADDR + a live prod-shape stack with a baked demo image"]
