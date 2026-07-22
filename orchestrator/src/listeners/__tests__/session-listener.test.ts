@@ -474,6 +474,57 @@ describe("SessionListener", () => {
     expect(rec.terminals).toEqual([]);
   });
 
+  test("an idle stream subscribes to the parked pull once and still delivers a late frame", async () => {
+    const rec = recordingConsumer();
+    let nextCalls = 0;
+    let probes = 0;
+    let deliverFrame: ((r: IteratorResult<WireEvent>) => void) | undefined;
+    // A hand-rolled iterator so we can count next() calls: the parked pull must
+    // be subscribed exactly once across many probe intervals (racing the pull
+    // promise directly would re-.then it per probe and leak reactions), and the
+    // late frame must still wake the loop.
+    const stream: OpenedSessionStream = {
+      events: {
+        [Symbol.asyncIterator]: () => ({
+          next: () => {
+            nextCalls++;
+            if (nextCalls === 1) {
+              return new Promise<IteratorResult<WireEvent>>((resolve) => {
+                deliverFrame = resolve;
+              });
+            }
+            if (nextCalls === 2) {
+              return Promise.resolve({ done: false, value: terminal(1n) });
+            }
+            return Promise.resolve({ done: true, value: undefined });
+          },
+        }),
+      },
+      close: () => {},
+    };
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => page([], after), // idle: log at cursor
+      openStream: async () => stream,
+      sleep: async (ms) => {
+        if (ms !== 77_777) return void (await never());
+        // Fire a handful of probe intervals with the pull parked, then park so
+        // the loop settles before the assertion.
+        if (probes++ >= 4) await never();
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => probes >= 5); // 5 probe intervals elapsed, pull still parked
+    expect(nextCalls).toBe(1); // the parked pull was subscribed once, not re-issued
+
+    deliverFrame!({ done: false, value: event(0n) }); // a frame finally arrives
+    await running; // wakes, delivers, then reads terminal(1n) and completes
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n]);
+    expect(rec.terminals).toEqual(["completed"]);
+  });
+
   test("an idx-less lag frame closes the stream and catches up without loss", async () => {
     const rec = recordingConsumer();
     const after: bigint[] = [];
