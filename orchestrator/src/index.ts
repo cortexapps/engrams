@@ -42,6 +42,7 @@ import { registerOrgSecret } from "./rpc/org-secret.ts";
 import { registerMint } from "./rpc/mint.ts";
 import { registerApiKeys } from "./rpc/api-key.ts";
 import { registerIntegration } from "./rpc/integration.ts";
+import { registerAutomations } from "./rpc/automations.ts";
 import { SURFACE } from "./rpc/surface.ts";
 import { controlPlaneTransport } from "./control-plane/transport.ts";
 import { sessions as controlPlaneSessions } from "./control-plane/client.ts";
@@ -185,6 +186,11 @@ const server = buildServer(
     // Native IntegrationService (ADR 0057 C3): admin-gated connector catalog CRUD
     // (Plane B) over the orchestrator's own DB; built-ins are read-only seeds.
     registerIntegration(router);
+
+    // Native AutomationService + WebhookRegistrationService (ADR 0102):
+    // admin-authored triggers, render preview, run/sample history, and sealed
+    // per-registration webhook secrets.
+    registerAutomations(router);
 
     // Generic passthrough: forwards SessionService, FleetService, ImageService
     // to the control plane with per-method CASL authz gate (ADR 0051 Task 18).
