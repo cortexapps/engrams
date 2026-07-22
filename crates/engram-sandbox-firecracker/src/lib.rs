@@ -726,6 +726,19 @@ struct LiveSandbox {
     /// `None` on non-Linux, so the flag has no reader there).
     #[cfg(target_os = "linux")]
     parked: bool,
+    /// Bumped once per FC `PUT /snapshot/create` against this sandbox.
+    /// Snapshot creation (`prepare_save`) queues a vsock
+    /// `TRANSPORT_RESET` for the guest (ADR 0074), and the resumed
+    /// guest's driver drops every open connection when it acks — with
+    /// no FIN/RST back through the muxer, so the host end of each
+    /// connection never EOFs. A one-shot stream parked in a read at
+    /// that moment (exec's event stream awaiting `Exit`) would block
+    /// forever on a connection the guest has forgotten (prod
+    /// 2026-07-22: review bootstraps wedged mid-`git clone` when the
+    /// seed-at-create checkpoint landed inside the exec). Readers
+    /// subscribe BEFORE dialing and treat any bump as connection
+    /// death.
+    vsock_epoch: tokio::sync::watch::Sender<u64>,
 }
 
 /// Sidecar JSON file written next to `state.bin` and `memory.bin` to
@@ -1441,6 +1454,7 @@ impl FirecrackerBackend {
                 parked: false,
                 agentd_slot_swapped: false,
                 agent_ready: ready_rx,
+                vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
 
@@ -1528,7 +1542,9 @@ impl FirecrackerBackend {
             ))
         })?;
         let (reader, writer) = tokio::io::split(conn);
-        drive_exec_protocol(sandbox_id, reader, writer, cmd).await
+        // Direct-UDS variant (tests/dev): no FC snapshot machinery, so no
+        // severance signal to watch.
+        drive_exec_protocol(sandbox_id, reader, writer, cmd, None).await
     }
 
     /// Drive agentd's existing `Upload` verb over a direct UDS. Public for
@@ -1566,10 +1582,11 @@ impl FirecrackerBackend {
         vsock_uds_path: &Path,
         port: u32,
         cmd: ExecRequest,
+        severed: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<ExecStream, SandboxError> {
         let conn = Self::connect_fc_vsock(vsock_uds_path, port).await?;
         let (reader, writer) = tokio::io::split(conn);
-        drive_exec_protocol(sandbox_id, reader, writer, cmd).await
+        drive_exec_protocol(sandbox_id, reader, writer, cmd, severed).await
     }
 
     async fn write_files_via_fc_vsock(
@@ -2466,6 +2483,7 @@ impl FirecrackerBackend {
                 parked: false,
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready_rx,
+                vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
         if let Some(pid) = fc_pid {
@@ -3440,6 +3458,7 @@ impl FirecrackerBackend {
                 parked: false,
                 agentd_slot_swapped,
                 agent_ready: ready_rx,
+                vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
         if let Some(pid) = fc_pid {
@@ -4208,6 +4227,7 @@ async fn drive_exec_protocol<R, W>(
     mut reader: R,
     mut writer: W,
     cmd: ExecRequest,
+    mut severed: Option<tokio::sync::watch::Receiver<u64>>,
 ) -> Result<ExecStream, SandboxError>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -4232,7 +4252,26 @@ where
 
     tokio::spawn(async move {
         loop {
-            match read_msg::<_, WireExecEvent>(&mut reader).await {
+            // A snapshot capture severs every vsock connection without an
+            // EOF on the host end (`LiveSandbox::vsock_epoch`); racing the
+            // read against the epoch watch is what turns that silent
+            // severance into stream termination. `changed()` erroring
+            // (sender dropped = sandbox destroyed) means the same thing.
+            let msg = match severed.as_mut() {
+                Some(epoch) => tokio::select! {
+                    msg = read_msg::<_, WireExecEvent>(&mut reader) => msg,
+                    _ = epoch.changed() => {
+                        tracing::warn!(
+                            %sandbox_id,
+                            "snapshot capture severed the exec vsock stream before Exit; synthesizing Exit(None)",
+                        );
+                        let _ = tx.send(ExecEvent::Exit(None)).await;
+                        return;
+                    }
+                },
+                None => read_msg::<_, WireExecEvent>(&mut reader).await,
+            };
+            match msg {
                 Ok(WireExecEvent::Stdout(b)) => {
                     if tx.send(ExecEvent::Stdout(Bytes::from(b))).await.is_err() {
                         return;
@@ -4434,9 +4473,16 @@ impl SandboxBackend for FirecrackerBackend {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        let vsock_uds_path = {
+        let (vsock_uds_path, severed) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.vsock_uds_path.clone()
+            // Subscribe BEFORE dialing: a capture that lands between the
+            // subscribe and the guest finishing the command still wakes
+            // this receiver; one that completed before the subscribe
+            // can't have severed a connection we haven't opened yet.
+            (
+                live.state.vsock_uds_path.clone(),
+                live.vsock_epoch.subscribe(),
+            )
         };
         // ADR 0015 M1: no boot-race retry here. Sessions only reach
         // exec_stream after `start_agent` has returned, and
@@ -4444,7 +4490,8 @@ impl SandboxBackend for FirecrackerBackend {
         // agentd dials the host's ready port). If we hit `early eof`
         // here, agentd genuinely went away after readiness signal —
         // surface the error rather than masking with retries.
-        Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd).await
+        Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd, Some(severed))
+            .await
     }
 
     async fn write_files(
@@ -6075,8 +6122,17 @@ impl FirecrackerBackend {
             .await
             .map_err(|e| SandboxError::Snapshot(format!("write sidecar: {e}")))?;
         let api = FirecrackerClient::new(&socket).with_timeout(Duration::from_secs(60));
-        api.create_snapshot_vmstate_only(&dest.join("state.bin"))
-            .await?;
+        let create_result = api
+            .create_snapshot_vmstate_only(&dest.join("state.bin"))
+            .await;
+        // Vmstate-only skips only the memory leg — `vmm.save_state()` still
+        // serializes devices, so vsock's `prepare_save` queues the same
+        // `TRANSPORT_RESET` a full capture does. Wake parked readers (see
+        // `snapshot_with_type`).
+        if let Some(live) = self.sandboxes.get(&id) {
+            live.vsock_epoch.send_modify(|v| *v += 1);
+        }
+        create_result?;
         Ok((snapshot_id, dest))
     }
 }
@@ -6149,17 +6205,27 @@ impl FirecrackerBackend {
         // 32 GiB capture). See `snapshot_create_timeout`.
         let api = FirecrackerClient::new(&socket)
             .with_timeout(snapshot_create_timeout(spec.memory.max_mib));
-        let paths = match snapshot_type {
-            client::SnapshotType::Full => api.create_snapshot(&dest).await?,
+        let create_result = match snapshot_type {
+            client::SnapshotType::Full => api.create_snapshot(&dest).await,
             client::SnapshotType::Diff => {
                 api.create_snapshot_at(
                     dest.join("state.bin"),
                     dest.join("memory.diff"),
                     client::SnapshotType::Diff,
                 )
-                .await?
+                .await
             }
         };
+        // The create ran `prepare_save`, which queued a vsock
+        // `TRANSPORT_RESET`: every connection open across this point is
+        // now doomed, and the host ends never EOF (ADR 0074). Wake every
+        // reader parked on one (`LiveSandbox::vsock_epoch`) — on failure
+        // too, since a create that errored mid-sequence may still have
+        // quiesced the vsock device.
+        if let Some(live) = self.sandboxes.get(&id) {
+            live.vsock_epoch.send_modify(|v| *v += 1);
+        }
+        let paths = create_result?;
 
         let created_at = Utc::now();
         // ADR 0018 commit 12o: stamp the canonical paths from what the
@@ -6827,6 +6893,66 @@ mod tests {
         }
     }
 
+    /// Prod 2026-07-22: a snapshot capture severs every vsock connection
+    /// with NO EOF on the host end (the guest silently forgets them when
+    /// it acks the capture's `TRANSPORT_RESET`; see
+    /// `LiveSandbox::vsock_epoch`). A reader parked in `read_msg` at that
+    /// moment must terminate with a synthetic `Exit(None)` when the epoch
+    /// bumps — it used to block forever, wedging the coord Exec stream
+    /// and its caller (review bootstraps hung mid-`git clone`).
+    #[tokio::test]
+    async fn exec_reader_synthesizes_exit_when_snapshot_severs_vsock() {
+        use futures_util::StreamExt;
+
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(host_end);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let req = ExecRequest {
+            command: vec!["git".into(), "clone".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+        };
+        let stream = drive_exec_protocol(SandboxId::new(), reader, writer, req, Some(epoch_rx))
+            .await
+            .expect("exec request write succeeds");
+
+        // Guest side: consume the request frame, emit one pre-severance
+        // stderr chunk, then go silent WITHOUT closing the connection —
+        // modeling the severed-but-never-EOF muxer UDS.
+        let _req: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
+        write_msg(
+            &mut guest_end,
+            &WireExecEvent::Stderr(b"Cloning into '/workspace'...\n".to_vec()),
+        )
+        .await
+        .expect("stderr chunk");
+
+        let mut events = stream.events;
+        match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+            Ok(Some(ExecEvent::Stderr(b))) => {
+                assert_eq!(&b[..], b"Cloning into '/workspace'...\n".as_slice());
+            }
+            other => panic!("expected the pre-severance stderr chunk, got {other:?}"),
+        }
+
+        // The checkpoint fires: epoch bumps, connection stays open.
+        epoch_tx.send_modify(|v| *v += 1);
+
+        match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+            Ok(Some(ExecEvent::Exit(None))) => {}
+            other => panic!("expected synthetic Exit(None) after severance, got {other:?}"),
+        }
+        match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+            Ok(None) => {}
+            other => panic!("stream must end after the synthetic Exit, got {other:?}"),
+        }
+        // Only now may the guest end drop: the property under test is
+        // termination WITHOUT any EOF from the connection.
+        drop(guest_end);
+    }
+
     /// ADR 0009 §4: the supervisor must prune the entry from the
     /// map when the watched pid disappears. Uses a real subprocess
     /// (`sleep 600`) so the kill-detection is exercised end-to-end:
@@ -7195,6 +7321,7 @@ mod tests {
                 parked: false,
                 agentd_slot_swapped: false,
                 agent_ready,
+                vsock_epoch: tokio::sync::watch::channel(0).0,
             }
         };
 
@@ -7269,6 +7396,7 @@ mod tests {
                 parked: false,
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.clone(),
+                vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
         let parked_id = SandboxId::new();
@@ -7286,6 +7414,7 @@ mod tests {
                 parked: false,
                 agentd_slot_swapped: false,
                 agent_ready: agent_ready.clone(),
+                vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
         be.set_parked_for_test(parked_id, true);
@@ -7429,6 +7558,7 @@ mod tests {
                 parked: false,
                 agentd_slot_swapped: false,
                 agent_ready,
+                vsock_epoch: tokio::sync::watch::channel(0).0,
             },
         );
 
