@@ -118,8 +118,6 @@ export interface ReviewControlPlane {
     reviewId: string;
     repo: string;
     prNumber: number;
-    headSha: string;
-    baseSha: string;
   }): Promise<void>;
   /** Post the review results. Retires the verifier worker first (best-effort)
    *  when a session id is given, so a stray worker never blocks the post. */
@@ -283,21 +281,72 @@ async function cloneRepo(
     command += ` && git -C ${workspace} checkout ${headSha}`;
   }
 
-  const stderrDecoder = new TextDecoder();
-  let stderr = "";
-  let exitStatus: number | undefined;
-  for await (const message of sessions.exec({ sessionId, command })) {
-    if (message.event.case === "stderr") {
-      stderr += stderrDecoder.decode(message.event.value, { stream: true });
-    } else if (message.event.case === "exit") {
-      exitStatus = message.event.value.exitStatus;
-    }
-  }
-  stderr += stderrDecoder.decode();
+  const { exitStatus, stderr } = await runExec(sessions, sessionId, command);
   if (exitStatus !== 0) {
     const detail = stderr.trim() || "exec stream ended without a successful exit status";
     throw new ReviewSetupError(`${phase} clone failed: ${detail}`);
   }
+}
+
+/** Drain an `exec` stream to completion, capturing stdout, stderr, and the
+ *  exit status. The one place both stream halves are decoded. */
+async function runExec(
+  sessions: ReviewSessionsClient,
+  sessionId: string,
+  command: string,
+): Promise<{ exitStatus: number | undefined; stdout: string; stderr: string }> {
+  const outDecoder = new TextDecoder();
+  const errDecoder = new TextDecoder();
+  let stdout = "";
+  let stderr = "";
+  let exitStatus: number | undefined;
+  for await (const message of sessions.exec({ sessionId, command })) {
+    if (message.event.case === "stdout") {
+      stdout += outDecoder.decode(message.event.value, { stream: true });
+    } else if (message.event.case === "stderr") {
+      stderr += errDecoder.decode(message.event.value, { stream: true });
+    } else if (message.event.case === "exit") {
+      exitStatus = message.event.value.exitStatus;
+    }
+  }
+  stdout += outDecoder.decode();
+  stderr += errDecoder.decode();
+  return { exitStatus, stdout, stderr };
+}
+
+/** Resolve the TRUE merge base (fork point) of the base and head commits in
+ *  the already-cloned checkout. GitHub's `pull.base.sha` is the base BRANCH's
+ *  current head, not the fork point — anchoring a diff there renders every
+ *  commit the base branch gained since the fork as phantom DELETIONS in the PR
+ *  (live: engrams#820 was reported as deleting `HarnessDescriptor.egress`, a
+ *  field main gained after the branch forked). Resolving here, in setup, hands
+ *  the finder the real anchor so it cannot mis-scope even with a two-dot
+ *  `git diff`. The full clone always contains the fork point, so this is a
+ *  local computation — no network, no API. Throws rather than fall back to the
+ *  wrong anchor. Both SHAs are validated before reaching `sh -c` (injection
+ *  defense in depth, as in cloneRepo). */
+async function resolveMergeBase(
+  sessions: ReviewSessionsClient,
+  sessionId: string,
+  repoDir: string,
+  baseSha: string,
+  headSha: string,
+): Promise<string> {
+  if (!SHA_RE.test(baseSha)) throw new ReviewSetupError(`invalid base SHA: ${baseSha}`);
+  if (!SHA_RE.test(headSha)) throw new ReviewSetupError(`invalid head SHA: ${headSha}`);
+  const { exitStatus, stdout, stderr } = await runExec(
+    sessions,
+    sessionId,
+    `git -C ${repoDir} merge-base ${baseSha} ${headSha}`,
+  );
+  const mergeBase = stdout.trim();
+  if (exitStatus !== 0 || !SHA_RE.test(mergeBase)) {
+    const detail = stderr.trim() || `merge-base returned ${JSON.stringify(mergeBase)}`;
+    throw new ReviewSetupError(
+      `failed to resolve merge base of ${baseSha}..${headSha}: ${detail}`,
+    );
+  }
+  return mergeBase;
 }
 
 function productionImagesClient(): ImagesClient {
@@ -554,20 +603,24 @@ export function makeReviewControlPlane(
 
     async sendFinderPrompt(sessionId, input) {
       const name = repoName(input.repo);
-      // THREE-dot, deliberately: baseSha is the base BRANCH's current head
-      // (GitHub's `pull.base.sha`), not the merge base. When the base branch
-      // has advanced past the PR's fork point, a two-dot diff shows every
-      // commit main gained since the fork as phantom DELETIONS in the PR —
-      // the finder then reports removals the author never made (observed
-      // live on engrams#820: "this PR deletes HarnessDescriptor.egress",
-      // a field merged to main after the branch forked). Three-dot makes
-      // git resolve the true merge base from the full clone.
-      const range = input.baseSha !== "" && input.headSha !== ""
-        ? `${input.baseSha}...${input.headSha}`
+      // Resolve the TRUE merge base here and hand it to the finder as the diff
+      // anchor. input.baseSha is GitHub's `pull.base.sha` — the base BRANCH's
+      // head, not the fork point — so it is the WRONG anchor (see
+      // resolveMergeBase for the engrams#820 phantom-deletion failure). By
+      // computing `git merge-base` in setup we give the finder the real fork
+      // point as base_sha, so its diff is correctly scoped even if it runs a
+      // two-dot `git diff base head`. The prompt still uses three-dot as a
+      // belt-and-suspenders (with a true merge base the two are equivalent).
+      const mergeBase = input.baseSha !== "" && input.headSha !== ""
+        ? await resolveMergeBase(sessions, sessionId, `/workspace/${name}`, input.baseSha, input.headSha)
+        : "";
+      const range = mergeBase !== ""
+        ? `${mergeBase}...${input.headSha}`
         : "the PR diff";
       const prompt = [
         `Review ${input.repo} pull request #${input.prNumber}.`,
         `Analyze ${range} in /workspace/${name}.`,
+        ...(mergeBase !== "" ? [`base_sha is ${mergeBase} (the merge base).`] : []),
         "Read /workspace/.review/finder.md and follow its instructions before reviewing.",
         ...(input.focus?.trim() ? [`Focus directive: ${input.focus.trim()}`] : []),
         "Report findings only through the provided review tools; do not edit files or push changes.",
