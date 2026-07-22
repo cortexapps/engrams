@@ -13,6 +13,18 @@
       { "header": "Authorization", "template": "Bearer {}", "secretRef": "slack.bot_token" }
     ]
   },
+  "webhook": {
+    "verificationScheme": "slack_v0",
+    "events": [
+      { "key": "app_mention", "displayName": "App mention" }
+    ],
+    "aliases": [
+      { "path": "event.text", "alias": "message.text" },
+      { "path": "event.user", "alias": "actor.id" },
+      { "path": "event.channel", "alias": "channel.id" },
+      { "path": "event.ts", "alias": "message.timestamp" }
+    ]
+  },
   "hosts": ["slack.com"],
   "test": { "path": "/api/auth.test" },
   "operations": [
