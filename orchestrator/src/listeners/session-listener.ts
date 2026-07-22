@@ -291,75 +291,77 @@ export class SessionListener {
         // #704), which is indistinguishable from a healthy idle session
         // without a periodic liveness read against the durable log.
         const iterator = opened.events[Symbol.asyncIterator]();
-        // Each pull is subscribed to exactly once. `Promise.race` calls `.then`
-        // on every arm on every call, so racing the pull promise itself would
-        // append a reaction to it per iteration — and on a quiet-but-alive
-        // stream the same parked `iterator.next()` is raced against the probe
-        // timer every interval, so those reactions pile up until a frame finally
-        // arrives (unbounded with idle uptime). Instead a one-shot reaction
-        // records each pull's outcome and wakes whatever race is current; the
-        // raced promises are then all either short-lived (a fresh per-iteration
-        // wake) or self-releasing (the probe timer, rebuilt each time it fires).
+        // Both the pull and the probe are subscribed to exactly once, via
+        // one-shot reactions that record their outcome and resolve whatever wake
+        // is current. `Promise.race` calls `.then` on every arm on every call,
+        // so racing a promise that outlives the iteration — the parked
+        // `iterator.next()` on a quiet stream, or the 30s probe timer on a busy
+        // one — would pile a reaction onto it every iteration. Here the only
+        // thing awaited is a FRESH per-iteration `wake` promise, so nothing
+        // accumulates on the hot path.
         type PullOutcome =
           | { result: IteratorResult<WireEvent, unknown> }
           | { err: unknown };
         let pullOutcome: PullOutcome | null = null;
-        let wakePull: (() => void) | null = null;
+        let probeDue = false;
+        let wake: (() => void) | null = null;
         const issuePull = (): void => {
           pullOutcome = null;
           void iterator.next().then(
             (result) => {
               pullOutcome = { result };
-              wakePull?.();
+              wake?.();
             },
             (err: unknown) => {
               pullOutcome = { err };
-              wakePull?.();
+              wake?.();
             },
           );
         };
-        // One probe timer, re-armed only when it actually fires — never torn
-        // down and rebuilt per frame (that would allocate a fresh uncancellable
-        // timer on the hot streaming path for every wire frame). A delivered
-        // frame just sets frameSinceProbe; when the timer fires we consult that
-        // flag: a stream that delivered this interval is demonstrably live
-        // (#touchLive already ran), so we skip the probe read and start a fresh
-        // interval. Only a silent stream reaches the read, and a stalled one
-        // reads on two consecutive firings with no frame between (sawLogAhead
-        // persists) — which condemns it. Idle sessions (no frames, log at
-        // cursor) still probe every interval, which is what keeps their lease
-        // alive.
-        let probeTimer: Promise<"probe"> | null = null;
+        // Arm the probe once; when it elapses its one-shot sets probeDue and
+        // wakes the loop, and it is re-armed only once that firing is consumed.
+        // A delivered frame sets frameSinceProbe, so a due probe on a stream
+        // that delivered this interval is demonstrably live (#touchLive ran) and
+        // skips the read; only a silent stream reaches the read, and a stalled
+        // one reads on two consecutive firings with no frame between (sawLogAhead
+        // persists) — which condemns it. Idle sessions still probe every
+        // interval, keeping their lease alive.
+        const armProbe = (): void => {
+          void this.#deps.sleep(this.#probeIntervalMs).then(() => {
+            probeDue = true;
+            wake?.();
+          });
+        };
         let sawLogAhead = false;
         let frameSinceProbe = false;
         try {
           issuePull();
+          armProbe();
           for (;;) {
             if (this.#stopRequested) return;
-            if (pullOutcome === null) {
-              probeTimer ??= this.#deps.sleep(this.#probeIntervalMs).then(() => "probe" as const);
-              // Race a FRESH per-iteration wake (resolved by the pull's one-shot
-              // reaction), never the long-lived pull itself — see the note on
-              // issuePull above. No stop arm either: #requestStop() closes the
-              // stream, which settles the pull, and the probe timer
-              // (≤ probeIntervalMs) bounds the pathological parked-dial case —
-              // exactly when the lease is being abandoned. We re-check the
-              // #stopRequested flag on every wake.
-              const pullReady = new Promise<"pull">((resolve) => {
-                wakePull = () => resolve("pull");
+            // Wait on a fresh promise resolved by whichever one-shot fires
+            // first. No stop arm: #requestStop() closes the stream, settling the
+            // pull; the probe (≤ probeIntervalMs) bounds the parked-dial case —
+            // exactly when the lease is being abandoned. Re-check the flag on
+            // every wake.
+            if (pullOutcome === null && !probeDue) {
+              await new Promise<void>((resolve) => {
+                wake = () => resolve();
               });
-              const winner = await Promise.race([pullReady, probeTimer]);
-              wakePull = null;
+              wake = null;
               if (this.#stopRequested) return;
-              if (winner === "probe") {
-                probeTimer = null; // fired: the next iteration re-arms it
-                if (frameSinceProbe) {
-                  frameSinceProbe = false;
-                  continue; // delivered this interval — no probe read needed
-                }
-                sawLogAhead = await this.#probeQuietStream(lastSeen, sawLogAhead);
-                continue;
+            }
+            // Pull results take priority over a due probe: deliver frames
+            // promptly and leave the probe for a genuinely quiet moment.
+            if (pullOutcome === null && probeDue) {
+              probeDue = false;
+              armProbe(); // re-arm for the next interval
+              if (frameSinceProbe) {
+                frameSinceProbe = false;
+                continue; // delivered this interval — no probe read needed
               }
+              sawLogAhead = await this.#probeQuietStream(lastSeen, sawLogAhead);
+              continue;
             }
             const outcome = pullOutcome!;
             pullOutcome = null;
