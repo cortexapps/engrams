@@ -85,6 +85,11 @@ export class SessionListener {
   readonly #deps: SessionListenerDeps;
   readonly #context: { sessionId: string };
   readonly #stopped: Promise<void>;
+  /** `#stopped` mapped to the race sentinel, created once. `#stopped` settles
+   * at most once, so a single shared reaction suffices; attaching a fresh
+   * `.then` per loop iteration / per RPC would retain a closure on this
+   * long-lived promise for the session's lifetime (grows with frames streamed). */
+  readonly #stoppedRace: Promise<"stopped">;
   readonly #rpcDeadlineMs: number;
   readonly #probeIntervalMs: number;
   readonly #staleGraceMs: number;
@@ -110,6 +115,7 @@ export class SessionListener {
     this.#stopped = new Promise<void>((resolve) => {
       this.#resolveStopped = resolve;
     });
+    this.#stoppedRace = this.#stopped.then(() => "stopped" as const);
   }
 
   run(): Promise<void> {
@@ -280,7 +286,7 @@ export class SessionListener {
                 (err: unknown) => ({ err }),
               ),
               probeTimer,
-              this.#stopped.then(() => "stopped" as const),
+              this.#stoppedRace,
             ]);
             if (winner === "stopped") return;
             if (winner === "probe") {
@@ -393,7 +399,7 @@ export class SessionListener {
         (err: unknown) => ({ ok: false as const, err }),
       ),
       this.#deps.sleep(this.#rpcDeadlineMs).then(() => "deadline" as const),
-      this.#stopped.then(() => "stopped" as const),
+      this.#stoppedRace,
     ]);
     if (typeof outcome === "string") {
       controller.abort();
