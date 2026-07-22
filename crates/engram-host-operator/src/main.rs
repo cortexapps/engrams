@@ -10,6 +10,7 @@ mod autoscale;
 mod coord;
 mod crd;
 mod error;
+mod metrics;
 mod reconcile;
 mod scaler;
 mod time_source;
@@ -67,10 +68,17 @@ async fn main() -> Result<(), OperatorError> {
             },
             _ => Arc::new(scaler::NoopScaler),
         };
+    let metrics_addr = std::env::var("ENGRAM_OPERATOR_METRICS_ADDR")
+        .unwrap_or_else(|_| "0.0.0.0:9102".to_string())
+        .parse()
+        .map_err(|e| OperatorError::Invalid(format!("ENGRAM_OPERATOR_METRICS_ADDR: {e}")))?;
+    metrics::init(metrics_addr);
+
     let ctx = Arc::new(Ctx {
         client: client.clone(),
         scaler: node_scaler,
         scaledown_ticks: std::sync::atomic::AtomicU32::new(0),
+        node_ready: crate::autoscale::NodeReadyTracker::default(),
     });
 
     tracing::info!("engram-host-operator starting; watching HostFleet resources");
