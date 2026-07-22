@@ -454,6 +454,26 @@ describe("SessionListener", () => {
     expect(reads).toBe(2); // the frame-covered firing skipped its read
   });
 
+  test("stop() on a delivering stream exits via stream close, not a #stopped race in the loop", async () => {
+    const rec = recordingConsumer();
+    const subject = await listener({
+      // sleep defaults to `never`, so the probe timer never fires: the only
+      // way the parked pull can wake for stop is #requestStop() closing the
+      // stream. If the frame loop still relied on racing #stopped this would
+      // pass too, but the point is that close alone is sufficient — the loop
+      // no longer subscribes a reaction to #stopped per frame.
+      openStream: async () => opened([event(0n), event(1n)], { waitAtEnd: true }),
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => rec.events.length === 2); // both delivered; loop now parked on the pull
+    await subject.stop(); // closes the stream -> settles the pull -> flag check exits
+    await running; // resolves iff stop does not depend on a #stopped race in the loop
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
+    expect(rec.terminals).toEqual([]);
+  });
+
   test("an idx-less lag frame closes the stream and catches up without loss", async () => {
     const rec = recordingConsumer();
     const after: bigint[] = [];

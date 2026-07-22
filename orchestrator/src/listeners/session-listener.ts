@@ -92,10 +92,13 @@ export class SessionListener {
   readonly #deps: SessionListenerDeps;
   readonly #context: { sessionId: string };
   readonly #stopped: Promise<void>;
-  /** `#stopped` mapped to the race sentinel, created once. `#stopped` settles
-   * at most once, so a single shared reaction suffices; attaching a fresh
-   * `.then` per loop iteration / per RPC would retain a closure on this
-   * long-lived promise for the session's lifetime (grows with frames streamed). */
+  /** `#stopped` mapped to the race sentinel once, so the bounded-rate callers
+   * that race it (`#guarded`, one per coordinator RPC) don't each allocate a
+   * fresh `.then` closure. Note this does NOT make racing it free: `Promise.race`
+   * still appends a reaction to `#stopped` on every call, and those reactions
+   * live until `#stopped` settles at session stop. It is therefore safe only on
+   * bounded-rate paths — never race it per wire frame; the hot frame loop checks
+   * the `#stopRequested` flag on wake instead. */
   readonly #stoppedRace: Promise<"stopped">;
   readonly #rpcDeadlineMs: number;
   readonly #probeIntervalMs: number;
@@ -297,17 +300,26 @@ export class SessionListener {
         let frameSinceProbe = false;
         try {
           for (;;) {
+            if (this.#stopRequested) return;
             pending ??= iterator.next();
             probeTimer ??= this.#deps.sleep(this.#probeIntervalMs).then(() => "probe" as const);
+            // Deliberately NOT racing #stopped here. This awaits once per wire
+            // frame, and Promise.race calls .then on each arm — so racing the
+            // session-lifetime #stopped promise would append a reaction to it
+            // per frame (O(frames) heap retention on the hot path, released
+            // only at session stop). Instead we wake on the pull or the probe
+            // timer and re-check the #stopRequested flag: #requestStop() closes
+            // the stream, which settles the pending pull promptly, and the
+            // probe timer (≤ probeIntervalMs) bounds the pathological
+            // parked-dial case — exactly when the lease is being abandoned.
             const winner = await Promise.race([
               pending.then(
                 (result) => ({ result }),
                 (err: unknown) => ({ err }),
               ),
               probeTimer,
-              this.#stoppedRace,
             ]);
-            if (winner === "stopped") return;
+            if (this.#stopRequested) return;
             if (winner === "probe") {
               probeTimer = null; // fired: the next iteration re-arms it
               if (frameSinceProbe) {
@@ -321,7 +333,6 @@ export class SessionListener {
             pending = null;
             if (winner.result.done) break;
             const frame = winner.result.value;
-            if (this.#stopRequested) return;
             this.#touchLive();
             sawLogAhead = false;
             frameSinceProbe = true; // re-arm decision deferred to the next firing
