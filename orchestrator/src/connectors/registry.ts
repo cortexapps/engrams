@@ -232,6 +232,30 @@ export interface OauthFacet {
   tokenResponsePath: string;
 }
 
+export type WebhookVerificationScheme =
+  | "github_hmac_sha256"
+  | "slack_v0"
+  | "generic_hmac_sha256";
+
+export interface WebhookEventSpec {
+  key: string;
+  displayName: string;
+}
+
+/** Declarative payload-path to curated-event-alias mapping. Custom connectors
+ * can only provide data in this shape; no module/function reference is loaded
+ * from connector JSON. */
+export interface WebhookAliasSpec {
+  path: string;
+  alias: string;
+}
+
+export interface WebhookFacet {
+  verificationScheme: WebhookVerificationScheme;
+  events: WebhookEventSpec[];
+  aliases: WebhookAliasSpec[];
+}
+
 export interface Connector {
   provider: string;
   /** Only `"http"` is implemented; other values are rejected at load. GraphQL
@@ -253,6 +277,8 @@ export interface Connector {
   test?: ConnectorTest;
   /** Optional OAuth authorization-code acquisition (e.g. Slack "Add to Slack"). */
   oauth?: OauthFacet;
+  /** Optional inbound-webhook taxonomy + declarative curated alias mapping. */
+  webhook?: WebhookFacet;
 }
 
 // ---------------------------------------------------------------------------
@@ -692,6 +718,108 @@ function parseOauth(where: string, raw: unknown, hosts: string[]): OauthFacet {
   };
 }
 
+const MAX_WEBHOOK_EVENTS = 200;
+const MAX_WEBHOOK_ALIASES = 200;
+const MAX_WEBHOOK_EVENT_KEY_LENGTH = 160;
+const MAX_WEBHOOK_PATH_LENGTH = 512;
+const MAX_WEBHOOK_ALIAS_LENGTH = 160;
+const WEBHOOK_EVENT_KEY_RE = /^[a-z0-9_-]+(?:\.[a-z0-9_-]+)*$/;
+const WEBHOOK_ALIAS_RE = /^[a-z_][a-z0-9_]*(?:\.[a-z_][a-z0-9_]*)*$/;
+const WEBHOOK_PATH_RE = /^[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*$/;
+const UNSAFE_OBJECT_PATH_SEGMENTS = new Set(["__proto__", "constructor", "prototype"]);
+const WEBHOOK_SCHEMES: ReadonlySet<WebhookVerificationScheme> = new Set([
+  "github_hmac_sha256",
+  "slack_v0",
+  "generic_hmac_sha256",
+]);
+
+/** Parse the optional connector webhook facet at the same allowlist boundary as
+ * every other connector field. The result is bounded and declarative only. */
+export function parseWebhookFacet(where: string, raw: unknown): WebhookFacet {
+  if (typeof raw !== "object" || raw === null) fail(where, '"webhook" must be an object');
+  const o = raw as Record<string, unknown>;
+  if (
+    typeof o.verificationScheme !== "string" ||
+    !WEBHOOK_SCHEMES.has(o.verificationScheme as WebhookVerificationScheme)
+  ) {
+    fail(
+      where,
+      '"webhook.verificationScheme" must be "github_hmac_sha256", "slack_v0", or "generic_hmac_sha256"',
+    );
+  }
+
+  if (!Array.isArray(o.events)) fail(where, '"webhook.events" must be an array');
+  if (o.events.length > MAX_WEBHOOK_EVENTS) {
+    fail(where, `"webhook.events" has ${o.events.length} entries (max ${MAX_WEBHOOK_EVENTS})`);
+  }
+  const eventKeys = new Set<string>();
+  const events = o.events.map((rawEvent, i): WebhookEventSpec => {
+    const eventWhere = `${where} webhook.events[${i}]`;
+    if (typeof rawEvent !== "object" || rawEvent === null) fail(eventWhere, "must be an object");
+    const event = rawEvent as Record<string, unknown>;
+    if (
+      typeof event.key !== "string" ||
+      event.key.length > MAX_WEBHOOK_EVENT_KEY_LENGTH ||
+      !WEBHOOK_EVENT_KEY_RE.test(event.key)
+    ) {
+      fail(eventWhere, '"key" must be a lowercase dot-delimited identifier');
+    }
+    if (eventKeys.has(event.key)) fail(eventWhere, `duplicate event key "${event.key}"`);
+    eventKeys.add(event.key);
+    if (
+      typeof event.displayName !== "string" ||
+      !event.displayName.trim() ||
+      event.displayName.length > 120
+    ) {
+      fail(eventWhere, '"displayName" must be a non-empty string of at most 120 characters');
+    }
+    return { key: event.key, displayName: event.displayName };
+  });
+
+  if (!Array.isArray(o.aliases)) fail(where, '"webhook.aliases" must be an array');
+  if (o.aliases.length > MAX_WEBHOOK_ALIASES) {
+    fail(where, `"webhook.aliases" has ${o.aliases.length} entries (max ${MAX_WEBHOOK_ALIASES})`);
+  }
+  const aliasNames = new Set<string>();
+  const aliases = o.aliases.map((rawAlias, i): WebhookAliasSpec => {
+    const aliasWhere = `${where} webhook.aliases[${i}]`;
+    if (typeof rawAlias !== "object" || rawAlias === null) fail(aliasWhere, "must be an object");
+    const alias = rawAlias as Record<string, unknown>;
+    if (
+      typeof alias.path !== "string" ||
+      alias.path.length > MAX_WEBHOOK_PATH_LENGTH ||
+      !WEBHOOK_PATH_RE.test(alias.path) ||
+      alias.path.split(".").some((segment) => UNSAFE_OBJECT_PATH_SEGMENTS.has(segment))
+    ) {
+      fail(aliasWhere, '"path" must be a dot-delimited payload path');
+    }
+    if (
+      typeof alias.alias !== "string" ||
+      alias.alias.length > MAX_WEBHOOK_ALIAS_LENGTH ||
+      !WEBHOOK_ALIAS_RE.test(alias.alias) ||
+      alias.alias === "raw" ||
+      alias.alias.startsWith("raw.") ||
+      alias.alias.split(".").some((segment) => UNSAFE_OBJECT_PATH_SEGMENTS.has(segment))
+    ) {
+      fail(aliasWhere, '"alias" must be a lowercase dot-delimited name outside event.raw');
+    }
+    if (aliasNames.has(alias.alias)) fail(aliasWhere, `duplicate alias "${alias.alias}"`);
+    for (const existing of aliasNames) {
+      if (existing.startsWith(`${alias.alias}.`) || alias.alias.startsWith(`${existing}.`)) {
+        fail(aliasWhere, `alias "${alias.alias}" conflicts with "${existing}"`);
+      }
+    }
+    aliasNames.add(alias.alias);
+    return { path: alias.path, alias: alias.alias };
+  });
+
+  return {
+    verificationScheme: o.verificationScheme as WebhookVerificationScheme,
+    events,
+    aliases,
+  };
+}
+
 /** Validate + narrow one raw connector object. Throws Error on any malformation. */
 export function parseConnector(raw: unknown, where: string): Connector {
   if (typeof raw !== "object" || raw === null) fail(where, "must be a JSON object");
@@ -803,6 +931,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
   }
 
   const oauth = o.oauth !== undefined ? parseOauth(where, o.oauth, hosts) : undefined;
+  const webhook = o.webhook !== undefined ? parseWebhookFacet(where, o.webhook) : undefined;
 
   // ADR 0059: the GraphQL endpoint (the single path GraphQL ops POST to). Required
   // when any operation has a GraphQL match; defaults to `/graphql`. Validated like
@@ -835,6 +964,7 @@ export function parseConnector(raw: unknown, where: string): Connector {
     ...(cli ? { cli } : {}),
     ...(test ? { test } : {}),
     ...(oauth ? { oauth } : {}),
+    ...(webhook ? { webhook } : {}),
   };
 }
 

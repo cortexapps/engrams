@@ -225,6 +225,13 @@
       "when": 1784501828354,
       "tag": "0031_bright_bruce_banner",
       "breakpoints": true
+    },
+    {
+      "idx": 32,
+      "version": "7",
+      "when": 1784744174178,
+      "tag": "0032_rapid_alice",
+      "breakpoints": true
     }
   ]
 }

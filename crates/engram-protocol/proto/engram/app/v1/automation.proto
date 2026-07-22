@@ -1,0 +1,265 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// Admin-authored cron/webhook triggers and their create-task action (ADR 0102).
+// ORCHESTRATOR-NATIVE: like task.proto/profile.proto, this service is not
+// compiled into the coordinator's Rust surface.
+service AutomationService {
+  rpc CreateAutomation(CreateAutomationRequest) returns (CreateAutomationResponse);
+  rpc UpdateAutomation(UpdateAutomationRequest) returns (UpdateAutomationResponse);
+  rpc ArchiveAutomation(ArchiveAutomationRequest) returns (ArchiveAutomationResponse);
+  rpc GetAutomation(GetAutomationRequest) returns (GetAutomationResponse);
+  rpc ListAutomations(ListAutomationsRequest) returns (ListAutomationsResponse);
+  rpc SetAutomationEnabled(SetAutomationEnabledRequest) returns (SetAutomationEnabledResponse);
+  rpc ListAutomationRuns(ListAutomationRunsRequest) returns (ListAutomationRunsResponse);
+  rpc TestRender(TestRenderRequest) returns (TestRenderResponse);
+  rpc ListWebhookSamples(ListWebhookSamplesRequest) returns (ListWebhookSamplesResponse);
+}
+
+service WebhookRegistrationService {
+  // The verification secret is returned only by this RPC. It is sealed into
+  // the org-secret store server-side and never persisted in orchestrator PG.
+  rpc CreateWebhookRegistration(CreateWebhookRegistrationRequest) returns (CreateWebhookRegistrationResponse);
+  rpc ListWebhookRegistrations(ListWebhookRegistrationsRequest) returns (ListWebhookRegistrationsResponse);
+  rpc DeleteWebhookRegistration(DeleteWebhookRegistrationRequest) returns (DeleteWebhookRegistrationResponse);
+  rpc ListWebhookEvents(ListWebhookEventsRequest) returns (ListWebhookEventsResponse);
+}
+
+message Automation {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  bool enabled = 4;
+  AutomationTrigger trigger = 5;
+  AutomationAction action = 6;
+  optional string created_by_user_id = 7;
+  optional string next_fire_at = 8;
+  optional string last_fired_at = 9;
+  bool archived = 10;
+  string created_at = 11;
+  string updated_at = 12;
+}
+
+message AutomationTrigger {
+  oneof trigger {
+    CronAutomationTrigger cron = 1;
+    WebhookAutomationTrigger webhook = 2;
+  }
+}
+
+message CronAutomationTrigger {
+  string schedule = 1;
+  string timezone = 2;
+}
+
+message WebhookAutomationTrigger {
+  string registration_id = 1;
+  repeated string events = 2;
+  // Optional declarative event filter. Phase 4 evaluates the validated shape.
+  optional string filter_json = 3;
+}
+
+message AutomationAction {
+  oneof action {
+    CreateTaskAutomationAction create_task = 1;
+  }
+}
+
+message CreateTaskAutomationAction {
+  string profile_id = 1;
+  string prompt_template = 2;
+  optional string title_template = 3;
+  bool include_event_context = 4;
+}
+
+message CreateAutomationRequest {
+  string name = 1;
+  string description = 2;
+  bool enabled = 3;
+  AutomationTrigger trigger = 4;
+  AutomationAction action = 5;
+}
+
+message CreateAutomationResponse {
+  Automation automation = 1;
+}
+
+message UpdateAutomationRequest {
+  string id = 1;
+  string name = 2;
+  string description = 3;
+  bool enabled = 4;
+  AutomationTrigger trigger = 5;
+  AutomationAction action = 6;
+}
+
+message UpdateAutomationResponse {
+  Automation automation = 1;
+}
+
+message ArchiveAutomationRequest {
+  string id = 1;
+}
+
+message ArchiveAutomationResponse {
+  Automation automation = 1;
+}
+
+message GetAutomationRequest {
+  string id = 1;
+}
+
+message GetAutomationResponse {
+  Automation automation = 1;
+}
+
+message ListAutomationsRequest {
+  bool include_archived = 1;
+}
+
+message ListAutomationsResponse {
+  repeated Automation automations = 1;
+}
+
+message SetAutomationEnabledRequest {
+  string id = 1;
+  bool enabled = 2;
+}
+
+message SetAutomationEnabledResponse {
+  Automation automation = 1;
+}
+
+message AutomationRun {
+  string id = 1;
+  string automation_id = 2;
+  string trigger_json = 3;
+  optional string rendered_prompt = 4;
+  optional string rendered_title = 5;
+  optional string task_id = 6;
+  optional string session_id = 7;
+  string status = 8;
+  optional string error = 9;
+  optional string scheduled_for = 10;
+  string created_at = 11;
+}
+
+message ListAutomationRunsRequest {
+  string automation_id = 1;
+  // Most-recent first; 0 uses the server default, capped server-side.
+  int32 limit = 2;
+}
+
+message ListAutomationRunsResponse {
+  repeated AutomationRun runs = 1;
+}
+
+message TemplateError {
+  // "prompt_template" | "title_template" | "sample"
+  string field = 1;
+  // "invalid_template" | "render_failed" | "output_too_long" | "invalid_sample"
+  string code = 2;
+  string message = 3;
+}
+
+message TestRenderRequest {
+  // When set, the stored automation supplies name/action unless draft_action or
+  // automation_name override them.
+  optional string automation_id = 1;
+  optional string automation_name = 2;
+  AutomationAction draft_action = 3;
+  // A stored sample id, or payload_json. If neither is set for a webhook
+  // trigger, registration_id + event_key select the newest stored sample.
+  oneof sample {
+    string sample_id = 4;
+    string payload_json = 5;
+  }
+  string registration_id = 6;
+  string event_key = 7;
+  // Cron previews carry no event payload.
+  optional string scheduled_for = 8;
+}
+
+message TestRenderResponse {
+  optional string rendered_prompt = 1;
+  optional string rendered_title = 2;
+  repeated TemplateError errors = 3;
+}
+
+message WebhookSample {
+  string id = 1;
+  string registration_id = 2;
+  string event_key = 3;
+  string payload_json = 4;
+  string received_at = 5;
+}
+
+message ListWebhookSamplesRequest {
+  string registration_id = 1;
+  optional string event_key = 2;
+  // Most-recent first; 0 uses the server default, capped server-side.
+  int32 limit = 3;
+}
+
+message ListWebhookSamplesResponse {
+  repeated WebhookSample samples = 1;
+}
+
+message WebhookRegistration {
+  string id = 1;
+  string name = 2;
+  string verification_scheme = 3;
+  optional string provider_hint = 4;
+  optional string created_by_user_id = 5;
+  string created_at = 6;
+  string updated_at = 7;
+}
+
+message CreateWebhookRegistrationRequest {
+  // Lowercase URL-safe slug used as /api/v1/hooks/:id.
+  string id = 1;
+  string name = 2;
+  string verification_scheme = 3;
+  optional string provider_hint = 4;
+}
+
+message CreateWebhookRegistrationResponse {
+  WebhookRegistration registration = 1;
+  // Plaintext verification secret, visible exactly once in this response.
+  string secret = 2;
+}
+
+message ListWebhookRegistrationsRequest {}
+
+message ListWebhookRegistrationsResponse {
+  repeated WebhookRegistration registrations = 1;
+}
+
+message DeleteWebhookRegistrationRequest {
+  string id = 1;
+}
+
+message DeleteWebhookRegistrationResponse {
+  bool deleted = 1;
+}
+
+message ListWebhookEventsRequest {
+  string registration_id = 1;
+}
+
+message WebhookEvent {
+  string key = 1;
+  string display_name = 2;
+  bool observed = 3;
+}
+
+message WebhookVariable {
+  string path = 1;
+  string alias = 2;
+}
+
+message ListWebhookEventsResponse {
+  repeated WebhookEvent events = 1;
+  repeated WebhookVariable variables = 2;
+}

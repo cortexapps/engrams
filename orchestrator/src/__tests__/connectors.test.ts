@@ -92,6 +92,127 @@ describe("parseConnector", () => {
     expect(c.credential.source).toBe("mint");
   });
 
+  test("parses a bounded declarative webhook facet", () => {
+    const c = parseConnector(
+      {
+        ...githubRaw,
+        webhook: {
+          verificationScheme: "github_hmac_sha256",
+          events: [{ key: "issues.opened", displayName: "Issue opened" }],
+          aliases: [
+            { path: "issue.title", alias: "issue.title" },
+            { path: "sender.login", alias: "actor.login" },
+          ],
+        },
+      },
+      "github",
+    );
+    expect(c.webhook).toEqual({
+      verificationScheme: "github_hmac_sha256",
+      events: [{ key: "issues.opened", displayName: "Issue opened" }],
+      aliases: [
+        { path: "issue.title", alias: "issue.title" },
+        { path: "sender.login", alias: "actor.login" },
+      ],
+    });
+  });
+
+  test("rejects invalid webhook facet shapes and drops non-allowlisted fields", () => {
+    expect(() =>
+      parseConnector(
+        {
+          ...githubRaw,
+          webhook: {
+            verificationScheme: "module_ref",
+            events: [],
+            aliases: [],
+            mapper: "./mapper.ts",
+          },
+        },
+        "custom",
+      ),
+    ).toThrow(/verificationScheme/);
+
+    const withModuleReference = parseConnector(
+      {
+        ...githubRaw,
+        webhook: {
+          verificationScheme: "github_hmac_sha256",
+          events: [],
+          aliases: [],
+          mapper: "./mapper.ts",
+        },
+      },
+      "custom",
+    );
+    expect(Object.keys(withModuleReference.webhook ?? {}).sort()).toEqual([
+      "aliases",
+      "events",
+      "verificationScheme",
+    ]);
+
+    expect(() =>
+      parseConnector(
+        {
+          ...githubRaw,
+          webhook: {
+            verificationScheme: "github_hmac_sha256",
+            events: [],
+            aliases: [{ path: "issue.title", alias: "raw.issue" }],
+          },
+        },
+        "custom",
+      ),
+    ).toThrow(/event.raw/);
+
+    for (const alias of ["__proto__.polluted", "constructor.prototype.polluted"]) {
+      expect(() =>
+        parseConnector(
+          {
+            ...githubRaw,
+            webhook: {
+              verificationScheme: "github_hmac_sha256",
+              events: [],
+              aliases: [{ path: "issue.title", alias }],
+            },
+          },
+          "custom",
+        ),
+      ).toThrow(/alias/);
+    }
+
+    expect(() =>
+      parseConnector(
+        {
+          ...githubRaw,
+          webhook: {
+            verificationScheme: "github_hmac_sha256",
+            events: [{ key: `issue.${"x".repeat(200)}`, displayName: "Too long" }],
+            aliases: [],
+          },
+        },
+        "custom",
+      ),
+    ).toThrow(/key/);
+
+    expect(() =>
+      parseConnector(
+        {
+          ...githubRaw,
+          webhook: {
+            verificationScheme: "github_hmac_sha256",
+            events: [],
+            aliases: [
+              { path: "issue", alias: "issue" },
+              { path: "issue.title", alias: "issue.title" },
+            ],
+          },
+        },
+        "custom",
+      ),
+    ).toThrow(/conflicts/);
+  });
+
   test("rejects a non-http protocol", () => {
     expect(() => parseConnector({ ...datadogRaw, protocol: "grpc" }, "x")).toThrow(/protocol/);
   });
@@ -453,6 +574,8 @@ describe("on-disk registry", () => {
     // datadog is inject, github is mint
     expect(reg.get("datadog")!.credential.source).toBe("inject");
     expect(reg.get("github")!.credential.source).toBe("mint");
+    expect(reg.get("github")!.webhook?.events.some((event) => event.key === "issues.opened")).toBe(true);
+    expect(reg.get("slack")!.webhook?.verificationScheme).toBe("slack_v0");
   });
 
   test("the shipped datadog connector compiles BOTH pup injects (api + app key)", () => {

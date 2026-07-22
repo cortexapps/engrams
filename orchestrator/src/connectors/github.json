@@ -8,6 +8,22 @@
     "icon": { "mono": "GH", "color": "#1f2328" }
   },
   "credential": { "source": "mint", "mint": { "kind": "github_app" } },
+  "webhook": {
+    "verificationScheme": "github_hmac_sha256",
+    "events": [
+      { "key": "issues.opened", "displayName": "Issue opened" },
+      { "key": "pull_request.opened", "displayName": "Pull request opened" },
+      { "key": "pull_request.synchronize", "displayName": "Pull request synchronized" }
+    ],
+    "aliases": [
+      { "path": "issue.title", "alias": "issue.title" },
+      { "path": "issue.number", "alias": "issue.number" },
+      { "path": "pull_request.title", "alias": "pull_request.title" },
+      { "path": "pull_request.number", "alias": "pull_request.number" },
+      { "path": "repository.full_name", "alias": "repository.full_name" },
+      { "path": "sender.login", "alias": "actor.login" }
+    ]
+  },
   "hosts": ["api.github.com"],
   "graphqlEndpoint": "/graphql",
   "operations": [

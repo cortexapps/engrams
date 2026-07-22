@@ -441,6 +441,140 @@ export const profile = pgTable(
 );
 
 // ---------------------------------------------------------------------------
+// Automations (ADR 0102): dynamic triggers that launch profile-backed tasks.
+// ---------------------------------------------------------------------------
+
+export type AutomationTrigger =
+  | { kind: "cron"; schedule: string; timezone: string }
+  | {
+      kind: "webhook";
+      registrationId: string;
+      events: string[];
+      filter?: Record<string, unknown>;
+    };
+
+export interface CreateTaskAutomationAction {
+  kind: "create_task";
+  profileId: string;
+  promptTemplate: string;
+  titleTemplate?: string;
+  includeEventContext: boolean;
+}
+
+export type AutomationAction = CreateTaskAutomationAction;
+
+export type WebhookVerificationScheme =
+  | "github_hmac_sha256"
+  | "slack_v0"
+  | "generic_hmac_sha256";
+
+export interface WebhookVerification {
+  scheme: WebhookVerificationScheme;
+  secretRef: string;
+}
+
+/** Redacted trigger input persisted with a run. The provider-specific payload
+ * stays data, never executable template source. */
+export interface AutomationRunTrigger {
+  source: "cron" | "webhook";
+  eventKey?: string;
+  deliveryId?: string;
+  payload?: Record<string, unknown>;
+}
+
+export const webhookRegistration = pgTable(
+  "webhook_registration",
+  {
+    id: text("id").primaryKey(), // validated slug; also the public hook URL segment
+    name: text("name").notNull(),
+    verification: jsonb("verification").$type<WebhookVerification>().notNull(),
+    providerHint: text("provider_hint"), // optional connector registry key
+    createdByUserId: text("created_by_user_id"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [index("webhook_registration_provider_idx").on(t.providerHint)],
+);
+
+export const automation = pgTable(
+  "automation",
+  {
+    id: text("id").primaryKey(),
+    name: text("name").notNull(),
+    description: text("description").notNull().default(""),
+    enabled: boolean("enabled").notNull().default(true),
+    trigger: jsonb("trigger").$type<AutomationTrigger>().notNull(),
+    action: jsonb("action").$type<AutomationAction>().notNull(),
+    createdByUserId: text("created_by_user_id"),
+    // Kept outside trigger JSON so the Phase 3 scanner can use an indexed due
+    // query and advance a claimed cron occurrence without rewriting config.
+    nextFireAt: timestamp("next_fire_at", { withTimezone: true }),
+    lastFiredAt: timestamp("last_fired_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+    archivedAt: timestamp("archived_at", { withTimezone: true }),
+  },
+  (t) => [index("automation_due_idx").on(t.enabled, t.nextFireAt)],
+);
+
+export const automationRun = pgTable(
+  "automation_run",
+  {
+    id: text("id").primaryKey(),
+    automationId: text("automation_id")
+      .notNull()
+      .references(() => automation.id, { onDelete: "cascade" }),
+    trigger: jsonb("trigger").$type<AutomationRunTrigger>().notNull(),
+    renderedPrompt: text("rendered_prompt"),
+    renderedTitle: text("rendered_title"),
+    taskId: text("task_id").references(() => task.id, { onDelete: "set null" }),
+    sessionId: text("session_id"), // logical ref to the control-plane session
+    status: text("status").notNull().default("pending"),
+    error: text("error"),
+    // A cron claim is the run row. The partial unique key gives one durable row
+    // per occurrence; an expired lease can be reacquired and the same DBOS id
+    // restarted without ever losing or duplicating the occurrence.
+    scheduledFor: timestamp("scheduled_for", { withTimezone: true }),
+    leaseOwner: text("lease_owner"),
+    leaseExpiresAt: timestamp("lease_expires_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    uniqueIndex("automation_run_occurrence_unique")
+      .on(t.automationId, t.scheduledFor)
+      .where(sql`scheduled_for is not null`),
+    index("automation_run_automation_created_idx").on(t.automationId, t.createdAt),
+    index("automation_run_lease_idx").on(t.leaseExpiresAt),
+  ],
+);
+
+export const webhookSample = pgTable(
+  "webhook_sample",
+  {
+    id: uuid("id").defaultRandom().primaryKey(),
+    registrationId: text("registration_id")
+      .notNull()
+      .references(() => webhookRegistration.id, { onDelete: "cascade" }),
+    eventKey: text("event_key").notNull(),
+    payload: jsonb("payload").$type<Record<string, unknown>>().notNull(),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    index("webhook_sample_registration_event_idx").on(
+      t.registrationId,
+      t.eventKey,
+      t.receivedAt,
+    ),
+  ],
+);
+
+// ---------------------------------------------------------------------------
 // Connector catalog (ADR 0057 C1)
 // ---------------------------------------------------------------------------
 
