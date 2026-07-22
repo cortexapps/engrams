@@ -163,9 +163,15 @@ describe("tool exec plain functions", () => {
 
     const invalidArgs = fixture({ argsJson: JSON.stringify({ text: 42 }) });
     await runAndSubmit(invalidArgs);
-    expect(JSON.parse(invalidArgs.completionCalls[0]!.resultJson)).toEqual({
-      error: "invalid arguments for tool save_memory",
-    });
+    const invalidArgsResult = JSON.parse(
+      invalidArgs.completionCalls[0]!.resultJson,
+    ) as { error: string };
+    // Names the offending field and expected shape so the model can fix the
+    // call without a guess-and-retry round trip (papercut 2026-07-21).
+    expect(invalidArgsResult.error).toStartWith(
+      "invalid arguments for tool save_memory: text:",
+    );
+    expect(invalidArgsResult.error).toContain("string");
 
     const invalidResult = fixture({ handler: () => ({ saved: "yes" }) });
     await runAndSubmit(invalidResult);
