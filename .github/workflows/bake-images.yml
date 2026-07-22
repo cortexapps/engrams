@@ -65,7 +65,6 @@ jobs:
       # publish-node-assets so a container-only change never rebakes node-assets
       # and churns the host-fleet DaemonSet tag (2026-07-20 host-roll incident).
       node_assets: ${{ steps.lanes.outputs.node_assets }}
-      dev_image: ${{ steps.lanes.outputs.dev_image }}
       fc_fork: ${{ steps.lanes.outputs.fc_fork }}
     steps:
       - uses: actions/checkout@v6
@@ -824,7 +823,6 @@ jobs:
           HOST_BASE_CHANGED: ${{ needs.detect.outputs.host_base }}
           TF_CHANGED: ${{ needs.detect.outputs.tf_or_helm }}
           BUNDLES_CHANGED: ${{ needs.detect.outputs.bundles }}
-          DEV_IMAGE_CHANGED: ${{ needs.detect.outputs.dev_image }}
           # Gate the bundles dispatch on the node-assets bake (see below).
           NODE_ASSETS_RESULT: ${{ needs.publish-node-assets.result }}
         run: |
@@ -877,18 +875,13 @@ jobs:
               exit 1
             fi
           fi
-          # ADR 0027: auto-rebake the dev-engrams dogfood session image when
-          # any source it builds moved. This only triggers the bake; ENABLING
-          # the freshly-baked image (POST /api/enabled-images) stays a manual
-          # step by design — auto-enable is a separate decision.
-          if [[ "$DEV_IMAGE_CHANGED" == "true" ]]; then
-            fire engrams-dev-image-changed
-          fi
+          # (The dev-engrams dogfood image is no longer dispatched from here:
+          # engrams-internal bakes + refreshes it on a workday-hourly schedule
+          # against OSS main — the same model as its dev-brain image.)
           if [[ "$CONTAINERS_CHANGED" != "true" \
              && "$HOST_BINARIES_CHANGED" != "true" \
              && "$HOST_BASE_CHANGED" != "true" \
              && "$TF_CHANGED" != "true" \
-             && "$BUNDLES_CHANGED" != "true" \
-             && "$DEV_IMAGE_CHANGED" != "true" ]]; then
+             && "$BUNDLES_CHANGED" != "true" ]]; then
             echo "No deploy-relevant paths changed in this push; skipping dispatches."
           fi
