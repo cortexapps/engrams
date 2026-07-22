@@ -10,17 +10,18 @@ import type { SessionConsumer } from "./consumer.ts";
 
 const log = rootLog.child({ component: "pr-link-consumer" });
 
-// Only the row identity (repo + number) is load-bearing, and even `repo` may
-// be absent from `data` (older connector manifests extracted only
-// number/title; GraphQL extraction depends on the client's selection) — it is
-// then derived from the fetchable PR URL. Everything decorative degrades to
-// "" rather than classifying the event as malformed and silently dropping
-// the task→PR link.
+// Only the row identity (repo + number) is load-bearing, and BOTH may be
+// absent from `data` (older connector manifests extracted only number/title;
+// GraphQL extraction depends on the client's selection — `gh pr create`'s
+// createPullRequest mutation selects only `id`+`url`, so its asset arrives as
+// `data: {}`) — each is then derived from the fetchable PR URL. Everything
+// decorative degrades to "" rather than classifying the event as malformed
+// and silently dropping the task→PR link.
 const pullRequestAssetSchema = z.object({
   asset_kind: z.literal("pull_request"),
   data: z.object({
     repo: z.string().min(1).optional(),
-    number: z.number().int().positive(),
+    number: z.number().int().positive().optional(),
     title: z.string().optional(),
     head_branch: z.string().optional(),
     base_branch: z.string().optional(),
@@ -45,10 +46,13 @@ function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
-/** Derive "owner/repo" from a forge PR URL like
+/** Derive the PR identity ("owner/repo" + number) from a forge PR URL like
  * `https://github.com/owner/repo/pull/97`. Returns null when the URL doesn't
- * carry that shape (or isn't a URL at all). */
-export function repoFromPrUrl(url: string): string | null {
+ * carry that shape (or isn't a URL at all); `number` is null when the segment
+ * after `pull` isn't a positive integer. */
+export function prIdentityFromUrl(
+  url: string,
+): { repo: string; number: number | null } | null {
   if (!url) return null;
   let parsed: URL;
   try {
@@ -58,7 +62,8 @@ export function repoFromPrUrl(url: string): string | null {
   }
   const segments = parsed.pathname.split("/").filter(Boolean);
   if (segments.length >= 4 && (segments[2] === "pull" || segments[2] === "pulls")) {
-    return `${segments[0]}/${segments[1]}`;
+    const number = /^[1-9]\d*$/.test(segments[3] ?? "") ? Number(segments[3]) : null;
+    return { repo: `${segments[0]}/${segments[1]}`, number };
   }
   return null;
 }
@@ -104,11 +109,13 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
 
       const { data, fetchable, at } = parsed.asset;
       const url = fetchable?.kind === "external" ? fetchable.url : "";
-      const repo = data.repo ?? repoFromPrUrl(url);
-      if (!repo) {
+      const fromUrl = prIdentityFromUrl(url);
+      const repo = data.repo ?? fromUrl?.repo;
+      const prNumber = data.number ?? fromUrl?.number;
+      if (!repo || !prNumber) {
         log.warn(
           { sessionId: ctx.sessionId, eventIdx: event.idx.toString() },
-          "pull-request asset carries no repo and none is derivable from its URL; skipping",
+          "pull-request asset carries no repo/number and neither is derivable from its URL; skipping",
         );
         return;
       }
@@ -116,7 +123,7 @@ export function makePrLinkConsumer(deps: PrLinkConsumerDeps): SessionConsumer {
       const taskId = await deps.findTaskId(ctx.sessionId);
       await deps.prRefs.upsert({
         repo,
-        prNumber: data.number,
+        prNumber,
         authoringTaskId: taskId,
         sessionId: ctx.sessionId,
         title: data.title ?? "",
