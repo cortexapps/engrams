@@ -99,6 +99,25 @@ async function listener(
   consumers: SessionConsumer[],
   cursorStore: CursorStore = makeInMemoryCursorStore(),
 ): Promise<SessionListener> {
+  // Wrap whatever sleep the test injects so it honors the abort signal like the
+  // production seam (resolve early on abort), delegating timing to the raw
+  // sleep. Signal-less calls (the probe timer) pass through unchanged.
+  const rawSleep = overrides.sleep ?? never;
+  const sleep = (ms: number, signal?: AbortSignal): Promise<void> => {
+    if (!signal) return rawSleep(ms);
+    if (signal.aborted) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      let settled = false;
+      const done = () => {
+        if (settled) return;
+        settled = true;
+        signal.removeEventListener("abort", done);
+        resolve();
+      };
+      void rawSleep(ms).then(done);
+      signal.addEventListener("abort", done, { once: true });
+    });
+  };
   return new SessionListener({
     sessionId: "session-1",
     owner: "owner-1",
@@ -108,8 +127,8 @@ async function listener(
     consumers,
     readPage: async (_sessionId, after) => page([], after),
     openStream: async () => opened([], { waitAtEnd: true }),
-    sleep: never,
     ...overrides,
+    sleep,
   });
 }
 
@@ -247,6 +266,348 @@ describe("SessionListener", () => {
 
     expect(since).toEqual([-1n, 0n]);
     expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
+  });
+
+  test("a catch-up read that never settles hits the rpc deadline, retries, and recovers", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let deadlineFires = 0;
+    const subject = await listener({
+      rpcDeadlineMs: 55_555,
+      readPage: async () => {
+        reads++;
+        if (reads === 1) return new Promise<never>(() => {}); // orphaned call (issue #704)
+        return page([event(4n)], 5n, "completed");
+      },
+      sleep: async (ms) => {
+        if (ms === 55_555) {
+          if (deadlineFires++ === 0) return; // first deadline fires; later ones park
+          await never();
+        } else if (ms < 10_000) {
+          return; // reconnect backoff is instant
+        } else {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(reads).toBe(2);
+    expect(deadlineFires).toBeGreaterThanOrEqual(1);
+    expect(rec.events.map((ev) => ev.idx)).toEqual([4n]);
+    expect(rec.terminals).toEqual(["completed"]);
+  });
+
+  test("a wedged listener stops renewing so the lease can pass to a replacement", async () => {
+    const base = await acquiredLease();
+    let renews = 0;
+    const leases: LeaseStore = {
+      ...base,
+      renew: async (sessionId, owner, ttlMs) => {
+        renews++;
+        return base.renew(sessionId, owner, ttlMs);
+      },
+    };
+    let clock = 0;
+    const subject = await listener({
+      leaseStore: leases,
+      staleGraceMs: 15_000,
+      now: () => clock,
+      // The catch-up read parks forever and even the rpc deadline never fires
+      // (a hypothetical wedge beyond layer-one protection): only the heartbeat
+      // staleness check can save this session.
+      readPage: () => new Promise<never>(() => {}),
+      sleep: async (ms) => {
+        if (ms === 10_000) {
+          clock += ms; // ttl/3 heartbeat cadence drives the virtual clock
+          return;
+        }
+        await never();
+      },
+    }, [recordingConsumer().consumer]);
+
+    await subject.run(); // resolves at all only because the lease is abandoned
+
+    expect(renews).toBe(1); // tick 1 renews (10s stale); tick 2 abandons (20s > 15s)
+    expect(await base.tryAcquire("session-1", "owner-2", 30_000)).toBe(true);
+  });
+
+  test("a silent stream that fell behind the durable log reconnects after two probe sightings", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let opens = 0;
+    let closed = 0;
+    let probeSleeps = 0;
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        if (reads === 1) return page([], after); // initial catch-up: empty log
+        if (reads <= 3) return page([], 5n); // probes: the log is ahead, the stream silent
+        return page([event(5n)], 6n, "completed"); // post-reconnect catch-up delivers
+      },
+      openStream: async () => {
+        opens++;
+        return opened([], { waitAtEnd: true, onClose: () => closed++ });
+      },
+      sleep: async (ms) => {
+        if (ms === 77_777) {
+          if (probeSleeps++ < 2) return; // two probe intervals elapse, then quiet
+          await never();
+        } else if (ms < 10_000) {
+          return; // reconnect backoff is instant
+        } else {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(opens).toBe(1); // the stalled stream is closed; catch-up reaches terminal first
+    expect(closed).toBe(1);
+    expect(reads).toBe(4);
+    expect(rec.events.map((ev) => ev.idx)).toEqual([5n]);
+    expect(rec.terminals).toEqual(["completed"]);
+  });
+
+  test("a genuinely idle session probes the log without reconnecting", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let opens = 0;
+    let probeSleeps = 0;
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        return page([], after); // the log never moves: genuine idleness
+      },
+      openStream: async () => {
+        opens++;
+        return opened([], { waitAtEnd: true });
+      },
+      sleep: async (ms) => {
+        if (ms === 77_777) {
+          if (probeSleeps++ < 2) return;
+          await never();
+        } else {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => reads === 3); // catch-up + two idle probes
+    await subject.stop();
+    await running;
+
+    expect(opens).toBe(1);
+    expect(rec.events).toEqual([]);
+    expect(rec.terminals).toEqual([]);
+  });
+
+  test("an actively delivering stream arms the probe timer once and issues no probe reads", async () => {
+    const rec = recordingConsumer();
+    let reads = 0; // readPage calls: catch-up only — a probe read would add more
+    let probeArmings = 0; // sleep(probeIntervalMs) calls: must be one, not per-frame
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        return page([], after); // catch-up empty; must never be consulted again
+      },
+      openStream: async () =>
+        opened([event(0n), event(1n), event(2n), terminal(3n)]),
+      sleep: async (ms) => {
+        if (ms === 77_777) probeArmings++;
+        // The probe timer never fires; frames win every race. A per-frame
+        // re-arm would allocate a fresh timer for each of the four frames.
+        await never();
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n, 2n]);
+    expect(rec.terminals).toEqual(["completed"]);
+    expect(reads).toBe(1); // just the initial catch-up — no probe reads
+    expect(probeArmings).toBe(1); // armed once at stream open, not per frame
+  });
+
+  test("a probe that fires after a delivered frame skips the read, then reads once quiet", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let probeArmings = 0;
+    let releaseFirstProbe: (() => void) | undefined;
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        return page([], after); // log stays at the cursor: genuinely idle once quiet
+      },
+      openStream: async () => opened([event(0n)], { waitAtEnd: true }),
+      sleep: async (ms) => {
+        if (ms !== 77_777) return void (await never());
+        probeArmings++;
+        // Arm #1 (armed at stream open) parks until the test releases it, so
+        // frame 0 is delivered first; it then fires with a frame in the
+        // interval → the read is skipped. Arm #2 fires immediately with no
+        // frame since → one real probe read. Arm #3 parks.
+        if (probeArmings === 1) {
+          await new Promise<void>((resolve) => (releaseFirstProbe = resolve));
+        } else if (probeArmings >= 3) {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => rec.events.length === 1); // frame 0 delivered
+    releaseFirstProbe!(); // fire the timer that was armed before frame 0
+    await waitFor(() => reads === 2); // catch-up + exactly one post-frame probe read
+    await subject.stop();
+    await running;
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n]);
+    expect(reads).toBe(2); // the frame-covered firing skipped its read
+  });
+
+  test("stop() on a delivering stream exits via stream close, not a #stopped race in the loop", async () => {
+    const rec = recordingConsumer();
+    const subject = await listener({
+      // sleep defaults to `never`, so the probe timer never fires: the only
+      // way the parked pull can wake for stop is #requestStop() closing the
+      // stream. If the frame loop still relied on racing #stopped this would
+      // pass too, but the point is that close alone is sufficient — the loop
+      // no longer subscribes a reaction to #stopped per frame.
+      openStream: async () => opened([event(0n), event(1n)], { waitAtEnd: true }),
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => rec.events.length === 2); // both delivered; loop now parked on the pull
+    await subject.stop(); // closes the stream -> settles the pull -> flag check exits
+    await running; // resolves iff stop does not depend on a #stopped race in the loop
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
+    expect(rec.terminals).toEqual([]);
+  });
+
+  test("an idle stream subscribes to the parked pull once and still delivers a late frame", async () => {
+    const rec = recordingConsumer();
+    let nextCalls = 0;
+    let probes = 0;
+    let deliverFrame: ((r: IteratorResult<WireEvent>) => void) | undefined;
+    // A hand-rolled iterator so we can count next() calls: the parked pull must
+    // be subscribed exactly once across many probe intervals (racing the pull
+    // promise directly would re-.then it per probe and leak reactions), and the
+    // late frame must still wake the loop.
+    const stream: OpenedSessionStream = {
+      events: {
+        [Symbol.asyncIterator]: () => ({
+          next: () => {
+            nextCalls++;
+            if (nextCalls === 1) {
+              return new Promise<IteratorResult<WireEvent>>((resolve) => {
+                deliverFrame = resolve;
+              });
+            }
+            if (nextCalls === 2) {
+              return Promise.resolve({ done: false, value: terminal(1n) });
+            }
+            return Promise.resolve({ done: true, value: undefined });
+          },
+        }),
+      },
+      close: () => {},
+    };
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => page([], after), // idle: log at cursor
+      openStream: async () => stream,
+      sleep: async (ms) => {
+        if (ms !== 77_777) return void (await never());
+        // Fire a handful of probe intervals with the pull parked, then park so
+        // the loop settles before the assertion.
+        if (probes++ >= 4) await never();
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => probes >= 5); // 5 probe intervals elapsed, pull still parked
+    expect(nextCalls).toBe(1); // the parked pull was subscribed once, not re-issued
+
+    deliverFrame!({ done: false, value: event(0n) }); // a frame finally arrives
+    await running; // wakes, delivers, then reads terminal(1n) and completes
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n]);
+    expect(rec.terminals).toEqual(["completed"]);
+  });
+
+  test("a deliver-then-drop stream climbs the reconnect backoff instead of resetting per frame", async () => {
+    const rec = recordingConsumer();
+    const backoffs: number[] = [];
+    let opens = 0;
+    const subject = await listener({
+      probeIntervalMs: 900_000,
+      now: () => 0, // every connection has zero duration — never counts as healthy
+      readPage: async (_sessionId, after) => page([], after), // empty catch-up
+      openStream: async () => {
+        opens++;
+        if (opens > 4) return opened([], { waitAtEnd: true }); // stop dropping, park
+        return opened([event(BigInt(opens))], { throwAfter: 1 }); // one frame, then drop
+      },
+      sleep: async (ms) => {
+        if (ms === 900_000 || ms === 15_000 || ms === 10_000) return void (await never()); // probe + heartbeat park
+        backoffs.push(ms); // reconnect backoff; resolve at once so the retry proceeds
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => backoffs.length === 4);
+    await subject.stop();
+    await running;
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([1n, 2n, 3n, 4n]);
+    // Climbs; the per-frame reset regression would hold every delay at 250.
+    expect(backoffs).toEqual([250, 500, 1_000, 2_000]);
+  });
+
+  test("a drop after a sustained healthy connection resets the reconnect backoff", async () => {
+    const backoffs: number[] = [];
+    let opens = 0;
+    let currentOpen = 0;
+    let clock = 0;
+    const rec = recordingConsumer({
+      handle: async () => {
+        // Make only the 4th connection "healthy": advance the clock past
+        // HEALTHY_STREAM_MS while it is open, so its drop resets the backoff.
+        if (currentOpen === 4) clock += 60_000;
+      },
+    });
+    const subject = await listener({
+      probeIntervalMs: 900_000,
+      now: () => clock,
+      readPage: async (_sessionId, after) => page([], after),
+      openStream: async () => {
+        currentOpen = ++opens;
+        if (opens > 4) return opened([], { waitAtEnd: true });
+        return opened([event(BigInt(opens))], { throwAfter: 1 });
+      },
+      sleep: async (ms) => {
+        if (ms === 900_000 || ms === 15_000 || ms === 10_000) return void (await never());
+        backoffs.push(ms);
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => backoffs.length === 4);
+    await subject.stop();
+    await running;
+
+    // Connections 1–3 flap (zero-duration) and climb; connection 4 stayed open
+    // a healthy while, so its drop resets the backoff back to the floor.
+    expect(backoffs).toEqual([250, 500, 1_000, 250]);
   });
 
   test("an idx-less lag frame closes the stream and catches up without loss", async () => {

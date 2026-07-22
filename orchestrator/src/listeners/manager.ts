@@ -161,9 +161,13 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionSlackConsumer(),
           makeProductionReviewConsumer(),
         ],
-        readPage: readSessionEventsBounded,
-        fetchStatus: async (id) => {
-          const response = await sessions.getSession({ sessionId: id });
+        readPage: (id, after, signal) =>
+          readSessionEventsBounded(id, after, undefined, signal),
+        fetchStatus: async (id, signal) => {
+          const response = await sessions.getSession(
+            { sessionId: id },
+            signal ? { signal } : {},
+          );
           return response.session?.status ?? "";
         },
         openStream: async (id, since) => {
@@ -180,7 +184,24 @@ export function makeProductionListenerManager(): ListenerManager {
             close: () => abort.abort(),
           };
         },
-        sleep: (ms) => Bun.sleep(ms),
+        sleep: (ms, signal) => {
+          if (!signal) return Bun.sleep(ms);
+          if (signal.aborted) return Promise.resolve();
+          return new Promise<void>((resolve) => {
+            const onAbort = () => {
+              clearTimeout(timer);
+              resolve();
+            };
+            // Remove the abort listener when the timer wins, so a recurring
+            // caller on a long-lived signal (e.g. the heartbeat's stop signal)
+            // doesn't accumulate listeners.
+            const timer = setTimeout(() => {
+              signal.removeEventListener("abort", onAbort);
+              resolve();
+            }, ms);
+            signal.addEventListener("abort", onAbort, { once: true });
+          });
+        },
       });
       return {
         start: () => listener.run(),
