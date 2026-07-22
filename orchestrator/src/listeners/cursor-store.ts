@@ -44,11 +44,14 @@ export function makeCursorStore(executor: CursorExecutor = productionExecutor())
     },
 
     async set(sessionId, consumer, idx) {
+      // Monotonic: a stale writer (e.g. a zombie listener whose lease was
+      // stolen, issue #704) must never rewind a successor's cursor.
       await executor.execute(sql`
         insert into "consumer_cursors" ("session_id", "consumer", "last_idx", "updated_at")
         values (${sessionId}, ${consumer}, ${idx}, now())
         on conflict ("session_id", "consumer") do update
         set "last_idx" = excluded."last_idx", "updated_at" = excluded."updated_at"
+        where "consumer_cursors"."last_idx" < excluded."last_idx"
       `);
     },
   };
@@ -62,6 +65,8 @@ export function makeInMemoryCursorStore(): CursorStore {
       return cursors.get(key(sessionId, consumer)) ?? -1n;
     },
     async set(sessionId, consumer, idx) {
+      const existing = cursors.get(key(sessionId, consumer));
+      if (existing !== undefined && existing >= idx) return;
       cursors.set(key(sessionId, consumer), idx);
     },
   };

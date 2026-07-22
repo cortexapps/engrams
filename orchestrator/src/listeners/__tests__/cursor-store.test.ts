@@ -13,4 +13,15 @@ describe("CursorStore contract", () => {
     expect(await store.get("session-1", "slack")).toBe(-1n);
     expect(await store.get("session-2", "tool-dispatch")).toBe(-1n);
   });
+
+  test("writes are monotonic: a stale writer can never rewind a cursor", async () => {
+    const store = makeInMemoryCursorStore();
+
+    await store.set("session-1", "tool-dispatch", 7n);
+    await store.set("session-1", "tool-dispatch", 3n); // zombie listener (issue #704)
+    expect(await store.get("session-1", "tool-dispatch")).toBe(7n);
+
+    await store.set("session-1", "tool-dispatch", 9n);
+    expect(await store.get("session-1", "tool-dispatch")).toBe(9n);
+  });
 });

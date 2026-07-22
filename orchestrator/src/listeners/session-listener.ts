@@ -19,6 +19,19 @@ const DEFAULT_QUEUE_CAPACITY = 1_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 30_000;
 const ERROR_EVERY_ATTEMPTS = 10;
+/** Deadline for one coordinator RPC (catch-up page, status probe, stream open).
+ * The transport can orphan a call forever — Bun's node:http2 never settles a
+ * call queued on a half-open dial (issue #704) — so the listener never awaits
+ * one bare. */
+const RPC_DEADLINE_MS = 15_000;
+/** On a silent stream, how often to prove coordinator liveness with a bounded
+ * log read (and detect a stream that is stalled behind the durable log). */
+const STREAM_PROBE_INTERVAL_MS = 30_000;
+/** Multiple of the lease TTL with no successful coordinator interaction after
+ * which the listener abandons its lease so the scanner can start a fresh
+ * replacement — possibly on another pod (issue #704: a wedged listener must
+ * never keep renewing). */
+const STALE_GRACE_TTL_FACTOR = 3;
 
 export interface OpenedSessionStream {
   events: AsyncIterable<WireEvent>;
@@ -32,14 +45,23 @@ export interface SessionListenerDeps {
   leaseStore: LeaseStore;
   cursorStore: CursorStore;
   consumers: SessionConsumer[];
-  readPage(sessionId: string, after: bigint): Promise<BoundedRead>;
+  readPage(sessionId: string, after: bigint, signal?: AbortSignal): Promise<BoundedRead>;
   openStream(sessionId: string, since: bigint): Promise<OpenedSessionStream>;
   /** Current session status (GetSession), probed once at start: a session
    * already in a terminal status finishes immediately — its event log may
    * predate terminal status_changed events. */
-  fetchStatus?(sessionId: string): Promise<string>;
+  fetchStatus?(sessionId: string, signal?: AbortSignal): Promise<string>;
   sleep(ms: number): Promise<void>;
   queueCapacity?: number;
+  /** Deadline for one coordinator RPC; default RPC_DEADLINE_MS. */
+  rpcDeadlineMs?: number;
+  /** Silent-stream probe cadence; default STREAM_PROBE_INTERVAL_MS. */
+  probeIntervalMs?: number;
+  /** No-coordinator-progress window before the listener abandons its lease;
+   * default STALE_GRACE_TTL_FACTOR × ttlMs. */
+  staleGraceMs?: number;
+  /** Clock for staleness accounting; default Date.now. */
+  now?: () => number;
 }
 
 interface ConsumerState {
@@ -63,16 +85,28 @@ export class SessionListener {
   readonly #deps: SessionListenerDeps;
   readonly #context: { sessionId: string };
   readonly #stopped: Promise<void>;
+  readonly #rpcDeadlineMs: number;
+  readonly #probeIntervalMs: number;
+  readonly #staleGraceMs: number;
+  readonly #now: () => number;
   #resolveStopped!: () => void;
   #stopRequested = false;
   #stream: OpenedSessionStream | null = null;
   #running: Promise<void> | null = null;
   #states: ConsumerState[] = [];
   #released = false;
+  /** Last time a coordinator interaction demonstrably succeeded (catch-up
+   * page, stream frame, probe read, status probe). Drives lease liveness. */
+  #lastLiveAt: number;
 
   constructor(deps: SessionListenerDeps) {
     this.#deps = deps;
     this.#context = { sessionId: deps.sessionId };
+    this.#rpcDeadlineMs = deps.rpcDeadlineMs ?? RPC_DEADLINE_MS;
+    this.#probeIntervalMs = deps.probeIntervalMs ?? STREAM_PROBE_INTERVAL_MS;
+    this.#staleGraceMs = deps.staleGraceMs ?? STALE_GRACE_TTL_FACTOR * deps.ttlMs;
+    this.#now = deps.now ?? Date.now;
+    this.#lastLiveAt = this.#now();
     this.#stopped = new Promise<void>((resolve) => {
       this.#resolveStopped = resolve;
     });
@@ -138,6 +172,20 @@ export class SessionListener {
       if (!(await this.#sleepOrStop(Math.max(1, Math.floor(this.#deps.ttlMs / 3))))) {
         return;
       }
+      // The lease means "I am listening", not "my process is alive" (issue
+      // #704): a listener with no coordinator progress inside the grace window
+      // stops renewing so the lease expires and a scanner — on any pod — can
+      // start a fresh replacement, even if this listener is wedged beyond the
+      // reach of #requestStop.
+      const staleMs = this.#now() - this.#lastLiveAt;
+      if (staleMs > this.#staleGraceMs) {
+        log.error(
+          { sessionId: this.#deps.sessionId, staleMs },
+          "listener made no coordinator progress within the grace window; abandoning the lease for a replacement",
+        );
+        this.#requestStop();
+        return;
+      }
       let renewed = false;
       try {
         renewed = await this.#deps.leaseStore.renew(
@@ -169,7 +217,10 @@ export class SessionListener {
     while (!this.#stopRequested) {
       try {
         if (!statusProbed && this.#deps.fetchStatus) {
-          const status = await this.#deps.fetchStatus(this.#deps.sessionId);
+          const fetchStatus = this.#deps.fetchStatus;
+          const status = await this.#guarded("status probe", (signal) =>
+            fetchStatus(this.#deps.sessionId, signal));
+          this.#touchLive();
           statusProbed = true;
           const outcome = terminalOutcomeForStatus(status);
           if (outcome) {
@@ -197,7 +248,8 @@ export class SessionListener {
         }
         if (this.#stopRequested) return;
 
-        const opened = await this.#deps.openStream(this.#deps.sessionId, lastSeen);
+        const opened = await this.#guarded("stream open", () =>
+          this.#deps.openStream(this.#deps.sessionId, lastSeen));
         this.#stream = opened;
         log.info(
           { sessionId: this.#deps.sessionId, since: String(lastSeen) },
@@ -206,9 +258,44 @@ export class SessionListener {
 
         let lagged = false;
         let terminalOutcome: TerminalOutcome | undefined;
+        // Pull frames manually so a silent stream can be probed: the dial is
+        // lazy (it happens on the first pull) and can park forever (issue
+        // #704), which is indistinguishable from a healthy idle session
+        // without a periodic liveness read against the durable log.
+        const iterator = opened.events[Symbol.asyncIterator]();
+        let pending: Promise<IteratorResult<WireEvent, unknown>> | null = null;
+        // One timer reused across frames (not one per frame): a stall verdict
+        // needs two probe firings with no frame in between (frames reset
+        // sawLogAhead), which still gives the stream a full interval to
+        // deliver before the second sighting condemns it.
+        let probeTimer: Promise<"probe"> | null = null;
+        let sawLogAhead = false;
         try {
-          for await (const frame of opened.events) {
+          for (;;) {
+            pending ??= iterator.next();
+            probeTimer ??= this.#deps.sleep(this.#probeIntervalMs).then(() => "probe" as const);
+            const winner = await Promise.race([
+              pending.then(
+                (result) => ({ result }),
+                (err: unknown) => ({ err }),
+              ),
+              probeTimer,
+              this.#stopped.then(() => "stopped" as const),
+            ]);
+            if (winner === "stopped") return;
+            if (winner === "probe") {
+              probeTimer = null;
+              sawLogAhead = await this.#probeQuietStream(lastSeen, sawLogAhead);
+              continue;
+            }
+            if ("err" in winner) throw winner.err;
+            pending = null;
+            if (winner.result.done) break;
+            const frame = winner.result.value;
             if (this.#stopRequested) return;
+            this.#touchLive();
+            sawLogAhead = false;
+            reconnectAttempt = 0;
             if (frame.idx === undefined) {
               lagged = true;
               break;
@@ -223,6 +310,11 @@ export class SessionListener {
           }
         } finally {
           opened.close();
+          try {
+            void Promise.resolve(iterator.return?.()).catch(() => {});
+          } catch {
+            // best-effort iterator teardown; opened.close() is authoritative
+          }
           if (this.#stream === opened) this.#stream = null;
         }
 
@@ -252,17 +344,28 @@ export class SessionListener {
           this.#requestStop();
           return;
         }
+        const staleMs = this.#now() - this.#lastLiveAt;
+        if (staleMs > this.#staleGraceMs) {
+          // Retrying on this pod has proven fruitless for a whole grace
+          // window; exit cleanly (releasing the lease) so a scanner starts a
+          // fresh listener — with fresh transport state, possibly elsewhere.
+          log.error(
+            { sessionId: this.#deps.sessionId, staleMs, err },
+            "listener made no coordinator progress within the grace window; exiting for a replacement",
+          );
+          return;
+        }
         reconnectAttempt++;
         const delayMs = Math.min(
           RETRY_MAX_MS,
           RETRY_INITIAL_MS * 2 ** Math.min(reconnectAttempt - 1, 16),
         );
         log.warn(
-          { sessionId: this.#deps.sessionId, err, delayMs },
+          { sessionId: this.#deps.sessionId, err, delayMs, attempt: reconnectAttempt },
           "listener stream dropped",
         );
         log.info(
-          { sessionId: this.#deps.sessionId, delayMs },
+          { sessionId: this.#deps.sessionId, delayMs, attempt: reconnectAttempt },
           "listener stream reconnecting",
         );
         if (!(await this.#sleepOrStop(delayMs))) return;
@@ -270,12 +373,76 @@ export class SessionListener {
     }
   }
 
+  #touchLive(): void {
+    this.#lastLiveAt = this.#now();
+  }
+
+  /** Run one coordinator RPC with a deadline. The transport can orphan a call
+   * forever (issue #704: Bun's node:http2 never settles a call queued on a
+   * half-open dial), so no coordinator await may run bare: on deadline the
+   * call is aborted and the failure takes the ordinary retry path. */
+  async #guarded<T>(
+    what: string,
+    start: (signal: AbortSignal) => Promise<T>,
+  ): Promise<T> {
+    const controller = new AbortController();
+    const work = start(controller.signal);
+    const outcome = await Promise.race([
+      work.then(
+        (value) => ({ ok: true as const, value }),
+        (err: unknown) => ({ ok: false as const, err }),
+      ),
+      this.#deps.sleep(this.#rpcDeadlineMs).then(() => "deadline" as const),
+      this.#stopped.then(() => "stopped" as const),
+    ]);
+    if (typeof outcome === "string") {
+      controller.abort();
+      void work.catch(() => {});
+      throw new Error(
+        outcome === "deadline"
+          ? `coordinator rpc exceeded its ${this.#rpcDeadlineMs}ms deadline: ${what}`
+          : "listener stopped",
+      );
+    }
+    if (!outcome.ok) throw outcome.err;
+    return outcome.value;
+  }
+
+  /** The stream produced nothing for a whole probe interval. One bounded read
+   * of the durable log distinguishes the three possibilities: a read failure
+   * (coordinator unreachable — staleness accrues toward the grace window), a
+   * page at the stream cursor (genuinely idle — proves liveness), or a page
+   * beyond it. The stream gets one full interval to deliver before a second
+   * consecutive ahead-sighting declares it stalled and forces a reconnect. */
+  async #probeQuietStream(lastSeen: bigint, sawLogAhead: boolean): Promise<boolean> {
+    let page: BoundedRead;
+    try {
+      page = await this.#guarded("stream probe read", (signal) =>
+        this.#deps.readPage(this.#deps.sessionId, lastSeen, signal));
+    } catch (err) {
+      if (this.#stopRequested || this.#now() - this.#lastLiveAt > this.#staleGraceMs) {
+        throw err;
+      }
+      log.warn(
+        { sessionId: this.#deps.sessionId, err },
+        "listener stream probe failed",
+      );
+      return sawLogAhead;
+    }
+    this.#touchLive();
+    if (page.nextAfter <= lastSeen) return false;
+    if (!sawLogAhead) return true;
+    throw new Error("event stream is stalled behind the durable log");
+  }
+
   async #catchUp(): Promise<CatchUpResult> {
     let after = this.#minimumCursor();
     let eventCount = 0;
     for (;;) {
       if (this.#stopRequested) return { lastSeen: after, eventCount };
-      const page = await this.#deps.readPage(this.#deps.sessionId, after);
+      const page = await this.#guarded("catch-up read", (signal) =>
+        this.#deps.readPage(this.#deps.sessionId, after, signal));
+      this.#touchLive();
       for (const event of page.events) {
         if (this.#stopRequested) return { lastSeen: after, eventCount };
         await this.#offer(event);
@@ -337,7 +504,9 @@ export class SessionListener {
     let attempt = 0;
     while (!this.#stopRequested && after < state.highestSeen) {
       try {
-        const page = await this.#deps.readPage(this.#deps.sessionId, after);
+        const page = await this.#guarded("recovery read", (signal) =>
+          this.#deps.readPage(this.#deps.sessionId, after, signal));
+        this.#touchLive();
         attempt = 0;
         for (const event of page.events) {
           if (event.idx <= state.highestOffered) continue;

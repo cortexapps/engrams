@@ -249,6 +249,145 @@ describe("SessionListener", () => {
     expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n]);
   });
 
+  test("a catch-up read that never settles hits the rpc deadline, retries, and recovers", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let deadlineFires = 0;
+    const subject = await listener({
+      rpcDeadlineMs: 55_555,
+      readPage: async () => {
+        reads++;
+        if (reads === 1) return new Promise<never>(() => {}); // orphaned call (issue #704)
+        return page([event(4n)], 5n, "completed");
+      },
+      sleep: async (ms) => {
+        if (ms === 55_555) {
+          if (deadlineFires++ === 0) return; // first deadline fires; later ones park
+          await never();
+        } else if (ms < 10_000) {
+          return; // reconnect backoff is instant
+        } else {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(reads).toBe(2);
+    expect(deadlineFires).toBeGreaterThanOrEqual(1);
+    expect(rec.events.map((ev) => ev.idx)).toEqual([4n]);
+    expect(rec.terminals).toEqual(["completed"]);
+  });
+
+  test("a wedged listener stops renewing so the lease can pass to a replacement", async () => {
+    const base = await acquiredLease();
+    let renews = 0;
+    const leases: LeaseStore = {
+      ...base,
+      renew: async (sessionId, owner, ttlMs) => {
+        renews++;
+        return base.renew(sessionId, owner, ttlMs);
+      },
+    };
+    let clock = 0;
+    const subject = await listener({
+      leaseStore: leases,
+      staleGraceMs: 15_000,
+      now: () => clock,
+      // The catch-up read parks forever and even the rpc deadline never fires
+      // (a hypothetical wedge beyond layer-one protection): only the heartbeat
+      // staleness check can save this session.
+      readPage: () => new Promise<never>(() => {}),
+      sleep: async (ms) => {
+        if (ms === 10_000) {
+          clock += ms; // ttl/3 heartbeat cadence drives the virtual clock
+          return;
+        }
+        await never();
+      },
+    }, [recordingConsumer().consumer]);
+
+    await subject.run(); // resolves at all only because the lease is abandoned
+
+    expect(renews).toBe(1); // tick 1 renews (10s stale); tick 2 abandons (20s > 15s)
+    expect(await base.tryAcquire("session-1", "owner-2", 30_000)).toBe(true);
+  });
+
+  test("a silent stream that fell behind the durable log reconnects after two probe sightings", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let opens = 0;
+    let closed = 0;
+    let probeSleeps = 0;
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        if (reads === 1) return page([], after); // initial catch-up: empty log
+        if (reads <= 3) return page([], 5n); // probes: the log is ahead, the stream silent
+        return page([event(5n)], 6n, "completed"); // post-reconnect catch-up delivers
+      },
+      openStream: async () => {
+        opens++;
+        return opened([], { waitAtEnd: true, onClose: () => closed++ });
+      },
+      sleep: async (ms) => {
+        if (ms === 77_777) {
+          if (probeSleeps++ < 2) return; // two probe intervals elapse, then quiet
+          await never();
+        } else if (ms < 10_000) {
+          return; // reconnect backoff is instant
+        } else {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(opens).toBe(1); // the stalled stream is closed; catch-up reaches terminal first
+    expect(closed).toBe(1);
+    expect(reads).toBe(4);
+    expect(rec.events.map((ev) => ev.idx)).toEqual([5n]);
+    expect(rec.terminals).toEqual(["completed"]);
+  });
+
+  test("a genuinely idle session probes the log without reconnecting", async () => {
+    const rec = recordingConsumer();
+    let reads = 0;
+    let opens = 0;
+    let probeSleeps = 0;
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        return page([], after); // the log never moves: genuine idleness
+      },
+      openStream: async () => {
+        opens++;
+        return opened([], { waitAtEnd: true });
+      },
+      sleep: async (ms) => {
+        if (ms === 77_777) {
+          if (probeSleeps++ < 2) return;
+          await never();
+        } else {
+          await never();
+        }
+      },
+    }, [rec.consumer]);
+
+    const running = subject.run();
+    await waitFor(() => reads === 3); // catch-up + two idle probes
+    await subject.stop();
+    await running;
+
+    expect(opens).toBe(1);
+    expect(rec.events).toEqual([]);
+    expect(rec.terminals).toEqual([]);
+  });
+
   test("an idx-less lag frame closes the stream and catches up without loss", async () => {
     const rec = recordingConsumer();
     const after: bigint[] = [];

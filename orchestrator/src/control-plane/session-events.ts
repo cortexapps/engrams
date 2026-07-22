@@ -108,19 +108,24 @@ export function curateWireEvent(ev: WireEvent): CuratedEvent | undefined {
     : undefined;
 }
 
-/** The injectable list seam: one bounded read of the log. */
+/** The injectable list seam: one bounded read of the log. `signal` aborts the
+ * underlying RPC when the caller's deadline fires (issue #704). */
 export type ListEventsFn = (
   sessionId: string,
   after: bigint,
   limit: bigint,
+  signal?: AbortSignal,
 ) => Promise<{ events: WireEvent[]; nextAfterIdx: bigint }>;
 
 /** Page size per bounded read. */
 const PAGE_LIMIT = 200n;
 
 /** Production list fn: the coordinator's unary `ListSessionEvents` RPC. */
-const defaultList: ListEventsFn = async (sessionId, after, limit) => {
-  const resp = await sessions.listSessionEvents({ sessionId, afterIdx: after, limit });
+const defaultList: ListEventsFn = async (sessionId, after, limit, signal) => {
+  const resp = await sessions.listSessionEvents(
+    { sessionId, afterIdx: after, limit },
+    signal ? { signal } : {},
+  );
   return { events: resp.events, nextAfterIdx: resp.nextAfterIdx };
 };
 
@@ -136,8 +141,9 @@ export async function readSessionEventsBounded(
   sessionId: string,
   after: bigint,
   list: ListEventsFn = defaultList,
+  signal?: AbortSignal,
 ): Promise<BoundedRead> {
-  const { events: page, nextAfterIdx } = await list(sessionId, after, PAGE_LIMIT);
+  const { events: page, nextAfterIdx } = await list(sessionId, after, PAGE_LIMIT, signal);
   const events: CuratedEvent[] = [];
   let terminal: { outcome: TerminalOutcome } | undefined;
   let lastAssistantText: string | undefined;

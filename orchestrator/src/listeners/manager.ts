@@ -161,9 +161,13 @@ export function makeProductionListenerManager(): ListenerManager {
           makeProductionSlackConsumer(),
           makeProductionReviewConsumer(),
         ],
-        readPage: readSessionEventsBounded,
-        fetchStatus: async (id) => {
-          const response = await sessions.getSession({ sessionId: id });
+        readPage: (id, after, signal) =>
+          readSessionEventsBounded(id, after, undefined, signal),
+        fetchStatus: async (id, signal) => {
+          const response = await sessions.getSession(
+            { sessionId: id },
+            signal ? { signal } : {},
+          );
           return response.session?.status ?? "";
         },
         openStream: async (id, since) => {
