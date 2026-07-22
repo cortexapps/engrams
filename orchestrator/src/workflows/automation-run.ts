@@ -3,6 +3,7 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
 import { buildAutomationTemplateContext, AutomationTemplateError, renderAutomationAction } from "../automations/template.ts";
+import { makeWebhookAliasResolver } from "../automations/aliases.ts";
 import { sessions as defaultSessions, images as defaultImages, harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
 import { makeAutomationStore, type AutomationWorkflowStore } from "../db/automations.ts";
 import { getDb } from "../db/client.ts";
@@ -56,6 +57,7 @@ export interface AutomationRunWorkflowDeps {
   taskCreator?: AutomationTaskCreator;
   render?: typeof renderAutomationAction;
   step?: AutomationStepRunner;
+  aliases?: (registrationId: string) => Promise<ReadonlyArray<{ path: string; alias: string }>>;
 }
 
 function messageOf(error: unknown): string {
@@ -182,6 +184,7 @@ export async function automationRunWorkflowImpl(
   const store = deps.store ?? makeAutomationStore();
   const taskCreator = deps.taskCreator ?? makeAutomationTaskCreator({ store });
   const render = deps.render ?? renderAutomationAction;
+  const aliases = deps.aliases ?? makeWebhookAliasResolver();
   const step: AutomationStepRunner = deps.step ?? ((fn, name, options) =>
     DBOS.runStep(fn, {
       name,
@@ -213,6 +216,9 @@ export async function automationRunWorkflowImpl(
         if (input.trigger.source === "cron" && scheduledFor === undefined) {
           throw new Error("cron automation run is missing scheduledFor");
         }
+        const webhookAliases = automation.trigger.kind === "webhook"
+          ? await aliases(automation.trigger.registrationId)
+          : [];
         const context = buildAutomationTemplateContext({
           automationName: automation.name,
           triggerKind: input.trigger.source,
@@ -220,6 +226,7 @@ export async function automationRunWorkflowImpl(
           ...(input.trigger.eventKey !== undefined ? { eventKey: input.trigger.eventKey } : {}),
           ...(scheduledFor !== undefined ? { scheduledFor } : {}),
           ...(input.trigger.payload !== undefined ? { rawPayload: input.trigger.payload } : {}),
+          aliases: webhookAliases,
         });
         const rendered = await render(automation.action, context);
         const title = rendered.title ?? null;

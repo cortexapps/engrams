@@ -48,7 +48,7 @@
 #    Slack backend (below) needs no accessor.
 #
 # 4. A second, no-IAP `BackendConfig` for the orchestrator's public
-#    Slack webhooks. IAP is enabled per GCP *backend service*, not per
+#    provider and automation webhooks. IAP is enabled per GCP *backend service*, not per
 #    path, so the only way to expose a path without IAP is to route it
 #    to a different backend whose BackendConfig has IAP off. Apply it
 #    from the chart's examples dir:
@@ -58,11 +58,11 @@
 #    This overlay then (a) enables a dedicated webhook Service
 #    (`orchestrator.webhookService`) — fronting the SAME orchestrator
 #    pods — and binds the no-IAP BackendConfig to IT (not to the primary
-#    orchestrator Service, so IAP stays available there), and (b) adds two
-#    Exact-match paths to the web Ingress retargeted at that webhook
-#    Service. The two Slack URLs skip IAP; everything else stays gated.
-#    Safe because the orchestrator verifies the Slack signing secret on
-#    every webhook AND its IAP bridge exempts these paths (ADR 0060).
+#    orchestrator Service, so IAP stays available there), and (b) adds
+#    provider Exact paths plus the dynamic automation-hook Prefix to the web
+#    Ingress, retargeted at that webhook Service. The orchestrator verifies
+#    every webhook signature and its IAP bridge applies the narrower exact
+#    application matcher before exempting dynamic hooks (ADRs 0060/0100/0102).
 #
 # What this overlay sets
 # ----------------------
@@ -107,6 +107,12 @@ web:
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           - path: /api/v1/integrations/github/events
             pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          # Dynamic automation hooks need a Prefix rule at the load balancer;
+          # the orchestrator's IAP bridge remains the exact POST + one-slug
+          # application boundary within this no-IAP prefix (ADR 0102).
+          - path: /api/v1/hooks/
+            pathType: Prefix
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           # Everything else → web nginx (IAP-protected).
           - path: /

@@ -136,9 +136,12 @@ import { extractApiKey } from "./api-key-header.ts";
  *      own signature (Slack signing secret + timestamp window, or GitHub's
  *      X-Hub-Signature-256 HMAC) and rejects a bad signature with 401 itself. The
  *      bridge would only get in the way, so we exempt the exact webhook paths.
+ *      Dynamic automation hooks additionally require POST plus exactly one
+ *      validated registration slug; the load balancer's broader Prefix rule
+ *      is not trusted as the application authorization boundary.
  *      The strings must stay in lockstep with the routes' `app.post(...)`
  *      paths in orchestrator/src/routes/{slack-events,slack-interactivity,
- *      github-events}.ts.
+ *      github-events,hooks}.ts.
  *
  *   3. The device-authorization CLI endpoints (`engrams auth login`). The CLI
  *      requests a code and polls for the token from a bare terminal — no IAP
@@ -160,9 +163,12 @@ const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/api/auth/device/token",
 ]);
 
+const HOOK_PATH_RE = /^\/api\/v1\/hooks\/[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$/;
+
 /** Pure seam for exact-path public ingress tests (query strings are ignored). */
-export function isIapPublicPath(url: string): boolean {
-  return PUBLIC_PATHS.has(url.split("?", 1)[0] ?? "/");
+export function isIapPublicPath(url: string, method = "GET"): boolean {
+  const path = url.split("?", 1)[0] ?? "/";
+  return PUBLIC_PATHS.has(path) || (method === "POST" && HOOK_PATH_RE.test(path));
 }
 
 // ---------------------------------------------------------------------------
@@ -455,7 +461,7 @@ export async function iapBridge(
   // fail-closed path below would 401 them → the pod never goes Ready. Let the
   // allowlist through before any IAP logic. Checked even when IAP is inert so
   // the path is identical in dev and prod. See PUBLIC_PATHS for the rationale.
-  if (isIapPublicPath(req.url ?? "/")) {
+  if (isIapPublicPath(req.url ?? "/", req.method ?? "GET")) {
     next();
     return;
   }

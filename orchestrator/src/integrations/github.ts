@@ -44,7 +44,7 @@ export function __resetGithubWebhookSecretCache(): void {
 /** GitHub's documented X-Hub-Signature-256 HMAC verification scheme. */
 export function verifyGithubSignature(
   secret: string,
-  rawBody: string,
+  rawBody: string | Uint8Array,
   signatureHeader: string | undefined,
 ): boolean {
   if (signatureHeader == null) return false;

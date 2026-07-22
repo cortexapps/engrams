@@ -99,6 +99,13 @@ export interface AutomationStore {
   deleteRegistration(id: string): Promise<boolean>;
 
   getSample(id: string): Promise<WebhookSampleRow | null>;
+  recordWebhookSample(input: {
+    registrationId: string;
+    eventKey: string;
+    payload: Record<string, unknown>;
+    receivedAt: Date;
+    retain: number;
+  }): Promise<void>;
   getLatestSample(registrationId: string, eventKey?: string): Promise<WebhookSampleRow | null>;
   listSamples(registrationId: string, eventKey: string | undefined, limit: number): Promise<WebhookSampleRow[]>;
   listObservedEventKeys(registrationId: string): Promise<string[]>;
@@ -230,6 +237,7 @@ export function makeAutomationStore(
         .from(automationTable)
         .where(
           and(
+            eq(automationTable.enabled, true),
             isNull(automationTable.archivedAt),
             sql`${automationTable.trigger}->>'kind' = 'webhook'`,
             sql`${automationTable.trigger}->>'registrationId' = ${registrationId}`,
@@ -540,6 +548,40 @@ export function makeAutomationStore(
     async getSample(id) {
       const [row] = await db.select().from(webhookSampleTable).where(eq(webhookSampleTable.id, id)).limit(1);
       return row ? sampleRow(row) : null;
+    },
+
+    async recordWebhookSample(input) {
+      if (!Number.isSafeInteger(input.retain) || input.retain < 1) {
+        throw new RangeError("webhook sample retention must be a positive safe integer");
+      }
+      await db.transaction(async (tx) => {
+        // Serialize writers per registration before insert+prune. Without this
+        // lock, two concurrent deliveries can both retain N rows from their
+        // snapshots and commit N+1 rows despite pruning in each transaction.
+        await tx.execute(sql`
+          select id from ${webhookRegistrationTable}
+          where id = ${input.registrationId}
+          for update
+        `);
+        await tx.insert(webhookSampleTable).values({
+          registrationId: input.registrationId,
+          eventKey: input.eventKey,
+          payload: input.payload,
+          receivedAt: input.receivedAt,
+        });
+        await tx.execute(sql`
+          delete from ${webhookSampleTable}
+          where registration_id = ${input.registrationId}
+            and event_key = ${input.eventKey}
+            and id not in (
+              select id from ${webhookSampleTable}
+              where registration_id = ${input.registrationId}
+                and event_key = ${input.eventKey}
+              order by received_at desc, id desc
+              limit ${input.retain}
+            )
+        `);
+      });
     },
 
     async getLatestSample(registrationId, eventKey) {

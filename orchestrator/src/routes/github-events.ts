@@ -2,6 +2,17 @@
 
 import { Hono } from "hono";
 
+import {
+  dispatchWebhookOccurrence,
+  SYSTEM_GITHUB_REGISTRATION_ID,
+  type DispatchWebhookInput,
+} from "../automations/dispatch.ts";
+import {
+  extractWebhookEvent,
+  parseWebhookPayload,
+  redactWebhookPayload,
+  WebhookEventError,
+} from "../automations/webhook.ts";
 import { config } from "../config.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import {
@@ -12,6 +23,7 @@ import {
   getGithubWebhookSecret,
   verifyGithubSignature,
 } from "../integrations/github.ts";
+import { BodyTooLargeError, readBoundedBody } from "../http/bounded-body.ts";
 import { log as rootLog } from "../log.ts";
 import {
   dispatchReview,
@@ -20,7 +32,6 @@ import {
 } from "../workflows/dispatch-review.ts";
 
 const log = rootLog.child({ component: "github-webhook" });
-const MAX_WEBHOOK_BODY_BYTES = 2 * 1024 * 1024;
 const AUTHORIZED_COMMENT_ASSOCIATIONS: ReadonlySet<string> = new Set([
   "OWNER",
   "MEMBER",
@@ -31,6 +42,8 @@ export interface GithubEventsDeps {
   webhookSecret?: () => Promise<string>;
   enrollments?: Pick<EnrollmentStore, "get">;
   dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>;
+  automationDispatch?: (input: DispatchWebhookInput) => Promise<unknown>;
+  now?: () => Date;
   /** The review App's @-mention handle (its slug). Defaults to the deployment's
    *  GITHUB_APP_LOGIN; blank disables mention commands. */
   mentionHandle?: string;
@@ -45,23 +58,55 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   const dispatch = deps.dispatch ?? ((input) => dispatchReview({
     enrollments: enrollments(),
   }, input));
+  const automationDispatch = deps.automationDispatch ?? dispatchWebhookOccurrence;
+  const now = deps.now ?? (() => new Date());
   const app = new Hono();
 
   app.post("/api/v1/integrations/github/events", async (c) => {
-    const contentLength = c.req.header("content-length");
-    if (
-      contentLength !== undefined
-      && Number(contentLength) > MAX_WEBHOOK_BODY_BYTES
-    ) {
-      return c.body(null, 413);
+    let rawBytes: Uint8Array;
+    try {
+      rawBytes = await readBoundedBody(c.req.raw);
+    } catch (error) {
+      if (error instanceof BodyTooLargeError) return c.body(null, 413);
+      throw error;
     }
-    const rawBody = await c.req.text();
     const valid = verifyGithubSignature(
       await webhookSecret(),
-      rawBody,
+      rawBytes,
       c.req.header("x-hub-signature-256"),
     );
     if (!valid) return c.json({ error: "invalid signature" }, 401);
+
+    const rawBody = new TextDecoder().decode(rawBytes);
+    // The installed GitHub App is a well-known system registration. It has no
+    // PG registration row, so dispatch skips sample persistence but still
+    // matches automations bound to "github-app". This happens before the
+    // PR-review classifier so every verified GitHub event is forwarded.
+    try {
+      const occurrence = extractWebhookEvent({
+        registration: {
+          verification: { scheme: "github_hmac_sha256", secretRef: "github.webhook_secret" },
+          providerHint: "github",
+        },
+        headers: c.req.raw.headers,
+        rawBody: rawBytes,
+        payload: parseWebhookPayload(rawBytes),
+      });
+      await automationDispatch({
+        registrationId: SYSTEM_GITHUB_REGISTRATION_ID,
+        registration: null,
+        eventKey: occurrence.eventKey,
+        deliveryId: occurrence.deliveryId,
+        payload: redactWebhookPayload(occurrence.payload),
+        receivedAt: now(),
+      });
+    } catch (error) {
+      if (!(error instanceof WebhookEventError)) throw error;
+      // Preserve the pre-existing PR-review classifier's tolerant behavior for
+      // signed-but-malformed/non-JSON requests. Legitimate GitHub deliveries
+      // always carry the event and delivery headers and a JSON object body.
+      log.warn({ error: error.message }, "github delivery not eligible for automation dispatch");
+    }
 
     const event = classifyGithubEvent(
       c.req.header("x-github-event") ?? "",

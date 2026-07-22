@@ -10,4 +10,11 @@ describe("GitHub webhook IAP exemption", () => {
     expect(isIapPublicPath("/api/v1/integrations/github/events/extra"))
       .toBe(false);
   });
+
+  test("dynamic hooks require POST plus exactly one valid registration slug", () => {
+    expect(isIapPublicPath("/api/v1/hooks/my-hook?delivery=1", "POST")).toBe(true);
+    expect(isIapPublicPath("/api/v1/hooks/my-hook", "GET")).toBe(false);
+    expect(isIapPublicPath("/api/v1/hooks/my-hook/extra", "POST")).toBe(false);
+    expect(isIapPublicPath("/api/v1/hooks/Bad_Slug", "POST")).toBe(false);
+  });
 });

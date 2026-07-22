@@ -91,6 +91,7 @@ function fakeStore(seed?: {
         .filter(
           (row) =>
             !row.archivedAt &&
+            row.enabled &&
             row.trigger.kind === "webhook" &&
             row.trigger.registrationId === registrationId,
         )
@@ -152,6 +153,10 @@ function fakeStore(seed?: {
     },
     async getSample(id) {
       return samples.get(id) ?? null;
+    },
+    async recordWebhookSample(input) {
+      const id = `sample-${samples.size + 1}`;
+      samples.set(id, { id, ...input });
     },
     async getLatestSample(registrationId, eventKey) {
       return (
@@ -274,6 +279,77 @@ describe("AutomationService", () => {
       now: () => NOW,
     });
     await expectCode(automations.createAutomation(cronRequest), Code.InvalidArgument);
+  });
+
+  test("webhook filters accept only bounded dotted payload-path equality keys", async () => {
+    const hook: WebhookRegistrationRow = {
+      id: "generic",
+      name: "Generic",
+      verification: {
+        scheme: "generic_hmac_sha256",
+        secretRef: "webhook.generic.secret",
+      },
+      providerHint: null,
+      createdByUserId: "admin",
+      createdAt: NOW,
+      updatedAt: NOW,
+    };
+    const { automations } = clients({
+      getSession: session("admin", "admin"),
+      store: fakeStore({ registrations: [hook] }),
+      profiles: { getActive: async () => profile() },
+      now: () => NOW,
+    });
+    const request = (filterJson: string) => automations.createAutomation({
+      name: "Filtered hook",
+      description: "",
+      enabled: true,
+      trigger: {
+        trigger: {
+          case: "webhook",
+          value: {
+            registrationId: "generic",
+            events: ["incident.opened"],
+            filterJson,
+          },
+        },
+      },
+      action: cronRequest.action,
+    });
+
+    await expectCode(request(JSON.stringify({ "incident.__proto__.admin": true })), Code.InvalidArgument);
+    const created = await request(JSON.stringify({ "incident.severity": "critical" }));
+    expect(created.automation?.trigger?.trigger.value).toMatchObject({
+      filterJson: JSON.stringify({ "incident.severity": "critical" }),
+    });
+  });
+
+  test("accepts the github-app system registration without a PG registration row", async () => {
+    const { automations } = clients({
+      getSession: session("admin", "admin"),
+      store: fakeStore(),
+      profiles: { getActive: async () => profile() },
+      now: () => NOW,
+    });
+    const created = await automations.createAutomation({
+      name: "GitHub issues",
+      description: "",
+      enabled: true,
+      trigger: {
+        trigger: {
+          case: "webhook",
+          value: {
+            registrationId: "github-app",
+            events: ["issues.opened"],
+          },
+        },
+      },
+      action: cronRequest.action,
+    });
+    expect(created.automation?.trigger?.trigger.value).toMatchObject({
+      registrationId: "github-app",
+      events: ["issues.opened"],
+    });
   });
 });
 
