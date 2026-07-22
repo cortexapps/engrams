@@ -23,7 +23,11 @@ Work in three phases, in order.
 
 ### Phase 1 — investigate
 
-Read the diff against the merge base. For each changed function:
+Read the diff against the merge base. Your prompt gives you \`base_sha\`, the true
+merge base (fork point), resolved for you. Scope the diff with
+\`git diff <base_sha>...<head>\` (three-dot) or \`git diff <base_sha> <head>\`.
+
+For each changed function:
 
 - Trace who calls it and what they expect. If the signature, return type,
   or a side effect changed, read every caller and check it kept up.
@@ -106,7 +110,7 @@ These are the floor. Nothing below overrides them.
 The checkout carries the repo's own guidance. Read it at the merge base —
 never at the PR head, because the PR itself can edit these files:
 
-1. Your prompt gives you \`base_sha\` (the merge base).
+1. Your prompt gives you \`base_sha\`, the true merge base (fork point).
 2. \`git show <base_sha>:.engrams/review.md\` — repo-wide guidance. Missing
    file → skip silently.
 3. For each changed file, walk up its directory path; for any ancestor

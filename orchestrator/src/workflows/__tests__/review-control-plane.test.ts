@@ -156,6 +156,7 @@ function enrollment(repo: string, profileId: string | null): EnrollmentRow {
 
 interface FakeSessionOptions {
   exitStatus?: number;
+  stdout?: string;
   stderr?: string;
   writeFailure?: string;
 }
@@ -182,6 +183,9 @@ function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & 
     },
     async *exec(req) {
       execCalls.push(req);
+      if (options.stdout) {
+        yield { event: { case: "stdout", value: new TextEncoder().encode(options.stdout) } };
+      }
       if (options.stderr) {
         yield { event: { case: "stderr", value: new TextEncoder().encode(options.stderr) } };
       }
@@ -705,12 +709,16 @@ describe("ReviewControlPlane", () => {
     expect(events).toEqual([[active.id, "reviewing", undefined]]);
   });
 
-  test("the finder range is THREE-dot (merge-base), never two-dot", async () => {
-    // baseSha is the base BRANCH's head, not the merge base — a two-dot
-    // range shows base-branch commits since the fork as phantom deletions
-    // in the PR (live: engrams#820 was reported as deleting a field that
-    // main gained after the branch forked).
-    const sessions = fakeSessions();
+  test("the finder anchors on the resolved merge base, never the base branch head", async () => {
+    // input.baseSha is the base BRANCH's head, not the fork point — anchoring
+    // a diff there shows base-branch commits gained since the fork as phantom
+    // deletions in the PR (live: engrams#820 was reported as deleting a field
+    // that main gained after the branch forked). sendFinderPrompt resolves the
+    // TRUE merge base with `git merge-base` and hands THAT to the finder.
+    const baseBranchHead = "b".repeat(40);
+    const headSha = "e".repeat(40);
+    const mergeBase = "a".repeat(40);
+    const sessions = fakeSessions({ stdout: `${mergeBase}\n` });
     const cp = makeReviewControlPlane({
       sessions,
       reviews: {
@@ -725,11 +733,17 @@ describe("ReviewControlPlane", () => {
       reviewId: active.id,
       repo: active.repo,
       prNumber: active.prNumber,
-      headSha: "head-sha",
-      baseSha: "base-sha",
+      headSha,
+      baseSha: baseBranchHead,
     });
-    expect(sessions.promptCalls[0]?.text).toContain("base-sha...head-sha");
-    expect(sessions.promptCalls[0]?.text).not.toContain("base-sha..head-sha ");
+    // Resolution ran against the base-branch head + head in the checkout...
+    expect(sessions.execCalls[0]?.command).toContain(
+      `merge-base ${baseBranchHead} ${headSha}`,
+    );
+    // ...and the prompt anchors the diff on the resolved merge base (three-dot),
+    // never on the base-branch head the phantom-deletion bug came from.
+    expect(sessions.promptCalls[0]?.text).toContain(`${mergeBase}...${headSha}`);
+    expect(sessions.promptCalls[0]?.text).not.toContain(baseBranchHead);
   });
 
   test("a retry finder session gets a DISTINCT prompt id", async () => {
@@ -781,8 +795,6 @@ describe("ReviewControlPlane", () => {
       reviewId: active.id,
       repo: active.repo,
       prNumber: active.prNumber,
-      headSha: active.headSha,
-      baseSha: "",
     });
 
     expect(sessions.promptCalls[0]).toMatchObject({

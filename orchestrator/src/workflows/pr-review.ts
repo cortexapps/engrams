@@ -155,7 +155,7 @@ export async function prReviewWorkflowImpl(
         "bootstrapVerifierSession",
       );
       await step(
-        () => cp.sendVerifierPrompt(sessionId, { reviewId, repo: first.repo, prNumber: first.prNumber, headSha, baseSha }),
+        () => cp.sendVerifierPrompt(sessionId, { reviewId, repo: first.repo, prNumber: first.prNumber }),
         "sendVerifierPrompt",
       );
     }
