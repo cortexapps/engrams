@@ -58,6 +58,15 @@ pub fn init(addr: SocketAddr) {
             tracing::warn!(error = %e, "host-agent metrics exporter init failed; continuing without metrics");
         }
     }
+
+    // Pre-register alert-critical zero-normally counters so they export
+    // as 0 from boot. A counter that only increments on disaster has no
+    // metric descriptor until the disaster happens, and Cloud Monitoring
+    // refuses to create an alert policy on a metric it has never seen —
+    // the alert must exist before the first firing, so the series must
+    // too. (Same rationale as the coordinator's pre-registration.)
+    ::metrics::counter!(CHECKPOINT_CHAIN_POISONED_TOTAL).absolute(0);
+    ::metrics::counter!(SPOOL_LINEAGE_MISMATCH_TOTAL).absolute(0);
 }
 
 // ─── metric name constants ────────────────────────────────────────
