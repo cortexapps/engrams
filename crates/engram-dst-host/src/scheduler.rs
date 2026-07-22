@@ -71,6 +71,15 @@ pub enum Step {
     /// = env unset); `u64` millis keeps [`Step`] `Eq` (an `f64` would not).
     /// A tiny budget overruns the final-flush deadline → the #225 shape.
     Sigterm(Option<u64>),
+    /// Flow A (af28cac4, 2026-07-21): the SIGTERM deadline overruns while
+    /// sandbox `.0`'s final flush is IN FLIGHT — a REAL `flush()` parked at
+    /// seam point `.1 % 3` — and the fixed driver ABORTS + reaps it before
+    /// the abandon sweep's spool export. [`Sigterm`](Step::Sigterm)'s binary
+    /// overrun (flush completes-before-export or never runs) cannot
+    /// represent this third state; the incident lived exactly there. The
+    /// step asserts the spool-coherence obligations inline (head unmoved,
+    /// spool stamp == head) at every seam point — the abort-safety sweep.
+    SigtermFlushParkedAt(usize, u8),
     /// Flow D (P5): begin an eviction finalize for sandbox `idx` — the sim
     /// analog of `snapshot_begin` (drain → stage → durable record → pause).
     /// Idempotent: a pending finalize re-observes the same snapshot id.
@@ -173,6 +182,7 @@ impl Step {
             Step::DropLocalBinding(..) => "DropLocalBinding",
             Step::RevokeOwnership(..) => "RevokeOwnership",
             Step::Sigterm(..) => "Sigterm",
+            Step::SigtermFlushParkedAt(..) => "SigtermFlushParkedAt",
             Step::SnapshotBegin(..) => "SnapshotBegin",
             Step::FinalizeTick(..) => "FinalizeTick",
             Step::FinalizeCrashAt(..) => "FinalizeCrashAt",
@@ -289,10 +299,11 @@ impl Sim {
             }
             return Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30)));
         }
-        // 0..112: 0..=99 the pre-P8 menu, 100..=106 the migration
-        // lifecycle, the tail AdvanceTime. Widening the range re-shuffles
-        // old seeds' exploration (fine — seeds pin to a commit).
-        let roll: u32 = self.rng.random_range(0..112);
+        // 0..114: 0..=99 the pre-P8 menu, 100..=106 the migration
+        // lifecycle, then the profile-specific fault menu, the tail
+        // AdvanceTime. Widening the range re-shuffles old seeds'
+        // exploration (fine — seeds pin to a commit).
+        let roll: u32 = self.rng.random_range(0..114);
         // Weights are part of the seed contract: changing them makes old
         // seeds explore differently (fine — seeds pin to a commit), but the
         // pick must NEVER branch on anything non-deterministic.
@@ -339,6 +350,14 @@ impl Sim {
                 104 => Step::MigrationTtlSweep,
                 105 => Step::MigrationCommit(self.rng.random_range(0..n)),
                 106 => Step::MigrationAbort(self.rng.random_range(0..n)),
+                // Flow A (af28cac4): the overrun-with-an-in-flight-flush
+                // SIGTERM. Graceful (abort + spool complete), so it belongs
+                // in the calm durability baseline like Sigterm.
+                107..=108 => {
+                    let idx = self.rng.random_range(0..n);
+                    let seam = self.rng.random_range(0..3u8);
+                    Step::SigtermFlushParkedAt(idx, seam)
+                }
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
@@ -406,6 +425,13 @@ impl Sim {
                 // arises under the swarm and the barrier's severed-live-holder +
                 // quarantine oracles guard it every step.
                 109 => Step::LoseRecord(self.rng.random_range(0..n)),
+                // Flow A (af28cac4): the overrun-with-an-in-flight-flush
+                // SIGTERM, under chaos — the roll it models IS a crash step.
+                110..=111 => {
+                    let idx = self.rng.random_range(0..n);
+                    let seam = self.rng.random_range(0..3u8);
+                    Step::SigtermFlushParkedAt(idx, seam)
+                }
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -455,6 +481,13 @@ impl Sim {
                 self.host.sigterm(budget_secs(budget_ms)).await?;
                 // A fresh host-agent process starts with an empty strike
                 // ledger; RAM died, so bias toward Restart next.
+                self.reconcile_strikes.clear();
+                self.crashed = true;
+            }
+            Step::SigtermFlushParkedAt(idx, seam) => {
+                self.host.sigterm_flush_parked(idx, seam).await?;
+                // A SIGTERM either way (parked-flush or the fallback plain
+                // overrun ladder): RAM died, strikes reset, Restart next.
                 self.reconcile_strikes.clear();
                 self.crashed = true;
             }
