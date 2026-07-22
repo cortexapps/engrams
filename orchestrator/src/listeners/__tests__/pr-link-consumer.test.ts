@@ -118,6 +118,72 @@ describe("PR-link consumer", () => {
     expect(recorder.upserts[0]?.title).toBe("Record authored pull requests");
   });
 
+  test("derives repo AND number from the PR URL for the `gh pr create` payload shape (empty data)", async () => {
+    // `gh pr create` opens the PR via the GraphQL createPullRequest mutation
+    // whose selection set carries only `id`+`url`, so every `data` extractor
+    // misses and the asset arrives as `data: {}` with just the fetchable URL
+    // (prod 2026-07-22: engrams#854/#858 were silently dropped this way).
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(
+      integrationAsset({
+        provider: "github",
+        asset_kind: "pull_request",
+        surface: "asset",
+        data: {},
+        fetchable: {
+          kind: "external",
+          url: "https://github.com/openai/engrams/pull/858",
+        },
+        at: "2026-07-22T17:20:53.946Z",
+      }),
+      { sessionId: "session-1" },
+    );
+
+    expect(recorder.upserts).toEqual([
+      {
+        repo: "openai/engrams",
+        prNumber: 858,
+        authoringTaskId: "task-1",
+        sessionId: "session-1",
+        title: "",
+        url: "https://github.com/openai/engrams/pull/858",
+        headBranch: "",
+        baseBranch: "",
+        observedAt: new Date("2026-07-22T17:20:53.946Z"),
+      },
+    ]);
+  });
+
+  test("skips a PR asset whose number is absent and underivable from the URL", async () => {
+    const recorder = prRefRecorder();
+    const consumer = makePrLinkConsumer({
+      prRefs: recorder.store,
+      findTaskId: async () => "task-1",
+    });
+
+    await consumer.handle(
+      integrationAsset({
+        provider: "github",
+        asset_kind: "pull_request",
+        surface: "asset",
+        data: { repo: "openai/engrams", title: "No number anywhere" },
+        fetchable: {
+          kind: "external",
+          url: "https://github.com/openai/engrams/pulls",
+        },
+        at: "2026-07-16T18:19:20.123Z",
+      }),
+      { sessionId: "session-1" },
+    );
+
+    expect(recorder.upserts).toEqual([]);
+  });
+
   test("skips a PR asset whose repo is absent and underivable", async () => {
     const recorder = prRefRecorder();
     const consumer = makePrLinkConsumer({
