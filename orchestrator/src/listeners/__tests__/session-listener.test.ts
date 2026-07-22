@@ -388,6 +388,34 @@ describe("SessionListener", () => {
     expect(rec.terminals).toEqual([]);
   });
 
+  test("an actively delivering stream re-arms its probe timer per frame and never probes the log", async () => {
+    const rec = recordingConsumer();
+    let reads = 0; // readPage calls: catch-up only — a probe read would add more
+    let probeArmings = 0; // sleep(probeIntervalMs) calls: one re-arm per frame
+    const subject = await listener({
+      probeIntervalMs: 77_777,
+      readPage: async (_sessionId, after) => {
+        reads++;
+        return page([], after); // catch-up empty; must never be consulted again
+      },
+      openStream: async () =>
+        opened([event(0n), event(1n), event(2n), terminal(3n)]),
+      sleep: async (ms) => {
+        if (ms === 77_777) probeArmings++;
+        // The probe timer never fires: every delivered frame re-arms it, so a
+        // delivering stream proves liveness via frames and issues no probe read.
+        await never();
+      },
+    }, [rec.consumer]);
+
+    await subject.run();
+
+    expect(rec.events.map((ev) => ev.idx)).toEqual([0n, 1n, 2n]);
+    expect(rec.terminals).toEqual(["completed"]);
+    expect(reads).toBe(1); // just the initial catch-up — no probe reads
+    expect(probeArmings).toBe(4); // re-armed once per delivered frame, not armed once
+  });
+
   test("an idx-less lag frame closes the stream and catches up without loss", async () => {
     const rec = recordingConsumer();
     const after: bigint[] = [];

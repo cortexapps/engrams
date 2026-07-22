@@ -19,10 +19,13 @@ const DEFAULT_QUEUE_CAPACITY = 1_000;
 const RETRY_INITIAL_MS = 250;
 const RETRY_MAX_MS = 30_000;
 const ERROR_EVERY_ATTEMPTS = 10;
-/** Deadline for one coordinator RPC (catch-up page, status probe, stream open).
- * The transport can orphan a call forever — Bun's node:http2 never settles a
- * call queued on a half-open dial (issue #704) — so the listener never awaits
- * one bare. */
+/** Deadline for one coordinator RPC (status probe, catch-up read, stream probe
+ * read, recovery read). The transport can orphan a call forever — Bun's
+ * node:http2 never settles a call queued on a half-open dial (issue #704) — so
+ * the listener never awaits one bare. Stream open itself is synchronous (it
+ * only builds the async iterable); its lazy first-pull dial — the actual park
+ * risk — is bounded by the silent-stream probe and its two-sighting stall
+ * verdict, not this deadline. */
 const RPC_DEADLINE_MS = 15_000;
 /** On a silent stream, how often to prove coordinator liveness with a bounded
  * log read (and detect a stream that is stalled behind the durable log). */
@@ -254,8 +257,12 @@ export class SessionListener {
         }
         if (this.#stopRequested) return;
 
-        const opened = await this.#guarded("stream open", () =>
-          this.#deps.openStream(this.#deps.sessionId, lastSeen));
+        // No #guarded here: openStream is synchronous — it only constructs the
+        // async iterable. The dial happens lazily on the first iterator.next()
+        // below, where the probe timer + stall verdict bound it (issue #704);
+        // a deadline around this synchronous call would never fire and its
+        // abort would reach nothing.
+        const opened = await this.#deps.openStream(this.#deps.sessionId, lastSeen);
         this.#stream = opened;
         log.info(
           { sessionId: this.#deps.sessionId, since: String(lastSeen) },
@@ -270,10 +277,13 @@ export class SessionListener {
         // without a periodic liveness read against the durable log.
         const iterator = opened.events[Symbol.asyncIterator]();
         let pending: Promise<IteratorResult<WireEvent, unknown>> | null = null;
-        // One timer reused across frames (not one per frame): a stall verdict
-        // needs two probe firings with no frame in between (frames reset
-        // sawLogAhead), which still gives the stream a full interval to
-        // deliver before the second sighting condemns it.
+        // The probe timer restarts on every delivered frame: a stream that is
+        // delivering already proves liveness via #touchLive, so it never issues
+        // a probe read. Only a silent stream leaves the timer running, and a
+        // stalled one leaves it running across two firings with no frame in
+        // between (sawLogAhead persists) — which condemns it and forces a
+        // reconnect. Idle sessions (no frames, log at cursor) still probe every
+        // interval, which is what keeps their lease alive.
         let probeTimer: Promise<"probe"> | null = null;
         let sawLogAhead = false;
         try {
@@ -301,6 +311,7 @@ export class SessionListener {
             if (this.#stopRequested) return;
             this.#touchLive();
             sawLogAhead = false;
+            probeTimer = null; // a delivering stream needs no liveness probe
             reconnectAttempt = 0;
             if (frame.idx === undefined) {
               lagged = true;
