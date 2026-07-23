@@ -70,6 +70,19 @@ const EXEC_OUTPUT_CAP: usize = 64 * 1024 * 1024;
 /// recover a lag from the retained buffers until the output cap is crossed.
 const EXEC_LIVE_EVENT_CAPACITY: usize = 512;
 
+/// Completed exec records retained per sandbox for late re-attach (the
+/// in-memory analogue of the guest journal's 32-record budget). Without a
+/// bound, a long-lived dev sandbox running many execs accumulates output
+/// buffers indefinitely. Running records are never evicted — they are
+/// bounded by actual concurrency. Attaching to an evicted ticket behaves
+/// like a TTL'd guest journal: nonzero offsets refuse loudly, zero offsets
+/// are a fresh attach-or-start.
+const EXEC_COMPLETED_RETENTION: usize = 32;
+
+/// Monotonic completion order across all records; drives oldest-first
+/// eviction above [`EXEC_COMPLETED_RETENTION`].
+static EXEC_COMPLETION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Per-sandbox state owned by the backend.
 #[derive(Clone, Debug)]
 struct SandboxState {
@@ -110,6 +123,8 @@ struct ExecRecordState {
     stderr_truncated: bool,
     /// `None` means running; `Some(None)` is an exact signal/unknown exit.
     exit: Option<Option<i32>>,
+    /// Completion order for retention eviction; `None` while running.
+    completed_seq: Option<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -158,7 +173,36 @@ impl ExecRecord {
     fn finish(&self, exit: Option<i32>) {
         let mut state = self.state.lock();
         state.exit = Some(exit);
+        state.completed_seq =
+            Some(EXEC_COMPLETION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
         let _ = self.progress.send(ExecRecordEvent::Exit(exit));
+    }
+}
+
+/// Evict the oldest completed records beyond [`EXEC_COMPLETED_RETENTION`].
+/// Called before each new exec's entry lookup — never while holding a map
+/// entry guard (iteration and entry() both take shard locks).
+fn prune_completed_exec_records(records: &DashMap<String, Arc<ExecRecord>>) {
+    let mut completed: Vec<(String, u64)> = records
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .value()
+                .state
+                .lock()
+                .completed_seq
+                .map(|seq| (entry.key().clone(), seq))
+        })
+        .collect();
+    if completed.len() <= EXEC_COMPLETED_RETENTION {
+        return;
+    }
+    completed.sort_by_key(|(_, seq)| *seq);
+    for (exec_id, _) in completed
+        .iter()
+        .take(completed.len() - EXEC_COMPLETED_RETENTION)
+    {
+        records.remove(exec_id);
     }
 }
 
@@ -324,6 +368,7 @@ impl SandboxBackend for ProcessBackend {
             .clone();
 
         let exec_records = state.exec_records.clone();
+        prune_completed_exec_records(&exec_records);
         let entry = exec_records.entry(exec_id.clone());
         match entry {
             Entry::Occupied(existing) => {
@@ -1546,6 +1591,42 @@ mod tests {
         b.cancel_exec(id, "completed-ticket".into())
             .await
             .expect("cancelling an exited record is a no-op");
+    }
+
+    /// PR #874 review class ("retention without a bound"): completed records
+    /// beyond the retention cap are evicted oldest-first, so a long-lived
+    /// sandbox cannot accumulate output buffers indefinitely. Running
+    /// records are untouched, and an evicted ticket behaves like a TTL'd
+    /// guest journal: nonzero-offset attaches refuse loudly.
+    #[tokio::test]
+    async fn completed_records_beyond_retention_evict_oldest_first() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        for i in 0..(EXEC_COMPLETED_RETENTION + 2) {
+            let req = durable_exec(&format!("retained-{i}"), &["sh", "-c", "printf done"]);
+            let (out, _, exit) = collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
+            assert_eq!((out.as_slice(), exit), (b"done".as_slice(), Some(Some(0))));
+        }
+
+        // The two oldest completed tickets were evicted: a nonzero-offset
+        // attach is the missing-record refusal, never a respawn.
+        let mut evicted = durable_exec("retained-0", &["sh", "-c", "printf done"]);
+        evicted.stdout_offset = Some(4);
+        let (_, err, exit) = collect_exec_stream(b.exec_stream(id, evicted).await.unwrap()).await;
+        assert_eq!(exit, Some(None));
+        assert!(
+            String::from_utf8_lossy(&err).contains("refusing to spawn a second command"),
+            "evicted ticket must refuse, got: {}",
+            String::from_utf8_lossy(&err)
+        );
+
+        // The newest ticket is still fully replayable.
+        let newest = durable_exec(
+            &format!("retained-{}", EXEC_COMPLETED_RETENTION + 1),
+            &["sh", "-c", "printf done"],
+        );
+        let (out, _, exit) = collect_exec_stream(b.exec_stream(id, newest).await.unwrap()).await;
+        assert_eq!((out.as_slice(), exit), (b"done".as_slice(), Some(Some(0))));
     }
 
     #[tokio::test]

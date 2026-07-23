@@ -138,6 +138,12 @@ impl ExecJournal {
         }
     }
 
+    /// Records that are actually recording: no completion or degraded
+    /// marker AND a live wrapper/command (or in-flight spawn). A wrapper
+    /// killed without writing `exit.json` is diagnosable but must not
+    /// occupy a cap slot forever — 32 unclean deaths would otherwise turn
+    /// every later exec on a long-lived session into a silent
+    /// `DegradedStart`, disabling durability with no signal.
     async fn active_count(&self) -> usize {
         let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
             return 0;
@@ -147,28 +153,41 @@ impl ExecJournal {
             let Ok(kind) = entry.file_type().await else {
                 continue;
             };
-            if kind.is_dir()
-                && tokio::fs::metadata(entry.path().join("exit.json"))
+            if !kind.is_dir()
+                || tokio::fs::metadata(entry.path().join("exit.json"))
                     .await
-                    .is_err()
-                && tokio::fs::metadata(entry.path().join("degraded"))
+                    .is_ok()
+                || tokio::fs::metadata(entry.path().join("degraded"))
                     .await
-                    .is_err()
+                    .is_ok()
             {
+                continue;
+            }
+            // Non-journal garbage (invalid exec_id names) was never started
+            // by us and holds no slot.
+            let Ok(journal) = JournalEntry::from_dir(entry.path()) else {
+                continue;
+            };
+            if journal.appears_live().await {
                 count += 1;
             }
         }
         count
     }
 
-    /// Best-effort TTL collection. Only a valid, renamed `exit.json` makes a
-    /// directory collectible; incomplete and garbage records are retained for
-    /// diagnosis instead of being mistaken for completed work.
+    /// Best-effort TTL collection. Completed records age from their
+    /// `exit.json`; records whose wrapper is provably dead (died-without-
+    /// marker, degraded, torn) age from their request record or, failing
+    /// that, the directory mtime. Both stay diagnosable for a full TTL
+    /// before reclamation, so incomplete records are never mistaken for
+    /// completed work — but they also cannot accumulate disk without bound.
+    /// A live recording is never collected, whatever its age.
     pub async fn gc_expired(&self) {
         let Ok(mut entries) = tokio::fs::read_dir(&self.root).await else {
             return;
         };
         let now = unix_ms();
+        let ttl_ms = self.ttl.as_millis() as u64;
         while let Ok(Some(entry)) = entries.next_entry().await {
             let Ok(kind) = entry.file_type().await else {
                 continue;
@@ -177,17 +196,45 @@ impl ExecJournal {
                 continue;
             }
             let exit_path = entry.path().join("exit.json");
-            let Ok(bytes) = tokio::fs::read(&exit_path).await else {
-                continue;
+            let age_ms = match tokio::fs::read(&exit_path).await {
+                Ok(bytes) => match serde_json::from_slice::<ExitRecord>(&bytes) {
+                    Ok(exit) => now.saturating_sub(exit.finished_at_unix_ms),
+                    // Corrupt exit marker: classify by liveness like any
+                    // other incomplete record below.
+                    Err(_) => match Self::dead_record_age_ms(entry.path(), now).await {
+                        Some(age) => age,
+                        None => continue,
+                    },
+                },
+                Err(_) => match Self::dead_record_age_ms(entry.path(), now).await {
+                    Some(age) => age,
+                    None => continue,
+                },
             };
-            let Ok(exit) = serde_json::from_slice::<ExitRecord>(&bytes) else {
-                continue;
-            };
-            let age_ms = now.saturating_sub(exit.finished_at_unix_ms);
-            if age_ms >= self.ttl.as_millis() as u64 {
+            if age_ms >= ttl_ms {
                 if let Err(error) = tokio::fs::remove_dir_all(entry.path()).await {
                     tracing::warn!(path = %entry.path().display(), %error, "exec journal TTL GC failed");
                 }
+            }
+        }
+    }
+
+    /// Age of an incomplete record that is provably not recording any more,
+    /// or `None` when it is live (or unparseable in a way that can't prove
+    /// death) and must be retained.
+    async fn dead_record_age_ms(dir: PathBuf, now: u64) -> Option<u64> {
+        let journal = JournalEntry::from_dir(&dir).ok()?;
+        if journal.appears_live().await {
+            return None;
+        }
+        match journal.request().await {
+            Ok(request) => Some(now.saturating_sub(request.created_at_unix_ms)),
+            Err(_) => {
+                let modified = tokio::fs::metadata(&dir)
+                    .await
+                    .ok()
+                    .and_then(|meta| meta.modified().ok())?;
+                Some(modified.elapsed().ok()?.as_millis() as u64)
             }
         }
     }
@@ -339,6 +386,50 @@ impl JournalEntry {
             Err(error) => AttachState::Died {
                 reason: format!("pid missing or corrupt and exit.json is absent: {error}"),
             },
+        }
+    }
+
+    /// Command-independent liveness for cap accounting and GC: is this
+    /// record's wrapper or command actually running (or still inside the
+    /// mkdir→write_pid spawn window)? Mirrors `state_for`'s ladder without
+    /// the request/command comparison. PID reuse can read a dead wrapper as
+    /// alive — an over-count, which is the safe direction for a resource cap
+    /// and merely delays GC by one reuse lifetime.
+    async fn appears_live(&self) -> bool {
+        match self.owner_pid().await {
+            Ok(pid) => return process_is_alive(pid),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => return false,
+            Err(_) => {}
+        }
+        match self.pid().await {
+            Ok(pid) => process_is_alive(pid),
+            Err(error) if error.kind() != io::ErrorKind::NotFound => false,
+            Err(_) => {
+                // Neither pid has landed. Within the spawn window that is a
+                // live start (the cap check in `attach_or_start` runs before
+                // `write_request`, so the dir under authorization has neither
+                // request nor pids); past the same 5s grace `state_for`
+                // uses, it is a dead torn record.
+                let since_created = match self.request().await {
+                    Ok(request) => unix_ms().saturating_sub(request.created_at_unix_ms),
+                    Err(_) => {
+                        let Some(modified) = tokio::fs::metadata(&self.dir)
+                            .await
+                            .ok()
+                            .and_then(|meta| meta.modified().ok())
+                        else {
+                            return false;
+                        };
+                        match modified.elapsed() {
+                            Ok(elapsed) => elapsed.as_millis() as u64,
+                            // Dir mtime in the future (clock step): treat as
+                            // just-created rather than reaping a live start.
+                            Err(_) => 0,
+                        }
+                    }
+                };
+                since_created < 5_000
+            }
         }
     }
 

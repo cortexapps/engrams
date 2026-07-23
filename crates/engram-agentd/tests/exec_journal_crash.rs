@@ -27,6 +27,25 @@ fn write_request(dir: &std::path::Path, command: &[String]) {
     .unwrap();
 }
 
+/// Like `write_request` but stamped now. Fixtures that flow through
+/// `attach_or_start` (which GC-reclaims provably-dead records past the TTL)
+/// must sit inside the diagnosis window to model a fresh crash rather than
+/// an expired one.
+fn write_request_now(dir: &std::path::Path, command: &[String]) {
+    fs::write(
+        dir.join("request.json"),
+        serde_json::to_vec(&RequestRecord {
+            command: command.to_vec(),
+            created_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+}
+
 fn entry(root: &std::path::Path, exec_id: &str) -> JournalEntry {
     let dir = root.join(exec_id);
     fs::create_dir_all(&dir).unwrap();
@@ -132,7 +151,7 @@ async fn command_mismatch_is_loud_before_any_recorded_output_is_replayed() {
     let temp = tempfile::tempdir().unwrap();
     let exec_id = "first-writer-wins";
     let record = entry(temp.path(), exec_id);
-    write_request(record.dir(), &["first-command".into()]);
+    write_request_now(record.dir(), &["first-command".into()]);
     fs::write(record.stdout_path(), b"must-not-leak").unwrap();
 
     let (mut client, server) = tokio::io::duplex(4096);
@@ -232,6 +251,113 @@ async fn attach_only_missing_journal_never_authorizes_a_second_spawn() {
     assert!(!temp.path().join(exec_id).exists());
 }
 
+/// PR #874 review finding: journals whose wrapper died without writing
+/// `exit.json` must not occupy active-cap slots forever. 32 unclean wrapper
+/// deaths (OOM-kill etc.) would otherwise silently degrade every later exec
+/// on a long-lived session to stage-1.
+#[tokio::test]
+async fn dead_wrapper_journals_free_their_active_slots() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = ExecJournal::new(temp.path());
+    let command = vec!["true".to_string()];
+    for i in 0..32 {
+        let record = entry(temp.path(), &format!("dead-{i}"));
+        write_request_now(record.dir(), &command);
+        fs::write(record.dir().join("pid"), u32::MAX.to_string()).unwrap();
+    }
+    assert!(
+        matches!(
+            journal
+                .attach_or_start("fresh-after-deaths", &command)
+                .await
+                .unwrap(),
+            AttachOrStart::Start(_)
+        ),
+        "dead-without-marker journals must not consume the durable-exec budget"
+    );
+}
+
+/// The inverse guard: genuinely live recordings still hold the cap, so the
+/// liveness-aware count cannot quietly disable the resource bound.
+#[tokio::test]
+async fn live_wrapper_journals_still_hold_the_cap() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = ExecJournal::new(temp.path());
+    let command = vec!["true".to_string()];
+    // 33 live records (this test process stands in for the wrapper): with
+    // the new dir itself the count is 34 > 32, so the start degrades.
+    for i in 0..33 {
+        let record = entry(temp.path(), &format!("live-{i}"));
+        write_request_now(record.dir(), &command);
+        fs::write(record.dir().join("pid"), std::process::id().to_string()).unwrap();
+    }
+    assert!(
+        matches!(
+            journal
+                .attach_or_start("fresh-over-cap", &command)
+                .await
+                .unwrap(),
+            AttachOrStart::DegradedStart { .. }
+        ),
+        "live recordings past the cap must still degrade the next start"
+    );
+}
+
+/// Provably-dead incomplete records are reclaimed after the TTL (bounding
+/// disk), but stay diagnosable inside it, and live recordings are never
+/// collected regardless of age.
+#[tokio::test]
+async fn gc_reclaims_dead_journals_after_ttl_but_retains_fresh_and_live() {
+    let temp = tempfile::tempdir().unwrap();
+    let journal = ExecJournal::new(temp.path());
+    let command = vec!["true".to_string()];
+
+    // Ancient (created_at 0 — the helper's default) + dead pid → collectible.
+    let ancient_dead = entry(temp.path(), "ancient-dead");
+    write_request(ancient_dead.dir(), &command);
+    fs::write(ancient_dead.dir().join("pid"), u32::MAX.to_string()).unwrap();
+
+    // Fresh + dead pid → inside the diagnosis window, retained.
+    let fresh_dead = entry(temp.path(), "fresh-dead");
+    fs::write(
+        fresh_dead.dir().join("request.json"),
+        serde_json::to_vec(&RequestRecord {
+            command: command.clone(),
+            created_at_unix_ms: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64,
+        })
+        .unwrap(),
+    )
+    .unwrap();
+    fs::write(fresh_dead.dir().join("pid"), u32::MAX.to_string()).unwrap();
+
+    // Ancient but live (this process's pid) → never collected.
+    let ancient_live = entry(temp.path(), "ancient-live");
+    write_request(ancient_live.dir(), &command);
+    fs::write(
+        ancient_live.dir().join("pid"),
+        std::process::id().to_string(),
+    )
+    .unwrap();
+
+    journal.gc_expired().await;
+
+    assert!(
+        !ancient_dead.dir().exists(),
+        "a provably-dead record past the TTL must be reclaimed"
+    );
+    assert!(
+        fresh_dead.dir().exists(),
+        "a dead record inside the TTL stays diagnosable"
+    );
+    assert!(
+        ancient_live.dir().exists(),
+        "a live recording is never collected, whatever its age"
+    );
+}
+
 /// PR #874 review finding: the `Died` terminal must drain like `Complete`
 /// does. A crashed wrapper (SIGKILL/OOM — pid dead, no exit.json) leaves
 /// static journal files; an attach reads them 8 KiB per iteration, and
@@ -243,7 +369,7 @@ async fn died_attach_drains_the_full_journal_before_exit_none() {
     let exec_id = "died-drain";
     let command = vec!["sh".to_string(), "-c".to_string(), "crashy".to_string()];
     let record = entry(temp.path(), exec_id);
-    write_request(record.dir(), &command);
+    write_request_now(record.dir(), &command);
     fs::write(record.dir().join("pid"), u32::MAX.to_string()).unwrap();
     // Several read-chunks (8 KiB each) on both streams, sizes offset so the
     // final partial chunks differ.
@@ -356,7 +482,7 @@ fn replay_case(stdout: Vec<u8>, stderr: Vec<u8>, out_seed: u16, err_seed: u16) {
         let exec_id = "offset-replay";
         let command = vec!["printf".to_string(), "journal".to_string()];
         let record = entry(temp.path(), exec_id);
-        write_request(record.dir(), &command);
+        write_request_now(record.dir(), &command);
         fs::write(record.stdout_path(), &stdout).unwrap();
         fs::write(record.stderr_path(), &stderr).unwrap();
         fs::write(

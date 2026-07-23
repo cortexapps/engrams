@@ -331,6 +331,14 @@ can no longer lose a result that was merely delayed.
   has sandbox-lifetime attach-or-start records instead of echoing a false
   durability signal, and durable VZ transport EOF ends without a fabricated
   exit while its legacy path retains the stage-1 `Exit(None)` floor.
+- Lifecycle accounting must not conflate "no completion marker" with "still
+  running", and retention must be bounded: the journal's active cap now counts
+  only records whose wrapper/command is provably live (a died-without-marker
+  wrapper frees its slot instead of monotonically shrinking the 32-exec budget
+  toward permanent `DegradedStart`), TTL GC also reclaims provably-dead
+  incomplete records (they stay diagnosable for a full TTL; live recordings
+  are never collected), and the Process backend evicts completed exec records
+  oldest-first beyond the same 32-record budget.
 - A full producer/pump/consumer sweep closed the missed half of the
   coordinator↔host adapter: the host-agent gRPC pump now turns backend
   end-without-Exit into `Unavailable` instead of re-fabricating `Exit(None)`.
