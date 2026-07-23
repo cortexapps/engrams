@@ -4257,8 +4257,13 @@ where
             // read against the epoch watch is what turns that silent
             // severance into stream termination. `changed()` erroring
             // (sender dropped = sandbox destroyed) means the same thing.
+            // `biased` polls the read first: a frame already on the wire
+            // (e.g. a real Exit(code) buffered just before the capture)
+            // must win over the epoch bump — the epoch branch is only for
+            // reads that will never complete.
             let msg = match severed.as_mut() {
                 Some(epoch) => tokio::select! {
+                    biased;
                     msg = read_msg::<_, WireExecEvent>(&mut reader) => msg,
                     _ = epoch.changed() => {
                         tracing::warn!(
@@ -6950,6 +6955,51 @@ mod tests {
         }
         // Only now may the guest end drop: the property under test is
         // termination WITHOUT any EOF from the connection.
+        drop(guest_end);
+    }
+
+    /// The severance race must not eat a real exit: when a genuine
+    /// `Exit(code)` frame is already buffered on the wire at the moment
+    /// the epoch bumps, the `biased` select delivers the true code
+    /// instead of the synthetic `Exit(None)` (which callers read as
+    /// failure). Without `biased`, the unordered select picks the epoch
+    /// branch ~half the time and a command that succeeded is reported
+    /// as severed.
+    #[tokio::test]
+    async fn exec_reader_prefers_buffered_exit_over_epoch_bump() {
+        use futures_util::StreamExt;
+
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(host_end);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let req = ExecRequest {
+            command: vec!["true".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+        };
+        let stream = drive_exec_protocol(SandboxId::new(), reader, writer, req, Some(epoch_rx))
+            .await
+            .expect("exec request write succeeds");
+
+        // Buffer the real exit, THEN bump the epoch — no await between
+        // the two, so the reader task observes both ready in one poll.
+        let _req: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
+        write_msg(&mut guest_end, &WireExecEvent::Exit(Some(0)))
+            .await
+            .expect("exit frame");
+        epoch_tx.send_modify(|v| *v += 1);
+
+        let mut events = stream.events;
+        match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+            Ok(Some(ExecEvent::Exit(Some(0)))) => {}
+            other => panic!("expected the real Exit(0), got {other:?}"),
+        }
+        match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+            Ok(None) => {}
+            other => panic!("stream must end after Exit, got {other:?}"),
+        }
         drop(guest_end);
     }
 
