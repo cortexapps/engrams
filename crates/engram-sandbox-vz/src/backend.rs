@@ -832,9 +832,27 @@ where
                     return;
                 }
                 Err(e) => {
+                    if durable_capable {
+                        // EOF/read failure is transport state, not a guest
+                        // journal verdict. End without Exit so the coordinator
+                        // exposes a retryable Unavailable and the caller can
+                        // attach again with its delivered offsets.
+                        tracing::warn!(
+                            %sandbox_id,
+                            %exec_id,
+                            error = %e,
+                            "durable vz exec connection ended without explicit Exit; ending event stream",
+                        );
+                        return;
+                    }
+                    // An old agent has no spawn-dedupe journal. Retrying may
+                    // double-run the command, so keep the stage-1 terminal
+                    // floor for the legacy path.
                     tracing::warn!(
+                        %sandbox_id,
+                        %exec_id,
                         error = %e,
-                        "vz agent connection ended without explicit Exit",
+                        "legacy vz exec connection ended without explicit Exit; emitting Exit(None)",
                     );
                     let _ = tx.send(ExecEvent::Exit(None)).await;
                     return;
@@ -1901,6 +1919,88 @@ impl SandboxBackend for VzBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    fn protocol_exec(exec_id: &str) -> ExecRequest {
+        ExecRequest {
+            command: vec!["printf".into(), "partial".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: Some(0),
+            stderr_offset: Some(0),
+            wake: None,
+        }
+    }
+
+    // Pure protocol tests live beside the existing backend unit tests. They
+    // instantiate no VZ objects and require neither a VM nor the
+    // virtualization entitlement, so the normal macOS nextest lane runs them.
+    #[tokio::test]
+    async fn durable_exec_eof_after_partial_output_ends_without_exit() {
+        let sandbox_id = SandboxId::new();
+        let exec_id = "durable-eof";
+        let (host_reader, mut agent_writer) = tokio::io::duplex(4 * 1024);
+        let (host_writer, _agent_reader) = tokio::io::duplex(4 * 1024);
+        let agent = tokio::spawn(async move {
+            write_msg(&mut agent_writer, &WireExecEvent::Started(exec_id.into()))
+                .await
+                .unwrap();
+            write_msg(
+                &mut agent_writer,
+                &WireExecEvent::Stdout(b"partial-output".to_vec()),
+            )
+            .await
+            .unwrap();
+            // Dropping the writer is the transport EOF under test.
+        });
+
+        let mut stream = drive_exec_protocol(
+            sandbox_id,
+            host_reader,
+            host_writer,
+            protocol_exec(exec_id),
+            true,
+        )
+        .await
+        .unwrap()
+        .events;
+        agent.await.unwrap();
+
+        match stream.next().await {
+            Some(ExecEvent::Stdout(bytes)) => assert_eq!(bytes, b"partial-output"[..]),
+            other => panic!("expected partial stdout before EOF, got {other:?}"),
+        }
+        assert!(
+            stream.next().await.is_none(),
+            "durable transport EOF must not fabricate Exit(None)"
+        );
+    }
+
+    #[tokio::test]
+    async fn legacy_exec_eof_preserves_exit_none_floor() {
+        let sandbox_id = SandboxId::new();
+        let exec_id = "legacy-eof";
+        let (host_reader, agent_writer) = tokio::io::duplex(4 * 1024);
+        let (host_writer, _agent_reader) = tokio::io::duplex(4 * 1024);
+        drop(agent_writer);
+
+        let mut stream = drive_exec_protocol(
+            sandbox_id,
+            host_reader,
+            host_writer,
+            protocol_exec(exec_id),
+            false,
+        )
+        .await
+        .unwrap()
+        .events;
+
+        assert!(matches!(stream.next().await, Some(ExecEvent::Exit(None))));
+        assert!(stream.next().await.is_none());
+    }
 
     #[test]
     fn new_rejects_missing_kernel_with_actionable_error() {

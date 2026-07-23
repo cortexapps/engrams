@@ -327,6 +327,10 @@ can no longer lose a result that was merely delayed.
   Any `ExecStarted`, stdout, or stderr frame resets both that counter and its
   backoff; an exec that keeps making progress is bounded by its deadline, not
   by a lifetime attach count.
+- Backend parity follows the same fabricate-only-where-unsafe rule: Process now
+  has sandbox-lifetime attach-or-start records instead of echoing a false
+  durability signal, and durable VZ transport EOF ends without a fabricated
+  exit while its legacy path retains the stage-1 `Exit(None)` floor.
 
 ## Alternatives considered
 
