@@ -10,10 +10,11 @@ use crate::state::SharedState;
 pub(crate) mod admin;
 pub mod auth;
 pub(crate) mod enabled_images;
-// `pub(crate)`: ADR 0051 — the app-gRPC services (`grpc_app/*`) call the
-// transport-agnostic `*_core` fns extracted from these handlers.
+// `pub`: ADR 0051's app-gRPC service and ADR 0103's co-simulator both call
+// the transport-agnostic exec core. The latter composes the real coordinator
+// persistence path with the real host/guest exec boundary.
 pub(crate) mod events;
-pub(crate) mod exec;
+pub mod exec;
 pub(crate) mod forge;
 // ADR 0021 P1.5a retired `mod harnesses;` — the harness_packs
 // registry doesn't exist anymore (the harness is an image property

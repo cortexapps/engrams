@@ -16,6 +16,9 @@
 //! * **finalize** ([`CosimHost::finalize_tick`]) → the REAL production loop
 //!   body `run_eviction_finalize_attempt` (upload + disk-manifest publish +
 //!   terminal destroy);
+//! * **durable exec** → the REAL Firecracker host reader and REAL agentd
+//!   journal handler over per-sandbox duplex connections; checkpoint steps
+//!   fake only vsock's silent `TRANSPORT_RESET`;
 //! * **teardown-reconcile** → the REAL
 //!   [`reconcile_once`](engram_host_agent::teardown_reconcile::reconcile_once)
 //!   over [`CosimReconcileBackend`].
@@ -41,11 +44,17 @@
 //! lockstep with the disk world).
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use dashmap::DashMap;
+use engram_agentd::exec_journal::{AttachOrStart, ExecJournal};
+use engram_agentd::{
+    serve_connection_with_journal, CaCertInstaller, CaCertPaths, HarnessSupervisor,
+};
 use engram_chunk_store::cache::{ChunkCache, ChunkCacheConfig};
 use engram_chunk_store::manifest::{
     ChunkHash, ChunkRef, ChunkSize, Manifest, ManifestKind, MANIFEST_SCHEMA_VERSION,
@@ -54,6 +63,7 @@ use engram_chunk_store::store::ChunkStore;
 use engram_core::error::SandboxError;
 use engram_core::traits::{Clock as _, Entropy as _};
 use engram_core::types::manifest::ManifestRef;
+use engram_core::types::sandbox::ExecRequest;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
 use engram_dst_host::device_plane::{DevicePlane, ServeOutcome};
@@ -66,8 +76,10 @@ use engram_host_agent::eviction_finalize::{
 };
 use engram_host_agent::teardown_reconcile::ReconcileBackend;
 use engram_host_core::{FinalizeStage, HostFs, TokioFs};
+use engram_sandbox_firecracker::BoxExecIo;
 use engram_sim::{SimClock, SimEntropy};
 use parking_lot::Mutex;
+use tokio::io::{AsyncRead, AsyncWrite, DuplexStream, ReadBuf};
 
 /// Disk geometry — small on purpose (the oracle asserts a boundary
 /// property, not throughput).
@@ -230,6 +242,178 @@ struct CosimSandbox {
     /// The work cursor (an events-index stand-in): advanced by each guest
     /// write, captured at eviction time. The boundary oracle keys on it.
     cursor: i64,
+    /// The guest journal + vsock-generation model. It survives connection
+    /// severance exactly like the guest filesystem survives a checkpoint.
+    exec: CosimExecPlane,
+}
+
+/// Per-sandbox guest exec state. Every connection runs the real agentd
+/// handler; only the vsock transport itself is modeled.
+struct CosimExecPlane {
+    journal: Arc<ExecJournal>,
+    supervisor: Arc<HarnessSupervisor>,
+    cacerts: Arc<CaCertInstaller>,
+    epoch: tokio::sync::watch::Sender<u64>,
+    guest_connections: Vec<tokio::task::AbortHandle>,
+    severances: u64,
+    connections_opened: u64,
+}
+
+impl CosimExecPlane {
+    fn new(root: std::path::PathBuf) -> Self {
+        let (epoch, _receiver) = tokio::sync::watch::channel(0);
+        Self {
+            journal: Arc::new(ExecJournal::new(root.join("journal"))),
+            supervisor: HarnessSupervisor::new(),
+            cacerts: Arc::new(CaCertInstaller::new(CaCertPaths {
+                bundle: root.join("cacerts/ca-bundle"),
+                extra_cert: root.join("cacerts/engram.crt"),
+            })),
+            epoch,
+            guest_connections: Vec::new(),
+            severances: 0,
+            connections_opened: 0,
+        }
+    }
+
+    async fn authorize_start(&self, cmd: &ExecRequest) -> Result<(), SandboxError> {
+        let exec_id = cmd.exec_id.as_deref().ok_or_else(|| {
+            SandboxError::InvalidSpec(
+                "cosim durable exec requires the coordinator-assigned exec_id".into(),
+            )
+        })?;
+        let authorization = self
+            .journal
+            .attach_or_start(exec_id, &cmd.command)
+            .await
+            .map_err(SandboxError::Io)?;
+        let entry = match authorization {
+            AttachOrStart::Start(entry) | AttachOrStart::DegradedStart { entry, .. } => entry,
+            AttachOrStart::Attach(_) => return Ok(()),
+            AttachOrStart::Missing => {
+                return Err(SandboxError::InvalidSpec(
+                    "fresh cosim exec unexpectedly returned a missing journal".into(),
+                ));
+            }
+        };
+
+        // `serve_durable_start` execs `current_exe __exec-wrapper`, which is
+        // the Rust test harness here rather than agentd. Pre-authorizing the
+        // journal and running the real wrapper in-process makes the handler's
+        // first request take its real Attach/live-tail path. Re-attachments
+        // then use the exact same path against the same journal directory.
+        let command = cmd.command.clone();
+        let timeout = cmd.timeout;
+        tokio::spawn(async move {
+            if let Err(error) =
+                engram_agentd::exec_journal::run_wrapper(entry, command, timeout).await
+            {
+                tracing::warn!(%error, "cosim durable exec wrapper failed");
+            }
+        });
+        Ok(())
+    }
+
+    fn connect(&mut self) -> BoxExecIo {
+        let (host, guest) = tokio::io::duplex(64 * 1024);
+        let task = tokio::spawn(serve_connection_with_journal(
+            guest,
+            None,
+            self.supervisor.clone(),
+            self.cacerts.clone(),
+            self.journal.clone(),
+        ));
+        self.guest_connections.push(task.abort_handle());
+        // Dropping the JoinHandle detaches the real handler. The abort handle
+        // remains the checkpoint's guest-side TRANSPORT_RESET control.
+        drop(task);
+        self.connections_opened += 1;
+        Box::new(SilentHostExecIo::new(host))
+    }
+
+    fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.epoch.subscribe()
+    }
+
+    fn sever(&mut self) {
+        for connection in self.guest_connections.drain(..) {
+            connection.abort();
+        }
+        self.severances += 1;
+        self.epoch.send_modify(|epoch| *epoch += 1);
+    }
+
+    fn counters(&self) -> (u64, u64) {
+        (self.severances, self.connections_opened)
+    }
+}
+
+impl Drop for CosimExecPlane {
+    fn drop(&mut self) {
+        for connection in self.guest_connections.drain(..) {
+            connection.abort();
+        }
+    }
+}
+
+/// Firecracker's muxer never forwards guest TRANSPORT_RESET as host EOF.
+/// Tokio's duplex normally would, so this wrapper converts peer EOF into a
+/// permanently pending read. The host reader can only escape via its epoch
+/// watch, exactly matching the production failure shape.
+struct SilentHostExecIo {
+    inner: DuplexStream,
+    peer_dropped: bool,
+}
+
+impl SilentHostExecIo {
+    fn new(inner: DuplexStream) -> Self {
+        Self {
+            inner,
+            peer_dropped: false,
+        }
+    }
+}
+
+impl AsyncRead for SilentHostExecIo {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.peer_dropped {
+            return Poll::Pending;
+        }
+        let filled = buf.filled().len();
+        match Pin::new(&mut this.inner).poll_read(cx, buf) {
+            Poll::Ready(Ok(())) if buf.filled().len() == filled => {
+                this.peer_dropped = true;
+                Poll::Pending
+            }
+            result => result,
+        }
+    }
+}
+
+impl AsyncWrite for SilentHostExecIo {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<Result<usize, std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Result<(), std::io::Error>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
 }
 
 /// The outcome of a [`CosimHost::finalize_tick`] the bridge maps to a
@@ -392,6 +576,7 @@ impl CosimHost {
         device: std::path::PathBuf,
         lease: NbdSlot,
     ) {
+        let exec = CosimExecPlane::new(self.fs.root().join("exec").join(id.to_string()));
         self.sandboxes.insert(
             id,
             CosimSandbox {
@@ -400,6 +585,7 @@ impl CosimHost {
                 published_ref: None,
                 backend: Some(backend),
                 cursor: 0,
+                exec,
             },
         );
         self.device.insert_served_slot(id, device, lease);
@@ -454,6 +640,50 @@ impl CosimHost {
     /// oracle bridging).
     pub fn cursor(&self, sandbox_id: SandboxId) -> Option<i64> {
         self.sandboxes.get(&sandbox_id).map(|s| s.cursor)
+    }
+
+    /// Authorize at most one wrapper spawn, open the first real agentd
+    /// connection, and subscribe the real host reader to this sandbox's
+    /// snapshot epoch.
+    pub async fn start_exec_transport(
+        &mut self,
+        sandbox_id: SandboxId,
+        cmd: &ExecRequest,
+    ) -> Result<(BoxExecIo, tokio::sync::watch::Receiver<u64>), SandboxError> {
+        let sandbox = self
+            .sandboxes
+            .get_mut(&sandbox_id)
+            .ok_or(SandboxError::NotFound)?;
+        sandbox.exec.authorize_start(cmd).await?;
+        let epoch = sandbox.exec.subscribe();
+        Ok((sandbox.exec.connect(), epoch))
+    }
+
+    /// Open a fresh real agentd handler on the sandbox's surviving journal.
+    pub fn redial_exec_transport(
+        &mut self,
+        sandbox_id: SandboxId,
+    ) -> Result<BoxExecIo, SandboxError> {
+        self.sandboxes
+            .get_mut(&sandbox_id)
+            .map(|sandbox| sandbox.exec.connect())
+            .ok_or(SandboxError::NotFound)
+    }
+
+    /// Model snapshot `TRANSPORT_RESET`: the guest forgets every connection,
+    /// the host endpoints remain silent, and the epoch wakes host readers.
+    pub fn sever_exec_transports(&mut self, sandbox_id: SandboxId) {
+        if let Some(sandbox) = self.sandboxes.get_mut(&sandbox_id) {
+            sandbox.exec.sever();
+        }
+    }
+
+    /// Oracle read for directed exec scenarios:
+    /// `(checkpoint severances, real agentd connections opened)`.
+    pub fn exec_transport_counters(&self, sandbox_id: SandboxId) -> Option<(u64, u64)> {
+        self.sandboxes
+            .get(&sandbox_id)
+            .map(|sandbox| sandbox.exec.counters())
     }
 
     /// Sandboxes with an eviction finalize in flight (drive `finalize_tick`
@@ -758,6 +988,12 @@ impl CosimHost {
                 "snapshot_begin: sandbox {sandbox_id} has no backend"
             ));
         };
+
+        // The eviction/manual capture path reaches the same Firecracker
+        // `prepare_save` hook as a periodic checkpoint: every live guest
+        // connection is forgotten without host EOF and the epoch advances
+        // even though the journal itself survives on the guest disk.
+        self.sever_exec_transports(sandbox_id);
 
         let snapshot_id = SnapshotId::from(self.entropy.uuid());
         let dest = self.fs.root().join("staging").join(snapshot_id.to_string());

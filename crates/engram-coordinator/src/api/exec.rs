@@ -148,7 +148,8 @@ fn build_exec(
 /// One frame of the streaming-exec body (after the `started` frame the
 /// gRPC handler prepends). The terminal `Exit` carries the same
 /// coordinator-side wall-time rusage the SSE/sync paths compute.
-pub(crate) enum ExecStreamEvent {
+#[derive(Debug)]
+pub enum ExecStreamEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     Exit {
@@ -157,11 +158,14 @@ pub(crate) enum ExecStreamEvent {
     },
 }
 
-/// gRPC `Exec` core. Resolves the exec env, auto-resumes the session,
-/// kicks off the backend exec stream, and returns `(exec_id, body)` where
-/// `body` yields stdout/stderr chunks then a terminal `Exit` — persisting
-/// each to the session bus exactly as the SSE handler does.
-pub(crate) async fn exec_stream_core(
+/// Transport-agnostic `Exec` core. Resolves the exec env, auto-resumes the
+/// session, kicks off the backend exec stream, and returns `(exec_id, body)`
+/// where `body` yields stdout/stderr chunks then a terminal `Exit` —
+/// persisting each to the session bus exactly as the SSE handler does.
+///
+/// Public so ADR 0103's co-simulator can exercise the real coordinator
+/// persistence path over the real host/guest exec protocol boundary.
+pub async fn exec_stream_core(
     state: &SharedState,
     id: SessionId,
     req: ExecRequest,

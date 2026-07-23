@@ -301,6 +301,13 @@ can no longer lose a result that was merely delayed.
 - Rust protobuf bindings regenerate as part of the Cargo build. The
   TypeScript/client `buf generate` output stays for the caller-side Stage 3
   change so this stage does not partially modify the orchestrator surface.
+- The co-simulator now pins the 2026-07-23 `6d403c4b` recurrence:
+  `checkpoint_severs_exec_mid_stream` composes the real coordinator exec
+  core, real Firecracker host reader, and real agentd journal handler across
+  a silent checkpoint severance. A FIFO orders the real subprocess around
+  the capture; the test uses real Tokio time so paused-time auto-advance
+  cannot outrun subprocess I/O through reconnect backoffs or journal grace
+  windows.
 
 ## Alternatives considered
 

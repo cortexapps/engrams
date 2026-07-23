@@ -69,7 +69,9 @@
 //!   load-bearing economic of the snapshot-evict mechanic.
 
 use std::collections::HashMap;
+use std::future::Future;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
@@ -1557,7 +1559,7 @@ impl FirecrackerBackend {
             cmd,
             durable_capable,
             None,
-            Some(ExecRedial::Unix(agent_socket.to_path_buf())),
+            Some(ExecRedial::unix(agent_socket.to_path_buf())),
         )
         .await
     }
@@ -1608,10 +1610,7 @@ impl FirecrackerBackend {
             cmd,
             durable_capable,
             severed,
-            Some(ExecRedial::Firecracker {
-                vsock_uds_path: vsock_uds_path.to_path_buf(),
-                port,
-            }),
+            Some(ExecRedial::firecracker(vsock_uds_path.to_path_buf(), port)),
         )
         .await
     }
@@ -4245,46 +4244,72 @@ fn spawn_process_supervisor<V, F, Fut>(
     });
 }
 
-trait ExecIo: AsyncRead + AsyncWrite + Unpin + Send {}
+/// Object-safe exec transport used by the ADR 0103 host protocol driver.
+///
+/// Public only for `engram-dst-cosim`, which composes this real host reader
+/// with a real agentd handler across a simulated snapshot severance.
+pub trait ExecIo: AsyncRead + AsyncWrite + Unpin + Send {}
 impl<T> ExecIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
-type BoxExecIo = Box<dyn ExecIo>;
 
+/// Boxed exec transport for the ADR 0103 co-simulation boundary.
+pub type BoxExecIo = Box<dyn ExecIo>;
+
+type ExecRedialFuture =
+    Pin<Box<dyn Future<Output = Result<BoxExecIo, SandboxError>> + Send + 'static>>;
+
+/// Reconnection factory used after a snapshot severs an exec connection.
+///
+/// Production constructs this from private Unix/Firecracker helpers.
+/// [`ExecRedial::provided`] is the narrow co-simulation seam: each call can
+/// create a fresh duplex backed by a new real agentd connection handler.
 #[derive(Clone)]
-enum ExecRedial {
-    Unix(PathBuf),
-    Firecracker {
-        vsock_uds_path: PathBuf,
-        port: u32,
-    },
-    #[cfg(test)]
-    Provided(Arc<tokio::sync::Mutex<Option<BoxExecIo>>>),
+pub struct ExecRedial {
+    connect: Arc<dyn Fn() -> ExecRedialFuture + Send + Sync>,
 }
 
 impl ExecRedial {
-    async fn connect(&self) -> Result<BoxExecIo, SandboxError> {
-        match self {
-            Self::Unix(path) => UnixStream::connect(path)
-                .await
-                .map(|stream| Box::new(stream) as BoxExecIo)
-                .map_err(|error| {
-                    vm_err(format!(
-                        "durable exec reattach connect to {}: {error}",
-                        path.display()
-                    ))
-                }),
-            Self::Firecracker {
-                vsock_uds_path,
-                port,
-            } => FirecrackerBackend::connect_fc_vsock(vsock_uds_path, *port)
-                .await
-                .map(|stream| Box::new(stream) as BoxExecIo),
-            #[cfg(test)]
-            Self::Provided(connection) => connection
-                .lock()
-                .await
-                .take()
-                .ok_or_else(|| vm_err("test durable exec redial connection already consumed")),
+    fn unix(path: PathBuf) -> Self {
+        Self::provided(move || {
+            let path = path.clone();
+            async move {
+                UnixStream::connect(&path)
+                    .await
+                    .map(|stream| Box::new(stream) as BoxExecIo)
+                    .map_err(|error| {
+                        vm_err(format!(
+                            "durable exec reattach connect to {}: {error}",
+                            path.display()
+                        ))
+                    })
+            }
+        })
+    }
+
+    fn firecracker(vsock_uds_path: PathBuf, port: u32) -> Self {
+        Self::provided(move || {
+            let vsock_uds_path = vsock_uds_path.clone();
+            async move {
+                FirecrackerBackend::connect_fc_vsock(&vsock_uds_path, port)
+                    .await
+                    .map(|stream| Box::new(stream) as BoxExecIo)
+            }
+        })
+    }
+
+    /// Construct a reusable redial factory for the coordinator↔host
+    /// co-simulator. Each invocation must return a fresh connection.
+    pub fn provided<F, Fut>(connect: F) -> Self
+    where
+        F: Fn() -> Fut + Send + Sync + 'static,
+        Fut: Future<Output = Result<BoxExecIo, SandboxError>> + Send + 'static,
+    {
+        Self {
+            connect: Arc::new(move || Box::pin(connect())),
         }
+    }
+
+    async fn connect(&self) -> Result<BoxExecIo, SandboxError> {
+        (self.connect)().await
     }
 
     async fn reconnect_after_snapshot(&self) -> Result<BoxExecIo, SandboxError> {
@@ -4346,11 +4371,15 @@ async fn probe_durable_exec(mut io: BoxExecIo) -> Result<bool, SandboxError> {
     }
 }
 
-/// Send one attach-or-start request and translate the guest's durable stream.
+/// Drive one attach-or-start request and translate the guest's durable stream.
 /// A snapshot epoch bump re-dials from the exact per-stream byte cursors once
 /// the capability probe has succeeded; every generation must still begin with
 /// a matching `Started` frame.
-async fn drive_exec_protocol(
+///
+/// Production enters through `SandboxBackend::exec_stream`; this is public
+/// only so `engram-dst-cosim` can pair the real reader with real agentd and
+/// exercise checkpoint severance/re-attach at their shared boundary.
+pub async fn drive_exec_protocol(
     sandbox_id: SandboxId,
     mut io: BoxExecIo,
     cmd: ExecRequest,
@@ -7311,9 +7340,19 @@ mod tests {
             req,
             true,
             Some(epoch_rx),
-            Some(ExecRedial::Provided(Arc::new(tokio::sync::Mutex::new(
-                Some(Box::new(reattach_host)),
-            )))),
+            Some(ExecRedial::provided({
+                let connection = Arc::new(tokio::sync::Mutex::new(Some(
+                    Box::new(reattach_host) as BoxExecIo
+                )));
+                move || {
+                    let connection = connection.clone();
+                    async move {
+                        connection.lock().await.take().ok_or_else(|| {
+                            vm_err("test durable exec redial connection already consumed")
+                        })
+                    }
+                }
+            })),
         )
         .await
         .unwrap();
