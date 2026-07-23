@@ -35,7 +35,7 @@ use crate::grpc::host_service_client::HostServiceClient;
 use crate::grpc::proxy_port_message::Body as ProxyPortBody;
 use crate::grpc::proxy_shell_message::Body as ProxyShellBody;
 use crate::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CreateSandboxRequest,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, CancelExecRequest, CreateSandboxRequest,
     DequeueHarnessQueuedPromptRequest, EditHarnessQueuedPromptRequest, Empty, ExecStartRequest,
     FencedSandboxRequest, GuestIpResponse, InterruptHarnessRequest, MaterializeImageRequest,
     MigrationExportRef, MigrationFetchRequest, MigrationItem, PeerChunkFrame, PeerChunkGetRequest,
@@ -1103,7 +1103,7 @@ impl GrpcHostClient {
     }
 
     /// Server-streaming exec. The first frame is `started` (carries
-    /// the host-assigned `exec_id`); subsequent frames carry
+    /// the canonical `exec_id`); subsequent frames carry
     /// stdout/stderr bytes; the stream ends with exactly one `exit`
     /// frame. Returned `ExecStream` mirrors the same shape the WS
     /// path returns so coord-side consumers don't notice.
@@ -1112,10 +1112,25 @@ impl GrpcHostClient {
         sandbox_id: SandboxId,
         request: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        let wire = WireExecRequest::from_engine(request);
+        let exec_id = request.exec_id.clone();
+        let stdout_offset = request.stdout_offset;
+        let stderr_offset = request.stderr_offset;
+        let wake = request.wake;
+        let mut wire = WireExecRequest::from_engine(request);
+        // ADR 0103 fields are native host.v1 fields. Keep the bincode payload
+        // as the base exec shape so there is one authoritative value for each
+        // resume option on the actual gRPC wire.
+        wire.exec_id = None;
+        wire.stdout_offset = None;
+        wire.stderr_offset = None;
+        wire.wake = None;
         let req = ExecStartRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             request_bincode: encode_bincode(&wire, "WireExecRequest")?,
+            exec_id,
+            stdout_offset,
+            stderr_offset,
+            wake,
         };
         let mut stream = self
             .inner
@@ -1186,6 +1201,22 @@ impl GrpcHostClient {
             exec_id,
             events: Box::pin(events) as Pin<Box<dyn Stream<Item = ExecEvent> + Send + 'static>>,
         })
+    }
+
+    pub async fn cancel_exec(
+        &self,
+        sandbox_id: SandboxId,
+        exec_id: String,
+    ) -> Result<(), SandboxError> {
+        self.inner
+            .clone()
+            .cancel_exec(CancelExecRequest {
+                sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
+                exec_id,
+            })
+            .await
+            .map_err(grpc_to_sandbox_err)?;
+        Ok(())
     }
 
     /// Unary batched file write. The opaque bincode payload keeps the
@@ -1485,6 +1516,10 @@ impl HostClient for GrpcHostClient {
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
         self.exec_start(id, cmd).await
+    }
+
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        Self::cancel_exec(self, id, exec_id).await
     }
 
     async fn write_files(

@@ -254,6 +254,15 @@ pub trait SandboxBackend: Send + Sync {
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError>;
 
+    /// Kill the process group owned by a durable exec ticket. Reading and
+    /// cancellation are deliberately separate operations: dropping an attach
+    /// stream leaves the command running so another caller can resume it.
+    async fn cancel_exec(&self, _id: SandboxId, _exec_id: String) -> Result<(), SandboxError> {
+        Err(SandboxError::Unsupported(
+            "cancel_exec is not implemented by this sandbox backend".into(),
+        ))
+    }
+
     /// Convenience wrapper that runs the command to completion and
     /// returns buffered stdout/stderr/exit-status. Default impl drains
     /// `exec_stream`. Don't call this for long-running commands —

@@ -1044,6 +1044,7 @@ dependencies = [
  "nix 0.29.0",
  "proptest",
  "serde",
+ "serde_json",
  "tempfile",
  "tokio",
  "tracing",

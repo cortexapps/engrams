@@ -278,6 +278,23 @@ can no longer lose a result that was merely delayed.
    workflows until the version-pinning/adopt-on-boot work lands — land
    that first or together.)
 
+### Stage 2 implementation notes (2026-07-22)
+
+- The initial journal policy is a 24-hour post-exit TTL, at most 32 active
+  journals per guest, and the specified 64 MiB cap per output stream.
+- Host epoch recovery carries an internal `attach_only` bit on the
+  host↔guest bincode request. It is deliberately absent from the public
+  API: a reconnect after GC must fall back loudly to Stage 1 instead of
+  interpreting the missing directory as permission to spawn again.
+- Rollout capability detection uses the reserved `CancelExec` ticket
+  `__engram_durable_exec_capability__`. A new agentd recognizes it without
+  touching the journal; an old agentd returns its typed unknown-request
+  error, after which the host submits the original five-field bincode shape
+  and retains Stage 1 behavior.
+- Rust protobuf bindings regenerate as part of the Cargo build. The
+  TypeScript/client `buf generate` output stays for the caller-side Stage 3
+  change so this stage does not partially modify the orchestrator surface.
+
 ## Alternatives considered
 
 - **In-memory ring buffer in agentd + replay verb.** Rejected: bounded by

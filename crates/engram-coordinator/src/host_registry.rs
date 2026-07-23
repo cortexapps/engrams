@@ -565,6 +565,11 @@ impl HostClient for HostRegistry {
         }
     }
 
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.cancel_exec(id, exec_id).await
+    }
+
     async fn write_files(
         &self,
         id: SandboxId,
@@ -1282,6 +1287,10 @@ mod tests {
                     env: Default::default(),
                     workdir: None,
                     timeout: None,
+                    exec_id: None,
+                    stdout_offset: None,
+                    stderr_offset: None,
+                    wake: None,
                 },
             )
             .await

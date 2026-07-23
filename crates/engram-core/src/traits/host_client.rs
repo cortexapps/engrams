@@ -108,6 +108,11 @@ pub trait HostClient: Send + Sync {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError>;
+    async fn cancel_exec(&self, _id: SandboxId, _exec_id: String) -> Result<(), SandboxError> {
+        Err(SandboxError::Unsupported(
+            "cancel_exec is not implemented by this host transport".into(),
+        ))
+    }
     async fn exec(&self, id: SandboxId, cmd: ExecRequest) -> Result<ExecHandle, SandboxError> {
         use futures::stream::StreamExt;
         let mut stream = self.exec_stream(id, cmd).await?;

@@ -429,6 +429,10 @@ async fn exec_streaming_smoke() {
         env: std::collections::HashMap::new(),
         workdir: None,
         timeout_secs: Some(10),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     });
     exec_req.set_timeout(rpc_timeout);
     let mut exec_stream = client

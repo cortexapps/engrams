@@ -18,7 +18,8 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::time::Duration;
 
-use engram_agentd::{serve_connection, HarnessSupervisor};
+use engram_agentd::exec_journal::ExecJournal;
+use engram_agentd::{serve_connection_with_journal, HarnessSupervisor};
 use engram_core::types::ids::SandboxId;
 use engram_core::types::sandbox::{ExecRequest, WriteFileSpec};
 use engram_sandbox_firecracker::FirecrackerBackend;
@@ -38,14 +39,21 @@ async fn spawn_test_agent(socket: PathBuf) -> JoinHandle<()> {
     // 0021 P1.1 added the cacerts installer arg).
     let supervisor = HarnessSupervisor::new();
     let cacerts = std::sync::Arc::new(engram_agentd::CaCertInstaller::for_tests());
+    // These in-process tests run from a Rust test harness binary, not the
+    // `engram-agentd` binary that implements the hidden durable wrapper mode.
+    // Force the explicit journal-failure path and exercise stage-1 streaming;
+    // exec_journal_crash.rs covers durable attach, and exec_real_vm covers the
+    // real wrapper executable.
+    let journal = std::sync::Arc::new(ExecJournal::new("/dev/null/execs"));
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, _)) => {
                     let sup = supervisor.clone();
                     let ca = cacerts.clone();
+                    let journal = journal.clone();
                     tokio::spawn(async move {
-                        let _ = serve_connection(stream, None, sup, ca).await;
+                        let _ = serve_connection_with_journal(stream, None, sup, ca, journal).await;
                     });
                 }
                 Err(_) => return,
@@ -69,6 +77,10 @@ async fn exec_stream_via_agent_socket_round_trips_stdout_and_exit() {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         },
     )
     .await
@@ -134,6 +146,10 @@ async fn exec_stream_propagates_nonzero_exit_status() {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         },
     )
     .await
@@ -163,6 +179,10 @@ async fn exec_stream_separates_stdout_and_stderr() {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         },
     )
     .await
@@ -190,6 +210,10 @@ async fn exec_stream_pipes_stdin_to_child() {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         },
     )
     .await
@@ -219,6 +243,10 @@ async fn exec_stream_translates_timeout_to_kill_and_exit_none() {
             env: HashMap::new(),
             workdir: None,
             timeout: Some(Duration::from_millis(50)),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         },
     )
     .await
@@ -242,6 +270,10 @@ async fn exec_stream_surfaces_connect_error_when_agent_socket_missing() {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         },
     )
     .await;

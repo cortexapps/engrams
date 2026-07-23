@@ -33,6 +33,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -73,6 +74,7 @@ pub struct ProcessBackend {
     /// Tracked separately from `sandboxes` because `tokio::process::Child`
     /// isn't `Clone`. Populated at `start_agent()`; killed at `destroy()`.
     agent_children: DashMap<SandboxId, std::sync::Mutex<Option<tokio::process::Child>>>,
+    exec_process_groups: Arc<DashMap<(SandboxId, String), u32>>,
 }
 
 impl ProcessBackend {
@@ -81,6 +83,7 @@ impl ProcessBackend {
             work_dir: work_dir.into(),
             sandboxes: DashMap::new(),
             agent_children: DashMap::new(),
+            exec_process_groups: Arc::new(DashMap::new()),
         }
     }
 
@@ -216,6 +219,10 @@ impl SandboxBackend for ProcessBackend {
         id: SandboxId,
         req: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        let exec_id = req
+            .exec_id
+            .clone()
+            .unwrap_or_else(|| SandboxId::new().to_string());
         let state = self
             .sandboxes
             .get(&id)
@@ -270,6 +277,9 @@ impl SandboxBackend for ProcessBackend {
         let mut child = cmd
             .spawn()
             .map_err(|e| SandboxError::Vm(format!("spawn `{argv}`: {e}").into()))?;
+        if let Some(pid) = child.id() {
+            self.exec_process_groups.insert((id, exec_id.clone()), pid);
+        }
 
         if let Some(stdin) = req.stdin.as_deref() {
             if let Some(mut sink) = child.stdin.take() {
@@ -310,6 +320,8 @@ impl SandboxBackend for ProcessBackend {
         // pipe readers to drain, then publish the terminal Exit event.
         // Dropping `tx` after that closes the receiver end, which is
         // what terminates the public stream.
+        let process_groups = self.exec_process_groups.clone();
+        let process_key = (id, exec_id.clone());
         tokio::spawn(async move {
             let exit_status = match tokio::time::timeout(timeout, child.wait()).await {
                 Ok(Ok(status)) => status.code(),
@@ -353,13 +365,41 @@ impl SandboxBackend for ProcessBackend {
             let _ = stdout_handle.await;
             let _ = stderr_handle.await;
             let _ = tx.send(ExecEvent::Exit(exit_status)).await;
+            process_groups.remove(&process_key);
         });
 
         Ok(ExecStream {
             sandbox_id: id,
-            exec_id: SandboxId::new().to_string(),
+            exec_id,
             events: Box::pin(ReceiverStream::new(rx)),
         })
+    }
+
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        let pid = self
+            .exec_process_groups
+            .get(&(id, exec_id.clone()))
+            .map(|entry| *entry)
+            .ok_or(SandboxError::NotFound)?;
+        #[cfg(unix)]
+        {
+            let raw = i32::try_from(pid).map_err(|error| {
+                SandboxError::Vm(format!("invalid process group for {exec_id}: {error}").into())
+            })?;
+            nix::sys::signal::killpg(
+                nix::unistd::Pid::from_raw(raw),
+                nix::sys::signal::Signal::SIGKILL,
+            )
+            .map_err(|error| SandboxError::Vm(format!("cancel {exec_id}: {error}").into()))?;
+            Ok(())
+        }
+        #[cfg(not(unix))]
+        {
+            let _ = pid;
+            Err(SandboxError::Unsupported(
+                "cancel_exec requires process groups".into(),
+            ))
+        }
     }
 
     async fn write_files(
@@ -894,6 +934,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         }
     }
 
@@ -942,6 +986,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: Some(Duration::from_millis(100)),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let started = std::time::Instant::now();
         let h = b.exec(id, req).await.unwrap();
@@ -962,6 +1010,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: Some(Duration::from_secs(2)),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let h = b.exec(id, req).await.unwrap();
         assert_eq!(h.exit_status, Some(0));
@@ -999,6 +1051,10 @@ mod tests {
             env: req_env,
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let h = b.exec(id, req).await.unwrap();
         assert_eq!(String::from_utf8(h.stdout).unwrap(), "from-request");
@@ -1021,6 +1077,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let res = b.exec(id, req).await;
         assert!(matches!(res, Err(SandboxError::InvalidSpec(_))));
@@ -1331,6 +1391,10 @@ mod tests {
             env: HashMap::new(),
             workdir: Some("deep/nested".into()),
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let h = b.exec(id, req).await.unwrap();
         let pwd = String::from_utf8(h.stdout).unwrap();

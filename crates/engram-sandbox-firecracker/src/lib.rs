@@ -68,6 +68,7 @@
 //!   immediately; pages stream in lazily on guest fault. This is the
 //!   load-bearing economic of the snapshot-evict mechanic.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -1535,16 +1536,30 @@ impl FirecrackerBackend {
         agent_socket: &Path,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        let conn = UnixStream::connect(agent_socket).await.map_err(|e| {
+        let probe = UnixStream::connect(agent_socket).await.map_err(|e| {
             vm_err(format!(
                 "connect to agent at {}: {e}",
                 agent_socket.display()
             ))
         })?;
-        let (reader, writer) = tokio::io::split(conn);
+        let durable_capable = probe_durable_exec(Box::new(probe)).await?;
+        let conn = UnixStream::connect(agent_socket).await.map_err(|e| {
+            vm_err(format!(
+                "connect to agent at {} after durable capability probe: {e}",
+                agent_socket.display()
+            ))
+        })?;
         // Direct-UDS variant (tests/dev): no FC snapshot machinery, so no
         // severance signal to watch.
-        drive_exec_protocol(sandbox_id, reader, writer, cmd, None).await
+        drive_exec_protocol(
+            sandbox_id,
+            Box::new(conn),
+            cmd,
+            durable_capable,
+            None,
+            Some(ExecRedial::Unix(agent_socket.to_path_buf())),
+        )
+        .await
     }
 
     /// Drive agentd's existing `Upload` verb over a direct UDS. Public for
@@ -1584,9 +1599,21 @@ impl FirecrackerBackend {
         cmd: ExecRequest,
         severed: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<ExecStream, SandboxError> {
+        let probe = Self::connect_fc_vsock(vsock_uds_path, port).await?;
+        let durable_capable = probe_durable_exec(Box::new(probe)).await?;
         let conn = Self::connect_fc_vsock(vsock_uds_path, port).await?;
-        let (reader, writer) = tokio::io::split(conn);
-        drive_exec_protocol(sandbox_id, reader, writer, cmd, severed).await
+        drive_exec_protocol(
+            sandbox_id,
+            Box::new(conn),
+            cmd,
+            durable_capable,
+            severed,
+            Some(ExecRedial::Firecracker {
+                vsock_uds_path: vsock_uds_path.to_path_buf(),
+                port,
+            }),
+        )
+        .await
     }
 
     async fn write_files_via_fc_vsock(
@@ -4218,39 +4245,154 @@ fn spawn_process_supervisor<V, F, Fut>(
     });
 }
 
-/// Send the WireExecRequest, spawn the reader task that translates
-/// agent events into the trait's `ExecEvent`, return an `ExecStream`.
-/// Generic over the reader/writer halves so both the direct-UDS and
-/// the FC-vsock-CONNECT paths can share it.
-async fn drive_exec_protocol<R, W>(
-    sandbox_id: SandboxId,
-    mut reader: R,
-    mut writer: W,
-    cmd: ExecRequest,
-    mut severed: Option<tokio::sync::watch::Receiver<u64>>,
-) -> Result<ExecStream, SandboxError>
-where
-    R: AsyncRead + Unpin + Send + 'static,
-    W: AsyncWrite + Unpin + Send + 'static,
-{
-    let req = WireRequest::Exec(WireExecRequest {
-        command: cmd.command,
-        stdin: cmd.stdin,
-        env: cmd.env,
-        workdir: cmd.workdir,
-        timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
-    });
-    write_msg(&mut writer, &req)
-        .await
-        .map_err(|e| vm_err(format!("send WireRequest::Exec: {e}")))?;
+trait ExecIo: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T> ExecIo for T where T: AsyncRead + AsyncWrite + Unpin + Send {}
+type BoxExecIo = Box<dyn ExecIo>;
 
-    let exec_id = format!("fc-{}", uuid::Uuid::new_v4().simple());
+#[derive(Clone)]
+enum ExecRedial {
+    Unix(PathBuf),
+    Firecracker {
+        vsock_uds_path: PathBuf,
+        port: u32,
+    },
+    #[cfg(test)]
+    Provided(Arc<tokio::sync::Mutex<Option<BoxExecIo>>>),
+}
+
+impl ExecRedial {
+    async fn connect(&self) -> Result<BoxExecIo, SandboxError> {
+        match self {
+            Self::Unix(path) => UnixStream::connect(path)
+                .await
+                .map(|stream| Box::new(stream) as BoxExecIo)
+                .map_err(|error| {
+                    vm_err(format!(
+                        "durable exec reattach connect to {}: {error}",
+                        path.display()
+                    ))
+                }),
+            Self::Firecracker {
+                vsock_uds_path,
+                port,
+            } => FirecrackerBackend::connect_fc_vsock(vsock_uds_path, *port)
+                .await
+                .map(|stream| Box::new(stream) as BoxExecIo),
+            #[cfg(test)]
+            Self::Provided(connection) => connection
+                .lock()
+                .await
+                .take()
+                .ok_or_else(|| vm_err("test durable exec redial connection already consumed")),
+        }
+    }
+
+    async fn reconnect_after_snapshot(&self) -> Result<BoxExecIo, SandboxError> {
+        let mut last_error = None;
+        for attempt in 0..40 {
+            match self.connect().await {
+                Ok(connection) => return Ok(connection),
+                Err(error) => last_error = Some(error),
+            }
+            if attempt < 39 {
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+        Err(last_error.unwrap_or_else(|| vm_err("durable exec reattach had no dial attempt")))
+    }
+}
+
+const DURABLE_EXEC_SKEW: &str = "ENGRAM_DURABLE_EXEC_VERSION_SKEW";
+
+#[derive(serde::Deserialize, serde::Serialize)]
+struct LegacyWireExecRequest {
+    command: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    env: HashMap<String, String>,
+    workdir: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(serde::Deserialize, serde::Serialize)]
+enum LegacyWireRequest {
+    Exec(LegacyWireExecRequest),
+}
+
+async fn probe_durable_exec(mut io: BoxExecIo) -> Result<bool, SandboxError> {
+    write_msg(
+        &mut io,
+        &WireRequest::CancelExec {
+            exec_id: engram_agentd::handler::DURABLE_EXEC_CAPABILITY_PROBE.into(),
+        },
+    )
+    .await
+    .map_err(|error| vm_err(format!("durable exec capability probe send: {error}")))?;
+    match read_msg::<_, WireResponse>(&mut io).await {
+        Ok(WireResponse::ExecCancelled) => Ok(true),
+        Ok(WireResponse::Error { kind, message }) => {
+            tracing::warn!(
+                %kind,
+                %message,
+                "guest agentd lacks ADR 0103 durable exec; using stage-1 protocol",
+            );
+            Ok(false)
+        }
+        Ok(other) => Err(vm_err(format!(
+            "durable exec capability probe returned unexpected response: {other:?}"
+        ))),
+        Err(error) => Err(vm_err(format!(
+            "durable exec capability probe failed before command submission: {error}"
+        ))),
+    }
+}
+
+/// Send one attach-or-start request and translate the guest's durable stream.
+/// A snapshot epoch bump re-dials from the exact per-stream byte cursors once
+/// the capability probe has succeeded; every generation must still begin with
+/// a matching `Started` frame.
+async fn drive_exec_protocol(
+    sandbox_id: SandboxId,
+    mut io: BoxExecIo,
+    cmd: ExecRequest,
+    durable_capable: bool,
+    mut severed: Option<tokio::sync::watch::Receiver<u64>>,
+    redial: Option<ExecRedial>,
+) -> Result<ExecStream, SandboxError> {
+    let exec_id = cmd
+        .exec_id
+        .clone()
+        .unwrap_or_else(|| format!("fc-{}", uuid::Uuid::new_v4().simple()));
+    let mut stdout_offset = cmd.stdout_offset.unwrap_or(0);
+    let mut stderr_offset = cmd.stderr_offset.unwrap_or(0);
+    if durable_capable {
+        let req = agent_exec_request(&cmd, &exec_id, stdout_offset, stderr_offset, false);
+        write_msg(&mut io, &req)
+            .await
+            .map_err(|e| vm_err(format!("send durable WireRequest::Exec: {e}")))?;
+    } else {
+        let req = LegacyWireRequest::Exec(LegacyWireExecRequest {
+            command: cmd.command.clone(),
+            stdin: cmd.stdin.clone(),
+            env: cmd.env.clone(),
+            workdir: cmd.workdir.clone(),
+            timeout_ms: cmd.timeout.map(|duration| duration.as_millis() as u64),
+        });
+        write_msg(&mut io, &req)
+            .await
+            .map_err(|e| vm_err(format!("send stage-1 WireRequest::Exec: {e}")))?;
+    }
+
     // 64 events of buffer is enough that a slow consumer doesn't
     // immediately backpressure the agent; the agent has its own
     // 64-event channel so total in-flight bound is bounded.
     let (tx, rx) = mpsc::channel::<ExecEvent>(64);
+    let reader_exec_id = exec_id.clone();
 
     tokio::spawn(async move {
+        let exec_id = reader_exec_id;
+        let mut durable_capable = durable_capable;
+        let mut expect_started = durable_capable;
+        let mut reattached_generation = false;
         loop {
             // A snapshot capture severs every vsock connection without an
             // EOF on the host end (`LiveSandbox::vsock_epoch`); racing the
@@ -4264,25 +4406,118 @@ where
             let msg = match severed.as_mut() {
                 Some(epoch) => tokio::select! {
                     biased;
-                    msg = read_msg::<_, WireExecEvent>(&mut reader) => msg,
+                    msg = read_msg::<_, WireExecEvent>(&mut io) => msg,
                     _ = epoch.changed() => {
-                        tracing::warn!(
-                            %sandbox_id,
-                            "snapshot capture severed the exec vsock stream before Exit; synthesizing Exit(None)",
-                        );
-                        let _ = tx.send(ExecEvent::Exit(None)).await;
-                        return;
+                        if !durable_capable {
+                            durable_exec_fallback(
+                                &tx,
+                                sandbox_id,
+                                format!(
+                                    "{DURABLE_EXEC_SKEW}: snapshot severed exec before durable Started capability; guest agentd predates ADR 0103 or never acknowledged it"
+                                ),
+                            ).await;
+                            return;
+                        }
+                        let Some(connector) = redial.as_ref() else {
+                            durable_exec_fallback(
+                                &tx,
+                                sandbox_id,
+                                "durable exec journal reattach unavailable on this transport".into(),
+                            ).await;
+                            return;
+                        };
+                        match connector.reconnect_after_snapshot().await {
+                            Ok(mut next) => {
+                                let attach = agent_exec_request(
+                                    &cmd,
+                                    &exec_id,
+                                    stdout_offset,
+                                    stderr_offset,
+                                    true,
+                                );
+                                if let Err(error) = write_msg(&mut next, &attach).await {
+                                    durable_exec_fallback(
+                                        &tx,
+                                        sandbox_id,
+                                        format!("durable exec reattach request failed (journal GC'd, sandbox gone, or protocol skew): {error}"),
+                                    ).await;
+                                    return;
+                                }
+                                tracing::info!(
+                                    %sandbox_id,
+                                    %exec_id,
+                                    stdout_offset,
+                                    stderr_offset,
+                                    "snapshot severed exec vsock; re-attached to guest journal",
+                                );
+                                io = next;
+                                expect_started = true;
+                                reattached_generation = true;
+                                continue;
+                            }
+                            Err(error) => {
+                                durable_exec_fallback(
+                                    &tx,
+                                    sandbox_id,
+                                    format!("durable exec reattach impossible (journal GC'd or sandbox gone): {error}"),
+                                ).await;
+                                return;
+                            }
+                        }
                     }
                 },
-                None => read_msg::<_, WireExecEvent>(&mut reader).await,
+                None => read_msg::<_, WireExecEvent>(&mut io).await,
             };
+            if expect_started && !matches!(&msg, Ok(WireExecEvent::Started(_))) {
+                durable_exec_fallback(
+                    &tx,
+                    sandbox_id,
+                    format!(
+                        "durable exec protocol violation: first frame for exec_id {exec_id} was not Started: {msg:?}"
+                    ),
+                )
+                .await;
+                return;
+            }
             match msg {
+                Ok(WireExecEvent::Started(started_id)) => {
+                    if !expect_started || started_id != exec_id {
+                        durable_exec_fallback(
+                            &tx,
+                            sandbox_id,
+                            format!(
+                                "durable exec protocol violation: expected Started({exec_id}), got Started({started_id})"
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                    durable_capable = true;
+                    expect_started = false;
+                }
+                Ok(WireExecEvent::Degraded(reason)) => {
+                    durable_capable = false;
+                    expect_started = false;
+                    tracing::warn!(
+                        %sandbox_id,
+                        %exec_id,
+                        %reason,
+                        "guest journal degraded; keeping stage-1 live stream",
+                    );
+                }
                 Ok(WireExecEvent::Stdout(b)) => {
+                    // An old agentd emits output/exit without Started. Keep
+                    // serving its stage-1 stream, but never re-attach it: a
+                    // retry would execute the command twice.
+                    expect_started = false;
+                    stdout_offset = stdout_offset.saturating_add(b.len() as u64);
                     if tx.send(ExecEvent::Stdout(Bytes::from(b))).await.is_err() {
                         return;
                     }
                 }
                 Ok(WireExecEvent::Stderr(b)) => {
+                    expect_started = false;
+                    stderr_offset = stderr_offset.saturating_add(b.len() as u64);
                     if tx.send(ExecEvent::Stderr(Bytes::from(b))).await.is_err() {
                         return;
                     }
@@ -4292,6 +4527,17 @@ where
                     return;
                 }
                 Err(e) => {
+                    if reattached_generation {
+                        durable_exec_fallback(
+                            &tx,
+                            sandbox_id,
+                            format!(
+                                "durable exec reattach stream failed (journal GC'd, sandbox gone, or agentd protocol skew): {e}"
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
                     // Connection died before Exit: surface as a
                     // synthetic Exit(None) so the consumer's
                     // ".next() until Exit" loop terminates.
@@ -4311,6 +4557,39 @@ where
         exec_id,
         events: Box::pin(ReceiverStream::new(rx)),
     })
+}
+
+fn agent_exec_request(
+    cmd: &ExecRequest,
+    exec_id: &str,
+    stdout_offset: u64,
+    stderr_offset: u64,
+    attach_only: bool,
+) -> WireRequest {
+    WireRequest::Exec(WireExecRequest {
+        command: cmd.command.clone(),
+        stdin: cmd.stdin.clone(),
+        env: cmd.env.clone(),
+        workdir: cmd.workdir.clone(),
+        timeout_ms: cmd.timeout.map(|duration| duration.as_millis() as u64),
+        exec_id: Some(exec_id.to_string()),
+        stdout_offset: Some(stdout_offset),
+        stderr_offset: Some(stderr_offset),
+        wake: cmd.wake,
+        attach_only,
+    })
+}
+
+async fn durable_exec_fallback(
+    tx: &mpsc::Sender<ExecEvent>,
+    sandbox_id: SandboxId,
+    reason: String,
+) {
+    tracing::warn!(%sandbox_id, %reason, "durable exec fell back to synthetic Exit(None)");
+    let _ = tx
+        .send(ExecEvent::Stderr(Bytes::from(format!("{reason}\n"))))
+        .await;
+    let _ = tx.send(ExecEvent::Exit(None)).await;
 }
 
 async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
@@ -4497,6 +4776,34 @@ impl SandboxBackend for FirecrackerBackend {
         // surface the error rather than masking with retries.
         Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd, Some(severed))
             .await
+    }
+
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.state.vsock_uds_path.clone()
+        };
+        let mut connection = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
+        write_msg(
+            &mut connection,
+            &WireRequest::CancelExec {
+                exec_id: exec_id.clone(),
+            },
+        )
+        .await
+        .map_err(|error| vm_err(format!("send CancelExec({exec_id}): {error}")))?;
+        match read_msg::<_, WireResponse>(&mut connection).await {
+            Ok(WireResponse::ExecCancelled) => Ok(()),
+            Ok(WireResponse::Error { kind, message }) => Err(vm_err(format!(
+                "agentd rejected CancelExec({exec_id}) ({kind}): {message}"
+            ))),
+            Ok(other) => Err(vm_err(format!(
+                "CancelExec({exec_id}) returned unexpected response: {other:?}"
+            ))),
+            Err(error) => Err(vm_err(format!(
+                "CancelExec({exec_id}) response failed; likely host/guest version skew (old agentd without ADR 0103): {error}"
+            ))),
+        }
     }
 
     async fn write_files(
@@ -6891,6 +7198,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         match b.exec_stream(SandboxId::new(), req).await {
             Err(SandboxError::NotFound) => {}
@@ -6910,7 +7221,6 @@ mod tests {
         use futures_util::StreamExt;
 
         let (host_end, mut guest_end) = tokio::io::duplex(4096);
-        let (reader, writer) = tokio::io::split(host_end);
         let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
         let req = ExecRequest {
             command: vec!["git".into(), "clone".into()],
@@ -6918,15 +7228,26 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: Some("exec-skew".into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
-        let stream = drive_exec_protocol(SandboxId::new(), reader, writer, req, Some(epoch_rx))
-            .await
-            .expect("exec request write succeeds");
+        let stream = drive_exec_protocol(
+            SandboxId::new(),
+            Box::new(host_end),
+            req,
+            false,
+            Some(epoch_rx),
+            None,
+        )
+        .await
+        .expect("exec request write succeeds");
 
         // Guest side: consume the request frame, emit one pre-severance
         // stderr chunk, then go silent WITHOUT closing the connection —
         // modeling the severed-but-never-EOF muxer UDS.
-        let _req: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
+        let _req: LegacyWireRequest = read_msg(&mut guest_end).await.expect("request frame");
         write_msg(
             &mut guest_end,
             &WireExecEvent::Stderr(b"Cloning into '/workspace'...\n".to_vec()),
@@ -6946,8 +7267,15 @@ mod tests {
         epoch_tx.send_modify(|v| *v += 1);
 
         match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
+            Ok(Some(ExecEvent::Stderr(message))) => assert!(
+                String::from_utf8_lossy(&message).contains(DURABLE_EXEC_SKEW),
+                "fallback must name the old-agentd skew"
+            ),
+            other => panic!("expected named skew error after severance, got {other:?}"),
+        }
+        match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
             Ok(Some(ExecEvent::Exit(None))) => {}
-            other => panic!("expected synthetic Exit(None) after severance, got {other:?}"),
+            other => panic!("expected synthetic Exit(None) after named skew, got {other:?}"),
         }
         match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
             Ok(None) => {}
@@ -6956,6 +7284,126 @@ mod tests {
         // Only now may the guest end drop: the property under test is
         // termination WITHOUT any EOF from the connection.
         drop(guest_end);
+    }
+
+    #[tokio::test]
+    async fn exec_reader_reattaches_from_delivered_offsets_after_epoch_bump() {
+        use futures_util::StreamExt;
+
+        let (host_end, mut first_guest) = tokio::io::duplex(4096);
+        let (reattach_host, mut reattach_guest) = tokio::io::duplex(4096);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let exec_id = "exec-reattach";
+        let req = ExecRequest {
+            command: vec!["sh".into(), "-c".into(), "sleep 1; echo done".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream = drive_exec_protocol(
+            SandboxId::new(),
+            Box::new(host_end),
+            req,
+            true,
+            Some(epoch_rx),
+            Some(ExecRedial::Provided(Arc::new(tokio::sync::Mutex::new(
+                Some(Box::new(reattach_host)),
+            )))),
+        )
+        .await
+        .unwrap();
+
+        let first_request: WireRequest = read_msg(&mut first_guest).await.unwrap();
+        assert!(matches!(
+            first_request,
+            WireRequest::Exec(WireExecRequest {
+                stdout_offset: Some(0),
+                stderr_offset: Some(0),
+                attach_only: false,
+                ..
+            })
+        ));
+        write_msg(&mut first_guest, &WireExecEvent::Started(exec_id.into()))
+            .await
+            .unwrap();
+        write_msg(
+            &mut first_guest,
+            &WireExecEvent::Stdout(b"before-".to_vec()),
+        )
+        .await
+        .unwrap();
+
+        let reattached = tokio::spawn(async move {
+            let request: WireRequest = read_msg(&mut reattach_guest).await.unwrap();
+            assert!(matches!(
+                request,
+                WireRequest::Exec(WireExecRequest {
+                    exec_id: Some(ref id),
+                    stdout_offset: Some(7),
+                    stderr_offset: Some(0),
+                    attach_only: true,
+                    ..
+                }) if id == exec_id
+            ));
+            write_msg(&mut reattach_guest, &WireExecEvent::Started(exec_id.into()))
+                .await
+                .unwrap();
+            write_msg(
+                &mut reattach_guest,
+                &WireExecEvent::Stdout(b"after".to_vec()),
+            )
+            .await
+            .unwrap();
+            write_msg(&mut reattach_guest, &WireExecEvent::Exit(Some(0)))
+                .await
+                .unwrap();
+        });
+
+        let mut events = stream.events;
+        assert!(matches!(
+            events.next().await,
+            Some(ExecEvent::Stdout(bytes)) if bytes == Bytes::from_static(b"before-")
+        ));
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+        assert!(matches!(
+            events.next().await,
+            Some(ExecEvent::Stdout(bytes)) if bytes == Bytes::from_static(b"after")
+        ));
+        assert!(matches!(
+            events.next().await,
+            Some(ExecEvent::Exit(Some(0)))
+        ));
+        assert!(events.next().await.is_none());
+        reattached.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn new_host_detects_stubbed_old_agentd_before_submitting_exec() {
+        let (host_end, mut old_agentd) = tokio::io::duplex(4096);
+        let stub = tokio::spawn(async move {
+            let request: WireRequest = read_msg(&mut old_agentd).await.expect("capability request");
+            assert!(matches!(
+                request,
+                WireRequest::CancelExec { ref exec_id }
+                    if exec_id == engram_agentd::handler::DURABLE_EXEC_CAPABILITY_PROBE
+            ));
+            write_msg(
+                &mut old_agentd,
+                &WireResponse::Error {
+                    kind: "InvalidData".into(),
+                    message: "unsupported request: old agentd protocol".into(),
+                },
+            )
+            .await
+            .expect("old agentd skew response");
+        });
+        assert!(!probe_durable_exec(Box::new(host_end)).await.unwrap());
+        stub.await.unwrap();
     }
 
     /// The severance race must not eat a real exit: when a genuine
@@ -6970,7 +7418,6 @@ mod tests {
         use futures_util::StreamExt;
 
         let (host_end, mut guest_end) = tokio::io::duplex(4096);
-        let (reader, writer) = tokio::io::split(host_end);
         let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
         let req = ExecRequest {
             command: vec!["true".into()],
@@ -6978,14 +7425,25 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: Some("exec-buffered-exit".into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
-        let stream = drive_exec_protocol(SandboxId::new(), reader, writer, req, Some(epoch_rx))
-            .await
-            .expect("exec request write succeeds");
+        let stream = drive_exec_protocol(
+            SandboxId::new(),
+            Box::new(host_end),
+            req,
+            false,
+            Some(epoch_rx),
+            None,
+        )
+        .await
+        .expect("exec request write succeeds");
 
         // Buffer the real exit, THEN bump the epoch — no await between
         // the two, so the reader task observes both ready in one poll.
-        let _req: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
+        let _req: LegacyWireRequest = read_msg(&mut guest_end).await.expect("request frame");
         write_msg(&mut guest_end, &WireExecEvent::Exit(Some(0)))
             .await
             .expect("exit frame");

@@ -231,6 +231,10 @@ async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(30)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let mut stream = backend.exec_stream(id, req).await.expect("exec_stream");
     let mut out = String::new();
@@ -796,6 +800,10 @@ async fn e2e_vz_forge_credential_round_trips() {
         env: exec_env,
         workdir: None,
         timeout: Some(Duration::from_secs(15)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let mut stream = backend.exec_stream(id, req).await.expect("exec_stream");
     let mut out = String::new();

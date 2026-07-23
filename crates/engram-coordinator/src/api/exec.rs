@@ -28,6 +28,10 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
     pub timeout_secs: Option<u64>,
+    pub exec_id: Option<String>,
+    pub stdout_offset: Option<u64>,
+    pub stderr_offset: Option<u64>,
+    pub wake: Option<bool>,
 }
 
 /// Resolve the image's launch env + default workdir for `id` so exec'd
@@ -125,6 +129,10 @@ fn build_exec(
         env,
         workdir: req.workdir.or(default_workdir),
         timeout: req.timeout_secs.map(Duration::from_secs),
+        exec_id: req.exec_id,
+        stdout_offset: req.stdout_offset,
+        stderr_offset: req.stderr_offset,
+        wake: req.wake,
     };
     Ok((argv, sandbox_req))
 }
@@ -165,9 +173,17 @@ pub(crate) async fn exec_stream_core(
     ApiError,
 > {
     let (base_env, default_workdir) = session_exec_env(state, id).await;
-    let (argv, sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
+    let wake = req.wake.unwrap_or(true);
+    let (argv, mut sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
+    let requested_exec_id = sandbox_req
+        .exec_id
+        .clone()
+        .unwrap_or_else(|| format!("exec:{}", state.services.entropy.uuid().simple()));
+    sandbox_req.exec_id = Some(requested_exec_id.clone());
 
-    crate::api::snapshot::ensure_active(state, id).await?;
+    if wake {
+        crate::api::snapshot::ensure_active(state, id).await?;
+    }
     let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
         ApiError::Conflict(
             "session has no live sandbox — create a new session or resume from snapshot".into(),
@@ -180,6 +196,11 @@ pub(crate) async fn exec_stream_core(
         .exec_stream(sandbox_id, sandbox_req)
         .await?;
     let exec_id = backend_stream.exec_id.clone();
+    if exec_id != requested_exec_id {
+        return Err(ApiError::Conflict(format!(
+            "durable exec identity changed across host boundary: requested {requested_exec_id}, got {exec_id}"
+        )));
+    }
 
     state
         .emit(
@@ -252,6 +273,24 @@ pub(crate) async fn exec_stream_core(
     Ok((exec_id, Box::pin(body)))
 }
 
+pub(crate) async fn cancel_exec_core(
+    state: &SharedState,
+    id: SessionId,
+    exec_id: String,
+) -> Result<(), ApiError> {
+    if exec_id.is_empty() {
+        return Err(ApiError::BadRequest("exec_id must not be empty".into()));
+    }
+    crate::api::snapshot::ensure_active(state, id).await?;
+    let sandbox_id = state.resolve_sandbox(id).await.ok_or_else(|| {
+        ApiError::Conflict(
+            "session has no live sandbox — create a new session or resume from snapshot".into(),
+        )
+    })?;
+    state.services.host.cancel_exec(sandbox_id, exec_id).await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,6 +305,10 @@ mod tests {
                 .collect(),
             workdir: workdir.map(str::to_string),
             timeout_secs: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         }
     }
 
@@ -313,6 +356,21 @@ mod tests {
             sandbox_req.env.get("ENGRAM_SESSION_ID").map(String::as_str),
             Some(session.to_string().as_str()),
         );
+    }
+
+    #[test]
+    fn durable_attach_fields_reach_the_host_request_unchanged() {
+        let session = SessionId::new();
+        let mut request = req(&[], None);
+        request.exec_id = Some("exec:caller-ticket".into());
+        request.stdout_offset = Some(123);
+        request.stderr_offset = Some(456);
+        request.wake = Some(false);
+        let (_argv, sandbox_req) = build_exec(request, session, base(&[]), None).unwrap();
+        assert_eq!(sandbox_req.exec_id.as_deref(), Some("exec:caller-ticket"));
+        assert_eq!(sandbox_req.stdout_offset, Some(123));
+        assert_eq!(sandbox_req.stderr_offset, Some(456));
+        assert_eq!(sandbox_req.wake, Some(false));
     }
 
     #[test]

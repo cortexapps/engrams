@@ -103,6 +103,7 @@ async fn exec_runs_inside_baked_microvm() {
     // would try to exec /sbin/init (debian's systemd) which we
     // don't have configured.
     cfg.default_boot_args = "console=ttyS0 reboot=k panic=1 pci=off init=/sbin/engram-init".into();
+    cfg.track_dirty_pages = true;
     let backend = FirecrackerBackend::new(work.path(), cfg);
 
     let spec = SandboxSpec {
@@ -134,6 +135,10 @@ async fn exec_runs_inside_baked_microvm() {
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(5)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
 
     // Make the FC backend leave the jail dir behind on failure so we
@@ -170,6 +175,42 @@ async fn exec_runs_inside_baked_microvm() {
         String::from_utf8_lossy(&stderr),
     );
     assert_eq!(exit, Some(0), "expected clean exit");
+
+    // ADR 0103 end-to-end healing proof, sized to one severance: start one
+    // short command, take a diff snapshot while it sleeps (which resets the
+    // guest vsock), and drain the SAME Exec call. The host reader must redial
+    // with its current offsets and the guest journal must deliver the one
+    // canonical output + exact exit.
+    let durable_stream = backend
+        .exec_stream(
+            sandbox_id,
+            ExecRequest {
+                command: vec![
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    "sleep 1; echo durable-after-snapshot".into(),
+                ],
+                stdin: None,
+                env: HashMap::new(),
+                workdir: None,
+                timeout: Some(Duration::from_secs(5)),
+                exec_id: Some("fc-durable-snapshot".into()),
+                stdout_offset: Some(0),
+                stderr_offset: Some(0),
+                wake: None,
+            },
+        )
+        .await
+        .expect("start durable exec");
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    backend
+        .snapshot_diff(sandbox_id)
+        .await
+        .expect("diff snapshot during durable exec");
+    let (stdout, stderr, exit) = drain(durable_stream.events).await;
+    assert_eq!(stdout, b"durable-after-snapshot\n");
+    assert!(stderr.is_empty(), "unexpected durable stderr: {stderr:?}");
+    assert_eq!(exit, Some(0), "durable exec lost its exact exit");
 
     // ---- 5. Cleanup ----
     backend.destroy(sandbox_id).await.expect("destroy");

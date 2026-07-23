@@ -397,6 +397,19 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
     pub timeout: Option<Duration>,
+    /// Durable caller ticket. When present, retries attach to the existing
+    /// guest journal instead of spawning a second command.
+    #[serde(default)]
+    pub exec_id: Option<String>,
+    /// Per-stream replay cursors used when attaching to a durable exec.
+    #[serde(default)]
+    pub stdout_offset: Option<u64>,
+    #[serde(default)]
+    pub stderr_offset: Option<u64>,
+    /// Ask the coordinator to wake a parked session before attaching.
+    /// Backends receive the normalized request after that wake has happened.
+    #[serde(default)]
+    pub wake: Option<bool>,
 }
 
 /// One file to write into a running sandbox.

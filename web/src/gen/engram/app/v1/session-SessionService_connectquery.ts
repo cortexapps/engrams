@@ -71,6 +71,11 @@ export const completeToolCall = SessionService.method.completeToolCall;
 export const listSessionEvents = SessionService.method.listSessionEvents;
 
 /**
+ * @generated from rpc engram.app.v1.SessionService.CancelExec
+ */
+export const cancelExec = SessionService.method.cancelExec;
+
+/**
  * ADR 0100: stage a batch of files inside a running session without
  * embedding content in a shell command. Each file reports its own result.
  *

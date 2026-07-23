@@ -767,6 +767,10 @@ async fn exec_out(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd:
         env: HashMap::new(),
         workdir: None,
         timeout: Some(std::time::Duration::from_secs(30)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let deadline = Instant::now() + std::time::Duration::from_secs(30);
     let stream = loop {

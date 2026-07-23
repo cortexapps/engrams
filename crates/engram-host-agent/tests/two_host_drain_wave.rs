@@ -498,6 +498,10 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
         env: HashMap::new(),
         workdir: None,
         timeout: Some(std::time::Duration::from_secs(30)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let stream = loop {

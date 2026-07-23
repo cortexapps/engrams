@@ -347,6 +347,19 @@ impl app::session_service_server::SessionService for AppSessionService {
         Ok(Response::new(Box::pin(started.chain(body))))
     }
 
+    async fn cancel_exec(
+        &self,
+        req: Request<app::CancelExecRequest>,
+    ) -> Result<Response<app::CancelExecResponse>, Status> {
+        self.auth.check(&req)?;
+        let request = req.into_inner();
+        let id = parse_session_id(&request.session_id)?;
+        crate::api::exec::cancel_exec_core(&self.state, id, request.exec_id)
+            .await
+            .map_err(into_status)?;
+        Ok(Response::new(app::CancelExecResponse {}))
+    }
+
     async fn write_files(
         &self,
         req: Request<app::WriteFilesRequest>,

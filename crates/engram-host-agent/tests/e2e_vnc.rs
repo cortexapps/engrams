@@ -583,6 +583,10 @@ async fn e2e_vnc_cold_via_pooled_backend() {
                 env: HashMap::new(),
                 workdir: Some("/workspace".into()),
                 timeout: Some(Duration::from_secs(60)),
+                exec_id: None,
+                stdout_offset: None,
+                stderr_offset: None,
+                wake: None,
             },
         )
         .await

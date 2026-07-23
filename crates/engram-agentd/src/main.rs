@@ -23,6 +23,14 @@ use engram_agentd::serve_connection;
 use engram_agentd::time_source;
 
 fn main() -> ExitCode {
+    // ADR 0103: a forked wrapper owns each durable exec journal. Intercept
+    // before telemetry/listener setup so RefreshAgent can execve agentd while
+    // this already-running child continues to drain output and atomically
+    // publish exit.json.
+    if std::env::args().nth(1).as_deref() == Some("__exec-wrapper") {
+        return run_exec_wrapper_mode();
+    }
+
     // ADR 0023: in-guest forge client mode. `engram-agentd
     // forge-credential` (GIT_ASKPASS) dials the host's forge vsock port and
     // exits, rather than running the exec server. Intercept before
@@ -116,6 +124,63 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             eprintln!("engram-agentd: {e}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+fn run_exec_wrapper_mode() -> ExitCode {
+    let mut args = std::env::args().skip(2);
+    let Some(journal_dir) = args.next() else {
+        eprintln!("engram-agentd __exec-wrapper: missing journal directory");
+        return ExitCode::from(2);
+    };
+    let Some(timeout_arg) = args.next() else {
+        eprintln!("engram-agentd __exec-wrapper: missing timeout");
+        return ExitCode::from(2);
+    };
+    if args.next().as_deref() != Some("--") {
+        eprintln!("engram-agentd __exec-wrapper: missing -- separator");
+        return ExitCode::from(2);
+    }
+    let command: Vec<String> = args.collect();
+    let timeout = if timeout_arg == "-" {
+        None
+    } else {
+        match timeout_arg.parse::<u64>() {
+            Ok(ms) => Some(std::time::Duration::from_millis(ms)),
+            Err(error) => {
+                eprintln!("engram-agentd __exec-wrapper: invalid timeout: {error}");
+                return ExitCode::from(2);
+            }
+        }
+    };
+    let entry = match engram_agentd::exec_journal::JournalEntry::from_dir(journal_dir) {
+        Ok(entry) => entry,
+        Err(error) => {
+            eprintln!("engram-agentd __exec-wrapper: invalid journal: {error}");
+            return ExitCode::from(2);
+        }
+    };
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("engram-agentd __exec-wrapper: runtime: {error}");
+            return ExitCode::from(1);
+        }
+    };
+    match runtime.block_on(engram_agentd::exec_journal::run_wrapper(
+        entry, command, timeout,
+    )) {
+        Ok(Some(code)) => u8::try_from(code)
+            .map(ExitCode::from)
+            .unwrap_or_else(|_| ExitCode::from(1)),
+        Ok(None) => ExitCode::from(1),
+        Err(error) => {
+            eprintln!("engram-agentd __exec-wrapper: {error}");
             ExitCode::from(1)
         }
     }

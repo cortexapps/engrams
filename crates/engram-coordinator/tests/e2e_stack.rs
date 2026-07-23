@@ -311,6 +311,10 @@ impl Driver {
             env: HashMap::new(),
             workdir: None,
             timeout_secs: Some(30),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let mut stream = self
             .sess

@@ -261,6 +261,10 @@ async fn wait_for_agent_ready(
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(5)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let deadline = std::time::Instant::now() + budget;
     let mut last_err = None;

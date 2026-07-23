@@ -379,6 +379,10 @@ fn wire_mirrors_golden() {
             env: HashMap::from([("A".into(), "B".into())]),
             workdir: Some("/tmp".into()),
             timeout_ms: Some(5_500),
+            exec_id: Some("exec-golden".into()),
+            stdout_offset: Some(7),
+            stderr_offset: Some(9),
+            wake: Some(true),
         },
     );
     assert_golden_no_eq(
@@ -461,7 +465,7 @@ fn wire_version_pinned() {
     // Proto-native scalar only; no bincode payload changed, so every
     // golden is byte-identical.
     assert_eq!(
-        WIRE_VERSION, 18,
+        WIRE_VERSION, 19,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -540,6 +544,10 @@ fn regen_golden() {
             env: HashMap::from([("A".into(), "B".into())]),
             workdir: Some("/tmp".into()),
             timeout_ms: Some(5_500),
+            exec_id: Some("exec-golden".into()),
+            stdout_offset: Some(7),
+            stderr_offset: Some(9),
+            wake: Some(true),
         },
     );
     write(

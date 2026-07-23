@@ -541,6 +541,10 @@ pub(crate) async fn create_artifact_from_path_core(
         env: std::collections::HashMap::new(),
         workdir: None,
         timeout: Some(std::time::Duration::from_secs(600)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let stream = state
         .services

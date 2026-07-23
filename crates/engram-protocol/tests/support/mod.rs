@@ -31,14 +31,32 @@ pub fn wire_exec_request() -> impl Strategy<Value = WireExecRequest> {
         proptest::option::of((s(), s())).prop_map(|kv| kv.into_iter().collect::<HashMap<_, _>>()),
         proptest::option::of(s()),
         proptest::option::of(any::<u64>()),
+        proptest::option::of(s()),
+        proptest::option::of(any::<u64>()),
+        proptest::option::of(any::<u64>()),
+        proptest::option::of(any::<bool>()),
     )
         .prop_map(
-            |(command, stdin, env, workdir, timeout_ms)| WireExecRequest {
+            |(
                 command,
                 stdin,
                 env,
                 workdir,
                 timeout_ms,
+                exec_id,
+                stdout_offset,
+                stderr_offset,
+                wake,
+            )| WireExecRequest {
+                command,
+                stdin,
+                env,
+                workdir,
+                timeout_ms,
+                exec_id,
+                stdout_offset,
+                stderr_offset,
+                wake,
             },
         )
 }

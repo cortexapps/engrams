@@ -24,8 +24,8 @@ use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer}
 use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BrowserPortResponse, CowStateAllResponse,
-    CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BrowserPortResponse, CancelExecRequest,
+    CowStateAllResponse, CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
     ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse, IdePortResponse,
     InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
@@ -1163,7 +1163,7 @@ impl HostService for HostServiceImpl {
     }
 
     /// Server-streaming exec. First frame is `started` (carries the
-    /// host-assigned `exec_id`); subsequent frames carry stdout /
+    /// canonical `exec_id`); subsequent frames carry stdout /
     /// stderr bytes; terminal frame is `exit` (always exactly one).
     async fn exec_start(
         &self,
@@ -1173,7 +1173,11 @@ impl HostService for HostServiceImpl {
         let r = req.into_inner();
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         let wire: WireExecRequest = decode_bincode(&r.request_bincode, "WireExecRequest")?;
-        let request = wire.into_engine();
+        let mut request = wire.into_engine();
+        request.exec_id = r.exec_id;
+        request.stdout_offset = r.stdout_offset;
+        request.stderr_offset = r.stderr_offset;
+        request.wake = r.wake;
 
         let mut stream = self
             .inner
@@ -1240,6 +1244,20 @@ impl HostService for HostServiceImpl {
 
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream) as Self::ExecStartStream))
+    }
+
+    async fn cancel_exec(
+        &self,
+        req: Request<CancelExecRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        check_wire_version(&req)?;
+        let request = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&request.sandbox_id)?;
+        self.inner
+            .cancel_exec(sandbox_id, request.exec_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
     }
 
     /// ADR 0100: unary batch file staging. The backend owns the guest
