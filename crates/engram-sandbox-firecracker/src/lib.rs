@@ -4421,7 +4421,6 @@ pub async fn drive_exec_protocol(
         let exec_id = reader_exec_id;
         let mut durable_capable = durable_capable;
         let mut expect_started = durable_capable;
-        let mut reattached_generation = false;
         loop {
             // A snapshot capture severs every vsock connection without an
             // EOF on the host end (`LiveSandbox::vsock_epoch`); racing the
@@ -4438,6 +4437,10 @@ pub async fn drive_exec_protocol(
                     msg = read_msg::<_, WireExecEvent>(&mut io) => msg,
                     _ = epoch.changed() => {
                         if !durable_capable {
+                            // An old/degraded agent has no spawn-dedupe
+                            // journal. A caller retry could double-run the
+                            // command, so terminate loudly at the stage-1
+                            // floor instead.
                             durable_exec_fallback(
                                 &tx,
                                 sandbox_id,
@@ -4448,11 +4451,17 @@ pub async fn drive_exec_protocol(
                             return;
                         }
                         let Some(connector) = redial.as_ref() else {
-                            durable_exec_fallback(
-                                &tx,
-                                sandbox_id,
-                                "durable exec journal reattach unavailable on this transport".into(),
-                            ).await;
+                            // This host-local transport cannot re-dial, but
+                            // the guest journal is still authoritative. End
+                            // without Exit so a fresh coordinator call can
+                            // attach-or-start safely with the same ticket.
+                            tracing::warn!(
+                                %sandbox_id,
+                                %exec_id,
+                                stdout_offset,
+                                stderr_offset,
+                                "durable exec snapshot reattach unavailable; ending without Exit",
+                            );
                             return;
                         };
                         match connector.reconnect_after_snapshot().await {
@@ -4465,11 +4474,17 @@ pub async fn drive_exec_protocol(
                                     true,
                                 );
                                 if let Err(error) = write_msg(&mut next, &attach).await {
-                                    durable_exec_fallback(
-                                        &tx,
-                                        sandbox_id,
-                                        format!("durable exec reattach request failed (journal GC'd, sandbox gone, or protocol skew): {error}"),
-                                    ).await;
+                                    // A failed write did not reach a guest
+                                    // journal verdict. A fresh caller can
+                                    // safely retry the deduped attach.
+                                    tracing::warn!(
+                                        %sandbox_id,
+                                        %exec_id,
+                                        stdout_offset,
+                                        stderr_offset,
+                                        %error,
+                                        "durable exec reattach request transport failed; ending without Exit",
+                                    );
                                     return;
                                 }
                                 tracing::info!(
@@ -4481,15 +4496,20 @@ pub async fn drive_exec_protocol(
                                 );
                                 io = next;
                                 expect_started = true;
-                                reattached_generation = true;
                                 continue;
                             }
                             Err(error) => {
-                                durable_exec_fallback(
-                                    &tx,
-                                    sandbox_id,
-                                    format!("durable exec reattach impossible (journal GC'd or sandbox gone): {error}"),
-                                ).await;
+                                // Connector failure is transport-shaped, not
+                                // proof that the guest journal is gone. Let
+                                // the caller establish a fresh host RPC.
+                                tracing::warn!(
+                                    %sandbox_id,
+                                    %exec_id,
+                                    stdout_offset,
+                                    stderr_offset,
+                                    %error,
+                                    "durable exec snapshot reconnect failed; ending without Exit",
+                                );
                                 return;
                             }
                         }
@@ -4497,20 +4517,44 @@ pub async fn drive_exec_protocol(
                 },
                 None => read_msg::<_, WireExecEvent>(&mut io).await,
             };
-            if expect_started && !matches!(&msg, Ok(WireExecEvent::Started(_))) {
-                durable_exec_fallback(
-                    &tx,
-                    sandbox_id,
-                    format!(
-                        "durable exec protocol violation: first frame for exec_id {exec_id} was not Started: {msg:?}"
-                    ),
-                )
-                .await;
-                return;
+            if expect_started {
+                match &msg {
+                    Ok(WireExecEvent::Started(_)) => {}
+                    Err(error) => {
+                        // EOF/read failure before Started is still only a
+                        // transport result. The durable ticket makes a fresh
+                        // attach-or-start safe.
+                        tracing::warn!(
+                            %sandbox_id,
+                            %exec_id,
+                            stdout_offset,
+                            stderr_offset,
+                            %error,
+                            "durable exec connection ended before Started; ending without Exit",
+                        );
+                        return;
+                    }
+                    Ok(_) => {
+                        // A real but out-of-contract guest frame is protocol
+                        // skew/violation, not transport loss. Retrying could
+                        // cross into an agent that did not honor the ticket.
+                        durable_exec_fallback(
+                            &tx,
+                            sandbox_id,
+                            format!(
+                                "durable exec protocol violation: first frame for exec_id {exec_id} was not Started: {msg:?}"
+                            ),
+                        )
+                        .await;
+                        return;
+                    }
+                }
             }
             match msg {
                 Ok(WireExecEvent::Started(started_id)) => {
                     if !expect_started || started_id != exec_id {
+                        // The guest acknowledged a different lifecycle or
+                        // ticket. Do not retry an identity-ambiguous exec.
                         durable_exec_fallback(
                             &tx,
                             sandbox_id,
@@ -4556,23 +4600,31 @@ pub async fn drive_exec_protocol(
                     return;
                 }
                 Err(e) => {
-                    if reattached_generation {
-                        durable_exec_fallback(
-                            &tx,
-                            sandbox_id,
-                            format!(
-                                "durable exec reattach stream failed (journal GC'd, sandbox gone, or agentd protocol skew): {e}"
-                            ),
-                        )
-                        .await;
+                    if durable_capable {
+                        // EOF/read failure is not a journal verdict. End the
+                        // host event stream without Exit; the coordinator
+                        // turns that into a retryable error and the caller
+                        // re-attaches with these delivered offsets.
+                        tracing::warn!(
+                            %sandbox_id,
+                            %exec_id,
+                            stdout_offset,
+                            stderr_offset,
+                            error = %e,
+                            "durable exec connection ended without explicit Exit; ending event stream",
+                        );
                         return;
                     }
-                    // Connection died before Exit: surface as a
-                    // synthetic Exit(None) so the consumer's
-                    // ".next() until Exit" loop terminates.
+                    // Legacy agentd and degraded journals have no safe
+                    // attach-or-start guarantee. Preserve the stage-1
+                    // terminal floor: retrying could double-spawn.
                     tracing::warn!(
+                        %sandbox_id,
+                        %exec_id,
+                        stdout_offset,
+                        stderr_offset,
                         error = %e,
-                        "agent connection ended without explicit Exit",
+                        "legacy/degraded exec connection ended without explicit Exit; emitting Exit(None)",
                     );
                     let _ = tx.send(ExecEvent::Exit(None)).await;
                     return;
@@ -7236,6 +7288,83 @@ mod tests {
             Err(SandboxError::NotFound) => {}
             other => panic!("expected NotFound, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn durable_exec_eof_ends_stream_without_synthetic_exit() {
+        use futures_util::StreamExt;
+
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let exec_id = "exec-durable-eof";
+        let req = ExecRequest {
+            command: vec!["sh".into(), "-c".into(), "printf partial".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream =
+            drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, true, None, None)
+                .await
+                .expect("durable exec request write succeeds");
+
+        let _request: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
+        write_msg(&mut guest_end, &WireExecEvent::Started(exec_id.into()))
+            .await
+            .expect("started frame");
+        write_msg(&mut guest_end, &WireExecEvent::Stdout(b"partial".to_vec()))
+            .await
+            .expect("stdout frame");
+        drop(guest_end);
+
+        let mut events = stream.events;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+            Ok(Some(ExecEvent::Stdout(bytes))) if bytes == Bytes::from_static(b"partial")
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+            Ok(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn legacy_exec_eof_preserves_synthetic_exit_floor() {
+        use futures_util::StreamExt;
+
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let req = ExecRequest {
+            command: vec!["true".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some("exec-legacy-eof".into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream =
+            drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, false, None, None)
+                .await
+                .expect("legacy exec request write succeeds");
+
+        let _request: LegacyWireRequest = read_msg(&mut guest_end).await.expect("request frame");
+        drop(guest_end);
+
+        let mut events = stream.events;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+            Ok(Some(ExecEvent::Exit(None)))
+        ));
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+            Ok(None)
+        ));
     }
 
     /// Prod 2026-07-22: a snapshot capture severs every vsock connection

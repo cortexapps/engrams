@@ -283,32 +283,170 @@ describe("durable orchestrator exec caller", () => {
       }
     }
 
-    // The cap permits eight severances. Walk one byte at a time across both
-    // files to pin attach-not-spawn through the maximum retry depth.
-    const manyDisconnects = new JournalExecServer(
-      encoder.encode("abcde"),
-      encoder.encode("xyz"),
-      [
-        { stdoutEnd: 1, stderrEnd: 0 },
-        { stdoutEnd: 1, stderrEnd: 1 },
-        { stdoutEnd: 2, stderrEnd: 1 },
-        { stdoutEnd: 2, stderrEnd: 2 },
-        { stdoutEnd: 3, stderrEnd: 2 },
-        { stdoutEnd: 4, stderrEnd: 2 },
-        { stdoutEnd: 4, stderrEnd: 3 },
-        { stdoutEnd: 5, stderrEnd: 3 },
-      ],
+  });
+
+  test("more than eight progressive disconnects complete before the deadline", async () => {
+    const stdout = encoder.encode("abcdefghijklmn");
+    const execId = "exec:session-many:reattach";
+    const server = new JournalExecServer(
+      stdout,
+      new Uint8Array(),
+      Array.from(
+        { length: 13 },
+        (_, index) => ({ stdoutEnd: index + 1, stderrEnd: 0 }),
+      ),
     );
+
     const result = await runExec(
-      manyDisconnects,
+      server,
       "session-many",
       "printf many",
-      { execId: "exec:session-many:reattach", deadlineMs: 10_000 },
+      { execId, deadlineMs: 10_000 },
       instantRuntime(),
     );
-    expect(result).toMatchObject({ stdout: "abcde", stderr: "xyz" });
-    expect(manyDisconnects.execCalls).toHaveLength(9);
-    expect(manyDisconnects.spawnCounts.get("exec:session-many:reattach")).toBe(1);
+
+    expect(result).toEqual({
+      exitStatus: 0,
+      stdout: "abcdefghijklmn",
+      stderr: "",
+    });
+    expect(server.execCalls).toHaveLength(14);
+    expect(server.spawnCounts.get(execId)).toBe(1);
+  });
+
+  test("nine consecutive attempts without a frame exhaust the retry budget", async () => {
+    let calls = 0;
+    const error = new ConnectError("stream unavailable", Code.Unavailable);
+    const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
+    const server: ReviewSessionsClient = {
+      createSession: () => base.createSession(),
+      deleteSession: (req) => base.deleteSession(req),
+      cancelExec: (req) => base.cancelExec(req),
+      writeFiles: (req) => base.writeFiles(req),
+      sendPrompt: () => base.sendPrompt(),
+      exec(): AsyncIterable<ExecFrame> {
+        calls++;
+        return {
+          async *[Symbol.asyncIterator]() {
+            throw error;
+          },
+        };
+      },
+    };
+
+    await expect(runExec(
+      server,
+      "session-no-frames",
+      "true",
+      { execId: "exec:session-no-frames:true", deadlineMs: 60_000 },
+      instantRuntime(),
+    )).rejects.toThrow(
+      "failed after 9 consecutive attempts without receiving a frame",
+    );
+    expect(calls).toBe(9);
+  });
+
+  test("a received frame resets the consecutive no-frame retry budget", async () => {
+    let calls = 0;
+    const error = new ConnectError("stream unavailable", Code.Unavailable);
+    const execId = "exec:session-reset:true";
+    const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
+    const server: ReviewSessionsClient = {
+      createSession: () => base.createSession(),
+      deleteSession: (req) => base.deleteSession(req),
+      cancelExec: (req) => base.cancelExec(req),
+      writeFiles: (req) => base.writeFiles(req),
+      sendPrompt: () => base.sendPrompt(),
+      exec(): AsyncIterable<ExecFrame> {
+        const call = ++calls;
+        return {
+          async *[Symbol.asyncIterator]() {
+            if (call === 7) {
+              yield { event: { case: "started", value: { execId } } };
+              yield {
+                event: { case: "stdout", value: encoder.encode("progress") },
+              };
+            }
+            throw error;
+          },
+        };
+      },
+    };
+
+    let failure: unknown;
+    try {
+      await runExec(
+        server,
+        "session-reset",
+        "true",
+        { execId, deadlineMs: 60_000 },
+        instantRuntime(),
+      );
+    } catch (error) {
+      failure = error;
+    }
+    expect(failure).toBeInstanceOf(RunExecError);
+    expect((failure as RunExecError).message).toContain(
+      "failed after 9 consecutive attempts without receiving a frame",
+    );
+    expect((failure as RunExecError).stdout).toBe("progress");
+    expect(calls).toBe(16);
+  });
+
+  test("a mid-output stream error re-attaches for the tail and one real exit", async () => {
+    let calls = 0;
+    let exitFrames = 0;
+    const execId = "exec:session-stream-error:build";
+    const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
+    const server: ReviewSessionsClient = {
+      createSession: () => base.createSession(),
+      deleteSession: (req) => base.deleteSession(req),
+      cancelExec: (req) => base.cancelExec(req),
+      writeFiles: (req) => base.writeFiles(req),
+      sendPrompt: () => base.sendPrompt(),
+      exec(req): AsyncIterable<ExecFrame> {
+        const call = ++calls;
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { event: { case: "started", value: { execId } } };
+            if (call === 1) {
+              expect(req.stdoutOffset).toBe(0n);
+              yield {
+                event: { case: "stdout", value: encoder.encode("head-") },
+              };
+              throw new ConnectError(
+                "coordinator transport severed",
+                Code.Unavailable,
+              );
+            }
+            expect(req.stdoutOffset).toBe(5n);
+            yield {
+              event: { case: "stdout", value: encoder.encode("tail") },
+            };
+            exitFrames++;
+            yield {
+              event: { case: "exit", value: { exitStatus: 0 } },
+            };
+          },
+        };
+      },
+    };
+
+    const result = await runExec(
+      server,
+      "session-stream-error",
+      "build",
+      { execId, deadlineMs: 10_000 },
+      instantRuntime(),
+    );
+
+    expect(result).toEqual({
+      exitStatus: 0,
+      stdout: "head-tail",
+      stderr: "",
+    });
+    expect(calls).toBe(2);
+    expect(exitFrames).toBe(1);
   });
 
   test("deadline expiry throws and issues best-effort CancelExec", async () => {
@@ -406,7 +544,11 @@ describe("durable orchestrator exec caller", () => {
         { execId: "exec:session-protocol:true", deadlineMs: 10_000 },
         instantRuntime(),
       )).rejects.toBeInstanceOf(RunExecError);
-      expect(calls).toBe(9);
+      if (firstFrame === "missing") {
+        expect(calls).toBe(9);
+      } else {
+        expect(calls).toBeGreaterThan(9);
+      }
     }
   });
 

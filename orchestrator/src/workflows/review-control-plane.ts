@@ -252,7 +252,7 @@ const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
 const BOOTSTRAP_CLONE_DEADLINE_MS = 5 * 60_000;
 const MERGE_BASE_DEADLINE_MS = 60_000;
-const MAX_EXEC_REATTACH_ATTEMPTS = 8;
+const MAX_EXEC_CONSECUTIVE_NO_FRAME_REATTACH_ATTEMPTS = 8;
 const EXEC_REATTACH_BASE_DELAY_MS = 50;
 const EXEC_REATTACH_MAX_DELAY_MS = 1_000;
 
@@ -399,9 +399,10 @@ function isTerminalExecError(error: unknown): boolean {
   ].includes(error.code);
 }
 
-function reattachDelayMs(reattachAttempt: number): number {
+function reattachDelayMs(consecutiveNoFrameAttempts: number): number {
   return Math.min(
-    EXEC_REATTACH_BASE_DELAY_MS * 2 ** (reattachAttempt - 1),
+    EXEC_REATTACH_BASE_DELAY_MS *
+      2 ** (Math.max(1, consecutiveNoFrameAttempts) - 1),
     EXEC_REATTACH_MAX_DELAY_MS,
   );
 }
@@ -478,16 +479,14 @@ export async function runExec(
   };
 
   let lastFailure: AttemptFailure = { kind: "ended" };
+  let consecutiveNoFrameAttempts = 0;
   try {
-    for (
-      let attempt = 0;
-      attempt <= MAX_EXEC_REATTACH_ATTEMPTS;
-      attempt++
-    ) {
+    for (;;) {
       if (deadlineExpired()) expire();
 
       activeAttempt = new AbortController();
       let iterator: AsyncIterator<ReviewExecOutput> | undefined;
+      let receivedFrame = false;
       try {
         const stream = sessions.exec({
           sessionId,
@@ -520,59 +519,64 @@ export async function runExec(
         if (first.kind === "deadline") return expire();
         if (first.kind === "error") {
           lastFailure = { kind: "error", error: first.error };
-        } else if (
-          first.value.done
-          || first.value.value.event.case !== "started"
-        ) {
+        } else if (first.value.done) {
           lastFailure = {
             kind: "protocol",
-            message: first.value.done
-              ? "stream ended before ExecStarted"
-              : `first frame was ${first.value.value.event.case ?? "empty"}, not ExecStarted`,
+            message: "stream ended before ExecStarted",
           };
         } else {
-          const startedExecId = first.value.value.event.value.execId;
-          if (startedExecId === "") {
+          receivedFrame = true;
+          if (first.value.value.event.case !== "started") {
             lastFailure = {
               kind: "protocol",
-              message: "ExecStarted carried an empty exec_id",
+              message:
+                `first frame was ${first.value.value.event.case ?? "empty"}, not ExecStarted`,
             };
           } else {
-            if (canonicalExecId === undefined) canonicalExecId = startedExecId;
-            if (startedExecId !== canonicalExecId) {
+            const startedExecId = first.value.value.event.value.execId;
+            if (startedExecId === "") {
               lastFailure = {
                 kind: "protocol",
-                message: `expected ExecStarted{exec_id=${canonicalExecId}}, got ${startedExecId}`,
+                message: "ExecStarted carried an empty exec_id",
               };
             } else {
-              for (;;) {
-                const next = await nextFrame();
-                if (next.kind === "deadline") return expire();
-                if (next.kind === "error") {
-                  lastFailure = { kind: "error", error: next.error };
-                  break;
-                }
-                if (next.value.done) {
-                  lastFailure = { kind: "ended" };
-                  break;
-                }
-                const { event } = next.value.value;
-                if (event.case === "stdout") {
-                  stdoutChunks.push(event.value);
-                  stdoutOffset += BigInt(event.value.byteLength);
-                } else if (event.case === "stderr") {
-                  stderrChunks.push(event.value);
-                  stderrOffset += BigInt(event.value.byteLength);
-                } else if (event.case === "exit") {
-                  return { exitStatus: event.value.exitStatus, ...output() };
-                } else {
-                  lastFailure = {
-                    kind: "protocol",
-                    message: event.case === "started"
-                      ? "received duplicate ExecStarted frame"
-                      : "received empty exec frame",
-                  };
-                  break;
+              if (canonicalExecId === undefined) canonicalExecId = startedExecId;
+              if (startedExecId !== canonicalExecId) {
+                lastFailure = {
+                  kind: "protocol",
+                  message: `expected ExecStarted{exec_id=${canonicalExecId}}, got ${startedExecId}`,
+                };
+              } else {
+                for (;;) {
+                  const next = await nextFrame();
+                  if (next.kind === "deadline") return expire();
+                  if (next.kind === "error") {
+                    lastFailure = { kind: "error", error: next.error };
+                    break;
+                  }
+                  if (next.value.done) {
+                    lastFailure = { kind: "ended" };
+                    break;
+                  }
+                  receivedFrame = true;
+                  const { event } = next.value.value;
+                  if (event.case === "stdout") {
+                    stdoutChunks.push(event.value);
+                    stdoutOffset += BigInt(event.value.byteLength);
+                  } else if (event.case === "stderr") {
+                    stderrChunks.push(event.value);
+                    stderrOffset += BigInt(event.value.byteLength);
+                  } else if (event.case === "exit") {
+                    return { exitStatus: event.value.exitStatus, ...output() };
+                  } else {
+                    lastFailure = {
+                      kind: "protocol",
+                      message: event.case === "started"
+                        ? "received duplicate ExecStarted frame"
+                        : "received empty exec frame",
+                    };
+                    break;
+                  }
                 }
               }
             }
@@ -601,7 +605,15 @@ export async function runExec(
           lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
         );
       }
-      if (attempt === MAX_EXEC_REATTACH_ATTEMPTS) {
+      if (receivedFrame) {
+        consecutiveNoFrameAttempts = 0;
+      } else {
+        consecutiveNoFrameAttempts++;
+      }
+      if (
+        consecutiveNoFrameAttempts >
+          MAX_EXEC_CONSECUTIVE_NO_FRAME_REATTACH_ATTEMPTS
+      ) {
         const captured = output();
         if (lastFailure.kind === "ended") {
           return { exitStatus: undefined, ...captured };
@@ -612,7 +624,9 @@ export async function runExec(
           ? lastFailure.error.message
           : String(lastFailure.error);
         throw new RunExecError(
-          `exec ${canonicalExecId} failed after ${MAX_EXEC_REATTACH_ATTEMPTS} re-attach attempts: ${detail}`,
+          `exec ${canonicalExecId} failed after ${
+            MAX_EXEC_CONSECUTIVE_NO_FRAME_REATTACH_ATTEMPTS + 1
+          } consecutive attempts without receiving a frame: ${detail}`,
           captured.stdout,
           captured.stderr,
           lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
@@ -620,12 +634,11 @@ export async function runExec(
       }
 
       const delayMs = Math.min(
-        reattachDelayMs(attempt + 1),
+        reattachDelayMs(consecutiveNoFrameAttempts),
         Math.max(0, deadlineAt - runtime.nowMs()),
       );
       await waitFor(runtime.sleep(delayMs));
     }
-    throw new Error("unreachable durable exec retry state");
   } finally {
     activeAttempt?.abort();
     clearDeadline();

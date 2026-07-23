@@ -147,7 +147,8 @@ fn build_exec(
 
 /// One frame of the streaming-exec body (after the `started` frame the
 /// gRPC handler prepends). The terminal `Exit` carries the same
-/// coordinator-side wall-time rusage the SSE/sync paths compute.
+/// coordinator-side wall-time rusage the SSE/sync paths compute. A backend
+/// stream that ends without a real `Exit` yields a retryable error instead.
 #[derive(Debug)]
 pub enum ExecStreamEvent {
     Stdout(Vec<u8>),
@@ -160,8 +161,9 @@ pub enum ExecStreamEvent {
 
 /// Transport-agnostic `Exec` core. Resolves the exec env, auto-resumes the
 /// session, kicks off the backend exec stream, and returns `(exec_id, body)`
-/// where `body` yields stdout/stderr chunks then a terminal `Exit` —
-/// persisting each to the session bus exactly as the SSE handler does.
+/// where `body` yields stdout/stderr chunks then either a terminal `Exit` or
+/// a retryable error when the backend stream ends first — persisting each
+/// genuine event to the session bus exactly as the SSE handler does.
 ///
 /// Public so ADR 0103's co-simulator can exercise the real coordinator
 /// persistence path over the real host/guest exec protocol boundary.
@@ -178,6 +180,7 @@ pub async fn exec_stream_core(
 > {
     let (base_env, default_workdir) = session_exec_env(state, id).await;
     let wake = req.wake.unwrap_or(true);
+    let first_attach = req.stdout_offset.unwrap_or(0) == 0 && req.stderr_offset.unwrap_or(0) == 0;
     let (argv, mut sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
     let requested_exec_id = sandbox_req
         .exec_id
@@ -206,16 +209,22 @@ pub async fn exec_stream_core(
         )));
     }
 
-    state
-        .emit(
-            id,
-            SessionEvent::ExecStarted {
-                exec_id: exec_id.clone(),
-                command: argv.clone(),
-                at: state.services.clock.now_utc(),
-            },
-        )
-        .await?;
+    if first_attach {
+        // Re-attaches from delivered offsets must not duplicate lifecycle
+        // events. A re-attach from offset 0 after zero delivered bytes can
+        // still re-emit this event; consumers treat ExecStarted as
+        // idempotent per exec_id.
+        state
+            .emit(
+                id,
+                SessionEvent::ExecStarted {
+                    exec_id: exec_id.clone(),
+                    command: argv.clone(),
+                    at: state.services.clock.now_utc(),
+                },
+            )
+            .await?;
+    }
 
     let state_for_stream = state.clone();
     let exec_id_for_stream = exec_id.clone();
@@ -223,6 +232,7 @@ pub async fn exec_stream_core(
     let body = async_stream::stream! {
         let mut events = backend_stream.events;
         let mut exit_status = None;
+        let mut saw_exit = false;
         while let Some(ev) = events.next().await {
             match ev {
                 ExecEvent::Stdout(bytes) => {
@@ -249,9 +259,17 @@ pub async fn exec_stream_core(
                 }
                 ExecEvent::Exit(code) => {
                     exit_status = code;
+                    saw_exit = true;
                     break;
                 }
             }
+        }
+        if !saw_exit {
+            yield Err(ApiError::Unavailable(format!(
+                "exec {exec_id_for_stream} backend stream ended without an Exit frame; \
+                 its result may still be recoverable by re-attaching with the same exec_id"
+            )));
+            return;
         }
         let rusage = ExecRusage {
             wall_ms: state_for_stream
@@ -262,6 +280,9 @@ pub async fn exec_stream_core(
                 .as_millis() as u64,
             ..ExecRusage::default()
         };
+        // Remaining duplicates arise only from journal replays of an
+        // already-complete exec and are idempotent-by-content. A severed
+        // attempt never reaches this emit.
         let _ = state_for_stream
             .emit(id, SessionEvent::ExecCompleted {
                 exec_id: exec_id_for_stream.clone(),
@@ -297,7 +318,207 @@ pub(crate) async fn cancel_exec_core(
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use bytes::Bytes;
+    use engram_core::traits::{HostClient, MetadataStore, SessionFence};
+    use engram_core::types::egress::SessionEgressPolicy;
+    use engram_core::types::sandbox::{
+        AgentSpec, ExecRequest as HostExecRequest, ExecStream, SandboxProbe, SandboxSpec,
+    };
+    use engram_core::types::snapshot::SnapshotMetadata;
+    use engram_core::types::{SessionSpec, SessionState};
+    use engram_core::{SandboxError, SandboxId};
+    use engram_sim::{ManualClock, MemBlobStorage, SimEntropy, SimMetadataStore};
+
     use super::*;
+
+    struct StubExecHost {
+        streams: parking_lot::Mutex<VecDeque<Vec<ExecEvent>>>,
+    }
+
+    impl StubExecHost {
+        fn new(streams: impl IntoIterator<Item = Vec<ExecEvent>>) -> Self {
+            Self {
+                streams: parking_lot::Mutex::new(streams.into_iter().collect()),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl HostClient for StubExecHost {
+        async fn create(&self, _spec: SandboxSpec) -> Result<SandboxId, SandboxError> {
+            unreachable!("exec-core tests never create sandboxes")
+        }
+
+        async fn destroy(&self, _id: SandboxId, _fence: SessionFence) -> Result<(), SandboxError> {
+            unreachable!("exec-core tests never destroy sandboxes")
+        }
+
+        async fn list(&self) -> Result<Vec<SandboxId>, SandboxError> {
+            unreachable!("exec-core tests never list sandboxes")
+        }
+
+        async fn probe_sandbox(&self, _id: SandboxId) -> Result<SandboxProbe, SandboxError> {
+            unreachable!("exec-core tests never probe sandboxes")
+        }
+
+        async fn exec_stream(
+            &self,
+            id: SandboxId,
+            cmd: HostExecRequest,
+        ) -> Result<ExecStream, SandboxError> {
+            let events = self
+                .streams
+                .lock()
+                .pop_front()
+                .expect("one scripted host stream per exec call");
+            Ok(ExecStream {
+                sandbox_id: id,
+                exec_id: cmd.exec_id.expect("coordinator supplies exec_id"),
+                events: Box::pin(futures::stream::iter(events)),
+            })
+        }
+
+        async fn snapshot(
+            &self,
+            _id: SandboxId,
+            _fence: SessionFence,
+        ) -> Result<SnapshotMetadata, SandboxError> {
+            unreachable!("exec-core tests never snapshot sandboxes")
+        }
+
+        async fn restore(
+            &self,
+            _metadata: SnapshotMetadata,
+            _fence: SessionFence,
+        ) -> Result<SandboxId, SandboxError> {
+            unreachable!("exec-core tests never restore sandboxes")
+        }
+
+        async fn start_agent(
+            &self,
+            _id: SandboxId,
+            _agent: AgentSpec,
+            _policy: SessionEgressPolicy,
+            _fence: SessionFence,
+        ) -> Result<(), SandboxError> {
+            unreachable!("exec-core tests never start agents")
+        }
+
+        async fn apply_egress_policy(
+            &self,
+            _policy: SessionEgressPolicy,
+        ) -> Result<(), SandboxError> {
+            unreachable!("exec-core tests never apply egress policy")
+        }
+
+        async fn guest_ip(&self, _id: SandboxId) -> Option<std::net::Ipv4Addr> {
+            None
+        }
+
+        async fn bind_session(
+            &self,
+            _session_id: SessionId,
+            _sandbox_id: SandboxId,
+            _binding_epoch: u64,
+        ) {
+        }
+
+        async fn unbind_session(&self, _session_id: SessionId) {}
+
+        async fn send_prompt(
+            &self,
+            _sandbox_id: SandboxId,
+            _prompt_id: String,
+            _text: String,
+        ) -> Result<(), SandboxError> {
+            unreachable!("exec-core tests never send prompts")
+        }
+    }
+
+    fn exec_test_state(
+        streams: impl IntoIterator<Item = Vec<ExecEvent>>,
+    ) -> (SharedState, Arc<SimMetadataStore>) {
+        let clock = ManualClock::new();
+        let entropy = Arc::new(SimEntropy::seeded(0xE103));
+        let meta = SimMetadataStore::new(clock.clone(), entropy.clone());
+        let blob = Arc::new(MemBlobStorage::new());
+        let services = crate::Services {
+            meta: meta.clone(),
+            host: Arc::new(StubExecHost::new(streams)),
+            host_pool: Arc::new(engram_protocol::grpc_pool::GrpcHostPool::new()),
+            secrets: Arc::new(engram_secrets_dev::InMemorySecretStore::new()),
+            kek: Arc::new(engram_crypto::EnvVarKeyProvider::from_bytes(
+                [0u8; 32], "test:v1",
+            )),
+            oci: Arc::new(engram_oci::OciClient::new(Arc::new(
+                engram_oci::AnonymousResolver,
+            ))),
+            auth_resolver: Arc::new(engram_oci::AnonymousResolver),
+            blob: blob.clone(),
+            chunk_store: engram_chunk_store::ChunkStore::new(blob),
+            materialize_dir: None,
+            clock,
+            entropy,
+        };
+        (
+            Arc::new(crate::AppState::new(
+                crate::CoordinatorConfig::default(),
+                services,
+            )),
+            meta,
+        )
+    }
+
+    async fn stage_exec_session(meta: &Arc<SimMetadataStore>) -> (SessionId, SandboxId) {
+        let sandbox_id = SandboxId::new();
+        let session_id = meta
+            .create_session(SessionSpec {
+                image: "test.invalid/exec:latest".into(),
+                mode: Default::default(),
+            })
+            .await
+            .expect("create exec test session");
+        meta.transition_session_created(session_id, sandbox_id)
+            .await
+            .expect("bind exec test sandbox");
+        meta.transition_session(session_id, SessionState::Active)
+            .await
+            .expect("activate exec test session");
+        (session_id, sandbox_id)
+    }
+
+    fn durable_req(
+        exec_id: &str,
+        stdout_offset: Option<u64>,
+        stderr_offset: Option<u64>,
+    ) -> ExecRequest {
+        ExecRequest {
+            command: Some("true".into()),
+            argv: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout_secs: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset,
+            stderr_offset,
+            wake: Some(false),
+        }
+    }
+
+    fn event_kinds(meta: &SimMetadataStore, session_id: SessionId) -> Vec<String> {
+        meta.with_db(|db| {
+            db.session_events
+                .get(&session_id)
+                .into_iter()
+                .flatten()
+                .map(|event| event.kind.clone())
+                .collect()
+        })
+    }
 
     fn req(env: &[(&str, &str)], workdir: Option<&str>) -> ExecRequest {
         ExecRequest {
@@ -401,5 +622,99 @@ mod tests {
         // Neither set → None (sandbox's own default cwd).
         let (_c, neither) = build_exec(req(&[], None), session, base(&[]), None).unwrap();
         assert_eq!(neither.workdir, None);
+    }
+
+    #[tokio::test]
+    async fn exec_started_is_persisted_only_for_zero_offset_attaches() {
+        for (stdout_offset, stderr_offset, expected_started) in [
+            (None, None, 1),
+            (Some(0), Some(0), 1),
+            (Some(6), Some(0), 0),
+        ] {
+            let (state, meta) = exec_test_state([vec![ExecEvent::Exit(Some(0))]]);
+            let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+            let (_exec_id, mut body) = exec_stream_core(
+                &state,
+                session_id,
+                durable_req("exec:lifecycle", stdout_offset, stderr_offset),
+            )
+            .await
+            .expect("start exec stream");
+            while let Some(item) = body.next().await {
+                item.expect("genuine exit stream is successful");
+            }
+
+            let started = event_kinds(&meta, session_id)
+                .into_iter()
+                .filter(|kind| kind == "exec_started")
+                .count();
+            assert_eq!(
+                started, expected_started,
+                "stdout_offset={stdout_offset:?}, stderr_offset={stderr_offset:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn backend_end_without_exit_yields_retryable_error_and_no_completion() {
+        let (state, meta) =
+            exec_test_state([vec![ExecEvent::Stdout(Bytes::from_static(b"partial"))]]);
+        let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+        let (_exec_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req("exec:severed", None, None))
+                .await
+                .expect("start exec stream");
+
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Stdout(bytes))) if bytes == b"partial"
+        ));
+        match body.next().await {
+            Some(Err(ApiError::Unavailable(message))) => {
+                assert!(message.contains("recoverable"));
+                assert!(message.contains("same exec_id"));
+            }
+            other => panic!("expected retryable unavailable error, got {other:?}"),
+        }
+        assert!(body.next().await.is_none());
+
+        let kinds = event_kinds(&meta, session_id);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| kind.as_str() == "exec_completed")
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn genuine_exit_persists_exactly_one_completion() {
+        let (state, meta) = exec_test_state([vec![ExecEvent::Exit(Some(7))]]);
+        let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+        let (_exec_id, mut body) = exec_stream_core(
+            &state,
+            session_id,
+            durable_req("exec:completed", None, None),
+        )
+        .await
+        .expect("start exec stream");
+
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Exit {
+                exit_status: Some(7),
+                ..
+            }))
+        ));
+        assert!(body.next().await.is_none());
+        let kinds = event_kinds(&meta, session_id);
+        assert_eq!(
+            kinds
+                .iter()
+                .filter(|kind| kind.as_str() == "exec_completed")
+                .count(),
+            1
+        );
     }
 }

@@ -1183,13 +1183,12 @@ impl GrpcHostClient {
                     },
                     Ok(None) => break,
                     Err(e) => {
-                        // Surface gRPC-level errors as an Exit(None)
-                        // so the demuxer downstream still terminates
-                        // cleanly. The error is logged here so it's
-                        // visible even if the consumer drops the
-                        // stream early.
-                        tracing::warn!(error = %e, "exec_start stream error; emitting Exit(None)");
-                        yield ExecEvent::Exit(None);
+                        // A host/coordinator transport loss says nothing
+                        // about the durable guest journal's result. End
+                        // without Exit so the coordinator surfaces a
+                        // retryable stream error and the caller can attach
+                        // again with the same exec_id and offsets.
+                        tracing::warn!(error = %e, "exec_start stream error; ending without Exit");
                         break;
                     }
                 }

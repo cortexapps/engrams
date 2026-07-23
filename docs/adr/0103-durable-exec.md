@@ -309,6 +309,25 @@ can no longer lose a result that was merely delayed.
   cannot outrun subprocess I/O through reconnect backoffs or journal grace
   windows.
 
+### Review hardening (2026-07-23)
+
+- A fabricated terminal `Exit(None)` is now reserved for cases where another
+  attach is unsafe: old-agentd rollout skew (double-spawn risk), a degraded or
+  missing/GC'd journal, command/exec identity mismatch, a command that died
+  without recording an exit, and explicit cancel/timeout kills. Transport loss
+  while the durable ticket remains valid ends without `Exit`; the coordinator
+  turns that into a retryable stream error so the caller can attach again.
+- The fabricated-terminal audit covered all four recovery layers: `runExec` no
+  longer abandons healthy progressive re-attaches; coordinator lifecycle
+  persistence suppresses offset re-attach `ExecStarted` duplicates and records
+  `ExecCompleted` only for a real Exit; the coord→host gRPC adapter no longer
+  converts stream errors into null exits; and the Firecracker reader no longer
+  converts durable EOF/reconnect failures into null exits.
+- `runExec`'s retry cap counts consecutive attempts that received no frame.
+  Any `ExecStarted`, stdout, or stderr frame resets both that counter and its
+  backoff; an exec that keeps making progress is bounded by its deadline, not
+  by a lifetime attach count.
+
 ## Alternatives considered
 
 - **In-memory ring buffer in agentd + replay verb.** Rejected: bounded by
