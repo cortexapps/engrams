@@ -112,6 +112,26 @@ pub struct IdleScanCandidate {
     pub shell_pinned_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// ADR 0103: the two durable-exec lifecycle markers in the session event
+/// log. Typed (rather than a raw kind string) so
+/// [`MetadataStore::session_exec_event_logged_at`] can only be asked about
+/// kinds whose payloads are guaranteed to carry an `exec_id`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecLifecycleEventKind {
+    Started,
+    Completed,
+}
+
+impl ExecLifecycleEventKind {
+    /// The `session_events.kind` discriminant this variant matches.
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            Self::Started => "exec_started",
+            Self::Completed => "exec_completed",
+        }
+    }
+}
+
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
 /// we can support SQLite for embedded deployments later.
 #[async_trait]
@@ -1728,20 +1748,26 @@ pub trait MetadataStore: Send + Sync {
 
     // ---- session event log ----
 
-    /// Return whether this session's durable event log already contains an
-    /// `exec_started` event for `exec_id`. Durable zero-byte re-attaches use
-    /// this to keep `ExecStarted` idempotent even when both replay offsets are
-    /// still zero.
+    /// Earliest recorded timestamp of the given exec lifecycle event for
+    /// `exec_id` in this session's durable event log, or `None` if absent.
     ///
-    /// Default false keeps event-less mock stores lightweight.
+    /// ADR 0103 uses this for two duties on the durable exec path: lifecycle
+    /// dedup on re-attach (presence check for both `exec_started` and
+    /// `exec_completed`, keyed by exec_id — replay offsets can legitimately
+    /// still be zero), and honest `wall_ms` accounting measured from the
+    /// logged start rather than from the attach segment that happened to
+    /// deliver the Exit.
+    ///
+    /// Default `None` keeps event-less mock stores lightweight.
     /// `PostgresStore` and `SimMetadataStore` implement the real event-log
-    /// predicate, covered by the ADR 0098 D4 conformance suite.
-    async fn session_exec_started_exists(
+    /// query, covered by the ADR 0098 D4 conformance suite.
+    async fn session_exec_event_logged_at(
         &self,
         _session_id: SessionId,
         _exec_id: &str,
-    ) -> Result<bool, MetaError> {
-        Ok(false)
+        _kind: ExecLifecycleEventKind,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+        Ok(None)
     }
 
     /// Append an event to a session's persistent log. Returns the

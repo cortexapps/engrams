@@ -65,50 +65,108 @@ async fn pg_ctx() -> Option<Ctx> {
     })
 }
 
-/// ADR 0103: zero-byte durable re-attaches must deduplicate the lifecycle
-/// event by exec_id, not by offsets (which legitimately remain `(0, 0)`).
-async fn session_exec_started_exists(ctx: &Ctx) {
+/// ADR 0103: durable re-attaches deduplicate lifecycle events by exec_id
+/// (offsets legitimately remain `(0, 0)`), and `wall_ms` is measured from
+/// the logged start. Every predicate clause is pinned: exec_id match,
+/// session scoping, kind filter (other event kinds also carry `exec_id`
+/// in their payloads), and MIN over duplicates.
+async fn session_exec_event_logged_at(ctx: &Ctx) {
+    use engram_core::traits::ExecLifecycleEventKind::{Completed, Started};
+
     let sid = ctx
         .meta
         .create_session(spec("test.invalid/exec-started:latest"))
         .await
         .unwrap();
+    let other_sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-started-other:latest"))
+        .await
+        .unwrap();
+    let exec_event = |kind: &str| {
+        serde_json::json!({
+            "type": kind,
+            "exec_id": "exec:present",
+            "command": ["true"],
+            "at": ctx.clock.now_utc(),
+        })
+    };
 
-    assert!(
-        !ctx.meta
-            .session_exec_started_exists(sid, "exec:present")
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_logged_at(sid, "exec:present", Started)
             .await
             .unwrap(),
+        None,
         "an absent exec_id must not match"
     );
 
+    // Same exec_id in a DIFFERENT session: the session_id clause is the
+    // isolation boundary between sessions' exec dedup.
+    ctx.meta
+        .append_session_event(other_sid, "exec_started", exec_event("exec_started"))
+        .await
+        .unwrap();
+    // Same exec_id under OTHER kinds in the same session: output and
+    // completion events also carry `exec_id`, so only the kind filter
+    // keeps them from satisfying a Started query.
     ctx.meta
         .append_session_event(
             sid,
-            "exec_started",
-            serde_json::json!({
-                "type": "exec_started",
-                "exec_id": "exec:present",
-                "command": ["true"],
-                "at": ctx.clock.now_utc(),
-            }),
+            "stdout",
+            serde_json::json!({ "type": "stdout", "exec_id": "exec:present", "chunk": "hi" }),
         )
         .await
         .unwrap();
-
-    assert!(
+    ctx.meta
+        .append_session_event(sid, "exec_completed", exec_event("exec_completed"))
+        .await
+        .unwrap();
+    assert_eq!(
         ctx.meta
-            .session_exec_started_exists(sid, "exec:present")
+            .session_exec_event_logged_at(sid, "exec:present", Started)
             .await
             .unwrap(),
-        "the persisted exec_id must match"
+        None,
+        "another session's exec_started and this session's non-started kinds must not match"
+    );
+
+    let first_started_at = ctx.clock.now_utc();
+    ctx.meta
+        .append_session_event(sid, "exec_started", exec_event("exec_started"))
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_millis(1500));
+    // A residual concurrent-attach duplicate must not move the timestamp:
+    // the earliest occurrence wins (SQL MIN).
+    ctx.meta
+        .append_session_event(sid, "exec_started", exec_event("exec_started"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_logged_at(sid, "exec:present", Started)
+            .await
+            .unwrap(),
+        Some(first_started_at),
+        "the persisted exec_id must match at its FIRST logged timestamp"
+    );
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_logged_at(sid, "exec:different", Started)
+            .await
+            .unwrap(),
+        None,
+        "a different exec_id must not match"
     );
     assert!(
-        !ctx.meta
-            .session_exec_started_exists(sid, "exec:different")
+        ctx.meta
+            .session_exec_event_logged_at(sid, "exec:present", Completed)
             .await
-            .unwrap(),
-        "a different exec_id must not match"
+            .unwrap()
+            .is_some(),
+        "the Completed kind resolves independently of Started"
     );
 }
 
@@ -1876,8 +1934,8 @@ conformance!(
 conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(
-    t_session_exec_started_exists,
-    super::session_exec_started_exists
+    t_session_exec_event_logged_at,
+    super::session_exec_event_logged_at
 );
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
 conformance!(

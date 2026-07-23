@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 use std::time::Duration;
 
+use engram_core::traits::ExecLifecycleEventKind;
 use engram_core::types::{ExecEvent, ExecRequest as SandboxExecRequest, ExecRusage};
 use engram_core::SessionId;
 use futures::stream::{Stream, StreamExt};
@@ -212,11 +213,12 @@ pub async fn exec_stream_core(
     let emit_exec_started = if !zero_offsets {
         false
     } else if caller_supplied_exec_id {
-        !state
+        state
             .services
             .meta
-            .session_exec_started_exists(id, &exec_id)
+            .session_exec_event_logged_at(id, &exec_id, ExecLifecycleEventKind::Started)
             .await?
+            .is_none()
     } else {
         // A coordinator-minted id cannot be a re-attach: the caller did not
         // know the ticket before this request.
@@ -284,27 +286,74 @@ pub async fn exec_stream_core(
             )));
             return;
         }
-        let rusage = ExecRusage {
-            wall_ms: state_for_stream
+        // wall_ms spans from the LOGGED exec_started to this Exit. On the
+        // ADR's happy path the Exit is delivered by a later re-attach, so
+        // the delivering segment is only a fraction of the exec's real
+        // runtime; the attach-segment measure is kept as the fallback for
+        // stores without the event log (or a failed lookup).
+        let logged_started_at = state_for_stream
+            .services
+            .meta
+            .session_exec_event_logged_at(
+                id,
+                &exec_id_for_stream,
+                ExecLifecycleEventKind::Started,
+            )
+            .await
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "exec_started lookup failed; wall_ms falls back to the attach segment",
+                );
+                None
+            });
+        let wall_ms = match logged_started_at {
+            Some(started) => (state_for_stream.services.clock.now_utc() - started)
+                .num_milliseconds()
+                .max(0) as u64,
+            None => state_for_stream
                 .services
                 .clock
                 .now_mono()
                 .saturating_sub(started_at)
                 .as_millis() as u64,
+        };
+        let rusage = ExecRusage {
+            wall_ms,
             ..ExecRusage::default()
         };
-        // Remaining duplicates arise only from journal replays of an
-        // already-complete exec and are idempotent-by-content. A severed
-        // attempt never reaches this emit.
-        let _ = state_for_stream
-            .emit(id, SessionEvent::ExecCompleted {
-                exec_id: exec_id_for_stream.clone(),
-                exit_status,
-                rusage,
-                at: state_for_stream.services.clock.now_utc(),
-            })
+        // A journal replay of an already-complete exec reaches a real Exit
+        // on EVERY attach, so completion is deduplicated by exec_id against
+        // the durable log — same residual concurrent-attach race as the
+        // ExecStarted dedup above; a failed lookup degrades to at-least-once.
+        let already_completed = state_for_stream
+            .services
+            .meta
+            .session_exec_event_logged_at(
+                id,
+                &exec_id_for_stream,
+                ExecLifecycleEventKind::Completed,
+            )
             .await
-            .map_err(|e| tracing::warn!(error = %e, "exec_completed event persistence failed"));
+            .unwrap_or_else(|e| {
+                tracing::warn!(
+                    error = %e,
+                    "exec_completed dedup lookup failed; emitting (at-least-once)",
+                );
+                None
+            })
+            .is_some();
+        if !already_completed {
+            let _ = state_for_stream
+                .emit(id, SessionEvent::ExecCompleted {
+                    exec_id: exec_id_for_stream.clone(),
+                    exit_status,
+                    rusage,
+                    at: state_for_stream.services.clock.now_utc(),
+                })
+                .await
+                .map_err(|e| tracing::warn!(error = %e, "exec_completed event persistence failed"));
+        }
         yield Ok(ExecStreamEvent::Exit { exit_status, rusage });
     };
 
@@ -454,7 +503,7 @@ mod tests {
 
     fn exec_test_state(
         streams: impl IntoIterator<Item = Vec<ExecEvent>>,
-    ) -> (SharedState, Arc<SimMetadataStore>) {
+    ) -> (SharedState, Arc<SimMetadataStore>, Arc<ManualClock>) {
         let clock = ManualClock::new();
         let entropy = Arc::new(SimEntropy::seeded(0xE103));
         let meta = SimMetadataStore::new(clock.clone(), entropy.clone());
@@ -474,7 +523,7 @@ mod tests {
             blob: blob.clone(),
             chunk_store: engram_chunk_store::ChunkStore::new(blob),
             materialize_dir: None,
-            clock,
+            clock: clock.clone(),
             entropy,
         };
         (
@@ -483,6 +532,7 @@ mod tests {
                 services,
             )),
             meta,
+            clock,
         )
     }
 
@@ -662,7 +712,7 @@ mod tests {
             (Some(0), Some(0), 1),
             (Some(6), Some(0), 0),
         ] {
-            let (state, meta) = exec_test_state([vec![ExecEvent::Exit(Some(0))]]);
+            let (state, meta, _clock) = exec_test_state([vec![ExecEvent::Exit(Some(0))]]);
             let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
             let (_exec_id, mut body) = exec_stream_core(
                 &state,
@@ -688,7 +738,7 @@ mod tests {
 
     #[tokio::test]
     async fn zero_byte_reattach_deduplicates_exec_started_by_exec_id() {
-        let (state, meta) = exec_test_state([
+        let (state, meta, _clock) = exec_test_state([
             vec![ExecEvent::Exit(Some(0))],
             vec![ExecEvent::Exit(Some(0))],
             vec![ExecEvent::Exit(Some(0))],
@@ -713,7 +763,7 @@ mod tests {
 
     #[tokio::test]
     async fn backend_end_without_exit_yields_retryable_error_and_no_completion() {
-        let (state, meta) =
+        let (state, meta, _clock) =
             exec_test_state([vec![ExecEvent::Stdout(Bytes::from_static(b"partial"))]]);
         let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
         let (_exec_id, mut body) =
@@ -746,7 +796,7 @@ mod tests {
 
     #[tokio::test]
     async fn genuine_exit_persists_exactly_one_completion() {
-        let (state, meta) = exec_test_state([vec![ExecEvent::Exit(Some(7))]]);
+        let (state, meta, _clock) = exec_test_state([vec![ExecEvent::Exit(Some(7))]]);
         let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
         let (_exec_id, mut body) = exec_stream_core(
             &state,
@@ -771,6 +821,81 @@ mod tests {
                 .filter(|kind| kind.as_str() == "exec_completed")
                 .count(),
             1
+        );
+    }
+
+    /// The ADR's own happy path: a checkpoint severs the delivering attach,
+    /// the caller re-attaches, and the journal's Exit lands on a LATER
+    /// `exec_stream_core` call. `exec_completed` must land exactly once and
+    /// `wall_ms` must span from the logged `exec_started`, not just the
+    /// attach segment that happened to deliver the Exit.
+    #[tokio::test]
+    async fn completed_journal_replay_deduplicates_exec_completed_with_true_wall() {
+        let (state, meta, clock) = exec_test_state([
+            // Attach 1: severed after partial output, no Exit.
+            vec![ExecEvent::Stdout(Bytes::from_static(b"partial"))],
+            // Attach 2: the journal delivers the real Exit.
+            vec![ExecEvent::Exit(Some(0))],
+            // Attach 3: a later caller replays the already-complete journal.
+            vec![ExecEvent::Exit(Some(0))],
+        ]);
+        let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+        let exec_id = "exec:true-wall";
+
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, None, None))
+                .await
+                .expect("start exec stream");
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Stdout(bytes))) if bytes == b"partial"
+        ));
+        assert!(matches!(
+            body.next().await,
+            Some(Err(ApiError::Unavailable(_)))
+        ));
+        assert!(body.next().await.is_none());
+
+        // The command keeps running in the guest for a minute before the
+        // caller's re-attach picks the result up.
+        clock.advance(Duration::from_secs(60));
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, Some(7), Some(0)))
+                .await
+                .expect("re-attach exec stream");
+        match body.next().await {
+            Some(Ok(ExecStreamEvent::Exit {
+                exit_status: Some(0),
+                rusage,
+            })) => assert_eq!(
+                rusage.wall_ms, 60_000,
+                "wall_ms must span from the logged exec_started, not the delivering attach segment"
+            ),
+            other => panic!("expected the journal's Exit, got {other:?}"),
+        }
+        assert!(body.next().await.is_none());
+
+        clock.advance(Duration::from_secs(10));
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, Some(7), Some(0)))
+                .await
+                .expect("replay exec stream");
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Exit {
+                exit_status: Some(0),
+                ..
+            }))
+        ));
+        assert!(body.next().await.is_none());
+
+        let completions = event_kinds(&meta, session_id)
+            .into_iter()
+            .filter(|kind| kind == "exec_completed")
+            .count();
+        assert_eq!(
+            completions, 1,
+            "a replay of an already-complete journal must not append another exec_completed"
         );
     }
 }

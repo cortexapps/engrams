@@ -341,12 +341,12 @@ describe("durable orchestrator exec caller", () => {
       { execId: "exec:session-no-frames:true", deadlineMs: 60_000 },
       instantRuntime(),
     )).rejects.toThrow(
-      "failed after 9 consecutive attempts without receiving a frame",
+      "failed after 9 consecutive attempts without progress",
     );
     expect(calls).toBe(9);
   });
 
-  test("a received frame resets the consecutive no-frame retry budget", async () => {
+  test("byte progress resets the consecutive no-progress retry budget", async () => {
     let calls = 0;
     const error = new ConnectError("stream unavailable", Code.Unavailable);
     const execId = "exec:session-reset:true";
@@ -387,10 +387,85 @@ describe("durable orchestrator exec caller", () => {
     }
     expect(failure).toBeInstanceOf(RunExecError);
     expect((failure as RunExecError).message).toContain(
-      "failed after 9 consecutive attempts without receiving a frame",
+      "failed after 9 consecutive attempts without progress",
     );
     expect((failure as RunExecError).stdout).toBe("progress");
     expect(calls).toBe(16);
+  });
+
+  test("a bare ExecStarted with no output does not reset the retry budget", async () => {
+    // The coordinator's gRPC handler prepends Started{exec_id} on EVERY
+    // attach, so "received a frame" is not progress: a start-then-fail loop
+    // must consume the budget with growing backoff, not hammer at the floor
+    // for the whole deadline.
+    let calls = 0;
+    const execId = "exec:session-started-only:true";
+    const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
+    const server: ReviewSessionsClient = {
+      createSession: () => base.createSession(),
+      deleteSession: (req) => base.deleteSession(req),
+      cancelExec: (req) => base.cancelExec(req),
+      writeFiles: (req) => base.writeFiles(req),
+      sendPrompt: () => base.sendPrompt(),
+      exec(): AsyncIterable<ExecFrame> {
+        calls++;
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { event: { case: "started", value: { execId } } };
+            throw new ConnectError(
+              "stream severed after started",
+              Code.Unavailable,
+            );
+          },
+        };
+      },
+    };
+
+    const runtime = instantRuntime();
+    await expect(runExec(
+      server,
+      "session-started-only",
+      "true",
+      { execId, deadlineMs: 600_000 },
+      runtime,
+    )).rejects.toThrow(
+      "failed after 9 consecutive attempts without progress",
+    );
+    expect(calls).toBe(9);
+    // Exponential backoff actually grew: 8 sleeps starting at 50ms and
+    // doubling dwarf a flat 8×50ms floor.
+    expect(runtime.elapsedMs()).toBeGreaterThan(1_000);
+  });
+
+  test("a repeated protocol violation exhausts the budget instead of retrying to the deadline", async () => {
+    let calls = 0;
+    const execId = "exec:session-proto:true";
+    const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
+    const server: ReviewSessionsClient = {
+      createSession: () => base.createSession(),
+      deleteSession: (req) => base.deleteSession(req),
+      cancelExec: (req) => base.cancelExec(req),
+      writeFiles: (req) => base.writeFiles(req),
+      sendPrompt: () => base.sendPrompt(),
+      exec(): AsyncIterable<ExecFrame> {
+        calls++;
+        return {
+          async *[Symbol.asyncIterator]() {
+            yield { event: { case: "started", value: { execId } } };
+            yield { event: { case: "started", value: { execId } } };
+          },
+        };
+      },
+    };
+
+    await expect(runExec(
+      server,
+      "session-proto",
+      "true",
+      { execId, deadlineMs: 600_000 },
+      instantRuntime(),
+    )).rejects.toThrow("received duplicate ExecStarted frame");
+    expect(calls).toBe(9);
   });
 
   test("a mid-output stream error re-attaches for the tail and one real exit", async () => {
@@ -544,11 +619,10 @@ describe("durable orchestrator exec caller", () => {
         { execId: "exec:session-protocol:true", deadlineMs: 10_000 },
         instantRuntime(),
       )).rejects.toBeInstanceOf(RunExecError);
-      if (firstFrame === "missing") {
-        expect(calls).toBe(9);
-      } else {
-        expect(calls).toBeGreaterThan(9);
-      }
+      // Both are protocol violations with zero byte progress, so both are
+      // bounded by the no-progress budget — a deterministic mismatch must
+      // not be retried until the deadline.
+      expect(calls).toBe(9);
     }
   });
 

@@ -252,7 +252,12 @@ const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
 const BOOTSTRAP_CLONE_DEADLINE_MS = 5 * 60_000;
 const MERGE_BASE_DEADLINE_MS = 60_000;
-const MAX_EXEC_CONSECUTIVE_NO_FRAME_REATTACH_ATTEMPTS = 8;
+// "Progress" means the replay offsets advanced (stdout/stderr bytes landed).
+// A bare ExecStarted frame does NOT count: the coordinator's gRPC handler
+// prepends Started{exec_id} on every attach it answers, so counting frames
+// would reset this budget on every start-then-fail attempt — an unbounded
+// 50ms retry storm until the deadline (review round 7).
+const MAX_EXEC_CONSECUTIVE_NO_PROGRESS_REATTACH_ATTEMPTS = 8;
 const EXEC_REATTACH_BASE_DELAY_MS = 50;
 const EXEC_REATTACH_MAX_DELAY_MS = 1_000;
 
@@ -399,10 +404,10 @@ function isTerminalExecError(error: unknown): boolean {
   ].includes(error.code);
 }
 
-function reattachDelayMs(consecutiveNoFrameAttempts: number): number {
+function reattachDelayMs(consecutiveNoProgressAttempts: number): number {
   return Math.min(
     EXEC_REATTACH_BASE_DELAY_MS *
-      2 ** (Math.max(1, consecutiveNoFrameAttempts) - 1),
+      2 ** (Math.max(1, consecutiveNoProgressAttempts) - 1),
     EXEC_REATTACH_MAX_DELAY_MS,
   );
 }
@@ -479,14 +484,15 @@ export async function runExec(
   };
 
   let lastFailure: AttemptFailure = { kind: "ended" };
-  let consecutiveNoFrameAttempts = 0;
+  let consecutiveNoProgressAttempts = 0;
   try {
     for (;;) {
       if (deadlineExpired()) expire();
 
       activeAttempt = new AbortController();
       let iterator: AsyncIterator<ReviewExecOutput> | undefined;
-      let receivedFrame = false;
+      const attemptStdoutStart = stdoutOffset;
+      const attemptStderrStart = stderrOffset;
       try {
         const stream = sessions.exec({
           sessionId,
@@ -525,7 +531,6 @@ export async function runExec(
             message: "stream ended before ExecStarted",
           };
         } else {
-          receivedFrame = true;
           if (first.value.value.event.case !== "started") {
             lastFailure = {
               kind: "protocol",
@@ -558,7 +563,6 @@ export async function runExec(
                     lastFailure = { kind: "ended" };
                     break;
                   }
-                  receivedFrame = true;
                   const { event } = next.value.value;
                   if (event.case === "stdout") {
                     stdoutChunks.push(event.value);
@@ -605,14 +609,16 @@ export async function runExec(
           lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
         );
       }
-      if (receivedFrame) {
-        consecutiveNoFrameAttempts = 0;
+      if (
+        stdoutOffset > attemptStdoutStart || stderrOffset > attemptStderrStart
+      ) {
+        consecutiveNoProgressAttempts = 0;
       } else {
-        consecutiveNoFrameAttempts++;
+        consecutiveNoProgressAttempts++;
       }
       if (
-        consecutiveNoFrameAttempts >
-          MAX_EXEC_CONSECUTIVE_NO_FRAME_REATTACH_ATTEMPTS
+        consecutiveNoProgressAttempts >
+          MAX_EXEC_CONSECUTIVE_NO_PROGRESS_REATTACH_ATTEMPTS
       ) {
         const captured = output();
         if (lastFailure.kind === "ended") {
@@ -625,8 +631,8 @@ export async function runExec(
           : String(lastFailure.error);
         throw new RunExecError(
           `exec ${canonicalExecId} failed after ${
-            MAX_EXEC_CONSECUTIVE_NO_FRAME_REATTACH_ATTEMPTS + 1
-          } consecutive attempts without receiving a frame: ${detail}`,
+            MAX_EXEC_CONSECUTIVE_NO_PROGRESS_REATTACH_ATTEMPTS + 1
+          } consecutive attempts without progress: ${detail}`,
           captured.stdout,
           captured.stderr,
           lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
@@ -634,7 +640,7 @@ export async function runExec(
       }
 
       const delayMs = Math.min(
-        reattachDelayMs(consecutiveNoFrameAttempts),
+        reattachDelayMs(consecutiveNoProgressAttempts),
         Math.max(0, deadlineAt - runtime.nowMs()),
       );
       await waitFor(runtime.sleep(delayMs));

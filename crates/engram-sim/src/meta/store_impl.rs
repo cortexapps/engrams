@@ -8,8 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::metadata::{
-    CreateDisposition, DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, PlacementNoFit,
-    SessionCreateWriteSet, SnapshotTotals,
+    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, GcCandidateRow,
+    MetadataStore, PlacementNoFit, SessionCreateWriteSet, SnapshotTotals,
 };
 use engram_core::types::capability::Capability;
 use engram_core::types::capture_job::{
@@ -945,22 +945,28 @@ impl MetadataStore for SimMetadataStore {
 
     // ================= session events =================
 
-    async fn session_exec_started_exists(
+    async fn session_exec_event_logged_at(
         &self,
         session_id: SessionId,
         exec_id: &str,
-    ) -> Result<bool, MetaError> {
+        kind: ExecLifecycleEventKind,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        Ok(db.session_events.get(&session_id).is_some_and(|events| {
-            events.iter().any(|event| {
-                event.kind == "exec_started"
-                    && event
-                        .payload
-                        .get("exec_id")
-                        .and_then(serde_json::Value::as_str)
-                        == Some(exec_id)
-            })
+        // `SELECT MIN(created_at) ... WHERE kind = $2 AND payload->>'exec_id' = $3`
+        Ok(db.session_events.get(&session_id).and_then(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.kind == kind.kind_str()
+                        && event
+                            .payload
+                            .get("exec_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(exec_id)
+                })
+                .map(|event| event.created_at)
+                .min()
         }))
     }
 

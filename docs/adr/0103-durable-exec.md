@@ -359,6 +359,27 @@ can no longer lose a result that was merely delayed.
   SpawnHarness 60s/attempt) or pre-application handshakes served by the
   always-running muxer with EOF-shaped retry (`connect_fc_vsock`), so the
   probe/cancel/upload trio closed the last unbounded reads on this class.
+- Progress means bytes, not frames: the coordinator's gRPC handler prepends
+  `Started{exec_id}` on every attach it answers, so `runExec`'s retry budget
+  counts consecutive attempts whose replay offsets did not advance. Counting
+  frames made the budget dead code on the production path — a start-then-fail
+  loop reset it every attempt and hammered re-attach at the 50 ms floor for
+  the whole deadline, and deterministic protocol violations (duplicate or
+  mismatched `ExecStarted`) retried until the deadline instead of bounding at
+  the same budget.
+- Completion accounting mirrors the start-side dedup: `ExecCompleted` is
+  deduplicated by exec_id against the durable log (a journal replay of an
+  already-complete exec reaches a real Exit on every attach), and `wall_ms`
+  spans from the logged `exec_started` to the Exit rather than the attach
+  segment that happened to deliver it. The store method generalized to
+  `session_exec_event_logged_at` (kind-typed, `MIN(created_at)`); its D4
+  conformance scenario pins every predicate clause — exec_id match, session
+  scoping, kind filter (stdout/completed payloads also carry exec_id), and
+  first-occurrence-wins over duplicates. Acknowledged residual: a re-attach
+  from offset zero after delivery (a replayed orchestrator step) re-persists
+  stdout/stderr rows — output chunks carry no offsets, so exactly-once
+  output rows would need an offset-keyed schema; accepted for ephemeral
+  review sessions.
 
 ## Alternatives considered
 

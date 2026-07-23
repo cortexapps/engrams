@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::clock::{Clock, Entropy, OsEntropy, SystemClock};
 use engram_core::traits::{
-    CreateDisposition, DisableEnabledImageOutcome, MetadataStore, SessionCreateWriteSet,
+    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, MetadataStore,
+    SessionCreateWriteSet,
 };
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
@@ -4059,23 +4060,25 @@ impl MetadataStore for PostgresStore {
             .collect()
     }
 
-    async fn session_exec_started_exists(
+    async fn session_exec_event_logged_at(
         &self,
         session_id: SessionId,
         exec_id: &str,
-    ) -> Result<bool, MetaError> {
+        kind: ExecLifecycleEventKind,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+        // MIN: the first logged occurrence is the authoritative one — a
+        // residual concurrent-attach duplicate must not move the timestamp.
         sqlx::query_scalar(
             r#"
-            SELECT EXISTS(
-                SELECT 1
-                  FROM session_events
-                 WHERE session_id = $1
-                   AND kind = 'exec_started'
-                   AND payload->>'exec_id' = $2
-            )
+            SELECT MIN(created_at)
+              FROM session_events
+             WHERE session_id = $1
+               AND kind = $2
+               AND payload->>'exec_id' = $3
             "#,
         )
         .bind(session_id.as_uuid())
+        .bind(kind.kind_str())
         .bind(exec_id)
         .fetch_one(&self.pool)
         .await
