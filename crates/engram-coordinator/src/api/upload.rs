@@ -438,15 +438,21 @@ fn ext_from_path(path: &str) -> String {
 /// Adapt an exec event stream (a `cat` of the target file) into a
 /// [`ByteStream`]: stdout becomes body bytes; a non-zero exit becomes a
 /// stream error so [`process_upload`] aborts + deletes (e.g. the path was
-/// missing/unreadable). Stderr is dropped.
+/// missing/unreadable). Ending without an Exit is transport loss, not clean
+/// EOF, and also becomes a stream error so truncated bytes are never stored.
+/// Stderr is dropped.
 fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
     let s = async_stream::stream! {
         let mut events = events;
+        let mut saw_exit = false;
         while let Some(ev) = events.next().await {
             match ev {
                 ExecEvent::Stdout(b) => yield Ok(b),
                 ExecEvent::Stderr(_) => {}
-                ExecEvent::Exit(Some(0)) => return,
+                ExecEvent::Exit(Some(0)) => {
+                    saw_exit = true;
+                    break;
+                }
                 ExecEvent::Exit(_) => {
                     yield Err(BlobError::Protocol(
                         "reading file from guest failed (cat exited non-zero — \
@@ -456,6 +462,13 @@ fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
                     return;
                 }
             }
+        }
+        if !saw_exit {
+            yield Err(BlobError::Protocol(
+                "reading file from guest lost transport mid-read before an Exit frame; \
+                 refusing a potentially truncated artifact"
+                    .into(),
+            ));
         }
     };
     ByteStream::new(s)
@@ -593,6 +606,47 @@ fn decode_upload_header(headers: &HeaderMap) -> Result<UploadRequest, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn exec_bytestream_reports_transport_loss_after_delivered_bytes() {
+        let events = futures::stream::iter([
+            ExecEvent::Stdout(Bytes::from_static(b"hello ")),
+            ExecEvent::Stdout(Bytes::from_static(b"world")),
+        ]);
+        let mut body = exec_stdout_bytestream(Box::pin(events));
+
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(bytes)) if bytes == Bytes::from_static(b"hello ")
+        ));
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(bytes)) if bytes == Bytes::from_static(b"world")
+        ));
+        match body.next().await {
+            Some(Err(BlobError::Protocol(message))) => {
+                assert!(message.contains("transport"));
+                assert!(message.contains("truncated"));
+            }
+            other => panic!("expected missing-Exit protocol error, got {other:?}"),
+        }
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_bytestream_zero_exit_ends_cleanly() {
+        let events = futures::stream::iter([
+            ExecEvent::Stdout(Bytes::from_static(b"complete")),
+            ExecEvent::Exit(Some(0)),
+        ]);
+        let mut body = exec_stdout_bytestream(Box::pin(events));
+
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(bytes)) if bytes == Bytes::from_static(b"complete")
+        ));
+        assert!(body.next().await.is_none());
+    }
 
     #[test]
     fn detects_image_and_video_signatures() {

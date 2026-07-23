@@ -331,6 +331,13 @@ can no longer lose a result that was merely delayed.
   has sandbox-lifetime attach-or-start records instead of echoing a false
   durability signal, and durable VZ transport EOF ends without a fabricated
   exit while its legacy path retains the stage-1 `Exit(None)` floor.
+- A full producer/pump/consumer sweep closed the missed half of the
+  coordinator↔host adapter: the host-agent gRPC pump now turns backend
+  end-without-Exit into `Unavailable` instead of re-fabricating `Exit(None)`.
+  The artifact-upload bytestream rejects the same condition instead of storing
+  a silently truncated file, the generic buffered exec drains fail honestly,
+  and zero-byte re-attaches deduplicate `exec_started` by durable
+  `(session_id, exec_id)` event-log lookup rather than by byte offsets.
 
 ## Alternatives considered
 

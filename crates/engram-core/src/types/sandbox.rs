@@ -431,8 +431,9 @@ pub struct WriteFileResult {
     pub error: Option<String>,
 }
 
-/// Output event from a streaming `exec`. The stream is terminated by
-/// exactly one `Exit` event (or an error).
+/// Output event from a streaming `exec`. A terminal backend result is marked
+/// by exactly one `Exit`. The event stream may instead end without `Exit` to
+/// report retryable transport loss while a durable result remains attachable.
 ///
 /// The variants are intentionally `Bytes` rather than `String` so a
 /// process emitting non-UTF-8 output (binary tools, raw pipe content)
@@ -454,9 +455,10 @@ impl ExecEvent {
 /// background task or returned across an `axum` handler boundary.
 pub type ExecEventStream = Pin<Box<dyn Stream<Item = ExecEvent> + Send + 'static>>;
 
-/// Streaming counterpart to [`ExecHandle`]. The backend returns
-/// immediately with metadata + a stream; the stream yields output as
-/// the underlying process produces it and ends with a single `Exit`.
+/// Streaming counterpart to [`ExecHandle`]. The backend returns immediately
+/// with metadata + a stream; the stream yields output as the underlying
+/// process produces it and ends with a single `Exit` only when it has a
+/// terminal result. End-without-Exit means transport loss, not completion.
 pub struct ExecStream {
     pub sandbox_id: SandboxId,
     pub exec_id: String,

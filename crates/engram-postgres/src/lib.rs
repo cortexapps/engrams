@@ -4059,6 +4059,29 @@ impl MetadataStore for PostgresStore {
             .collect()
     }
 
+    async fn session_exec_started_exists(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+    ) -> Result<bool, MetaError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT EXISTS(
+                SELECT 1
+                  FROM session_events
+                 WHERE session_id = $1
+                   AND kind = 'exec_started'
+                   AND payload->>'exec_id' = $2
+            )
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(exec_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
     async fn append_session_event(
         &self,
         session_id: SessionId,

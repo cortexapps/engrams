@@ -1728,6 +1728,22 @@ pub trait MetadataStore: Send + Sync {
 
     // ---- session event log ----
 
+    /// Return whether this session's durable event log already contains an
+    /// `exec_started` event for `exec_id`. Durable zero-byte re-attaches use
+    /// this to keep `ExecStarted` idempotent even when both replay offsets are
+    /// still zero.
+    ///
+    /// Default false keeps event-less mock stores lightweight.
+    /// `PostgresStore` and `SimMetadataStore` implement the real event-log
+    /// predicate, covered by the ADR 0098 D4 conformance suite.
+    async fn session_exec_started_exists(
+        &self,
+        _session_id: SessionId,
+        _exec_id: &str,
+    ) -> Result<bool, MetaError> {
+        Ok(false)
+    }
+
     /// Append an event to a session's persistent log. Returns the
     /// monotonic per-session `idx` assigned to this event. Allocation
     /// is atomic — concurrent appends to the same session never

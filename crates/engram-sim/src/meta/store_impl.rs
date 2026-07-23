@@ -945,6 +945,25 @@ impl MetadataStore for SimMetadataStore {
 
     // ================= session events =================
 
+    async fn session_exec_started_exists(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+    ) -> Result<bool, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        Ok(db.session_events.get(&session_id).is_some_and(|events| {
+            events.iter().any(|event| {
+                event.kind == "exec_started"
+                    && event
+                        .payload
+                        .get("exec_id")
+                        .and_then(serde_json::Value::as_str)
+                        == Some(exec_id)
+            })
+        }))
+    }
+
     /// CTE mirror: atomically allocate next_event_idx from the session
     /// row (missing session -> NotFound), stamp recovery_epoch, insert,
     /// pg_notify('session_events', {session_id, idx}).

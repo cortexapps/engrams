@@ -1104,9 +1104,9 @@ impl GrpcHostClient {
 
     /// Server-streaming exec. The first frame is `started` (carries
     /// the canonical `exec_id`); subsequent frames carry
-    /// stdout/stderr bytes; the stream ends with exactly one `exit`
-    /// frame. Returned `ExecStream` mirrors the same shape the WS
-    /// path returns so coord-side consumers don't notice.
+    /// stdout/stderr bytes. A terminal result ends with exactly one
+    /// `exit` frame; an RPC error/closure before it ends the returned
+    /// ExecStream without Exit so coordinator consumers can re-attach.
     pub async fn exec_start(
         &self,
         sandbox_id: SandboxId,

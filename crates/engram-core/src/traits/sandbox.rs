@@ -243,8 +243,10 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// Run a command in the sandbox and return a stream of stdout/stderr
-    /// chunks ending with a single [`ExecEvent::Exit`]. Terminating the
-    /// stream early (dropping it) does NOT necessarily kill the
+    /// chunks. A terminal backend result ends with one [`ExecEvent::Exit`];
+    /// ending without `Exit` means transport loss and must not be interpreted
+    /// as a terminal status. Terminating the stream early (dropping it) does
+    /// NOT necessarily kill the
     /// underlying process — backends are free to detach and let it run
     /// to completion. Callers that need cancellation should hold the
     /// stream until exit or use a separate kill API (future work).
@@ -271,17 +273,20 @@ pub trait SandboxBackend: Send + Sync {
         let mut stream = self.exec_stream(id, cmd).await?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut exit_status = None;
-        while let Some(event) = stream.events.next().await {
-            match event {
-                ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-                ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-                ExecEvent::Exit(s) => {
-                    exit_status = s;
-                    break;
+        let exit_status = loop {
+            match stream.events.next().await {
+                Some(ExecEvent::Stdout(b)) => stdout.extend_from_slice(&b),
+                Some(ExecEvent::Stderr(b)) => stderr.extend_from_slice(&b),
+                Some(ExecEvent::Exit(status)) => break status,
+                None => {
+                    return Err(SandboxError::Unavailable(format!(
+                        "exec {} event stream ended without an Exit frame; its result may be \
+                         recoverable through exec_stream re-attach",
+                        stream.exec_id
+                    )));
                 }
             }
-        }
+        };
         Ok(ExecHandle {
             sandbox_id: stream.sandbox_id,
             exec_id: stream.exec_id,

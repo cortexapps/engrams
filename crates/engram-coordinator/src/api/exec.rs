@@ -1,11 +1,10 @@
-//! `POST /sessions/:id/exec` (sync) and `POST /sessions/:id/exec/stream`
-//! (SSE).
+//! Transport-agnostic exec core for the app-gRPC `SessionService::Exec`
+//! stream and ADR 0103's deterministic co-simulator.
 //!
-//! Both go through the same SandboxBackend `exec_stream`. The sync
-//! endpoint drains the stream into buffered stdout/stderr; the SSE
-//! endpoint forwards each event to the client *and* publishes it to
-//! the session-wide bus so other observers (browser tabs, Slack bots)
-//! see it too.
+//! The core resolves the session environment and sandbox, drives the shared
+//! `HostClient::exec_stream` path, persists genuine lifecycle/output events,
+//! and preserves end-without-Exit as retryable transport loss for callers
+//! that can re-attach to the durable exec ticket.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -180,7 +179,8 @@ pub async fn exec_stream_core(
 > {
     let (base_env, default_workdir) = session_exec_env(state, id).await;
     let wake = req.wake.unwrap_or(true);
-    let first_attach = req.stdout_offset.unwrap_or(0) == 0 && req.stderr_offset.unwrap_or(0) == 0;
+    let caller_supplied_exec_id = req.exec_id.is_some();
+    let zero_offsets = req.stdout_offset.unwrap_or(0) == 0 && req.stderr_offset.unwrap_or(0) == 0;
     let (argv, mut sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
     let requested_exec_id = sandbox_req
         .exec_id
@@ -209,11 +209,24 @@ pub async fn exec_stream_core(
         )));
     }
 
-    if first_attach {
-        // Re-attaches from delivered offsets must not duplicate lifecycle
-        // events. A re-attach from offset 0 after zero delivered bytes can
-        // still re-emit this event; consumers treat ExecStarted as
-        // idempotent per exec_id.
+    let emit_exec_started = if !zero_offsets {
+        false
+    } else if caller_supplied_exec_id {
+        !state
+            .services
+            .meta
+            .session_exec_started_exists(id, &exec_id)
+            .await?
+    } else {
+        // A coordinator-minted id cannot be a re-attach: the caller did not
+        // know the ticket before this request.
+        true
+    };
+    if emit_exec_started {
+        // Non-zero offset re-attaches skip lifecycle emission by construction.
+        // A legitimate zero-byte re-attach still arrives at `(0, 0)`, so the
+        // durable event-log predicate above enforces the residual
+        // consumer-idempotency expectation at the source, keyed by exec_id.
         state
             .emit(
                 id,
@@ -520,6 +533,24 @@ mod tests {
         })
     }
 
+    fn exec_started_ids(meta: &SimMetadataStore, session_id: SessionId) -> Vec<String> {
+        meta.with_db(|db| {
+            db.session_events
+                .get(&session_id)
+                .into_iter()
+                .flatten()
+                .filter(|event| event.kind == "exec_started")
+                .filter_map(|event| {
+                    event
+                        .payload
+                        .get("exec_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        })
+    }
+
     fn req(env: &[(&str, &str)], workdir: Option<&str>) -> ExecRequest {
         ExecRequest {
             command: Some("true".into()),
@@ -653,6 +684,31 @@ mod tests {
                 "stdout_offset={stdout_offset:?}, stderr_offset={stderr_offset:?}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn zero_byte_reattach_deduplicates_exec_started_by_exec_id() {
+        let (state, meta) = exec_test_state([
+            vec![ExecEvent::Exit(Some(0))],
+            vec![ExecEvent::Exit(Some(0))],
+            vec![ExecEvent::Exit(Some(0))],
+        ]);
+        let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+
+        for exec_id in ["exec:zero-byte", "exec:zero-byte", "exec:different"] {
+            let (_exec_id, mut body) =
+                exec_stream_core(&state, session_id, durable_req(exec_id, Some(0), Some(0)))
+                    .await
+                    .expect("start exec stream");
+            while let Some(item) = body.next().await {
+                item.expect("genuine exit stream is successful");
+            }
+        }
+
+        assert_eq!(
+            exec_started_ids(&meta, session_id),
+            vec!["exec:zero-byte", "exec:different"]
+        );
     }
 
     #[tokio::test]

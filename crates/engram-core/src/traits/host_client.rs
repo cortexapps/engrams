@@ -118,17 +118,24 @@ pub trait HostClient: Send + Sync {
         let mut stream = self.exec_stream(id, cmd).await?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut exit_status = None;
-        while let Some(event) = stream.events.next().await {
-            match event {
-                crate::types::sandbox::ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-                crate::types::sandbox::ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-                crate::types::sandbox::ExecEvent::Exit(s) => {
-                    exit_status = s;
-                    break;
+        let exit_status = loop {
+            match stream.events.next().await {
+                Some(crate::types::sandbox::ExecEvent::Stdout(b)) => {
+                    stdout.extend_from_slice(&b);
+                }
+                Some(crate::types::sandbox::ExecEvent::Stderr(b)) => {
+                    stderr.extend_from_slice(&b);
+                }
+                Some(crate::types::sandbox::ExecEvent::Exit(status)) => break status,
+                None => {
+                    return Err(SandboxError::Unavailable(format!(
+                        "exec {} event stream ended without an Exit frame; its result may be \
+                         recoverable through exec_stream re-attach",
+                        stream.exec_id
+                    )));
                 }
             }
-        }
+        };
         Ok(ExecHandle {
             sandbox_id: stream.sandbox_id,
             exec_id: stream.exec_id,

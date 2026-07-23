@@ -65,6 +65,53 @@ async fn pg_ctx() -> Option<Ctx> {
     })
 }
 
+/// ADR 0103: zero-byte durable re-attaches must deduplicate the lifecycle
+/// event by exec_id, not by offsets (which legitimately remain `(0, 0)`).
+async fn session_exec_started_exists(ctx: &Ctx) {
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-started:latest"))
+        .await
+        .unwrap();
+
+    assert!(
+        !ctx.meta
+            .session_exec_started_exists(sid, "exec:present")
+            .await
+            .unwrap(),
+        "an absent exec_id must not match"
+    );
+
+    ctx.meta
+        .append_session_event(
+            sid,
+            "exec_started",
+            serde_json::json!({
+                "type": "exec_started",
+                "exec_id": "exec:present",
+                "command": ["true"],
+                "at": ctx.clock.now_utc(),
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(
+        ctx.meta
+            .session_exec_started_exists(sid, "exec:present")
+            .await
+            .unwrap(),
+        "the persisted exec_id must match"
+    );
+    assert!(
+        !ctx.meta
+            .session_exec_started_exists(sid, "exec:different")
+            .await
+            .unwrap(),
+        "a different exec_id must not match"
+    );
+}
+
 /// One scenario, two tests: `<name>::sim` (always) and `<name>::pg`
 /// (`#[ignore]`'d, live Postgres).
 macro_rules! conformance {
@@ -1828,6 +1875,10 @@ conformance!(
 );
 conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
+conformance!(
+    t_session_exec_started_exists,
+    super::session_exec_started_exists
+);
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
 conformance!(
     t_latest_snapshot_reports_recoverable_flag,
