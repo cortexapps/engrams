@@ -114,6 +114,13 @@ export const POLICY: Record<string, PolicyEntry> = {
     subject: "Session",
     sessionIdField: "sessionId",
   },
+  // ADR 0103: kill a durable exec by ticket — same interactive-access bar as
+  // starting one.
+  "SessionService.CancelExec": {
+    action: "shell",
+    subject: "Session",
+    sessionIdField: "sessionId",
+  },
   "SessionService.WriteFiles": {
     action: "shell",
     subject: "Session",

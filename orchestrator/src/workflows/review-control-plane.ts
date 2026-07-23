@@ -150,15 +150,28 @@ interface ReviewControlPlaneStore extends Pick<
 
 interface ReviewExecOutput {
   event:
-    | { case: "started"; value: unknown }
+    | { case: "started"; value: { execId: string } }
     | { case: "stdout"; value: Uint8Array }
     | { case: "stderr"; value: Uint8Array }
-    | { case: "exit"; value: { exitStatus?: number } }
+    | { case: "exit"; value: { exitStatus?: number | null } }
     | { case: undefined; value?: undefined };
 }
 
+interface ReviewExecRequest {
+  sessionId: string;
+  command: string;
+  execId?: string;
+  stdoutOffset?: bigint;
+  stderrOffset?: bigint;
+  wake?: boolean;
+}
+
 export interface ReviewSessionsClient extends TaskSessionsClient {
-  exec(req: { sessionId: string; command: string }): AsyncIterable<ReviewExecOutput>;
+  exec(
+    req: ReviewExecRequest,
+    options?: { signal?: AbortSignal },
+  ): AsyncIterable<ReviewExecOutput>;
+  cancelExec(req: { sessionId: string; execId: string }): Promise<unknown>;
   writeFiles(req: {
     sessionId: string;
     files: Array<{ path: string; content: Uint8Array; mode: number }>;
@@ -185,6 +198,8 @@ export interface ReviewControlPlaneDeps {
   createSessionForExistingTask?: CreateExistingTaskSession;
   /** Focused seam for asserting binding-before-listener publication. */
   registerSessionListener?: (sessionId: string) => Promise<void>;
+  /** Deterministic retry/deadline scheduler for durable-exec tests. */
+  execRuntime?: RunExecRuntime;
 }
 
 /** Human detail for a `posted` activity-log entry. */
@@ -235,6 +250,11 @@ const VERIFIER_SYSTEM_PROMPT = [
 // — defense in depth on top of the signature check + enrollment gate.
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+const BOOTSTRAP_CLONE_DEADLINE_MS = 5 * 60_000;
+const MERGE_BASE_DEADLINE_MS = 60_000;
+const MAX_EXEC_REATTACH_ATTEMPTS = 8;
+const EXEC_REATTACH_BASE_DELAY_MS = 50;
+const EXEC_REATTACH_MAX_DELAY_MS = 1_000;
 
 // Security clamp: reviewer workers may read only the reviewed repo, while the
 // orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
@@ -270,6 +290,7 @@ async function cloneRepo(
   repo: string,
   headSha: string,
   phase: string,
+  execRuntime: RunExecRuntime,
 ): Promise<void> {
   const name = repoName(repo);
   if (headSha !== "" && !SHA_RE.test(headSha)) {
@@ -281,37 +302,334 @@ async function cloneRepo(
     command += ` && git -C ${workspace} checkout ${headSha}`;
   }
 
-  const { exitStatus, stderr } = await runExec(sessions, sessionId, command);
+  let result: RunExecResult;
+  try {
+    result = await runExec(sessions, sessionId, command, {
+      execId: `exec:${sessionId}:bootstrap-clone`,
+      deadlineMs: BOOTSTRAP_CLONE_DEADLINE_MS,
+    }, execRuntime);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stderr = error instanceof RunExecError ? error.stderr.trim() : "";
+    throw new ReviewSetupError(
+      `${phase} clone failed: ${message}${stderr === "" ? "" : `: ${stderr}`}`,
+    );
+  }
+  const { exitStatus, stderr } = result;
   if (exitStatus !== 0) {
     const detail = stderr.trim() || "exec stream ended without a successful exit status";
     throw new ReviewSetupError(`${phase} clone failed: ${detail}`);
   }
 }
 
-/** Drain an `exec` stream to completion, capturing stdout, stderr, and the
- *  exit status. The one place both stream halves are decoded. */
-async function runExec(
+export interface RunExecOptions {
+  /** Stable across DBOS step replay for exactly-once spawn. */
+  execId?: string;
+  deadlineMs: number;
+}
+
+export interface RunExecResult {
+  exitStatus: number | null | undefined;
+  stdout: string;
+  stderr: string;
+}
+
+export interface RunExecRuntime {
+  nowMs(): number;
+  sleep(ms: number): Promise<void>;
+  /** Arm the wall-clock deadline and return a disposer. */
+  scheduleDeadline(delayMs: number, onDeadline: () => void): () => void;
+}
+
+const defaultRunExecRuntime: RunExecRuntime = {
+  nowMs: Date.now,
+  sleep: (ms) => Bun.sleep(ms),
+  scheduleDeadline(delayMs, onDeadline) {
+    const timer = setTimeout(onDeadline, delayMs);
+    return () => clearTimeout(timer);
+  },
+};
+
+export class RunExecError extends Error {
+  constructor(
+    message: string,
+    readonly stdout: string,
+    readonly stderr: string,
+    options?: ErrorOptions,
+  ) {
+    super(message, options);
+    this.name = "RunExecError";
+  }
+}
+
+type AttemptFailure =
+  | { kind: "ended" }
+  | { kind: "error"; error: unknown }
+  | { kind: "protocol"; message: string };
+
+function decodeExecOutput(chunks: readonly Uint8Array[]): string {
+  let byteLength = 0;
+  for (const chunk of chunks) byteLength += chunk.byteLength;
+  const joined = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const chunk of chunks) {
+    joined.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return new TextDecoder().decode(joined);
+}
+
+function isTerminalExecError(error: unknown): boolean {
+  if (!(error instanceof ConnectError)) return false;
+  if (error.code === Code.NotFound) return true;
+  if (
+    error.code === Code.FailedPrecondition
+    && /session has no live sandbox/i.test(error.rawMessage)
+  ) {
+    return true;
+  }
+  return ![
+    Code.Canceled,
+    Code.Unknown,
+    Code.DeadlineExceeded,
+    Code.Aborted,
+    Code.ResourceExhausted,
+    Code.Internal,
+    Code.Unavailable,
+  ].includes(error.code);
+}
+
+function reattachDelayMs(reattachAttempt: number): number {
+  return Math.min(
+    EXEC_REATTACH_BASE_DELAY_MS * 2 ** (reattachAttempt - 1),
+    EXEC_REATTACH_MAX_DELAY_MS,
+  );
+}
+
+/** Attach-or-start, drain, and re-attach from exact byte offsets until Exit.
+ * This is the sole orchestrator exec caller so step replay and transport
+ * severance share one identity/retry implementation. */
+export async function runExec(
   sessions: ReviewSessionsClient,
   sessionId: string,
   command: string,
-): Promise<{ exitStatus: number | undefined; stdout: string; stderr: string }> {
-  const outDecoder = new TextDecoder();
-  const errDecoder = new TextDecoder();
-  let stdout = "";
-  let stderr = "";
-  let exitStatus: number | undefined;
-  for await (const message of sessions.exec({ sessionId, command })) {
-    if (message.event.case === "stdout") {
-      stdout += outDecoder.decode(message.event.value, { stream: true });
-    } else if (message.event.case === "stderr") {
-      stderr += errDecoder.decode(message.event.value, { stream: true });
-    } else if (message.event.case === "exit") {
-      exitStatus = message.event.value.exitStatus;
-    }
+  options: RunExecOptions,
+  runtime: RunExecRuntime = defaultRunExecRuntime,
+): Promise<RunExecResult> {
+  if (!Number.isFinite(options.deadlineMs) || options.deadlineMs <= 0) {
+    throw new Error(`exec deadlineMs must be positive, got ${options.deadlineMs}`);
   }
-  stdout += outDecoder.decode();
-  stderr += errDecoder.decode();
-  return { exitStatus, stdout, stderr };
+
+  const stdoutChunks: Uint8Array[] = [];
+  const stderrChunks: Uint8Array[] = [];
+  let stdoutOffset = 0n;
+  let stderrOffset = 0n;
+  let canonicalExecId = options.execId;
+  let activeAttempt: AbortController | undefined;
+  let deadlineFired = false;
+  let resolveDeadline!: () => void;
+  const deadlineReached = new Promise<void>((resolve) => {
+    resolveDeadline = resolve;
+  });
+  const deadlineAt = runtime.nowMs() + options.deadlineMs;
+  const clearDeadline = runtime.scheduleDeadline(options.deadlineMs, () => {
+    deadlineFired = true;
+    activeAttempt?.abort();
+    resolveDeadline();
+  });
+
+  const output = () => ({
+    stdout: decodeExecOutput(stdoutChunks),
+    stderr: decodeExecOutput(stderrChunks),
+  });
+  const expire = (): never => {
+    const execId = canonicalExecId ?? options.execId ?? "<unknown>";
+    if (canonicalExecId !== undefined) {
+      try {
+        void sessions.cancelExec({ sessionId, execId: canonicalExecId })
+          .catch((error) => {
+            log.warn(
+              { sessionId, execId: canonicalExecId, error },
+              "durable exec cancellation failed (best-effort)",
+            );
+          });
+      } catch (error) {
+        log.warn(
+          { sessionId, execId: canonicalExecId, error },
+          "durable exec cancellation failed (best-effort)",
+        );
+      }
+    }
+    const captured = output();
+    throw new RunExecError(
+      `exec ${execId} exceeded deadline of ${options.deadlineMs}ms`,
+      captured.stdout,
+      captured.stderr,
+    );
+  };
+  const deadlineExpired = () =>
+    deadlineFired || runtime.nowMs() >= deadlineAt;
+  const waitFor = async (promise: Promise<void>): Promise<void> => {
+    const outcome = await Promise.race([
+      promise.then(() => "ready" as const),
+      deadlineReached.then(() => "deadline" as const),
+    ]);
+    if (outcome === "deadline" || deadlineExpired()) expire();
+  };
+
+  let lastFailure: AttemptFailure = { kind: "ended" };
+  try {
+    for (
+      let attempt = 0;
+      attempt <= MAX_EXEC_REATTACH_ATTEMPTS;
+      attempt++
+    ) {
+      if (deadlineExpired()) expire();
+
+      activeAttempt = new AbortController();
+      let iterator: AsyncIterator<ReviewExecOutput> | undefined;
+      try {
+        const stream = sessions.exec({
+          sessionId,
+          command,
+          ...(canonicalExecId !== undefined ? { execId: canonicalExecId } : {}),
+          stdoutOffset,
+          stderrOffset,
+          wake: true,
+        }, { signal: activeAttempt.signal });
+        iterator = stream[Symbol.asyncIterator]();
+      } catch (error) {
+        lastFailure = { kind: "error", error };
+      }
+
+      if (iterator !== undefined) {
+        const nextFrame = async (): Promise<
+          | { kind: "frame"; value: IteratorResult<ReviewExecOutput> }
+          | { kind: "error"; error: unknown }
+          | { kind: "deadline" }
+        > =>
+          Promise.race([
+            iterator.next().then(
+              (value) => ({ kind: "frame" as const, value }),
+              (error: unknown) => ({ kind: "error" as const, error }),
+            ),
+            deadlineReached.then(() => ({ kind: "deadline" as const })),
+          ]);
+
+        const first = await nextFrame();
+        if (first.kind === "deadline") return expire();
+        if (first.kind === "error") {
+          lastFailure = { kind: "error", error: first.error };
+        } else if (
+          first.value.done
+          || first.value.value.event.case !== "started"
+        ) {
+          lastFailure = {
+            kind: "protocol",
+            message: first.value.done
+              ? "stream ended before ExecStarted"
+              : `first frame was ${first.value.value.event.case ?? "empty"}, not ExecStarted`,
+          };
+        } else {
+          const startedExecId = first.value.value.event.value.execId;
+          if (startedExecId === "") {
+            lastFailure = {
+              kind: "protocol",
+              message: "ExecStarted carried an empty exec_id",
+            };
+          } else {
+            if (canonicalExecId === undefined) canonicalExecId = startedExecId;
+            if (startedExecId !== canonicalExecId) {
+              lastFailure = {
+                kind: "protocol",
+                message: `expected ExecStarted{exec_id=${canonicalExecId}}, got ${startedExecId}`,
+              };
+            } else {
+              for (;;) {
+                const next = await nextFrame();
+                if (next.kind === "deadline") return expire();
+                if (next.kind === "error") {
+                  lastFailure = { kind: "error", error: next.error };
+                  break;
+                }
+                if (next.value.done) {
+                  lastFailure = { kind: "ended" };
+                  break;
+                }
+                const { event } = next.value.value;
+                if (event.case === "stdout") {
+                  stdoutChunks.push(event.value);
+                  stdoutOffset += BigInt(event.value.byteLength);
+                } else if (event.case === "stderr") {
+                  stderrChunks.push(event.value);
+                  stderrOffset += BigInt(event.value.byteLength);
+                } else if (event.case === "exit") {
+                  return { exitStatus: event.value.exitStatus, ...output() };
+                } else {
+                  lastFailure = {
+                    kind: "protocol",
+                    message: event.case === "started"
+                      ? "received duplicate ExecStarted frame"
+                      : "received empty exec frame",
+                  };
+                  break;
+                }
+              }
+            }
+          }
+        }
+      }
+
+      activeAttempt.abort();
+      activeAttempt = undefined;
+      const closeAttempt = iterator?.return?.();
+      if (closeAttempt !== undefined) void closeAttempt.catch(() => {});
+
+      if (deadlineExpired()) expire();
+      if (
+        lastFailure.kind === "error"
+        && isTerminalExecError(lastFailure.error)
+      ) {
+        throw lastFailure.error;
+      }
+      if (canonicalExecId === undefined) {
+        const captured = output();
+        throw new RunExecError(
+          "exec attempt failed before ExecStarted; cannot safely retry without a caller-supplied exec_id",
+          captured.stdout,
+          captured.stderr,
+          lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
+        );
+      }
+      if (attempt === MAX_EXEC_REATTACH_ATTEMPTS) {
+        const captured = output();
+        if (lastFailure.kind === "ended") {
+          return { exitStatus: undefined, ...captured };
+        }
+        const detail = lastFailure.kind === "protocol"
+          ? lastFailure.message
+          : lastFailure.error instanceof Error
+          ? lastFailure.error.message
+          : String(lastFailure.error);
+        throw new RunExecError(
+          `exec ${canonicalExecId} failed after ${MAX_EXEC_REATTACH_ATTEMPTS} re-attach attempts: ${detail}`,
+          captured.stdout,
+          captured.stderr,
+          lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
+        );
+      }
+
+      const delayMs = Math.min(
+        reattachDelayMs(attempt + 1),
+        Math.max(0, deadlineAt - runtime.nowMs()),
+      );
+      await waitFor(runtime.sleep(delayMs));
+    }
+    throw new Error("unreachable durable exec retry state");
+  } finally {
+    activeAttempt?.abort();
+    clearDeadline();
+  }
 }
 
 /** Resolve the TRUE merge base (fork point) of the base and head commits in
@@ -331,6 +649,7 @@ async function resolveMergeBase(
   repoDir: string,
   baseSha: string,
   headSha: string,
+  execRuntime: RunExecRuntime,
 ): Promise<string> {
   if (!SHA_RE.test(baseSha)) throw new ReviewSetupError(`invalid base SHA: ${baseSha}`);
   if (!SHA_RE.test(headSha)) throw new ReviewSetupError(`invalid head SHA: ${headSha}`);
@@ -338,6 +657,11 @@ async function resolveMergeBase(
     sessions,
     sessionId,
     `git -C ${repoDir} merge-base ${baseSha} ${headSha}`,
+    {
+      execId: `exec:${sessionId}:merge-base:${baseSha}:${headSha}`,
+      deadlineMs: MERGE_BASE_DEADLINE_MS,
+    },
+    execRuntime,
   );
   const mergeBase = stdout.trim();
   if (exitStatus !== 0 || !SHA_RE.test(mergeBase)) {
@@ -409,6 +733,7 @@ export function makeReviewControlPlane(
   const insertTask = deps.insertTask ?? ((input) =>
     insertReviewTask(db(), input));
   const sessions = deps.sessions ?? defaultSessions;
+  const execRuntime = deps.execRuntime ?? defaultRunExecRuntime;
   let profileStore = deps.profiles;
   const profiles = () => (profileStore ??= makeProfileStore(db()));
   let enrollmentStore = deps.enrollments;
@@ -578,7 +903,14 @@ export function makeReviewControlPlane(
 
     async bootstrapFinderSession(sessionId, input) {
       await recordEvent(input.reviewId, "cloning", "finder");
-      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "finder");
+      await cloneRepo(
+        sessions,
+        sessionId,
+        input.repo,
+        input.headSha,
+        "finder",
+        execRuntime,
+      );
 
       const encoder = new TextEncoder();
       const files = renderReviewer({
@@ -612,7 +944,14 @@ export function makeReviewControlPlane(
       // two-dot `git diff base head`. The prompt still uses three-dot as a
       // belt-and-suspenders (with a true merge base the two are equivalent).
       const mergeBase = input.baseSha !== "" && input.headSha !== ""
-        ? await resolveMergeBase(sessions, sessionId, `/workspace/${name}`, input.baseSha, input.headSha)
+        ? await resolveMergeBase(
+          sessions,
+          sessionId,
+          `/workspace/${name}`,
+          input.baseSha,
+          input.headSha,
+          execRuntime,
+        )
         : "";
       const range = mergeBase !== ""
         ? `${mergeBase}...${input.headSha}`
@@ -688,7 +1027,14 @@ export function makeReviewControlPlane(
 
     async bootstrapVerifierSession(sessionId, input) {
       await recordEvent(input.reviewId, "cloning", "verifier");
-      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "verifier");
+      await cloneRepo(
+        sessions,
+        sessionId,
+        input.repo,
+        input.headSha,
+        "verifier",
+        execRuntime,
+      );
 
       const review = await reviews().getReview(input.reviewId);
       if (!review) {

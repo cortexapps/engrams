@@ -162,17 +162,20 @@ interface FakeSessionOptions {
 }
 
 function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & {
-  execCalls: Array<{ sessionId: string; command: string }>;
+  execCalls: Array<Parameters<ReviewSessionsClient["exec"]>[0]>;
+  cancelCalls: Array<Parameters<ReviewSessionsClient["cancelExec"]>[0]>;
   writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]>;
   promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]>;
   deletedIds: string[];
 } {
-  const execCalls: Array<{ sessionId: string; command: string }> = [];
+  const execCalls: Array<Parameters<ReviewSessionsClient["exec"]>[0]> = [];
+  const cancelCalls: Array<Parameters<ReviewSessionsClient["cancelExec"]>[0]> = [];
   const writeCalls: Array<Parameters<ReviewSessionsClient["writeFiles"]>[0]> = [];
   const promptCalls: Array<Parameters<ReviewSessionsClient["sendPrompt"]>[0]> = [];
   const deletedIds: string[] = [];
   return {
     execCalls,
+    cancelCalls,
     writeCalls,
     promptCalls,
     deletedIds,
@@ -183,6 +186,12 @@ function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & 
     },
     async *exec(req) {
       execCalls.push(req);
+      yield {
+        event: {
+          case: "started",
+          value: { execId: req.execId ?? "exec:server-minted" },
+        },
+      };
       if (options.stdout) {
         yield { event: { case: "stdout", value: new TextEncoder().encode(options.stdout) } };
       }
@@ -195,6 +204,10 @@ function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & 
           value: { exitStatus: options.exitStatus ?? 0 },
         },
       };
+    },
+    async cancelExec(req) {
+      cancelCalls.push(req);
+      return {};
     },
     async writeFiles(req) {
       writeCalls.push(req);
@@ -573,6 +586,10 @@ describe("ReviewControlPlane", () => {
     expect(sessions.execCalls).toEqual([{
       sessionId: "finder-session",
       command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams checkout ${active.headSha}`,
+      execId: "exec:finder-session:bootstrap-clone",
+      stdoutOffset: 0n,
+      stderrOffset: 0n,
+      wake: true,
     }]);
     expect(sessions.writeCalls).toHaveLength(1);
     expect(sessions.writeCalls[0]?.files.map((file) => file.path)).toEqual([
@@ -644,6 +661,10 @@ describe("ReviewControlPlane", () => {
     expect(sessions.execCalls[0]).toEqual({
       sessionId: "verifier-session",
       command: `rm -rf /workspace/engrams && git clone https://github.com/${active.repo}.git /workspace/engrams && git -C /workspace/engrams checkout ${active.headSha}`,
+      execId: "exec:verifier-session:bootstrap-clone",
+      stdoutOffset: 0n,
+      stderrOffset: 0n,
+      wake: true,
     });
     const files = sessions.writeCalls[0]?.files ?? [];
     expect(files.map((file) => file.path)).toEqual([
