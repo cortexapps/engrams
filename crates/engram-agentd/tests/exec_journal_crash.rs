@@ -232,6 +232,84 @@ async fn attach_only_missing_journal_never_authorizes_a_second_spawn() {
     assert!(!temp.path().join(exec_id).exists());
 }
 
+/// PR #874 review finding: the `Died` terminal must drain like `Complete`
+/// does. A crashed wrapper (SIGKILL/OOM — pid dead, no exit.json) leaves
+/// static journal files; an attach reads them 8 KiB per iteration, and
+/// returning on the iteration that first observes `Died` dropped everything
+/// past the current chunk — the crash diagnostics the caller attached for.
+#[tokio::test]
+async fn died_attach_drains_the_full_journal_before_exit_none() {
+    let temp = tempfile::tempdir().unwrap();
+    let exec_id = "died-drain";
+    let command = vec!["sh".to_string(), "-c".to_string(), "crashy".to_string()];
+    let record = entry(temp.path(), exec_id);
+    write_request(record.dir(), &command);
+    fs::write(record.dir().join("pid"), u32::MAX.to_string()).unwrap();
+    // Several read-chunks (8 KiB each) on both streams, sizes offset so the
+    // final partial chunks differ.
+    let stdout_payload: Vec<u8> = (0..(3 * 8 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+    let stderr_payload: Vec<u8> = (0..(2 * 8 * 1024 + 5)).map(|i| (i % 241) as u8).collect();
+    fs::write(record.stdout_path(), &stdout_payload).unwrap();
+    fs::write(record.stderr_path(), &stderr_payload).unwrap();
+
+    let (mut client, server) = tokio::io::duplex(128 * 1024);
+    let ca = CaCertInstaller::new(CaCertPaths {
+        bundle: temp.path().join("ca-bundle"),
+        extra_cert: temp.path().join("ca-extra"),
+    });
+    let server_task = tokio::spawn(serve_connection_with_journal(
+        server,
+        None,
+        HarnessSupervisor::new(),
+        Arc::new(ca),
+        Arc::new(ExecJournal::new(temp.path())),
+    ));
+    write_msg(
+        &mut client,
+        &WireRequest::Exec(WireExecRequest {
+            command,
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout_ms: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: Some(0),
+            stderr_offset: Some(0),
+            wake: None,
+            attach_only: false,
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        read_msg::<_, WireExecEvent>(&mut client).await.unwrap(),
+        WireExecEvent::Started(exec_id.into())
+    );
+    let mut replayed_stdout = Vec::new();
+    let mut replayed_stderr = Vec::new();
+    loop {
+        match read_msg::<_, WireExecEvent>(&mut client).await.unwrap() {
+            WireExecEvent::Stdout(bytes) => replayed_stdout.extend(bytes),
+            WireExecEvent::Stderr(bytes) => replayed_stderr.extend(bytes),
+            WireExecEvent::Exit(status) => {
+                assert_eq!(status, None, "a died record must never fabricate an exit");
+                break;
+            }
+            WireExecEvent::Started(id) => panic!("duplicate Started({id})"),
+            WireExecEvent::Degraded(reason) => panic!("healthy died record degraded: {reason}"),
+        }
+    }
+    assert_eq!(replayed_stdout, stdout_payload, "stdout tail dropped");
+    let (diagnostic_tail, message) = replayed_stderr.split_at(stderr_payload.len());
+    assert_eq!(diagnostic_tail, stderr_payload, "stderr tail dropped");
+    assert!(
+        String::from_utf8_lossy(message).contains("died without exit.json"),
+        "the died terminal must still be loud after the drain"
+    );
+    server_task.await.unwrap().unwrap();
+}
+
 #[cfg(target_os = "linux")]
 #[tokio::test]
 async fn cancel_kills_the_recorded_child_process_group() {

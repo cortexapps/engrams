@@ -843,7 +843,10 @@ where
                 write_msg(writer, &WireExecEvent::Exit(None)).await?;
                 return Ok(());
             }
-            AttachState::Died { reason } => {
+            // Like `Complete`, `Died` terminates only once the drain has
+            // caught up: the dead wrapper's files are static, and their tail
+            // is the crash diagnostic the caller attached for.
+            AttachState::Died { reason } if !progressed => {
                 let message = format!(
                     "exec_id {} died without exit.json; no exit was fabricated: {reason}\n",
                     entry.exec_id()
@@ -852,7 +855,7 @@ where
                 write_msg(writer, &WireExecEvent::Exit(None)).await?;
                 return Ok(());
             }
-            AttachState::Running | AttachState::Complete(_) => {
+            AttachState::Running | AttachState::Complete(_) | AttachState::Died { .. } => {
                 if !progressed {
                     tokio::time::sleep(Duration::from_millis(25)).await;
                 }
