@@ -234,6 +234,33 @@ can no longer lose a result that was merely delayed.
   `ci.yml`'s FC lane explicitly.
 - **Skew:** new host code against a stubbed old-protocol agentd → stage-1
   fallback with the named error.
+- **Caller layer (orchestrator) — the review flow is the reference
+  consumer and gets pinned explicitly:**
+  - *Stage-1 regression (needed now, independent of stages 2+3):* a fake
+    sessions client whose exec stream ends **without an exit frame** (and a
+    variant with `exit_status: null`) → `bootstrapFinderSession` /
+    `bootstrapVerifierSession` must throw `ReviewSetupError` and the
+    workflow must land in `failReview` with a durable failed record —
+    never report success, never hang. This pins the "downstream already
+    handles a synthetic `Exit(None)`" claim stage 1 relies on; today that
+    behavior exists (`exitStatus !== 0` where `undefined !== 0`) but no
+    test asserts it.
+  - *`runExec` attach loop:* against a fake exec server — disconnect
+    mid-stream → re-attach with offsets → assembled stdout/stderr have no
+    gaps and no duplicated bytes; deadline expiry → error and
+    `CancelExec` issued; server counts spawns per `exec_id` and the test
+    asserts exactly one across arbitrarily many disconnect/re-attach
+    cycles.
+  - *Step-replay safety:* re-run the whole control-plane method (as a
+    DBOS step re-run would) with the same deterministic `exec_id` → the
+    fake server sees attach, not a second spawn; the caller still gets
+    the original result. This is the double-execution guarantee, tested
+    at the layer that owns it.
+  - *e2e-stack smoke (one, minimal):* start a real exec through the full
+    orchestrator → coordinator → host path, kill the coordinator-side
+    stream once, assert the caller's retry loop completes with the right
+    exit — the only lane that proves the hops compose (per the e2e-lane
+    rule in AGENTS.md).
 
 ## Rollout
 
