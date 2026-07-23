@@ -200,7 +200,14 @@ can no longer lose a result that was merely delayed.
 
 - **Exactly-once submission.** For a given `exec_id`, at most one spawn per
   surviving guest timeline — retries, replays, and redeliveries can never
-  start a second copy. (The journal dir is the guard.)
+  start a second copy. (The journal dir is the guard.) *Skew exception:*
+  an old agentd (a session created before the fleet roll; `RefreshAgent`
+  upgrades agentd only at session create) has no journal and therefore no
+  dedupe — if the caller's retry loop re-calls `Exec` against one (only
+  possible when the coordinator↔caller stream itself died without any exit
+  frame), the command spawns again. That is stage-1 exposure, not a
+  regression: it closes with the roll, and review sessions never hit it
+  (they are created fresh, after the roll, with new agentd).
 - **One canonical result.** The caller gets whatever the surviving timeline
   recorded. Exit codes are always exact; output is exact up to the cap.
 - **At-least-once external side effects under rewind.** A snapshot taken
