@@ -346,6 +346,19 @@ can no longer lose a result that was merely delayed.
   a silently truncated file, the generic buffered exec drains fail honestly,
   and zero-byte re-attaches deduplicate `exec_started` by durable
   `(session_id, exec_id)` event-log lookup rather than by byte offsets.
+- Guard the resource, not the code path: the severance epoch must be raced by
+  *every* read that can park on an established guest vsock connection, not
+  just the steady-state exec reader loop. The audit that follows from that
+  rule found three more unguarded one-shot response reads — the durable
+  capability probe (which runs on every exec, before the guarded loop
+  exists), `CancelExec`, and `write_files`' Upload — each a re-introduction
+  of the infinite wedge on its own hop. All three now race the epoch watch
+  via a shared helper and fail as retryable `Unavailable` (all three
+  round-trips are idempotent). The remaining vsock reads are either
+  timeout-bounded (GuestIp 2s, RefreshAgent 10s, shell/IDE/VNC 15–30s,
+  SpawnHarness 60s/attempt) or pre-application handshakes served by the
+  always-running muxer with EOF-shaped retry (`connect_fc_vsock`), so the
+  probe/cancel/upload trio closed the last unbounded reads on this class.
 
 ## Alternatives considered
 

@@ -1544,7 +1544,9 @@ impl FirecrackerBackend {
                 agent_socket.display()
             ))
         })?;
-        let durable_capable = probe_durable_exec(Box::new(probe)).await?;
+        // Direct-UDS variant (tests/dev): no FC snapshot machinery, so no
+        // severance signal to race the probe read against.
+        let durable_capable = probe_durable_exec(Box::new(probe), None).await?;
         let conn = UnixStream::connect(agent_socket).await.map_err(|e| {
             vm_err(format!(
                 "connect to agent at {} after durable capability probe: {e}",
@@ -1574,7 +1576,9 @@ impl FirecrackerBackend {
         let mut results = Vec::with_capacity(files.len());
         for file in files {
             let result = match UnixStream::connect(agent_socket).await {
-                Ok(conn) => upload_file_over_stream(conn, file).await,
+                // Direct-UDS variant: no snapshot machinery, no severance
+                // signal to race against.
+                Ok(conn) => upload_file_over_stream(conn, file, None).await,
                 Err(error) => write_file_failure(
                     file.path,
                     format!(
@@ -1599,10 +1603,15 @@ impl FirecrackerBackend {
         vsock_uds_path: &Path,
         port: u32,
         cmd: ExecRequest,
-        severed: Option<tokio::sync::watch::Receiver<u64>>,
+        mut severed: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<ExecStream, SandboxError> {
         let probe = Self::connect_fc_vsock(vsock_uds_path, port).await?;
-        let durable_capable = probe_durable_exec(Box::new(probe)).await?;
+        // The probe's response read sits on an established vsock connection
+        // BEFORE the epoch-guarded reader loop exists — a checkpoint landing
+        // here severs it with no host EOF, so the read must race the same
+        // epoch watch or it wedges forever (the ADR 0103 incident, on the
+        // probe hop).
+        let durable_capable = probe_durable_exec(Box::new(probe), severed.as_mut()).await?;
         let conn = Self::connect_fc_vsock(vsock_uds_path, port).await?;
         drive_exec_protocol(
             sandbox_id,
@@ -1620,11 +1629,12 @@ impl FirecrackerBackend {
         vsock_uds_path: &Path,
         port: u32,
         files: Vec<WriteFileSpec>,
+        mut severed: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
         let mut results = Vec::with_capacity(files.len());
         for file in files {
             let result = match Self::connect_fc_vsock(vsock_uds_path, port).await {
-                Ok(conn) => upload_file_over_stream(conn, file).await,
+                Ok(conn) => upload_file_over_stream(conn, file, severed.as_mut()).await,
                 Err(error) => write_file_failure(
                     file.path,
                     format!("sandbox {sandbox_id}: connect to agentd vsock: {error}"),
@@ -4343,7 +4353,40 @@ enum LegacyWireRequest {
     Exec(LegacyWireExecRequest),
 }
 
-async fn probe_durable_exec(mut io: BoxExecIo) -> Result<bool, SandboxError> {
+/// Read one `WireResponse`, racing the read against the snapshot-severance
+/// epoch watch. A checkpoint drops every established vsock connection with
+/// no host-side EOF (`LiveSandbox::vsock_epoch`), so any one-shot
+/// request/response read on such a connection would otherwise block forever.
+/// Mirrors the reader-loop guard in `drive_exec_protocol`: `biased` so a
+/// response already buffered on the wire beats the epoch bump; the epoch
+/// branch is only for reads that will never complete. On a bump the caller
+/// gets a retryable `Unavailable` naming `what` — both call sites are
+/// idempotent round-trips (a capability probe, a cancel), so a fresh dial
+/// and retry is always safe.
+async fn read_wire_response_racing_severance<S>(
+    io: &mut S,
+    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+    what: &str,
+) -> Result<std::io::Result<WireResponse>, SandboxError>
+where
+    S: AsyncRead + Unpin,
+{
+    match severed {
+        Some(epoch) => tokio::select! {
+            biased;
+            msg = read_msg::<_, WireResponse>(io) => Ok(msg),
+            _ = epoch.changed() => Err(SandboxError::Unavailable(format!(
+                "snapshot capture severed the agentd vsock connection before the {what} response; re-dial and retry"
+            ))),
+        },
+        None => Ok(read_msg::<_, WireResponse>(io).await),
+    }
+}
+
+async fn probe_durable_exec(
+    mut io: BoxExecIo,
+    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+) -> Result<bool, SandboxError> {
     write_msg(
         &mut io,
         &WireRequest::CancelExec {
@@ -4352,7 +4395,9 @@ async fn probe_durable_exec(mut io: BoxExecIo) -> Result<bool, SandboxError> {
     )
     .await
     .map_err(|error| vm_err(format!("durable exec capability probe send: {error}")))?;
-    match read_msg::<_, WireResponse>(&mut io).await {
+    match read_wire_response_racing_severance(&mut io, severed, "durable exec capability probe")
+        .await?
+    {
         Ok(WireResponse::ExecCancelled) => Ok(true),
         Ok(WireResponse::Error { kind, message }) => {
             tracing::warn!(
@@ -4367,6 +4412,36 @@ async fn probe_durable_exec(mut io: BoxExecIo) -> Result<bool, SandboxError> {
         ))),
         Err(error) => Err(vm_err(format!(
             "durable exec capability probe failed before command submission: {error}"
+        ))),
+    }
+}
+
+/// One `CancelExec` request/response round-trip against agentd. Split out of
+/// `SandboxBackend::cancel_exec` so the epoch-severance unit test can drive it
+/// over a duplex pair without a live sandbox (run_once pattern, ADR 0098).
+async fn cancel_exec_roundtrip(
+    mut io: BoxExecIo,
+    exec_id: &str,
+    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+) -> Result<(), SandboxError> {
+    write_msg(
+        &mut io,
+        &WireRequest::CancelExec {
+            exec_id: exec_id.to_string(),
+        },
+    )
+    .await
+    .map_err(|error| vm_err(format!("send CancelExec({exec_id}): {error}")))?;
+    match read_wire_response_racing_severance(&mut io, severed, "CancelExec").await? {
+        Ok(WireResponse::ExecCancelled) => Ok(()),
+        Ok(WireResponse::Error { kind, message }) => Err(vm_err(format!(
+            "agentd rejected CancelExec({exec_id}) ({kind}): {message}"
+        ))),
+        Ok(other) => Err(vm_err(format!(
+            "CancelExec({exec_id}) returned unexpected response: {other:?}"
+        ))),
+        Err(error) => Err(vm_err(format!(
+            "CancelExec({exec_id}) response failed; likely host/guest version skew (old agentd without ADR 0103): {error}"
         ))),
     }
 }
@@ -4673,7 +4748,11 @@ async fn durable_exec_fallback(
     let _ = tx.send(ExecEvent::Exit(None)).await;
 }
 
-async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
+async fn upload_file_over_stream<S>(
+    mut stream: S,
+    file: WriteFileSpec,
+    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+) -> WriteFileResult
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -4686,17 +4765,22 @@ where
     if let Err(error) = write_msg(&mut stream, &request).await {
         return write_file_failure(path, format!("send Upload request: {error}"));
     }
-    match read_msg::<_, WireResponse>(&mut stream).await {
-        Ok(WireResponse::UploadOk) => WriteFileResult {
+    // Same severance race as the exec probe: an Upload response read on an
+    // established vsock connection wedges forever if a checkpoint lands
+    // mid-round-trip. Uploads are content-idempotent, so the caller can
+    // always retry the reported failure.
+    match read_wire_response_racing_severance(&mut stream, severed, "Upload").await {
+        Ok(Ok(WireResponse::UploadOk)) => WriteFileResult {
             path,
             ok: true,
             error: None,
         },
-        Ok(WireResponse::Error { kind, message }) => {
+        Ok(Ok(WireResponse::Error { kind, message })) => {
             write_file_failure(path, format!("agentd rejected Upload ({kind}): {message}"))
         }
-        Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
-        Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
+        Ok(Ok(other)) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
+        Ok(Err(error)) => write_file_failure(path, format!("read Upload response: {error}")),
+        Err(error) => write_file_failure(path, format!("{error}")),
     }
 }
 
@@ -4860,31 +4944,18 @@ impl SandboxBackend for FirecrackerBackend {
     }
 
     async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
-        let vsock_uds_path = {
+        let (vsock_uds_path, mut severed) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.vsock_uds_path.clone()
+            // Subscribe BEFORE dialing (same ordering as exec_stream): the
+            // response read must race the severance watch or a checkpoint
+            // landing mid-round-trip wedges it forever.
+            (
+                live.state.vsock_uds_path.clone(),
+                live.vsock_epoch.subscribe(),
+            )
         };
-        let mut connection = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
-        write_msg(
-            &mut connection,
-            &WireRequest::CancelExec {
-                exec_id: exec_id.clone(),
-            },
-        )
-        .await
-        .map_err(|error| vm_err(format!("send CancelExec({exec_id}): {error}")))?;
-        match read_msg::<_, WireResponse>(&mut connection).await {
-            Ok(WireResponse::ExecCancelled) => Ok(()),
-            Ok(WireResponse::Error { kind, message }) => Err(vm_err(format!(
-                "agentd rejected CancelExec({exec_id}) ({kind}): {message}"
-            ))),
-            Ok(other) => Err(vm_err(format!(
-                "CancelExec({exec_id}) returned unexpected response: {other:?}"
-            ))),
-            Err(error) => Err(vm_err(format!(
-                "CancelExec({exec_id}) response failed; likely host/guest version skew (old agentd without ADR 0103): {error}"
-            ))),
-        }
+        let connection = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
+        cancel_exec_roundtrip(Box::new(connection), &exec_id, Some(&mut severed)).await
     }
 
     async fn write_files(
@@ -4892,11 +4963,21 @@ impl SandboxBackend for FirecrackerBackend {
         id: SandboxId,
         files: Vec<WriteFileSpec>,
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let vsock_uds_path = {
+        let (vsock_uds_path, severed) = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            live.state.vsock_uds_path.clone()
+            (
+                live.state.vsock_uds_path.clone(),
+                live.vsock_epoch.subscribe(),
+            )
         };
-        Self::write_files_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, files).await
+        Self::write_files_via_fc_vsock(
+            id,
+            &vsock_uds_path,
+            ENGRAM_AGENTD_PORT,
+            files,
+            Some(severed),
+        )
+        .await
     }
 
     /// ADR 0066: connect to the in-guest agentd relay listener on `port`
@@ -7570,8 +7651,108 @@ mod tests {
             .await
             .expect("old agentd skew response");
         });
-        assert!(!probe_durable_exec(Box::new(host_end)).await.unwrap());
+        assert!(!probe_durable_exec(Box::new(host_end), None).await.unwrap());
         stub.await.unwrap();
+    }
+
+    /// The capability probe runs on EVERY exec, on its own vsock connection,
+    /// BEFORE the epoch-guarded reader loop exists. A checkpoint landing
+    /// between the probe's request and agentd's response severs that
+    /// connection with no host EOF — the probe's read must race the epoch
+    /// watch and fail retryably (nothing was submitted, a re-dial is always
+    /// safe) instead of blocking forever.
+    #[tokio::test]
+    async fn checkpoint_severing_the_probe_response_errors_retryably_instead_of_hanging() {
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+
+        let severed_guest = tokio::spawn(async move {
+            // Consume the probe request, then go silent WITHOUT closing the
+            // connection — the severed-but-never-EOF muxer UDS.
+            let request: WireRequest = read_msg(&mut guest_end).await.expect("probe request");
+            assert!(matches!(request, WireRequest::CancelExec { .. }));
+            epoch_tx.send_modify(|epoch| *epoch += 1);
+            // Hold the connection open until the probe has resolved.
+            guest_end
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            probe_durable_exec(Box::new(host_end), Some(&mut epoch_rx)),
+        )
+        .await
+        .expect("probe must resolve promptly after the epoch bump, not hang");
+        assert!(
+            matches!(result, Err(SandboxError::Unavailable(_))),
+            "severed probe must be a retryable Unavailable, got {result:?}"
+        );
+        drop(severed_guest.await.unwrap());
+    }
+
+    /// Same severance window on the CancelExec round-trip: its response read
+    /// also sits on a bare established vsock connection.
+    #[tokio::test]
+    async fn checkpoint_severing_cancel_exec_response_errors_retryably_instead_of_hanging() {
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+
+        let severed_guest = tokio::spawn(async move {
+            let request: WireRequest = read_msg(&mut guest_end).await.expect("cancel request");
+            assert!(
+                matches!(request, WireRequest::CancelExec { ref exec_id } if exec_id == "exec-victim")
+            );
+            epoch_tx.send_modify(|epoch| *epoch += 1);
+            guest_end
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            cancel_exec_roundtrip(Box::new(host_end), "exec-victim", Some(&mut epoch_rx)),
+        )
+        .await
+        .expect("cancel round-trip must resolve promptly after the epoch bump, not hang");
+        assert!(
+            matches!(result, Err(SandboxError::Unavailable(_))),
+            "severed cancel must be a retryable Unavailable, got {result:?}"
+        );
+        drop(severed_guest.await.unwrap());
+    }
+
+    /// And on the Upload round-trip (`write_files`): a severed response read
+    /// must surface as a per-file failure the caller can retry, not a hang.
+    #[tokio::test]
+    async fn checkpoint_severing_the_upload_response_reports_failure_instead_of_hanging() {
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+
+        let severed_guest = tokio::spawn(async move {
+            let request: WireRequest = read_msg(&mut guest_end).await.expect("upload request");
+            assert!(matches!(request, WireRequest::Upload { .. }));
+            epoch_tx.send_modify(|epoch| *epoch += 1);
+            guest_end
+        });
+
+        let file = WriteFileSpec {
+            path: "/workspace/hello.txt".into(),
+            content: b"hi".to_vec(),
+            mode: None,
+        };
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            upload_file_over_stream(host_end, file, Some(&mut epoch_rx)),
+        )
+        .await
+        .expect("upload must resolve promptly after the epoch bump, not hang");
+        assert!(!result.ok, "severed upload must report failure");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("severed")),
+            "failure must name the severance, got {:?}",
+            result.error
+        );
+        drop(severed_guest.await.unwrap());
     }
 
     /// The severance race must not eat a real exit: when a genuine
