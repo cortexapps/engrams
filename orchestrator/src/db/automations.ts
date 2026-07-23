@@ -76,7 +76,13 @@ export interface AutomationStore {
   list(opts: { includeArchived: boolean }): Promise<AutomationRow[]>;
   get(id: string): Promise<AutomationRow | null>;
   getActive(id: string): Promise<AutomationRow | null>;
-  listActiveForWebhookRegistration(registrationId: string): Promise<AutomationRow[]>;
+  /** Non-archived automations referencing the registration, INCLUDING
+   * disabled ones — the deletion guard's view (disabling is a pause, not a
+   * divorce from the registration). */
+  listBoundToWebhookRegistration(registrationId: string): Promise<AutomationRow[]>;
+  /** Enabled, non-archived automations referencing the registration — the
+   * dispatch view (a disabled automation must not fire). */
+  listEnabledForWebhookRegistration(registrationId: string): Promise<AutomationRow[]>;
   create(input: AutomationInput, createdByUserId: string): Promise<AutomationRow>;
   update(id: string, input: AutomationInput): Promise<AutomationRow | null>;
   archive(id: string): Promise<AutomationRow | null>;
@@ -231,7 +237,22 @@ export function makeAutomationStore(
       return row ? automationRow(row) : null;
     },
 
-    async listActiveForWebhookRegistration(registrationId) {
+    async listBoundToWebhookRegistration(registrationId) {
+      const rows = await db
+        .select()
+        .from(automationTable)
+        .where(
+          and(
+            isNull(automationTable.archivedAt),
+            sql`${automationTable.trigger}->>'kind' = 'webhook'`,
+            sql`${automationTable.trigger}->>'registrationId' = ${registrationId}`,
+          ),
+        )
+        .orderBy(automationTable.id);
+      return rows.map(automationRow);
+    },
+
+    async listEnabledForWebhookRegistration(registrationId) {
       const rows = await db
         .select()
         .from(automationTable)

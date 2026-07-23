@@ -691,7 +691,7 @@ export function registerAutomations(router: ConnectRouter, deps?: AutomationDeps
     async deleteWebhookRegistration(req, ctx) {
       await requireAdmin(ctx, getSession);
       const id = requiredText(req.id, "id");
-      const boundAutomations = await store.listActiveForWebhookRegistration(id);
+      const boundAutomations = await store.listBoundToWebhookRegistration(id);
       if (boundAutomations.length > 0) {
         throw new ConnectError(
           `cannot delete webhook registration "${id}": ${boundAutomations.length} non-archived automation(s) reference it (${boundAutomations.map((automation) => automation.id).join(", ")})`,

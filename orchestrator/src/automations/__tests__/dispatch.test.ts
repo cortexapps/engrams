@@ -57,7 +57,7 @@ function fixture(automations: AutomationRow[]) {
     async recordWebhookSample(input) {
       samples.push(input);
     },
-    async listActiveForWebhookRegistration() {
+    async listEnabledForWebhookRegistration() {
       return automations;
     },
   };
