@@ -132,6 +132,15 @@ describe("in-memory DBOS status store", () => {
         recoveryAttempts: 0,
       },
       {
+        workflowUuid: "pending-same-time",
+        name: "WorkflowOne",
+        status: "PENDING",
+        applicationVersion: "dead-c",
+        createdAtEpochMs: 100,
+        updatedAtEpochMs: 100,
+        recoveryAttempts: 0,
+      },
+      {
         workflowUuid: "pending-live",
         name: "WorkflowOne",
         status: "PENDING",
@@ -172,12 +181,31 @@ describe("in-memory DBOS status store", () => {
     ]);
     expect(
       (await store.listNonTerminalOnVersionsNotIn([], 10)).map((row) => row.workflowUuid),
-    ).toEqual(["pending-live", "pending-old", "enqueued-next"]);
+    ).toEqual([
+      "pending-live",
+      "pending-old",
+      "pending-same-time",
+      "enqueued-next",
+    ]);
+    expect(
+      (
+        await store.listNonTerminalOnVersionsNotIn([], 10, {
+          createdAtEpochMs: 100,
+          workflowUuid: "pending-old",
+        })
+      ).map((row) => row.workflowUuid),
+    ).toEqual(["pending-same-time", "enqueued-next"]);
   });
 
   test("adopts only PENDING and clears only the version on ENQUEUED", async () => {
-    const { makeInMemoryDbosStatusStore } = await sweepModule();
+    const {
+      makeInMemoryDbosStatusStore,
+      makeInMemorySweepLedgerStore,
+    } = await sweepModule();
     let nowMs = 5_000;
+    const ledger = makeInMemorySweepLedgerStore(
+      () => new Date(nowMs),
+    );
     const store = makeInMemoryDbosStatusStore(
       [
         {
@@ -217,11 +245,42 @@ describe("in-memory DBOS status store", () => {
         },
       ],
       () => new Date(nowMs),
+      {
+        recordSweep: (workflowUuid, workflowName) =>
+          ledger.recordSweep(workflowUuid, workflowName),
+      },
     );
 
-    expect(await store.adoptPending(["pending", "enqueued", "terminal"])).toEqual([
-      "pending",
-    ]);
+    expect(
+      await store.adoptPendingRecording(
+        {
+          workflowUuid: "pending",
+          expectedVersion: "dead",
+          workflowName: "WorkflowOne",
+        },
+        60_000,
+      ),
+    ).toEqual({ flipped: true, sweepCount: 1 });
+    expect(
+      await store.adoptPendingRecording(
+        {
+          workflowUuid: "enqueued",
+          expectedVersion: "dead",
+          workflowName: "WorkflowOne",
+        },
+        60_000,
+      ),
+    ).toEqual({ flipped: false });
+    expect(
+      await store.adoptPendingRecording(
+        {
+          workflowUuid: "terminal",
+          expectedVersion: "dead",
+          workflowName: "WorkflowOne",
+        },
+        60_000,
+      ),
+    ).toEqual({ flipped: false });
     expect(store.inspect("pending")).toMatchObject({
       status: "ENQUEUED",
       queueName: "_dbos_internal_queue",
@@ -241,9 +300,26 @@ describe("in-memory DBOS status store", () => {
     });
 
     nowMs = 6_000;
-    expect(await store.clearVersionOnEnqueued(["enqueued", "terminal"])).toEqual([
-      "enqueued",
-    ]);
+    expect(
+      await store.clearVersionOnEnqueuedRecording(
+        {
+          workflowUuid: "enqueued",
+          expectedVersion: "dead",
+          workflowName: "WorkflowOne",
+        },
+        60_000,
+      ),
+    ).toEqual({ flipped: true, sweepCount: 1 });
+    expect(
+      await store.clearVersionOnEnqueuedRecording(
+        {
+          workflowUuid: "terminal",
+          expectedVersion: "dead",
+          workflowName: "WorkflowOne",
+        },
+        60_000,
+      ),
+    ).toEqual({ flipped: false });
     expect(store.inspect("enqueued")).toMatchObject({
       applicationVersion: null,
       queueName: "custom",
@@ -416,6 +492,9 @@ describe("DBOS sweep stores with live Postgres", () => {
       const enqueued = `${runId}-enqueued`;
       const live = `${runId}-live`;
       const terminal = `${runId}-terminal`;
+      const deadVersionA = `${runId}-dead-a`;
+      const deadVersionB = `${runId}-dead-b`;
+      const liveVersion = `${runId}-live-version`;
 
       await getDb().execute(sql`
         insert into "dbos"."workflow_status"
@@ -423,30 +502,74 @@ describe("DBOS sweep stores with live Postgres", () => {
            "recovery_attempts", "created_at", "updated_at", "queue_name",
            "workflow_deadline_epoch_ms", "deduplication_id", "started_at_epoch_ms")
         values
-          (${pendingA}, 'PENDING', 'WorkflowOne', 'dead-a', 7, 100, 100,
+          (${pendingA}, 'PENDING', 'WorkflowOne', ${deadVersionA}, 7, 100, 100,
            'old-queue', 900, ${`${runId}-dedup-a`}, 500),
-          (${pendingB}, 'PENDING', 'WorkflowOne', 'dead-a', 1, 200, 200,
+          (${pendingB}, 'PENDING', 'WorkflowOne', ${deadVersionA}, 1, 200, 200,
            null, null, null, null),
-          (${enqueued}, 'ENQUEUED', 'WorkflowTwo', 'dead-b', 3, 300, 300,
+          (${enqueued}, 'ENQUEUED', 'WorkflowTwo', ${deadVersionB}, 3, 300, 300,
            'custom-queue', 901, ${`${runId}-dedup-b`}, 501),
-          (${live}, 'PENDING', 'WorkflowOne', 'live', 0, 50, 50,
+          (${live}, 'PENDING', 'WorkflowOne', ${liveVersion}, 0, 50, 50,
            null, null, null, null),
-          (${terminal}, 'SUCCESS', 'WorkflowOne', 'dead-a', 9, 25, 25,
+          (${terminal}, 'SUCCESS', 'WorkflowOne', ${deadVersionA}, 9, 25, 25,
            null, null, null, null)
       `);
 
       expect(
-        (await store.listNonTerminalOnVersionsNotIn(["live"], 2)).map(
+        (await store.listNonTerminalOnVersionsNotIn([liveVersion], 2)).map(
           (row) => row.workflowUuid,
         ),
       ).toEqual([pendingA, pendingB]);
 
-      expect(await store.adoptPending([pendingA, enqueued, terminal])).toEqual([
-        pendingA,
-      ]);
-      expect(await store.clearVersionOnEnqueued([enqueued, terminal])).toEqual([
-        enqueued,
-      ]);
+      expect(
+        await store.adoptPendingRecording(
+          {
+            workflowUuid: pendingA,
+            expectedVersion: deadVersionA,
+            workflowName: "WorkflowOne",
+          },
+          60_000,
+        ),
+      ).toEqual({ flipped: true, sweepCount: 1 });
+      expect(
+        await store.adoptPendingRecording(
+          {
+            workflowUuid: enqueued,
+            expectedVersion: deadVersionB,
+            workflowName: "WorkflowTwo",
+          },
+          60_000,
+        ),
+      ).toEqual({ flipped: false });
+      expect(
+        await store.adoptPendingRecording(
+          {
+            workflowUuid: terminal,
+            expectedVersion: deadVersionA,
+            workflowName: "WorkflowOne",
+          },
+          60_000,
+        ),
+      ).toEqual({ flipped: false });
+      expect(
+        await store.clearVersionOnEnqueuedRecording(
+          {
+            workflowUuid: enqueued,
+            expectedVersion: deadVersionB,
+            workflowName: "WorkflowTwo",
+          },
+          60_000,
+        ),
+      ).toEqual({ flipped: true, sweepCount: 1 });
+      expect(
+        await store.clearVersionOnEnqueuedRecording(
+          {
+            workflowUuid: terminal,
+            expectedVersion: deadVersionA,
+            workflowName: "WorkflowOne",
+          },
+          60_000,
+        ),
+      ).toEqual({ flipped: false });
 
       const result = await getDb().execute(sql`
         select "workflow_uuid", "status", "application_version", "queue_name",
@@ -479,10 +602,120 @@ describe("DBOS sweep stores with live Postgres", () => {
       });
       expect(byId.get(terminal)).toMatchObject({
         status: "SUCCESS",
-        application_version: "dead-a",
+        application_version: deadVersionA,
         recovery_attempts: "9",
         updated_at: "25",
       });
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "adoption is fenced by a heartbeat that arrives after listing",
+    async () => {
+      const {
+        makeDbosStatusStore,
+        makeSweepLedgerStore,
+      } = await sweepModule();
+      const store = makeDbosStatusStore();
+      const workflowUuid = `${runId}-heartbeat-fence`;
+      const applicationVersion = `${runId}-heartbeat-fence-version`;
+      const podName = `${runId}-heartbeat-fence-pod`;
+
+      await getDb().execute(sql`
+        insert into "dbos"."workflow_status"
+          ("workflow_uuid", "status", "name", "application_version",
+           "recovery_attempts", "created_at", "updated_at")
+        values (
+          ${workflowUuid}, 'PENDING', 'WorkflowOne', ${applicationVersion},
+          0, 100, 100
+        )
+      `);
+      await getDb().execute(sql`
+        insert into "dbos_version_heartbeats"
+          ("application_version", "pod_name", "last_seen")
+        values (${applicationVersion}, ${podName}, now())
+      `);
+
+      expect(
+        await store.adoptPendingRecording(
+          {
+            workflowUuid,
+            expectedVersion: applicationVersion,
+            workflowName: "WorkflowOne",
+          },
+          60_000,
+        ),
+      ).toEqual({ flipped: false });
+      expect(
+        await makeSweepLedgerStore().get(workflowUuid),
+      ).toBeNull();
+
+      await getDb().execute(sql`
+        update "dbos_version_heartbeats"
+        set "last_seen" = now() - interval '1 hour'
+        where "application_version" = ${applicationVersion}
+          and "pod_name" = ${podName}
+      `);
+      expect(
+        await store.adoptPendingRecording(
+          {
+            workflowUuid,
+            expectedVersion: applicationVersion,
+            workflowName: "WorkflowOne",
+          },
+          60_000,
+        ),
+      ).toEqual({ flipped: true, sweepCount: 1 });
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "a ledger failure rolls the status flip back in the same transaction",
+    async () => {
+      const { makeDbosStatusStore } = await sweepModule();
+      const store = makeDbosStatusStore();
+      const workflowUuid = `${runId}-atomic-rollback`;
+      const applicationVersion = `${runId}-atomic-rollback-version`;
+
+      await getDb().execute(sql`
+        insert into "dbos"."workflow_status"
+          ("workflow_uuid", "status", "name", "application_version",
+           "recovery_attempts", "created_at", "updated_at")
+        values (
+          ${workflowUuid}, 'PENDING', 'WorkflowOne', ${applicationVersion},
+          0, 100, 100
+        )
+      `);
+      await getDb().execute(sql`
+        insert into "dbos_sweep_ledger"
+          ("workflow_uuid", "workflow_name", "sweep_count")
+        values (${workflowUuid}, 'WorkflowOne', 2147483647)
+      `);
+
+      await expect(
+        store.adoptPendingRecording(
+          {
+            workflowUuid,
+            expectedVersion: applicationVersion,
+            workflowName: "WorkflowOne",
+          },
+          60_000,
+        ),
+      ).rejects.toThrow();
+
+      const result = await getDb().execute(sql`
+        select "workflow"."status", "workflow"."application_version",
+               "ledger"."sweep_count"
+        from "dbos"."workflow_status" as "workflow"
+        inner join "dbos_sweep_ledger" as "ledger"
+          on "ledger"."workflow_uuid" = "workflow"."workflow_uuid"
+        where "workflow"."workflow_uuid" = ${workflowUuid}
+      `);
+      expect(result.rows[0]).toMatchObject({
+        status: "PENDING",
+        application_version: applicationVersion,
+      });
+      expect(Number(result.rows[0]?.sweep_count)).toBe(2147483647);
     },
   );
 

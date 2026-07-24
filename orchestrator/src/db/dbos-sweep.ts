@@ -61,6 +61,16 @@ export interface DbosWorkflowRow {
   recoveryAttempts: number;
 }
 
+export interface DbosSweepTransitionInput {
+  workflowUuid: string;
+  expectedVersion: string;
+  workflowName: string;
+}
+
+export type DbosSweepTransitionResult =
+  | { flipped: false }
+  | { flipped: true; sweepCount: number };
+
 export interface FailedDbosWorkflowRow extends DbosWorkflowRow {
   updatedAtEpochMs: number;
 }
@@ -69,9 +79,16 @@ export interface DbosStatusStore {
   listNonTerminalOnVersionsNotIn(
     liveVersions: string[],
     limit: number,
+    after?: { createdAtEpochMs: number; workflowUuid: string },
   ): Promise<DbosWorkflowRow[]>;
-  adoptPending(workflowUuids: string[]): Promise<string[]>;
-  clearVersionOnEnqueued(workflowUuids: string[]): Promise<string[]>;
+  adoptPendingRecording(
+    input: DbosSweepTransitionInput,
+    graceMs: number,
+  ): Promise<DbosSweepTransitionResult>;
+  clearVersionOnEnqueuedRecording(
+    input: DbosSweepTransitionInput,
+    graceMs: number,
+  ): Promise<DbosSweepTransitionResult>;
   listNewlyTerminalFailed(
     sinceEpochMs: number,
     limit: number,
@@ -142,6 +159,29 @@ function failedDbosWorkflowRow(
   };
 }
 
+function recordSweepQuery(
+  workflowUuid: string,
+  workflowName: string,
+): SQL {
+  return sql`
+    insert into "dbos_sweep_ledger"
+      ("workflow_uuid", "workflow_name", "sweep_count",
+       "first_swept_at", "last_swept_at")
+    values (${workflowUuid}, ${workflowName}, 1, now(), now())
+    on conflict ("workflow_uuid") do update
+    set "workflow_name" = excluded."workflow_name",
+        "sweep_count" = "dbos_sweep_ledger"."sweep_count" + 1,
+        "first_swept_at" = coalesce(
+          "dbos_sweep_ledger"."first_swept_at",
+          excluded."first_swept_at"
+        ),
+        "last_swept_at" = now()
+    returning "workflow_uuid", "workflow_name", "sweep_count",
+              "first_swept_at", "last_swept_at", "suppressed",
+              "cleanup_done_at", "cleanup_fn", "alerted_at"
+  `;
+}
+
 export function makeHeartbeatStore(
   db: ReturnType<typeof getDb> = getDb(),
 ): HeartbeatStore {
@@ -204,23 +244,9 @@ export function makeSweepLedgerStore(
 ): SweepLedgerStore {
   return {
     async recordSweep(workflowUuid, workflowName) {
-      const result = await db.execute(sql`
-        insert into "dbos_sweep_ledger"
-          ("workflow_uuid", "workflow_name", "sweep_count",
-           "first_swept_at", "last_swept_at")
-        values (${workflowUuid}, ${workflowName}, 1, now(), now())
-        on conflict ("workflow_uuid") do update
-        set "workflow_name" = excluded."workflow_name",
-            "sweep_count" = "dbos_sweep_ledger"."sweep_count" + 1,
-            "first_swept_at" = coalesce(
-              "dbos_sweep_ledger"."first_swept_at",
-              excluded."first_swept_at"
-            ),
-            "last_swept_at" = now()
-        returning "workflow_uuid", "workflow_name", "sweep_count",
-                  "first_swept_at", "last_swept_at", "suppressed",
-                  "cleanup_done_at", "cleanup_fn", "alerted_at"
-      `);
+      const result = await db.execute(
+        recordSweepQuery(workflowUuid, workflowName),
+      );
       const row = result.rows[0];
       if (!row) throw new Error(`sweep ledger upsert returned no row for ${workflowUuid}`);
       return ledgerRow(row);
@@ -292,7 +318,13 @@ export function makeDbosStatusStore(
   db: ReturnType<typeof getDb> = getDb(),
 ): DbosStatusStore {
   return {
-    async listNonTerminalOnVersionsNotIn(liveVersions, limit) {
+    async listNonTerminalOnVersionsNotIn(liveVersions, limit, after) {
+      const afterClause = after
+        ? sql`
+          and ("created_at", "workflow_uuid") >
+              (${after.createdAtEpochMs}, ${after.workflowUuid})
+        `
+        : sql``;
       const result = await db.execute(sql`
         select "workflow_uuid", "name", "status", "application_version",
                "created_at", coalesce("recovery_attempts", 0) as "recovery_attempts"
@@ -300,41 +332,90 @@ export function makeDbosStatusStore(
         where "status" in ('PENDING', 'ENQUEUED')
           and "application_version" is not null
           and "application_version" <> all(${textArray(liveVersions)})
-        order by "created_at" asc
+          ${afterClause}
+        order by "created_at" asc, "workflow_uuid" asc
         limit ${limit}
       `);
       return result.rows.map(dbosWorkflowRow);
     },
 
-    async adoptPending(workflowUuids) {
-      if (workflowUuids.length === 0) return [];
-      const result = await db.execute(sql`
-        update "dbos"."workflow_status"
-        set "status" = 'ENQUEUED',
-            "queue_name" = '_dbos_internal_queue',
-            "application_version" = null,
-            "workflow_deadline_epoch_ms" = null,
-            "deduplication_id" = null,
-            "started_at_epoch_ms" = null,
-            "completed_at" = null,
-            "updated_at" = (extract(epoch from now()) * 1000)::bigint
-        where "status" = 'PENDING'
-          and "workflow_uuid" = any(${textArray(workflowUuids)})
-        returning "workflow_uuid"
-      `);
-      return result.rows.map((row) => String(row.workflow_uuid));
+    async adoptPendingRecording(input, graceMs) {
+      return db.transaction(async (tx) => {
+        const flipped = await tx.execute(sql`
+          update "dbos"."workflow_status"
+          set "status" = 'ENQUEUED',
+              "queue_name" = '_dbos_internal_queue',
+              "application_version" = null,
+              "workflow_deadline_epoch_ms" = null,
+              "deduplication_id" = null,
+              "started_at_epoch_ms" = null,
+              "completed_at" = null,
+              "updated_at" = (extract(epoch from now()) * 1000)::bigint
+          where "status" = 'PENDING'
+            and "workflow_uuid" = ${input.workflowUuid}
+            and "application_version" = ${input.expectedVersion}
+            and not exists (
+              select 1
+              from "dbos_version_heartbeats" as "heartbeat"
+              where "heartbeat"."application_version" =
+                    ${input.expectedVersion}
+                and "heartbeat"."last_seen" >
+                    now() - (${graceMs} * interval '1 millisecond')
+            )
+          returning "workflow_uuid"
+        `);
+        if (affectedRows(flipped) === 0) return { flipped: false };
+
+        const recorded = await tx.execute(
+          recordSweepQuery(input.workflowUuid, input.workflowName),
+        );
+        const row = recorded.rows[0];
+        if (!row) {
+          throw new Error(
+            `sweep ledger upsert returned no row for ${input.workflowUuid}`,
+          );
+        }
+        return {
+          flipped: true,
+          sweepCount: numberValue(row.sweep_count),
+        };
+      });
     },
 
-    async clearVersionOnEnqueued(workflowUuids) {
-      if (workflowUuids.length === 0) return [];
-      const result = await db.execute(sql`
-        update "dbos"."workflow_status"
-        set "application_version" = null
-        where "status" = 'ENQUEUED'
-          and "workflow_uuid" = any(${textArray(workflowUuids)})
-        returning "workflow_uuid"
-      `);
-      return result.rows.map((row) => String(row.workflow_uuid));
+    async clearVersionOnEnqueuedRecording(input, graceMs) {
+      return db.transaction(async (tx) => {
+        const flipped = await tx.execute(sql`
+          update "dbos"."workflow_status"
+          set "application_version" = null
+          where "status" = 'ENQUEUED'
+            and "workflow_uuid" = ${input.workflowUuid}
+            and "application_version" = ${input.expectedVersion}
+            and not exists (
+              select 1
+              from "dbos_version_heartbeats" as "heartbeat"
+              where "heartbeat"."application_version" =
+                    ${input.expectedVersion}
+                and "heartbeat"."last_seen" >
+                    now() - (${graceMs} * interval '1 millisecond')
+            )
+          returning "workflow_uuid"
+        `);
+        if (affectedRows(flipped) === 0) return { flipped: false };
+
+        const recorded = await tx.execute(
+          recordSweepQuery(input.workflowUuid, input.workflowName),
+        );
+        const row = recorded.rows[0];
+        if (!row) {
+          throw new Error(
+            `sweep ledger upsert returned no row for ${input.workflowUuid}`,
+          );
+        }
+        return {
+          flipped: true,
+          sweepCount: numberValue(row.sweep_count),
+        };
+      });
     },
 
     async listNewlyTerminalFailed(sinceEpochMs, limit) {
@@ -587,10 +668,22 @@ export interface InMemoryDbosStatusStore extends DbosStatusStore {
   inspect(workflowUuid: string): InMemoryDbosStatusRow | null;
 }
 
+export interface InMemoryDbosStatusOptions {
+  isVersionLive?: (
+    applicationVersion: string,
+    graceMs: number,
+  ) => boolean | Promise<boolean>;
+  recordSweep?: (
+    workflowUuid: string,
+    workflowName: string,
+  ) => Promise<SweepLedgerRow>;
+}
+
 /** Deterministic in-memory DBOS system-table projection for sweep unit tests. */
 export function makeInMemoryDbosStatusStore(
   initialRows: InMemoryDbosStatusSeed[] = [],
   now: () => Date = () => new Date(),
+  options: InMemoryDbosStatusOptions = {},
 ): InMemoryDbosStatusStore {
   const rows = new Map<string, InMemoryDbosStatusRow>(
     initialRows.map((row) => [
@@ -621,25 +714,68 @@ export function makeInMemoryDbosStatusStore(
     updatedAtEpochMs: row.updatedAtEpochMs,
   });
 
+  const recordTransition = async (
+    row: InMemoryDbosStatusRow,
+    input: DbosSweepTransitionInput,
+    mutate: () => void,
+  ): Promise<DbosSweepTransitionResult> => {
+    const before = { ...row };
+    mutate();
+    try {
+      const recorded = await options.recordSweep?.(
+        input.workflowUuid,
+        input.workflowName,
+      );
+      return {
+        flipped: true,
+        sweepCount: recorded?.sweepCount ?? 1,
+      };
+    } catch (error) {
+      rows.set(input.workflowUuid, before);
+      throw error;
+    }
+  };
+
   return {
-    async listNonTerminalOnVersionsNotIn(liveVersions, limit) {
+    async listNonTerminalOnVersionsNotIn(liveVersions, limit, after) {
       return [...rows.values()]
         .filter(
           (row) =>
             (row.status === "PENDING" || row.status === "ENQUEUED") &&
             row.applicationVersion !== null &&
-            !liveVersions.includes(row.applicationVersion),
+            !liveVersions.includes(row.applicationVersion) &&
+            (after === undefined ||
+              row.createdAtEpochMs > after.createdAtEpochMs ||
+              (row.createdAtEpochMs === after.createdAtEpochMs &&
+                row.workflowUuid > after.workflowUuid)),
         )
-        .sort((left, right) => left.createdAtEpochMs - right.createdAtEpochMs)
+        .sort(
+          (left, right) =>
+            left.createdAtEpochMs - right.createdAtEpochMs ||
+            (left.workflowUuid < right.workflowUuid
+              ? -1
+              : left.workflowUuid > right.workflowUuid
+                ? 1
+                : 0),
+        )
         .slice(0, limit)
         .map(workflowProjection);
     },
 
-    async adoptPending(workflowUuids) {
-      const adopted: string[] = [];
-      for (const workflowUuid of workflowUuids) {
-        const row = rows.get(workflowUuid);
-        if (!row || row.status !== "PENDING") continue;
+    async adoptPendingRecording(input, graceMs) {
+      const row = rows.get(input.workflowUuid);
+      if (
+        !row ||
+        row.status !== "PENDING" ||
+        row.applicationVersion !== input.expectedVersion ||
+        (await options.isVersionLive?.(
+          input.expectedVersion,
+          graceMs,
+        )) === true
+      ) {
+        return { flipped: false };
+      }
+      return recordTransition(row, input, () => {
         row.status = "ENQUEUED";
         row.queueName = "_dbos_internal_queue";
         row.applicationVersion = null;
@@ -647,20 +783,25 @@ export function makeInMemoryDbosStatusStore(
         row.deduplicationId = null;
         row.startedAtEpochMs = null;
         row.updatedAtEpochMs = now().getTime();
-        adopted.push(workflowUuid);
-      }
-      return adopted;
+      });
     },
 
-    async clearVersionOnEnqueued(workflowUuids) {
-      const cleared: string[] = [];
-      for (const workflowUuid of workflowUuids) {
-        const row = rows.get(workflowUuid);
-        if (!row || row.status !== "ENQUEUED") continue;
-        row.applicationVersion = null;
-        cleared.push(workflowUuid);
+    async clearVersionOnEnqueuedRecording(input, graceMs) {
+      const row = rows.get(input.workflowUuid);
+      if (
+        !row ||
+        row.status !== "ENQUEUED" ||
+        row.applicationVersion !== input.expectedVersion ||
+        (await options.isVersionLive?.(
+          input.expectedVersion,
+          graceMs,
+        )) === true
+      ) {
+        return { flipped: false };
       }
-      return cleared;
+      return recordTransition(row, input, () => {
+        row.applicationVersion = null;
+      });
     },
 
     async listNewlyTerminalFailed(sinceEpochMs, limit) {

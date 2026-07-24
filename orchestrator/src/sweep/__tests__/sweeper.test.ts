@@ -63,7 +63,13 @@ async function fixture(
   const heartbeats = makeInMemoryHeartbeatStore(now);
   await heartbeats.beat(CURRENT_VERSION, "pod-current");
   const lease = makeInMemorySweepLeaseStore(now);
-  const status = makeInMemoryDbosStatusStore(rows, now);
+  const ledger = makeInMemorySweepLedgerStore(now);
+  const status = makeInMemoryDbosStatusStore(rows, now, {
+    isVersionLive: async (applicationVersion, graceMs) =>
+      (await heartbeats.liveVersions(graceMs)).includes(applicationVersion),
+    recordSweep: (workflowUuid, workflowName) =>
+      ledger.recordSweep(workflowUuid, workflowName),
+  });
   const cancelled: string[] = [];
   const deps: SweepTickDeps = {
     owner: "sweeper-owner",
@@ -71,7 +77,7 @@ async function fixture(
     config: { ...DEFAULT_SWEEP_CONFIG, ...config },
     heartbeats,
     lease,
-    ledger: makeInMemorySweepLedgerStore(now),
+    ledger,
     status,
     cancelWorkflow: async (workflowUuid) => {
       cancelled.push(workflowUuid);
@@ -119,7 +125,7 @@ describe("runSweepTick", () => {
     expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);
   });
 
-  test("adopts a fresh PENDING workflow and records the sweep first", async () => {
+  test("atomically adopts a fresh PENDING workflow and records one sweep", async () => {
     const f = await fixture([row("wf-pending")]);
 
     const result = await runSweepTick(f.deps);
@@ -276,6 +282,74 @@ describe("runSweepTick", () => {
     expect(f.status.inspect("wf-2")?.applicationVersion).toBe(DEAD_VERSION);
   });
 
+  test("paginates past more than one page of alert-only rows to adopt younger work", async () => {
+    const alertOnlyRows = Array.from({ length: 5 }, (_, index) =>
+      row(`wf-unknown-${index}`, {
+        name: "DeletedWorkflowName",
+        createdAtEpochMs: NOW.getTime() - (10_000 - index),
+      }),
+    );
+    const f = await fixture(
+      [
+        ...alertOnlyRows,
+        row("wf-adoptable", {
+          createdAtEpochMs: NOW.getTime() - 1_000,
+        }),
+      ],
+      {},
+      { batchCap: 1 },
+    );
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.scanned).toBe(6);
+    expect(result.decisions.map((decision) => decision.action)).toEqual([
+      "alert_only",
+      "alert_only",
+      "alert_only",
+      "alert_only",
+      "alert_only",
+      "adopted",
+    ]);
+    expect(f.status.inspect("wf-adoptable")?.applicationVersion).toBeNull();
+  });
+
+  test("stops pagination at the total scan budget and logs the cap", async () => {
+    const alertOnlyRows = Array.from({ length: 40 }, (_, index) =>
+      row(`wf-unknown-${String(index).padStart(2, "0")}`, {
+        name: "DeletedWorkflowName",
+        createdAtEpochMs: NOW.getTime() - (100_000 - index),
+      }),
+    );
+    const f = await fixture(
+      [
+        ...alertOnlyRows,
+        row("wf-beyond-budget", {
+          createdAtEpochMs: NOW.getTime() - 1_000,
+        }),
+      ],
+      {},
+      { batchCap: 1 },
+    );
+    const warnings: string[] = [];
+    f.deps.log = {
+      info() {},
+      warn(_fields: object, message: string) {
+        warnings.push(message);
+      },
+      error() {},
+    } as unknown as Logger;
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.scanned).toBe(40);
+    expect(result.decisions).toHaveLength(40);
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(
+      DEAD_VERSION,
+    );
+    expect(warnings).toEqual(["DBOS orphan sweep scan budget exhausted"]);
+  });
+
   test("contains a cancel error and continues to the next row", async () => {
     const f = await fixture([
       row("wf-bad-cancel", {
@@ -310,8 +384,8 @@ describe("runSweepTick", () => {
     const underlying = makeInMemoryDbosStatusStore([row("wf-raced")]);
     const status: DbosStatusStore = {
       ...underlying,
-      async adoptPending() {
-        return [];
+      async adoptPendingRecording() {
+        return { flipped: false };
       },
     };
     const f = await fixture([], { status });
@@ -320,8 +394,142 @@ describe("runSweepTick", () => {
 
     expect(result.decisions[0]).toMatchObject({
       action: "error",
-      reason: "no longer PENDING",
+      reason: "owner became live or row changed",
     });
+  });
+
+  test("does not adopt when the owner heartbeats after listing but before the flip", async () => {
+    const f = await fixture([]);
+    const underlying = makeInMemoryDbosStatusStore(
+      [row("wf-owner-returned")],
+      () => new Date(NOW),
+      {
+        isVersionLive: async (applicationVersion, graceMs) =>
+          (await f.heartbeats.liveVersions(graceMs)).includes(
+            applicationVersion,
+          ),
+      },
+    );
+    f.deps.status = {
+      ...underlying,
+      async listNonTerminalOnVersionsNotIn(liveVersions, limit, after) {
+        const listed = await underlying.listNonTerminalOnVersionsNotIn(
+          liveVersions,
+          limit,
+          after,
+        );
+        await f.heartbeats.beat(DEAD_VERSION, "pod-returned");
+        return listed;
+      },
+    };
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions).toEqual([
+      {
+        workflowUuid: "wf-owner-returned",
+        name: "ToolExecWorkflow",
+        action: "error",
+        reason: "owner became live or row changed",
+      },
+    ]);
+    expect(underlying.inspect("wf-owner-returned")).toMatchObject({
+      status: "PENDING",
+      applicationVersion: DEAD_VERSION,
+    });
+  });
+
+  test("does not record a sweep when the adoption transaction throws", async () => {
+    const f = await fixture([row("wf-flip-failed")]);
+    f.deps.status = {
+      ...f.status,
+      async adoptPendingRecording() {
+        throw new Error("flip transaction failed");
+      },
+    };
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]).toMatchObject({
+      action: "error",
+      reason: "flip transaction failed",
+    });
+    expect(await f.deps.ledger.get("wf-flip-failed")).toBeNull();
+    expect(f.status.inspect("wf-flip-failed")?.status).toBe("PENDING");
+  });
+
+  test("three failed adoption transactions do not burn the cap or cancel untouched work", async () => {
+    const f = await fixture([row("wf-never-flipped")]);
+    f.deps.status = {
+      ...f.status,
+      async adoptPendingRecording() {
+        throw new Error("flip transaction failed");
+      },
+    };
+
+    for (let attempt = 0; attempt < 4; attempt++) {
+      const result = await runSweepTick(f.deps);
+      expect(result.decisions[0]).toMatchObject({
+        action: "error",
+        reason: "flip transaction failed",
+      });
+    }
+
+    expect(await f.deps.ledger.get("wf-never-flipped")).toBeNull();
+    expect(f.cancelled).toEqual([]);
+    expect(f.status.inspect("wf-never-flipped")?.status).toBe("PENDING");
+  });
+
+  test("records stale-cancel intent before a throwing cancellation", async () => {
+    const f = await fixture([
+      row("wf-cancel-intent", {
+        createdAtEpochMs: NOW.getTime() - 2 * HOUR_MS,
+      }),
+    ]);
+    f.deps.cancelWorkflow = async () => {
+      throw new Error("cancel failed");
+    };
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]).toMatchObject({
+      action: "error",
+      reason: "cancel failed",
+    });
+    expect(await f.deps.ledger.get("wf-cancel-intent")).toMatchObject({
+      sweepCount: 1,
+      workflowName: "ToolExecWorkflow",
+    });
+    expect(f.status.inspect("wf-cancel-intent")?.status).toBe("PENDING");
+  });
+
+  test("records policy-cancel intent before a throwing cancellation", async () => {
+    SWEEP_POLICIES.CancelTestWorkflow = {
+      mode: "cancel",
+      staleAfterHours: 48,
+    };
+    const f = await fixture([
+      row("wf-policy-cancel-intent", { name: "CancelTestWorkflow" }),
+    ]);
+    f.deps.cancelWorkflow = async () => {
+      throw new Error("cancel failed");
+    };
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]).toMatchObject({
+      action: "error",
+      reason: "cancel failed",
+    });
+    expect(
+      await f.deps.ledger.get("wf-policy-cancel-intent"),
+    ).toMatchObject({
+      sweepCount: 1,
+      workflowName: "CancelTestWorkflow",
+    });
+    expect(
+      f.status.inspect("wf-policy-cancel-intent")?.status,
+    ).toBe("PENDING");
   });
 
   test("releases the lease even when the tick body throws", async () => {
@@ -330,11 +538,11 @@ describe("runSweepTick", () => {
       async listNonTerminalOnVersionsNotIn(): Promise<DbosWorkflowRow[]> {
         throw new Error("status unavailable");
       },
-      async adoptPending() {
-        return [];
+      async adoptPendingRecording() {
+        return { flipped: false };
       },
-      async clearVersionOnEnqueued() {
-        return [];
+      async clearVersionOnEnqueuedRecording() {
+        return { flipped: false };
       },
       async listNewlyTerminalFailed() {
         return [];

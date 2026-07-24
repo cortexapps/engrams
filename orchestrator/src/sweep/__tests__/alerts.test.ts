@@ -234,6 +234,106 @@ describe("SweepAlerter.scanTerminalFailures", () => {
     );
   });
 
+  test("retries the second cleanup when terminal failures share a timestamp", async () => {
+    const tiedAt = NOW.getTime() - 1_000;
+    const first = failedRow("wf-tied-succeeded", {
+      name: "FirstWorkflow",
+      updatedAtEpochMs: tiedAt,
+    });
+    const second = failedRow("wf-tied-retry", {
+      name: "SecondWorkflow",
+      updatedAtEpochMs: tiedAt,
+    });
+    const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
+    const alertPosts = new Map<string, number>();
+    const cleanupCalls = new Map<string, number>();
+    const alerter = makeSweepAlerter({
+      ledger,
+      status: makeInMemoryDbosStatusStore([first, second]),
+      post: async (text) => {
+        for (const workflowUuid of [first.workflowUuid, second.workflowUuid]) {
+          if (text.includes(workflowUuid)) {
+            alertPosts.set(
+              workflowUuid,
+              (alertPosts.get(workflowUuid) ?? 0) + 1,
+            );
+          }
+        }
+      },
+      policies: (name) => ({
+        mode: "adopt",
+        staleAfterHours: 1,
+        async onTerminalFailure(_ctx, workflow) {
+          const calls = (cleanupCalls.get(workflow.workflowUuid) ?? 0) + 1;
+          cleanupCalls.set(workflow.workflowUuid, calls);
+          if (name === second.name && calls === 1) {
+            throw new Error("retry this cleanup");
+          }
+        },
+      }),
+      cleanupCtx: cleanupContext(),
+      now: () => new Date(NOW),
+      log,
+      maxCleanupAttempts: 3,
+    });
+
+    const firstScan = await alerter.scanTerminalFailures();
+    expect(firstScan.watermark).toBe(tiedAt - 1);
+    expect((await ledger.get(second.workflowUuid))?.cleanupDoneAt).toBeNull();
+
+    const secondScan = await alerter.scanTerminalFailures();
+    expect(secondScan.scanned).toBe(2);
+    expect((await ledger.get(second.workflowUuid))?.cleanupDoneAt).not.toBeNull();
+    expect(cleanupCalls.get(second.workflowUuid)).toBe(2);
+    // Re-including the timestamp is quiet for the row that already completed.
+    expect(cleanupCalls.get(first.workflowUuid)).toBe(1);
+    expect(alertPosts.get(first.workflowUuid)).toBe(1);
+    expect(alertPosts.get(second.workflowUuid)).toBe(1);
+  });
+
+  test("expands a re-scan when the batch limit cuts through a timestamp tie", async () => {
+    const tiedAt = NOW.getTime() - 1_000;
+    const rows = Array.from({ length: 51 }, (_, index) =>
+      failedRow(`wf-tied-batch-${index.toString().padStart(2, "0")}`, {
+        updatedAtEpochMs: tiedAt,
+      }),
+    );
+    const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
+    const postCounts = new Map<string, number>();
+    const alerter = makeSweepAlerter({
+      ledger,
+      status: makeInMemoryDbosStatusStore(rows),
+      post: async (text) => {
+        const row = rows.find(({ workflowUuid }) =>
+          text.includes(workflowUuid),
+        );
+        if (row) {
+          postCounts.set(
+            row.workflowUuid,
+            (postCounts.get(row.workflowUuid) ?? 0) + 1,
+          );
+        }
+      },
+      policies: () => ({ mode: "alert-only" }),
+      cleanupCtx: cleanupContext(),
+      now: () => new Date(NOW),
+      log,
+      maxCleanupAttempts: 3,
+    });
+
+    const firstScan = await alerter.scanTerminalFailures();
+    expect(firstScan.scanned).toBe(50);
+    expect(firstScan.watermark).toBe(tiedAt - 1);
+    expect(postCounts.has(rows[50]!.workflowUuid)).toBe(false);
+
+    const secondScan = await alerter.scanTerminalFailures();
+    expect(secondScan.scanned).toBe(51);
+    expect(secondScan.watermark).toBe(tiedAt);
+    expect(postCounts.get(rows[50]!.workflowUuid)).toBe(1);
+    // The 50 re-included rows are ledger-deduped and stay quiet.
+    expect([...postCounts.values()].every((count) => count === 1)).toBe(true);
+  });
+
   test("holds the watermark on cleanup failure, retries, then gives up at the cap", async () => {
     const row = failedRow("wf-broken-cleanup");
     const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
@@ -270,9 +370,11 @@ describe("SweepAlerter.scanTerminalFailures", () => {
       alerted: 1,
       cleanupsRun: 1,
       cleanupsFailed: 1,
-      watermark: NOW.getTime() - DAY_MS,
+      watermark: row.updatedAtEpochMs - 1,
     });
-    expect(await ledger.getWatermark("terminal_failures")).toBeNull();
+    expect(await ledger.getWatermark("terminal_failures")).toBe(
+      row.updatedAtEpochMs - 1,
+    );
     expect((await ledger.get(row.workflowUuid))?.cleanupDoneAt).toBeNull();
 
     expect(await alerter.scanTerminalFailures()).toEqual({
@@ -292,6 +394,58 @@ describe("SweepAlerter.scanTerminalFailures", () => {
     expect(posts).toHaveLength(2);
     expect(posts[1]).toContain("abandoned");
     expect(posts[1]).toContain("brokenCleanup");
+  });
+
+  test("retries abandonment alerting before recording cleanup as gave up", async () => {
+    const row = failedRow("wf-abandonment-alert-retry");
+    const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
+    let cleanupCalls = 0;
+    let genericAlerts = 0;
+    let abandonmentAttempts = 0;
+    let abandonmentAlerts = 0;
+    async function brokenCleanup(): Promise<void> {
+      cleanupCalls++;
+      throw new Error("cleanup remains broken");
+    }
+    const alerter = makeSweepAlerter({
+      ledger,
+      status: makeInMemoryDbosStatusStore([row]),
+      post: async (text) => {
+        if (text.startsWith("DBOS cleanup abandoned:")) {
+          abandonmentAttempts++;
+          if (abandonmentAttempts === 1) {
+            throw new Error("ops channel temporarily unavailable");
+          }
+          abandonmentAlerts++;
+        } else {
+          genericAlerts++;
+        }
+      },
+      policies: () => ({
+        mode: "adopt",
+        staleAfterHours: 1,
+        onTerminalFailure: brokenCleanup,
+      }),
+      cleanupCtx: cleanupContext(),
+      now: () => new Date(NOW),
+      log,
+      maxCleanupAttempts: 1,
+    });
+
+    const firstScan = await alerter.scanTerminalFailures();
+    expect(firstScan.watermark).toBe(row.updatedAtEpochMs - 1);
+    expect((await ledger.get(row.workflowUuid))?.cleanupDoneAt).toBeNull();
+
+    const secondScan = await alerter.scanTerminalFailures();
+    expect(secondScan.scanned).toBe(1);
+    expect(secondScan.watermark).toBe(row.updatedAtEpochMs);
+    expect(cleanupCalls).toBe(2);
+    expect(genericAlerts).toBe(1);
+    expect(abandonmentAttempts).toBe(2);
+    expect(abandonmentAlerts).toBe(1);
+    expect((await ledger.get(row.workflowUuid))?.cleanupFn).toBe(
+      "gave-up:brokenCleanup",
+    );
   });
 
   test("a wedged cleanup holds the watermark but later failures still alert", async () => {
@@ -333,9 +487,12 @@ describe("SweepAlerter.scanTerminalFailures", () => {
     expect(result.alerted).toBe(2);
     expect(posts.some((p) => p.includes("wf-wedged"))).toBe(true);
     expect(posts.some((p) => p.includes("wf-newer"))).toBe(true);
-    // …but the watermark stays before the wedged row so it is re-scanned.
-    expect(result.watermark).toBe(NOW.getTime() - DAY_MS);
-    expect(await ledger.getWatermark("terminal_failures")).toBeNull();
+    // …but the watermark stays immediately before the wedged row so it is
+    // re-scanned without replaying unrelated older timestamps.
+    expect(result.watermark).toBe(wedged.updatedAtEpochMs - 1);
+    expect(await ledger.getWatermark("terminal_failures")).toBe(
+      wedged.updatedAtEpochMs - 1,
+    );
 
     // The re-scan stays quiet on alerts (ledger dedup) and retries the cleanup.
     const second = await alerter.scanTerminalFailures();

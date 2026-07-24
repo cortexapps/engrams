@@ -81,6 +81,32 @@ export function diffWorkflowHashSnapshots(
   return diffs;
 }
 
+export function prApplicationVersionWarningMessages(
+  main: WorkflowHashSnapshot,
+  checkedOut: WorkflowHashSnapshot,
+): string[] {
+  const consequence =
+    " — in-flight executions will be stranded and swept on the next rollout " +
+    "(ADR 0104)";
+
+  return diffWorkflowHashSnapshots(main, checkedOut).map((diff) => {
+    const prefix = "this PR changes the DBOS application version: ";
+    switch (diff.kind) {
+      case "changed":
+        return `${prefix}workflow ${diff.name} body changed vs main${consequence}`;
+      case "added":
+        return `${prefix}workflow ${diff.name} was added vs main${consequence}`;
+      case "removed":
+        return `${prefix}workflow ${diff.name} was removed vs main${consequence}`;
+      case "sdk-version-changed":
+        return (
+          `${prefix}DBOS SDK changed vs main ` +
+          `(${diff.previousVersion} → ${diff.currentVersion})${consequence}`
+        );
+    }
+  });
+}
+
 export function serializeWorkflowHashSnapshot(
   snapshot: WorkflowHashSnapshot,
 ): string {

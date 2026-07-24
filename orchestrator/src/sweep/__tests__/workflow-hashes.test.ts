@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import {
   buildWorkflowHashSnapshot,
   diffWorkflowHashSnapshots,
+  prApplicationVersionWarningMessages,
   serializeWorkflowHashSnapshot,
   type WorkflowHashSnapshot,
 } from "../workflow-hashes.ts";
@@ -75,6 +76,44 @@ describe("DBOS workflow hash snapshots", () => {
         previousVersion: "4.21.6",
         currentVersion: "4.22.0",
       },
+    ]);
+  });
+
+  test("describes workflow body changes against main as PR warnings", () => {
+    const current: WorkflowHashSnapshot = {
+      ...original,
+      workflows: {
+        ...original.workflows,
+        AlphaWorkflow: "alpha-new",
+      },
+    };
+
+    expect(prApplicationVersionWarningMessages(original, current)).toEqual([
+      "this PR changes the DBOS application version: workflow AlphaWorkflow " +
+        "body changed vs main — in-flight executions will be stranded and " +
+        "swept on the next rollout (ADR 0104)",
+    ]);
+  });
+
+  test("describes added, removed, and SDK changes against main", () => {
+    const current: WorkflowHashSnapshot = {
+      sdkVersion: "4.22.0",
+      workflows: {
+        AddedWorkflow: "added-hash",
+        AlphaWorkflow: "alpha-old",
+      },
+    };
+
+    expect(prApplicationVersionWarningMessages(original, current)).toEqual([
+      "this PR changes the DBOS application version: workflow AddedWorkflow " +
+        "was added vs main — in-flight executions will be stranded and swept " +
+        "on the next rollout (ADR 0104)",
+      "this PR changes the DBOS application version: workflow RemovedWorkflow " +
+        "was removed vs main — in-flight executions will be stranded and " +
+        "swept on the next rollout (ADR 0104)",
+      "this PR changes the DBOS application version: DBOS SDK changed vs main " +
+        "(4.21.6 → 4.22.0) — in-flight executions will be stranded and swept " +
+        "on the next rollout (ADR 0104)",
     ]);
   });
 

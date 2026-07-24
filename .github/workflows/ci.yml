@@ -608,6 +608,11 @@ jobs:
         run: bun install --frozen-lockfile
       - name: DBOS workflow hash warning (non-blocking, ADR 0104)
         run: |
+          # The default checkout is depth-1; fetch main so the script's
+          # merge-base tier can annotate PRs that intentionally change a
+          # workflow hash. Best-effort: the script skips that tier cleanly
+          # when the ref is unavailable.
+          git fetch --no-tags --depth=50 origin main || true
           NODE_ENV=test bun scripts/dbos-workflow-hashes.ts
       - name: bun typecheck
         run: bun run typecheck

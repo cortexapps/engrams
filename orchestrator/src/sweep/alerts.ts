@@ -134,19 +134,9 @@ async function processRow(
 
     if (failures < deps.maxCleanupAttempts) return false;
 
-    // Attempt cap hit (per process lifetime): abandon the cleanup durably and
-    // say so on the ops channel, so the watermark can move on.
+    // Attempt cap hit (per process lifetime): the abandonment alert must land
+    // before the durable gave-up mark allows the watermark to move on.
     const gaveUpName = `gave-up:${fnName}`;
-    try {
-      await deps.ledger.markCleanupDone(row.workflowUuid, row.name, gaveUpName);
-      cleanupFailures.delete(row.workflowUuid);
-    } catch (markError) {
-      deps.log.error(
-        { error: markError, workflowUuid: row.workflowUuid, cleanup: fnName },
-        "failed to record abandoned DBOS cleanup",
-      );
-      return false;
-    }
     try {
       await deps.post(
         `DBOS cleanup abandoned: ${row.name} ${row.workflowUuid} — ` +
@@ -157,6 +147,17 @@ async function processRow(
         { error: postError, workflowUuid: row.workflowUuid, cleanup: fnName },
         "failed to post abandoned DBOS cleanup alert",
       );
+      return false;
+    }
+    try {
+      await deps.ledger.markCleanupDone(row.workflowUuid, row.name, gaveUpName);
+      cleanupFailures.delete(row.workflowUuid);
+    } catch (markError) {
+      deps.log.error(
+        { error: markError, workflowUuid: row.workflowUuid, cleanup: fnName },
+        "failed to record abandoned DBOS cleanup",
+      );
+      return false;
     }
     return true;
   }
@@ -165,10 +166,17 @@ async function processRow(
 /**
  * Failure cleanup callbacks are at-least-once. A process can crash after a
  * callback's side effect and before markCleanupDone commits, so callbacks must
- * tolerate a repeat.
+ * tolerate a repeat. The in-memory attempt cap resets across pods/restarts,
+ * which permits extra idempotent cleanup attempts but never a lost alarm. Once
+ * the cap is reached, every retry remains capped: the abandonment alert posts
+ * first, and only its success permits the durable gave-up cleanup mark and
+ * watermark advance.
  */
 export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
   const cleanupFailures = new Map<string, number>();
+  let expandedRescan:
+    | { watermark: number; queryLimit: number }
+    | undefined;
 
   return {
     async alertDecisions(decisions) {
@@ -196,9 +204,14 @@ export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
       const since =
         (await deps.ledger.getWatermark(TERMINAL_FAILURE_WATERMARK)) ??
         deps.now().getTime() - TERMINAL_FAILURE_LOOKBACK_MS;
+      const queryLimit =
+        expandedRescan?.watermark === since
+          ? expandedRescan.queryLimit
+          : TERMINAL_FAILURE_BATCH_SIZE;
+      expandedRescan = undefined;
       const rows = await deps.status.listNewlyTerminalFailed(
         since,
-        TERMINAL_FAILURE_BATCH_SIZE,
+        queryLimit,
       );
       const result: FailureScanResult = {
         scanned: rows.length,
@@ -208,17 +221,36 @@ export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
         watermark: since,
       };
 
-      // The watermark only advances across FULLY-processed rows, and stops at
-      // the first row whose alert or cleanup did not land — that row is
-      // re-scanned next cycle (ledger dedup keeps re-scans quiet). Later rows
-      // are still processed so one wedged cleanup can't block alerting for
-      // everything behind it.
-      let blocked = false;
+      // Rewind one millisecond before the first blocked row, or before the
+      // final timestamp of a full batch. This re-includes every row tied at
+      // that timestamp; ledger dedup keeps completed work quiet. A full batch
+      // also expands the next query enough to get past a tied prefix that
+      // would otherwise consume the same LIMIT forever.
+      let firstBlockedAt: number | undefined;
 
       for (const row of rows) {
         const processed = await processRow(deps, cleanupFailures, row, result);
-        if (!processed) blocked = true;
-        if (!blocked) result.watermark = row.updatedAtEpochMs;
+        if (!processed && firstBlockedAt === undefined) {
+          firstBlockedAt = row.updatedAtEpochMs;
+        }
+      }
+
+      if (firstBlockedAt !== undefined) {
+        result.watermark = firstBlockedAt - 1;
+      } else if (rows.length > 0) {
+        const lastUpdatedAt = rows[rows.length - 1]!.updatedAtEpochMs;
+        if (rows.length < queryLimit) {
+          result.watermark = lastUpdatedAt;
+        } else {
+          result.watermark = lastUpdatedAt - 1;
+          const tiedAtBoundary = rows.filter(
+            (row) => row.updatedAtEpochMs === lastUpdatedAt,
+          ).length;
+          expandedRescan = {
+            watermark: result.watermark,
+            queryLimit: TERMINAL_FAILURE_BATCH_SIZE + tiedAtBoundary,
+          };
+        }
       }
 
       if (result.watermark !== since) {

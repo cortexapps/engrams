@@ -8,6 +8,7 @@ import { getAllRegisteredFunctions } from "../node_modules/@dbos-inc/dbos-sdk/di
 import {
   buildWorkflowHashSnapshot,
   diffWorkflowHashSnapshots,
+  prApplicationVersionWarningMessages,
   serializeWorkflowHashSnapshot,
   type WorkflowHashDiff,
   type WorkflowHashSnapshot,
@@ -85,6 +86,60 @@ async function readCommittedSnapshot(): Promise<WorkflowHashSnapshot | null> {
   return (await file.json()) as WorkflowHashSnapshot;
 }
 
+function gitOutput(args: string[]): string | null {
+  try {
+    const result = Bun.spawnSync(["git", ...args], {
+      stderr: "pipe",
+      stdout: "pipe",
+    });
+    if (result.exitCode !== 0) return null;
+    return result.stdout.toString().trim();
+  } catch {
+    return null;
+  }
+}
+
+function readMainSnapshot(): WorkflowHashSnapshot | null {
+  const mergeBase = gitOutput(["merge-base", "HEAD", "origin/main"]);
+  const refs = mergeBase ? [mergeBase, "origin/main"] : ["origin/main"];
+
+  for (const ref of refs) {
+    const serialized = gitOutput([
+      "show",
+      `${ref}:${snapshotDisplayPath}`,
+    ]);
+    if (serialized === null) continue;
+    try {
+      return JSON.parse(serialized) as WorkflowHashSnapshot;
+    } catch {
+      // Try the origin/main fallback if the merge-base copy is malformed.
+    }
+  }
+  return null;
+}
+
+function warnAboutPrApplicationVersionChange(
+  checkedOut: WorkflowHashSnapshot | null,
+): void {
+  if (checkedOut === null) {
+    console.log(
+      "DBOS workflow hash main comparison skipped: checked-out snapshot is unavailable",
+    );
+    return;
+  }
+  const main = readMainSnapshot();
+  if (main === null) {
+    console.log(
+      "DBOS workflow hash main comparison skipped: git history, origin/main, " +
+        "or its snapshot is unavailable",
+    );
+    return;
+  }
+  for (const message of prApplicationVersionWarningMessages(main, checkedOut)) {
+    printWarning(message);
+  }
+}
+
 const args = new Set(Bun.argv.slice(2));
 const update = args.delete("--update");
 const checkOnly = args.delete("--check-only");
@@ -121,4 +176,8 @@ if (update) {
   } else {
     for (const diff of diffs) printWarning(annotationMessage(diff));
   }
+}
+
+if (!update && !checkOnly) {
+  warnAboutPrApplicationVersionChange(committed);
 }

@@ -158,126 +158,170 @@ export async function runSweepTick(
       return result;
     }
 
-    const rows = await deps.status.listNonTerminalOnVersionsNotIn(
-      liveVersions,
-      deps.config.batchCap * 4,
-    );
-    result.scanned = rows.length;
+    const pageSize = deps.config.batchCap * 4;
+    const scanBudget = deps.config.batchCap * 40;
     let actions = 0;
+    let after:
+      | { createdAtEpochMs: number; workflowUuid: string }
+      | undefined;
     const nowMs = (deps.now ?? (() => new Date()))().getTime();
 
-    for (const row of rows) {
-      if (actions >= deps.config.batchCap) break;
-      let decision: SweepDecision;
-      try {
-        const policy = (deps.resolvePolicy ?? resolvePolicy)(row.name);
-        if (policy.mode === "alert-only") {
-          decision = {
-            workflowUuid: row.workflowUuid,
-            name: row.name,
-            action: "alert_only",
-          };
-        } else if (policy.mode === "ignore") {
-          decision = {
-            workflowUuid: row.workflowUuid,
-            name: row.name,
-            action: "ignored",
-          };
-        } else {
-          const prior = await deps.ledger.get(row.workflowUuid);
-          if (prior?.suppressed) {
+    while (
+      actions < deps.config.batchCap &&
+      result.scanned < scanBudget
+    ) {
+      const rows = await deps.status.listNonTerminalOnVersionsNotIn(
+        liveVersions,
+        pageSize,
+        after,
+      );
+      result.scanned += rows.length;
+
+      for (const row of rows) {
+        if (actions >= deps.config.batchCap) break;
+        let decision: SweepDecision;
+        try {
+          const policy = (deps.resolvePolicy ?? resolvePolicy)(row.name);
+          if (policy.mode === "alert-only") {
             decision = {
               workflowUuid: row.workflowUuid,
               name: row.name,
-              action: "suppressed",
+              action: "alert_only",
+            };
+          } else if (policy.mode === "ignore") {
+            decision = {
+              workflowUuid: row.workflowUuid,
+              name: row.name,
+              action: "ignored",
             };
           } else {
-            const ageHours =
-              (nowMs - row.createdAtEpochMs) / (60 * 60 * 1_000);
-            if (
-              policy.mode === "adopt" &&
-              ageHours > policy.staleAfterHours
-            ) {
-              await deps.cancelWorkflow(row.workflowUuid);
-              await deps.ledger.recordSweep(row.workflowUuid, row.name);
+            const prior = await deps.ledger.get(row.workflowUuid);
+            if (prior?.suppressed) {
               decision = {
                 workflowUuid: row.workflowUuid,
                 name: row.name,
-                action: "cancelled_stale",
-              };
-            } else if (
-              prior !== null &&
-              prior.sweepCount >= deps.config.maxSweeps
-            ) {
-              await deps.cancelWorkflow(row.workflowUuid);
-              decision = {
-                workflowUuid: row.workflowUuid,
-                name: row.name,
-                action: "cancelled_capped",
-              };
-            } else if (policy.mode === "cancel") {
-              await deps.cancelWorkflow(row.workflowUuid);
-              await deps.ledger.recordSweep(row.workflowUuid, row.name);
-              decision = {
-                workflowUuid: row.workflowUuid,
-                name: row.name,
-                action: "cancelled_policy",
+                action: "suppressed",
               };
             } else {
-              await deps.ledger.recordSweep(row.workflowUuid, row.name);
-              if (row.status === "PENDING") {
-                const adopted = await deps.status.adoptPending([
-                  row.workflowUuid,
-                ]);
-                decision = adopted.includes(row.workflowUuid)
-                  ? {
-                      workflowUuid: row.workflowUuid,
-                      name: row.name,
-                      action: "adopted",
-                    }
-                  : {
-                      workflowUuid: row.workflowUuid,
-                      name: row.name,
-                      action: "error",
-                      reason: "no longer PENDING",
-                    };
-              } else if (row.status === "ENQUEUED") {
-                const cleared = await deps.status.clearVersionOnEnqueued([
-                  row.workflowUuid,
-                ]);
-                decision = cleared.includes(row.workflowUuid)
-                  ? {
-                      workflowUuid: row.workflowUuid,
-                      name: row.name,
-                      action: "enqueued_cleared",
-                    }
-                  : {
-                      workflowUuid: row.workflowUuid,
-                      name: row.name,
-                      action: "error",
-                      reason: "no longer ENQUEUED",
-                    };
-              } else {
+              const ageHours =
+                (nowMs - row.createdAtEpochMs) / (60 * 60 * 1_000);
+              if (
+                policy.mode === "adopt" &&
+                ageHours > policy.staleAfterHours
+              ) {
+                await deps.ledger.recordSweep(row.workflowUuid, row.name);
+                await deps.cancelWorkflow(row.workflowUuid);
                 decision = {
                   workflowUuid: row.workflowUuid,
                   name: row.name,
-                  action: "error",
-                  reason: `unsupported status ${row.status}`,
+                  action: "cancelled_stale",
                 };
+              } else if (
+                prior !== null &&
+                prior.sweepCount >= deps.config.maxSweeps
+              ) {
+                await deps.cancelWorkflow(row.workflowUuid);
+                decision = {
+                  workflowUuid: row.workflowUuid,
+                  name: row.name,
+                  action: "cancelled_capped",
+                };
+              } else if (policy.mode === "cancel") {
+                await deps.ledger.recordSweep(row.workflowUuid, row.name);
+                await deps.cancelWorkflow(row.workflowUuid);
+                decision = {
+                  workflowUuid: row.workflowUuid,
+                  name: row.name,
+                  action: "cancelled_policy",
+                };
+              } else {
+                if (row.status === "PENDING") {
+                  const adopted =
+                    await deps.status.adoptPendingRecording(
+                      {
+                        workflowUuid: row.workflowUuid,
+                        expectedVersion: row.applicationVersion!,
+                        workflowName: row.name,
+                      },
+                      deps.config.graceMs,
+                    );
+                  decision = adopted.flipped
+                    ? {
+                        workflowUuid: row.workflowUuid,
+                        name: row.name,
+                        action: "adopted",
+                      }
+                    : {
+                        workflowUuid: row.workflowUuid,
+                        name: row.name,
+                        action: "error",
+                        reason: "owner became live or row changed",
+                      };
+                } else if (row.status === "ENQUEUED") {
+                  const cleared =
+                    await deps.status.clearVersionOnEnqueuedRecording(
+                      {
+                        workflowUuid: row.workflowUuid,
+                        expectedVersion: row.applicationVersion!,
+                        workflowName: row.name,
+                      },
+                      deps.config.graceMs,
+                    );
+                  decision = cleared.flipped
+                    ? {
+                        workflowUuid: row.workflowUuid,
+                        name: row.name,
+                        action: "enqueued_cleared",
+                      }
+                    : {
+                        workflowUuid: row.workflowUuid,
+                        name: row.name,
+                        action: "error",
+                        reason: "owner became live or row changed",
+                      };
+                } else {
+                  decision = {
+                    workflowUuid: row.workflowUuid,
+                    name: row.name,
+                    action: "error",
+                    reason: `unsupported status ${row.status}`,
+                  };
+                }
               }
             }
           }
+        } catch (error) {
+          decision = {
+            workflowUuid: row.workflowUuid,
+            name: row.name,
+            action: "error",
+            reason: errorMessage(error),
+          };
         }
-      } catch (error) {
-        decision = {
-          workflowUuid: row.workflowUuid,
-          name: row.name,
-          action: "error",
-          reason: errorMessage(error),
-        };
+        result.decisions.push(decision);
+        if (MUTATING_ACTIONS.has(decision.action)) actions++;
       }
-      result.decisions.push(decision);
-      if (MUTATING_ACTIONS.has(decision.action)) actions++;
+
+      if (actions >= deps.config.batchCap || rows.length < pageSize) {
+        break;
+      }
+      if (result.scanned >= scanBudget) {
+        deps.log.warn(
+          {
+            component: "dbos-sweep",
+            scanned: result.scanned,
+            scanBudget,
+          },
+          "DBOS orphan sweep scan budget exhausted",
+        );
+        break;
+      }
+      const last = rows.at(-1);
+      if (!last) break;
+      after = {
+        createdAtEpochMs: last.createdAtEpochMs,
+        workflowUuid: last.workflowUuid,
+      };
     }
 
     if (deps.alerter) {
