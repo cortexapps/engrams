@@ -4588,7 +4588,27 @@ pub async fn drive_exec_protocol(
                                     stderr_offset,
                                     true,
                                 );
-                                if let Err(error) = write_msg(&mut next, &attach).await {
+                                // Race the attach write against the epoch too:
+                                // the freshly-dialed socket buffer can fill
+                                // (a large stdin clones into the frame) before
+                                // the guest drains it, and a SECOND capture
+                                // severing this parked write would wedge the
+                                // reader forever — the same hazard as the
+                                // initial request write, on the reconnect hop.
+                                let write = write_wire_message_racing_severance(
+                                    &mut next,
+                                    &attach,
+                                    severed.as_mut(),
+                                    "reattach exec request",
+                                )
+                                .await;
+                                let write_result = match write {
+                                    Ok(inner) => inner.map_err(|e| e.to_string()),
+                                    // Severed again mid-write: transport-shaped,
+                                    // end without Exit for a fresh attach.
+                                    Err(severed_err) => Err(severed_err.to_string()),
+                                };
+                                if let Err(error) = write_result {
                                     // A failed write did not reach a guest
                                     // journal verdict. A fresh caller can
                                     // safely retry the deduped attach.
@@ -7934,6 +7954,103 @@ mod tests {
             "severed initial write must be retryable Unavailable, got {result:?}"
         );
         drop(severed_guest.await.unwrap());
+    }
+
+    /// The RECONNECT-hop attach write must race the epoch too: after one
+    /// severance the reader re-dials and writes the attach frame (which
+    /// clones the full stdin); a SECOND capture severing that parked write
+    /// must end the stream without Exit, not wedge the reader forever.
+    #[tokio::test]
+    async fn checkpoint_severing_the_reattach_request_write_ends_without_hanging() {
+        use futures_util::StreamExt;
+
+        // First buffer holds the whole 2 MiB initial request so the initial
+        // write drains and drive_exec_protocol returns; the REATTACH buffer
+        // is tiny so the (equally large) attach frame parks on its write.
+        let (host_end, mut first_guest) = tokio::io::duplex(4 * 1024 * 1024);
+        let (reattach_host, reattach_guest) = tokio::io::duplex(256);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        // Fires when the reader actually re-dials, so the SECOND sever lands
+        // while the attach write is parked — the two bumps must not coalesce
+        // into one observed change (watch keeps only the latest).
+        let (redialed_tx, redialed_rx) = tokio::sync::oneshot::channel();
+        let exec_id = "exec-severed-reattach-write";
+        let req = ExecRequest {
+            command: vec!["cat".into()],
+            stdin: Some(vec![0x5A; 2 * 1024 * 1024]),
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream = drive_exec_protocol(
+            SandboxId::new(),
+            Box::new(host_end),
+            req,
+            true,
+            Some(epoch_rx),
+            Some(ExecRedial::provided({
+                let connection = Arc::new(tokio::sync::Mutex::new(Some(
+                    Box::new(reattach_host) as BoxExecIo
+                )));
+                let redialed_tx = Arc::new(tokio::sync::Mutex::new(Some(redialed_tx)));
+                move || {
+                    let connection = connection.clone();
+                    let redialed_tx = redialed_tx.clone();
+                    async move {
+                        if let Some(tx) = redialed_tx.lock().await.take() {
+                            let _ = tx.send(());
+                        }
+                        connection.lock().await.take().ok_or_else(|| {
+                            vm_err("test durable exec redial connection already consumed")
+                        })
+                    }
+                }
+            })),
+        )
+        .await
+        .unwrap();
+
+        // First connection: drain the initial request, deliver a byte, then
+        // bump the epoch so the reader re-dials onto the tiny buffer.
+        let epoch_after_first = tokio::spawn(async move {
+            let _first: WireRequest = read_msg(&mut first_guest).await.unwrap();
+            write_msg(&mut first_guest, &WireExecEvent::Started(exec_id.into()))
+                .await
+                .unwrap();
+            write_msg(&mut first_guest, &WireExecEvent::Stdout(b"x".to_vec()))
+                .await
+                .unwrap();
+            (first_guest, epoch_tx)
+        });
+
+        let mut events = stream.events;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(2), events.next()).await,
+            Ok(Some(ExecEvent::Stdout(b))) if b == Bytes::from_static(b"x")
+        ));
+        let (_first_guest, epoch_tx) = epoch_after_first.await.unwrap();
+
+        // Sever #1 → the reader re-dials. Wait for the actual redial, so
+        // sever #2 lands strictly after (no coalescing) while the 2 MiB
+        // attach write is parked on the never-drained tiny buffer.
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+        redialed_rx
+            .await
+            .expect("reader must re-dial after the first sever");
+        // The write is now parking; let it register, then sever again.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+
+        // End-without-Exit (stream closes) promptly, not a hang.
+        match tokio::time::timeout(Duration::from_secs(2), events.next()).await {
+            Ok(None) => {}
+            other => panic!("reattach-write severance must end the stream, got {other:?}"),
+        }
+        drop(reattach_guest);
     }
 
     /// The severance race must not eat a real exit: when a genuine

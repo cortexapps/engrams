@@ -4068,6 +4068,10 @@ impl MetadataStore for PostgresStore {
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
         // MIN: the first logged occurrence is the authoritative one — a
         // residual concurrent-attach duplicate must not move the timestamp.
+        // Live timeline only: an ADR-0028 rewind tombstones exec rows AND
+        // rewinds the guest journal, so a replayed step legitimately re-runs
+        // the ticket — its fresh lifecycle rows must not be suppressed by
+        // the tombstoned past.
         sqlx::query_scalar(
             r#"
             SELECT MIN(created_at)
@@ -4075,6 +4079,7 @@ impl MetadataStore for PostgresStore {
              WHERE session_id = $1
                AND kind = $2
                AND payload->>'exec_id' = $3
+               AND rewound_at IS NULL
             "#,
         )
         .bind(session_id.as_uuid())
@@ -4092,7 +4097,9 @@ impl MetadataStore for PostgresStore {
         stream: ExecOutputStream,
     ) -> Result<u64, MetaError> {
         // Unstamped (pre-ADR-0103) rows yield NULL from ->> and MAX skips
-        // NULLs, so they are ignored by construction.
+        // NULLs, so they are ignored by construction. Live timeline only:
+        // rewound output rows must not hold the mark up — the re-run's
+        // output must be re-recorded.
         let max: Option<i64> = sqlx::query_scalar(
             r#"
             SELECT MAX((payload->>'bytes_end')::bigint)
@@ -4100,6 +4107,7 @@ impl MetadataStore for PostgresStore {
              WHERE session_id = $1
                AND kind = $2
                AND payload->>'exec_id' = $3
+               AND rewound_at IS NULL
             "#,
         )
         .bind(session_id.as_uuid())

@@ -464,6 +464,9 @@ describe("durable orchestrator exec caller", () => {
       instantRuntime(),
     )).rejects.toThrow("received duplicate ExecStarted frame");
     expect(calls).toBe(1);
+    // Our own exec spawned and is streaming; giving up must reap it so it
+    // doesn't burn guest CPU until journal TTL.
+    expect(base.cancelCalls).toEqual([{ sessionId: "session-proto", execId }]);
   });
 
   test("an exec refusal is terminal on the first occurrence", async () => {
@@ -499,6 +502,10 @@ describe("durable orchestrator exec caller", () => {
       instantRuntime(),
     )).rejects.toThrow("exec refused");
     expect(calls).toBe(1);
+    // A refusal must NOT reap: the ticket's real first-writer command is
+    // running, and cancelling by this exec_id would kill that legitimate
+    // exec.
+    expect(base.cancelCalls).toHaveLength(0);
   });
 
   test("a mid-output stream error re-attaches for the tail and one real exit", async () => {

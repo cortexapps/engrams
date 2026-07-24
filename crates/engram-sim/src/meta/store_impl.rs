@@ -953,12 +953,14 @@ impl MetadataStore for SimMetadataStore {
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        // `SELECT MIN(created_at) ... WHERE kind = $2 AND payload->>'exec_id' = $3`
+        // `SELECT MIN(created_at) ... WHERE kind = $2 AND payload->>'exec_id' = $3
+        //  AND rewound_at IS NULL` — the dedup sees the live timeline only.
         Ok(db.session_events.get(&session_id).and_then(|events| {
             events
                 .iter()
                 .filter(|event| {
-                    event.kind == kind.kind_str()
+                    event.rewound_at.is_none()
+                        && event.kind == kind.kind_str()
                         && event
                             .payload
                             .get("exec_id")
@@ -978,8 +980,9 @@ impl MetadataStore for SimMetadataStore {
     ) -> Result<u64, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        // `SELECT MAX((payload->>'bytes_end')::bigint) ...` — unstamped rows
-        // are skipped, matching NULL-ignoring SQL MAX.
+        // `SELECT MAX((payload->>'bytes_end')::bigint) ... AND rewound_at IS
+        // NULL` — unstamped rows are skipped, matching NULL-ignoring SQL MAX,
+        // and tombstoned rows must not hold the mark up.
         Ok(db
             .session_events
             .get(&session_id)
@@ -987,7 +990,8 @@ impl MetadataStore for SimMetadataStore {
                 events
                     .iter()
                     .filter(|event| {
-                        event.kind == stream.kind_str()
+                        event.rewound_at.is_none()
+                            && event.kind == stream.kind_str()
                             && event
                                 .payload
                                 .get("exec_id")

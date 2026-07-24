@@ -216,6 +216,14 @@ pub async fn exec_stream_core(
         )));
     }
 
+    // Whether THIS attach is eligible to record `ExecStarted`: a zero-offset
+    // attach with no prior live Started for the ticket. Non-zero offsets are
+    // re-attaches (never a start); a coordinator-minted id cannot be a
+    // re-attach. The row is NOT emitted here — the terminal taxonomy says a
+    // Refusal records no lifecycle rows, and a refusal is only observable
+    // once the backend stream is polled. Emission is deferred to the first
+    // NON-`Refused` frame below, so a refused attach records nothing (and
+    // cannot poison the ticket's start-dedup for a later real run).
     let emit_exec_started = if !zero_offsets {
         false
     } else if caller_supplied_exec_id {
@@ -226,26 +234,8 @@ pub async fn exec_stream_core(
             .await?
             .is_none()
     } else {
-        // A coordinator-minted id cannot be a re-attach: the caller did not
-        // know the ticket before this request.
         true
     };
-    if emit_exec_started {
-        // Non-zero offset re-attaches skip lifecycle emission by construction.
-        // A legitimate zero-byte re-attach still arrives at `(0, 0)`, so the
-        // durable event-log predicate above enforces the residual
-        // consumer-idempotency expectation at the source, keyed by exec_id.
-        state
-            .emit(
-                id,
-                SessionEvent::ExecStarted {
-                    exec_id: exec_id.clone(),
-                    command: argv.clone(),
-                    at: state.services.clock.now_utc(),
-                },
-            )
-            .await?;
-    }
 
     let state_for_stream = state.clone();
     let exec_id_for_stream = exec_id.clone();
@@ -278,11 +268,28 @@ pub async fn exec_stream_core(
         });
     let mut stdout_pos = stdout_attach_offset;
     let mut stderr_pos = stderr_attach_offset;
+    let started_command = argv.clone();
     let body = async_stream::stream! {
         let mut events = backend_stream.events;
         let mut exit_status = None;
         let mut saw_exit = false;
+        let mut started_emitted = false;
         while let Some(ev) = events.next().await {
+            // Deferred ExecStarted: emit once, on the first frame that is not
+            // a Refusal. A Refused attach falls through to its arm below
+            // having recorded no lifecycle row. Best-effort like the other
+            // streaming emits (the module's log-and-continue posture).
+            if emit_exec_started && !started_emitted && !matches!(ev, ExecEvent::Refused(_)) {
+                started_emitted = true;
+                let _ = state_for_stream
+                    .emit(id, SessionEvent::ExecStarted {
+                        exec_id: exec_id_for_stream.clone(),
+                        command: started_command.clone(),
+                        at: state_for_stream.services.clock.now_utc(),
+                    })
+                    .await
+                    .map_err(|e| tracing::warn!(error = %e, "exec_started event persistence failed; live tail continues"));
+            }
             match ev {
                 ExecEvent::Stdout(bytes) => {
                     let bytes_start = stdout_pos;
@@ -924,6 +931,13 @@ mod tests {
             exec_completed_statuses(&meta, session_id).is_empty(),
             "a refusal must never persist exec_completed"
         );
+        // The taxonomy: a refusal records NO lifecycle rows. A stray
+        // exec_started here would also poison the ticket's start-dedup, so
+        // the later real run's start would be suppressed.
+        assert!(
+            exec_started_ids(&meta, session_id).is_empty(),
+            "a refusal must never persist exec_started"
+        );
 
         let (_id, mut body) =
             exec_stream_core(&state, session_id, durable_req(exec_id, Some(0), Some(0)))
@@ -938,6 +952,13 @@ mod tests {
         ));
         assert!(body.next().await.is_none());
         assert_eq!(exec_completed_statuses(&meta, session_id), vec![Some(0)]);
+        // The real run's start WAS recorded — the refusal did not consume
+        // the dedup slot.
+        assert_eq!(
+            exec_started_ids(&meta, session_id),
+            vec![exec_id.to_string()],
+            "the genuine run must record exactly one exec_started"
+        );
     }
 
     /// The ADR's own happy path: a checkpoint severs the delivering attach,

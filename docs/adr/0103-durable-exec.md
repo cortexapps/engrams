@@ -423,6 +423,34 @@ deadline left).
   the coordinator is never recorded at all (closing that needs a
   completion-triggered journal drain — a second 64 MiB transfer per exec,
   unjustified for a debugging surface).
+- **Cancel and dedup safety pass (review round 8/9).** Four findings, each
+  a case of the same principle — *the guard must cover every entry to the
+  hazard, and the safe direction must be consistent across sites*:
+  - The exec path validates the raw `exec_id` before building a journal
+    path; CancelExec did not, so a `../`-shaped ticket escaped the journal
+    root and could SIGKILL an arbitrary in-guest process group. Fixed by
+    validating the raw string at the wire entry (`existing_entry`) plus a
+    `..`-component reject in `from_dir` as defense in depth.
+  - `appears_live` treats PID reuse conservatively (over-count), but
+    `cancel` killed by the recorded pid unconditionally — the *unsafe*
+    direction against the same hazard. Fixed: a terminal `exit.json`
+    short-circuits cancel to a no-op (nothing to kill; the pid is reusable).
+  - The lifecycle/high-water dedup queries counted rewound (tombstoned)
+    rows, so after an ADR-0028 recovery rewind — which also rewinds the
+    guest journal, forcing a genuine re-run — both stores suppressed the
+    re-run's lifecycle rows and held its output high-water up. Fixed with
+    `AND rewound_at IS NULL` (both stores, D4-conformance-covered): the
+    dedup sees the live timeline only.
+  - `ExecStarted` was persisted before the stream was polled, so a refused
+    attach still recorded a start (and poisoned the ticket's start-dedup for
+    a later real run). Fixed by deferring the emission to the first
+    non-`Refused` frame — the taxonomy's "refusal records no lifecycle rows"
+    now holds at the coordinator.
+  - The reconnect-hop attach write was the one severable write the earlier
+    write-sweep missed; it now races the epoch like the initial write,
+    CancelExec, and Upload. And `runExec` reaps its own spawned exec on the
+    protocol-violation give-up (but never on a refusal — the ticket's real
+    first-writer is running there, and cancelling would kill it).
 
 ## Alternatives considered
 

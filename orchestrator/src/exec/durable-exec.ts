@@ -190,24 +190,29 @@ export async function runExec(
     stdout: decodeExecOutput(stdoutChunks),
     stderr: decodeExecOutput(stderrChunks),
   });
+  // Every give-up path reaps the spawned exec: `CancelExec` exists precisely
+  // so a caller that stops reading doesn't leave a command burning guest CPU
+  // until journal TTL. No-op until we know the ticket (nothing spawned yet).
+  const reap = () => {
+    if (canonicalExecId === undefined) return;
+    try {
+      void sessions.cancelExec({ sessionId, execId: canonicalExecId })
+        .catch((error) => {
+          log.warn(
+            { sessionId, execId: canonicalExecId, error },
+            "durable exec cancellation failed (best-effort)",
+          );
+        });
+    } catch (error) {
+      log.warn(
+        { sessionId, execId: canonicalExecId, error },
+        "durable exec cancellation failed (best-effort)",
+      );
+    }
+  };
   const expire = (): never => {
     const execId = canonicalExecId ?? options.execId ?? "<unknown>";
-    if (canonicalExecId !== undefined) {
-      try {
-        void sessions.cancelExec({ sessionId, execId: canonicalExecId })
-          .catch((error) => {
-            log.warn(
-              { sessionId, execId: canonicalExecId, error },
-              "durable exec cancellation failed (best-effort)",
-            );
-          });
-      } catch (error) {
-        log.warn(
-          { sessionId, execId: canonicalExecId, error },
-          "durable exec cancellation failed (best-effort)",
-        );
-      }
-    }
+    reap();
     const captured = output();
     throw new RunExecError(
       `exec ${execId} exceeded deadline of ${options.deadlineMs}ms`,
@@ -345,7 +350,12 @@ export async function runExec(
       if (lastFailure.kind === "protocol") {
         // Deterministic contract violation (duplicate/mismatched/empty
         // ExecStarted): terminal on first occurrence — retrying cannot
-        // change the answer.
+        // change the answer. Our own exec may be spawned and streaming, so
+        // reap it before giving up. (The terminal-error path above must NOT
+        // reap: a refusal there means the ticket's real first-writer command
+        // is running, and cancelling would kill that legitimate exec; a
+        // NotFound / gone-sandbox has nothing to reap.)
+        reap();
         const captured = output();
         throw new RunExecError(
           `exec ${canonicalExecId ?? options.execId ?? "<unknown>"} protocol violation: ${lastFailure.message}`,

@@ -168,6 +168,28 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
             .is_some(),
         "the Completed kind resolves independently of Started"
     );
+
+    // An ADR-0028 recovery rewind tombstones exec lifecycle rows. The guest
+    // journal rewinds with the disk, so a replayed step legitimately re-runs
+    // the same ticket — the dedup must see the LIVE timeline only, or the
+    // re-run leaves no lifecycle record at all.
+    ctx.meta.rewind_session_to_cursor(sid, 0).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_logged_at(sid, "exec:present", Started)
+            .await
+            .unwrap(),
+        None,
+        "tombstoned (rewound) rows must not satisfy the dedup lookup"
+    );
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_logged_at(sid, "exec:present", Completed)
+            .await
+            .unwrap(),
+        None,
+        "tombstoned (rewound) completions must not satisfy the dedup lookup"
+    );
 }
 
 /// ADR 0103: output recording is observation-independent — re-attaches skip
@@ -271,6 +293,18 @@ async fn session_exec_output_high_water(ctx: &Ctx) {
             .unwrap(),
         999,
         "streams carry independent marks"
+    );
+
+    // After a recovery rewind the guest re-runs the ticket and its output
+    // must be re-recorded — tombstoned rows must not hold the mark up.
+    ctx.meta.rewind_session_to_cursor(sid, 0).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        0,
+        "tombstoned (rewound) chunk rows must not satisfy the high-water mark"
     );
 }
 

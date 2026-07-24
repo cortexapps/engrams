@@ -409,7 +409,10 @@ where
                 write_msg(&mut writer, &WireResponse::ExecCancelled).await?;
                 return Ok(());
             }
-            let entry = match JournalEntry::from_dir(journal.root().join(&exec_id)) {
+            // Validate the RAW ticket before any path exists — the exec path
+            // does this inside attach_or_start; cancel must be symmetric or
+            // a `../`-shaped exec_id escapes the journal root.
+            let entry = match journal.existing_entry(&exec_id) {
                 Ok(entry) => entry,
                 Err(error) => {
                     write_msg(

@@ -124,6 +124,16 @@ impl ExecJournal {
         }
     }
 
+    /// Resolve an entry for a RAW caller-supplied exec_id, validating the
+    /// string BEFORE any path is built. This is the only correct way to turn
+    /// wire input into a journal path: `validate_exec_id` rejects `/` and
+    /// leading `.`, so a hostile `../..`-shaped id can never escape the
+    /// journal root (the CancelExec traversal, review round 8).
+    pub fn existing_entry(&self, exec_id: &str) -> io::Result<JournalEntry> {
+        validate_exec_id(exec_id)?;
+        Ok(JournalEntry::new(self.root.join(exec_id), exec_id))
+    }
+
     pub async fn attach_existing(&self, exec_id: &str) -> io::Result<AttachOrStart> {
         validate_exec_id(exec_id)?;
         let entry = JournalEntry::new(self.root.join(exec_id), exec_id);
@@ -287,6 +297,19 @@ impl JournalEntry {
 
     pub fn from_dir(dir: impl Into<PathBuf>) -> io::Result<Self> {
         let dir = dir.into();
+        // Defense in depth behind `ExecJournal::existing_entry`'s raw-string
+        // validation: `Path::join` never normalizes `..`, so a path that
+        // still carries a ParentDir component points outside whatever root
+        // it was joined onto and must not become an entry.
+        if dir
+            .components()
+            .any(|component| component == std::path::Component::ParentDir)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "journal path must not contain '..'",
+            ));
+        }
         let exec_id = dir
             .file_name()
             .and_then(|name| name.to_str())
@@ -623,6 +646,15 @@ where
 pub async fn cancel(entry: &JournalEntry) -> io::Result<()> {
     let mut last_error = None;
     for _ in 0..10 {
+        // The terminal marker gates the kill: once `exit.json` exists the
+        // command is finished and its pgid is free for the kernel to reuse —
+        // killing by the recorded pid could SIGKILL an unrelated process
+        // group. Cancel of a terminal exec is a successful no-op. Checked
+        // inside the loop so a command finishing DURING the pid-wait also
+        // resolves as terminal instead of erroring.
+        if entry.exit().await.is_ok() {
+            return Ok(());
+        }
         match entry.pid().await {
             Ok(pid) => {
                 kill_process_group(Some(pid))?;
