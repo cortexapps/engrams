@@ -279,3 +279,20 @@ root rather than as suggested:
   permitting it once the timestamp is older than any possible commit lag.
 - `makeProductionSweeper` / `makeProductionVersionHeartbeat` retired
   (dead since `production.ts`'s `makeSweepRuntime` replaced them).
+
+The re-review round (2 LOW):
+
+- **Heartbeat rows are pruned under the sweep lease**: `(version, pod)` rows
+  accumulate across deploys with no reaper. Each tick prunes rows older than
+  `max(HEARTBEAT_RETENTION_MS = 7d, 2 × graceMs)` — rows older than the grace
+  window are already dead for liveness (liveVersions takes max(last_seen) per
+  version; the flip fence checks only fresh rows), so the prune can only
+  bound growth, never change behavior. Contained: a failed prune logs and the
+  sweep proceeds.
+- **Cancel alerts always post**: alert dedup via `alertedAt` now applies only
+  to the recurring actions (`alert_only`, `error`, which re-fire every cycle
+  for rows that stay in the scan set). A successful cancel is intrinsically
+  once-per-workflow — the row turns CANCELLED and leaves the scan set — so a
+  `cancelled_stale`/`cancelled_capped` alert is never suppressed by an
+  earlier alert-only alert; the termination is the transition operators must
+  see.

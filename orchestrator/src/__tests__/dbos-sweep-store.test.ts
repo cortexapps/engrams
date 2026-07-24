@@ -40,6 +40,20 @@ describe("in-memory heartbeat store", () => {
     await store.beat("v-old", "pod-a");
     expect(await store.liveVersions(50)).toEqual(["v-live", "v-old"]);
   });
+
+  test("prune drops rows past retention and reports the count", async () => {
+    const { makeInMemoryHeartbeatStore } = await sweepModule();
+    let nowMs = 10_000;
+    const store = makeInMemoryHeartbeatStore(() => new Date(nowMs));
+    await store.beat("v-old", "pod-a");
+    nowMs = 20_000;
+    await store.beat("v-new", "pod-a");
+    nowMs = 21_000;
+
+    expect(await store.prune(5_000)).toBe(1);
+    // The un-pruned old row would still satisfy this wide grace window.
+    expect(await store.liveVersions(20_000)).toEqual(["v-new"]);
+  });
 });
 
 describe("in-memory sweep lease store", () => {
@@ -440,6 +454,28 @@ describe("DBOS sweep stores with live Postgres", () => {
     `);
 
     expect(await store.liveVersions(60_000)).toEqual(["live-version"]);
+  });
+
+  test.skipIf(!dbReachable)("prune deletes only rows older than the retention window", async () => {
+    const { makeHeartbeatStore } = await sweepModule();
+    const store = makeHeartbeatStore();
+    await store.beat("prune-fresh-version", `${runId}-prune-fresh`);
+    await getDb().execute(sql`
+      insert into "dbos_version_heartbeats"
+        ("application_version", "pod_name", "last_seen")
+      values ('prune-old-version', ${`${runId}-prune-old`}, now() - interval '8 days')
+    `);
+
+    expect(await store.prune(7 * 24 * 60 * 60 * 1_000)).toBeGreaterThanOrEqual(1);
+
+    const rows = await getDb().execute(sql`
+      select "pod_name" from "dbos_version_heartbeats"
+      where "pod_name" like ${`${runId}-prune-%`}
+      order by "pod_name"
+    `);
+    expect(rows.rows.map((row) => row.pod_name)).toEqual([
+      `${runId}-prune-fresh`,
+    ]);
   });
 
   test.skipIf(!dbReachable)("lease steals only after expiry and release is owner-guarded", async () => {

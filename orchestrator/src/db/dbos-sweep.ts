@@ -17,6 +17,14 @@ function textArray(values: string[]): SQL {
 export interface HeartbeatStore {
   beat(appVersion: string, podName: string): Promise<void>;
   liveVersions(graceMs: number): Promise<string[]>;
+  /**
+   * Delete rows whose last_seen is older than retentionMs. Rows older than
+   * the grace window are already dead for liveness purposes (liveVersions
+   * takes max(last_seen) per version; the flip fence only checks fresh
+   * rows), so any retention >= the grace window cannot change behavior —
+   * this only bounds table growth across deploys. Returns the deleted count.
+   */
+  prune(retentionMs: number): Promise<number>;
 }
 
 export interface SweepLeaseStore {
@@ -205,6 +213,15 @@ export function makeHeartbeatStore(
         order by "application_version"
       `);
       return result.rows.map((row) => String(row.application_version));
+    },
+
+    async prune(retentionMs) {
+      const result = await db.execute(sql`
+        delete from "dbos_version_heartbeats"
+        where "last_seen" < now() - (${retentionMs} * interval '1 millisecond')
+        returning "application_version"
+      `);
+      return affectedRows(result);
     },
   };
 }
@@ -507,6 +524,18 @@ export function makeInMemoryHeartbeatStore(
         .filter(([, lastSeen]) => lastSeen > cutoff)
         .map(([appVersion]) => appVersion)
         .sort();
+    },
+
+    async prune(retentionMs) {
+      const cutoff = now().getTime() - retentionMs;
+      let deleted = 0;
+      for (const [key, lastSeen] of rows) {
+        if (lastSeen < cutoff) {
+          rows.delete(key);
+          deleted++;
+        }
+      }
+      return deleted;
     },
   };
 }

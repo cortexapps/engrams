@@ -28,6 +28,15 @@ const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
   "cancelled_capped",
   "error",
 ]);
+// alert_only and error decisions recur every cycle for a row that stays in
+// the scan set, so they dedup on the ledger's alertedAt. A successful cancel
+// is intrinsically once-per-workflow — the row turns CANCELLED and leaves the
+// scan set — so cancel alerts always post, even after an earlier alert_only
+// alert set alertedAt (the cancellation is the transition operators must see).
+const DEDUPED_ALERT_ACTIONS = new Set<SweepDecision["action"]>([
+  "alert_only",
+  "error",
+]);
 
 export interface FailureScanResult {
   scanned: number;
@@ -190,8 +199,10 @@ export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
       for (const decision of decisions) {
         if (!ALERT_ACTIONS.has(decision.action)) continue;
         try {
-          const ledger = await deps.ledger.get(decision.workflowUuid);
-          if (ledger?.alertedAt) continue;
+          if (DEDUPED_ALERT_ACTIONS.has(decision.action)) {
+            const ledger = await deps.ledger.get(decision.workflowUuid);
+            if (ledger?.alertedAt) continue;
+          }
           await deps.post(decisionMessage(decision));
           await deps.ledger.markAlerted(decision.workflowUuid, decision.name);
         } catch (error) {

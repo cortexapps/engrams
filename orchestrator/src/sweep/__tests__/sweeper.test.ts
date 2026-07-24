@@ -644,6 +644,53 @@ describe("runSweepTick", () => {
     ).toBe("PENDING");
   });
 
+  test("prunes stale heartbeat rows under the lease with a grace-safe floor", async () => {
+    const f = await fixture([], {}, { graceMs: 600_000 });
+    const pruneCalls: number[] = [];
+    f.deps.heartbeats = {
+      ...f.deps.heartbeats,
+      prune: async (retentionMs) => {
+        pruneCalls.push(retentionMs);
+        return 2;
+      },
+    };
+
+    await runSweepTick(f.deps);
+
+    // 7 days dominates the default grace; an absurd grace still wins 2×.
+    expect(pruneCalls).toEqual([7 * 24 * HOUR_MS]);
+
+    const wide = await fixture([], {}, { graceMs: 8 * 24 * HOUR_MS });
+    const wideCalls: number[] = [];
+    wide.deps.heartbeats = {
+      ...wide.deps.heartbeats,
+      prune: async (retentionMs) => {
+        wideCalls.push(retentionMs);
+        return 0;
+      },
+    };
+    // The sweeper's own version must stay live under the huge grace window.
+    await wide.heartbeats.beat(CURRENT_VERSION, "pod-current");
+
+    await runSweepTick(wide.deps);
+
+    expect(wideCalls).toEqual([16 * 24 * HOUR_MS]);
+  });
+
+  test("a failing heartbeat prune does not abort the sweep", async () => {
+    const f = await fixture([row("wf-pending")]);
+    f.deps.heartbeats = {
+      ...f.deps.heartbeats,
+      prune: async () => {
+        throw new Error("prune unavailable");
+      },
+    };
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]?.action).toBe("adopted");
+  });
+
   test("releases the lease even when the tick body throws", async () => {
     const f = await fixture();
     f.deps.status = {
@@ -763,6 +810,9 @@ describe("VersionHeartbeat", () => {
         },
         async liveVersions() {
           return [];
+        },
+        async prune() {
+          return 0;
         },
       },
       intervalMs: 30_000,

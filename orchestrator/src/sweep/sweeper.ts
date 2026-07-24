@@ -18,6 +18,11 @@ export const MAX_SWEEPS = 3;
 // can never execute again on any current version. Alerting gives operators
 // this window to suppress before the sweep cancels it to a terminal state.
 export const ALERT_ONLY_STALE_AFTER_HOURS = 48;
+// dbos_version_heartbeats accrues one row per (version, pod) across deploys
+// and nothing else deletes them. Rows older than the grace window are already
+// dead for liveness, so pruning at a comfortable multiple only bounds growth;
+// a week keeps recent deploy history visible for operators.
+export const HEARTBEAT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export interface SweepConfig {
   heartbeatIntervalMs: number;
@@ -163,6 +168,25 @@ export async function runSweepTick(
         "aborting DBOS orphan sweep because this version is not live",
       );
       return result;
+    }
+
+    // Contained: a failed prune must never abort the sweep it rides on. The
+    // grace multiple keeps the floor safe even for absurdly long grace configs.
+    try {
+      const pruned = await deps.heartbeats.prune(
+        Math.max(HEARTBEAT_RETENTION_MS, 2 * deps.config.graceMs),
+      );
+      if (pruned > 0) {
+        deps.log.info(
+          { component: "dbos-sweep", pruned },
+          "pruned stale version-heartbeat rows",
+        );
+      }
+    } catch (error) {
+      deps.log.error(
+        { error },
+        "failed to prune stale version-heartbeat rows",
+      );
     }
 
     const pageSize = deps.config.batchCap * 4;

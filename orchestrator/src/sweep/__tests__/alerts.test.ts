@@ -127,6 +127,54 @@ describe("SweepAlerter.alertDecisions", () => {
     expect((await ledger.get("wf-never-swept"))?.alertedAt).not.toBeNull();
   });
 
+  test("a cancel alert posts even after an earlier alert_only alert", async () => {
+    // The cancellation is the transition operators must see; alertedAt dedup
+    // applies only to the recurring actions (alert_only, error). A successful
+    // cancel is once-per-workflow by construction — the row turns CANCELLED
+    // and leaves the scan set — so this cannot re-alert every cycle.
+    const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
+    const posts: string[] = [];
+    const alerter = makeSweepAlerter({
+      ledger,
+      status: makeInMemoryDbosStatusStore(),
+      post: async (text) => {
+        posts.push(text);
+      },
+      policies: () => ({ mode: "alert-only" }),
+      cleanupCtx: cleanupContext(),
+      now: () => new Date(NOW),
+      log,
+      maxCleanupAttempts: 3,
+    });
+
+    await alerter.alertDecisions([
+      {
+        workflowUuid: "wf-orphan",
+        name: "DeletedWorkflowName",
+        action: "alert_only",
+      },
+    ]);
+    await alerter.alertDecisions([
+      {
+        workflowUuid: "wf-orphan",
+        name: "DeletedWorkflowName",
+        action: "alert_only",
+      },
+    ]);
+    await alerter.alertDecisions([
+      {
+        workflowUuid: "wf-orphan",
+        name: "DeletedWorkflowName",
+        action: "cancelled_stale",
+        reason: "unregistered workflow name past the stale window",
+      },
+    ]);
+
+    expect(posts).toHaveLength(2);
+    expect(posts[0]).toContain("alert_only");
+    expect(posts[1]).toContain("cancelled_stale");
+  });
+
   test("contains a posting failure and continues to the next decision", async () => {
     const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
     await ledger.recordSweep("wf-bad", "ToolExecWorkflow");
