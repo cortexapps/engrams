@@ -545,8 +545,8 @@ impl HostClient for HostRegistry {
         // retry a bounded number of times, re-resolving the owner each
         // attempt (the binding may have moved), before surfacing the
         // transient error as a retryable 503. Only the stream-ESTABLISH
-        // call is retried here; a mid-stream drop surfaces downstream as
-        // a truncated-stream 502 (ADR 0050 B) — exec is not idempotent.
+        // call is retried here; a mid-stream drop ends without Exit so the
+        // durable exec caller can re-attach with the same ticket + offsets.
         const MAX_ATTEMPTS: u32 = 3;
         let mut attempt = 0;
         loop {
@@ -563,6 +563,11 @@ impl HostClient for HostRegistry {
                 other => return other,
             }
         }
+    }
+
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        let (_, backend) = self.resolve_owner(id).await?;
+        backend.cancel_exec(id, exec_id).await
     }
 
     async fn write_files(
@@ -1282,6 +1287,10 @@ mod tests {
                     env: Default::default(),
                     workdir: None,
                     timeout: None,
+                    exec_id: None,
+                    stdout_offset: None,
+                    stderr_offset: None,
+                    wake: None,
                 },
             )
             .await

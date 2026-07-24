@@ -35,6 +35,7 @@ service SessionService {
   // degenerate collected case.
   // buf:lint:ignore RPC_RESPONSE_STANDARD_NAME
   rpc Exec(ExecRequest) returns (stream ExecOutput);
+  rpc CancelExec(CancelExecRequest) returns (CancelExecResponse);
   // ADR 0100: stage a batch of files inside a running session without
   // embedding content in a shell command. Each file reports its own result.
   rpc WriteFiles(WriteFilesRequest) returns (WriteFilesResponse);
@@ -322,7 +323,21 @@ message ExecRequest {
   map<string, string> env = 4;
   optional string workdir = 5;
   optional uint64 timeout_secs = 6;
+  // Durable attach-or-start ticket. Omitted callers receive the minted value
+  // in the stream's first ExecStarted frame.
+  optional string exec_id = 7;
+  optional uint64 stdout_offset = 8;
+  optional uint64 stderr_offset = 9;
+  // Resume a parked session before attaching, matching SendPrompt semantics.
+  optional bool wake = 10;
 }
+
+message CancelExecRequest {
+  string session_id = 1;
+  string exec_id = 2;
+}
+
+message CancelExecResponse {}
 
 message WriteFileSpec {
   string path = 1;

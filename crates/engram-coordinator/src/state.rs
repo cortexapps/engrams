@@ -80,10 +80,20 @@ pub enum SessionEvent {
         /// Subscribers wanting raw bytes use the per-exec stream
         /// endpoint (which preserves them).
         chunk: String,
+        /// ADR 0103: absolute RAW byte range of this chunk within the
+        /// exec's stdout stream (wire offsets, not lossy-string lengths).
+        /// Recording is observation-independent: a re-attach skips
+        /// persisting at or below the ticket's recorded `bytes_end`
+        /// high-water mark, so attaching N times records the same rows as
+        /// attaching once.
+        bytes_start: u64,
+        bytes_end: u64,
     },
     Stderr {
         exec_id: String,
         chunk: String,
+        bytes_start: u64,
+        bytes_end: u64,
     },
     SnapshotTaken {
         snapshot_id: SnapshotId,

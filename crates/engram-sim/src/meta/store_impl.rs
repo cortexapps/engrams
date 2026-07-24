@@ -8,8 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::metadata::{
-    CreateDisposition, DisableEnabledImageOutcome, GcCandidateRow, MetadataStore, PlacementNoFit,
-    SessionCreateWriteSet, SnapshotTotals,
+    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, ExecOutputStream,
+    GcCandidateRow, MetadataStore, PlacementNoFit, SessionCreateWriteSet, SnapshotTotals,
 };
 use engram_core::types::capability::Capability;
 use engram_core::types::capture_job::{
@@ -944,6 +944,83 @@ impl MetadataStore for SimMetadataStore {
     }
 
     // ================= session events =================
+
+    async fn session_exec_event_at(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+        kind: ExecLifecycleEventKind,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        // `SELECT MIN((payload->>'at')::timestamptz) ... WHERE kind = $2 AND
+        //  payload->>'exec_id' = $3 AND rewound_at IS NULL` — the event's OWN
+        // `at` stamp (attach time), not the row's created_at (first-frame
+        // time), and the dedup sees the live timeline only.
+        Ok(db.session_events.get(&session_id).and_then(|events| {
+            events
+                .iter()
+                .filter(|event| {
+                    event.rewound_at.is_none()
+                        && event.kind == kind.kind_str()
+                        && event
+                            .payload
+                            .get("exec_id")
+                            .and_then(serde_json::Value::as_str)
+                            == Some(exec_id)
+                })
+                .filter_map(|event| {
+                    event
+                        .payload
+                        .get("at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw| {
+                            chrono::DateTime::parse_from_rfc3339(raw)
+                                .ok()
+                                .map(|at| at.with_timezone(&chrono::Utc))
+                        })
+                })
+                .min()
+        }))
+    }
+
+    async fn session_exec_output_high_water(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+        stream: ExecOutputStream,
+    ) -> Result<u64, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        // `SELECT MAX((payload->>'bytes_end')::bigint) ... AND rewound_at IS
+        // NULL` — unstamped rows are skipped, matching NULL-ignoring SQL MAX,
+        // and tombstoned rows must not hold the mark up.
+        Ok(db
+            .session_events
+            .get(&session_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| {
+                        event.rewound_at.is_none()
+                            && event.kind == stream.kind_str()
+                            && event
+                                .payload
+                                .get("exec_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(exec_id)
+                    })
+                    .filter_map(|event| {
+                        event
+                            .payload
+                            .get("bytes_end")
+                            .and_then(serde_json::Value::as_u64)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0))
+    }
 
     /// CTE mirror: atomically allocate next_event_idx from the session
     /// row (missing session -> NotFound), stamp recovery_epoch, insert,

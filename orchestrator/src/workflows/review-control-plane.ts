@@ -3,6 +3,14 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 
 import { getDb } from "../db/client.ts";
+import {
+  defaultRunExecRuntime,
+  runExec,
+  RunExecError,
+  type DurableExecClient,
+  type RunExecResult,
+  type RunExecRuntime,
+} from "../exec/durable-exec.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
@@ -148,17 +156,11 @@ interface ReviewControlPlaneStore extends Pick<
   | "recordEvent"
 > {}
 
-interface ReviewExecOutput {
-  event:
-    | { case: "started"; value: unknown }
-    | { case: "stdout"; value: Uint8Array }
-    | { case: "stderr"; value: Uint8Array }
-    | { case: "exit"; value: { exitStatus?: number } }
-    | { case: undefined; value?: undefined };
-}
-
-export interface ReviewSessionsClient extends TaskSessionsClient {
-  exec(req: { sessionId: string; command: string }): AsyncIterable<ReviewExecOutput>;
+// The review control plane knows nothing about exec transport mechanics
+// (severance, replay offsets, backoff) — that is `DurableExecClient` /
+// `runExec`'s job, in ../exec/durable-exec.ts. Reviews only decide WHAT to
+// run (clone, merge-base), the ticket name, and the deadline.
+export interface ReviewSessionsClient extends TaskSessionsClient, DurableExecClient {
   writeFiles(req: {
     sessionId: string;
     files: Array<{ path: string; content: Uint8Array; mode: number }>;
@@ -185,6 +187,8 @@ export interface ReviewControlPlaneDeps {
   createSessionForExistingTask?: CreateExistingTaskSession;
   /** Focused seam for asserting binding-before-listener publication. */
   registerSessionListener?: (sessionId: string) => Promise<void>;
+  /** Deterministic retry/deadline scheduler for durable-exec tests. */
+  execRuntime?: RunExecRuntime;
 }
 
 /** Human detail for a `posted` activity-log entry. */
@@ -235,6 +239,8 @@ const VERIFIER_SYSTEM_PROMPT = [
 // — defense in depth on top of the signature check + enrollment gate.
 const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
+const BOOTSTRAP_CLONE_DEADLINE_MS = 5 * 60_000;
+const MERGE_BASE_DEADLINE_MS = 60_000;
 
 // Security clamp: reviewer workers may read only the reviewed repo, while the
 // orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
@@ -270,6 +276,7 @@ async function cloneRepo(
   repo: string,
   headSha: string,
   phase: string,
+  execRuntime: RunExecRuntime,
 ): Promise<void> {
   const name = repoName(repo);
   if (headSha !== "" && !SHA_RE.test(headSha)) {
@@ -281,37 +288,24 @@ async function cloneRepo(
     command += ` && git -C ${workspace} checkout ${headSha}`;
   }
 
-  const { exitStatus, stderr } = await runExec(sessions, sessionId, command);
+  let result: RunExecResult;
+  try {
+    result = await runExec(sessions, sessionId, command, {
+      execId: `exec:${sessionId}:bootstrap-clone`,
+      deadlineMs: BOOTSTRAP_CLONE_DEADLINE_MS,
+    }, execRuntime);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    const stderr = error instanceof RunExecError ? error.stderr.trim() : "";
+    throw new ReviewSetupError(
+      `${phase} clone failed: ${message}${stderr === "" ? "" : `: ${stderr}`}`,
+    );
+  }
+  const { exitStatus, stderr } = result;
   if (exitStatus !== 0) {
     const detail = stderr.trim() || "exec stream ended without a successful exit status";
     throw new ReviewSetupError(`${phase} clone failed: ${detail}`);
   }
-}
-
-/** Drain an `exec` stream to completion, capturing stdout, stderr, and the
- *  exit status. The one place both stream halves are decoded. */
-async function runExec(
-  sessions: ReviewSessionsClient,
-  sessionId: string,
-  command: string,
-): Promise<{ exitStatus: number | undefined; stdout: string; stderr: string }> {
-  const outDecoder = new TextDecoder();
-  const errDecoder = new TextDecoder();
-  let stdout = "";
-  let stderr = "";
-  let exitStatus: number | undefined;
-  for await (const message of sessions.exec({ sessionId, command })) {
-    if (message.event.case === "stdout") {
-      stdout += outDecoder.decode(message.event.value, { stream: true });
-    } else if (message.event.case === "stderr") {
-      stderr += errDecoder.decode(message.event.value, { stream: true });
-    } else if (message.event.case === "exit") {
-      exitStatus = message.event.value.exitStatus;
-    }
-  }
-  stdout += outDecoder.decode();
-  stderr += errDecoder.decode();
-  return { exitStatus, stdout, stderr };
 }
 
 /** Resolve the TRUE merge base (fork point) of the base and head commits in
@@ -331,6 +325,7 @@ async function resolveMergeBase(
   repoDir: string,
   baseSha: string,
   headSha: string,
+  execRuntime: RunExecRuntime,
 ): Promise<string> {
   if (!SHA_RE.test(baseSha)) throw new ReviewSetupError(`invalid base SHA: ${baseSha}`);
   if (!SHA_RE.test(headSha)) throw new ReviewSetupError(`invalid head SHA: ${headSha}`);
@@ -338,6 +333,11 @@ async function resolveMergeBase(
     sessions,
     sessionId,
     `git -C ${repoDir} merge-base ${baseSha} ${headSha}`,
+    {
+      execId: `exec:${sessionId}:merge-base:${baseSha}:${headSha}`,
+      deadlineMs: MERGE_BASE_DEADLINE_MS,
+    },
+    execRuntime,
   );
   const mergeBase = stdout.trim();
   if (exitStatus !== 0 || !SHA_RE.test(mergeBase)) {
@@ -409,6 +409,7 @@ export function makeReviewControlPlane(
   const insertTask = deps.insertTask ?? ((input) =>
     insertReviewTask(db(), input));
   const sessions = deps.sessions ?? defaultSessions;
+  const execRuntime = deps.execRuntime ?? defaultRunExecRuntime;
   let profileStore = deps.profiles;
   const profiles = () => (profileStore ??= makeProfileStore(db()));
   let enrollmentStore = deps.enrollments;
@@ -578,7 +579,14 @@ export function makeReviewControlPlane(
 
     async bootstrapFinderSession(sessionId, input) {
       await recordEvent(input.reviewId, "cloning", "finder");
-      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "finder");
+      await cloneRepo(
+        sessions,
+        sessionId,
+        input.repo,
+        input.headSha,
+        "finder",
+        execRuntime,
+      );
 
       const encoder = new TextEncoder();
       const files = renderReviewer({
@@ -612,7 +620,14 @@ export function makeReviewControlPlane(
       // two-dot `git diff base head`. The prompt still uses three-dot as a
       // belt-and-suspenders (with a true merge base the two are equivalent).
       const mergeBase = input.baseSha !== "" && input.headSha !== ""
-        ? await resolveMergeBase(sessions, sessionId, `/workspace/${name}`, input.baseSha, input.headSha)
+        ? await resolveMergeBase(
+          sessions,
+          sessionId,
+          `/workspace/${name}`,
+          input.baseSha,
+          input.headSha,
+          execRuntime,
+        )
         : "";
       const range = mergeBase !== ""
         ? `${mergeBase}...${input.headSha}`
@@ -688,7 +703,14 @@ export function makeReviewControlPlane(
 
     async bootstrapVerifierSession(sessionId, input) {
       await recordEvent(input.reviewId, "cloning", "verifier");
-      await cloneRepo(sessions, sessionId, input.repo, input.headSha, "verifier");
+      await cloneRepo(
+        sessions,
+        sessionId,
+        input.repo,
+        input.headSha,
+        "verifier",
+        execRuntime,
+      );
 
       const review = await reviews().getReview(input.reviewId);
       if (!review) {

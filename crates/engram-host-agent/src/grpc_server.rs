@@ -18,14 +18,15 @@
 use std::sync::Arc;
 
 use engram_core::traits::{HostClient, SessionFence};
+use engram_core::types::sandbox::{ExecEvent, ExecEventStream};
 use engram_core::SandboxError;
 use engram_protocol::admin::HostAdminHandler;
 use engram_protocol::grpc::host_service_server::{HostService, HostServiceServer};
 use engram_protocol::grpc::proxy_port_message::Body as ProxyPortBody;
 use engram_protocol::grpc::proxy_shell_message::Body as ProxyShellBody;
 use engram_protocol::grpc::{
-    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BrowserPortResponse, CowStateAllResponse,
-    CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
+    ApplyEgressPolicyRequest, BindHarnessSessionRequest, BrowserPortResponse, CancelExecRequest,
+    CowStateAllResponse, CowStateResponse, CreateSandboxRequest, CreateSandboxResponse,
     DequeueHarnessQueuedPromptRequest, DrainOutcomeResponse, EditHarnessQueuedPromptRequest, Empty,
     ExecExit, ExecFrame, ExecStartRequest, FencedSandboxRequest, GuestIpResponse, IdePortResponse,
     InterruptHarnessRequest, ListSandboxesResponse, MaterializeImageDone, MaterializeImageEvent,
@@ -201,6 +202,61 @@ pub async fn boot(
         .add_service(HostServiceServer::new(svc).max_encoding_message_size(32 * 1024 * 1024))
         .serve(listen_addr)
         .await
+}
+
+/// Forward one backend exec stream onto the host-service gRPC stream.
+///
+/// [`ExecEvent::Exit`] and [`ExecEvent::Refused`] are terminal. If the backend
+/// event channel closes first, the durable guest journal may still hold the
+/// result, so surface `Unavailable` instead of inventing `Exit(None)`.
+async fn pump_exec_frames(
+    exec_id: String,
+    mut events: ExecEventStream,
+    tx: mpsc::Sender<Result<ExecFrame, Status>>,
+) {
+    use futures::StreamExt;
+
+    while let Some(event) = events.next().await {
+        let frame = match event {
+            ExecEvent::Stdout(bytes) => ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Stdout(
+                    bytes.to_vec(),
+                )),
+            },
+            ExecEvent::Stderr(bytes) => ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Stderr(
+                    bytes.to_vec(),
+                )),
+            },
+            ExecEvent::Exit(status) => {
+                let frame = ExecFrame {
+                    frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(ExecExit {
+                        status,
+                    })),
+                };
+                let _ = tx.send(Ok(frame)).await;
+                return;
+            }
+            ExecEvent::Refused(reason) => {
+                let frame = ExecFrame {
+                    frame: Some(engram_protocol::grpc::exec_frame::Frame::Refused(reason)),
+                };
+                let _ = tx.send(Ok(frame)).await;
+                return;
+            }
+        };
+        if tx.send(Ok(frame)).await.is_err() {
+            // Client dropped the stream — stop pumping.
+            return;
+        }
+    }
+
+    let _ = tx
+        .send(Err(Status::unavailable(format!(
+            "exec {exec_id} backend stream ended without an Exit or Refused frame; \
+             its result may be recoverable by re-attaching with the same exec_id"
+        ))))
+        .await;
 }
 
 #[tonic::async_trait]
@@ -1163,8 +1219,9 @@ impl HostService for HostServiceImpl {
     }
 
     /// Server-streaming exec. First frame is `started` (carries the
-    /// host-assigned `exec_id`); subsequent frames carry stdout /
-    /// stderr bytes; terminal frame is `exit` (always exactly one).
+    /// canonical `exec_id`); subsequent frames carry stdout /
+    /// stderr bytes. A backend-produced `Exit` is forwarded verbatim;
+    /// backend closure before `Exit` terminates the RPC with `Unavailable`.
     async fn exec_start(
         &self,
         req: Request<ExecStartRequest>,
@@ -1173,19 +1230,20 @@ impl HostService for HostServiceImpl {
         let r = req.into_inner();
         let sandbox_id = decode_sandbox_id(&r.sandbox_id)?;
         let wire: WireExecRequest = decode_bincode(&r.request_bincode, "WireExecRequest")?;
-        let request = wire.into_engine();
+        let mut request = wire.into_engine();
+        request.exec_id = r.exec_id;
+        request.stdout_offset = r.stdout_offset;
+        request.stderr_offset = r.stderr_offset;
+        request.wake = r.wake;
 
-        let mut stream = self
+        let stream = self
             .inner
             .exec_stream(sandbox_id, request)
             .await
             .map_err(sandbox_to_status)?;
 
-        // mpsc channel feeds the gRPC stream out. We pump the
-        // backend's `ExecStream` events into it; the stream ends
-        // when the backend sends `Exit` or its events channel
-        // closes (treat-as-Exit-None per the WS path's drain
-        // logic).
+        // mpsc channel feeds the gRPC stream out. A backend-produced Exit or
+        // Refused is terminal; closure first becomes Unavailable.
         let (tx, rx) = mpsc::channel::<Result<ExecFrame, Status>>(64);
 
         // First frame: `started` with the assigned exec_id.
@@ -1199,47 +1257,24 @@ impl HostService for HostServiceImpl {
             return Err(Status::cancelled("client closed stream before Started"));
         }
 
-        tokio::spawn(async move {
-            use engram_core::types::sandbox::ExecEvent;
-            use futures::StreamExt;
-            while let Some(ev) = stream.events.next().await {
-                let frame = match ev {
-                    ExecEvent::Stdout(b) => ExecFrame {
-                        frame: Some(engram_protocol::grpc::exec_frame::Frame::Stdout(b.to_vec())),
-                    },
-                    ExecEvent::Stderr(b) => ExecFrame {
-                        frame: Some(engram_protocol::grpc::exec_frame::Frame::Stderr(b.to_vec())),
-                    },
-                    ExecEvent::Exit(status) => {
-                        let frame = ExecFrame {
-                            frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(ExecExit {
-                                status,
-                            })),
-                        };
-                        let _ = tx.send(Ok(frame)).await;
-                        return;
-                    }
-                };
-                if tx.send(Ok(frame)).await.is_err() {
-                    // Client dropped the stream — stop pumping.
-                    return;
-                }
-            }
-            // Backend events channel ended without an explicit Exit
-            // frame. Synthesize Exit(None) so the demuxer downstream
-            // terminates cleanly — matches the WS path's
-            // `drain_exec_stream` behavior.
-            let _ = tx
-                .send(Ok(ExecFrame {
-                    frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(ExecExit {
-                        status: None,
-                    })),
-                }))
-                .await;
-        });
+        tokio::spawn(pump_exec_frames(stream.exec_id, stream.events, tx));
 
         let out_stream = tokio_stream::wrappers::ReceiverStream::new(rx);
         Ok(Response::new(Box::pin(out_stream) as Self::ExecStartStream))
+    }
+
+    async fn cancel_exec(
+        &self,
+        req: Request<CancelExecRequest>,
+    ) -> Result<Response<Empty>, Status> {
+        check_wire_version(&req)?;
+        let request = req.into_inner();
+        let sandbox_id = decode_sandbox_id(&request.sandbox_id)?;
+        self.inner
+            .cancel_exec(sandbox_id, request.exec_id)
+            .await
+            .map_err(sandbox_to_status)?;
+        Ok(Response::new(Empty {}))
     }
 
     /// ADR 0100: unary batch file staging. The backend owns the guest
@@ -1689,7 +1724,124 @@ fn sandbox_to_status(err: SandboxError) -> Status {
 #[cfg(test)]
 mod wire_version_tests {
     use super::*;
+    use bytes::Bytes;
+    use engram_core::types::sandbox::ExecEventStream;
     use engram_protocol::wire::WIRE_VERSION_METADATA_KEY;
+    use futures::StreamExt;
+
+    fn exec_events<I>(events: I) -> ExecEventStream
+    where
+        I: IntoIterator<Item = ExecEvent>,
+        I::IntoIter: Send + 'static,
+    {
+        Box::pin(futures::stream::iter(events))
+    }
+
+    async fn pump_items(events: ExecEventStream) -> Vec<Result<ExecFrame, Status>> {
+        let (tx, rx) = mpsc::channel(16);
+        pump_exec_frames("exec:pump-test".into(), events, tx).await;
+        tokio_stream::wrappers::ReceiverStream::new(rx)
+            .collect()
+            .await
+    }
+
+    #[tokio::test]
+    async fn exec_pump_closure_without_exit_sends_unavailable_not_exit() {
+        let items = pump_items(exec_events([ExecEvent::Stdout(Bytes::from_static(
+            b"partial",
+        ))]))
+        .await;
+
+        assert_eq!(items.len(), 2);
+        assert!(matches!(
+            &items[0],
+            Ok(ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Stdout(bytes)),
+            }) if bytes == b"partial"
+        ));
+        match &items[1] {
+            Err(status) => {
+                assert_eq!(status.code(), tonic::Code::Unavailable);
+                assert!(status.message().contains("exec:pump-test"));
+                assert!(status.message().contains("recoverable"));
+                assert!(status.message().contains("re-attaching"));
+            }
+            Ok(frame) => panic!("expected Unavailable, not frame {frame:?}"),
+        }
+        assert!(!items.iter().any(|item| {
+            matches!(
+                item,
+                Ok(ExecFrame {
+                    frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(_)),
+                })
+            )
+        }));
+    }
+
+    #[tokio::test]
+    async fn exec_pump_forwards_output_and_real_exit_verbatim() {
+        let items = pump_items(exec_events([
+            ExecEvent::Stdout(Bytes::from_static(b"out")),
+            ExecEvent::Stderr(Bytes::from_static(b"err")),
+            ExecEvent::Exit(Some(7)),
+            ExecEvent::Stdout(Bytes::from_static(b"after-exit")),
+        ]))
+        .await;
+
+        assert_eq!(items.len(), 3);
+        assert!(matches!(
+            &items[0],
+            Ok(ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Stdout(bytes)),
+            }) if bytes == b"out"
+        ));
+        assert!(matches!(
+            &items[1],
+            Ok(ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Stderr(bytes)),
+            }) if bytes == b"err"
+        ));
+        assert!(matches!(
+            &items[2],
+            Ok(ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(ExecExit {
+                    status: Some(7),
+                })),
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exec_pump_preserves_backend_exit_none() {
+        let items = pump_items(exec_events([ExecEvent::Exit(None)])).await;
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            Ok(ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Exit(ExecExit {
+                    status: None,
+                })),
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exec_pump_forwards_refused_as_distinct_terminal_frame() {
+        let items = pump_items(exec_events([
+            ExecEvent::Refused("first writer wins".into()),
+            ExecEvent::Stdout(Bytes::from_static(b"after-refusal")),
+        ]))
+        .await;
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            Ok(ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Refused(reason)),
+            }) if reason == "first writer wins"
+        ));
+    }
 
     /// Build a `Request<()>` carrying an `x-engram-wire-version` metadata
     /// header set to `coord` — the shape the coord's `TraceparentInjector`

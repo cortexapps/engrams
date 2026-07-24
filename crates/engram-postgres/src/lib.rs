@@ -13,7 +13,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::clock::{Clock, Entropy, OsEntropy, SystemClock};
 use engram_core::traits::{
-    CreateDisposition, DisableEnabledImageOutcome, MetadataStore, SessionCreateWriteSet,
+    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, ExecOutputStream,
+    MetadataStore, SessionCreateWriteSet,
 };
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
@@ -4057,6 +4058,71 @@ impl MetadataStore for PostgresStore {
                     .map_err(db_err)
             })
             .collect()
+    }
+
+    async fn session_exec_event_at(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+        kind: ExecLifecycleEventKind,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+        // The event's OWN `at` stamp, not the row's `created_at`: the
+        // exec_started stamp is the attach time, while its row lands only at
+        // the first delivered frame — for a silent command that is the Exit
+        // itself, so `created_at` would collapse wall_ms to ~0. Lifecycle
+        // rows are written exclusively by the coordinator with a valid
+        // RFC3339 `at`, so the cast never sees garbage.
+        // MIN: the first recorded occurrence is the authoritative one — a
+        // residual concurrent-attach duplicate must not move the timestamp.
+        // Live timeline only: an ADR-0028 rewind tombstones exec rows AND
+        // rewinds the guest journal, so a replayed step legitimately re-runs
+        // the ticket — its fresh lifecycle rows must not be suppressed by
+        // the tombstoned past.
+        sqlx::query_scalar(
+            r#"
+            SELECT MIN((payload->>'at')::timestamptz)
+              FROM session_events
+             WHERE session_id = $1
+               AND kind = $2
+               AND payload->>'exec_id' = $3
+               AND rewound_at IS NULL
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(kind.kind_str())
+        .bind(exec_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)
+    }
+
+    async fn session_exec_output_high_water(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+        stream: ExecOutputStream,
+    ) -> Result<u64, MetaError> {
+        // Unstamped (pre-ADR-0103) rows yield NULL from ->> and MAX skips
+        // NULLs, so they are ignored by construction. Live timeline only:
+        // rewound output rows must not hold the mark up — the re-run's
+        // output must be re-recorded.
+        let max: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT MAX((payload->>'bytes_end')::bigint)
+              FROM session_events
+             WHERE session_id = $1
+               AND kind = $2
+               AND payload->>'exec_id' = $3
+               AND rewound_at IS NULL
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(stream.kind_str())
+        .bind(exec_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(max.unwrap_or(0).max(0) as u64)
     }
 
     async fn append_session_event(

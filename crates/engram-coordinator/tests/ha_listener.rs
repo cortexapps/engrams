@@ -66,6 +66,8 @@ async fn cross_replica_event_fan_out() {
     let event = engram_coordinator::state::SessionEvent::Stdout {
         exec_id: "test-exec".into(),
         chunk: test_chunk.clone(),
+        bytes_start: 0,
+        bytes_end: test_chunk.len() as u64,
     };
 
     // coord-A's pg_listener may still be establishing its `LISTEN` when we

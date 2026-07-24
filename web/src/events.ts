@@ -16,7 +16,8 @@ import type { SessionState } from "./lib/types";
 export type AgentRole = "assistant" | "user" | "system";
 
 export interface ExecRusage {
-  duration_ms: number;
+  /** Coordinator-measured exec wall time (engram_core `ExecRusage.wall_ms`). */
+  wall_ms: number;
   // Other rusage fields exist on the wire but the UI doesn't read them.
   [k: string]: unknown;
 }

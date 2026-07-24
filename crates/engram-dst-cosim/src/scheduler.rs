@@ -288,7 +288,15 @@ impl Cosim {
             let host = self.world.host.lock().await;
             (host.cursor(sandbox).unwrap_or(0), self.world.clock_now())
         };
-        let _ = self.world.host.lock().await.flush(sandbox).await;
+        let _ = {
+            let mut host = self.world.host.lock().await;
+            // Firecracker's `prepare_save` queues TRANSPORT_RESET for every
+            // guest vsock connection on periodic captures. The guest forgets
+            // them without host EOF; the epoch is the host reader's only
+            // wakeup and re-attach signal (ADR 0103).
+            host.sever_exec_transports(sandbox);
+            host.flush(sandbox).await
+        };
         use engram_core::traits::Entropy as _;
         let snap = recoverable_snapshot_row(
             engram_core::SnapshotId::from(self.world.entropy.uuid()),

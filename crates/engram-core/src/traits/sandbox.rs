@@ -243,7 +243,9 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// Run a command in the sandbox and return a stream of stdout/stderr
-    /// chunks ending with a single [`ExecEvent::Exit`]. Terminating the
+    /// chunks. A terminal backend result ends with one [`ExecEvent::Exit`] or
+    /// [`ExecEvent::Refused`]; ending without either terminal means transport
+    /// loss and must not be interpreted as a terminal status. Terminating the
     /// stream early (dropping it) does NOT necessarily kill the
     /// underlying process — backends are free to detach and let it run
     /// to completion. Callers that need cancellation should hold the
@@ -254,6 +256,15 @@ pub trait SandboxBackend: Send + Sync {
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError>;
 
+    /// Kill the process group owned by a durable exec ticket. Reading and
+    /// cancellation are deliberately separate operations: dropping an attach
+    /// stream leaves the command running so another caller can resume it.
+    async fn cancel_exec(&self, _id: SandboxId, _exec_id: String) -> Result<(), SandboxError> {
+        Err(SandboxError::Unsupported(
+            "cancel_exec is not implemented by this sandbox backend".into(),
+        ))
+    }
+
     /// Convenience wrapper that runs the command to completion and
     /// returns buffered stdout/stderr/exit-status. Default impl drains
     /// `exec_stream`. Don't call this for long-running commands —
@@ -262,17 +273,26 @@ pub trait SandboxBackend: Send + Sync {
         let mut stream = self.exec_stream(id, cmd).await?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut exit_status = None;
-        while let Some(event) = stream.events.next().await {
-            match event {
-                ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-                ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-                ExecEvent::Exit(s) => {
-                    exit_status = s;
-                    break;
+        let exit_status = loop {
+            match stream.events.next().await {
+                Some(ExecEvent::Stdout(b)) => stdout.extend_from_slice(&b),
+                Some(ExecEvent::Stderr(b)) => stderr.extend_from_slice(&b),
+                Some(ExecEvent::Exit(status)) => break status,
+                Some(ExecEvent::Refused(reason)) => {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "exec {} refused: {reason}",
+                        stream.exec_id
+                    )));
+                }
+                None => {
+                    return Err(SandboxError::Unavailable(format!(
+                        "exec {} event stream ended without an Exit or Refused frame; its result \
+                         may be recoverable through exec_stream re-attach",
+                        stream.exec_id
+                    )));
                 }
             }
-        }
+        };
         Ok(ExecHandle {
             sandbox_id: stream.sandbox_id,
             exec_id: stream.exec_id,

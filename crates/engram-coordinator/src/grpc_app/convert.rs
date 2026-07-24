@@ -189,6 +189,10 @@ pub(crate) fn exec_request_from_proto(r: app::ExecRequest) -> ApiExecRequest {
         env,
         workdir,
         timeout_secs,
+        exec_id,
+        stdout_offset,
+        stderr_offset,
+        wake,
     } = r;
     ApiExecRequest {
         command,
@@ -196,6 +200,10 @@ pub(crate) fn exec_request_from_proto(r: app::ExecRequest) -> ApiExecRequest {
         env,
         workdir,
         timeout_secs,
+        exec_id,
+        stdout_offset,
+        stderr_offset,
+        wake,
     }
 }
 
@@ -1083,6 +1091,10 @@ mod tests {
             env: env.clone(),
             workdir: Some("/tmp".to_string()),
             timeout_secs: Some(30),
+            exec_id: Some("exec:caller".into()),
+            stdout_offset: Some(12),
+            stderr_offset: Some(34),
+            wake: Some(true),
         };
         let api = exec_request_from_proto(r);
         assert_eq!(
@@ -1093,6 +1105,10 @@ mod tests {
         assert_eq!(api.env.get("FOO").map(|s| s.as_str()), Some("bar"));
         assert_eq!(api.workdir.as_deref(), Some("/tmp"));
         assert_eq!(api.timeout_secs, Some(30));
+        assert_eq!(api.exec_id.as_deref(), Some("exec:caller"));
+        assert_eq!(api.stdout_offset, Some(12));
+        assert_eq!(api.stderr_offset, Some(34));
+        assert_eq!(api.wake, Some(true));
 
         // argv empty: argv maps to None.
         let r2 = app::ExecRequest {
@@ -1102,6 +1118,10 @@ mod tests {
             env: std::collections::HashMap::new(),
             workdir: None,
             timeout_secs: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let api2 = exec_request_from_proto(r2);
         assert_eq!(api2.argv, None);

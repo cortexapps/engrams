@@ -17,6 +17,7 @@
 pub mod browser;
 pub mod cacerts;
 pub mod clock;
+pub mod exec_journal;
 pub mod forge;
 pub mod handler;
 pub mod harness_supervisor;
@@ -35,7 +36,7 @@ pub mod shell;
 pub mod time_source;
 
 pub use cacerts::{CaCertInstaller, CaCertPaths};
-pub use handler::serve_connection;
+pub use handler::{serve_connection, serve_connection_with_journal};
 pub use harness_supervisor::HarnessSupervisor;
 pub use proto::{
     read_msg, write_msg, AgentReady, SpawnHarnessRequest, WireDownloadResponse, WireExecEvent,

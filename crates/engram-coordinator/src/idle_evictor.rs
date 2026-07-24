@@ -2251,6 +2251,10 @@ mod tests {
             env: Default::default(),
             workdir: None,
             timeout: Some(Duration::from_secs(5)),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         state.services.host.exec(sandbox_id, req).await.unwrap();
 

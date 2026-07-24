@@ -11,6 +11,7 @@ workspace = true
 
 [dependencies]
 engram-chunk-store.workspace = true
+engram-agentd.workspace = true
 engram-coordinator.workspace = true
 engram-core.workspace = true
 engram-crypto.workspace = true
@@ -20,6 +21,7 @@ engram-host-core.workspace = true
 engram-oci.workspace = true
 engram-protocol.workspace = true
 engram-secrets-dev.workspace = true
+engram-sandbox-firecracker.workspace = true
 engram-sim.workspace = true
 engram-storage-local.workspace = true
 async-trait.workspace = true
@@ -32,8 +34,11 @@ rand_chacha = { workspace = true }
 serde_json.workspace = true
 tokio.workspace = true
 toml.workspace = true
+tracing.workspace = true
 uuid.workspace = true
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+futures-util.workspace = true
+tempfile = "3"
 tokio = { workspace = true, features = ["macros", "rt", "test-util"] }

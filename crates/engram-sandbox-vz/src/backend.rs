@@ -7,6 +7,7 @@
 //! `match` cleanly. Each method's real body lands in a follow-up
 //! commit (see plan tasks 27 / 28 / 29).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,6 +43,20 @@ use crate::vsock_bridge::{port_uds_path, VsockBridge, VsockConnector};
 /// Vsock port engram-agentd binds inside the rootfs. Same number FC
 /// uses; the in-VM binary doesn't know which VMM is hosting it.
 const ENGRAM_AGENTD_PORT: u32 = 1024;
+
+#[derive(serde::Serialize)]
+struct LegacyWireExecRequest {
+    command: Vec<String>,
+    stdin: Option<Vec<u8>>,
+    env: HashMap<String, String>,
+    workdir: Option<String>,
+    timeout_ms: Option<u64>,
+}
+
+#[derive(serde::Serialize)]
+enum LegacyWireRequest {
+    Exec(LegacyWireExecRequest),
+}
 
 /// Static config for the VZ backend — values that are the same for
 /// every sandbox the backend creates. Per-sandbox overrides ride on
@@ -741,27 +756,67 @@ async fn drive_exec_protocol<R, W>(
     mut reader: R,
     mut writer: W,
     cmd: ExecRequest,
+    durable_capable: bool,
 ) -> Result<ExecStream, SandboxError>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let req = WireRequest::Exec(WireExecRequest {
-        command: cmd.command,
-        stdin: cmd.stdin,
-        env: cmd.env,
-        workdir: cmd.workdir,
-        timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
-    });
-    write_msg(&mut writer, &req)
+    let exec_id = cmd
+        .exec_id
+        .clone()
+        .unwrap_or_else(|| format!("vz-{}", uuid::Uuid::new_v4().simple()));
+    if durable_capable {
+        let req = WireRequest::Exec(WireExecRequest {
+            command: cmd.command.clone(),
+            stdin: cmd.stdin.clone(),
+            env: cmd.env.clone(),
+            workdir: cmd.workdir.clone(),
+            timeout_ms: cmd.timeout.map(|d| d.as_millis() as u64),
+            exec_id: Some(exec_id.clone()),
+            stdout_offset: cmd.stdout_offset,
+            stderr_offset: cmd.stderr_offset,
+            wake: cmd.wake,
+            attach_only: false,
+        });
+        write_msg(&mut writer, &req)
+            .await
+            .map_err(|e| SandboxError::Vm(format!("send durable WireRequest::Exec: {e}").into()))?;
+    } else {
+        write_msg(
+            &mut writer,
+            &LegacyWireRequest::Exec(LegacyWireExecRequest {
+                command: cmd.command.clone(),
+                stdin: cmd.stdin.clone(),
+                env: cmd.env.clone(),
+                workdir: cmd.workdir.clone(),
+                timeout_ms: cmd.timeout.map(|duration| duration.as_millis() as u64),
+            }),
+        )
         .await
-        .map_err(|e| SandboxError::Vm(format!("send WireRequest::Exec: {e}").into()))?;
+        .map_err(|e| SandboxError::Vm(format!("send stage-1 WireRequest::Exec: {e}").into()))?;
+    }
 
-    let exec_id = format!("vz-{}", uuid::Uuid::new_v4().simple());
     let (tx, rx) = mpsc::channel::<ExecEvent>(64);
+    let reader_exec_id = exec_id.clone();
     tokio::spawn(async move {
+        let exec_id = reader_exec_id;
         loop {
             match read_msg::<_, WireExecEvent>(&mut reader).await {
+                Ok(WireExecEvent::Started(started_id)) => {
+                    if started_id != exec_id {
+                        let _ = tx
+                            .send(ExecEvent::Stderr(Bytes::from(format!(
+                                "durable exec protocol violation: expected Started({exec_id}), got Started({started_id})\n"
+                            ))))
+                            .await;
+                        let _ = tx.send(ExecEvent::Exit(None)).await;
+                        return;
+                    }
+                }
+                Ok(WireExecEvent::Degraded(reason)) => {
+                    tracing::warn!(%reason, "guest durable exec journal degraded");
+                }
                 Ok(WireExecEvent::Stdout(b)) => {
                     if tx.send(ExecEvent::Stdout(Bytes::from(b))).await.is_err() {
                         return;
@@ -776,10 +831,32 @@ where
                     let _ = tx.send(ExecEvent::Exit(code)).await;
                     return;
                 }
+                Ok(WireExecEvent::Refused { reason }) => {
+                    let _ = tx.send(ExecEvent::Refused(reason)).await;
+                    return;
+                }
                 Err(e) => {
+                    if durable_capable {
+                        // EOF/read failure is transport state, not a guest
+                        // journal verdict. End without Exit so the coordinator
+                        // exposes a retryable Unavailable and the caller can
+                        // attach again with its delivered offsets.
+                        tracing::warn!(
+                            %sandbox_id,
+                            %exec_id,
+                            error = %e,
+                            "durable vz exec connection ended without explicit Exit; ending event stream",
+                        );
+                        return;
+                    }
+                    // An old agent has no spawn-dedupe journal. Retrying may
+                    // double-run the command, so keep the stage-1 terminal
+                    // floor for the legacy path.
                     tracing::warn!(
+                        %sandbox_id,
+                        %exec_id,
                         error = %e,
-                        "vz agent connection ended without explicit Exit",
+                        "legacy vz exec connection ended without explicit Exit; emitting Exit(None)",
                     );
                     let _ = tx.send(ExecEvent::Exit(None)).await;
                     return;
@@ -818,6 +895,30 @@ where
         }
         Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
         Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
+    }
+}
+
+async fn probe_durable_exec(mut stream: UnixStream) -> Result<bool, SandboxError> {
+    write_msg(
+        &mut stream,
+        &WireRequest::CancelExec {
+            exec_id: engram_agentd::handler::DURABLE_EXEC_CAPABILITY_PROBE.into(),
+        },
+    )
+    .await
+    .map_err(|error| SandboxError::Vm(format!("durable exec capability send: {error}").into()))?;
+    match read_msg::<_, WireResponse>(&mut stream).await {
+        Ok(WireResponse::ExecCancelled) => Ok(true),
+        Ok(WireResponse::Error { kind, message }) => {
+            tracing::warn!(%kind, %message, "VZ guest agentd lacks ADR 0103; using stage-1 exec");
+            Ok(false)
+        }
+        Ok(other) => Err(SandboxError::Vm(
+            format!("durable exec capability returned {other:?}").into(),
+        )),
+        Err(error) => Err(SandboxError::Vm(
+            format!("durable exec capability failed before submission: {error}").into(),
+        )),
     }
 }
 
@@ -1144,13 +1245,56 @@ impl SandboxBackend for VzBackend {
         // get here — no boot-race window to retry through. A failed
         // connect now reflects a real fault (process crashed, vsock
         // tunnel torn down) that retrying wouldn't recover.
-        let conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+        let probe = UnixStream::connect(&agent_uds).await.map_err(|e| {
             SandboxError::Vm(
                 format!("connect engram-agentd UDS {}: {e}", agent_uds.display()).into(),
             )
         })?;
+        let durable_capable = probe_durable_exec(probe).await?;
+        let conn = UnixStream::connect(&agent_uds).await.map_err(|e| {
+            SandboxError::Vm(
+                format!(
+                    "connect engram-agentd UDS {} after durable probe: {e}",
+                    agent_uds.display()
+                )
+                .into(),
+            )
+        })?;
         let (reader, writer) = tokio::io::split(conn);
-        drive_exec_protocol(id, reader, writer, cmd).await
+        drive_exec_protocol(id, reader, writer, cmd, durable_capable).await
+    }
+
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        let vsock_uds_path = {
+            let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
+            live.vsock_uds_path.clone()
+        };
+        let agent_uds = port_uds_path(&vsock_uds_path, ENGRAM_AGENTD_PORT);
+        let mut stream = UnixStream::connect(&agent_uds).await.map_err(|error| {
+            SandboxError::Vm(
+                format!("connect engram-agentd UDS {}: {error}", agent_uds.display()).into(),
+            )
+        })?;
+        write_msg(
+            &mut stream,
+            &WireRequest::CancelExec {
+                exec_id: exec_id.clone(),
+            },
+        )
+        .await
+        .map_err(|error| SandboxError::Vm(format!("send CancelExec: {error}").into()))?;
+        match read_msg::<_, WireResponse>(&mut stream).await {
+            Ok(WireResponse::ExecCancelled) => Ok(()),
+            Ok(WireResponse::Error { kind, message }) => Err(SandboxError::Vm(
+                format!("CancelExec({exec_id}) rejected ({kind}): {message}").into(),
+            )),
+            Ok(other) => Err(SandboxError::Vm(
+                format!("CancelExec({exec_id}) returned {other:?}").into(),
+            )),
+            Err(error) => Err(SandboxError::Vm(
+                format!("CancelExec({exec_id}) failed (old agentd protocol skew): {error}").into(),
+            )),
+        }
     }
 
     async fn write_files(
@@ -1779,6 +1923,127 @@ impl SandboxBackend for VzBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::StreamExt;
+
+    fn protocol_exec(exec_id: &str) -> ExecRequest {
+        ExecRequest {
+            command: vec!["printf".into(), "partial".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: Some(0),
+            stderr_offset: Some(0),
+            wake: None,
+        }
+    }
+
+    // Pure protocol tests live beside the existing backend unit tests. They
+    // instantiate no VZ objects and require neither a VM nor the
+    // virtualization entitlement, so the normal macOS nextest lane runs them.
+    #[tokio::test]
+    async fn durable_exec_eof_after_partial_output_ends_without_exit() {
+        let sandbox_id = SandboxId::new();
+        let exec_id = "durable-eof";
+        let (host_reader, mut agent_writer) = tokio::io::duplex(4 * 1024);
+        let (host_writer, _agent_reader) = tokio::io::duplex(4 * 1024);
+        let agent = tokio::spawn(async move {
+            write_msg(&mut agent_writer, &WireExecEvent::Started(exec_id.into()))
+                .await
+                .unwrap();
+            write_msg(
+                &mut agent_writer,
+                &WireExecEvent::Stdout(b"partial-output".to_vec()),
+            )
+            .await
+            .unwrap();
+            // Dropping the writer is the transport EOF under test.
+        });
+
+        let mut stream = drive_exec_protocol(
+            sandbox_id,
+            host_reader,
+            host_writer,
+            protocol_exec(exec_id),
+            true,
+        )
+        .await
+        .unwrap()
+        .events;
+        agent.await.unwrap();
+
+        match stream.next().await {
+            Some(ExecEvent::Stdout(bytes)) => assert_eq!(bytes, b"partial-output"[..]),
+            other => panic!("expected partial stdout before EOF, got {other:?}"),
+        }
+        assert!(
+            stream.next().await.is_none(),
+            "durable transport EOF must not fabricate Exit(None)"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_exec_refusal_is_forwarded_as_terminal_refusal() {
+        let sandbox_id = SandboxId::new();
+        let exec_id = "durable-refused";
+        let (host_reader, mut agent_writer) = tokio::io::duplex(4 * 1024);
+        let (host_writer, _agent_reader) = tokio::io::duplex(4 * 1024);
+        let agent = tokio::spawn(async move {
+            write_msg(&mut agent_writer, &WireExecEvent::Started(exec_id.into()))
+                .await
+                .unwrap();
+            write_msg(
+                &mut agent_writer,
+                &WireExecEvent::Refused {
+                    reason: "first writer wins".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = drive_exec_protocol(
+            sandbox_id,
+            host_reader,
+            host_writer,
+            protocol_exec(exec_id),
+            true,
+        )
+        .await
+        .unwrap()
+        .events;
+        agent.await.unwrap();
+
+        assert!(matches!(
+            stream.next().await,
+            Some(ExecEvent::Refused(reason)) if reason == "first writer wins"
+        ));
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn legacy_exec_eof_preserves_exit_none_floor() {
+        let sandbox_id = SandboxId::new();
+        let exec_id = "legacy-eof";
+        let (host_reader, agent_writer) = tokio::io::duplex(4 * 1024);
+        let (host_writer, _agent_reader) = tokio::io::duplex(4 * 1024);
+        drop(agent_writer);
+
+        let mut stream = drive_exec_protocol(
+            sandbox_id,
+            host_reader,
+            host_writer,
+            protocol_exec(exec_id),
+            false,
+        )
+        .await
+        .unwrap()
+        .events;
+
+        assert!(matches!(stream.next().await, Some(ExecEvent::Exit(None))));
+        assert!(stream.next().await.is_none());
+    }
 
     #[test]
     fn new_rejects_missing_kernel_with_actionable_error() {

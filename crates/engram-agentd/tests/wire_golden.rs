@@ -118,6 +118,11 @@ fn exec_request() -> WireExecRequest {
         env: HashMap::from([("RUST_LOG".into(), "info".into())]),
         workdir: Some("/tmp".into()),
         timeout_ms: Some(5_000),
+        exec_id: Some("exec-golden".into()),
+        stdout_offset: Some(11),
+        stderr_offset: Some(12),
+        wake: Some(true),
+        attach_only: true,
     }
 }
 
@@ -150,6 +155,9 @@ fn wire_request_golden_and_variant_indices() {
     let spawn = WireRequest::SpawnHarness(spawn_harness());
     let start_browser = WireRequest::StartBrowser { port: Some(5900) };
     let start_ide = WireRequest::StartIde { port: Some(13337) };
+    let cancel_exec = WireRequest::CancelExec {
+        exec_id: "exec-golden".into(),
+    };
 
     assert_golden("request_exec", &exec);
     assert_golden("request_stat", &stat);
@@ -165,6 +173,7 @@ fn wire_request_golden_and_variant_indices() {
     assert_golden("request_stop_browser", &WireRequest::StopBrowser);
     assert_golden("request_start_ide", &start_ide);
     assert_golden("request_stop_ide", &WireRequest::StopIde);
+    assert_golden("request_cancel_exec", &cancel_exec);
 
     assert_variant_index(&exec, 0, "WireRequest::Exec");
     assert_variant_index(&stat, 1, "WireRequest::Stat");
@@ -185,6 +194,12 @@ fn wire_request_golden_and_variant_indices() {
     // ADR 0085: appended after RefreshAgent.
     assert_variant_index(&start_ide, 13, "WireRequest::StartIde");
     assert_variant_index(&WireRequest::StopIde, 14, "WireRequest::StopIde");
+    assert_variant_index(
+        &WireRequest::StepClock { unix_nanos: 123 },
+        15,
+        "WireRequest::StepClock",
+    );
+    assert_variant_index(&cancel_exec, 16, "WireRequest::CancelExec");
 }
 
 // ---- WireResponse ------------------------------------------------------
@@ -250,6 +265,7 @@ fn wire_response_golden_and_variant_indices() {
     assert_golden("response_browser_stopped", &WireResponse::BrowserStopped);
     assert_golden("response_ide_ready", &ide_ready);
     assert_golden("response_ide_stopped", &WireResponse::IdeStopped);
+    assert_golden("response_exec_cancelled", &WireResponse::ExecCancelled);
 
     assert_variant_index(&stat, 0, "WireResponse::Stat");
     assert_variant_index(&WireResponse::UploadOk, 1, "WireResponse::UploadOk");
@@ -281,6 +297,18 @@ fn wire_response_golden_and_variant_indices() {
     // ADR 0085: appended after AgentRefreshed.
     assert_variant_index(&ide_ready, 13, "WireResponse::IdeReady");
     assert_variant_index(&WireResponse::IdeStopped, 14, "WireResponse::IdeStopped");
+    assert_variant_index(
+        &WireResponse::ClockStepped {
+            applied_offset_nanos: Some(123),
+        },
+        15,
+        "WireResponse::ClockStepped",
+    );
+    assert_variant_index(
+        &WireResponse::ExecCancelled,
+        16,
+        "WireResponse::ExecCancelled",
+    );
 }
 
 // ---- WireExecEvent -----------------------------------------------------
@@ -290,14 +318,25 @@ fn wire_exec_event_golden_and_variant_indices() {
     let stdout = WireExecEvent::Stdout(b"hello\n".to_vec());
     let stderr = WireExecEvent::Stderr(vec![0xff, 0x00, 0xff]);
     let exit = WireExecEvent::Exit(Some(0));
+    let started = WireExecEvent::Started("exec-golden".into());
+    let degraded = WireExecEvent::Degraded("ENOSPC".into());
+    let refused = WireExecEvent::Refused {
+        reason: "first writer wins".into(),
+    };
 
     assert_golden("exec_event_stdout", &stdout);
     assert_golden("exec_event_stderr", &stderr);
     assert_golden("exec_event_exit", &exit);
+    assert_golden("exec_event_started", &started);
+    assert_golden("exec_event_degraded", &degraded);
+    assert_golden("exec_event_refused", &refused);
 
     assert_variant_index(&stdout, 0, "WireExecEvent::Stdout");
     assert_variant_index(&stderr, 1, "WireExecEvent::Stderr");
     assert_variant_index(&exit, 2, "WireExecEvent::Exit");
+    assert_variant_index(&started, 3, "WireExecEvent::Started");
+    assert_variant_index(&degraded, 4, "WireExecEvent::Degraded");
+    assert_variant_index(&refused, 5, "WireExecEvent::Refused");
 }
 
 // ---- handshake + ready structs -----------------------------------------
@@ -389,6 +428,12 @@ fn regen_golden() {
         &WireRequest::StartIde { port: Some(13337) },
     );
     write("request_stop_ide", &WireRequest::StopIde);
+    write(
+        "request_cancel_exec",
+        &WireRequest::CancelExec {
+            exec_id: "exec-golden".into(),
+        },
+    );
 
     write(
         "response_stat",
@@ -459,6 +504,7 @@ fn regen_golden() {
         },
     );
     write("response_ide_stopped", &WireResponse::IdeStopped);
+    write("response_exec_cancelled", &WireResponse::ExecCancelled);
 
     write(
         "exec_event_stdout",
@@ -469,6 +515,20 @@ fn regen_golden() {
         &WireExecEvent::Stderr(vec![0xff, 0x00, 0xff]),
     );
     write("exec_event_exit", &WireExecEvent::Exit(Some(0)));
+    write(
+        "exec_event_started",
+        &WireExecEvent::Started("exec-golden".into()),
+    );
+    write(
+        "exec_event_degraded",
+        &WireExecEvent::Degraded("ENOSPC".into()),
+    );
+    write(
+        "exec_event_refused",
+        &WireExecEvent::Refused {
+            reason: "first writer wins".into(),
+        },
+    );
 
     write(
         "agent_ready",

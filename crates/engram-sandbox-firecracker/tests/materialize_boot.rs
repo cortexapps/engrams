@@ -210,6 +210,10 @@ async fn exec_ok(
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(10)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     let stream = loop {

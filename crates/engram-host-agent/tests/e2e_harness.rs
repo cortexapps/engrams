@@ -626,6 +626,10 @@ async fn drive_harness(
                 env: HashMap::new(),
                 workdir: None,
                 timeout: Some(Duration::from_secs(10)),
+                exec_id: None,
+                stdout_offset: None,
+                stderr_offset: None,
+                wake: None,
             },
         )
         .await
@@ -945,6 +949,10 @@ async fn e2e_harness_dev_vm_mode_via_pooled_backend() {
                 env: HashMap::new(),
                 workdir: None,
                 timeout: Some(Duration::from_secs(10)),
+                exec_id: None,
+                stdout_offset: None,
+                stderr_offset: None,
+                wake: None,
             },
         )
         .await

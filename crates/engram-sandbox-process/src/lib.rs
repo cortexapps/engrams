@@ -33,12 +33,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::Utc;
-use dashmap::DashMap;
+use dashmap::{mapref::entry::Entry, DashMap};
 use engram_core::traits::sandbox::SandboxBackend;
 use engram_core::types::endpoints::GuestEndpoints;
 use engram_core::types::ids::{SandboxId, SnapshotId};
@@ -47,10 +48,11 @@ use engram_core::types::sandbox::{
 };
 use engram_core::types::snapshot::SnapshotMetadata;
 use engram_core::SandboxError;
+use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::process::Command;
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tokio_stream::wrappers::ReceiverStream;
 
 /// POSIX `timeout(1)` convention: command was killed because it
@@ -59,11 +61,155 @@ use tokio_stream::wrappers::ReceiverStream;
 /// command from a normal nonzero exit.
 const EXIT_CODE_TIMEOUT: i32 = 124;
 
+/// Match the guest journal's per-stream retention bound. Live consumers
+/// continue receiving bytes beyond this point, but later attaches can only
+/// replay the retained prefix.
+const EXEC_OUTPUT_CAP: usize = 64 * 1024 * 1024;
+
+/// A few MiB of live output at the 8 KiB pipe-read size. Slow consumers can
+/// recover a lag from the retained buffers until the output cap is crossed.
+const EXEC_LIVE_EVENT_CAPACITY: usize = 512;
+
+/// Completed exec records retained per sandbox for late re-attach (the
+/// in-memory analogue of the guest journal's 32-record budget). Without a
+/// bound, a long-lived dev sandbox running many execs accumulates output
+/// buffers indefinitely. Running records are never evicted — they are
+/// bounded by actual concurrency. Attaching to an evicted ticket behaves
+/// like a TTL'd guest journal: nonzero offsets refuse loudly, zero offsets
+/// are a fresh attach-or-start.
+const EXEC_COMPLETED_RETENTION: usize = 32;
+
+/// Monotonic completion order across all records; drives oldest-first
+/// eviction above [`EXEC_COMPLETED_RETENTION`].
+static EXEC_COMPLETION_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// Per-sandbox state owned by the backend.
 #[derive(Clone, Debug)]
 struct SandboxState {
     spec: SandboxSpec,
     cwd: PathBuf,
+    /// ADR 0103: process sandboxes themselves do not survive a host-agent
+    /// restart, so their durable-exec equivalent lives in memory for exactly
+    /// the sandbox lifetime. An on-disk `ExecJournal` would buy nothing:
+    /// after restart the sandbox lookup is already `NotFound`.
+    exec_records: Arc<DashMap<String, Arc<ExecRecord>>>,
+}
+
+impl SandboxState {
+    fn new(spec: SandboxSpec, cwd: PathBuf) -> Self {
+        Self {
+            spec,
+            cwd,
+            exec_records: Arc::new(DashMap::new()),
+        }
+    }
+}
+
+#[derive(Debug)]
+struct ExecRecord {
+    command: Vec<String>,
+    pgid: Option<u32>,
+    state: Mutex<ExecRecordState>,
+    progress: broadcast::Sender<ExecRecordEvent>,
+}
+
+#[derive(Debug, Default)]
+struct ExecRecordState {
+    stdout_buf: Vec<u8>,
+    stderr_buf: Vec<u8>,
+    stdout_len: u64,
+    stderr_len: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    /// `None` means running; `Some(None)` is an exact signal/unknown exit.
+    exit: Option<Option<i32>>,
+    /// Completion order for retention eviction; `None` while running.
+    completed_seq: Option<u64>,
+}
+
+#[derive(Clone, Debug)]
+enum ExecRecordEvent {
+    Stdout { offset: u64, bytes: Bytes },
+    Stderr { offset: u64, bytes: Bytes },
+    Exit(Option<i32>),
+}
+
+impl ExecRecord {
+    fn new(command: Vec<String>, pgid: Option<u32>) -> Self {
+        let (progress, _) = broadcast::channel(EXEC_LIVE_EVENT_CAPACITY);
+        Self {
+            command,
+            pgid,
+            state: Mutex::new(ExecRecordState::default()),
+            progress,
+        }
+    }
+
+    fn append_stdout(&self, bytes: Bytes) {
+        let mut state = self.state.lock();
+        let state = &mut *state;
+        let offset = state.stdout_len;
+        state.stdout_len = state.stdout_len.saturating_add(bytes.len() as u64);
+        append_retained(&mut state.stdout_buf, &mut state.stdout_truncated, &bytes);
+        // Send under the state lock so an attacher that subscribes before
+        // taking its replay snapshot cannot observe new total length without
+        // the corresponding live event already being queued.
+        let _ = self
+            .progress
+            .send(ExecRecordEvent::Stdout { offset, bytes });
+    }
+
+    fn append_stderr(&self, bytes: Bytes) {
+        let mut state = self.state.lock();
+        let state = &mut *state;
+        let offset = state.stderr_len;
+        state.stderr_len = state.stderr_len.saturating_add(bytes.len() as u64);
+        append_retained(&mut state.stderr_buf, &mut state.stderr_truncated, &bytes);
+        let _ = self
+            .progress
+            .send(ExecRecordEvent::Stderr { offset, bytes });
+    }
+
+    fn finish(&self, exit: Option<i32>) {
+        let mut state = self.state.lock();
+        state.exit = Some(exit);
+        state.completed_seq =
+            Some(EXEC_COMPLETION_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed));
+        let _ = self.progress.send(ExecRecordEvent::Exit(exit));
+    }
+}
+
+/// Evict the oldest completed records beyond [`EXEC_COMPLETED_RETENTION`].
+/// Called before each new exec's entry lookup — never while holding a map
+/// entry guard (iteration and entry() both take shard locks).
+fn prune_completed_exec_records(
+    records: &DashMap<String, Arc<ExecRecord>>,
+    requested_exec_id: &str,
+) {
+    let mut completed: Vec<(String, u64)> = records
+        .iter()
+        .filter_map(|entry| {
+            if entry.key() == requested_exec_id {
+                return None;
+            }
+            entry
+                .value()
+                .state
+                .lock()
+                .completed_seq
+                .map(|seq| (entry.key().clone(), seq))
+        })
+        .collect();
+    if completed.len() <= EXEC_COMPLETED_RETENTION {
+        return;
+    }
+    completed.sort_by_key(|(_, seq)| *seq);
+    for (exec_id, _) in completed
+        .iter()
+        .take(completed.len() - EXEC_COMPLETED_RETENTION)
+    {
+        records.remove(exec_id);
+    }
 }
 
 pub struct ProcessBackend {
@@ -127,7 +273,7 @@ impl SandboxBackend for ProcessBackend {
         // in `start_agent` below) then wires skills from these the same
         // way the FC guest does.
         stage_aux_bundles(&cwd).await;
-        self.sandboxes.insert(id, SandboxState { spec, cwd });
+        self.sandboxes.insert(id, SandboxState::new(spec, cwd));
         Ok(id)
     }
 
@@ -216,150 +362,151 @@ impl SandboxBackend for ProcessBackend {
         id: SandboxId,
         req: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
+        let caller_supplied_exec_id = req.exec_id.is_some();
+        let exec_id = req
+            .exec_id
+            .clone()
+            .unwrap_or_else(|| SandboxId::new().to_string());
         let state = self
             .sandboxes
             .get(&id)
             .ok_or(SandboxError::NotFound)?
             .clone();
-        let argv = req
-            .command
-            .first()
-            .cloned()
-            .ok_or_else(|| SandboxError::InvalidSpec("argv must not be empty".into()))?;
-        let workdir = match req.workdir.as_ref() {
-            Some(rel) => state.cwd.join(rel),
-            None => state.cwd.clone(),
-        };
 
-        let mut env = state.spec.env.clone();
-        env.extend(req.env.iter().map(|(k, v)| (k.clone(), v.clone())));
-        // PATH is *not* inherited if env is non-empty otherwise — keep
-        // the host PATH so simple commands like `echo` resolve. Callers
-        // that want full hermeticity can clear it explicitly.
-        if !env.contains_key("PATH") {
-            if let Ok(p) = std::env::var("PATH") {
-                env.insert("PATH".into(), p);
+        let exec_records = state.exec_records.clone();
+        prune_completed_exec_records(&exec_records, &exec_id);
+        let entry = exec_records.entry(exec_id.clone());
+        match entry {
+            Entry::Occupied(existing) => {
+                let record = existing.get().clone();
+                drop(existing);
+                return Ok(attach_exec_record(
+                    id,
+                    exec_id,
+                    record,
+                    &req.command,
+                    req.stdout_offset.unwrap_or(0),
+                    req.stderr_offset.unwrap_or(0),
+                ));
+            }
+            Entry::Vacant(vacant) => {
+                let stdout_offset = req.stdout_offset.unwrap_or(0);
+                let stderr_offset = req.stderr_offset.unwrap_or(0);
+                if caller_supplied_exec_id && (stdout_offset != 0 || stderr_offset != 0) {
+                    return Ok(refused_exec_stream(
+                        id,
+                        exec_id.clone(),
+                        format!(
+                            "durable exec reattach failed: record for exec_id {exec_id} is missing; \
+                             refusing to spawn a second command with requested offsets \
+                             stdout={stdout_offset}, stderr={stderr_offset}\n"
+                        ),
+                    ));
+                }
+
+                let argv =
+                    req.command.first().cloned().ok_or_else(|| {
+                        SandboxError::InvalidSpec("argv must not be empty".into())
+                    })?;
+                let workdir = match req.workdir.as_ref() {
+                    Some(rel) => state.cwd.join(rel),
+                    None => state.cwd.clone(),
+                };
+
+                let mut env = state.spec.env.clone();
+                env.extend(req.env.iter().map(|(k, v)| (k.clone(), v.clone())));
+                // PATH is *not* inherited if env is non-empty otherwise — keep
+                // the host PATH so simple commands like `echo` resolve. Callers
+                // that want full hermeticity can clear it explicitly.
+                if !env.contains_key("PATH") {
+                    if let Ok(p) = std::env::var("PATH") {
+                        env.insert("PATH".into(), p);
+                    }
+                }
+
+                let mut cmd = Command::new(&argv);
+                cmd.args(req.command.iter().skip(1))
+                    .current_dir(&workdir)
+                    .env_clear()
+                    .envs(env_iter(&env))
+                    .stdin(if req.stdin.is_some() {
+                        Stdio::piped()
+                    } else {
+                        Stdio::null()
+                    })
+                    .stdout(Stdio::piped())
+                    .stderr(Stdio::piped())
+                    .kill_on_drop(true)
+                    // Put the child in its own process group so a timeout kill
+                    // can take the whole tree down with a single
+                    // `kill(-pgid, SIGKILL)`. Without this, commands like
+                    // `sh -c "sleep 30"` on shells that *fork* (Ubuntu's dash
+                    // for `-c`, vs bash which execs) leak the inner sleep —
+                    // killing the shell leaves the child orphaned, holding
+                    // stdout/stderr pipes open, blocking the drain task for
+                    // the full natural duration. (Verified failure mode on
+                    // Blacksmith Ubuntu runners; macOS+bash and the dev VM's
+                    // nix-bash exec the inner command, so the bug was hidden.)
+                    .process_group(0);
+
+                // The vacant ticket guard stays held through spawn, making
+                // first-writer-wins atomic: no concurrent caller can observe
+                // the same ticket as absent and spawn a second process.
+                let mut child = cmd
+                    .spawn()
+                    .map_err(|e| SandboxError::Vm(format!("spawn `{argv}`: {e}").into()))?;
+                let stdin = child.stdin.take();
+                let stdout = child
+                    .stdout
+                    .take()
+                    .ok_or_else(|| SandboxError::Vm("stdout pipe missing".into()))?;
+                let stderr = child
+                    .stderr
+                    .take()
+                    .ok_or_else(|| SandboxError::Vm("stderr pipe missing".into()))?;
+                let record = Arc::new(ExecRecord::new(req.command.clone(), child.id()));
+                vacant.insert(record.clone());
+
+                // Subscribe before starting either pipe drain. This makes the
+                // first stream gapless even if the command fills a pipe as
+                // soon as it is spawned.
+                let stream =
+                    attach_exec_record(id, exec_id.clone(), record.clone(), &req.command, 0, 0);
+                spawn_exec_record_owner(
+                    exec_id,
+                    record,
+                    SpawnedExec {
+                        child,
+                        stdin,
+                        input: req.stdin,
+                        stdout,
+                        stderr,
+                        timeout: req
+                            .timeout
+                            .or(state.spec.ttl)
+                            .unwrap_or(Duration::from_secs(60 * 60)),
+                    },
+                );
+                return Ok(stream);
             }
         }
+    }
 
-        let mut cmd = Command::new(&argv);
-        cmd.args(req.command.iter().skip(1))
-            .current_dir(&workdir)
-            .env_clear()
-            .envs(env_iter(&env))
-            .stdin(if req.stdin.is_some() {
-                Stdio::piped()
-            } else {
-                Stdio::null()
-            })
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true)
-            // Put the child in its own process group so a timeout kill
-            // can take the whole tree down with a single
-            // `kill(-pgid, SIGKILL)`. Without this, commands like
-            // `sh -c "sleep 30"` on shells that *fork* (Ubuntu's dash
-            // for `-c`, vs bash which execs) leak the inner sleep —
-            // killing the shell leaves the child orphaned, holding
-            // stdout/stderr pipes open, blocking the drain task for
-            // the full natural duration. (Verified failure mode on
-            // Blacksmith Ubuntu runners; macOS+bash and the dev VM's
-            // nix-bash exec the inner command, so the bug was hidden.)
-            .process_group(0);
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| SandboxError::Vm(format!("spawn `{argv}`: {e}").into()))?;
-
-        if let Some(stdin) = req.stdin.as_deref() {
-            if let Some(mut sink) = child.stdin.take() {
-                sink.write_all(stdin).await?;
-            }
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        let state = self
+            .sandboxes
+            .get(&id)
+            .ok_or(SandboxError::NotFound)?
+            .clone();
+        let record = state
+            .exec_records
+            .get(&exec_id)
+            .map(|entry| entry.clone())
+            .ok_or(SandboxError::NotFound)?;
+        if record.state.lock().exit.is_some() {
+            return Ok(());
         }
-
-        let stdout = child
-            .stdout
-            .take()
-            .ok_or_else(|| SandboxError::Vm("stdout pipe missing".into()))?;
-        let stderr = child
-            .stderr
-            .take()
-            .ok_or_else(|| SandboxError::Vm("stderr pipe missing".into()))?;
-
-        // Channel feeding the public stream. Capacity is small —
-        // backpressure on the readers if a client is slow to consume.
-        let (tx, rx) = mpsc::channel::<ExecEvent>(32);
-
-        let stdout_handle = tokio::spawn(pipe_to_channel(
-            stdout,
-            tx.clone(),
-            ExecEvent::Stdout as fn(Bytes) -> ExecEvent,
-        ));
-        let stderr_handle = tokio::spawn(pipe_to_channel(
-            stderr,
-            tx.clone(),
-            ExecEvent::Stderr as fn(Bytes) -> ExecEvent,
-        ));
-
-        let timeout = req
-            .timeout
-            .or(state.spec.ttl)
-            .unwrap_or(Duration::from_secs(60 * 60));
-
-        // Waiter task: wait for the child (or timeout), then for the
-        // pipe readers to drain, then publish the terminal Exit event.
-        // Dropping `tx` after that closes the receiver end, which is
-        // what terminates the public stream.
-        tokio::spawn(async move {
-            let exit_status = match tokio::time::timeout(timeout, child.wait()).await {
-                Ok(Ok(status)) => status.code(),
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "child wait failed");
-                    None
-                }
-                Err(_) => {
-                    // Timeout. Two-stage kill:
-                    //   1. SIGKILL the *process group* so any
-                    //      grandchildren the leader spawned die too.
-                    //      Without this, `sh -c "sleep N"` shells
-                    //      that fork (Ubuntu's dash) leave the inner
-                    //      command alive holding stdout/stderr pipes;
-                    //      the drain task below then waits the full
-                    //      natural duration. The leader is its own
-                    //      pgrp leader thanks to `.process_group(0)`
-                    //      at spawn time, so killpg reaches the whole
-                    //      tree.
-                    //   2. SIGKILL the leader via `child.start_kill()`
-                    //      so tokio reaps it cleanly and `wait()`
-                    //      returns.
-                    let pid = child.id();
-                    if let Some(pid) = pid {
-                        let pgrp = nix::unistd::Pid::from_raw(pid as i32);
-                        // ESRCH (group already gone) is fine — best-effort.
-                        let _ = nix::sys::signal::killpg(pgrp, nix::sys::signal::Signal::SIGKILL);
-                    }
-                    if let Err(e) = child.start_kill() {
-                        tracing::warn!(error = %e, ?pid, "child.start_kill() after timeout failed");
-                    }
-                    if let Err(e) = child.wait().await {
-                        tracing::warn!(error = %e, ?pid, "child.wait() after kill failed");
-                    }
-                    Some(EXIT_CODE_TIMEOUT)
-                }
-            };
-
-            // Drain the readers so all stdout/stderr is delivered
-            // *before* the terminal Exit event.
-            let _ = stdout_handle.await;
-            let _ = stderr_handle.await;
-            let _ = tx.send(ExecEvent::Exit(exit_status)).await;
-        });
-
-        Ok(ExecStream {
-            sandbox_id: id,
-            exec_id: SandboxId::new().to_string(),
-            events: Box::pin(ReceiverStream::new(rx)),
-        })
+        kill_exec_process_group(record.pgid, &exec_id)
     }
 
     async fn write_files(
@@ -532,7 +679,7 @@ impl SandboxBackend for ProcessBackend {
                     network: Default::default(),
                     aux_ro_drives: Vec::new(),
                 };
-                self.sandboxes.insert(id, SandboxState { spec, cwd });
+                self.sandboxes.insert(id, SandboxState::new(spec, cwd));
                 return Ok(id);
             }
             Err(e) => return Err(e.into()),
@@ -583,7 +730,7 @@ impl SandboxBackend for ProcessBackend {
             network: Default::default(),
             aux_ro_drives: Vec::new(),
         };
-        self.sandboxes.insert(id, SandboxState { spec, cwd });
+        self.sandboxes.insert(id, SandboxState::new(spec, cwd));
         Ok(id)
     }
 
@@ -603,6 +750,16 @@ impl SandboxBackend for ProcessBackend {
             }
         }
         if let Some((_, state)) = self.sandboxes.remove(&id) {
+            // Exec lifecycle tasks are detached from consumer streams, so
+            // sandbox destruction explicitly kills every still-running
+            // record before dropping the sandbox-owned ticket map.
+            for entry in state.exec_records.iter() {
+                let record = entry.value();
+                if record.state.lock().exit.is_none() {
+                    let _ = kill_exec_process_group(record.pgid, entry.key());
+                }
+            }
+            state.exec_records.clear();
             // Best-effort cleanup; if the cwd disappeared between create
             // and destroy, that's fine.
             let _ = tokio::fs::remove_dir_all(&state.cwd).await;
@@ -830,15 +987,96 @@ async fn recursive_copy(src: &std::path::Path, dst: &std::path::Path) -> std::io
     Ok(())
 }
 
-/// Read 8 KiB chunks from a child pipe, wrap each into an `ExecEvent`,
-/// and forward into the channel. Returns when the pipe yields EOF, the
-/// receiver is dropped, or an I/O error occurs — channel close being
-/// the signal that downstream stopped caring.
-async fn pipe_to_channel<R>(
-    mut reader: R,
-    tx: mpsc::Sender<ExecEvent>,
-    wrap: fn(Bytes) -> ExecEvent,
-) where
+fn append_retained(buffer: &mut Vec<u8>, truncated: &mut bool, bytes: &[u8]) {
+    let remaining = EXEC_OUTPUT_CAP.saturating_sub(buffer.len());
+    let keep = remaining.min(bytes.len());
+    buffer.extend_from_slice(&bytes[..keep]);
+    if keep < bytes.len() {
+        *truncated = true;
+    }
+}
+
+struct SpawnedExec {
+    child: tokio::process::Child,
+    stdin: Option<tokio::process::ChildStdin>,
+    input: Option<Vec<u8>>,
+    stdout: tokio::process::ChildStdout,
+    stderr: tokio::process::ChildStderr,
+    timeout: Duration,
+}
+
+fn spawn_exec_record_owner(exec_id: String, record: Arc<ExecRecord>, spawned: SpawnedExec) {
+    let SpawnedExec {
+        mut child,
+        stdin,
+        input,
+        stdout,
+        stderr,
+        timeout,
+    } = spawned;
+    // The lifecycle task, rather than any returned stream, owns the child and
+    // both drains. Dropping every consumer only drops broadcast receivers; the
+    // command continues and completes its sandbox-owned record.
+    let stdout_record = record.clone();
+    let stdout_handle = tokio::spawn(async move {
+        pipe_to_record(stdout, stdout_record, ExecOutput::Stdout).await;
+    });
+    let stderr_record = record.clone();
+    let stderr_handle = tokio::spawn(async move {
+        pipe_to_record(stderr, stderr_record, ExecOutput::Stderr).await;
+    });
+    if let (Some(mut sink), Some(input)) = (stdin, input) {
+        tokio::spawn(async move {
+            if let Err(error) = sink.write_all(&input).await {
+                tracing::debug!(%error, "exec stdin write ended early");
+            }
+        });
+    }
+
+    tokio::spawn(async move {
+        let exit = match tokio::time::timeout(timeout, child.wait()).await {
+            Ok(Ok(status)) => status.code(),
+            Ok(Err(error)) => {
+                tracing::warn!(%error, %exec_id, "child wait failed");
+                None
+            }
+            Err(_) => {
+                // Timeout remains a two-stage kill:
+                //   1. SIGKILL the process group so grandchildren die too.
+                //   2. SIGKILL/reap the leader through tokio's Child handle.
+                //
+                // The group exists because `.process_group(0)` made the child
+                // its leader at spawn time.
+                let pid = child.id();
+                if let Err(error) = kill_exec_process_group(pid, &exec_id) {
+                    tracing::warn!(%error, %exec_id, ?pid, "process-group timeout kill failed");
+                }
+                if let Err(error) = child.start_kill() {
+                    tracing::warn!(%error, %exec_id, ?pid, "child.start_kill() after timeout failed");
+                }
+                if let Err(error) = child.wait().await {
+                    tracing::warn!(%error, %exec_id, ?pid, "child.wait() after timeout kill failed");
+                }
+                Some(EXIT_CODE_TIMEOUT)
+            }
+        };
+
+        // Both pipes reach EOF before the terminal record is published, so
+        // every consumer observes all available output before Exit.
+        let _ = stdout_handle.await;
+        let _ = stderr_handle.await;
+        record.finish(exit);
+    });
+}
+
+#[derive(Clone, Copy)]
+enum ExecOutput {
+    Stdout,
+    Stderr,
+}
+
+async fn pipe_to_record<R>(mut reader: R, record: Arc<ExecRecord>, output: ExecOutput)
+where
     R: AsyncReadExt + Unpin,
 {
     let mut buf = vec![0u8; 8 * 1024];
@@ -847,8 +1085,9 @@ async fn pipe_to_channel<R>(
             Ok(0) => return, // EOF
             Ok(n) => {
                 let chunk = Bytes::copy_from_slice(&buf[..n]);
-                if tx.send(wrap(chunk)).await.is_err() {
-                    return; // receiver dropped
+                match output {
+                    ExecOutput::Stdout => record.append_stdout(chunk),
+                    ExecOutput::Stderr => record.append_stderr(chunk),
                 }
             }
             Err(e) => {
@@ -856,6 +1095,363 @@ async fn pipe_to_channel<R>(
                 return;
             }
         }
+    }
+}
+
+fn attach_exec_record(
+    sandbox_id: SandboxId,
+    exec_id: String,
+    record: Arc<ExecRecord>,
+    command: &[String],
+    stdout_offset: u64,
+    stderr_offset: u64,
+) -> ExecStream {
+    if record.command != command {
+        return refused_exec_stream(
+            sandbox_id,
+            exec_id.clone(),
+            format!(
+                "exec_id {exec_id} already belongs to command {:?}; refusing different command \
+                 {:?} (first writer wins)\n",
+                record.command, command
+            ),
+        );
+    }
+
+    // Subscribe before taking the state snapshot. Record publishers send
+    // under the same state lock, so bytes produced after subscription are
+    // represented either in this snapshot, in the live receiver, or both.
+    let mut progress = record.progress.subscribe();
+    let snapshot = {
+        let state = record.state.lock();
+        if stdout_offset > state.stdout_buf.len() as u64 {
+            return refused_offset_stream(
+                sandbox_id,
+                exec_id,
+                "stdout",
+                stdout_offset,
+                state.stdout_buf.len() as u64,
+                state.stdout_truncated,
+            );
+        }
+        if stderr_offset > state.stderr_buf.len() as u64 {
+            return refused_offset_stream(
+                sandbox_id,
+                exec_id,
+                "stderr",
+                stderr_offset,
+                state.stderr_buf.len() as u64,
+                state.stderr_truncated,
+            );
+        }
+        ExecAttachSnapshot {
+            stdout: Bytes::copy_from_slice(&state.stdout_buf[stdout_offset as usize..]),
+            stderr: Bytes::copy_from_slice(&state.stderr_buf[stderr_offset as usize..]),
+            stdout_cursor: state.stdout_buf.len() as u64,
+            stderr_cursor: state.stderr_buf.len() as u64,
+            stdout_len: state.stdout_len,
+            stderr_len: state.stderr_len,
+            stdout_truncated: state.stdout_truncated,
+            stderr_truncated: state.stderr_truncated,
+            exit: state.exit,
+        }
+    };
+
+    let (tx, rx) = mpsc::channel::<ExecEvent>(32);
+    let stream_exec_id = exec_id.clone();
+    tokio::spawn(async move {
+        if !snapshot.stdout.is_empty()
+            && tx
+                .send(ExecEvent::Stdout(snapshot.stdout.clone()))
+                .await
+                .is_err()
+        {
+            return;
+        }
+        if !snapshot.stderr.is_empty()
+            && tx
+                .send(ExecEvent::Stderr(snapshot.stderr.clone()))
+                .await
+                .is_err()
+        {
+            return;
+        }
+
+        let mut stdout_cursor = snapshot.stdout_cursor;
+        let mut stderr_cursor = snapshot.stderr_cursor;
+        if snapshot.exit.is_none()
+            && (snapshot.stdout_len > stdout_cursor || snapshot.stderr_len > stderr_cursor)
+        {
+            let message = format!(
+                "durable exec reattach failed for exec_id {stream_exec_id}: retained \
+                 stdout={stdout_cursor} of {} bytes (truncated={}), stderr={stderr_cursor} of {} \
+                 bytes (truncated={}); refusing a gapped live replay\n",
+                snapshot.stdout_len,
+                snapshot.stdout_truncated,
+                snapshot.stderr_len,
+                snapshot.stderr_truncated,
+            );
+            send_record_refusal(&tx, message).await;
+            return;
+        }
+        if let Some(exit) = snapshot.exit {
+            let _ = tx.send(ExecEvent::Exit(exit)).await;
+            return;
+        }
+
+        loop {
+            match progress.recv().await {
+                Ok(ExecRecordEvent::Stdout { offset, bytes }) => {
+                    if forward_recorded_output(
+                        &tx,
+                        &stream_exec_id,
+                        "stdout",
+                        offset,
+                        bytes,
+                        &mut stdout_cursor,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ExecRecordEvent::Stderr { offset, bytes }) => {
+                    if forward_recorded_output(
+                        &tx,
+                        &stream_exec_id,
+                        "stderr",
+                        offset,
+                        bytes,
+                        &mut stderr_cursor,
+                    )
+                    .await
+                    .is_err()
+                    {
+                        return;
+                    }
+                }
+                Ok(ExecRecordEvent::Exit(exit)) => {
+                    let gap = {
+                        let state = record.state.lock();
+                        (stdout_cursor < state.stdout_len)
+                            .then_some(("stdout", stdout_cursor, state.stdout_len))
+                            .or_else(|| {
+                                (stderr_cursor < state.stderr_len).then_some((
+                                    "stderr",
+                                    stderr_cursor,
+                                    state.stderr_len,
+                                ))
+                            })
+                    };
+                    if let Some((name, cursor, produced)) = gap {
+                        send_record_refusal(
+                            &tx,
+                            format!(
+                                "durable exec reattach failed for exec_id {stream_exec_id}: {name} \
+                                 replay ended at offset {cursor}, but the command produced \
+                                 {produced} bytes; refusing a gapped replay\n"
+                            ),
+                        )
+                        .await;
+                    } else {
+                        let _ = tx.send(ExecEvent::Exit(exit)).await;
+                    }
+                    return;
+                }
+                Err(broadcast::error::RecvError::Lagged(_)) => {
+                    match recover_retained_output(
+                        &tx,
+                        &stream_exec_id,
+                        &record,
+                        &mut stdout_cursor,
+                        &mut stderr_cursor,
+                    )
+                    .await
+                    {
+                        Ok(Some(exit)) => {
+                            let _ = tx.send(ExecEvent::Exit(exit)).await;
+                            return;
+                        }
+                        Ok(None) => {}
+                        Err(()) => return,
+                    }
+                }
+                Err(broadcast::error::RecvError::Closed) => return,
+            }
+        }
+    });
+
+    ExecStream {
+        sandbox_id,
+        exec_id,
+        events: Box::pin(ReceiverStream::new(rx)),
+    }
+}
+
+#[derive(Debug)]
+struct ExecAttachSnapshot {
+    stdout: Bytes,
+    stderr: Bytes,
+    stdout_cursor: u64,
+    stderr_cursor: u64,
+    stdout_len: u64,
+    stderr_len: u64,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
+    exit: Option<Option<i32>>,
+}
+
+async fn forward_recorded_output(
+    tx: &mpsc::Sender<ExecEvent>,
+    exec_id: &str,
+    name: &str,
+    offset: u64,
+    bytes: Bytes,
+    cursor: &mut u64,
+) -> Result<(), ()> {
+    let end = offset.saturating_add(bytes.len() as u64);
+    if end <= *cursor {
+        return Ok(());
+    }
+    if offset > *cursor {
+        send_record_refusal(
+            tx,
+            format!(
+                "durable exec reattach failed for exec_id {exec_id}: {name} replay gap at offset \
+                 {}; next available byte is {offset}; refusing a gapped replay\n",
+                *cursor
+            ),
+        )
+        .await;
+        return Err(());
+    }
+    let skip = (*cursor - offset) as usize;
+    if tx
+        .send(match name {
+            "stdout" => ExecEvent::Stdout(bytes.slice(skip..)),
+            _ => ExecEvent::Stderr(bytes.slice(skip..)),
+        })
+        .await
+        .is_err()
+    {
+        return Err(());
+    }
+    *cursor = end;
+    Ok(())
+}
+
+async fn recover_retained_output(
+    tx: &mpsc::Sender<ExecEvent>,
+    exec_id: &str,
+    record: &ExecRecord,
+    stdout_cursor: &mut u64,
+    stderr_cursor: &mut u64,
+) -> Result<Option<Option<i32>>, ()> {
+    let (stdout, stderr, stdout_len, stderr_len, exit) = {
+        let state = record.state.lock();
+        let stdout = if *stdout_cursor <= state.stdout_buf.len() as u64 {
+            Bytes::copy_from_slice(&state.stdout_buf[*stdout_cursor as usize..])
+        } else {
+            Bytes::new()
+        };
+        let stderr = if *stderr_cursor <= state.stderr_buf.len() as u64 {
+            Bytes::copy_from_slice(&state.stderr_buf[*stderr_cursor as usize..])
+        } else {
+            Bytes::new()
+        };
+        (
+            stdout,
+            stderr,
+            state.stdout_len,
+            state.stderr_len,
+            state.exit,
+        )
+    };
+    if !stdout.is_empty() {
+        *stdout_cursor = stdout_cursor.saturating_add(stdout.len() as u64);
+        if tx.send(ExecEvent::Stdout(stdout)).await.is_err() {
+            return Err(());
+        }
+    }
+    if !stderr.is_empty() {
+        *stderr_cursor = stderr_cursor.saturating_add(stderr.len() as u64);
+        if tx.send(ExecEvent::Stderr(stderr)).await.is_err() {
+            return Err(());
+        }
+    }
+    if stdout_len > *stdout_cursor || stderr_len > *stderr_cursor {
+        send_record_refusal(
+            tx,
+            format!(
+                "durable exec reattach failed for exec_id {exec_id}: live consumer lag crossed \
+                 the retained output boundary (stdout {} of {stdout_len}, stderr {} of \
+                 {stderr_len}); refusing a gapped replay\n",
+                *stdout_cursor, *stderr_cursor
+            ),
+        )
+        .await;
+        return Err(());
+    }
+    Ok(exit)
+}
+
+async fn send_record_refusal(tx: &mpsc::Sender<ExecEvent>, message: String) {
+    let _ = tx.send(ExecEvent::Refused(message)).await;
+}
+
+fn refused_offset_stream(
+    sandbox_id: SandboxId,
+    exec_id: String,
+    name: &str,
+    requested: u64,
+    retained: u64,
+    truncated: bool,
+) -> ExecStream {
+    refused_exec_stream(
+        sandbox_id,
+        exec_id.clone(),
+        format!(
+            "durable exec reattach failed for exec_id {exec_id}: requested {name} offset \
+             {requested} exceeds retained length {retained} (truncated={truncated}); refusing a \
+             gapped replay\n"
+        ),
+    )
+}
+
+fn refused_exec_stream(sandbox_id: SandboxId, exec_id: String, message: String) -> ExecStream {
+    ExecStream {
+        sandbox_id,
+        exec_id,
+        events: Box::pin(tokio_stream::iter([ExecEvent::Refused(message)])),
+    }
+}
+
+fn kill_exec_process_group(pgid: Option<u32>, exec_id: &str) -> Result<(), SandboxError> {
+    #[cfg(unix)]
+    {
+        let pgid = pgid.ok_or_else(|| {
+            SandboxError::Vm(format!("process group absent for exec_id {exec_id}").into())
+        })?;
+        let raw = i32::try_from(pgid).map_err(|error| {
+            SandboxError::Vm(format!("invalid process group for {exec_id}: {error}").into())
+        })?;
+        match nix::sys::signal::killpg(
+            nix::unistd::Pid::from_raw(raw),
+            nix::sys::signal::Signal::SIGKILL,
+        ) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(SandboxError::Vm(
+                format!("cancel {exec_id}: {error}").into(),
+            )),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pgid;
+        Err(SandboxError::Unsupported(
+            "cancel_exec requires process groups".into(),
+        ))
     }
 }
 
@@ -894,7 +1490,332 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         }
+    }
+
+    fn durable_exec(exec_id: &str, argv: &[&str]) -> ExecRequest {
+        let mut req = exec(argv);
+        req.exec_id = Some(exec_id.into());
+        req.timeout = Some(Duration::from_secs(3));
+        req
+    }
+
+    async fn collect_exec_stream(
+        mut stream: ExecStream,
+    ) -> (Vec<u8>, Vec<u8>, Option<Option<i32>>) {
+        use futures::StreamExt;
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut exit = None;
+        while let Some(event) = stream.events.next().await {
+            match event {
+                ExecEvent::Stdout(bytes) => stdout.extend_from_slice(&bytes),
+                ExecEvent::Stderr(bytes) => stderr.extend_from_slice(&bytes),
+                ExecEvent::Exit(code) => {
+                    exit = Some(code);
+                    break;
+                }
+                ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
+            }
+        }
+        (stdout, stderr, exit)
+    }
+
+    async fn collect_refusal(mut stream: ExecStream) -> String {
+        use futures::StreamExt;
+
+        let reason = match stream.events.next().await {
+            Some(ExecEvent::Refused(reason)) => reason,
+            other => panic!("expected Refused terminal, got {other:?}"),
+        };
+        assert!(
+            stream.events.next().await.is_none(),
+            "Refused must be the last event"
+        );
+        reason
+    }
+
+    #[tokio::test]
+    async fn durable_exec_mid_run_reattach_spawns_once_and_resumes_offsets() {
+        use futures::StreamExt;
+
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let req = durable_exec(
+            "mid-run-ticket",
+            &[
+                "sh",
+                "-c",
+                "printf 'spawn\\n' >> marker; printf first-out; printf first-err >&2; \
+                 sleep 0.3; printf second-out; printf second-err >&2; exit 7",
+            ],
+        );
+        let mut first = b.exec_stream(id, req.clone()).await.unwrap();
+        let mut prefix_stdout = Vec::new();
+        let mut prefix_stderr = Vec::new();
+        while prefix_stdout != b"first-out" || prefix_stderr != b"first-err" {
+            let event = tokio::time::timeout(Duration::from_secs(2), first.events.next())
+                .await
+                .expect("first output should arrive before the command exits")
+                .expect("first stream should remain open");
+            match event {
+                ExecEvent::Stdout(bytes) => prefix_stdout.extend_from_slice(&bytes),
+                ExecEvent::Stderr(bytes) => prefix_stderr.extend_from_slice(&bytes),
+                ExecEvent::Exit(exit) => panic!("command exited before reattach: {exit:?}"),
+                ExecEvent::Refused(reason) => panic!("command refused before reattach: {reason}"),
+            }
+        }
+
+        let mut attach = req;
+        attach.stdout_offset = Some(prefix_stdout.len() as u64);
+        attach.stderr_offset = Some(prefix_stderr.len() as u64);
+        let second = b.exec_stream(id, attach).await.unwrap();
+        drop(first);
+        let (suffix_stdout, suffix_stderr, exit) = collect_exec_stream(second).await;
+
+        prefix_stdout.extend_from_slice(&suffix_stdout);
+        prefix_stderr.extend_from_slice(&suffix_stderr);
+        assert_eq!(prefix_stdout, b"first-outsecond-out");
+        assert_eq!(prefix_stderr, b"first-errsecond-err");
+        assert_eq!(exit, Some(Some(7)));
+        let marker = fs::read_to_string(b.cwd_for(id).join("marker")).unwrap();
+        assert_eq!(marker.lines().count(), 1, "ticket must spawn exactly once");
+    }
+
+    #[tokio::test]
+    async fn durable_exec_attach_after_exit_replays_output_and_exact_exit() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let req = durable_exec(
+            "completed-ticket",
+            &[
+                "sh",
+                "-c",
+                "printf complete-out; printf complete-err >&2; exit 19",
+            ],
+        );
+        let first = collect_exec_stream(b.exec_stream(id, req.clone()).await.unwrap()).await;
+        let replay = collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
+
+        assert_eq!(first, replay);
+        assert_eq!(replay.0, b"complete-out");
+        assert_eq!(replay.1, b"complete-err");
+        assert_eq!(replay.2, Some(Some(19)));
+        b.cancel_exec(id, "completed-ticket".into())
+            .await
+            .expect("cancelling an exited record is a no-op");
+    }
+
+    /// PR #874 review class ("retention without a bound"): completed records
+    /// beyond the retention cap are evicted oldest-first, so a long-lived
+    /// sandbox cannot accumulate output buffers indefinitely. Running
+    /// records are untouched, and an evicted ticket behaves like a TTL'd
+    /// guest journal: nonzero-offset attaches refuse loudly.
+    #[tokio::test]
+    async fn completed_records_beyond_retention_evict_oldest_first() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        for i in 0..(EXEC_COMPLETED_RETENTION + 2) {
+            let req = durable_exec(&format!("retained-{i}"), &["sh", "-c", "printf done"]);
+            let (out, _, exit) = collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
+            assert_eq!((out.as_slice(), exit), (b"done".as_slice(), Some(Some(0))));
+        }
+
+        // The two oldest completed tickets were evicted: a nonzero-offset
+        // attach is the missing-record refusal, never a respawn.
+        let mut evicted = durable_exec("retained-0", &["sh", "-c", "printf done"]);
+        evicted.stdout_offset = Some(4);
+        let reason = collect_refusal(b.exec_stream(id, evicted).await.unwrap()).await;
+        assert!(
+            reason.contains("refusing to spawn a second command"),
+            "evicted ticket must refuse, got: {reason}"
+        );
+
+        // The newest ticket is still fully replayable.
+        let newest = durable_exec(
+            &format!("retained-{}", EXEC_COMPLETED_RETENTION + 1),
+            &["sh", "-c", "printf done"],
+        );
+        let (out, _, exit) = collect_exec_stream(b.exec_stream(id, newest).await.unwrap()).await;
+        assert_eq!((out.as_slice(), exit), (b"done".as_slice(), Some(Some(0))));
+    }
+
+    #[tokio::test]
+    async fn attaching_oldest_completed_record_exempts_it_from_pruning() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let oldest_command = "printf 'spawn\\n' >> marker; printf oldest";
+
+        for i in 0..=EXEC_COMPLETED_RETENTION {
+            let command = if i == 0 {
+                oldest_command.to_string()
+            } else {
+                format!("printf 'spawn\\n' >> marker; printf record-{i}")
+            };
+            let req = durable_exec(&format!("retained-attach-{i}"), &["sh", "-c", &command]);
+            let (_, _, exit) = collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
+            assert_eq!(exit, Some(Some(0)));
+        }
+        let spawn_count_before = fs::read_to_string(b.cwd_for(id).join("marker"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(spawn_count_before, EXEC_COMPLETED_RETENTION + 1);
+
+        let replay = durable_exec("retained-attach-0", &["sh", "-c", oldest_command]);
+        let (stdout, stderr, exit) =
+            collect_exec_stream(b.exec_stream(id, replay).await.unwrap()).await;
+
+        assert_eq!(stdout, b"oldest");
+        assert!(stderr.is_empty());
+        assert_eq!(exit, Some(Some(0)));
+        let spawn_count_after = fs::read_to_string(b.cwd_for(id).join("marker"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(
+            spawn_count_after, spawn_count_before,
+            "attaching a still-present completed record must replay instead of pruning and respawning it"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_exec_command_mismatch_refuses_without_second_spawn() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let first = durable_exec(
+            "mismatch-ticket",
+            &["sh", "-c", "printf 'first\\n' >> marker"],
+        );
+        let (_, _, exit) = collect_exec_stream(b.exec_stream(id, first).await.unwrap()).await;
+        assert_eq!(exit, Some(Some(0)));
+
+        let mismatch = durable_exec(
+            "mismatch-ticket",
+            &["sh", "-c", "printf 'second\\n' >> marker"],
+        );
+        let reason = collect_refusal(b.exec_stream(id, mismatch).await.unwrap()).await;
+        assert!(reason.contains("first writer wins"), "{reason}");
+        assert!(reason.contains("refusing different command"), "{reason}");
+        assert_eq!(
+            fs::read_to_string(b.cwd_for(id).join("marker")).unwrap(),
+            "first\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_exec_unknown_ticket_with_offsets_refuses_without_spawn() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let mut req = durable_exec(
+            "missing-ticket",
+            &["sh", "-c", "printf spawned > must-not-exist"],
+        );
+        req.stdout_offset = Some(1);
+        let reason = collect_refusal(b.exec_stream(id, req).await.unwrap()).await;
+        assert!(reason.contains("record for exec_id missing-ticket is missing"));
+        assert!(reason.contains("refusing to spawn a second command"));
+        assert!(!b.cwd_for(id).join("must-not-exist").exists());
+    }
+
+    #[tokio::test]
+    async fn durable_exec_cancel_kills_the_process_group() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let stream = b
+            .exec_stream(
+                id,
+                durable_exec(
+                    "cancel-ticket",
+                    &[
+                        "sh",
+                        "-c",
+                        "sleep 30 & child=$!; printf %s \"$child\" > child.pid; wait \"$child\"",
+                    ],
+                ),
+            )
+            .await
+            .unwrap();
+        let child_pid_path = b.cwd_for(id).join("child.pid");
+        for _ in 0..100 {
+            if child_pid_path.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let child_pid = fs::read_to_string(&child_pid_path)
+            .expect("shell should publish its child pid")
+            .parse::<i32>()
+            .unwrap();
+
+        b.cancel_exec(id, "cancel-ticket".into()).await.unwrap();
+        let (_, _, exit) =
+            tokio::time::timeout(Duration::from_secs(2), collect_exec_stream(stream))
+                .await
+                .expect("cancelled process group should close both pipes promptly");
+        assert_eq!(exit, Some(None));
+
+        let mut child_alive = true;
+        for _ in 0..100 {
+            child_alive = std::process::Command::new("kill")
+                .args(["-0", &child_pid.to_string()])
+                .status()
+                .is_ok_and(|status| status.success());
+            if !child_alive {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!child_alive, "child process {child_pid} survived cancel");
+    }
+
+    #[tokio::test]
+    async fn durable_exec_dropped_consumer_does_not_kill_command() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let req = durable_exec(
+            "drop-ticket",
+            &[
+                "sh",
+                "-c",
+                "printf 'spawn\\n' >> drop-marker; sleep 0.2; printf survived",
+            ],
+        );
+        drop(b.exec_stream(id, req.clone()).await.unwrap());
+        tokio::time::sleep(Duration::from_millis(350)).await;
+
+        let (stdout, stderr, exit) =
+            collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
+        assert_eq!(stdout, b"survived");
+        assert!(stderr.is_empty());
+        assert_eq!(exit, Some(Some(0)));
+        assert_eq!(
+            fs::read_to_string(b.cwd_for(id).join("drop-marker"))
+                .unwrap()
+                .lines()
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn durable_exec_offset_beyond_retained_output_refuses_gap() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let req = durable_exec("gap-ticket", &["sh", "-c", "printf abc"]);
+        let _ = collect_exec_stream(b.exec_stream(id, req.clone()).await.unwrap()).await;
+
+        let mut attach = req;
+        attach.stdout_offset = Some(4);
+        let reason = collect_refusal(b.exec_stream(id, attach).await.unwrap()).await;
+        assert!(reason.contains("requested stdout offset 4"));
+        assert!(reason.contains("retained length 3"));
+        assert!(reason.contains("gapped replay"));
     }
 
     #[tokio::test]
@@ -942,6 +1863,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: Some(Duration::from_millis(100)),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let started = std::time::Instant::now();
         let h = b.exec(id, req).await.unwrap();
@@ -962,6 +1887,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: Some(Duration::from_secs(2)),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let h = b.exec(id, req).await.unwrap();
         assert_eq!(h.exit_status, Some(0));
@@ -999,6 +1928,10 @@ mod tests {
             env: req_env,
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let h = b.exec(id, req).await.unwrap();
         assert_eq!(String::from_utf8(h.stdout).unwrap(), "from-request");
@@ -1021,6 +1954,10 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let res = b.exec(id, req).await;
         assert!(matches!(res, Err(SandboxError::InvalidSpec(_))));
@@ -1243,6 +2180,7 @@ mod tests {
                     exit = code;
                     break;
                 }
+                ExecEvent::Refused(reason) => panic!("streaming command refused: {reason}"),
             }
         }
         assert_eq!(exit, Some(0));
@@ -1331,6 +2269,10 @@ mod tests {
             env: HashMap::new(),
             workdir: Some("deep/nested".into()),
             timeout: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let h = b.exec(id, req).await.unwrap();
         let pwd = String::from_utf8(h.stdout).unwrap();

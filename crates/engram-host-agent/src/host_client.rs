@@ -118,6 +118,10 @@ impl HostClient for LocalHostClient {
         self.sandbox.exec_stream(id, cmd).await
     }
 
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        self.sandbox.cancel_exec(id, exec_id).await
+    }
+
     async fn write_files(
         &self,
         id: SandboxId,

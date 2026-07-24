@@ -112,6 +112,44 @@ pub struct IdleScanCandidate {
     pub shell_pinned_until: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// ADR 0103: the two durable-exec lifecycle markers in the session event
+/// log. Typed (rather than a raw kind string) so
+/// [`MetadataStore::session_exec_event_at`] can only be asked about
+/// kinds whose payloads are guaranteed to carry an `exec_id` and an `at`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecLifecycleEventKind {
+    Started,
+    Completed,
+}
+
+impl ExecLifecycleEventKind {
+    /// The `session_events.kind` discriminant this variant matches.
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            Self::Started => "exec_started",
+            Self::Completed => "exec_completed",
+        }
+    }
+}
+
+/// ADR 0103: the two exec output streams whose chunk rows carry absolute
+/// byte-range stamps (`bytes_start`/`bytes_end`) in their payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl ExecOutputStream {
+    /// The `session_events.kind` discriminant this variant matches.
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
 /// we can support SQLite for embedded deployments later.
 #[async_trait]
@@ -1727,6 +1765,56 @@ pub trait MetadataStore: Send + Sync {
     }
 
     // ---- session event log ----
+
+    /// Earliest `at` stamp CARRIED BY the given exec lifecycle event for
+    /// `exec_id` in this session's durable event log, or `None` if absent.
+    ///
+    /// This reads the event's own recorded timestamp (`payload.at`), not the
+    /// row's `created_at`: the `exec_started` stamp is the attach time (the
+    /// closest host-side proxy for spawn), while its row lands only at the
+    /// first delivered frame — for a silent command that is the Exit itself,
+    /// so measuring from `created_at` would collapse `wall_ms` to ~0.
+    ///
+    /// ADR 0103 uses this for two duties on the durable exec path: lifecycle
+    /// dedup on re-attach (presence check for both `exec_started` and
+    /// `exec_completed`, keyed by exec_id — replay offsets can legitimately
+    /// still be zero), and honest `wall_ms` accounting measured from the
+    /// recorded start rather than from the attach segment that happened to
+    /// deliver the Exit.
+    ///
+    /// Default `None` keeps event-less mock stores lightweight.
+    /// `PostgresStore` and `SimMetadataStore` implement the real event-log
+    /// query, covered by the ADR 0098 D4 conformance suite.
+    async fn session_exec_event_at(
+        &self,
+        _session_id: SessionId,
+        _exec_id: &str,
+        _kind: ExecLifecycleEventKind,
+    ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
+        Ok(None)
+    }
+
+    /// Highest recorded absolute byte end-offset among this exec's persisted
+    /// output chunk rows for `stream`, or 0 when none are stamped.
+    ///
+    /// ADR 0103: output recording must be observation-independent — a
+    /// re-attach skips persisting chunk bytes at or below this mark, so
+    /// attaching N times records the same rows as attaching once. Rows
+    /// written before byte-range stamping existed carry no `bytes_end` and
+    /// are ignored (their execs may duplicate once more; stamped rows never
+    /// do).
+    ///
+    /// Default 0 keeps event-less mock stores lightweight. `PostgresStore`
+    /// and `SimMetadataStore` implement the real query, covered by the ADR
+    /// 0098 D4 conformance suite.
+    async fn session_exec_output_high_water(
+        &self,
+        _session_id: SessionId,
+        _exec_id: &str,
+        _stream: ExecOutputStream,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
+    }
 
     /// Append an event to a session's persistent log. Returns the
     /// monotonic per-session `idx` assigned to this event. Allocation

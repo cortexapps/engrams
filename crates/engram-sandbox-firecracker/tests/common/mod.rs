@@ -143,6 +143,7 @@ pub async fn drain(
                 exit_code = code;
                 break;
             }
+            ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
         }
     }
     (stdout, stderr, exit_code)

@@ -110,7 +110,11 @@ use serde::{Deserialize, Serialize};
 // field addition (mixed-roll-safe: an old host ignores it and packs
 // content-sized), bumped so the deploy posture is explicit — an enable
 // on a v17 host silently loses the floor.
-pub const WIRE_VERSION: u32 = 18;
+// v19 (ADR 0103): durable ExecRequest ticket/resume fields and the
+// CancelExec coord↔host RPC. Lockstep coord+host roll.
+// v20 (ADR 0103 review hardening): ExecFrame carries terminal refusals as
+// their own oneof variant instead of collapsing them into Exit(None).
+pub const WIRE_VERSION: u32 = 20;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic
@@ -162,6 +166,14 @@ pub struct WireExecRequest {
     pub workdir: Option<String>,
     /// Wall-clock timeout in milliseconds. `None` disables.
     pub timeout_ms: Option<u64>,
+    #[serde(default)]
+    pub exec_id: Option<String>,
+    #[serde(default)]
+    pub stdout_offset: Option<u64>,
+    #[serde(default)]
+    pub stderr_offset: Option<u64>,
+    #[serde(default)]
+    pub wake: Option<bool>,
 }
 
 impl WireExecRequest {
@@ -172,6 +184,10 @@ impl WireExecRequest {
             env: req.env,
             workdir: req.workdir,
             timeout_ms: req.timeout.map(|d| d.as_millis() as u64),
+            exec_id: req.exec_id,
+            stdout_offset: req.stdout_offset,
+            stderr_offset: req.stderr_offset,
+            wake: req.wake,
         }
     }
 
@@ -182,6 +198,10 @@ impl WireExecRequest {
             env: self.env,
             workdir: self.workdir,
             timeout: self.timeout_ms.map(Duration::from_millis),
+            exec_id: self.exec_id,
+            stdout_offset: self.stdout_offset,
+            stderr_offset: self.stderr_offset,
+            wake: self.wake,
         }
     }
 }
@@ -290,6 +310,10 @@ mod tests {
             env: HashMap::from([("A".into(), "B".into())]),
             workdir: Some("/tmp".into()),
             timeout: Some(Duration::from_millis(5_500)),
+            exec_id: Some("exec-roundtrip".into()),
+            stdout_offset: Some(7),
+            stderr_offset: Some(9),
+            wake: Some(true),
         };
         let wire = WireExecRequest::from_engine(original.clone());
         let bytes = bincode::serialize(&wire).unwrap();
@@ -300,6 +324,10 @@ mod tests {
         assert_eq!(recovered.env, original.env);
         assert_eq!(recovered.workdir, original.workdir);
         assert_eq!(recovered.timeout, original.timeout);
+        assert_eq!(recovered.exec_id, original.exec_id);
+        assert_eq!(recovered.stdout_offset, original.stdout_offset);
+        assert_eq!(recovered.stderr_offset, original.stderr_offset);
+        assert_eq!(recovered.wake, original.wake);
     }
 
     #[test]

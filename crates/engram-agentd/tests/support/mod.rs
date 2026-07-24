@@ -48,6 +48,9 @@ pub fn wire_exec_event() -> impl Strategy<Value = WireExecEvent> {
         small_bytes().prop_map(WireExecEvent::Stdout),
         small_bytes().prop_map(WireExecEvent::Stderr),
         proptest::option::of(any::<i32>()).prop_map(WireExecEvent::Exit),
+        s().prop_map(WireExecEvent::Started),
+        s().prop_map(WireExecEvent::Degraded),
+        s().prop_map(|reason| WireExecEvent::Refused { reason }),
     ]
 }
 
@@ -58,14 +61,35 @@ pub fn wire_exec_request() -> impl Strategy<Value = WireExecRequest> {
         small_env(),
         opt_s(),
         proptest::option::of(any::<u64>()),
+        opt_s(),
+        proptest::option::of(any::<u64>()),
+        proptest::option::of(any::<u64>()),
+        proptest::option::of(any::<bool>()),
+        any::<bool>(),
     )
         .prop_map(
-            |(command, stdin, env, workdir, timeout_ms)| WireExecRequest {
+            |(
                 command,
                 stdin,
                 env,
                 workdir,
                 timeout_ms,
+                exec_id,
+                stdout_offset,
+                stderr_offset,
+                wake,
+                attach_only,
+            )| WireExecRequest {
+                command,
+                stdin,
+                env,
+                workdir,
+                timeout_ms,
+                exec_id,
+                stdout_offset,
+                stderr_offset,
+                wake,
+                attach_only,
             },
         )
 }
@@ -106,6 +130,7 @@ pub fn wire_request() -> impl Strategy<Value = WireRequest> {
         proptest::option::of(any::<u16>()).prop_map(|port| WireRequest::StartIde { port }),
         Just(WireRequest::StopIde),
         any::<i64>().prop_map(|unix_nanos| WireRequest::StepClock { unix_nanos }),
+        s().prop_map(|exec_id| WireRequest::CancelExec { exec_id }),
     ]
 }
 
@@ -151,6 +176,7 @@ pub fn wire_response() -> impl Strategy<Value = WireResponse> {
                 applied_offset_nanos,
             }
         }),
+        Just(WireResponse::ExecCancelled),
     ]
 }
 
@@ -208,6 +234,7 @@ fn _exhaustiveness_wire_request(r: &WireRequest) {
         WireRequest::StartIde { .. } => {}
         WireRequest::StopIde => {}
         WireRequest::StepClock { .. } => {}
+        WireRequest::CancelExec { .. } => {}
     }
 }
 
@@ -229,6 +256,7 @@ fn _exhaustiveness_wire_response(r: &WireResponse) {
         WireResponse::IdeReady { .. } => {}
         WireResponse::IdeStopped => {}
         WireResponse::ClockStepped { .. } => {}
+        WireResponse::ExecCancelled => {}
     }
 }
 
@@ -237,5 +265,8 @@ fn _exhaustiveness_wire_exec_event(e: &WireExecEvent) {
         WireExecEvent::Stdout(_) => {}
         WireExecEvent::Stderr(_) => {}
         WireExecEvent::Exit(_) => {}
+        WireExecEvent::Started(_) => {}
+        WireExecEvent::Degraded(_) => {}
+        WireExecEvent::Refused { .. } => {}
     }
 }

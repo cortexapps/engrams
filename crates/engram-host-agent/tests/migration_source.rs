@@ -338,6 +338,10 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
         env: HashMap::new(),
         workdir: None,
         timeout: Some(std::time::Duration::from_secs(30)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     let stream = loop {
@@ -357,7 +361,8 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
         match ev {
             ExecEvent::Stdout(b) => out.extend_from_slice(&b),
             ExecEvent::Exit(_) => break,
-            _ => {}
+            ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
+            ExecEvent::Stderr(_) => {}
         }
     }
     String::from_utf8_lossy(&out).into_owned()

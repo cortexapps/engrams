@@ -274,6 +274,10 @@ async fn exec_ok(backend: &FirecrackerBackend, sandbox_id: SandboxId, script: &s
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(10)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let handle = backend.exec(sandbox_id, req).await.expect("exec");
     assert_eq!(
@@ -296,6 +300,10 @@ async fn wait_for_agent(
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(5)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let deadline = Instant::now() + budget;
     let mut last_err = None;

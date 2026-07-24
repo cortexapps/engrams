@@ -65,6 +65,276 @@ async fn pg_ctx() -> Option<Ctx> {
     })
 }
 
+/// ADR 0103: durable re-attaches deduplicate lifecycle events by exec_id
+/// (offsets legitimately remain `(0, 0)`), and `wall_ms` is measured from
+/// the logged start. Every predicate clause is pinned: exec_id match,
+/// session scoping, kind filter (other event kinds also carry `exec_id`
+/// in their payloads), and MIN over duplicates.
+async fn session_exec_event_at(ctx: &Ctx) {
+    use engram_core::traits::ExecLifecycleEventKind::{Completed, Started};
+
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-started:latest"))
+        .await
+        .unwrap();
+    let other_sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-started-other:latest"))
+        .await
+        .unwrap();
+    let exec_event = |kind: &str| {
+        serde_json::json!({
+            "type": kind,
+            "exec_id": "exec:present",
+            "command": ["true"],
+            "at": ctx.clock.now_utc(),
+        })
+    };
+
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:present", Started)
+            .await
+            .unwrap(),
+        None,
+        "an absent exec_id must not match"
+    );
+
+    // Same exec_id in a DIFFERENT session: the session_id clause is the
+    // isolation boundary between sessions' exec dedup.
+    ctx.meta
+        .append_session_event(other_sid, "exec_started", exec_event("exec_started"))
+        .await
+        .unwrap();
+    // Same exec_id under OTHER kinds in the same session: output and
+    // completion events also carry `exec_id`, so only the kind filter
+    // keeps them from satisfying a Started query.
+    ctx.meta
+        .append_session_event(
+            sid,
+            "stdout",
+            serde_json::json!({ "type": "stdout", "exec_id": "exec:present", "chunk": "hi" }),
+        )
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(sid, "exec_completed", exec_event("exec_completed"))
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:present", Started)
+            .await
+            .unwrap(),
+        None,
+        "another session's exec_started and this session's non-started kinds must not match"
+    );
+
+    let first_started_at = ctx.clock.now_utc();
+    ctx.meta
+        .append_session_event(sid, "exec_started", exec_event("exec_started"))
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_millis(1500));
+    // A residual concurrent-attach duplicate must not move the timestamp:
+    // the earliest occurrence wins (SQL MIN).
+    ctx.meta
+        .append_session_event(sid, "exec_started", exec_event("exec_started"))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:present", Started)
+            .await
+            .unwrap(),
+        Some(first_started_at),
+        "the persisted exec_id must match at its FIRST logged timestamp"
+    );
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:different", Started)
+            .await
+            .unwrap(),
+        None,
+        "a different exec_id must not match"
+    );
+    assert!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:present", Completed)
+            .await
+            .unwrap()
+            .is_some(),
+        "the Completed kind resolves independently of Started"
+    );
+
+    // The lookup returns the event's OWN `at` stamp, not the row's
+    // created_at. A silent command's exec_started row lands only at its
+    // first delivered frame (the Exit itself) while its `at` records the
+    // attach time — measuring from created_at would collapse wall_ms to ~0.
+    let skewed_at = ctx.clock.now_utc() - chrono::Duration::seconds(30);
+    ctx.meta
+        .append_session_event(
+            sid,
+            "exec_started",
+            serde_json::json!({
+                "type": "exec_started",
+                "exec_id": "exec:skewed",
+                "command": ["true"],
+                "at": skewed_at,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:skewed", Started)
+            .await
+            .unwrap(),
+        Some(skewed_at),
+        "the lookup must return the event's recorded `at`, not the row's created_at"
+    );
+
+    // An ADR-0028 recovery rewind tombstones exec lifecycle rows. The guest
+    // journal rewinds with the disk, so a replayed step legitimately re-runs
+    // the same ticket — the dedup must see the LIVE timeline only, or the
+    // re-run leaves no lifecycle record at all.
+    ctx.meta.rewind_session_to_cursor(sid, 0).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:present", Started)
+            .await
+            .unwrap(),
+        None,
+        "tombstoned (rewound) rows must not satisfy the dedup lookup"
+    );
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:present", Completed)
+            .await
+            .unwrap(),
+        None,
+        "tombstoned (rewound) completions must not satisfy the dedup lookup"
+    );
+}
+
+/// ADR 0103: output recording is observation-independent — re-attaches skip
+/// persisting at or below the recorded high-water mark. Pins every predicate
+/// clause: byte-range stamps (unstamped legacy rows invisible), per-stream
+/// separation, per-exec and per-session isolation, and MAX over rows.
+async fn session_exec_output_high_water(ctx: &Ctx) {
+    use engram_core::traits::metadata::ExecOutputStream::{Stderr, Stdout};
+
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-highwater:latest"))
+        .await
+        .unwrap();
+    let other_sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-highwater-other:latest"))
+        .await
+        .unwrap();
+    let chunk = |exec_id: &str, start: u64, end: u64| {
+        serde_json::json!({
+            "type": "stdout",
+            "exec_id": exec_id,
+            "chunk": "x",
+            "bytes_start": start,
+            "bytes_end": end,
+        })
+    };
+
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        0,
+        "no rows → zero"
+    );
+
+    // Legacy row without stamps: invisible to the mark.
+    ctx.meta
+        .append_session_event(
+            sid,
+            "stdout",
+            serde_json::json!({ "type": "stdout", "exec_id": "exec:hw", "chunk": "legacy" }),
+        )
+        .await
+        .unwrap();
+    // Foreign rows that must not count: another exec, another session, and
+    // the other stream.
+    ctx.meta
+        .append_session_event(sid, "stdout", chunk("exec:other", 0, 99_999))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(other_sid, "stdout", chunk("exec:hw", 0, 77_777))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(
+            sid,
+            "stderr",
+            serde_json::json!({
+                "type": "stderr",
+                "exec_id": "exec:hw",
+                "chunk": "e",
+                "bytes_start": 0,
+                "bytes_end": 999,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        0,
+        "legacy/foreign/other-stream rows must not move the stdout mark"
+    );
+
+    ctx.meta
+        .append_session_event(sid, "stdout", chunk("exec:hw", 0, 4096))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(sid, "stdout", chunk("exec:hw", 4096, 8192))
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        8192,
+        "the mark is the MAX stamped end offset"
+    );
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stderr)
+            .await
+            .unwrap(),
+        999,
+        "streams carry independent marks"
+    );
+
+    // After a recovery rewind the guest re-runs the ticket and its output
+    // must be re-recorded — tombstoned rows must not hold the mark up.
+    ctx.meta.rewind_session_to_cursor(sid, 0).await.unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        0,
+        "tombstoned (rewound) chunk rows must not satisfy the high-water mark"
+    );
+}
+
 /// One scenario, two tests: `<name>::sim` (always) and `<name>::pg`
 /// (`#[ignore]`'d, live Postgres).
 macro_rules! conformance {
@@ -1828,6 +2098,11 @@ conformance!(
 );
 conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
+conformance!(t_session_exec_event_at, super::session_exec_event_at);
+conformance!(
+    t_session_exec_output_high_water,
+    super::session_exec_output_high_water
+);
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
 conformance!(
     t_latest_snapshot_reports_recoverable_flag,

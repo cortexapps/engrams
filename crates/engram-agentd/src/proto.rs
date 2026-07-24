@@ -12,19 +12,21 @@
 //! [`WireRequest`] per connection. The verb's response shape
 //! depends on the variant:
 //!
-//! - `WireRequest::Exec(req)` — agent streams [`WireExecEvent`]s
-//!   ending with `Exit`. Same as the original exec-only protocol;
-//!   the new envelope just wraps it.
-//! - `WireRequest::Stat | Upload | Download | Ping | Shutdown` —
+//! - `WireRequest::Exec(req)` — agent streams [`WireExecEvent`]s,
+//!   beginning with `Started` and ending with `Exit`.
+//! - `WireRequest::Stat | Upload | Download | Ping | Shutdown | CancelExec` —
 //!   agent sends exactly one [`WireResponse`] and closes.
 //!
 //! ### Without auth (development, default for back-compat):
 //!
 //! ```text
 //!   host ──[ WireRequest::Exec(WireExecRequest) ]──► agent
+//!   agent ──[ WireExecEvent::Started(exec_id) ]──► host  (exactly once, first)
 //!   agent ──[ WireExecEvent::Stdout(bytes) ]──► host    (0+ times)
 //!   agent ──[ WireExecEvent::Stderr(bytes) ]──► host    (0+ times)
+//!   agent ──[ WireExecEvent::Degraded(reason) ]──► host (0 or 1 times)
 //!   agent ──[ WireExecEvent::Exit(status)  ]──► host    (exactly once)
+//!   agent ──[ WireExecEvent::Refused{reason} ]──► host  (terminal)
 //!   <connection closed>
 //! ```
 //!
@@ -99,17 +101,45 @@ pub struct WireExecRequest {
     /// Wall-clock timeout. After this, the agent SIGKILLs the child
     /// and emits `Exit(None)`. `None` disables the timeout.
     pub timeout_ms: Option<u64>,
+    /// Durable caller ticket. Omitted callers receive one in the first
+    /// [`WireExecEvent::Started`] frame.
+    #[serde(default)]
+    pub exec_id: Option<String>,
+    /// Resume cursors for the journal's stdout and stderr files.
+    #[serde(default)]
+    pub stdout_offset: Option<u64>,
+    #[serde(default)]
+    pub stderr_offset: Option<u64>,
+    /// Carried for shape parity with the outer RPCs. Waking happens before
+    /// the request reaches agentd.
+    #[serde(default)]
+    pub wake: Option<bool>,
+    /// Host-reader redials set this after an epoch bump. A missing journal is
+    /// then terminal instead of authorizing a fresh spawn after TTL GC.
+    #[serde(default)]
+    pub attach_only: bool,
 }
 
-/// Each event the agent emits during exec. The stream is terminated by
-/// exactly one `Exit` (or an abrupt connection close on agent crash,
-/// which the host treats as a failure).
+/// Each event the agent emits during exec. A terminal stream ends with
+/// exactly one `Exit` or `Refused` frame (or an abrupt connection close on
+/// agent crash, which the host treats as transport loss).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WireExecEvent {
     Stdout(Vec<u8>),
     Stderr(Vec<u8>),
     /// `None` = signalled / timed out. `Some(0)` = clean exit 0.
     Exit(Option<i32>),
+    /// Always the first frame emitted by durable agentd. Hosts validate it
+    /// before accepting replay or terminal frames.
+    Started(String),
+    /// Journal persistence failed; the command continues with stage-1 live
+    /// streaming and must never be re-attached (that could double-spawn).
+    Degraded(String),
+    /// Deterministic rejection of this attach. Append-only: variant indices
+    /// are part of the bincode wire contract.
+    Refused {
+        reason: String,
+    },
 }
 
 /// First frame the host sends when auth is enabled. The agent
@@ -356,6 +386,9 @@ pub enum WireRequest {
         /// Host `CLOCK_REALTIME` at send, in Unix nanoseconds.
         unix_nanos: i64,
     },
+    /// Kill the process group for a durable exec ticket. Appended for wire
+    /// compatibility; old agentd rejects it with the named skew response.
+    CancelExec { exec_id: String },
 }
 
 /// Body of [`WireRequest::SpawnHarness`]. ADR 0021 P1.4 dropped the
@@ -508,6 +541,8 @@ pub enum WireResponse {
     ClockStepped {
         applied_offset_nanos: Option<i64>,
     },
+    /// The durable exec's process group was signalled (or had already exited).
+    ExecCancelled,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -585,6 +620,11 @@ mod tests {
             env: HashMap::from([("RUST_LOG".into(), "info".into())]),
             workdir: Some("/tmp".into()),
             timeout_ms: Some(5_000),
+            exec_id: Some("exec-test".into()),
+            stdout_offset: Some(2),
+            stderr_offset: Some(3),
+            wake: Some(true),
+            attach_only: true,
         }
     }
 
@@ -644,6 +684,11 @@ mod tests {
             WireExecEvent::Exit(Some(0)),
             WireExecEvent::Exit(Some(137)),
             WireExecEvent::Exit(None),
+            WireExecEvent::Started("exec-roundtrip".into()),
+            WireExecEvent::Degraded("ENOSPC".into()),
+            WireExecEvent::Refused {
+                reason: "first writer wins".into(),
+            },
         ] {
             let mut buf = Vec::new();
             write_msg(&mut buf, &ev).await.unwrap();

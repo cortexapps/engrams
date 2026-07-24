@@ -27,7 +27,9 @@
 //! `run_eviction_finalize_attempt` finalize legs, a real `ChunkedDiskBackend`
 //! over a real `ChunkStore`, and the REAL
 //! [`reconcile_once`](engram_host_agent::teardown_reconcile::reconcile_once)
-//! teardown-reconcile tick.
+//! teardown-reconcile tick. ADR 0103 also composes the real Firecracker
+//! host-side exec driver with real agentd connection handlers over a
+//! per-sandbox durable journal; the duplex/vsock severance is the only fake.
 //!
 //! **Faked (only the transport):** the [`bridge`] — [`CosimHostClient`]
 //! (coordinator→host: the `HostClient` verbs drive the host's real ops) and

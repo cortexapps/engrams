@@ -397,6 +397,19 @@ pub struct ExecRequest {
     pub env: HashMap<String, String>,
     pub workdir: Option<String>,
     pub timeout: Option<Duration>,
+    /// Durable caller ticket. When present, retries attach to the existing
+    /// guest journal instead of spawning a second command.
+    #[serde(default)]
+    pub exec_id: Option<String>,
+    /// Per-stream replay cursors used when attaching to a durable exec.
+    #[serde(default)]
+    pub stdout_offset: Option<u64>,
+    #[serde(default)]
+    pub stderr_offset: Option<u64>,
+    /// Ask the coordinator to wake a parked session before attaching.
+    /// Backends receive the normalized request after that wake has happened.
+    #[serde(default)]
+    pub wake: Option<bool>,
 }
 
 /// One file to write into a running sandbox.
@@ -418,8 +431,10 @@ pub struct WriteFileResult {
     pub error: Option<String>,
 }
 
-/// Output event from a streaming `exec`. The stream is terminated by
-/// exactly one `Exit` event (or an error).
+/// Output event from a streaming `exec`. A terminal backend result is marked
+/// by exactly one `Exit` or `Refused`. The event stream may instead end
+/// without either terminal to report retryable transport loss while a durable
+/// result remains attachable.
 ///
 /// The variants are intentionally `Bytes` rather than `String` so a
 /// process emitting non-UTF-8 output (binary tools, raw pipe content)
@@ -429,11 +444,12 @@ pub enum ExecEvent {
     Stdout(Bytes),
     Stderr(Bytes),
     Exit(Option<i32>),
+    Refused(String),
 }
 
 impl ExecEvent {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Exit(_))
+        matches!(self, Self::Exit(_) | Self::Refused(_))
     }
 }
 
@@ -441,9 +457,11 @@ impl ExecEvent {
 /// background task or returned across an `axum` handler boundary.
 pub type ExecEventStream = Pin<Box<dyn Stream<Item = ExecEvent> + Send + 'static>>;
 
-/// Streaming counterpart to [`ExecHandle`]. The backend returns
-/// immediately with metadata + a stream; the stream yields output as
-/// the underlying process produces it and ends with a single `Exit`.
+/// Streaming counterpart to [`ExecHandle`]. The backend returns immediately
+/// with metadata + a stream; the stream yields output as the underlying
+/// process produces it and ends with a single `Exit` or `Refused` only when
+/// it has a terminal result. End-without-terminal means transport loss, not
+/// completion.
 pub struct ExecStream {
     pub sandbox_id: SandboxId,
     pub exec_id: String,
@@ -654,10 +672,11 @@ mod tests {
     }
 
     #[test]
-    fn exec_event_terminal_only_on_exit() {
+    fn exec_event_terminal_only_on_exit_or_refusal() {
         assert!(!ExecEvent::Stdout(Bytes::from_static(b"x")).is_terminal());
         assert!(!ExecEvent::Stderr(Bytes::from_static(b"x")).is_terminal());
         assert!(ExecEvent::Exit(Some(0)).is_terminal());
         assert!(ExecEvent::Exit(None).is_terminal());
+        assert!(ExecEvent::Refused("first writer wins".into()).is_terminal());
     }
 }

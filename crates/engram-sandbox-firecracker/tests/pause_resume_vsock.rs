@@ -131,6 +131,10 @@ async fn vsock_delivers_after_plain_pause_resume() {
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(5)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let stream = wait_for_agent(&backend, sandbox_id, &req, Duration::from_secs(20))
         .await
@@ -154,6 +158,10 @@ async fn vsock_delivers_after_plain_pause_resume() {
         env: HashMap::new(),
         workdir: None,
         timeout: Some(Duration::from_secs(5)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     // Hard outer timeout as well: a gated CONNECT can make the dial BLOCK
     // (not error), which would hang the test instead of failing it.

@@ -42,6 +42,7 @@ use engram_host_core::{
     CoordControlPlane, CoordError, LiveManifestPublishOutcome, LiveManifestPublishRequest,
     LiveManifestPublishResponse,
 };
+use engram_sandbox_firecracker::{drive_exec_protocol, ExecRedial};
 
 use crate::host::{build_base_sandbox, SharedHost};
 
@@ -124,13 +125,26 @@ impl HostClient for CosimHostClient {
 
     async fn exec_stream(
         &self,
-        _id: SandboxId,
-        _cmd: ExecRequest,
+        id: SandboxId,
+        cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        Err(SandboxError::Unsupported(
-            "cosim: exec is not modeled (ADR 0098 non-goal)".into(),
-        ))
+        let (io, severed) = self
+            .host
+            .lock()
+            .await
+            .start_exec_transport(id, &cmd)
+            .await?;
+        let host = self.host.clone();
+        let redial = ExecRedial::provided(move || {
+            let host = host.clone();
+            async move { host.lock().await.redial_exec_transport(id) }
+        });
+        drive_exec_protocol(id, io, cmd, true, Some(severed), Some(redial)).await
     }
+
+    // `cancel_exec` intentionally retains the HostClient default Unsupported
+    // result. The checkpoint-severance composition needs only attach/tail;
+    // cancel's real guest verb is covered at the agentd boundary.
 
     async fn snapshot(
         &self,

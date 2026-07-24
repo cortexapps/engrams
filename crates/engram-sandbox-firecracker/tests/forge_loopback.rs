@@ -160,6 +160,10 @@ async fn forge_credential_round_trips_over_vsock() {
         env: exec_env,
         workdir: None,
         timeout: Some(Duration::from_secs(15)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
 
     let stream = wait_for_agent(&backend, sandbox_id, &req, Duration::from_secs(25))

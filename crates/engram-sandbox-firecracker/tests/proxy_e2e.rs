@@ -399,6 +399,10 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         env: diag_env,
         workdir: None,
         timeout: Some(Duration::from_secs(15)),
+        exec_id: None,
+        stdout_offset: None,
+        stderr_offset: None,
+        wake: None,
     };
     let stream = backend.exec_stream(sandbox_id, req).await.expect("exec");
     let (out, err, exit) = drain(stream.events).await;

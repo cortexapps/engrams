@@ -1046,11 +1046,24 @@ impl PooledBackend {
         // full images and the busybox test fixtures (no bare /bin/sync
         // there).
         let req = ExecRequest {
-            command: vec!["/bin/sh".into(), "-c".into(), "sync".into()],
+            // ADR 0103: this helper is used only by the warm base-image
+            // capture path. Remove the warm hook's completed journals and
+            // this sync command's own mkdir marker before the disk capture;
+            // the wrapper deliberately tolerates losing its record and the
+            // still-attached live stream carries the exact result.
+            command: vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "rm -rf /var/lib/engram/execs/* && sync".into(),
+            ],
             stdin: None,
             env: std::collections::HashMap::new(),
             workdir: None,
             timeout: Some(std::time::Duration::from_secs(120)),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         let started = crate::time_source::metrics_now();
         let stream = self
@@ -1059,19 +1072,27 @@ impl PooledBackend {
             .map_err(|e| SandboxError::Snapshot(format!("pre-capture guest sync exec: {e}")))?;
         let mut events = stream.events;
         while let Some(ev) = events.next().await {
-            if let ExecEvent::Exit(status) = ev {
-                return if status == Some(0) {
-                    tracing::info!(
-                        sandbox_id = %id,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "pre-capture guest sync complete",
-                    );
-                    Ok(())
-                } else {
-                    Err(SandboxError::Snapshot(format!(
-                        "pre-capture guest sync exited {status:?}"
-                    )))
-                };
+            match ev {
+                ExecEvent::Exit(status) => {
+                    return if status == Some(0) {
+                        tracing::info!(
+                            sandbox_id = %id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "pre-capture guest sync complete",
+                        );
+                        Ok(())
+                    } else {
+                        Err(SandboxError::Snapshot(format!(
+                            "pre-capture guest sync exited {status:?}"
+                        )))
+                    };
+                }
+                ExecEvent::Refused(reason) => {
+                    return Err(SandboxError::Snapshot(format!(
+                        "pre-capture guest sync exec refused: {reason}"
+                    )));
+                }
+                ExecEvent::Stdout(_) | ExecEvent::Stderr(_) => {}
             }
         }
         Err(SandboxError::Snapshot(
@@ -1130,6 +1151,10 @@ impl PooledBackend {
             // In-guest backstop unchanged: agentd SIGKILLs the child at this
             // deadline regardless of what the host-side watchdog decides.
             timeout: Some(warm.timeout()),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
         };
         tracing::info!(
             sandbox_id = %id,
@@ -1268,6 +1293,15 @@ impl PooledBackend {
                             }
                         }
                         Some(ExecEvent::Exit(status)) => break status,
+                        Some(ExecEvent::Refused(reason)) => {
+                            return Err(violation_failure(
+                                CaptureFailureKind::WarmExitNonZero,
+                                watchdog,
+                                &tail,
+                                &last_detail,
+                                format!("[warm] hook exec refused: {reason}"),
+                            ));
+                        }
                         None => {
                             return Err(violation_failure(
                                 CaptureFailureKind::WarmExecTransport,
@@ -6631,6 +6665,10 @@ impl SandboxBackend for PooledBackend {
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
         self.inner.exec_stream(id, cmd).await
+    }
+
+    async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
+        self.inner.cancel_exec(id, exec_id).await
     }
 
     async fn write_files(

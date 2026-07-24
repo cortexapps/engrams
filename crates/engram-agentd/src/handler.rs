@@ -3,20 +3,22 @@
 //! Concurrency model: stdout and stderr are read in parallel tasks
 //! that send `WireExecEvent`s through an `mpsc` channel; a single
 //! writer task drains the channel and frames each event onto the
-//! connection. This keeps `WireExecEvent::Exit` strictly *last* on
-//! the wire (we close the channel only after both readers drain),
+//! connection. This keeps a genuine `WireExecEvent::Exit` strictly *last*
+//! on the wire (we close the channel only after both readers drain),
 //! and avoids the lock-around-the-stream dance that two writers
 //! would otherwise need.
 
 use std::io;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::io::{split, AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
+use crate::exec_journal::{AttachOrStart, AttachState, ExecJournal, JournalEntry};
 use crate::harness_supervisor::HarnessSupervisor;
 use crate::proto::{
     read_msg, write_msg, WireDownloadResponse, WireExecEvent, WireHandshake, WireHandshakeAck,
@@ -32,6 +34,7 @@ const EVENT_BUF: usize = 64;
 /// overhead and frame granularity (a single frame can carry up to 8 KiB
 /// of stdout, which keeps the JSON framing comparable in chunkiness).
 const READ_BUF_BYTES: usize = 8 * 1024;
+pub const DURABLE_EXEC_CAPABILITY_PROBE: &str = "__engram_durable_exec_capability__";
 
 /// Drive one connection: read a `WireExecRequest`, run the child,
 /// stream events, close. All errors are surfaced as `io::Error` —
@@ -49,6 +52,29 @@ pub async fn serve_connection<S>(
     expected_token: Option<String>,
     supervisor: Arc<HarnessSupervisor>,
     cacerts: Arc<crate::cacerts::CaCertInstaller>,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
+{
+    serve_connection_with_journal(
+        stream,
+        expected_token,
+        supervisor,
+        cacerts,
+        Arc::new(ExecJournal::default()),
+    )
+    .await
+}
+
+/// Testable/configurable sibling of [`serve_connection`]. Production uses the
+/// fixed `/var/lib/engram/execs` root; crash-state tests inject a plain temp
+/// directory and construct records entirely from outside the implementation.
+pub async fn serve_connection_with_journal<S>(
+    stream: S,
+    expected_token: Option<String>,
+    supervisor: Arc<HarnessSupervisor>,
+    cacerts: Arc<crate::cacerts::CaCertInstaller>,
+    journal: Arc<ExecJournal>,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
@@ -378,9 +404,57 @@ where
             write_msg(&mut writer, &resp).await?;
             return Ok(());
         }
+        WireRequest::CancelExec { exec_id } => {
+            if exec_id == DURABLE_EXEC_CAPABILITY_PROBE {
+                write_msg(&mut writer, &WireResponse::ExecCancelled).await?;
+                return Ok(());
+            }
+            // Validate the RAW ticket before any path exists — the exec path
+            // does this inside attach_or_start; cancel must be symmetric or
+            // a `../`-shaped exec_id escapes the journal root.
+            let entry = match journal.existing_entry(&exec_id) {
+                Ok(entry) => entry,
+                Err(error) => {
+                    write_msg(
+                        &mut writer,
+                        &WireResponse::Error {
+                            kind: format!("{:?}", error.kind()),
+                            message: format!("invalid cancel exec_id {exec_id:?}: {error}"),
+                        },
+                    )
+                    .await?;
+                    return Ok(());
+                }
+            };
+            match crate::exec_journal::cancel(&entry).await {
+                Ok(()) => write_msg(&mut writer, &WireResponse::ExecCancelled).await?,
+                Err(error) => {
+                    write_msg(
+                        &mut writer,
+                        &WireResponse::Error {
+                            kind: format!("{:?}", error.kind()),
+                            message: format!("cancel exec {exec_id}: {error}"),
+                        },
+                    )
+                    .await?;
+                }
+            }
+            return Ok(());
+        }
     };
 
-    let req = exec_req;
+    serve_exec(exec_req, writer, supervisor, journal).await
+}
+
+async fn serve_exec<W>(
+    req: crate::proto::WireExecRequest,
+    mut writer: W,
+    supervisor: Arc<HarnessSupervisor>,
+    journal: Arc<ExecJournal>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     if req.command.is_empty() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -394,8 +468,110 @@ where
     // token windows, and timestamps. No-op when there's no skew / no PTP.
     crate::clock::sync_now();
 
-    let mut cmd = Command::new(&req.command[0]);
-    cmd.args(&req.command[1..]);
+    let exec_id = req
+        .exec_id
+        .clone()
+        .unwrap_or_else(|| format!("exec-{}", engram_core::SandboxId::new()));
+    // This is the durable capability signal. It precedes replay, mismatch
+    // errors, and terminal frames on every new-agentd path.
+    write_msg(&mut writer, &WireExecEvent::Started(exec_id.clone())).await?;
+
+    let attach_result = if req.attach_only {
+        journal.attach_existing(&exec_id).await
+    } else {
+        journal.attach_or_start(&exec_id, &req.command).await
+    };
+    let attach = match attach_result {
+        Ok(attach) => attach,
+        Err(error) => {
+            write_msg(
+                &mut writer,
+                &WireExecEvent::Stderr(
+                    format!("durable exec {exec_id} rejected: {error}\n").into_bytes(),
+                ),
+            )
+            .await?;
+            write_msg(&mut writer, &WireExecEvent::Exit(None)).await?;
+            return Ok(());
+        }
+    };
+    match attach {
+        AttachOrStart::Attach(entry) => {
+            tail_journal(
+                &entry,
+                &req.command,
+                req.stdout_offset.unwrap_or(0),
+                req.stderr_offset.unwrap_or(0),
+                &mut writer,
+            )
+            .await
+        }
+        AttachOrStart::Start(entry) => {
+            let stdout_offset = req.stdout_offset.unwrap_or(0);
+            let stderr_offset = req.stderr_offset.unwrap_or(0);
+            if stdout_offset != 0 || stderr_offset != 0 {
+                let cleanup = tokio::fs::remove_dir_all(entry.dir()).await;
+                write_msg(
+                    &mut writer,
+                    &WireExecEvent::Refused {
+                        reason: format!(
+                            "no journal for exec_id {exec_id} with non-zero replay offsets; refusing to spawn from scratch"
+                        ),
+                    },
+                )
+                .await?;
+                cleanup.map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "remove refused vacant journal {}: {error}",
+                            entry.dir().display()
+                        ),
+                    )
+                })?;
+                return Ok(());
+            }
+            serve_durable_start(req, entry, writer, supervisor).await
+        }
+        AttachOrStart::Missing => {
+            write_msg(
+                &mut writer,
+                &WireExecEvent::Refused {
+                    reason: format!(
+                        "durable exec reattach failed: journal for exec_id {exec_id} was GC'd or is missing; refusing to spawn a second command\n"
+                    ),
+                },
+            )
+            .await
+        }
+        AttachOrStart::DegradedStart { reason, .. } => {
+            tracing::warn!(%exec_id, %reason, "durable exec degraded to stage-1 live streaming");
+            write_msg(&mut writer, &WireExecEvent::Degraded(reason)).await?;
+            serve_live_exec(req, writer, supervisor).await
+        }
+    }
+}
+
+async fn serve_durable_start<W>(
+    mut req: crate::proto::WireExecRequest,
+    entry: JournalEntry,
+    writer: W,
+    supervisor: Arc<HarnessSupervisor>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let current_exe = std::env::current_exe()?;
+    let mut cmd = Command::new(&current_exe);
+    cmd.arg("__exec-wrapper")
+        .arg(entry.dir())
+        .arg(
+            req.timeout_ms
+                .map(|timeout| timeout.to_string())
+                .unwrap_or_else(|| "-".to_string()),
+        )
+        .arg("--")
+        .args(&req.command);
     // Base: the durable session env agentd holds from the bind (image
     // `[env]`, secrets, PATH, session id) — identical to what the harness
     // and the interactive shell get, so `engram exec cargo build` sees the
@@ -419,9 +595,9 @@ where
         } else {
             Stdio::null()
         })
-        // SIGKILL on drop in case any later .await? bails before we
-        // reach child.wait — we'd otherwise leak the process.
-        .kill_on_drop(true);
+        // The wrapper is the durable owner: dropping agentd's handle during
+        // RefreshAgent must not kill it.
+        .kill_on_drop(false);
 
     // Issue #569: `spawn_tracked` registers the pid with the reaper's
     // tracked-pid set atomically with the spawn itself (see `crate::reaper`),
@@ -429,12 +605,16 @@ where
     // `child.wait()` for the exit status. `TrackedChild::new` re-asserts the
     // (already-set) registration and untracks on drop, covering every return
     // path below (including the timeout branch).
-    let mut child = crate::reaper::spawn_tracked(&mut cmd)
-        .map_err(|e| io::Error::new(e.kind(), format!("spawn {:?}: {e}", req.command[0])))?;
+    let mut child = crate::reaper::spawn_tracked(&mut cmd).map_err(|e| {
+        io::Error::new(
+            e.kind(),
+            format!("spawn durable wrapper for {:?}: {e}", req.command[0]),
+        )
+    })?;
     let _tracked = child.id().map(crate::reaper::TrackedChild::new);
 
     // stdin is fire-and-forget: drain the buffer, then close.
-    if let Some(bytes) = req.stdin {
+    if let Some(bytes) = req.stdin.take() {
         if let Some(mut stdin) = child.stdin.take() {
             stdin.write_all(&bytes).await.ok();
             // Dropping closes the pipe — child sees EOF on stdin.
@@ -448,6 +628,38 @@ where
 
     let stdout_task = tokio::spawn(forward_stream(stdout, tx.clone(), Stream::Out));
     let stderr_task = tokio::spawn(forward_stream(stderr, tx.clone(), Stream::Err));
+    let degraded_entry = entry.clone();
+    let degraded_tx = tx.clone();
+    let degraded_sent = Arc::new(AtomicBool::new(false));
+    let degraded_sent_by_task = degraded_sent.clone();
+    let degraded_task = tokio::spawn(async move {
+        loop {
+            match degraded_entry.degraded_reason().await {
+                Ok(reason) => {
+                    if !degraded_sent_by_task.swap(true, Ordering::AcqRel) {
+                        drop_send(&degraded_tx, WireExecEvent::Degraded(reason)).await;
+                    }
+                    return;
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    tracing::warn!(
+                        exec_id = degraded_entry.exec_id(),
+                        %error,
+                        "read durable exec degradation marker failed",
+                    );
+                    return;
+                }
+            }
+            if tokio::fs::metadata(degraded_entry.dir().join("exit.json"))
+                .await
+                .is_ok()
+            {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    });
 
     // Single writer task owns the connection's write half and the
     // bincode framing — keeps event ordering well-defined.
@@ -459,38 +671,261 @@ where
         Ok::<_, io::Error>(())
     });
 
-    // Wait on the child (with optional timeout). On timeout, SIGKILL
-    // and emit Exit(None) so the host sees a definitive end.
-    let exit_status = match req.timeout_ms {
-        Some(ms) => match tokio::time::timeout(Duration::from_millis(ms), child.wait()).await {
-            Ok(res) => res?,
-            Err(_) => {
-                // Best-effort kill; if the child already raced to
-                // exit, kill returns Ok or NotFound, both fine.
-                let _ = child.kill().await;
-                let _ = child.wait().await;
-                drop_send(&tx, WireExecEvent::Exit(None)).await;
-                drop(tx);
-                let _ = stdout_task.await;
-                let _ = stderr_task.await;
-                writer_task.await.unwrap_or(Ok(()))?;
-                return Ok(());
-            }
-        },
-        None => child.wait().await?,
-    };
+    let wrapper_status = child.wait().await?;
 
     // Make sure both pipe-drainers finish before sending Exit so the
     // host sees all output that preceded the exit.
     let _ = stdout_task.await;
     let _ = stderr_task.await;
-    drop_send(&tx, WireExecEvent::Exit(exit_status.code())).await;
+    degraded_task.abort();
+    let _ = degraded_task.await;
+    if let Ok(reason) = entry.degraded_reason().await {
+        if !degraded_sent.swap(true, Ordering::AcqRel) {
+            drop_send(&tx, WireExecEvent::Degraded(reason)).await;
+        }
+    }
+    let exit = entry
+        .exit()
+        .await
+        .map(|record| record.exit)
+        .unwrap_or_else(|_| wrapper_status.code());
+    drop_send(&tx, WireExecEvent::Exit(exit)).await;
     drop(tx);
 
     // Surface a writer error (e.g. host disconnected mid-stream) so
     // a test can fail; the agent's accept loop just logs it.
     writer_task.await.unwrap_or(Ok(()))?;
     Ok(())
+}
+
+async fn serve_live_exec<W>(
+    mut req: crate::proto::WireExecRequest,
+    writer: W,
+    supervisor: Arc<HarnessSupervisor>,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin + Send + 'static,
+{
+    let mut cmd = Command::new(&req.command[0]);
+    cmd.args(&req.command[1..]);
+    let session_env = supervisor.session_env();
+    for (key, value) in &session_env {
+        cmd.env(key, value);
+    }
+    for (key, value) in &req.env {
+        cmd.env(key, value);
+    }
+    if let Some(workdir) = &req.workdir {
+        cmd.current_dir(workdir);
+    }
+    cmd.stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .stdin(if req.stdin.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .kill_on_drop(true);
+    let mut child = crate::reaper::spawn_tracked(&mut cmd).map_err(|error| {
+        io::Error::new(error.kind(), format!("spawn {:?}: {error}", req.command[0]))
+    })?;
+    let _tracked = child.id().map(crate::reaper::TrackedChild::new);
+    if let Some(bytes) = req.stdin.take() {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(&bytes).await;
+        }
+    }
+    let stdout = child.stdout.take().expect("piped stdout");
+    let stderr = child.stderr.take().expect("piped stderr");
+    let (tx, mut rx) = mpsc::channel::<WireExecEvent>(EVENT_BUF);
+    let stdout_task = tokio::spawn(forward_stream(stdout, tx.clone(), Stream::Out));
+    let stderr_task = tokio::spawn(forward_stream(stderr, tx.clone(), Stream::Err));
+    let writer_task = tokio::spawn(async move {
+        let mut writer = writer;
+        while let Some(event) = rx.recv().await {
+            write_msg(&mut writer, &event).await?;
+        }
+        Ok::<_, io::Error>(())
+    });
+    let status = match req.timeout_ms {
+        Some(timeout_ms) => {
+            match tokio::time::timeout(Duration::from_millis(timeout_ms), child.wait()).await {
+                Ok(status) => status?,
+                Err(_) => {
+                    let _ = child.kill().await;
+                    let _ = child.wait().await;
+                    drop_send(&tx, WireExecEvent::Exit(None)).await;
+                    drop(tx);
+                    let _ = stdout_task.await;
+                    let _ = stderr_task.await;
+                    writer_task.await.unwrap_or(Ok(()))?;
+                    return Ok(());
+                }
+            }
+        }
+        None => child.wait().await?,
+    };
+    let _ = stdout_task.await;
+    let _ = stderr_task.await;
+    drop_send(&tx, WireExecEvent::Exit(status.code())).await;
+    drop(tx);
+    writer_task.await.unwrap_or(Ok(()))?;
+    Ok(())
+}
+
+async fn tail_journal<W>(
+    entry: &JournalEntry,
+    command: &[String],
+    mut stdout_offset: u64,
+    mut stderr_offset: u64,
+    writer: &mut W,
+) -> io::Result<()>
+where
+    W: AsyncWrite + Unpin,
+{
+    // Command identity is checked before replaying even one byte. A caller
+    // that loses the first-writer race must not receive the other command's
+    // output before the loud mismatch terminal.
+    if let Ok(request) = entry.request().await {
+        if request.command != command {
+            let message = format!(
+                "exec_id {} already belongs to command {:?}; refusing different command {:?} (first writer wins)\n",
+                entry.exec_id(), request.command, command
+            );
+            write_msg(writer, &WireExecEvent::Refused { reason: message }).await?;
+            return Ok(());
+        }
+    }
+    if let Ok(reason) = entry.degraded_reason().await {
+        write_msg(writer, &WireExecEvent::Degraded(reason.clone())).await?;
+        write_msg(
+            writer,
+            &WireExecEvent::Stderr(
+                format!(
+                    "exec_id {} journal is degraded and cannot be re-attached safely: {reason}\n",
+                    entry.exec_id()
+                )
+                .into_bytes(),
+            ),
+        )
+        .await?;
+        write_msg(writer, &WireExecEvent::Exit(None)).await?;
+        return Ok(());
+    }
+
+    // The mkdir marker precedes request.json. Give its first writer a small,
+    // bounded window to publish the command before classifying a torn record.
+    let mut state = entry.state_for(command).await;
+    for _ in 0..40 {
+        if !matches!(
+            &state,
+            AttachState::Died { reason } if reason.starts_with("request.json missing")
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+        state = entry.state_for(command).await;
+    }
+
+    // Identity is decided PERMANENTLY the moment request.json exists (it is
+    // written once, atomically, and never mutated), so one check here covers
+    // every later iteration — and it must precede the drain loop: when the
+    // winner published request.json only after this attach began (skipping
+    // the pre-replay check above), the loser would otherwise stream the
+    // winner's output bytes before its loud mismatch terminal.
+    if let AttachState::Mismatch { recorded_command } = &state {
+        let message = format!(
+            "exec_id {} already belongs to command {:?}; refusing different command {:?} (first writer wins)\n",
+            entry.exec_id(),
+            recorded_command,
+            command
+        );
+        write_msg(writer, &WireExecEvent::Refused { reason: message }).await?;
+        return Ok(());
+    }
+
+    loop {
+        if let Ok(reason) = entry.degraded_reason().await {
+            write_msg(writer, &WireExecEvent::Degraded(reason.clone())).await?;
+            write_msg(
+                writer,
+                &WireExecEvent::Stderr(
+                    format!(
+                        "exec_id {} journal degraded while attached and cannot provide a complete replay: {reason}\n",
+                        entry.exec_id()
+                    )
+                    .into_bytes(),
+                ),
+            )
+            .await?;
+            write_msg(writer, &WireExecEvent::Exit(None)).await?;
+            return Ok(());
+        }
+        let mut progressed = false;
+        if let Some(bytes) = read_journal_chunk(&entry.stdout_path(), &mut stdout_offset).await? {
+            write_msg(writer, &WireExecEvent::Stdout(bytes)).await?;
+            progressed = true;
+        }
+        if let Some(bytes) = read_journal_chunk(&entry.stderr_path(), &mut stderr_offset).await? {
+            write_msg(writer, &WireExecEvent::Stderr(bytes)).await?;
+            progressed = true;
+        }
+
+        state = entry.state_for(command).await;
+        match state {
+            AttachState::Complete(exit) if !progressed => {
+                write_msg(writer, &WireExecEvent::Exit(exit.exit)).await?;
+                return Ok(());
+            }
+            AttachState::Mismatch { recorded_command } => {
+                let message = format!(
+                    "exec_id {} already belongs to command {:?}; refusing different command {:?} (first writer wins)\n",
+                    entry.exec_id(), recorded_command, command
+                );
+                write_msg(writer, &WireExecEvent::Refused { reason: message }).await?;
+                return Ok(());
+            }
+            // Like `Complete`, `Died` terminates only once the drain has
+            // caught up: the dead wrapper's files are static, and their tail
+            // is the crash diagnostic the caller attached for.
+            AttachState::Died { reason } if !progressed => {
+                let message = format!(
+                    "exec_id {} died without exit.json; no exit was fabricated: {reason}\n",
+                    entry.exec_id()
+                );
+                write_msg(writer, &WireExecEvent::Stderr(message.into_bytes())).await?;
+                write_msg(writer, &WireExecEvent::Exit(None)).await?;
+                return Ok(());
+            }
+            AttachState::Running | AttachState::Complete(_) | AttachState::Died { .. } => {
+                if !progressed {
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            }
+        }
+    }
+}
+
+async fn read_journal_chunk(
+    path: &std::path::Path,
+    offset: &mut u64,
+) -> io::Result<Option<Vec<u8>>> {
+    let mut file = match tokio::fs::File::open(path).await {
+        Ok(file) => file,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let len = file.metadata().await?.len();
+    if *offset >= len {
+        return Ok(None);
+    }
+    file.seek(std::io::SeekFrom::Start(*offset)).await?;
+    let available = usize::try_from((len - *offset).min(READ_BUF_BYTES as u64))
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+    let mut bytes = vec![0u8; available];
+    file.read_exact(&mut bytes).await?;
+    *offset += bytes.len() as u64;
+    Ok(Some(bytes))
 }
 
 #[derive(Clone, Copy)]
@@ -702,7 +1137,8 @@ mod tests {
         loop {
             match read_msg::<_, WireExecEvent>(&mut client).await {
                 Ok(ev) => {
-                    let is_exit = matches!(ev, WireExecEvent::Exit(_));
+                    let is_exit =
+                        matches!(ev, WireExecEvent::Exit(_) | WireExecEvent::Refused { .. });
                     events.push(ev);
                     if is_exit {
                         break;
@@ -716,6 +1152,77 @@ mod tests {
         events
     }
 
+    /// A losing attach must NEVER stream the winner's output, even when the
+    /// winner publishes `request.json` only AFTER the loser's attach began
+    /// (the mkdir marker precedes request.json, so the loser's pre-replay
+    /// identity check is skipped). Identity is decided permanently the
+    /// moment request.json exists — the refusal must precede any drain.
+    #[tokio::test]
+    async fn losing_attach_refuses_before_replaying_any_output() {
+        use crate::exec_journal::{JournalEntry, RequestRecord};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("exec-race-loser");
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let entry = JournalEntry::from_dir(&dir).unwrap();
+        // The winner's bytes are already on disk before its request.json is
+        // published — the out-of-order visibility the loser must tolerate.
+        tokio::fs::write(entry.stdout_path(), b"winner secret output")
+            .await
+            .unwrap();
+
+        let publisher = {
+            let entry = entry.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                entry
+                    .write_request(&RequestRecord {
+                        command: vec!["winner-command".into()],
+                        created_at_unix_ms: 0,
+                    })
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let (mut host, mut writer) = duplex(64 * 1024);
+        let tail = {
+            let entry = entry.clone();
+            tokio::spawn(async move {
+                tail_journal(&entry, &["loser-command".into()], 0, 0, &mut writer).await
+            })
+        };
+
+        let mut events = Vec::new();
+        loop {
+            match read_msg::<_, WireExecEvent>(&mut host).await {
+                Ok(ev) => {
+                    let terminal =
+                        matches!(ev, WireExecEvent::Exit(_) | WireExecEvent::Refused { .. });
+                    events.push(ev);
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read_msg: {e}"),
+            }
+        }
+        publisher.await.unwrap();
+        tail.await.unwrap().unwrap();
+
+        assert!(
+            matches!(events.last(), Some(WireExecEvent::Refused { .. })),
+            "the losing attach must terminate with a refusal, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, WireExecEvent::Stdout(_) | WireExecEvent::Stderr(_))),
+            "the losing attach must not replay a single byte of the winner's output, got {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn echo_emits_stdout_and_clean_exit() {
         let evs = run_against(WireExecRequest {
@@ -724,6 +1231,11 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout_ms: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+            attach_only: false,
         })
         .await;
         let stdout: Vec<u8> = evs
@@ -747,6 +1259,11 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout_ms: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+            attach_only: false,
         })
         .await;
         assert!(matches!(evs.last(), Some(WireExecEvent::Exit(Some(7)))));
@@ -760,6 +1277,11 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout_ms: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+            attach_only: false,
         })
         .await;
         let stderr: Vec<u8> = evs
@@ -783,6 +1305,11 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout_ms: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+            attach_only: false,
         })
         .await;
         let stdout: Vec<u8> = evs
@@ -805,6 +1332,11 @@ mod tests {
             env: HashMap::from([("ENGRAM_TEST".into(), "wired".into())]),
             workdir: None,
             timeout_ms: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+            attach_only: false,
         })
         .await;
         let stdout: Vec<u8> = evs
@@ -826,6 +1358,11 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout_ms: Some(50),
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+            attach_only: false,
         })
         .await;
         // Killed by timeout: Exit(None) per the protocol.
@@ -855,6 +1392,11 @@ mod tests {
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
+                exec_id: None,
+                stdout_offset: None,
+                stderr_offset: None,
+                wake: None,
+                attach_only: false,
             }),
         )
         .await
@@ -884,6 +1426,11 @@ mod tests {
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
+                exec_id: None,
+                stdout_offset: None,
+                stderr_offset: None,
+                wake: None,
+                attach_only: false,
             }),
         )
         .await
@@ -929,6 +1476,11 @@ mod tests {
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
+                exec_id: None,
+                stdout_offset: None,
+                stderr_offset: None,
+                wake: None,
+                attach_only: false,
             }),
         )
         .await
@@ -1011,6 +1563,11 @@ mod tests {
                 env: HashMap::new(),
                 workdir: None,
                 timeout_ms: None,
+                exec_id: None,
+                stdout_offset: None,
+                stderr_offset: None,
+                wake: None,
+                attach_only: false,
             }),
         )
         .await
@@ -1041,6 +1598,11 @@ mod tests {
             env: HashMap::new(),
             workdir: None,
             timeout_ms: None,
+            exec_id: None,
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+            attach_only: false,
         })
         .await;
         let mut total_out = Vec::new();
@@ -1050,6 +1612,11 @@ mod tests {
                 WireExecEvent::Stdout(b) => total_out.extend_from_slice(b),
                 WireExecEvent::Stderr(b) => total_err.extend_from_slice(b),
                 WireExecEvent::Exit(_) => panic!("Exit must be the last event, not in the middle"),
+                WireExecEvent::Started(_) => {}
+                WireExecEvent::Degraded(_) => {}
+                WireExecEvent::Refused { reason } => {
+                    panic!("healthy command was unexpectedly refused: {reason}")
+                }
             }
         }
         assert_eq!(total_out, b"out");

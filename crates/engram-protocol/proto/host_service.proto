@@ -5,7 +5,7 @@ syntax = "proto3";
 // `HostClient` trait method (transport per-method dispatch is the
 // debug-grep win); structurally-simple payloads use native proto
 // fields; structurally-complex payloads (SandboxSpec,
-// SnapshotMetadata, SessionEgressPolicy, AgentSpec, ExecRequest)
+// SnapshotMetadata, SessionEgressPolicy, AgentSpec, and ExecRequest's base)
 // stay bincode-encoded inside a `bytes` field. That carves a small
 // proto surface while keeping the existing Rust types
 // authoritative — coord+host always deploy at the same OSS tag so
@@ -203,6 +203,7 @@ service HostService {
 
   // ---- streaming ----
   rpc ExecStart(ExecStartRequest) returns (stream ExecFrame);
+  rpc CancelExec(CancelExecRequest) returns (Empty);
 
   // ADR 0014 issue #6: bidi shell tunnel. Coord pods in GKE can't
   // reach the per-VM `guest_ip` (10.200.0.x; lives behind a TAP on
@@ -739,13 +740,17 @@ message WriteFilesResponse {
 
 message ExecStartRequest {
   bytes sandbox_id = 1; // 16-byte UUID
-  // bincode-encoded `engram_protocol::wire::WireExecRequest`.
+  // bincode-encoded base `engram_protocol::wire::WireExecRequest` fields.
   bytes request_bincode = 2;
+  optional string exec_id = 3;
+  optional uint64 stdout_offset = 4;
+  optional uint64 stderr_offset = 5;
+  optional bool wake = 6;
 }
 
 message ExecFrame {
   oneof frame {
-    // First frame on a fresh stream — carries the host-assigned
+    // First frame on every start or attach — carries the canonical
     // `exec_id`. Mirrors today's `ResponseKind::ExecStarted`.
     string started = 1;
     bytes stdout = 2;
@@ -754,11 +759,19 @@ message ExecFrame {
     // these. `status` is `None` when the process was killed by
     // signal without an exit code.
     ExecExit exit = 4;
+    // Terminal deterministic rejection of this attach. Distinct from Exit
+    // and from a transport-shaped stream error.
+    string refused = 5;
   }
 }
 
 message ExecExit {
   optional int32 status = 1;
+}
+
+message CancelExecRequest {
+  bytes sandbox_id = 1; // 16-byte UUID
+  string exec_id = 2;
 }
 
 // --- ADR 0014 issue #6: ProxyShell ---

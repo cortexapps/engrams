@@ -108,22 +108,40 @@ pub trait HostClient: Send + Sync {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError>;
+    async fn cancel_exec(&self, _id: SandboxId, _exec_id: String) -> Result<(), SandboxError> {
+        Err(SandboxError::Unsupported(
+            "cancel_exec is not implemented by this host transport".into(),
+        ))
+    }
     async fn exec(&self, id: SandboxId, cmd: ExecRequest) -> Result<ExecHandle, SandboxError> {
         use futures::stream::StreamExt;
         let mut stream = self.exec_stream(id, cmd).await?;
         let mut stdout = Vec::new();
         let mut stderr = Vec::new();
-        let mut exit_status = None;
-        while let Some(event) = stream.events.next().await {
-            match event {
-                crate::types::sandbox::ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
-                crate::types::sandbox::ExecEvent::Stderr(b) => stderr.extend_from_slice(&b),
-                crate::types::sandbox::ExecEvent::Exit(s) => {
-                    exit_status = s;
-                    break;
+        let exit_status = loop {
+            match stream.events.next().await {
+                Some(crate::types::sandbox::ExecEvent::Stdout(b)) => {
+                    stdout.extend_from_slice(&b);
+                }
+                Some(crate::types::sandbox::ExecEvent::Stderr(b)) => {
+                    stderr.extend_from_slice(&b);
+                }
+                Some(crate::types::sandbox::ExecEvent::Exit(status)) => break status,
+                Some(crate::types::sandbox::ExecEvent::Refused(reason)) => {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "exec {} refused: {reason}",
+                        stream.exec_id
+                    )));
+                }
+                None => {
+                    return Err(SandboxError::Unavailable(format!(
+                        "exec {} event stream ended without an Exit or Refused frame; its result \
+                         may be recoverable through exec_stream re-attach",
+                        stream.exec_id
+                    )));
                 }
             }
-        }
+        };
         Ok(ExecHandle {
             sandbox_id: stream.sandbox_id,
             exec_id: stream.exec_id,
