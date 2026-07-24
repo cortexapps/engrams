@@ -13,7 +13,6 @@ export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const SWEEP_INTERVAL_MS = 60_000;
 export const SWEEP_GRACE_MS = 600_000;
 export const SWEEP_BATCH_CAP = 5;
-export const MAX_SWEEPS = 3;
 // An unregistered workflow name means no live binary carries its code, so it
 // can never execute again on any current version. Alerting gives operators
 // this window to suppress before the sweep cancels it to a terminal state.
@@ -32,7 +31,6 @@ export interface SweepConfig {
   sweepIntervalMs: number;
   graceMs: number;
   batchCap: number;
-  maxSweeps: number;
 }
 
 export const DEFAULT_SWEEP_CONFIG = {
@@ -40,7 +38,6 @@ export const DEFAULT_SWEEP_CONFIG = {
   sweepIntervalMs: SWEEP_INTERVAL_MS,
   graceMs: SWEEP_GRACE_MS,
   batchCap: SWEEP_BATCH_CAP,
-  maxSweeps: MAX_SWEEPS,
 } as const satisfies SweepConfig;
 
 export interface ScanCursor {
@@ -79,7 +76,6 @@ export type SweepDecision = {
     | "adopted"
     | "enqueued_cleared"
     | "cancelled_stale"
-    | "cancelled_capped"
     | "alert_only"
     | "suppressed"
     // The flip's fence no-opped: the owner version regained liveness or the
@@ -103,13 +99,11 @@ const MUTATING_ACTIONS = new Set<SweepDecision["action"]>([
   "adopted",
   "enqueued_cleared",
   "cancelled_stale",
-  "cancelled_capped",
 ]);
 
 const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
   "alert_only",
   "cancelled_stale",
-  "cancelled_capped",
   "error",
 ]);
 
@@ -240,22 +234,14 @@ export async function runSweepTick(
               name: row.name,
               action: "suppressed",
             };
-          } else if (
-            // The cap dominates every repeated intent: once a workflow has
-            // consumed maxSweeps recorded attempts (adoptions or failing
-            // cancels), further ticks cancel WITHOUT recordSweep, so a
-            // persistently-failing cancelWorkflow retries once per rotation
-            // but can no longer inflate sweep_count without bound.
-            prior !== null &&
-            prior.sweepCount >= deps.config.maxSweeps
-          ) {
-            await deps.cancelWorkflow(row.workflowUuid);
-            decision = {
-              workflowUuid: row.workflowUuid,
-              name: row.name,
-              action: "cancelled_capped",
-            };
           } else {
+            // No automatic sweep-count cap: re-stranding only happens via
+            // version death (once per deploy), so a healthy long-lived
+            // workflow is adopted once per deploy indefinitely — that's
+            // normal, not pathology. A replay that fails loud goes terminal
+            // ERROR and is never re-swept; the rare silent zombie is an
+            // operator call via the ledger's `suppressed` flag, with
+            // sweep_count kept as the evidence trail.
             const lastSeenMs = lastSeenByVersion.get(
               row.applicationVersion!,
             );

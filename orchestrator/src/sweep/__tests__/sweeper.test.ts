@@ -229,19 +229,20 @@ describe("runSweepTick", () => {
     expect(f.cancelled).toEqual(["wf-ancient"]);
   });
 
-  test("cancels a workflow that has reached the sweep-count cap", async () => {
-    const f = await fixture([row("wf-capped")]);
-    for (let count = 0; count < f.deps.config.maxSweeps; count++) {
-      await f.deps.ledger.recordSweep("wf-capped", "ToolExecWorkflow");
+  test("keeps adopting a workflow no matter how often it was swept before", async () => {
+    // Re-stranding only happens once per deploy, so a healthy long-lived
+    // workflow (e.g. a Slack thread drain) accumulates one sweep per deploy
+    // indefinitely — a high count is normal, never grounds for cancellation.
+    const f = await fixture([row("wf-veteran")]);
+    for (let count = 0; count < 10; count++) {
+      await f.deps.ledger.recordSweep("wf-veteran", "ToolExecWorkflow");
     }
 
     const result = await runSweepTick(f.deps);
 
-    expect(result.decisions[0]?.action).toBe("cancelled_capped");
-    expect(f.cancelled).toEqual(["wf-capped"]);
-    expect((await f.deps.ledger.get("wf-capped"))?.sweepCount).toBe(
-      f.deps.config.maxSweeps,
-    );
+    expect(result.decisions[0]?.action).toBe("adopted");
+    expect(f.cancelled).toEqual([]);
+    expect((await f.deps.ledger.get("wf-veteran"))?.sweepCount).toBe(11);
   });
 
   test("does not touch a suppressed workflow", async () => {
@@ -464,7 +465,7 @@ describe("runSweepTick", () => {
     ).toBeNull();
   });
 
-  test("a persistently failing stale cancel stops inflating the sweep count at the cap", async () => {
+  test("a persistently failing stale cancel retries every tick until it lands", async () => {
     const f = await fixture(
       [row("wf-cancel-wedged")],
       {},
@@ -475,30 +476,20 @@ describe("runSweepTick", () => {
       throw new Error("cancel keeps failing");
     };
 
-    // maxSweeps failing cancelled_stale attempts each record intent…
-    for (let attempt = 0; attempt < f.deps.config.maxSweeps; attempt++) {
+    // Each failing attempt is a contained row error; sweep_count records
+    // every attempt (it's an evidence trail, never a trigger).
+    for (let attempt = 0; attempt < 3; attempt++) {
       const result = await runSweepTick(f.deps);
       expect(result.decisions[0]?.action).toBe("error");
     }
-    expect((await f.deps.ledger.get("wf-cancel-wedged"))?.sweepCount).toBe(
-      f.deps.config.maxSweeps,
-    );
+    expect((await f.deps.ledger.get("wf-cancel-wedged"))?.sweepCount).toBe(3);
 
-    // …then the cap dominates: further ticks retry the cancel via
-    // cancelled_capped WITHOUT recordSweep, so the count stays bounded.
-    for (let attempt = 0; attempt < 3; attempt++) {
-      await runSweepTick(f.deps);
-    }
-    expect((await f.deps.ledger.get("wf-cancel-wedged"))?.sweepCount).toBe(
-      f.deps.config.maxSweeps,
-    );
-
-    // When the cancel finally succeeds, the workflow terminates as capped.
+    // When the cancel finally succeeds, the workflow terminates as stale.
     f.deps.cancelWorkflow = async (workflowUuid) => {
       f.cancelled.push(workflowUuid);
     };
     const final = await runSweepTick(f.deps);
-    expect(final.decisions[0]?.action).toBe("cancelled_capped");
+    expect(final.decisions[0]?.action).toBe("cancelled_stale");
     expect(f.cancelled).toEqual(["wf-cancel-wedged"]);
   });
 
@@ -520,17 +511,16 @@ describe("runSweepTick", () => {
   });
 
   test("contains a cancel error and continues to the next row", async () => {
-    // wf-bad-cancel hits the cap path (cancel throws); wf-next on the same
-    // freshly-abandoned version still adopts.
+    // wf-bad-cancel sits on a version with no heartbeat history (abandoned
+    // forever → stale-cancel path, and the cancel throws); wf-next on the
+    // freshly-abandoned DEAD_VERSION still adopts.
     const f = await fixture([
       row("wf-bad-cancel", {
+        applicationVersion: "version-no-history",
         createdAtEpochMs: NOW.getTime() - 3 * HOUR_MS,
       }),
       row("wf-next", { createdAtEpochMs: NOW.getTime() - 1_000 }),
     ]);
-    for (let count = 0; count < f.deps.config.maxSweeps; count++) {
-      await f.deps.ledger.recordSweep("wf-bad-cancel", "ToolExecWorkflow");
-    }
     f.deps.cancelWorkflow = async (workflowUuid) => {
       if (workflowUuid === "wf-bad-cancel") throw new Error("cancel failed");
       f.cancelled.push(workflowUuid);

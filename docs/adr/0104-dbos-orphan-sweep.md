@@ -95,8 +95,12 @@ abandoned rows back into the queue and pods pull.
    Stuck `ENQUEUED` rows on dead versions get only the
    `application_version = NULL` part.
 4. **Sweep ledger** (second table): per-workflow sweep count + timestamps +
-   per-instance `suppressed` flag. Caps re-sweeps (default 3), dedupes
-   alerts, records which cleanup callback ran, gives operators history.
+   per-instance `suppressed` flag. Dedupes alerts and gives operators
+   history. The sweep count is an evidence trail only — there is **no
+   automatic re-sweep cap** (removed in review; see below): a healthy
+   long-lived workflow is stranded once per deploy by design, so a high
+   count is normal, and the `suppressed` flag is the operator kill switch
+   for the rare genuine zombie.
 5. **Sweep policy registry** — keyed by registered workflow name, lives in
    code, **exhaustive by construction**: at boot every registered workflow
    must have a policy entry (mode `adopt`; unknown names are alert-only) or
@@ -146,7 +150,6 @@ abandoned rows back into the queue and pods pull.
 | grace window (version considered dead) | 10 min |
 | staleness cutoff (cancel instead of adopt) | 48h |
 | batch cap per cycle | 5 workflows |
-| max sweeps per workflow | 3 |
 
 ### Safety properties
 
@@ -305,9 +308,8 @@ The re-review round (2 LOW):
   to the recurring actions (`alert_only`, `error`, which re-fire every cycle
   for rows that stay in the scan set). A successful cancel is intrinsically
   once-per-workflow — the row turns CANCELLED and leaves the scan set — so a
-  `cancelled_stale`/`cancelled_capped` alert is never suppressed by an
-  earlier alert-only alert; the termination is the transition operators must
-  see.
+  `cancelled_stale` alert is never suppressed by an earlier alert-only
+  alert; the termination is the transition operators must see.
 
 Third round (2 LOW):
 
@@ -418,3 +420,26 @@ cancellation**:
 - The declined boot-guard finding stands unchanged: the first heartbeat
   still crashes on failure because unproven liveness is a real adoption
   hazard.
+
+### Simplification: no automatic sweep-count cap (2026-07-24)
+
+The re-sweep cap (`maxSweeps`, default 3, action `cancelled_capped`)
+conflated "swept N times" with "N failed rescue attempts" and would have
+cancelled healthy work: a long-lived workflow (a thread drain is PENDING for
+its whole multi-day session by design) is stranded once per deploy, so at
+~10 deploys/day the cap guaranteed destruction of any thread surviving four
+deploys. Removed entirely, because the loop it guarded barely exists:
+
+- Re-stranding only happens via version death — **once per deploy, never
+  faster** — so "runaway re-adoption" is bounded by deploy cadence and each
+  adoption costs one UPDATE + re-enqueue.
+- A replay that fails loud goes terminal `ERROR`, alerts, and is never
+  re-swept: the real poison-pill backstop, independent of any cap.
+- The residual case (a silent zombie re-adopted forever) is an operator
+  call: the ledger's `suppressed` flag stops adoption for one workflow, and
+  `sweep_count` (still recorded by the flip transaction, unbounded, purely
+  evidence) makes the candidate visible.
+
+This supersedes the third round's cap-ordering fix — that machinery is gone.
+Deleted: `MAX_SWEEPS`, `SweepConfig.maxSweeps`, the cap branch, the
+`cancelled_capped` action and its alert wiring.
