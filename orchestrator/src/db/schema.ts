@@ -381,12 +381,6 @@ export const dbosSweepLedger = pgTable("dbos_sweep_ledger", {
   terminalAlertedAt: timestamp("terminal_alerted_at", { withTimezone: true }),
 });
 
-/** Tiny watermark KV used by the terminal-failure alert scan. */
-export const dbosSweepState = pgTable("dbos_sweep_state", {
-  key: text("key").primaryKey(),
-  epochMs: bigint("epoch_ms", { mode: "number" }).notNull(),
-});
-
 /** Single-row cross-pod lease for one sweep owner per cycle. */
 export const dbosSweepLease = pgTable("dbos_sweep_lease", {
   name: text("name").primaryKey(),

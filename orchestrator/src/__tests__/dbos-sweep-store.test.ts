@@ -13,11 +13,10 @@ async function sweepModule() {
 }
 
 describe("DBOS sweep schema", () => {
-  test("exports all four sweep tables", async () => {
+  test("exports the three sweep tables", async () => {
     const schema = await import("../db/schema.ts");
     expect(schema.dbosVersionHeartbeats).toBeDefined();
     expect(schema.dbosSweepLedger).toBeDefined();
-    expect(schema.dbosSweepState).toBeDefined();
     expect(schema.dbosSweepLease).toBeDefined();
   });
 });
@@ -122,12 +121,6 @@ describe("in-memory sweep ledger store", () => {
     // The two alert streams keep distinct dedup keys.
     expect((await store.get("wf-1"))?.alertedAt?.getTime()).toBe(23_000);
     expect(await store.get("missing")).toBeNull();
-
-    expect(await store.getWatermark("failures")).toBeNull();
-    await store.setWatermark("failures", 123);
-    expect(await store.getWatermark("failures")).toBe(123);
-    await store.setWatermark("failures", 456);
-    expect(await store.getWatermark("failures")).toBe(456);
   });
 });
 
@@ -358,58 +351,76 @@ describe("in-memory DBOS status store", () => {
     });
   });
 
-  test("lists only newly terminal failures after the strict watermark", async () => {
+  test("lists unhandled terminal failures inside the lookback, oldest first", async () => {
     const { makeInMemoryDbosStatusStore } = await sweepModule();
-    const store = makeInMemoryDbosStatusStore([
+    const nowMs = 10_000;
+    const handled = new Set(["already-handled"]);
+    const store = makeInMemoryDbosStatusStore(
+      [
+        {
+          workflowUuid: "too-old",
+          name: "WorkflowOne",
+          status: "ERROR",
+          applicationVersion: null,
+          createdAtEpochMs: 10,
+          updatedAtEpochMs: nowMs - 5_000,
+          recoveryAttempts: 1,
+        },
+        {
+          workflowUuid: "already-handled",
+          name: "WorkflowTwo",
+          status: "ERROR",
+          applicationVersion: "dead",
+          createdAtEpochMs: 20,
+          updatedAtEpochMs: nowMs - 400,
+          recoveryAttempts: 2,
+        },
+        {
+          workflowUuid: "max-recovery",
+          name: "WorkflowTwo",
+          status: "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
+          applicationVersion: "dead",
+          createdAtEpochMs: 30,
+          updatedAtEpochMs: nowMs - 300,
+          recoveryAttempts: 10,
+        },
+        {
+          workflowUuid: "error",
+          name: "WorkflowOne",
+          status: "ERROR",
+          applicationVersion: "dead",
+          createdAtEpochMs: 40,
+          updatedAtEpochMs: nowMs - 200,
+          recoveryAttempts: 2,
+        },
+        {
+          workflowUuid: "success",
+          name: "WorkflowOne",
+          status: "SUCCESS",
+          applicationVersion: "dead",
+          createdAtEpochMs: 50,
+          updatedAtEpochMs: nowMs - 100,
+          recoveryAttempts: 0,
+        },
+      ],
+      () => new Date(nowMs),
       {
-        workflowUuid: "at-watermark",
-        name: "WorkflowOne",
-        status: "ERROR",
-        applicationVersion: null,
-        createdAtEpochMs: 10,
-        updatedAtEpochMs: 100,
-        recoveryAttempts: 1,
+        isTerminalFailureHandled: (workflowUuid) => handled.has(workflowUuid),
       },
-      {
-        workflowUuid: "max-recovery",
-        name: "WorkflowTwo",
-        status: "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
-        applicationVersion: "dead",
-        createdAtEpochMs: 20,
-        updatedAtEpochMs: 101,
-        recoveryAttempts: 10,
-      },
-      {
-        workflowUuid: "error",
-        name: "WorkflowOne",
-        status: "ERROR",
-        applicationVersion: "dead",
-        createdAtEpochMs: 30,
-        updatedAtEpochMs: 102,
-        recoveryAttempts: 2,
-      },
-      {
-        workflowUuid: "success",
-        name: "WorkflowOne",
-        status: "SUCCESS",
-        applicationVersion: "dead",
-        createdAtEpochMs: 40,
-        updatedAtEpochMs: 103,
-        recoveryAttempts: 0,
-      },
-    ]);
+    );
 
-    expect(await store.listNewlyTerminalFailed(100, 1)).toEqual([
-      {
-        workflowUuid: "max-recovery",
-        name: "WorkflowTwo",
-        status: "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
-        applicationVersion: "dead",
-        createdAtEpochMs: 20,
-        updatedAtEpochMs: 101,
-        recoveryAttempts: 10,
-      },
-    ]);
+    // The lookback excludes too-old, the anti-join excludes already-handled,
+    // the status filter excludes success, and the limit binds after both.
+    expect(
+      (await store.listUnhandledTerminalFailures(1_000, 1)).map(
+        (row) => row.workflowUuid,
+      ),
+    ).toEqual(["max-recovery"]);
+    expect(
+      (await store.listUnhandledTerminalFailures(1_000, 10)).map(
+        (row) => row.workflowUuid,
+      ),
+    ).toEqual(["max-recovery", "error"]);
   });
 });
 
@@ -444,8 +455,6 @@ describe("DBOS sweep stores with live Postgres", () => {
                          where "pod_name" like ${`${runId}-%`}`);
     await db.execute(sql`delete from "dbos_sweep_ledger"
                          where "workflow_uuid" like ${`${runId}-%`}`);
-    await db.execute(sql`delete from "dbos_sweep_state"
-                         where "key" like ${`${runId}-%`}`);
     await db.execute(sql`delete from "dbos_sweep_lease"
                          where "owner" like ${`${runId}-%`}`);
     await DBOS.shutdown();
@@ -507,7 +516,6 @@ describe("DBOS sweep stores with live Postgres", () => {
     const { makeSweepLedgerStore } = await sweepModule();
     const store = makeSweepLedgerStore();
     const workflowUuid = `${runId}-ledger`;
-    const watermarkKey = `${runId}-failures`;
 
     expect((await store.recordSweep(workflowUuid, "WorkflowOne")).sweepCount).toBe(1);
     expect((await store.recordSweep(workflowUuid, "WorkflowOne")).sweepCount).toBe(2);
@@ -524,9 +532,6 @@ describe("DBOS sweep stores with live Postgres", () => {
     });
     expect((await store.get(workflowUuid))?.alertedAt).not.toBeNull();
     expect((await store.get(workflowUuid))?.terminalAlertedAt).not.toBeNull();
-    await store.setWatermark(watermarkKey, 123);
-    await store.setWatermark(watermarkKey, 456);
-    expect(await store.getWatermark(watermarkKey)).toBe(456);
   });
 
   test.skipIf(!dbReachable)(
@@ -766,35 +771,37 @@ describe("DBOS sweep stores with live Postgres", () => {
     },
   );
 
-  test.skipIf(!dbReachable)("terminal failure scan uses a strict ordered watermark", async () => {
-    const { makeDbosStatusStore } = await sweepModule();
+  test.skipIf(!dbReachable)("terminal failure scan anti-joins the ledger's completion marks", async () => {
+    const { makeDbosStatusStore, makeSweepLedgerStore } = await sweepModule();
     const store = makeDbosStatusStore();
-    const atWatermark = `${runId}-failed-at`;
-    const maxRecovery = `${runId}-failed-max`;
-    const error = `${runId}-failed-error`;
+    const ledger = makeSweepLedgerStore();
+    const tooOld = `${runId}-failed-too-old`;
+    const handled = `${runId}-failed-handled`;
+    const alertedOnly = `${runId}-failed-alerted-only`;
+    const fresh = `${runId}-failed-fresh`;
 
+    const nowExpr = sql`(extract(epoch from now()) * 1000)::bigint`;
     await getDb().execute(sql`
       insert into "dbos"."workflow_status"
         ("workflow_uuid", "status", "name", "application_version",
          "recovery_attempts", "created_at", "updated_at")
       values
-        (${atWatermark}, 'ERROR', 'WorkflowOne', null, 1, 10, 100),
-        (${maxRecovery}, 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', 'WorkflowTwo',
-         'dead', 10, 20, 101),
-        (${error}, 'ERROR', 'WorkflowOne', 'dead', 2, 30, 102)
+        (${tooOld}, 'ERROR', 'WorkflowOne', null, 1, 10, ${nowExpr} - 5000),
+        (${handled}, 'ERROR', 'WorkflowTwo', 'dead', 2, 20, ${nowExpr} - 400),
+        (${alertedOnly}, 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', 'WorkflowTwo',
+         'dead', 10, 30, ${nowExpr} - 300),
+        (${fresh}, 'ERROR', 'WorkflowOne', 'dead', 2, 40, ${nowExpr} - 200)
     `);
+    // handled has BOTH completion marks and is excluded; alertedOnly has
+    // only the alert mark and must stay in the set until its cleanup lands.
+    await ledger.markTerminalAlerted(handled, "WorkflowTwo");
+    await ledger.markCleanupDone(handled, "WorkflowTwo", "none");
+    await ledger.markTerminalAlerted(alertedOnly, "WorkflowTwo");
 
-    expect(await store.listNewlyTerminalFailed(100, 1)).toEqual([
-      {
-        workflowUuid: maxRecovery,
-        name: "WorkflowTwo",
-        status: "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
-        applicationVersion: "dead",
-        createdAtEpochMs: 20,
-        updatedAtEpochMs: 101,
-        recoveryAttempts: 10,
-      },
-    ]);
+    const rows = (await store.listUnhandledTerminalFailures(1_000, 500))
+      .map((row) => row.workflowUuid)
+      .filter((workflowUuid) => workflowUuid.startsWith(runId));
+    expect(rows).toEqual([alertedOnly, fresh]);
   });
 
   test.skipIf(!dbReachable)(

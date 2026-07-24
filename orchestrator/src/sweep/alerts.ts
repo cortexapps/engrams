@@ -12,16 +12,13 @@ import type {
 } from "./policy.ts";
 import type { SweepDecision } from "./sweeper.ts";
 
-const TERMINAL_FAILURE_WATERMARK = "terminal_failures";
-const TERMINAL_FAILURE_LOOKBACK_MS = 24 * 60 * 60 * 1_000;
+// Progress through terminal failures is tracked by the ledger's completion
+// marks (terminal_alerted_at + cleanup_done_at) via a store-level anti-join,
+// never by a timestamp watermark: a row whose commit becomes visible late, or
+// that ties another row's timestamp, is simply still in the set next cycle.
+// The lookback only bounds the query; a week tolerates long outages.
+const TERMINAL_FAILURE_LOOKBACK_MS = 7 * 24 * 60 * 60 * 1_000;
 const TERMINAL_FAILURE_BATCH_SIZE = 50;
-// The DBOS SDK stamps workflow_status.updated_at in JS before the write
-// commits, so a row can become visible AFTER a scan already advanced the
-// watermark past its timestamp (narrowest case: a same-millisecond tie whose
-// commit lands late). The watermark therefore never advances into the most
-// recent lag window; once a timestamp is older than the lag, no new commits
-// can appear behind it and advancing to it exactly is safe.
-export const TERMINAL_FAILURE_VISIBILITY_LAG_MS = 10_000;
 const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
   "alert_only",
   "cancelled_stale",
@@ -44,7 +41,6 @@ export interface FailureScanResult {
   alerted: number;
   cleanupsRun: number;
   cleanupsFailed: number;
-  watermark: number;
 }
 
 export interface SweepAlerter {
@@ -58,7 +54,6 @@ export interface SweepAlerterDeps {
   post: (text: string) => Promise<void>;
   policies: (name: string) => ResolvedPolicy;
   cleanupCtx: SweepContext;
-  now: () => Date;
   log: Logger;
   maxCleanupAttempts: number;
 }
@@ -89,14 +84,15 @@ function terminalFailureMessage(workflow: FailedWorkflow): string {
 }
 
 /** Handle one terminal-failed row: unconditional alert first, then the policy
- * cleanup callback. Returns true when the row is fully processed (the
- * watermark may move past it), false when it must be re-scanned next cycle. */
+ * cleanup callback. Progress is recorded as ledger completion marks; a row
+ * that returns without both marks simply stays in the anti-join's result set
+ * and is retried next cycle. */
 async function processRow(
   deps: SweepAlerterDeps,
   cleanupFailures: Map<string, number>,
   row: { workflowUuid: string; name: string; status: string; updatedAtEpochMs: number },
   result: FailureScanResult,
-): Promise<boolean> {
+): Promise<void> {
   const workflow: FailedWorkflow = {
     workflowUuid: row.workflowUuid,
     name: row.name,
@@ -119,7 +115,7 @@ async function processRow(
         { error, workflowUuid: row.workflowUuid },
         "failed to post DBOS terminal failure alert",
       );
-      return false;
+      return;
     }
   }
 
@@ -127,7 +123,19 @@ async function processRow(
   const callback =
     "onTerminalFailure" in policy ? policy.onTerminalFailure : undefined;
   const ledgerBeforeCleanup = await deps.ledger.get(row.workflowUuid);
-  if (!callback || ledgerBeforeCleanup?.cleanupDoneAt) return true;
+  if (ledgerBeforeCleanup?.cleanupDoneAt) return;
+  if (!callback) {
+    // Record "nothing to clean up" so the anti-join stops returning the row.
+    try {
+      await deps.ledger.markCleanupDone(row.workflowUuid, row.name, "none");
+    } catch (error) {
+      deps.log.error(
+        { error, workflowUuid: row.workflowUuid },
+        "failed to record no-op DBOS cleanup",
+      );
+    }
+    return;
+  }
 
   const fnName = callbackName(callback);
   result.cleanupsRun++;
@@ -135,7 +143,7 @@ async function processRow(
     await callback(deps.cleanupCtx, workflow);
     await deps.ledger.markCleanupDone(row.workflowUuid, row.name, fnName);
     cleanupFailures.delete(row.workflowUuid);
-    return true;
+    return;
   } catch (error) {
     result.cleanupsFailed++;
     const failures = (cleanupFailures.get(row.workflowUuid) ?? 0) + 1;
@@ -151,10 +159,10 @@ async function processRow(
       "DBOS terminal failure cleanup failed",
     );
 
-    if (failures < deps.maxCleanupAttempts) return false;
+    if (failures < deps.maxCleanupAttempts) return;
 
     // Attempt cap hit (per process lifetime): the abandonment alert must land
-    // before the durable gave-up mark allows the watermark to move on.
+    // before the durable gave-up mark removes the row from the unhandled set.
     const gaveUpName = `gave-up:${fnName}`;
     try {
       await deps.post(
@@ -166,7 +174,7 @@ async function processRow(
         { error: postError, workflowUuid: row.workflowUuid, cleanup: fnName },
         "failed to post abandoned DBOS cleanup alert",
       );
-      return false;
+      return;
     }
     try {
       await deps.ledger.markCleanupDone(row.workflowUuid, row.name, gaveUpName);
@@ -176,9 +184,7 @@ async function processRow(
         { error: markError, workflowUuid: row.workflowUuid, cleanup: fnName },
         "failed to record abandoned DBOS cleanup",
       );
-      return false;
     }
-    return true;
   }
 }
 
@@ -188,14 +194,11 @@ async function processRow(
  * tolerate a repeat. The in-memory attempt cap resets across pods/restarts,
  * which permits extra idempotent cleanup attempts but never a lost alarm. Once
  * the cap is reached, every retry remains capped: the abandonment alert posts
- * first, and only its success permits the durable gave-up cleanup mark and
- * watermark advance.
+ * first, and only its success permits the durable gave-up cleanup mark that
+ * removes the row from the unhandled set.
  */
 export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
   const cleanupFailures = new Map<string, number>();
-  let expandedRescan:
-    | { watermark: number; queryLimit: number }
-    | undefined;
 
   return {
     async alertDecisions(decisions) {
@@ -222,75 +225,19 @@ export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
     },
 
     async scanTerminalFailures() {
-      const since =
-        (await deps.ledger.getWatermark(TERMINAL_FAILURE_WATERMARK)) ??
-        deps.now().getTime() - TERMINAL_FAILURE_LOOKBACK_MS;
-      const queryLimit =
-        expandedRescan?.watermark === since
-          ? expandedRescan.queryLimit
-          : TERMINAL_FAILURE_BATCH_SIZE;
-      expandedRescan = undefined;
-      const rows = await deps.status.listNewlyTerminalFailed(
-        since,
-        queryLimit,
+      const rows = await deps.status.listUnhandledTerminalFailures(
+        TERMINAL_FAILURE_LOOKBACK_MS,
+        TERMINAL_FAILURE_BATCH_SIZE,
       );
       const result: FailureScanResult = {
         scanned: rows.length,
         alerted: 0,
         cleanupsRun: 0,
         cleanupsFailed: 0,
-        watermark: since,
       };
 
-      // Rewind one millisecond before the first blocked row, or before the
-      // final timestamp of a full batch. This re-includes every row tied at
-      // that timestamp; ledger dedup keeps completed work quiet. A full batch
-      // also expands the next query enough to get past a tied prefix that
-      // would otherwise consume the same LIMIT forever.
-      let firstBlockedAt: number | undefined;
-
       for (const row of rows) {
-        const processed = await processRow(deps, cleanupFailures, row, result);
-        if (!processed && firstBlockedAt === undefined) {
-          firstBlockedAt = row.updatedAtEpochMs;
-        }
-      }
-
-      if (firstBlockedAt !== undefined) {
-        result.watermark = firstBlockedAt - 1;
-      } else if (rows.length > 0) {
-        const lastUpdatedAt = rows[rows.length - 1]!.updatedAtEpochMs;
-        if (rows.length < queryLimit) {
-          result.watermark = lastUpdatedAt;
-        } else {
-          result.watermark = lastUpdatedAt - 1;
-          const tiedAtBoundary = rows.filter(
-            (row) => row.updatedAtEpochMs === lastUpdatedAt,
-          ).length;
-          expandedRescan = {
-            watermark: result.watermark,
-            queryLimit: TERMINAL_FAILURE_BATCH_SIZE + tiedAtBoundary,
-          };
-        }
-      }
-
-      // Trail wall clock by the visibility lag (see the constant above) so a
-      // late-committing row can never land behind the watermark. The clamped
-      // window is re-scanned next cycle; ledger dedup keeps it quiet.
-      result.watermark = Math.max(
-        since,
-        Math.min(
-          result.watermark,
-          deps.now().getTime() - TERMINAL_FAILURE_VISIBILITY_LAG_MS,
-        ),
-      );
-      if (expandedRescan) expandedRescan.watermark = result.watermark;
-
-      if (result.watermark !== since) {
-        await deps.ledger.setWatermark(
-          TERMINAL_FAILURE_WATERMARK,
-          result.watermark,
-        );
+        await processRow(deps, cleanupFailures, row, result);
       }
 
       return result;

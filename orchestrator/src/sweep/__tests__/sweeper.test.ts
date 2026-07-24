@@ -740,7 +740,7 @@ describe("runSweepTick", () => {
       async clearVersionOnEnqueuedRecording() {
         return { flipped: false };
       },
-      async listNewlyTerminalFailed() {
+      async listUnhandledTerminalFailures() {
         return [];
       },
     };
@@ -764,7 +764,6 @@ describe("runSweepTick", () => {
           alerted: 1,
           cleanupsRun: 1,
           cleanupsFailed: 0,
-          watermark: 123,
         };
       },
     };
@@ -778,7 +777,6 @@ describe("runSweepTick", () => {
       alerted: 1,
       cleanupsRun: 1,
       cleanupsFailed: 0,
-      watermark: 123,
     });
     // The alerter ran before the finally block released the lease.
     expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);

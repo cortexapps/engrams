@@ -120,10 +120,12 @@ abandoned rows back into the queue and pods pull.
    unconditionally. DB names with no registration: renamed/deleted workflow
    types → alert-only, never adopt; `temp_workflow-send-*` → adopt (a single
    idempotent send); other unknowns → alert-only.
-6. **Failure alerting**: the same loop scans for *newly* terminal-failed
-   workflows (`ERROR`, `MAX_RECOVERY_ATTEMPTS_EXCEEDED`) via a watermark and
-   posts to a configured Slack ops channel. Alert failures log and never
-   crash the sweep.
+6. **Failure alerting**: the same loop scans for *unhandled* terminal-failed
+   workflows (`ERROR`, `MAX_RECOVERY_ATTEMPTS_EXCEEDED`) — a 7-day-lookback
+   query that anti-joins the ledger's completion marks (`terminal_alerted_at`
+   AND `cleanup_done_at`); handled rows drop out of the set, so there is no
+   cursor or watermark to advance — and posts to a configured Slack ops
+   channel. Alert failures log and never crash the sweep.
 7. **Thread black-hole guard**: when a `SlackThreadWorkflow` fails terminally
    (typically a changed-body replay after adoption), post one note to the
    affected thread itself ("this conversation hit a snag — start a fresh
@@ -309,3 +311,35 @@ Third round (2 LOW):
   terminal-failure alerts are distinct streams; sharing `alerted_at` let an
   adoption-race `error` decision alert suppress the later terminal-failure
   alarm for the same workflow.
+
+Fourth round (2 LOW, both reductions): `cancelled_policy` joins
+ALERT_ACTIONS so a future cancel-mode policy cannot cancel silently — it
+inherits the cancel-class dedup exemption for the same once-per-workflow
+reason. `makeDisabledSweepAlerter` lost its last caller when the dead
+production factories were retired; deleted per the clean-breaks convention.
+
+### Simplification: the failure scan is an anti-join, not a watermark
+
+Four of the seven post-merge review findings were bugs in the failure scan's
+watermark machinery (the rewind rules, timestamp ties, the late-commit
+clamp, the shared dedup key), not in the sweep itself — the signature of a
+structure fighting its own optimization. The watermark existed only to avoid
+re-scanning old rows, but the ledger already records exactly which failures
+were handled. Replaced wholesale:
+
+- `listUnhandledTerminalFailures(lookbackMs, limit)` selects terminal
+  failures from the last 7 days with **no ledger row carrying both
+  completion marks** (`terminal_alerted_at` AND `cleanup_done_at`). Progress
+  is exclusion-by-completion: a late-visible commit or a timestamp tie is
+  simply still in the set next cycle; a full batch leaves the remainder for
+  the next cycle; a wedged cleanup keeps only its own row in the set until
+  the attempt cap's durable gave-up mark excludes it.
+- A workflow whose policy has no `onTerminalFailure` gets
+  `cleanup_done_at`/`cleanup_fn = "none"` recorded after its alert, so it
+  too leaves the set.
+- Deleted: the `dbos_sweep_state` watermark table (migration 0035; created
+  and dropped within this branch, never deployed), `getWatermark` /
+  `setWatermark`, the first-blocked/full-batch rewind rules, the
+  `expandedRescan` tie expansion, the 10s visibility-lag clamp, and the
+  alerter's `now` dependency. The 7-day lookback (up from the watermark's
+  24h bootstrap) also tolerates multi-day outages.

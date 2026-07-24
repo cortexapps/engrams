@@ -16,7 +16,6 @@ import {
   makeHeartbeatStore,
   makeSweepLeaseStore,
   makeSweepLedgerStore,
-  type SweepLedgerStore,
 } from "../../db/dbos-sweep.ts";
 import { makeSweepAlerter } from "../alerts.ts";
 import {
@@ -52,7 +51,6 @@ const {
 
 const workflowIds = new Set<string>();
 const heartbeatPodPrefix = `${runId}-pod`;
-const stateKeyPrefix = `${runId}:`;
 const POLL_INTERVAL_MS = 100;
 
 interface WorkflowRow {
@@ -256,15 +254,6 @@ async function deleteSynthetic(workflowId: string): Promise<void> {
   `);
 }
 
-function namespacedWatermarks(ledger: SweepLedgerStore): SweepLedgerStore {
-  return {
-    ...ledger,
-    getWatermark: (key) => ledger.getWatermark(`${stateKeyPrefix}${key}`),
-    setWatermark: (key, epochMs) =>
-      ledger.setWatermark(`${stateKeyPrefix}${key}`, epochMs),
-  };
-}
-
 describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () => {
   beforeAll(async () => {
     DBOS.setConfig({
@@ -306,10 +295,6 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
     await db.execute(sql`
       delete from "dbos_sweep_ledger"
       where "workflow_uuid" like ${`%${runId}%`}
-    `);
-    await db.execute(sql`
-      delete from "dbos_sweep_state"
-      where "key" like ${`${stateKeyPrefix}%`}
     `);
     await db.execute(sql`
       delete from "dbos_sweep_lease"
@@ -428,13 +413,7 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
       expect(errorText).toContain("beta");
       expect(failedStatus?.status).toBe("ERROR");
 
-      const ledger = namespacedWatermarks(makeSweepLedgerStore());
-      // Start immediately before this failure rather than inheriting unrelated
-      // terminal failures from a shared test database.
-      await ledger.setWatermark(
-        "terminal_failures",
-        failedRow.updatedAtEpochMs - 1,
-      );
+      const ledger = makeSweepLedgerStore();
       const posts: string[] = [];
       const cleanupCalls: string[] = [];
       async function recordingCleanup(
@@ -464,15 +443,30 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
               onTerminalFailure: recordingCleanup,
             }
           : integrationPolicy(name);
+      // Scan only this scenario's workflow so unrelated terminal failures in
+      // a shared test database cannot skew the counts.
+      const rawStatus = makeDbosStatusStore();
+      const status = {
+        ...rawStatus,
+        async listUnhandledTerminalFailures(
+          lookbackMs: number,
+          limit: number,
+        ) {
+          const rows = await rawStatus.listUnhandledTerminalFailures(
+            lookbackMs,
+            limit,
+          );
+          return rows.filter((row) => row.workflowUuid === workflowId);
+        },
+      };
       const alerter = makeSweepAlerter({
         ledger,
-        status: makeDbosStatusStore(),
+        status,
         post: async (text) => {
           posts.push(text);
         },
         policies,
         cleanupCtx,
-        now: () => new Date(),
         log,
         maxCleanupAttempts: 3,
       });
@@ -483,9 +477,6 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
         alerted: 1,
         cleanupsRun: 1,
         cleanupsFailed: 0,
-        // The failure is seconds old — inside the visibility lag — so the
-        // watermark holds instead of advancing past a potential late commit.
-        watermark: failedRow.updatedAtEpochMs - 1,
       });
       expect(posts).toHaveLength(1);
       expect(posts[0]).toContain(workflowId);
@@ -495,14 +486,11 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
       });
       expect((await ledger.get(workflowId))?.terminalAlertedAt).not.toBeNull();
       expect((await ledger.get(workflowId))?.cleanupDoneAt).not.toBeNull();
-      expect(await ledger.getWatermark("terminal_failures")).toBe(
-        failedRow.updatedAtEpochMs - 1,
-      );
 
-      // The re-scan of the held window is quiet: the row is examined again
-      // but its alert and cleanup are ledger-deduped.
+      // Both completion marks are recorded, so the anti-join now excludes
+      // the row entirely — no re-scan, no duplicate alert or cleanup.
       const secondScan = await alerter.scanTerminalFailures();
-      expect(secondScan.scanned).toBe(1);
+      expect(secondScan.scanned).toBe(0);
       expect(posts).toHaveLength(1);
       expect(cleanupCalls).toEqual([workflowId]);
     },

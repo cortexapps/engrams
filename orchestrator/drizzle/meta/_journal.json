@@ -246,6 +246,13 @@
       "when": 1784912663484,
       "tag": "0034_last_komodo",
       "breakpoints": true
+    },
+    {
+      "idx": 35,
+      "version": "7",
+      "when": 1784914376240,
+      "tag": "0035_green_centennial",
+      "breakpoints": true
     }
   ]
 }

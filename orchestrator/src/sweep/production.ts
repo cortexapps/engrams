@@ -104,7 +104,6 @@ export function makeSweepRuntime(deps: SweepRuntimeDeps): {
     post,
     policies: resolvePolicy,
     cleanupCtx,
-    now,
     log,
     maxCleanupAttempts: MAX_SWEEPS,
   });

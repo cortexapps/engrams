@@ -63,8 +63,6 @@ export interface SweepLedgerStore {
     workflowUuid: string,
     workflowName: string,
   ): Promise<void>;
-  getWatermark(key: string): Promise<number | null>;
-  setWatermark(key: string, epochMs: number): Promise<void>;
 }
 
 export interface DbosWorkflowRow {
@@ -104,8 +102,17 @@ export interface DbosStatusStore {
     input: DbosSweepTransitionInput,
     graceMs: number,
   ): Promise<DbosSweepTransitionResult>;
-  listNewlyTerminalFailed(
-    sinceEpochMs: number,
+  /**
+   * Terminal failures inside the lookback window that still need handling:
+   * an anti-join on the ledger excludes rows whose terminal alert AND cleanup
+   * are both recorded. The ledger is the single source of truth for progress
+   * — there is no watermark to advance, so a row whose commit becomes visible
+   * late, or that ties another row's timestamp, is simply still in the set
+   * next cycle. Wedged rows are bounded by the cleanup attempt cap, which
+   * ends in a durable gave-up mark that excludes them here too.
+   */
+  listUnhandledTerminalFailures(
+    lookbackMs: number,
     limit: number,
   ): Promise<FailedDbosWorkflowRow[]>;
 }
@@ -330,24 +337,6 @@ export function makeSweepLedgerStore(
       `);
     },
 
-    async getWatermark(key) {
-      const result = await db.execute(sql`
-        select "epoch_ms"
-        from "dbos_sweep_state"
-        where "key" = ${key}
-        limit 1
-      `);
-      const row = result.rows[0];
-      return row ? numberValue(row.epoch_ms) : null;
-    },
-
-    async setWatermark(key, epochMs) {
-      await db.execute(sql`
-        insert into "dbos_sweep_state" ("key", "epoch_ms")
-        values (${key}, ${epochMs})
-        on conflict ("key") do update set "epoch_ms" = excluded."epoch_ms"
-      `);
-    },
   };
 }
 
@@ -455,15 +444,23 @@ export function makeDbosStatusStore(
       });
     },
 
-    async listNewlyTerminalFailed(sinceEpochMs, limit) {
+    async listUnhandledTerminalFailures(lookbackMs, limit) {
       const result = await db.execute(sql`
         select "workflow_uuid", "name", "status", "application_version",
                "created_at", "updated_at",
                coalesce("recovery_attempts", 0) as "recovery_attempts"
-        from "dbos"."workflow_status"
-        where "status" in ('ERROR', 'MAX_RECOVERY_ATTEMPTS_EXCEEDED')
-          and "updated_at" > ${sinceEpochMs}
-        order by "updated_at" asc
+        from "dbos"."workflow_status" as "ws"
+        where "ws"."status" in ('ERROR', 'MAX_RECOVERY_ATTEMPTS_EXCEEDED')
+          and "ws"."updated_at" >
+              (extract(epoch from now()) * 1000)::bigint - ${lookbackMs}
+          and not exists (
+            select 1
+            from "dbos_sweep_ledger" as "ledger"
+            where "ledger"."workflow_uuid" = "ws"."workflow_uuid"
+              and "ledger"."terminal_alerted_at" is not null
+              and "ledger"."cleanup_done_at" is not null
+          )
+        order by "ws"."updated_at" asc
         limit ${limit}
       `);
       return result.rows.map(failedDbosWorkflowRow);
@@ -610,12 +607,11 @@ function cloneLedgerRow(row: SweepLedgerRow): SweepLedgerRow {
   };
 }
 
-/** Deterministic in-memory ledger and watermark KV shared by sweep unit tests. */
+/** Deterministic in-memory ledger shared by sweep unit tests. */
 export function makeInMemorySweepLedgerStore(
   now: () => Date = () => new Date(),
 ): SweepLedgerStore {
   const rows = new Map<string, SweepLedgerRow>();
-  const watermarks = new Map<string, number>();
   return {
     async recordSweep(workflowUuid, workflowName) {
       const sweptAt = now();
@@ -671,14 +667,6 @@ export function makeInMemorySweepLedgerStore(
       const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
       rows.set(workflowUuid, row);
       row.terminalAlertedAt = now();
-    },
-
-    async getWatermark(key) {
-      return watermarks.get(key) ?? null;
-    },
-
-    async setWatermark(key, epochMs) {
-      watermarks.set(key, epochMs);
     },
   };
 }
@@ -737,6 +725,11 @@ export interface InMemoryDbosStatusOptions {
     workflowUuid: string,
     workflowName: string,
   ) => Promise<SweepLedgerRow>;
+  /** Mirrors the PG anti-join: excluded when the terminal alert AND cleanup
+   * are both recorded. Tests wire this to the in-memory ledger. */
+  isTerminalFailureHandled?: (
+    workflowUuid: string,
+  ) => boolean | Promise<boolean>;
 }
 
 /** Deterministic in-memory DBOS system-table projection for sweep unit tests. */
@@ -864,17 +857,27 @@ export function makeInMemoryDbosStatusStore(
       });
     },
 
-    async listNewlyTerminalFailed(sinceEpochMs, limit) {
-      return [...rows.values()]
+    async listUnhandledTerminalFailures(lookbackMs, limit) {
+      const cutoff = now().getTime() - lookbackMs;
+      const candidates = [...rows.values()]
         .filter(
           (row) =>
             (row.status === "ERROR" ||
               row.status === "MAX_RECOVERY_ATTEMPTS_EXCEEDED") &&
-            row.updatedAtEpochMs > sinceEpochMs,
+            row.updatedAtEpochMs > cutoff,
         )
-        .sort((left, right) => left.updatedAtEpochMs - right.updatedAtEpochMs)
-        .slice(0, limit)
-        .map(failedProjection);
+        .sort(
+          (left, right) => left.updatedAtEpochMs - right.updatedAtEpochMs,
+        );
+      const unhandled: InMemoryDbosStatusRow[] = [];
+      for (const row of candidates) {
+        if (unhandled.length >= limit) break;
+        const handled = await options.isTerminalFailureHandled?.(
+          row.workflowUuid,
+        );
+        if (!handled) unhandled.push(row);
+      }
+      return unhandled.map(failedProjection);
     },
 
     inspect(workflowUuid) {
