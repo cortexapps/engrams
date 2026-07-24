@@ -15,6 +15,13 @@ import type { SweepDecision } from "./sweeper.ts";
 const TERMINAL_FAILURE_WATERMARK = "terminal_failures";
 const TERMINAL_FAILURE_LOOKBACK_MS = 24 * 60 * 60 * 1_000;
 const TERMINAL_FAILURE_BATCH_SIZE = 50;
+// The DBOS SDK stamps workflow_status.updated_at in JS before the write
+// commits, so a row can become visible AFTER a scan already advanced the
+// watermark past its timestamp (narrowest case: a same-millisecond tie whose
+// commit lands late). The watermark therefore never advances into the most
+// recent lag window; once a timestamp is older than the lag, no new commits
+// can appear behind it and advancing to it exactly is safe.
+export const TERMINAL_FAILURE_VISIBILITY_LAG_MS = 10_000;
 const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
   "alert_only",
   "cancelled_stale",
@@ -252,6 +259,18 @@ export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
           };
         }
       }
+
+      // Trail wall clock by the visibility lag (see the constant above) so a
+      // late-committing row can never land behind the watermark. The clamped
+      // window is re-scanned next cycle; ledger dedup keeps it quiet.
+      result.watermark = Math.max(
+        since,
+        Math.min(
+          result.watermark,
+          deps.now().getTime() - TERMINAL_FAILURE_VISIBILITY_LAG_MS,
+        ),
+      );
+      if (expandedRescan) expandedRescan.watermark = result.watermark;
 
       if (result.watermark !== since) {
         await deps.ledger.setWatermark(

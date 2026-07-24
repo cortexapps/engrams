@@ -19,6 +19,7 @@ import {
 import {
   DEFAULT_SWEEP_CONFIG,
   runSweepTick,
+  Sweeper,
   VersionHeartbeat,
   type SweepConfig,
   type SweepTickDeps,
@@ -260,7 +261,7 @@ describe("runSweepTick", () => {
     expect(f.status.inspect("wf-policy-ignore")?.status).toBe("PENDING");
   });
 
-  test("caps mutating actions while scanned reflects the full fetched list", async () => {
+  test("caps mutating actions and stops examining rows at the cap", async () => {
     const rows = [
       row("wf-unknown", {
         name: "DeletedWorkflowName",
@@ -273,7 +274,9 @@ describe("runSweepTick", () => {
 
     const result = await runSweepTick(f.deps);
 
-    expect(result.scanned).toBe(3);
+    // scanned counts examined rows only: the row after the cap is left for
+    // the next tick's cursor, not silently counted as covered.
+    expect(result.scanned).toBe(2);
     expect(result.decisions.map((decision) => decision.action)).toEqual([
       "alert_only",
       "adopted",
@@ -347,7 +350,116 @@ describe("runSweepTick", () => {
     expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(
       DEAD_VERSION,
     );
-    expect(warnings).toEqual(["DBOS orphan sweep scan budget exhausted"]);
+    expect(warnings).toEqual([
+      "DBOS orphan sweep scan budget exhausted; resuming from the cursor next cycle",
+    ]);
+  });
+
+  test("a persisted cursor rotates past non-actionable rows to reach newer work", async () => {
+    // The starvation regression: enough young alert-only rows to fill the
+    // whole scan budget, with the adoptable workflow sorted after them. A
+    // cursor-less scan would re-examine the alert-only prefix every tick and
+    // never reach it.
+    const alertOnlyRows = Array.from({ length: 40 }, (_, index) =>
+      row(`wf-unknown-${String(index).padStart(2, "0")}`, {
+        name: "DeletedWorkflowName",
+        createdAtEpochMs: NOW.getTime() - (100_000 - index),
+      }),
+    );
+    const scanCursor: SweepTickDeps["scanCursor"] = { value: undefined };
+    const f = await fixture(
+      [
+        ...alertOnlyRows,
+        row("wf-beyond-budget", {
+          createdAtEpochMs: NOW.getTime() - 1_000,
+        }),
+      ],
+      { scanCursor },
+      { batchCap: 1 },
+    );
+
+    const first = await runSweepTick(f.deps);
+    expect(first.scanned).toBe(40);
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(
+      DEAD_VERSION,
+    );
+    expect(scanCursor.value?.workflowUuid).toBe("wf-unknown-39");
+
+    const second = await runSweepTick(f.deps);
+    expect(
+      second.decisions.map((decision) => decision.action),
+    ).toEqual(["adopted"]);
+    expect(
+      f.status.inspect("wf-beyond-budget")?.applicationVersion,
+    ).toBeNull();
+    // The pass reached the end of the backlog, so the next tick restarts
+    // from the oldest row.
+    expect(scanCursor.value).toBeUndefined();
+  });
+
+  test("cancels an alert-only workflow past the stale window", async () => {
+    const f = await fixture([
+      row("wf-dead-name", {
+        name: "DeletedWorkflowName",
+        createdAtEpochMs: NOW.getTime() - 49 * HOUR_MS,
+      }),
+    ]);
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]).toMatchObject({
+      action: "cancelled_stale",
+      reason: "unregistered workflow name past the stale window",
+    });
+    expect(f.cancelled).toEqual(["wf-dead-name"]);
+    expect((await f.deps.ledger.get("wf-dead-name"))?.sweepCount).toBe(1);
+  });
+
+  test("Sweeper.runOnce carries its own cursor between ticks", async () => {
+    const alertOnlyRows = Array.from({ length: 40 }, (_, index) =>
+      row(`wf-unknown-${String(index).padStart(2, "0")}`, {
+        name: "DeletedWorkflowName",
+        createdAtEpochMs: NOW.getTime() - (100_000 - index),
+      }),
+    );
+    const f = await fixture(
+      [
+        ...alertOnlyRows,
+        row("wf-beyond-budget", {
+          createdAtEpochMs: NOW.getTime() - 1_000,
+        }),
+      ],
+      {},
+      { batchCap: 1 },
+    );
+    const sweeper = new Sweeper(f.deps);
+
+    await sweeper.runOnce();
+    expect(f.status.inspect("wf-beyond-budget")?.applicationVersion).toBe(
+      DEAD_VERSION,
+    );
+
+    await sweeper.runOnce();
+    expect(
+      f.status.inspect("wf-beyond-budget")?.applicationVersion,
+    ).toBeNull();
+  });
+
+  test("suppression vetoes the alert-only stale cancel", async () => {
+    const f = await fixture([
+      row("wf-dead-name", {
+        name: "DeletedWorkflowName",
+        createdAtEpochMs: NOW.getTime() - 49 * HOUR_MS,
+      }),
+    ]);
+    await f.deps.ledger.recordSweep("wf-dead-name", "DeletedWorkflowName");
+    await f.deps.ledger.setSuppressed("wf-dead-name", true);
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]?.action).toBe("suppressed");
+    expect(f.cancelled).toEqual([]);
+    expect(f.status.inspect("wf-dead-name")?.status).toBe("PENDING");
   });
 
   test("contains a cancel error and continues to the next row", async () => {

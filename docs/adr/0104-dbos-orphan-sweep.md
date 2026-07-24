@@ -243,3 +243,39 @@ above, found in review:
   both, plus the claim-path contract.
 - **The flip also nulls `completed_at`** (present in 4.21.6's schema despite
   its absence from older docs), for parity with SDK `resumeWorkflows`.
+
+### PR #876 review round
+
+The engrams PR review surfaced three more defects; each was fixed at its
+root rather than as suggested:
+
+- **Scan-cursor rotation + alert-only staleness cancel** (HIGH, starvation).
+  Two root causes: the keyset cursor reset every tick (the oldest prefix was
+  re-scanned forever), and alert-only rows never leave the scan set. The
+  cursor now persists across ticks (`SweepTickDeps.scanCursor`; the `Sweeper`
+  injects one), resetting only when a pass reaches the end of the backlog —
+  fairness holds no matter what accumulates. Separately, an unregistered
+  workflow name means no live binary carries its code, so it can never
+  execute again: past `ALERT_ONLY_STALE_AFTER_HOURS` (48h) the sweep cancels
+  it (`cancelled_stale`, reason "unregistered workflow name past the stale
+  window"), keeping the permanent population bounded. The suppression check
+  moved ahead of every mode branch so operators can veto that cancel; the
+  first-sight alert gives them the 48h window. `scanned` now counts examined
+  rows (the cursor must point at the last examined row, and a row past the
+  cap must not be reported as covered).
+- **Grace/heartbeat relationship validated at load** (MEDIUM). Config now
+  rejects `sweepGraceMs < 2 × sweepHeartbeatIntervalMs` (one missed beat +
+  pod-termination grace); previously the comment claimed a protection the
+  code didn't provide.
+- **Failure-scan watermark trails wall clock** (MEDIUM). The reported
+  same-millisecond tie drop is the narrow case of a deeper bug: the SDK
+  stamps `updated_at` in JS before the commit becomes visible, so a row can
+  land behind an already-advanced watermark at any offset, not just a tie.
+  The watermark now clamps to `now − TERMINAL_FAILURE_VISIBILITY_LAG_MS`
+  (10s); ledger dedup keeps the re-scanned window quiet. The review's
+  suggested fix (rewind 1ms on non-full batches) was rejected: advancing to
+  the exact last timestamp on a completed batch is what lets the watermark
+  pass a large tie group, and the clamp makes that advance safe by only
+  permitting it once the timestamp is older than any possible commit lag.
+- `makeProductionSweeper` / `makeProductionVersionHeartbeat` retired
+  (dead since `production.ts`'s `makeSweepRuntime` replaced them).

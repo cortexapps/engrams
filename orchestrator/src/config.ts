@@ -300,8 +300,7 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // OPTIONAL: DBOS orphan-sweep operations. The boolean is deliberately
   // narrow: only the documented "1" and "true" spellings activate the kill
   // switch. Interval values reject explicit invalid input instead of silently
-  // falling back, because an unsafe grace/heartbeat relationship can adopt
-  // workflows that still have a live owner.
+  // falling back.
   const sweepDisabled =
     env["ORCHESTRATOR_SWEEP_DISABLED"] === "1" ||
     env["ORCHESTRATOR_SWEEP_DISABLED"] === "true";
@@ -318,6 +317,18 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     "ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS",
     HEARTBEAT_INTERVAL_MS,
   );
+  // A live pod proves its version with a heartbeat every interval. The grace
+  // window must absorb at least one missed beat plus pod-termination grace,
+  // or the sweep declares a healthy pod's version dead between beats and
+  // re-enqueues workflows that still have a live owner (double execution).
+  if (sweepGraceMs < 2 * sweepHeartbeatIntervalMs) {
+    throw new Error(
+      `Orchestrator: ORCHESTRATOR_SWEEP_GRACE_MS (${sweepGraceMs}) must be at ` +
+        `least twice ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS ` +
+        `(${sweepHeartbeatIntervalMs}); a shorter grace window can adopt ` +
+        `workflows whose owner pod is alive but between heartbeats`,
+    );
+  }
 
   if (missing.length > 0) {
     throw new Error(

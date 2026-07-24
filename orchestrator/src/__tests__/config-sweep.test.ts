@@ -47,6 +47,38 @@ describe("config — DBOS orphan sweep", () => {
     );
   });
 
+  test("rejects a grace window smaller than twice the heartbeat interval", () => {
+    // A healthy pod between beats must never look dead: the grace window has
+    // to absorb a missed beat plus pod-termination grace.
+    expect(() =>
+      loadConfig({
+        ...BASE,
+        ORCHESTRATOR_SWEEP_GRACE_MS: "15000",
+        ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS: "30000",
+      }),
+    ).toThrow(/ORCHESTRATOR_SWEEP_GRACE_MS/);
+  });
+
+  test("rejects a too-small default grace when only the heartbeat is raised", () => {
+    expect(() =>
+      loadConfig({
+        ...BASE,
+        ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS: "400000",
+      }),
+    ).toThrow(/ORCHESTRATOR_SWEEP_GRACE_MS/);
+  });
+
+  test("accepts a grace window exactly twice the heartbeat interval", () => {
+    const config = loadConfig({
+      ...BASE,
+      ORCHESTRATOR_SWEEP_GRACE_MS: "60000",
+      ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS: "30000",
+    });
+
+    expect(config.sweepGraceMs).toBe(60_000);
+    expect(config.sweepHeartbeatIntervalMs).toBe(30_000);
+  });
+
   test.each(["1", "true"])(
     "ORCHESTRATOR_SWEEP_DISABLED=%s enables the kill switch",
     (value) => {

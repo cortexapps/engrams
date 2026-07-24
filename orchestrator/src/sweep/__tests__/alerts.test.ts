@@ -7,7 +7,10 @@ import {
   makeInMemorySweepLookupStore,
   type FailedDbosWorkflowRow,
 } from "../../db/dbos-sweep.ts";
-import { makeSweepAlerter } from "../alerts.ts";
+import {
+  makeSweepAlerter,
+  TERMINAL_FAILURE_VISIBILITY_LAG_MS,
+} from "../alerts.ts";
 import type {
   FailedWorkflow,
   ResolvedPolicy,
@@ -19,6 +22,8 @@ const NOW = new Date("2026-07-23T12:00:00.000Z");
 const DAY_MS = 24 * 60 * 60 * 1_000;
 const log: Logger = pino({ level: "silent" });
 
+// Rows default to timestamps older than TERMINAL_FAILURE_VISIBILITY_LAG_MS so
+// the wall-clock clamp stays out of the way; the clamp has its own test.
 function failedRow(
   workflowUuid: string,
   overrides: Partial<FailedDbosWorkflowRow> = {},
@@ -28,8 +33,8 @@ function failedRow(
     name: "ToolExecWorkflow",
     status: "ERROR",
     applicationVersion: "dead-version",
-    createdAtEpochMs: NOW.getTime() - 10_000,
-    updatedAtEpochMs: NOW.getTime() - 1_000,
+    createdAtEpochMs: NOW.getTime() - 120_000,
+    updatedAtEpochMs: NOW.getTime() - 60_000,
     recoveryAttempts: 3,
     ...overrides,
   };
@@ -199,10 +204,10 @@ describe("SweepAlerter.scanTerminalFailures", () => {
 
   test("advances the watermark past fully processed rows", async () => {
     const first = failedRow("wf-first", {
-      updatedAtEpochMs: NOW.getTime() - 2_000,
+      updatedAtEpochMs: NOW.getTime() - 62_000,
     });
     const second = failedRow("wf-second", {
-      updatedAtEpochMs: NOW.getTime() - 1_000,
+      updatedAtEpochMs: NOW.getTime() - 61_000,
     });
     const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
     await ledger.recordSweep(first.workflowUuid, first.name);
@@ -234,8 +239,59 @@ describe("SweepAlerter.scanTerminalFailures", () => {
     );
   });
 
+  test("the watermark trails wall clock so a late-committing tie still alerts", async () => {
+    // updated_at is stamped in JS before the row's transaction commits: a row
+    // tied to (or older than) the last processed timestamp can become visible
+    // only after the scan. Without the wall-clock clamp the watermark passes
+    // it and its alert + cleanup are dropped forever.
+    const processed = failedRow("wf-early", {
+      updatedAtEpochMs: NOW.getTime() - 1_000,
+    });
+    const lateCommit = failedRow("wf-late-commit", {
+      updatedAtEpochMs: NOW.getTime() - 1_000,
+    });
+    let lateCommitVisible = false;
+    const underlying = makeInMemoryDbosStatusStore([processed, lateCommit]);
+    const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
+    const posts: string[] = [];
+    const alerter = makeSweepAlerter({
+      ledger,
+      status: {
+        ...underlying,
+        async listNewlyTerminalFailed(since, limit) {
+          const rows = await underlying.listNewlyTerminalFailed(since, limit);
+          return lateCommitVisible
+            ? rows
+            : rows.filter(
+                (row) => row.workflowUuid !== lateCommit.workflowUuid,
+              );
+        },
+      },
+      post: async (text) => {
+        posts.push(text);
+      },
+      policies: () => ({ mode: "alert-only" }),
+      cleanupCtx: cleanupContext(),
+      now: () => new Date(NOW),
+      log,
+      maxCleanupAttempts: 3,
+    });
+
+    const first = await alerter.scanTerminalFailures();
+    expect(first.watermark).toBe(
+      NOW.getTime() - TERMINAL_FAILURE_VISIBILITY_LAG_MS,
+    );
+
+    lateCommitVisible = true;
+    const second = await alerter.scanTerminalFailures();
+    expect(second.alerted).toBe(1);
+    expect(posts.some((post) => post.includes("wf-late-commit"))).toBe(true);
+    // The already-processed tie is ledger-deduped, not re-alerted.
+    expect(posts.filter((post) => post.includes("wf-early"))).toHaveLength(1);
+  });
+
   test("retries the second cleanup when terminal failures share a timestamp", async () => {
-    const tiedAt = NOW.getTime() - 1_000;
+    const tiedAt = NOW.getTime() - 60_000;
     const first = failedRow("wf-tied-succeeded", {
       name: "FirstWorkflow",
       updatedAtEpochMs: tiedAt,
@@ -292,7 +348,7 @@ describe("SweepAlerter.scanTerminalFailures", () => {
   });
 
   test("expands a re-scan when the batch limit cuts through a timestamp tie", async () => {
-    const tiedAt = NOW.getTime() - 1_000;
+    const tiedAt = NOW.getTime() - 60_000;
     const rows = Array.from({ length: 51 }, (_, index) =>
       failedRow(`wf-tied-batch-${index.toString().padStart(2, "0")}`, {
         updatedAtEpochMs: tiedAt,
@@ -451,10 +507,10 @@ describe("SweepAlerter.scanTerminalFailures", () => {
   test("a wedged cleanup holds the watermark but later failures still alert", async () => {
     const wedged = failedRow("wf-wedged", {
       name: "SlackThreadWorkflow",
-      updatedAtEpochMs: NOW.getTime() - 2_000,
+      updatedAtEpochMs: NOW.getTime() - 62_000,
     });
     const newer = failedRow("wf-newer", {
-      updatedAtEpochMs: NOW.getTime() - 1_000,
+      updatedAtEpochMs: NOW.getTime() - 61_000,
     });
     const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
     const posts: string[] = [];

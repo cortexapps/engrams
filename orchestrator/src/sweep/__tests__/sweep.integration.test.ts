@@ -483,7 +483,9 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
         alerted: 1,
         cleanupsRun: 1,
         cleanupsFailed: 0,
-        watermark: failedRow.updatedAtEpochMs,
+        // The failure is seconds old — inside the visibility lag — so the
+        // watermark holds instead of advancing past a potential late commit.
+        watermark: failedRow.updatedAtEpochMs - 1,
       });
       expect(posts).toHaveLength(1);
       expect(posts[0]).toContain(workflowId);
@@ -494,11 +496,13 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
       expect((await ledger.get(workflowId))?.alertedAt).not.toBeNull();
       expect((await ledger.get(workflowId))?.cleanupDoneAt).not.toBeNull();
       expect(await ledger.getWatermark("terminal_failures")).toBe(
-        failedRow.updatedAtEpochMs,
+        failedRow.updatedAtEpochMs - 1,
       );
 
+      // The re-scan of the held window is quiet: the row is examined again
+      // but its alert and cleanup are ledger-deduped.
       const secondScan = await alerter.scanTerminalFailures();
-      expect(secondScan.scanned).toBe(0);
+      expect(secondScan.scanned).toBe(1);
       expect(posts).toHaveLength(1);
       expect(cleanupCalls).toEqual([workflowId]);
     },

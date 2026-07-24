@@ -1,23 +1,12 @@
-import { DBOS } from "@dbos-inc/dbos-sdk";
-import { hostname } from "node:os";
 import type { Logger } from "pino";
 
-import {
-  makeDbosStatusStore,
-  makeHeartbeatStore,
-  makeSweepLeaseStore,
-  makeSweepLedgerStore,
-  type DbosStatusStore,
-  type HeartbeatStore,
-  type SweepLeaseStore,
-  type SweepLedgerStore,
+import type {
+  DbosStatusStore,
+  HeartbeatStore,
+  SweepLeaseStore,
+  SweepLedgerStore,
 } from "../db/dbos-sweep.ts";
-import { log as rootLog } from "../log.ts";
-import {
-  makeDisabledSweepAlerter,
-  type FailureScanResult,
-  type SweepAlerter,
-} from "./alerts.ts";
+import type { FailureScanResult, SweepAlerter } from "./alerts.ts";
 import { resolvePolicy, type ResolvedPolicy } from "./policy.ts";
 
 export const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -25,6 +14,10 @@ export const SWEEP_INTERVAL_MS = 60_000;
 export const SWEEP_GRACE_MS = 600_000;
 export const SWEEP_BATCH_CAP = 5;
 export const MAX_SWEEPS = 3;
+// An unregistered workflow name means no live binary carries its code, so it
+// can never execute again on any current version. Alerting gives operators
+// this window to suppress before the sweep cancels it to a terminal state.
+export const ALERT_ONLY_STALE_AFTER_HOURS = 48;
 
 export interface SweepConfig {
   heartbeatIntervalMs: number;
@@ -42,6 +35,11 @@ export const DEFAULT_SWEEP_CONFIG = {
   maxSweeps: MAX_SWEEPS,
 } as const satisfies SweepConfig;
 
+export interface ScanCursor {
+  createdAtEpochMs: number;
+  workflowUuid: string;
+}
+
 export interface SweepTickDeps {
   owner: string;
   appVersion: () => string;
@@ -53,6 +51,15 @@ export interface SweepTickDeps {
   cancelWorkflow: (workflowUuid: string) => Promise<void>;
   alerter?: SweepAlerter;
   resolvePolicy?: (name: string) => ResolvedPolicy;
+  /**
+   * Keyset position shared across ticks. Non-actionable rows (alert-only,
+   * ignored, suppressed) stay in the scan set, so a scan that always restarted
+   * at the oldest row would re-examine that prefix forever and starve newer
+   * adoptable work once the prefix outgrows the scan budget. Persisting the
+   * cursor makes consecutive ticks rotate through the whole backlog; it resets
+   * once a pass reaches the end. The Sweeper class injects one automatically.
+   */
+  scanCursor?: { value: ScanCursor | undefined };
   log: Logger;
   now?: () => Date;
 }
@@ -161,12 +168,12 @@ export async function runSweepTick(
     const pageSize = deps.config.batchCap * 4;
     const scanBudget = deps.config.batchCap * 40;
     let actions = 0;
-    let after:
-      | { createdAtEpochMs: number; workflowUuid: string }
-      | undefined;
+    const cursor = deps.scanCursor;
+    let after = cursor?.value;
+    let exhausted = false;
     const nowMs = (deps.now ?? (() => new Date()))().getTime();
 
-    while (
+    scan: while (
       actions < deps.config.batchCap &&
       result.scanned < scanBudget
     ) {
@@ -175,18 +182,28 @@ export async function runSweepTick(
         pageSize,
         after,
       );
-      result.scanned += rows.length;
 
       for (const row of rows) {
-        if (actions >= deps.config.batchCap) break;
+        if (
+          actions >= deps.config.batchCap ||
+          result.scanned >= scanBudget
+        ) {
+          break scan;
+        }
+        result.scanned++;
+        after = {
+          createdAtEpochMs: row.createdAtEpochMs,
+          workflowUuid: row.workflowUuid,
+        };
         let decision: SweepDecision;
         try {
           const policy = (deps.resolvePolicy ?? resolvePolicy)(row.name);
-          if (policy.mode === "alert-only") {
+          const prior = await deps.ledger.get(row.workflowUuid);
+          if (prior?.suppressed) {
             decision = {
               workflowUuid: row.workflowUuid,
               name: row.name,
-              action: "alert_only",
+              action: "suppressed",
             };
           } else if (policy.mode === "ignore") {
             decision = {
@@ -195,98 +212,104 @@ export async function runSweepTick(
               action: "ignored",
             };
           } else {
-            const prior = await deps.ledger.get(row.workflowUuid);
-            if (prior?.suppressed) {
+            const ageHours =
+              (nowMs - row.createdAtEpochMs) / (60 * 60 * 1_000);
+            const staleAfterHours =
+              policy.mode === "alert-only"
+                ? ALERT_ONLY_STALE_AFTER_HOURS
+                : policy.staleAfterHours;
+            if (
+              policy.mode !== "cancel" &&
+              ageHours > staleAfterHours
+            ) {
+              await deps.ledger.recordSweep(row.workflowUuid, row.name);
+              await deps.cancelWorkflow(row.workflowUuid);
               decision = {
                 workflowUuid: row.workflowUuid,
                 name: row.name,
-                action: "suppressed",
+                action: "cancelled_stale",
+                ...(policy.mode === "alert-only"
+                  ? {
+                      reason:
+                        "unregistered workflow name past the stale window",
+                    }
+                  : {}),
+              };
+            } else if (policy.mode === "alert-only") {
+              decision = {
+                workflowUuid: row.workflowUuid,
+                name: row.name,
+                action: "alert_only",
+              };
+            } else if (
+              prior !== null &&
+              prior.sweepCount >= deps.config.maxSweeps
+            ) {
+              await deps.cancelWorkflow(row.workflowUuid);
+              decision = {
+                workflowUuid: row.workflowUuid,
+                name: row.name,
+                action: "cancelled_capped",
+              };
+            } else if (policy.mode === "cancel") {
+              await deps.ledger.recordSweep(row.workflowUuid, row.name);
+              await deps.cancelWorkflow(row.workflowUuid);
+              decision = {
+                workflowUuid: row.workflowUuid,
+                name: row.name,
+                action: "cancelled_policy",
               };
             } else {
-              const ageHours =
-                (nowMs - row.createdAtEpochMs) / (60 * 60 * 1_000);
-              if (
-                policy.mode === "adopt" &&
-                ageHours > policy.staleAfterHours
-              ) {
-                await deps.ledger.recordSweep(row.workflowUuid, row.name);
-                await deps.cancelWorkflow(row.workflowUuid);
-                decision = {
-                  workflowUuid: row.workflowUuid,
-                  name: row.name,
-                  action: "cancelled_stale",
-                };
-              } else if (
-                prior !== null &&
-                prior.sweepCount >= deps.config.maxSweeps
-              ) {
-                await deps.cancelWorkflow(row.workflowUuid);
-                decision = {
-                  workflowUuid: row.workflowUuid,
-                  name: row.name,
-                  action: "cancelled_capped",
-                };
-              } else if (policy.mode === "cancel") {
-                await deps.ledger.recordSweep(row.workflowUuid, row.name);
-                await deps.cancelWorkflow(row.workflowUuid);
-                decision = {
-                  workflowUuid: row.workflowUuid,
-                  name: row.name,
-                  action: "cancelled_policy",
-                };
-              } else {
-                if (row.status === "PENDING") {
-                  const adopted =
-                    await deps.status.adoptPendingRecording(
-                      {
-                        workflowUuid: row.workflowUuid,
-                        expectedVersion: row.applicationVersion!,
-                        workflowName: row.name,
-                      },
-                      deps.config.graceMs,
-                    );
-                  decision = adopted.flipped
-                    ? {
-                        workflowUuid: row.workflowUuid,
-                        name: row.name,
-                        action: "adopted",
-                      }
-                    : {
-                        workflowUuid: row.workflowUuid,
-                        name: row.name,
-                        action: "error",
-                        reason: "owner became live or row changed",
-                      };
-                } else if (row.status === "ENQUEUED") {
-                  const cleared =
-                    await deps.status.clearVersionOnEnqueuedRecording(
-                      {
-                        workflowUuid: row.workflowUuid,
-                        expectedVersion: row.applicationVersion!,
-                        workflowName: row.name,
-                      },
-                      deps.config.graceMs,
-                    );
-                  decision = cleared.flipped
-                    ? {
-                        workflowUuid: row.workflowUuid,
-                        name: row.name,
-                        action: "enqueued_cleared",
-                      }
-                    : {
-                        workflowUuid: row.workflowUuid,
-                        name: row.name,
-                        action: "error",
-                        reason: "owner became live or row changed",
-                      };
-                } else {
-                  decision = {
+              if (row.status === "PENDING") {
+                const adopted = await deps.status.adoptPendingRecording(
+                  {
                     workflowUuid: row.workflowUuid,
-                    name: row.name,
-                    action: "error",
-                    reason: `unsupported status ${row.status}`,
-                  };
-                }
+                    expectedVersion: row.applicationVersion!,
+                    workflowName: row.name,
+                  },
+                  deps.config.graceMs,
+                );
+                decision = adopted.flipped
+                  ? {
+                      workflowUuid: row.workflowUuid,
+                      name: row.name,
+                      action: "adopted",
+                    }
+                  : {
+                      workflowUuid: row.workflowUuid,
+                      name: row.name,
+                      action: "error",
+                      reason: "owner became live or row changed",
+                    };
+              } else if (row.status === "ENQUEUED") {
+                const cleared =
+                  await deps.status.clearVersionOnEnqueuedRecording(
+                    {
+                      workflowUuid: row.workflowUuid,
+                      expectedVersion: row.applicationVersion!,
+                      workflowName: row.name,
+                    },
+                    deps.config.graceMs,
+                  );
+                decision = cleared.flipped
+                  ? {
+                      workflowUuid: row.workflowUuid,
+                      name: row.name,
+                      action: "enqueued_cleared",
+                    }
+                  : {
+                      workflowUuid: row.workflowUuid,
+                      name: row.name,
+                      action: "error",
+                      reason: "owner became live or row changed",
+                    };
+              } else {
+                decision = {
+                  workflowUuid: row.workflowUuid,
+                  name: row.name,
+                  action: "error",
+                  reason: `unsupported status ${row.status}`,
+                };
               }
             }
           }
@@ -302,27 +325,28 @@ export async function runSweepTick(
         if (MUTATING_ACTIONS.has(decision.action)) actions++;
       }
 
-      if (actions >= deps.config.batchCap || rows.length < pageSize) {
+      // A short page means this pass examined the end of the backlog.
+      if (rows.length < pageSize) {
+        exhausted = true;
         break;
       }
-      if (result.scanned >= scanBudget) {
-        deps.log.warn(
-          {
-            component: "dbos-sweep",
-            scanned: result.scanned,
-            scanBudget,
-          },
-          "DBOS orphan sweep scan budget exhausted",
-        );
-        break;
-      }
-      const last = rows.at(-1);
-      if (!last) break;
-      after = {
-        createdAtEpochMs: last.createdAtEpochMs,
-        workflowUuid: last.workflowUuid,
-      };
     }
+
+    if (
+      !exhausted &&
+      actions < deps.config.batchCap &&
+      result.scanned >= scanBudget
+    ) {
+      deps.log.warn(
+        {
+          component: "dbos-sweep",
+          scanned: result.scanned,
+          scanBudget,
+        },
+        "DBOS orphan sweep scan budget exhausted; resuming from the cursor next cycle",
+      );
+    }
+    if (cursor) cursor.value = exhausted ? undefined : after;
 
     if (deps.alerter) {
       try {
@@ -369,7 +393,12 @@ export class Sweeper {
   #tick: Promise<SweepTickResult> | null = null;
 
   constructor(deps: SweeperDeps) {
-    this.#deps = deps;
+    // Every Sweeper carries a scan cursor so consecutive ticks rotate
+    // through the orphan backlog instead of re-scanning the oldest prefix.
+    this.#deps = {
+      ...deps,
+      scanCursor: deps.scanCursor ?? { value: undefined },
+    };
   }
 
   runOnce(): Promise<SweepTickResult> {
@@ -459,45 +488,4 @@ export class VersionHeartbeat {
     }
     await this.#tick?.catch(() => {});
   }
-}
-
-function sweepConfig(overrides: Partial<SweepConfig>): SweepConfig {
-  return { ...DEFAULT_SWEEP_CONFIG, ...overrides };
-}
-
-export function makeProductionSweeper(
-  cfg: Partial<SweepConfig> = {},
-  options: { alerter?: SweepAlerter } = {},
-): Sweeper {
-  const config = sweepConfig(cfg);
-  const owner = `${hostname()}:${process.pid}:${crypto.randomUUID()}`;
-  const log = rootLog.child({ component: "dbos-sweep" });
-  return new Sweeper({
-    owner,
-    // Public getter; only populated after DBOS.launch(), hence the lazy read.
-    appVersion: () => DBOS.applicationVersion,
-    config,
-    heartbeats: makeHeartbeatStore(),
-    lease: makeSweepLeaseStore(),
-    ledger: makeSweepLedgerStore(),
-    status: makeDbosStatusStore(),
-    cancelWorkflow: (workflowUuid) => DBOS.cancelWorkflow(workflowUuid),
-    alerter: options.alerter ?? makeDisabledSweepAlerter(log),
-    log,
-    now: () => new Date(),
-  });
-}
-
-export function makeProductionVersionHeartbeat(
-  cfg: Partial<SweepConfig> = {},
-): VersionHeartbeat {
-  const config = sweepConfig(cfg);
-  const podName = hostname();
-  return new VersionHeartbeat({
-    appVersion: () => DBOS.applicationVersion,
-    podName,
-    heartbeats: makeHeartbeatStore(),
-    intervalMs: config.heartbeatIntervalMs,
-    log: rootLog.child({ component: "dbos-sweep-heartbeat" }),
-  });
 }
