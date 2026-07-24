@@ -230,7 +230,7 @@ pub async fn exec_stream_core(
         state
             .services
             .meta
-            .session_exec_event_logged_at(id, &exec_id, ExecLifecycleEventKind::Started)
+            .session_exec_event_at(id, &exec_id, ExecLifecycleEventKind::Started)
             .await?
             .is_none()
     } else {
@@ -240,6 +240,14 @@ pub async fn exec_stream_core(
     let state_for_stream = state.clone();
     let exec_id_for_stream = exec_id.clone();
     let started_at = state.services.clock.now_mono();
+    // Captured at ATTACH time for the deferred `exec_started` stamp below:
+    // a silent command's first coordinator-level frame is its Exit (agentd's
+    // wire Started never reaches this layer), so stamping at first-frame
+    // delivery would collapse wall_ms to ~0 for exactly the silent-clone
+    // shape this ADR makes durable. Attach time is the closest host-side
+    // proxy for spawn time; only the emission is deferred (for the
+    // refusal-records-nothing rule), not the measurement.
+    let attach_at_utc = state.services.clock.now_utc();
     // ADR 0103: output recording is observation-independent. Chunk rows are
     // stamped with their absolute RAW byte range, and this attach skips
     // persisting anything at or below the mark already recorded for the
@@ -285,7 +293,7 @@ pub async fn exec_stream_core(
                     .emit(id, SessionEvent::ExecStarted {
                         exec_id: exec_id_for_stream.clone(),
                         command: started_command.clone(),
-                        at: state_for_stream.services.clock.now_utc(),
+                        at: attach_at_utc,
                     })
                     .await
                     .map_err(|e| tracing::warn!(error = %e, "exec_started event persistence failed; live tail continues"));
@@ -351,15 +359,16 @@ pub async fn exec_stream_core(
             )));
             return;
         }
-        // wall_ms spans from the LOGGED exec_started to this Exit. On the
-        // ADR's happy path the Exit is delivered by a later re-attach, so
-        // the delivering segment is only a fraction of the exec's real
+        // wall_ms spans from the RECORDED exec_started stamp (the attach
+        // time it carries — see `session_exec_event_at`) to this Exit. On
+        // the ADR's happy path the Exit is delivered by a later re-attach,
+        // so the delivering segment is only a fraction of the exec's real
         // runtime; the attach-segment measure is kept as the fallback for
         // stores without the event log (or a failed lookup).
-        let logged_started_at = state_for_stream
+        let recorded_started_at = state_for_stream
             .services
             .meta
-            .session_exec_event_logged_at(
+            .session_exec_event_at(
                 id,
                 &exec_id_for_stream,
                 ExecLifecycleEventKind::Started,
@@ -372,7 +381,7 @@ pub async fn exec_stream_core(
                 );
                 None
             });
-        let wall_ms = match logged_started_at {
+        let wall_ms = match recorded_started_at {
             Some(started) => (state_for_stream.services.clock.now_utc() - started)
                 .num_milliseconds()
                 .max(0) as u64,
@@ -394,7 +403,7 @@ pub async fn exec_stream_core(
         let already_completed = state_for_stream
             .services
             .meta
-            .session_exec_event_logged_at(
+            .session_exec_event_at(
                 id,
                 &exec_id_for_stream,
                 ExecLifecycleEventKind::Completed,
@@ -1033,6 +1042,42 @@ mod tests {
         assert_eq!(
             completions, 1,
             "a replay of an already-complete journal must not append another exec_completed"
+        );
+    }
+
+    /// A silent command (the ADR's non-tty `git clone`) delivers its Exit as
+    /// the FIRST coordinator-level frame — agentd's wire `Started` never
+    /// reaches this layer. The deferred `exec_started` must therefore be
+    /// stamped with the ATTACH time, not the first-frame delivery time, or
+    /// `wall_ms` collapses to ~0 for exactly the exec shape ADR 0103 exists
+    /// to make durable.
+    #[tokio::test]
+    async fn silent_exec_wall_spans_from_attach_not_first_frame() {
+        let (state, meta, clock) = exec_test_state([vec![ExecEvent::Exit(Some(0))]]);
+        let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+        let exec_id = "exec:silent-wall";
+
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, None, None))
+                .await
+                .expect("start exec stream");
+        // The command runs silently for 45s before its journal Exit is the
+        // first (and only) frame this attach delivers.
+        clock.advance(Duration::from_secs(45));
+        match body.next().await {
+            Some(Ok(ExecStreamEvent::Exit {
+                exit_status: Some(0),
+                rusage,
+            })) => assert_eq!(
+                rusage.wall_ms, 45_000,
+                "wall_ms must span from attach, not from the first delivered frame"
+            ),
+            other => panic!("expected the exit, got {other:?}"),
+        }
+        assert!(body.next().await.is_none());
+        assert_eq!(
+            exec_started_ids(&meta, session_id),
+            vec![exec_id.to_string()]
         );
     }
 

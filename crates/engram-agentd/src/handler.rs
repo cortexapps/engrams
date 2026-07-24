@@ -827,6 +827,23 @@ where
         state = entry.state_for(command).await;
     }
 
+    // Identity is decided PERMANENTLY the moment request.json exists (it is
+    // written once, atomically, and never mutated), so one check here covers
+    // every later iteration — and it must precede the drain loop: when the
+    // winner published request.json only after this attach began (skipping
+    // the pre-replay check above), the loser would otherwise stream the
+    // winner's output bytes before its loud mismatch terminal.
+    if let AttachState::Mismatch { recorded_command } = &state {
+        let message = format!(
+            "exec_id {} already belongs to command {:?}; refusing different command {:?} (first writer wins)\n",
+            entry.exec_id(),
+            recorded_command,
+            command
+        );
+        write_msg(writer, &WireExecEvent::Refused { reason: message }).await?;
+        return Ok(());
+    }
+
     loop {
         if let Ok(reason) = entry.degraded_reason().await {
             write_msg(writer, &WireExecEvent::Degraded(reason.clone())).await?;
@@ -1133,6 +1150,77 @@ mod tests {
         }
         let _ = server_task.await.unwrap();
         events
+    }
+
+    /// A losing attach must NEVER stream the winner's output, even when the
+    /// winner publishes `request.json` only AFTER the loser's attach began
+    /// (the mkdir marker precedes request.json, so the loser's pre-replay
+    /// identity check is skipped). Identity is decided permanently the
+    /// moment request.json exists — the refusal must precede any drain.
+    #[tokio::test]
+    async fn losing_attach_refuses_before_replaying_any_output() {
+        use crate::exec_journal::{JournalEntry, RequestRecord};
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("exec-race-loser");
+        tokio::fs::create_dir(&dir).await.unwrap();
+        let entry = JournalEntry::from_dir(&dir).unwrap();
+        // The winner's bytes are already on disk before its request.json is
+        // published — the out-of-order visibility the loser must tolerate.
+        tokio::fs::write(entry.stdout_path(), b"winner secret output")
+            .await
+            .unwrap();
+
+        let publisher = {
+            let entry = entry.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(150)).await;
+                entry
+                    .write_request(&RequestRecord {
+                        command: vec!["winner-command".into()],
+                        created_at_unix_ms: 0,
+                    })
+                    .await
+                    .unwrap();
+            })
+        };
+
+        let (mut host, mut writer) = duplex(64 * 1024);
+        let tail = {
+            let entry = entry.clone();
+            tokio::spawn(async move {
+                tail_journal(&entry, &["loser-command".into()], 0, 0, &mut writer).await
+            })
+        };
+
+        let mut events = Vec::new();
+        loop {
+            match read_msg::<_, WireExecEvent>(&mut host).await {
+                Ok(ev) => {
+                    let terminal =
+                        matches!(ev, WireExecEvent::Exit(_) | WireExecEvent::Refused { .. });
+                    events.push(ev);
+                    if terminal {
+                        break;
+                    }
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => break,
+                Err(e) => panic!("read_msg: {e}"),
+            }
+        }
+        publisher.await.unwrap();
+        tail.await.unwrap().unwrap();
+
+        assert!(
+            matches!(events.last(), Some(WireExecEvent::Refused { .. })),
+            "the losing attach must terminate with a refusal, got {events:?}"
+        );
+        assert!(
+            !events
+                .iter()
+                .any(|ev| matches!(ev, WireExecEvent::Stdout(_) | WireExecEvent::Stderr(_))),
+            "the losing attach must not replay a single byte of the winner's output, got {events:?}"
+        );
     }
 
     #[tokio::test]

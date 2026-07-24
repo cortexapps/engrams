@@ -4060,13 +4060,19 @@ impl MetadataStore for PostgresStore {
             .collect()
     }
 
-    async fn session_exec_event_logged_at(
+    async fn session_exec_event_at(
         &self,
         session_id: SessionId,
         exec_id: &str,
         kind: ExecLifecycleEventKind,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
-        // MIN: the first logged occurrence is the authoritative one — a
+        // The event's OWN `at` stamp, not the row's `created_at`: the
+        // exec_started stamp is the attach time, while its row lands only at
+        // the first delivered frame — for a silent command that is the Exit
+        // itself, so `created_at` would collapse wall_ms to ~0. Lifecycle
+        // rows are written exclusively by the coordinator with a valid
+        // RFC3339 `at`, so the cast never sees garbage.
+        // MIN: the first recorded occurrence is the authoritative one — a
         // residual concurrent-attach duplicate must not move the timestamp.
         // Live timeline only: an ADR-0028 rewind tombstones exec rows AND
         // rewinds the guest journal, so a replayed step legitimately re-runs
@@ -4074,7 +4080,7 @@ impl MetadataStore for PostgresStore {
         // the tombstoned past.
         sqlx::query_scalar(
             r#"
-            SELECT MIN(created_at)
+            SELECT MIN((payload->>'at')::timestamptz)
               FROM session_events
              WHERE session_id = $1
                AND kind = $2

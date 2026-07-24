@@ -158,3 +158,97 @@ async fn cancel_of_a_completed_exec_without_a_pid_file_is_ok() {
         .await
         .expect("a terminal journal has nothing to kill; cancel must succeed");
 }
+
+/// The terminal marker only covers the CLEAN half of the PID-reuse hazard:
+/// a wrapper stuck draining (daemonized child holding the pipe) or dead
+/// uncleanly never writes `exit.json`, yet its command was reaped long ago
+/// and the recorded pid is kernel-reusable. The (pid, starttime) identity
+/// recorded at spawn is the gate: a mismatch proves the pid now belongs to
+/// someone else — and a pid is only recyclable once our whole group is
+/// empty, so there is provably nothing of ours left to kill.
+#[tokio::test]
+async fn cancel_of_a_recycled_pid_never_kills_the_new_owner() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = vec!["sh".to_string(), "-c".to_string(), "sleep 30".to_string()];
+
+    // The decoy stands in for the unrelated process group that inherited
+    // the recorded pid. The recorded identity deliberately mismatches the
+    // decoy's true start time.
+    let mut decoy = group_leader_decoy();
+    let dir = temp.path().join("exec-recycled-pid");
+    fs::create_dir_all(&dir).unwrap();
+    write_request_now(&dir, &command);
+    fs::write(dir.join("pid"), decoy.id().to_string()).unwrap();
+    let wrong_ticks = engram_agentd::exec_journal::process_start_ticks(decoy.id())
+        .unwrap_or(0)
+        .wrapping_add(99_999);
+    fs::write(dir.join("pid_start"), wrong_ticks.to_string()).unwrap();
+
+    let entry = JournalEntry::from_dir(&dir).unwrap();
+    engram_agentd::exec_journal::cancel(&entry)
+        .await
+        .expect("a provably-recycled pid means our command is gone; cancel is a successful no-op");
+    // Meaningful on Linux (CI): kill_process_group is a no-op on macOS.
+    assert!(
+        decoy_is_alive(&mut decoy),
+        "a recycled pid must never be SIGKILLed on the old journal's behalf"
+    );
+    decoy.kill().ok();
+}
+
+/// The inverse guard: a MATCHING identity must still kill — the gate must
+/// not turn cancel into a universal no-op.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn cancel_with_matching_identity_kills_the_group() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = vec!["sleep".to_string(), "30".to_string()];
+
+    let mut decoy = group_leader_decoy();
+    let dir = temp.path().join("exec-live-match");
+    fs::create_dir_all(&dir).unwrap();
+    write_request_now(&dir, &command);
+    fs::write(dir.join("pid"), decoy.id().to_string()).unwrap();
+    let true_ticks = engram_agentd::exec_journal::process_start_ticks(decoy.id())
+        .expect("a live decoy has readable stat");
+    fs::write(dir.join("pid_start"), true_ticks.to_string()).unwrap();
+
+    let entry = JournalEntry::from_dir(&dir).unwrap();
+    engram_agentd::exec_journal::cancel(&entry)
+        .await
+        .expect("cancel of a verified live command succeeds");
+    assert!(
+        !decoy_is_alive(&mut decoy),
+        "a verified (pid, starttime) identity must still be killed"
+    );
+    decoy.kill().ok();
+}
+
+/// Cancel of an exec whose group is already gone (finished, or the wrapper
+/// died uncleanly without `exit.json`) is the cancel's GOAL STATE — it must
+/// resolve Ok, not surface the killpg ESRCH as an error to the caller.
+#[tokio::test]
+async fn cancel_of_a_dead_group_is_ok_not_an_error() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = vec!["true".to_string()];
+
+    // A group leader that has already exited and been reaped: its pgid no
+    // longer exists (killpg → ESRCH on Linux).
+    let mut leader = {
+        let mut c = Command::new("true");
+        c.process_group(0);
+        c.spawn().expect("spawn short-lived leader")
+    };
+    let pid = leader.id();
+    leader.wait().expect("reap short-lived leader");
+
+    let dir = temp.path().join("exec-dead-group");
+    fs::create_dir_all(&dir).unwrap();
+    write_request_now(&dir, &command);
+    fs::write(dir.join("pid"), pid.to_string()).unwrap();
+
+    let entry = JournalEntry::from_dir(&dir).unwrap();
+    engram_agentd::exec_journal::cancel(&entry)
+        .await
+        .expect("nothing is running: cancel reached its goal state and must not error");
+}

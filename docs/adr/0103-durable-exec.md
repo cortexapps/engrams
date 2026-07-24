@@ -398,12 +398,14 @@ deadline left).
 - Completion accounting mirrors the start-side dedup: `ExecCompleted` is
   deduplicated by exec_id against the durable log (a journal replay of an
   already-complete exec reaches a real Exit on every attach), and `wall_ms`
-  spans from the logged `exec_started` to the Exit rather than the attach
+  spans from the recorded `exec_started` to the Exit rather than the attach
   segment that happened to deliver it. The store method generalized to
-  `session_exec_event_logged_at` (kind-typed, `MIN(created_at)`); its D4
-  conformance scenario pins every predicate clause — exec_id match, session
-  scoping, kind filter (stdout/completed payloads also carry exec_id), and
-  first-occurrence-wins over duplicates.
+  `session_exec_event_at` (kind-typed, `MIN((payload->>'at')::timestamptz)` —
+  the event's OWN stamp, not the row's `created_at`; see the self-review
+  section for why); its D4 conformance scenario pins every predicate
+  clause — exec_id match, session scoping, kind filter (stdout/completed
+  payloads also carry exec_id), first-occurrence-wins over duplicates, and
+  payload-stamp-not-row-time via a skewed row.
 - **Output recording is observation-independent (fixed in this PR).** The
   coordinator persists exec output rows as a side effect of serving an
   attach — the writer placement is forced (it is the only PG-capable
@@ -451,6 +453,71 @@ deadline left).
     CancelExec, and Upload. And `runExec` reaps its own spawned exec on the
     protocol-violation give-up (but never on a refusal — the ticket's real
     first-writer is running there, and cancelling would kill it).
+
+### Self-review hardening (2026-07-24)
+
+An adversarial self-review of the round-8/9 changes (three independent
+reviewers per hazard area, findings hand-verified) surfaced six defects —
+several of them *introduced or made load-bearing by* the earlier fixes:
+
+- **`isTerminalExecError` treated every FailedPrecondition as terminal.**
+  The two message guards ("exec refused", "no live sandbox") were dead code
+  — FailedPrecondition wasn't in the retryable fallthrough list, so the
+  function answered "terminal" before ever consulting them. But the
+  coordinator maps `Gone`, `HostLost`, AND every `Conflict` — including the
+  documented-retryable Evacuating/Queued/Pending states and the transient
+  no-live-sandbox eviction flip — onto FailedPrecondition. An operator
+  drain mid-exec therefore failed the workflow instantly with hours of
+  deadline left, violating "the deadline is the ONLY budget"; and because
+  terminal errors deliberately never reap, it also leaked the running exec.
+  Fixed: FailedPrecondition is retryable BY DEFAULT; terminal only for the
+  `engram-error-slug: snapshot_invalidated` metadata (`ApiError::Gone` —
+  dead/failed/completed session), "exec refused", and the identity-changed
+  invariant guard. If the slug is stripped in transit the failure mode is
+  retry-until-deadline (bounded), never a premature give-up.
+- **The deferred `ExecStarted` collapsed `wall_ms` to ~0 for silent
+  commands** — the exact non-tty `git clone` shape this ADR exists for.
+  Deferring emission to the first frame also deferred the *measurement*:
+  a silent command's first coordinator-level frame is its Exit. Fixed
+  twice over: the emission stamps the attach-time clock reading (only the
+  emission is deferred, not the measurement), and the store lookup reads
+  the event's own `at` (renamed `session_exec_event_at`) instead of the
+  row's `created_at` — the row lands at first-frame time even with the
+  stamp fixed.
+- **A losing attach could stream the winner's output before its refusal.**
+  The pre-replay identity check is skipped when the winner hasn't flushed
+  `request.json` yet, and the drain loop read chunks before checking state.
+  Since `request.json` is written once, atomically, and never mutated,
+  identity is decided permanently the moment it exists: one Mismatch check
+  after the publish-wait window, before any drain, closes every ordering.
+- **The terminal-marker cancel gate covered only the CLEAN half of the
+  PID-reuse hazard.** `exit.json` lands after the wrapper's pipe drain, but
+  the command's pid becomes reusable at reap — a daemonizing child that
+  inherits stdout stalls the drain forever, leaving a reaped pid with no
+  marker. The wrapper now records the command's `(pid, starttime)` identity
+  at spawn (read pre-wait, while even a fast-exiting command is a readable
+  zombie), and cancel verifies it before `killpg`: a mismatch proves the
+  pid was recycled — and a pid is only recyclable once the whole group is
+  empty — so there is provably nothing left to kill. `kill_process_group`
+  also swallows ESRCH (the group being gone is every caller's goal state);
+  previously the `?` made cancelling a provably-dead exec an error and
+  defeated the finished-during-cancel retry loop.
+- **The probe and CancelExec writes didn't race the epoch** while this ADR
+  claimed all one-shot I/O did. Fixed (the record and the code now agree).
+- **The web UI read `rusage.duration_ms`, the wire carries `wall_ms`** —
+  exec durations had never rendered. Pre-existing, fixed alongside.
+
+Documented residuals (accepted, not fixed): a reap against an idle-evicted
+session resurrects the VM just to kill one process (`cancel_exec_core`
+calls `ensure_active`; correct direction — the command would resume-and-
+burn otherwise — but a heavy discard); a failed best-effort `exec_started`
+emission leaves output rows with no start row, which the web transcript
+drops until a later attach self-heals the start; the concurrent
+duplicate-`Started` window widened from one await to first-frame (same
+MIN-absorbed race as before); and a refusal on a GC'd ticket after a
+genuine earlier run leaves the earlier run's rows in place — "refusal
+records no lifecycle rows" is about the refused attach, not about
+retroactively erasing history.
 
 ## Alternatives considered
 

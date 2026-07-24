@@ -945,7 +945,7 @@ impl MetadataStore for SimMetadataStore {
 
     // ================= session events =================
 
-    async fn session_exec_event_logged_at(
+    async fn session_exec_event_at(
         &self,
         session_id: SessionId,
         exec_id: &str,
@@ -953,8 +953,10 @@ impl MetadataStore for SimMetadataStore {
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
         self.gate()?;
         let db = self.db.lock();
-        // `SELECT MIN(created_at) ... WHERE kind = $2 AND payload->>'exec_id' = $3
-        //  AND rewound_at IS NULL` — the dedup sees the live timeline only.
+        // `SELECT MIN((payload->>'at')::timestamptz) ... WHERE kind = $2 AND
+        //  payload->>'exec_id' = $3 AND rewound_at IS NULL` — the event's OWN
+        // `at` stamp (attach time), not the row's created_at (first-frame
+        // time), and the dedup sees the live timeline only.
         Ok(db.session_events.get(&session_id).and_then(|events| {
             events
                 .iter()
@@ -967,7 +969,17 @@ impl MetadataStore for SimMetadataStore {
                             .and_then(serde_json::Value::as_str)
                             == Some(exec_id)
                 })
-                .map(|event| event.created_at)
+                .filter_map(|event| {
+                    event
+                        .payload
+                        .get("at")
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(|raw| {
+                            chrono::DateTime::parse_from_rfc3339(raw)
+                                .ok()
+                                .map(|at| at.with_timezone(&chrono::Utc))
+                        })
+                })
                 .min()
         }))
     }

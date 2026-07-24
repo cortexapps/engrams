@@ -114,8 +114,8 @@ pub struct IdleScanCandidate {
 
 /// ADR 0103: the two durable-exec lifecycle markers in the session event
 /// log. Typed (rather than a raw kind string) so
-/// [`MetadataStore::session_exec_event_logged_at`] can only be asked about
-/// kinds whose payloads are guaranteed to carry an `exec_id`.
+/// [`MetadataStore::session_exec_event_at`] can only be asked about
+/// kinds whose payloads are guaranteed to carry an `exec_id` and an `at`.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ExecLifecycleEventKind {
     Started,
@@ -1766,20 +1766,26 @@ pub trait MetadataStore: Send + Sync {
 
     // ---- session event log ----
 
-    /// Earliest recorded timestamp of the given exec lifecycle event for
+    /// Earliest `at` stamp CARRIED BY the given exec lifecycle event for
     /// `exec_id` in this session's durable event log, or `None` if absent.
+    ///
+    /// This reads the event's own recorded timestamp (`payload.at`), not the
+    /// row's `created_at`: the `exec_started` stamp is the attach time (the
+    /// closest host-side proxy for spawn), while its row lands only at the
+    /// first delivered frame — for a silent command that is the Exit itself,
+    /// so measuring from `created_at` would collapse `wall_ms` to ~0.
     ///
     /// ADR 0103 uses this for two duties on the durable exec path: lifecycle
     /// dedup on re-attach (presence check for both `exec_started` and
     /// `exec_completed`, keyed by exec_id — replay offsets can legitimately
     /// still be zero), and honest `wall_ms` accounting measured from the
-    /// logged start rather than from the attach segment that happened to
+    /// recorded start rather than from the attach segment that happened to
     /// deliver the Exit.
     ///
     /// Default `None` keeps event-less mock stores lightweight.
     /// `PostgresStore` and `SimMetadataStore` implement the real event-log
     /// query, covered by the ADR 0098 D4 conformance suite.
-    async fn session_exec_event_logged_at(
+    async fn session_exec_event_at(
         &self,
         _session_id: SessionId,
         _exec_id: &str,

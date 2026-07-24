@@ -70,7 +70,7 @@ async fn pg_ctx() -> Option<Ctx> {
 /// the logged start. Every predicate clause is pinned: exec_id match,
 /// session scoping, kind filter (other event kinds also carry `exec_id`
 /// in their payloads), and MIN over duplicates.
-async fn session_exec_event_logged_at(ctx: &Ctx) {
+async fn session_exec_event_at(ctx: &Ctx) {
     use engram_core::traits::ExecLifecycleEventKind::{Completed, Started};
 
     let sid = ctx
@@ -94,7 +94,7 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
 
     assert_eq!(
         ctx.meta
-            .session_exec_event_logged_at(sid, "exec:present", Started)
+            .session_exec_event_at(sid, "exec:present", Started)
             .await
             .unwrap(),
         None,
@@ -124,7 +124,7 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
         .unwrap();
     assert_eq!(
         ctx.meta
-            .session_exec_event_logged_at(sid, "exec:present", Started)
+            .session_exec_event_at(sid, "exec:present", Started)
             .await
             .unwrap(),
         None,
@@ -146,7 +146,7 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
 
     assert_eq!(
         ctx.meta
-            .session_exec_event_logged_at(sid, "exec:present", Started)
+            .session_exec_event_at(sid, "exec:present", Started)
             .await
             .unwrap(),
         Some(first_started_at),
@@ -154,7 +154,7 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
     );
     assert_eq!(
         ctx.meta
-            .session_exec_event_logged_at(sid, "exec:different", Started)
+            .session_exec_event_at(sid, "exec:different", Started)
             .await
             .unwrap(),
         None,
@@ -162,11 +162,38 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
     );
     assert!(
         ctx.meta
-            .session_exec_event_logged_at(sid, "exec:present", Completed)
+            .session_exec_event_at(sid, "exec:present", Completed)
             .await
             .unwrap()
             .is_some(),
         "the Completed kind resolves independently of Started"
+    );
+
+    // The lookup returns the event's OWN `at` stamp, not the row's
+    // created_at. A silent command's exec_started row lands only at its
+    // first delivered frame (the Exit itself) while its `at` records the
+    // attach time — measuring from created_at would collapse wall_ms to ~0.
+    let skewed_at = ctx.clock.now_utc() - chrono::Duration::seconds(30);
+    ctx.meta
+        .append_session_event(
+            sid,
+            "exec_started",
+            serde_json::json!({
+                "type": "exec_started",
+                "exec_id": "exec:skewed",
+                "command": ["true"],
+                "at": skewed_at,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_event_at(sid, "exec:skewed", Started)
+            .await
+            .unwrap(),
+        Some(skewed_at),
+        "the lookup must return the event's recorded `at`, not the row's created_at"
     );
 
     // An ADR-0028 recovery rewind tombstones exec lifecycle rows. The guest
@@ -176,7 +203,7 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
     ctx.meta.rewind_session_to_cursor(sid, 0).await.unwrap();
     assert_eq!(
         ctx.meta
-            .session_exec_event_logged_at(sid, "exec:present", Started)
+            .session_exec_event_at(sid, "exec:present", Started)
             .await
             .unwrap(),
         None,
@@ -184,7 +211,7 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
     );
     assert_eq!(
         ctx.meta
-            .session_exec_event_logged_at(sid, "exec:present", Completed)
+            .session_exec_event_at(sid, "exec:present", Completed)
             .await
             .unwrap(),
         None,
@@ -2071,10 +2098,7 @@ conformance!(
 );
 conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
-conformance!(
-    t_session_exec_event_logged_at,
-    super::session_exec_event_logged_at
-);
+conformance!(t_session_exec_event_at, super::session_exec_event_at);
 conformance!(
     t_session_exec_output_high_water,
     super::session_exec_output_high_water

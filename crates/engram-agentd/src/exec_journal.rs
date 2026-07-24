@@ -346,6 +346,21 @@ impl JournalEntry {
         atomic_write(&self.dir.join("pid"), pid.to_string().as_bytes()).await
     }
 
+    /// Kernel start time of the recorded command pid at spawn. The
+    /// (pid, starttime) pair is a unique process identity for the lifetime
+    /// of a boot; `cancel` verifies it before killing so a recycled pid is
+    /// never SIGKILLed on this journal's behalf.
+    pub async fn write_pid_start(&self, ticks: u64) -> io::Result<()> {
+        atomic_write(&self.dir.join("pid_start"), ticks.to_string().as_bytes()).await
+    }
+
+    pub async fn pid_start(&self) -> io::Result<u64> {
+        let raw = tokio::fs::read_to_string(self.dir.join("pid_start")).await?;
+        raw.trim()
+            .parse::<u64>()
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
+    }
+
     pub async fn write_owner_pid(&self, pid: u32) -> io::Result<()> {
         atomic_write(&self.dir.join("owner_pid"), pid.to_string().as_bytes()).await
     }
@@ -530,6 +545,14 @@ pub async fn run_wrapper(
         if let Err(error) = entry.write_pid(pid).await {
             entry.mark_degraded(&format!("write pid: {error}")).await;
         }
+        // Identity for a future CancelExec: (pid, starttime) is unique for
+        // the lifetime of a boot. Read pre-wait, while the pid is still
+        // reserved (even a fast-exiting command is a readable zombie until
+        // reaped). Best-effort — absence just means cancel falls back to
+        // the bare group kill.
+        if let Some(ticks) = process_start_ticks(pid) {
+            let _ = entry.write_pid_start(ticks).await;
+        }
     }
 
     let stdout = child
@@ -657,6 +680,25 @@ pub async fn cancel(entry: &JournalEntry) -> io::Result<()> {
         }
         match entry.pid().await {
             Ok(pid) => {
+                // The marker only covers the CLEAN half of the reuse hazard:
+                // a wrapper stuck draining (a daemonized child holding the
+                // pipe open) or dead uncleanly never writes `exit.json`, yet
+                // its command was reaped long ago. The (pid, starttime)
+                // identity recorded at spawn closes the rest: a mismatch
+                // proves the pid was recycled — and a pid is only recyclable
+                // once our whole group is empty (a live group pins its pgid)
+                // — so there is provably nothing of ours left to kill. A
+                // missing identity file (torn spawn window) falls back to
+                // the bare kill; a reaped leader with SURVIVING group
+                // members reads as no-stat and proceeds, because a pgid
+                // with members cannot be recycled.
+                if let (Ok(recorded), Some(current)) =
+                    (entry.pid_start().await, process_start_ticks(pid))
+                {
+                    if current != recorded {
+                        return Ok(());
+                    }
+                }
                 kill_process_group(Some(pid))?;
                 return Ok(());
             }
@@ -732,16 +774,43 @@ fn process_is_alive(pid: u32) -> bool {
     pid == std::process::id()
 }
 
+/// Kernel start time (clock ticks since boot; `/proc/<pid>/stat` field 22)
+/// of `pid`, or `None` when the process no longer exists. The
+/// (pid, starttime) pair is a unique process identity for the lifetime of a
+/// boot — the check that makes killing by a recorded pid safe against PID
+/// reuse. FC snapshot/resume preserves guest kernel state, so identities
+/// recorded before a checkpoint stay valid after resume.
+#[cfg(target_os = "linux")]
+pub fn process_start_ticks(pid: u32) -> Option<u64> {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    // comm (field 2) may itself contain spaces and parens; everything after
+    // the LAST ')' is fields 3.. — starttime is field 22, index 19 there.
+    let rest = stat.rsplit_once(')')?.1;
+    rest.split_whitespace().nth(19)?.parse().ok()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn process_start_ticks(_pid: u32) -> Option<u64> {
+    None
+}
+
 #[cfg(target_os = "linux")]
 fn kill_process_group(pid: Option<u32>) -> io::Result<()> {
     let pid = pid
         .and_then(|pid| i32::try_from(pid).ok())
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "invalid process-group pid"))?;
-    nix::sys::signal::killpg(
+    match nix::sys::signal::killpg(
         nix::unistd::Pid::from_raw(pid),
         nix::sys::signal::Signal::SIGKILL,
-    )
-    .map_err(|error| io::Error::from_raw_os_error(error as i32))
+    ) {
+        Ok(()) => Ok(()),
+        // The group no longer exists — the goal state of every caller
+        // (the wrapper's timeout kill, CancelExec). Not an error: surfacing
+        // ESRCH made cancelling a provably-dead exec fail, and defeated the
+        // finished-during-cancel retry loop above.
+        Err(nix::errno::Errno::ESRCH) => Ok(()),
+        Err(error) => Err(io::Error::from_raw_os_error(error as i32)),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]

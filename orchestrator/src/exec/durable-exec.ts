@@ -121,19 +121,27 @@ function decodeExecOutput(chunks: readonly Uint8Array[]): string {
 function isTerminalExecError(error: unknown): boolean {
   if (!(error instanceof ConnectError)) return false;
   if (error.code === Code.NotFound) return true;
-  if (
-    error.code === Code.FailedPrecondition
-    && /session has no live sandbox/i.test(error.rawMessage)
-  ) {
-    return true;
-  }
-  // A refusal (first-writer-wins command mismatch, GC'd/missing ticket) is
-  // deterministic: retrying cannot change agentd's answer.
-  if (
-    error.code === Code.FailedPrecondition
-    && /exec refused/i.test(error.rawMessage)
-  ) {
-    return true;
+  if (error.code === Code.FailedPrecondition) {
+    // The coordinator maps BOTH permanent and self-healing states onto
+    // FailedPrecondition: `Gone` (dead/failed/completed session, invalidated
+    // snapshot) is permanent, while Evacuating/Queued/Pending conflicts, the
+    // transient no-live-sandbox eviction flip, and HostLost are all
+    // documented "retry shortly". The engram-error-slug status metadata is
+    // the machine-readable discriminator for `Gone`; two deterministic
+    // conflict shapes are terminal by message. EVERYTHING else retries —
+    // the deadline is the ONLY budget, and if the slug got stripped in
+    // transit the failure mode is retry-until-deadline (bounded), never a
+    // premature give-up.
+    if (error.metadata.get("engram-error-slug") === "snapshot_invalidated") {
+      return true;
+    }
+    // A refusal (first-writer-wins command mismatch, GC'd/missing ticket) is
+    // deterministic: retrying cannot change agentd's answer.
+    if (/exec refused/i.test(error.rawMessage)) return true;
+    // The coordinator's exec-identity invariant guard tripping is equally
+    // deterministic — the backend keeps answering with a different ticket.
+    if (/durable exec identity changed/i.test(error.rawMessage)) return true;
+    return false;
   }
   return ![
     Code.Canceled,

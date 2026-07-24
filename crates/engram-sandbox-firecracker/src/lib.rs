@@ -4415,15 +4415,21 @@ where
 
 async fn probe_durable_exec(
     mut io: BoxExecIo,
-    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+    mut severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
 ) -> Result<bool, SandboxError> {
-    write_msg(
+    // The write races the epoch like every other one-shot vsock I/O: the
+    // frame is tiny, but a checkpoint landing between dial and write still
+    // severs with no host-side EOF, and an unraced write is exactly the
+    // wedge shape ADR 0103 exists to close.
+    write_wire_message_racing_severance(
         &mut io,
         &WireRequest::CancelExec {
             exec_id: engram_agentd::handler::DURABLE_EXEC_CAPABILITY_PROBE.into(),
         },
+        severed.as_deref_mut(),
+        "durable exec capability probe",
     )
-    .await
+    .await?
     .map_err(|error| vm_err(format!("durable exec capability probe send: {error}")))?;
     match read_wire_response_racing_severance(&mut io, severed, "durable exec capability probe")
         .await?
@@ -4452,15 +4458,18 @@ async fn probe_durable_exec(
 async fn cancel_exec_roundtrip(
     mut io: BoxExecIo,
     exec_id: &str,
-    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+    mut severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
 ) -> Result<(), SandboxError> {
-    write_msg(
+    // Raced like every other one-shot vsock I/O (see probe_durable_exec).
+    write_wire_message_racing_severance(
         &mut io,
         &WireRequest::CancelExec {
             exec_id: exec_id.to_string(),
         },
+        severed.as_deref_mut(),
+        "CancelExec",
     )
-    .await
+    .await?
     .map_err(|error| vm_err(format!("send CancelExec({exec_id}): {error}")))?;
     match read_wire_response_racing_severance(&mut io, severed, "CancelExec").await? {
         Ok(WireResponse::ExecCancelled) => Ok(()),
@@ -7834,6 +7843,35 @@ mod tests {
             "severed cancel must be a retryable Unavailable, got {result:?}"
         );
         drop(severed_guest.await.unwrap());
+    }
+
+    /// The WRITE half of the CancelExec round-trip must race the epoch too:
+    /// a checkpoint landing between dial and write leaves the frame parked
+    /// on a full, never-drained socket buffer with no host-side EOF. The
+    /// probe write shares this exact code path (see `probe_durable_exec`).
+    #[tokio::test]
+    async fn checkpoint_severing_the_cancel_exec_write_errors_retryably_instead_of_hanging() {
+        // A buffer smaller than the frame parks the write; the guest never
+        // reads a byte — the severed-but-never-EOF muxer UDS.
+        let (host_end, guest_end) = tokio::io::duplex(16);
+        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+
+        let cancel = tokio::spawn(async move {
+            cancel_exec_roundtrip(Box::new(host_end), "exec-victim", Some(&mut epoch_rx)).await
+        });
+        // Let the write park on the tiny buffer, then sever.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        epoch_tx.send_modify(|epoch| *epoch += 1);
+
+        let result = tokio::time::timeout(Duration::from_secs(2), cancel)
+            .await
+            .expect("severed cancel write must resolve promptly, not hang")
+            .expect("cancel task must not panic");
+        assert!(
+            matches!(result, Err(SandboxError::Unavailable(_))),
+            "a write severed mid-frame must be a retryable Unavailable, got {result:?}"
+        );
+        drop(guest_end);
     }
 
     /// And on the Upload round-trip (`write_files`): a severed response read

@@ -588,12 +588,23 @@ describe("durable orchestrator exec caller", () => {
     expect(runtime.elapsedMs()).toBe(60);
   });
 
-  test("not-found and no-live-sandbox coordinator errors are terminal", async () => {
+  test("not-found and gone-session coordinator errors are terminal", async () => {
     for (const error of [
       new ConnectError("session not found", Code.NotFound),
+      // `ApiError::Gone` (dead/failed/completed session, invalidated
+      // snapshot) shares FailedPrecondition with retryable conflicts; the
+      // coordinator's engram-error-slug metadata is the discriminator.
       new ConnectError(
-        "session has no live sandbox — create a new session or resume from snapshot",
+        "session is dead and cannot be resumed",
         Code.FailedPrecondition,
+        new Headers({ "engram-error-slug": "snapshot_invalidated" }),
+      ),
+      // A durable-exec identity change is an invariant guard tripping —
+      // deterministic, retrying cannot change the answer.
+      new ConnectError(
+        "durable exec identity changed across host boundary: requested exec:a, got exec:b",
+        Code.FailedPrecondition,
+        new Headers({ "engram-error-slug": "conflict" }),
       ),
     ]) {
       let calls = 0;
@@ -622,6 +633,64 @@ describe("durable orchestrator exec caller", () => {
         instantRuntime(),
       )).rejects.toBe(error);
       expect(calls).toBe(1);
+    }
+  });
+
+  test("documented-retryable conflicts never give up before the deadline", async () => {
+    // The coordinator maps Evacuating/Queued/Pending conflicts, the
+    // transient no-live-sandbox eviction flip, AND HostLost all to
+    // FailedPrecondition — every one of them documented "retry shortly" /
+    // self-healing. The deadline is the ONLY budget: none of these may be
+    // terminal, whether or not the slug metadata survived the transport.
+    const retryable = [
+      new ConnectError(
+        "session is relocating (operator drain / teleport); it will resume automatically — retry shortly",
+        Code.FailedPrecondition,
+        new Headers({ "engram-error-slug": "conflict" }),
+      ),
+      new ConnectError(
+        "session has no live sandbox — create a new session or resume from snapshot",
+        Code.FailedPrecondition,
+      ),
+      new ConnectError(
+        "host lost; the session will be redriven to Idle",
+        Code.FailedPrecondition,
+        new Headers({ "engram-error-slug": "host_lost" }),
+      ),
+    ];
+    for (const error of retryable) {
+      let calls = 0;
+      const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
+      const execId = "exec:evacuating:true";
+      const server: ReviewSessionsClient = {
+        createSession: () => base.createSession(),
+        deleteSession: (req) => base.deleteSession(req),
+        cancelExec: (req) => base.cancelExec(req),
+        writeFiles: (req) => base.writeFiles(req),
+        sendPrompt: () => base.sendPrompt(),
+        exec(): AsyncIterable<ExecFrame> {
+          calls++;
+          return {
+            async *[Symbol.asyncIterator]() {
+              throw error;
+            },
+          };
+        },
+      };
+
+      await expect(runExec(
+        server,
+        "evacuating-session",
+        "true",
+        { execId, deadlineMs: 5_000 },
+        instantRuntime(),
+      )).rejects.toThrow(`exec ${execId} exceeded deadline of 5000ms`);
+      // Retried throughout the budget instead of giving up on attempt one.
+      expect(calls).toBeGreaterThan(1);
+      // The deadline give-up reaps the ticket we may have spawned.
+      expect(base.cancelCalls).toEqual([
+        { sessionId: "evacuating-session", execId },
+      ]);
     }
   });
 
