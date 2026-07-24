@@ -445,6 +445,43 @@ describe("runSweepTick", () => {
     ).toBeNull();
   });
 
+  test("a persistently failing stale cancel stops inflating the sweep count at the cap", async () => {
+    const f = await fixture([
+      row("wf-cancel-wedged", {
+        createdAtEpochMs: NOW.getTime() - 2 * HOUR_MS,
+      }),
+    ]);
+    f.deps.cancelWorkflow = async () => {
+      throw new Error("cancel keeps failing");
+    };
+
+    // maxSweeps failing cancelled_stale attempts each record intent…
+    for (let attempt = 0; attempt < f.deps.config.maxSweeps; attempt++) {
+      const result = await runSweepTick(f.deps);
+      expect(result.decisions[0]?.action).toBe("error");
+    }
+    expect((await f.deps.ledger.get("wf-cancel-wedged"))?.sweepCount).toBe(
+      f.deps.config.maxSweeps,
+    );
+
+    // …then the cap dominates: further ticks retry the cancel via
+    // cancelled_capped WITHOUT recordSweep, so the count stays bounded.
+    for (let attempt = 0; attempt < 3; attempt++) {
+      await runSweepTick(f.deps);
+    }
+    expect((await f.deps.ledger.get("wf-cancel-wedged"))?.sweepCount).toBe(
+      f.deps.config.maxSweeps,
+    );
+
+    // When the cancel finally succeeds, the workflow terminates as capped.
+    f.deps.cancelWorkflow = async (workflowUuid) => {
+      f.cancelled.push(workflowUuid);
+    };
+    const final = await runSweepTick(f.deps);
+    expect(final.decisions[0]?.action).toBe("cancelled_capped");
+    expect(f.cancelled).toEqual(["wf-cancel-wedged"]);
+  });
+
   test("suppression vetoes the alert-only stale cancel", async () => {
     const f = await fixture([
       row("wf-dead-name", {

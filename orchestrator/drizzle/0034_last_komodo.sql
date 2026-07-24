@@ -1,0 +1,1 @@
+ALTER TABLE "dbos_sweep_ledger" ADD COLUMN "terminal_alerted_at" timestamp with time zone;

@@ -296,3 +296,16 @@ The re-review round (2 LOW):
   `cancelled_stale`/`cancelled_capped` alert is never suppressed by an
   earlier alert-only alert; the termination is the transition operators must
   see.
+
+Third round (2 LOW):
+
+- **The sweep cap dominates every repeated intent**: the cap check moved
+  ahead of the stale/policy-cancel branches, so a persistently-failing
+  `cancelWorkflow` degrades to `cancelled_capped` after `maxSweeps` recorded
+  attempts — it still retries once per rotation (bounded, self-healing) but
+  can no longer inflate `sweep_count` without bound.
+- **Terminal-failure alerts dedup on their own marker**
+  (`terminal_alerted_at`, migration 0034): sweep-decision alerts and
+  terminal-failure alerts are distinct streams; sharing `alerted_at` let an
+  adoption-race `error` decision alert suppress the later terminal-failure
+  alarm for the same workflow.

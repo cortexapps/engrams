@@ -104,12 +104,14 @@ async function processRow(
   };
 
   // Generic ops alert FIRST, outside the callback, unconditionally — a buggy
-  // cleanup can never suppress the alarm.
+  // cleanup can never suppress the alarm. Dedup on the terminal-failure
+  // marker, never the sweep-decision alertedAt: a decision alert (e.g. an
+  // adoption-race error) must not swallow the later terminal-failure alarm.
   const ledgerBeforeAlert = await deps.ledger.get(row.workflowUuid);
-  if (!ledgerBeforeAlert?.alertedAt) {
+  if (!ledgerBeforeAlert?.terminalAlertedAt) {
     try {
       await deps.post(terminalFailureMessage(workflow));
-      await deps.ledger.markAlerted(row.workflowUuid, row.name);
+      await deps.ledger.markTerminalAlerted(row.workflowUuid, row.name);
       result.alerted++;
     } catch (error) {
       deps.log.error(

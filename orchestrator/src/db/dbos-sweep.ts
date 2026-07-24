@@ -42,6 +42,7 @@ export interface SweepLedgerRow {
   cleanupDoneAt: Date | null;
   cleanupFn: string | null;
   alertedAt: Date | null;
+  terminalAlertedAt: Date | null;
 }
 
 export interface SweepLedgerStore {
@@ -56,6 +57,12 @@ export interface SweepLedgerStore {
     fnName: string,
   ): Promise<void>;
   markAlerted(workflowUuid: string, workflowName: string): Promise<void>;
+  /** Terminal-failure alerts dedup separately from sweep-decision alerts —
+   * a decision alert must never suppress the terminal-failure alarm. */
+  markTerminalAlerted(
+    workflowUuid: string,
+    workflowName: string,
+  ): Promise<void>;
   getWatermark(key: string): Promise<number | null>;
   setWatermark(key: string, epochMs: number): Promise<void>;
 }
@@ -143,6 +150,7 @@ function ledgerRow(row: Record<string, unknown>): SweepLedgerRow {
     cleanupDoneAt: nullableDate(row.cleanup_done_at),
     cleanupFn: row.cleanup_fn === null ? null : String(row.cleanup_fn),
     alertedAt: nullableDate(row.alerted_at),
+    terminalAlertedAt: nullableDate(row.terminal_alerted_at),
   };
 }
 
@@ -186,7 +194,8 @@ function recordSweepQuery(
         "last_swept_at" = now()
     returning "workflow_uuid", "workflow_name", "sweep_count",
               "first_swept_at", "last_swept_at", "suppressed",
-              "cleanup_done_at", "cleanup_fn", "alerted_at"
+              "cleanup_done_at", "cleanup_fn", "alerted_at",
+              "terminal_alerted_at"
   `;
 }
 
@@ -273,7 +282,8 @@ export function makeSweepLedgerStore(
       const result = await db.execute(sql`
         select "workflow_uuid", "workflow_name", "sweep_count",
                "first_swept_at", "last_swept_at", "suppressed",
-               "cleanup_done_at", "cleanup_fn", "alerted_at"
+               "cleanup_done_at", "cleanup_fn", "alerted_at",
+               "terminal_alerted_at"
         from "dbos_sweep_ledger"
         where "workflow_uuid" = ${workflowUuid}
         limit 1
@@ -307,6 +317,16 @@ export function makeSweepLedgerStore(
         values (${workflowUuid}, ${workflowName}, now())
         on conflict ("workflow_uuid") do update
         set "alerted_at" = now()
+      `);
+    },
+
+    async markTerminalAlerted(workflowUuid, workflowName) {
+      await db.execute(sql`
+        insert into "dbos_sweep_ledger"
+          ("workflow_uuid", "workflow_name", "terminal_alerted_at")
+        values (${workflowUuid}, ${workflowName}, now())
+        on conflict ("workflow_uuid") do update
+        set "terminal_alerted_at" = now()
       `);
     },
 
@@ -573,6 +593,7 @@ function emptyLedgerRow(
     cleanupDoneAt: null,
     cleanupFn: null,
     alertedAt: null,
+    terminalAlertedAt: null,
   };
 }
 
@@ -583,6 +604,9 @@ function cloneLedgerRow(row: SweepLedgerRow): SweepLedgerRow {
     lastSweptAt: row.lastSweptAt ? new Date(row.lastSweptAt) : null,
     cleanupDoneAt: row.cleanupDoneAt ? new Date(row.cleanupDoneAt) : null,
     alertedAt: row.alertedAt ? new Date(row.alertedAt) : null,
+    terminalAlertedAt: row.terminalAlertedAt
+      ? new Date(row.terminalAlertedAt)
+      : null,
   };
 }
 
@@ -614,6 +638,7 @@ export function makeInMemorySweepLedgerStore(
             cleanupDoneAt: null,
             cleanupFn: null,
             alertedAt: null,
+            terminalAlertedAt: null,
           };
       rows.set(workflowUuid, row);
       return cloneLedgerRow(row);
@@ -640,6 +665,12 @@ export function makeInMemorySweepLedgerStore(
       const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
       rows.set(workflowUuid, row);
       row.alertedAt = now();
+    },
+
+    async markTerminalAlerted(workflowUuid, workflowName) {
+      const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
+      rows.set(workflowUuid, row);
+      row.terminalAlertedAt = now();
     },
 
     async getWatermark(key) {

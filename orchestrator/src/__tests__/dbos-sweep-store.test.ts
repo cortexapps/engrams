@@ -91,6 +91,7 @@ describe("in-memory sweep ledger store", () => {
       cleanupDoneAt: null,
       cleanupFn: null,
       alertedAt: null,
+      terminalAlertedAt: null,
     });
     expect(first.firstSweptAt?.getTime()).toBe(20_000);
     expect(first.lastSweptAt?.getTime()).toBe(20_000);
@@ -112,6 +113,13 @@ describe("in-memory sweep ledger store", () => {
       cleanupFn: "cleanWorkflow",
     });
     expect((await store.get("wf-1"))?.cleanupDoneAt?.getTime()).toBe(22_000);
+    expect((await store.get("wf-1"))?.alertedAt?.getTime()).toBe(23_000);
+    nowMs = 24_000;
+    await store.markTerminalAlerted("wf-1", "WorkflowOne");
+    expect((await store.get("wf-1"))?.terminalAlertedAt?.getTime()).toBe(
+      24_000,
+    );
+    // The two alert streams keep distinct dedup keys.
     expect((await store.get("wf-1"))?.alertedAt?.getTime()).toBe(23_000);
     expect(await store.get("missing")).toBeNull();
 
@@ -506,6 +514,7 @@ describe("DBOS sweep stores with live Postgres", () => {
     await store.setSuppressed(workflowUuid, true);
     await store.markCleanupDone(workflowUuid, "WorkflowOne", "cleanup");
     await store.markAlerted(workflowUuid, "WorkflowOne");
+    await store.markTerminalAlerted(workflowUuid, "WorkflowOne");
     expect(await store.get(workflowUuid)).toMatchObject({
       workflowUuid,
       workflowName: "WorkflowOne",
@@ -513,6 +522,8 @@ describe("DBOS sweep stores with live Postgres", () => {
       suppressed: true,
       cleanupFn: "cleanup",
     });
+    expect((await store.get(workflowUuid))?.alertedAt).not.toBeNull();
+    expect((await store.get(workflowUuid))?.terminalAlertedAt).not.toBeNull();
     await store.setWatermark(watermarkKey, 123);
     await store.setWatermark(watermarkKey, 456);
     expect(await store.getWatermark(watermarkKey)).toBe(456);

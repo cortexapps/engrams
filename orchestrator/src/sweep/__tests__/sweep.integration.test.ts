@@ -493,7 +493,7 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
       expect(await ledger.get(workflowId)).toMatchObject({
         cleanupFn: "recordingCleanup",
       });
-      expect((await ledger.get(workflowId))?.alertedAt).not.toBeNull();
+      expect((await ledger.get(workflowId))?.terminalAlertedAt).not.toBeNull();
       expect((await ledger.get(workflowId))?.cleanupDoneAt).not.toBeNull();
       expect(await ledger.getWatermark("terminal_failures")).toBe(
         failedRow.updatedAtEpochMs - 1,

@@ -375,6 +375,10 @@ export const dbosSweepLedger = pgTable("dbos_sweep_ledger", {
   cleanupDoneAt: timestamp("cleanup_done_at", { withTimezone: true }),
   cleanupFn: text("cleanup_fn"),
   alertedAt: timestamp("alerted_at", { withTimezone: true }),
+  // Sweep-decision alerts and terminal-failure alerts are distinct streams;
+  // sharing one dedup key would let a decision alert (e.g. an adoption-race
+  // error) suppress the later terminal-failure alarm.
+  terminalAlertedAt: timestamp("terminal_alerted_at", { withTimezone: true }),
 });
 
 /** Tiny watermark KV used by the terminal-failure alert scan. */

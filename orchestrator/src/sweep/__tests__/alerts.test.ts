@@ -338,6 +338,42 @@ describe("SweepAlerter.scanTerminalFailures", () => {
     expect(posts.filter((post) => post.includes("wf-early"))).toHaveLength(1);
   });
 
+  test("a sweep-decision alert does not suppress the terminal-failure alert", async () => {
+    // The two alert streams dedup on distinct markers: an adoption-race
+    // error decision stamps alertedAt, but if that workflow later fails
+    // terminally on its new owner, the terminal-failure alarm must still fire.
+    const row = failedRow("wf-raced-then-failed");
+    const ledger = makeInMemorySweepLedgerStore(() => new Date(NOW));
+    await ledger.markAlerted(row.workflowUuid, row.name);
+    const posts: string[] = [];
+    const alerter = makeSweepAlerter({
+      ledger,
+      status: makeInMemoryDbosStatusStore([row]),
+      post: async (text) => {
+        posts.push(text);
+      },
+      policies: () => ({ mode: "adopt", staleAfterHours: 1 }),
+      cleanupCtx: cleanupContext(),
+      now: () => new Date(NOW),
+      log,
+      maxCleanupAttempts: 3,
+    });
+
+    const result = await alerter.scanTerminalFailures();
+
+    expect(result.alerted).toBe(1);
+    expect(posts).toHaveLength(1);
+    expect(posts[0]).toContain("terminal failure");
+    expect(
+      (await ledger.get(row.workflowUuid))?.terminalAlertedAt,
+    ).not.toBeNull();
+
+    // …and the terminal marker still dedups its own stream.
+    const second = await alerter.scanTerminalFailures();
+    expect(second.alerted).toBe(0);
+    expect(posts).toHaveLength(1);
+  });
+
   test("retries the second cleanup when terminal failures share a timestamp", async () => {
     const tiedAt = NOW.getTime() - 60_000;
     const first = failedRow("wf-tied-succeeded", {
@@ -633,7 +669,9 @@ describe("SweepAlerter.scanTerminalFailures", () => {
     await expect(alerter.scanTerminalFailures()).resolves.toBeDefined();
 
     expect(events).toEqual(["alert", "cleanup"]);
-    expect((await ledger.get(row.workflowUuid))?.alertedAt).not.toBeNull();
+    expect(
+      (await ledger.get(row.workflowUuid))?.terminalAlertedAt,
+    ).not.toBeNull();
   });
 
   test("skips a callback already recorded as complete", async () => {

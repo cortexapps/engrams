@@ -235,6 +235,21 @@ export async function runSweepTick(
               name: row.name,
               action: "ignored",
             };
+          } else if (
+            // The cap dominates every repeated intent: once a workflow has
+            // consumed maxSweeps recorded attempts (adoptions or failing
+            // cancels), further ticks cancel WITHOUT recordSweep, so a
+            // persistently-failing cancelWorkflow retries once per rotation
+            // but can no longer inflate sweep_count without bound.
+            prior !== null &&
+            prior.sweepCount >= deps.config.maxSweeps
+          ) {
+            await deps.cancelWorkflow(row.workflowUuid);
+            decision = {
+              workflowUuid: row.workflowUuid,
+              name: row.name,
+              action: "cancelled_capped",
+            };
           } else {
             const ageHours =
               (nowMs - row.createdAtEpochMs) / (60 * 60 * 1_000);
@@ -264,16 +279,6 @@ export async function runSweepTick(
                 workflowUuid: row.workflowUuid,
                 name: row.name,
                 action: "alert_only",
-              };
-            } else if (
-              prior !== null &&
-              prior.sweepCount >= deps.config.maxSweeps
-            ) {
-              await deps.cancelWorkflow(row.workflowUuid);
-              decision = {
-                workflowUuid: row.workflowUuid,
-                name: row.name,
-                action: "cancelled_capped",
               };
             } else if (policy.mode === "cancel") {
               await deps.ledger.recordSweep(row.workflowUuid, row.name);
