@@ -99,9 +99,11 @@ abandoned rows back into the queue and pods pull.
    alerts, records which cleanup callback ran, gives operators history.
 5. **Sweep policy registry** — keyed by registered workflow name, lives in
    code, **exhaustive by construction**: at boot every registered workflow
-   must have a policy entry (`adopt` / `cancel` / `ignore`) or the
-   orchestrator fails to start (same discipline as the wire-proto
-   exhaustiveness guards).
+   must have a policy entry (mode `adopt`; unknown names are alert-only) or
+   the orchestrator fails to start (same discipline as the wire-proto
+   exhaustiveness guards). Hypothetical `cancel`/`ignore` modes were built
+   and deleted unused — staleness cancels and operator suppression already
+   cover every "don't adopt this" need.
 
    ```ts
    const SWEEP_POLICIES: Record<string, SweepPolicy> = {
@@ -360,3 +362,27 @@ Fifth round (1 MEDIUM + 1 LOW):
   a healthy outcome. `raced` is excluded from ALERT_ACTIONS, so a rollback
   of a version that stranded many workflows no longer pages once per
   workflow; `error` is reserved for thrown exceptions.
+
+### Sixth round + scope re-audit (loop closed here)
+
+- **`notifyThread` is bounded by the note window** (MEDIUM, fixed): the
+  failure scan's 7-day lookback is an outage buffer for *ops alerts*, but
+  the user-facing thread note past 48h is exactly the necro-post this ADR
+  forbids (first deploy / post-outage bursts would have posted to every
+  quiet thread from the past week). The note now skips past
+  `THREAD_NOTE_MAX_AGE_HOURS` (48h); alert + completion marks unaffected.
+  `failReviewCleanup` intentionally stays unbounded — failing a stale stuck
+  review is correct at any age (it unlocks RetryReview).
+- **First-beat boot failure deliberately crashes** (LOW, declined): the
+  reviewer suggested guarding `heartbeat.start()`'s initial beat like the
+  interval callback. That guard would be a safety bug: a pod must prove its
+  version live BEFORE workflows run, or a peer's sweep can adopt its fresh
+  PENDING rows (a version with zero heartbeat rows passes the flip fence).
+  Crash-and-restart is the correct behavior; boot already hard-requires PG
+  one line earlier (`initDbos`).
+- **Unused policy modes deleted** (scope re-audit against this ADR's
+  original intent): `cancel` and `ignore` modes, the `cancelled_policy` and
+  `ignored` actions, their decision branches and tests were speculative
+  surface no registered policy ever used. `SweepMode` is now just `adopt`;
+  staleness cancels + suppression cover "don't adopt this". This also
+  retires the fourth round's `cancelled_policy` alert handling.

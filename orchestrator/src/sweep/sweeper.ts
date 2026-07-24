@@ -77,10 +77,8 @@ export type SweepDecision = {
     | "enqueued_cleared"
     | "cancelled_stale"
     | "cancelled_capped"
-    | "cancelled_policy"
     | "alert_only"
     | "suppressed"
-    | "ignored"
     // The flip's fence no-opped: the owner version regained liveness or the
     // row changed underneath us. A healthy lost race, never alert-worthy.
     | "raced"
@@ -103,14 +101,12 @@ const MUTATING_ACTIONS = new Set<SweepDecision["action"]>([
   "enqueued_cleared",
   "cancelled_stale",
   "cancelled_capped",
-  "cancelled_policy",
 ]);
 
 const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
   "alert_only",
   "cancelled_stale",
   "cancelled_capped",
-  "cancelled_policy",
   "error",
 ]);
 
@@ -233,12 +229,6 @@ export async function runSweepTick(
               name: row.name,
               action: "suppressed",
             };
-          } else if (policy.mode === "ignore") {
-            decision = {
-              workflowUuid: row.workflowUuid,
-              name: row.name,
-              action: "ignored",
-            };
           } else if (
             // The cap dominates every repeated intent: once a workflow has
             // consumed maxSweeps recorded attempts (adoptions or failing
@@ -261,10 +251,7 @@ export async function runSweepTick(
               policy.mode === "alert-only"
                 ? ALERT_ONLY_STALE_AFTER_HOURS
                 : policy.staleAfterHours;
-            if (
-              policy.mode !== "cancel" &&
-              ageHours > staleAfterHours
-            ) {
+            if (ageHours > staleAfterHours) {
               await deps.ledger.recordSweep(row.workflowUuid, row.name);
               await deps.cancelWorkflow(row.workflowUuid);
               decision = {
@@ -283,14 +270,6 @@ export async function runSweepTick(
                 workflowUuid: row.workflowUuid,
                 name: row.name,
                 action: "alert_only",
-              };
-            } else if (policy.mode === "cancel") {
-              await deps.ledger.recordSweep(row.workflowUuid, row.name);
-              await deps.cancelWorkflow(row.workflowUuid);
-              decision = {
-                workflowUuid: row.workflowUuid,
-                name: row.name,
-                action: "cancelled_policy",
               };
             } else {
               if (row.status === "PENDING") {

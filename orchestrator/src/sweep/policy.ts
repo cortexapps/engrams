@@ -4,7 +4,10 @@ import type { Logger } from "pino";
 import type { SweepLookupStore } from "../db/dbos-sweep.ts";
 import { failReviewCleanup, notifyThread } from "./cleanups.ts";
 
-export type SweepMode = "adopt" | "cancel" | "ignore";
+// Registered policies adopt; unknown names are alert-only. Hypothetical
+// cancel/ignore modes were built and then deleted unused — staleness cancels
+// and operator suppression already cover "don't adopt this".
+export type SweepMode = "adopt";
 
 export interface FailedWorkflow {
   workflowUuid: string;

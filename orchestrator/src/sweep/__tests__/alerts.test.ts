@@ -154,19 +154,10 @@ describe("SweepAlerter.alertDecisions", () => {
         reason: "unregistered workflow name past the stale window",
       },
     ]);
-    // Every cancel class posts, including policy-driven cancels.
-    await f.alerter.alertDecisions([
-      {
-        workflowUuid: "wf-policy",
-        name: "CancelModeWorkflow",
-        action: "cancelled_policy",
-      },
-    ]);
 
-    expect(f.posts).toHaveLength(3);
+    expect(f.posts).toHaveLength(2);
     expect(f.posts[0]).toContain("alert_only");
     expect(f.posts[1]).toContain("cancelled_stale");
-    expect(f.posts[2]).toContain("cancelled_policy");
   });
 
   test("contains a posting failure and continues to the next decision", async () => {

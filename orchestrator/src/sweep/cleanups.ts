@@ -8,6 +8,11 @@ const threadSourceSchema = z.object({
   threadRoot: z.string().min(1),
 });
 
+// The ADR's "never necro-post a weeks-dead conversation" bound. The failure
+// scan's 7-day lookback exists as an outage buffer for ops alerts; the
+// user-facing thread note only makes sense while the conversation is warm.
+export const THREAD_NOTE_MAX_AGE_HOURS = 48;
+
 /**
  * Warn the owner of a terminally failed Slack thread workflow.
  *
@@ -18,6 +23,16 @@ export async function notifyThread(
   ctx: SweepContext,
   wf: FailedWorkflow,
 ): Promise<void> {
+  const ageHours =
+    (Date.now() - wf.updatedAtEpochMs) / (60 * 60 * 1_000);
+  if (ageHours > THREAD_NOTE_MAX_AGE_HOURS) {
+    ctx.log.info(
+      { workflowUuid: wf.workflowUuid, ageHours },
+      "terminal Slack workflow is past the thread-note window; not posting",
+    );
+    return;
+  }
+
   const source = await ctx.lookups.threadSourceForWorkflow(wf.workflowUuid);
   if (source === null) {
     ctx.log.info(

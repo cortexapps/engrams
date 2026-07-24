@@ -23,7 +23,6 @@ const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
   "alert_only",
   "cancelled_stale",
   "cancelled_capped",
-  "cancelled_policy",
   "error",
 ]);
 // alert_only and error decisions recur every cycle for a row that stays in

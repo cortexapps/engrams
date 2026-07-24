@@ -1,4 +1,4 @@
-import { afterEach, describe, expect, test } from "bun:test";
+import { describe, expect, test } from "bun:test";
 import pino, { type Logger } from "pino";
 
 import {
@@ -12,10 +12,7 @@ import {
   type InMemoryDbosStatusSeed,
   type SweepLeaseStore,
 } from "../../db/dbos-sweep.ts";
-import {
-  assertSweepPoliciesExhaustive,
-  SWEEP_POLICIES,
-} from "../policy.ts";
+import { assertSweepPoliciesExhaustive } from "../policy.ts";
 import {
   DEFAULT_SWEEP_CONFIG,
   runSweepTick,
@@ -89,11 +86,6 @@ async function fixture(
   };
   return { deps, status, heartbeats, lease, cancelled };
 }
-
-afterEach(() => {
-  delete SWEEP_POLICIES.CancelTestWorkflow;
-  delete SWEEP_POLICIES.IgnoreTestWorkflow;
-});
 
 describe("runSweepTick", () => {
   test("returns without scanning when the lease is not held", async () => {
@@ -228,37 +220,6 @@ describe("runSweepTick", () => {
 
     expect(result.decisions[0]?.action).toBe("adopted");
     expect(f.status.inspect("wf-prefix")?.applicationVersion).toBeNull();
-  });
-
-  test("cancels a workflow whose policy mode is cancel", async () => {
-    SWEEP_POLICIES.CancelTestWorkflow = {
-      mode: "cancel",
-      staleAfterHours: 48,
-    };
-    const f = await fixture([
-      row("wf-policy-cancel", { name: "CancelTestWorkflow" }),
-    ]);
-
-    const result = await runSweepTick(f.deps);
-
-    expect(result.decisions[0]?.action).toBe("cancelled_policy");
-    expect(f.cancelled).toEqual(["wf-policy-cancel"]);
-    expect((await f.deps.ledger.get("wf-policy-cancel"))?.sweepCount).toBe(1);
-  });
-
-  test("ignores a workflow whose policy mode is ignore", async () => {
-    SWEEP_POLICIES.IgnoreTestWorkflow = {
-      mode: "ignore",
-      staleAfterHours: 48,
-    };
-    const f = await fixture([
-      row("wf-policy-ignore", { name: "IgnoreTestWorkflow" }),
-    ]);
-
-    const result = await runSweepTick(f.deps);
-
-    expect(result.decisions[0]?.action).toBe("ignored");
-    expect(f.status.inspect("wf-policy-ignore")?.status).toBe("PENDING");
   });
 
   test("caps mutating actions and stops examining rows at the cap", async () => {
@@ -652,35 +613,6 @@ describe("runSweepTick", () => {
       workflowName: "ToolExecWorkflow",
     });
     expect(f.status.inspect("wf-cancel-intent")?.status).toBe("PENDING");
-  });
-
-  test("records policy-cancel intent before a throwing cancellation", async () => {
-    SWEEP_POLICIES.CancelTestWorkflow = {
-      mode: "cancel",
-      staleAfterHours: 48,
-    };
-    const f = await fixture([
-      row("wf-policy-cancel-intent", { name: "CancelTestWorkflow" }),
-    ]);
-    f.deps.cancelWorkflow = async () => {
-      throw new Error("cancel failed");
-    };
-
-    const result = await runSweepTick(f.deps);
-
-    expect(result.decisions[0]).toMatchObject({
-      action: "error",
-      reason: "cancel failed",
-    });
-    expect(
-      await f.deps.ledger.get("wf-policy-cancel-intent"),
-    ).toMatchObject({
-      sweepCount: 1,
-      workflowName: "CancelTestWorkflow",
-    });
-    expect(
-      f.status.inspect("wf-policy-cancel-intent")?.status,
-    ).toBe("PENDING");
   });
 
   test("prunes stale heartbeat rows under the lease with a grace-safe floor", async () => {

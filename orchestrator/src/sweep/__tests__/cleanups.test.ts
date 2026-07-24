@@ -14,7 +14,9 @@ function workflow(
     workflowUuid: "wf-terminal",
     name: "SlackThreadWorkflow",
     status: "ERROR",
-    updatedAtEpochMs: 1_000,
+    // A fresh failure: inside the thread-note window (notifyThread compares
+    // against wall clock).
+    updatedAtEpochMs: Date.now() - 60_000,
     ...overrides,
   };
 }
@@ -57,6 +59,29 @@ function context(
 }
 
 describe("notifyThread", () => {
+  test("does not necro-post to a thread whose failure is past the note window", async () => {
+    const { ctx, messages } = context({
+      lookups: makeInMemorySweepLookupStore({
+        threadSources: {
+          "wf-terminal": {
+            team: "T1",
+            channel: "C1",
+            threadRoot: "1721.001",
+          },
+        },
+      }),
+    });
+
+    await notifyThread(
+      ctx,
+      workflow({
+        updatedAtEpochMs: Date.now() - 49 * 60 * 60 * 1_000,
+      }),
+    );
+
+    expect(messages).toEqual([]);
+  });
+
   test("posts the black-hole warning to the owning channel and thread", async () => {
     const f = context({
       lookups: makeInMemorySweepLookupStore({
