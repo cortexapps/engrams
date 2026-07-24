@@ -1,6 +1,6 @@
 # 0104. DBOS orphan-sweep: adopt workflows stranded by version-gated recovery
 
-Status: Proposed
+Status: Accepted
 
 Issue: cortexapps/engrams#872
 
@@ -165,6 +165,25 @@ abandoned rows back into the queue and pods pull.
 - **Ancient orphans**: past the staleness cutoff, cancel instead of adopt —
   never necro-post a weeks-dead conversation.
 
+## Operations (replaces the manual resume recipe)
+
+- **Stranded workflows recover themselves**: within one sweep interval of a
+  version going dead (no heartbeat for the grace window), fresh orphans are
+  re-enqueued and claimed by live pods. The manual
+  `UPDATE … SET status='ENQUEUED', application_version=NULL` recipe is
+  retired.
+- **Ops signal**: one log line per cycle (`component: dbos-sweep`) with live
+  versions and per-action counts; alerts (terminal failures, alert-only
+  orphans, cancels) go to `ORCHESTRATOR_SWEEP_ALERT_CHANNEL`, or the log when
+  unset.
+- **Exclude one workflow**: `update dbos_sweep_ledger set suppressed = true
+  where workflow_uuid = '…'` (insert the row first if it was never swept).
+- **Kill switch**: `ORCHESTRATOR_SWEEP_DISABLED=1` stops the sweeper only;
+  heartbeats continue so the pod's own version stays provably live.
+- **A workflow cancelled or failed by the sweep**: Slack threads get the
+  in-thread "start a fresh thread" note; reviews flip to failed and
+  `RetryReview` mints a successor epoch.
+
 ## Consequences
 
 - Stranded-forever becomes at-least-once with a tiny duplication window.
@@ -177,9 +196,26 @@ abandoned rows back into the queue and pods pull.
 
 ## Implementation record
 
-Landed as a commit chain on `fix/872-dbos-orphan-sweep` (T1 stores/migration,
-T2 sweep core, T3 alerting/cleanups, T4 wiring/config, T5 CI hash warning,
-T6 integration suite). Divergences from the design above, found in review:
+Landed as a commit chain on `fix/872-dbos-orphan-sweep`: `96d46732` (this
+ADR) → `eb817c31` (T1 stores/migration) → `0b65bc5b` (T2 sweep core) →
+`f165b61b` (T3 alerting/cleanups) → `f1a0a39d` (T5 CI hash warning) →
+`a7350879` (T4 wiring/config) → `a98a028d` (T6 integration suite) →
+`02524bc6` (adversarial-review hardening). Divergences from the design
+above, found in review:
+
+- **Adversarial-review hardening** (all six findings fixed in `02524bc6`):
+  keyset-paginated scan with a logged budget (starvation); the flip SQL
+  fences on expected version + fresh-heartbeat NOT EXISTS (TOCTOU);
+  flip+ledger-count are one transaction and cancels record intent first
+  (burned-cap cancellations); the failure-scan watermark rewinds to
+  first-blocked−1 / last−1 on full batches (timestamp ties); abandonment
+  alerts post before the durable gave-up mark; the CI hash script also
+  diffs against the merge-base snapshot so committing `--update` cannot
+  silence the PR annotation. Residual accepted risk: the window between
+  `DBOS.launch()` recovery and the first heartbeat on a rolled-back pod is
+  a few ms and remains bounded by the `(workflow_uuid, function_id)`
+  step-conflict guard; cleanup attempt counts stay in process memory
+  (restarts retry an idempotent-required callback, alarms are never lost).
 
 - **Drizzle array params**: the `sql` template JSON-stringifies a raw JS-array
   param (PG 22P02 under `::text[]`); array params are expanded element-wise
