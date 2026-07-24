@@ -20,8 +20,11 @@ export const MAX_SWEEPS = 3;
 export const ALERT_ONLY_STALE_AFTER_HOURS = 48;
 // dbos_version_heartbeats accrues one row per (version, pod) across deploys
 // and nothing else deletes them. Rows older than the grace window are already
-// dead for liveness, so pruning at a comfortable multiple only bounds growth;
-// a week keeps recent deploy history visible for operators.
+// dead for liveness, so pruning at a comfortable multiple only bounds growth.
+// INVARIANT: retention must exceed every policy's staleAfterHours — the
+// heartbeat history is also the staleness clock (a version with no surviving
+// rows reads as abandoned forever), so pruning too aggressively would make a
+// freshly-stranded workflow look ancient.
 export const HEARTBEAT_RETENTION_MS = 7 * 24 * 60 * 60 * 1_000;
 
 export interface SweepConfig {
@@ -189,6 +192,14 @@ export async function runSweepTick(
       );
     }
 
+    // Staleness is measured from ABANDONMENT — when the workflow's owning
+    // version last heartbeat — never from creation: a thread workflow lives
+    // for its whole session, so a days-old created_at says nothing about
+    // whether the work was active moments before a deploy stranded it. A
+    // version with no surviving heartbeat history (pre-feature orphans, or
+    // rows past HEARTBEAT_RETENTION_MS) is abandoned forever.
+    const lastSeenByVersion = await deps.heartbeats.lastSeenByVersion();
+
     const pageSize = deps.config.batchCap * 4;
     const scanBudget = deps.config.batchCap * 40;
     let actions = 0;
@@ -245,13 +256,18 @@ export async function runSweepTick(
               action: "cancelled_capped",
             };
           } else {
-            const ageHours =
-              (nowMs - row.createdAtEpochMs) / (60 * 60 * 1_000);
+            const lastSeenMs = lastSeenByVersion.get(
+              row.applicationVersion!,
+            );
+            const abandonedHours =
+              lastSeenMs === undefined
+                ? Number.POSITIVE_INFINITY
+                : (nowMs - lastSeenMs) / (60 * 60 * 1_000);
             const staleAfterHours =
               policy.mode === "alert-only"
                 ? ALERT_ONLY_STALE_AFTER_HOURS
                 : policy.staleAfterHours;
-            if (ageHours > staleAfterHours) {
+            if (abandonedHours > staleAfterHours) {
               await deps.ledger.recordSweep(row.workflowUuid, row.name);
               await deps.cancelWorkflow(row.workflowUuid);
               decision = {

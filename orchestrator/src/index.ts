@@ -20,9 +20,8 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import githubEventsRoute from "./routes/github-events.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
-// Importing registers the Slack adapter on the generic SDK seam; the getter is
-// also injected into the production orphan-sweep runtime below.
-import { getSlackClient } from "./integrations/slack.ts";
+// Importing registers the Slack adapter on the generic SDK seam.
+import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { makeVncRoute } from "./routes/vnc.ts";
 import { makeIdeRoute, makeIdeUpgradeHandler } from "./routes/ide.ts";

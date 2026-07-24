@@ -225,6 +225,27 @@ async function beatParent(gracePod = "parent"): Promise<void> {
   );
 }
 
+/** Record that a version was alive until moments ago: dead for liveness
+ * (outside the 5s test grace window) but freshly abandoned, so the sweep
+ * adopts its rows instead of stale-cancelling them — staleness is measured
+ * from version abandonment, and a version with no heartbeat history reads
+ * as abandoned forever. */
+async function markVersionRecentlyDead(
+  applicationVersion: string,
+): Promise<void> {
+  await getDb().execute(sql`
+    insert into "dbos_version_heartbeats"
+      ("application_version", "pod_name", "last_seen")
+    values (
+      ${applicationVersion},
+      ${`${heartbeatPodPrefix}-dead`},
+      now() - interval '30 seconds'
+    )
+    on conflict ("application_version", "pod_name") do update
+    set "last_seen" = now() - interval '30 seconds'
+  `);
+}
+
 async function insertSyntheticPending(
   workflowId: string,
   applicationVersion: string,
@@ -343,6 +364,7 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
       );
 
       await beatParent("adopt-recv");
+      await markVersionRecentlyDead(deadVersion);
       const tick = await runSweepTick(sweepDeps("adopt-recv"));
       expect(
         tick.decisions.find(
@@ -384,6 +406,7 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
       );
 
       await beatParent("adopt-changed");
+      await markVersionRecentlyDead(deadVersion);
       const tick = await runSweepTick(sweepDeps("adopt-changed"));
       expect(
         tick.decisions.find(
@@ -524,6 +547,7 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
 
       try {
         await beatParent("concurrent");
+        await markVersionRecentlyDead(`concurrent-dead-${runId}`);
         const [first, second] = await Promise.all([
           runSweepTick(sweepDeps("concurrent-a")),
           runSweepTick(sweepDeps("concurrent-b")),

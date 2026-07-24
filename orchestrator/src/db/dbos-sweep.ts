@@ -18,6 +18,15 @@ export interface HeartbeatStore {
   beat(appVersion: string, podName: string): Promise<void>;
   liveVersions(graceMs: number): Promise<string[]>;
   /**
+   * Freshest heartbeat per version (epoch ms) — when each version was last
+   * provably alive. This is the sweep's abandonment clock: staleness is
+   * measured from when a workflow's owning version DIED, never from the
+   * workflow's creation (a thread workflow lives for its whole session, so
+   * creation age says nothing about abandonment). A version absent from the
+   * map has no surviving history and is treated as abandoned forever.
+   */
+  lastSeenByVersion(): Promise<Map<string, number>>;
+  /**
    * Delete rows whose last_seen is older than retentionMs. Rows older than
    * the grace window are already dead for liveness purposes (liveVersions
    * takes max(last_seen) per version; the flip fence only checks fresh
@@ -208,6 +217,22 @@ export function makeHeartbeatStore(
         order by "application_version"
       `);
       return result.rows.map((row) => String(row.application_version));
+    },
+
+    async lastSeenByVersion() {
+      const result = await db.execute(sql`
+        select "application_version",
+               (extract(epoch from max("last_seen")) * 1000)::bigint
+                 as "last_seen_ms"
+        from "dbos_version_heartbeats"
+        group by "application_version"
+      `);
+      return new Map(
+        result.rows.map((row) => [
+          String(row.application_version),
+          numberValue(row.last_seen_ms),
+        ]),
+      );
     },
 
     async prune(retentionMs) {
@@ -459,6 +484,21 @@ export function makeInMemoryHeartbeatStore(
         .filter(([, lastSeen]) => lastSeen > cutoff)
         .map(([appVersion]) => appVersion)
         .sort();
+    },
+
+    async lastSeenByVersion() {
+      const latestByVersion = new Map<string, number>();
+      for (const [key, lastSeen] of rows) {
+        const appVersion = key.slice(0, key.indexOf("\0"));
+        latestByVersion.set(
+          appVersion,
+          Math.max(
+            latestByVersion.get(appVersion) ?? Number.NEGATIVE_INFINITY,
+            lastSeen,
+          ),
+        );
+      }
+      return latestByVersion;
     },
 
     async prune(retentionMs) {

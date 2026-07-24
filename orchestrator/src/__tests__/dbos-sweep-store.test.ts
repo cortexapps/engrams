@@ -38,6 +38,13 @@ describe("in-memory heartbeat store", () => {
 
     await store.beat("v-old", "pod-a");
     expect(await store.liveVersions(50)).toEqual(["v-live", "v-old"]);
+    // The abandonment clock: freshest beat per version, regardless of grace.
+    expect(await store.lastSeenByVersion()).toEqual(
+      new Map([
+        ["v-live", 1_075],
+        ["v-old", 1_100],
+      ]),
+    );
   });
 
   test("prune drops rows past retention and reports the count", async () => {
@@ -465,6 +472,11 @@ describe("DBOS sweep stores with live Postgres", () => {
     `);
 
     expect(await store.liveVersions(60_000)).toEqual(["live-version"]);
+    const lastSeen = await store.lastSeenByVersion();
+    expect(lastSeen.get("live-version")).toBeGreaterThan(
+      Date.now() - 60_000,
+    );
+    expect(lastSeen.get("old-version")).toBeLessThan(Date.now() - 30 * 60_000);
   });
 
   test.skipIf(!dbReachable)("prune deletes only rows older than the retention window", async () => {

@@ -56,9 +56,28 @@ async function fixture(
   rows: InMemoryDbosStatusSeed[] = [],
   overrides: Partial<SweepTickDeps> = {},
   config: Partial<SweepConfig> = {},
+  options: {
+    /** When DEAD_VERSION was last provably alive. Defaults to 30 minutes ago:
+     * past the grace window (dead for liveness) but freshly abandoned, so
+     * adopt-mode rows adopt. Pass null for a version with no heartbeat
+     * history (reads as abandoned forever). */
+    deadVersionLastSeen?: Date | null;
+  } = {},
 ): Promise<Fixture> {
   const now = () => new Date(NOW);
-  const heartbeats = makeInMemoryHeartbeatStore(now);
+  // The heartbeat clock is mutable so the fixture can backdate the dead
+  // version's last beat — the store always stamps its injected now().
+  let heartbeatClock = new Date(NOW);
+  const heartbeats = makeInMemoryHeartbeatStore(() => heartbeatClock);
+  const deadVersionLastSeen =
+    options.deadVersionLastSeen === undefined
+      ? new Date(NOW.getTime() - 30 * 60_000)
+      : options.deadVersionLastSeen;
+  if (deadVersionLastSeen !== null) {
+    heartbeatClock = deadVersionLastSeen;
+    await heartbeats.beat(DEAD_VERSION, "pod-dead");
+    heartbeatClock = new Date(NOW);
+  }
   await heartbeats.beat(CURRENT_VERSION, "pod-current");
   const lease = makeInMemorySweepLeaseStore(now);
   const ledger = makeInMemorySweepLedgerStore(now);
@@ -157,11 +176,14 @@ describe("runSweepTick", () => {
   });
 
   test("cancels a stale adopt-policy workflow instead of adopting it", async () => {
-    const f = await fixture([
-      row("wf-stale", {
-        createdAtEpochMs: NOW.getTime() - 2 * HOUR_MS,
-      }),
-    ]);
+    // Staleness = version abandonment: DEAD_VERSION last heartbeat 2h ago,
+    // past ToolExecWorkflow's 1h window. The workflow's own age is irrelevant.
+    const f = await fixture(
+      [row("wf-stale")],
+      {},
+      {},
+      { deadVersionLastSeen: new Date(NOW.getTime() - 2 * HOUR_MS) },
+    );
 
     const result = await runSweepTick(f.deps);
 
@@ -169,6 +191,42 @@ describe("runSweepTick", () => {
     expect(f.cancelled).toEqual(["wf-stale"]);
     expect(f.status.inspect("wf-stale")?.status).toBe("PENDING");
     expect((await f.deps.ledger.get("wf-stale"))?.sweepCount).toBe(1);
+  });
+
+  test("adopts a days-old workflow whose version died moments ago", async () => {
+    // The regression: a thread workflow lives for its whole session, so a
+    // long-running active thread has an old created_at. Staleness must key
+    // on version abandonment, or a routine deploy silently cancels it.
+    const f = await fixture([
+      row("wf-long-lived-thread", {
+        name: "SlackThreadWorkflow",
+        createdAtEpochMs: NOW.getTime() - 72 * HOUR_MS,
+      }),
+    ]);
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]?.action).toBe("adopted");
+    expect(f.cancelled).toEqual([]);
+    expect(
+      f.status.inspect("wf-long-lived-thread")?.applicationVersion,
+    ).toBeNull();
+  });
+
+  test("a version with no heartbeat history is abandoned forever", async () => {
+    // Pre-feature orphans (or rows past heartbeat retention) have no
+    // last-seen record: never adopt them, cancel them.
+    const f = await fixture(
+      [row("wf-ancient", { createdAtEpochMs: NOW.getTime() - 1_000 })],
+      {},
+      {},
+      { deadVersionLastSeen: null },
+    );
+
+    const result = await runSweepTick(f.deps);
+
+    expect(result.decisions[0]?.action).toBe("cancelled_stale");
+    expect(f.cancelled).toEqual(["wf-ancient"]);
   });
 
   test("cancels a workflow that has reached the sweep-count cap", async () => {
@@ -359,12 +417,12 @@ describe("runSweepTick", () => {
   });
 
   test("cancels an alert-only workflow past the stale window", async () => {
-    const f = await fixture([
-      row("wf-dead-name", {
-        name: "DeletedWorkflowName",
-        createdAtEpochMs: NOW.getTime() - 49 * HOUR_MS,
-      }),
-    ]);
+    const f = await fixture(
+      [row("wf-dead-name", { name: "DeletedWorkflowName" })],
+      {},
+      {},
+      { deadVersionLastSeen: new Date(NOW.getTime() - 49 * HOUR_MS) },
+    );
 
     const result = await runSweepTick(f.deps);
 
@@ -407,11 +465,12 @@ describe("runSweepTick", () => {
   });
 
   test("a persistently failing stale cancel stops inflating the sweep count at the cap", async () => {
-    const f = await fixture([
-      row("wf-cancel-wedged", {
-        createdAtEpochMs: NOW.getTime() - 2 * HOUR_MS,
-      }),
-    ]);
+    const f = await fixture(
+      [row("wf-cancel-wedged")],
+      {},
+      {},
+      { deadVersionLastSeen: new Date(NOW.getTime() - 2 * HOUR_MS) },
+    );
     f.deps.cancelWorkflow = async () => {
       throw new Error("cancel keeps failing");
     };
@@ -444,12 +503,12 @@ describe("runSweepTick", () => {
   });
 
   test("suppression vetoes the alert-only stale cancel", async () => {
-    const f = await fixture([
-      row("wf-dead-name", {
-        name: "DeletedWorkflowName",
-        createdAtEpochMs: NOW.getTime() - 49 * HOUR_MS,
-      }),
-    ]);
+    const f = await fixture(
+      [row("wf-dead-name", { name: "DeletedWorkflowName" })],
+      {},
+      {},
+      { deadVersionLastSeen: new Date(NOW.getTime() - 49 * HOUR_MS) },
+    );
     await f.deps.ledger.recordSweep("wf-dead-name", "DeletedWorkflowName");
     await f.deps.ledger.setSuppressed("wf-dead-name", true);
 
@@ -461,12 +520,17 @@ describe("runSweepTick", () => {
   });
 
   test("contains a cancel error and continues to the next row", async () => {
+    // wf-bad-cancel hits the cap path (cancel throws); wf-next on the same
+    // freshly-abandoned version still adopts.
     const f = await fixture([
       row("wf-bad-cancel", {
         createdAtEpochMs: NOW.getTime() - 3 * HOUR_MS,
       }),
       row("wf-next", { createdAtEpochMs: NOW.getTime() - 1_000 }),
     ]);
+    for (let count = 0; count < f.deps.config.maxSweeps; count++) {
+      await f.deps.ledger.recordSweep("wf-bad-cancel", "ToolExecWorkflow");
+    }
     f.deps.cancelWorkflow = async (workflowUuid) => {
       if (workflowUuid === "wf-bad-cancel") throw new Error("cancel failed");
       f.cancelled.push(workflowUuid);
@@ -593,11 +657,12 @@ describe("runSweepTick", () => {
   });
 
   test("records stale-cancel intent before a throwing cancellation", async () => {
-    const f = await fixture([
-      row("wf-cancel-intent", {
-        createdAtEpochMs: NOW.getTime() - 2 * HOUR_MS,
-      }),
-    ]);
+    const f = await fixture(
+      [row("wf-cancel-intent")],
+      {},
+      {},
+      { deadVersionLastSeen: new Date(NOW.getTime() - 2 * HOUR_MS) },
+    );
     f.deps.cancelWorkflow = async () => {
       throw new Error("cancel failed");
     };
@@ -769,6 +834,9 @@ describe("VersionHeartbeat", () => {
         },
         async liveVersions() {
           return [];
+        },
+        async lastSeenByVersion() {
+          return new Map<string, number>();
         },
         async prune() {
           return 0;
