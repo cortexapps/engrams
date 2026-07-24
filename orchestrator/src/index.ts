@@ -284,8 +284,12 @@ process.on("SIGTERM", () => {
     await automationScheduler.stop();
     await listenerManager.stop();
     await sweeper.stop();
-    await heartbeat.stop();
+    // The heartbeat must outlive the DBOS drain: workflows can execute until
+    // shutdownDbos() returns (or SIGKILL lands), and this pod's version must
+    // stay provably live for that whole window or another pod's sweep could
+    // adopt still-running work. Stopping the heartbeat is the LAST step.
     await shutdownDbos();
+    await heartbeat.stop();
     if (err) {
       log.error({ err }, "orchestrator: error during shutdown");
       process.exit(1);

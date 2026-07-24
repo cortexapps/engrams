@@ -317,10 +317,13 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     "ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS",
     HEARTBEAT_INTERVAL_MS,
   );
-  // A live pod proves its version with a heartbeat every interval. The grace
-  // window must absorb at least one missed beat plus pod-termination grace,
-  // or the sweep declares a healthy pod's version dead between beats and
-  // re-enqueues workflows that still have a live owner (double execution).
+  // A live pod proves its version with a heartbeat every interval, and the
+  // SIGTERM handler stops the heartbeat only AFTER the DBOS drain completes
+  // (index.ts) — so whenever workflow code can execute, the freshest beat is
+  // at most one interval + one missed beat old. 2× the interval is therefore
+  // the true floor; below it the sweep can declare a healthy pod's version
+  // dead between beats and re-enqueue workflows that still have a live owner
+  // (double execution).
   if (sweepGraceMs < 2 * sweepHeartbeatIntervalMs) {
     throw new Error(
       `Orchestrator: ORCHESTRATOR_SWEEP_GRACE_MS (${sweepGraceMs}) must be at ` +

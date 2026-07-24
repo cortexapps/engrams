@@ -81,6 +81,9 @@ export type SweepDecision = {
     | "alert_only"
     | "suppressed"
     | "ignored"
+    // The flip's fence no-opped: the owner version regained liveness or the
+    // row changed underneath us. A healthy lost race, never alert-worthy.
+    | "raced"
     | "error";
   reason?: string;
 };
@@ -308,7 +311,7 @@ export async function runSweepTick(
                   : {
                       workflowUuid: row.workflowUuid,
                       name: row.name,
-                      action: "error",
+                      action: "raced",
                       reason: "owner became live or row changed",
                     };
               } else if (row.status === "ENQUEUED") {
@@ -330,7 +333,7 @@ export async function runSweepTick(
                   : {
                       workflowUuid: row.workflowUuid,
                       name: row.name,
-                      action: "error",
+                      action: "raced",
                       reason: "owner became live or row changed",
                     };
               } else {

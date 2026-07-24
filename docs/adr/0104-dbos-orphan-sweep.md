@@ -343,3 +343,20 @@ were handled. Replaced wholesale:
   `expandedRescan` tie expansion, the 10s visibility-lag clamp, and the
   alerter's `now` dependency. The 7-day lookback (up from the watermark's
   24h bootstrap) also tolerates multi-day outages.
+
+Fifth round (1 MEDIUM + 1 LOW):
+
+- **The heartbeat outlives the DBOS drain** (MEDIUM, fixed at the ordering
+  root rather than the suggested validation widening): SIGTERM previously
+  stopped the heartbeat before `shutdownDbos()`, so a pod stopped proving
+  liveness while workflows were still draining — at the validation floor
+  (grace = 2× heartbeat) another pod could adopt still-running work during
+  the k8s termination window. `heartbeat.stop()` is now the LAST shutdown
+  step, which makes 2× heartbeat the true floor: whenever workflow code can
+  execute, the freshest beat is at most one interval + one missed beat old.
+  No termination-grace config knob needed.
+- **Lost flip races are `raced`, not `error`** (LOW): the fence no-opping
+  because the owner regained liveness (a rollback) or DBOS moved the row is
+  a healthy outcome. `raced` is excluded from ALERT_ACTIONS, so a rollback
+  of a version that stranded many workflows no longer pages once per
+  workflow; `error` is reserved for thrown exceptions.

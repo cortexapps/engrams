@@ -541,8 +541,10 @@ describe("runSweepTick", () => {
 
     const result = await runSweepTick(f.deps);
 
+    // A lost flip race is a healthy outcome (the owner is back or DBOS moved
+    // the row) — reported as raced, which never reaches the ops channel.
     expect(result.decisions[0]).toMatchObject({
-      action: "error",
+      action: "raced",
       reason: "owner became live or row changed",
     });
   });
@@ -578,7 +580,7 @@ describe("runSweepTick", () => {
       {
         workflowUuid: "wf-owner-returned",
         name: "ToolExecWorkflow",
-        action: "error",
+        action: "raced",
         reason: "owner became live or row changed",
       },
     ]);
