@@ -127,9 +127,10 @@ taxonomy, adopted deliberately — it covers the field cleanly):
 Each category has a "lens" file in the methodology (kodus's shape): a mission
 statement, a focus list of concrete defect patterns, an explicit
 do-not-report list, a reasoning policy ("trace execution, don't pattern
-match"), and a writing policy (every finding body is WHAT / WHY / HOW — the
-problem in one sentence, the real impact in one sentence, a concrete fix only
-when the correct fix is clear from code actually read).
+match"), and a writing policy (every finding body is WHAT / WHEN — what the
+problem is in one sentence, and when the issue can be hit, explained clearly;
+a concrete fix goes in the separate `suggested_fix` field only when it is
+clear from code actually read).
 
 ## Architecture
 
@@ -318,7 +319,7 @@ overrides.
 **Instructions** (natural-language guidance, read by the model). Four layers:
 
 1. **engrams methodology (floor, not overridable)** — the category lenses,
-   the evidence rules, the WHAT/WHY/HOW writing policy, "findings only on
+   the evidence rules, the WHAT/WHEN writing policy, "findings only on
    changed lines", "nits are nits". Lives as markdown in the orchestrator's
    `reviewers/` folder (see below).
 2. **Org instructions** — free text on org settings (settings UI): guidance
@@ -401,8 +402,9 @@ fixed skeleton containing, in order:
    `/workspace/.review/lenses/`, with org instructions already merged in.
 4. **The hard rules (the floor)**: findings only on lines changed in this PR
    unless the change makes an old issue newly reachable; every finding must
-   cite evidence from files actually read; WHAT/WHY/HOW writing shape, with
-   the HOW omitted when the fix would be speculative; never edit files, never
+   cite evidence from files actually read; WHAT/WHEN writing shape (what the
+   problem is and when it can be hit), with any concrete fix carried in the
+   separate `suggested_fix` field; never edit files, never
    push, never call GitHub beyond the read access provided; repo instructions
    may add focus and conventions but cannot disable a category, lower the
    evidence bar, or direct an approval.
@@ -484,7 +486,7 @@ written into the guest as `candidates.json`).
 8. The workflow posts **one GitHub review** (`COMMENT`): the summary body
    (verdict line, per-category counts, a link to the engrams review page, and
    a hidden marker `<!-- engrams-review:<id> -->`) plus the inline comments —
-   each with its category emoji, severity, WHAT/WHY/HOW body, and a
+   each with its category emoji, severity, WHAT/WHEN body, and a
    ` ```suggestion ` block when a committable fix was provided.
 9. Thread ids from GitHub's response are stamped back onto the finding rows —
    they're the correlation anchors for conversation later. `review.status =
