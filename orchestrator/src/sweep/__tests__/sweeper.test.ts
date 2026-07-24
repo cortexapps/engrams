@@ -344,6 +344,63 @@ describe("runSweepTick", () => {
     await expect(runSweepTick(f.deps)).rejects.toThrow("status unavailable");
     expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);
   });
+
+  test("runs both alert passes under the lease and reports their results", async () => {
+    const f = await fixture([row("wf-alerted")]);
+    const calls: string[] = [];
+    f.deps.alerter = {
+      async alertDecisions(decisions) {
+        expect(decisions).toHaveLength(1);
+        calls.push("decisions");
+      },
+      async scanTerminalFailures() {
+        calls.push("failures");
+        return {
+          scanned: 2,
+          alerted: 1,
+          cleanupsRun: 1,
+          cleanupsFailed: 0,
+          watermark: 123,
+        };
+      },
+    };
+
+    const result = await runSweepTick(f.deps);
+
+    expect(calls).toEqual(["decisions", "failures"]);
+    expect(result.alerted).toBe(0);
+    expect(result.failureScan).toEqual({
+      scanned: 2,
+      alerted: 1,
+      cleanupsRun: 1,
+      cleanupsFailed: 0,
+      watermark: 123,
+    });
+    // The alerter ran before the finally block released the lease.
+    expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);
+  });
+
+  test("contains failures from both alerter passes", async () => {
+    const f = await fixture([row("wf-error")]);
+    const calls: string[] = [];
+    f.deps.alerter = {
+      async alertDecisions() {
+        calls.push("decisions");
+        throw new Error("decision alert failed");
+      },
+      async scanTerminalFailures() {
+        calls.push("failures");
+        throw new Error("failure scan failed");
+      },
+    };
+
+    await expect(runSweepTick(f.deps)).resolves.toMatchObject({
+      leaseHeld: true,
+      scanned: 1,
+    });
+    expect(calls).toEqual(["decisions", "failures"]);
+    expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);
+  });
 });
 
 describe("sweep policy exhaustiveness", () => {

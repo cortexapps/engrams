@@ -40,8 +40,14 @@ export interface SweepLedgerStore {
   recordSweep(workflowUuid: string, workflowName: string): Promise<SweepLedgerRow>;
   get(workflowUuid: string): Promise<SweepLedgerRow | null>;
   setSuppressed(workflowUuid: string, suppressed: boolean): Promise<void>;
-  markCleanupDone(workflowUuid: string, fnName: string): Promise<void>;
-  markAlerted(workflowUuid: string): Promise<void>;
+  /** Upserts: an alert-only or naturally-failed workflow has no prior sweep
+   * row, and alert dedup must still stick for it. */
+  markCleanupDone(
+    workflowUuid: string,
+    workflowName: string,
+    fnName: string,
+  ): Promise<void>;
+  markAlerted(workflowUuid: string, workflowName: string): Promise<void>;
   getWatermark(key: string): Promise<number | null>;
   setWatermark(key: string, epochMs: number): Promise<void>;
 }
@@ -70,6 +76,16 @@ export interface DbosStatusStore {
     sinceEpochMs: number,
     limit: number,
   ): Promise<FailedDbosWorkflowRow[]>;
+}
+
+export interface SweepReviewLookup {
+  id: string;
+  status: string;
+}
+
+export interface SweepLookupStore {
+  threadSourceForWorkflow(workflowUuid: string): Promise<unknown | null>;
+  reviewForWorkflow(workflowUuid: string): Promise<SweepReviewLookup | null>;
 }
 
 function affectedRows(result: {
@@ -231,19 +247,23 @@ export function makeSweepLedgerStore(
       `);
     },
 
-    async markCleanupDone(workflowUuid, fnName) {
+    async markCleanupDone(workflowUuid, workflowName, fnName) {
       await db.execute(sql`
-        update "dbos_sweep_ledger"
+        insert into "dbos_sweep_ledger"
+          ("workflow_uuid", "workflow_name", "cleanup_done_at", "cleanup_fn")
+        values (${workflowUuid}, ${workflowName}, now(), ${fnName})
+        on conflict ("workflow_uuid") do update
         set "cleanup_done_at" = now(), "cleanup_fn" = ${fnName}
-        where "workflow_uuid" = ${workflowUuid}
       `);
     },
 
-    async markAlerted(workflowUuid) {
+    async markAlerted(workflowUuid, workflowName) {
       await db.execute(sql`
-        update "dbos_sweep_ledger"
+        insert into "dbos_sweep_ledger"
+          ("workflow_uuid", "workflow_name", "alerted_at")
+        values (${workflowUuid}, ${workflowName}, now())
+        on conflict ("workflow_uuid") do update
         set "alerted_at" = now()
-        where "workflow_uuid" = ${workflowUuid}
       `);
     },
 
@@ -333,6 +353,55 @@ export function makeDbosStatusStore(
   };
 }
 
+export function makeSweepLookupStore(
+  db: ReturnType<typeof getDb> = getDb(),
+): SweepLookupStore {
+  return {
+    async threadSourceForWorkflow(workflowUuid) {
+      const result = await db.execute(sql`
+        select "t"."source"
+        from "task" as "t"
+        inner join "task_session" as "ts"
+          on "ts"."task_id" = "t"."id"
+        where "ts"."session_id" in (
+          select "session_id"
+          from "slack_session"
+          where "thread_wf_id" = ${workflowUuid}
+        )
+          and "t"."type" = 'slack_thread'
+        limit 1
+      `);
+      return result.rows[0]?.source ?? null;
+    },
+
+    async reviewForWorkflow(workflowUuid) {
+      const result = await db.execute(sql`
+        select "id", "status"
+        from "review"
+        where "finder_session_id" in (
+          select "session_id"
+          from "review_session"
+          where "review_workflow_id" = ${workflowUuid}
+        )
+          or "verifier_session_id" in (
+            select "session_id"
+            from "review_session"
+            where "review_workflow_id" = ${workflowUuid}
+          )
+        order by "created_at" desc
+        limit 1
+      `);
+      const row = result.rows[0];
+      return row
+        ? {
+            id: String(row.id),
+            status: String(row.status),
+          }
+        : null;
+    },
+  };
+}
+
 /** Deterministic in-memory heartbeat store shared by sweep unit tests. */
 export function makeInMemoryHeartbeatStore(
   now: () => Date = () => new Date(),
@@ -377,6 +446,23 @@ export function makeInMemorySweepLeaseStore(
     async release(owner) {
       if (lease?.owner === owner) lease = null;
     },
+  };
+}
+
+function emptyLedgerRow(
+  workflowUuid: string,
+  workflowName: string,
+): SweepLedgerRow {
+  return {
+    workflowUuid,
+    workflowName,
+    sweepCount: 0,
+    firstSweptAt: null,
+    lastSweptAt: null,
+    suppressed: false,
+    cleanupDoneAt: null,
+    cleanupFn: null,
+    alertedAt: null,
   };
 }
 
@@ -433,16 +519,17 @@ export function makeInMemorySweepLedgerStore(
       if (row) row.suppressed = suppressed;
     },
 
-    async markCleanupDone(workflowUuid, fnName) {
-      const row = rows.get(workflowUuid);
-      if (!row) return;
+    async markCleanupDone(workflowUuid, workflowName, fnName) {
+      const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
+      rows.set(workflowUuid, row);
       row.cleanupDoneAt = now();
       row.cleanupFn = fnName;
     },
 
-    async markAlerted(workflowUuid) {
-      const row = rows.get(workflowUuid);
-      if (row) row.alertedAt = now();
+    async markAlerted(workflowUuid, workflowName) {
+      const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
+      rows.set(workflowUuid, row);
+      row.alertedAt = now();
     },
 
     async getWatermark(key) {
@@ -451,6 +538,29 @@ export function makeInMemorySweepLedgerStore(
 
     async setWatermark(key, epochMs) {
       watermarks.set(key, epochMs);
+    },
+  };
+}
+
+export interface InMemorySweepLookupSeed {
+  threadSources?: Record<string, unknown>;
+  reviews?: Record<string, SweepReviewLookup>;
+}
+
+/** Deterministic cleanup lookup store shared by sweep unit tests. */
+export function makeInMemorySweepLookupStore(
+  seed: InMemorySweepLookupSeed = {},
+): SweepLookupStore {
+  const threadSources = new Map(Object.entries(seed.threadSources ?? {}));
+  const reviews = new Map(Object.entries(seed.reviews ?? {}));
+  return {
+    async threadSourceForWorkflow(workflowUuid) {
+      return threadSources.get(workflowUuid) ?? null;
+    },
+
+    async reviewForWorkflow(workflowUuid) {
+      const row = reviews.get(workflowUuid);
+      return row ? { ...row } : null;
     },
   };
 }

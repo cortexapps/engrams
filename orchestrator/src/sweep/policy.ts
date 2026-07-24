@@ -1,6 +1,7 @@
 import { getAllRegisteredFunctions } from "../../node_modules/@dbos-inc/dbos-sdk/dist/src/decorators.js";
 import type { Logger } from "pino";
 
+import type { SweepLookupStore } from "../db/dbos-sweep.ts";
 import { failReviewCleanup, notifyThread } from "./cleanups.ts";
 
 export type SweepMode = "adopt" | "cancel" | "ignore";
@@ -14,6 +15,22 @@ export interface FailedWorkflow {
 
 export interface SweepContext {
   log: Logger;
+  lookups: SweepLookupStore;
+  slack: () => Promise<SlackPostClient>;
+  failReview: (
+    reviewId: string,
+    opts: { reason?: string },
+  ) => Promise<void>;
+}
+
+export interface SlackPostClient {
+  chat: {
+    postMessage(args: {
+      channel: string;
+      thread_ts?: string;
+      text?: string;
+    }): Promise<unknown>;
+  };
 }
 
 export interface SweepPolicy {

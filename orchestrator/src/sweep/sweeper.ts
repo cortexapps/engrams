@@ -13,6 +13,11 @@ import {
   type SweepLedgerStore,
 } from "../db/dbos-sweep.ts";
 import { log as rootLog } from "../log.ts";
+import {
+  makeDisabledSweepAlerter,
+  type FailureScanResult,
+  type SweepAlerter,
+} from "./alerts.ts";
 import { resolvePolicy } from "./policy.ts";
 
 export const HEARTBEAT_INTERVAL_MS = 30_000;
@@ -46,6 +51,7 @@ export interface SweepTickDeps {
   ledger: SweepLedgerStore;
   status: DbosStatusStore;
   cancelWorkflow: (workflowUuid: string) => Promise<void>;
+  alerter?: SweepAlerter;
   log: Logger;
   now?: () => Date;
 }
@@ -72,6 +78,8 @@ export interface SweepTickResult {
   liveVersions: string[];
   scanned: number;
   decisions: SweepDecision[];
+  alerted?: number;
+  failureScan?: FailureScanResult;
 }
 
 const MUTATING_ACTIONS = new Set<SweepDecision["action"]>([
@@ -80,6 +88,13 @@ const MUTATING_ACTIONS = new Set<SweepDecision["action"]>([
   "cancelled_stale",
   "cancelled_capped",
   "cancelled_policy",
+]);
+
+const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
+  "alert_only",
+  "cancelled_stale",
+  "cancelled_capped",
+  "error",
 ]);
 
 function errorMessage(error: unknown): string {
@@ -264,6 +279,30 @@ export async function runSweepTick(
       if (MUTATING_ACTIONS.has(decision.action)) actions++;
     }
 
+    if (deps.alerter) {
+      try {
+        await deps.alerter.alertDecisions(result.decisions);
+        result.alerted = result.decisions.filter((decision) =>
+          ALERT_ACTIONS.has(decision.action),
+        ).length;
+      } catch (error) {
+        deps.log.error(
+          { error },
+          "DBOS sweep decision alerting failed",
+        );
+      }
+
+      try {
+        result.failureScan =
+          await deps.alerter.scanTerminalFailures();
+      } catch (error) {
+        deps.log.error(
+          { error },
+          "DBOS terminal failure scan failed",
+        );
+      }
+    }
+
     return result;
   } finally {
     await deps.lease.release(deps.owner);
@@ -383,9 +422,11 @@ function sweepConfig(overrides: Partial<SweepConfig>): SweepConfig {
 
 export function makeProductionSweeper(
   cfg: Partial<SweepConfig> = {},
+  options: { alerter?: SweepAlerter } = {},
 ): Sweeper {
   const config = sweepConfig(cfg);
   const owner = `${hostname()}:${process.pid}:${crypto.randomUUID()}`;
+  const log = rootLog.child({ component: "dbos-sweep" });
   return new Sweeper({
     owner,
     // Public getter; only populated after DBOS.launch(), hence the lazy read.
@@ -396,7 +437,8 @@ export function makeProductionSweeper(
     ledger: makeSweepLedgerStore(),
     status: makeDbosStatusStore(),
     cancelWorkflow: (workflowUuid) => DBOS.cancelWorkflow(workflowUuid),
-    log: rootLog.child({ component: "dbos-sweep" }),
+    alerter: options.alerter ?? makeDisabledSweepAlerter(log),
+    log,
     now: () => new Date(),
   });
 }
