@@ -87,8 +87,6 @@ describe("in-memory sweep ledger store", () => {
       workflowName: "WorkflowOne",
       sweepCount: 1,
       suppressed: false,
-      cleanupDoneAt: null,
-      cleanupFn: null,
       alertedAt: null,
       terminalAlertedAt: null,
     });
@@ -103,15 +101,11 @@ describe("in-memory sweep ledger store", () => {
     expect(second.lastSweptAt?.getTime()).toBe(21_000);
 
     await store.setSuppressed("wf-1", true);
-    nowMs = 22_000;
-    await store.markCleanupDone("wf-1", "WorkflowOne", "cleanWorkflow");
     nowMs = 23_000;
     await store.markAlerted("wf-1", "WorkflowOne");
     expect(await store.get("wf-1")).toMatchObject({
       suppressed: true,
-      cleanupFn: "cleanWorkflow",
     });
-    expect((await store.get("wf-1"))?.cleanupDoneAt?.getTime()).toBe(22_000);
     expect((await store.get("wf-1"))?.alertedAt?.getTime()).toBe(23_000);
     nowMs = 24_000;
     await store.markTerminalAlerted("wf-1", "WorkflowOne");
@@ -512,7 +506,7 @@ describe("DBOS sweep stores with live Postgres", () => {
     await store.release(ownerB);
   });
 
-  test.skipIf(!dbReachable)("ledger and watermark round-trip through Postgres", async () => {
+  test.skipIf(!dbReachable)("ledger round-trips through Postgres", async () => {
     const { makeSweepLedgerStore } = await sweepModule();
     const store = makeSweepLedgerStore();
     const workflowUuid = `${runId}-ledger`;
@@ -520,7 +514,6 @@ describe("DBOS sweep stores with live Postgres", () => {
     expect((await store.recordSweep(workflowUuid, "WorkflowOne")).sweepCount).toBe(1);
     expect((await store.recordSweep(workflowUuid, "WorkflowOne")).sweepCount).toBe(2);
     await store.setSuppressed(workflowUuid, true);
-    await store.markCleanupDone(workflowUuid, "WorkflowOne", "cleanup");
     await store.markAlerted(workflowUuid, "WorkflowOne");
     await store.markTerminalAlerted(workflowUuid, "WorkflowOne");
     expect(await store.get(workflowUuid)).toMatchObject({
@@ -528,7 +521,6 @@ describe("DBOS sweep stores with live Postgres", () => {
       workflowName: "WorkflowOne",
       sweepCount: 2,
       suppressed: true,
-      cleanupFn: "cleanup",
     });
     expect((await store.get(workflowUuid))?.alertedAt).not.toBeNull();
     expect((await store.get(workflowUuid))?.terminalAlertedAt).not.toBeNull();
@@ -792,11 +784,10 @@ describe("DBOS sweep stores with live Postgres", () => {
          'dead', 10, 30, ${nowExpr} - 300),
         (${fresh}, 'ERROR', 'WorkflowOne', 'dead', 2, 40, ${nowExpr} - 200)
     `);
-    // handled has BOTH completion marks and is excluded; alertedOnly has
-    // only the alert mark and must stay in the set until its cleanup lands.
+    // handled carries the terminal-alert mark and is excluded; a decision
+    // alert (alertedAt) must NOT count as handled.
     await ledger.markTerminalAlerted(handled, "WorkflowTwo");
-    await ledger.markCleanupDone(handled, "WorkflowTwo", "none");
-    await ledger.markTerminalAlerted(alertedOnly, "WorkflowTwo");
+    await ledger.markAlerted(alertedOnly, "WorkflowTwo");
 
     const rows = (await store.listUnhandledTerminalFailures(1_000, 500))
       .map((row) => row.workflowUuid)
@@ -804,68 +795,4 @@ describe("DBOS sweep stores with live Postgres", () => {
     expect(rows).toEqual([alertedOnly, fresh]);
   });
 
-  test.skipIf(!dbReachable)(
-    "cleanup lookups resolve Slack thread sources and the newest linked review",
-    async () => {
-      const { makeSweepLookupStore } = await sweepModule();
-      const store = makeSweepLookupStore();
-      const slackWorkflow = `${runId}-slack-workflow`;
-      const reviewWorkflow = `${runId}-review-workflow`;
-      const slackTask = `${runId}-slack-task`;
-      const reviewTask = `${runId}-review-task`;
-      const slackSession = `${runId}-slack-session`;
-      const finderSession = `${runId}-finder-session`;
-      const verifierSession = `${runId}-verifier-session`;
-      const olderReviewId = crypto.randomUUID();
-      const newestReviewId = crypto.randomUUID();
-      const source = {
-        team: "T123",
-        channel: "C456",
-        threadRoot: "1721234567.001200",
-      };
-
-      await getDb().execute(sql`
-        insert into "task" ("id", "type", "status", "source")
-        values
-          (${slackTask}, 'slack_thread', 'open', ${source}),
-          (${reviewTask}, 'chat', 'open', null)
-      `);
-      await getDb().execute(sql`
-        insert into "task_session" ("task_id", "session_id")
-        values
-          (${slackTask}, ${slackSession}),
-          (${reviewTask}, ${finderSession}),
-          (${reviewTask}, ${verifierSession})
-      `);
-      await getDb().execute(sql`
-        insert into "slack_session" ("session_id", "thread_wf_id")
-        values (${slackSession}, ${slackWorkflow})
-      `);
-      await getDb().execute(sql`
-        insert into "review_session"
-          ("session_id", "review_workflow_id", "role")
-        values
-          (${finderSession}, ${reviewWorkflow}, 'finder'),
-          (${verifierSession}, ${reviewWorkflow}, 'verifier')
-      `);
-      await getDb().execute(sql`
-        insert into "review"
-          ("id", "repo", "pr_number", "task_id", "head_sha", "base_sha",
-           "trigger", "status", "finder_session_id", "created_at")
-        values
-          (${olderReviewId}, 'owner/repo', 1, ${reviewTask}, 'head-a', 'base',
-           'manual', 'failed', ${finderSession}, now() - interval '1 hour'),
-          (${newestReviewId}, 'owner/repo', 1, ${reviewTask}, 'head-b', 'base',
-           'manual', 'verifying', ${verifierSession}, now())
-      `);
-
-      expect(await store.threadSourceForWorkflow(slackWorkflow)).toEqual(source);
-      expect(await store.reviewForWorkflow(reviewWorkflow)).toEqual({
-        id: newestReviewId,
-        status: "verifying",
-      });
-      expect(await store.threadSourceForWorkflow(`${runId}-missing`)).toBeNull();
-      expect(await store.reviewForWorkflow(`${runId}-missing`)).toBeNull();
-    },
-  );
 });

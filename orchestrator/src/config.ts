@@ -137,12 +137,6 @@ export interface Config {
    * "true" enables it; default false.
    */
   sweepDisabled: boolean;
-  /**
-   * ORCHESTRATOR_SWEEP_ALERT_CHANNEL — Slack channel for generic DBOS sweep
-   * alerts. Empty (the default) logs alerts locally instead; terminal-failure
-   * cleanup callbacks still run.
-   */
-  sweepAlertChannel: string;
   /** ORCHESTRATOR_SWEEP_INTERVAL_MS — default SWEEP_INTERVAL_MS. */
   sweepIntervalMs: number;
   /** ORCHESTRATOR_SWEEP_GRACE_MS — default SWEEP_GRACE_MS. */
@@ -304,7 +298,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   const sweepDisabled =
     env["ORCHESTRATOR_SWEEP_DISABLED"] === "1" ||
     env["ORCHESTRATOR_SWEEP_DISABLED"] === "true";
-  const sweepAlertChannel = env["ORCHESTRATOR_SWEEP_ALERT_CHANNEL"] ?? "";
   const sweepIntervalMs = positiveNumber(
     "ORCHESTRATOR_SWEEP_INTERVAL_MS",
     SWEEP_INTERVAL_MS,
@@ -363,7 +356,6 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     previewBaseDomain,
     adminEmails,
     sweepDisabled,
-    sweepAlertChannel,
     sweepIntervalMs,
     sweepGraceMs,
     sweepHeartbeatIntervalMs,

@@ -1,69 +1,21 @@
 import { getAllRegisteredFunctions } from "../../node_modules/@dbos-inc/dbos-sdk/dist/src/decorators.js";
-import type { Logger } from "pino";
 
-import type { SweepLookupStore } from "../db/dbos-sweep.ts";
-import { failReviewCleanup, notifyThread } from "./cleanups.ts";
-
-// Registered policies adopt; unknown names are alert-only. Hypothetical
-// cancel/ignore modes were built and then deleted unused — staleness cancels
-// and operator suppression already cover "don't adopt this".
-export type SweepMode = "adopt";
-
-export interface FailedWorkflow {
-  workflowUuid: string;
-  name: string;
-  status: string;
-  updatedAtEpochMs: number;
-}
-
-export interface SweepContext {
-  log: Logger;
-  lookups: SweepLookupStore;
-  slack: () => Promise<SlackPostClient>;
-  failReview: (
-    reviewId: string,
-    opts: { reason?: string },
-  ) => Promise<void>;
-}
-
-export interface SlackPostClient {
-  chat: {
-    postMessage(args: {
-      channel: string;
-      thread_ts?: string;
-      text?: string;
-    }): Promise<unknown>;
-  };
-}
-
+/**
+ * Registered policies adopt; unknown names are alert-only. There are no
+ * cleanup callbacks and no cancel/ignore modes — terminal failures are
+ * error-level log lines (the operator wires log alerting), staleness cancels
+ * and operator suppression cover every "don't adopt this" need.
+ */
 export interface SweepPolicy {
-  mode: SweepMode;
+  mode: "adopt";
   staleAfterHours: number;
-  onTerminalFailure?: (
-    ctx: SweepContext,
-    wf: FailedWorkflow,
-  ) => Promise<void>;
 }
 
 export const SWEEP_POLICIES: Record<string, SweepPolicy> = {
-  SlackThreadWorkflow: {
-    mode: "adopt",
-    staleAfterHours: 48,
-    onTerminalFailure: notifyThread,
-  },
-  PrReviewWorkflow: {
-    mode: "adopt",
-    staleAfterHours: 48,
-    onTerminalFailure: failReviewCleanup,
-  },
-  ToolExecWorkflow: {
-    mode: "adopt",
-    staleAfterHours: 1,
-  },
-  AutomationRunWorkflow: {
-    mode: "adopt",
-    staleAfterHours: 1,
-  },
+  SlackThreadWorkflow: { mode: "adopt", staleAfterHours: 48 },
+  PrReviewWorkflow: { mode: "adopt", staleAfterHours: 48 },
+  ToolExecWorkflow: { mode: "adopt", staleAfterHours: 1 },
+  AutomationRunWorkflow: { mode: "adopt", staleAfterHours: 1 },
 };
 
 export type ResolvedPolicy = SweepPolicy | { mode: "alert-only" };

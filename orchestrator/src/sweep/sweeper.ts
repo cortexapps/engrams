@@ -183,7 +183,7 @@ export async function runSweepTick(
         );
       }
     } catch (error) {
-      deps.log.error(
+      deps.log.warn(
         { error },
         "failed to prune stale version-heartbeat rows",
       );
@@ -367,7 +367,7 @@ export async function runSweepTick(
           ALERT_ACTIONS.has(decision.action),
         ).length;
       } catch (error) {
-        deps.log.error(
+        deps.log.warn(
           { error },
           "DBOS sweep decision alerting failed",
         );
@@ -377,7 +377,7 @@ export async function runSweepTick(
         result.failureScan =
           await deps.alerter.scanTerminalFailures();
       } catch (error) {
-        deps.log.error(
+        deps.log.warn(
           { error },
           "DBOS terminal failure scan failed",
         );
@@ -430,7 +430,7 @@ export class Sweeper {
     this.#timer = schedule(
       () =>
         void this.runOnce().catch((error) =>
-          this.#deps.log.error({ error }, "DBOS orphan sweep tick failed"),
+          this.#deps.log.warn({ error }, "DBOS orphan sweep tick failed"),
         ),
       this.#deps.config.sweepIntervalMs,
     );
@@ -486,7 +486,7 @@ export class VersionHeartbeat {
     this.#timer = schedule(
       () =>
         void this.runOnce().catch((error) =>
-          this.#deps.log.error({ error }, "version heartbeat failed"),
+          this.#deps.log.warn({ error }, "version heartbeat failed"),
         ),
       this.#deps.intervalMs,
     );

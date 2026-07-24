@@ -39,8 +39,6 @@ export interface SweepLedgerRow {
   firstSweptAt: Date | null;
   lastSweptAt: Date | null;
   suppressed: boolean;
-  cleanupDoneAt: Date | null;
-  cleanupFn: string | null;
   alertedAt: Date | null;
   terminalAlertedAt: Date | null;
 }
@@ -51,11 +49,6 @@ export interface SweepLedgerStore {
   setSuppressed(workflowUuid: string, suppressed: boolean): Promise<void>;
   /** Upserts: an alert-only or naturally-failed workflow has no prior sweep
    * row, and alert dedup must still stick for it. */
-  markCleanupDone(
-    workflowUuid: string,
-    workflowName: string,
-    fnName: string,
-  ): Promise<void>;
   markAlerted(workflowUuid: string, workflowName: string): Promise<void>;
   /** Terminal-failure alerts dedup separately from sweep-decision alerts —
    * a decision alert must never suppress the terminal-failure alarm. */
@@ -103,28 +96,17 @@ export interface DbosStatusStore {
     graceMs: number,
   ): Promise<DbosSweepTransitionResult>;
   /**
-   * Terminal failures inside the lookback window that still need handling:
-   * an anti-join on the ledger excludes rows whose terminal alert AND cleanup
-   * are both recorded. The ledger is the single source of truth for progress
-   * — there is no watermark to advance, so a row whose commit becomes visible
+   * Terminal failures inside the lookback window that have not been logged
+   * yet: an anti-join on the ledger excludes rows whose terminal_alerted_at
+   * is recorded. The ledger is the single source of truth for progress —
+   * there is no watermark to advance, so a row whose commit becomes visible
    * late, or that ties another row's timestamp, is simply still in the set
-   * next cycle. Wedged rows are bounded by the cleanup attempt cap, which
-   * ends in a durable gave-up mark that excludes them here too.
+   * next cycle.
    */
   listUnhandledTerminalFailures(
     lookbackMs: number,
     limit: number,
   ): Promise<FailedDbosWorkflowRow[]>;
-}
-
-export interface SweepReviewLookup {
-  id: string;
-  status: string;
-}
-
-export interface SweepLookupStore {
-  threadSourceForWorkflow(workflowUuid: string): Promise<unknown | null>;
-  reviewForWorkflow(workflowUuid: string): Promise<SweepReviewLookup | null>;
 }
 
 function affectedRows(result: {
@@ -154,8 +136,6 @@ function ledgerRow(row: Record<string, unknown>): SweepLedgerRow {
     firstSweptAt: nullableDate(row.first_swept_at),
     lastSweptAt: nullableDate(row.last_swept_at),
     suppressed: row.suppressed === true,
-    cleanupDoneAt: nullableDate(row.cleanup_done_at),
-    cleanupFn: row.cleanup_fn === null ? null : String(row.cleanup_fn),
     alertedAt: nullableDate(row.alerted_at),
     terminalAlertedAt: nullableDate(row.terminal_alerted_at),
   };
@@ -201,8 +181,7 @@ function recordSweepQuery(
         "last_swept_at" = now()
     returning "workflow_uuid", "workflow_name", "sweep_count",
               "first_swept_at", "last_swept_at", "suppressed",
-              "cleanup_done_at", "cleanup_fn", "alerted_at",
-              "terminal_alerted_at"
+              "alerted_at", "terminal_alerted_at"
   `;
 }
 
@@ -289,8 +268,7 @@ export function makeSweepLedgerStore(
       const result = await db.execute(sql`
         select "workflow_uuid", "workflow_name", "sweep_count",
                "first_swept_at", "last_swept_at", "suppressed",
-               "cleanup_done_at", "cleanup_fn", "alerted_at",
-               "terminal_alerted_at"
+               "alerted_at", "terminal_alerted_at"
         from "dbos_sweep_ledger"
         where "workflow_uuid" = ${workflowUuid}
         limit 1
@@ -304,16 +282,6 @@ export function makeSweepLedgerStore(
         update "dbos_sweep_ledger"
         set "suppressed" = ${suppressed}
         where "workflow_uuid" = ${workflowUuid}
-      `);
-    },
-
-    async markCleanupDone(workflowUuid, workflowName, fnName) {
-      await db.execute(sql`
-        insert into "dbos_sweep_ledger"
-          ("workflow_uuid", "workflow_name", "cleanup_done_at", "cleanup_fn")
-        values (${workflowUuid}, ${workflowName}, now(), ${fnName})
-        on conflict ("workflow_uuid") do update
-        set "cleanup_done_at" = now(), "cleanup_fn" = ${fnName}
       `);
     },
 
@@ -458,61 +426,11 @@ export function makeDbosStatusStore(
             from "dbos_sweep_ledger" as "ledger"
             where "ledger"."workflow_uuid" = "ws"."workflow_uuid"
               and "ledger"."terminal_alerted_at" is not null
-              and "ledger"."cleanup_done_at" is not null
           )
         order by "ws"."updated_at" asc
         limit ${limit}
       `);
       return result.rows.map(failedDbosWorkflowRow);
-    },
-  };
-}
-
-export function makeSweepLookupStore(
-  db: ReturnType<typeof getDb> = getDb(),
-): SweepLookupStore {
-  return {
-    async threadSourceForWorkflow(workflowUuid) {
-      const result = await db.execute(sql`
-        select "t"."source"
-        from "task" as "t"
-        inner join "task_session" as "ts"
-          on "ts"."task_id" = "t"."id"
-        where "ts"."session_id" in (
-          select "session_id"
-          from "slack_session"
-          where "thread_wf_id" = ${workflowUuid}
-        )
-          and "t"."type" = 'slack_thread'
-        limit 1
-      `);
-      return result.rows[0]?.source ?? null;
-    },
-
-    async reviewForWorkflow(workflowUuid) {
-      const result = await db.execute(sql`
-        select "id", "status"
-        from "review"
-        where "finder_session_id" in (
-          select "session_id"
-          from "review_session"
-          where "review_workflow_id" = ${workflowUuid}
-        )
-          or "verifier_session_id" in (
-            select "session_id"
-            from "review_session"
-            where "review_workflow_id" = ${workflowUuid}
-          )
-        order by "created_at" desc
-        limit 1
-      `);
-      const row = result.rows[0];
-      return row
-        ? {
-            id: String(row.id),
-            status: String(row.status),
-          }
-        : null;
     },
   };
 }
@@ -587,8 +505,6 @@ function emptyLedgerRow(
     firstSweptAt: null,
     lastSweptAt: null,
     suppressed: false,
-    cleanupDoneAt: null,
-    cleanupFn: null,
     alertedAt: null,
     terminalAlertedAt: null,
   };
@@ -599,7 +515,6 @@ function cloneLedgerRow(row: SweepLedgerRow): SweepLedgerRow {
     ...row,
     firstSweptAt: row.firstSweptAt ? new Date(row.firstSweptAt) : null,
     lastSweptAt: row.lastSweptAt ? new Date(row.lastSweptAt) : null,
-    cleanupDoneAt: row.cleanupDoneAt ? new Date(row.cleanupDoneAt) : null,
     alertedAt: row.alertedAt ? new Date(row.alertedAt) : null,
     terminalAlertedAt: row.terminalAlertedAt
       ? new Date(row.terminalAlertedAt)
@@ -631,8 +546,6 @@ export function makeInMemorySweepLedgerStore(
             firstSweptAt: sweptAt,
             lastSweptAt: sweptAt,
             suppressed: false,
-            cleanupDoneAt: null,
-            cleanupFn: null,
             alertedAt: null,
             terminalAlertedAt: null,
           };
@@ -650,13 +563,6 @@ export function makeInMemorySweepLedgerStore(
       if (row) row.suppressed = suppressed;
     },
 
-    async markCleanupDone(workflowUuid, workflowName, fnName) {
-      const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
-      rows.set(workflowUuid, row);
-      row.cleanupDoneAt = now();
-      row.cleanupFn = fnName;
-    },
-
     async markAlerted(workflowUuid, workflowName) {
       const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
       rows.set(workflowUuid, row);
@@ -667,29 +573,6 @@ export function makeInMemorySweepLedgerStore(
       const row = rows.get(workflowUuid) ?? emptyLedgerRow(workflowUuid, workflowName);
       rows.set(workflowUuid, row);
       row.terminalAlertedAt = now();
-    },
-  };
-}
-
-export interface InMemorySweepLookupSeed {
-  threadSources?: Record<string, unknown>;
-  reviews?: Record<string, SweepReviewLookup>;
-}
-
-/** Deterministic cleanup lookup store shared by sweep unit tests. */
-export function makeInMemorySweepLookupStore(
-  seed: InMemorySweepLookupSeed = {},
-): SweepLookupStore {
-  const threadSources = new Map(Object.entries(seed.threadSources ?? {}));
-  const reviews = new Map(Object.entries(seed.reviews ?? {}));
-  return {
-    async threadSourceForWorkflow(workflowUuid) {
-      return threadSources.get(workflowUuid) ?? null;
-    },
-
-    async reviewForWorkflow(workflowUuid) {
-      const row = reviews.get(workflowUuid);
-      return row ? { ...row } : null;
     },
   };
 }
@@ -725,8 +608,8 @@ export interface InMemoryDbosStatusOptions {
     workflowUuid: string,
     workflowName: string,
   ) => Promise<SweepLedgerRow>;
-  /** Mirrors the PG anti-join: excluded when the terminal alert AND cleanup
-   * are both recorded. Tests wire this to the in-memory ledger. */
+  /** Mirrors the PG anti-join: excluded once the terminal alert is recorded.
+   * Tests wire this to the in-memory ledger. */
   isTerminalFailureHandled?: (
     workflowUuid: string,
   ) => boolean | Promise<boolean>;

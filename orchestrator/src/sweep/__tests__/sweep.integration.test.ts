@@ -18,11 +18,7 @@ import {
   makeSweepLedgerStore,
 } from "../../db/dbos-sweep.ts";
 import { makeSweepAlerter } from "../alerts.ts";
-import {
-  resolvePolicy,
-  type ResolvedPolicy,
-  type SweepContext,
-} from "../policy.ts";
+import { resolvePolicy, type ResolvedPolicy } from "../policy.ts";
 import {
   DEFAULT_SWEEP_CONFIG,
   runSweepTick,
@@ -415,34 +411,6 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
 
       const ledger = makeSweepLedgerStore();
       const posts: string[] = [];
-      const cleanupCalls: string[] = [];
-      async function recordingCleanup(
-        _ctx: SweepContext,
-        workflow: { workflowUuid: string },
-      ): Promise<void> {
-        cleanupCalls.push(workflow.workflowUuid);
-      }
-      const cleanupCtx: SweepContext = {
-        log,
-        lookups: {
-          threadSourceForWorkflow: async () => null,
-          reviewForWorkflow: async () => null,
-        },
-        slack: async () => ({
-          chat: {
-            postMessage: async () => {},
-          },
-        }),
-        failReview: async () => {},
-      };
-      const policies = (name: string): ResolvedPolicy =>
-        name === sweepTestChangedWorkflowName
-          ? {
-              mode: "adopt",
-              staleAfterHours: 48,
-              onTerminalFailure: recordingCleanup,
-            }
-          : integrationPolicy(name);
       // Scan only this scenario's workflow so unrelated terminal failures in
       // a shared test database cannot skew the counts.
       const rawStatus = makeDbosStatusStore();
@@ -459,40 +427,33 @@ describe.skipIf(!dbReachable)("DBOS orphan sweep (real engine + Postgres)", () =
           return rows.filter((row) => row.workflowUuid === workflowId);
         },
       };
+      // Alerts are error-level log lines; capture the terminal-failure ones.
+      const alertLog = {
+        info() {},
+        warn() {},
+        error(fields: Record<string, unknown>, message: string) {
+          if (message === "DBOS workflow terminal failure") {
+            posts.push(`${message} ${JSON.stringify(fields)}`);
+          }
+        },
+      } as unknown as Logger;
       const alerter = makeSweepAlerter({
         ledger,
         status,
-        post: async (text) => {
-          posts.push(text);
-        },
-        policies,
-        cleanupCtx,
-        log,
-        maxCleanupAttempts: 3,
+        log: alertLog,
       });
 
       const firstScan = await alerter.scanTerminalFailures();
-      expect(firstScan).toMatchObject({
-        scanned: 1,
-        alerted: 1,
-        cleanupsRun: 1,
-        cleanupsFailed: 0,
-      });
+      expect(firstScan).toEqual({ scanned: 1 });
       expect(posts).toHaveLength(1);
       expect(posts[0]).toContain(workflowId);
-      expect(cleanupCalls).toEqual([workflowId]);
-      expect(await ledger.get(workflowId)).toMatchObject({
-        cleanupFn: "recordingCleanup",
-      });
       expect((await ledger.get(workflowId))?.terminalAlertedAt).not.toBeNull();
-      expect((await ledger.get(workflowId))?.cleanupDoneAt).not.toBeNull();
 
-      // Both completion marks are recorded, so the anti-join now excludes
-      // the row entirely — no re-scan, no duplicate alert or cleanup.
+      // The terminal-alert mark is recorded, so the anti-join now excludes
+      // the row entirely — no re-scan, no duplicate alert line.
       const secondScan = await alerter.scanTerminalFailures();
       expect(secondScan.scanned).toBe(0);
       expect(posts).toHaveLength(1);
-      expect(cleanupCalls).toEqual([workflowId]);
     },
     45_000,
   );

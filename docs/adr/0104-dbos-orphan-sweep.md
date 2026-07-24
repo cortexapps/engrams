@@ -107,34 +107,31 @@ abandoned rows back into the queue and pods pull.
 
    ```ts
    const SWEEP_POLICIES: Record<string, SweepPolicy> = {
-     SlackThreadWorkflow: { mode: "adopt", staleAfterHours: 48, onTerminalFailure: notifyThread },
-     PrReviewWorkflow:    { mode: "adopt", staleAfterHours: 48, onTerminalFailure: failReview },
+     SlackThreadWorkflow: { mode: "adopt", staleAfterHours: 48 },
+     PrReviewWorkflow:    { mode: "adopt", staleAfterHours: 48 },
      ToolExecWorkflow:    { mode: "adopt", staleAfterHours: 1 },
    };
-   // onTerminalFailure?: (ctx: SweepContext, wf: FailedWorkflow) => Promise<void>
    ```
 
-   `onTerminalFailure` is an optional callback: deps arrive via the injected
-   `SweepContext`; **at-least-once** — the ledger marks cleanup done only
-   after the callback returns, so callbacks must be idempotent; failures are
-   contained (logged, retried next cycle up to the cap) and can never crash
-   the sweep. The generic ops alert fires *outside* the callback,
-   unconditionally. DB names with no registration: renamed/deleted workflow
-   types → alert-only, never adopt; `temp_workflow-send-*` → adopt (a single
-   idempotent send); other unknowns → alert-only.
+   DB names with no registration: renamed/deleted workflow types →
+   alert-only, never adopt; `temp_workflow-*` → adopt (a single idempotent
+   operation); other unknowns → alert-only. There are **no cleanup
+   callbacks** (owner decision, 2026-07-24): terminal failures alert via the
+   log and the operator acts. The originally-designed side effects (an
+   in-thread "start a fresh thread" note; auto-failing a stuck review) were
+   built and then removed — the note risked necro-posting and both were
+   impl surface the alert makes unnecessary (reviews recover via
+   `RetryReview` once the operator sees the alert).
 6. **Failure alerting**: the same loop scans for *unhandled* terminal-failed
    workflows (`ERROR`, `MAX_RECOVERY_ATTEMPTS_EXCEEDED`) — a 7-day-lookback
-   query that anti-joins the ledger's completion marks (`terminal_alerted_at`
-   AND `cleanup_done_at`); handled rows drop out of the set, so there is no
-   cursor or watermark to advance — and posts to a configured Slack ops
-   channel. Alert failures log and never crash the sweep.
-7. **Thread black-hole guard**: when a `SlackThreadWorkflow` fails terminally
-   (typically a changed-body replay after adoption), post one note to the
-   affected thread itself ("this conversation hit a snag — start a fresh
-   thread") and cancel the workflow. Without this, new messages in that
-   thread route to a dead workflow id and vanish — the original bug through
-   the side door.
-8. **CI hash warning (non-blocking)**: a script that imports the workflow
+   query that anti-joins the ledger's `terminal_alerted_at` mark; handled
+   rows drop out of the set, so there is no cursor or watermark to advance.
+   Alerts are **error-level log lines** (`component: dbos-sweep`, messages
+   "DBOS orphan sweep alert" / "DBOS workflow terminal failure"); the
+   operator wires log-based alerting. Internal hiccups (a failed ledger
+   write, a PG blip in a tick) log at **warn** so the error level stays a
+   clean alert signal.
+7. **CI hash warning (non-blocking)**: a script that imports the workflow
    modules, hashes each registered workflow's `origFunction.toString()` plus
    the SDK version, and diffs a committed snapshot. On change it emits
    GitHub Actions `::warning::` annotations and always exits 0; `--update`
@@ -176,17 +173,18 @@ abandoned rows back into the queue and pods pull.
   re-enqueued and claimed by live pods. The manual
   `UPDATE … SET status='ENQUEUED', application_version=NULL` recipe is
   retired.
-- **Ops signal**: one log line per cycle (`component: dbos-sweep`) with live
-  versions and per-action counts; alerts (terminal failures, alert-only
-  orphans, cancels) go to `ORCHESTRATOR_SWEEP_ALERT_CHANNEL`, or the log when
-  unset.
+- **Ops signal**: one info log line per cycle (`component: dbos-sweep`) with
+  live versions and per-action counts. Alerts are **error-level** log lines
+  on the same component (messages "DBOS orphan sweep alert" and "DBOS
+  workflow terminal failure") — wire log-based alerting on level=error +
+  component=dbos-sweep. Internal retryable hiccups log at warn.
 - **Exclude one workflow**: `update dbos_sweep_ledger set suppressed = true
   where workflow_uuid = '…'` (insert the row first if it was never swept).
 - **Kill switch**: `ORCHESTRATOR_SWEEP_DISABLED=1` stops the sweeper only;
   heartbeats continue so the pod's own version stays provably live.
-- **A workflow cancelled or failed by the sweep**: Slack threads get the
-  in-thread "start a fresh thread" note; reviews flip to failed and
-  `RetryReview` mints a successor epoch.
+- **A workflow cancelled or failed by the sweep**: the alert is the whole
+  mechanism — the operator posts to the affected thread or runs
+  `RetryReview` as needed. The sweep performs no user-facing side effects.
 
 ## Consequences
 
@@ -386,3 +384,27 @@ Fifth round (1 MEDIUM + 1 LOW):
   surface no registered policy ever used. `SweepMode` is now just `adopt`;
   staleness cancels + suppression cover "don't adopt this". This also
   retires the fourth round's `cancelled_policy` alert handling.
+
+### Owner simplification: alerts are logs, no cleanup impls (2026-07-24)
+
+By owner decision the sweep performs **no side effects beyond adoption and
+cancellation**:
+
+- **Slack ops-alert posting deleted** (`ORCHESTRATOR_SWEEP_ALERT_CHANNEL`,
+  the post transport, its fallback logic). Alerts are error-level log lines;
+  the operator wires log alerting. With an infallible transport, the
+  alert-ordering retry machinery (post-before-mark, abandonment-alert
+  retries) collapsed away.
+- **Cleanup callbacks deleted entirely**: `notifyThread` (and its necro-post
+  guard — that review finding is moot by removal), `failReviewCleanup`,
+  `onTerminalFailure`, `SweepContext`, the `SweepLookupStore` and its
+  thread/review queries, the per-cleanup attempt cap/gave-up machinery, and
+  the ledger's `cleanup_done_at`/`cleanup_fn` columns (migration 0036). The
+  terminal-failure path is now: error-log, mark `terminal_alerted_at`, done
+  — the anti-join keys on that single mark.
+- **Log-level contract**: error = deliberate alert lines only; warn = every
+  internal contained failure (ledger blips, tick failures, prune failures),
+  so error-level log alerting never fires on transients.
+- The declined boot-guard finding stands unchanged: the first heartbeat
+  still crashes on failure because unproven liveness is a real adoption
+  hazard.

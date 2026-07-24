@@ -247,14 +247,10 @@ assertSweepPoliciesExhaustive();
 const { heartbeat, sweeper } = makeSweepRuntime({
   config: {
     sweepDisabled: config.sweepDisabled,
-    sweepAlertChannel: config.sweepAlertChannel,
     sweepIntervalMs: config.sweepIntervalMs,
     sweepGraceMs: config.sweepGraceMs,
     sweepHeartbeatIntervalMs: config.sweepHeartbeatIntervalMs,
   },
-  slack: () => getSlackClient(),
-  failReview: (reviewId, opts) =>
-    reviewControlPlane.failReview(reviewId, opts),
 });
 // Always heartbeat, including under the sweeper kill switch: otherwise another
 // pod can mistake this live DBOS application version for an abandoned owner.

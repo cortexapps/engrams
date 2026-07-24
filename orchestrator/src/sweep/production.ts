@@ -7,26 +7,21 @@ import {
   makeHeartbeatStore,
   makeSweepLeaseStore,
   makeSweepLedgerStore,
-  makeSweepLookupStore,
   type DbosStatusStore,
   type HeartbeatStore,
   type SweepLeaseStore,
   type SweepLedgerStore,
-  type SweepLookupStore,
 } from "../db/dbos-sweep.ts";
 import { log as rootLog } from "../log.ts";
 import { makeSweepAlerter } from "./alerts.ts";
-import { resolvePolicy, type SlackPostClient } from "./policy.ts";
 import {
   DEFAULT_SWEEP_CONFIG,
-  MAX_SWEEPS,
   Sweeper,
   VersionHeartbeat,
 } from "./sweeper.ts";
 
 export interface SweepRuntimeConfig {
   sweepDisabled: boolean;
-  sweepAlertChannel: string;
   sweepIntervalMs: number;
   sweepGraceMs: number;
   sweepHeartbeatIntervalMs: number;
@@ -35,7 +30,7 @@ export interface SweepRuntimeConfig {
 /**
  * Optional deterministic replacements for process/DBOS/Postgres state. The
  * production call omits this bundle; unit tests provide it as a complete
- * graph so the real alerter and cleanup callbacks can run end to end.
+ * graph so the real alerter runs end to end.
  */
 export interface SweepRuntimeOverrides {
   owner: string;
@@ -47,16 +42,10 @@ export interface SweepRuntimeOverrides {
   lease: SweepLeaseStore;
   ledger: SweepLedgerStore;
   status: DbosStatusStore;
-  lookups: SweepLookupStore;
 }
 
 export interface SweepRuntimeDeps {
   config: SweepRuntimeConfig;
-  slack: () => Promise<SlackPostClient>;
-  failReview: (
-    reviewId: string,
-    opts: { reason?: string },
-  ) => Promise<void>;
   log?: Logger;
   runtime?: SweepRuntimeOverrides;
 }
@@ -71,42 +60,15 @@ export function makeSweepRuntime(deps: SweepRuntimeDeps): {
   const lease = deps.runtime?.lease ?? makeSweepLeaseStore();
   const ledger = deps.runtime?.ledger ?? makeSweepLedgerStore();
   const status = deps.runtime?.status ?? makeDbosStatusStore();
-  const lookups = deps.runtime?.lookups ?? makeSweepLookupStore();
   const appVersion =
     deps.runtime?.appVersion ?? (() => DBOS.applicationVersion);
   const cancelWorkflow =
     deps.runtime?.cancelWorkflow ??
     ((workflowUuid: string) => DBOS.cancelWorkflow(workflowUuid));
 
-  const cleanupCtx = {
-    log,
-    lookups,
-    slack: deps.slack,
-    failReview: deps.failReview,
-  };
-  const post = deps.config.sweepAlertChannel
-    ? async (text: string): Promise<void> => {
-        const client = await deps.slack();
-        await client.chat.postMessage({
-          channel: deps.config.sweepAlertChannel,
-          text,
-        });
-      }
-    : async (text: string): Promise<void> => {
-        log.warn(
-          { alert: text },
-          "DBOS sweep alert (no ops channel configured)",
-        );
-      };
-  const alerter = makeSweepAlerter({
-    ledger,
-    status,
-    post,
-    policies: resolvePolicy,
-    cleanupCtx,
-    log,
-    maxCleanupAttempts: MAX_SWEEPS,
-  });
+  // Alerts are error-level log lines (component=dbos-sweep); log-based
+  // alerting is the operator's concern.
+  const alerter = makeSweepAlerter({ ledger, status, log });
   const config = {
     ...DEFAULT_SWEEP_CONFIG,
     sweepIntervalMs: deps.config.sweepIntervalMs,

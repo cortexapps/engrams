@@ -693,12 +693,7 @@ describe("runSweepTick", () => {
       },
       async scanTerminalFailures() {
         calls.push("failures");
-        return {
-          scanned: 2,
-          alerted: 1,
-          cleanupsRun: 1,
-          cleanupsFailed: 0,
-        };
+        return { scanned: 2 };
       },
     };
 
@@ -706,12 +701,7 @@ describe("runSweepTick", () => {
 
     expect(calls).toEqual(["decisions", "failures"]);
     expect(result.alerted).toBe(0);
-    expect(result.failureScan).toEqual({
-      scanned: 2,
-      alerted: 1,
-      cleanupsRun: 1,
-      cleanupsFailed: 0,
-    });
+    expect(result.failureScan).toEqual({ scanned: 2 });
     // The alerter ran before the finally block released the lease.
     expect(await f.lease.tryAcquire("next-owner", 120_000)).toBe(true);
   });

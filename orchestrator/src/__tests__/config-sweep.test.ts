@@ -14,22 +14,19 @@ describe("config — DBOS orphan sweep", () => {
     const config = loadConfig({ ...BASE });
 
     expect(config.sweepDisabled).toBe(false);
-    expect(config.sweepAlertChannel).toBe("");
     expect(config.sweepIntervalMs).toBe(SWEEP_INTERVAL_MS);
     expect(config.sweepGraceMs).toBe(SWEEP_GRACE_MS);
     expect(config.sweepHeartbeatIntervalMs).toBe(HEARTBEAT_INTERVAL_MS);
   });
 
-  test("accepts explicit alert channel and positive interval overrides", () => {
+  test("accepts positive interval overrides", () => {
     const config = loadConfig({
       ...BASE,
-      ORCHESTRATOR_SWEEP_ALERT_CHANNEL: "C012OPS",
       ORCHESTRATOR_SWEEP_INTERVAL_MS: "1500",
       ORCHESTRATOR_SWEEP_GRACE_MS: "2500.5",
       ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS: "750",
     });
 
-    expect(config.sweepAlertChannel).toBe("C012OPS");
     expect(config.sweepIntervalMs).toBe(1500);
     expect(config.sweepGraceMs).toBe(2500.5);
     expect(config.sweepHeartbeatIntervalMs).toBe(750);
