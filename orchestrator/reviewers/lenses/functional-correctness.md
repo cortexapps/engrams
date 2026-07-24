@@ -51,7 +51,6 @@ exact input and the exact wrong output.
 
 ## Writing policy
 
-WHAT: input → actual behavior → expected behavior, in one sentence. WHY: who
-hits it — every call, or a specific edge — and what the user-visible wrong
-result is. HOW: the minimal correction, only when the intended behavior is
-unambiguous from the code and tests you read.
+WHAT: input → actual behavior → expected behavior, in one sentence. WHEN: who
+hits it — every call, or a specific edge — and the concrete input or state that
+produces the wrong result.

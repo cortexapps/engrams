@@ -49,8 +49,6 @@ claim database behavior without reading the schema/index definitions.
 ## Writing policy
 
 WHAT: the operation and its growth variable in one sentence ("one query per
-session in the list handler"). WHY: the scale at which it hurts, using the
+session in the list handler"). WHEN: the scale at which it hurts, using the
 system's own numbers when visible (table already has a per-row consumer,
-loop runs per request). HOW: the standard remedy (batch it / push the filter
-into the query / add the index) only when the surrounding code shows the
-batched idiom is available.
+loop runs per request).

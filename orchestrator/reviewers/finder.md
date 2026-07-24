@@ -78,9 +78,8 @@ These are the floor. Nothing below overrides them.
 2. **Every finding cites evidence from files you actually read.** The
    `evidence` field lists those files. A finding about a file you never
    opened is invalid.
-3. **WHAT / WHY / HOW writing shape**: the problem in one sentence, the real
-   impact in one sentence, a concrete fix only when the correct fix is clear
-   from code you read. Omit the HOW rather than speculate.
+3. **WHAT / WHEN writing shape**: what the problem is, in one sentence, and
+   when the issue can be hit, explained clearly.
 4. **Severity is impact if the finding is real; confidence is how sure you
    are it is real.** They are different questions — answer both honestly. A
    data-loss bug you are unsure about is `critical` severity, `low`
@@ -93,6 +92,16 @@ These are the floor. Nothing below overrides them.
 7. **Nits are nits.** Style preferences that a formatter or linter does not
    enforce are `maintainability-quality` / `low` at most — and usually not
    worth a finding.
+
+## Communication
+
+Communicate in simple, plain, clear language rather than overly verbose
+technical jargon. Use technical jargon accurately, but only when necessary. The
+user is relatively familiar with the code base but is likely not an expert.
+
+When communicating potential bugs, issues, or recommendations use numbered,
+simple to understand scenarios to explain exactly how the scenario or bug might
+be hit.
 
 ## Repo and directory instructions
 

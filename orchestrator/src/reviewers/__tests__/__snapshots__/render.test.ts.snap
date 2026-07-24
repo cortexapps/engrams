@@ -89,9 +89,8 @@ These are the floor. Nothing below overrides them.
 2. **Every finding cites evidence from files you actually read.** The
    \`evidence\` field lists those files. A finding about a file you never
    opened is invalid.
-3. **WHAT / WHY / HOW writing shape**: the problem in one sentence, the real
-   impact in one sentence, a concrete fix only when the correct fix is clear
-   from code you read. Omit the HOW rather than speculate.
+3. **WHAT / WHEN writing shape**: what the problem is, in one sentence, and
+   when the issue can be hit, explained clearly.
 4. **Severity is impact if the finding is real; confidence is how sure you
    are it is real.** They are different questions — answer both honestly. A
    data-loss bug you are unsure about is \`critical\` severity, \`low\`
@@ -104,6 +103,16 @@ These are the floor. Nothing below overrides them.
 7. **Nits are nits.** Style preferences that a formatter or linter does not
    enforce are \`maintainability-quality\` / \`low\` at most — and usually not
    worth a finding.
+
+## Communication
+
+Communicate in simple, plain, clear language rather than overly verbose
+technical jargon. Use technical jargon accurately, but only when necessary. The
+user is relatively familiar with the code base but is likely not an expert.
+
+When communicating potential bugs, issues, or recommendations use numbered,
+simple to understand scenarios to explain exactly how the scenario or bug might
+be hit.
 
 ## Repo and directory instructions
 
@@ -143,8 +152,8 @@ read; anything you do not submit does not exist.
 - \`confidence\` (required) — \`high\` | \`medium\` | \`low\`. How sure you are it
   **is** real.
 - \`title\` (string, required) — one-line summary.
-- \`body_md\` (string, required) — WHAT / WHY / HOW (omit HOW if a fix would be
-  speculative).
+- \`body_md\` (string, required) — WHAT / WHEN: what the problem is, in one
+  sentence, and when the issue can be hit, explained clearly.
 - \`suggested_fix\` (string, optional) — a concrete fix only when it is clear
   from code you read.
 - \`evidence\` (string[], required) — the files you actually read to reach this
@@ -213,11 +222,10 @@ they gain, it is not a security finding.
 
 ## Writing policy
 
-WHAT: the sink and the unvalidated source in one sentence. WHY: what the
-attacker gains (read what? write what? act as whom?). HOW: the narrowest fix
-that closes the path (validate here / scope this query / move the check),
-only if the correct boundary is clear from code you read. Never write
-proof-of-concept exploit payloads into the finding.
+WHAT: the sink and the unvalidated source in one sentence. WHEN: the request or
+input that reaches the sink, and what the attacker gains (read what? write
+what? act as whom?). Never write proof-of-concept exploit payloads into the
+finding.
 "
 ,
     "path": "/workspace/.review/lenses/security-privacy.md",
@@ -276,11 +284,9 @@ release: who frees this, and does that line run on the error path?
 
 ## Writing policy
 
-WHAT: the failure and its trigger in one sentence ("a timeout here leaves
-the lock held"). WHY: the blast radius — one request, one worker, or the
-whole process, and whether it recovers. HOW: the concrete change (release in
-finally / bound the queue / add the timeout) only when the surrounding
-code's idiom makes the right fix evident.
+WHAT: the failure in one sentence ("a timeout here leaves the lock held").
+WHEN: the trigger and its blast radius — one request, one worker, or the
+whole process, and whether it recovers.
 "
 ,
     "path": "/workspace/.review/lenses/stability-availability.md",
@@ -339,11 +345,8 @@ almost never on the side that changed.
 
 ## Writing policy
 
-WHAT: which data becomes wrong and when. WHY: what downstream decisions or
-records the corruption reaches, and whether it is detectable after the fact.
-HOW: the fix that restores atomicity or agreement (move into the
-transaction / add the conflict target / dual-read during rollout), only when
-you read both sides of the boundary.
+WHAT: which data becomes wrong. WHEN: the operation, ordering, or failure that
+triggers the corruption, and whether it is detectable after the fact.
 "
 ,
     "path": "/workspace/.review/lenses/data-integrity-integration.md",
@@ -403,10 +406,9 @@ exact input and the exact wrong output.
 
 ## Writing policy
 
-WHAT: input → actual behavior → expected behavior, in one sentence. WHY: who
-hits it — every call, or a specific edge — and what the user-visible wrong
-result is. HOW: the minimal correction, only when the intended behavior is
-unambiguous from the code and tests you read.
+WHAT: input → actual behavior → expected behavior, in one sentence. WHEN: who
+hits it — every call, or a specific edge — and the concrete input or state that
+produces the wrong result.
 "
 ,
     "path": "/workspace/.review/lenses/functional-correctness.md",
@@ -464,11 +466,9 @@ claim database behavior without reading the schema/index definitions.
 ## Writing policy
 
 WHAT: the operation and its growth variable in one sentence ("one query per
-session in the list handler"). WHY: the scale at which it hurts, using the
+session in the list handler"). WHEN: the scale at which it hurts, using the
 system's own numbers when visible (table already has a per-row consumer,
-loop runs per request). HOW: the standard remedy (batch it / push the filter
-into the query / add the index) only when the surrounding code shows the
-batched idiom is available.
+loop runs per request).
 "
 ,
     "path": "/workspace/.review/lenses/performance-scalability.md",
@@ -528,12 +528,11 @@ following a local idiom you haven't read yet.
 
 ## Writing policy
 
-WHAT: the misleading or duplicated element in one sentence. WHY: the future
+WHAT: the misleading or duplicated element in one sentence. WHEN: the future
 edit or misreading it invites — be concrete ("the next caller will trust
-this comment and skip the null check"). HOW: the smallest rename/move/merge
-that fixes it. Severity is \`low\` unless the deception is about safety or
-money; confidence is usually \`high\` because you can see the contradiction
-directly.
+this comment and skip the null check"). Severity is \`low\` unless the
+deception is about safety or money; confidence is usually \`high\` because you
+can see the contradiction directly.
 "
 ,
     "path": "/workspace/.review/lenses/maintainability-quality.md",
