@@ -7,6 +7,11 @@
  */
 
 import { parseAdminEmails } from "./auth/admin-allowlist.ts";
+import {
+  HEARTBEAT_INTERVAL_MS,
+  SWEEP_GRACE_MS,
+  SWEEP_INTERVAL_MS,
+} from "./sweep/sweeper.ts";
 
 export interface Config {
   /** ORCHESTRATOR_PORT — default 8787 */
@@ -125,6 +130,22 @@ export interface Config {
    * promotion hooks are fully inert (dev/local default).
    */
   adminEmails: string[];
+  /**
+   * ORCHESTRATOR_SWEEP_DISABLED — emergency kill switch for the DBOS orphan
+   * sweeper only. The version heartbeat remains active so other pods never
+   * mistake this live application version for an abandoned one. "1" or
+   * "true" enables it; default false.
+   */
+  sweepDisabled: boolean;
+  /** ORCHESTRATOR_SWEEP_INTERVAL_MS — default SWEEP_INTERVAL_MS. */
+  sweepIntervalMs: number;
+  /** ORCHESTRATOR_SWEEP_GRACE_MS — default SWEEP_GRACE_MS. */
+  sweepGraceMs: number;
+  /**
+   * ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS — default
+   * HEARTBEAT_INTERVAL_MS.
+   */
+  sweepHeartbeatIntervalMs: number;
 }
 
 /** A configured generic OIDC provider (better-auth genericOAuth). */
@@ -164,6 +185,18 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
 
   function optional(key: string, fallback: string): string {
     return env[key] || fallback;
+  }
+
+  function positiveNumber(key: string, fallback: number): number {
+    const raw = env[key];
+    if (raw === undefined) return fallback;
+    const value = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) {
+      throw new Error(
+        `Orchestrator: ${key}="${raw}" must be a positive number`,
+      );
+    }
+    return value;
   }
 
   const portStr = optional("ORCHESTRATOR_PORT", "8787");
@@ -258,6 +291,41 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
   // needed — unset is valid and means "no bootstrap admins".
   const adminEmails = parseAdminEmails(env["ORCHESTRATOR_ADMIN_EMAILS"]);
 
+  // OPTIONAL: DBOS orphan-sweep operations. The boolean is deliberately
+  // narrow: only the documented "1" and "true" spellings activate the kill
+  // switch. Interval values reject explicit invalid input instead of silently
+  // falling back.
+  const sweepDisabled =
+    env["ORCHESTRATOR_SWEEP_DISABLED"] === "1" ||
+    env["ORCHESTRATOR_SWEEP_DISABLED"] === "true";
+  const sweepIntervalMs = positiveNumber(
+    "ORCHESTRATOR_SWEEP_INTERVAL_MS",
+    SWEEP_INTERVAL_MS,
+  );
+  const sweepGraceMs = positiveNumber(
+    "ORCHESTRATOR_SWEEP_GRACE_MS",
+    SWEEP_GRACE_MS,
+  );
+  const sweepHeartbeatIntervalMs = positiveNumber(
+    "ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS",
+    HEARTBEAT_INTERVAL_MS,
+  );
+  // A live pod proves its version with a heartbeat every interval, and the
+  // SIGTERM handler stops the heartbeat only AFTER the DBOS drain completes
+  // (index.ts) — so whenever workflow code can execute, the freshest beat is
+  // at most one interval + one missed beat old. 2× the interval is therefore
+  // the true floor; below it the sweep can declare a healthy pod's version
+  // dead between beats and re-enqueue workflows that still have a live owner
+  // (double execution).
+  if (sweepGraceMs < 2 * sweepHeartbeatIntervalMs) {
+    throw new Error(
+      `Orchestrator: ORCHESTRATOR_SWEEP_GRACE_MS (${sweepGraceMs}) must be at ` +
+        `least twice ORCHESTRATOR_SWEEP_HEARTBEAT_INTERVAL_MS ` +
+        `(${sweepHeartbeatIntervalMs}); a shorter grace window can adopt ` +
+        `workflows whose owner pod is alive but between heartbeats`,
+    );
+  }
+
   if (missing.length > 0) {
     throw new Error(
       `Orchestrator: missing required environment variable(s): ${missing.join(", ")}`,
@@ -287,6 +355,10 @@ export function loadConfig(env: Record<string, string | undefined> = process.env
     oidc,
     previewBaseDomain,
     adminEmails,
+    sweepDisabled,
+    sweepIntervalMs,
+    sweepGraceMs,
+    sweepHeartbeatIntervalMs,
   };
 }
 

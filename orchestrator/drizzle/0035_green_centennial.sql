@@ -1,0 +1,1 @@
+DROP TABLE "dbos_sweep_state" CASCADE;

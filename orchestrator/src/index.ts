@@ -20,7 +20,7 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import githubEventsRoute from "./routes/github-events.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
-// Side-effect import: registers the Slack adapter on the generic SDK seam.
+// Importing registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
 import { makeVncRoute } from "./routes/vnc.ts";
@@ -60,6 +60,8 @@ import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
 import { makeProductionListenerManager } from "./listeners/manager.ts";
 import { makeProductionAutomationScheduler } from "./automations/scheduler.ts";
+import { assertSweepPoliciesExhaustive } from "./sweep/policy.ts";
+import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
@@ -224,12 +226,13 @@ const server = buildServer(
 // bind can start a workflow.
 setThreadPolicy(makeSlackPolicy());
 setThreadControlPlane(makeThreadControlPlane());
-setReviewControlPlane(makeReviewControlPlane({
+const reviewControlPlane = makeReviewControlPlane({
   sessions: controlPlaneSessions,
   profiles: makeProfileStore(getDb()),
   enrollments: makeEnrollmentStore(getDb()),
   renderReviewer,
-}));
+});
+setReviewControlPlane(reviewControlPlane);
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
@@ -239,6 +242,25 @@ void seedReviewerProfile(makeProfileStore(getDb()), log).catch((err) =>
 );
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();
 await initDbos();
+assertSweepPoliciesExhaustive();
+const { heartbeat, sweeper } = makeSweepRuntime({
+  config: {
+    sweepDisabled: config.sweepDisabled,
+    sweepIntervalMs: config.sweepIntervalMs,
+    sweepGraceMs: config.sweepGraceMs,
+    sweepHeartbeatIntervalMs: config.sweepHeartbeatIntervalMs,
+  },
+});
+// Always heartbeat, including under the sweeper kill switch: otherwise another
+// pod can mistake this live DBOS application version for an abandoned owner.
+await heartbeat.start();
+if (!config.sweepDisabled) {
+  await sweeper.start();
+} else {
+  log.warn(
+    "DBOS orphan sweep disabled via ORCHESTRATOR_SWEEP_DISABLED",
+  );
+}
 const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
@@ -256,7 +278,13 @@ process.on("SIGTERM", () => {
     // after the HTTP server stops accepting connections.
     await automationScheduler.stop();
     await listenerManager.stop();
+    await sweeper.stop();
+    // The heartbeat must outlive the DBOS drain: workflows can execute until
+    // shutdownDbos() returns (or SIGKILL lands), and this pod's version must
+    // stay provably live for that whole window or another pod's sweep could
+    // adopt still-running work. Stopping the heartbeat is the LAST step.
     await shutdownDbos();
+    await heartbeat.stop();
     if (err) {
       log.error({ err }, "orchestrator: error during shutdown");
       process.exit(1);
