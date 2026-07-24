@@ -103,7 +103,7 @@ describe("SessionThread", () => {
             type: "exec_completed",
             exec_id: "x1",
             exit_status: 0,
-            rusage: { duration_ms: 4200 },
+            rusage: { wall_ms: 4200 },
             at: AT2,
           },
           { type: "harness_idle", at: AT2 },

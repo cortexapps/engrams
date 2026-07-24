@@ -714,7 +714,7 @@ export function buildMessages(
         if (part) {
           const args = part.args as unknown as ShellArgs;
           args.exit = ev.exit_status;
-          args.durationMs = ev.rusage?.duration_ms ?? null;
+          args.durationMs = ev.rusage?.wall_ms ?? null;
           part.isError = ev.exit_status != null && ev.exit_status !== 0;
           openExecs.delete(ev.exec_id);
         }
