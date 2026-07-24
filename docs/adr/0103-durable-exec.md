@@ -154,8 +154,14 @@ guest CPU.
 
 The host-side reader keeps the stage-1 epoch race — but a bump now
 triggers **re-dial and re-attach from the current offsets** instead of
-giving up; the synthetic `Exit(None)` remains the fallback when re-attach
-is impossible (agentd predates the upgrade, journal GC'd, sandbox gone).
+giving up. When re-attach is impossible the reader distinguishes two very
+different situations: transport-shaped loss while the ticket may still be
+valid (reconnect failed, stream ended without an Exit) ends the stream
+**without any Exit frame** so the caller re-attaches; only conditions
+where another attach is *unsafe or meaningless* (agentd predates the
+upgrade, degraded journal) fall back to the loud stage-1 `Exit(None)`
+floor. Refusals (identity mismatch, GC'd ticket) are their own terminal
+frame — see the taxonomy below — never an exit.
 
 ### The caller (orchestrator)
 
@@ -195,6 +201,11 @@ can no longer lose a result that was merely delayed.
 | 8 | Guest disk full during journal write | n/a | Exec proceeds; record marked degraded; stage-1 semantics for that exec |
 | 9 | Snapshot rewind past a completed side effect (D5 class) | Same exposure — inherent to crash-restore | Unchanged and now **documented**: ticket = exactly-once spawn per timeline; external side effects = at-least-once under rewind (see Contract) |
 | 10 | New coordinator, old agentd (rollout skew) | n/a | Capability-detected → stage-1 fallback, named in the error (the #567 skew pattern) |
+| 11 | Checkpoint fires during the capability probe / CancelExec / Upload round-trip (before any exec stream exists) | n/a (new surface) | One-shot reads AND writes race the epoch watch → retryable `Unavailable`; all three round-trips are idempotent |
+| 12 | Silent exec (non-tty `git clone` prints nothing) + transport flap burst mid-run | n/a (new surface) | Flap costs retries, never the result: the deadline is the only budget; an open attach waiting through silence consumes nothing |
+| 13 | Attach with a ticket agentd must refuse (command mismatch, GC'd/missing journal with offsets) | n/a (new surface) | Distinct `Refused` terminal — deterministic, fails fast at the caller, never recorded as a completion |
+| 14 | Wrapper killed (OOM) while its command lives on in its own process group | n/a (new surface) | The record counts live and is never GC'd while the *command* pid survives — the spawn-dedupe marker outlives the wrapper |
+| 15 | Ticket re-used after guest journal TTL/GC with zero offsets | Documented residual | Attach-or-start semantics re-run the command; coordinator lifecycle rows stay deduped by exec_id, so run 2 leaves no new rows — callers mint fresh tickets per logical run |
 
 ## The contract, stated plainly
 
@@ -241,6 +252,12 @@ can no longer lose a result that was merely delayed.
   `ci.yml`'s FC lane explicitly.
 - **Skew:** new host code against a stubbed old-protocol agentd → stage-1
   fallback with the named error.
+- **Deferred (recorded, not forgotten):** the e2e-stack severance smoke
+  (kill the coordinator-side stream once mid-exec through the full
+  orchestrator→coordinator→host stack and assert the retry completes) is
+  not yet implemented — the cosim covers the composition with the real
+  coordinator core and real agentd; the e2e lane currently drains
+  happy-path execs only.
 - **Caller layer (orchestrator) — the review flow is the reference
   consumer and gets pinned explicitly:**
   - *Stage-1 regression (needed now, independent of stages 2+3):* a fake
@@ -311,22 +328,32 @@ can no longer lose a result that was merely delayed.
 
 ### Review hardening (2026-07-23)
 
-- A fabricated terminal `Exit(None)` is now reserved for cases where another
-  attach is unsafe: old-agentd rollout skew (double-spawn risk), a degraded or
-  missing/GC'd journal, command/exec identity mismatch, a command that died
-  without recording an exit, and explicit cancel/timeout kills. Transport loss
-  while the durable ticket remains valid ends without `Exit`; the coordinator
-  turns that into a retryable stream error so the caller can attach again.
-- The fabricated-terminal audit covered all four recovery layers: `runExec` no
-  longer abandons healthy progressive re-attaches; coordinator lifecycle
-  persistence suppresses offset re-attach `ExecStarted` duplicates and records
-  `ExecCompleted` only for a real Exit; the coord→host gRPC adapter no longer
-  converts stream errors into null exits; and the Firecracker reader no longer
-  converts durable EOF/reconnect failures into null exits.
-- `runExec`'s retry cap counts consecutive attempts that received no frame.
-  Any `ExecStarted`, stdout, or stderr frame resets both that counter and its
-  backoff; an exec that keeps making progress is bounded by its deadline, not
-  by a lifetime attach count.
+### Terminal taxonomy (normative)
+
+Every way an exec stream can end falls into exactly one of four classes.
+Every hop — agentd, backend reader, host pump, coordinator, caller — must
+preserve the class; converting between them is the bug this section exists
+to prevent.
+
+| Class | Wire shape | Coordinator | Caller (`runExec`) | Lifecycle rows |
+|---|---|---|---|---|
+| **Genuine exit** — the command completed (incl. a real died-without-exit `Exit(None)` after diagnostics, and cancel/timeout kills) | `Exit{status?}` | persists `exec_completed` (deduped by exec_id), `wall_ms` from the logged start | returns the status | started + completed |
+| **Transport loss** — severance, EOF, reconnect failure, pump channel close, while the ticket may still be valid | stream ends **without** `Exit` → `Unavailable` | retryable error, **no** completion row | re-attach from offsets, capped backoff, until the deadline (the only budget) | none new |
+| **Refusal** — deterministic rejection of THIS attach: command/identity mismatch (first-writer-wins), GC'd/missing journal with a used ticket, non-zero offsets against a missing record | `Refused{reason}` — its own frame, never an `Exit` | terminal non-retryable error, **no** lifecycle rows | fails fast, no retry | none |
+| **Stage-1 floor** — another attach is unsafe or meaningless: old-agentd skew (double-spawn risk), degraded journal | `Exit(None)` after the named `Degraded`/skew diagnostic | persists the null completion | returns `exitStatus: null` (callers treat non-zero as failure) | started + completed(None) |
+
+Caller policy, stated once: **the deadline is the only budget.** Retry
+every transport loss with capped exponential backoff (reset the backoff on
+byte progress so healing is fast; a silent healthy exec holds one open
+attach and consumes nothing). Refusals, protocol violations (duplicate or
+mismatched `ExecStarted`), NotFound, and no-live-sandbox are terminal
+immediately — deterministic conditions are not retried at all. There is no
+attempt counter: every previous attempt-counting scheme was either dead
+code (any-frame reset — the coordinator prepends `Started` on every
+answered attach) or a hair trigger (byte-progress reset — a ~10s transport
+flap burned 9 attempts against a silent `git clone` with minutes of
+deadline left).
+
 - Backend parity follows the same fabricate-only-where-unsafe rule: Process now
   has sandbox-lifetime attach-or-start records instead of echoing a false
   durability signal, and durable VZ transport EOF ends without a fabricated
@@ -354,19 +381,20 @@ can no longer lose a result that was merely delayed.
   exists), `CancelExec`, and `write_files`' Upload — each a re-introduction
   of the infinite wedge on its own hop. All three now race the epoch watch
   via a shared helper and fail as retryable `Unavailable` (all three
-  round-trips are idempotent). The remaining vsock reads are either
-  timeout-bounded (GuestIp 2s, RefreshAgent 10s, shell/IDE/VNC 15–30s,
-  SpawnHarness 60s/attempt) or pre-application handshakes served by the
-  always-running muxer with EOF-shaped retry (`connect_fc_vsock`), so the
-  probe/cancel/upload trio closed the last unbounded reads on this class.
-- Progress means bytes, not frames: the coordinator's gRPC handler prepends
-  `Started{exec_id}` on every attach it answers, so `runExec`'s retry budget
-  counts consecutive attempts whose replay offsets did not advance. Counting
-  frames made the budget dead code on the production path — a start-then-fail
-  loop reset it every attempt and hammered re-attach at the 50 ms floor for
-  the whole deadline, and deterministic protocol violations (duplicate or
-  mismatched `ExecStarted`) retried until the deadline instead of bounding at
-  the same budget.
+  round-trips are idempotent). The same rule applies to WRITES: a large
+  Upload payload (or exec stdin) written into a severed connection parks
+  once the socket buffer fills, so severable writes race the epoch too.
+  The remaining vsock reads are either timeout-bounded (GuestIp 2s,
+  RefreshAgent 10s, shell/IDE/VNC 15–30s, SpawnHarness 60s/attempt) or
+  pre-application handshakes served by the always-running muxer with
+  EOF-shaped retry (`connect_fc_vsock`).
+- Journal liveness is about the COMMAND, not the wrapper: an OOM-killed
+  wrapper whose command survives in its own process group must keep its
+  cap slot and its spawn-dedupe marker (GC'ing the dir would let a retry
+  double-spawn a still-running command), and dead incomplete records age
+  from their last observed activity (newest file mtime), not from their
+  start time — a 24h exec that dies uncleanly still gets a full diagnosis
+  window.
 - Completion accounting mirrors the start-side dedup: `ExecCompleted` is
   deduplicated by exec_id against the durable log (a journal replay of an
   already-complete exec reaches a real Exit on every attach), and `wall_ms`
@@ -375,11 +403,26 @@ can no longer lose a result that was merely delayed.
   `session_exec_event_logged_at` (kind-typed, `MIN(created_at)`); its D4
   conformance scenario pins every predicate clause — exec_id match, session
   scoping, kind filter (stdout/completed payloads also carry exec_id), and
-  first-occurrence-wins over duplicates. Acknowledged residual: a re-attach
-  from offset zero after delivery (a replayed orchestrator step) re-persists
-  stdout/stderr rows — output chunks carry no offsets, so exactly-once
-  output rows would need an offset-keyed schema; accepted for ephemeral
-  review sessions.
+  first-occurrence-wins over duplicates.
+- **Output recording is observation-independent (fixed in this PR).** The
+  coordinator persists exec output rows as a side effect of serving an
+  attach — the writer placement is forced (it is the only PG-capable
+  component that sees the bytes, and only while serving), so the fix is
+  idempotence, not relocation: every chunk row is stamped with its absolute
+  RAW byte range (`bytes_start`/`bytes_end`), and an attach skips
+  persisting at or below the ticket's recorded per-stream high-water mark
+  (`session_exec_output_high_water`, D4-conformance-covered), trimming a
+  straddling chunk at the raw byte boundary before the lossy decode.
+  Attaching N times now records the same rows as attaching once; replayed
+  bytes still stream to the caller. Documented residuals: two simultaneous
+  from-zero attaches can still double-record (same accepted race as the
+  lifecycle dedup); a persistence gap below the mark is no longer healed by
+  replay (best-effort recording, unchanged posture); rows written before
+  stamping existed are invisible to the mark (their execs may duplicate
+  once more, then never again); and output no caller ever pulls through
+  the coordinator is never recorded at all (closing that needs a
+  completion-triggered journal drain — a second 64 MiB transfer per exec,
+  unjustified for a debugging surface).
 
 ## Alternatives considered
 
@@ -391,6 +434,36 @@ can no longer lose a result that was merely delayed.
   gives the same durability with one verb, and one-shot callers keep
   single-call ergonomics. The split survives only as vocabulary inside
   `runExec`'s loop.
+- **Coordinator-side healing (make durable exec "a coordinator protocol the
+  orchestrator just consumes").** The coordinator could internally re-attach
+  to the host on coord↔host stream loss, hiding host-agent rolls from the
+  caller within one RPC. Rejected because it removes NOTHING from the
+  caller: the two failures this feature exists for are the coordinator's
+  own death and the caller's own replay, and both make the ticket and the
+  cursor irreducibly caller-side — "delivered" means delivered to the
+  caller (only the receiver knows its own high-water mark across the
+  server's death, the same reason Kafka consumers own their offsets and
+  SSE clients send Last-Event-ID), and only the caller can name an exec
+  deterministically across its own DBOS step replays. Server-side healing
+  would add a third retry loop and a second offset-tracking state between
+  the FC driver's redial and the caller's loop, while the caller keeps
+  every obligation it has today. One dumb idempotent verb + one
+  caller-held cursor is the smallest total system.
+- **SSE (or similar resumable-stream transport) instead of the gRPC
+  stream.** SSE's `Last-Event-ID` is exactly our byte cursor — the design
+  borrows that idea — but adopting the transport removes nothing (the
+  cursor is renamed, the exactly-once ticket has no SSE analog, deadline/
+  cancel stay caller-side) and costs real things: SSE has no typed terminal
+  frames (every ending is an untyped connection drop, erasing the terminal
+  taxonomy this ADR is built on), output is UTF-8-only (base64 for binary,
+  +33% on build logs), and it would resurrect the coordinator HTTP surface
+  ADR 0051 retired, leaving two exec protocols to keep in conformance.
+  EventSource's auto-reconnect — the one labor-saver — is a browser
+  affordance; our server-side caller hand-writes the loop either way.
+  Note the current design is already "polling with a push optimization":
+  each attach is a poll of the journal from the cursor that keeps pushing
+  while connected, and under repeated severance it degrades gracefully
+  into exactly that.
 - **Exec rows in Postgres.** Rejected: the journal already is the state,
   and a PG mirror adds a second source of truth, MetadataStore surface
   (and its ADR 0098 D4 conformance burden) for no additional durability.

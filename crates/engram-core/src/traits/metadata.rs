@@ -132,6 +132,24 @@ impl ExecLifecycleEventKind {
     }
 }
 
+/// ADR 0103: the two exec output streams whose chunk rows carry absolute
+/// byte-range stamps (`bytes_start`/`bytes_end`) in their payloads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ExecOutputStream {
+    Stdout,
+    Stderr,
+}
+
+impl ExecOutputStream {
+    /// The `session_events.kind` discriminant this variant matches.
+    pub fn kind_str(self) -> &'static str {
+        match self {
+            Self::Stdout => "stdout",
+            Self::Stderr => "stderr",
+        }
+    }
+}
+
 /// Authoritative source of truth. Postgres-backed in v1; trait exists so
 /// we can support SQLite for embedded deployments later.
 #[async_trait]
@@ -1768,6 +1786,28 @@ pub trait MetadataStore: Send + Sync {
         _kind: ExecLifecycleEventKind,
     ) -> Result<Option<chrono::DateTime<chrono::Utc>>, MetaError> {
         Ok(None)
+    }
+
+    /// Highest recorded absolute byte end-offset among this exec's persisted
+    /// output chunk rows for `stream`, or 0 when none are stamped.
+    ///
+    /// ADR 0103: output recording must be observation-independent — a
+    /// re-attach skips persisting chunk bytes at or below this mark, so
+    /// attaching N times records the same rows as attaching once. Rows
+    /// written before byte-range stamping existed carry no `bytes_end` and
+    /// are ignored (their execs may duplicate once more; stamped rows never
+    /// do).
+    ///
+    /// Default 0 keeps event-less mock stores lightweight. `PostgresStore`
+    /// and `SimMetadataStore` implement the real query, covered by the ADR
+    /// 0098 D4 conformance suite.
+    async fn session_exec_output_high_water(
+        &self,
+        _session_id: SessionId,
+        _exec_id: &str,
+        _stream: ExecOutputStream,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
     }
 
     /// Append an event to a session's persistent log. Returns the

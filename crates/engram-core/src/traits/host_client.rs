@@ -127,10 +127,16 @@ pub trait HostClient: Send + Sync {
                     stderr.extend_from_slice(&b);
                 }
                 Some(crate::types::sandbox::ExecEvent::Exit(status)) => break status,
+                Some(crate::types::sandbox::ExecEvent::Refused(reason)) => {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "exec {} refused: {reason}",
+                        stream.exec_id
+                    )));
+                }
                 None => {
                     return Err(SandboxError::Unavailable(format!(
-                        "exec {} event stream ended without an Exit frame; its result may be \
-                         recoverable through exec_stream re-attach",
+                        "exec {} event stream ended without an Exit or Refused frame; its result \
+                         may be recoverable through exec_stream re-attach",
                         stream.exec_id
                     )));
                 }

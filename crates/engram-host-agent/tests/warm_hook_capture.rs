@@ -400,6 +400,7 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
             ExecEvent::Stdout(b) => stdout.extend_from_slice(&b),
             ExecEvent::Stderr(_) => {}
             ExecEvent::Exit(_) => break,
+            ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
         }
     }
     String::from_utf8_lossy(&stdout).into_owned()

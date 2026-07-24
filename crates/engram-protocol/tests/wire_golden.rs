@@ -464,8 +464,10 @@ fn wire_version_pinned() {
     // (the image's `suggested_disk_gib` now floors the packed ext4 size).
     // Proto-native scalar only; no bincode payload changed, so every
     // golden is byte-identical.
+    // 19 -> 20: ADR 0103 review hardening — ExecFrame gains the proto-native
+    // Refused terminal. No bincode payload changed.
     assert_eq!(
-        WIRE_VERSION, 19,
+        WIRE_VERSION, 20,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

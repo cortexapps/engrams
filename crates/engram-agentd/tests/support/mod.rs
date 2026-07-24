@@ -50,6 +50,7 @@ pub fn wire_exec_event() -> impl Strategy<Value = WireExecEvent> {
         proptest::option::of(any::<i32>()).prop_map(WireExecEvent::Exit),
         s().prop_map(WireExecEvent::Started),
         s().prop_map(WireExecEvent::Degraded),
+        s().prop_map(|reason| WireExecEvent::Refused { reason }),
     ]
 }
 
@@ -266,5 +267,6 @@ fn _exhaustiveness_wire_exec_event(e: &WireExecEvent) {
         WireExecEvent::Exit(_) => {}
         WireExecEvent::Started(_) => {}
         WireExecEvent::Degraded(_) => {}
+        WireExecEvent::Refused { .. } => {}
     }
 }

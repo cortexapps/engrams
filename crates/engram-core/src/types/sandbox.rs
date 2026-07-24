@@ -432,8 +432,9 @@ pub struct WriteFileResult {
 }
 
 /// Output event from a streaming `exec`. A terminal backend result is marked
-/// by exactly one `Exit`. The event stream may instead end without `Exit` to
-/// report retryable transport loss while a durable result remains attachable.
+/// by exactly one `Exit` or `Refused`. The event stream may instead end
+/// without either terminal to report retryable transport loss while a durable
+/// result remains attachable.
 ///
 /// The variants are intentionally `Bytes` rather than `String` so a
 /// process emitting non-UTF-8 output (binary tools, raw pipe content)
@@ -443,11 +444,12 @@ pub enum ExecEvent {
     Stdout(Bytes),
     Stderr(Bytes),
     Exit(Option<i32>),
+    Refused(String),
 }
 
 impl ExecEvent {
     pub fn is_terminal(&self) -> bool {
-        matches!(self, Self::Exit(_))
+        matches!(self, Self::Exit(_) | Self::Refused(_))
     }
 }
 
@@ -457,8 +459,9 @@ pub type ExecEventStream = Pin<Box<dyn Stream<Item = ExecEvent> + Send + 'static
 
 /// Streaming counterpart to [`ExecHandle`]. The backend returns immediately
 /// with metadata + a stream; the stream yields output as the underlying
-/// process produces it and ends with a single `Exit` only when it has a
-/// terminal result. End-without-Exit means transport loss, not completion.
+/// process produces it and ends with a single `Exit` or `Refused` only when
+/// it has a terminal result. End-without-terminal means transport loss, not
+/// completion.
 pub struct ExecStream {
     pub sandbox_id: SandboxId,
     pub exec_id: String,
@@ -669,10 +672,11 @@ mod tests {
     }
 
     #[test]
-    fn exec_event_terminal_only_on_exit() {
+    fn exec_event_terminal_only_on_exit_or_refusal() {
         assert!(!ExecEvent::Stdout(Bytes::from_static(b"x")).is_terminal());
         assert!(!ExecEvent::Stderr(Bytes::from_static(b"x")).is_terminal());
         assert!(ExecEvent::Exit(Some(0)).is_terminal());
         assert!(ExecEvent::Exit(None).is_terminal());
+        assert!(ExecEvent::Refused("first writer wins".into()).is_terminal());
     }
 }

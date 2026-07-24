@@ -247,6 +247,7 @@ async fn exec(backend: &VzBackend, id: SandboxId, sh: &str) -> (String, Option<i
                 code = c;
                 break;
             }
+            ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
         }
     }
     (out, code)
@@ -817,6 +818,7 @@ async fn e2e_vz_forge_credential_round_trips() {
                 code = c;
                 break;
             }
+            ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
         }
     }
     assert_eq!(code, Some(0), "forge-credential exit (stderr: {err})");

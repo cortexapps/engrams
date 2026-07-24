@@ -3,8 +3,8 @@
 //! Concurrency model: stdout and stderr are read in parallel tasks
 //! that send `WireExecEvent`s through an `mpsc` channel; a single
 //! writer task drains the channel and frames each event onto the
-//! connection. This keeps `WireExecEvent::Exit` strictly *last* on
-//! the wire (we close the channel only after both readers drain),
+//! connection. This keeps a genuine `WireExecEvent::Exit` strictly *last*
+//! on the wire (we close the channel only after both readers drain),
 //! and avoids the lock-around-the-stream dance that two writers
 //! would otherwise need.
 
@@ -503,19 +503,43 @@ where
             )
             .await
         }
-        AttachOrStart::Start(entry) => serve_durable_start(req, entry, writer, supervisor).await,
+        AttachOrStart::Start(entry) => {
+            let stdout_offset = req.stdout_offset.unwrap_or(0);
+            let stderr_offset = req.stderr_offset.unwrap_or(0);
+            if stdout_offset != 0 || stderr_offset != 0 {
+                let cleanup = tokio::fs::remove_dir_all(entry.dir()).await;
+                write_msg(
+                    &mut writer,
+                    &WireExecEvent::Refused {
+                        reason: format!(
+                            "no journal for exec_id {exec_id} with non-zero replay offsets; refusing to spawn from scratch"
+                        ),
+                    },
+                )
+                .await?;
+                cleanup.map_err(|error| {
+                    io::Error::new(
+                        error.kind(),
+                        format!(
+                            "remove refused vacant journal {}: {error}",
+                            entry.dir().display()
+                        ),
+                    )
+                })?;
+                return Ok(());
+            }
+            serve_durable_start(req, entry, writer, supervisor).await
+        }
         AttachOrStart::Missing => {
             write_msg(
                 &mut writer,
-                &WireExecEvent::Stderr(
-                    format!(
+                &WireExecEvent::Refused {
+                    reason: format!(
                         "durable exec reattach failed: journal for exec_id {exec_id} was GC'd or is missing; refusing to spawn a second command\n"
-                    )
-                    .into_bytes(),
-                ),
+                    ),
+                },
             )
-            .await?;
-            write_msg(&mut writer, &WireExecEvent::Exit(None)).await
+            .await
         }
         AttachOrStart::DegradedStart { reason, .. } => {
             tracing::warn!(%exec_id, %reason, "durable exec degraded to stage-1 live streaming");
@@ -765,8 +789,7 @@ where
                 "exec_id {} already belongs to command {:?}; refusing different command {:?} (first writer wins)\n",
                 entry.exec_id(), request.command, command
             );
-            write_msg(writer, &WireExecEvent::Stderr(message.into_bytes())).await?;
-            write_msg(writer, &WireExecEvent::Exit(None)).await?;
+            write_msg(writer, &WireExecEvent::Refused { reason: message }).await?;
             return Ok(());
         }
     }
@@ -839,8 +862,7 @@ where
                     "exec_id {} already belongs to command {:?}; refusing different command {:?} (first writer wins)\n",
                     entry.exec_id(), recorded_command, command
                 );
-                write_msg(writer, &WireExecEvent::Stderr(message.into_bytes())).await?;
-                write_msg(writer, &WireExecEvent::Exit(None)).await?;
+                write_msg(writer, &WireExecEvent::Refused { reason: message }).await?;
                 return Ok(());
             }
             // Like `Complete`, `Died` terminates only once the drain has
@@ -1095,7 +1117,8 @@ mod tests {
         loop {
             match read_msg::<_, WireExecEvent>(&mut client).await {
                 Ok(ev) => {
-                    let is_exit = matches!(ev, WireExecEvent::Exit(_));
+                    let is_exit =
+                        matches!(ev, WireExecEvent::Exit(_) | WireExecEvent::Refused { .. });
                     events.push(ev);
                     if is_exit {
                         break;
@@ -1500,6 +1523,9 @@ mod tests {
                 WireExecEvent::Exit(_) => panic!("Exit must be the last event, not in the middle"),
                 WireExecEvent::Started(_) => {}
                 WireExecEvent::Degraded(_) => {}
+                WireExecEvent::Refused { reason } => {
+                    panic!("healthy command was unexpectedly refused: {reason}")
+                }
             }
         }
         assert_eq!(total_out, b"out");

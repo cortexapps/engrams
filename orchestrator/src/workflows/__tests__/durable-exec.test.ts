@@ -5,14 +5,16 @@ import type { ProfileRow } from "../../db/profiles.ts";
 import type { ReviewDetail, ReviewRow } from "../../db/reviews.ts";
 import type { GithubReviewPoster } from "../../reviews/github-review.ts";
 import {
-  makeReviewControlPlane,
-  ReviewSetupError,
   runExec,
   RunExecError,
+  type RunExecRuntime,
+} from "../../exec/durable-exec.ts";
+import {
+  makeReviewControlPlane,
+  ReviewSetupError,
   type ReviewControlPlane,
   type ReviewControlPlaneDeps,
   type ReviewSessionsClient,
-  type RunExecRuntime,
 } from "../review-control-plane.ts";
 import { prReviewWorkflowImpl, type StepRunner } from "../pr-review.ts";
 import type { ReviewInbox } from "../review-inbox.ts";
@@ -314,7 +316,9 @@ describe("durable orchestrator exec caller", () => {
     expect(server.spawnCounts.get(execId)).toBe(1);
   });
 
-  test("nine consecutive attempts without a frame exhaust the retry budget", async () => {
+  test("transport loss retries until the deadline, then cancels", async () => {
+    // ADR 0103 terminal taxonomy: the deadline is the ONLY budget for
+    // transport loss. No attempt counter may give up early.
     let calls = 0;
     const error = new ConnectError("stream unavailable", Code.Unavailable);
     const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
@@ -334,22 +338,27 @@ describe("durable orchestrator exec caller", () => {
       },
     };
 
+    const runtime = instantRuntime();
     await expect(runExec(
       server,
       "session-no-frames",
       "true",
       { execId: "exec:session-no-frames:true", deadlineMs: 60_000 },
-      instantRuntime(),
-    )).rejects.toThrow(
-      "failed after 9 consecutive attempts without progress",
-    );
-    expect(calls).toBe(9);
+      runtime,
+    )).rejects.toThrow("exceeded deadline");
+    // Backoff caps at 1s, so a 60s outage costs ~60+ attempts — far more
+    // than any early-give-up budget, far fewer than a 50ms storm (1200).
+    expect(calls).toBeGreaterThan(20);
+    expect(calls).toBeLessThan(200);
+    expect(base.cancelCalls).toHaveLength(1);
   });
 
-  test("byte progress resets the consecutive no-progress retry budget", async () => {
+  test("a silent exec survives a transport flap burst and delivers its exit", async () => {
+    // The reference consumer is a non-tty `git clone`: it prints NOTHING
+    // until it finishes. A ~10s flap burst mid-run must cost retries, never
+    // the result (ADR 0103 failure-matrix row 12).
     let calls = 0;
-    const error = new ConnectError("stream unavailable", Code.Unavailable);
-    const execId = "exec:session-reset:true";
+    const execId = "exec:session-silent:clone";
     const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
     const server: ReviewSessionsClient = {
       createSession: () => base.createSession(),
@@ -361,43 +370,35 @@ describe("durable orchestrator exec caller", () => {
         const call = ++calls;
         return {
           async *[Symbol.asyncIterator]() {
-            if (call === 7) {
-              yield { event: { case: "started", value: { execId } } };
-              yield {
-                event: { case: "stdout", value: encoder.encode("progress") },
-              };
+            yield { event: { case: "started", value: { execId } } };
+            if (call <= 12) {
+              throw new ConnectError(
+                "transport flap mid-silent-clone",
+                Code.Unavailable,
+              );
             }
-            throw error;
+            yield { event: { case: "exit", value: { exitStatus: 0 } } };
           },
         };
       },
     };
 
-    let failure: unknown;
-    try {
-      await runExec(
-        server,
-        "session-reset",
-        "true",
-        { execId, deadlineMs: 60_000 },
-        instantRuntime(),
-      );
-    } catch (error) {
-      failure = error;
-    }
-    expect(failure).toBeInstanceOf(RunExecError);
-    expect((failure as RunExecError).message).toContain(
-      "failed after 9 consecutive attempts without progress",
+    const result = await runExec(
+      server,
+      "session-silent",
+      "git clone https://github.com/org/repo /workspace",
+      { execId, deadlineMs: 5 * 60_000 },
+      instantRuntime(),
     );
-    expect((failure as RunExecError).stdout).toBe("progress");
-    expect(calls).toBe(16);
+    expect(result).toEqual({ exitStatus: 0, stdout: "", stderr: "" });
+    expect(calls).toBe(13);
   });
 
-  test("a bare ExecStarted with no output does not reset the retry budget", async () => {
+  test("a start-then-fail loop backs off instead of storming, until the deadline", async () => {
     // The coordinator's gRPC handler prepends Started{exec_id} on EVERY
-    // attach, so "received a frame" is not progress: a start-then-fail loop
-    // must consume the budget with growing backoff, not hammer at the floor
-    // for the whole deadline.
+    // attach, so a bare Started is not progress. Without a give-up budget,
+    // the bound is the deadline — but the backoff must grow to its cap, not
+    // hammer at the 50ms floor (~12000 attempts for this deadline).
     let calls = 0;
     const execId = "exec:session-started-only:true";
     const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
@@ -428,16 +429,13 @@ describe("durable orchestrator exec caller", () => {
       "true",
       { execId, deadlineMs: 600_000 },
       runtime,
-    )).rejects.toThrow(
-      "failed after 9 consecutive attempts without progress",
-    );
-    expect(calls).toBe(9);
-    // Exponential backoff actually grew: 8 sleeps starting at 50ms and
-    // doubling dwarf a flat 8×50ms floor.
-    expect(runtime.elapsedMs()).toBeGreaterThan(1_000);
+    )).rejects.toThrow("exceeded deadline");
+    expect(calls).toBeGreaterThan(100);
+    expect(calls).toBeLessThan(1_000);
   });
 
-  test("a repeated protocol violation exhausts the budget instead of retrying to the deadline", async () => {
+  test("a protocol violation is terminal on the first occurrence", async () => {
+    // A duplicate ExecStarted is deterministic — retrying cannot change it.
     let calls = 0;
     const execId = "exec:session-proto:true";
     const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
@@ -465,7 +463,42 @@ describe("durable orchestrator exec caller", () => {
       { execId, deadlineMs: 600_000 },
       instantRuntime(),
     )).rejects.toThrow("received duplicate ExecStarted frame");
-    expect(calls).toBe(9);
+    expect(calls).toBe(1);
+  });
+
+  test("an exec refusal is terminal on the first occurrence", async () => {
+    // ADR 0103 terminal taxonomy: a refusal (first-writer-wins mismatch,
+    // GC'd ticket) is deterministic and must fail fast, never retry.
+    let calls = 0;
+    const base = new JournalExecServer(new Uint8Array(), new Uint8Array());
+    const refusal = new ConnectError(
+      "exec refused: exec_id exec:x already belongs to command [\"other\"]",
+      Code.FailedPrecondition,
+    );
+    const server: ReviewSessionsClient = {
+      createSession: () => base.createSession(),
+      deleteSession: (req) => base.deleteSession(req),
+      cancelExec: (req) => base.cancelExec(req),
+      writeFiles: (req) => base.writeFiles(req),
+      sendPrompt: () => base.sendPrompt(),
+      exec(): AsyncIterable<ExecFrame> {
+        calls++;
+        return {
+          async *[Symbol.asyncIterator]() {
+            throw refusal;
+          },
+        };
+      },
+    };
+
+    await expect(runExec(
+      server,
+      "session-refused",
+      "true",
+      { execId: "exec:x", deadlineMs: 600_000 },
+      instantRuntime(),
+    )).rejects.toThrow("exec refused");
+    expect(calls).toBe(1);
   });
 
   test("a mid-output stream error re-attaches for the tail and one real exit", async () => {
@@ -619,10 +652,9 @@ describe("durable orchestrator exec caller", () => {
         { execId: "exec:session-protocol:true", deadlineMs: 10_000 },
         instantRuntime(),
       )).rejects.toBeInstanceOf(RunExecError);
-      // Both are protocol violations with zero byte progress, so both are
-      // bounded by the no-progress budget — a deterministic mismatch must
-      // not be retried until the deadline.
-      expect(calls).toBe(9);
+      // Both are deterministic protocol violations: terminal on the first
+      // occurrence, never retried.
+      expect(calls).toBe(1);
     }
   });
 

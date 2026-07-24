@@ -190,14 +190,9 @@ async fn command_mismatch_is_loud_before_any_recorded_output_is_replayed() {
     let mismatch = read_msg::<_, WireExecEvent>(&mut client).await.unwrap();
     assert!(matches!(
         mismatch,
-        WireExecEvent::Stderr(message)
-            if String::from_utf8_lossy(&message).contains("first writer wins")
-                && !message.windows(b"must-not-leak".len()).any(|window| window == b"must-not-leak")
+        WireExecEvent::Refused { reason }
+            if reason.contains("first writer wins") && !reason.contains("must-not-leak")
     ));
-    assert_eq!(
-        read_msg::<_, WireExecEvent>(&mut client).await.unwrap(),
-        WireExecEvent::Exit(None)
-    );
     server_task.await.unwrap().unwrap();
 }
 
@@ -240,15 +235,96 @@ async fn attach_only_missing_journal_never_authorizes_a_second_spawn() {
     ));
     assert!(matches!(
         read_msg::<_, WireExecEvent>(&mut client).await.unwrap(),
-        WireExecEvent::Stderr(message)
-            if String::from_utf8_lossy(&message).contains("refusing to spawn a second command")
+        WireExecEvent::Refused { reason }
+            if reason.contains("refusing to spawn a second command")
     ));
-    assert_eq!(
-        read_msg::<_, WireExecEvent>(&mut client).await.unwrap(),
-        WireExecEvent::Exit(None)
-    );
     server_task.await.unwrap().unwrap();
     assert!(!temp.path().join(exec_id).exists());
+}
+
+#[tokio::test]
+async fn nonzero_offsets_against_vacant_journal_refuse_without_spawn_or_leak() {
+    let temp = tempfile::tempdir().unwrap();
+    let exec_id = "vacant-with-offsets";
+    let command = vec!["true".into()];
+
+    let make_request = |stdout_offset| {
+        WireRequest::Exec(WireExecRequest {
+            command: command.clone(),
+            stdin: None,
+            env: HashMap::new(),
+            workdir: Some(temp.path().to_string_lossy().into_owned()),
+            timeout_ms: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: Some(stdout_offset),
+            stderr_offset: Some(0),
+            wake: None,
+            attach_only: false,
+        })
+    };
+
+    let (mut client, server) = tokio::io::duplex(4096);
+    let ca = CaCertInstaller::new(CaCertPaths {
+        bundle: temp.path().join("ca-bundle"),
+        extra_cert: temp.path().join("ca-extra"),
+    });
+    let server_task = tokio::spawn(serve_connection_with_journal(
+        server,
+        None,
+        HarnessSupervisor::new(),
+        Arc::new(ca),
+        Arc::new(ExecJournal::new(temp.path().join("journal"))),
+    ));
+    write_msg(&mut client, &make_request(1)).await.unwrap();
+    assert!(matches!(
+        read_msg::<_, WireExecEvent>(&mut client).await.unwrap(),
+        WireExecEvent::Started(id) if id == exec_id
+    ));
+    assert!(matches!(
+        read_msg::<_, WireExecEvent>(&mut client).await.unwrap(),
+        WireExecEvent::Refused { reason }
+            if reason.contains("no journal for exec_id vacant-with-offsets")
+                && reason.contains("non-zero replay offsets")
+                && reason.contains("refusing to spawn from scratch")
+    ));
+    server_task.await.unwrap().unwrap();
+    assert!(!temp.path().join("journal").join(exec_id).exists());
+
+    // Cleanup of the refused vacant authorization matters: a normal
+    // zero-offset attach with the same ticket must still win Start.
+    let (mut client, server) = tokio::io::duplex(4096);
+    let ca = CaCertInstaller::new(CaCertPaths {
+        bundle: temp.path().join("ca-bundle-2"),
+        extra_cert: temp.path().join("ca-extra-2"),
+    });
+    let server_task = tokio::spawn(serve_connection_with_journal(
+        server,
+        None,
+        HarnessSupervisor::new(),
+        Arc::new(ca),
+        Arc::new(ExecJournal::new(temp.path().join("journal"))),
+    ));
+    write_msg(&mut client, &make_request(0)).await.unwrap();
+    assert!(matches!(
+        read_msg::<_, WireExecEvent>(&mut client).await.unwrap(),
+        WireExecEvent::Started(id) if id == exec_id
+    ));
+    loop {
+        match read_msg::<_, WireExecEvent>(&mut client).await.unwrap() {
+            WireExecEvent::Exit(Some(0)) => break,
+            WireExecEvent::Stdout(_) | WireExecEvent::Stderr(_) => {}
+            other => panic!("zero-offset follow-up must start cleanly, got {other:?}"),
+        }
+    }
+    server_task.await.unwrap().unwrap();
+    assert!(
+        temp.path()
+            .join("journal")
+            .join(exec_id)
+            .join("request.json")
+            .exists(),
+        "the zero-offset follow-up must receive a fresh Start authorization"
+    );
 }
 
 /// PR #874 review finding: journals whose wrapper died without writing
@@ -312,10 +388,29 @@ async fn gc_reclaims_dead_journals_after_ttl_but_retains_fresh_and_live() {
     let journal = ExecJournal::new(temp.path());
     let command = vec!["true".to_string()];
 
-    // Ancient (created_at 0 — the helper's default) + dead pid → collectible.
+    // Ancient + dead pid → collectible. Dead records age from their newest
+    // file mtime (last observed activity), so "ancient" means the mtimes
+    // are backdated too, not just `created_at`.
     let ancient_dead = entry(temp.path(), "ancient-dead");
     write_request(ancient_dead.dir(), &command);
     fs::write(ancient_dead.dir().join("pid"), u32::MAX.to_string()).unwrap();
+    for path in [
+        ancient_dead.dir().to_path_buf(),
+        ancient_dead.dir().join("request.json"),
+        ancient_dead.dir().join("pid"),
+    ] {
+        assert!(
+            std::process::Command::new("touch")
+                .arg("-t")
+                .arg("202001010000")
+                .arg(&path)
+                .status()
+                .unwrap()
+                .success(),
+            "backdate {}",
+            path.display()
+        );
+    }
 
     // Fresh + dead pid → inside the diagnosis window, retained.
     let fresh_dead = entry(temp.path(), "fresh-dead");
@@ -424,6 +519,7 @@ async fn died_attach_drains_the_full_journal_before_exit_none() {
             }
             WireExecEvent::Started(id) => panic!("duplicate Started({id})"),
             WireExecEvent::Degraded(reason) => panic!("healthy died record degraded: {reason}"),
+            WireExecEvent::Refused { reason } => panic!("healthy died record refused: {reason}"),
         }
     }
     assert_eq!(replayed_stdout, stdout_payload, "stdout tail dropped");
@@ -546,6 +642,9 @@ fn replay_case(stdout: Vec<u8>, stderr: Vec<u8>, out_seed: u16, err_seed: u16) {
                 }
                 WireExecEvent::Started(id) => panic!("duplicate Started({id})"),
                 WireExecEvent::Degraded(reason) => panic!("completed record degraded: {reason}"),
+                WireExecEvent::Refused { reason } => {
+                    panic!("completed record unexpectedly refused: {reason}")
+                }
             }
         }
         assert_eq!(replayed_stdout, stdout[stdout_offset..]);

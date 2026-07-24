@@ -26,6 +26,7 @@
 //!   agent ──[ WireExecEvent::Stderr(bytes) ]──► host    (0+ times)
 //!   agent ──[ WireExecEvent::Degraded(reason) ]──► host (0 or 1 times)
 //!   agent ──[ WireExecEvent::Exit(status)  ]──► host    (exactly once)
+//!   agent ──[ WireExecEvent::Refused{reason} ]──► host  (terminal)
 //!   <connection closed>
 //! ```
 //!
@@ -119,9 +120,9 @@ pub struct WireExecRequest {
     pub attach_only: bool,
 }
 
-/// Each event the agent emits during exec. The stream is terminated by
-/// exactly one `Exit` (or an abrupt connection close on agent crash,
-/// which the host treats as a failure).
+/// Each event the agent emits during exec. A terminal stream ends with
+/// exactly one `Exit` or `Refused` frame (or an abrupt connection close on
+/// agent crash, which the host treats as transport loss).
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum WireExecEvent {
     Stdout(Vec<u8>),
@@ -134,6 +135,11 @@ pub enum WireExecEvent {
     /// Journal persistence failed; the command continues with stage-1 live
     /// streaming and must never be re-attached (that could double-spawn).
     Degraded(String),
+    /// Deterministic rejection of this attach. Append-only: variant indices
+    /// are part of the bincode wire contract.
+    Refused {
+        reason: String,
+    },
 }
 
 /// First frame the host sends when auth is enabled. The agent
@@ -678,6 +684,11 @@ mod tests {
             WireExecEvent::Exit(Some(0)),
             WireExecEvent::Exit(Some(137)),
             WireExecEvent::Exit(None),
+            WireExecEvent::Started("exec-roundtrip".into()),
+            WireExecEvent::Degraded("ENOSPC".into()),
+            WireExecEvent::Refused {
+                reason: "first writer wins".into(),
+            },
         ] {
             let mut buf = Vec::new();
             write_msg(&mut buf, &ev).await.unwrap();

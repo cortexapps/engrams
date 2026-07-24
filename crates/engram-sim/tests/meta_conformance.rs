@@ -170,6 +170,110 @@ async fn session_exec_event_logged_at(ctx: &Ctx) {
     );
 }
 
+/// ADR 0103: output recording is observation-independent — re-attaches skip
+/// persisting at or below the recorded high-water mark. Pins every predicate
+/// clause: byte-range stamps (unstamped legacy rows invisible), per-stream
+/// separation, per-exec and per-session isolation, and MAX over rows.
+async fn session_exec_output_high_water(ctx: &Ctx) {
+    use engram_core::traits::metadata::ExecOutputStream::{Stderr, Stdout};
+
+    let sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-highwater:latest"))
+        .await
+        .unwrap();
+    let other_sid = ctx
+        .meta
+        .create_session(spec("test.invalid/exec-highwater-other:latest"))
+        .await
+        .unwrap();
+    let chunk = |exec_id: &str, start: u64, end: u64| {
+        serde_json::json!({
+            "type": "stdout",
+            "exec_id": exec_id,
+            "chunk": "x",
+            "bytes_start": start,
+            "bytes_end": end,
+        })
+    };
+
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        0,
+        "no rows → zero"
+    );
+
+    // Legacy row without stamps: invisible to the mark.
+    ctx.meta
+        .append_session_event(
+            sid,
+            "stdout",
+            serde_json::json!({ "type": "stdout", "exec_id": "exec:hw", "chunk": "legacy" }),
+        )
+        .await
+        .unwrap();
+    // Foreign rows that must not count: another exec, another session, and
+    // the other stream.
+    ctx.meta
+        .append_session_event(sid, "stdout", chunk("exec:other", 0, 99_999))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(other_sid, "stdout", chunk("exec:hw", 0, 77_777))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(
+            sid,
+            "stderr",
+            serde_json::json!({
+                "type": "stderr",
+                "exec_id": "exec:hw",
+                "chunk": "e",
+                "bytes_start": 0,
+                "bytes_end": 999,
+            }),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        0,
+        "legacy/foreign/other-stream rows must not move the stdout mark"
+    );
+
+    ctx.meta
+        .append_session_event(sid, "stdout", chunk("exec:hw", 0, 4096))
+        .await
+        .unwrap();
+    ctx.meta
+        .append_session_event(sid, "stdout", chunk("exec:hw", 4096, 8192))
+        .await
+        .unwrap();
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stdout)
+            .await
+            .unwrap(),
+        8192,
+        "the mark is the MAX stamped end offset"
+    );
+    assert_eq!(
+        ctx.meta
+            .session_exec_output_high_water(sid, "exec:hw", Stderr)
+            .await
+            .unwrap(),
+        999,
+        "streams carry independent marks"
+    );
+}
+
 /// One scenario, two tests: `<name>::sim` (always) and `<name>::pg`
 /// (`#[ignore]`'d, live Postgres).
 macro_rules! conformance {
@@ -1936,6 +2040,10 @@ conformance!(t_session_lifecycle, super::session_lifecycle);
 conformance!(
     t_session_exec_event_logged_at,
     super::session_exec_event_logged_at
+);
+conformance!(
+    t_session_exec_output_high_water,
+    super::session_exec_output_high_water
 );
 conformance!(t_list_host_lost_sessions, super::list_host_lost_sessions);
 conformance!(

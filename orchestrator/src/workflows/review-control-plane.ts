@@ -3,6 +3,14 @@
 import { Code, ConnectError } from "@connectrpc/connect";
 
 import { getDb } from "../db/client.ts";
+import {
+  defaultRunExecRuntime,
+  runExec,
+  RunExecError,
+  type DurableExecClient,
+  type RunExecResult,
+  type RunExecRuntime,
+} from "../exec/durable-exec.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
@@ -148,30 +156,11 @@ interface ReviewControlPlaneStore extends Pick<
   | "recordEvent"
 > {}
 
-interface ReviewExecOutput {
-  event:
-    | { case: "started"; value: { execId: string } }
-    | { case: "stdout"; value: Uint8Array }
-    | { case: "stderr"; value: Uint8Array }
-    | { case: "exit"; value: { exitStatus?: number | null } }
-    | { case: undefined; value?: undefined };
-}
-
-interface ReviewExecRequest {
-  sessionId: string;
-  command: string;
-  execId?: string;
-  stdoutOffset?: bigint;
-  stderrOffset?: bigint;
-  wake?: boolean;
-}
-
-export interface ReviewSessionsClient extends TaskSessionsClient {
-  exec(
-    req: ReviewExecRequest,
-    options?: { signal?: AbortSignal },
-  ): AsyncIterable<ReviewExecOutput>;
-  cancelExec(req: { sessionId: string; execId: string }): Promise<unknown>;
+// The review control plane knows nothing about exec transport mechanics
+// (severance, replay offsets, backoff) — that is `DurableExecClient` /
+// `runExec`'s job, in ../exec/durable-exec.ts. Reviews only decide WHAT to
+// run (clone, merge-base), the ticket name, and the deadline.
+export interface ReviewSessionsClient extends TaskSessionsClient, DurableExecClient {
   writeFiles(req: {
     sessionId: string;
     files: Array<{ path: string; content: Uint8Array; mode: number }>;
@@ -252,14 +241,6 @@ const REPO_RE = /^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/;
 const SHA_RE = /^[0-9a-fA-F]{7,40}$/;
 const BOOTSTRAP_CLONE_DEADLINE_MS = 5 * 60_000;
 const MERGE_BASE_DEADLINE_MS = 60_000;
-// "Progress" means the replay offsets advanced (stdout/stderr bytes landed).
-// A bare ExecStarted frame does NOT count: the coordinator's gRPC handler
-// prepends Started{exec_id} on every attach it answers, so counting frames
-// would reset this budget on every start-then-fail attempt — an unbounded
-// 50ms retry storm until the deadline (review round 7).
-const MAX_EXEC_CONSECUTIVE_NO_PROGRESS_REATTACH_ATTEMPTS = 8;
-const EXEC_REATTACH_BASE_DELAY_MS = 50;
-const EXEC_REATTACH_MAX_DELAY_MS = 1_000;
 
 // Security clamp: reviewer workers may read only the reviewed repo, while the
 // orchestrator remains the sole GitHub writer. Direct clone/codeload hosts are
@@ -324,330 +305,6 @@ async function cloneRepo(
   if (exitStatus !== 0) {
     const detail = stderr.trim() || "exec stream ended without a successful exit status";
     throw new ReviewSetupError(`${phase} clone failed: ${detail}`);
-  }
-}
-
-export interface RunExecOptions {
-  /** Stable across DBOS step replay for exactly-once spawn. */
-  execId?: string;
-  deadlineMs: number;
-}
-
-export interface RunExecResult {
-  exitStatus: number | null | undefined;
-  stdout: string;
-  stderr: string;
-}
-
-export interface RunExecRuntime {
-  nowMs(): number;
-  sleep(ms: number): Promise<void>;
-  /** Arm the wall-clock deadline and return a disposer. */
-  scheduleDeadline(delayMs: number, onDeadline: () => void): () => void;
-}
-
-const defaultRunExecRuntime: RunExecRuntime = {
-  nowMs: Date.now,
-  sleep: (ms) => Bun.sleep(ms),
-  scheduleDeadline(delayMs, onDeadline) {
-    const timer = setTimeout(onDeadline, delayMs);
-    return () => clearTimeout(timer);
-  },
-};
-
-export class RunExecError extends Error {
-  constructor(
-    message: string,
-    readonly stdout: string,
-    readonly stderr: string,
-    options?: ErrorOptions,
-  ) {
-    super(message, options);
-    this.name = "RunExecError";
-  }
-}
-
-type AttemptFailure =
-  | { kind: "ended" }
-  | { kind: "error"; error: unknown }
-  | { kind: "protocol"; message: string };
-
-function decodeExecOutput(chunks: readonly Uint8Array[]): string {
-  let byteLength = 0;
-  for (const chunk of chunks) byteLength += chunk.byteLength;
-  const joined = new Uint8Array(byteLength);
-  let offset = 0;
-  for (const chunk of chunks) {
-    joined.set(chunk, offset);
-    offset += chunk.byteLength;
-  }
-  return new TextDecoder().decode(joined);
-}
-
-function isTerminalExecError(error: unknown): boolean {
-  if (!(error instanceof ConnectError)) return false;
-  if (error.code === Code.NotFound) return true;
-  if (
-    error.code === Code.FailedPrecondition
-    && /session has no live sandbox/i.test(error.rawMessage)
-  ) {
-    return true;
-  }
-  return ![
-    Code.Canceled,
-    Code.Unknown,
-    Code.DeadlineExceeded,
-    Code.Aborted,
-    Code.ResourceExhausted,
-    Code.Internal,
-    Code.Unavailable,
-  ].includes(error.code);
-}
-
-function reattachDelayMs(consecutiveNoProgressAttempts: number): number {
-  return Math.min(
-    EXEC_REATTACH_BASE_DELAY_MS *
-      2 ** (Math.max(1, consecutiveNoProgressAttempts) - 1),
-    EXEC_REATTACH_MAX_DELAY_MS,
-  );
-}
-
-/** Attach-or-start, drain, and re-attach from exact byte offsets until Exit.
- * This is the sole orchestrator exec caller so step replay and transport
- * severance share one identity/retry implementation. */
-export async function runExec(
-  sessions: ReviewSessionsClient,
-  sessionId: string,
-  command: string,
-  options: RunExecOptions,
-  runtime: RunExecRuntime = defaultRunExecRuntime,
-): Promise<RunExecResult> {
-  if (!Number.isFinite(options.deadlineMs) || options.deadlineMs <= 0) {
-    throw new Error(`exec deadlineMs must be positive, got ${options.deadlineMs}`);
-  }
-
-  const stdoutChunks: Uint8Array[] = [];
-  const stderrChunks: Uint8Array[] = [];
-  let stdoutOffset = 0n;
-  let stderrOffset = 0n;
-  let canonicalExecId = options.execId;
-  let activeAttempt: AbortController | undefined;
-  let deadlineFired = false;
-  let resolveDeadline!: () => void;
-  const deadlineReached = new Promise<void>((resolve) => {
-    resolveDeadline = resolve;
-  });
-  const deadlineAt = runtime.nowMs() + options.deadlineMs;
-  const clearDeadline = runtime.scheduleDeadline(options.deadlineMs, () => {
-    deadlineFired = true;
-    activeAttempt?.abort();
-    resolveDeadline();
-  });
-
-  const output = () => ({
-    stdout: decodeExecOutput(stdoutChunks),
-    stderr: decodeExecOutput(stderrChunks),
-  });
-  const expire = (): never => {
-    const execId = canonicalExecId ?? options.execId ?? "<unknown>";
-    if (canonicalExecId !== undefined) {
-      try {
-        void sessions.cancelExec({ sessionId, execId: canonicalExecId })
-          .catch((error) => {
-            log.warn(
-              { sessionId, execId: canonicalExecId, error },
-              "durable exec cancellation failed (best-effort)",
-            );
-          });
-      } catch (error) {
-        log.warn(
-          { sessionId, execId: canonicalExecId, error },
-          "durable exec cancellation failed (best-effort)",
-        );
-      }
-    }
-    const captured = output();
-    throw new RunExecError(
-      `exec ${execId} exceeded deadline of ${options.deadlineMs}ms`,
-      captured.stdout,
-      captured.stderr,
-    );
-  };
-  const deadlineExpired = () =>
-    deadlineFired || runtime.nowMs() >= deadlineAt;
-  const waitFor = async (promise: Promise<void>): Promise<void> => {
-    const outcome = await Promise.race([
-      promise.then(() => "ready" as const),
-      deadlineReached.then(() => "deadline" as const),
-    ]);
-    if (outcome === "deadline" || deadlineExpired()) expire();
-  };
-
-  let lastFailure: AttemptFailure = { kind: "ended" };
-  let consecutiveNoProgressAttempts = 0;
-  try {
-    for (;;) {
-      if (deadlineExpired()) expire();
-
-      activeAttempt = new AbortController();
-      let iterator: AsyncIterator<ReviewExecOutput> | undefined;
-      const attemptStdoutStart = stdoutOffset;
-      const attemptStderrStart = stderrOffset;
-      try {
-        const stream = sessions.exec({
-          sessionId,
-          command,
-          ...(canonicalExecId !== undefined ? { execId: canonicalExecId } : {}),
-          stdoutOffset,
-          stderrOffset,
-          wake: true,
-        }, { signal: activeAttempt.signal });
-        iterator = stream[Symbol.asyncIterator]();
-      } catch (error) {
-        lastFailure = { kind: "error", error };
-      }
-
-      if (iterator !== undefined) {
-        const nextFrame = async (): Promise<
-          | { kind: "frame"; value: IteratorResult<ReviewExecOutput> }
-          | { kind: "error"; error: unknown }
-          | { kind: "deadline" }
-        > =>
-          Promise.race([
-            iterator.next().then(
-              (value) => ({ kind: "frame" as const, value }),
-              (error: unknown) => ({ kind: "error" as const, error }),
-            ),
-            deadlineReached.then(() => ({ kind: "deadline" as const })),
-          ]);
-
-        const first = await nextFrame();
-        if (first.kind === "deadline") return expire();
-        if (first.kind === "error") {
-          lastFailure = { kind: "error", error: first.error };
-        } else if (first.value.done) {
-          lastFailure = {
-            kind: "protocol",
-            message: "stream ended before ExecStarted",
-          };
-        } else {
-          if (first.value.value.event.case !== "started") {
-            lastFailure = {
-              kind: "protocol",
-              message:
-                `first frame was ${first.value.value.event.case ?? "empty"}, not ExecStarted`,
-            };
-          } else {
-            const startedExecId = first.value.value.event.value.execId;
-            if (startedExecId === "") {
-              lastFailure = {
-                kind: "protocol",
-                message: "ExecStarted carried an empty exec_id",
-              };
-            } else {
-              if (canonicalExecId === undefined) canonicalExecId = startedExecId;
-              if (startedExecId !== canonicalExecId) {
-                lastFailure = {
-                  kind: "protocol",
-                  message: `expected ExecStarted{exec_id=${canonicalExecId}}, got ${startedExecId}`,
-                };
-              } else {
-                for (;;) {
-                  const next = await nextFrame();
-                  if (next.kind === "deadline") return expire();
-                  if (next.kind === "error") {
-                    lastFailure = { kind: "error", error: next.error };
-                    break;
-                  }
-                  if (next.value.done) {
-                    lastFailure = { kind: "ended" };
-                    break;
-                  }
-                  const { event } = next.value.value;
-                  if (event.case === "stdout") {
-                    stdoutChunks.push(event.value);
-                    stdoutOffset += BigInt(event.value.byteLength);
-                  } else if (event.case === "stderr") {
-                    stderrChunks.push(event.value);
-                    stderrOffset += BigInt(event.value.byteLength);
-                  } else if (event.case === "exit") {
-                    return { exitStatus: event.value.exitStatus, ...output() };
-                  } else {
-                    lastFailure = {
-                      kind: "protocol",
-                      message: event.case === "started"
-                        ? "received duplicate ExecStarted frame"
-                        : "received empty exec frame",
-                    };
-                    break;
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-
-      activeAttempt.abort();
-      activeAttempt = undefined;
-      const closeAttempt = iterator?.return?.();
-      if (closeAttempt !== undefined) void closeAttempt.catch(() => {});
-
-      if (deadlineExpired()) expire();
-      if (
-        lastFailure.kind === "error"
-        && isTerminalExecError(lastFailure.error)
-      ) {
-        throw lastFailure.error;
-      }
-      if (canonicalExecId === undefined) {
-        const captured = output();
-        throw new RunExecError(
-          "exec attempt failed before ExecStarted; cannot safely retry without a caller-supplied exec_id",
-          captured.stdout,
-          captured.stderr,
-          lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
-        );
-      }
-      if (
-        stdoutOffset > attemptStdoutStart || stderrOffset > attemptStderrStart
-      ) {
-        consecutiveNoProgressAttempts = 0;
-      } else {
-        consecutiveNoProgressAttempts++;
-      }
-      if (
-        consecutiveNoProgressAttempts >
-          MAX_EXEC_CONSECUTIVE_NO_PROGRESS_REATTACH_ATTEMPTS
-      ) {
-        const captured = output();
-        if (lastFailure.kind === "ended") {
-          return { exitStatus: undefined, ...captured };
-        }
-        const detail = lastFailure.kind === "protocol"
-          ? lastFailure.message
-          : lastFailure.error instanceof Error
-          ? lastFailure.error.message
-          : String(lastFailure.error);
-        throw new RunExecError(
-          `exec ${canonicalExecId} failed after ${
-            MAX_EXEC_CONSECUTIVE_NO_PROGRESS_REATTACH_ATTEMPTS + 1
-          } consecutive attempts without progress: ${detail}`,
-          captured.stdout,
-          captured.stderr,
-          lastFailure.kind === "error" ? { cause: lastFailure.error } : undefined,
-        );
-      }
-
-      const delayMs = Math.min(
-        reattachDelayMs(consecutiveNoProgressAttempts),
-        Math.max(0, deadlineAt - runtime.nowMs()),
-      );
-      await waitFor(runtime.sleep(delayMs));
-    }
-  } finally {
-    activeAttempt?.abort();
-    clearDeadline();
   }
 }
 

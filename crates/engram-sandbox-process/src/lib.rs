@@ -182,10 +182,16 @@ impl ExecRecord {
 /// Evict the oldest completed records beyond [`EXEC_COMPLETED_RETENTION`].
 /// Called before each new exec's entry lookup — never while holding a map
 /// entry guard (iteration and entry() both take shard locks).
-fn prune_completed_exec_records(records: &DashMap<String, Arc<ExecRecord>>) {
+fn prune_completed_exec_records(
+    records: &DashMap<String, Arc<ExecRecord>>,
+    requested_exec_id: &str,
+) {
     let mut completed: Vec<(String, u64)> = records
         .iter()
         .filter_map(|entry| {
+            if entry.key() == requested_exec_id {
+                return None;
+            }
             entry
                 .value()
                 .state
@@ -368,7 +374,7 @@ impl SandboxBackend for ProcessBackend {
             .clone();
 
         let exec_records = state.exec_records.clone();
-        prune_completed_exec_records(&exec_records);
+        prune_completed_exec_records(&exec_records, &exec_id);
         let entry = exec_records.entry(exec_id.clone());
         match entry {
             Entry::Occupied(existing) => {
@@ -1391,8 +1397,7 @@ async fn recover_retained_output(
 }
 
 async fn send_record_refusal(tx: &mpsc::Sender<ExecEvent>, message: String) {
-    let _ = tx.send(ExecEvent::Stderr(Bytes::from(message))).await;
-    let _ = tx.send(ExecEvent::Exit(None)).await;
+    let _ = tx.send(ExecEvent::Refused(message)).await;
 }
 
 fn refused_offset_stream(
@@ -1418,10 +1423,7 @@ fn refused_exec_stream(sandbox_id: SandboxId, exec_id: String, message: String) 
     ExecStream {
         sandbox_id,
         exec_id,
-        events: Box::pin(tokio_stream::iter([
-            ExecEvent::Stderr(Bytes::from(message)),
-            ExecEvent::Exit(None),
-        ])),
+        events: Box::pin(tokio_stream::iter([ExecEvent::Refused(message)])),
     }
 }
 
@@ -1518,9 +1520,24 @@ mod tests {
                     exit = Some(code);
                     break;
                 }
+                ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
             }
         }
         (stdout, stderr, exit)
+    }
+
+    async fn collect_refusal(mut stream: ExecStream) -> String {
+        use futures::StreamExt;
+
+        let reason = match stream.events.next().await {
+            Some(ExecEvent::Refused(reason)) => reason,
+            other => panic!("expected Refused terminal, got {other:?}"),
+        };
+        assert!(
+            stream.events.next().await.is_none(),
+            "Refused must be the last event"
+        );
+        reason
     }
 
     #[tokio::test]
@@ -1550,6 +1567,7 @@ mod tests {
                 ExecEvent::Stdout(bytes) => prefix_stdout.extend_from_slice(&bytes),
                 ExecEvent::Stderr(bytes) => prefix_stderr.extend_from_slice(&bytes),
                 ExecEvent::Exit(exit) => panic!("command exited before reattach: {exit:?}"),
+                ExecEvent::Refused(reason) => panic!("command refused before reattach: {reason}"),
             }
         }
 
@@ -1612,12 +1630,10 @@ mod tests {
         // attach is the missing-record refusal, never a respawn.
         let mut evicted = durable_exec("retained-0", &["sh", "-c", "printf done"]);
         evicted.stdout_offset = Some(4);
-        let (_, err, exit) = collect_exec_stream(b.exec_stream(id, evicted).await.unwrap()).await;
-        assert_eq!(exit, Some(None));
+        let reason = collect_refusal(b.exec_stream(id, evicted).await.unwrap()).await;
         assert!(
-            String::from_utf8_lossy(&err).contains("refusing to spawn a second command"),
-            "evicted ticket must refuse, got: {}",
-            String::from_utf8_lossy(&err)
+            reason.contains("refusing to spawn a second command"),
+            "evicted ticket must refuse, got: {reason}"
         );
 
         // The newest ticket is still fully replayable.
@@ -1627,6 +1643,45 @@ mod tests {
         );
         let (out, _, exit) = collect_exec_stream(b.exec_stream(id, newest).await.unwrap()).await;
         assert_eq!((out.as_slice(), exit), (b"done".as_slice(), Some(Some(0))));
+    }
+
+    #[tokio::test]
+    async fn attaching_oldest_completed_record_exempts_it_from_pruning() {
+        let (b, _d) = backend();
+        let id = b.create(spec()).await.unwrap();
+        let oldest_command = "printf 'spawn\\n' >> marker; printf oldest";
+
+        for i in 0..=EXEC_COMPLETED_RETENTION {
+            let command = if i == 0 {
+                oldest_command.to_string()
+            } else {
+                format!("printf 'spawn\\n' >> marker; printf record-{i}")
+            };
+            let req = durable_exec(&format!("retained-attach-{i}"), &["sh", "-c", &command]);
+            let (_, _, exit) = collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
+            assert_eq!(exit, Some(Some(0)));
+        }
+        let spawn_count_before = fs::read_to_string(b.cwd_for(id).join("marker"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(spawn_count_before, EXEC_COMPLETED_RETENTION + 1);
+
+        let replay = durable_exec("retained-attach-0", &["sh", "-c", oldest_command]);
+        let (stdout, stderr, exit) =
+            collect_exec_stream(b.exec_stream(id, replay).await.unwrap()).await;
+
+        assert_eq!(stdout, b"oldest");
+        assert!(stderr.is_empty());
+        assert_eq!(exit, Some(Some(0)));
+        let spawn_count_after = fs::read_to_string(b.cwd_for(id).join("marker"))
+            .unwrap()
+            .lines()
+            .count();
+        assert_eq!(
+            spawn_count_after, spawn_count_before,
+            "attaching a still-present completed record must replay instead of pruning and respawning it"
+        );
     }
 
     #[tokio::test]
@@ -1644,12 +1699,9 @@ mod tests {
             "mismatch-ticket",
             &["sh", "-c", "printf 'second\\n' >> marker"],
         );
-        let (_, stderr, exit) =
-            collect_exec_stream(b.exec_stream(id, mismatch).await.unwrap()).await;
-        let stderr = String::from_utf8(stderr).unwrap();
-        assert!(stderr.contains("first writer wins"), "{stderr}");
-        assert!(stderr.contains("refusing different command"), "{stderr}");
-        assert_eq!(exit, Some(None));
+        let reason = collect_refusal(b.exec_stream(id, mismatch).await.unwrap()).await;
+        assert!(reason.contains("first writer wins"), "{reason}");
+        assert!(reason.contains("refusing different command"), "{reason}");
         assert_eq!(
             fs::read_to_string(b.cwd_for(id).join("marker")).unwrap(),
             "first\n"
@@ -1665,12 +1717,9 @@ mod tests {
             &["sh", "-c", "printf spawned > must-not-exist"],
         );
         req.stdout_offset = Some(1);
-        let (_, stderr, exit) = collect_exec_stream(b.exec_stream(id, req).await.unwrap()).await;
-        let stderr = String::from_utf8(stderr).unwrap();
-
-        assert!(stderr.contains("record for exec_id missing-ticket is missing"));
-        assert!(stderr.contains("refusing to spawn a second command"));
-        assert_eq!(exit, Some(None));
+        let reason = collect_refusal(b.exec_stream(id, req).await.unwrap()).await;
+        assert!(reason.contains("record for exec_id missing-ticket is missing"));
+        assert!(reason.contains("refusing to spawn a second command"));
         assert!(!b.cwd_for(id).join("must-not-exist").exists());
     }
 
@@ -1763,12 +1812,10 @@ mod tests {
 
         let mut attach = req;
         attach.stdout_offset = Some(4);
-        let (_, stderr, exit) = collect_exec_stream(b.exec_stream(id, attach).await.unwrap()).await;
-        let stderr = String::from_utf8(stderr).unwrap();
-        assert!(stderr.contains("requested stdout offset 4"));
-        assert!(stderr.contains("retained length 3"));
-        assert!(stderr.contains("gapped replay"));
-        assert_eq!(exit, Some(None));
+        let reason = collect_refusal(b.exec_stream(id, attach).await.unwrap()).await;
+        assert!(reason.contains("requested stdout offset 4"));
+        assert!(reason.contains("retained length 3"));
+        assert!(reason.contains("gapped replay"));
     }
 
     #[tokio::test]
@@ -2133,6 +2180,7 @@ mod tests {
                     exit = code;
                     break;
                 }
+                ExecEvent::Refused(reason) => panic!("streaming command refused: {reason}"),
             }
         }
         assert_eq!(exit, Some(0));

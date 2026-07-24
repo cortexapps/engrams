@@ -1072,19 +1072,27 @@ impl PooledBackend {
             .map_err(|e| SandboxError::Snapshot(format!("pre-capture guest sync exec: {e}")))?;
         let mut events = stream.events;
         while let Some(ev) = events.next().await {
-            if let ExecEvent::Exit(status) = ev {
-                return if status == Some(0) {
-                    tracing::info!(
-                        sandbox_id = %id,
-                        elapsed_ms = started.elapsed().as_millis() as u64,
-                        "pre-capture guest sync complete",
-                    );
-                    Ok(())
-                } else {
-                    Err(SandboxError::Snapshot(format!(
-                        "pre-capture guest sync exited {status:?}"
-                    )))
-                };
+            match ev {
+                ExecEvent::Exit(status) => {
+                    return if status == Some(0) {
+                        tracing::info!(
+                            sandbox_id = %id,
+                            elapsed_ms = started.elapsed().as_millis() as u64,
+                            "pre-capture guest sync complete",
+                        );
+                        Ok(())
+                    } else {
+                        Err(SandboxError::Snapshot(format!(
+                            "pre-capture guest sync exited {status:?}"
+                        )))
+                    };
+                }
+                ExecEvent::Refused(reason) => {
+                    return Err(SandboxError::Snapshot(format!(
+                        "pre-capture guest sync exec refused: {reason}"
+                    )));
+                }
+                ExecEvent::Stdout(_) | ExecEvent::Stderr(_) => {}
             }
         }
         Err(SandboxError::Snapshot(
@@ -1285,6 +1293,15 @@ impl PooledBackend {
                             }
                         }
                         Some(ExecEvent::Exit(status)) => break status,
+                        Some(ExecEvent::Refused(reason)) => {
+                            return Err(violation_failure(
+                                CaptureFailureKind::WarmExitNonZero,
+                                watchdog,
+                                &tail,
+                                &last_detail,
+                                format!("[warm] hook exec refused: {reason}"),
+                            ));
+                        }
                         None => {
                             return Err(violation_failure(
                                 CaptureFailureKind::WarmExecTransport,

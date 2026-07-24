@@ -243,10 +243,10 @@ pub trait SandboxBackend: Send + Sync {
     }
 
     /// Run a command in the sandbox and return a stream of stdout/stderr
-    /// chunks. A terminal backend result ends with one [`ExecEvent::Exit`];
-    /// ending without `Exit` means transport loss and must not be interpreted
-    /// as a terminal status. Terminating the stream early (dropping it) does
-    /// NOT necessarily kill the
+    /// chunks. A terminal backend result ends with one [`ExecEvent::Exit`] or
+    /// [`ExecEvent::Refused`]; ending without either terminal means transport
+    /// loss and must not be interpreted as a terminal status. Terminating the
+    /// stream early (dropping it) does NOT necessarily kill the
     /// underlying process — backends are free to detach and let it run
     /// to completion. Callers that need cancellation should hold the
     /// stream until exit or use a separate kill API (future work).
@@ -278,10 +278,16 @@ pub trait SandboxBackend: Send + Sync {
                 Some(ExecEvent::Stdout(b)) => stdout.extend_from_slice(&b),
                 Some(ExecEvent::Stderr(b)) => stderr.extend_from_slice(&b),
                 Some(ExecEvent::Exit(status)) => break status,
+                Some(ExecEvent::Refused(reason)) => {
+                    return Err(SandboxError::InvalidSpec(format!(
+                        "exec {} refused: {reason}",
+                        stream.exec_id
+                    )));
+                }
                 None => {
                     return Err(SandboxError::Unavailable(format!(
-                        "exec {} event stream ended without an Exit frame; its result may be \
-                         recoverable through exec_stream re-attach",
+                        "exec {} event stream ended without an Exit or Refused frame; its result \
+                         may be recoverable through exec_stream re-attach",
                         stream.exec_id
                     )));
                 }

@@ -831,6 +831,10 @@ where
                     let _ = tx.send(ExecEvent::Exit(code)).await;
                     return;
                 }
+                Ok(WireExecEvent::Refused { reason }) => {
+                    let _ = tx.send(ExecEvent::Refused(reason)).await;
+                    return;
+                }
                 Err(e) => {
                     if durable_capable {
                         // EOF/read failure is transport state, not a guest
@@ -1977,6 +1981,45 @@ mod tests {
             stream.next().await.is_none(),
             "durable transport EOF must not fabricate Exit(None)"
         );
+    }
+
+    #[tokio::test]
+    async fn durable_exec_refusal_is_forwarded_as_terminal_refusal() {
+        let sandbox_id = SandboxId::new();
+        let exec_id = "durable-refused";
+        let (host_reader, mut agent_writer) = tokio::io::duplex(4 * 1024);
+        let (host_writer, _agent_reader) = tokio::io::duplex(4 * 1024);
+        let agent = tokio::spawn(async move {
+            write_msg(&mut agent_writer, &WireExecEvent::Started(exec_id.into()))
+                .await
+                .unwrap();
+            write_msg(
+                &mut agent_writer,
+                &WireExecEvent::Refused {
+                    reason: "first writer wins".into(),
+                },
+            )
+            .await
+            .unwrap();
+        });
+
+        let mut stream = drive_exec_protocol(
+            sandbox_id,
+            host_reader,
+            host_writer,
+            protocol_exec(exec_id),
+            true,
+        )
+        .await
+        .unwrap()
+        .events;
+        agent.await.unwrap();
+
+        assert!(matches!(
+            stream.next().await,
+            Some(ExecEvent::Refused(reason)) if reason == "first writer wins"
+        ));
+        assert!(stream.next().await.is_none());
     }
 
     #[tokio::test]

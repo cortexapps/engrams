@@ -148,7 +148,8 @@ fn build_exec(
 /// One frame of the streaming-exec body (after the `started` frame the
 /// gRPC handler prepends). The terminal `Exit` carries the same
 /// coordinator-side wall-time rusage the SSE/sync paths compute. A backend
-/// stream that ends without a real `Exit` yields a retryable error instead.
+/// refusal yields a non-retryable error; a stream that ends without either
+/// terminal yields a retryable error.
 #[derive(Debug)]
 pub enum ExecStreamEvent {
     Stdout(Vec<u8>),
@@ -162,8 +163,9 @@ pub enum ExecStreamEvent {
 /// Transport-agnostic `Exec` core. Resolves the exec env, auto-resumes the
 /// session, kicks off the backend exec stream, and returns `(exec_id, body)`
 /// where `body` yields stdout/stderr chunks then either a terminal `Exit` or
-/// a retryable error when the backend stream ends first — persisting each
-/// genuine event to the session bus exactly as the SSE handler does.
+/// an error: non-retryable for `Refused`, retryable when the backend stream
+/// ends first. Genuine events are persisted to the session bus exactly as
+/// the SSE handler does.
 ///
 /// Public so ADR 0103's co-simulator can exercise the real coordinator
 /// persistence path over the real host/guest exec protocol boundary.
@@ -181,7 +183,11 @@ pub async fn exec_stream_core(
     let (base_env, default_workdir) = session_exec_env(state, id).await;
     let wake = req.wake.unwrap_or(true);
     let caller_supplied_exec_id = req.exec_id.is_some();
-    let zero_offsets = req.stdout_offset.unwrap_or(0) == 0 && req.stderr_offset.unwrap_or(0) == 0;
+    // Absolute positions of the first byte each stream will deliver on THIS
+    // attach — the base for the persisted chunk rows' byte-range stamps.
+    let stdout_attach_offset = req.stdout_offset.unwrap_or(0);
+    let stderr_attach_offset = req.stderr_offset.unwrap_or(0);
+    let zero_offsets = stdout_attach_offset == 0 && stderr_attach_offset == 0;
     let (argv, mut sandbox_req) = build_exec(req, id, base_env, default_workdir)?;
     let requested_exec_id = sandbox_req
         .exec_id
@@ -244,6 +250,34 @@ pub async fn exec_stream_core(
     let state_for_stream = state.clone();
     let exec_id_for_stream = exec_id.clone();
     let started_at = state.services.clock.now_mono();
+    // ADR 0103: output recording is observation-independent. Chunk rows are
+    // stamped with their absolute RAW byte range, and this attach skips
+    // persisting anything at or below the mark already recorded for the
+    // ticket — attaching N times records the same rows as attaching once.
+    // Bytes still STREAM to the caller regardless (it asked for them from
+    // its own offsets); only the durable record is deduplicated. A failed
+    // lookup degrades to persist-everything (at-least-once), same posture
+    // as the lifecycle dedup.
+    let stdout_high_water = state
+        .services
+        .meta
+        .session_exec_output_high_water(id, &exec_id, engram_core::traits::ExecOutputStream::Stdout)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "stdout high-water lookup failed; recording at-least-once");
+            0
+        });
+    let stderr_high_water = state
+        .services
+        .meta
+        .session_exec_output_high_water(id, &exec_id, engram_core::traits::ExecOutputStream::Stderr)
+        .await
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "stderr high-water lookup failed; recording at-least-once");
+            0
+        });
+    let mut stdout_pos = stdout_attach_offset;
+    let mut stderr_pos = stderr_attach_offset;
     let body = async_stream::stream! {
         let mut events = backend_stream.events;
         let mut exit_status = None;
@@ -251,25 +285,45 @@ pub async fn exec_stream_core(
         while let Some(ev) = events.next().await {
             match ev {
                 ExecEvent::Stdout(bytes) => {
-                    let chunk = String::from_utf8_lossy(&bytes).into_owned();
-                    let _ = state_for_stream
-                        .emit(id, SessionEvent::Stdout {
-                            exec_id: exec_id_for_stream.clone(),
-                            chunk,
-                        })
-                        .await
-                        .map_err(|e| tracing::warn!(error = %e, "stdout event persistence failed; live tail continues"));
+                    let bytes_start = stdout_pos;
+                    let bytes_end = bytes_start + bytes.len() as u64;
+                    stdout_pos = bytes_end;
+                    if bytes_end > stdout_high_water {
+                        // Trim the RAW bytes of a straddling chunk before the
+                        // lossy decode so the recorded range stays exact.
+                        let persist_from = bytes_start.max(stdout_high_water);
+                        let raw = &bytes[(persist_from - bytes_start) as usize..];
+                        let chunk = String::from_utf8_lossy(raw).into_owned();
+                        let _ = state_for_stream
+                            .emit(id, SessionEvent::Stdout {
+                                exec_id: exec_id_for_stream.clone(),
+                                chunk,
+                                bytes_start: persist_from,
+                                bytes_end,
+                            })
+                            .await
+                            .map_err(|e| tracing::warn!(error = %e, "stdout event persistence failed; live tail continues"));
+                    }
                     yield Ok(ExecStreamEvent::Stdout(bytes.to_vec()));
                 }
                 ExecEvent::Stderr(bytes) => {
-                    let chunk = String::from_utf8_lossy(&bytes).into_owned();
-                    let _ = state_for_stream
-                        .emit(id, SessionEvent::Stderr {
-                            exec_id: exec_id_for_stream.clone(),
-                            chunk,
-                        })
-                        .await
-                        .map_err(|e| tracing::warn!(error = %e, "stderr event persistence failed; live tail continues"));
+                    let bytes_start = stderr_pos;
+                    let bytes_end = bytes_start + bytes.len() as u64;
+                    stderr_pos = bytes_end;
+                    if bytes_end > stderr_high_water {
+                        let persist_from = bytes_start.max(stderr_high_water);
+                        let raw = &bytes[(persist_from - bytes_start) as usize..];
+                        let chunk = String::from_utf8_lossy(raw).into_owned();
+                        let _ = state_for_stream
+                            .emit(id, SessionEvent::Stderr {
+                                exec_id: exec_id_for_stream.clone(),
+                                chunk,
+                                bytes_start: persist_from,
+                                bytes_end,
+                            })
+                            .await
+                            .map_err(|e| tracing::warn!(error = %e, "stderr event persistence failed; live tail continues"));
+                    }
                     yield Ok(ExecStreamEvent::Stderr(bytes.to_vec()));
                 }
                 ExecEvent::Exit(code) => {
@@ -277,11 +331,15 @@ pub async fn exec_stream_core(
                     saw_exit = true;
                     break;
                 }
+                ExecEvent::Refused(reason) => {
+                    yield Err(ApiError::Conflict(format!("exec refused: {reason}")));
+                    return;
+                }
             }
         }
         if !saw_exit {
             yield Err(ApiError::Unavailable(format!(
-                "exec {exec_id_for_stream} backend stream ended without an Exit frame; \
+                "exec {exec_id_for_stream} backend stream ended without an Exit or Refused frame; \
                  its result may still be recoverable by re-attaching with the same exec_id"
             )));
             return;
@@ -601,6 +659,23 @@ mod tests {
         })
     }
 
+    fn exec_completed_statuses(meta: &SimMetadataStore, session_id: SessionId) -> Vec<Option<i64>> {
+        meta.with_db(|db| {
+            db.session_events
+                .get(&session_id)
+                .into_iter()
+                .flatten()
+                .filter(|event| event.kind == "exec_completed")
+                .map(|event| {
+                    event
+                        .payload
+                        .get("exit_status")
+                        .and_then(serde_json::Value::as_i64)
+                })
+                .collect()
+        })
+    }
+
     fn req(env: &[(&str, &str)], workdir: Option<&str>) -> ExecRequest {
         ExecRequest {
             command: Some("true".into()),
@@ -824,6 +899,47 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn refusal_cannot_poison_later_genuine_completion_for_same_exec_id() {
+        let (state, meta, _clock) = exec_test_state([
+            vec![ExecEvent::Refused("first writer wins".into())],
+            vec![ExecEvent::Exit(Some(0))],
+        ]);
+        let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+        let exec_id = "exec:refusal-poisoning";
+
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, None, None))
+                .await
+                .expect("start refused exec stream");
+        match body.next().await {
+            Some(Err(ApiError::Conflict(message))) => {
+                assert!(message.starts_with("exec refused: "), "{message}");
+                assert!(message.contains("first writer wins"), "{message}");
+            }
+            other => panic!("expected terminal refusal error, got {other:?}"),
+        }
+        assert!(body.next().await.is_none());
+        assert!(
+            exec_completed_statuses(&meta, session_id).is_empty(),
+            "a refusal must never persist exec_completed"
+        );
+
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, Some(0), Some(0)))
+                .await
+                .expect("start genuine replay stream");
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Exit {
+                exit_status: Some(0),
+                ..
+            }))
+        ));
+        assert!(body.next().await.is_none());
+        assert_eq!(exec_completed_statuses(&meta, session_id), vec![Some(0)]);
+    }
+
     /// The ADR's own happy path: a checkpoint severs the delivering attach,
     /// the caller re-attaches, and the journal's Exit lands on a LATER
     /// `exec_stream_core` call. `exec_completed` must land exactly once and
@@ -896,6 +1012,91 @@ mod tests {
         assert_eq!(
             completions, 1,
             "a replay of an already-complete journal must not append another exec_completed"
+        );
+    }
+
+    /// ADR 0103 "known defect" fix: output recording is
+    /// observation-independent. A zero-offset re-attach replays bytes the
+    /// log already holds; those bytes still STREAM to the caller but must
+    /// not be recorded twice — and a chunk straddling the recorded
+    /// high-water mark is trimmed at the RAW byte boundary, so the rows
+    /// reconstruct the output exactly once with exact range stamps.
+    #[tokio::test]
+    async fn zero_offset_replay_records_output_rows_exactly_once() {
+        let (state, meta, _clock) = exec_test_state([
+            // Attach 1: "hello" lands, then severed without Exit.
+            vec![ExecEvent::Stdout(Bytes::from_static(b"hello"))],
+            // Attach 2 from offset 0: the journal replays everything plus
+            // the tail as ONE straddling chunk, then the real Exit.
+            vec![
+                ExecEvent::Stdout(Bytes::from_static(b"hello world")),
+                ExecEvent::Exit(Some(0)),
+            ],
+        ]);
+        let (session_id, _sandbox_id) = stage_exec_session(&meta).await;
+        let exec_id = "exec:record-once";
+
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, None, None))
+                .await
+                .expect("start exec stream");
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Stdout(bytes))) if bytes == b"hello"
+        ));
+        assert!(matches!(
+            body.next().await,
+            Some(Err(ApiError::Unavailable(_)))
+        ));
+        assert!(body.next().await.is_none());
+
+        let (_id, mut body) =
+            exec_stream_core(&state, session_id, durable_req(exec_id, Some(0), Some(0)))
+                .await
+                .expect("re-attach exec stream");
+        // The caller asked for byte 0, so the full replay still streams.
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Stdout(bytes))) if bytes == b"hello world"
+        ));
+        assert!(matches!(
+            body.next().await,
+            Some(Ok(ExecStreamEvent::Exit {
+                exit_status: Some(0),
+                ..
+            }))
+        ));
+        assert!(body.next().await.is_none());
+
+        let rows: Vec<(String, u64, u64)> = meta.with_db(|db| {
+            db.session_events
+                .get(&session_id)
+                .into_iter()
+                .flatten()
+                .filter(|event| {
+                    event.kind == "stdout" && event.payload["exec_id"].as_str() == Some(exec_id)
+                })
+                .map(|event| {
+                    (
+                        event.payload["chunk"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                        event.payload["bytes_start"].as_u64().unwrap_or(u64::MAX),
+                        event.payload["bytes_end"].as_u64().unwrap_or(u64::MAX),
+                    )
+                })
+                .collect()
+        });
+        let assembled: String = rows.iter().map(|(chunk, _, _)| chunk.as_str()).collect();
+        assert_eq!(
+            assembled, "hello world",
+            "recorded rows must reconstruct the output exactly once, got rows {rows:?}"
+        );
+        assert_eq!(
+            rows,
+            vec![("hello".to_string(), 0, 5), (" world".to_string(), 5, 11),],
+            "the straddling replay chunk must be trimmed at the recorded high-water mark"
         );
     }
 }

@@ -222,10 +222,19 @@ impl ExecJournal {
     /// Age of an incomplete record that is provably not recording any more,
     /// or `None` when it is live (or unparseable in a way that can't prove
     /// death) and must be retained.
+    ///
+    /// Dead records age from their LAST OBSERVED ACTIVITY — the newest file
+    /// mtime in the dir (output keeps landing while the command runs), not
+    /// from `request.created_at`: an exec that ran 23h and then died
+    /// uncleanly still gets its full TTL diagnosis window, instead of being
+    /// reclaimed minutes after death.
     async fn dead_record_age_ms(dir: PathBuf, now: u64) -> Option<u64> {
         let journal = JournalEntry::from_dir(&dir).ok()?;
         if journal.appears_live().await {
             return None;
+        }
+        if let Some(activity) = newest_activity_unix_ms(&dir).await {
+            return Some(now.saturating_sub(activity));
         }
         match journal.request().await {
             Ok(request) => Some(now.saturating_sub(request.created_at_unix_ms)),
@@ -238,6 +247,24 @@ impl ExecJournal {
             }
         }
     }
+}
+
+/// Newest mtime among the record's files, as unix ms — the record's last
+/// observed activity. `None` when the dir can't be scanned or holds nothing
+/// with a readable mtime (callers fall back to the request timestamp).
+async fn newest_activity_unix_ms(dir: &Path) -> Option<u64> {
+    let mut entries = tokio::fs::read_dir(dir).await.ok()?;
+    let mut newest: Option<std::time::SystemTime> = None;
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        if let Ok(modified) = entry.metadata().await.and_then(|meta| meta.modified()) {
+            newest = Some(newest.map_or(modified, |current| current.max(modified)));
+        }
+    }
+    let unix = newest?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    Some(unix)
 }
 
 impl Default for ExecJournal {
@@ -396,10 +423,16 @@ impl JournalEntry {
     /// alive — an over-count, which is the safe direction for a resource cap
     /// and merely delays GC by one reuse lifetime.
     async fn appears_live(&self) -> bool {
+        // Liveness is about the RECORDING, and the recording outlives the
+        // wrapper: an OOM-killed wrapper whose command survives in its own
+        // process group is still a live exec — its journal dir is the
+        // spawn-dedupe marker, and collecting it would let a retry
+        // double-spawn a running command. So a dead/missing owner_pid falls
+        // through to the command pid instead of concluding death.
         match self.owner_pid().await {
-            Ok(pid) => return process_is_alive(pid),
+            Ok(pid) if process_is_alive(pid) => return true,
             Err(error) if error.kind() != io::ErrorKind::NotFound => return false,
-            Err(_) => {}
+            _ => {}
         }
         match self.pid().await {
             Ok(pid) => process_is_alive(pid),

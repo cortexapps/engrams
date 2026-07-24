@@ -1104,9 +1104,10 @@ impl GrpcHostClient {
 
     /// Server-streaming exec. The first frame is `started` (carries
     /// the canonical `exec_id`); subsequent frames carry
-    /// stdout/stderr bytes. A terminal result ends with exactly one
-    /// `exit` frame; an RPC error/closure before it ends the returned
-    /// ExecStream without Exit so coordinator consumers can re-attach.
+    /// stdout/stderr bytes. A terminal result ends with exactly one `exit` or
+    /// `refused` frame; an RPC error/closure before it ends the returned
+    /// ExecStream without a terminal frame so coordinator consumers can
+    /// re-attach.
     pub async fn exec_start(
         &self,
         sandbox_id: SandboxId,
@@ -1171,6 +1172,10 @@ impl GrpcHostClient {
                         }
                         Some(crate::grpc::exec_frame::Frame::Exit(exit)) => {
                             yield ExecEvent::Exit(exit.status);
+                            break;
+                        }
+                        Some(crate::grpc::exec_frame::Frame::Refused(reason)) => {
+                            yield ExecEvent::Refused(reason);
                             break;
                         }
                         // Spurious Started or an unrecognised oneof

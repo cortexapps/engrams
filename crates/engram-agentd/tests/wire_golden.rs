@@ -320,18 +320,23 @@ fn wire_exec_event_golden_and_variant_indices() {
     let exit = WireExecEvent::Exit(Some(0));
     let started = WireExecEvent::Started("exec-golden".into());
     let degraded = WireExecEvent::Degraded("ENOSPC".into());
+    let refused = WireExecEvent::Refused {
+        reason: "first writer wins".into(),
+    };
 
     assert_golden("exec_event_stdout", &stdout);
     assert_golden("exec_event_stderr", &stderr);
     assert_golden("exec_event_exit", &exit);
     assert_golden("exec_event_started", &started);
     assert_golden("exec_event_degraded", &degraded);
+    assert_golden("exec_event_refused", &refused);
 
     assert_variant_index(&stdout, 0, "WireExecEvent::Stdout");
     assert_variant_index(&stderr, 1, "WireExecEvent::Stderr");
     assert_variant_index(&exit, 2, "WireExecEvent::Exit");
     assert_variant_index(&started, 3, "WireExecEvent::Started");
     assert_variant_index(&degraded, 4, "WireExecEvent::Degraded");
+    assert_variant_index(&refused, 5, "WireExecEvent::Refused");
 }
 
 // ---- handshake + ready structs -----------------------------------------
@@ -517,6 +522,12 @@ fn regen_golden() {
     write(
         "exec_event_degraded",
         &WireExecEvent::Degraded("ENOSPC".into()),
+    );
+    write(
+        "exec_event_refused",
+        &WireExecEvent::Refused {
+            reason: "first writer wins".into(),
+        },
     );
 
     write(

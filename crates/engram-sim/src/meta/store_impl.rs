@@ -8,8 +8,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::metadata::{
-    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, GcCandidateRow,
-    MetadataStore, PlacementNoFit, SessionCreateWriteSet, SnapshotTotals,
+    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, ExecOutputStream,
+    GcCandidateRow, MetadataStore, PlacementNoFit, SessionCreateWriteSet, SnapshotTotals,
 };
 use engram_core::types::capability::Capability;
 use engram_core::types::capture_job::{
@@ -968,6 +968,42 @@ impl MetadataStore for SimMetadataStore {
                 .map(|event| event.created_at)
                 .min()
         }))
+    }
+
+    async fn session_exec_output_high_water(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+        stream: ExecOutputStream,
+    ) -> Result<u64, MetaError> {
+        self.gate()?;
+        let db = self.db.lock();
+        // `SELECT MAX((payload->>'bytes_end')::bigint) ...` — unstamped rows
+        // are skipped, matching NULL-ignoring SQL MAX.
+        Ok(db
+            .session_events
+            .get(&session_id)
+            .map(|events| {
+                events
+                    .iter()
+                    .filter(|event| {
+                        event.kind == stream.kind_str()
+                            && event
+                                .payload
+                                .get("exec_id")
+                                .and_then(serde_json::Value::as_str)
+                                == Some(exec_id)
+                    })
+                    .filter_map(|event| {
+                        event
+                            .payload
+                            .get("bytes_end")
+                            .and_then(serde_json::Value::as_u64)
+                    })
+                    .max()
+                    .unwrap_or(0)
+            })
+            .unwrap_or(0))
     }
 
     /// CTE mirror: atomically allocate next_event_idx from the session

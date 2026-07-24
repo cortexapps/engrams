@@ -424,6 +424,7 @@ async fn exec(backend: &Arc<PooledBackend>, id: engram_core::SandboxId, cmd: &st
                 exit = code;
                 break;
             }
+            ExecEvent::Refused(reason) => panic!("exec refused: {reason}"),
         }
     }
     assert_eq!(

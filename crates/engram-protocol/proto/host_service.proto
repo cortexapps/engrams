@@ -759,6 +759,9 @@ message ExecFrame {
     // these. `status` is `None` when the process was killed by
     // signal without an exit code.
     ExecExit exit = 4;
+    // Terminal deterministic rejection of this attach. Distinct from Exit
+    // and from a transport-shaped stream error.
+    string refused = 5;
   }
 }
 

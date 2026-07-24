@@ -13,8 +13,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use engram_core::traits::clock::{Clock, Entropy, OsEntropy, SystemClock};
 use engram_core::traits::{
-    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, MetadataStore,
-    SessionCreateWriteSet,
+    CreateDisposition, DisableEnabledImageOutcome, ExecLifecycleEventKind, ExecOutputStream,
+    MetadataStore, SessionCreateWriteSet,
 };
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
@@ -4083,6 +4083,32 @@ impl MetadataStore for PostgresStore {
         .fetch_one(&self.pool)
         .await
         .map_err(db_err)
+    }
+
+    async fn session_exec_output_high_water(
+        &self,
+        session_id: SessionId,
+        exec_id: &str,
+        stream: ExecOutputStream,
+    ) -> Result<u64, MetaError> {
+        // Unstamped (pre-ADR-0103) rows yield NULL from ->> and MAX skips
+        // NULLs, so they are ignored by construction.
+        let max: Option<i64> = sqlx::query_scalar(
+            r#"
+            SELECT MAX((payload->>'bytes_end')::bigint)
+              FROM session_events
+             WHERE session_id = $1
+               AND kind = $2
+               AND payload->>'exec_id' = $3
+            "#,
+        )
+        .bind(session_id.as_uuid())
+        .bind(stream.kind_str())
+        .bind(exec_id)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(max.unwrap_or(0).max(0) as u64)
     }
 
     async fn append_session_event(

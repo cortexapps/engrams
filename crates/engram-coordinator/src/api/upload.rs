@@ -440,7 +440,7 @@ fn ext_from_path(path: &str) -> String {
 /// stream error so [`process_upload`] aborts + deletes (e.g. the path was
 /// missing/unreadable). Ending without an Exit is transport loss, not clean
 /// EOF, and also becomes a stream error so truncated bytes are never stored.
-/// Stderr is dropped.
+/// Refusal is a distinct protocol error. Stderr is dropped.
 fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
     let s = async_stream::stream! {
         let mut events = events;
@@ -459,6 +459,12 @@ fn exec_stdout_bytestream(events: ExecEventStream) -> ByteStream {
                          missing or unreadable path?)"
                             .into(),
                     ));
+                    return;
+                }
+                ExecEvent::Refused(reason) => {
+                    yield Err(BlobError::Protocol(format!(
+                        "reading file from guest exec refused: {reason}"
+                    )));
                     return;
                 }
             }
@@ -645,6 +651,23 @@ mod tests {
             body.next().await,
             Some(Ok(bytes)) if bytes == Bytes::from_static(b"complete")
         ));
+        assert!(body.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn exec_bytestream_refusal_is_a_protocol_error() {
+        let events = futures::stream::iter([ExecEvent::Refused(
+            "journal was GC'd; refusing to spawn".into(),
+        )]);
+        let mut body = exec_stdout_bytestream(Box::pin(events));
+
+        match body.next().await {
+            Some(Err(BlobError::Protocol(message))) => {
+                assert!(message.contains("exec refused"), "{message}");
+                assert!(message.contains("journal was GC'd"), "{message}");
+            }
+            other => panic!("expected refusal protocol error, got {other:?}"),
+        }
         assert!(body.next().await.is_none());
     }
 

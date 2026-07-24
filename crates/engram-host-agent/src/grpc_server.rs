@@ -206,9 +206,9 @@ pub async fn boot(
 
 /// Forward one backend exec stream onto the host-service gRPC stream.
 ///
-/// Only an [`ExecEvent::Exit`] is terminal. If the backend event channel
-/// closes first, the durable guest journal may still hold the result, so
-/// surface `Unavailable` instead of inventing `Exit(None)`.
+/// [`ExecEvent::Exit`] and [`ExecEvent::Refused`] are terminal. If the backend
+/// event channel closes first, the durable guest journal may still hold the
+/// result, so surface `Unavailable` instead of inventing `Exit(None)`.
 async fn pump_exec_frames(
     exec_id: String,
     mut events: ExecEventStream,
@@ -237,6 +237,13 @@ async fn pump_exec_frames(
                 let _ = tx.send(Ok(frame)).await;
                 return;
             }
+            ExecEvent::Refused(reason) => {
+                let frame = ExecFrame {
+                    frame: Some(engram_protocol::grpc::exec_frame::Frame::Refused(reason)),
+                };
+                let _ = tx.send(Ok(frame)).await;
+                return;
+            }
         };
         if tx.send(Ok(frame)).await.is_err() {
             // Client dropped the stream — stop pumping.
@@ -246,7 +253,7 @@ async fn pump_exec_frames(
 
     let _ = tx
         .send(Err(Status::unavailable(format!(
-            "exec {exec_id} backend stream ended without an Exit frame; \
+            "exec {exec_id} backend stream ended without an Exit or Refused frame; \
              its result may be recoverable by re-attaching with the same exec_id"
         ))))
         .await;
@@ -1235,8 +1242,8 @@ impl HostService for HostServiceImpl {
             .await
             .map_err(sandbox_to_status)?;
 
-        // mpsc channel feeds the gRPC stream out. Only a backend-produced
-        // Exit is terminal; closure first becomes an Unavailable stream item.
+        // mpsc channel feeds the gRPC stream out. A backend-produced Exit or
+        // Refused is terminal; closure first becomes Unavailable.
         let (tx, rx) = mpsc::channel::<Result<ExecFrame, Status>>(64);
 
         // First frame: `started` with the assigned exec_id.
@@ -1816,6 +1823,23 @@ mod wire_version_tests {
                     status: None,
                 })),
             })
+        ));
+    }
+
+    #[tokio::test]
+    async fn exec_pump_forwards_refused_as_distinct_terminal_frame() {
+        let items = pump_items(exec_events([
+            ExecEvent::Refused("first writer wins".into()),
+            ExecEvent::Stdout(Bytes::from_static(b"after-refusal")),
+        ]))
+        .await;
+
+        assert_eq!(items.len(), 1);
+        assert!(matches!(
+            &items[0],
+            Ok(ExecFrame {
+                frame: Some(engram_protocol::grpc::exec_frame::Frame::Refused(reason)),
+            }) if reason == "first writer wins"
         ));
     }
 

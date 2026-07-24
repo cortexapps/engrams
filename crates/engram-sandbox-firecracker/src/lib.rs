@@ -4353,16 +4353,30 @@ enum LegacyWireRequest {
     Exec(LegacyWireExecRequest),
 }
 
-/// Read one `WireResponse`, racing the read against the snapshot-severance
-/// epoch watch. A checkpoint drops every established vsock connection with
-/// no host-side EOF (`LiveSandbox::vsock_epoch`), so any one-shot
-/// request/response read on such a connection would otherwise block forever.
-/// Mirrors the reader-loop guard in `drive_exec_protocol`: `biased` so a
-/// response already buffered on the wire beats the epoch bump; the epoch
-/// branch is only for reads that will never complete. On a bump the caller
-/// gets a retryable `Unavailable` naming `what` — both call sites are
-/// idempotent round-trips (a capability probe, a cancel), so a fresh dial
-/// and retry is always safe.
+/// Race one I/O operation on an established guest vsock against the
+/// snapshot-severance epoch. A checkpoint drops established connections with
+/// no host-side EOF (`LiveSandbox::vsock_epoch`), so either a read or a large
+/// write can otherwise block forever. `biased` preserves a result that is
+/// already ready on the socket over a simultaneous epoch bump.
+async fn io_racing_severance<T>(
+    operation: impl Future<Output = T>,
+    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+    what: &str,
+) -> Result<T, SandboxError> {
+    tokio::pin!(operation);
+    match severed {
+        Some(epoch) => tokio::select! {
+            biased;
+            result = &mut operation => Ok(result),
+            _ = epoch.changed() => Err(SandboxError::Unavailable(format!(
+                "snapshot capture severed the agentd vsock connection during {what}; re-dial and retry"
+            ))),
+        },
+        None => Ok(operation.await),
+    }
+}
+
+/// Read one `WireResponse`, racing the read against snapshot severance.
 async fn read_wire_response_racing_severance<S>(
     io: &mut S,
     severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
@@ -4371,16 +4385,32 @@ async fn read_wire_response_racing_severance<S>(
 where
     S: AsyncRead + Unpin,
 {
-    match severed {
-        Some(epoch) => tokio::select! {
-            biased;
-            msg = read_msg::<_, WireResponse>(io) => Ok(msg),
-            _ = epoch.changed() => Err(SandboxError::Unavailable(format!(
-                "snapshot capture severed the agentd vsock connection before the {what} response; re-dial and retry"
-            ))),
-        },
-        None => Ok(read_msg::<_, WireResponse>(io).await),
-    }
+    io_racing_severance(
+        read_msg::<_, WireResponse>(io),
+        severed,
+        &format!("the {what} response"),
+    )
+    .await
+}
+
+/// Write one framed request, racing a potentially backpressured write against
+/// snapshot severance.
+async fn write_wire_message_racing_severance<S, T>(
+    io: &mut S,
+    message: &T,
+    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+    what: &str,
+) -> Result<std::io::Result<()>, SandboxError>
+where
+    S: AsyncWrite + Unpin,
+    T: serde::Serialize,
+{
+    io_racing_severance(
+        write_msg(io, message),
+        severed,
+        &format!("the {what} write"),
+    )
+    .await
 }
 
 async fn probe_durable_exec(
@@ -4470,9 +4500,14 @@ pub async fn drive_exec_protocol(
     let mut stderr_offset = cmd.stderr_offset.unwrap_or(0);
     if durable_capable {
         let req = agent_exec_request(&cmd, &exec_id, stdout_offset, stderr_offset, false);
-        write_msg(&mut io, &req)
-            .await
-            .map_err(|e| vm_err(format!("send durable WireRequest::Exec: {e}")))?;
+        write_wire_message_racing_severance(
+            &mut io,
+            &req,
+            severed.as_mut(),
+            "initial durable exec request",
+        )
+        .await?
+        .map_err(|e| vm_err(format!("send durable WireRequest::Exec: {e}")))?;
     } else {
         let req = LegacyWireRequest::Exec(LegacyWireExecRequest {
             command: cmd.command.clone(),
@@ -4481,9 +4516,14 @@ pub async fn drive_exec_protocol(
             workdir: cmd.workdir.clone(),
             timeout_ms: cmd.timeout.map(|duration| duration.as_millis() as u64),
         });
-        write_msg(&mut io, &req)
-            .await
-            .map_err(|e| vm_err(format!("send stage-1 WireRequest::Exec: {e}")))?;
+        write_wire_message_racing_severance(
+            &mut io,
+            &req,
+            severed.as_mut(),
+            "initial stage-1 exec request",
+        )
+        .await?
+        .map_err(|e| vm_err(format!("send stage-1 WireRequest::Exec: {e}")))?;
     }
 
     // 64 events of buffer is enough that a slow consumer doesn't
@@ -4674,6 +4714,10 @@ pub async fn drive_exec_protocol(
                     let _ = tx.send(ExecEvent::Exit(code)).await;
                     return;
                 }
+                Ok(WireExecEvent::Refused { reason }) => {
+                    let _ = tx.send(ExecEvent::Refused(reason)).await;
+                    return;
+                }
                 Err(e) => {
                     if durable_capable {
                         // EOF/read failure is not a journal verdict. End the
@@ -4751,7 +4795,7 @@ async fn durable_exec_fallback(
 async fn upload_file_over_stream<S>(
     mut stream: S,
     file: WriteFileSpec,
-    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
+    mut severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
 ) -> WriteFileResult
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -4762,8 +4806,19 @@ where
         bytes: file.content,
         mode: file.mode,
     };
-    if let Err(error) = write_msg(&mut stream, &request).await {
-        return write_file_failure(path, format!("send Upload request: {error}"));
+    match write_wire_message_racing_severance(
+        &mut stream,
+        &request,
+        severed.as_deref_mut(),
+        "Upload request",
+    )
+    .await
+    {
+        Ok(Ok(())) => {}
+        Ok(Err(error)) => {
+            return write_file_failure(path, format!("send Upload request: {error}"));
+        }
+        Err(error) => return write_file_failure(path, error.to_string()),
     }
     // Same severance race as the exec probe: an Upload response read on an
     // established vsock connection wedges forever if a checkpoint lands
@@ -7414,6 +7469,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn durable_exec_refusal_is_forwarded_as_terminal_refusal() {
+        use futures_util::StreamExt;
+
+        let (host_end, mut guest_end) = tokio::io::duplex(4096);
+        let exec_id = "exec-durable-refused";
+        let req = ExecRequest {
+            command: vec!["true".into()],
+            stdin: None,
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some(exec_id.into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+        let stream =
+            drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, true, None, None)
+                .await
+                .expect("durable exec request write succeeds");
+
+        let _request: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
+        write_msg(&mut guest_end, &WireExecEvent::Started(exec_id.into()))
+            .await
+            .expect("started frame");
+        write_msg(
+            &mut guest_end,
+            &WireExecEvent::Refused {
+                reason: "first writer wins".into(),
+            },
+        )
+        .await
+        .expect("refused frame");
+
+        let mut events = stream.events;
+        assert!(matches!(
+            events.next().await,
+            Some(ExecEvent::Refused(reason)) if reason == "first writer wins"
+        ));
+        assert!(events.next().await.is_none());
+    }
+
+    #[tokio::test]
     async fn legacy_exec_eof_preserves_synthetic_exit_floor() {
         use futures_util::StreamExt;
 
@@ -7751,6 +7849,89 @@ mod tests {
                 .is_some_and(|error| error.contains("severed")),
             "failure must name the severance, got {:?}",
             result.error
+        );
+        drop(severed_guest.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_severing_the_upload_request_write_reports_failure_instead_of_hanging() {
+        let (host_end, guest_end) = tokio::io::duplex(256);
+        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+        let severed_guest = tokio::spawn(async move {
+            // Never read: the large Upload frame fills the tiny socket
+            // buffer and leaves the host parked in write_msg.
+            tokio::task::yield_now().await;
+            epoch_tx.send_modify(|epoch| *epoch += 1);
+            guest_end
+        });
+        let file = WriteFileSpec {
+            path: "/workspace/large.bin".into(),
+            content: vec![0xA5; 2 * 1024 * 1024],
+            mode: None,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            upload_file_over_stream(host_end, file, Some(&mut epoch_rx)),
+        )
+        .await
+        .expect("upload request write must resolve promptly after the epoch bump, not hang");
+
+        assert!(!result.ok, "severed upload write must report failure");
+        assert!(
+            result
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("severed") && error.contains("Upload")),
+            "failure must name the severed Upload request, got {:?}",
+            result.error
+        );
+        drop(severed_guest.await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn checkpoint_severing_the_initial_exec_request_write_errors_retryably_instead_of_hanging(
+    ) {
+        let (host_end, guest_end) = tokio::io::duplex(256);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
+        let severed_guest = tokio::spawn(async move {
+            // Never read: stdin makes the initial Exec frame larger than the
+            // tiny buffer, exactly like a severed established vsock whose
+            // peer has disappeared without host-side EOF.
+            tokio::task::yield_now().await;
+            epoch_tx.send_modify(|epoch| *epoch += 1);
+            guest_end
+        });
+        let req = ExecRequest {
+            command: vec!["cat".into()],
+            stdin: Some(vec![0x5A; 2 * 1024 * 1024]),
+            env: HashMap::new(),
+            workdir: None,
+            timeout: None,
+            exec_id: Some("exec-severed-initial-write".into()),
+            stdout_offset: None,
+            stderr_offset: None,
+            wake: None,
+        };
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_exec_protocol(
+                SandboxId::new(),
+                Box::new(host_end),
+                req,
+                true,
+                Some(epoch_rx),
+                None,
+            ),
+        )
+        .await
+        .expect("initial exec write must resolve promptly after the epoch bump, not hang");
+
+        assert!(
+            matches!(&result, Err(SandboxError::Unavailable(message))
+                if message.contains("severed") && message.contains("exec request")),
+            "severed initial write must be retryable Unavailable, got {result:?}"
         );
         drop(severed_guest.await.unwrap());
     }

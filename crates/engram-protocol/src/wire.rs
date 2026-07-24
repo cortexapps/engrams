@@ -112,7 +112,9 @@ use serde::{Deserialize, Serialize};
 // on a v17 host silently loses the floor.
 // v19 (ADR 0103): durable ExecRequest ticket/resume fields and the
 // CancelExec coord↔host RPC. Lockstep coord+host roll.
-pub const WIRE_VERSION: u32 = 19;
+// v20 (ADR 0103 review hardening): ExecFrame carries terminal refusals as
+// their own oneof variant instead of collapsing them into Exit(None).
+pub const WIRE_VERSION: u32 = 20;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

@@ -26,9 +26,10 @@
 //! Active execs running on the dead host don't need explicit
 //! synthesis: dropping the host's `RemoteSandboxBackend` cascades
 //! through the WS demuxer's `Closed` state, the per-exec stream
-//! channel drops, and the SSE handler in `api/exec.rs` emits
-//! `SessionEvent::ExecCompleted{exit_status: None}` at the natural
-//! end of its event loop — same path as a clean exec exit.
+//! channel drops, and `api/exec.rs` surfaces the end-without-Exit as
+//! a retryable `Unavailable` (ADR 0103) — no completion is recorded,
+//! so a caller holding a durable ticket can re-attach once the
+//! session is recovered onto a live host.
 //!
 //! Without this detector, sessions on a dead host stay `Active`
 //! forever (with a `host_id` pointing at a host that won't respond);
