@@ -26,6 +26,7 @@ const ALERT_ACTIONS = new Set<SweepDecision["action"]>([
   "alert_only",
   "cancelled_stale",
   "cancelled_capped",
+  "cancelled_policy",
   "error",
 ]);
 // alert_only and error decisions recur every cycle for a row that stays in
@@ -297,26 +298,3 @@ export function makeSweepAlerter(deps: SweepAlerterDeps): SweepAlerter {
   };
 }
 
-export function makeDisabledSweepAlerter(log: Logger): SweepAlerter {
-  let logged = false;
-  const logDisabled = () => {
-    if (logged) return;
-    logged = true;
-    log.warn("alerts disabled: no ops channel configured");
-  };
-  return {
-    async alertDecisions() {
-      logDisabled();
-    },
-    async scanTerminalFailures() {
-      logDisabled();
-      return {
-        scanned: 0,
-        alerted: 0,
-        cleanupsRun: 0,
-        cleanupsFailed: 0,
-        watermark: 0,
-      };
-    },
-  };
-}
