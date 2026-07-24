@@ -1,0 +1,509 @@
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { DBOS } from "@dbos-inc/dbos-sdk";
+import { sql } from "drizzle-orm";
+
+import { checkDb, getDb } from "../db/client.ts";
+
+const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
+const dbReachable = DB_URL ? await checkDb() : false;
+const runId = `sweeptest-${Date.now()}`;
+
+async function sweepModule() {
+  return import("../db/dbos-sweep.ts");
+}
+
+describe("DBOS sweep schema", () => {
+  test("exports all four sweep tables", async () => {
+    const schema = await import("../db/schema.ts");
+    expect(schema.dbosVersionHeartbeats).toBeDefined();
+    expect(schema.dbosSweepLedger).toBeDefined();
+    expect(schema.dbosSweepState).toBeDefined();
+    expect(schema.dbosSweepLease).toBeDefined();
+  });
+});
+
+describe("in-memory heartbeat store", () => {
+  test("beats by app/pod and reports only versions inside the strict grace window", async () => {
+    const { makeInMemoryHeartbeatStore } = await sweepModule();
+    let nowMs = 1_000;
+    const store = makeInMemoryHeartbeatStore(() => new Date(nowMs));
+
+    await store.beat("v-old", "pod-a");
+    nowMs = 1_050;
+    await store.beat("v-live", "pod-a");
+    nowMs = 1_075;
+    await store.beat("v-live", "pod-b");
+    nowMs = 1_100;
+
+    expect(await store.liveVersions(50)).toEqual(["v-live"]);
+
+    await store.beat("v-old", "pod-a");
+    expect(await store.liveVersions(50)).toEqual(["v-live", "v-old"]);
+  });
+});
+
+describe("in-memory sweep lease store", () => {
+  test("acquires once, steals only after expiry, and releases only for the owner", async () => {
+    const { makeInMemorySweepLeaseStore } = await sweepModule();
+    let nowMs = 10_000;
+    const store = makeInMemorySweepLeaseStore(() => new Date(nowMs));
+
+    expect(await store.tryAcquire("pod-a", 100)).toBe(true);
+    expect(await store.tryAcquire("pod-b", 100)).toBe(false);
+    nowMs = 10_100;
+    expect(await store.tryAcquire("pod-b", 100)).toBe(false);
+    nowMs = 10_101;
+    expect(await store.tryAcquire("pod-b", 100)).toBe(true);
+
+    await store.release("pod-a");
+    expect(await store.tryAcquire("pod-c", 100)).toBe(false);
+    await store.release("pod-b");
+    expect(await store.tryAcquire("pod-c", 100)).toBe(true);
+  });
+});
+
+describe("in-memory sweep ledger store", () => {
+  test("records sweep history, flags, cleanup, alerts, and watermarks", async () => {
+    const { makeInMemorySweepLedgerStore } = await sweepModule();
+    let nowMs = 20_000;
+    const store = makeInMemorySweepLedgerStore(() => new Date(nowMs));
+
+    const first = await store.recordSweep("wf-1", "WorkflowOne");
+    expect(first).toMatchObject({
+      workflowUuid: "wf-1",
+      workflowName: "WorkflowOne",
+      sweepCount: 1,
+      suppressed: false,
+      cleanupDoneAt: null,
+      cleanupFn: null,
+      alertedAt: null,
+    });
+    expect(first.firstSweptAt?.getTime()).toBe(20_000);
+    expect(first.lastSweptAt?.getTime()).toBe(20_000);
+
+    nowMs = 21_000;
+    const second = await store.recordSweep("wf-1", "WorkflowOneRenamed");
+    expect(second.sweepCount).toBe(2);
+    expect(second.workflowName).toBe("WorkflowOneRenamed");
+    expect(second.firstSweptAt?.getTime()).toBe(20_000);
+    expect(second.lastSweptAt?.getTime()).toBe(21_000);
+
+    await store.setSuppressed("wf-1", true);
+    nowMs = 22_000;
+    await store.markCleanupDone("wf-1", "cleanWorkflow");
+    nowMs = 23_000;
+    await store.markAlerted("wf-1");
+    expect(await store.get("wf-1")).toMatchObject({
+      suppressed: true,
+      cleanupFn: "cleanWorkflow",
+    });
+    expect((await store.get("wf-1"))?.cleanupDoneAt?.getTime()).toBe(22_000);
+    expect((await store.get("wf-1"))?.alertedAt?.getTime()).toBe(23_000);
+    expect(await store.get("missing")).toBeNull();
+
+    expect(await store.getWatermark("failures")).toBeNull();
+    await store.setWatermark("failures", 123);
+    expect(await store.getWatermark("failures")).toBe(123);
+    await store.setWatermark("failures", 456);
+    expect(await store.getWatermark("failures")).toBe(456);
+  });
+});
+
+describe("in-memory DBOS status store", () => {
+  test("lists dead-version work in age order with a batch cap", async () => {
+    const { makeInMemoryDbosStatusStore } = await sweepModule();
+    const store = makeInMemoryDbosStatusStore([
+      {
+        workflowUuid: "pending-old",
+        name: "WorkflowOne",
+        status: "PENDING",
+        applicationVersion: "dead-a",
+        createdAtEpochMs: 100,
+        updatedAtEpochMs: 100,
+        recoveryAttempts: 2,
+      },
+      {
+        workflowUuid: "enqueued-next",
+        name: "WorkflowOne",
+        status: "ENQUEUED",
+        applicationVersion: "dead-b",
+        createdAtEpochMs: 200,
+        updatedAtEpochMs: 200,
+        recoveryAttempts: 0,
+      },
+      {
+        workflowUuid: "pending-live",
+        name: "WorkflowOne",
+        status: "PENDING",
+        applicationVersion: "live",
+        createdAtEpochMs: 50,
+        updatedAtEpochMs: 50,
+        recoveryAttempts: 0,
+      },
+      {
+        workflowUuid: "pending-null",
+        name: "WorkflowOne",
+        status: "PENDING",
+        applicationVersion: null,
+        createdAtEpochMs: 25,
+        updatedAtEpochMs: 25,
+        recoveryAttempts: 0,
+      },
+      {
+        workflowUuid: "terminal",
+        name: "WorkflowOne",
+        status: "SUCCESS",
+        applicationVersion: "dead-a",
+        createdAtEpochMs: 10,
+        updatedAtEpochMs: 10,
+        recoveryAttempts: 0,
+      },
+    ]);
+
+    expect(await store.listNonTerminalOnVersionsNotIn(["live"], 1)).toEqual([
+      {
+        workflowUuid: "pending-old",
+        name: "WorkflowOne",
+        status: "PENDING",
+        applicationVersion: "dead-a",
+        createdAtEpochMs: 100,
+        recoveryAttempts: 2,
+      },
+    ]);
+    expect(
+      (await store.listNonTerminalOnVersionsNotIn([], 10)).map((row) => row.workflowUuid),
+    ).toEqual(["pending-live", "pending-old", "enqueued-next"]);
+  });
+
+  test("adopts only PENDING and clears only the version on ENQUEUED", async () => {
+    const { makeInMemoryDbosStatusStore } = await sweepModule();
+    let nowMs = 5_000;
+    const store = makeInMemoryDbosStatusStore(
+      [
+        {
+          workflowUuid: "pending",
+          name: "WorkflowOne",
+          status: "PENDING",
+          applicationVersion: "dead",
+          createdAtEpochMs: 100,
+          updatedAtEpochMs: 100,
+          recoveryAttempts: 7,
+          queueName: "old-queue",
+          workflowDeadlineEpochMs: 600,
+          deduplicationId: "dedup",
+          startedAtEpochMs: 400,
+        },
+        {
+          workflowUuid: "enqueued",
+          name: "WorkflowOne",
+          status: "ENQUEUED",
+          applicationVersion: "dead",
+          createdAtEpochMs: 200,
+          updatedAtEpochMs: 200,
+          recoveryAttempts: 3,
+          queueName: "custom",
+          workflowDeadlineEpochMs: 700,
+          deduplicationId: "keep",
+          startedAtEpochMs: 450,
+        },
+        {
+          workflowUuid: "terminal",
+          name: "WorkflowOne",
+          status: "ERROR",
+          applicationVersion: "dead",
+          createdAtEpochMs: 300,
+          updatedAtEpochMs: 300,
+          recoveryAttempts: 9,
+        },
+      ],
+      () => new Date(nowMs),
+    );
+
+    expect(await store.adoptPending(["pending", "enqueued", "terminal"])).toEqual([
+      "pending",
+    ]);
+    expect(store.inspect("pending")).toMatchObject({
+      status: "ENQUEUED",
+      queueName: "_dbos_internal_queue",
+      applicationVersion: null,
+      workflowDeadlineEpochMs: null,
+      deduplicationId: null,
+      startedAtEpochMs: null,
+      updatedAtEpochMs: 5_000,
+      recoveryAttempts: 7,
+    });
+    expect(store.inspect("enqueued")).toMatchObject({
+      applicationVersion: "dead",
+      queueName: "custom",
+      workflowDeadlineEpochMs: 700,
+      deduplicationId: "keep",
+      startedAtEpochMs: 450,
+    });
+
+    nowMs = 6_000;
+    expect(await store.clearVersionOnEnqueued(["enqueued", "terminal"])).toEqual([
+      "enqueued",
+    ]);
+    expect(store.inspect("enqueued")).toMatchObject({
+      applicationVersion: null,
+      queueName: "custom",
+      workflowDeadlineEpochMs: 700,
+      deduplicationId: "keep",
+      startedAtEpochMs: 450,
+      updatedAtEpochMs: 200,
+      recoveryAttempts: 3,
+    });
+    expect(store.inspect("terminal")).toMatchObject({
+      status: "ERROR",
+      applicationVersion: "dead",
+      recoveryAttempts: 9,
+    });
+  });
+
+  test("lists only newly terminal failures after the strict watermark", async () => {
+    const { makeInMemoryDbosStatusStore } = await sweepModule();
+    const store = makeInMemoryDbosStatusStore([
+      {
+        workflowUuid: "at-watermark",
+        name: "WorkflowOne",
+        status: "ERROR",
+        applicationVersion: null,
+        createdAtEpochMs: 10,
+        updatedAtEpochMs: 100,
+        recoveryAttempts: 1,
+      },
+      {
+        workflowUuid: "max-recovery",
+        name: "WorkflowTwo",
+        status: "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
+        applicationVersion: "dead",
+        createdAtEpochMs: 20,
+        updatedAtEpochMs: 101,
+        recoveryAttempts: 10,
+      },
+      {
+        workflowUuid: "error",
+        name: "WorkflowOne",
+        status: "ERROR",
+        applicationVersion: "dead",
+        createdAtEpochMs: 30,
+        updatedAtEpochMs: 102,
+        recoveryAttempts: 2,
+      },
+      {
+        workflowUuid: "success",
+        name: "WorkflowOne",
+        status: "SUCCESS",
+        applicationVersion: "dead",
+        createdAtEpochMs: 40,
+        updatedAtEpochMs: 103,
+        recoveryAttempts: 0,
+      },
+    ]);
+
+    expect(await store.listNewlyTerminalFailed(100, 1)).toEqual([
+      {
+        workflowUuid: "max-recovery",
+        name: "WorkflowTwo",
+        status: "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
+        applicationVersion: "dead",
+        createdAtEpochMs: 20,
+        updatedAtEpochMs: 101,
+        recoveryAttempts: 10,
+      },
+    ]);
+  });
+});
+
+describe("DBOS sweep stores with live Postgres", () => {
+  beforeAll(async () => {
+    if (!dbReachable) return;
+    DBOS.setConfig({
+      name: "engrams-orchestrator",
+      systemDatabaseUrl: DB_URL!,
+      systemDatabaseSchemaName: "dbos",
+      runAdminServer: false,
+    });
+    await DBOS.launch();
+  });
+
+  afterAll(async () => {
+    if (!dbReachable) return;
+    const db = getDb();
+    await db.execute(sql`delete from "dbos"."workflow_status"
+                         where "workflow_uuid" like ${`${runId}-%`}`);
+    await db.execute(sql`delete from "dbos_version_heartbeats"
+                         where "pod_name" like ${`${runId}-%`}`);
+    await db.execute(sql`delete from "dbos_sweep_ledger"
+                         where "workflow_uuid" like ${`${runId}-%`}`);
+    await db.execute(sql`delete from "dbos_sweep_state"
+                         where "key" like ${`${runId}-%`}`);
+    await db.execute(sql`delete from "dbos_sweep_lease"
+                         where "owner" like ${`${runId}-%`}`);
+    await DBOS.shutdown();
+  });
+
+  test.skipIf(!dbReachable)("heartbeat uses server time and strict grace", async () => {
+    const { makeHeartbeatStore } = await sweepModule();
+    const store = makeHeartbeatStore();
+    await store.beat("live-version", `${runId}-pod`);
+    await getDb().execute(sql`
+      insert into "dbos_version_heartbeats"
+        ("application_version", "pod_name", "last_seen")
+      values ('old-version', ${`${runId}-old-pod`}, now() - interval '1 hour')
+    `);
+
+    expect(await store.liveVersions(60_000)).toEqual(["live-version"]);
+  });
+
+  test.skipIf(!dbReachable)("lease steals only after expiry and release is owner-guarded", async () => {
+    const { makeSweepLeaseStore } = await sweepModule();
+    const store = makeSweepLeaseStore();
+    const ownerA = `${runId}-owner-a`;
+    const ownerB = `${runId}-owner-b`;
+
+    expect(await store.tryAcquire(ownerA, 60_000)).toBe(true);
+    expect(await store.tryAcquire(ownerB, 60_000)).toBe(false);
+    await store.release(ownerB);
+    expect(await store.tryAcquire(ownerB, 60_000)).toBe(false);
+    await getDb().execute(sql`
+      update "dbos_sweep_lease" set "expires_at" = now() - interval '1 second'
+    `);
+    expect(await store.tryAcquire(ownerB, 60_000)).toBe(true);
+    await store.release(ownerB);
+  });
+
+  test.skipIf(!dbReachable)("ledger and watermark round-trip through Postgres", async () => {
+    const { makeSweepLedgerStore } = await sweepModule();
+    const store = makeSweepLedgerStore();
+    const workflowUuid = `${runId}-ledger`;
+    const watermarkKey = `${runId}-failures`;
+
+    expect((await store.recordSweep(workflowUuid, "WorkflowOne")).sweepCount).toBe(1);
+    expect((await store.recordSweep(workflowUuid, "WorkflowOne")).sweepCount).toBe(2);
+    await store.setSuppressed(workflowUuid, true);
+    await store.markCleanupDone(workflowUuid, "cleanup");
+    await store.markAlerted(workflowUuid);
+    expect(await store.get(workflowUuid)).toMatchObject({
+      workflowUuid,
+      workflowName: "WorkflowOne",
+      sweepCount: 2,
+      suppressed: true,
+      cleanupFn: "cleanup",
+    });
+    await store.setWatermark(watermarkKey, 123);
+    await store.setWatermark(watermarkKey, 456);
+    expect(await store.getWatermark(watermarkKey)).toBe(456);
+  });
+
+  test.skipIf(!dbReachable)(
+    "DBOS status queries cap batches and preserve guarded transition fields",
+    async () => {
+      const { makeDbosStatusStore } = await sweepModule();
+      const store = makeDbosStatusStore();
+      const pendingA = `${runId}-pending-a`;
+      const pendingB = `${runId}-pending-b`;
+      const enqueued = `${runId}-enqueued`;
+      const live = `${runId}-live`;
+      const terminal = `${runId}-terminal`;
+
+      await getDb().execute(sql`
+        insert into "dbos"."workflow_status"
+          ("workflow_uuid", "status", "name", "application_version",
+           "recovery_attempts", "created_at", "updated_at", "queue_name",
+           "workflow_deadline_epoch_ms", "deduplication_id", "started_at_epoch_ms")
+        values
+          (${pendingA}, 'PENDING', 'WorkflowOne', 'dead-a', 7, 100, 100,
+           'old-queue', 900, ${`${runId}-dedup-a`}, 500),
+          (${pendingB}, 'PENDING', 'WorkflowOne', 'dead-a', 1, 200, 200,
+           null, null, null, null),
+          (${enqueued}, 'ENQUEUED', 'WorkflowTwo', 'dead-b', 3, 300, 300,
+           'custom-queue', 901, ${`${runId}-dedup-b`}, 501),
+          (${live}, 'PENDING', 'WorkflowOne', 'live', 0, 50, 50,
+           null, null, null, null),
+          (${terminal}, 'SUCCESS', 'WorkflowOne', 'dead-a', 9, 25, 25,
+           null, null, null, null)
+      `);
+
+      expect(
+        (await store.listNonTerminalOnVersionsNotIn(["live"], 2)).map(
+          (row) => row.workflowUuid,
+        ),
+      ).toEqual([pendingA, pendingB]);
+
+      expect(await store.adoptPending([pendingA, enqueued, terminal])).toEqual([
+        pendingA,
+      ]);
+      expect(await store.clearVersionOnEnqueued([enqueued, terminal])).toEqual([
+        enqueued,
+      ]);
+
+      const result = await getDb().execute(sql`
+        select "workflow_uuid", "status", "application_version", "queue_name",
+               "workflow_deadline_epoch_ms", "deduplication_id",
+               "started_at_epoch_ms", "recovery_attempts", "updated_at"
+        from "dbos"."workflow_status"
+        where "workflow_uuid" in (${pendingA}, ${enqueued}, ${terminal})
+        order by "workflow_uuid"
+      `);
+      const byId = new Map(result.rows.map((row) => [row.workflow_uuid, row]));
+      expect(byId.get(pendingA)).toMatchObject({
+        status: "ENQUEUED",
+        application_version: null,
+        queue_name: "_dbos_internal_queue",
+        workflow_deadline_epoch_ms: null,
+        deduplication_id: null,
+        started_at_epoch_ms: null,
+        recovery_attempts: "7",
+      });
+      expect(Number(byId.get(pendingA)?.updated_at)).toBeGreaterThan(1_000);
+      expect(byId.get(enqueued)).toMatchObject({
+        status: "ENQUEUED",
+        application_version: null,
+        queue_name: "custom-queue",
+        workflow_deadline_epoch_ms: "901",
+        deduplication_id: `${runId}-dedup-b`,
+        started_at_epoch_ms: "501",
+        recovery_attempts: "3",
+        updated_at: "300",
+      });
+      expect(byId.get(terminal)).toMatchObject({
+        status: "SUCCESS",
+        application_version: "dead-a",
+        recovery_attempts: "9",
+        updated_at: "25",
+      });
+    },
+  );
+
+  test.skipIf(!dbReachable)("terminal failure scan uses a strict ordered watermark", async () => {
+    const { makeDbosStatusStore } = await sweepModule();
+    const store = makeDbosStatusStore();
+    const atWatermark = `${runId}-failed-at`;
+    const maxRecovery = `${runId}-failed-max`;
+    const error = `${runId}-failed-error`;
+
+    await getDb().execute(sql`
+      insert into "dbos"."workflow_status"
+        ("workflow_uuid", "status", "name", "application_version",
+         "recovery_attempts", "created_at", "updated_at")
+      values
+        (${atWatermark}, 'ERROR', 'WorkflowOne', null, 1, 10, 100),
+        (${maxRecovery}, 'MAX_RECOVERY_ATTEMPTS_EXCEEDED', 'WorkflowTwo',
+         'dead', 10, 20, 101),
+        (${error}, 'ERROR', 'WorkflowOne', 'dead', 2, 30, 102)
+    `);
+
+    expect(await store.listNewlyTerminalFailed(100, 1)).toEqual([
+      {
+        workflowUuid: maxRecovery,
+        name: "WorkflowTwo",
+        status: "MAX_RECOVERY_ATTEMPTS_EXCEEDED",
+        applicationVersion: "dead",
+        createdAtEpochMs: 20,
+        updatedAtEpochMs: 101,
+        recoveryAttempts: 10,
+      },
+    ]);
+  });
+});

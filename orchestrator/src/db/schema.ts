@@ -349,6 +349,48 @@ export const reviewSession = pgTable("review_session", {
 });
 
 // ---------------------------------------------------------------------------
+// DBOS orphan sweep (ADR 0104)
+// ---------------------------------------------------------------------------
+
+/** Per-pod application-version heartbeats used to distinguish live versions
+ * from abandoned workflow versions. */
+export const dbosVersionHeartbeats = pgTable(
+  "dbos_version_heartbeats",
+  {
+    applicationVersion: text("application_version").notNull(),
+    podName: text("pod_name").notNull(),
+    lastSeen: timestamp("last_seen", { withTimezone: true }).notNull(),
+  },
+  (t) => [primaryKey({ columns: [t.applicationVersion, t.podName] })],
+);
+
+/** Durable per-workflow sweep history and operator-control flags. */
+export const dbosSweepLedger = pgTable("dbos_sweep_ledger", {
+  workflowUuid: text("workflow_uuid").primaryKey(),
+  workflowName: text("workflow_name").notNull(),
+  sweepCount: integer("sweep_count").notNull().default(0),
+  firstSweptAt: timestamp("first_swept_at", { withTimezone: true }),
+  lastSweptAt: timestamp("last_swept_at", { withTimezone: true }),
+  suppressed: boolean("suppressed").notNull().default(false),
+  cleanupDoneAt: timestamp("cleanup_done_at", { withTimezone: true }),
+  cleanupFn: text("cleanup_fn"),
+  alertedAt: timestamp("alerted_at", { withTimezone: true }),
+});
+
+/** Tiny watermark KV used by the terminal-failure alert scan. */
+export const dbosSweepState = pgTable("dbos_sweep_state", {
+  key: text("key").primaryKey(),
+  epochMs: bigint("epoch_ms", { mode: "number" }).notNull(),
+});
+
+/** Single-row cross-pod lease for one sweep owner per cycle. */
+export const dbosSweepLease = pgTable("dbos_sweep_lease", {
+  name: text("name").primaryKey(),
+  owner: text("owner").notNull(),
+  expiresAt: timestamp("expires_at", { withTimezone: true }).notNull(),
+});
+
+// ---------------------------------------------------------------------------
 // Session profiles (ADR 0053)
 //
 // Admin-curated session starting points. Orchestrator-only data — the control
