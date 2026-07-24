@@ -18,14 +18,18 @@ export interface HeartbeatStore {
   beat(appVersion: string, podName: string): Promise<void>;
   liveVersions(graceMs: number): Promise<string[]>;
   /**
-   * Freshest heartbeat per version (epoch ms) — when each version was last
-   * provably alive. This is the sweep's abandonment clock: staleness is
-   * measured from when a workflow's owning version DIED, never from the
-   * workflow's creation (a thread workflow lives for its whole session, so
-   * creation age says nothing about abandonment). A version absent from the
-   * map has no surviving history and is treated as abandoned forever.
+   * Milliseconds since each version's freshest heartbeat — how long each
+   * version has been abandoned. This is the sweep's abandonment clock:
+   * staleness is measured from when a workflow's owning version DIED, never
+   * from the workflow's creation (a thread workflow lives for its whole
+   * session, so creation age says nothing about abandonment). The age is
+   * computed inside Postgres against the same PG now() that stamped the
+   * heartbeat, so pod↔PG clock skew can never shift it — the store's time
+   * never leaves the database, matching liveVersions and the flip fences.
+   * A version absent from the map has no surviving history and is treated
+   * as abandoned forever.
    */
-  lastSeenByVersion(): Promise<Map<string, number>>;
+  abandonedMsByVersion(): Promise<Map<string, number>>;
   /**
    * Delete rows whose last_seen is older than retentionMs. Rows older than
    * the grace window are already dead for liveness purposes (liveVersions
@@ -219,18 +223,18 @@ export function makeHeartbeatStore(
       return result.rows.map((row) => String(row.application_version));
     },
 
-    async lastSeenByVersion() {
+    async abandonedMsByVersion() {
       const result = await db.execute(sql`
         select "application_version",
-               (extract(epoch from max("last_seen")) * 1000)::bigint
-                 as "last_seen_ms"
+               (extract(epoch from (now() - max("last_seen"))) * 1000)::bigint
+                 as "abandoned_ms"
         from "dbos_version_heartbeats"
         group by "application_version"
       `);
       return new Map(
         result.rows.map((row) => [
           String(row.application_version),
-          numberValue(row.last_seen_ms),
+          numberValue(row.abandoned_ms),
         ]),
       );
     },
@@ -486,19 +490,20 @@ export function makeInMemoryHeartbeatStore(
         .sort();
     },
 
-    async lastSeenByVersion() {
-      const latestByVersion = new Map<string, number>();
+    async abandonedMsByVersion() {
+      const nowMs = now().getTime();
+      const abandonedByVersion = new Map<string, number>();
       for (const [key, lastSeen] of rows) {
         const appVersion = key.slice(0, key.indexOf("\0"));
-        latestByVersion.set(
+        abandonedByVersion.set(
           appVersion,
-          Math.max(
-            latestByVersion.get(appVersion) ?? Number.NEGATIVE_INFINITY,
-            lastSeen,
+          Math.min(
+            abandonedByVersion.get(appVersion) ?? Number.POSITIVE_INFINITY,
+            nowMs - lastSeen,
           ),
         );
       }
-      return latestByVersion;
+      return abandonedByVersion;
     },
 
     async prune(retentionMs) {

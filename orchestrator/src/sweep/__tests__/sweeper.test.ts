@@ -100,7 +100,6 @@ async function fixture(
       cancelled.push(workflowUuid);
     },
     log,
-    now,
     ...overrides,
   };
   return { deps, status, heartbeats, lease, cancelled };
@@ -825,7 +824,7 @@ describe("VersionHeartbeat", () => {
         async liveVersions() {
           return [];
         },
-        async lastSeenByVersion() {
+        async abandonedMsByVersion() {
           return new Map<string, number>();
         },
         async prune() {

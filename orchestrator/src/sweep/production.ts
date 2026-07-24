@@ -37,7 +37,6 @@ export interface SweepRuntimeOverrides {
   podName: string;
   appVersion: () => string;
   cancelWorkflow: (workflowUuid: string) => Promise<void>;
-  now: () => Date;
   heartbeats: HeartbeatStore;
   lease: SweepLeaseStore;
   ledger: SweepLedgerStore;
@@ -55,7 +54,6 @@ export function makeSweepRuntime(deps: SweepRuntimeDeps): {
   sweeper: Sweeper;
 } {
   const log = deps.log ?? rootLog.child({ component: "dbos-sweep" });
-  const now = deps.runtime?.now ?? (() => new Date());
   const heartbeats = deps.runtime?.heartbeats ?? makeHeartbeatStore();
   const lease = deps.runtime?.lease ?? makeSweepLeaseStore();
   const ledger = deps.runtime?.ledger ?? makeSweepLedgerStore();
@@ -88,7 +86,6 @@ export function makeSweepRuntime(deps: SweepRuntimeDeps): {
     cancelWorkflow,
     alerter,
     log,
-    now,
   });
   const heartbeat = new VersionHeartbeat({
     appVersion,

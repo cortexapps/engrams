@@ -72,7 +72,6 @@ describe("makeSweepRuntime", () => {
         podName: "test-pod",
         appVersion: () => CURRENT_VERSION,
         cancelWorkflow: async () => {},
-        now,
         heartbeats,
         lease,
         ledger,

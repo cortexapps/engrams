@@ -169,15 +169,18 @@ abandoned rows back into the queue and pods pull.
 - **Ancient orphans**: past the staleness cutoff, cancel instead of adopt —
   never necro-post a weeks-dead conversation. **Staleness is measured from
   version abandonment, not workflow creation**: the clock is
-  `max(last_seen)` of the workflow's dead version in
-  `dbos_version_heartbeats` (`lastSeenByVersion`). Long-lived workflows
-  (Slack thread drains run for the whole session — days) would otherwise be
-  cancelled by their own age on every deploy, recreating the original bug.
-  A version with no heartbeat history at all (pre-sweep backlog) is
-  abandoned-forever → stale → cancelled, which is exactly the first-deploy
-  backfill behavior we want. Invariant: heartbeat retention (7d) must exceed
-  every policy's `staleAfterHours` (max 48h), or a still-recent abandonment
-  could lose its history and read as ancient.
+  `now() - max(last_seen)` of the workflow's dead version in
+  `dbos_version_heartbeats` (`abandonedMsByVersion`), computed **inside
+  Postgres** — the same clock that stamps heartbeats, decides liveness, and
+  fences the flips — so pod↔PG clock skew can never shift a staleness
+  decision. Long-lived workflows (Slack thread drains run for the whole
+  session — days) would otherwise be cancelled by their own age on every
+  deploy, recreating the original bug. A version with no heartbeat history
+  at all (pre-sweep backlog) is abandoned-forever → stale → cancelled,
+  which is exactly the first-deploy backfill behavior we want. Invariant:
+  heartbeat retention (7d) must exceed every policy's `staleAfterHours`
+  (max 48h), or a still-recent abandonment could lose its history and read
+  as ancient.
 
 ## Operations (replaces the manual resume recipe)
 

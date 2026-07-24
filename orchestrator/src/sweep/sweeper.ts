@@ -66,7 +66,6 @@ export interface SweepTickDeps {
    */
   scanCursor?: { value: ScanCursor | undefined };
   log: Logger;
-  now?: () => Date;
 }
 
 export type SweepDecision = {
@@ -191,8 +190,11 @@ export async function runSweepTick(
     // for its whole session, so a days-old created_at says nothing about
     // whether the work was active moments before a deploy stranded it. A
     // version with no surviving heartbeat history (pre-feature orphans, or
-    // rows past HEARTBEAT_RETENTION_MS) is abandoned forever.
-    const lastSeenByVersion = await deps.heartbeats.lastSeenByVersion();
+    // rows past HEARTBEAT_RETENTION_MS) is abandoned forever. The age is
+    // computed inside Postgres — the same clock that stamps heartbeats and
+    // drives liveVersions and the flip fences — so pod↔PG skew can't shift
+    // a staleness decision.
+    const abandonedMsByVersion = await deps.heartbeats.abandonedMsByVersion();
 
     const pageSize = deps.config.batchCap * 4;
     const scanBudget = deps.config.batchCap * 40;
@@ -200,7 +202,6 @@ export async function runSweepTick(
     const cursor = deps.scanCursor;
     let after = cursor?.value;
     let exhausted = false;
-    const nowMs = (deps.now ?? (() => new Date()))().getTime();
 
     scan: while (
       actions < deps.config.batchCap &&
@@ -242,13 +243,13 @@ export async function runSweepTick(
             // ERROR and is never re-swept; the rare silent zombie is an
             // operator call via the ledger's `suppressed` flag, with
             // sweep_count kept as the evidence trail.
-            const lastSeenMs = lastSeenByVersion.get(
+            const abandonedMs = abandonedMsByVersion.get(
               row.applicationVersion!,
             );
             const abandonedHours =
-              lastSeenMs === undefined
+              abandonedMs === undefined
                 ? Number.POSITIVE_INFINITY
-                : (nowMs - lastSeenMs) / (60 * 60 * 1_000);
+                : abandonedMs / (60 * 60 * 1_000);
             const staleAfterHours =
               policy.mode === "alert-only"
                 ? ALERT_ONLY_STALE_AFTER_HOURS
