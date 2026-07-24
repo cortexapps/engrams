@@ -50,8 +50,6 @@ release: who frees this, and does that line run on the error path?
 
 ## Writing policy
 
-WHAT: the failure and its trigger in one sentence ("a timeout here leaves
-the lock held"). WHY: the blast radius — one request, one worker, or the
-whole process, and whether it recovers. HOW: the concrete change (release in
-finally / bound the queue / add the timeout) only when the surrounding
-code's idiom makes the right fix evident.
+WHAT: the failure in one sentence ("a timeout here leaves the lock held").
+WHEN: the trigger and its blast radius — one request, one worker, or the
+whole process, and whether it recovers.

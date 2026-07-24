@@ -50,8 +50,5 @@ almost never on the side that changed.
 
 ## Writing policy
 
-WHAT: which data becomes wrong and when. WHY: what downstream decisions or
-records the corruption reaches, and whether it is detectable after the fact.
-HOW: the fix that restores atomicity or agreement (move into the
-transaction / add the conflict target / dual-read during rollout), only when
-you read both sides of the boundary.
+WHAT: which data becomes wrong. WHEN: the operation, ordering, or failure that
+triggers the corruption, and whether it is detectable after the fact.

@@ -47,8 +47,7 @@ they gain, it is not a security finding.
 
 ## Writing policy
 
-WHAT: the sink and the unvalidated source in one sentence. WHY: what the
-attacker gains (read what? write what? act as whom?). HOW: the narrowest fix
-that closes the path (validate here / scope this query / move the check),
-only if the correct boundary is clear from code you read. Never write
-proof-of-concept exploit payloads into the finding.
+WHAT: the sink and the unvalidated source in one sentence. WHEN: the request or
+input that reaches the sink, and what the attacker gains (read what? write
+what? act as whom?). Never write proof-of-concept exploit payloads into the
+finding.

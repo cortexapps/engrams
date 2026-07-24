@@ -51,9 +51,8 @@ following a local idiom you haven't read yet.
 
 ## Writing policy
 
-WHAT: the misleading or duplicated element in one sentence. WHY: the future
+WHAT: the misleading or duplicated element in one sentence. WHEN: the future
 edit or misreading it invites — be concrete ("the next caller will trust
-this comment and skip the null check"). HOW: the smallest rename/move/merge
-that fixes it. Severity is `low` unless the deception is about safety or
-money; confidence is usually `high` because you can see the contradiction
-directly.
+this comment and skip the null check"). Severity is `low` unless the
+deception is about safety or money; confidence is usually `high` because you
+can see the contradiction directly.
