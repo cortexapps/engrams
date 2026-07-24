@@ -177,4 +177,33 @@ abandoned rows back into the queue and pods pull.
 
 ## Implementation record
 
-(To be filled in as phases land.)
+Landed as a commit chain on `fix/872-dbos-orphan-sweep` (T1 stores/migration,
+T2 sweep core, T3 alerting/cleanups, T4 wiring/config, T5 CI hash warning,
+T6 integration suite). Divergences from the design above, found in review:
+
+- **Drizzle array params**: the `sql` template JSON-stringifies a raw JS-array
+  param (PG 22P02 under `::text[]`); array params are expanded element-wise
+  via a `textArray()` helper in `db/dbos-sweep.ts`.
+- **`temp_workflow-` prefix broadened** (was `temp_workflow-send-` only): every
+  DBOS temp wrapper is a single idempotent operation, so all adopt. The
+  registry also covers `AutomationRunWorkflow` (adopt, 1h) — the design's
+  example listed three workflows; four are registered.
+- **Ledger alert/cleanup marks are UPSERTs**: an `alert-only` or
+  naturally-failed workflow has no prior sweep row; plain UPDATEs meant alert
+  dedup never stuck and the ops channel re-alerted every cycle.
+- **Watermark hold, not break**: a wedged cleanup holds the failure-scan
+  watermark at its own row but later rows are still processed, so one failing
+  cleanup cannot block alerting for everything behind it.
+- **Alerting is log-only without a channel, never off**: cleanups (the thread
+  black-hole note, failReview) run regardless of whether
+  `ORCHESTRATOR_SWEEP_ALERT_CHANNEL` is configured; only the alert transport
+  degrades to the orchestrator log.
+- **Heartbeat is unconditional**: `ORCHESTRATOR_SWEEP_DISABLED` disables only
+  the sweeper. A live pod must still heartbeat its version or another pod's
+  sweeper would adopt its in-flight workflows.
+- **SDK seams**: app version reads public `DBOS.applicationVersion`; workflow
+  registry enumeration needs `getAllRegisteredFunctions` via a relative dist
+  import (the SDK exports map hides it) — the SDK-upgrade canary test guards
+  both, plus the claim-path contract.
+- **The flip also nulls `completed_at`** (present in 4.21.6's schema despite
+  its absence from older docs), for parity with SDK `resumeWorkflows`.

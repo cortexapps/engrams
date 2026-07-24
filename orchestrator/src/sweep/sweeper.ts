@@ -18,7 +18,7 @@ import {
   type FailureScanResult,
   type SweepAlerter,
 } from "./alerts.ts";
-import { resolvePolicy } from "./policy.ts";
+import { resolvePolicy, type ResolvedPolicy } from "./policy.ts";
 
 export const HEARTBEAT_INTERVAL_MS = 30_000;
 export const SWEEP_INTERVAL_MS = 60_000;
@@ -52,6 +52,7 @@ export interface SweepTickDeps {
   status: DbosStatusStore;
   cancelWorkflow: (workflowUuid: string) => Promise<void>;
   alerter?: SweepAlerter;
+  resolvePolicy?: (name: string) => ResolvedPolicy;
   log: Logger;
   now?: () => Date;
 }
@@ -169,7 +170,7 @@ export async function runSweepTick(
       if (actions >= deps.config.batchCap) break;
       let decision: SweepDecision;
       try {
-        const policy = resolvePolicy(row.name);
+        const policy = (deps.resolvePolicy ?? resolvePolicy)(row.name);
         if (policy.mode === "alert-only") {
           decision = {
             workflowUuid: row.workflowUuid,
