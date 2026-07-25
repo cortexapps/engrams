@@ -67,7 +67,7 @@ jobs:
       node_assets: ${{ steps.lanes.outputs.node_assets }}
       fc_fork: ${{ steps.lanes.outputs.fc_fork }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           # Full history so the detector can diff github.event.before..sha.
           fetch-depth: 0
@@ -121,12 +121,12 @@ jobs:
         image: ${{ (github.event_name == 'workflow_dispatch' && fromJSON('["coordinator","host-agent","host-operator","web","orchestrator"]')) || fromJSON(needs.detect.outputs.images_matrix) }}
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.sha }}
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -135,7 +135,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@v4
 
       - name: Derive tags
         id: tags
@@ -156,7 +156,7 @@ jobs:
           { echo 'list<<EOF'; cat /tmp/tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Build + push ${{ matrix.image }}
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           file: docker/${{ matrix.image }}.Dockerfile
@@ -194,7 +194,7 @@ jobs:
       group: bake-host-binaries-${{ github.ref }}
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.sha }}
 
@@ -250,13 +250,13 @@ jobs:
           file dist/engram-host-agent dist/engram-uffd-handler
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish musl binaries to GHCR (oras)
         working-directory: dist
@@ -304,7 +304,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.sha }}
           # The forked FC source lives in the submodule; fetch it. (Only THIS job
@@ -418,13 +418,13 @@ jobs:
           install -m0755 "$BIN" "$GITHUB_WORKSPACE/dist/firecracker"
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish forked firecracker to GHCR (oras), keyed by fork SHA
         working-directory: dist
@@ -460,7 +460,7 @@ jobs:
       group: bake-cli-tools-${{ github.ref }}
       cancel-in-progress: true
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.sha }}
 
@@ -486,13 +486,13 @@ jobs:
           ../dist/engrams --version
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish cli-tools to GHCR (oras)
         working-directory: dist
@@ -553,20 +553,20 @@ jobs:
       contents: read   # read this repo's own (private) guest-kernel release asset
       packages: write  # push to GHCR
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.sha }}
 
       # GHCR login first: node-assets-fetch.sh oras-pulls the bundle-*:main
       # artifacts below, and the buildx push needs it too.
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       # ADR 0045 Phase B: pull the FORKED firecracker binary that build-firecracker
       # published, keyed by the submodule's gitlink SHA. We read that SHA straight
@@ -598,7 +598,7 @@ jobs:
           ENGRAM_FC_SRC: ${{ steps.fcfork.outputs.src }}
         run: bash docker/node-assets-fetch.sh node-assets-ctx
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       - name: Derive tags
         id: tags
@@ -617,7 +617,7 @@ jobs:
           { echo 'list<<EOF'; cat /tmp/na-tags.txt; echo 'EOF'; } >> "$GITHUB_OUTPUT"
 
       - name: Build + push node-assets
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: node-assets-ctx
           file: docker/node-assets.Dockerfile
@@ -640,7 +640,7 @@ jobs:
       contents: read
       packages: write
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           ref: ${{ inputs.ref || github.sha }}
 
@@ -725,13 +725,13 @@ jobs:
           ls -l dist/
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@v4
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - uses: oras-project/setup-oras@v1
+      - uses: oras-project/setup-oras@v2
 
       - name: Publish bundles to GHCR (oras)
         working-directory: dist
