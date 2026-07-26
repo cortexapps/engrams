@@ -105,6 +105,30 @@ shaped this ADR:
    a ready workspace and spends zero tokens on mechanical setup; and because
    the clone already happened, the review session needs no network access at
    all in v1.
+9. **The review record carries the PR's identity, not just its coordinates**
+   (added 2026-07-25). `repo` + `pr_number` + two SHAs are enough to *run* a
+   review and not enough to *read* one: every surface that reports a review has
+   to say "cortexapps/engrams #881" where a human thinks "the quinn-proto bump".
+   So the record also stores the PR's title, author, head/base branch, state,
+   and diff size. This costs nothing to collect — the title arrives on every
+   `pull_request` webhook delivery, and `fetchPrHeads` already GETs the whole PR
+   object to pull two SHAs out of it — but it must be *stored*, because the
+   reviewer workers are network-clamped to a read-only clone credential and
+   cannot fetch PR metadata themselves. Every field is nullable: reviews
+   recorded before this decision keep only their coordinates, forever, so every
+   consumer degrades to `repo #number` rather than assuming a title exists.
+10. **Reviewer-session transcripts inherit the review's visibility** (added
+   2026-07-25). Reviews are org-visible by decision; the sessions that produce
+   them were not, because a `pr_review` task is inserted with a null owner and
+   session reads are owner-scoped — so every non-admin got a 404 on the very
+   transcript that would justify a finding. A session named as a review's
+   `finder_session_id` / `verifier_session_id` is therefore readable by anyone
+   who can read that review. This is a *derived* permission, resolved in the
+   session guard from a review the caller can already see; it is deliberately
+   not a rule in the ability set, because owner-scoped-plus-sharing is the
+   OpenFGA threshold and this decision does not cross it. Nothing becomes
+   writable: prompting, shell, and delete stay owner-scoped and therefore
+   admin-only on reviewer sessions.
 
 ## Finding categories
 
@@ -675,18 +699,106 @@ and comments are attacker-controlled. Containment, enforced in code:
 
 ## Web UI
 
-`/reviews` as a sibling of `/sessions` (the papercuts page on the
-`papercuts-kaizen` branch is the reference pattern: proto → native Connect
-service → generated connectquery client → hook → page):
+`/reviews` is served by the `ReviewService` proto (List/Get/Retry) through the
+standard chain — proto → native Connect service → generated connectquery client
+→ hook → page. Reviews are org-visible: a team dashboard, not a personal list.
 
-- **List**: repo, PR, status chip, finding counts by severity, autofix state,
-  links to the PR and the phase sessions' transcripts.
-- **Detail**: the summary; every finding with category/severity/confidence,
-  state (posted / UI-only / suppressed-refuted with the verifier's reasoning /
-  superseded), resolution, and a link to its GitHub thread; the autofix
-  round history; a "Send to authoring task" button when applicable.
-- A `ReviewService` proto (List/Get) serves it; reviews are org-visible (a
-  team dashboard, not a personal list).
+The first implementation shipped the list-plus-expanding-row shape sketched in
+the original revision of this section: one table row per review, expanding to
+reveal every finding sorted by severity. Field use showed three problems, and
+this section was rewritten on 2026-07-25 to fix them.
+
+- One PR occupies several rows, because a retry and every `synchronize` push
+  mint a new review record. The table repeats the PR and buries which pass is
+  current.
+- A review had no name. `cortexapps/engrams #881` is a coordinate, not a
+  subject — hence decision 9 above.
+- The finding list flattened the two things a reader most needs separated:
+  what the finder claimed, and what the verifier did about it. `ui_only`
+  rendered as one label, "shown here only", while actually meaning four
+  different things.
+
+**A PR is the record; a pass is an entry in it.** `/reviews` becomes a section
+shell with a persistent rail, matching the `/sessions` convention. Rail rows are
+PRs — reviews grouped by repo + PR number, showing the latest pass's state — so
+opening one moves a highlight rather than swapping the layout. The section index
+is the fuller ledger: the same PR-grouped list, filterable by repo, status, and
+severity, for the scan-many job a rail cannot do.
+
+**The dossier at `/reviews/$id` is addressed by pass, not by PR.** The id stays
+a review record's id so the hidden marker in the posted summary
+(`<!-- engrams-review:<id> -->`) can deep-link the exact pass that produced a
+comment; the dossier shows the PR's context around it and lists sibling passes
+as history, with a forward link when a newer pass exists. It composes as: PR
+context header → verdict band → progress → findings → pass history → actions.
+
+**The verdict band states the kept-vs-killed ratio.** "5 of 7 kept · verifier
+refuted 2" is the number that tells a reader whether to trust the output, and
+the first implementation did not show it anywhere. It is the dossier's headline
+on a finished pass.
+
+**Progress has two weights, not two homes.** While a pass is queued, finding, or
+verifying, there are no stable findings yet and progress *is* the content: the
+activity log takes the verdict band's slot, full width, current step live. Once
+the pass is terminal, findings are the content and the log collapses to a single
+line — step count, total duration, per-phase split — expanding in place. Step
+durations continue to derive from adjacent `review_event` rows rather than a
+wall clock, and a failure surfaces the event's `detail` string ("finder phase
+deadline expired") rather than a bare status.
+
+**Findings group by outcome, and the not-posted reasons are derived, not
+stored.** Posted-to-the-PR leads; then not-posted, split by reason; then refuted,
+collapsed behind a disclosure that names the count. The split is computed from
+rows the client already has, so no column is added:
+
+| Reason | Derivation |
+| --- | --- |
+| Unverified | no verdict row for the finding |
+| No line anchor | verdict `confirmed`, `start_line` and `end_line` both null |
+| Over the comment cap | verdict `confirmed`, anchored, state not `posted` |
+| Refuted | verdict `refuted` (its own collapsed group) |
+
+The 422 batch-fallback deliberately folds into "over the cap" rather than
+earning a persisted disposition — it is rare, it demotes the whole batch at
+once, and separating it would buy a schema field for a distinction no reader
+acts on differently.
+
+**Each finding card carries two attributed voices and never blends them.** The
+finder's claim is the body — its WHAT/WHEN prose, file anchor, category, the
+evidence file list that is its receipts, and its own confidence, which is a
+different axis from severity. The verifier's ruling sits below it as a visibly
+separate annotation. `suggested_fix` renders as code, because GitHub receives it
+as a committable suggestion block, so prose there is a bug in the finder's
+output rather than something the UI should smooth over.
+
+Two states the UI must not get wrong: a failed or mid-flight pass leaves every
+finding at `candidate`, since only `postReviewResults` advances them — so
+`candidate` is a common terminal state, not a transient one. And `confirmed`,
+`suppressed_by_config`, and `superseded` are never written today; the UI does not
+invent labels for them.
+
+**The activity log is the way into the transcripts.** Decision 10 makes reviewer
+sessions readable, and the milestones that name a session — `finder_started`,
+`cloning`, `reviewing` for the finder; `verifier_started`, `verifying` for the
+verifier — are the click targets that open that session's thread in a side pane,
+with an escape hatch to the full session page. Control-plane milestones
+(`queued`, `posted`, `failed`, `halted`) have no session behind them and stay
+inert. The pane reuses the existing session-transcript component and its event
+subscription unchanged, and shows the transcript only: the reviewer VM is
+destroyed at phase end, so a shell or browser tab would be dead by
+construction. The transcript itself survives, because tearing down a session
+flips its status and destroys its sandbox without deleting its event log.
+
+Known limitation, accepted rather than fixed here: the event subscription
+replays a bounded first page and then tails live, so a finished session with a
+very long transcript is truncated at that bound. This is pre-existing behavior
+shared with the session detail page and is tracked separately; the review pane
+inherits it rather than forking a second event-reading path.
+
+The autofix surfaces this section originally listed — round history and the
+"send to authoring task" control — remain P2 work and land in the dossier's
+actions and pass history when that phase ships; the composition above leaves
+room for them rather than specifying them now.
 
 ## Failure modes
 
