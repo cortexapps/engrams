@@ -1,5 +1,4 @@
 import { useState } from "react";
-import { Link } from "@tanstack/react-router";
 import { timestampDate } from "@bufbuild/protobuf/wkt";
 import {
   Ban,
@@ -40,11 +39,14 @@ export function ReviewProgress({
   events,
   judged,
   loading,
+  onOpenRole,
 }: {
   review: Review;
   events: ReviewEvent[];
   judged: JudgedFinding[];
   loading: boolean;
+  /** Open a worker session's transcript beside the dossier. */
+  onOpenRole: (role: "finder" | "verifier") => void;
 }) {
   const live = isActive(review.status);
   // Live passes open the log; terminal ones start collapsed and remember the
@@ -60,7 +62,7 @@ export function ReviewProgress({
       {loading && events.length === 0 ? (
         <Skeleton className="h-4 w-48" />
       ) : events.length === 0 ? null : live ? (
-        <ReviewLog review={review} events={events} active />
+        <ReviewLog review={review} events={events} active onOpenRole={onOpenRole} />
       ) : (
         <>
           <button
@@ -72,7 +74,9 @@ export function ReviewProgress({
             <Chevron className="size-3.5" aria-hidden />
             <span className="font-mono tabular-nums">{summarise(events)}</span>
           </button>
-          {expanded && <ReviewLog review={review} events={events} active={false} />}
+          {expanded && (
+            <ReviewLog review={review} events={events} active={false} onOpenRole={onOpenRole} />
+          )}
         </>
       )}
     </section>
@@ -167,17 +171,21 @@ function ReviewLog({
   review,
   events,
   active,
+  onOpenRole,
 }: {
   review: Review;
   events: ReviewEvent[];
   active: boolean;
+  onOpenRole: (role: "finder" | "verifier") => void;
 }) {
   // The log is the way into the transcripts: a milestone that names a worker
   // session is the click target for that session's thread. The ids are stamped
   // at kickoff and outlive the session itself, so a finished pass still links.
-  const sessionFor = (role: "finder" | "verifier" | undefined): string | undefined => {
-    if (role === "finder") return review.finderSessionId;
-    if (role === "verifier") return review.verifierSessionId;
+  const openableRole = (
+    role: "finder" | "verifier" | undefined,
+  ): "finder" | "verifier" | undefined => {
+    if (role === "finder" && review.finderSessionId) return "finder";
+    if (role === "verifier" && review.verifierSessionId) return "verifier";
     return undefined;
   };
 
@@ -199,15 +207,16 @@ function ReviewLog({
           const span =
             at && next ? shortDuration(timestampDate(next).getTime() - at.getTime()) : undefined;
 
-          const sessionId = sessionFor(meta.role);
+          const role = openableRole(meta.role);
 
           return (
             <li key={event.id}>
               <StepRow
-                sessionId={sessionId}
+                role={role}
+                onOpenRole={onOpenRole}
                 className={cn(
-                  "flex items-center gap-2 rounded-md px-2 py-1 text-sm",
-                  sessionId &&
+                  "flex w-full items-center gap-2 rounded-md px-2 py-1 text-left text-sm",
+                  role &&
                     "-mx-2 transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:outline-none",
                 )}
               >
@@ -234,9 +243,7 @@ function ReviewLog({
                   ) : at ? (
                     at.toLocaleTimeString()
                   ) : null}
-                  {sessionId && (
-                    <Terminal className="size-3 text-muted-foreground/70" aria-hidden />
-                  )}
+                  {role && <Terminal className="size-3 text-muted-foreground/70" aria-hidden />}
                 </span>
               </StepRow>
             </li>
@@ -248,26 +255,28 @@ function ReviewLog({
 }
 
 /**
- * A milestone that names a worker session opens that session; one that doesn't
- * renders as plain text. It links to the full session page today — the side pane
- * is a sibling change, and this is the same destination one hop further out, so
- * the affordance is real rather than promised.
+ * A milestone that names a worker session opens that session's transcript beside
+ * the dossier; one that doesn't renders as plain text. This is what makes the
+ * activity log navigation rather than a readout — the coarse status can't tell
+ * you what the finder was doing, and the transcript can.
  */
 function StepRow({
-  sessionId,
+  role,
+  onOpenRole,
   className,
   children,
 }: {
-  sessionId: string | undefined;
+  role: "finder" | "verifier" | undefined;
+  onOpenRole: (role: "finder" | "verifier") => void;
   className?: string;
   children: React.ReactNode;
 }) {
-  if (!sessionId) {
+  if (!role) {
     return <div className={className}>{children}</div>;
   }
   return (
-    <Link to="/sessions/$id" params={{ id: sessionId }} className={className}>
+    <button type="button" onClick={() => onOpenRole(role)} className={className}>
       {children}
-    </Link>
+    </button>
   );
 }

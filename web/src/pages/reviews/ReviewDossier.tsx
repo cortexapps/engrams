@@ -1,5 +1,6 @@
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { Link, useParams } from "@tanstack/react-router";
+import type { ImperativePanelHandle } from "react-resizable-panels";
 import {
   ArrowLeft,
   ChevronDown,
@@ -8,21 +9,32 @@ import {
   GitPullRequestArrow,
   Loader2,
   RotateCcw,
+  ScanSearch,
+  ShieldCheck,
 } from "lucide-react";
 
 import type { Review } from "../../gen/engram/app/v1/review_pb";
 import { useRetryReview, useReview, useReviews } from "../../hooks/useReviews";
 import { useNow } from "../../hooks/useNow";
+import { useIsMobile } from "../../hooks/use-mobile";
 import { errorMessage } from "../../lib/errors";
 import { relativeTime } from "../sessions/session-format";
 import { Text } from "@/components/ui/text";
 import { Button } from "@/components/ui/button";
 import { Skeleton } from "@/components/ui/skeleton";
+import { Sheet, SheetContent, SheetTitle } from "@/components/ui/sheet";
+import { ResizableHandle, ResizablePanel, ResizablePanelGroup } from "@/components/ui/resizable";
 import { cn } from "@/lib/utils";
 import { ReviewGlyph } from "./ReviewGlyph";
 import { ReviewProgress } from "./ReviewProgress";
 import { FindingsLedger } from "./FindingsLedger";
-import { groupByPr, groupOf, supersededBy } from "./review-groups";
+import {
+  ReviewTranscriptPane,
+  ROLE_LABEL,
+  roleSession,
+  type WorkerRole,
+} from "./ReviewTranscriptPane";
+import { groupByPr, groupOf, supersededBy, type PrGroup } from "./review-groups";
 import { judgeFindings } from "./review-findings";
 import {
   diffSummary,
@@ -85,7 +97,44 @@ export function ReviewDossier() {
   const newer = group ? supersededBy(group, review.id) : undefined;
 
   return (
-    <div className="flex-1 overflow-auto">
+    <DossierPanes review={review} newer={newer} group={group} detail={detail} judged={judged} />
+  );
+}
+
+/**
+ * The dossier beside an optional worker transcript. Geometry copied from the
+ * session detail page, which already proves it: a collapsible resizable pane on
+ * desktop with an edge rail to reopen it, and a full-width sheet on a phone.
+ */
+function DossierPanes({
+  review,
+  newer,
+  group,
+  detail,
+  judged,
+}: {
+  review: Review;
+  newer: Review | undefined;
+  group: PrGroup | undefined;
+  detail: ReturnType<typeof useReview>;
+  judged: ReturnType<typeof judgeFindings>;
+}) {
+  const isMobile = useIsMobile();
+  const [role, setRole] = useState<WorkerRole | null>(null);
+  const paneRef = useRef<ImperativePanelHandle>(null);
+
+  // One entry point for both geometries: pick the role, then reveal the pane.
+  const openRole = (next: WorkerRole) => {
+    setRole(next);
+    paneRef.current?.expand();
+  };
+  const closePane = () => {
+    setRole(null);
+    paneRef.current?.collapse();
+  };
+
+  const body = (
+    <div className="min-h-0 flex-1 overflow-auto">
       <div className="mx-auto flex max-w-4xl flex-col gap-6 p-4 md:p-6">
         <BackToLedger />
         <PrHeader review={review} />
@@ -95,12 +144,90 @@ export function ReviewDossier() {
           events={detail.data?.events ?? []}
           judged={judged}
           loading={detail.isPending}
+          onOpenRole={openRole}
         />
         <FindingsLedger review={review} judged={judged} loading={detail.isPending} />
         {group && group.passes.length > 1 && (
           <PassHistory passes={group.passes} currentId={review.id} />
         )}
       </div>
+    </div>
+  );
+
+  const openable = (["finder", "verifier"] as const).filter((r) => Boolean(roleSession(review, r)));
+
+  if (isMobile) {
+    return (
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {body}
+        <Sheet open={role !== null} onOpenChange={(open) => !open && setRole(null)}>
+          <SheetContent side="right" showCloseButton={false} className="w-full gap-0 p-0">
+            <SheetTitle className="sr-only">Worker session transcript</SheetTitle>
+            {role && (
+              <ReviewTranscriptPane
+                review={review}
+                role={role}
+                onChangeRole={setRole}
+                onClose={() => setRole(null)}
+              />
+            )}
+          </SheetContent>
+        </Sheet>
+      </div>
+    );
+  }
+
+  return (
+    <div className="flex min-h-0 flex-1 overflow-hidden">
+      <ResizablePanelGroup direction="horizontal" className="min-h-0 flex-1">
+        <ResizablePanel id="dossier" order={1} minSize={35} defaultSize={100} className="min-w-0">
+          {body}
+        </ResizablePanel>
+        <ResizableHandle className={role ? "" : "hidden"} />
+        <ResizablePanel
+          id="transcript"
+          order={2}
+          ref={paneRef}
+          collapsible
+          collapsedSize={0}
+          minSize={28}
+          defaultSize={0}
+          onCollapse={() => setRole(null)}
+          className="min-w-0 overflow-hidden"
+        >
+          {role && (
+            <ReviewTranscriptPane
+              review={review}
+              role={role}
+              onChangeRole={setRole}
+              onClose={closePane}
+            />
+          )}
+        </ResizablePanel>
+      </ResizablePanelGroup>
+
+      {/* Collapsed edge rail — the reopen affordance, one glyph per worker whose
+          session actually ran. Hidden entirely when no phase ever started. */}
+      {!role && openable.length > 0 && (
+        <div
+          className="flex w-9 shrink-0 flex-col items-center gap-1 border-l bg-background py-2"
+          aria-label="Open a worker transcript"
+        >
+          {openable.map((r) => (
+            <Button
+              key={r}
+              variant="ghost"
+              size="icon"
+              className="size-7 text-muted-foreground hover:text-foreground"
+              title={`Open the ${ROLE_LABEL[r].toLowerCase()} transcript`}
+              aria-label={`Open the ${ROLE_LABEL[r].toLowerCase()} transcript`}
+              onClick={() => openRole(r)}
+            >
+              {r === "finder" ? <ScanSearch /> : <ShieldCheck />}
+            </Button>
+          ))}
+        </div>
+      )}
     </div>
   );
 }

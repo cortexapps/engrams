@@ -166,6 +166,14 @@ vi.mock("../../hooks/useReviews", () => ({
   }),
 }));
 vi.mock("../../hooks/useNow", () => ({ useNow: () => 0 }));
+// The transcript pane streams over SSE, which jsdom has no EventSource for; the
+// pane's job here is to mount the right session, not to replay a transcript.
+vi.mock("../../hooks/useSessionEvents", () => ({
+  useSessionEvents: () => ({ events: [], streamingText: "" }),
+}));
+vi.mock("../../hooks/useSessions", () => ({
+  useSession: () => ({ data: { id: "finder-sess-1", status: "completed" } }),
+}));
 
 beforeEach(() => {
   view.id = "review-1";
@@ -285,15 +293,50 @@ describe("Review dossier", () => {
     expect(screen.queryByRole("button", { name: /4 steps/i })).toBeNull();
   });
 
-  it("links the milestones that name a worker session to that session", async () => {
+  // The activity log is the way INTO the transcripts: a milestone that names a
+  // worker session opens that session's thread beside the dossier.
+  it("opens a worker transcript from the milestone that names it", async () => {
     renderWithProviders(<ReviewDossier />);
     const user = userEvent.setup();
     await user.click(await screen.findByRole("button", { name: /4 steps/i }));
 
-    const cloning = screen.getByRole("link", { name: /Cloning repository/i });
-    expect(cloning.getAttribute("href")).toContain("/sessions/finder-sess-1");
-    const verifying = screen.getByRole("link", { name: /Verifying findings/i });
-    expect(verifying.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+    // Nothing open yet — the pane is collapsed.
+    expect(screen.queryByRole("link", { name: /Full session/i })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /Verifying findings/i }));
+
+    // The pane mounts on the verifier and offers the way out to the full page.
+    const full = await screen.findByRole("link", { name: /Full session/i });
+    expect(full.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+    expect(screen.getByRole("button", { name: "Finder" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Verifier" })).toBeTruthy();
+  });
+
+  it("switches the pane between the finder and the verifier", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+
+    // The collapsed edge rail is the other way in.
+    await user.click(await screen.findByRole("button", { name: /Open the finder transcript/i }));
+    expect(
+      (await screen.findByRole("link", { name: /Full session/i })).getAttribute("href"),
+    ).toContain("/sessions/finder-sess-1");
+
+    await user.click(screen.getByRole("button", { name: "Verifier" }));
+    expect(screen.getByRole("link", { name: /Full session/i }).getAttribute("href")).toContain(
+      "/sessions/verifier-sess-1",
+    );
+  });
+
+  it("closes the transcript pane", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /Open the finder transcript/i }));
+    await screen.findByRole("link", { name: /Full session/i });
+
+    await user.click(screen.getByRole("button", { name: /Close transcript/i }));
+    expect(screen.queryByRole("link", { name: /Full session/i })).toBeNull();
   });
 
   it("offers a re-run on a finished pass and dispatches a fresh one", async () => {
