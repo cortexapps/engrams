@@ -46,10 +46,33 @@ export interface UpsertStatusCommentInput {
   body: string;
 }
 
+/**
+ * ADR 0100 decision 9 — the PR's descriptive identity, captured alongside the
+ * heads from the same GET. Every field is independently nullable and nothing
+ * here is load-bearing: a review must never fail because GitHub omitted or
+ * renamed a descriptive field, so extraction degrades field by field.
+ */
+export interface PrContext {
+  title: string | null;
+  /** Login of the PR author. */
+  author: string | null;
+  headBranch: string | null;
+  baseBranch: string | null;
+  /** open | draft | closed | merged, as of this capture. Never refreshed. */
+  state: string | null;
+  additions: number | null;
+  deletions: number | null;
+  changedFiles: number | null;
+}
+
 export interface GithubReviewPoster {
-  fetchPrHeads(repo: string, prNumber: number): Promise<{
+  /** The heads a pass pins itself to, plus the PR context recorded on the
+   *  review record. The SHAs are load-bearing and throw when absent; `pr` is
+   *  best-effort. */
+  fetchPrContext(repo: string, prNumber: number): Promise<{
     headSha: string;
     baseSha: string;
+    pr: PrContext;
   }>;
   alreadyPosted(repo: string, prNumber: number, reviewId: string): Promise<boolean>;
   postReview(input: PostReviewInput): Promise<PostReviewResult>;
@@ -120,6 +143,49 @@ const CATEGORY_LABELS: Readonly<Record<string, string>> = {
 };
 const REVIEWS_PER_PAGE = 100;
 const MAX_REVIEW_PAGES = 50;
+
+/**
+ * Pull the descriptive PR fields out of the pull-request response the head
+ * resolution already fetches (ADR 0100 decision 9). Deliberately total: every
+ * field falls back to null on its own, so an unexpected payload costs a title,
+ * never a review.
+ */
+function readPrContext(pr: Record<string, unknown>): PrContext {
+  const head = isObject(pr["head"]) ? pr["head"] : null;
+  const base = isObject(pr["base"]) ? pr["base"] : null;
+  const user = isObject(pr["user"]) ? pr["user"] : null;
+  return {
+    title: nullableString(pr["title"]),
+    author: user ? nullableString(user["login"]) : null,
+    headBranch: head ? nullableString(head["ref"]) : null,
+    baseBranch: base ? nullableString(base["ref"]) : null,
+    state: readPrState(pr),
+    additions: nullableCount(pr["additions"]),
+    deletions: nullableCount(pr["deletions"]),
+    changedFiles: nullableCount(pr["changed_files"]),
+  };
+}
+
+/**
+ * GitHub splits a PR's disposition across three fields — `state` is only
+ * open/closed, with `merged` and `draft` as separate booleans. Readers think in
+ * one axis, so fold them: merged outranks closed (every merged PR is closed),
+ * and draft only means anything while the PR is open.
+ */
+function readPrState(pr: Record<string, unknown>): string | null {
+  if (pr["merged"] === true) return "merged";
+  const state = nullableString(pr["state"]);
+  if (state === "open") return pr["draft"] === true ? "draft" : "open";
+  return state;
+}
+
+function nullableString(value: unknown): string | null {
+  return typeof value === "string" && value !== "" ? value : null;
+}
+
+function nullableCount(value: unknown): number | null {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
+}
 
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
@@ -263,7 +329,7 @@ export function makeGithubReviewPoster(
   const runOp = deps.runIntegrationOp ?? defaultRunIntegrationOp;
 
   return {
-    async fetchPrHeads(repo, prNumber) {
+    async fetchPrContext(repo, prNumber) {
       const response = await runOp("github", {
         method: "GET",
         path: `/repos/${repo}/pulls/${prNumber}`,
@@ -281,7 +347,7 @@ export function makeGithubReviewPoster(
       if (typeof headSha !== "string" || typeof baseSha !== "string") {
         throw new Error("get pull request response is missing head/base SHAs");
       }
-      return { headSha, baseSha };
+      return { headSha, baseSha, pr: readPrContext(value) };
     },
 
     async alreadyPosted(repo, prNumber, reviewId) {

@@ -48,6 +48,7 @@ import {
   buildStatusComment,
   makeGithubReviewPoster,
   type GithubReviewPoster,
+  type PrContext,
   type ReviewStatusPhase,
 } from "../reviews/github-review.ts";
 import {
@@ -70,12 +71,21 @@ export interface EnsureReviewRecordInput {
   headSha: string;
   baseSha: string;
   trigger: string;
+  /** ADR 0100 decision 9. Absent when head resolution failed before it could be
+   *  captured — the record is still created, just unnamed. */
+  pr?: PrContext;
 }
 
 export interface ReviewControlPlane {
+  /** The name stays `resolvePrHeads` even though it now also returns the PR
+   *  context: it appears as a `step(...)` name inside `prReviewWorkflowImpl`,
+   *  and DBOS derives the application version from that function's source, so
+   *  renaming it would rotate the version and strand in-flight reviews for no
+   *  benefit. */
   resolvePrHeads(repo: string, prNumber: number): Promise<{
     headSha: string;
     baseSha: string;
+    pr: PrContext;
   }>;
   ensureReviewRecord(
     input: EnsureReviewRecordInput,
@@ -517,7 +527,7 @@ export function makeReviewControlPlane(
 
   return {
     async resolvePrHeads(repo, prNumber) {
-      return githubPoster.fetchPrHeads(repo, prNumber);
+      return githubPoster.fetchPrContext(repo, prNumber);
     },
 
     async ensureReviewRecord(input) {
@@ -531,10 +541,25 @@ export function makeReviewControlPlane(
         repo: input.repo,
         prNumber: input.prNumber,
       });
+      // Flattened field by field rather than spread: `input` carries a nested
+      // `pr` object, and this value goes straight into a drizzle insert where an
+      // unknown key is a runtime error rather than a type error.
       const reviewId = await reviews().createReview({
-        ...input,
+        repo: input.repo,
+        prNumber: input.prNumber,
+        headSha: input.headSha,
+        baseSha: input.baseSha,
+        trigger: input.trigger,
         taskId,
         status: "queued",
+        prTitle: input.pr?.title ?? null,
+        prAuthor: input.pr?.author ?? null,
+        headBranch: input.pr?.headBranch ?? null,
+        baseBranch: input.pr?.baseBranch ?? null,
+        prState: input.pr?.state ?? null,
+        additions: input.pr?.additions ?? null,
+        deletions: input.pr?.deletions ?? null,
+        changedFiles: input.pr?.changedFiles ?? null,
       });
       await recordEvent(reviewId, "queued");
       await ackStatus(reviewId, "acknowledged");
@@ -795,7 +820,7 @@ export function makeReviewControlPlane(
       const { repo, prNumber } = detail.review;
       let { headSha, baseSha } = detail.review;
       if (headSha === "" || baseSha === "") {
-        const live = await githubPoster.fetchPrHeads(repo, prNumber);
+        const live = await githubPoster.fetchPrContext(repo, prNumber);
         if (headSha === "") headSha = live.headSha;
         if (baseSha === "") baseSha = live.baseSha;
         await reviews().finalizeReview(reviewId, {

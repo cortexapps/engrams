@@ -26,6 +26,14 @@ function reviewInput(
     headSha: "head-sha",
     baseSha: "base-sha",
     trigger: "dispatch",
+    prTitle: null,
+    prAuthor: null,
+    headBranch: null,
+    baseBranch: null,
+    prState: null,
+    additions: null,
+    deletions: null,
+    changedFiles: null,
     ...overrides,
   };
 }

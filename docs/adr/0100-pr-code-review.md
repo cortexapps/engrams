@@ -110,13 +110,25 @@ shaped this ADR:
    review and not enough to *read* one: every surface that reports a review has
    to say "cortexapps/engrams #881" where a human thinks "the quinn-proto bump".
    So the record also stores the PR's title, author, head/base branch, state,
-   and diff size. This costs nothing to collect — the title arrives on every
-   `pull_request` webhook delivery, and `fetchPrHeads` already GETs the whole PR
-   object to pull two SHAs out of it — but it must be *stored*, because the
+   and diff size. It must be *stored* rather than read on demand, because the
    reviewer workers are network-clamped to a read-only clone credential and
    cannot fetch PR metadata themselves. Every field is nullable: reviews
    recorded before this decision keep only their coordinates, forever, so every
    consumer degrades to `repo #number` rather than assuming a title exists.
+
+   **Capture happens at head resolution, and only there.** Every trigger already
+   resolves the PR heads unconditionally — the trigger contract carries no
+   `baseSha`, so `opened`, `synchronize`, `command`, `dispatch`, and `retry` all
+   pass through the same `GET /repos/{repo}/pulls/{n}`, whose response already
+   contains every field above and today discards all but two SHAs. That makes it
+   the one choke point covering all five triggers with one code path. The
+   `pull_request` webhook payload also carries the title, and an earlier revision
+   of this decision proposed reading it there as well; that was dropped as
+   redundant, and because widening the trigger message would have rotated the
+   DBOS application version for no gain. For the same reason the control-plane
+   method keeps the now-slightly-narrow name `resolvePrHeads` — it appears as a
+   `step(...)` name inside the version-hashed workflow body — while the GitHub
+   client method it delegates to was renamed `fetchPrContext`.
 10. **Reviewer-session transcripts inherit the review's visibility** (added
    2026-07-25). Reviews are org-visible by decision; the sessions that produce
    them were not, because a `pr_review` task is inserted with a null owner and

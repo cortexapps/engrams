@@ -33,7 +33,20 @@ function recordingControlPlane(
     return value;
   };
   return {
-    resolvePrHeads: async () => rec("resolvePrHeads", { headSha: "h", baseSha: "b" }),
+    resolvePrHeads: async () => rec("resolvePrHeads", {
+      headSha: "h",
+      baseSha: "b",
+      pr: {
+        title: null,
+        author: null,
+        headBranch: null,
+        baseBranch: null,
+        state: null,
+        additions: null,
+        deletions: null,
+        changedFiles: null,
+      },
+    }),
     ensureReviewRecord: async () => rec("ensureReviewRecord", { reviewId: "rev-1", taskId: "task-1" }),
     createFinderSession: async () => rec("createFinderSession", { sessionId: "finder-1" }),
     bootstrapFinderSession: async () => { rec("bootstrapFinderSession", undefined); },

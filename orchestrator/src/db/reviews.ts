@@ -25,6 +25,15 @@ export interface CreateReviewInput {
   baseSha: string;
   trigger: string;
   status?: string;
+  // ADR 0100 decision 9 — the PR as of this pass. Snapshot, never refreshed.
+  prTitle: string | null;
+  prAuthor: string | null;
+  headBranch: string | null;
+  baseBranch: string | null;
+  prState: string | null;
+  additions: number | null;
+  deletions: number | null;
+  changedFiles: number | null;
 }
 
 export interface ReviewRow {
@@ -41,6 +50,16 @@ export interface ReviewRow {
   finderSessionId: string | null;
   verifierSessionId: string | null;
   summaryMd: string | null;
+  // ADR 0100 decision 9. Null on every review recorded before it landed, and on
+  // any review whose head resolution failed — readers degrade to `repo #n`.
+  prTitle: string | null;
+  prAuthor: string | null;
+  headBranch: string | null;
+  baseBranch: string | null;
+  prState: string | null;
+  additions: number | null;
+  deletions: number | null;
+  changedFiles: number | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -167,6 +186,14 @@ function toReviewRow(row: typeof reviewTable.$inferSelect): ReviewRow {
     finderSessionId: row.finderSessionId ?? null,
     verifierSessionId: row.verifierSessionId ?? null,
     summaryMd: row.summaryMd ?? null,
+    prTitle: row.prTitle ?? null,
+    prAuthor: row.prAuthor ?? null,
+    headBranch: row.headBranch ?? null,
+    baseBranch: row.baseBranch ?? null,
+    prState: row.prState ?? null,
+    additions: row.additions ?? null,
+    deletions: row.deletions ?? null,
+    changedFiles: row.changedFiles ?? null,
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };

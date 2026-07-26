@@ -45,6 +45,14 @@ const review: ReviewRow = {
   finderSessionId: null,
   verifierSessionId: null,
   summaryMd: null,
+  prTitle: null,
+  prAuthor: null,
+  headBranch: null,
+  baseBranch: null,
+  prState: null,
+  additions: null,
+  deletions: null,
+  changedFiles: null,
   createdAt: new Date("2026-07-22T00:00:00Z"),
   updatedAt: new Date("2026-07-22T00:00:00Z"),
 };
@@ -239,7 +247,20 @@ function bootstrapControlPlane(
 }
 
 const githubPoster: GithubReviewPoster = {
-  fetchPrHeads: async () => ({ headSha: HEAD_SHA, baseSha: BASE_SHA }),
+  fetchPrContext: async () => ({
+    headSha: HEAD_SHA,
+    baseSha: BASE_SHA,
+    pr: {
+      title: null,
+      author: null,
+      headBranch: null,
+      baseBranch: null,
+      state: null,
+      additions: null,
+      deletions: null,
+      changedFiles: null,
+    },
+  }),
   alreadyPosted: async () => false,
   upsertStatusComment: async () => ({ commentId: "status-comment" }),
   postReview: async () => ({

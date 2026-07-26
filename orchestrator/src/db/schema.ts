@@ -203,6 +203,23 @@ export const review = pgTable(
     finderSessionId: text("finder_session_id"),
     verifierSessionId: text("verifier_session_id"),
     summaryMd: text("summary_md"),
+    // ADR 0100 decision 9 — the PR's identity, not just its coordinates, so a
+    // review can be named ("the quinn-proto bump") rather than only located
+    // ("engrams #881"). Captured once from the same GET the head resolution
+    // already makes, and never refreshed: this is the PR AS OF the moment this
+    // pass started, so a PR that merges afterwards still reads `open` here.
+    // Every column is nullable — reviews recorded before this landed keep only
+    // their coordinates forever, so readers must degrade rather than assume.
+    prTitle: text("pr_title"),
+    prAuthor: text("pr_author"),
+    headBranch: text("head_branch"),
+    baseBranch: text("base_branch"),
+    // open | draft | closed | merged, folded from GitHub's state + draft +
+    // merged triple into the one axis a reader actually thinks in.
+    prState: text("pr_state"),
+    additions: integer("additions"),
+    deletions: integer("deletions"),
+    changedFiles: integer("changed_files"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },

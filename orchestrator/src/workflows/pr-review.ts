@@ -21,6 +21,7 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
 import { log as rootLog } from "../log.ts";
+import type { PrContext } from "../reviews/github-review.ts";
 import type { ReviewControlPlane } from "./review-control-plane.ts";
 import { REVIEW_TOPIC, type ReviewInbox } from "./review-inbox.ts";
 
@@ -74,6 +75,10 @@ export async function prReviewWorkflowImpl(
 
   let headSha = first.headSha ?? "";
   let baseSha = "";
+  // ADR 0100 decision 9: the same resolution that pins the heads also carries
+  // the PR's descriptive context onto the review record. Hoisted out of the try
+  // so the record below can name itself; left undefined when resolution failed.
+  let prContext: PrContext | undefined;
   try {
     // The trigger contract does not carry baseSha, so every trigger resolves
     // the PR heads. Preserve an event-provided head SHA and only fill missing
@@ -84,6 +89,7 @@ export async function prReviewWorkflowImpl(
     );
     if (headSha === "") headSha = resolved.headSha;
     baseSha = resolved.baseSha;
+    prContext = resolved.pr;
   } catch (err) {
     log.error(
       { repo: first.repo, prNumber: first.prNumber, err },
@@ -115,6 +121,7 @@ export async function prReviewWorkflowImpl(
       headSha,
       baseSha,
       trigger: first.trigger,
+      ...(prContext ? { pr: prContext } : {}),
     }),
     "ensureReviewRecord",
   );

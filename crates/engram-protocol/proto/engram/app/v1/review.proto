@@ -87,6 +87,23 @@ message Review {
   // when its phase ends, so the id survives as the record of which session ran.
   optional string finder_session_id = 14;
   optional string verifier_session_id = 15;
+  // ADR 0100 decision 9 — the PR as of the moment this pass started, captured
+  // from the same read that pins the heads and never refreshed. A PR merged
+  // after the pass still reports the state it had then. Unset on every review
+  // recorded before this landed (there is no backfill) and on any review whose
+  // head resolution failed, so a reader must fall back to "repo #number"
+  // rather than assume a title exists.
+  optional string pr_title = 16;
+  // Login of the PR author.
+  optional string pr_author = 17;
+  optional string head_branch = 18;
+  optional string base_branch = 19;
+  // open | draft | closed | merged, folded from GitHub's state/draft/merged
+  // triple into the one axis a reader thinks in.
+  optional string pr_state = 20;
+  optional int32 additions = 21;
+  optional int32 deletions = 22;
+  optional int32 changed_files = 23;
 }
 
 // Per-severity finding counts for the list page.

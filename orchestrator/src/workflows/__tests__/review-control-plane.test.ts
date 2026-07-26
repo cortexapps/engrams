@@ -11,13 +11,30 @@ import type {
   ReviewVerdictRow,
 } from "../../db/reviews.ts";
 import type { ReviewSessionStore } from "../../db/review-sessions.ts";
-import type { GithubReviewPoster, PostReviewInput } from "../../reviews/github-review.ts";
+import type {
+  GithubReviewPoster,
+  PostReviewInput,
+  PrContext,
+} from "../../reviews/github-review.ts";
 import type { CreateSessionForExistingTaskParams } from "../../rpc/task-create.ts";
 import {
   makeReviewControlPlane,
   ReviewSetupError,
   type ReviewSessionsClient,
 } from "../review-control-plane.ts";
+
+/** A PR whose descriptive context is unavailable — what every review recorded
+ *  before ADR 0100 decision 9 looks like, and what a junk payload degrades to. */
+const NO_PR_CONTEXT: PrContext = {
+  title: null,
+  author: null,
+  headBranch: null,
+  baseBranch: null,
+  state: null,
+  additions: null,
+  deletions: null,
+  changedFiles: null,
+};
 
 const active: ReviewRow = {
   id: "review-1",
@@ -33,6 +50,14 @@ const active: ReviewRow = {
   finderSessionId: null,
   verifierSessionId: null,
   summaryMd: null,
+  prTitle: null,
+  prAuthor: null,
+  headBranch: null,
+  baseBranch: null,
+  prState: null,
+  additions: null,
+  deletions: null,
+  changedFiles: null,
   createdAt: new Date("2026-07-17T00:00:00Z"),
   updatedAt: new Date("2026-07-17T00:00:00Z"),
 };
@@ -289,9 +314,79 @@ describe("ReviewControlPlane", () => {
       trigger: "dispatch",
       taskId: "task-new",
       status: "queued",
+      // No `pr` on the input → an unnamed review, which is a real state (head
+      // resolution failed, or the record predates ADR 0100 decision 9). The
+      // columns are written explicitly null rather than left undefined.
+      prTitle: null,
+      prAuthor: null,
+      headBranch: null,
+      baseBranch: null,
+      prState: null,
+      additions: null,
+      deletions: null,
+      changedFiles: null,
     }]);
     await cp.haltReview("review-new");
     expect(statuses).toEqual([["review-new", "halted"]]);
+  });
+
+  // ADR 0100 decision 9: the nested PrContext is flattened onto the row here,
+  // because the value goes straight into a drizzle insert where a stray nested
+  // key would be a runtime error rather than a type error.
+  test("flattens the PR context onto the created review row", async () => {
+    const creates: unknown[] = [];
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewStoreStub,
+        async createReview(input) {
+          creates.push(input);
+          return "review-new";
+        },
+      },
+      insertTask: async () => "task-new",
+      githubPoster: {
+        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
+        alreadyPosted: async () => false,
+        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
+        upsertStatusComment: async () => ({ commentId: "gh-comment-1" }),
+      },
+    });
+
+    await cp.ensureReviewRecord({
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: "new-head",
+      baseSha: "new-base",
+      trigger: "opened",
+      pr: {
+        title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+        author: "dependabot[bot]",
+        headBranch: "dependabot/cargo/quinn-proto-0.11.16",
+        baseBranch: "main",
+        state: "open",
+        additions: 12,
+        deletions: 4,
+        changedFiles: 2,
+      },
+    });
+
+    expect(creates).toEqual([{
+      repo: active.repo,
+      prNumber: active.prNumber,
+      headSha: "new-head",
+      baseSha: "new-base",
+      trigger: "opened",
+      taskId: "task-new",
+      status: "queued",
+      prTitle: "Bump quinn-proto from 0.11.14 to 0.11.16",
+      prAuthor: "dependabot[bot]",
+      headBranch: "dependabot/cargo/quinn-proto-0.11.16",
+      baseBranch: "main",
+      prState: "open",
+      additions: 12,
+      deletions: 4,
+      changedFiles: 2,
+    }]);
   });
 
   test("acks the sticky status comment on pickup and persists its id", async () => {
@@ -310,7 +405,7 @@ describe("ReviewControlPlane", () => {
       },
       insertTask: async () => "task-new",
       githubPoster: {
-        fetchPrHeads: async () => ({ headSha: "h", baseSha: "b" }),
+        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
         alreadyPosted: async () => false,
         postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
         async upsertStatusComment(input) {
@@ -346,7 +441,7 @@ describe("ReviewControlPlane", () => {
       },
       insertTask: async () => "task-new",
       githubPoster: {
-        fetchPrHeads: async () => ({ headSha: "h", baseSha: "b" }),
+        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
         alreadyPosted: async () => false,
         postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
         upsertStatusComment: async () => { throw new Error("GitHub down"); },
@@ -866,7 +961,11 @@ describe("ReviewControlPlane", () => {
     }> = [];
     const posted: PostReviewInput[] = [];
     const githubPoster: GithubReviewPoster = {
-      fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
+      fetchPrContext: async () => ({
+        headSha: "live-head",
+        baseSha: "live-base",
+        pr: NO_PR_CONTEXT,
+      }),
       alreadyPosted: async () => false,
       upsertStatusComment: async () => ({ commentId: "status-1" }),
       async postReview(input) {
@@ -970,7 +1069,11 @@ describe("ReviewControlPlane", () => {
         },
       },
       githubPoster: {
-        fetchPrHeads: async () => ({ headSha: "live-head", baseSha: "live-base" }),
+        fetchPrContext: async () => ({
+          headSha: "live-head",
+          baseSha: "live-base",
+          pr: NO_PR_CONTEXT,
+        }),
         alreadyPosted: async () => true,
         upsertStatusComment: async () => ({ commentId: "status-1" }),
         postReview: async () => {
@@ -1014,9 +1117,9 @@ describe("ReviewControlPlane", () => {
         finalizeReview: async () => {},
       },
       githubPoster: {
-        fetchPrHeads: async () => {
+        fetchPrContext: async () => {
           fetchCalls++;
-          return { headSha: "live-head", baseSha: "live-base" };
+          return { headSha: "live-head", baseSha: "live-base", pr: NO_PR_CONTEXT };
         },
         alreadyPosted: async () => false,
         upsertStatusComment: async () => ({ commentId: "status-1" }),

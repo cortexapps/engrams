@@ -122,6 +122,17 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     ...(row.finderSessionId != null ? { finderSessionId: row.finderSessionId } : {}),
     ...(row.verifierSessionId != null ? { verifierSessionId: row.verifierSessionId } : {}),
     ...(row.summaryMd != null ? { summaryMd: row.summaryMd } : {}),
+    // ADR 0100 decision 9. Each field is emitted only when present, so a
+    // pre-decision review arrives with none of them set and the UI falls back
+    // to the PR's coordinates rather than rendering empty strings.
+    ...(row.prTitle != null ? { prTitle: row.prTitle } : {}),
+    ...(row.prAuthor != null ? { prAuthor: row.prAuthor } : {}),
+    ...(row.headBranch != null ? { headBranch: row.headBranch } : {}),
+    ...(row.baseBranch != null ? { baseBranch: row.baseBranch } : {}),
+    ...(row.prState != null ? { prState: row.prState } : {}),
+    ...(row.additions != null ? { additions: row.additions } : {}),
+    ...(row.deletions != null ? { deletions: row.deletions } : {}),
+    ...(row.changedFiles != null ? { changedFiles: row.changedFiles } : {}),
     createdAt: timestampFromDate(row.createdAt),
     updatedAt: timestampFromDate(row.updatedAt),
     findingCounts: counts,

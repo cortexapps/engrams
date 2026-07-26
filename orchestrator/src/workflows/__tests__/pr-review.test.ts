@@ -12,11 +12,27 @@ const trigger: ReviewInbox = {
   headSha: "head-sha",
 };
 
+/** What head resolution hands back for the PR under review (ADR 0100 d9). */
+const RESOLVED_PR = {
+  title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+  author: "dependabot[bot]",
+  headBranch: "dependabot/cargo/quinn-proto-0.11.16",
+  baseBranch: "main",
+  state: "open",
+  additions: 12,
+  deletions: 4,
+  changedFiles: 2,
+};
+
 function fakeControlPlane(
   overrides: Partial<ReviewControlPlane> = {},
 ): ReviewControlPlane {
   return {
-    resolvePrHeads: async () => ({ headSha: "resolved-head", baseSha: "resolved-base" }),
+    resolvePrHeads: async () => ({
+      headSha: "resolved-head",
+      baseSha: "resolved-base",
+      pr: RESOLVED_PR,
+    }),
     ensureReviewRecord: async () => ({ reviewId: "review-1", taskId: "task-1" }),
     createFinderSession: async () => ({ sessionId: "finder-session" }),
     bootstrapFinderSession: async () => {},
@@ -331,6 +347,51 @@ describe("PrReviewWorkflow", () => {
       "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
+      "failReview",
+    ]);
+  });
+
+  // ADR 0100 decision 9: head resolution is the only unconditional GitHub read
+  // on the path, so it is where the PR's descriptive context is captured — and
+  // the record has to actually receive it.
+  test("threads the resolved PR context onto the review record", async () => {
+    const records: unknown[] = [];
+    const steps = runner();
+    const cp = fakeControlPlane({
+      async ensureReviewRecord(input) {
+        records.push(input);
+        return { reviewId: "review-1", taskId: "task-1" };
+      },
+    });
+
+    await run(cp, [trigger], steps.step);
+
+    expect(records).toHaveLength(1);
+    expect(records[0]).toMatchObject({ pr: RESOLVED_PR });
+  });
+
+  test("still records a review, unnamed, when head resolution fails", async () => {
+    const records: Array<Record<string, unknown>> = [];
+    const steps = runner();
+    const cp = fakeControlPlane({
+      resolvePrHeads: async () => {
+        throw new Error("GitHub down");
+      },
+      async ensureReviewRecord(input) {
+        records.push(input as unknown as Record<string, unknown>);
+        return { reviewId: "review-1", taskId: "task-1" };
+      },
+    });
+
+    await run(cp, [trigger], steps.step);
+
+    // A durable failed record is the point of this path; it simply has no PR
+    // context to carry, and must not invent an empty one.
+    expect(records).toHaveLength(1);
+    expect("pr" in records[0]!).toBe(false);
+    expect(steps.steps).toEqual([
+      "resolvePrHeads",
+      "ensureReviewRecord",
       "failReview",
     ]);
   });
