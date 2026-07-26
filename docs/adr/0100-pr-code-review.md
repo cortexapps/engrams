@@ -865,6 +865,16 @@ room for them rather than specifying them now.
 - **P3 — depth**: per-directory config, review detail page polish, the
   follow-ups below as they earn priority.
 
+**Landed so far** (2026-07-25): P0, plus the P3 review-surface work and decisions
+9–10 as the commit chain `033cb922` (this ADR's decisions) → `e5534652` (PR
+context on the record) → `cfc99f0a` (derived transcript read) → `9cf12bea` (PR
+dossiers replace the flat pass list) → `5d940d46` (the worker transcript pane).
+This ADR stays **Proposed** rather than flipping to Accepted, because P1
+(conversation + incremental passes) and P2 (autofix) are specified here and not
+built — `update_finding_status` resolutions, the dirty-set sweeps, the
+`superseded` state, and the autofix round history all remain unimplemented, and
+marking the ADR Accepted would claim otherwise.
+
 ## Future follow-ups (described, deliberately deferred)
 
 1. **Proactive deterministic anchor validation.** Fetch the PR diff
@@ -942,6 +952,41 @@ room for them rather than specifying them now.
 - **`RetryReview` authz.** Gated as `create` on the `Review` subject — any
   authenticated member, mirroring "any member can trigger a review by command";
   enrollment mutations stay admin-only.
+- **PR context is captured at head resolution only** (decision 9, as built). The
+  first draft of that decision also read the title off the `pull_request` webhook
+  payload. Dropped: `resolvePrHeads` already runs unconditionally on every
+  trigger (the trigger contract carries no `baseSha`), so one capture point
+  covers `opened`, `synchronize`, `command`, `dispatch`, and `retry` with one
+  code path — and widening the trigger message would have rotated the DBOS
+  application version for nothing. The control-plane method keeps the name
+  `resolvePrHeads` for the same reason (it is a `step(...)` name inside the
+  version-hashed workflow body); the GitHub client method became
+  `fetchPrContext`. Threading the context into `ensureReviewRecord` did change
+  the workflow body, so that rotation is real and the hash snapshot was updated
+  deliberately.
+- **The derived session read short-circuits on ownership** (decision 10, as
+  built). The first draft consulted the review-worker lookup on every denial,
+  which two existing anti-enumeration tests caught by turning 404 into 500: it
+  also meant any session-id probe cost a database query. Since a reviewer session
+  is unowned by construction, the check now runs only when the session resolved
+  to no owner, and the lookup fails closed so a transient DB error denies rather
+  than surfacing as a 500 on the SSE path.
+- **The four `ui_only` reasons stayed derived, and no column was added.** The
+  plan considered persisting the demotion reason while the schema was already
+  open. Not done: three reasons fall out of rows the client already has (no
+  verdict, null line range, confirmed-but-not-posted), and the fourth (the 422
+  batch fallback) folds into "over the cap" rather than earning a column for a
+  distinction no reader acts on differently.
+- **`components/Markdown.tsx` was dead, not missing.** Finding bodies rendered
+  raw markdown in a `<pre>`. The component existed but mapped onto `.md-*`
+  classes in a `theme.css` that never existed, so it rendered unstyled and had no
+  callers. The classes now live in `index.css` and the component is used.
+- **The transcript pane reuses the session event subscription unchanged**, and so
+  inherits its bounded first-page replay: a finished session with a very long
+  transcript truncates at that bound and never advances, because no further
+  events will ever be published to it. Pre-existing and shared with the session
+  detail page; deliberately not forked into a second event-reading path here, and
+  tracked separately.
 
 ## References
 
