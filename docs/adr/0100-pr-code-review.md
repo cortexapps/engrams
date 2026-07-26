@@ -142,6 +142,15 @@ shaped this ADR:
    writable: prompting, shell, and delete stay owner-scoped and therefore
    admin-only on reviewer sessions.
 
+   Two properties worth stating plainly rather than implying. It widens `read`
+   on the *whole* reviewer session — transcript, metadata, logs, artifacts — not
+   only the transcript; that is acceptable because it is the same class of data
+   the review page already shows, and it should not be described as narrower
+   than it is. And the derived check is gated on the session resolving to *no*
+   owner, which every `pr_review` worker does by construction, so an ordinary
+   cross-owner denial short-circuits before the lookup and no session-id probe
+   can turn a denial into a database query.
+
 ## Finding categories
 
 Findings are labeled with exactly one category (this is CodeRabbit's public

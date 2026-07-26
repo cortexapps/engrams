@@ -267,6 +267,13 @@
       "when": 1785043181579,
       "tag": "0037_parched_thor_girl",
       "breakpoints": true
+    },
+    {
+      "idx": 38,
+      "version": "7",
+      "when": 1785043443061,
+      "tag": "0038_low_franklin_storm",
+      "breakpoints": true
     }
   ]
 }

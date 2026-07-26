@@ -18,9 +18,13 @@
 
 import type { Context } from "hono";
 import { HTTPException } from "hono/http-exception";
-import { subject } from "@casl/ability";
 import { abilityFor } from "../authz/ability.ts";
 import { resolveSessionOwner } from "../authz/resolve.ts";
+import {
+  canAccessSession,
+  isReviewWorkerSession,
+  type IsReviewWorkerSession,
+} from "../authz/session-access.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import type { Actions } from "../authz/ability.ts";
 
@@ -61,7 +65,8 @@ export type GuardResult =
  * `Context` exists:
  *   1. Resolve the better-auth session from `headers` → 401 if absent.
  *   2. Resolve the session owner via DB (`resolveOwner`) → 404 if unknown.
- *   3. Check `ability.can(action, subject('Session', { createdByUserId: owner }))` → 404 if denied.
+ *   3. Check ownership, or the ADR 0100 d10 derived read for a review's
+ *      finder/verifier worker → 404 if denied.
  *
  * Anti-enumeration: unknown and unowned sessions both map to 404.
  */
@@ -71,6 +76,7 @@ export async function authorizeSessionAccess(
   action: Actions,
   resolveSession: GetSession,
   ownerResolver: ResolveOwner,
+  isReviewWorker: IsReviewWorkerSession = isReviewWorkerSession,
 ): Promise<GuardResult> {
   const session = await resolveSession(headers);
   if (!session) return { ok: false, status: 401 };
@@ -84,9 +90,14 @@ export async function authorizeSessionAccess(
 
   const ability = abilityFor(user);
   const ownerId = await ownerResolver(sessionId);
-  if (!ability.can(action, subject("Session", { createdByUserId: ownerId }))) {
-    return { ok: false, status: 404 };
-  }
+  const allowed = await canAccessSession(
+    ability,
+    action,
+    sessionId,
+    ownerId,
+    isReviewWorker,
+  );
+  if (!allowed) return { ok: false, status: 404 };
 
   return { ok: true, user };
 }
@@ -113,10 +124,18 @@ function resolveDefaults(
 export function makeHeaderGuard(
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
+  isReviewWorker: IsReviewWorkerSession = isReviewWorkerSession,
 ) {
   const { resolveSession, ownerResolver } = resolveDefaults(getSession, resolveOwner);
   return (headers: Headers, sessionId: string | undefined, action: Actions) =>
-    authorizeSessionAccess(headers, sessionId, action, resolveSession, ownerResolver);
+    authorizeSessionAccess(
+      headers,
+      sessionId,
+      action,
+      resolveSession,
+      ownerResolver,
+      isReviewWorker,
+    );
 }
 
 /**
@@ -130,8 +149,9 @@ export function makeHeaderGuard(
 export function makeGuard(
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
+  isReviewWorker?: IsReviewWorkerSession,
 ) {
-  const headerGuard = makeHeaderGuard(getSession, resolveOwner);
+  const headerGuard = makeHeaderGuard(getSession, resolveOwner, isReviewWorker);
 
   return async function guardSession(
     c: Context,

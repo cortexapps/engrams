@@ -226,6 +226,11 @@ export const review = pgTable(
   (t) => [
     index("review_repo_pr_number_idx").on(t.repo, t.prNumber),
     index("review_task_idx").on(t.taskId),
+    // ADR 0100 decision 10: the session guard resolves "is this session a
+    // review's worker?" from these columns on every read of a reviewer session
+    // (SSE reconnects, event paging), so they are lookup keys, not just record.
+    index("review_finder_session_idx").on(t.finderSessionId),
+    index("review_verifier_session_idx").on(t.verifierSessionId),
   ],
 );
 

@@ -372,6 +372,10 @@ describe("SSE events route — abort + guard", () => {
       },
       getSession: makeGetSession(MEMBER_A),
       resolveOwner: async (_sid) => null, // always null → no owner
+      // Not a review's worker either, so the ADR 0100 d10 derived read does not
+      // apply. Injected so this asserts a real "no such review" answer rather
+      // than riding the production lookup's fail-closed error path.
+      isReviewWorker: async () => false,
     });
 
     const app = new Hono();
@@ -391,6 +395,45 @@ describe("SSE events route — abort + guard", () => {
       );
       expect(res.status).toBe(404);
       console.log("Test 6 PASS: unattributed session → 404 for member");
+    } finally {
+      await stopServer(server);
+    }
+  });
+
+  // ADR 0100 d10: a review's finder/verifier session is owned by nobody, so the
+  // owner check alone 404'd the transcript the review page links to. This is the
+  // SSE path the review dossier's transcript pane actually streams.
+  test("6b: a review's worker session streams for any member", async () => {
+    const REVIEWER_SESSION = "session-review-finder";
+    const eventsRoute = makeEventsRoute({
+      sessions: {
+        async *streamEvents() {
+          yield { idx: 0n, kind: "agent_message", payloadJson: "{}" };
+        },
+      },
+      getSession: makeGetSession(MEMBER_B),
+      // Unowned, exactly as `insertReviewTask` leaves it.
+      resolveOwner: async (_sid) => null,
+      isReviewWorker: async (sid) => sid === REVIEWER_SESSION,
+    });
+
+    const app = new Hono();
+    app.route("/", eventsRoute);
+    app.notFound((c) => c.json({ error: "not found" }, 404));
+    app.onError((err, c) => {
+      if ("status" in err && typeof err.status === "number") {
+        return c.json({ error: err.message }, err.status as 404);
+      }
+      return c.json({ error: String(err) }, 500);
+    });
+
+    const { baseUrl, server } = await startServer(app);
+    try {
+      const res = await fetch(
+        `${baseUrl}/api/v1/sessions/${REVIEWER_SESSION}/events`,
+      );
+      expect(res.status).toBe(200);
+      console.log("Test 6b PASS: review worker session readable by member");
     } finally {
       await stopServer(server);
     }
