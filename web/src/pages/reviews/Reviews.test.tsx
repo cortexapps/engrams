@@ -3,66 +3,158 @@ import { screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderWithProviders } from "../../test-utils";
 import { Reviews } from "./Reviews";
+import { ReviewDossier } from "./ReviewDossier";
 
-const review = {
-  id: "review-1",
+// Two passes over the same PR: the ledger shows ONE row for the PR carrying the
+// newer pass, which is the whole point of grouping (a retry and every push mint
+// another review row).
+const newerPass = {
+  id: "review-2",
   repo: "cortexapps/engrams",
   prNumber: 100,
+  taskId: "task-1",
+  headSha: "bbbbbbbbbbbbbbbb",
+  baseSha: "aaaaaaaaaaaaaaaa",
+  trigger: "synchronize",
   status: "verifying",
-  githubReviewId: "",
-  finderSessionId: "finder-sess-1",
-  verifierSessionId: "verifier-sess-1",
+  finderSessionId: "finder-sess-2",
+  verifierSessionId: "verifier-sess-2",
+  prTitle: "Bump quinn-proto from 0.11.14 to 0.11.16",
+  prAuthor: "dependabot[bot]",
+  headBranch: "dependabot/cargo/quinn-proto-0.11.16",
+  baseBranch: "main",
+  prState: "open",
+  additions: 12,
+  deletions: 4,
+  changedFiles: 2,
+  createdAt: { seconds: 2000n, nanos: 0 },
   findingCounts: { critical: 0, high: 1, medium: 0, low: 0, total: 1 },
 };
 
-const detail = {
-  review,
-  findings: [
-    {
-      id: "f1",
-      reviewId: "review-1",
-      path: "src/index.ts",
-      startLine: 10,
-      endLine: 12,
-      severity: "high",
-      category: "functional-correctness",
-      title: "Unchecked value reaches the caller",
-      bodyMd: "The validated value is dropped.",
-      state: "posted",
-      sessionId: "finder-sess-1",
-    },
-  ],
-  verdicts: [
-    {
-      id: "v1",
-      findingId: "f1",
-      verdict: "confirmed",
-      confidence: "high",
-      reasoning: "Reproduced from the diff.",
-      sessionId: "verifier-sess-1",
-    },
-  ],
-  events: [
-    { id: "e1", reviewId: "review-1", kind: "queued" },
-    { id: "e2", reviewId: "review-1", kind: "cloning", detail: "finder" },
-    { id: "e3", reviewId: "review-1", kind: "reviewing" },
-    { id: "e4", reviewId: "review-1", kind: "verifying", detail: "1 candidate finding" },
-  ],
+const olderPass = {
+  ...newerPass,
+  id: "review-1",
+  headSha: "cccccccccccccccc",
+  trigger: "opened",
+  status: "posted",
+  finderSessionId: "finder-sess-1",
+  verifierSessionId: "verifier-sess-1",
+  createdAt: { seconds: 1000n, nanos: 0 },
 };
 
-// A mutable status so a test can render a terminal review (retry is offered)
-// without re-mocking; defaults to the active "verifying" the other cases use.
-const view = { status: "verifying" };
+const findings = [
+  {
+    id: "f1",
+    reviewId: "review-1",
+    path: "src/index.ts",
+    startLine: 10,
+    endLine: 12,
+    severity: "high",
+    confidence: "medium",
+    category: "functional-correctness",
+    title: "Unchecked value reaches the caller",
+    bodyMd: "The validated value is dropped.",
+    evidence: ["src/index.ts", "src/validate.ts"],
+    state: "posted",
+    sessionId: "finder-sess-1",
+  },
+  {
+    id: "f2",
+    reviewId: "review-1",
+    path: "src/wide.ts",
+    severity: "low",
+    confidence: "low",
+    category: "maintainability-quality",
+    title: "Duplicated helper",
+    bodyMd: "Two copies of the same guard.",
+    evidence: ["src/wide.ts"],
+    state: "ui_only",
+    sessionId: "finder-sess-1",
+  },
+  {
+    id: "f3",
+    reviewId: "review-1",
+    path: "src/gone.ts",
+    startLine: 4,
+    endLine: 4,
+    severity: "critical",
+    confidence: "low",
+    category: "security-privacy",
+    title: "Imagined injection",
+    bodyMd: "Claimed unvalidated sink.",
+    evidence: ["src/gone.ts"],
+    state: "suppressed_refuted",
+    sessionId: "finder-sess-1",
+  },
+];
+
+const verdicts = [
+  {
+    id: "v1",
+    findingId: "f1",
+    verdict: "confirmed",
+    confidence: "high",
+    reasoning: "Reproduced from the diff.",
+    sessionId: "verifier-sess-1",
+  },
+  // f2 has NO verdict → unverified.
+  {
+    id: "v3",
+    findingId: "f3",
+    verdict: "refuted",
+    confidence: "high",
+    reasoning: "validate.ts:44 already guards this path.",
+    sessionId: "verifier-sess-1",
+  },
+];
+
+const events = [
+  { id: "e1", reviewId: "review-1", kind: "queued", createdAt: { seconds: 1000n, nanos: 0 } },
+  {
+    id: "e2",
+    reviewId: "review-1",
+    kind: "cloning",
+    detail: "finder",
+    createdAt: { seconds: 1010n, nanos: 0 },
+  },
+  { id: "e3", reviewId: "review-1", kind: "reviewing", createdAt: { seconds: 1020n, nanos: 0 } },
+  {
+    id: "e4",
+    reviewId: "review-1",
+    kind: "verifying",
+    detail: "3 candidate findings",
+    createdAt: { seconds: 1100n, nanos: 0 },
+  },
+];
+
+// Which pass the dossier resolves, and its status — mutable so one mock covers
+// the live and terminal shapes.
+const view = { id: "review-1", status: "posted" };
 const retryMutate = vi.fn();
+
+vi.mock("@tanstack/react-router", async () => {
+  const actual = await vi.importActual<Record<string, unknown>>("@tanstack/react-router");
+  return { ...actual, useParams: () => ({ id: view.id }) };
+});
 
 vi.mock("../../hooks/useReviews", () => ({
   useReviews: () => ({
-    data: { reviews: [{ ...review, status: view.status }] },
+    data: {
+      reviews: [
+        { ...olderPass, status: view.id === "review-1" ? view.status : olderPass.status },
+        newerPass,
+      ],
+    },
     isPending: false,
     error: null,
   }),
   useReview: () => ({
-    data: { ...detail, review: { ...review, status: view.status } },
+    data: {
+      review: { ...olderPass, status: view.status },
+      findings,
+      verdicts,
+      events,
+    },
     isPending: false,
     error: null,
   }),
@@ -76,70 +168,154 @@ vi.mock("../../hooks/useReviews", () => ({
 vi.mock("../../hooks/useNow", () => ({ useNow: () => 0 }));
 
 beforeEach(() => {
-  view.status = "verifying";
+  view.id = "review-1";
+  view.status = "posted";
   retryMutate.mockClear();
 });
 
-describe("Reviews page", () => {
-  it("shows the workflow stage for each review", async () => {
+describe("Reviews ledger", () => {
+  it("shows one row per pull request, carrying the newest pass", async () => {
     renderWithProviders(<Reviews />);
-    expect(await screen.findByText("cortexapps/engrams")).toBeTruthy();
-    // status "verifying" → the "Verifying" stage label.
+
+    // Two review rows over one PR collapse to a single entry…
+    expect(await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
+    expect(screen.getByText("1 of 1 pull requests")).toBeTruthy();
+    // …and it reports the newer pass's stage, not the older one's.
     expect(screen.getByText("Verifying")).toBeTruthy();
+    expect(screen.getByText("2 passes")).toBeTruthy();
   });
 
-  it("offers a live watch link to the active phase's session without expanding", async () => {
+  it("links a row to the newest pass's dossier", async () => {
     renderWithProviders(<Reviews />);
-    // status "verifying" → the verifier session is the live one.
-    const watch = await screen.findByRole("link", { name: /watch live/i });
-    expect(watch.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+
+    const row = await screen.findByRole("link", {
+      name: /Bump quinn-proto/i,
+    });
+    expect(row.getAttribute("href")).toContain("/reviews/review-2");
   });
 
-  it("expands a row to reveal findings, verdict, and the finder session link", async () => {
+  it("falls back to the PR number when no title was captured", async () => {
     renderWithProviders(<Reviews />);
-    const user = userEvent.setup();
-    await user.click(await screen.findByText("cortexapps/engrams"));
+    // Both fixtures carry a title, so assert the coordinate is still shown
+    // alongside it — the number is the stable identity.
+    expect(await screen.findByText("#100")).toBeTruthy();
+  });
+});
+
+describe("Review dossier", () => {
+  it("names the PR and reports the context captured at pass start", async () => {
+    renderWithProviders(<ReviewDossier />);
+
+    expect(await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
+    expect(screen.getByText("dependabot[bot]")).toBeTruthy();
+    expect(screen.getByText("main ← dependabot/cargo/quinn-proto-0.11.16")).toBeTruthy();
+    expect(screen.getByText("+12 −4 across 2 files")).toBeTruthy();
+    // The head SHA is shown short, with the full value available on hover.
+    expect(screen.getByText("ccccccc")).toBeTruthy();
+  });
+
+  it("states the kept-vs-killed ratio", async () => {
+    renderWithProviders(<ReviewDossier />);
+    // 3 findings, 1 refuted → 2 kept, 1 posted.
+    expect(await screen.findByText(/2 of 3 kept · verifier refuted 1/)).toBeTruthy();
+  });
+
+  it("groups findings by outcome and names why each did not post", async () => {
+    renderWithProviders(<ReviewDossier />);
+
+    expect(await screen.findByText("Posted to the pull request")).toBeTruthy();
+    // f2 has no verdict → unverified, not "over the cap".
+    expect(screen.getByText("Not verified")).toBeTruthy();
+    expect(screen.getByText("Refuted by the verifier")).toBeTruthy();
+  });
+
+  it("keeps the finder's claim and the verifier's ruling as separate voices", async () => {
+    renderWithProviders(<ReviewDossier />);
 
     expect(await screen.findByText("Unchecked value reaches the caller")).toBeTruthy();
-    expect(screen.getByText(/src\/index\.ts:L10-L12/)).toBeTruthy();
-    expect(screen.getByText(/Verifier: confirmed/)).toBeTruthy();
-    const finderLink = screen.getByRole("link", { name: /finder session/i });
-    expect(finderLink.getAttribute("href")).toContain("/sessions/finder-sess-1");
-    const verifierLink = screen.getByRole("link", { name: /verifier session/i });
-    expect(verifierLink.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+    expect(screen.getByText("The validated value is dropped.")).toBeTruthy();
+    // The verifier is attributed, and carries its own confidence.
+    expect(screen.getByText(/Verifier confirmed this/)).toBeTruthy();
+    expect(screen.getByText("Reproduced from the diff.")).toBeTruthy();
   });
 
-  it("offers a retry on a terminal review and dispatches a fresh pass", async () => {
-    view.status = "failed";
-    renderWithProviders(<Reviews />);
+  it("collapses refuted findings behind a count", async () => {
+    renderWithProviders(<ReviewDossier />);
     const user = userEvent.setup();
-    await user.click(await screen.findByText("cortexapps/engrams"));
 
-    const retry = await screen.findByRole("button", { name: /retry review/i });
-    await user.click(retry);
+    // Collapsed: the refuted finding's title isn't rendered until asked for.
+    await screen.findByText("Refuted by the verifier");
+    expect(screen.queryByText("Imagined injection")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /Refuted by the verifier/i }));
+    expect(await screen.findByText("Imagined injection")).toBeTruthy();
+    expect(screen.getByText("validate.ts:44 already guards this path.")).toBeTruthy();
+  });
+
+  it("shows the finder's evidence on request — the claim's receipt", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+
+    const toggle = await screen.findByRole("button", { name: /2 files the finder read/i });
+    expect(screen.queryByText("src/validate.ts")).toBeNull();
+    await user.click(toggle);
+    expect(await screen.findByText("src/validate.ts")).toBeTruthy();
+  });
+
+  it("collapses the activity log on a finished pass and expands it in place", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+
+    // Terminal → one summary line, no steps.
+    const summary = await screen.findByRole("button", { name: /4 steps/i });
+    expect(screen.queryByText("Cloning repository")).toBeNull();
+
+    await user.click(summary);
+    expect(await screen.findByText("Cloning repository")).toBeTruthy();
+    expect(screen.getByText("Reviewing changes")).toBeTruthy();
+  });
+
+  it("opens the log and marks the running step while a pass is live", async () => {
+    view.status = "verifying";
+    renderWithProviders(<ReviewDossier />);
+
+    // Live → the log IS the content, already open, with the last step running.
+    expect(await screen.findByText("Verifying findings")).toBeTruthy();
+    expect(screen.getByText("in progress")).toBeTruthy();
+    expect(screen.queryByRole("button", { name: /4 steps/i })).toBeNull();
+  });
+
+  it("links the milestones that name a worker session to that session", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+    await user.click(await screen.findByRole("button", { name: /4 steps/i }));
+
+    const cloning = screen.getByRole("link", { name: /Cloning repository/i });
+    expect(cloning.getAttribute("href")).toContain("/sessions/finder-sess-1");
+    const verifying = screen.getByRole("link", { name: /Verifying findings/i });
+    expect(verifying.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+  });
+
+  it("offers a re-run on a finished pass and dispatches a fresh one", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /re-run/i }));
     expect(retryMutate).toHaveBeenCalledWith({ id: "review-1" });
   });
 
-  it("does not offer a retry while a review is still running", async () => {
-    // Default status is the active "verifying" — no retry button.
-    renderWithProviders(<Reviews />);
-    const user = userEvent.setup();
-    await user.click(await screen.findByText("cortexapps/engrams"));
+  it("does not offer a re-run while a pass is still running", async () => {
+    view.status = "verifying";
+    renderWithProviders(<ReviewDossier />);
 
-    await screen.findByText("Unchecked value reaches the caller");
-    expect(screen.queryByRole("button", { name: /retry review/i })).toBeNull();
+    await screen.findByText("Verifying findings");
+    expect(screen.queryByRole("button", { name: /re-run/i })).toBeNull();
   });
 
-  it("renders the review activity log with per-step milestones", async () => {
-    renderWithProviders(<Reviews />);
-    const user = userEvent.setup();
-    await user.click(await screen.findByText("cortexapps/engrams"));
+  it("points forward when a newer pass has superseded this one", async () => {
+    renderWithProviders(<ReviewDossier />);
 
-    // The durable log surfaces sub-phase steps the coarse status can't show.
-    expect(await screen.findByText("Cloning repository")).toBeTruthy();
-    expect(screen.getByText("Reviewing changes")).toBeTruthy();
-    expect(screen.getByText("Verifying findings")).toBeTruthy();
-    // status "verifying" → the last step ("Verifying findings") reads as live.
-    expect(screen.getByText("in progress")).toBeTruthy();
+    const forward = await screen.findByRole("link", { name: /Open the current pass/i });
+    expect(forward.getAttribute("href")).toContain("/reviews/review-2");
   });
 });

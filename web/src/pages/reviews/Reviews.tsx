@@ -1,222 +1,252 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { Link } from "@tanstack/react-router";
-import { timestampDate } from "@bufbuild/protobuf/wkt";
-import {
-  Ban,
-  CheckCircle2,
-  ChevronDown,
-  ChevronRight,
-  Clock,
-  ExternalLink,
-  Loader2,
-  XCircle,
-} from "lucide-react";
 
 import { PageHeading } from "../../components/page-heading";
-import type { Review } from "../../gen/engram/app/v1/review_pb";
+import { LivePulse } from "../../components/LivePulse";
 import { useNow } from "../../hooks/useNow";
 import { useReviews } from "../../hooks/useReviews";
+import { useDebouncedValue } from "../../hooks/useDebouncedValue";
 import { errorMessage } from "../../lib/errors";
 import { relativeTime } from "../sessions/session-format";
-import { cn } from "@/lib/utils";
-import { Badge } from "@/components/ui/badge";
+import { FilterBar, type FilterField } from "../sessions/filter-bar";
+import { Input } from "@/components/ui/input";
+import { Button } from "@/components/ui/button";
+import { Skeleton } from "@/components/ui/skeleton";
+import { X } from "lucide-react";
+import { ReviewGlyph } from "./ReviewGlyph";
+import { groupByPr, type PrGroup } from "./review-groups";
 import {
-  Table,
-  TableBody,
-  TableCell,
-  TableHead,
-  TableHeader,
-  TableRow,
-} from "@/components/ui/table";
-import { ReviewDetailPanel } from "./ReviewDetailPanel";
+  isActive,
+  prTitleOf,
+  reviewCreatedAt,
+  severityCounts,
+  severityTone,
+  stageOf,
+} from "./review-format";
+import { cn } from "@/lib/utils";
 
-// The workflow's durable status → a human-facing stage. Active phases spin; the
-// terminal ones carry their own colour so the ledger scans at a glance.
-const STAGE: Record<
-  string,
-  { label: string; icon: typeof Clock; spin?: boolean; className: string }
-> = {
-  queued: { label: "Queued", icon: Clock, className: "text-muted-foreground" },
-  finding: { label: "Finding", icon: Loader2, spin: true, className: "text-sky-500" },
-  verifying: { label: "Verifying", icon: Loader2, spin: true, className: "text-amber-500" },
-  posted: { label: "Posted", icon: CheckCircle2, className: "text-emerald-500" },
-  failed: { label: "Failed", icon: XCircle, className: "text-destructive" },
-  halted: { label: "Halted", icon: Ban, className: "text-muted-foreground" },
-  superseded: { label: "Superseded", icon: Ban, className: "text-muted-foreground" },
-};
-
-function ReviewStage({ status }: { status: string }) {
-  const stage = STAGE[status] ?? {
-    label: status,
-    icon: Clock,
-    className: "text-muted-foreground",
-  };
-  const Icon = stage.icon;
-  return (
-    <span className={cn("inline-flex items-center gap-1.5 text-sm", stage.className)}>
-      <Icon className={cn("size-3.5", stage.spin && "animate-spin")} aria-hidden />
-      {stage.label}
-    </span>
-  );
-}
-
-// The session for the phase running right now, so the row can offer a live
-// "watch" link without expanding. Empty outside an active phase (or before the
-// session id has been stamped).
-function liveSession(review: Review): string | undefined {
-  if (review.status === "finding") return review.finderSessionId;
-  if (review.status === "verifying") return review.verifierSessionId;
-  return undefined;
-}
-
-function WatchLive({ review }: { review: Review }) {
-  const sessionId = liveSession(review);
-  if (!sessionId) return null;
-  return (
-    <Link
-      to="/sessions/$id"
-      params={{ id: sessionId }}
-      onClick={(e) => e.stopPropagation()}
-      className="inline-flex items-center gap-1 text-xs text-emerald-600 underline decoration-emerald-500/40 underline-offset-4 transition-colors hover:text-emerald-500 dark:text-emerald-400"
-    >
-      Watch live
-      <span className="relative flex size-1.5" aria-hidden>
-        <span className="absolute inline-flex size-full animate-ping rounded-full bg-emerald-500/70" />
-        <span className="relative inline-flex size-1.5 rounded-full bg-emerald-500" />
-      </span>
-    </Link>
-  );
-}
-
-function CreatedAt({ review, now }: { review: Review; now: number }) {
-  if (!review.createdAt) return null;
-  const createdAt = timestampDate(review.createdAt);
-  return (
-    <span title={createdAt.toLocaleString()}>{relativeTime(createdAt.toISOString(), now)} ago</span>
-  );
-}
-
-function FindingCounts({ review }: { review: Review }) {
-  const counts = review.findingCounts;
-  if (!counts || counts.total === 0) {
-    return <span className="text-muted-foreground">0 findings</span>;
-  }
-
-  const severities = [
-    ["critical", counts.critical],
-    ["high", counts.high],
-    ["medium", counts.medium],
-    ["low", counts.low],
-  ] as const;
-  return (
-    <div className="flex flex-wrap gap-1.5">
-      {severities.map(([severity, count]) =>
-        count > 0 ? (
-          <Badge key={severity} variant="outline">
-            {count} {severity}
-          </Badge>
-        ) : null,
-      )}
-    </div>
-  );
-}
-
-function ReviewRow({ review, now }: { review: Review; now: number }) {
-  const [open, setOpen] = useState(false);
-  const Chevron = open ? ChevronDown : ChevronRight;
-  return (
-    <>
-      <TableRow className="cursor-pointer" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
-        <TableCell className="w-8 pr-0 text-muted-foreground">
-          <Chevron className="size-4" aria-hidden />
-        </TableCell>
-        <TableCell className="font-mono text-xs">{review.repo}</TableCell>
-        <TableCell>
-          <a
-            href={`https://github.com/${review.repo}/pull/${review.prNumber}`}
-            target="_blank"
-            rel="noreferrer"
-            onClick={(e) => e.stopPropagation()}
-            className="inline-flex items-center gap-1 underline decoration-border underline-offset-4 transition-colors hover:text-foreground"
-          >
-            #{review.prNumber}
-            <ExternalLink className="size-3" aria-hidden />
-          </a>
-        </TableCell>
-        <TableCell>
-          <div className="flex items-center gap-3">
-            <ReviewStage status={review.status} />
-            <WatchLive review={review} />
-          </div>
-        </TableCell>
-        <TableCell>
-          <FindingCounts review={review} />
-        </TableCell>
-        <TableCell className="font-mono text-xs tabular-nums text-muted-foreground">
-          <CreatedAt review={review} now={now} />
-        </TableCell>
-      </TableRow>
-      {open && (
-        <TableRow className="hover:bg-transparent">
-          <TableCell colSpan={6} className="p-0">
-            <ReviewDetailPanel review={review} />
-          </TableCell>
-        </TableRow>
-      )}
-    </>
-  );
-}
+// The reviews ledger: one row per reviewed PULL REQUEST, newest pass first.
+//
+// This replaces a table with one row per pass, which repeated the same PR once
+// per retry and once per push and buried which pass was current. Rows are
+// navigable — the dossier is a route, so a review is linkable from Slack and
+// from the summary comment engrams posts on the PR itself — rather than
+// expanding in place.
+//
+// The rail beside this page is the switcher; this page is for scanning and
+// filtering many at once, which a rail can't do.
 
 export function Reviews() {
   const { data, error, isPending } = useReviews();
   const now = useNow();
-  const reviews = data?.reviews ?? [];
+  const [query, setQuery] = useState("");
+  const search = useDebouncedValue(query, 150).trim().toLowerCase();
+  const [filters, setFilters] = useState<Record<string, string[]>>({});
+
+  const groups = useMemo(() => groupByPr(data?.reviews ?? []), [data?.reviews]);
+
+  const fields: FilterField[] = useMemo(() => {
+    const repos = [...new Set(groups.map((g) => g.repo))].sort();
+    const stages = [...new Set(groups.map((g) => g.latest.status))].sort();
+    return [
+      {
+        key: "repo",
+        label: "Repository",
+        options: repos.map((repo) => ({ value: repo, label: repo })),
+      },
+      {
+        key: "stage",
+        label: "Stage",
+        options: stages.map((status) => ({
+          value: status,
+          label: stageOf(status).label,
+        })),
+      },
+      {
+        key: "severity",
+        label: "Severity",
+        options: ["critical", "high", "medium", "low"].map((s) => ({
+          value: s,
+          label: s,
+        })),
+      },
+    ];
+  }, [groups]);
+
+  const rows = useMemo(() => {
+    const repo = filters["repo"] ?? [];
+    const stage = filters["stage"] ?? [];
+    const severity = filters["severity"] ?? [];
+    return groups.filter((group) => {
+      if (repo.length > 0 && !repo.includes(group.repo)) return false;
+      if (stage.length > 0 && !stage.includes(group.latest.status)) return false;
+      if (severity.length > 0) {
+        const counts = group.latest.findingCounts;
+        const hit = severity.some((s) => (counts?.[s as "critical"] ?? 0) > 0);
+        if (!hit) return false;
+      }
+      if (search) {
+        const title = prTitleOf(group.latest) ?? "";
+        const haystack = `${group.repo} #${group.prNumber} ${title}`.toLowerCase();
+        if (!haystack.includes(search)) return false;
+      }
+      return true;
+    });
+  }, [groups, filters, search]);
+
+  const hasFilters = query !== "" || Object.values(filters).some((v) => v.length > 0);
 
   return (
-    <div className="flex-1 overflow-auto p-4 md:p-6">
-      <div className="flex flex-col gap-6">
-        <PageHeading
-          title="Reviews"
-          eyebrow="Pull requests"
-          description="Durable review passes and the findings recorded by finder and verifier sessions. Expand a row to see findings, verdicts, and the sessions that produced them."
+    <div className="flex min-h-0 flex-1 flex-col gap-6 overflow-auto p-4 md:p-6">
+      <PageHeading
+        title="Reviews"
+        eyebrow="Pull requests"
+        description="Every pull request engrams has reviewed. Open one to see what the finder reported, what the verifier made of it, and what reached the PR."
+      />
+
+      <div className="flex flex-wrap items-center gap-2">
+        <Input
+          value={query}
+          onChange={(e) => setQuery(e.target.value)}
+          placeholder="Search pull requests…"
+          aria-label="Search pull requests"
+          className="max-w-xs"
         />
-
-        {isPending && <p className="text-sm text-muted-foreground">Loading…</p>}
-
-        {!isPending && error && reviews.length === 0 && (
-          <div role="alert" className="rounded-lg border border-dashed p-8 text-center">
-            <p className="text-sm text-destructive">Couldn’t load reviews. {errorMessage(error)}</p>
-          </div>
-        )}
-
-        {!isPending && !error && reviews.length === 0 && (
-          <div className="rounded-lg border border-dashed p-8 text-center">
-            <p className="text-sm text-muted-foreground">No reviews yet</p>
-          </div>
-        )}
-
-        {reviews.length > 0 && (
-          <div className="rounded-lg border bg-card shadow-xs">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-8" />
-                  <TableHead>Repository</TableHead>
-                  <TableHead>PR</TableHead>
-                  <TableHead>Stage</TableHead>
-                  <TableHead>Findings</TableHead>
-                  <TableHead>Created</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {reviews.map((review) => (
-                  <ReviewRow key={review.id} review={review} now={now} />
-                ))}
-              </TableBody>
-            </Table>
-          </div>
+        <FilterBar fields={fields} value={filters} onChange={setFilters} />
+        {hasFilters && (
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => {
+              setQuery("");
+              setFilters({});
+            }}
+          >
+            <X className="size-3.5" aria-hidden />
+            Clear
+          </Button>
         )}
       </div>
+
+      {isPending ? (
+        <ul
+          className="overflow-hidden rounded-lg border"
+          role="status"
+          aria-label="Loading reviews"
+        >
+          {Array.from({ length: 5 }).map((_, i) => (
+            <li key={i} className="flex items-center gap-3 border-b px-3 py-3 last:border-b-0">
+              <Skeleton className="size-3 rounded-full" />
+              <Skeleton className="h-4 flex-1" />
+              <Skeleton className="h-4 w-24" />
+            </li>
+          ))}
+        </ul>
+      ) : error && groups.length === 0 ? (
+        <div role="alert" className="rounded-lg border border-dashed py-12 text-center">
+          <p className="text-sm text-destructive">Couldn’t load reviews. {errorMessage(error)}</p>
+        </div>
+      ) : rows.length === 0 ? (
+        <div className="flex flex-col items-center gap-3 rounded-lg border border-dashed py-16 text-center">
+          <span className="text-xl leading-none">
+            <ReviewGlyph status="queued" beat={false} />
+          </span>
+          <p className="max-w-sm text-sm text-muted-foreground">
+            {groups.length === 0
+              ? "No pull requests reviewed yet. Enrol a repository in settings, or ask for a review on a PR with @engrams review."
+              : "No pull requests match these filters."}
+          </p>
+        </div>
+      ) : (
+        <>
+          <ul className="overflow-hidden rounded-lg border">
+            {rows.map((group) => (
+              <li key={group.key} className="border-b border-border last:border-b-0">
+                <PrRow group={group} now={now} />
+              </li>
+            ))}
+          </ul>
+          <p className="font-mono text-xs tabular-nums text-muted-foreground">
+            {rows.length} of {groups.length} pull requests
+          </p>
+        </>
+      )}
     </div>
+  );
+}
+
+/**
+ * One reviewed PR. The number is the stable identity and the title is what a
+ * developer remembers, so they share the leading line; a PR reviewed before the
+ * title was captured shows the number alone rather than a placeholder.
+ */
+function PrRow({ group, now }: { group: PrGroup; now: number }) {
+  const review = group.latest;
+  const title = prTitleOf(review);
+  const at = reviewCreatedAt(review);
+  const stage = stageOf(review.status);
+  const counts = severityCounts(review);
+
+  return (
+    <Link
+      to="/reviews/$id"
+      params={{ id: review.id }}
+      className="flex items-center gap-3 px-3 py-2.5 outline-none transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset"
+    >
+      <span className="w-3 shrink-0 text-[0.8rem] leading-none">
+        <ReviewGlyph status={review.status} />
+      </span>
+
+      <span className="flex min-w-0 flex-1 flex-col">
+        <span className="flex min-w-0 items-baseline gap-2">
+          <span className="shrink-0 font-mono text-xs tabular-nums text-muted-foreground">
+            #{group.prNumber}
+          </span>
+          <span className={cn("truncate text-sm", title ? "font-medium" : "font-mono")}>
+            {title ?? `Pull request #${group.prNumber}`}
+          </span>
+        </span>
+        <span className="flex min-w-0 items-baseline gap-2 text-xs text-muted-foreground">
+          <span className="truncate font-mono">{group.repo}</span>
+          {group.passes.length > 1 && (
+            <span className="shrink-0 tabular-nums">{group.passes.length} passes</span>
+          )}
+        </span>
+      </span>
+
+      {/* Severity counts as words in their own tones, not a row of pills: the
+          shape of the number is the data, and a low count must not read as
+          loudly as a critical one. */}
+      <span className="hidden shrink-0 items-baseline gap-2 sm:flex">
+        {counts.length === 0 ? (
+          <span className="text-xs text-muted-foreground">no findings</span>
+        ) : (
+          counts.map(([severity, count]) => (
+            <span
+              key={severity}
+              className="font-mono text-xs tabular-nums"
+              style={{ color: severityTone(severity) }}
+              title={`${count} ${severity}`}
+            >
+              {count} {severity.slice(0, 4)}
+            </span>
+          ))
+        )}
+      </span>
+
+      <span className="flex w-24 shrink-0 items-center justify-end gap-1.5">
+        {isActive(review.status) && <LivePulse />}
+        <span className="text-xs" style={{ color: stage.tone }}>
+          {stage.label}
+        </span>
+      </span>
+
+      <span
+        title={at?.toLocaleString()}
+        className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground"
+      >
+        {at ? relativeTime(at.toISOString(), now) : "—"}
+      </span>
+    </Link>
   );
 }

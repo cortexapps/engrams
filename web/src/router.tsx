@@ -31,6 +31,8 @@ import { MySessions } from "./pages/sessions/MySessions";
 import { AllSessions } from "./pages/sessions/AllSessions";
 import { SessionDetail } from "./pages/SessionDetail";
 import { Reviews } from "./pages/reviews/Reviews";
+import { ReviewsLayout } from "./pages/reviews/ReviewsLayout";
+import { ReviewDossier } from "./pages/reviews/ReviewDossier";
 import { OperatorLayout } from "./pages/operator/OperatorLayout";
 import { Overview } from "./pages/operator/Overview";
 import { KaizenLayout } from "./pages/kaizen/KaizenLayout";
@@ -168,11 +170,26 @@ const sessionDetailRoute = createRoute({
   component: SessionDetail,
 });
 
-// /reviews — org-visible PR review ledger ----------------------------------
-const reviewsRoute = createRoute({
+// /reviews — org-visible PR review ledger, with a persistent rail over reviewed
+// PRs (ADR 0100). The dossier is a CHILD of this layout at /reviews/$id, so the
+// rail wraps it too and opening a PR moves the highlight rather than swapping
+// the layout — the same shape as the /sessions section.
+const reviewsLayoutRoute = createRoute({
   getParentRoute: () => appLayoutRoute,
   path: "/reviews",
+  component: ReviewsLayout,
+});
+const reviewsIndexRoute = createRoute({
+  getParentRoute: () => reviewsLayoutRoute,
+  path: "/",
   component: Reviews,
+});
+// `$id` is a review PASS id, not a PR: the marker in the summary comment engrams
+// posts on the PR names the exact pass, so it can deep-link straight to it.
+const reviewDossierRoute = createRoute({
+  getParentRoute: () => reviewsLayoutRoute,
+  path: "$id",
+  component: ReviewDossier,
 });
 
 // /operator layout route (second sidebar) — the admin hat. The whole section
@@ -344,7 +361,7 @@ export const routeTree = rootRoute.addChildren([
       allSessionsRoute,
       sessionDetailRoute,
     ]),
-    reviewsRoute,
+    reviewsLayoutRoute.addChildren([reviewsIndexRoute, reviewDossierRoute]),
     operatorLayoutRoute.addChildren([
       operatorIndexRoute,
       operatorFleetRoute,
