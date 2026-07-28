@@ -148,7 +148,22 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     if (event.kind === "ping") return c.body(null, 200);
     if (event.kind === "ignore") return c.body(null, 200);
 
-    const idempotencyKey = c.req.header("x-github-delivery") ?? "";
+    // `X-GitHub-Delivery` is part of GitHub's documented webhook contract, and the
+    // signature check above already passed, so a request without one is malformed
+    // rather than merely unusual. Refuse it instead of inventing a key: there is
+    // nothing stable to deduplicate a redelivery against, and an empty key is
+    // actively destructive downstream — DBOS takes it as a real message id and its
+    // notifications table conflicts on that id ALONE, so the first empty-key send
+    // silently swallows every later one, for every review, until the row is
+    // deleted by hand.
+    const idempotencyKey = c.req.header("x-github-delivery");
+    if (!idempotencyKey) {
+      log.warn(
+        { event: c.req.header("x-github-event") ?? "" },
+        "github delivery carries no delivery id",
+      );
+      return c.json({ error: "missing x-github-delivery" }, 400);
+    }
 
     if (event.kind === "pull_request") {
       const enrollment = await enrollments().get(event.repo);
@@ -236,7 +251,6 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
         prNumber: event.prNumber,
         trigger: "command",
         idempotencyKey,
-        commentId: event.commentId,
         ...(command.focus != null ? { focus: command.focus } : {}),
       });
     } else if (command.kind === "stop") {

@@ -161,6 +161,29 @@ describe("POST /api/v1/integrations/github/events", () => {
     expect(res.status).toBe(401);
   });
 
+  test("refuses a signed delivery that carries no delivery id", async () => {
+    // X-GitHub-Delivery is part of GitHub's webhook contract, so a signed request
+    // without one is malformed. It must not be given a derived key either: an
+    // empty key reaches DBOS.send as a real message id, and its notifications
+    // table conflicts on that id ALONE, so the first empty-key send would
+    // silently swallow every later one for every review in the system.
+    const body = pullRequestBody("opened", false);
+    const fixture = app();
+    const { "x-github-delivery": _omitted, ...withoutDelivery } = headers(
+      body,
+      "pull_request",
+    );
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: withoutDelivery,
+    });
+
+    expect(res.status).toBe(400);
+    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.dispatches).toEqual([]);
+  });
+
   test("acks ping", async () => {
     const body = JSON.stringify({ zen: "hi" });
     const fixture = app();
@@ -315,7 +338,6 @@ describe("POST /api/v1/integrations/github/events", () => {
       prNumber: 100,
       trigger: "command",
       idempotencyKey: "delivery-1",
-      commentId: "42",
       focus: "focus on auth",
     }]);
   });

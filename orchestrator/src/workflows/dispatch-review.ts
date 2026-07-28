@@ -64,11 +64,23 @@ export interface DispatchReviewDeps {
   dbos?: DispatchDbosOps;
 }
 
-const defaultDbos: DispatchDbosOps = {
+/** The production DBOS ops. Exported so its empty-key guard is testable without a
+ *  live engine — the guard rejects before it reaches `DBOS.send`. */
+export const defaultDbos: DispatchDbosOps = {
   async startWorkflow(workflowId) {
     await DBOS.startWorkflow(prReviewWorkflow, { workflowID: workflowId })();
   },
   async send(workflowId, message, topic, idempotencyKey) {
+    // DBOS replaces only null/undefined with a fresh uuid (`messageUUID ??
+    // randomUUID()`), and its notifications table is `ON CONFLICT (message_uuid)
+    // DO NOTHING` keyed on that id ALONE — no destination, no topic. So an empty
+    // string is not a missing key, it is a real one shared by every empty-key
+    // send in the system: the first one inserts and all the rest silently vanish.
+    // Callers are supposed to carry a real key; this is the assertion, placed
+    // where the damage would happen.
+    if (idempotencyKey === "") {
+      throw new Error("review dispatch requires a non-empty idempotency key");
+    }
     await DBOS.send<ReviewInbox>(
       workflowId,
       message,

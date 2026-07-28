@@ -3,6 +3,7 @@ import { describe, expect, test } from "bun:test";
 import type { EnrollmentRow } from "../../db/enrollments.ts";
 import type { ReviewRow } from "../../db/reviews.ts";
 import {
+  defaultDbos,
   dispatchReview,
   dispatchReviewPass,
   dispatchReviewSupersede,
@@ -69,6 +70,21 @@ function dbosFixture() {
   };
   return { dbos, starts, sends };
 }
+
+describe("the production DBOS send seam", () => {
+  test("refuses an empty idempotency key before it reaches DBOS", async () => {
+    // DBOS substitutes a fresh uuid only for null/undefined (`messageUUID ??
+    // randomUUID()`), and its notifications table is ON CONFLICT (message_uuid)
+    // DO NOTHING keyed on that id ALONE — no destination, no topic. So "" is not a
+    // missing key, it is one key shared by every empty-key send in the system: the
+    // first inserts and all the rest silently vanish, wedging their reviews.
+    // Every caller owns a real key now, so this can only fire on a programming
+    // error. It throws rather than reaching DBOS, which is why no engine is needed.
+    await expect(
+      defaultDbos.send("review:abc", { kind: "stop" }, "review-topic", ""),
+    ).rejects.toThrow("non-empty idempotency key");
+  });
+});
 
 describe("dispatchReview", () => {
   test("returns unenrolled without looking up or starting a pass", async () => {
