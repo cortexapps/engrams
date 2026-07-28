@@ -152,6 +152,9 @@ function parseJson(result: IntegrationOpResult, operation: string): unknown {
  * still fails, while a 502 must retry, because the pull request is fine and
  * GitHub is not.
  */
+/** Shared by the class and the structural reader below, so the two cannot drift. */
+const GITHUB_REQUEST_ERROR_NAME = "GithubRequestError";
+
 export class GithubRequestError extends Error {
   constructor(
     readonly status: number,
@@ -159,8 +162,43 @@ export class GithubRequestError extends Error {
     readonly responseBody: string,
   ) {
     super(message);
-    this.name = "GithubRequestError";
+    this.name = GITHUB_REQUEST_ERROR_NAME;
   }
+}
+
+/**
+ * Read the fields of a GitHub request failure — whether it is a live
+ * `GithubRequestError` or one DBOS revived from a durable step's recorded error.
+ *
+ * `instanceof` cannot be used here. DBOS records a step error with
+ * `serializeError` and revives it with `deserializeError`, which returns a plain
+ * `Error` carrying the original's own properties. Verified by round-tripping the
+ * real class: `instanceof` is false afterwards, while `name`, `status` and
+ * `responseBody` all survive. So a replayed workflow that classified by class
+ * would take the OPPOSITE branch from the original run — a permanent 404 would
+ * look retryable and be rethrown, leaving its review row stuck active forever.
+ * Classifying on the fields that survive is what makes replay agree with the
+ * first execution.
+ */
+function readGithubFailure(
+  error: unknown,
+): { status: number; responseBody: string } | null {
+  if (typeof error !== "object" || error === null) return null;
+  // Sound: `error` is a confirmed non-null object, and every property read off
+  // this view is validated before it is used.
+  const candidate = error as {
+    name?: unknown;
+    status?: unknown;
+    responseBody?: unknown;
+  };
+  if (candidate.name !== GITHUB_REQUEST_ERROR_NAME) return null;
+  if (typeof candidate.status !== "number") return null;
+  return {
+    status: candidate.status,
+    responseBody: typeof candidate.responseBody === "string"
+      ? candidate.responseBody
+      : "",
+  };
 }
 
 function isRateLimitResponseBody(body: string): boolean {
@@ -185,15 +223,18 @@ function isRateLimitResponseBody(body: string): boolean {
  * case here and it is NOT retryable.
  */
 export function isPermanentGithubFailure(error: unknown): boolean {
-  if (!(error instanceof GithubRequestError)) return false;
-  if (error.status === 403) {
+  const failure = readGithubFailure(error);
+  if (!failure) return false;
+  if (failure.status === 403) {
     // IntegrationOpResult intentionally carries no response headers across the
     // coordinator boundary, so x-ratelimit-remaining/retry-after are unavailable
     // here. GitHub includes "rate limit" in the JSON message for both primary
     // and secondary throttles; those 403s must retry, while other 403s fail fast.
-    return !isRateLimitResponseBody(error.responseBody);
+    return !isRateLimitResponseBody(failure.responseBody);
   }
-  return error.status === 401 || error.status === 404 || error.status === 410;
+  return failure.status === 401
+    || failure.status === 404
+    || failure.status === 410;
 }
 
 function responseError(operation: string, result: IntegrationOpResult): Error {
