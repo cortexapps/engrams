@@ -16,17 +16,17 @@ import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts"
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import {
   makeReviewStore,
+  type BeginReviewPassInput,
+  type BeginReviewPassResult,
   type ReviewDetail,
   type ReviewStore,
+  type UpdateReviewPassContextInput,
 } from "../db/reviews.ts";
 import {
   makeReviewSessionStore,
   type ReviewSessionStore,
 } from "../db/review-sessions.ts";
-import {
-  task as taskTable,
-  type ProfileNetwork,
-} from "../db/schema.ts";
+import { type ProfileNetwork } from "../db/schema.ts";
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import {
@@ -48,9 +48,9 @@ import {
   buildStatusComment,
   makeGithubReviewPoster,
   type GithubReviewPoster,
-  type PrContext,
   type ReviewStatusPhase,
 } from "../reviews/github-review.ts";
+import type { PrContext } from "../reviews/pr-context.ts";
 import {
   runPolicyGate,
   type FindingDecision,
@@ -65,15 +65,28 @@ import {
 
 const log = rootLog.child({ component: "review-control-plane" });
 
-export interface EnsureReviewRecordInput {
+export interface ResolveReviewTargetInput {
+  provider: string;
+  providerId: string;
+  repo: string;
+  number: number;
+  title: string | null;
+  author: string | null;
+  state: string | null;
+  url: string | null;
+  providerUpdatedAt: Date | null;
+}
+
+export interface StartReviewPassInput {
+  reviewId: string;
+  taskId: string;
   repo: string;
   prNumber: number;
+  trigger: string;
+  idempotencyKey: string;
   headSha: string;
   baseSha: string;
-  trigger: string;
-  /** ADR 0100 decision 9. Absent when head resolution failed before it could be
-   *  captured — the record is still created, just unnamed. */
-  pr?: PrContext;
+  focus?: string;
 }
 
 export interface ReviewControlPlane {
@@ -87,9 +100,20 @@ export interface ReviewControlPlane {
     baseSha: string;
     pr: PrContext;
   }>;
-  ensureReviewRecord(
-    input: EnsureReviewRecordInput,
-  ): Promise<{ reviewId: string; taskId: string }>;
+  /** Find or create the row for the change under review, and return its id.
+   *  Refreshes the title/state, so a rename lands everywhere at once. */
+  resolveReviewTarget(input: ResolveReviewTargetInput): Promise<{ targetId: string }>;
+  /** Atomically decide whether this request deduplicates or creates a pass. */
+  createReviewPass(input: BeginReviewPassInput): Promise<BeginReviewPassResult>;
+  /** Fill an early retry row once GitHub resolves its current pass facts. */
+  updateReviewPassContext(
+    reviewId: string,
+    input: UpdateReviewPassContextInput,
+  ): Promise<boolean>;
+  /** Hand a fully resolved request to the review workflow. */
+  startReviewPass(input: StartReviewPassInput): Promise<void>;
+  /** Tell a committed predecessor to tear down without changing its status. */
+  signalSupersededPass(reviewId: string, idempotencyKey: string): Promise<void>;
   createFinderSession(input: {
     reviewId: string;
     taskId: string;
@@ -151,13 +175,20 @@ export interface ReviewControlPlane {
   ): Promise<void>;
   /** Tear down the given worker (best-effort) and mark the review halted. */
   haltReview(reviewId: string, opts?: { sessionId?: string }): Promise<void>;
+  /** Tear down a superseded worker without rewriting the transaction's status. */
+  cleanupSupersededReview(
+    reviewId: string,
+    opts?: { sessionId?: string },
+  ): Promise<void>;
 }
 
 interface ReviewControlPlaneStore extends Pick<
   ReviewStore,
-  | "createReview"
+  | "claimTargetId"
+  | "upsertTarget"
+  | "beginReviewPass"
+  | "updateReviewPassContext"
   | "getReview"
-  | "getActiveReviewForPr"
   | "updateReviewStatus"
   | "updateFindingState"
   | "finalizeReview"
@@ -186,7 +217,6 @@ type CreateExistingTaskSession = (
 export interface ReviewControlPlaneDeps {
   reviews?: ReviewControlPlaneStore;
   db?: ReturnType<typeof getDb>;
-  insertTask?: (input: { repo: string; prNumber: number }) => Promise<string>;
   sessions?: ReviewSessionsClient;
   profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
   enrollments?: Pick<EnrollmentStore, "get">;
@@ -199,6 +229,14 @@ export interface ReviewControlPlaneDeps {
   registerSessionListener?: (sessionId: string) => Promise<void>;
   /** Deterministic retry/deadline scheduler for durable-exec tests. */
   execRuntime?: RunExecRuntime;
+  /** Hands a resolved request to the review workflow. Injected rather than
+   *  imported: `dispatch-review` reaches `pr-review`, which reaches this module,
+   *  so a direct import would close a cycle. */
+  dispatchPass?: (input: StartReviewPassInput) => Promise<void>;
+  signalSupersededPass?: (
+    reviewId: string,
+    idempotencyKey: string,
+  ) => Promise<void>;
 }
 
 /** Human detail for a `posted` activity-log entry. */
@@ -387,28 +425,6 @@ function productionHarnessCatalogClient(): HarnessCatalogClient {
   };
 }
 
-/** Insert only the automation-owned task row. Review phase sessions attach
- * task_session rows later in the ADR 0100 execution PR. */
-export async function insertReviewTask(
-  db: ReturnType<typeof getDb>,
-  input: { repo: string; prNumber: number },
-): Promise<string> {
-  const taskId = crypto.randomUUID();
-  await db.insert(taskTable).values({
-    id: taskId,
-    type: "pr_review",
-    title: `Review ${input.repo}#${input.prNumber}`,
-    status: "working",
-    createdByUserId: null,
-    source: {
-      provider: "github",
-      repo: input.repo,
-      prNumber: input.prNumber,
-    },
-  });
-  return taskId;
-}
-
 export function makeReviewControlPlane(
   deps: ReviewControlPlaneDeps = {},
 ): ReviewControlPlane {
@@ -416,8 +432,6 @@ export function makeReviewControlPlane(
   const db = () => (resolvedDb ??= getDb());
   let reviewStore = deps.reviews;
   const reviews = () => (reviewStore ??= makeReviewStore(db()));
-  const insertTask = deps.insertTask ?? ((input) =>
-    insertReviewTask(db(), input));
   const sessions = deps.sessions ?? defaultSessions;
   const execRuntime = deps.execRuntime ?? defaultRunExecRuntime;
   let profileStore = deps.profiles;
@@ -479,6 +493,15 @@ export function makeReviewControlPlane(
       log.error({ reviewId, kind, err }, "review event record failed (best-effort)");
     }
   };
+  const logRefusedTransition = (
+    reviewId: string,
+    attemptedStatus: string,
+  ): void => {
+    log.warn(
+      { reviewId, attemptedStatus },
+      "refused a late review transition because the row is already terminal",
+    );
+  };
   // Delete a worker's coordinator session and forget its binding. Tolerates an
   // already-absent session (a prior partial teardown) so it is safe to retry.
   const removeWorkerSession = async (sessionId: string): Promise<void> => {
@@ -524,46 +547,70 @@ export function makeReviewControlPlane(
   });
   const registerSessionListener = deps.registerSessionListener
     ?? ((sessionId: string) => registerExistingSessionListener(db(), sessionId));
+  const dispatchPass = deps.dispatchPass ?? (async (input: StartReviewPassInput) => {
+    // Imported at call time, not at module load: `dispatch-review` reaches
+    // `pr-review`, which reaches this module. A top-level import would close the
+    // cycle and leave one of the three partially initialised.
+    const { dispatchReviewPass } = await import("./dispatch-review.ts");
+    await dispatchReviewPass(input);
+  });
+  const signalSupersededPass = deps.signalSupersededPass
+    ?? (async (reviewId: string, idempotencyKey: string) => {
+      const { dispatchReviewSupersede } = await import("./dispatch-review.ts");
+      await dispatchReviewSupersede(reviewId, idempotencyKey);
+    });
 
   return {
     async resolvePrHeads(repo, prNumber) {
       return githubPoster.fetchPrContext(repo, prNumber);
     },
 
-    async ensureReviewRecord(input) {
-      const active = await reviews().getActiveReviewForPr(
-        input.repo,
-        input.prNumber,
-      );
-      if (active) return { reviewId: active.id, taskId: active.taskId };
+    async resolveReviewTarget(input) {
+      // Adopt a row that is still waiting for an id before inserting a new one.
+      // Without this, a pull request whose row predates the id column would get a
+      // SECOND row on its next review, splitting its history in two. Returns null
+      // in the ordinary case, where every row already has an id.
+      const claimed = await reviews().claimTargetId({
+        provider: input.provider,
+        providerId: input.providerId,
+        repo: input.repo,
+        number: input.number,
+      });
+      if (claimed) {
+        log.info(
+          { provider: input.provider, repo: input.repo, number: input.number },
+          "adopted a review target that had no provider id",
+        );
+      }
+      const target = await reviews().upsertTarget(input);
+      return { targetId: target.id };
+    },
 
-      const taskId = await insertTask({
-        repo: input.repo,
-        prNumber: input.prNumber,
-      });
-      // Flattened field by field rather than spread: `input` carries a nested
-      // `pr` object, and this value goes straight into a drizzle insert where an
-      // unknown key is a runtime error rather than a type error.
-      const reviewId = await reviews().createReview({
-        repo: input.repo,
-        prNumber: input.prNumber,
-        headSha: input.headSha,
-        baseSha: input.baseSha,
-        trigger: input.trigger,
-        taskId,
-        status: "queued",
-        prTitle: input.pr?.title ?? null,
-        prAuthor: input.pr?.author ?? null,
-        headBranch: input.pr?.headBranch ?? null,
-        baseBranch: input.pr?.baseBranch ?? null,
-        prState: input.pr?.state ?? null,
-        additions: input.pr?.additions ?? null,
-        deletions: input.pr?.deletions ?? null,
-        changedFiles: input.pr?.changedFiles ?? null,
-      });
-      await recordEvent(reviewId, "queued");
-      await ackStatus(reviewId, "acknowledged");
-      return { reviewId, taskId };
+    async createReviewPass(input) {
+      const result = await reviews().beginReviewPass(input);
+      if (result.kind === "created") {
+        await ackStatus(result.reviewId, "acknowledged");
+      }
+      return result;
+    },
+
+    async updateReviewPassContext(reviewId, input) {
+      const updated = await reviews().updateReviewPassContext(reviewId, input);
+      if (!updated) {
+        log.warn(
+          { reviewId, attemptedStatus: "queued-context" },
+          "refused a late review-pass context write to a terminal row",
+        );
+      }
+      return updated;
+    },
+
+    async startReviewPass(input) {
+      await dispatchPass(input);
+    },
+
+    async signalSupersededPass(reviewId, idempotencyKey) {
+      await signalSupersededPass(reviewId, idempotencyKey);
     },
 
     async createFinderSession(input) {
@@ -677,7 +724,10 @@ export function makeReviewControlPlane(
         promptId: `review:${input.reviewId}:finder:${sessionId}`,
         text: prompt,
       });
-      await reviews().updateReviewStatus(input.reviewId, "finding");
+      if (!(await reviews().updateReviewStatus(input.reviewId, "finding"))) {
+        logRefusedTransition(input.reviewId, "finding");
+        return;
+      }
       await recordEvent(input.reviewId, "reviewing");
       await ackStatus(input.reviewId, "finding");
     },
@@ -799,7 +849,10 @@ export function makeReviewControlPlane(
         promptId: `review:${input.reviewId}:verifier:${sessionId}`,
         text: prompt,
       });
-      await reviews().updateReviewStatus(input.reviewId, "verifying");
+      if (!(await reviews().updateReviewStatus(input.reviewId, "verifying"))) {
+        logRefusedTransition(input.reviewId, "verifying");
+        return;
+      }
       const detail = await reviews().getReview(input.reviewId);
       const candidateCount = detail?.findings.filter(
         (finding) => finding.state === "candidate",
@@ -823,12 +876,16 @@ export function makeReviewControlPlane(
         const live = await githubPoster.fetchPrContext(repo, prNumber);
         if (headSha === "") headSha = live.headSha;
         if (baseSha === "") baseSha = live.baseSha;
-        await reviews().finalizeReview(reviewId, {
+        const updated = await reviews().finalizeReview(reviewId, {
           status: detail.review.status,
           summaryMd: detail.review.summaryMd ?? "",
           headSha,
           baseSha,
         });
+        if (!updated) {
+          logRefusedTransition(reviewId, detail.review.status);
+          return;
+        }
       }
 
       // Settle every finding into its decided terminal state. Idempotent, so it
@@ -869,10 +926,14 @@ export function makeReviewControlPlane(
       if (await githubPoster.alreadyPosted(repo, prNumber, reviewId)) {
         const decision = buildDecision(detail);
         await applyFindingStates(decision, true);
-        await reviews().finalizeReview(reviewId, {
+        const finalized = await reviews().finalizeReview(reviewId, {
           status: "posted",
           summaryMd: detail.review.summaryMd ?? "",
         });
+        if (!finalized) {
+          logRefusedTransition(reviewId, "posted");
+          return;
+        }
         const surfaced = decision.toPost.length + decision.uiOnly.length;
         await recordEvent(reviewId, "posted", postedSummary(surfaced));
         await ackStatus(reviewId, "posted", surfaced);
@@ -912,13 +973,17 @@ export function makeReviewControlPlane(
       if (!posted.posted) throw new Error("GitHub review was not posted");
 
       await applyFindingStates(decision, posted.inlinePosted);
-      await reviews().finalizeReview(reviewId, {
+      const finalized = await reviews().finalizeReview(reviewId, {
         status: "posted",
         summaryMd: posted.summaryMd,
         ...(posted.githubReviewId !== undefined
           ? { githubReviewId: posted.githubReviewId }
           : {}),
       });
+      if (!finalized) {
+        logRefusedTransition(reviewId, "posted");
+        return;
+      }
       const surfaced = decision.toPost.length + decision.uiOnly.length;
       await recordEvent(reviewId, "posted", postedSummary(surfaced));
       await ackStatus(reviewId, "posted", surfaced);
@@ -926,16 +991,28 @@ export function makeReviewControlPlane(
 
     async failReview(reviewId, opts = {}) {
       await cleanupWorkerSession(opts.sessionId);
-      await reviews().updateReviewStatus(reviewId, "failed");
+      if (!(await reviews().updateReviewStatus(reviewId, "failed"))) {
+        logRefusedTransition(reviewId, "failed");
+        return;
+      }
       await recordEvent(reviewId, "failed", opts.reason);
       await ackStatus(reviewId, "failed");
     },
 
     async haltReview(reviewId, opts = {}) {
       await cleanupWorkerSession(opts.sessionId);
-      await reviews().updateReviewStatus(reviewId, "halted");
+      if (!(await reviews().updateReviewStatus(reviewId, "halted"))) {
+        logRefusedTransition(reviewId, "halted");
+        return;
+      }
       await recordEvent(reviewId, "halted");
       await ackStatus(reviewId, "halted");
+    },
+
+    async cleanupSupersededReview(_reviewId, opts = {}) {
+      // The ingress transaction already committed `superseded`. This step owns
+      // only teardown; writing status here would reintroduce the race B6 removes.
+      await cleanupWorkerSession(opts.sessionId);
     },
   };
 }

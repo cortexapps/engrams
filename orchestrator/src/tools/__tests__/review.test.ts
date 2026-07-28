@@ -24,6 +24,8 @@ const OTHER_FINDING_ID = "00000000-0000-4000-8000-000000000003";
 function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
   return {
     id: REVIEW_ID,
+    targetId: "target-1",
+    provider: "github",
     repo: "openai/engrams",
     prNumber: 100,
     taskId: "task-1",
@@ -36,6 +38,8 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     finderSessionId: null,
     verifierSessionId: null,
     summaryMd: null,
+    providerId: null,
+    prUrl: null,
     prTitle: null,
     prAuthor: null,
     headBranch: null,
@@ -89,8 +93,20 @@ function fakeReviewStore(options: {
     ? { review: reviewRow(), findings: [], verdicts: [] }
     : options.detail;
   const store: ReviewStore = {
-    async createReview() {
-      return REVIEW_ID;
+    async claimTargetId() {
+      return null;
+    },
+    async upsertTarget() {
+      return { id: "target-1" };
+    },
+    async getTargetForRefresh() {
+      return null;
+    },
+    async beginReviewPass() {
+      throw new Error("unused");
+    },
+    async updateReviewPassContext() {
+      return true;
     },
     async getReview() {
       return detail;
@@ -101,7 +117,10 @@ function fakeReviewStore(options: {
     async getActiveReviewForTask() {
       return active;
     },
-    async getActiveReviewForPr() {
+    async getActiveReviewForTarget() {
+      return null;
+    },
+    async getActiveReviewByCoordinate() {
       return null;
     },
     async insertFinding(input) {
@@ -135,9 +154,13 @@ function fakeReviewStore(options: {
     async listEvents() {
       return [];
     },
-    async updateReviewStatus() {},
+    async updateReviewStatus() {
+      return true;
+    },
     async updateFindingState() {},
-    async finalizeReview() {},
+    async finalizeReview() {
+      return true;
+    },
   };
   return { store, findings, verdicts, summaries };
 }

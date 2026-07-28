@@ -16,8 +16,8 @@ service ReviewService {
   rpc GetReview(GetReviewRequest) returns (GetReviewResponse);
   // Re-run a review from scratch. The review record is terminal (failed,
   // halted, or posted); this dispatches a fresh pass over the PR's current
-  // head, minting a new review record and workflow epoch. The old record is
-  // left intact as history.
+  // head, minting a new review row and `review:<review_id>` workflow. The old
+  // row is left intact as history.
   rpc RetryReview(RetryReviewRequest) returns (RetryReviewResponse);
 
   rpc ListEnrollments(ListEnrollmentsRequest) returns (ListEnrollmentsResponse);
@@ -65,9 +65,18 @@ message DeleteEnrollmentRequest {
 
 message DeleteEnrollmentResponse {}
 
-// One review pass over a PR at a pinned head_sha.
+// One review pass over a PR at a pinned head_sha, flattened with the PR it is
+// about (ADR 0100 decision 11).
+//
+// The two are separate rows: a PR is a durable entity, a pass is an event about
+// it. Fields marked PR are read from the pull request's own record, so they are
+// CURRENT and identical across every pass over that PR — a pass that failed
+// before it could learn anything still reports the PR's real name. Fields marked
+// PASS describe the code this pass actually read and are never rewritten.
 message Review {
   string id = 1;
+  // PR. `repo` is a mutable name: it is what the PR was last seen at, and
+  // `provider_id` is the identity that survives a rename or transfer.
   string repo = 2;
   int32 pr_number = 3;
   string task_id = 4;
@@ -75,7 +84,7 @@ message Review {
   string base_sha = 6;
   // What started this pass, e.g. "dispatch" | "command" | "opened" | "synchronize".
   string trigger = 7;
-  // queued | finding | verifying | posted | failed | superseded
+  // queued | finding | verifying | posted | failed | superseded | halted
   string status = 8;
   optional string github_review_id = 9;
   optional string summary_md = 10;
@@ -87,23 +96,46 @@ message Review {
   // when its phase ends, so the id survives as the record of which session ran.
   optional string finder_session_id = 14;
   optional string verifier_session_id = 15;
-  // ADR 0100 decision 9 — the PR as of the moment this pass started, captured
-  // from the same read that pins the heads and never refreshed. A PR merged
-  // after the pass still reports the state it had then. Unset on every review
-  // recorded before this landed (there is no backfill) and on any review whose
-  // head resolution failed, so a reader must fall back to "repo #number"
-  // rather than assume a title exists.
+  // PR. Refreshed on every pass, so a renamed PR reads correctly everywhere at
+  // once. Unset only when no pass over this PR ever captured it — a record
+  // backfilled from before the PR table existed, or a PR whose every resolution
+  // failed — so a reader still falls back to "repo #number" rather than assume.
   optional string pr_title = 16;
   // Login of the PR author.
   optional string pr_author = 17;
+  // PASS: the branches THIS pass compared. Per-pass because a PR can be
+  // retargeted, and an old pass must keep reporting what it actually read.
   optional string head_branch = 18;
   optional string base_branch = 19;
-  // open | draft | closed | merged, folded from GitHub's state/draft/merged
-  // triple into the one axis a reader thinks in.
+  // PR: open | draft | closed | merged, folded from GitHub's state/draft/merged
+  // triple into the one axis a reader thinks in. Current, not a snapshot.
   optional string pr_state = 20;
+  // PASS: the diff at this head. Grows with every push, so it is not a PR fact.
   optional int32 additions = 21;
   optional int32 deletions = 22;
   optional int32 changed_files = 23;
+  // The change's own record. Every pass over the same pull request shares this
+  // id, so it is the grouping key — `repo` + `pr_number` is a coordinate that a
+  // rename can move out from under a client, and a reused repo name can even
+  // point two different pull requests at it.
+  string target_id = 24;
+  // PR: which forge this came from. "github" today. Named for the concept rather
+  // than the vendor, so a second forge needs no field rename here.
+  string provider = 25;
+  // PR: the forge's own stable id — the identity, and the only field a rename or
+  // a transfer cannot move. Unset on a record that predates the change table, and
+  // on one whose pull request we can no longer read; it fills in when the
+  // hydrator or the next review resolves it.
+  optional string provider_id = 26;
+  // PR: the forge's own URL, so a link is never rebuilt from a stale repo name.
+  optional string pr_url = 27;
+  // Derived server-side from the same active-status vocabulary that guards
+  // writes and the database uniqueness constraint. The browser does not carry
+  // a second hand-copied list.
+  bool active = 28;
+  // Derived server-side from the same trigger classifier ingress uses for
+  // dedup-versus-supersede. Unknown triggers are human by default.
+  bool human_trigger = 29;
 }
 
 // Per-severity finding counts for the list page.

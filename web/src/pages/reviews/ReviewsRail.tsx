@@ -8,7 +8,7 @@ import { relativeTime } from "../sessions/session-format";
 import { LivePulse } from "../../components/LivePulse";
 import { ReviewGlyph } from "./ReviewGlyph";
 import { groupByPr } from "./review-groups";
-import { isActive, prTitleOf, reviewCreatedAt } from "./review-format";
+import { isActive, prTitleOf, reviewCreatedAt, stageOf } from "./review-format";
 import {
   SidebarContent,
   SidebarFooter,
@@ -72,7 +72,7 @@ export function ReviewsRail() {
           onChange={(event) => setSearch(event.target.value)}
           placeholder="Search pull requests…"
           aria-label="Search pull requests"
-          className="border-sidebar-border bg-sidebar-accent/40 text-sidebar-foreground placeholder:text-sidebar-foreground/60 dark:bg-sidebar-accent/40"
+          className="border-sidebar-border bg-sidebar-accent/40 text-sidebar-foreground placeholder:text-sidebar-foreground/80 dark:bg-sidebar-accent/40"
         />
       </SidebarHeader>
 
@@ -111,7 +111,7 @@ export function ReviewsRail() {
                   Couldn’t load reviews.
                 </p>
               ) : rows.length === 0 ? (
-                <p className="px-2 py-2 text-xs text-sidebar-foreground/70">
+                <p className="px-2 py-2 text-xs text-sidebar-foreground/85">
                   {search ? "No matching pull requests." : "No reviews yet."}
                 </p>
               ) : (
@@ -132,8 +132,13 @@ export function ReviewsRail() {
                           params={{ id: review.id }}
                           title={`${group.repo}#${group.prNumber}`}
                         >
+                          {/* The glyph is aria-hidden by contract and the rail has
+                              no room for the stage word, so the word goes to
+                              assistive tech only — otherwise a rail row announces
+                              a PR with no indication of what happened to it. */}
                           <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
                             <ReviewGlyph status={review.status} />
+                            <span className="sr-only">{stageOf(review.status).label}</span>
                           </span>
                           <span className="flex min-w-0 flex-1 flex-col">
                             {/* Number and title share a line: the number is the
@@ -142,7 +147,7 @@ export function ReviewsRail() {
                                 recorded before capture landed) keep the number
                                 alone rather than showing a blank. */}
                             <span className="flex min-w-0 items-baseline gap-1.5">
-                              <span className="shrink-0 font-mono text-[0.7rem] leading-tight tabular-nums text-sidebar-foreground/70">
+                              <span className="shrink-0 font-mono text-[0.7rem] leading-tight tabular-nums text-sidebar-foreground/85">
                                 #{group.prNumber}
                               </span>
                               {title && (
@@ -151,7 +156,7 @@ export function ReviewsRail() {
                                 </span>
                               )}
                             </span>
-                            <span className="flex min-w-0 items-baseline gap-1.5 text-[0.7rem] leading-tight text-sidebar-foreground/70">
+                            <span className="flex min-w-0 items-baseline gap-1.5 text-[0.7rem] leading-tight text-sidebar-foreground/85">
                               <span className="truncate font-mono">{group.repo}</span>
                               {total > 0 && (
                                 <span className="shrink-0 tabular-nums">
@@ -166,11 +171,16 @@ export function ReviewsRail() {
                             </span>
                           </span>
                           <span className="flex min-w-[1.4rem] shrink-0 items-start justify-end gap-1 self-stretch leading-none">
-                            {isActive(review.status) && <LivePulse className="mt-1" />}
+                            {isActive(review) && (
+                              <>
+                                <LivePulse className="mt-1" />
+                                <span className="sr-only">Running now</span>
+                              </>
+                            )}
                             {at && (
                               <span
                                 title={at.toLocaleString()}
-                                className="mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/70"
+                                className="mt-0.5 font-mono text-[0.65rem] tabular-nums text-sidebar-foreground/85"
                               >
                                 {relativeTime(at.toISOString(), now)}
                               </span>

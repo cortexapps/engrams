@@ -25,6 +25,8 @@ import {
   type ReviewStore,
   type ReviewVerdictRow,
 } from "../db/reviews.ts";
+import { isActiveReviewStatus } from "../db/schema.ts";
+import { isHumanReviewTrigger } from "../reviews/review-trigger.ts";
 import {
   ReviewService,
   type RepoEnrollment,
@@ -34,10 +36,9 @@ import {
   type ReviewVerdict as ReviewVerdictProto,
 } from "../gen/engram/app/v1/review_pb.ts";
 import {
-  dispatchReview,
-  type DispatchReviewInput,
-  type DispatchReviewResult,
-} from "../workflows/dispatch-review.ts";
+  startReviewIngress,
+  type ReviewIngressStart,
+} from "../workflows/review-ingress.ts";
 
 export type GetSession = (
   headers: Headers,
@@ -51,7 +52,9 @@ export interface ReviewDeps {
   enrollments?: EnrollmentStore;
   profiles?: { get(id: string): Promise<{ id: string } | null> };
   db?: ReturnType<typeof getDb>;
-  dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>;
+  /** Starts durable review ingress, which resolves the PR before a pass begins
+   *  (ADR 0100 d11). A re-run goes through it like any other request. */
+  startIngress?: (input: ReviewIngressStart) => Promise<void>;
   randomUUID?: () => string;
 }
 
@@ -125,6 +128,10 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     // ADR 0100 decision 9. Each field is emitted only when present, so a
     // pre-decision review arrives with none of them set and the UI falls back
     // to the PR's coordinates rather than rendering empty strings.
+    targetId: row.targetId,
+    provider: row.provider,
+    ...(row.providerId != null ? { providerId: row.providerId } : {}),
+    ...(row.prUrl != null ? { prUrl: row.prUrl } : {}),
     ...(row.prTitle != null ? { prTitle: row.prTitle } : {}),
     ...(row.prAuthor != null ? { prAuthor: row.prAuthor } : {}),
     ...(row.headBranch != null ? { headBranch: row.headBranch } : {}),
@@ -133,6 +140,8 @@ function reviewToProto(row: ReviewRow, counts: FindingCounts): ReviewProto {
     ...(row.additions != null ? { additions: row.additions } : {}),
     ...(row.deletions != null ? { deletions: row.deletions } : {}),
     ...(row.changedFiles != null ? { changedFiles: row.changedFiles } : {}),
+    active: isActiveReviewStatus(row.status),
+    humanTrigger: isHumanReviewTrigger(row.trigger),
     createdAt: timestampFromDate(row.createdAt),
     updatedAt: timestampFromDate(row.updatedAt),
     findingCounts: counts,
@@ -198,9 +207,7 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
   let profileStore = deps?.profiles;
   const profiles = (): { get(id: string): Promise<{ id: string } | null> } =>
     (profileStore ??= makeProfileStore(deps?.db ?? getDb()));
-  const dispatch = deps?.dispatch
-    ?? ((input: DispatchReviewInput) =>
-      dispatchReview({ enrollments: enrollments() }, input));
+  const startIngress = deps?.startIngress ?? startReviewIngress;
   const randomUUID = deps?.randomUUID ?? (() => crypto.randomUUID());
 
   router.service(ReviewService, {
@@ -235,22 +242,31 @@ export function registerReviews(router: ConnectRouter, deps?: ReviewDeps): void 
       }
       const detail = await reviews().getReview(id);
       if (!detail) throw new ConnectError("not found", Code.NotFound);
-      const { repo, prNumber } = detail.review;
-      // A fresh dispatch mints a new review record (a terminal review is not
-      // "active") and a successor workflow epoch, re-reviewing the PR's current
-      // head. The old record stays as history.
-      const result = await dispatch({
-        repo,
-        prNumber,
-        trigger: "retry",
-        idempotencyKey: randomUUID(),
-      });
-      if (!result.enrolled || !result.workflowId) {
+      const { repo, prNumber, provider, targetId } = detail.review;
+      if (!(await enrollments().get(repo))) {
         throw new ConnectError("repo is not enrolled", Code.FailedPrecondition);
       }
+      // Ingress resolves the PR's CURRENT head and identity, then mints a new
+      // review record (a terminal review is not "active") and a successor workflow
+      // epoch. The old record stays as history.
+      //
+      // A fresh uuid per re-run, so each press gets its own ingress execution
+      // rather than deduping onto the previous one.
+      const idempotencyKey = randomUUID();
+      await startIngress({
+        provider,
+        repo,
+        prNumber,
+        targetId,
+        trigger: "retry",
+        idempotencyKey,
+      });
       return {
-        workflowId: result.workflowId,
-        ...(result.reviewId != null ? { reviewId: result.reviewId } : {}),
+        // Ingress owns the review workflow id now, and it is derived from the PR
+        // inside that workflow — so there is nothing to report back here yet. The
+        // client follows the review list, which is how it already learned about
+        // the new pass; `dispatchReview` never returned a review id either.
+        workflowId: `review-ingress:${idempotencyKey}`,
       };
     },
 

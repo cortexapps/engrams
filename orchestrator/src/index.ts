@@ -55,6 +55,7 @@ import type { ConnectRouter } from "@connectrpc/connect";
 import { initDbos, shutdownDbos } from "./workflows/dbos.ts";
 import { setThreadPolicy, setThreadControlPlane } from "./workflows/slack-thread.ts";
 import { setReviewControlPlane } from "./workflows/pr-review.ts";
+import { setReviewIngressControlPlane } from "./workflows/review-ingress.ts";
 import { makeSlackPolicy } from "./integrations/slack-policy.ts";
 import { makeThreadControlPlane } from "./workflows/thread-control-plane.ts";
 import { makeReviewControlPlane } from "./workflows/review-control-plane.ts";
@@ -65,11 +66,17 @@ import { makeSweepRuntime } from "./sweep/production.ts";
 import { getDb } from "./db/client.ts";
 import { makePapercutStore } from "./db/papercuts.ts";
 import { makeReviewStore } from "./db/reviews.ts";
+import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
 import { makeEnrollmentStore } from "./db/enrollments.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
+import { makeGithubReviewPoster } from "./reviews/github-review.ts";
+import {
+  DEFAULT_TARGET_HYDRATOR_CONFIG,
+  TargetHydrator,
+} from "./reviews/target-hydrator.ts";
 
 const app = new Hono();
 
@@ -233,6 +240,9 @@ const reviewControlPlane = makeReviewControlPlane({
   renderReviewer,
 });
 setReviewControlPlane(reviewControlPlane);
+// Review ingress shares the same control plane: it resolves the change, then
+// starts the pass (ADR 0100 d11).
+setReviewIngressControlPlane(reviewControlPlane);
 // ADR 0089: production built-ins and optional dev smoke tools are registered
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
@@ -261,6 +271,16 @@ if (!config.sweepDisabled) {
     "DBOS orphan sweep disabled via ORCHESTRATOR_SWEEP_DISABLED",
   );
 }
+// Plain timer driver, not a DBOS workflow: hydration is bounded database/API
+// maintenance and does not need durable workflow replay or a sweep policy.
+const targetHydrator = new TargetHydrator({
+  config: DEFAULT_TARGET_HYDRATOR_CONFIG,
+  store: makeReviewTargetHydrationStore(getDb()),
+  github: makeGithubReviewPoster(),
+  now: () => new Date(),
+  log: log.child({ component: "review-target-hydrator" }),
+});
+await targetHydrator.start();
 const listenerManager = makeProductionListenerManager();
 await listenerManager.start();
 const automationScheduler = makeProductionAutomationScheduler();
@@ -278,6 +298,7 @@ process.on("SIGTERM", () => {
     // after the HTTP server stops accepting connections.
     await automationScheduler.stop();
     await listenerManager.stop();
+    await targetHydrator.stop();
     await sweeper.stop();
     // The heartbeat must outlive the DBOS drain: workflows can execute until
     // shutdownDbos() returns (or SIGKILL lands), and this pod's version must

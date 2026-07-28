@@ -12,7 +12,7 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/review.proto.
  */
 export const file_engram_app_v1_review: GenFile = /*@__PURE__*/
-  fileDesc("ChplbmdyYW0vYXBwL3YxL3Jldmlldy5wcm90bxINZW5ncmFtLmFwcC52MSLNAQoOUmVwb0Vucm9sbG1lbnQSDAoEcmVwbxgBIAEoCRIUCgx0cmlnZ2VyX21vZGUYAiABKAkSDwoHYXV0b2ZpeBgDIAEoCRIXCgpwcm9maWxlX2lkGAQgASgJSACIAQESLgoKY3JlYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCDQoLX3Byb2ZpbGVfaWQiGAoWTGlzdEVucm9sbG1lbnRzUmVxdWVzdCJNChdMaXN0RW5yb2xsbWVudHNSZXNwb25zZRIyCgtlbnJvbGxtZW50cxgBIAMoCzIdLmVuZ3JhbS5hcHAudjEuUmVwb0Vucm9sbG1lbnQidgoXVXBzZXJ0RW5yb2xsbWVudFJlcXVlc3QSDAoEcmVwbxgBIAEoCRIUCgx0cmlnZ2VyX21vZGUYAiABKAkSDwoHYXV0b2ZpeBgDIAEoCRIXCgpwcm9maWxlX2lkGAQgASgJSACIAQFCDQoLX3Byb2ZpbGVfaWQiTQoYVXBzZXJ0RW5yb2xsbWVudFJlc3BvbnNlEjEKCmVucm9sbG1lbnQYASABKAsyHS5lbmdyYW0uYXBwLnYxLlJlcG9FbnJvbGxtZW50IicKF0RlbGV0ZUVucm9sbG1lbnRSZXF1ZXN0EgwKBHJlcG8YASABKAkiGgoYRGVsZXRlRW5yb2xsbWVudFJlc3BvbnNlIqkGCgZSZXZpZXcSCgoCaWQYASABKAkSDAoEcmVwbxgCIAEoCRIRCglwcl9udW1iZXIYAyABKAUSDwoHdGFza19pZBgEIAEoCRIQCghoZWFkX3NoYRgFIAEoCRIQCghiYXNlX3NoYRgGIAEoCRIPCgd0cmlnZ2VyGAcgASgJEg4KBnN0YXR1cxgIIAEoCRIdChBnaXRodWJfcmV2aWV3X2lkGAkgASgJSACIAQESFwoKc3VtbWFyeV9tZBgKIAEoCUgBiAEBEi4KCmNyZWF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYDCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjQKDmZpbmRpbmdfY291bnRzGA0gASgLMhwuZW5ncmFtLmFwcC52MS5GaW5kaW5nQ291bnRzEh4KEWZpbmRlcl9zZXNzaW9uX2lkGA4gASgJSAKIAQESIAoTdmVyaWZpZXJfc2Vzc2lvbl9pZBgPIAEoCUgDiAEBEhUKCHByX3RpdGxlGBAgASgJSASIAQESFgoJcHJfYXV0aG9yGBEgASgJSAWIAQESGAoLaGVhZF9icmFuY2gYEiABKAlIBogBARIYCgtiYXNlX2JyYW5jaBgTIAEoCUgHiAEBEhUKCHByX3N0YXRlGBQgASgJSAiIAQESFgoJYWRkaXRpb25zGBUgASgFSAmIAQESFgoJZGVsZXRpb25zGBYgASgFSAqIAQESGgoNY2hhbmdlZF9maWxlcxgXIAEoBUgLiAEBQhMKEV9naXRodWJfcmV2aWV3X2lkQg0KC19zdW1tYXJ5X21kQhQKEl9maW5kZXJfc2Vzc2lvbl9pZEIWChRfdmVyaWZpZXJfc2Vzc2lvbl9pZEILCglfcHJfdGl0bGVCDAoKX3ByX2F1dGhvckIOCgxfaGVhZF9icmFuY2hCDgoMX2Jhc2VfYnJhbmNoQgsKCV9wcl9zdGF0ZUIMCgpfYWRkaXRpb25zQgwKCl9kZWxldGlvbnNCEAoOX2NoYW5nZWRfZmlsZXMiWwoNRmluZGluZ0NvdW50cxIQCghjcml0aWNhbBgBIAEoBRIMCgRoaWdoGAIgASgFEg4KBm1lZGl1bRgDIAEoBRILCgNsb3cYBCABKAUSDQoFdG90YWwYBSABKAUimwQKDVJldmlld0ZpbmRpbmcSCgoCaWQYASABKAkSEQoJcmV2aWV3X2lkGAIgASgJEgwKBHBhdGgYAyABKAkSFwoKc3RhcnRfbGluZRgEIAEoBUgAiAEBEhUKCGVuZF9saW5lGAUgASgFSAGIAQESEQoEc2lkZRgGIAEoCUgCiAEBEhAKCGNhdGVnb3J5GAcgASgJEhAKCHNldmVyaXR5GAggASgJEhIKCmNvbmZpZGVuY2UYCSABKAkSDQoFdGl0bGUYCiABKAkSDwoHYm9keV9tZBgLIAEoCRIaCg1zdWdnZXN0ZWRfZml4GAwgASgJSAOIAQESEAoIZXZpZGVuY2UYDSADKAkSDQoFc3RhdGUYDiABKAkSGwoOdmVyZGljdF9yZWFzb24YDyABKAlIBIgBARIdChBnaXRodWJfdGhyZWFkX2lkGBAgASgJSAWIAQESFwoKcmVzb2x1dGlvbhgRIAEoCUgGiAEBEhIKCnNlc3Npb25faWQYEiABKAkSLgoKY3JlYXRlZF9hdBgTIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCDQoLX3N0YXJ0X2xpbmVCCwoJX2VuZF9saW5lQgcKBV9zaWRlQhAKDl9zdWdnZXN0ZWRfZml4QhEKD192ZXJkaWN0X3JlYXNvbkITChFfZ2l0aHViX3RocmVhZF9pZEINCgtfcmVzb2x1dGlvbiJvCg1SZXZpZXdWZXJkaWN0EhIKCmZpbmRpbmdfaWQYASABKAkSDwoHdmVyZGljdBgCIAEoCRISCgpjb25maWRlbmNlGAMgASgJEhEKCXJlYXNvbmluZxgEIAEoCRISCgpzZXNzaW9uX2lkGAUgASgJIjAKEkxpc3RSZXZpZXdzUmVxdWVzdBIRCgRyZXBvGAEgASgJSACIAQFCBwoFX3JlcG8iPQoTTGlzdFJldmlld3NSZXNwb25zZRImCgdyZXZpZXdzGAEgAygLMhUuZW5ncmFtLmFwcC52MS5SZXZpZXciHgoQR2V0UmV2aWV3UmVxdWVzdBIKCgJpZBgBIAEoCSIgChJSZXRyeVJldmlld1JlcXVlc3QSCgoCaWQYASABKAkiUAoTUmV0cnlSZXZpZXdSZXNwb25zZRITCgt3b3JrZmxvd19pZBgBIAEoCRIWCglyZXZpZXdfaWQYAiABKAlIAIgBAUIMCgpfcmV2aWV3X2lkIsYBChFHZXRSZXZpZXdSZXNwb25zZRIlCgZyZXZpZXcYASABKAsyFS5lbmdyYW0uYXBwLnYxLlJldmlldxIuCghmaW5kaW5ncxgCIAMoCzIcLmVuZ3JhbS5hcHAudjEuUmV2aWV3RmluZGluZxIuCgh2ZXJkaWN0cxgDIAMoCzIcLmVuZ3JhbS5hcHAudjEuUmV2aWV3VmVyZGljdBIqCgZldmVudHMYBCADKAsyGi5lbmdyYW0uYXBwLnYxLlJldmlld0V2ZW50IooBCgtSZXZpZXdFdmVudBIKCgJpZBgBIAEoCRIRCglyZXZpZXdfaWQYAiABKAkSDAoEa2luZBgDIAEoCRITCgZkZXRhaWwYBCABKAlIAIgBARIuCgpjcmVhdGVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEIJCgdfZGV0YWlsMrcECg1SZXZpZXdTZXJ2aWNlElQKC0xpc3RSZXZpZXdzEiEuZW5ncmFtLmFwcC52MS5MaXN0UmV2aWV3c1JlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkxpc3RSZXZpZXdzUmVzcG9uc2USTgoJR2V0UmV2aWV3Eh8uZW5ncmFtLmFwcC52MS5HZXRSZXZpZXdSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5HZXRSZXZpZXdSZXNwb25zZRJUCgtSZXRyeVJldmlldxIhLmVuZ3JhbS5hcHAudjEuUmV0cnlSZXZpZXdSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5SZXRyeVJldmlld1Jlc3BvbnNlEmAKD0xpc3RFbnJvbGxtZW50cxIlLmVuZ3JhbS5hcHAudjEuTGlzdEVucm9sbG1lbnRzUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuTGlzdEVucm9sbG1lbnRzUmVzcG9uc2USYwoQVXBzZXJ0RW5yb2xsbWVudBImLmVuZ3JhbS5hcHAudjEuVXBzZXJ0RW5yb2xsbWVudFJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLlVwc2VydEVucm9sbG1lbnRSZXNwb25zZRJjChBEZWxldGVFbnJvbGxtZW50EiYuZW5ncmFtLmFwcC52MS5EZWxldGVFbnJvbGxtZW50UmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuRGVsZXRlRW5yb2xsbWVudFJlc3BvbnNlYgZwcm90bzM", [file_google_protobuf_timestamp]);
+  fileDesc("ChplbmdyYW0vYXBwL3YxL3Jldmlldy5wcm90bxINZW5ncmFtLmFwcC52MSLNAQoOUmVwb0Vucm9sbG1lbnQSDAoEcmVwbxgBIAEoCRIUCgx0cmlnZ2VyX21vZGUYAiABKAkSDwoHYXV0b2ZpeBgDIAEoCRIXCgpwcm9maWxlX2lkGAQgASgJSACIAQESLgoKY3JlYXRlZF9hdBgFIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXASLgoKdXBkYXRlZF9hdBgGIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCDQoLX3Byb2ZpbGVfaWQiGAoWTGlzdEVucm9sbG1lbnRzUmVxdWVzdCJNChdMaXN0RW5yb2xsbWVudHNSZXNwb25zZRIyCgtlbnJvbGxtZW50cxgBIAMoCzIdLmVuZ3JhbS5hcHAudjEuUmVwb0Vucm9sbG1lbnQidgoXVXBzZXJ0RW5yb2xsbWVudFJlcXVlc3QSDAoEcmVwbxgBIAEoCRIUCgx0cmlnZ2VyX21vZGUYAiABKAkSDwoHYXV0b2ZpeBgDIAEoCRIXCgpwcm9maWxlX2lkGAQgASgJSACIAQFCDQoLX3Byb2ZpbGVfaWQiTQoYVXBzZXJ0RW5yb2xsbWVudFJlc3BvbnNlEjEKCmVucm9sbG1lbnQYASABKAsyHS5lbmdyYW0uYXBwLnYxLlJlcG9FbnJvbGxtZW50IicKF0RlbGV0ZUVucm9sbG1lbnRSZXF1ZXN0EgwKBHJlcG8YASABKAkiGgoYRGVsZXRlRW5yb2xsbWVudFJlc3BvbnNlIr8HCgZSZXZpZXcSCgoCaWQYASABKAkSDAoEcmVwbxgCIAEoCRIRCglwcl9udW1iZXIYAyABKAUSDwoHdGFza19pZBgEIAEoCRIQCghoZWFkX3NoYRgFIAEoCRIQCghiYXNlX3NoYRgGIAEoCRIPCgd0cmlnZ2VyGAcgASgJEg4KBnN0YXR1cxgIIAEoCRIdChBnaXRodWJfcmV2aWV3X2lkGAkgASgJSACIAQESFwoKc3VtbWFyeV9tZBgKIAEoCUgBiAEBEi4KCmNyZWF0ZWRfYXQYCyABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEi4KCnVwZGF0ZWRfYXQYDCABKAsyGi5nb29nbGUucHJvdG9idWYuVGltZXN0YW1wEjQKDmZpbmRpbmdfY291bnRzGA0gASgLMhwuZW5ncmFtLmFwcC52MS5GaW5kaW5nQ291bnRzEh4KEWZpbmRlcl9zZXNzaW9uX2lkGA4gASgJSAKIAQESIAoTdmVyaWZpZXJfc2Vzc2lvbl9pZBgPIAEoCUgDiAEBEhUKCHByX3RpdGxlGBAgASgJSASIAQESFgoJcHJfYXV0aG9yGBEgASgJSAWIAQESGAoLaGVhZF9icmFuY2gYEiABKAlIBogBARIYCgtiYXNlX2JyYW5jaBgTIAEoCUgHiAEBEhUKCHByX3N0YXRlGBQgASgJSAiIAQESFgoJYWRkaXRpb25zGBUgASgFSAmIAQESFgoJZGVsZXRpb25zGBYgASgFSAqIAQESGgoNY2hhbmdlZF9maWxlcxgXIAEoBUgLiAEBEhEKCXRhcmdldF9pZBgYIAEoCRIQCghwcm92aWRlchgZIAEoCRIYCgtwcm92aWRlcl9pZBgaIAEoCUgMiAEBEhMKBnByX3VybBgbIAEoCUgNiAEBEg4KBmFjdGl2ZRgcIAEoCBIVCg1odW1hbl90cmlnZ2VyGB0gASgIQhMKEV9naXRodWJfcmV2aWV3X2lkQg0KC19zdW1tYXJ5X21kQhQKEl9maW5kZXJfc2Vzc2lvbl9pZEIWChRfdmVyaWZpZXJfc2Vzc2lvbl9pZEILCglfcHJfdGl0bGVCDAoKX3ByX2F1dGhvckIOCgxfaGVhZF9icmFuY2hCDgoMX2Jhc2VfYnJhbmNoQgsKCV9wcl9zdGF0ZUIMCgpfYWRkaXRpb25zQgwKCl9kZWxldGlvbnNCEAoOX2NoYW5nZWRfZmlsZXNCDgoMX3Byb3ZpZGVyX2lkQgkKB19wcl91cmwiWwoNRmluZGluZ0NvdW50cxIQCghjcml0aWNhbBgBIAEoBRIMCgRoaWdoGAIgASgFEg4KBm1lZGl1bRgDIAEoBRILCgNsb3cYBCABKAUSDQoFdG90YWwYBSABKAUimwQKDVJldmlld0ZpbmRpbmcSCgoCaWQYASABKAkSEQoJcmV2aWV3X2lkGAIgASgJEgwKBHBhdGgYAyABKAkSFwoKc3RhcnRfbGluZRgEIAEoBUgAiAEBEhUKCGVuZF9saW5lGAUgASgFSAGIAQESEQoEc2lkZRgGIAEoCUgCiAEBEhAKCGNhdGVnb3J5GAcgASgJEhAKCHNldmVyaXR5GAggASgJEhIKCmNvbmZpZGVuY2UYCSABKAkSDQoFdGl0bGUYCiABKAkSDwoHYm9keV9tZBgLIAEoCRIaCg1zdWdnZXN0ZWRfZml4GAwgASgJSAOIAQESEAoIZXZpZGVuY2UYDSADKAkSDQoFc3RhdGUYDiABKAkSGwoOdmVyZGljdF9yZWFzb24YDyABKAlIBIgBARIdChBnaXRodWJfdGhyZWFkX2lkGBAgASgJSAWIAQESFwoKcmVzb2x1dGlvbhgRIAEoCUgGiAEBEhIKCnNlc3Npb25faWQYEiABKAkSLgoKY3JlYXRlZF9hdBgTIAEoCzIaLmdvb2dsZS5wcm90b2J1Zi5UaW1lc3RhbXBCDQoLX3N0YXJ0X2xpbmVCCwoJX2VuZF9saW5lQgcKBV9zaWRlQhAKDl9zdWdnZXN0ZWRfZml4QhEKD192ZXJkaWN0X3JlYXNvbkITChFfZ2l0aHViX3RocmVhZF9pZEINCgtfcmVzb2x1dGlvbiJvCg1SZXZpZXdWZXJkaWN0EhIKCmZpbmRpbmdfaWQYASABKAkSDwoHdmVyZGljdBgCIAEoCRISCgpjb25maWRlbmNlGAMgASgJEhEKCXJlYXNvbmluZxgEIAEoCRISCgpzZXNzaW9uX2lkGAUgASgJIjAKEkxpc3RSZXZpZXdzUmVxdWVzdBIRCgRyZXBvGAEgASgJSACIAQFCBwoFX3JlcG8iPQoTTGlzdFJldmlld3NSZXNwb25zZRImCgdyZXZpZXdzGAEgAygLMhUuZW5ncmFtLmFwcC52MS5SZXZpZXciHgoQR2V0UmV2aWV3UmVxdWVzdBIKCgJpZBgBIAEoCSIgChJSZXRyeVJldmlld1JlcXVlc3QSCgoCaWQYASABKAkiUAoTUmV0cnlSZXZpZXdSZXNwb25zZRITCgt3b3JrZmxvd19pZBgBIAEoCRIWCglyZXZpZXdfaWQYAiABKAlIAIgBAUIMCgpfcmV2aWV3X2lkIsYBChFHZXRSZXZpZXdSZXNwb25zZRIlCgZyZXZpZXcYASABKAsyFS5lbmdyYW0uYXBwLnYxLlJldmlldxIuCghmaW5kaW5ncxgCIAMoCzIcLmVuZ3JhbS5hcHAudjEuUmV2aWV3RmluZGluZxIuCgh2ZXJkaWN0cxgDIAMoCzIcLmVuZ3JhbS5hcHAudjEuUmV2aWV3VmVyZGljdBIqCgZldmVudHMYBCADKAsyGi5lbmdyYW0uYXBwLnYxLlJldmlld0V2ZW50IooBCgtSZXZpZXdFdmVudBIKCgJpZBgBIAEoCRIRCglyZXZpZXdfaWQYAiABKAkSDAoEa2luZBgDIAEoCRITCgZkZXRhaWwYBCABKAlIAIgBARIuCgpjcmVhdGVkX2F0GAUgASgLMhouZ29vZ2xlLnByb3RvYnVmLlRpbWVzdGFtcEIJCgdfZGV0YWlsMrcECg1SZXZpZXdTZXJ2aWNlElQKC0xpc3RSZXZpZXdzEiEuZW5ncmFtLmFwcC52MS5MaXN0UmV2aWV3c1JlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLkxpc3RSZXZpZXdzUmVzcG9uc2USTgoJR2V0UmV2aWV3Eh8uZW5ncmFtLmFwcC52MS5HZXRSZXZpZXdSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5HZXRSZXZpZXdSZXNwb25zZRJUCgtSZXRyeVJldmlldxIhLmVuZ3JhbS5hcHAudjEuUmV0cnlSZXZpZXdSZXF1ZXN0GiIuZW5ncmFtLmFwcC52MS5SZXRyeVJldmlld1Jlc3BvbnNlEmAKD0xpc3RFbnJvbGxtZW50cxIlLmVuZ3JhbS5hcHAudjEuTGlzdEVucm9sbG1lbnRzUmVxdWVzdBomLmVuZ3JhbS5hcHAudjEuTGlzdEVucm9sbG1lbnRzUmVzcG9uc2USYwoQVXBzZXJ0RW5yb2xsbWVudBImLmVuZ3JhbS5hcHAudjEuVXBzZXJ0RW5yb2xsbWVudFJlcXVlc3QaJy5lbmdyYW0uYXBwLnYxLlVwc2VydEVucm9sbG1lbnRSZXNwb25zZRJjChBEZWxldGVFbnJvbGxtZW50EiYuZW5ncmFtLmFwcC52MS5EZWxldGVFbnJvbGxtZW50UmVxdWVzdBonLmVuZ3JhbS5hcHAudjEuRGVsZXRlRW5yb2xsbWVudFJlc3BvbnNlYgZwcm90bzM", [file_google_protobuf_timestamp]);
 
 /**
  * A repo enrolled for PR review.
@@ -179,7 +179,14 @@ export const DeleteEnrollmentResponseSchema: GenMessage<DeleteEnrollmentResponse
   messageDesc(file_engram_app_v1_review, 6);
 
 /**
- * One review pass over a PR at a pinned head_sha.
+ * One review pass over a PR at a pinned head_sha, flattened with the PR it is
+ * about (ADR 0100 decision 11).
+ *
+ * The two are separate rows: a PR is a durable entity, a pass is an event about
+ * it. Fields marked PR are read from the pull request's own record, so they are
+ * CURRENT and identical across every pass over that PR — a pass that failed
+ * before it could learn anything still reports the PR's real name. Fields marked
+ * PASS describe the code this pass actually read and are never rewritten.
  *
  * @generated from message engram.app.v1.Review
  */
@@ -190,6 +197,9 @@ export type Review = Message<"engram.app.v1.Review"> & {
   id: string;
 
   /**
+   * PR. `repo` is a mutable name: it is what the PR was last seen at, and
+   * `provider_id` is the identity that survives a rename or transfer.
+   *
    * @generated from field: string repo = 2;
    */
   repo: string;
@@ -222,7 +232,7 @@ export type Review = Message<"engram.app.v1.Review"> & {
   trigger: string;
 
   /**
-   * queued | finding | verifying | posted | failed | superseded
+   * queued | finding | verifying | posted | failed | superseded | halted
    *
    * @generated from field: string status = 8;
    */
@@ -268,12 +278,10 @@ export type Review = Message<"engram.app.v1.Review"> & {
   verifierSessionId?: string;
 
   /**
-   * ADR 0100 decision 9 — the PR as of the moment this pass started, captured
-   * from the same read that pins the heads and never refreshed. A PR merged
-   * after the pass still reports the state it had then. Unset on every review
-   * recorded before this landed (there is no backfill) and on any review whose
-   * head resolution failed, so a reader must fall back to "repo #number"
-   * rather than assume a title exists.
+   * PR. Refreshed on every pass, so a renamed PR reads correctly everywhere at
+   * once. Unset only when no pass over this PR ever captured it — a record
+   * backfilled from before the PR table existed, or a PR whose every resolution
+   * failed — so a reader still falls back to "repo #number" rather than assume.
    *
    * @generated from field: optional string pr_title = 16;
    */
@@ -287,6 +295,9 @@ export type Review = Message<"engram.app.v1.Review"> & {
   prAuthor?: string;
 
   /**
+   * PASS: the branches THIS pass compared. Per-pass because a PR can be
+   * retargeted, and an old pass must keep reporting what it actually read.
+   *
    * @generated from field: optional string head_branch = 18;
    */
   headBranch?: string;
@@ -297,14 +308,16 @@ export type Review = Message<"engram.app.v1.Review"> & {
   baseBranch?: string;
 
   /**
-   * open | draft | closed | merged, folded from GitHub's state/draft/merged
-   * triple into the one axis a reader thinks in.
+   * PR: open | draft | closed | merged, folded from GitHub's state/draft/merged
+   * triple into the one axis a reader thinks in. Current, not a snapshot.
    *
    * @generated from field: optional string pr_state = 20;
    */
   prState?: string;
 
   /**
+   * PASS: the diff at this head. Grows with every push, so it is not a PR fact.
+   *
    * @generated from field: optional int32 additions = 21;
    */
   additions?: number;
@@ -318,6 +331,58 @@ export type Review = Message<"engram.app.v1.Review"> & {
    * @generated from field: optional int32 changed_files = 23;
    */
   changedFiles?: number;
+
+  /**
+   * The change's own record. Every pass over the same pull request shares this
+   * id, so it is the grouping key — `repo` + `pr_number` is a coordinate that a
+   * rename can move out from under a client, and a reused repo name can even
+   * point two different pull requests at it.
+   *
+   * @generated from field: string target_id = 24;
+   */
+  targetId: string;
+
+  /**
+   * PR: which forge this came from. "github" today. Named for the concept rather
+   * than the vendor, so a second forge needs no field rename here.
+   *
+   * @generated from field: string provider = 25;
+   */
+  provider: string;
+
+  /**
+   * PR: the forge's own stable id — the identity, and the only field a rename or
+   * a transfer cannot move. Unset on a record that predates the change table, and
+   * on one whose pull request we can no longer read; it fills in when the
+   * hydrator or the next review resolves it.
+   *
+   * @generated from field: optional string provider_id = 26;
+   */
+  providerId?: string;
+
+  /**
+   * PR: the forge's own URL, so a link is never rebuilt from a stale repo name.
+   *
+   * @generated from field: optional string pr_url = 27;
+   */
+  prUrl?: string;
+
+  /**
+   * Derived server-side from the same active-status vocabulary that guards
+   * writes and the database uniqueness constraint. The browser does not carry
+   * a second hand-copied list.
+   *
+   * @generated from field: bool active = 28;
+   */
+  active: boolean;
+
+  /**
+   * Derived server-side from the same trigger classifier ingress uses for
+   * dedup-versus-supersede. Unknown triggers are human by default.
+   *
+   * @generated from field: bool human_trigger = 29;
+   */
+  humanTrigger: boolean;
 };
 
 /**
@@ -745,8 +810,8 @@ export const ReviewService: GenService<{
   /**
    * Re-run a review from scratch. The review record is terminal (failed,
    * halted, or posted); this dispatches a fresh pass over the PR's current
-   * head, minting a new review record and workflow epoch. The old record is
-   * left intact as history.
+   * head, minting a new review row and `review:<review_id>` workflow. The old
+   * row is left intact as history.
    *
    * @generated from rpc engram.app.v1.ReviewService.RetryReview
    */

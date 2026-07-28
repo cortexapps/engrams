@@ -10,6 +10,8 @@ import {
   buildInlineCommentBody,
   buildReviewSummary,
   buildStatusComment,
+  GithubRequestError,
+  isPermanentGithubFailure,
   makeGithubReviewPoster,
 } from "../github-review.ts";
 import type { PolicyDecision } from "../policy-gate.ts";
@@ -76,6 +78,9 @@ describe("GithubReviewPoster", () => {
       headSha: "head-sha",
       baseSha: "base-sha",
       pr: {
+        providerId: null,
+        url: null,
+        providerUpdatedAt: null,
         title: null,
         author: null,
         headBranch: null,
@@ -99,6 +104,9 @@ describe("GithubReviewPoster", () => {
   test("fetchPrContext captures the PR's descriptive context (ADR 0100 d9)", async () => {
     const fake = fakeRunOp([
       response(200, {
+        id: 2158810101,
+        node_id: "PR_kwDOJ1",
+        html_url: "https://github.com/openai/engrams/pull/881",
         title: "Bump quinn-proto from 0.11.14 to 0.11.16",
         user: { login: "dependabot[bot]" },
         state: "open",
@@ -107,6 +115,7 @@ describe("GithubReviewPoster", () => {
         additions: 12,
         deletions: 4,
         changed_files: 2,
+        updated_at: "2026-07-21T12:34:56Z",
         head: { sha: "head-sha", ref: "dependabot/cargo/quinn-proto-0.11.16" },
         base: { sha: "base-sha", ref: "main" },
       }),
@@ -115,6 +124,9 @@ describe("GithubReviewPoster", () => {
 
     const { pr } = await poster.fetchPrContext("openai/engrams", 881);
     expect(pr).toEqual({
+      providerId: "2158810101",
+      url: "https://github.com/openai/engrams/pull/881",
+      providerUpdatedAt: new Date("2026-07-21T12:34:56Z"),
       title: "Bump quinn-proto from 0.11.14 to 0.11.16",
       author: "dependabot[bot]",
       headBranch: "dependabot/cargo/quinn-proto-0.11.16",
@@ -164,6 +176,9 @@ describe("GithubReviewPoster", () => {
     expect(result.headSha).toBe("head-sha");
     expect(result.baseSha).toBe("base-sha");
     expect(result.pr).toEqual({
+      providerId: null,
+      url: null,
+      providerUpdatedAt: null,
       title: null,
       author: null,
       headBranch: null,
@@ -173,6 +188,37 @@ describe("GithubReviewPoster", () => {
       deletions: null,
       changedFiles: null,
     });
+  });
+
+  test("classifies permanent failures without treating GitHub throttles as permanent", () => {
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(
+        403,
+        "primary limit",
+        JSON.stringify({ message: "API Rate Limit exceeded for installation" }),
+      ),
+    )).toBe(false);
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(
+        403,
+        "secondary limit",
+        JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
+      ),
+    )).toBe(false);
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(403, "forbidden", JSON.stringify({ message: "Forbidden" })),
+    )).toBe(true);
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(403, "not JSON", "gateway rejected the request"),
+    )).toBe(true);
+    for (const status of [401, 404, 410]) {
+      expect(isPermanentGithubFailure(
+        new GithubRequestError(status, "permanent", JSON.stringify({ message: "rate limit" })),
+      )).toBe(true);
+    }
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(500, "transient", JSON.stringify({ message: "server error" })),
+    )).toBe(false);
   });
 
   test("posts exact single- and multi-line anchors with a suggestion block", async () => {

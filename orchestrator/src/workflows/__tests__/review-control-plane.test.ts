@@ -14,8 +14,8 @@ import type { ReviewSessionStore } from "../../db/review-sessions.ts";
 import type {
   GithubReviewPoster,
   PostReviewInput,
-  PrContext,
 } from "../../reviews/github-review.ts";
+import type { PrContext } from "../../reviews/pr-context.ts";
 import type { CreateSessionForExistingTaskParams } from "../../rpc/task-create.ts";
 import {
   makeReviewControlPlane,
@@ -26,6 +26,8 @@ import {
 /** A PR whose descriptive context is unavailable — what every review recorded
  *  before ADR 0100 decision 9 looks like, and what a junk payload degrades to. */
 const NO_PR_CONTEXT: PrContext = {
+  providerId: null,
+  url: null,
   title: null,
   author: null,
   headBranch: null,
@@ -34,10 +36,13 @@ const NO_PR_CONTEXT: PrContext = {
   additions: null,
   deletions: null,
   changedFiles: null,
+  providerUpdatedAt: null,
 };
 
 const active: ReviewRow = {
   id: "review-1",
+  targetId: "target-1",
+  provider: "github",
   repo: "openai/engrams",
   prNumber: 100,
   taskId: "task-1",
@@ -50,6 +55,8 @@ const active: ReviewRow = {
   finderSessionId: null,
   verifierSessionId: null,
   summaryMd: null,
+  providerId: null,
+  prUrl: null,
   prTitle: null,
   prAuthor: null,
   headBranch: null,
@@ -96,10 +103,18 @@ function detail(findings: ReviewFindingRow[] = []): ReviewDetail {
 
 const reviewPostingNoops = {
   updateFindingState: async () => {},
-  finalizeReview: async () => {},
+  finalizeReview: async () => true,
   setStatusCommentId: async () => {},
   setReviewSessionId: async () => {},
   recordEvent: async () => {},
+  claimTargetId: async () => null,
+  upsertTarget: async () => ({ id: "target-1" }),
+  beginReviewPass: async () => ({
+    kind: "created" as const,
+    reviewId: "review-stub",
+    taskId: "task-stub",
+  }),
+  updateReviewPassContext: async () => true,
 };
 
 // A full ReviewControlPlaneStore of no-ops for the session-lifecycle tests that
@@ -107,10 +122,8 @@ const reviewPostingNoops = {
 // now stamp the session id on the review at kickoff).
 const reviewStoreStub = {
   ...reviewPostingNoops,
-  getActiveReviewForPr: async () => null,
   getReview: async () => detail(),
-  createReview: async () => "review-stub",
-  updateReviewStatus: async () => {},
+  updateReviewStatus: async () => true,
 };
 
 function reviewSessionRecorder(order?: string[]): ReviewSessionStore & {
@@ -254,192 +267,119 @@ function fakeSessions(options: FakeSessionOptions = {}): ReviewSessionsClient & 
 }
 
 describe("ReviewControlPlane", () => {
-  test("dedupes against an active review without inserting a task", async () => {
-    let taskInserts = 0;
-    const cp = makeReviewControlPlane({
-      reviews: {
-        ...reviewPostingNoops,
-        getActiveReviewForPr: async () => active,
-        getReview: async () => detail(),
-        createReview: async () => { throw new Error("unexpected create"); },
-        updateReviewStatus: async () => {},
-      },
-      insertTask: async () => {
-        taskInserts++;
-        return "task-new";
-      },
-    });
-    expect(await cp.ensureReviewRecord({
-      repo: active.repo,
-      prNumber: active.prNumber,
-      headSha: active.headSha,
-      baseSha: "",
-      trigger: "command",
-    })).toEqual({ reviewId: active.id, taskId: active.taskId });
-    expect(taskInserts).toBe(0);
-  });
-
-  test("creates a bare task/review and marks an active review halted", async () => {
-    let current: ReviewRow | null = null;
-    const creates: unknown[] = [];
-    const statuses: unknown[] = [];
-    const cp = makeReviewControlPlane({
-      reviews: {
-        ...reviewPostingNoops,
-        getActiveReviewForPr: async () => current,
-        getReview: async () => detail(),
-        createReview: async (input) => {
-          creates.push(input);
-          current = { ...active, id: "review-new", taskId: input.taskId };
-          return "review-new";
-        },
-        updateReviewStatus: async (reviewId, status) => {
-          statuses.push([reviewId, status]);
-        },
-      },
-      insertTask: async () => "task-new",
-    });
-    expect(await cp.ensureReviewRecord({
-      repo: active.repo,
-      prNumber: active.prNumber,
-      headSha: "new-head",
-      baseSha: "",
-      trigger: "dispatch",
-    })).toEqual({ reviewId: "review-new", taskId: "task-new" });
-    expect(creates).toEqual([{
-      repo: active.repo,
-      prNumber: active.prNumber,
-      headSha: "new-head",
-      baseSha: "",
-      trigger: "dispatch",
-      taskId: "task-new",
-      status: "queued",
-      // No `pr` on the input → an unnamed review, which is a real state (head
-      // resolution failed, or the record predates ADR 0100 decision 9). The
-      // columns are written explicitly null rather than left undefined.
-      prTitle: null,
-      prAuthor: null,
-      headBranch: null,
-      baseBranch: null,
-      prState: null,
-      additions: null,
-      deletions: null,
-      changedFiles: null,
-    }]);
-    await cp.haltReview("review-new");
-    expect(statuses).toEqual([["review-new", "halted"]]);
-  });
-
-  // ADR 0100 decision 9: the nested PrContext is flattened onto the row here,
-  // because the value goes straight into a drizzle insert where a stray nested
-  // key would be a runtime error rather than a type error.
-  test("flattens the PR context onto the created review row", async () => {
-    const creates: unknown[] = [];
+  test("resolves a target by claiming legacy identity before the guarded upsert", async () => {
+    const calls: unknown[] = [];
     const cp = makeReviewControlPlane({
       reviews: {
         ...reviewStoreStub,
-        async createReview(input) {
-          creates.push(input);
-          return "review-new";
+        claimTargetId: async (input) => {
+          calls.push(["claim", input]);
+          return { id: "target-legacy" };
+        },
+        upsertTarget: async (input) => {
+          calls.push(["upsert", input]);
+          return { id: "target-legacy" };
         },
       },
-      insertTask: async () => "task-new",
-      githubPoster: {
-        fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
-        alreadyPosted: async () => false,
-        postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
-        upsertStatusComment: async () => ({ commentId: "gh-comment-1" }),
-      },
     });
-
-    await cp.ensureReviewRecord({
+    const input = {
+      provider: "github",
+      providerId: "2158810101",
       repo: active.repo,
-      prNumber: active.prNumber,
-      headSha: "new-head",
-      baseSha: "new-base",
-      trigger: "opened",
-      pr: {
-        title: "Bump quinn-proto from 0.11.14 to 0.11.16",
-        author: "dependabot[bot]",
-        headBranch: "dependabot/cargo/quinn-proto-0.11.16",
-        baseBranch: "main",
-        state: "open",
-        additions: 12,
-        deletions: 4,
-        changedFiles: 2,
-      },
+      number: active.prNumber,
+      title: "Review target",
+      author: "octocat",
+      state: "open",
+      url: "https://github.com/openai/engrams/pull/100",
+      providerUpdatedAt: new Date("2026-07-17T00:00:00Z"),
+    };
+
+    expect(await cp.resolveReviewTarget(input)).toEqual({
+      targetId: "target-legacy",
     });
-
-    expect(creates).toEqual([{
-      repo: active.repo,
-      prNumber: active.prNumber,
-      headSha: "new-head",
-      baseSha: "new-base",
-      trigger: "opened",
-      taskId: "task-new",
-      status: "queued",
-      prTitle: "Bump quinn-proto from 0.11.14 to 0.11.16",
-      prAuthor: "dependabot[bot]",
-      headBranch: "dependabot/cargo/quinn-proto-0.11.16",
-      baseBranch: "main",
-      prState: "open",
-      additions: 12,
-      deletions: 4,
-      changedFiles: 2,
-    }]);
+    expect(calls).toEqual([
+      ["claim", {
+        provider: "github",
+        providerId: "2158810101",
+        repo: active.repo,
+        number: active.prNumber,
+      }],
+      ["upsert", input],
+    ]);
   });
 
-  test("acks the sticky status comment on pickup and persists its id", async () => {
+  test("creates a pass through the atomic store seam and acknowledges pickup", async () => {
+    const passInputs: unknown[] = [];
     const upserts: Array<{ commentId?: string; body: string }> = [];
     let persisted: string | undefined;
     const cp = makeReviewControlPlane({
       reviews: {
-        ...reviewPostingNoops,
-        getActiveReviewForPr: async () => null,
+        ...reviewStoreStub,
         getReview: async () => detail(),
-        createReview: async () => "review-new",
-        updateReviewStatus: async () => {},
+        beginReviewPass: async (input) => {
+          passInputs.push(input);
+          return {
+            kind: "created",
+            reviewId: active.id,
+            taskId: active.taskId,
+          };
+        },
         setStatusCommentId: async (_id, commentId) => {
           persisted = commentId;
         },
       },
-      insertTask: async () => "task-new",
       githubPoster: {
         fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
         alreadyPosted: async () => false,
         postReview: async () => ({ posted: true, inlinePosted: true, summaryMd: "" }),
         async upsertStatusComment(input) {
-          upserts.push({ ...(input.commentId ? { commentId: input.commentId } : {}), body: input.body });
+          upserts.push({
+            ...(input.commentId ? { commentId: input.commentId } : {}),
+            body: input.body,
+          });
           return { commentId: "gh-comment-1" };
         },
       },
     });
-
-    await cp.ensureReviewRecord({
+    const input = {
+      provider: "github",
+      targetId: active.targetId,
       repo: active.repo,
       prNumber: active.prNumber,
-      headSha: "h",
-      baseSha: "b",
-      trigger: "command",
-    });
+      headSha: active.headSha,
+      baseSha: active.baseSha,
+      trigger: "opened",
+      headBranch: active.headBranch,
+      baseBranch: active.baseBranch,
+      additions: active.additions,
+      deletions: active.deletions,
+      changedFiles: active.changedFiles,
+      deduplicateSameHead: true,
+    };
 
+    expect(await cp.createReviewPass(input)).toEqual({
+      kind: "created",
+      reviewId: active.id,
+      taskId: active.taskId,
+    });
+    expect(passInputs).toEqual([input]);
     expect(upserts).toHaveLength(1);
     expect(upserts[0]?.commentId).toBeUndefined();
     expect(upserts[0]?.body).toContain("👀");
     expect(persisted).toBe("gh-comment-1");
   });
 
-  test("a failing status ack never wedges the review record", async () => {
+  test("a failing status ack never wedges pass creation", async () => {
     const cp = makeReviewControlPlane({
       reviews: {
-        ...reviewPostingNoops,
-        getActiveReviewForPr: async () => null,
+        ...reviewStoreStub,
         getReview: async () => detail(),
-        createReview: async () => "review-new",
-        updateReviewStatus: async () => {},
-        setStatusCommentId: async () => {},
+        beginReviewPass: async () => ({
+          kind: "created",
+          reviewId: active.id,
+          taskId: active.taskId,
+        }),
       },
-      insertTask: async () => "task-new",
       githubPoster: {
         fetchPrContext: async () => ({ headSha: "h", baseSha: "b", pr: NO_PR_CONTEXT }),
         alreadyPosted: async () => false,
@@ -448,13 +388,25 @@ describe("ReviewControlPlane", () => {
       },
     });
 
-    expect(await cp.ensureReviewRecord({
+    expect(await cp.createReviewPass({
+      provider: "github",
+      targetId: active.targetId,
       repo: active.repo,
       prNumber: active.prNumber,
-      headSha: "h",
-      baseSha: "b",
+      headSha: active.headSha,
+      baseSha: active.baseSha,
       trigger: "command",
-    })).toEqual({ reviewId: "review-new", taskId: "task-new" });
+      headBranch: null,
+      baseBranch: null,
+      additions: null,
+      deletions: null,
+      changedFiles: null,
+      deduplicateSameHead: false,
+    })).toEqual({
+      kind: "created",
+      reviewId: active.id,
+      taskId: active.taskId,
+    });
   });
 
   test("creates the finder with the designated profile and clamped review policy", async () => {
@@ -667,6 +619,28 @@ describe("ReviewControlPlane", () => {
     expect(reviewSessions.removes).toEqual(["review-session"]);
   });
 
+  test("a late failReview cannot overwrite a superseded terminal row", async () => {
+    let status = "superseded";
+    const events: string[] = [];
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewStoreStub,
+        updateReviewStatus: async (_reviewId, attempted) => {
+          expect(attempted).toBe("failed");
+          return false;
+        },
+        recordEvent: async (_reviewId, kind) => {
+          events.push(kind);
+        },
+      },
+    });
+
+    await cp.failReview(active.id, { reason: "late phase timeout" });
+
+    expect(status).toBe("superseded");
+    expect(events).toEqual([]);
+  });
+
   test("bootstraps with an idempotent clone, checkout, and rendered finder files", async () => {
     const sessions = fakeSessions();
     const cp = makeReviewControlPlane({ sessions });
@@ -737,13 +711,11 @@ describe("ReviewControlPlane", () => {
       sessions,
       reviews: {
         ...reviewPostingNoops,
-        getActiveReviewForPr: async () => active,
         getReview: async () => detail([
           finding("candidate-1"),
           finding("already-confirmed", "confirmed"),
         ]),
-        createReview: async () => active.id,
-        updateReviewStatus: async () => {},
+        updateReviewStatus: async () => true,
       },
     });
 
@@ -792,11 +764,10 @@ describe("ReviewControlPlane", () => {
       sessions,
       reviews: {
         ...reviewPostingNoops,
-        getActiveReviewForPr: async () => null,
         getReview: async () => detail(),
-        createReview: async () => "unused",
         updateReviewStatus: async (reviewId, status) => {
           statuses.push([reviewId, status]);
+          return true;
         },
         recordEvent: async (reviewId, kind, detail) => {
           events.push([reviewId, kind, detail]);
@@ -839,10 +810,8 @@ describe("ReviewControlPlane", () => {
       sessions,
       reviews: {
         ...reviewPostingNoops,
-        getActiveReviewForPr: async () => null,
         getReview: async () => detail(),
-        createReview: async () => "unused",
-        updateReviewStatus: async () => {},
+        updateReviewStatus: async () => true,
       },
     });
     await cp.sendFinderPrompt("finder-session", {
@@ -872,10 +841,8 @@ describe("ReviewControlPlane", () => {
       sessions,
       reviews: {
         ...reviewPostingNoops,
-        getActiveReviewForPr: async () => null,
         getReview: async () => detail(),
-        createReview: async () => "unused",
-        updateReviewStatus: async () => {},
+        updateReviewStatus: async () => true,
       },
     });
     const input = {
@@ -898,11 +865,10 @@ describe("ReviewControlPlane", () => {
       sessions,
       reviews: {
         ...reviewPostingNoops,
-        getActiveReviewForPr: async () => null,
         getReview: async () => detail(),
-        createReview: async () => "unused",
         updateReviewStatus: async (reviewId, status) => {
           statuses.push([reviewId, status]);
+          return true;
         },
       },
     });
@@ -980,18 +946,15 @@ describe("ReviewControlPlane", () => {
     };
     const cp = makeReviewControlPlane({
       reviews: {
-        getActiveReviewForPr: async () => active,
+        ...reviewPostingNoops,
         getReview: async () => ({ review: active, findings: [confirmed, refuted], verdicts }),
-        createReview: async () => active.id,
-        updateReviewStatus: async () => {},
-        setStatusCommentId: async () => {},
-        setReviewSessionId: async () => {},
-        recordEvent: async () => {},
+        updateReviewStatus: async () => true,
         async updateFindingState(id, state, opts) {
           findingUpdates.push({ id, state, ...(opts ? { opts } : {}) });
         },
         async finalizeReview(id, input) {
           finalizations.push({ id, input });
+          return true;
         },
       },
       githubPoster,
@@ -1054,18 +1017,15 @@ describe("ReviewControlPlane", () => {
     const findingStates: Array<[string, string]> = [];
     const cp = makeReviewControlPlane({
       reviews: {
-        getActiveReviewForPr: async () => active,
+        ...reviewPostingNoops,
         getReview: async () => detail([finding("candidate")]),
-        createReview: async () => active.id,
-        updateReviewStatus: async () => {},
-        setStatusCommentId: async () => {},
-        setReviewSessionId: async () => {},
-        recordEvent: async () => {},
+        updateReviewStatus: async () => true,
         updateFindingState: async (id, state) => {
           findingStates.push([id, state]);
         },
         finalizeReview: async (_id, input) => {
           finalizations.push(input);
+          return true;
         },
       },
       githubPoster: {
@@ -1109,12 +1069,10 @@ describe("ReviewControlPlane", () => {
     const cp = makeReviewControlPlane({
       reviews: {
         ...reviewPostingNoops,
-        getActiveReviewForPr: async () => reviewed,
         getReview: async () => ({ review: reviewed, findings: [finding("candidate")], verdicts: [] }),
-        createReview: async () => reviewed.id,
-        updateReviewStatus: async () => {},
+        updateReviewStatus: async () => true,
         updateFindingState: async () => {},
-        finalizeReview: async () => {},
+        finalizeReview: async () => true,
       },
       githubPoster: {
         fetchPrContext: async () => {

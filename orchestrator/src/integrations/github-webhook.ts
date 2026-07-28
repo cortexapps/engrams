@@ -1,15 +1,37 @@
 /** Pure GitHub webhook classification and review-command parsing — the command
  *  mention matches the configured App handle, not a hardcoded name (ADR 0100). */
 
+import { readPrContext, type PrContext } from "../reviews/pr-context.ts";
+
 export type GithubEvent =
   | {
       kind: "pull_request";
-      action: "opened" | "synchronize" | "ready_for_review" | "closed";
+      action:
+        | "opened"
+        | "synchronize"
+        | "ready_for_review"
+        | "closed"
+        | "reopened"
+        | "edited"
+        | "converted_to_draft";
       repo: string;
       prNumber: number;
       headSha: string;
+      /** Null when the payload omitted it; the pass then resolves heads the
+       *  slow way rather than being dropped. */
+      baseSha: string | null;
       baseRef: string;
       draft: boolean;
+      /**
+       * The PR as this delivery described it (ADR 0100 decision 11).
+       *
+       * The payload carries the whole pull-request object, so a review
+       * triggered by a webhook needs no API call to know what it is reviewing.
+       * That is mostly a resilience win rather than a latency one: a GitHub
+       * blip during head resolution fails the pass outright, and that is
+       * exactly the case that used to leave a review record with no PR name.
+       */
+      pr: PrContext;
     }
   | {
       kind: "comment";
@@ -33,6 +55,9 @@ const PULL_REQUEST_ACTIONS: ReadonlySet<string> = new Set([
   "synchronize",
   "ready_for_review",
   "closed",
+  "reopened",
+  "edited",
+  "converted_to_draft",
 ] as const);
 
 type PullRequestAction = Extract<GithubEvent, { kind: "pull_request" }>["action"];
@@ -59,15 +84,21 @@ export function classifyGithubEvent(
     const repo = repository && stringField(repository, "full_name");
     const prNumber = integerField(body, "number");
     const headSha = head && stringField(head, "sha");
+    const baseSha = base && stringField(base, "sha");
     const baseRef = base && stringField(base, "ref");
     const draft = pullRequest && booleanField(pullRequest, "draft");
+    // `baseSha` is deliberately NOT required here. It is an optimisation — its
+    // absence costs the pass one API call, whereas gating classification on it
+    // would silently drop a real review trigger. `pullRequest` is implied by
+    // `headSha` (which is read through it) but TypeScript cannot see that.
     if (
       !isPullRequestAction(action) ||
       !repo ||
       prNumber == null ||
       !headSha ||
       !baseRef ||
-      draft == null
+      draft == null ||
+      !pullRequest
     ) {
       return { kind: "ignore" };
     }
@@ -77,8 +108,10 @@ export function classifyGithubEvent(
       repo,
       prNumber,
       headSha,
+      baseSha,
       baseRef,
       draft,
+      pr: readPrContext(pullRequest),
     };
   }
 

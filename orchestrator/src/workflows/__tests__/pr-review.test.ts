@@ -6,34 +6,37 @@ import { prReviewWorkflowImpl, type StepRunner } from "../pr-review.ts";
 
 const trigger: ReviewInbox = {
   kind: "trigger",
+  reviewId: "review-1",
+  taskId: "task-1",
   repo: "openai/engrams",
   prNumber: 100,
   trigger: "opened",
   headSha: "head-sha",
-};
-
-/** What head resolution hands back for the PR under review (ADR 0100 d9). */
-const RESOLVED_PR = {
-  title: "Bump quinn-proto from 0.11.14 to 0.11.16",
-  author: "dependabot[bot]",
-  headBranch: "dependabot/cargo/quinn-proto-0.11.16",
-  baseBranch: "main",
-  state: "open",
-  additions: 12,
-  deletions: 4,
-  changedFiles: 2,
+  baseSha: "base-sha",
 };
 
 function fakeControlPlane(
   overrides: Partial<ReviewControlPlane> = {},
 ): ReviewControlPlane {
   return {
-    resolvePrHeads: async () => ({
-      headSha: "resolved-head",
-      baseSha: "resolved-base",
-      pr: RESOLVED_PR,
-    }),
-    ensureReviewRecord: async () => ({ reviewId: "review-1", taskId: "task-1" }),
+    resolvePrHeads: async () => {
+      throw new Error("pass workflow must not resolve pull requests");
+    },
+    resolveReviewTarget: async () => {
+      throw new Error("pass workflow must not resolve targets");
+    },
+    createReviewPass: async () => {
+      throw new Error("pass workflow must not create review rows");
+    },
+    updateReviewPassContext: async () => {
+      throw new Error("pass workflow must not update ingress context");
+    },
+    startReviewPass: async () => {
+      throw new Error("pass workflow must not dispatch itself");
+    },
+    signalSupersededPass: async () => {
+      throw new Error("pass workflow must not signal predecessors");
+    },
     createFinderSession: async () => ({ sessionId: "finder-session" }),
     bootstrapFinderSession: async () => {},
     sendFinderPrompt: async () => {},
@@ -45,6 +48,7 @@ function fakeControlPlane(
     postReviewResults: async () => {},
     failReview: async () => {},
     haltReview: async () => {},
+    cleanupSupersededReview: async () => {},
     ...overrides,
   };
 }
@@ -102,8 +106,6 @@ describe("PrReviewWorkflow", () => {
     ], steps.step);
 
     expect(steps.steps).toEqual([
-      "resolvePrHeads",
-      "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
       "sendFinderPrompt",
@@ -343,56 +345,60 @@ describe("PrReviewWorkflow", () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]?.opts).toMatchObject({ sessionId: "finder-session" });
     expect(steps.steps).toEqual([
-      "resolvePrHeads",
-      "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
       "failReview",
     ]);
   });
 
-  // ADR 0100 decision 9: head resolution is the only unconditional GitHub read
-  // on the path, so it is where the PR's descriptive context is captured — and
-  // the record has to actually receive it.
-  test("threads the resolved PR context onto the review record", async () => {
-    const records: unknown[] = [];
+  test("uses the review and task ids ingress put on the trigger", async () => {
+    const finderInputs: unknown[] = [];
     const steps = runner();
     const cp = fakeControlPlane({
-      async ensureReviewRecord(input) {
-        records.push(input);
-        return { reviewId: "review-1", taskId: "task-1" };
+      async createFinderSession(input) {
+        finderInputs.push(input);
+        return { sessionId: "finder-session" };
       },
     });
 
-    await run(cp, [trigger], steps.step);
+    await run(cp, [trigger, { kind: "stop" }], steps.step);
 
-    expect(records).toHaveLength(1);
-    expect(records[0]).toMatchObject({ pr: RESOLVED_PR });
+    expect(finderInputs).toEqual([{
+      reviewId: "review-1",
+      taskId: "task-1",
+      repo: "openai/engrams",
+      prNumber: 100,
+      workflowId: "review-wf-1",
+    }]);
+    expect(steps.steps).not.toContain("resolvePrHeads");
+    expect(steps.steps).not.toContain("createReviewPass");
   });
 
-  test("still records a review, unnamed, when head resolution fails", async () => {
-    const records: Array<Record<string, unknown>> = [];
+  test("supersede tears down the active worker without changing status", async () => {
+    const cleaned: Array<{ reviewId: string; opts?: unknown }> = [];
+    let halted = 0;
+    let failed = 0;
     const steps = runner();
     const cp = fakeControlPlane({
-      resolvePrHeads: async () => {
-        throw new Error("GitHub down");
+      cleanupSupersededReview: async (reviewId, opts) => {
+        cleaned.push({ reviewId, opts });
       },
-      async ensureReviewRecord(input) {
-        records.push(input as unknown as Record<string, unknown>);
-        return { reviewId: "review-1", taskId: "task-1" };
+      haltReview: async () => {
+        halted++;
+      },
+      failReview: async () => {
+        failed++;
       },
     });
 
-    await run(cp, [trigger], steps.step);
+    await run(cp, [trigger, { kind: "supersede" }], steps.step);
 
-    // A durable failed record is the point of this path; it simply has no PR
-    // context to carry, and must not invent an empty one.
-    expect(records).toHaveLength(1);
-    expect("pr" in records[0]!).toBe(false);
-    expect(steps.steps).toEqual([
-      "resolvePrHeads",
-      "ensureReviewRecord",
-      "failReview",
-    ]);
+    expect(cleaned).toEqual([{
+      reviewId: "review-1",
+      opts: { sessionId: "finder-session" },
+    }]);
+    expect(halted).toBe(0);
+    expect(failed).toBe(0);
+    expect(steps.steps.at(-1)).toBe("cleanupSupersededReview");
   });
 });

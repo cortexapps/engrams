@@ -191,7 +191,7 @@ function PrRow({ group, now }: { group: PrGroup; now: number }) {
     <Link
       to="/reviews/$id"
       params={{ id: review.id }}
-      className="flex items-center gap-3 px-3 py-2.5 outline-none transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset"
+      className="flex items-center gap-3 px-3 py-2.5 outline-none transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-inset"
     >
       <span className="w-3 shrink-0 text-[0.8rem] leading-none">
         <ReviewGlyph status={review.status} />
@@ -214,20 +214,26 @@ function PrRow({ group, now }: { group: PrGroup; now: number }) {
         </span>
       </span>
 
-      {/* Severity counts as words in their own tones, not a row of pills: the
-          shape of the number is the data, and a low count must not read as
-          loudly as a critical one. */}
-      <span className="hidden shrink-0 items-baseline gap-2 sm:flex">
+      {/* Severity counts as words, not a row of pills. The tone rides a dot
+          rather than the text: amber-on-paper measures 2.5:1 as 12px type, and
+          `index.css` sets the rule these tokens were chosen against — a coloured
+          dot beside ink, never coloured body copy. The word names the severity,
+          so the dot is redundant and AA holds. */}
+      <span className="hidden shrink-0 items-baseline gap-2.5 sm:flex">
         {counts.length === 0 ? (
           <span className="text-xs text-muted-foreground">no findings</span>
         ) : (
           counts.map(([severity, count]) => (
             <span
               key={severity}
-              className="font-mono text-xs tabular-nums"
-              style={{ color: severityTone(severity) }}
+              className="inline-flex items-center gap-1 font-mono text-xs tabular-nums"
               title={`${count} ${severity}`}
             >
+              <span
+                aria-hidden
+                className="size-1.5 rounded-full"
+                style={{ backgroundColor: severityTone(severity) }}
+              />
               {count} {severity.slice(0, 4)}
             </span>
           ))
@@ -235,10 +241,8 @@ function PrRow({ group, now }: { group: PrGroup; now: number }) {
       </span>
 
       <span className="flex w-24 shrink-0 items-center justify-end gap-1.5">
-        {isActive(review.status) && <LivePulse />}
-        <span className="text-xs" style={{ color: stage.tone }}>
-          {stage.label}
-        </span>
+        {isActive(review) && <LivePulse />}
+        <span className="text-xs">{stage.label}</span>
       </span>
 
       <span

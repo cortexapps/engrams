@@ -24,7 +24,7 @@ export function roleSession(review: Review, role: WorkerRole): string | undefine
 }
 
 /**
- * The finder or verifier session's thread, beside the dossier.
+ * The finder or verifier session's thread, in a sheet over the dossier.
  *
  * Reuses the session transcript wholesale: `SessionThread` is a pure props
  * component and already degrades to read-only on a terminal session (the
@@ -53,7 +53,7 @@ export function ReviewTranscriptPane({
   );
 
   return (
-    <div className="flex h-full min-h-0 flex-col border-l bg-background">
+    <div className="flex h-full min-h-0 flex-col">
       <header className="flex shrink-0 items-center gap-1 border-b px-2 py-1.5">
         {/* Typeset tabs rather than a segmented control: two roles, and the
             active one is named by weight plus a lime rule, matching TabRow. */}

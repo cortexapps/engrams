@@ -9,6 +9,7 @@ import type {
   FindingDecision,
   PolicyDecision,
 } from "./policy-gate.ts";
+import { readPrContext, type PrContext } from "./pr-context.ts";
 
 export interface InlineComment {
   findingId: string;
@@ -44,25 +45,6 @@ export interface UpsertStatusCommentInput {
   /** The comment to edit in place; omit to post a fresh one. */
   commentId?: string;
   body: string;
-}
-
-/**
- * ADR 0100 decision 9 — the PR's descriptive identity, captured alongside the
- * heads from the same GET. Every field is independently nullable and nothing
- * here is load-bearing: a review must never fail because GitHub omitted or
- * renamed a descriptive field, so extraction degrades field by field.
- */
-export interface PrContext {
-  title: string | null;
-  /** Login of the PR author. */
-  author: string | null;
-  headBranch: string | null;
-  baseBranch: string | null;
-  /** open | draft | closed | merged, as of this capture. Never refreshed. */
-  state: string | null;
-  additions: number | null;
-  deletions: number | null;
-  changedFiles: number | null;
 }
 
 export interface GithubReviewPoster {
@@ -144,49 +126,6 @@ const CATEGORY_LABELS: Readonly<Record<string, string>> = {
 const REVIEWS_PER_PAGE = 100;
 const MAX_REVIEW_PAGES = 50;
 
-/**
- * Pull the descriptive PR fields out of the pull-request response the head
- * resolution already fetches (ADR 0100 decision 9). Deliberately total: every
- * field falls back to null on its own, so an unexpected payload costs a title,
- * never a review.
- */
-function readPrContext(pr: Record<string, unknown>): PrContext {
-  const head = isObject(pr["head"]) ? pr["head"] : null;
-  const base = isObject(pr["base"]) ? pr["base"] : null;
-  const user = isObject(pr["user"]) ? pr["user"] : null;
-  return {
-    title: nullableString(pr["title"]),
-    author: user ? nullableString(user["login"]) : null,
-    headBranch: head ? nullableString(head["ref"]) : null,
-    baseBranch: base ? nullableString(base["ref"]) : null,
-    state: readPrState(pr),
-    additions: nullableCount(pr["additions"]),
-    deletions: nullableCount(pr["deletions"]),
-    changedFiles: nullableCount(pr["changed_files"]),
-  };
-}
-
-/**
- * GitHub splits a PR's disposition across three fields — `state` is only
- * open/closed, with `merged` and `draft` as separate booleans. Readers think in
- * one axis, so fold them: merged outranks closed (every merged PR is closed),
- * and draft only means anything while the PR is open.
- */
-function readPrState(pr: Record<string, unknown>): string | null {
-  if (pr["merged"] === true) return "merged";
-  const state = nullableString(pr["state"]);
-  if (state === "open") return pr["draft"] === true ? "draft" : "open";
-  return state;
-}
-
-function nullableString(value: unknown): string | null {
-  return typeof value === "string" && value !== "" ? value : null;
-}
-
-function nullableCount(value: unknown): number | null {
-  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
-}
-
 function isObject(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -204,10 +143,65 @@ function parseJson(result: IntegrationOpResult, operation: string): unknown {
   }
 }
 
+/**
+ * A GitHub response we could not use, carrying the status so callers can tell a
+ * permanent failure from a transient one.
+ *
+ * That distinction is load-bearing for review ingress: a 404 must fail the review
+ * immediately, because retrying a pull request that is gone wastes calls and
+ * still fails, while a 502 must retry, because the pull request is fine and
+ * GitHub is not.
+ */
+export class GithubRequestError extends Error {
+  constructor(
+    readonly status: number,
+    message: string,
+    readonly responseBody: string,
+  ) {
+    super(message);
+    this.name = "GithubRequestError";
+  }
+}
+
+function isRateLimitResponseBody(body: string): boolean {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    return (
+      isObject(parsed)
+      && typeof parsed["message"] === "string"
+      && /rate limit/i.test(parsed["message"])
+    );
+  } catch {
+    // A non-JSON 403 has no trustworthy rate-limit signal, so it retains the
+    // permanent-by-default classification below.
+    return false;
+  }
+}
+
+/**
+ * True when GitHub will not change its mind: the pull request is deleted, was
+ * transferred away, or our installation no longer has access. GitHub answers 404
+ * rather than 403 for a private repository we cannot see, so 404 is the common
+ * case here and it is NOT retryable.
+ */
+export function isPermanentGithubFailure(error: unknown): boolean {
+  if (!(error instanceof GithubRequestError)) return false;
+  if (error.status === 403) {
+    // IntegrationOpResult intentionally carries no response headers across the
+    // coordinator boundary, so x-ratelimit-remaining/retry-after are unavailable
+    // here. GitHub includes "rate limit" in the JSON message for both primary
+    // and secondary throttles; those 403s must retry, while other 403s fail fast.
+    return !isRateLimitResponseBody(error.responseBody);
+  }
+  return error.status === 401 || error.status === 404 || error.status === 410;
+}
+
 function responseError(operation: string, result: IntegrationOpResult): Error {
   const detail = decodeBody(result.body).trim();
-  return new Error(
+  return new GithubRequestError(
+    result.status,
     `${operation} failed with GitHub status ${result.status}${detail ? `: ${detail}` : ""}`,
+    detail,
   );
 }
 

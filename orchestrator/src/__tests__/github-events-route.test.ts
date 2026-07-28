@@ -2,8 +2,10 @@ import { createHmac } from "node:crypto";
 import { describe, expect, test } from "bun:test";
 
 import type { EnrollmentRow } from "../db/enrollments.ts";
+import type { UpsertReviewTargetInput } from "../db/reviews.ts";
 import type { DispatchWebhookInput } from "../automations/dispatch.ts";
 import type { DispatchReviewInput } from "../workflows/dispatch-review.ts";
+import type { ReviewIngressStart } from "../workflows/review-ingress.ts";
 import { makeGithubEventsRoute } from "../routes/github-events.ts";
 
 const SECRET = "github-route-secret";
@@ -26,18 +28,51 @@ function headers(body: string, event: string) {
   };
 }
 
-function pullRequestBody(action = "opened", draft = false) {
+/** A realistic delivery: GitHub sends the whole pull-request object, and the
+ *  route forwards it so the review needs no API call to start (ADR 0100 d11). */
+function pullRequestBody(
+  action = "opened",
+  draft = false,
+  pullRequestOverrides: Record<string, unknown> = {},
+) {
   return JSON.stringify({
     action,
     number: 100,
     repository: { full_name: enrollment.repo },
     pull_request: {
-      head: { sha: "head-sha" },
-      base: { ref: "main" },
+      id: 2158810101,
+      node_id: "PR_kwDOJ1",
+      html_url: `https://github.com/${enrollment.repo}/pull/100`,
+      title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+      user: { login: "dependabot[bot]" },
+      state: "open",
+      merged: false,
+      head: { sha: "head-sha", ref: "dependabot/cargo/quinn-proto-0.11.16" },
+      base: { sha: "base-sha", ref: "main" },
       draft,
+      additions: 12,
+      deletions: 4,
+      changed_files: 2,
+      updated_at: "2026-07-21T12:34:56Z",
+      ...pullRequestOverrides,
     },
   });
 }
+
+/** What the route is expected to hand review ingress from that delivery. */
+const FORWARDED_PR = {
+  providerId: "2158810101",
+  url: `https://github.com/${enrollment.repo}/pull/100`,
+  providerUpdatedAt: new Date("2026-07-21T12:34:56Z"),
+  title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+  author: "dependabot[bot]",
+  state: "open",
+  headBranch: "dependabot/cargo/quinn-proto-0.11.16",
+  baseBranch: "main",
+  additions: 12,
+  deletions: 4,
+  changedFiles: 2,
+};
 
 function commentBody(
   body: string,
@@ -55,9 +90,13 @@ function commentBody(
 
 function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
   const dispatches: DispatchReviewInput[] = [];
+  const ingresses: ReviewIngressStart[] = [];
+  const refreshes: UpsertReviewTargetInput[] = [];
   const automationDispatches: DispatchWebhookInput[] = [];
   return {
     dispatches,
+    ingresses,
+    refreshes,
     automationDispatches,
     app: makeGithubEventsRoute({
       webhookSecret: async () => SECRET,
@@ -65,7 +104,19 @@ function app(enrolled = true, enrollmentRow: EnrollmentRow = enrollment) {
       enrollments: { get: async () => enrolled ? enrollmentRow : null },
       dispatch: async (input) => {
         dispatches.push(input);
-        return { enrolled: true, workflowId: "review:wf" };
+        return {
+          enrolled: true,
+          activePass: true,
+          workflowId: "review:wf",
+          reviewId: "review-row-1",
+        };
+      },
+      startIngress: async (input) => {
+        ingresses.push(input);
+      },
+      refreshTarget: async (input) => {
+        refreshes.push(input);
+        return true;
       },
       automationDispatch: async (input) => {
         automationDispatches.push(input);
@@ -162,6 +213,10 @@ describe("POST /api/v1/integrations/github/events", () => {
     });
     expect(res.status).toBe(200);
     expect(fixture.dispatches).toEqual([]);
+    expect(fixture.ingresses).toEqual([]);
+    // The route still offers the delivery to the existing-only refresh seam;
+    // production returns false when this PR has never had a target.
+    expect(fixture.refreshes).toHaveLength(1);
   });
 
   test("dispatches an opened non-draft PR for auto enrollment", async () => {
@@ -173,12 +228,15 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "pull_request"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([{
+    expect(fixture.ingresses).toEqual([{
+      provider: "github",
       repo: enrollment.repo,
       prNumber: 100,
       trigger: "opened",
       idempotencyKey: "delivery-1",
       headSha: "head-sha",
+      baseSha: "base-sha",
+      pr: FORWARDED_PR,
     }]);
   });
 
@@ -191,12 +249,15 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "pull_request"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([{
+    expect(fixture.ingresses).toEqual([{
+      provider: "github",
       repo: enrollment.repo,
       prNumber: 100,
       trigger: "synchronize",
       idempotencyKey: "delivery-1",
       headSha: "head-sha",
+      baseSha: "base-sha",
+      pr: FORWARDED_PR,
     }]);
   });
 
@@ -209,7 +270,8 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "pull_request"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.refreshes).toHaveLength(1);
   });
 
   test("does NOT auto-review an opened PR under manual enrollment", async () => {
@@ -221,7 +283,8 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "pull_request"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.refreshes).toHaveLength(1);
   });
 
   test("does NOT auto-review a draft PR even under auto enrollment", async () => {
@@ -233,7 +296,8 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "pull_request"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.refreshes).toHaveLength(1);
   });
 
   test("dispatches a review command (mentioning the configured App handle) with its focus", async () => {
@@ -245,12 +309,39 @@ describe("POST /api/v1/integrations/github/events", () => {
       headers: headers(body, "issue_comment"),
     });
     expect(res.status).toBe(200);
-    expect(fixture.dispatches).toEqual([{
+    expect(fixture.ingresses).toEqual([{
+      provider: "github",
       repo: enrollment.repo,
       prNumber: 100,
       trigger: "command",
       idempotencyKey: "delivery-1",
+      commentId: "42",
       focus: "focus on auth",
+    }]);
+  });
+
+  test("closed refreshes an existing target without starting a pass", async () => {
+    const body = pullRequestBody("closed", false, { state: "closed" });
+    const fixture = app();
+    const res = await fixture.app.request(PATH, {
+      method: "POST",
+      body,
+      headers: headers(body, "pull_request"),
+    });
+
+    expect(res.status).toBe(200);
+    expect(fixture.ingresses).toEqual([]);
+    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.refreshes).toEqual([{
+      provider: "github",
+      providerId: "2158810101",
+      repo: enrollment.repo,
+      number: 100,
+      title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+      author: "dependabot[bot]",
+      state: "closed",
+      url: `https://github.com/${enrollment.repo}/pull/100`,
+      providerUpdatedAt: new Date("2026-07-21T12:34:56Z"),
     }]);
   });
 

@@ -4,38 +4,76 @@ import { eq, inArray } from "drizzle-orm";
 import { checkDb, getDb } from "../db/client.ts";
 import {
   makeReviewStore,
-  type CreateReviewInput,
   type ReviewFindingInput,
+  type ReviewStore,
+  type UpsertReviewTargetInput,
 } from "../db/reviews.ts";
 import {
   review as reviewTable,
+  reviewTarget as targetTable,
   task as taskTable,
 } from "../db/schema.ts";
 
 const DB_URL = process.env["ORCHESTRATOR_DATABASE_URL"];
 const dbReachable = DB_URL ? await checkDb() : false;
 
-function reviewInput(
-  taskId: string,
-  overrides: Partial<CreateReviewInput> = {},
-): CreateReviewInput {
+/** A minimal identified capture. Ingress never writes a target until the forge
+ *  has supplied its immutable provider id. */
+function blankTarget(repo: string, prNumber: number): UpsertReviewTargetInput {
   return {
-    repo: "openai/engrams",
-    prNumber: 100,
-    taskId,
-    headSha: "head-sha",
-    baseSha: "base-sha",
-    trigger: "dispatch",
-    prTitle: null,
-    prAuthor: null,
-    headBranch: null,
-    baseBranch: null,
-    prState: null,
-    additions: null,
-    deletions: null,
-    changedFiles: null,
-    ...overrides,
+    provider: "github",
+    providerId: `${repo}#${prNumber}`,
+    repo,
+    number: prNumber,
+    title: null,
+    author: null,
+    state: null,
+    url: null,
+    providerUpdatedAt: null,
   };
+}
+
+/** Create a pass over a PR, minting the PR's target row the way the control
+ *  plane does (ADR 0100 d11: target first, then the pass that points at it). */
+async function createPass(
+  store: ReviewStore,
+  taskId: string,
+  opts: {
+    repo: string;
+    prNumber?: number;
+    headSha?: string;
+    baseSha?: string;
+    trigger?: string;
+    status?: string;
+  },
+): Promise<string> {
+  const {
+    repo,
+    prNumber = 100,
+    headSha = "head-sha",
+    baseSha = "base-sha",
+    trigger = "dispatch",
+    status = "queued",
+  } = opts;
+  const target = await store.upsertTarget(blankTarget(repo, prNumber));
+  const rows = await getDb()
+    .insert(reviewTable)
+    .values({
+      targetId: target.id,
+      taskId,
+      headSha,
+      baseSha,
+      trigger,
+      status,
+      headBranch: null,
+      baseBranch: null,
+      additions: null,
+      deletions: null,
+      changedFiles: null,
+    })
+    .returning({ id: reviewTable.id });
+  if (!rows[0]) throw new Error("test review insert returned no row");
+  return rows[0].id;
 }
 
 function findingInput(
@@ -81,7 +119,7 @@ describe("ReviewStore", () => {
       });
 
       try {
-        const firstReviewId = await store.createReview(reviewInput(taskId, { repo }));
+        const firstReviewId = await createPass(store, taskId, { repo });
         reviewIds.push(firstReviewId);
         await db
           .update(reviewTable)
@@ -156,24 +194,24 @@ describe("ReviewStore", () => {
         });
         expect(detail?.verdicts).toHaveLength(1);
 
-        const terminalReviewId = await store.createReview(reviewInput(taskId, {
+        const terminalReviewId = await createPass(store, taskId, {
           repo,
           prNumber: 101,
           status: "posted",
           headSha: "terminal-head",
-        }));
+        });
         reviewIds.push(terminalReviewId);
         await db
           .update(reviewTable)
           .set({ createdAt: new Date("2026-07-17T11:00:00Z") })
           .where(eq(reviewTable.id, terminalReviewId));
 
-        const activeReviewId = await store.createReview(reviewInput(taskId, {
+        const activeReviewId = await createPass(store, taskId, {
           repo,
           prNumber: 102,
           status: "verifying",
           headSha: "active-head",
-        }));
+        });
         reviewIds.push(activeReviewId);
         await db
           .update(reviewTable)
@@ -181,8 +219,10 @@ describe("ReviewStore", () => {
           .where(eq(reviewTable.id, activeReviewId));
 
         expect((await store.getActiveReviewForTask(taskId))?.id).toBe(activeReviewId);
-        expect((await store.getActiveReviewForPr(repo, 102))?.id).toBe(activeReviewId);
-        expect(await store.getActiveReviewForPr(repo, 101)).toBeNull();
+        const activeTargetId = (await store.getReview(activeReviewId))!.review.targetId;
+        const terminalTargetId = (await store.getReview(terminalReviewId))!.review.targetId;
+        expect((await store.getActiveReviewForTarget(activeTargetId))?.id).toBe(activeReviewId);
+        expect(await store.getActiveReviewForTarget(terminalTargetId)).toBeNull();
 
         const listed = await store.listReviews({ repo });
         expect(listed.map((row) => row.id).slice(0, 3)).toEqual([
@@ -205,6 +245,8 @@ describe("ReviewStore", () => {
             .catch(() => {});
         }
         await db.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
+        // Passes cascade from their target, but the target itself outlives them.
+        await db.delete(targetTable).where(eq(targetTable.repo, repo)).catch(() => {});
       }
     },
   );
@@ -224,11 +266,9 @@ describe("ReviewStore", () => {
       });
 
       try {
-        const reviewId = await store.createReview(reviewInput(taskId, { repo }));
+        const reviewId = await createPass(store, taskId, { repo });
         reviewIds.push(reviewId);
-        const otherReviewId = await store.createReview(
-          reviewInput(taskId, { repo, prNumber: 200 }),
-        );
+        const otherReviewId = await createPass(store, taskId, { repo, prNumber: 200 });
         reviewIds.push(otherReviewId);
 
         // Two findings from a first (failed) finder session, one from the retry.
@@ -267,6 +307,280 @@ describe("ReviewStore", () => {
             .catch(() => {});
         }
         await db.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
+        // Passes cascade from their target, but the target itself outlives them.
+        await db.delete(targetTable).where(eq(targetTable.repo, repo)).catch(() => {});
+      }
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "upsertTarget rejects stale facts, preserves null fields, and follows a rename",
+    async () => {
+      const db = getDb();
+      const store = makeReviewStore(db);
+      const scope = `review-target-${crypto.randomUUID()}`;
+      const repo = `${scope}/engrams`;
+      const renamed = `${scope}/engrams-renamed`;
+      const providerId = `${Date.now()}${Math.trunc(performance.now())}`;
+
+      try {
+        const first = await store.upsertTarget({
+          provider: "github",
+          repo,
+          number: 881,
+          providerId,
+          title: "Bump quinn-proto",
+          author: "dependabot",
+          state: "open",
+          url: `https://github.com/${repo}/pull/881`,
+          providerUpdatedAt: new Date("2026-07-21T12:00:00Z"),
+        });
+
+        // A delayed older delivery must return the same id without overwriting
+        // facts learned from the newer delivery.
+        const stale = await store.upsertTarget({
+          provider: "github",
+          repo,
+          number: 881,
+          providerId,
+          title: "Stale title",
+          author: "stale-user",
+          state: "draft",
+          url: null,
+          providerUpdatedAt: new Date("2026-07-21T11:59:59Z"),
+        });
+        expect(stale.id).toBe(first.id);
+        const preserved = await db
+          .select()
+          .from(targetTable)
+          .where(eq(targetTable.id, first.id));
+        expect(preserved[0]).toMatchObject({
+          title: "Bump quinn-proto",
+          author: "dependabot",
+          state: "open",
+          providerId,
+        });
+
+        // A current capture that omitted optional fields does not blank them.
+        const partial = await store.upsertTarget({
+          provider: "github",
+          repo,
+          number: 881,
+          providerId,
+          title: "Bump quinn-proto to 0.11.16",
+          author: null,
+          state: null,
+          url: null,
+          providerUpdatedAt: null,
+        });
+        expect(partial.id).toBe(first.id);
+
+        // The repo is renamed. Resolution by the stable id must MOVE the
+        // existing row rather than mint a second target for the same PR —
+        // otherwise the PR's whole review history splits in two.
+        const afterRename = await store.upsertTarget({
+          provider: "github",
+          repo: renamed,
+          number: 881,
+          providerId,
+          title: "Bump quinn-proto to 0.11.16",
+          author: null,
+          state: "merged",
+          url: null,
+          providerUpdatedAt: new Date("2026-07-21T13:00:00Z"),
+        });
+        expect(afterRename.id).toBe(first.id);
+        const moved = await db
+          .select()
+          .from(targetTable)
+          .where(eq(targetTable.providerId, providerId));
+        expect(moved).toHaveLength(1);
+        expect(moved[0]).toMatchObject({
+          repo: renamed,
+          title: "Bump quinn-proto to 0.11.16",
+          state: "merged",
+          // Untouched by a capture that did not carry them.
+          author: "dependabot",
+          url: `https://github.com/${repo}/pull/881`,
+        });
+
+        // A different PR in the same repo is a different target.
+        const other = await store.upsertTarget(blankTarget(renamed, 882));
+        expect(other.id).not.toBe(first.id);
+      } finally {
+        await db
+          .delete(targetTable)
+          .where(inArray(targetTable.repo, [repo, renamed]))
+          .catch(() => {});
+      }
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "claimTargetId adopts only a null-id target",
+    async () => {
+      const db = getDb();
+      const store = makeReviewStore(db);
+      const scope = `review-claim-${crypto.randomUUID()}`;
+      const waitingRepo = `${scope}/waiting`;
+      const identifiedRepo = `${scope}/identified`;
+      const rows = await db
+        .insert(targetTable)
+        .values([
+          {
+            provider: "github",
+            providerId: null,
+            repo: waitingRepo,
+            number: 7,
+          },
+          {
+            provider: "github",
+            providerId: "existing-provider-id",
+            repo: identifiedRepo,
+            number: 8,
+          },
+        ])
+        .returning({ id: targetTable.id });
+
+      try {
+        expect(await store.claimTargetId({
+          provider: "github",
+          providerId: "claimed-provider-id",
+          repo: waitingRepo,
+          number: 7,
+        })).toEqual({ id: rows[0]!.id });
+        expect(await store.claimTargetId({
+          provider: "github",
+          providerId: "replacement-provider-id",
+          repo: identifiedRepo,
+          number: 8,
+        })).toBeNull();
+
+        const persisted = await db
+          .select({
+            id: targetTable.id,
+            providerId: targetTable.providerId,
+          })
+          .from(targetTable)
+          .where(inArray(targetTable.id, rows.map((row) => row.id)));
+        expect(persisted).toEqual(expect.arrayContaining([
+          { id: rows[0]!.id, providerId: "claimed-provider-id" },
+          { id: rows[1]!.id, providerId: "existing-provider-id" },
+        ]));
+      } finally {
+        await db
+          .delete(targetTable)
+          .where(inArray(targetTable.id, rows.map((row) => row.id)))
+          .catch(() => {});
+      }
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "the partial unique index arbitrates concurrent active-pass creation",
+    async () => {
+      const db = getDb();
+      const store = makeReviewStore(db);
+      const repo = `review-race-${crypto.randomUUID()}/engrams`;
+      const target = await store.upsertTarget(blankTarget(repo, 100));
+      const input = {
+        provider: "github",
+        targetId: target.id,
+        repo,
+        prNumber: 100,
+        headSha: "race-head",
+        baseSha: "race-base",
+        trigger: "synchronize",
+        headBranch: "feature",
+        baseBranch: "main",
+        additions: 1,
+        deletions: 0,
+        changedFiles: 1,
+        deduplicateSameHead: true,
+      };
+
+      try {
+        const results = await Promise.all([
+          store.beginReviewPass(input),
+          store.beginReviewPass(input),
+        ]);
+        const activeRows = await db
+          .select()
+          .from(reviewTable)
+          .where(eq(reviewTable.targetId, target.id));
+
+        expect(activeRows).toHaveLength(1);
+        expect(results.filter((result) => result.kind === "created")).toHaveLength(1);
+        expect(results.filter((result) => result.kind === "deduplicated")).toHaveLength(1);
+        expect(new Set(results.map((result) => result.reviewId)).size).toBe(1);
+      } finally {
+        const tasks = await db
+          .select({ id: reviewTable.taskId })
+          .from(reviewTable)
+          .where(eq(reviewTable.targetId, target.id));
+        await db.delete(targetTable).where(eq(targetTable.id, target.id)).catch(() => {});
+        if (tasks.length > 0) {
+          await db
+            .delete(taskTable)
+            .where(inArray(taskTable.id, tasks.map((row) => row.id)))
+            .catch(() => {});
+        }
+      }
+    },
+  );
+
+  test.skipIf(!dbReachable)(
+    "a superseded terminal row refuses a late failed transition",
+    async () => {
+      const db = getDb();
+      const store = makeReviewStore(db);
+      const repo = `review-terminal-${crypto.randomUUID()}/engrams`;
+      const target = await store.upsertTarget(blankTarget(repo, 100));
+      const first = await store.beginReviewPass({
+        provider: "github",
+        targetId: target.id,
+        repo,
+        prNumber: 100,
+        headSha: "head-1",
+        baseSha: "base",
+        trigger: "opened",
+        headBranch: "feature",
+        baseBranch: "main",
+        additions: 1,
+        deletions: 0,
+        changedFiles: 1,
+        deduplicateSameHead: true,
+      });
+      if (first.kind !== "created") throw new Error("first pass was not created");
+      const second = await store.beginReviewPass({
+        provider: "github",
+        targetId: target.id,
+        repo,
+        prNumber: 100,
+        headSha: "head-2",
+        baseSha: "base",
+        trigger: "synchronize",
+        headBranch: "feature",
+        baseBranch: "main",
+        additions: 2,
+        deletions: 0,
+        changedFiles: 1,
+        deduplicateSameHead: true,
+      });
+      if (second.kind !== "created") throw new Error("successor pass was not created");
+
+      try {
+        expect(second.supersededReviewId).toBe(first.reviewId);
+        expect(await store.updateReviewStatus(first.reviewId, "failed")).toBe(false);
+        expect((await store.getReview(first.reviewId))?.review.status)
+          .toBe("superseded");
+      } finally {
+        const taskIds = [first.taskId, second.taskId];
+        await db.delete(targetTable).where(eq(targetTable.id, target.id)).catch(() => {});
+        await db
+          .delete(taskTable)
+          .where(inArray(taskTable.id, taskIds))
+          .catch(() => {});
       }
     },
   );

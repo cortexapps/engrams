@@ -21,7 +21,6 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
 import { log as rootLog } from "../log.ts";
-import type { PrContext } from "../reviews/github-review.ts";
 import type { ReviewControlPlane } from "./review-control-plane.ts";
 import { REVIEW_TOPIC, type ReviewInbox } from "./review-inbox.ts";
 
@@ -73,58 +72,11 @@ export async function prReviewWorkflowImpl(
   const workflowId = deps.workflowId ?? DBOS.workflowID;
   if (!workflowId) throw new Error("Review workflow ID is unavailable");
 
-  let headSha = first.headSha ?? "";
-  let baseSha = "";
-  // ADR 0100 decision 9: the same resolution that pins the heads also carries
-  // the PR's descriptive context onto the review record. Hoisted out of the try
-  // so the record below can name itself; left undefined when resolution failed.
-  let prContext: PrContext | undefined;
-  try {
-    // The trigger contract does not carry baseSha, so every trigger resolves
-    // the PR heads. Preserve an event-provided head SHA and only fill missing
-    // values so a later push cannot change the commit this workflow reviews.
-    const resolved = await step(
-      () => cp.resolvePrHeads(first.repo, first.prNumber),
-      "resolvePrHeads",
-    );
-    if (headSha === "") headSha = resolved.headSha;
-    baseSha = resolved.baseSha;
-    prContext = resolved.pr;
-  } catch (err) {
-    log.error(
-      { repo: first.repo, prNumber: first.prNumber, err },
-      "pull request head resolution failed",
-    );
-    // markReviewFailed is review-ID based, so retain a durable failed record
-    // while ensuring no worker can bootstrap against unresolved code.
-    const { reviewId } = await step(
-      () => cp.ensureReviewRecord({
-        repo: first.repo,
-        prNumber: first.prNumber,
-        headSha,
-        baseSha,
-        trigger: first.trigger,
-      }),
-      "ensureReviewRecord",
-    );
-    await step(
-      () => cp.failReview(reviewId, { reason: "head resolution failed" }),
-      "failReview",
-    );
-    return;
-  }
-
-  const { reviewId, taskId } = await step(
-    () => cp.ensureReviewRecord({
-      repo: first.repo,
-      prNumber: first.prNumber,
-      headSha,
-      baseSha,
-      trigger: first.trigger,
-      ...(prContext ? { pr: prContext } : {}),
-    }),
-    "ensureReviewRecord",
-  );
+  // Ingress created exactly this pass row before starting exactly this workflow.
+  // The workflow consumes that durable identity; it never creates or selects a
+  // pass of its own.
+  const { headSha, baseSha } = first;
+  const { reviewId, taskId } = first;
 
   // Worker session ids are workflow-local state, rebuilt deterministically on
   // replay from the checkpointed step outputs. The setup/teardown closures are
@@ -197,7 +149,7 @@ export async function prReviewWorkflowImpl(
       // The active worker went silent for a full receive window. There is no
       // in-workflow retry: tear it down and mark failed in one step. Re-running
       // a review is an explicit action (the /reviews retry button / dispatch
-      // endpoint), which mints a fresh review record + workflow epoch.
+      // endpoint), which mints a fresh review row + immutable workflow id.
       await step(
         () => cp.failReview(reviewId, {
           sessionId: sessionIdFor(activeRole),
@@ -212,6 +164,16 @@ export async function prReviewWorkflowImpl(
       await step(
         () => cp.haltReview(reviewId, { sessionId: sessionIdFor(activeRole) }),
         "haltReview",
+      );
+      return;
+    }
+
+    if (message.kind === "supersede") {
+      await step(
+        () => cp.cleanupSupersededReview(reviewId, {
+          sessionId: sessionIdFor(activeRole),
+        }),
+        "cleanupSupersededReview",
       );
       return;
     }

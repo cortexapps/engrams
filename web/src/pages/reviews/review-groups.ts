@@ -10,7 +10,8 @@ import type { Review } from "../../gen/engram/app/v1/review_pb";
  * and the rail show is grouped through here first.
  */
 export interface PrGroup {
-  /** Stable identity for the PR itself: "owner/name#881". */
+  /** The PR's own record id (ADR 0100 decision 11) — stable across a repo
+   *  rename, which the "owner/name#number" coordinate is not. */
   key: string;
   repo: string;
   prNumber: number;
@@ -33,7 +34,10 @@ function createdAtMs(review: Review): number {
 export function groupByPr(reviews: readonly Review[]): PrGroup[] {
   const groups = new Map<string, Review[]>();
   for (const review of reviews) {
-    const key = `${review.repo}#${review.prNumber}`;
+    // The change's own record id. The coordinate fallback covers a cached bundle
+    // talking to a server that predates the field: without it, an empty id would
+    // collapse every pull request into a single row.
+    const key = review.targetId || `${review.repo}#${review.prNumber}`;
     const existing = groups.get(key);
     if (existing) existing.push(review);
     else groups.set(key, [review]);
@@ -59,15 +63,4 @@ export function groupByPr(reviews: readonly Review[]): PrGroup[] {
 /** The group a given pass belongs to, or undefined when it isn't in the list. */
 export function groupOf(groups: readonly PrGroup[], reviewId: string): PrGroup | undefined {
   return groups.find((g) => g.passes.some((p) => p.id === reviewId));
-}
-
-/**
- * The pass that superseded this one, if any — the next-newer pass over the same
- * PR. Derived from the grouping rather than a stored flag, which is why the
- * `superseded` status is never written (ADR 0100).
- */
-export function supersededBy(group: PrGroup, reviewId: string): Review | undefined {
-  const index = group.passes.findIndex((p) => p.id === reviewId);
-  if (index <= 0) return undefined;
-  return group.passes[index - 1];
 }

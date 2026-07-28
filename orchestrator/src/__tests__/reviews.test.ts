@@ -23,10 +23,7 @@ import type {
 } from "../db/reviews.ts";
 import { ReviewService } from "../gen/engram/app/v1/review_pb.ts";
 import { registerReviews } from "../rpc/reviews.ts";
-import type {
-  DispatchReviewInput,
-  DispatchReviewResult,
-} from "../workflows/dispatch-review.ts";
+import type { ReviewIngressStart } from "../workflows/review-ingress.ts";
 
 const REVIEW_ID = "00000000-0000-4000-8000-000000000001";
 const FINDING_ID = "00000000-0000-4000-8000-000000000002";
@@ -36,6 +33,8 @@ const UPDATED_AT = new Date("2026-07-17T10:12:13.456Z");
 function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
   return {
     id: REVIEW_ID,
+    targetId: "target-1",
+    provider: "github",
     repo: "openai/engrams",
     prNumber: 100,
     taskId: "task-review-1",
@@ -48,6 +47,8 @@ function reviewRow(overrides: Partial<ReviewRow> = {}): ReviewRow {
     finderSessionId: null,
     verifierSessionId: null,
     summaryMd: "Finder summary",
+    providerId: null,
+    prUrl: null,
     prTitle: null,
     prAuthor: null,
     headBranch: null,
@@ -111,8 +112,20 @@ function makeStore(
   const listCalls: Array<{ repo?: string }> = [];
   return {
     listCalls,
-    async createReview() {
+    async claimTargetId() {
+      return null;
+    },
+    async upsertTarget() {
+      return { id: "target-1" };
+    },
+    async getTargetForRefresh() {
+      return null;
+    },
+    async beginReviewPass() {
       throw new Error("unused");
+    },
+    async updateReviewPassContext() {
+      return true;
     },
     async getReview(id) {
       return detail?.review.id === id ? detail : null;
@@ -139,7 +152,10 @@ function makeStore(
     async getActiveReviewForTask() {
       return null;
     },
-    async getActiveReviewForPr() {
+    async getActiveReviewForTarget() {
+      return null;
+    },
+    async getActiveReviewByCoordinate() {
       return null;
     },
     async insertFinding() {
@@ -155,9 +171,13 @@ function makeStore(
     async setFinderSummary() {},
     async setStatusCommentId() {},
     async setReviewSessionId() {},
-    async updateReviewStatus() {},
+    async updateReviewStatus() {
+      return true;
+    },
     async updateFindingState() {},
-    async finalizeReview() {},
+    async finalizeReview() {
+      return true;
+    },
   };
 }
 
@@ -167,7 +187,7 @@ function spawn(
   role = "user",
   enrollments?: EnrollmentStore,
   profileExists = true,
-  dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>,
+  startIngress?: (input: ReviewIngressStart) => Promise<void>,
 ) {
   const transport = createRouterTransport((router) =>
     registerReviews(router, {
@@ -178,7 +198,9 @@ function spawn(
       profiles: {
         get: async (id) => profileExists ? { id } : null,
       },
-      ...(dispatch != null ? { dispatch, randomUUID: () => "idem-1" } : {}),
+      ...(startIngress != null
+        ? { startIngress, randomUUID: () => "idem-1" }
+        : {}),
     }),
   );
   return createClient(ReviewService, transport);
@@ -247,6 +269,8 @@ describe("ReviewService", () => {
       prNumber: 100,
       taskId: "task-review-1",
       status: "verifying",
+      active: true,
+      humanTrigger: true,
       summaryMd: "Finder summary",
       findingCounts: { high: 1, total: 1 },
     });
@@ -313,26 +337,40 @@ describe("ReviewService", () => {
     );
   });
 
-  test("RetryReview dispatches a fresh pass for the review's PR", async () => {
-    const calls: DispatchReviewInput[] = [];
-    const dispatch = async (
-      input: DispatchReviewInput,
-    ): Promise<DispatchReviewResult> => {
+  test("RetryReview starts ingress with the prior target id", async () => {
+    const calls: ReviewIngressStart[] = [];
+    const startIngress = async (input: ReviewIngressStart): Promise<void> => {
       calls.push(input);
-      return { enrolled: true, workflowId: "wf-2", reviewId: "review-2" };
     };
     const store = makeStore({
       ...detail,
       review: reviewRow({ status: "failed" }),
     });
-    const response = await spawn(store, true, "user", undefined, true, dispatch)
+    const enrollments = makeEnrollmentStore([{
+      repo: "openai/engrams",
+      triggerMode: "manual",
+      autofix: "off",
+      profileId: null,
+      createdAt: CREATED_AT,
+      updatedAt: UPDATED_AT,
+    }]);
+    const response = await spawn(
+      store,
+      true,
+      "user",
+      enrollments,
+      true,
+      startIngress,
+    )
       .retryReview({ id: REVIEW_ID });
 
-    expect(response.workflowId).toBe("wf-2");
-    expect(response.reviewId).toBe("review-2");
+    expect(response.workflowId).toBe("review-ingress:idem-1");
+    expect(response.reviewId).toBeUndefined();
     expect(calls).toEqual([{
+      provider: "github",
       repo: "openai/engrams",
       prNumber: 100,
+      targetId: "target-1",
       trigger: "retry",
       idempotencyKey: "idem-1",
     }]);
@@ -346,23 +384,27 @@ describe("ReviewService", () => {
   });
 
   test("RetryReview returns NotFound for an unknown review", async () => {
-    const dispatch = async (): Promise<DispatchReviewResult> => ({
-      enrolled: true,
-      workflowId: "wf",
-    });
+    const startIngress = async (): Promise<void> => {};
     await expectConnectError(
-      spawn(makeStore(null), true, "user", undefined, true, dispatch)
+      spawn(makeStore(null), true, "user", undefined, true, startIngress)
         .retryReview({ id: REVIEW_ID }),
       Code.NotFound,
     );
   });
 
   test("RetryReview fails when the repo is no longer enrolled", async () => {
-    const dispatch = async (): Promise<DispatchReviewResult> => ({
-      enrolled: false,
-    });
+    const startIngress = async (): Promise<void> => {
+      throw new Error("must not start ingress");
+    };
     await expectConnectError(
-      spawn(makeStore(detail), true, "user", undefined, true, dispatch)
+      spawn(
+        makeStore(detail),
+        true,
+        "user",
+        makeEnrollmentStore([]),
+        true,
+        startIngress,
+      )
         .retryReview({ id: REVIEW_ID }),
       Code.FailedPrecondition,
     );

@@ -1,0 +1,1 @@
+CREATE UNIQUE INDEX "review_one_active_per_target_idx" ON "review" USING btree ("target_id") WHERE "review"."status" IN ('queued', 'finding', 'verifying');

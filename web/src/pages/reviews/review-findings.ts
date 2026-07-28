@@ -13,7 +13,9 @@ import { SEVERITY_ORDER } from "./review-format";
  *                                            verifier's silence is a low-confidence
  *                                            verdict, not an oversight)
  *   confirmed, no line anchor             → nowhere to hang an inline comment
- *   confirmed, anchored, but not posted   → over the 10-comment cap
+ *   confirmed, anchored, gate ran         → over the 10-comment cap
+ *   confirmed, anchored, gate never ran   → unresolved; the pass died or is still
+ *                                            going, so no decision was made
  *   refuted                               → the verifier killed it
  *
  * The GitHub 422 batch-fallback (a single stale anchor demotes the whole batch)
@@ -21,7 +23,7 @@ import { SEVERITY_ORDER } from "./review-format";
  * once, and separating it would cost a schema column for a distinction no reader
  * acts on differently.
  */
-export type Outcome = "posted" | "unverified" | "no_anchor" | "over_cap" | "refuted";
+export type Outcome = "posted" | "unresolved" | "unverified" | "no_anchor" | "refuted" | "over_cap";
 
 export interface JudgedFinding {
   finding: ReviewFinding;
@@ -40,14 +42,24 @@ function isAnchored(finding: ReviewFinding): boolean {
   return finding.endLine != null || finding.startLine != null;
 }
 
-function outcomeOf(finding: ReviewFinding, verdict: ReviewVerdict | undefined): Outcome {
+function outcomeOf(
+  finding: ReviewFinding,
+  verdict: ReviewVerdict | undefined,
+  /** False while the pass is still running or after it died — see below. */
+  gateRan: boolean,
+): Outcome {
   if (finding.state === "posted") return "posted";
   if (verdict?.verdict === "refuted" || finding.state === "suppressed_refuted") {
     return "refuted";
   }
   if (!verdict) return "unverified";
   if (!isAnchored(finding)) return "no_anchor";
-  return "over_cap";
+  // Only `postReviewResults` advances a finding past `candidate`, so on a pass
+  // that never reached posting EVERY confirmed anchored finding still looks
+  // exactly like an over-cap one. Calling it "over the comment cap" would be a
+  // statement about a gate that never ran — and the page would simultaneously say
+  // the pass didn't finish and that this finding lost a race inside it.
+  return gateRan ? "over_cap" : "unresolved";
 }
 
 /**
@@ -68,16 +80,35 @@ function bySeverityThenConfidence(a: JudgedFinding, b: JudgedFinding): number {
 }
 
 /** Reading order: what shipped, then what didn't and why, then what was killed. */
-const OUTCOME_ORDER: Outcome[] = ["posted", "unverified", "no_anchor", "over_cap", "refuted"];
+const OUTCOME_ORDER: Outcome[] = [
+  "posted",
+  "unresolved",
+  "unverified",
+  "no_anchor",
+  "over_cap",
+  "refuted",
+];
+
+/**
+ * The posting gate is the only thing that advances a finding past `candidate`, and
+ * it runs once, at the end. So "did the gate run?" is exactly "did this pass reach
+ * `posted`?" — and every outcome that reasons about the gate's *decision* is only
+ * meaningful once it has.
+ */
+export function gateHasRun(review: Review): boolean {
+  return review.status === "posted";
+}
 
 export function judgeFindings(
   findings: readonly ReviewFinding[],
   verdicts: readonly ReviewVerdict[],
+  review: Review,
 ): JudgedFinding[] {
   const byFinding = new Map(verdicts.map((v) => [v.findingId, v]));
+  const gateRan = gateHasRun(review);
   return findings.map((finding) => {
     const verdict = byFinding.get(finding.id);
-    return { finding, verdict, outcome: outcomeOf(finding, verdict) };
+    return { finding, verdict, outcome: outcomeOf(finding, verdict, gateRan) };
   });
 }
 

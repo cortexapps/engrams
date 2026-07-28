@@ -16,6 +16,11 @@ import {
 import { config } from "../config.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import {
+  makeReviewStore,
+  type ReviewStore,
+  type UpsertReviewTargetInput,
+} from "../db/reviews.ts";
+import {
   classifyGithubEvent,
   parseReviewCommand,
 } from "../integrations/github-webhook.ts";
@@ -30,6 +35,10 @@ import {
   type DispatchReviewInput,
   type DispatchReviewResult,
 } from "../workflows/dispatch-review.ts";
+import {
+  startReviewIngress,
+  type ReviewIngressStart,
+} from "../workflows/review-ingress.ts";
 
 const log = rootLog.child({ component: "github-webhook" });
 const AUTHORIZED_COMMENT_ASSOCIATIONS: ReadonlySet<string> = new Set([
@@ -42,6 +51,13 @@ export interface GithubEventsDeps {
   webhookSecret?: () => Promise<string>;
   enrollments?: Pick<EnrollmentStore, "get">;
   dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>;
+  /** Starts the durable ingress workflow that resolves the change and then starts
+   *  a review (ADR 0100 d11). Separate from `dispatch`, which carries comments
+   *  and stops straight to a running pass and needs no resolution. */
+  startIngress?: (input: ReviewIngressStart) => Promise<void>;
+  /** Refresh a target only when it already exists. Non-reviewing PR actions
+   *  must never create dossiers for pull requests engrams has never reviewed. */
+  refreshTarget?: (input: UpsertReviewTargetInput) => Promise<boolean>;
   automationDispatch?: (input: DispatchWebhookInput) => Promise<unknown>;
   now?: () => Date;
   /** The review App's @-mention handle (its slug). Defaults to the deployment's
@@ -58,6 +74,23 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
   const dispatch = deps.dispatch ?? ((input) => dispatchReview({
     enrollments: enrollments(),
   }, input));
+  const startIngress = deps.startIngress ?? startReviewIngress;
+  let reviewStore: ReviewStore | undefined;
+  const reviews = (): ReviewStore => (reviewStore ??= makeReviewStore());
+  const refreshTarget = deps.refreshTarget ?? (async (input) => {
+    const existing = await reviews().getTargetForRefresh(input);
+    if (!existing) return false;
+    if (existing.providerId === null) {
+      await reviews().claimTargetId({
+        provider: input.provider,
+        providerId: input.providerId,
+        repo: input.repo,
+        number: input.number,
+      });
+    }
+    await reviews().upsertTarget(input);
+    return true;
+  });
   const automationDispatch = deps.automationDispatch ?? dispatchWebhookOccurrence;
   const now = deps.now ?? (() => new Date());
   const app = new Hono();
@@ -115,37 +148,63 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     if (event.kind === "ping") return c.body(null, 200);
     if (event.kind === "ignore") return c.body(null, 200);
 
-    const enrollment = await enrollments().get(event.repo);
-    if (!enrollment) return c.body(null, 200);
     const idempotencyKey = c.req.header("x-github-delivery") ?? "";
 
     if (event.kind === "pull_request") {
-      if (event.action === "closed") {
+      const enrollment = await enrollments().get(event.repo);
+      const startsReview = (
+        event.action === "opened"
+        || event.action === "synchronize"
+        || event.action === "ready_for_review"
+      ) && enrollment?.triggerMode === "auto" && !event.draft;
+
+      if (!startsReview) {
+        if (event.pr.providerId === null) {
+          log.warn(
+            { repo: event.repo, prNumber: event.prNumber, action: event.action },
+            "github PR target refresh skipped because the payload had no provider id",
+          );
+          return c.body(null, 200);
+        }
+        const refreshed = await refreshTarget({
+          provider: "github",
+          providerId: event.pr.providerId,
+          repo: event.repo,
+          number: event.prNumber,
+          title: event.pr.title,
+          author: event.pr.author,
+          state: event.pr.state,
+          url: event.pr.url,
+          providerUpdatedAt: event.pr.providerUpdatedAt,
+        });
         log.info(
-          { repo: event.repo, prNumber: event.prNumber },
-          "github PR closed; review halt is deferred",
+          {
+            repo: event.repo,
+            prNumber: event.prNumber,
+            action: event.action,
+            refreshed,
+          },
+          "github PR action refreshed target without starting a review",
         );
         return c.body(null, 200);
       }
-      // Every remaining pull_request action (opened / synchronize /
-      // ready_for_review) is an AUTOMATIC trigger. It fires a review only when
-      // the repo is enrolled in auto mode and the PR isn't a draft; in manual
-      // (mention-only) mode all of them are ignored — a review comes from an
-      // @mention command instead. (synchronize was previously ungated, so a
-      // push to a manual-mode PR auto-reviewed — the #802 bug.)
-      if (enrollment.triggerMode !== "auto" || event.draft) {
-        return c.body(null, 200);
-      }
-      await dispatch({
+      // The delivery already describes the change in full, so ingress starts a
+      // review without asking GitHub anything (ADR 0100 decision 11).
+      await startIngress({
+        provider: "github",
         repo: event.repo,
         prNumber: event.prNumber,
         trigger: event.action === "synchronize" ? "synchronize" : "opened",
         idempotencyKey,
         headSha: event.headSha,
+        ...(event.baseSha != null ? { baseSha: event.baseSha } : {}),
+        pr: event.pr,
       });
       return c.body(null, 200);
     }
 
+    const enrollment = await enrollments().get(event.repo);
+    if (!enrollment) return c.body(null, 200);
     const command = parseReviewCommand(event.body, mentionHandle);
     if (!command) return c.body(null, 200);
     if (event.senderType === "Bot") {
@@ -169,11 +228,15 @@ export function makeGithubEventsRoute(deps: GithubEventsDeps = {}): Hono {
     }
 
     if (command.kind === "review") {
-      await dispatch({
+      // An issue_comment payload describes the ISSUE, and `issue.id` is the
+      // issue's id, not the pull request's. So ingress must resolve this one.
+      await startIngress({
+        provider: "github",
         repo: event.repo,
         prNumber: event.prNumber,
         trigger: "command",
         idempotencyKey,
+        commentId: event.commentId,
         ...(command.focus != null ? { focus: command.focus } : {}),
       });
     } else if (command.kind === "stop") {

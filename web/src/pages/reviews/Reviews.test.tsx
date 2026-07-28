@@ -1,5 +1,5 @@
 import { beforeEach, describe, it, expect, vi } from "vitest";
-import { screen } from "@testing-library/react";
+import { act, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { renderWithProviders } from "../../test-utils";
 import { Reviews } from "./Reviews";
@@ -10,6 +10,9 @@ import { ReviewDossier } from "./ReviewDossier";
 // another review row).
 const newerPass = {
   id: "review-2",
+  // Grouping keys on the PR's own record, not on "repo#number" (ADR 0100 d11).
+  targetId: "target-100",
+  provider: "github",
   repo: "cortexapps/engrams",
   prNumber: 100,
   taskId: "task-1",
@@ -17,6 +20,8 @@ const newerPass = {
   baseSha: "aaaaaaaaaaaaaaaa",
   trigger: "synchronize",
   status: "verifying",
+  active: true,
+  humanTrigger: false,
   finderSessionId: "finder-sess-2",
   verifierSessionId: "verifier-sess-2",
   prTitle: "Bump quinn-proto from 0.11.14 to 0.11.16",
@@ -35,8 +40,11 @@ const olderPass = {
   ...newerPass,
   id: "review-1",
   headSha: "cccccccccccccccc",
-  trigger: "opened",
+  // A person asked for this one; the newer pass was an automatic push.
+  trigger: "command",
   status: "posted",
+  active: false,
+  humanTrigger: true,
   finderSessionId: "finder-sess-1",
   verifierSessionId: "verifier-sess-1",
   createdAt: { seconds: 1000n, nanos: 0 },
@@ -56,6 +64,8 @@ const findings = [
     bodyMd: "The validated value is dropped.",
     evidence: ["src/index.ts", "src/validate.ts"],
     state: "posted",
+    githubThreadId: "998877",
+    resolution: "fixed",
     sessionId: "finder-sess-1",
   },
   {
@@ -127,10 +137,23 @@ const events = [
   },
 ];
 
-// Which pass the dossier resolves, and its status — mutable so one mock covers
-// the live and terminal shapes.
-const view = { id: "review-1", status: "posted" };
-const retryMutate = vi.fn();
+// Which pass the dossier resolves, its status, and what it reported — mutable so
+// one mock covers the live, terminal, and reported-nothing shapes.
+const view: {
+  id: string;
+  status: string;
+  findings: typeof findings;
+  events: typeof events;
+  /** Extra passes over OTHER pull requests, for grouping tests. */
+  others: Array<typeof newerPass>;
+} = {
+  id: "review-1",
+  status: "posted",
+  findings,
+  events,
+  others: [],
+};
+const retryMutate = vi.fn<(input: { id: string }, options?: { onSuccess?: () => void }) => void>();
 
 vi.mock("@tanstack/react-router", async () => {
   const actual = await vi.importActual<Record<string, unknown>>("@tanstack/react-router");
@@ -141,8 +164,16 @@ vi.mock("../../hooks/useReviews", () => ({
   useReviews: () => ({
     data: {
       reviews: [
-        { ...olderPass, status: view.id === "review-1" ? view.status : olderPass.status },
+        {
+          ...olderPass,
+          status: view.id === "review-1" ? view.status : olderPass.status,
+          active:
+            view.id === "review-1"
+              ? ["queued", "finding", "verifying"].includes(view.status)
+              : olderPass.active,
+        },
         newerPass,
+        ...view.others,
       ],
     },
     isPending: false,
@@ -150,10 +181,14 @@ vi.mock("../../hooks/useReviews", () => ({
   }),
   useReview: () => ({
     data: {
-      review: { ...olderPass, status: view.status },
-      findings,
+      review: {
+        ...olderPass,
+        status: view.status,
+        active: ["queued", "finding", "verifying"].includes(view.status),
+      },
+      findings: view.findings,
       verdicts,
-      events,
+      events: view.events,
     },
     isPending: false,
     error: null,
@@ -178,6 +213,9 @@ vi.mock("../../hooks/useSessions", () => ({
 beforeEach(() => {
   view.id = "review-1";
   view.status = "posted";
+  view.findings = findings;
+  view.events = events;
+  view.others = [];
   retryMutate.mockClear();
 });
 
@@ -202,6 +240,34 @@ describe("Reviews ledger", () => {
     expect(row.getAttribute("href")).toContain("/reviews/review-2");
   });
 
+  it("keeps separate pull requests apart, and a renamed repo together", async () => {
+    view.others = [
+      // A different PR — must be its own row.
+      {
+        ...newerPass,
+        id: "review-3",
+        targetId: "target-204",
+        prNumber: 204,
+        prTitle: "Trim the firecracker CI lane",
+        createdAt: { seconds: 3000n, nanos: 0 },
+      },
+      // The SAME PR as review-1/2, seen after the repo was renamed. Keyed on the
+      // PR's record it stays in that group; keyed on "repo#number" it would
+      // split the history in two.
+      {
+        ...newerPass,
+        id: "review-4",
+        repo: "cortexapps/engrams-renamed",
+        createdAt: { seconds: 2500n, nanos: 0 },
+      },
+    ];
+    renderWithProviders(<Reviews />);
+
+    expect(await screen.findByText("2 of 2 pull requests")).toBeTruthy();
+    expect(screen.getByText("Trim the firecracker CI lane")).toBeTruthy();
+    expect(screen.getByText("3 passes")).toBeTruthy();
+  });
+
   it("falls back to the PR number when no title was captured", async () => {
     renderWithProviders(<Reviews />);
     // Both fixtures carry a title, so assert the coordinate is still shown
@@ -211,21 +277,46 @@ describe("Reviews ledger", () => {
 });
 
 describe("Review dossier", () => {
-  it("names the PR and reports the context captured at pass start", async () => {
+  it("names the PR once, with a single way over to GitHub", async () => {
     renderWithProviders(<ReviewDossier />);
 
     expect(await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16")).toBeTruthy();
     expect(screen.getByText("dependabot[bot]")).toBeTruthy();
     expect(screen.getByText("main ← dependabot/cargo/quinn-proto-0.11.16")).toBeTruthy();
     expect(screen.getByText("+12 −4 across 2 files")).toBeTruthy();
-    // The head SHA is shown short, with the full value available on hover.
-    expect(screen.getByText("ccccccc")).toBeTruthy();
+
+    const gh = screen.getAllByRole("link", { name: /GitHub/i });
+    expect(gh).toHaveLength(1);
+    expect(gh[0]!.getAttribute("href")).toBe("https://github.com/cortexapps/engrams/pull/100");
   });
 
-  it("states the kept-vs-killed ratio", async () => {
+  // A pass is an address, not a section: it costs one line, and its siblings live
+  // in a menu rather than a list the findings have to sit underneath.
+  it("switches passes from a menu, marking the one being read", async () => {
     renderWithProviders(<ReviewDossier />);
-    // 3 findings, 1 refuted → 2 kept, 1 posted.
-    expect(await screen.findByText(/2 of 3 kept · verifier refuted 1/)).toBeTruthy();
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /Choose a pass/i }));
+
+    const items = await screen.findAllByRole("menuitem");
+    expect(items).toHaveLength(2);
+    // Newest first, and the open one is the one the route names.
+    expect(items[0]!.getAttribute("href")).toContain("/reviews/review-2");
+    expect(items[1]!.getAttribute("href")).toContain("/reviews/review-1");
+    expect(items[1]!.getAttribute("aria-current")).toBe("page");
+  });
+
+  it("marks only the passes a person asked for", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /Choose a pass/i }));
+
+    // review-1 came from an @mention; review-2 was an automatic push, and
+    // labelling automation on every row would be a column carrying nothing. The
+    // marker is an icon, so the word rides along for assistive tech.
+    expect(await screen.findByText("Mentioned")).toBeTruthy();
+    expect(screen.queryByText("New commits")).toBeNull();
   });
 
   it("groups findings by outcome and names why each did not post", async () => {
@@ -240,11 +331,25 @@ describe("Review dossier", () => {
   it("keeps the finder's claim and the verifier's ruling as separate voices", async () => {
     renderWithProviders(<ReviewDossier />);
 
+    // The leading group is small, so it arrives open — no clicks for the common case.
     expect(await screen.findByText("Unchecked value reaches the caller")).toBeTruthy();
     expect(screen.getByText("The validated value is dropped.")).toBeTruthy();
     // The verifier is attributed, and carries its own confidence.
     expect(screen.getByText(/Verifier confirmed this/)).toBeTruthy();
     expect(screen.getByText("Reproduced from the diff.")).toBeTruthy();
+  });
+
+  // A body runs to twenty lines and the cap is 200 findings, so only the leading
+  // group opens itself; everything else is a row until asked for.
+  it("collapses findings outside the leading group", async () => {
+    renderWithProviders(<ReviewDossier />);
+    const user = userEvent.setup();
+
+    expect(await screen.findByText("Duplicated helper")).toBeTruthy();
+    expect(screen.queryByText("Two copies of the same guard.")).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: /Duplicated helper/i }));
+    expect(await screen.findByText("Two copies of the same guard.")).toBeTruthy();
   });
 
   it("collapses refuted findings behind a count", async () => {
@@ -256,8 +361,8 @@ describe("Review dossier", () => {
     expect(screen.queryByText("Imagined injection")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: /Refuted by the verifier/i }));
-    expect(await screen.findByText("Imagined injection")).toBeTruthy();
-    expect(screen.getByText("validate.ts:44 already guards this path.")).toBeTruthy();
+    await user.click(await screen.findByRole("button", { name: /Imagined injection/i }));
+    expect(await screen.findByText("validate.ts:44 already guards this path.")).toBeTruthy();
   });
 
   it("shows the finder's evidence on request — the claim's receipt", async () => {
@@ -270,57 +375,71 @@ describe("Review dossier", () => {
     expect(await screen.findByText("src/validate.ts")).toBeTruthy();
   });
 
-  it("collapses the activity log on a finished pass and expands it in place", async () => {
+  it("states the ratio only when the verifier killed something", async () => {
+    renderWithProviders(<ReviewDossier />);
+    // 3 findings, 1 refuted. Deliberately silent about what "stands": an
+    // unverified finding never posts, so counting it as surviving would overstate.
+    expect(await screen.findByText("The verifier refuted 1 of 3.")).toBeTruthy();
+  });
+
+  it("says why there is nothing to show instead of drawing an empty box", async () => {
+    view.status = "failed";
+    view.findings = [];
+    renderWithProviders(<ReviewDossier />);
+
+    expect(await screen.findByText("This pass failed before it reported anything.")).toBeTruthy();
+    expect(screen.queryByText(/verifier refuted/)).toBeNull();
+  });
+
+  // State and activity are one idea at two zoom levels: a terminal pass's state
+  // IS the last line of its own log, so one control carries both.
+  it("carries the pass state and opens the log from the same control", async () => {
     renderWithProviders(<ReviewDossier />);
     const user = userEvent.setup();
 
-    // Terminal → one summary line, no steps.
-    const summary = await screen.findByRole("button", { name: /4 steps/i });
     expect(screen.queryByText("Cloning repository")).toBeNull();
+    const control = await screen.findByRole("button", { name: /Posted — show the activity log/i });
+    // The terminal state, plus the step count behind it.
+    expect(control.textContent).toMatch(/Posted/);
+    expect(control.textContent).toMatch(/4/);
 
-    await user.click(summary);
+    await user.click(control);
     expect(await screen.findByText("Cloning repository")).toBeTruthy();
     expect(screen.getByText("Reviewing changes")).toBeTruthy();
   });
 
-  it("opens the log and marks the running step while a pass is live", async () => {
+  // Live, the step says more than the stage word does: "Reviewing changes" beats
+  // "Finding".
+  it("reports the running step rather than the stage while a pass is live", async () => {
     view.status = "verifying";
     renderWithProviders(<ReviewDossier />);
 
-    // Live → the log IS the content, already open, with the last step running.
-    expect(await screen.findByText("Verifying findings")).toBeTruthy();
-    expect(screen.getByText("in progress")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: /4 steps/i })).toBeNull();
+    const control = await screen.findByRole("button", {
+      name: /Verifying findings — show the activity log/i,
+    });
+    expect(control.textContent).toMatch(/Verifying findings/);
   });
 
-  // The activity log is the way INTO the transcripts: a milestone that names a
-  // worker session opens that session's thread beside the dossier.
-  it("opens a worker transcript from the milestone that names it", async () => {
+  it("opens the selected pass's worker sessions in a sheet", async () => {
     renderWithProviders(<ReviewDossier />);
     const user = userEvent.setup();
-    await user.click(await screen.findByRole("button", { name: /4 steps/i }));
 
-    // Nothing open yet — the pane is collapsed.
     expect(screen.queryByRole("link", { name: /Full session/i })).toBeNull();
+    await user.click(await screen.findByRole("button", { name: "Sessions" }));
 
-    await user.click(screen.getByRole("button", { name: /Verifying findings/i }));
-
-    // The pane mounts on the verifier and offers the way out to the full page.
+    // The sheet mounts on the finder and offers the way out to the full page.
     const full = await screen.findByRole("link", { name: /Full session/i });
-    expect(full.getAttribute("href")).toContain("/sessions/verifier-sess-1");
+    expect(full.getAttribute("href")).toContain("/sessions/finder-sess-1");
     expect(screen.getByRole("button", { name: "Finder" })).toBeTruthy();
     expect(screen.getByRole("button", { name: "Verifier" })).toBeTruthy();
   });
 
-  it("switches the pane between the finder and the verifier", async () => {
+  it("switches the sheet between the finder and the verifier", async () => {
     renderWithProviders(<ReviewDossier />);
     const user = userEvent.setup();
 
-    // The collapsed edge rail is the other way in.
-    await user.click(await screen.findByRole("button", { name: /Open the finder transcript/i }));
-    expect(
-      (await screen.findByRole("link", { name: /Full session/i })).getAttribute("href"),
-    ).toContain("/sessions/finder-sess-1");
+    await user.click(await screen.findByRole("button", { name: "Sessions" }));
+    await screen.findByRole("link", { name: /Full session/i });
 
     await user.click(screen.getByRole("button", { name: "Verifier" }));
     expect(screen.getByRole("link", { name: /Full session/i }).getAttribute("href")).toContain(
@@ -328,11 +447,11 @@ describe("Review dossier", () => {
     );
   });
 
-  it("closes the transcript pane", async () => {
+  it("closes the transcript sheet", async () => {
     renderWithProviders(<ReviewDossier />);
     const user = userEvent.setup();
 
-    await user.click(await screen.findByRole("button", { name: /Open the finder transcript/i }));
+    await user.click(await screen.findByRole("button", { name: "Sessions" }));
     await screen.findByRole("link", { name: /Full session/i });
 
     await user.click(screen.getByRole("button", { name: /Close transcript/i }));
@@ -344,21 +463,139 @@ describe("Review dossier", () => {
     const user = userEvent.setup();
 
     await user.click(await screen.findByRole("button", { name: /re-run/i }));
-    expect(retryMutate).toHaveBeenCalledWith({ id: "review-1" });
+    // The second argument is the per-call onSuccess that navigates to the new pass.
+    expect(retryMutate.mock.calls[0]?.[0]).toEqual({ id: "review-1" });
+
+    // The RPC only returns ingress's workflow id. Until the review list exposes
+    // the new pass, the same button must stay disabled rather than allowing a
+    // second intentional supersede.
+    await act(async () => {
+      retryMutate.mock.calls[0]?.[1]?.onSuccess?.();
+    });
+    expect((screen.getByRole("button", { name: /re-run/i }) as HTMLButtonElement).disabled).toBe(
+      true,
+    );
   });
 
   it("does not offer a re-run while a pass is still running", async () => {
     view.status = "verifying";
     renderWithProviders(<ReviewDossier />);
 
-    await screen.findByText("Verifying findings");
+    await screen.findByRole("button", { name: /Show the activity log/i });
     expect(screen.queryByRole("button", { name: /re-run/i })).toBeNull();
   });
 
-  it("points forward when a newer pass has superseded this one", async () => {
+  // Deciding whether a finding is real means looking at the code; acting on it
+  // means the thread it became. Both were a manual hunt on GitHub before this.
+  it("links a finding to the code at the commit the pass read, and to its thread", async () => {
     renderWithProviders(<ReviewDossier />);
 
-    const forward = await screen.findByRole("link", { name: /Open the current pass/i });
+    const code = await screen.findByRole("link", { name: /View the code/i });
+    // Pinned to headSha, not a branch: lines that have shifted since are worse
+    // than no link at all.
+    expect(code.getAttribute("href")).toBe(
+      "https://github.com/cortexapps/engrams/blob/cccccccccccccccc/src/index.ts#L10-L12",
+    );
+
+    const thread = screen.getByRole("link", { name: /Open the thread/i });
+    expect(thread.getAttribute("href")).toContain("#discussion_r998877");
+    // What the author actually did is the strongest post-hoc trust signal there is.
+    expect(screen.getByText("Author fixed this")).toBeTruthy();
+  });
+
+  it("says why a pass failed, in the reading flow", async () => {
+    view.status = "failed";
+    view.findings = [];
+    view.events = [
+      { id: "e1", reviewId: "review-1", kind: "queued", createdAt: { seconds: 1000n, nanos: 0 } },
+      {
+        id: "e2",
+        reviewId: "review-1",
+        kind: "failed",
+        detail: "finder setup failed",
+        createdAt: { seconds: 1010n, nanos: 0 },
+      },
+    ];
+    renderWithProviders(<ReviewDossier />);
+
+    // Not buried in the activity popover behind a duration-labelled control.
+    expect(await screen.findByText("finder setup failed")).toBeTruthy();
+  });
+
+  // The canonical entry point is a marker in a comment on a PR that has very
+  // likely been pushed to since, so reading history must not look like the present.
+  it("marks a superseded pass and points at the current one", async () => {
+    renderWithProviders(<ReviewDossier />);
+
+    const forward = await screen.findByRole("link", { name: /Open it/i });
     expect(forward.getAttribute("href")).toContain("/reviews/review-2");
+    expect(screen.getByText(/A newer pass ran/)).toBeTruthy();
+    // And the trigger says where you are without opening anything. Numbered
+    // oldest-first, the way attempts are counted: review-1 was the first try.
+    expect(screen.getByText("pass 1 of 2")).toBeTruthy();
+  });
+
+  it("gives the route a heading outline to navigate by", async () => {
+    renderWithProviders(<ReviewDossier />);
+
+    const h1 = await screen.findByRole("heading", { level: 1 });
+    expect(h1.textContent).toBe("Bump quinn-proto from 0.11.14 to 0.11.16");
+    // Each outcome group is the reason a finding didn't post, so it is reachable.
+    const h2s = screen.getAllByRole("heading", { level: 2 });
+    expect(h2s.map((h) => h.textContent)).toContain("Posted to the pull request");
+  });
+
+  // A reviewer session is owned by nobody, and session reads are owner-scoped, so
+  // only an admin can actually open one. Offering a button that answers 404 is
+  // worse than not offering it.
+  it("hides the sessions button from a member who could not open them", async () => {
+    renderWithProviders(<ReviewDossier />, {
+      principal: {
+        email: "member@example.com",
+        display_name: "Member",
+        role: "member",
+        is_admin: false,
+        can_sign_out: true,
+      },
+    });
+
+    await screen.findByText("Bump quinn-proto from 0.11.14 to 0.11.16");
+    expect(screen.queryByRole("button", { name: "Sessions" })).toBeNull();
+  });
+
+  // Only the posting gate advances a finding past `candidate`, so on a pass that
+  // died before it ran, a confirmed anchored finding looks identical to one that
+  // lost a race inside the cap. Saying "over the comment cap" describes a
+  // decision that was never made.
+  it("does not blame the comment cap when the gate never ran", async () => {
+    view.status = "failed";
+    view.findings = [{ ...findings[0]!, state: "candidate" }];
+    renderWithProviders(<ReviewDossier />);
+
+    expect(await screen.findByText("No decision yet")).toBeTruthy();
+    expect(screen.queryByText("Over the comment cap")).toBeNull();
+  });
+
+  // Review-event writes are best-effort and their failures are swallowed, so the
+  // last event is not reliably the one that ended the pass.
+  it("does not present an unrelated event as the failure reason", async () => {
+    view.status = "failed";
+    view.findings = [];
+    view.events = [
+      { id: "e1", reviewId: "review-1", kind: "queued", createdAt: { seconds: 1000n, nanos: 0 } },
+      {
+        id: "e2",
+        reviewId: "review-1",
+        kind: "verifying",
+        detail: "3 candidate findings",
+        createdAt: { seconds: 1010n, nanos: 0 },
+      },
+    ];
+    renderWithProviders(<ReviewDossier />);
+
+    await screen.findByText("This pass failed before it reported anything.");
+    // The `failed` event never landed, so we say nothing rather than blaming the
+    // verifier's progress note.
+    expect(screen.queryByText("3 candidate findings")).toBeNull();
   });
 });

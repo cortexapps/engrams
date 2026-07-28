@@ -10,6 +10,8 @@ import { runPolicyGate } from "../policy-gate.ts";
 
 const review: ReviewRow = {
   id: "review-1",
+  targetId: "target-1",
+  provider: "github",
   repo: "openai/engrams",
   prNumber: 100,
   taskId: "task-1",
@@ -22,6 +24,8 @@ const review: ReviewRow = {
   finderSessionId: null,
   verifierSessionId: null,
   summaryMd: null,
+  providerId: null,
+  prUrl: null,
   prTitle: null,
   prAuthor: null,
   headBranch: null,
