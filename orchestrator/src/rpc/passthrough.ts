@@ -24,14 +24,10 @@
 import { ConnectError, Code } from "@connectrpc/connect";
 import type { ConnectRouter, Transport, HandlerContext } from "@connectrpc/connect";
 import type { DescService } from "@bufbuild/protobuf";
+import { subject } from "@casl/ability";
 import { POLICY, policyKey } from "../authz/policy-map.ts";
 import { abilityFor } from "../authz/ability.ts";
 import { resolveSessionOwner } from "../authz/resolve.ts";
-import {
-  canAccessSession,
-  isReviewWorkerSession,
-  type IsReviewWorkerSession,
-} from "../authz/session-access.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 
 // ---------------------------------------------------------------------------
@@ -173,8 +169,6 @@ function upstreamHeaders(inbound: Headers): Headers {
  * @param resolveOwner  Optional override for session-owner DB lookup (tests).
  * @param preflight     Optional per-method pre-flight hooks, keyed by policyKey.
  *                      Each runs after the authz gate and before the forward.
- * @param isReviewWorker Optional override for the ADR 0100 d10 review-worker
- *                      lookup (tests).
  */
 export function registerPassthrough(
   router: ConnectRouter,
@@ -183,15 +177,12 @@ export function registerPassthrough(
   getSession?: GetSession,
   resolveOwner?: ResolveOwner,
   preflight?: Record<string, Preflight>,
-  isReviewWorker?: IsReviewWorkerSession,
 ): void {
   const resolveSession: GetSession =
     getSession ??
     getSessionFromHeaders;
 
   const ownerResolver: ResolveOwner = resolveOwner ?? resolveSessionOwner;
-  const reviewWorkerResolver: IsReviewWorkerSession =
-    isReviewWorker ?? isReviewWorkerSession;
 
   for (const { service, methods } of specs) {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -262,19 +253,14 @@ export function registerPassthrough(
 
           const ownerId = await ownerResolver(sid);
 
-          // Ownership, or the ADR 0100 d10 derived read for a review's
-          // finder/verifier worker.
-          //
           // Anti-enumeration: return NotFound even when the session exists
           // but is not owned by the caller — don't confirm existence.
-          const allowed = await canAccessSession(
-            ability,
-            entry.action,
-            sid,
-            ownerId,
-            reviewWorkerResolver,
-          );
-          if (!allowed) {
+          if (
+            !ability.can(
+              entry.action,
+              subject("Session", { createdByUserId: ownerId }),
+            )
+          ) {
             throw new ConnectError("not found", Code.NotFound);
           }
         } else {

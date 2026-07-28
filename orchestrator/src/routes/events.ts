@@ -31,7 +31,6 @@ import {
 } from "../control-plane/client.ts";
 import { makeGuard } from "./guard.ts";
 import type { GetSession, ResolveOwner } from "./guard.ts";
-import type { IsReviewWorkerSession } from "../authz/session-access.ts";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,9 +49,6 @@ export interface EventsDeps {
   sessions?: SessionsClient;
   getSession?: GetSession;
   resolveOwner?: ResolveOwner;
-  /** ADR 0100 d10 review-worker lookup; injected in tests. Every other guarded
-   *  route picks up the real one through `makeGuard`'s default. */
-  isReviewWorker?: IsReviewWorkerSession;
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +60,7 @@ export function makeEventsRoute(deps?: EventsDeps): Hono {
   const sessionsClient: SessionsClient =
     (deps?.sessions as SessionsClient | undefined) ??
     (defaultSessions as unknown as SessionsClient);
-  const guardFn = makeGuard(deps?.getSession, deps?.resolveOwner, deps?.isReviewWorker);
+  const guardFn = makeGuard(deps?.getSession, deps?.resolveOwner);
 
   app.get("/api/v1/sessions/:id/events", async (c) => {
     // 1. Auth + ownership check — throws HTTPException on failure.

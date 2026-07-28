@@ -35,7 +35,6 @@ import { abilityFor } from "../authz/ability.ts";
 import { buildServer } from "../server.ts";
 import { registerPassthrough } from "../rpc/passthrough.ts";
 import type { GetSession, ResolveOwner } from "../rpc/passthrough.ts";
-import type { IsReviewWorkerSession } from "../authz/session-access.ts";
 import { makeExternalToolCompletionGuard } from "../rpc/tool-completion-guard.ts";
 import { SURFACE } from "../rpc/surface.ts";
 import { POLICY } from "../authz/policy-map.ts";
@@ -70,8 +69,6 @@ const MEMBER_A = "member-a-id";
 const MEMBER_B = "member-b-id";
 const ADMIN_ID  = "admin-id";
 const SESSION_OF_A = "session-owned-by-a";
-/** A review's finder worker: owned by nobody, readable via ADR 0100 d10. */
-const REVIEWER_SESSION = "session-review-finder";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -96,15 +93,6 @@ const fakeResolveOwner: ResolveOwner = async (sessionId) => {
   if (sessionId === SESSION_OF_A) return MEMBER_A;
   return null;
 };
-
-/**
- * Fake review-worker lookup (ADR 0100 d10): only REVIEWER_SESSION is a review's
- * finder/verifier worker. Injected so the matrix needs no DB — and so the
- * unknown-session cases below assert a real "no such review" answer rather than
- * riding the production lookup's fail-closed error path.
- */
-const fakeIsReviewWorker: IsReviewWorkerSession = async (sessionId) =>
-  sessionId === REVIEWER_SESSION;
 
 interface TestOrchestrator {
   /** Base URL WITHOUT /rpc suffix — use makeTransport() which adds /rpc. */
@@ -147,15 +135,7 @@ async function spawnOrchestrator(
   app.notFound((c) => c.json({ error: "not found" }, 404));
 
   const server = buildServer(app, (router: ConnectRouter) => {
-    registerPassthrough(
-      router,
-      SURFACE,
-      upstream,
-      getSession,
-      fakeResolveOwner,
-      undefined,
-      fakeIsReviewWorker,
-    );
+    registerPassthrough(router, SURFACE, upstream, getSession, fakeResolveOwner);
   });
 
   return new Promise<TestOrchestrator>((resolve, reject) => {
@@ -248,7 +228,6 @@ function completeToolCallTransport(
           registry,
         }),
       },
-      fakeIsReviewWorker,
     );
   });
   return { transport, upstreamCallCount };
@@ -350,34 +329,6 @@ describe("authz.matrix — member cross-session access (anti-enumeration)", () =
       const client = createClient(SessionService, makeTransport(orch.serverUrl));
       await expectCode(
         () => client.getSession({ sessionId: SESSION_OF_A }),
-        Code.NotFound,
-      );
-      expect(orch.upstreamCallCount.value).toBe(0);
-    } finally {
-      await orch.close();
-    }
-  });
-
-  // ADR 0100 d10: reviews are org-visible but their worker sessions are owned by
-  // nobody, so the owner check alone 404'd the transcript that justifies a
-  // finding. A member may READ a reviewer session — and nothing more.
-  test("member reading a review's worker session → allowed (derived read)", async () => {
-    const orch = await spawnOrchestrator(makeGetSession(MEMBER_B, "user"));
-    try {
-      const client = createClient(SessionService, makeTransport(orch.serverUrl));
-      await client.getSession({ sessionId: REVIEWER_SESSION });
-      expect(orch.upstreamCallCount.value).toBe(1);
-    } finally {
-      await orch.close();
-    }
-  });
-
-  test("member deleting a review's worker session → NotFound (read only)", async () => {
-    const orch = await spawnOrchestrator(makeGetSession(MEMBER_B, "user"));
-    try {
-      const client = createClient(SessionService, makeTransport(orch.serverUrl));
-      await expectCode(
-        () => client.deleteSession({ sessionId: REVIEWER_SESSION }),
         Code.NotFound,
       );
       expect(orch.upstreamCallCount.value).toBe(0);
