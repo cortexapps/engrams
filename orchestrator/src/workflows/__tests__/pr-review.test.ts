@@ -34,6 +34,12 @@ function fakeControlPlane(
     startReviewPass: async () => {
       throw new Error("pass workflow must not dispatch itself");
     },
+    abandonIngress: async () => {
+      throw new Error("pass workflow must not abandon ingress");
+    },
+    acknowledgeReviewPass: async () => {
+      throw new Error("pass workflow must not acknowledge ingress passes");
+    },
     signalSupersededPass: async () => {
       throw new Error("pass workflow must not signal predecessors");
     },

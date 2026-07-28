@@ -45,6 +45,8 @@ function controlPlane(
     updateReviewPassContext: async () => true,
     startReviewPass: async () => {},
     signalSupersededPass: async () => {},
+    abandonIngress: async () => {},
+    acknowledgeReviewPass: async () => {},
     createFinderSession: async () => ({ sessionId: "finder-1" }),
     bootstrapFinderSession: async () => {},
     sendFinderPrompt: async () => {},
@@ -68,34 +70,26 @@ function commandInput(overrides: Partial<ReviewIngressInput> = {}): ReviewIngres
     repo: "openai/engrams",
     prNumber: 100,
     trigger: "command",
-    idempotencyKey: "",
-    commentId: "42",
+    idempotencyKey: "delivery-1",
     focus: "auth",
     ...overrides,
   };
 }
 
 describe("review ingress workflow id", () => {
-  test("fallback identity distinguishes comments and focus but dedups redelivery", () => {
-    const first = commandInput();
-    expect(reviewIngressWorkflowId(first)).toBe(reviewIngressWorkflowId({ ...first }));
-    expect(reviewIngressWorkflowId(first)).not.toBe(
-      reviewIngressWorkflowId(commandInput({ commentId: "43" })),
-    );
-    expect(reviewIngressWorkflowId(first)).not.toBe(
-      reviewIngressWorkflowId(commandInput({ focus: "storage" })),
-    );
+  test("the delivery id is the identity, so a redelivery maps onto one execution", () => {
+    expect(reviewIngressWorkflowId(commandInput())).toBe("review-ingress:delivery-1");
+    expect(reviewIngressWorkflowId(commandInput({ focus: "storage" })))
+      .toBe("review-ingress:delivery-1");
   });
 
-  test("GitHub delivery id remains the preferred identity", () => {
-    expect(reviewIngressWorkflowId(commandInput({
-      idempotencyKey: "delivery-1",
-      commentId: "42",
-    }))).toBe("review-ingress:delivery-1");
-    expect(reviewIngressWorkflowId(commandInput({
-      idempotencyKey: "delivery-1",
-      commentId: "43",
-    }))).toBe("review-ingress:delivery-1");
+  test("an empty key is refused rather than given a derived identity", () => {
+    // An empty key reaches DBOS.send as a real message id, and its notifications
+    // table conflicts on that id alone — the first empty-key send would silently
+    // swallow every later one system-wide. Every entry point owns a real key now,
+    // so this can only fire on a programming error, and it must fire loudly.
+    expect(() => reviewIngressWorkflowId(commandInput({ idempotencyKey: "" })))
+      .toThrow("non-empty idempotency key");
   });
 });
 
@@ -319,7 +313,10 @@ describe("ReviewIngressWorkflow", () => {
   });
 
   test("a permanent retry resolution failure leaves its early pass failed", async () => {
-    const failed: Array<{ reviewId: string; reason?: string }> = [];
+    // `abandonIngress` carries the review id, which is what makes the pass fail
+    // rather than merely be reported (review-control-plane.test.ts asserts that
+    // arm actually reaches failReview).
+    const abandoned: Array<{ reviewId?: string; reason: string }> = [];
     let started = 0;
     const cp = controlPlane({
       resolvePrHeads: async () => {
@@ -329,8 +326,8 @@ describe("ReviewIngressWorkflow", () => {
           JSON.stringify({ message: "Not Found" }),
         );
       },
-      failReview: async (reviewId, opts) => {
-        failed.push({ reviewId, reason: opts?.reason });
+      abandonIngress: async (_source, reason, reviewId) => {
+        abandoned.push({ reviewId, reason });
       },
       startReviewPass: async () => {
         started++;
@@ -346,11 +343,214 @@ describe("ReviewIngressWorkflow", () => {
       idempotencyKey: "retry-1",
     }, { controlPlane: cp, step: directStep });
 
-    expect(failed).toHaveLength(1);
-    expect(failed[0]).toMatchObject({
+    expect(abandoned).toEqual([{
       reviewId: "review-1",
       reason: "GitHub pull request request failed (404)",
-    });
+    }]);
     expect(started).toBe(0);
+  });
+
+  test("exhausted transient retries abandon the early pass instead of orphaning it", async () => {
+    // DBOS gives up after a finite number of attempts and throws
+    // DBOSMaxStepRetriesError, which is not a GitHub error at all. That used to
+    // rethrow straight past the catch, leaving the early retry row active
+    // forever: it holds the one-active-per-target index, so automation would
+    // dedupe onto a pass that can never run.
+    const abandoned: Array<{ reviewId?: string; reason: string }> = [];
+    const exhausted = new Error("Step reached maximum retries");
+    exhausted.name = "DBOSMaxStepRetriesError";
+    const cp = controlPlane({
+      resolvePrHeads: async () => {
+        throw exhausted;
+      },
+      abandonIngress: async (_source, reason, reviewId) => {
+        abandoned.push({ reviewId, reason });
+      },
+    });
+
+    await expect(reviewIngressWorkflowImpl({
+      provider: "github",
+      repo: "openai/engrams",
+      prNumber: 100,
+      targetId: "target-1",
+      trigger: "retry",
+      idempotencyKey: "retry-3",
+    }, { controlPlane: cp, step: directStep })).rejects.toBe(exhausted);
+
+    expect(abandoned).toEqual([{
+      reviewId: "review-1",
+      reason: "Step reached maximum retries",
+    }]);
+  });
+
+  test("a revived permanent error still fails the pass after replay", async () => {
+    // DBOS records a step error with serializeError and revives it with
+    // deserializeError, which returns a plain Error carrying the original's own
+    // properties — so `instanceof GithubRequestError` is false on replay while
+    // name/status/responseBody survive. Classifying by class made a replayed 404
+    // look retryable and rethrow, stranding the row. This is that revived shape.
+    const revived = new Error("GitHub pull request request failed (404)");
+    revived.name = "GithubRequestError";
+    Object.assign(revived, {
+      status: 404,
+      responseBody: JSON.stringify({ message: "Not Found" }),
+    });
+    expect(revived instanceof GithubRequestError).toBe(false);
+
+    const abandoned: Array<{ reviewId?: string; reason: string }> = [];
+    const cp = controlPlane({
+      resolvePrHeads: async () => {
+        throw revived;
+      },
+      abandonIngress: async (_source, reason, reviewId) => {
+        abandoned.push({ reviewId, reason });
+      },
+    });
+
+    // Resolves rather than rejects: the revived error is classified permanent, so
+    // ingress ends cleanly instead of erroring the workflow.
+    await expect(reviewIngressWorkflowImpl({
+      provider: "github",
+      repo: "openai/engrams",
+      prNumber: 100,
+      targetId: "target-1",
+      trigger: "retry",
+      idempotencyKey: "retry-4",
+    }, { controlPlane: cp, step: directStep })).resolves.toBeUndefined();
+
+    expect(abandoned).toEqual([{
+      reviewId: "review-1",
+      reason: "GitHub pull request request failed (404)",
+    }]);
+  });
+
+  test("the status ack is a separate step from the non-idempotent create", async () => {
+    // Creation and acknowledgement must not share a step. beginReviewPass is one
+    // non-idempotent transaction and the step allows retries, so DBOS re-invokes
+    // the whole callback on any throw — a GitHub ack inside it would turn one
+    // transient failure into a second pass.
+    const names: string[] = [];
+    const step: IngressStepRunner = async (fn, name) => {
+      names.push(name);
+      return fn();
+    };
+    let acked: string | undefined;
+    const cp = controlPlane({
+      acknowledgeReviewPass: async (reviewId) => {
+        acked = reviewId;
+      },
+    });
+
+    await reviewIngressWorkflowImpl({
+      provider: "github",
+      repo: "openai/engrams",
+      prNumber: 100,
+      trigger: "opened",
+      idempotencyKey: "delivery-9",
+      headSha: "delivery-head",
+      baseSha: "delivery-base",
+      pr: COMPLETE_PR,
+    }, { controlPlane: cp, step });
+
+    expect(acked).toBe("review-1");
+    expect(names).toEqual([
+      "resolveReviewTarget",
+      "createReviewPass",
+      "acknowledgeReviewPass",
+    ]);
+  });
+
+  test("a permanent failure with no pass yet abandons without a review id", async () => {
+    const abandoned: Array<{ reviewId?: string; reason: string }> = [];
+    let created = 0;
+    const cp = controlPlane({
+      resolvePrHeads: async () => {
+        throw new GithubRequestError(
+          404,
+          "GitHub pull request request failed (404)",
+          JSON.stringify({ message: "Not Found" }),
+        );
+      },
+      createReviewPass: async () => {
+        created++;
+        throw new Error("must not create a pass for an unidentifiable PR");
+      },
+      abandonIngress: async (_source, reason, reviewId) => {
+        abandoned.push({ reviewId, reason });
+      },
+    });
+
+    await reviewIngressWorkflowImpl({
+      provider: "github",
+      repo: "openai/engrams",
+      prNumber: 100,
+      trigger: "command",
+      idempotencyKey: "comment-42",
+    }, { controlPlane: cp, step: directStep });
+
+    expect(created).toBe(0);
+    expect(abandoned).toEqual([{
+      reviewId: undefined,
+      reason: "GitHub pull request request failed (404)",
+    }]);
+  });
+
+  test("a resolved PR with no provider id never reaches the target table", async () => {
+    const abandoned: string[] = [];
+    let resolvedTargets = 0;
+    const cp = controlPlane({
+      resolvePrHeads: async () => ({
+        headSha: "resolved-head",
+        baseSha: "resolved-base",
+        pr: { ...COMPLETE_PR, providerId: null },
+      }),
+      resolveReviewTarget: async () => {
+        resolvedTargets++;
+        return { targetId: "target-1" };
+      },
+      abandonIngress: async (_source, reason) => {
+        abandoned.push(reason);
+      },
+    });
+
+    await reviewIngressWorkflowImpl({
+      provider: "github",
+      repo: "openai/engrams",
+      prNumber: 100,
+      trigger: "command",
+      idempotencyKey: "comment-43",
+    }, { controlPlane: cp, step: directStep });
+
+    expect(resolvedTargets).toBe(0);
+    expect(abandoned).toEqual(["github returned no id for openai/engrams#100"]);
+  });
+
+  test("a target id that does not match the retry's own abandons the pass", async () => {
+    const abandoned: Array<{ reviewId?: string; reason: string }> = [];
+    let started = 0;
+    const cp = controlPlane({
+      resolveReviewTarget: async () => ({ targetId: "target-other" }),
+      abandonIngress: async (_source, reason, reviewId) => {
+        abandoned.push({ reviewId, reason });
+      },
+      startReviewPass: async () => {
+        started++;
+      },
+    });
+
+    await reviewIngressWorkflowImpl({
+      provider: "github",
+      repo: "openai/engrams",
+      prNumber: 100,
+      targetId: "target-1",
+      trigger: "retry",
+      idempotencyKey: "retry-2",
+    }, { controlPlane: cp, step: directStep });
+
+    expect(started).toBe(0);
+    expect(abandoned).toEqual([{
+      reviewId: "review-1",
+      reason: "resolved target target-other, expected target-1",
+    }]);
   });
 });

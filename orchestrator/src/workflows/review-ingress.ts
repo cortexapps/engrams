@@ -17,17 +17,21 @@
  * registered function body on purpose: DBOS derives the application version from
  * that source, so a change to the graph rotates the version and version-gates
  * replay instead of running a recovered execution through changed code.
+ *
+ * The corollary is that everything which is NOT the graph must stay out. Log
+ * calls in particular: a reworded message is not a behaviour change, but hashed
+ * inline it rotates the version all the same and strands in-flight executions
+ * (ADR 0104). So the body below contains no logging. Each control-plane method
+ * reports its own entry and outcome, and every give-up path funnels through the
+ * one `abandonIngress` step, which owns both arms and their logging.
  */
 
 import { DBOS } from "@dbos-inc/dbos-sdk";
 
-import { log as rootLog } from "../log.ts";
 import { isPermanentGithubFailure } from "../reviews/github-review.ts";
 import { isCompletePrContext, type PrContext } from "../reviews/pr-context.ts";
 import { isHumanReviewTrigger } from "../reviews/review-trigger.ts";
 import type { ReviewControlPlane } from "./review-control-plane.ts";
-
-const log = rootLog.child({ component: "review-ingress" });
 
 export interface ReviewIngressInput {
   /** Which forge this came from. `github` today; the column is not GitHub-shaped. */
@@ -44,9 +48,6 @@ export interface ReviewIngressInput {
   headSha?: string;
   baseSha?: string;
   pr?: PrContext;
-  /** The GitHub comment that carried a command. Part of fallback identity when
-   *  a delivery id is absent, so two distinct comments never collapse. */
-  commentId?: string;
   focus?: string;
 }
 
@@ -85,49 +86,55 @@ export async function reviewIngressWorkflowImpl(
         ...(options.shouldRetry ? { shouldRetry: options.shouldRetry } : {}),
       }));
 
-  let headSha = input.headSha ?? "";
-  let baseSha = input.baseSha ?? "";
-  let pr = input.pr;
-  let targetId = input.targetId;
-  let pass:
-    | { reviewId: string; taskId: string }
-    | undefined;
+  const source = {
+    provider: input.provider,
+    repo: input.repo,
+    prNumber: input.prNumber,
+    trigger: input.trigger,
+  };
+  let pass: { reviewId: string; taskId: string } | undefined;
 
-  const createPass = async (resolvedTargetId: string): Promise<boolean> => {
+  /** The one give-up path. Reads `pass` at call time, so it fails the row when
+   *  ingress had already created one and reports when it had not. */
+  const abandon = (reason: string): Promise<void> =>
+    step(
+      () => cp.abandonIngress(source, reason, pass?.reviewId),
+      "abandonIngress",
+      { retry: true },
+    );
+
+  /** Create this request's pass row. False means an equivalent pass already
+   *  runs, so there is nothing left to do. */
+  const createPass = async (
+    targetId: string,
+    facts: { headSha: string; baseSha: string; pr?: PrContext },
+  ): Promise<boolean> => {
     const result = await step(
       () => cp.createReviewPass({
-        provider: input.provider,
-        targetId: resolvedTargetId,
-        repo: input.repo,
-        prNumber: input.prNumber,
-        trigger: input.trigger,
-        headSha,
-        baseSha,
-        headBranch: pr?.headBranch ?? null,
-        baseBranch: pr?.baseBranch ?? null,
-        additions: pr?.additions ?? null,
-        deletions: pr?.deletions ?? null,
-        changedFiles: pr?.changedFiles ?? null,
+        ...source,
+        targetId,
+        headSha: facts.headSha,
+        baseSha: facts.baseSha,
+        headBranch: facts.pr?.headBranch ?? null,
+        baseBranch: facts.pr?.baseBranch ?? null,
+        additions: facts.pr?.additions ?? null,
+        deletions: facts.pr?.deletions ?? null,
+        changedFiles: facts.pr?.changedFiles ?? null,
         deduplicateSameHead: !isHumanReviewTrigger(input.trigger),
       }),
       "createReviewPass",
       { retry: true },
     );
-    if (result.kind === "deduplicated") {
-      log.info(
-        {
-          repo: input.repo,
-          prNumber: input.prNumber,
-          trigger: input.trigger,
-          reviewId: result.reviewId,
-          headSha,
-        },
-        "review ingress deduplicated onto the active pass",
-      );
-      return false;
-    }
-
+    if (result.kind === "deduplicated") return false;
     pass = { reviewId: result.reviewId, taskId: result.taskId };
+    // Its own step, deliberately. Inside createReviewPass this GitHub call could
+    // throw after the row was committed, and DBOS would re-invoke that whole
+    // callback — creating a second pass. Out here it cannot reach the transaction.
+    await step(
+      () => cp.acknowledgeReviewPass(result.reviewId),
+      "acknowledgeReviewPass",
+      { retry: true },
+    );
     if (result.supersededReviewId !== undefined) {
       await cp.signalSupersededPass(
         result.supersededReviewId,
@@ -140,15 +147,26 @@ export async function reviewIngressWorkflowImpl(
   // Retry is the one entry point that already owns a stable target id. Create
   // its queued row before touching GitHub so a permanent resolution failure is
   // a visible failed pass instead of an RPC-success spinner with no record.
-  if (targetId !== undefined && !(await createPass(targetId))) return;
+  const expectedTargetId = input.targetId;
+  if (expectedTargetId !== undefined
+    && !(await createPass(expectedTargetId, { headSha: "", baseSha: "" }))) {
+    return;
+  }
 
   // A webhook delivery already carries both SHAs and the whole pull request, so
   // there is nothing left to ask GitHub. Anything short of complete resolves the
   // slow way. The gate is on the DATA, not on a list of webhook actions we assume
   // are complete: a wrong assumption there would silently persist nulls.
-  try {
-    if (headSha === "" || baseSha === "" || !pr || !isCompletePrContext(pr)) {
-      const resolved = await step(
+  //
+  // Resolving as one value (rather than reassigning three variables) is what
+  // guarantees every per-pass fact describes the SAME commit as the head we pin.
+  const { headSha: sentHead, baseSha: sentBase, pr: sentPr } = input;
+  let resolved: { headSha: string; baseSha: string; pr: PrContext };
+  if (sentHead && sentBase && sentPr && isCompletePrContext(sentPr)) {
+    resolved = { headSha: sentHead, baseSha: sentBase, pr: sentPr };
+  } else {
+    try {
+      resolved = await step(
         () => cp.resolvePrHeads(input.repo, input.prNumber),
         "resolvePrHeads",
         // Retry a busy or broken GitHub. Do NOT retry a pull request that is gone,
@@ -156,56 +174,33 @@ export async function reviewIngressWorkflowImpl(
         // not change, and the review cannot proceed without it.
         { retry: true, shouldRetry: (error) => !isPermanentGithubFailure(error) },
       );
-      // Every per-pass fact must describe the SAME commit as the head we pin. So
-      // this takes the resolved head AND the resolved branches and counts
-      // together, rather than pinning the delivery's head and describing a later
-      // one.
-      headSha = resolved.headSha;
-      baseSha = resolved.baseSha;
-      pr = resolved.pr;
+    } catch (error) {
+      // Abandon on EVERY failure, not only a permanent one. The pass cannot
+      // proceed without the SHAs, and an early retry row that outlives this step
+      // is worse than a failed one: it stays active, holds the
+      // one-active-per-target index, and automation deduplicates onto a pass that
+      // will never run. Exhausting the step's retry budget throws
+      // DBOSMaxStepRetriesError, which is not a GitHub failure at all — that used
+      // to rethrow straight past this and orphan the row.
+      await abandon(error instanceof Error ? error.message : String(error));
+      // A permanent answer is an ordinary outcome, so end cleanly. Anything else
+      // means GitHub or we are broken, so let the workflow end ERROR where an
+      // operator can see it rather than looking like a normal no-op.
+      if (!isPermanentGithubFailure(error)) throw error;
+      return;
     }
-  } catch (error) {
-    if (!isPermanentGithubFailure(error)) throw error;
-    const reason = error instanceof Error ? error.message : String(error);
-    const failedPass = pass;
-    if (failedPass) {
-      await step(
-        () => cp.failReview(failedPass.reviewId, { reason }),
-        "failIngressReview",
-        { retry: true },
-      );
-    } else {
-      log.error(
-        { repo: input.repo, prNumber: input.prNumber, trigger: input.trigger, error },
-        "review ingress failed permanently before it could identify a target",
-      );
-    }
-    return;
   }
+  const { headSha, baseSha, pr } = resolved;
 
-  if (pr.providerId === null) {
-    // The forge answered but gave no id. Nothing downstream can key on identity,
-    // so refuse rather than write a row that cannot be reconciled later.
-    const reason =
-      `review ingress: ${input.provider} returned no id for ${input.repo}#${input.prNumber}`;
-    const failedPass = pass;
-    if (failedPass) {
-      await step(
-        () => cp.failReview(failedPass.reviewId, { reason }),
-        "failIngressReview",
-        { retry: true },
-      );
-    } else {
-      log.error(
-        { repo: input.repo, prNumber: input.prNumber, trigger: input.trigger },
-        reason,
-      );
-    }
-    return;
-  }
+  // The forge answered but gave no id. Nothing downstream can key on identity,
+  // so refuse rather than write a row that cannot be reconciled later.
   const providerId = pr.providerId;
+  if (providerId === null) {
+    await abandon(`${input.provider} returned no id for ${input.repo}#${input.prNumber}`);
+    return;
+  }
 
-  const resolvedTarget = await step(
+  const target = await step(
     () => cp.resolveReviewTarget({
       provider: input.provider,
       providerId,
@@ -220,28 +215,18 @@ export async function reviewIngressWorkflowImpl(
     "resolveReviewTarget",
     { retry: true },
   );
-  if (targetId !== undefined && resolvedTarget.targetId !== targetId) {
-    const reason =
-      `review ingress resolved target ${resolvedTarget.targetId}, expected ${targetId}`;
-    const mismatchedPass = pass;
-    if (!mismatchedPass) {
-      throw new Error("review ingress target mismatch had no pass row");
-    }
-    await step(
-      () => cp.failReview(mismatchedPass.reviewId, { reason }),
-      "failIngressReview",
-      { retry: true },
-    );
+  if (expectedTargetId !== undefined && target.targetId !== expectedTargetId) {
+    await abandon(`resolved target ${target.targetId}, expected ${expectedTargetId}`);
     return;
   }
-  targetId = resolvedTarget.targetId;
 
-  if (!pass) {
-    if (!(await createPass(targetId))) return;
-  } else {
-    const existingPass = pass;
-    const updated = await step(
-      () => cp.updateReviewPassContext(existingPass.reviewId, {
+  // The retry row was created before GitHub answered, so its pass facts are
+  // still blank; fill them now. Every other entry point creates the row here,
+  // already complete.
+  const early = pass;
+  if (early) {
+    const filled = await step(
+      () => cp.updateReviewPassContext(early.reviewId, {
         headSha,
         baseSha,
         headBranch: pr.headBranch,
@@ -253,10 +238,12 @@ export async function reviewIngressWorkflowImpl(
       "updateReviewPassContext",
       { retry: true },
     );
-    if (!updated) return;
+    if (!filled) return;
+  } else if (!(await createPass(target.targetId, { headSha, baseSha, pr }))) {
+    return;
   }
-  const readyPass = pass;
-  if (!readyPass) throw new Error("review ingress created no pass");
+  const ready = pass;
+  if (!ready) throw new Error("review ingress created no pass");
 
   // Only now does the pass workflow start, with a row and immutable workflow id
   // that ingress already chose.
@@ -266,8 +253,8 @@ export async function reviewIngressWorkflowImpl(
   // Re-running it on replay is safe by construction — the review workflow id is
   // derived, not minted, and the trigger message carries an idempotency key.
   await cp.startReviewPass({
-    reviewId: readyPass.reviewId,
-    taskId: readyPass.taskId,
+    reviewId: ready.reviewId,
+    taskId: ready.taskId,
     repo: input.repo,
     prNumber: input.prNumber,
     trigger: input.trigger,
@@ -276,17 +263,6 @@ export async function reviewIngressWorkflowImpl(
     baseSha,
     ...(input.focus !== undefined ? { focus: input.focus } : {}),
   });
-
-  log.info(
-    {
-      repo: input.repo,
-      prNumber: input.prNumber,
-      trigger: input.trigger,
-      targetId,
-      reviewId: readyPass.reviewId,
-    },
-    "review ingress dispatched a pass",
-  );
 }
 
 export const reviewIngressWorkflow = DBOS.registerWorkflow(reviewIngressWorkflowImpl, {
@@ -300,21 +276,20 @@ export type ReviewIngressStart = ReviewIngressInput;
  *
  * The workflow id is derived from the caller's idempotency key — the GitHub
  * delivery id for a webhook, a fresh uuid for a re-run — so a redelivered webhook
- * maps onto the same execution instead of resolving and reviewing twice. The
- * fallback covers a delivery that arrives with no id at all; it is deterministic
- * so it dedups rather than multiplying.
+ * maps onto the same execution instead of resolving and reviewing twice.
+ *
+ * There is no fallback for a missing key, on purpose. Every entry point now owns
+ * a real one: the webhook route refuses a delivery with no delivery id, and the
+ * API and retry paths mint a uuid. An empty key must never reach DBOS, because
+ * its notifications table conflicts on the message id alone.
  */
 export function reviewIngressWorkflowId(input: ReviewIngressInput): string {
-  const fallback = [
-    input.provider,
-    `${input.repo}#${input.prNumber}`,
-    input.trigger,
-    input.headSha ?? "",
-    input.commentId ?? "",
-    input.focus ?? "",
-  ].map(encodeURIComponent).join(":");
-  const key = input.idempotencyKey || fallback;
-  return `review-ingress:${key}`;
+  if (!input.idempotencyKey) {
+    throw new Error("review ingress requires a non-empty idempotency key");
+  }
+  // Not encoded: `rpc/reviews.ts` and `routes/reviews-dispatch.ts` report this id
+  // back to their callers by building the same string, so the two must agree.
+  return `review-ingress:${input.idempotencyKey}`;
 }
 
 export async function startReviewIngress(input: ReviewIngressInput): Promise<void> {

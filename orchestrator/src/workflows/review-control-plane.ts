@@ -89,6 +89,15 @@ export interface StartReviewPassInput {
   focus?: string;
 }
 
+/** Who asked for a review. Carried whole so the ingress workflow body never has
+ *  to assemble a log payload of its own — see `abandonIngress`. */
+export interface ReviewIngressSource {
+  provider: string;
+  repo: string;
+  prNumber: number;
+  trigger: string;
+}
+
 export interface ReviewControlPlane {
   /** The name stays `resolvePrHeads` even though it now also returns the PR
    *  context: it appears as a `step(...)` name inside `prReviewWorkflowImpl`,
@@ -103,8 +112,13 @@ export interface ReviewControlPlane {
   /** Find or create the row for the change under review, and return its id.
    *  Refreshes the title/state, so a rename lands everywhere at once. */
   resolveReviewTarget(input: ResolveReviewTargetInput): Promise<{ targetId: string }>;
-  /** Atomically decide whether this request deduplicates or creates a pass. */
+  /** Atomically decide whether this request deduplicates or creates a pass. The
+   *  transaction and nothing else — see the implementation's warning. */
   createReviewPass(input: BeginReviewPassInput): Promise<BeginReviewPassResult>;
+  /** Post the 👀 status comment for a freshly created pass. Split out of
+   *  `createReviewPass` so a slow or failing GitHub ack can never re-run that
+   *  method's non-idempotent transaction. */
+  acknowledgeReviewPass(reviewId: string): Promise<void>;
   /** Fill an early retry row once GitHub resolves its current pass facts. */
   updateReviewPassContext(
     reviewId: string,
@@ -114,6 +128,25 @@ export interface ReviewControlPlane {
   startReviewPass(input: StartReviewPassInput): Promise<void>;
   /** Tell a committed predecessor to tear down without changing its status. */
   signalSupersededPass(reviewId: string, idempotencyKey: string): Promise<void>;
+  /**
+   * The single give-up path for ingress: a request that will never become a
+   * review.
+   *
+   * `reviewId` is present only when ingress had already created a pass row (the
+   * retry entry point does). Then this fails that row, so the user who pressed
+   * retry sees a failed review instead of a spinner. With no row there is
+   * nothing to fail, so it only reports.
+   *
+   * Both arms — and their logging — live here rather than in the workflow so
+   * the ingress body stays free of branches and log calls. DBOS hashes that
+   * body to derive the application version, so editing a log message there
+   * would rotate the version and strand in-flight executions (ADR 0104).
+   */
+  abandonIngress(
+    source: ReviewIngressSource,
+    reason: string,
+    reviewId?: string,
+  ): Promise<void>;
   createFinderSession(input: {
     reviewId: string;
     taskId: string;
@@ -559,6 +592,20 @@ export function makeReviewControlPlane(
       const { dispatchReviewSupersede } = await import("./dispatch-review.ts");
       await dispatchReviewSupersede(reviewId, idempotencyKey);
     });
+  // Hoisted out of the returned object so `abandonIngress` can reuse it without
+  // reaching back through `this`, which a plain object literal cannot do safely.
+  const failReview = async (
+    reviewId: string,
+    opts: { sessionId?: string; reason?: string } = {},
+  ): Promise<void> => {
+    await cleanupWorkerSession(opts.sessionId);
+    if (!(await reviews().updateReviewStatus(reviewId, "failed"))) {
+      logRefusedTransition(reviewId, "failed");
+      return;
+    }
+    await recordEvent(reviewId, "failed", opts.reason);
+    await ackStatus(reviewId, "failed");
+  };
 
   return {
     async resolvePrHeads(repo, prNumber) {
@@ -586,12 +633,52 @@ export function makeReviewControlPlane(
       return { targetId: target.id };
     },
 
+    /**
+     * NOTHING FALLIBLE MAY FOLLOW `beginReviewPass` IN THIS METHOD.
+     *
+     * `beginReviewPass` is one transaction and it is NOT idempotent: re-running it
+     * either deduplicates onto the row it just created (automation, leaving the
+     * pass unstarted) or supersedes that row and creates a second one (a human
+     * trigger, leaving a spurious dossier). Ingress runs this as a step with
+     * retries allowed, and DBOS re-invokes the whole callback on any throw. So a
+     * fallible call placed after the commit would turn its first transient error
+     * into a double-create — no crash required.
+     *
+     * The GitHub status ack used to sit here. It is now its own step
+     * (`acknowledgeReviewPass`), which is why retries are safe: a throw can only
+     * come from the transaction itself, and that means it rolled back and created
+     * nothing. Logging below is a synchronous, infallible write, not an effect.
+     */
     async createReviewPass(input) {
       const result = await reviews().beginReviewPass(input);
-      if (result.kind === "created") {
-        await ackStatus(result.reviewId, "acknowledged");
+      const where = {
+        repo: input.repo,
+        prNumber: input.prNumber,
+        trigger: input.trigger,
+        targetId: input.targetId,
+        headSha: input.headSha,
+        reviewId: result.reviewId,
+      };
+      if (result.kind === "deduplicated") {
+        log.info(where, "review request deduplicated onto the active pass");
+        return result;
       }
+      log.info(
+        {
+          ...where,
+          ...(result.supersededReviewId !== undefined
+            ? { supersededReviewId: result.supersededReviewId }
+            : {}),
+        },
+        "review pass created",
+      );
       return result;
+    },
+
+    async acknowledgeReviewPass(reviewId) {
+      // Best-effort by construction: ackStatus swallows its own failures, so this
+      // never throws. It is still a step so a replay does not re-post the comment.
+      await ackStatus(reviewId, "acknowledged");
     },
 
     async updateReviewPassContext(reviewId, input) {
@@ -606,11 +693,35 @@ export function makeReviewControlPlane(
     },
 
     async startReviewPass(input) {
+      const where = {
+        repo: input.repo,
+        prNumber: input.prNumber,
+        trigger: input.trigger,
+        reviewId: input.reviewId,
+        headSha: input.headSha,
+      };
+      log.info(where, "dispatching a review pass");
       await dispatchPass(input);
+      log.info(where, "review pass dispatched");
     },
 
     async signalSupersededPass(reviewId, idempotencyKey) {
+      log.info({ reviewId }, "signalling a superseded review pass to tear down");
       await signalSupersededPass(reviewId, idempotencyKey);
+    },
+
+    async abandonIngress(source, reason, reviewId) {
+      if (reviewId === undefined) {
+        // Nothing was created, so there is no row to carry this. The log is the
+        // only record — which is why it is an error, not a warning.
+        log.error(
+          { ...source, reason },
+          "review ingress gave up before it could identify a target",
+        );
+        return;
+      }
+      log.error({ ...source, reviewId, reason }, "review ingress gave up; failing the pass");
+      await failReview(reviewId, { reason });
     },
 
     async createFinderSession(input) {
@@ -989,15 +1100,7 @@ export function makeReviewControlPlane(
       await ackStatus(reviewId, "posted", surfaced);
     },
 
-    async failReview(reviewId, opts = {}) {
-      await cleanupWorkerSession(opts.sessionId);
-      if (!(await reviews().updateReviewStatus(reviewId, "failed"))) {
-        logRefusedTransition(reviewId, "failed");
-        return;
-      }
-      await recordEvent(reviewId, "failed", opts.reason);
-      await ackStatus(reviewId, "failed");
-    },
+    failReview,
 
     async haltReview(reviewId, opts = {}) {
       await cleanupWorkerSession(opts.sessionId);

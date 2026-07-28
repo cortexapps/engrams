@@ -363,6 +363,14 @@ describe("ReviewControlPlane", () => {
       taskId: active.taskId,
     });
     expect(passInputs).toEqual([input]);
+    // The ack is NOT part of pass creation. `beginReviewPass` is a single,
+    // non-idempotent transaction, and ingress runs it as a retryable step — DBOS
+    // re-invokes the whole callback on any throw. A GitHub call after the commit
+    // would therefore turn its first transient error into a second pass. So the
+    // ack is its own step, and creation must touch GitHub zero times.
+    expect(upserts).toEqual([]);
+
+    await cp.acknowledgeReviewPass(active.id);
     expect(upserts).toHaveLength(1);
     expect(upserts[0]?.commentId).toBeUndefined();
     expect(upserts[0]?.body).toContain("👀");
@@ -407,6 +415,12 @@ describe("ReviewControlPlane", () => {
       reviewId: active.id,
       taskId: active.taskId,
     });
+
+    // And the ack itself swallows the failure rather than propagating it. A 👀
+    // comment is cosmetic; failing the review over it would be worse than losing
+    // it. This is also what lets ingress run the ack as a plain step with no
+    // error handling of its own.
+    await expect(cp.acknowledgeReviewPass(active.id)).resolves.toBeUndefined();
   });
 
   test("creates the finder with the designated profile and clamped review policy", async () => {
@@ -598,6 +612,56 @@ describe("ReviewControlPlane", () => {
 
     expect(sessions.deletedIds).toEqual(["review-session"]);
     expect(reviewSessions.removes).toEqual(["review-session"]);
+  });
+
+  test("abandonIngress fails the pass when ingress had already created one", async () => {
+    const statuses: string[] = [];
+    const events: Array<{ kind: string; detail?: string }> = [];
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewStoreStub,
+        getReview: async () => null,
+        updateReviewStatus: async (_reviewId, status) => {
+          statuses.push(status);
+          return true;
+        },
+        recordEvent: async (_reviewId, kind, detail) => {
+          events.push({ kind, ...(detail === undefined ? {} : { detail }) });
+        },
+      },
+    });
+
+    await cp.abandonIngress(
+      { provider: "github", repo: "openai/engrams", prNumber: 100, trigger: "retry" },
+      "GitHub pull request request failed (404)",
+      "review-1",
+    );
+
+    expect(statuses).toEqual(["failed"]);
+    expect(events).toEqual([
+      { kind: "failed", detail: "GitHub pull request request failed (404)" },
+    ]);
+  });
+
+  test("abandonIngress touches no row when ingress never created a pass", async () => {
+    let touched = 0;
+    const cp = makeReviewControlPlane({
+      reviews: {
+        ...reviewStoreStub,
+        getReview: async () => null,
+        updateReviewStatus: async () => {
+          touched++;
+          return true;
+        },
+      },
+    });
+
+    await cp.abandonIngress(
+      { provider: "github", repo: "openai/engrams", prNumber: 100, trigger: "command" },
+      "github returned no id for openai/engrams#100",
+    );
+
+    expect(touched).toBe(0);
   });
 
   test("failReview still settles when the worker session is already absent", async () => {
