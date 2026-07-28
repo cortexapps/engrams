@@ -179,13 +179,87 @@ export const prRef = pgTable(
 // Pull request reviews (ADR 0100)
 // ---------------------------------------------------------------------------
 
+/** The only statuses that represent a live pass. Store queries, guarded
+ * transitions, and the partial unique index all derive from this vocabulary. */
+export const ACTIVE_REVIEW_STATUSES = [
+  "queued",
+  "finding",
+  "verifying",
+] as const;
+
+export function isActiveReviewStatus(
+  status: string,
+): status is (typeof ACTIVE_REVIEW_STATUSES)[number] {
+  return ACTIVE_REVIEW_STATUSES.some((candidate) => candidate === status);
+}
+
+/**
+ * The change under review — one row, however many times we review it (ADR 0100
+ * decision 11).
+ *
+ * A pull request is a durable entity and a pass is an event about it. Modelling
+ * only the event meant every pass carried its own copy of the name, so a pass
+ * that failed before it could capture one erased the identity from the UI, and a
+ * renamed pull request kept showing the old title forever.
+ *
+ * Deliberately NOT GitHub-shaped. `provider` + `provider_id` is the identity, so
+ * a second forge (GitLab merge requests, say) needs no column rename and no
+ * migration of this table — only a new `provider` value. Nothing GitHub-specific
+ * survives here: the GraphQL `node_id` was dropped because nothing read it.
+ */
+export const reviewTarget = pgTable(
+  "review_target",
+  {
+    id: uuid("id").primaryKey().defaultRandom(),
+    // Which forge this came from. Text, not an enum, like `trigger_mode` below.
+    provider: text("provider").notNull().default("github"),
+    // The forge's own stable id — the identity, and the only field a rename or a
+    // transfer cannot move. Null in exactly two cases: a row backfilled from
+    // passes that predate this table, and a pull request we can no longer read.
+    // The hydrator fills the first kind in; see `hydration_failed_at`.
+    providerId: text("provider_id"),
+    // `owner/name` AS OF the last capture. Mutable, and a reusable name at that,
+    // which is why it is a fact and never an identity.
+    repo: text("repo").notNull(),
+    number: integer("number").notNull(),
+    title: text("title"),
+    author: text("author"),
+    // open | draft | closed | merged — CURRENT, not a snapshot.
+    state: text("state"),
+    url: text("url"),
+    // The forge's own last-modified time, NOT ours. Webhook deliveries are not
+    // ordered, so this is what lets a late delivery be recognised as stale
+    // instead of overwriting newer facts.
+    providerUpdatedAt: timestamp("provider_updated_at", { withTimezone: true }),
+    // Set when the hydrator gives up reading this row's pull request (404/401/403
+    // — deleted, transferred away, or our install lost access). It exists purely
+    // to stop an unreachable row being retried, and ERROR-logged, on every tick
+    // forever; that noise would bury real errors.
+    hydrationFailedAt: timestamp("hydration_failed_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    // The identity, and the upsert's conflict target. Safe as a conflict target
+    // precisely because it never changes — the coordinate is not, which is why
+    // an earlier draft of this table deadlocked itself on renames. Postgres
+    // permits many NULLs in a unique index, so un-hydrated rows coexist here.
+    uniqueIndex("review_target_provider_id_unique").on(t.provider, t.providerId),
+    // A plain index, NOT unique: two rows can share a coordinate while one is
+    // still waiting for its id, and a reused repo name is a different change at
+    // the same coordinate.
+    index("review_target_coordinate_idx").on(t.provider, t.repo, t.number),
+  ],
+);
+
 /** One durable review pass over a pull request at a pinned head SHA. */
 export const review = pgTable(
   "review",
   {
     id: uuid("id").primaryKey().defaultRandom(),
-    repo: text("repo").notNull(),
-    prNumber: integer("pr_number").notNull(),
+    targetId: uuid("target_id")
+      .notNull()
+      .references(() => reviewTarget.id, { onDelete: "cascade" }),
     taskId: text("task_id")
       .notNull()
       .references(() => task.id),
@@ -203,12 +277,30 @@ export const review = pgTable(
     finderSessionId: text("finder_session_id"),
     verifierSessionId: text("verifier_session_id"),
     summaryMd: text("summary_md"),
+    // What THIS pass read (ADR 0100 decision 11). The PR's name and state live
+    // on the target row because they describe the PR; these describe the code
+    // reviewed at this head, so they are never rewritten — the diff grows with
+    // every push and a PR can be retargeted mid-life. Nullable: a pass whose
+    // head resolution failed still gets a durable record, just an incomplete one.
+    headBranch: text("head_branch"),
+    baseBranch: text("base_branch"),
+    additions: integer("additions"),
+    deletions: integer("deletions"),
+    changedFiles: integer("changed_files"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [
-    index("review_repo_pr_number_idx").on(t.repo, t.prNumber),
+    index("review_target_idx").on(t.targetId),
     index("review_task_idx").on(t.taskId),
+    uniqueIndex("review_one_active_per_target_idx")
+      .on(t.targetId)
+      .where(sql`${t.status} IN ('queued', 'finding', 'verifying')`),
+    // ADR 0100 decision 10: these were added for a derived transcript-read rule
+    // that was reverted before merge. Migration 0038 is immutable, so the
+    // now-unused indexes remain rather than earning a drop migration.
+    index("review_finder_session_idx").on(t.finderSessionId),
+    index("review_verifier_session_idx").on(t.verifierSessionId),
   ],
 );
 

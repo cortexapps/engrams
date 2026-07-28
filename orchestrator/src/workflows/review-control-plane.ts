@@ -16,17 +16,17 @@ import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts"
 import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
 import {
   makeReviewStore,
+  type BeginReviewPassInput,
+  type BeginReviewPassResult,
   type ReviewDetail,
   type ReviewStore,
+  type UpdateReviewPassContextInput,
 } from "../db/reviews.ts";
 import {
   makeReviewSessionStore,
   type ReviewSessionStore,
 } from "../db/review-sessions.ts";
-import {
-  task as taskTable,
-  type ProfileNetwork,
-} from "../db/schema.ts";
+import { type ProfileNetwork } from "../db/schema.ts";
 import { config } from "../config.ts";
 import { log as rootLog } from "../log.ts";
 import {
@@ -50,6 +50,7 @@ import {
   type GithubReviewPoster,
   type ReviewStatusPhase,
 } from "../reviews/github-review.ts";
+import type { PrContext } from "../reviews/pr-context.ts";
 import {
   runPolicyGate,
   type FindingDecision,
@@ -64,22 +65,88 @@ import {
 
 const log = rootLog.child({ component: "review-control-plane" });
 
-export interface EnsureReviewRecordInput {
+export interface ResolveReviewTargetInput {
+  provider: string;
+  providerId: string;
+  repo: string;
+  number: number;
+  title: string | null;
+  author: string | null;
+  state: string | null;
+  url: string | null;
+  providerUpdatedAt: Date | null;
+}
+
+export interface StartReviewPassInput {
+  reviewId: string;
+  taskId: string;
   repo: string;
   prNumber: number;
+  trigger: string;
+  idempotencyKey: string;
   headSha: string;
   baseSha: string;
+  focus?: string;
+}
+
+/** Who asked for a review. Carried whole so the ingress workflow body never has
+ *  to assemble a log payload of its own — see `abandonIngress`. */
+export interface ReviewIngressSource {
+  provider: string;
+  repo: string;
+  prNumber: number;
   trigger: string;
 }
 
 export interface ReviewControlPlane {
+  /** The name stays `resolvePrHeads` even though it now also returns the PR
+   *  context: it appears as a `step(...)` name inside `prReviewWorkflowImpl`,
+   *  and DBOS derives the application version from that function's source, so
+   *  renaming it would rotate the version and strand in-flight reviews for no
+   *  benefit. */
   resolvePrHeads(repo: string, prNumber: number): Promise<{
     headSha: string;
     baseSha: string;
+    pr: PrContext;
   }>;
-  ensureReviewRecord(
-    input: EnsureReviewRecordInput,
-  ): Promise<{ reviewId: string; taskId: string }>;
+  /** Find or create the row for the change under review, and return its id.
+   *  Refreshes the title/state, so a rename lands everywhere at once. */
+  resolveReviewTarget(input: ResolveReviewTargetInput): Promise<{ targetId: string }>;
+  /** Atomically decide whether this request deduplicates or creates a pass. The
+   *  transaction and nothing else — see the implementation's warning. */
+  createReviewPass(input: BeginReviewPassInput): Promise<BeginReviewPassResult>;
+  /** Post the 👀 status comment for a freshly created pass. Split out of
+   *  `createReviewPass` so a slow or failing GitHub ack can never re-run that
+   *  method's non-idempotent transaction. */
+  acknowledgeReviewPass(reviewId: string): Promise<void>;
+  /** Fill an early retry row once GitHub resolves its current pass facts. */
+  updateReviewPassContext(
+    reviewId: string,
+    input: UpdateReviewPassContextInput,
+  ): Promise<boolean>;
+  /** Hand a fully resolved request to the review workflow. */
+  startReviewPass(input: StartReviewPassInput): Promise<void>;
+  /** Tell a committed predecessor to tear down without changing its status. */
+  signalSupersededPass(reviewId: string, idempotencyKey: string): Promise<void>;
+  /**
+   * The single give-up path for ingress: a request that will never become a
+   * review.
+   *
+   * `reviewId` is present only when ingress had already created a pass row (the
+   * retry entry point does). Then this fails that row, so the user who pressed
+   * retry sees a failed review instead of a spinner. With no row there is
+   * nothing to fail, so it only reports.
+   *
+   * Both arms — and their logging — live here rather than in the workflow so
+   * the ingress body stays free of branches and log calls. DBOS hashes that
+   * body to derive the application version, so editing a log message there
+   * would rotate the version and strand in-flight executions (ADR 0104).
+   */
+  abandonIngress(
+    source: ReviewIngressSource,
+    reason: string,
+    reviewId?: string,
+  ): Promise<void>;
   createFinderSession(input: {
     reviewId: string;
     taskId: string;
@@ -141,13 +208,20 @@ export interface ReviewControlPlane {
   ): Promise<void>;
   /** Tear down the given worker (best-effort) and mark the review halted. */
   haltReview(reviewId: string, opts?: { sessionId?: string }): Promise<void>;
+  /** Tear down a superseded worker without rewriting the transaction's status. */
+  cleanupSupersededReview(
+    reviewId: string,
+    opts?: { sessionId?: string },
+  ): Promise<void>;
 }
 
 interface ReviewControlPlaneStore extends Pick<
   ReviewStore,
-  | "createReview"
+  | "claimTargetId"
+  | "upsertTarget"
+  | "beginReviewPass"
+  | "updateReviewPassContext"
   | "getReview"
-  | "getActiveReviewForPr"
   | "updateReviewStatus"
   | "updateFindingState"
   | "finalizeReview"
@@ -176,7 +250,6 @@ type CreateExistingTaskSession = (
 export interface ReviewControlPlaneDeps {
   reviews?: ReviewControlPlaneStore;
   db?: ReturnType<typeof getDb>;
-  insertTask?: (input: { repo: string; prNumber: number }) => Promise<string>;
   sessions?: ReviewSessionsClient;
   profiles?: Pick<ProfileStore, "getActive" | "getByDesignation">;
   enrollments?: Pick<EnrollmentStore, "get">;
@@ -189,6 +262,14 @@ export interface ReviewControlPlaneDeps {
   registerSessionListener?: (sessionId: string) => Promise<void>;
   /** Deterministic retry/deadline scheduler for durable-exec tests. */
   execRuntime?: RunExecRuntime;
+  /** Hands a resolved request to the review workflow. Injected rather than
+   *  imported: `dispatch-review` reaches `pr-review`, which reaches this module,
+   *  so a direct import would close a cycle. */
+  dispatchPass?: (input: StartReviewPassInput) => Promise<void>;
+  signalSupersededPass?: (
+    reviewId: string,
+    idempotencyKey: string,
+  ) => Promise<void>;
 }
 
 /** Human detail for a `posted` activity-log entry. */
@@ -377,28 +458,6 @@ function productionHarnessCatalogClient(): HarnessCatalogClient {
   };
 }
 
-/** Insert only the automation-owned task row. Review phase sessions attach
- * task_session rows later in the ADR 0100 execution PR. */
-export async function insertReviewTask(
-  db: ReturnType<typeof getDb>,
-  input: { repo: string; prNumber: number },
-): Promise<string> {
-  const taskId = crypto.randomUUID();
-  await db.insert(taskTable).values({
-    id: taskId,
-    type: "pr_review",
-    title: `Review ${input.repo}#${input.prNumber}`,
-    status: "working",
-    createdByUserId: null,
-    source: {
-      provider: "github",
-      repo: input.repo,
-      prNumber: input.prNumber,
-    },
-  });
-  return taskId;
-}
-
 export function makeReviewControlPlane(
   deps: ReviewControlPlaneDeps = {},
 ): ReviewControlPlane {
@@ -406,8 +465,6 @@ export function makeReviewControlPlane(
   const db = () => (resolvedDb ??= getDb());
   let reviewStore = deps.reviews;
   const reviews = () => (reviewStore ??= makeReviewStore(db()));
-  const insertTask = deps.insertTask ?? ((input) =>
-    insertReviewTask(db(), input));
   const sessions = deps.sessions ?? defaultSessions;
   const execRuntime = deps.execRuntime ?? defaultRunExecRuntime;
   let profileStore = deps.profiles;
@@ -469,6 +526,15 @@ export function makeReviewControlPlane(
       log.error({ reviewId, kind, err }, "review event record failed (best-effort)");
     }
   };
+  const logRefusedTransition = (
+    reviewId: string,
+    attemptedStatus: string,
+  ): void => {
+    log.warn(
+      { reviewId, attemptedStatus },
+      "refused a late review transition because the row is already terminal",
+    );
+  };
   // Delete a worker's coordinator session and forget its binding. Tolerates an
   // already-absent session (a prior partial teardown) so it is safe to retry.
   const removeWorkerSession = async (sessionId: string): Promise<void> => {
@@ -514,31 +580,148 @@ export function makeReviewControlPlane(
   });
   const registerSessionListener = deps.registerSessionListener
     ?? ((sessionId: string) => registerExistingSessionListener(db(), sessionId));
+  const dispatchPass = deps.dispatchPass ?? (async (input: StartReviewPassInput) => {
+    // Imported at call time, not at module load: `dispatch-review` reaches
+    // `pr-review`, which reaches this module. A top-level import would close the
+    // cycle and leave one of the three partially initialised.
+    const { dispatchReviewPass } = await import("./dispatch-review.ts");
+    await dispatchReviewPass(input);
+  });
+  const signalSupersededPass = deps.signalSupersededPass
+    ?? (async (reviewId: string, idempotencyKey: string) => {
+      const { dispatchReviewSupersede } = await import("./dispatch-review.ts");
+      await dispatchReviewSupersede(reviewId, idempotencyKey);
+    });
+  // Hoisted out of the returned object so `abandonIngress` can reuse it without
+  // reaching back through `this`, which a plain object literal cannot do safely.
+  const failReview = async (
+    reviewId: string,
+    opts: { sessionId?: string; reason?: string } = {},
+  ): Promise<void> => {
+    await cleanupWorkerSession(opts.sessionId);
+    if (!(await reviews().updateReviewStatus(reviewId, "failed"))) {
+      logRefusedTransition(reviewId, "failed");
+      return;
+    }
+    await recordEvent(reviewId, "failed", opts.reason);
+    await ackStatus(reviewId, "failed");
+  };
 
   return {
     async resolvePrHeads(repo, prNumber) {
-      return githubPoster.fetchPrHeads(repo, prNumber);
+      return githubPoster.fetchPrContext(repo, prNumber);
     },
 
-    async ensureReviewRecord(input) {
-      const active = await reviews().getActiveReviewForPr(
-        input.repo,
-        input.prNumber,
-      );
-      if (active) return { reviewId: active.id, taskId: active.taskId };
+    async resolveReviewTarget(input) {
+      // Adopt a row that is still waiting for an id before inserting a new one.
+      // Without this, a pull request whose row predates the id column would get a
+      // SECOND row on its next review, splitting its history in two. Returns null
+      // in the ordinary case, where every row already has an id.
+      const claimed = await reviews().claimTargetId({
+        provider: input.provider,
+        providerId: input.providerId,
+        repo: input.repo,
+        number: input.number,
+      });
+      if (claimed) {
+        log.info(
+          { provider: input.provider, repo: input.repo, number: input.number },
+          "adopted a review target that had no provider id",
+        );
+      }
+      const target = await reviews().upsertTarget(input);
+      return { targetId: target.id };
+    },
 
-      const taskId = await insertTask({
+    /**
+     * NOTHING FALLIBLE MAY FOLLOW `beginReviewPass` IN THIS METHOD.
+     *
+     * `beginReviewPass` is one transaction and it is NOT idempotent: re-running it
+     * either deduplicates onto the row it just created (automation, leaving the
+     * pass unstarted) or supersedes that row and creates a second one (a human
+     * trigger, leaving a spurious dossier). Ingress runs this as a step with
+     * retries allowed, and DBOS re-invokes the whole callback on any throw. So a
+     * fallible call placed after the commit would turn its first transient error
+     * into a double-create — no crash required.
+     *
+     * The GitHub status ack used to sit here. It is now its own step
+     * (`acknowledgeReviewPass`), which is why retries are safe: a throw can only
+     * come from the transaction itself, and that means it rolled back and created
+     * nothing. Logging below is a synchronous, infallible write, not an effect.
+     */
+    async createReviewPass(input) {
+      const result = await reviews().beginReviewPass(input);
+      const where = {
         repo: input.repo,
         prNumber: input.prNumber,
-      });
-      const reviewId = await reviews().createReview({
-        ...input,
-        taskId,
-        status: "queued",
-      });
-      await recordEvent(reviewId, "queued");
+        trigger: input.trigger,
+        targetId: input.targetId,
+        headSha: input.headSha,
+        reviewId: result.reviewId,
+      };
+      if (result.kind === "deduplicated") {
+        log.info(where, "review request deduplicated onto the active pass");
+        return result;
+      }
+      log.info(
+        {
+          ...where,
+          ...(result.supersededReviewId !== undefined
+            ? { supersededReviewId: result.supersededReviewId }
+            : {}),
+        },
+        "review pass created",
+      );
+      return result;
+    },
+
+    async acknowledgeReviewPass(reviewId) {
+      // Best-effort by construction: ackStatus swallows its own failures, so this
+      // never throws. It is still a step so a replay does not re-post the comment.
       await ackStatus(reviewId, "acknowledged");
-      return { reviewId, taskId };
+    },
+
+    async updateReviewPassContext(reviewId, input) {
+      const updated = await reviews().updateReviewPassContext(reviewId, input);
+      if (!updated) {
+        log.warn(
+          { reviewId, attemptedStatus: "queued-context" },
+          "refused a late review-pass context write to a terminal row",
+        );
+      }
+      return updated;
+    },
+
+    async startReviewPass(input) {
+      const where = {
+        repo: input.repo,
+        prNumber: input.prNumber,
+        trigger: input.trigger,
+        reviewId: input.reviewId,
+        headSha: input.headSha,
+      };
+      log.info(where, "dispatching a review pass");
+      await dispatchPass(input);
+      log.info(where, "review pass dispatched");
+    },
+
+    async signalSupersededPass(reviewId, idempotencyKey) {
+      log.info({ reviewId }, "signalling a superseded review pass to tear down");
+      await signalSupersededPass(reviewId, idempotencyKey);
+    },
+
+    async abandonIngress(source, reason, reviewId) {
+      if (reviewId === undefined) {
+        // Nothing was created, so there is no row to carry this. The log is the
+        // only record — which is why it is an error, not a warning.
+        log.error(
+          { ...source, reason },
+          "review ingress gave up before it could identify a target",
+        );
+        return;
+      }
+      log.error({ ...source, reviewId, reason }, "review ingress gave up; failing the pass");
+      await failReview(reviewId, { reason });
     },
 
     async createFinderSession(input) {
@@ -652,7 +835,10 @@ export function makeReviewControlPlane(
         promptId: `review:${input.reviewId}:finder:${sessionId}`,
         text: prompt,
       });
-      await reviews().updateReviewStatus(input.reviewId, "finding");
+      if (!(await reviews().updateReviewStatus(input.reviewId, "finding"))) {
+        logRefusedTransition(input.reviewId, "finding");
+        return;
+      }
       await recordEvent(input.reviewId, "reviewing");
       await ackStatus(input.reviewId, "finding");
     },
@@ -774,7 +960,10 @@ export function makeReviewControlPlane(
         promptId: `review:${input.reviewId}:verifier:${sessionId}`,
         text: prompt,
       });
-      await reviews().updateReviewStatus(input.reviewId, "verifying");
+      if (!(await reviews().updateReviewStatus(input.reviewId, "verifying"))) {
+        logRefusedTransition(input.reviewId, "verifying");
+        return;
+      }
       const detail = await reviews().getReview(input.reviewId);
       const candidateCount = detail?.findings.filter(
         (finding) => finding.state === "candidate",
@@ -795,15 +984,19 @@ export function makeReviewControlPlane(
       const { repo, prNumber } = detail.review;
       let { headSha, baseSha } = detail.review;
       if (headSha === "" || baseSha === "") {
-        const live = await githubPoster.fetchPrHeads(repo, prNumber);
+        const live = await githubPoster.fetchPrContext(repo, prNumber);
         if (headSha === "") headSha = live.headSha;
         if (baseSha === "") baseSha = live.baseSha;
-        await reviews().finalizeReview(reviewId, {
+        const updated = await reviews().finalizeReview(reviewId, {
           status: detail.review.status,
           summaryMd: detail.review.summaryMd ?? "",
           headSha,
           baseSha,
         });
+        if (!updated) {
+          logRefusedTransition(reviewId, detail.review.status);
+          return;
+        }
       }
 
       // Settle every finding into its decided terminal state. Idempotent, so it
@@ -844,10 +1037,14 @@ export function makeReviewControlPlane(
       if (await githubPoster.alreadyPosted(repo, prNumber, reviewId)) {
         const decision = buildDecision(detail);
         await applyFindingStates(decision, true);
-        await reviews().finalizeReview(reviewId, {
+        const finalized = await reviews().finalizeReview(reviewId, {
           status: "posted",
           summaryMd: detail.review.summaryMd ?? "",
         });
+        if (!finalized) {
+          logRefusedTransition(reviewId, "posted");
+          return;
+        }
         const surfaced = decision.toPost.length + decision.uiOnly.length;
         await recordEvent(reviewId, "posted", postedSummary(surfaced));
         await ackStatus(reviewId, "posted", surfaced);
@@ -887,30 +1084,38 @@ export function makeReviewControlPlane(
       if (!posted.posted) throw new Error("GitHub review was not posted");
 
       await applyFindingStates(decision, posted.inlinePosted);
-      await reviews().finalizeReview(reviewId, {
+      const finalized = await reviews().finalizeReview(reviewId, {
         status: "posted",
         summaryMd: posted.summaryMd,
         ...(posted.githubReviewId !== undefined
           ? { githubReviewId: posted.githubReviewId }
           : {}),
       });
+      if (!finalized) {
+        logRefusedTransition(reviewId, "posted");
+        return;
+      }
       const surfaced = decision.toPost.length + decision.uiOnly.length;
       await recordEvent(reviewId, "posted", postedSummary(surfaced));
       await ackStatus(reviewId, "posted", surfaced);
     },
 
-    async failReview(reviewId, opts = {}) {
-      await cleanupWorkerSession(opts.sessionId);
-      await reviews().updateReviewStatus(reviewId, "failed");
-      await recordEvent(reviewId, "failed", opts.reason);
-      await ackStatus(reviewId, "failed");
-    },
+    failReview,
 
     async haltReview(reviewId, opts = {}) {
       await cleanupWorkerSession(opts.sessionId);
-      await reviews().updateReviewStatus(reviewId, "halted");
+      if (!(await reviews().updateReviewStatus(reviewId, "halted"))) {
+        logRefusedTransition(reviewId, "halted");
+        return;
+      }
       await recordEvent(reviewId, "halted");
       await ackStatus(reviewId, "halted");
+    },
+
+    async cleanupSupersededReview(_reviewId, opts = {}) {
+      // The ingress transaction already committed `superseded`. This step owns
+      // only teardown; writing status here would reintroduce the race B6 removes.
+      await cleanupWorkerSession(opts.sessionId);
     },
   };
 }

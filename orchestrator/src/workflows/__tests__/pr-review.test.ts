@@ -6,18 +6,43 @@ import { prReviewWorkflowImpl, type StepRunner } from "../pr-review.ts";
 
 const trigger: ReviewInbox = {
   kind: "trigger",
+  reviewId: "review-1",
+  taskId: "task-1",
   repo: "openai/engrams",
   prNumber: 100,
   trigger: "opened",
   headSha: "head-sha",
+  baseSha: "base-sha",
 };
 
 function fakeControlPlane(
   overrides: Partial<ReviewControlPlane> = {},
 ): ReviewControlPlane {
   return {
-    resolvePrHeads: async () => ({ headSha: "resolved-head", baseSha: "resolved-base" }),
-    ensureReviewRecord: async () => ({ reviewId: "review-1", taskId: "task-1" }),
+    resolvePrHeads: async () => {
+      throw new Error("pass workflow must not resolve pull requests");
+    },
+    resolveReviewTarget: async () => {
+      throw new Error("pass workflow must not resolve targets");
+    },
+    createReviewPass: async () => {
+      throw new Error("pass workflow must not create review rows");
+    },
+    updateReviewPassContext: async () => {
+      throw new Error("pass workflow must not update ingress context");
+    },
+    startReviewPass: async () => {
+      throw new Error("pass workflow must not dispatch itself");
+    },
+    abandonIngress: async () => {
+      throw new Error("pass workflow must not abandon ingress");
+    },
+    acknowledgeReviewPass: async () => {
+      throw new Error("pass workflow must not acknowledge ingress passes");
+    },
+    signalSupersededPass: async () => {
+      throw new Error("pass workflow must not signal predecessors");
+    },
     createFinderSession: async () => ({ sessionId: "finder-session" }),
     bootstrapFinderSession: async () => {},
     sendFinderPrompt: async () => {},
@@ -29,6 +54,7 @@ function fakeControlPlane(
     postReviewResults: async () => {},
     failReview: async () => {},
     haltReview: async () => {},
+    cleanupSupersededReview: async () => {},
     ...overrides,
   };
 }
@@ -86,8 +112,6 @@ describe("PrReviewWorkflow", () => {
     ], steps.step);
 
     expect(steps.steps).toEqual([
-      "resolvePrHeads",
-      "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
       "sendFinderPrompt",
@@ -327,11 +351,60 @@ describe("PrReviewWorkflow", () => {
     expect(failed).toHaveLength(1);
     expect(failed[0]?.opts).toMatchObject({ sessionId: "finder-session" });
     expect(steps.steps).toEqual([
-      "resolvePrHeads",
-      "ensureReviewRecord",
       "createFinderSession",
       "bootstrapFinderSession",
       "failReview",
     ]);
+  });
+
+  test("uses the review and task ids ingress put on the trigger", async () => {
+    const finderInputs: unknown[] = [];
+    const steps = runner();
+    const cp = fakeControlPlane({
+      async createFinderSession(input) {
+        finderInputs.push(input);
+        return { sessionId: "finder-session" };
+      },
+    });
+
+    await run(cp, [trigger, { kind: "stop" }], steps.step);
+
+    expect(finderInputs).toEqual([{
+      reviewId: "review-1",
+      taskId: "task-1",
+      repo: "openai/engrams",
+      prNumber: 100,
+      workflowId: "review-wf-1",
+    }]);
+    expect(steps.steps).not.toContain("resolvePrHeads");
+    expect(steps.steps).not.toContain("createReviewPass");
+  });
+
+  test("supersede tears down the active worker without changing status", async () => {
+    const cleaned: Array<{ reviewId: string; opts?: unknown }> = [];
+    let halted = 0;
+    let failed = 0;
+    const steps = runner();
+    const cp = fakeControlPlane({
+      cleanupSupersededReview: async (reviewId, opts) => {
+        cleaned.push({ reviewId, opts });
+      },
+      haltReview: async () => {
+        halted++;
+      },
+      failReview: async () => {
+        failed++;
+      },
+    });
+
+    await run(cp, [trigger, { kind: "supersede" }], steps.step);
+
+    expect(cleaned).toEqual([{
+      reviewId: "review-1",
+      opts: { sessionId: "finder-session" },
+    }]);
+    expect(halted).toBe(0);
+    expect(failed).toBe(0);
+    expect(steps.steps.at(-1)).toBe("cleanupSupersededReview");
   });
 });

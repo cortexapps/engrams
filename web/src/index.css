@@ -259,6 +259,85 @@
   }
 }
 
+/* Markdown from a model, styled in-system (src/components/Markdown.tsx maps
+   react-markdown's elements onto these). The component referenced a `theme.css`
+   that never existed, so it rendered unstyled and went unused; the classes live
+   here now. Logbook grammar: square bullets, hairline-boxed inline code, a
+   ruled code block, and a quote held by a single hairline rule rather than a
+   coloured bar. */
+.md-h {
+  font-family: var(--font-display);
+  font-weight: 600;
+  letter-spacing: -0.01em;
+  line-height: 1.3;
+  margin-block: 0.9em 0.35em;
+}
+.md-h:first-child {
+  margin-block-start: 0;
+}
+.md-ul,
+.md-ol {
+  margin-block: 0.5em;
+  padding-inline-start: 1.35em;
+}
+.md-ul {
+  list-style: square;
+}
+.md-ol {
+  list-style: decimal;
+}
+.md-ul li,
+.md-ol li {
+  margin-block: 0.15em;
+}
+.md-ul::marker,
+.md-ol::marker {
+  color: var(--muted-foreground);
+}
+.md-code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 0.05em 0.3em;
+  background-color: var(--muted);
+}
+.md-pre {
+  margin-block: 0.6em;
+  padding: 0.7em 0.85em;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  background-color: var(--muted);
+  /* Wide code scrolls inside its own box; the page never scrolls sideways. */
+  overflow-x: auto;
+}
+/* Inside a block, the inline treatment would double the box. */
+.md-pre .md-code {
+  border: 0;
+  padding: 0;
+  background: transparent;
+  font-size: 0.85em;
+}
+.md-link {
+  text-decoration: underline;
+  text-decoration-color: var(--border);
+  text-underline-offset: 4px;
+}
+.md-link:hover {
+  text-decoration-color: currentColor;
+}
+.md-quote {
+  margin-block: 0.6em;
+  padding-inline-start: 0.85em;
+  border-inline-start: 1px solid var(--border);
+  color: var(--muted-foreground);
+}
+.md-hr {
+  margin-block: 1em;
+  border: 0;
+  border-block-start: 1px solid var(--border);
+}
+
 @utility bg-carbon-fade {
   /* A 2/2 carbon-fibre twill: two sets of diagonal threads offset to read as
      a woven lattice, plus a soft vertical sheen. Threads are translucent so

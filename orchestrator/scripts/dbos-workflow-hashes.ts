@@ -1,5 +1,6 @@
 import "../src/workflows/slack-thread.ts";
 import "../src/workflows/pr-review.ts";
+import "../src/workflows/review-ingress.ts";
 import "../src/workflows/tool-exec.ts";
 import "../src/workflows/automation-run.ts";
 

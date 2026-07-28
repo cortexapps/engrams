@@ -33,6 +33,8 @@ const BASE_SHA = "abcdef0123456789abcdef0123456789abcdef01";
 
 const review: ReviewRow = {
   id: "review-durable-exec",
+  targetId: "target-1",
+  provider: "github",
   repo: "openai/engrams",
   prNumber: 103,
   taskId: "task-durable-exec",
@@ -45,6 +47,16 @@ const review: ReviewRow = {
   finderSessionId: null,
   verifierSessionId: null,
   summaryMd: null,
+  providerId: null,
+  prUrl: null,
+  prTitle: null,
+  prAuthor: null,
+  headBranch: null,
+  baseBranch: null,
+  prState: null,
+  additions: null,
+  deletions: null,
+  changedFiles: null,
   createdAt: new Date("2026-07-22T00:00:00Z"),
   updatedAt: new Date("2026-07-22T00:00:00Z"),
 };
@@ -80,12 +92,18 @@ function reviewStore(
   overrides: Partial<ReviewStoreStub> = {},
 ): ReviewStoreStub {
   return {
-    getActiveReviewForPr: async () => review,
+    claimTargetId: async () => null,
+    upsertTarget: async () => ({ id: "target-1" }),
+    beginReviewPass: async () => ({
+      kind: "created",
+      reviewId: review.id,
+      taskId: review.taskId,
+    }),
+    updateReviewPassContext: async () => true,
     getReview: async () => reviewDetail(),
-    createReview: async () => review.id,
-    updateReviewStatus: async () => {},
+    updateReviewStatus: async () => true,
     updateFindingState: async () => {},
-    finalizeReview: async () => {},
+    finalizeReview: async () => true,
     setStatusCommentId: async () => {},
     setReviewSessionId: async () => {},
     recordEvent: async () => {},
@@ -239,7 +257,23 @@ function bootstrapControlPlane(
 }
 
 const githubPoster: GithubReviewPoster = {
-  fetchPrHeads: async () => ({ headSha: HEAD_SHA, baseSha: BASE_SHA }),
+  fetchPrContext: async () => ({
+    headSha: HEAD_SHA,
+    baseSha: BASE_SHA,
+    pr: {
+      providerId: null,
+      url: null,
+      title: null,
+      author: null,
+      headBranch: null,
+      baseBranch: null,
+      state: null,
+      additions: null,
+      deletions: null,
+      changedFiles: null,
+      providerUpdatedAt: null,
+    },
+  }),
   alreadyPosted: async () => false,
   upsertStatusComment: async () => ({ commentId: "status-comment" }),
   postReview: async () => ({
@@ -771,10 +805,10 @@ describe("durable orchestrator exec caller", () => {
         sessions,
         execRuntime: instantRuntime(),
         reviews: reviewStore({
-          getActiveReviewForPr: async () => ({ ...review, status: persistedStatus }),
           getReview: async () => reviewDetail(persistedStatus),
           updateReviewStatus: async (_reviewId, status) => {
             persistedStatus = status;
+            return true;
           },
           recordEvent: async (_reviewId, kind) => {
             events.push(kind);
@@ -800,10 +834,13 @@ describe("durable orchestrator exec caller", () => {
       });
       const messages: Array<ReviewInbox | null> = [{
         kind: "trigger",
+        reviewId: review.id,
+        taskId: review.taskId,
         repo: review.repo,
         prNumber: review.prNumber,
         trigger: review.trigger,
         headSha: review.headSha,
+        baseSha: review.baseSha,
       }];
       const steps: string[] = [];
       const step: StepRunner = async (fn, name) => {

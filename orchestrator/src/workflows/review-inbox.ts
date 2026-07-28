@@ -1,18 +1,22 @@
 /** The PrReviewWorkflow's single mailbox contract (ADR 0100). */
 
 import type { TerminalOutcome } from "../control-plane/session-events.ts";
-
 export const REVIEW_TOPIC = "review";
 
 export type ReviewInbox =
   | {
       kind: "trigger";
-      // The first message must carry the unhashed identity: the deterministic
-      // workflow id cannot be reversed when the durable review row is created.
+      // ADR 0100 decision 11: ingress resolves the change BEFORE this message is
+      // sent, so every field here is required. The review workflow can no longer
+      // reach a state where it does not know what it is reviewing — that state is
+      // gone, not handled.
+      reviewId: string;
+      taskId: string;
       repo: string;
       prNumber: number;
       trigger: string;
-      headSha?: string;
+      headSha: string;
+      baseSha: string;
       focus?: string;
     }
   | { kind: "comment"; commentId: string; body: string }
@@ -28,4 +32,5 @@ export type ReviewInbox =
       sessionId: string;
       outcome: TerminalOutcome;
     }
-  | { kind: "stop" };
+  | { kind: "stop" }
+  | { kind: "supersede" };

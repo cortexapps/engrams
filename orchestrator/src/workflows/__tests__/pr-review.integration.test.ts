@@ -33,8 +33,30 @@ function recordingControlPlane(
     return value;
   };
   return {
-    resolvePrHeads: async () => rec("resolvePrHeads", { headSha: "h", baseSha: "b" }),
-    ensureReviewRecord: async () => rec("ensureReviewRecord", { reviewId: "rev-1", taskId: "task-1" }),
+    resolvePrHeads: async () => {
+      throw new Error("pass workflow must not resolve pull requests");
+    },
+    resolveReviewTarget: async () => {
+      throw new Error("pass workflow must not resolve targets");
+    },
+    createReviewPass: async () => {
+      throw new Error("pass workflow must not create review rows");
+    },
+    updateReviewPassContext: async () => {
+      throw new Error("pass workflow must not update ingress context");
+    },
+    startReviewPass: async () => {
+      throw new Error("pass workflow must not dispatch itself");
+    },
+    abandonIngress: async () => {
+      throw new Error("pass workflow must not abandon ingress");
+    },
+    acknowledgeReviewPass: async () => {
+      throw new Error("pass workflow must not acknowledge ingress passes");
+    },
+    signalSupersededPass: async () => {
+      throw new Error("pass workflow must not signal predecessors");
+    },
     createFinderSession: async () => rec("createFinderSession", { sessionId: "finder-1" }),
     bootstrapFinderSession: async () => { rec("bootstrapFinderSession", undefined); },
     sendFinderPrompt: async () => { rec("sendFinderPrompt", undefined); },
@@ -45,11 +67,21 @@ function recordingControlPlane(
     postReviewResults: async () => { rec("postReviewResults", undefined); },
     failReview: async () => { rec("failReview", undefined); },
     haltReview: async () => { rec("haltReview", undefined); },
+    cleanupSupersededReview: async () => {
+      rec("cleanupSupersededReview", undefined);
+    },
   };
 }
 
 const trigger: ReviewInbox = {
-  kind: "trigger", repo: "acme/repo", prNumber: 7, trigger: "opened",
+  kind: "trigger",
+  reviewId: "rev-1",
+  taskId: "task-1",
+  repo: "acme/repo",
+  prNumber: 7,
+  trigger: "opened",
+  headSha: "h",
+  baseSha: "b",
 };
 
 async function runToTerminal(
@@ -91,7 +123,6 @@ describe.skipIf(!dbReachable)("PrReviewWorkflow (real DBOS engine)", () => {
     ]);
     expect(status).toBe("SUCCESS");
     expect(calls).toEqual([
-      "resolvePrHeads", "ensureReviewRecord",
       "createFinderSession", "bootstrapFinderSession", "sendFinderPrompt",
       "concludeFinderPhase",
       "createVerifierSession", "bootstrapVerifierSession", "sendVerifierPrompt",

@@ -1,8 +1,8 @@
 import { describe, expect, test } from "bun:test";
 
 import type { EnrollmentRow } from "../db/enrollments.ts";
-import type { DispatchReviewInput } from "../workflows/dispatch-review.ts";
 import { makeReviewsDispatchRoute } from "../routes/reviews-dispatch.ts";
+import type { ReviewIngressStart } from "../workflows/review-ingress.ts";
 
 const PATH = "/api/v1/reviews/dispatch";
 const enrollment: EnrollmentRow = {
@@ -15,22 +15,17 @@ const enrollment: EnrollmentRow = {
 };
 
 function app(options: { authenticated?: boolean; enrolled?: boolean } = {}) {
-  const dispatches: DispatchReviewInput[] = [];
+  const ingresses: ReviewIngressStart[] = [];
   return {
-    dispatches,
+    ingresses,
     app: makeReviewsDispatchRoute({
       getSession: async () => options.authenticated === false
         ? null
         : { user: { id: "api-user" } },
       enrollments: { get: async () => options.enrolled === false ? null : enrollment },
       randomUUID: () => "dispatch-key-1",
-      dispatch: async (input) => {
-        dispatches.push(input);
-        return {
-          enrolled: true,
-          workflowId: "review:workflow-1",
-          reviewId: "review-row-1",
-        };
+      startIngress: async (input) => {
+        ingresses.push(input);
       },
     }),
   };
@@ -51,18 +46,18 @@ describe("POST /api/v1/reviews/dispatch", () => {
   test("requires authentication", async () => {
     const fixture = app({ authenticated: false });
     expect((await request(fixture.app)).status).toBe(401);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.ingresses).toEqual([]);
   });
 
-  test("dispatches an enrolled repo and returns workflow/review ids", async () => {
+  test("starts ingress for an enrolled repo and returns its workflow id", async () => {
     const fixture = app();
     const res = await request(fixture.app);
     expect(res.status).toBe(200);
     expect(await res.json()).toEqual({
-      workflow_id: "review:workflow-1",
-      review_id: "review-row-1",
+      workflow_id: "review-ingress:dispatch-key-1",
     });
-    expect(fixture.dispatches).toEqual([{
+    expect(fixture.ingresses).toEqual([{
+      provider: "github",
       repo: enrollment.repo,
       prNumber: 100,
       trigger: "dispatch",
@@ -73,6 +68,6 @@ describe("POST /api/v1/reviews/dispatch", () => {
   test("returns 404 without dispatch for an un-enrolled repo", async () => {
     const fixture = app({ enrolled: false });
     expect((await request(fixture.app)).status).toBe(404);
-    expect(fixture.dispatches).toEqual([]);
+    expect(fixture.ingresses).toEqual([]);
   });
 });

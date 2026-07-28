@@ -105,6 +105,170 @@ shaped this ADR:
    a ready workspace and spends zero tokens on mechanical setup; and because
    the clone already happened, the review session needs no network access at
    all in v1.
+9. **The review record carries the PR's identity, not just its coordinates**
+   (added 2026-07-25). `repo` + `pr_number` + two SHAs are enough to *run* a
+   review and not enough to *read* one: every surface that reports a review has
+   to say "cortexapps/engrams #881" where a human thinks "the quinn-proto bump".
+   So the record also stores the PR's title, author, head/base branch, state,
+   and diff size. It must be *stored* rather than read on demand, because the
+   reviewer workers are network-clamped to a read-only clone credential and
+   cannot fetch PR metadata themselves. Every field is nullable: reviews
+   recorded before this decision keep only their coordinates, forever, so every
+   consumer degrades to `repo #number` rather than assuming a title exists.
+
+   **Superseded by decision 11.** Storing identity on the pass was the wrong home
+   for it, and the review workflow is no longer the capture point. Durable ingress
+   now captures a complete `pull_request` webhook directly and calls
+   `resolvePrHeads` only when its input is incomplete.
+
+10. **Reviewer-session transcripts stay admin-only** (added 2026-07-25, revised
+   2026-07-26). Reviews are org-visible by decision; the sessions that produce
+   them are not. A `pr_review` task is inserted with a null owner and session
+   reads are owner-scoped, so only an admin can open a finder or verifier
+   transcript. A member reads the finding, its severity, the verifier's
+   reasoning and the code it quotes — but not the worker's own thread.
+
+   An earlier revision of this decision granted a *derived* read: a session named
+   as a review's `finder_session_id` / `verifier_session_id` was readable by
+   anyone who could read that review. **It was reverted before merge**, and the
+   reason is worth recording, because the shape of the mistake generalises.
+
+   The rule keyed on the policy *action*, granting the derived permission to
+   every operation classified `read`. `SessionService.Resume` is classified
+   `read` — it rehydrates a parked VM. So a member could read a reviewer's
+   session id off the review, call `Resume`, and change VM state and spend
+   resources on a session the feature described as read-only. The written
+   justification listed `prompt`, `shell` and `delete` as the things that stayed
+   owner-scoped; nobody enumerated the rest of the `read` bucket. **An
+   action-level grant is only as narrow as the action's own membership, and that
+   membership is not visible from the grant site.** A future attempt should
+   authorize specific methods, not an action class.
+
+   Consequence for the UI: the dossier hides its `Sessions` control unless the
+   viewer's ability actually permits reading an unowned session. It asks the
+   ability that question rather than checking for an admin role, so the control
+   follows the rule if the rule ever changes. Offering a button that answers 404
+   is worse than not offering it.
+
+   Left behind deliberately: migration 0038's indexes on
+   `review.finder_session_id` / `verifier_session_id`. They were added for the
+   derived-read lookup and are now unused, but the migration has been applied and
+   is checksum-immutable, so they stay rather than earning a drop migration for
+   two indexes on a small table.
+
+11. **A pull request is a row; ingress identifies it before a pass starts**
+   (added 2026-07-26, corrected to the as-built design 2026-07-27).
+   Decision 9 put the PR's identity on the *pass*, which is one row per review
+   run. Three things follow from that, and all three are real:
+
+   - **A failed pass erases the PR's name.** Identity is read from the newest
+     pass. When head resolution fails we deliberately still write a record, with
+     null context — so a failed retry reverts the dossier, the ledger and the rail
+     to `Pull request #802`, and title search stops finding it. The data is not
+     lost; the UI stops looking at it.
+   - **The title never refreshes.** Rename a PR and every pass keeps the old name.
+   - **Seven passes store seven copies** of the same title and author.
+
+   Underneath all three: a pull request is a durable entity and a pass is an event
+   about it, and we modelled only the event.
+
+   So the provider-neutral `review_target` holds one row per pull request:
+   `provider`, `provider_id`, repo, number, title, author, state and URL. Its
+   identity is the unique `(provider, provider_id)` pair. `(provider, repo,
+   number)` is only a non-unique coordinate index: a repo is a mutable, reusable
+   name, and after a rename a different repository can take the old name and
+   reuse the same pull-request number. `review` points to the target by required
+   `target_id` and keeps only per-pass facts: the SHAs, branches, diff counts,
+   trigger, status, session ids, status-comment id and posted review id.
+
+   `pr_state` moves to the target and stops being a snapshot. That retires the
+   "was open" framing decision 9 forced on every consumer — "this PR is merged" is
+   what a reader wants, not "it was open when pass 3 ran".
+
+   **Ingress is durable.** Every request first enters
+   `ReviewIngressWorkflow`. A complete `pull_request` webhook needs no GitHub
+   call; an incomplete webhook, command, dispatch or retry resolves through
+   `resolvePrHeads`. The completeness check is over the data, not an assumed
+   action schema, and both webhook and API readers share
+   `reviews/pr-context.ts`. This is a workflow rather than a function call
+   because GitHub resolution is a retryable network operation: a transient
+   outage delays ingress instead of creating a nameless failed pass. The pass
+   workflow starts only after ingress has a target and pass row.
+
+   **The target refresh is one statement.** `upsertTarget` is `INSERT ... ON
+   CONFLICT (provider, provider_id) DO UPDATE ... WHERE`, with a
+   `provider_updated_at` freshness guard so a delayed webhook cannot replace
+   newer facts. Null descriptive fields preserve known values. There is no
+   transaction, row lock or read-modify-write. The earlier locking/two-conflict-
+   target draft existed only because it treated the mutable coordinate as an
+   identity; choosing the immutable provider id removes that race and the
+   machinery built around it.
+
+   **Nullable provider ids are transitional.** `claimTargetId` adopts a
+   pre-existing null-`provider_id` row by coordinate before the upsert. That
+   avoids splitting ordinary backfilled history, but it cannot prove identity:
+   after a repo rename a new repo can reuse the old name and PR number, joining
+   unrelated histories. A background hydrator fetches those rows in bounded
+   batches. Success writes the id; permanent failure stamps
+   `hydration_failed_at` and emits an ERROR without deleting history; transient
+   failures remain eligible. Once every row is hydrated, make `provider_id` NOT
+   NULL and delete `claimTargetId`.
+
+   Ingress fails fast on permanent forge failures and retries transient ones,
+   including 403 rate limits identified from GitHub's response body. A retry
+   already knows its target, so ingress creates its queued pass first and can
+   persist the terminal failure and reason for the dossier. A bare command that
+   cannot identify a target has no dossier spinner to settle, so it logs and
+   stops rather than fabricating a row.
+
+   **The mixed-version rollout error window is accepted.** The pre-upgrade
+   migration runs before a zero-unavailable Deployment roll, so old pods can
+   briefly issue review queries against the new clean-break schema and receive
+   `42703`. Avoiding that would preserve the retired model in compatibility
+   code; this ADR accepts the bounded review-path error window.
+
+   *Resolved, and deliberately NOT moved:* `status_comment_id` stays on the pass.
+   It looked like duplication — a PR reviewed seven times accumulates seven sticky
+   comments — but per-pass is the intent, and the hidden marker
+   (`<!-- engrams-status:<reviewId> -->`) says so. Editing one comment forever
+   would be quieter on the PR and worse for the author: GitHub notifies on a new
+   comment, not on an edit, so a fresh push would silently update a comment nobody
+   is told to re-read. The anti-stacking the code comment describes is *within* a
+   pass (👀 → ⏳ → ✅), which is exactly the right scope.
+
+   Sequenced as its own change rather than folded into the dossier work: a table
+   split plus a proto change is a different review from a UI restructure. The
+   stopgap it replaced — the dossier reading identity from the newest pass that
+   captured any — is deleted; grouping now keys on `target_id`, which is
+   also what keeps a renamed PR's history in one group.
+
+12. **One review row is one pass is one workflow** (added 2026-07-27). The
+   previous workflow id was derived from the mutable `repo #number` coordinate
+   and an epoch walk. A second trigger could be sent to a live workflow after
+   its initial receive and be ignored, while two concurrent ingresses could
+   read no active pass and both insert one. These defects pre-dated decision 11;
+   decision 11 supplied the stable `target_id` that made the invariant
+   enforceable.
+
+   Ingress now creates the review row and task atomically. The pass workflow id
+   is exactly `review:<reviewId>`; the pass receives `reviewId` and `taskId` and
+   creates nothing. A literal partial unique index allows one active
+   (`queued`, `finding`, `verifying`) review per target. The transaction marks a
+   predecessor `superseded` and inserts its successor together; the unique
+   index arbitrates concurrent writers, and a loser adopts the winning pass.
+
+   Deduplication is intentional and narrow. Automation (`opened` or
+   `synchronize`) at the same head returns the active pass. A human request
+   (`command`, `retry`, `dispatch`) at the same head supersedes it because the
+   person may have changed focus. Any request at a different head supersedes
+   because the old pass is reviewing stale code. After commit, ingress sends a
+   `supersede` message to the predecessor so it tears down its worker without
+   rewriting the status.
+
+   Every terminal transition is guarded in the store's `WHERE` clause: only an
+   active row can move to failed, halted or posted. A late timeout therefore
+   cannot overwrite `superseded` (or any other terminal outcome), and a refused
+   transition is logged rather than hidden.
 
 ## Finding categories
 
@@ -555,7 +719,8 @@ ladder, which is ~20 lines and fails soft.
    comment, and surfaces the failure on the review page. Never silently green.
 3. Re-running is an explicit action, not an in-workflow retry (see the
    divergence note below): the `/reviews` **Retry** button (or the dispatch
-   endpoint) mints a fresh review record + workflow epoch over the PR's current
+   endpoint) asks ingress to mint a fresh review row + `review:<reviewId>`
+   workflow over the PR's current
    head. The failed row stays as history.
 
 ## Conversation on the PR
@@ -675,18 +840,106 @@ and comments are attacker-controlled. Containment, enforced in code:
 
 ## Web UI
 
-`/reviews` as a sibling of `/sessions` (the papercuts page on the
-`papercuts-kaizen` branch is the reference pattern: proto → native Connect
-service → generated connectquery client → hook → page):
+`/reviews` is served by the `ReviewService` proto (List/Get/Retry) through the
+standard chain — proto → native Connect service → generated connectquery client
+→ hook → page. Reviews are org-visible: a team dashboard, not a personal list.
 
-- **List**: repo, PR, status chip, finding counts by severity, autofix state,
-  links to the PR and the phase sessions' transcripts.
-- **Detail**: the summary; every finding with category/severity/confidence,
-  state (posted / UI-only / suppressed-refuted with the verifier's reasoning /
-  superseded), resolution, and a link to its GitHub thread; the autofix
-  round history; a "Send to authoring task" button when applicable.
-- A `ReviewService` proto (List/Get) serves it; reviews are org-visible (a
-  team dashboard, not a personal list).
+This section has been rewritten twice against real screens. The first
+implementation was a list-plus-expanding-row table: one row per review, expanding
+to every finding sorted by severity. Field use killed it for three reasons — one
+PR occupied several rows because a retry and every `synchronize` push mint a
+record; a review had no name, only the coordinate `cortexapps/engrams #881`
+(hence decision 9); and the finding list flattened the two things a reader most
+needs separated, the finder's claim and the verifier's ruling, with `ui_only`
+rendering as one label, "shown here only", while meaning four different things.
+
+The replacement was PR-grouped but wrong in the other direction: a verdict band,
+a progress block, a findings section and a collapsed pass history, all above the
+fold, with the transcript in a resizable third pane. It read as busy, and two
+further attempts (a pass accordion, then a horizontal pass strip) failed for the
+same underlying reason — **passes were competing with findings for the page.**
+
+### The shape that shipped
+
+**The findings are the product. A pass is an address, not a section.**
+
+1. **Identity, one line.** The PR title leads (decision 9); the coordinate carries
+   the heading when no title was captured. Repo, author, branches, diff size and
+   the PR's state assemble into a single dot-separated line from whatever exists,
+   rather than a grid of labels over nulls. One GitHub affordance, labelled for
+   where it actually lands — "Review on GitHub" when the pass posted one, "Pull
+   request on GitHub" otherwise.
+2. **The selected pass, one line — three ranked groups, not six loose tokens.**
+   The **state control** (see below), then a **bordered** switcher carrying the SHA
+   and `pass 7 of 7`, then one mono readout for duration and age, then `Sessions`.
+   Passes display newest-first but are numbered **oldest-first**, the way attempts
+   are counted — ranking by recency read as the exact opposite of what it meant.
+   Menu rows carry the stage *word*: seven rows of `✓ abc1234 3d` made choosing a
+   pass an exercise in recalling a glyph alphabet. Stage carries no display weight;
+   it is a state, and giving it headline size made a status compete with the title.
+3. **Three conditional lines, and only when each has something to say.** The
+   failure reason (the last event's `detail`, in the reading flow, not buried in
+   the activity popover). The refuted count, when the verifier killed something —
+   deliberately silent about what "stands", because an unverified finding never
+   posts and counting it as surviving would overstate. A forward link when a newer
+   pass exists: the canonical entry point is a marker in a PR comment on a PR that
+   has probably been pushed to since, so history must not look like the present.
+4. **The findings**, grouped by outcome, each a scannable row opening to the
+   body, the code and thread links, the evidence receipt, and the verifier's
+   ruling as a separately attributed voice.
+5. **Nothing below them.**
+
+### Consequences worth recording
+
+- **State and activity are one control.** `posted`, `failed` and `halted` are
+  simultaneously review statuses and `review_event` kinds: a terminal pass's state
+  IS the last line of its own log. So the state is the button, and clicking it
+  opens the log it summarises. Live it reports the running step ("Reviewing
+  changes" says more than the stage word "Finding") and breathes; terminal it
+  reports the stage with the step count behind it; with no events it degrades to a
+  plain readout rather than a button that opens nothing. Two separate controls for
+  one idea was the last thing making that row unreadable. The earlier "the log
+  takes the verdict band's slot" rule is retired along with the band.
+- **Findings collapse.** A body runs to 20 000 chars and the cap is 200, so
+  rendering every body was the wall of text the surface kept becoming. The leading
+  group's first three cards arrive open regardless of group size, so the boundary
+  is visible in the result rather than a threshold to infer.
+- **Outcome headings are sticky.** The heading is the only place the outcome is
+  stated — no card repeats it as a badge — so a card scrolled away from its
+  heading could no longer say why it didn't post.
+- **`ui_only` is derived, not stored.** Four reasons computed client-side from
+  rows already on the wire: no verdict → unverified; confirmed but unanchored →
+  nowhere to hang a comment; confirmed and anchored but unposted → over the
+  10-comment cap; refuted → the verifier killed it. The GitHub 422 batch-fallback
+  folds into "over the cap" deliberately: rare, demotes everything at once, and
+  separating it would cost a column for a distinction no reader acts on.
+- **Status text is ink; colour rides a glyph or a dot.** `web/src/index.css`
+  states the rule the `--instrument-*` tokens were chosen against. Amber as text
+  measures 2.5–2.7:1 on celadon paper — below even the large-text floor — so
+  `ReviewStage` (glyph in tone, word in ink) is the only status form that reaches
+  a content surface. Caught by a critique pass, not by the type checker.
+- **A finding's code link pins `headSha`.** The branch has moved on; lines that
+  have shifted since are worse than no link. `githubThreadId` and `resolution`
+  were on the wire and rendered nowhere until this pass.
+- **`superseded` is now durable.** Decision 12 writes it atomically with the
+  successor pass. Grouping still presents the newest pass first, while the old
+  row now records why it stopped and rejects late terminal rewrites.
+- **The transcript is a right sheet, not a pane.** It explains how a pass reached
+  its conclusion; it is not a second thing to read alongside the findings.
+  `SessionThread` is reused unchanged and already degrades to read-only on a
+  terminal session, which is what a torn-down reviewer session needs.
+
+The autofix surfaces this section originally listed — round history and the
+"send to authoring task" control — remain P2 work; the composition above leaves
+room for them in the pass menu and the header actions rather than specifying them
+now.
+
+Known gaps, recorded rather than fixed: no expand-all at the 200-finding cap, no
+filter or virtualization there, no per-finding deep link (so a finding cannot be
+shared), and `summaryMd` — what engrams actually said on the PR — is still
+unrendered anywhere in the UI. A 0-finding pass, the *typical* outcome, still
+answers the surface's central question with one muted sentence.
+
 
 ## Failure modes
 
@@ -731,6 +984,18 @@ service → generated connectquery client → hook → page):
   fresh-fix-session fallback, role-aware routing + budgets, the UI button.
 - **P3 — depth**: per-directory config, review detail page polish, the
   follow-ups below as they earn priority.
+
+**Landed so far** (2026-07-27): P0, plus the P3 review-surface work and decisions
+9–10 as the commit chain `033cb922` (this ADR's decisions) → `e5534652` (PR
+context on the record) → `cfc99f0a` (derived transcript read) → `9cf12bea` (PR
+dossiers replace the flat pass list) → `5d940d46` (the worker transcript pane),
+followed by decisions 11–12's provider-neutral target/ingress split and
+one-row/one-pass/one-workflow invariant.
+This ADR stays **Proposed** rather than flipping to Accepted, because P1
+(conversation + incremental passes) and P2 (autofix) are specified here and not
+built — `update_finding_status` resolutions, the dirty-set sweeps, the
+incremental finder path, and the autofix round history all remain unimplemented, and
+marking the ADR Accepted would claim otherwise.
 
 ## Future follow-ups (described, deliberately deferred)
 
@@ -801,14 +1066,40 @@ service → generated connectquery client → hook → page):
 - **No in-workflow retry (supersedes the "session dies" retry-once above).** A
   dead/errored phase marks the review `failed` immediately. Re-running is an
   explicit `ReviewService.RetryReview` RPC (the `/reviews` **Retry** button) or
-  the dispatch endpoint, both of which re-enter `dispatchReview` → a fresh
-  review record (a terminal review is not "active") + successor workflow epoch.
+  the dispatch endpoint, both of which enter durable review ingress → a fresh
+  review row + the immutable `review:<reviewId>` pass workflow.
   This removed the retry counters, the per-phase deadline-window counting (now
   one `recv` window is the phase deadline), and `deleteFindingsForSession` (the
   retry-only finding-dedup step), which is dropped from the control-plane seam.
 - **`RetryReview` authz.** Gated as `create` on the `Review` subject — any
   authenticated member, mirroring "any member can trigger a review by command";
   enrollment mutations stay admin-only.
+- **PR context is captured by ingress** (decisions 9 and 11, as built). A
+  complete `pull_request` webhook takes the shortcut with no GitHub read;
+  incomplete webhooks, commands, dispatches and retries use the durable
+  `resolvePrHeads` step. The pass workflow receives the resolved SHAs and row
+  ids and performs no identity or head resolution.
+- **The derived session read was reverted before merge** (decision 10). It
+  granted every operation classified as `read`, including
+  `SessionService.Resume`, so it was not a read-only exception. Reviewer
+  transcripts remain admin-only and the dossier hides the control when the
+  viewer cannot read the unowned session.
+- **The four `ui_only` reasons stayed derived, and no column was added.** The
+  plan considered persisting the demotion reason while the schema was already
+  open. Not done: three reasons fall out of rows the client already has (no
+  verdict, null line range, confirmed-but-not-posted), and the fourth (the 422
+  batch fallback) folds into "over the cap" rather than earning a column for a
+  distinction no reader acts on differently.
+- **`components/Markdown.tsx` was dead, not missing.** Finding bodies rendered
+  raw markdown in a `<pre>`. The component existed but mapped onto `.md-*`
+  classes in a `theme.css` that never existed, so it rendered unstyled and had no
+  callers. The classes now live in `index.css` and the component is used.
+- **The transcript pane reuses the session event subscription unchanged**, and so
+  inherits its bounded first-page replay: a finished session with a very long
+  transcript truncates at that bound and never advances, because no further
+  events will ever be published to it. Pre-existing and shared with the session
+  detail page; deliberately not forked into a second event-reading path here, and
+  tracked separately.
 
 ## References
 

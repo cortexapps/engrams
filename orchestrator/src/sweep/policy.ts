@@ -14,6 +14,11 @@ export interface SweepPolicy {
 export const SWEEP_POLICIES: Record<string, SweepPolicy> = {
   SlackThreadWorkflow: { mode: "adopt", staleAfterHours: 48 },
   PrReviewWorkflow: { mode: "adopt", staleAfterHours: 48 },
+  // Ingress resolves a pull request and hands off (ADR 0100 d11). It is bounded
+  // by a couple of API calls, so an hour is generous — unlike the review pass it
+  // starts, which waits on an agent and gets 48. A stranded ingress means a
+  // review that was asked for and never began, so adopting it is the point.
+  ReviewIngressWorkflow: { mode: "adopt", staleAfterHours: 1 },
   ToolExecWorkflow: { mode: "adopt", staleAfterHours: 1 },
   AutomationRunWorkflow: { mode: "adopt", staleAfterHours: 1 },
 };

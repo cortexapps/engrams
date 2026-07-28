@@ -36,7 +36,7 @@ export function useReview(
 }
 
 /** Re-run a terminal review from scratch. Dispatches a fresh pass (a new review
- *  record + workflow epoch) and refreshes the list so the new row appears. */
+ *  row + `review:<reviewId>` workflow) and refreshes the list so it appears. */
 export function useRetryReview() {
   const qc = useQueryClient();
   return useMutation(retryReview, {

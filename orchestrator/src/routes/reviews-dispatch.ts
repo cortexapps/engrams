@@ -5,10 +5,9 @@ import { Hono } from "hono";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import { makeEnrollmentStore, type EnrollmentStore } from "../db/enrollments.ts";
 import {
-  dispatchReview,
-  type DispatchReviewInput,
-  type DispatchReviewResult,
-} from "../workflows/dispatch-review.ts";
+  startReviewIngress,
+  type ReviewIngressStart,
+} from "../workflows/review-ingress.ts";
 
 type GetSession = (
   headers: Headers,
@@ -17,7 +16,7 @@ type GetSession = (
 export interface ReviewsDispatchDeps {
   getSession?: GetSession;
   enrollments?: Pick<EnrollmentStore, "get">;
-  dispatch?: (input: DispatchReviewInput) => Promise<DispatchReviewResult>;
+  startIngress?: (input: ReviewIngressStart) => Promise<void>;
   randomUUID?: () => string;
 }
 
@@ -28,9 +27,7 @@ export function makeReviewsDispatchRoute(
   let enrollmentStore = deps.enrollments;
   const enrollments = (): Pick<EnrollmentStore, "get"> =>
     (enrollmentStore ??= makeEnrollmentStore());
-  const dispatch = deps.dispatch ?? ((input) => dispatchReview({
-    enrollments: enrollments(),
-  }, input));
+  const startIngress = deps.startIngress ?? startReviewIngress;
   const randomUUID = deps.randomUUID ?? (() => crypto.randomUUID());
   const app = new Hono();
 
@@ -55,19 +52,18 @@ export function makeReviewsDispatchRoute(
       // A missing enrollment is a stable resource miss, not a transient conflict.
       return c.json({ error: "repo is not enrolled" }, 404);
     }
-    const result = await dispatch({
+    // A CI dispatch carries only a coordinate, so ingress resolves the change
+    // before any pass starts (ADR 0100 d11). A GitHub blip now delays the review
+    // instead of failing it.
+    const idempotencyKey = randomUUID();
+    await startIngress({
+      provider: "github",
       repo,
       prNumber,
       trigger: "dispatch",
-      idempotencyKey: randomUUID(),
+      idempotencyKey,
     });
-    if (!result.enrolled || !result.workflowId) {
-      return c.json({ error: "repo is not enrolled" }, 404);
-    }
-    return c.json({
-      workflow_id: result.workflowId,
-      ...(result.reviewId != null ? { review_id: result.reviewId } : {}),
-    });
+    return c.json({ workflow_id: `review-ingress:${idempotencyKey}` });
   });
 
   return app;

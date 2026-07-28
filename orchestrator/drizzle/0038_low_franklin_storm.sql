@@ -1,0 +1,2 @@
+CREATE INDEX "review_finder_session_idx" ON "review" USING btree ("finder_session_id");--> statement-breakpoint
+CREATE INDEX "review_verifier_session_idx" ON "review" USING btree ("verifier_session_id");

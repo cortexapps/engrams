@@ -10,6 +10,8 @@ import {
   buildInlineCommentBody,
   buildReviewSummary,
   buildStatusComment,
+  GithubRequestError,
+  isPermanentGithubFailure,
   makeGithubReviewPoster,
 } from "../github-review.ts";
 import type { PolicyDecision } from "../policy-gate.ts";
@@ -66,15 +68,28 @@ function finding(overrides: Partial<ReviewFindingRow> = {}): ReviewFindingRow {
 }
 
 describe("GithubReviewPoster", () => {
-  test("fetchPrHeads decodes the byte response and reads head/base SHAs", async () => {
+  test("fetchPrContext decodes the byte response and reads head/base SHAs", async () => {
     const fake = fakeRunOp([
       response(200, { head: { sha: "head-sha" }, base: { sha: "base-sha" } }),
     ]);
     const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
 
-    expect(await poster.fetchPrHeads("openai/engrams", 100)).toEqual({
+    expect(await poster.fetchPrContext("openai/engrams", 100)).toEqual({
       headSha: "head-sha",
       baseSha: "base-sha",
+      pr: {
+        providerId: null,
+        url: null,
+        providerUpdatedAt: null,
+        title: null,
+        author: null,
+        headBranch: null,
+        baseBranch: null,
+        state: null,
+        additions: null,
+        deletions: null,
+        changedFiles: null,
+      },
     });
     expect(fake.calls).toEqual([{
       provider: "github",
@@ -84,6 +99,126 @@ describe("GithubReviewPoster", () => {
         contentType: "application/json",
       },
     }]);
+  });
+
+  test("fetchPrContext captures the PR's descriptive context (ADR 0100 d9)", async () => {
+    const fake = fakeRunOp([
+      response(200, {
+        id: 2158810101,
+        node_id: "PR_kwDOJ1",
+        html_url: "https://github.com/openai/engrams/pull/881",
+        title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+        user: { login: "dependabot[bot]" },
+        state: "open",
+        draft: false,
+        merged: false,
+        additions: 12,
+        deletions: 4,
+        changed_files: 2,
+        updated_at: "2026-07-21T12:34:56Z",
+        head: { sha: "head-sha", ref: "dependabot/cargo/quinn-proto-0.11.16" },
+        base: { sha: "base-sha", ref: "main" },
+      }),
+    ]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    const { pr } = await poster.fetchPrContext("openai/engrams", 881);
+    expect(pr).toEqual({
+      providerId: "2158810101",
+      url: "https://github.com/openai/engrams/pull/881",
+      providerUpdatedAt: new Date("2026-07-21T12:34:56Z"),
+      title: "Bump quinn-proto from 0.11.14 to 0.11.16",
+      author: "dependabot[bot]",
+      headBranch: "dependabot/cargo/quinn-proto-0.11.16",
+      baseBranch: "main",
+      state: "open",
+      additions: 12,
+      deletions: 4,
+      changedFiles: 2,
+    });
+  });
+
+  // GitHub splits a PR's disposition across state/draft/merged; the reader folds
+  // them into one axis, and the precedence matters (a merged PR is also closed).
+  test.each([
+    [{ state: "open", draft: true, merged: false }, "draft"],
+    [{ state: "open", draft: false, merged: false }, "open"],
+    [{ state: "closed", draft: false, merged: false }, "closed"],
+    [{ state: "closed", draft: false, merged: true }, "merged"],
+    // draft is meaningless once closed, and merged still outranks it
+    [{ state: "closed", draft: true, merged: true }, "merged"],
+  ])("folds %o into pr state %s", async (flags, expected) => {
+    const fake = fakeRunOp([
+      response(200, { ...flags, head: { sha: "h" }, base: { sha: "b" } }),
+    ]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    const { pr } = await poster.fetchPrContext("openai/engrams", 1);
+    expect(pr.state).toBe(expected);
+  });
+
+  test("fetchPrContext still resolves heads when descriptive fields are junk", async () => {
+    const fake = fakeRunOp([
+      response(200, {
+        title: 42,
+        user: "not-an-object",
+        additions: -1,
+        changed_files: 1.5,
+        head: { sha: "head-sha", ref: "" },
+        base: { sha: "base-sha" },
+      }),
+    ]);
+    const poster = makeGithubReviewPoster({ runIntegrationOp: fake.run });
+
+    // A review must never fail over a descriptive field: the SHAs come through
+    // and every unusable field degrades to null on its own.
+    const result = await poster.fetchPrContext("openai/engrams", 1);
+    expect(result.headSha).toBe("head-sha");
+    expect(result.baseSha).toBe("base-sha");
+    expect(result.pr).toEqual({
+      providerId: null,
+      url: null,
+      providerUpdatedAt: null,
+      title: null,
+      author: null,
+      headBranch: null,
+      baseBranch: null,
+      state: null,
+      additions: null,
+      deletions: null,
+      changedFiles: null,
+    });
+  });
+
+  test("classifies permanent failures without treating GitHub throttles as permanent", () => {
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(
+        403,
+        "primary limit",
+        JSON.stringify({ message: "API Rate Limit exceeded for installation" }),
+      ),
+    )).toBe(false);
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(
+        403,
+        "secondary limit",
+        JSON.stringify({ message: "You have exceeded a secondary rate limit" }),
+      ),
+    )).toBe(false);
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(403, "forbidden", JSON.stringify({ message: "Forbidden" })),
+    )).toBe(true);
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(403, "not JSON", "gateway rejected the request"),
+    )).toBe(true);
+    for (const status of [401, 404, 410]) {
+      expect(isPermanentGithubFailure(
+        new GithubRequestError(status, "permanent", JSON.stringify({ message: "rate limit" })),
+      )).toBe(true);
+    }
+    expect(isPermanentGithubFailure(
+      new GithubRequestError(500, "transient", JSON.stringify({ message: "server error" })),
+    )).toBe(false);
   });
 
   test("posts exact single- and multi-line anchors with a suggestion block", async () => {
