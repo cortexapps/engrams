@@ -33,10 +33,20 @@ user_env = "CLAUDE_CODE_OAUTH_TOKEN"
 user_env_hint = "Run `claude setup-token` on your machine and paste the token it prints. It's required before you can start an interactive Claude session."
 
 [[models]]
-id      = "opus"
-label   = "Claude Opus 4.8"
+id      = "opus-5"
+label   = "Claude Opus 5"
 default = true
-env     = { ANTHROPIC_MODEL = "claude-opus-4-8" }
+env     = { ANTHROPIC_MODEL = "claude-opus-5" }
+
+[[models]]
+id    = "fable-5"
+label = "Claude Fable 5"
+env   = { ANTHROPIC_MODEL = "claude-fable-5" }
+
+[[models]]
+id    = "opus"
+label = "Claude Opus 4.8"
+env   = { ANTHROPIC_MODEL = "claude-opus-4-8" }
 
 [[models]]
 id    = "sonnet"
