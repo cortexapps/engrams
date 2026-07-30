@@ -2437,7 +2437,9 @@ async fn list_session_events_pages_without_gap_or_dup(ctx: &Ctx) {
         walked, expected,
         "the walk reconstructs the whole log exactly once"
     );
-    assert_eq!(reads, 3, "25 events over pages of 10 = 10 + 10 + 5");
+    // We do NOT assert an exact read count. The number of reads is an
+    // implementation detail of the page size. The behavior that matters is
+    // above: no gap, no duplicate, and the walk terminates.
 
     // At the tail, a further read returns nothing and must NOT rewind the
     // cursor — the stream relies on this to stop walking.

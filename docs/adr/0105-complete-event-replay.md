@@ -85,12 +85,39 @@ state: the cursor.
 short page means the stream reached the end of the log. Then change to the
 tail state. `REPLAY_PAGE` is a page size. It is not a ceiling.
 
-**The tail state.** Forward each bus event above the cursor. Drop each bus
-event at or below the cursor, because a page already sent it.
+**The tail state.** Forward a bus event only when its index is exactly
+`cursor + 1`. Then move the cursor. Drop a bus event at or below the cursor,
+because the stream already sent it.
 
-That drop is safe for one reason. The log allocates an index without gaps.
-The `MetadataStore` trait states this rule. So a walk that reached the cursor
-sent every event at or below the cursor.
+An index above `cursor + 1` is a jump. The stream does not send it. Instead
+the stream returns to the catch-up state and reads the log.
+
+### The bus is not ordered. The log is.
+
+Two paths publish to the bus. `AppState::emit` publishes a local commit at
+once. `pg_listener` publishes a commit from another replica later, after a
+`LISTEN/NOTIFY` round trip. Production runs two coordinator replicas.
+Therefore one replica can see its own index 12 before the notification for a
+peer's index 11.
+
+The log has no such problem. `append_session_event` allocates an index in one
+autocommit statement. That statement takes a row lock on `sessions`.
+Therefore appends to the same session serialize, and commit order equals
+index order. A visible index 12 proves that index 11 is also visible.
+
+This is why the jump returns to the log. If the stream sent index 12 and
+moved the cursor to 12, then index 11 would be lost forever. The late bus
+copy of 11 would look already-sent. A client that reconnects at
+`Last-Event-ID: 12` would also skip 11.
+
+The walk sends the whole range in order. So the cursor keeps its true
+meaning: the stream sent every event up to the cursor.
+
+**The drop rule also removes a duplicate.** `pg_listener` re-broadcasts on
+every replica, including the replica that produced the event. So each local
+event reaches the bus two times. The cursor drops the second copy. The old
+code compared against a constant, which it set one time at the start of the
+stream. Therefore both copies passed, and the client got the event two times.
 
 Phase 1c chunks (ADR 0052) are different. They never enter the log. They
 hold no real index. Therefore they skip the cursor test. They also must not
@@ -206,16 +233,33 @@ Unit tests in `api::events` use `SimMetadataStore`:
 | `replay_to_live_seam_is_gap_free_and_dup_free` | an event that arrives during a walk appears one time |
 | `failed_page_read_is_terminal_not_clean_eof` | a failed read sends `Err`, not the end of the stream |
 | `bus_lag_backfills_from_the_log` | a lag repairs the hole, with no gap and no duplicate |
+| `out_of_order_bus_event_walks_instead_of_skipping_the_hole` | a jump reads the log and sends the range in order |
+| `listen_echo_of_a_local_emit_is_dropped` | the second copy of a local event never reaches the client |
 | `ephemeral_chunk_bypasses_the_cursor_gate` | a chunk skips the cursor test and does not move the cursor |
 
 Each `next()` call has a timeout. This is deliberate. A short walk leaves
 the stream in the tail state. Then an unbounded `next()` waits forever. A
 test that waits forever reports a timeout. It does not name the defect.
 
-**We did a red check.** We set the walk back to one read
+**We did two red checks.** First we set the walk back to one read
 (`catching_up = false`). Then
-`replay_to_live_seam_is_gap_free_and_dup_free` failed. Both walk tests
-stopped at 500 events. Therefore the tests are not vacuous.
+`replay_to_live_seam_is_gap_free_and_dup_free` failed, and both walk tests
+stopped at 500 events. Second we set the tail test back to `idx > cursor`.
+Then `out_of_order_bus_event_walks_instead_of_skipping_the_hole` failed.
+Therefore the tests are not vacuous.
+
+`listen_echo_of_a_local_emit_is_dropped` passes under both tail rules. It
+guards a different regression: a return to a constant boundary, which the
+code used before this ADR.
+
+### Review history
+
+A Codex review found the out-of-order defect. The first version of this
+change moved the cursor to any bus index above it. That version fixed the
+1291-event incident but lost events in a two-replica deployment. We confirmed
+the report against the code, and we confirmed the index-allocation order that
+makes the repair correct. The repair also removes the duplicate that
+`pg_listener` produces on the replica that emits an event.
 
 End-to-end test in `crates/engram-coordinator/tests/grpc_app.rs`:
 `session_stream_events_replays_past_one_page` calls the real `StreamEvents`

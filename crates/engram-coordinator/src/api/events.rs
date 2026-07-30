@@ -19,10 +19,22 @@
 //!
 //! Sequencing rule: subscribe to the bus *before* reading the log, so an
 //! event published mid-walk queues in the broadcast buffer instead of
-//! landing on the floor. The cursor then de-dupes the seam: the walk
-//! reads strictly above it, the tail drops at-or-below it. That drop is
-//! sound because log idx allocation leaves no gaps, so anything at or
-//! below the cursor was already delivered by a page.
+//! landing on the floor. The cursor de-dupes the seam: the walk reads
+//! strictly above it, the tail drops at-or-below it.
+//!
+//! **The bus is not ordered by idx; the log is.** `AppState::emit`
+//! publishes a local commit at once, while `pg_listener` publishes a peer
+//! replica's commit later over LISTEN/NOTIFY — and prod runs two
+//! replicas, so a replica can see its own idx 12 before the notification
+//! for a peer's idx 11. The log cannot do that: `append_session_event`
+//! allocates in ONE autocommit statement holding a row lock on
+//! `sessions`, so same-session appends serialize and commit order equals
+//! idx order. A visible idx 12 therefore proves idx 11 is visible.
+//!
+//! That asymmetry is why the tail forwards only `cursor + 1` and sends
+//! any jump back to the log. It also means every local event hits the bus
+//! TWICE (emit plus the LISTEN echo, which fires on the producer too);
+//! the at-or-below-cursor drop is what removes the echo.
 
 use std::sync::Arc;
 
@@ -132,9 +144,11 @@ pub(crate) enum MergedEvent {
 ///   pages, yielding each event and advancing the cursor. A short page
 ///   means the tail is reached → start tailing. This is a WALK, not a
 ///   capped read; every event reaches the client.
-/// - **Tailing**: forward bus events above the cursor. Phase 1c EPHEMERAL
-///   chunks (ADR 0052) were never in the log and carry no real idx, so
-///   they bypass the cursor gate entirely.
+/// - **Tailing**: forward a bus event only when its idx is exactly
+///   `cursor + 1`; a jump goes back to catching up (the bus is not ordered
+///   — see the module docs). Phase 1c EPHEMERAL chunks (ADR 0052) were
+///   never in the log and carry no real idx, so they bypass the gate
+///   entirely.
 ///
 /// A `Lagged(n)` flips the loop back to catching up: the bus dropped events
 /// this stream never delivered, but the log still holds them, so we report
@@ -195,11 +209,37 @@ pub(crate) fn merged_event_stream(
                 // no meaningful idx — pass through without touching the
                 // cursor, so they can't advance a client's Last-Event-ID.
                 Ok(indexed) if indexed.ephemeral => yield Ok(MergedEvent::Live(indexed)),
-                Ok(indexed) if indexed.idx > cursor => {
+                // EXACTLY the next event: contiguity holds, so forwarding it
+                // keeps the cursor's meaning ("everything up to here was
+                // delivered") true. This is the common case.
+                Ok(indexed) if indexed.idx == cursor + 1 => {
                     cursor = indexed.idx;
                     yield Ok(MergedEvent::Live(indexed));
                 }
-                // Already delivered by a walk — drop it, don't duplicate.
+                // A JUMP — the bus is NOT ordered by idx. Two publish paths
+                // feed it: `AppState::emit` publishes a local commit
+                // immediately, while a peer replica's commit arrives later
+                // over LISTEN/NOTIFY (`pg_listener`). So a replica can see
+                // its own idx 12 before the notification for a peer's idx
+                // 11.
+                //
+                // Forwarding 12 and advancing the cursor past 11 would
+                // strand 11 forever: the late bus copy then looks
+                // already-delivered, and a client reconnecting at the
+                // advanced Last-Event-ID skips it too. Read the log instead
+                // — it IS ordered (idx allocation is one autocommit
+                // statement holding a row lock on `sessions`, so
+                // same-session commit order equals idx order), so the walk
+                // delivers the whole range in order.
+                Ok(indexed) if indexed.idx > cursor => {
+                    let _ = indexed;
+                    catching_up = true;
+                }
+                // At or below the cursor: already delivered. This is also
+                // what drops the LISTEN echo of our own `emit` on the
+                // producing replica — that echo fires on every replica
+                // INCLUDING the producer, so every local event reaches this
+                // bus twice.
                 Ok(_) => {}
                 Err(RecvError::Lagged(n)) => {
                     yield Ok(MergedEvent::Lagged(n));
@@ -324,27 +364,18 @@ mod tests {
         .expect("create session")
     }
 
-    /// Pull one item and require it to be a replayed (log-sourced) event,
-    /// returning its idx.
+    /// Pull one frame and return its idx. Reject a lag notification.
     ///
-    /// Bounded on purpose: a walk that stops short leaves the stream parked
-    /// on the live tail forever, so an unbounded `next()` would HANG rather
-    /// than fail. That is exactly the regression shape here (the pre-ADR
-    /// 0105 single read stalls after one page), and a hanging test reports
-    /// a timeout instead of naming the bug.
-    async fn next_replay_idx(
-        s: &mut (impl Stream<Item = Result<MergedEvent, ApiError>> + Unpin),
-    ) -> i64 {
-        let item = tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
+    /// This helper does NOT check which arm produced the frame. A client
+    /// cannot see that difference: it receives frames that carry an idx. A
+    /// test that checked the arm would pin HOW the code works instead of
+    /// WHAT the client gets. It would also fail a correct redesign — for
+    /// example a tail that reorders bus events in place instead of reading
+    /// the log again.
+    async fn next_idx(s: &mut (impl Stream<Item = Result<MergedEvent, ApiError>> + Unpin)) -> i64 {
+        next_frame_idx(s)
             .await
-            .expect("stream stalled — the walk stopped before reaching the log tail");
-        match item {
-            Some(Ok(MergedEvent::Replay(ev))) => ev.idx,
-            Some(Ok(MergedEvent::Live(ev))) => panic!("expected Replay, got Live idx={}", ev.idx),
-            Some(Ok(MergedEvent::Lagged(n))) => panic!("expected Replay, got Lagged({n})"),
-            Some(Err(e)) => panic!("expected Replay, got Err({e:?})"),
-            None => panic!("expected Replay, stream ended"),
-        }
+            .expect("expected an event frame, got a lag notification")
     }
 
     /// THE regression test for the prod incident. A session with more
@@ -376,7 +407,7 @@ mod tests {
 
         let mut seen = Vec::with_capacity(TOTAL);
         for _ in 0..TOTAL {
-            seen.push(next_replay_idx(&mut s).await);
+            seen.push(next_idx(&mut s).await);
         }
 
         assert_eq!(seen.len(), TOTAL, "every event reaches the client");
@@ -407,7 +438,7 @@ mod tests {
         // Drain page one, leaving the walk suspended mid-log.
         let mut seen = Vec::new();
         for _ in 0..REPLAY_PAGE {
-            seen.push(next_replay_idx(&mut s).await);
+            seen.push(next_idx(&mut s).await);
         }
 
         // A new event arrives NOW — after the walk started, before it
@@ -417,7 +448,7 @@ mod tests {
 
         // Finish the walk: rows 500..=600, the late arrival included.
         for _ in 0..=(600 - REPLAY_PAGE) {
-            seen.push(next_replay_idx(&mut s).await);
+            seen.push(next_idx(&mut s).await);
         }
 
         let expected: Vec<i64> = (0..=600).collect();
@@ -453,7 +484,7 @@ mod tests {
         ));
 
         for _ in 0..REPLAY_PAGE {
-            next_replay_idx(&mut s).await;
+            next_idx(&mut s).await;
         }
 
         // The store breaks before the walk asks for page two.
@@ -495,9 +526,9 @@ mod tests {
 
         // Walk the short log, then sit in the tail.
         let mut seen = vec![
-            next_replay_idx(&mut s).await,
-            next_replay_idx(&mut s).await,
-            next_replay_idx(&mut s).await,
+            next_idx(&mut s).await,
+            next_idx(&mut s).await,
+            next_idx(&mut s).await,
         ];
         assert_eq!(seen, vec![0, 1, 2]);
 
@@ -528,7 +559,7 @@ mod tests {
         // ...then the hole is refilled from the log, in full.
         let last = 2 + BURST;
         for _ in 3..=last {
-            seen.push(next_replay_idx(&mut s).await);
+            seen.push(next_idx(&mut s).await);
         }
         let expected: Vec<i64> = (0..=last).collect();
         assert_eq!(
@@ -539,6 +570,218 @@ mod tests {
         // Bus entries at or below the cursor must not re-emit.
         let dup = tokio::time::timeout(std::time::Duration::from_millis(50), s.next()).await;
         assert!(dup.is_err(), "backfilled events are not duplicated");
+    }
+
+    /// The bus is NOT ordered by idx. `AppState::emit` publishes a local
+    /// commit at once; a peer replica's commit arrives later over
+    /// LISTEN/NOTIFY. So a replica can see its own idx 4 before the
+    /// notification for a peer's idx 3.
+    ///
+    /// The stream must NOT forward the jump and advance past the hole. That
+    /// strands idx 3: its late bus copy then looks already-delivered, and a
+    /// client reconnecting at the advanced Last-Event-ID skips it too. Found
+    /// by review; prod runs two coordinator replicas, so this is reachable.
+    #[tokio::test]
+    async fn out_of_order_bus_event_walks_instead_of_skipping_the_hole() {
+        let meta = sim_meta();
+        let id = new_session(&meta).await;
+        for n in 0..3 {
+            append(&meta, id, n).await;
+        }
+
+        let bus = SessionEventBus::default();
+        let mut s = Box::pin(merged_event_stream(
+            meta.clone(),
+            id,
+            bus.subscribe(id),
+            None,
+        ));
+        for _ in 0..3 {
+            next_idx(&mut s).await;
+        }
+        // Cursor is now 2.
+
+        // Both rows commit — idx allocation serializes on a row lock, so a
+        // visible idx 4 implies idx 3 is visible too.
+        let three = append(&meta, id, 3).await;
+        let four = append(&meta, id, 4).await;
+        assert_eq!((three, four), (3, 4));
+
+        // Only idx 4 reaches the bus. The notification for idx 3 is still
+        // in flight on this replica.
+        bus.publish(id, live_at(four));
+
+        // The stream must close the hole from the log, IN ORDER — not
+        // forward 4 and abandon 3.
+        assert_eq!(next_idx(&mut s).await, 3, "the hole is filled first");
+        assert_eq!(next_idx(&mut s).await, 4, "then the jumped event");
+
+        // The late notification for idx 3 must not duplicate it.
+        bus.publish(id, live_at(three));
+        let dup = tokio::time::timeout(std::time::Duration::from_millis(50), s.next()).await;
+        assert!(
+            dup.is_err(),
+            "the late notification is dropped, not re-sent"
+        );
+    }
+
+    /// `pg_listener` re-broadcasts on EVERY replica including the producer,
+    /// so each local event reaches the bus twice: once from `emit`, once as
+    /// the LISTEN echo. The cursor must drop the echo.
+    ///
+    /// The pre-ADR-0105 boundary was a CONSTANT high-water fixed at stream
+    /// start, so both copies passed it and the client got the event twice.
+    #[tokio::test]
+    async fn listen_echo_of_a_local_emit_is_dropped() {
+        let meta = sim_meta();
+        let id = new_session(&meta).await;
+        append(&meta, id, 0).await;
+
+        let bus = SessionEventBus::default();
+        let mut s = Box::pin(merged_event_stream(
+            meta.clone(),
+            id,
+            bus.subscribe(id),
+            None,
+        ));
+        assert_eq!(next_idx(&mut s).await, 0);
+
+        // `emit` publishes idx 1, then the LISTEN echo publishes it again.
+        let one = append(&meta, id, 1).await;
+        bus.publish(id, live_at(one));
+        bus.publish(id, live_at(one));
+
+        match s.next().await {
+            Some(Ok(MergedEvent::Live(ev))) => assert_eq!(ev.idx, 1),
+            _ => panic!("expected the live event once"),
+        }
+        let dup = tokio::time::timeout(std::time::Duration::from_millis(50), s.next()).await;
+        assert!(dup.is_err(), "the echo must not reach the client");
+    }
+
+    /// Pull one frame. Return its idx, or `None` for a lag notification.
+    ///
+    /// A lag notification carries no idx and does not move the cursor. So a
+    /// caller that counts events must skip it. [`next_idx`] rejects it
+    /// instead, for tests where no lag can occur.
+    async fn next_frame_idx(
+        s: &mut (impl Stream<Item = Result<MergedEvent, ApiError>> + Unpin),
+    ) -> Option<i64> {
+        let item = tokio::time::timeout(std::time::Duration::from_secs(5), s.next())
+            .await
+            .expect("stream stalled — an event was neither delivered nor recoverable");
+        match item {
+            Some(Ok(MergedEvent::Replay(ev))) => Some(ev.idx),
+            Some(Ok(MergedEvent::Live(ev))) => Some(ev.idx),
+            Some(Ok(MergedEvent::Lagged(_))) => None,
+            Some(Err(e)) => panic!("unexpected stream error: {e:?}"),
+            None => panic!("stream ended before delivering the log tail"),
+        }
+    }
+
+    proptest::proptest! {
+        #![proptest_config(proptest::test_runner::Config {
+            cases: 64,
+            // In-crate unit test: source-relative persistence works; pin it
+            // anyway so a counterexample lands deterministically (ADR 0099 H3
+            // — a CI property failure means pin the case and fix it).
+            failure_persistence: Some(Box::new(
+                proptest::test_runner::FileFailurePersistence::Direct(
+                    "proptest-regressions/event_stream_order.txt",
+                ),
+            )),
+            ..proptest::test_runner::Config::default()
+        })]
+
+        /// THE property the example tests failed to state: whatever order the
+        /// bus publishes in, the client receives every event exactly once, in
+        /// ascending idx order.
+        ///
+        /// This is the test that would have caught the out-of-order defect.
+        /// Every example test above publishes bus events in ascending,
+        /// contiguous order — so they encode the author's model of the
+        /// producer rather than challenging it, and the difference between
+        /// `idx > cursor` and `idx == cursor + 1` is invisible to all of them.
+        ///
+        /// Production has TWO publishers whose relative order no one
+        /// controls: `AppState::emit` (local, immediate) and `pg_listener`
+        /// (peer replica, after LISTEN/NOTIFY, and it echoes local events
+        /// too). So arbitrary order — including duplicates — is the real
+        /// contract. The log stays contiguous, which is what makes recovery
+        /// possible.
+        #[test]
+        fn any_bus_publish_order_delivers_every_event_once_in_order(
+            seeded in 1usize..5,
+            order_keys in proptest::collection::vec(0u32..48, 1..10),
+            echo in proptest::bool::ANY,
+        ) {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .expect("runtime");
+            rt.block_on(async move {
+                let extra = order_keys.len();
+                let meta = sim_meta();
+                let id = new_session(&meta).await;
+                for n in 0..seeded {
+                    append(&meta, id, n).await;
+                }
+
+                let bus = SessionEventBus::default();
+                let mut s = Box::pin(merged_event_stream(
+                    meta.clone(),
+                    id,
+                    bus.subscribe(id),
+                    None,
+                ));
+                for _ in 0..seeded {
+                    next_idx(&mut s).await;
+                }
+                // The cursor now sits at `seeded - 1`.
+
+                // The log is always contiguous and complete: idx allocation
+                // is one autocommit statement under a row lock on
+                // `sessions`, so same-session commit order equals idx order.
+                let mut appended = Vec::with_capacity(extra);
+                for n in 0..extra {
+                    appended.push(append(&meta, id, seeded + n).await);
+                }
+
+                // Publish in an ARBITRARY order — the part production does
+                // not control. `echo` replays each publication, modelling
+                // the LISTEN echo of a local emit.
+                let mut order: Vec<usize> = (0..extra).collect();
+                order.sort_by_key(|&i| order_keys[i]);
+                for &i in &order {
+                    bus.publish(id, live_at(appended[i]));
+                    if echo {
+                        bus.publish(id, live_at(appended[i]));
+                    }
+                }
+
+                let mut got = Vec::with_capacity(extra);
+                while got.len() < extra {
+                    if let Some(idx) = next_frame_idx(&mut s).await {
+                        got.push(idx);
+                    }
+                }
+
+                let expected: Vec<i64> =
+                    ((seeded as i64)..(seeded as i64 + extra as i64)).collect();
+                assert_eq!(
+                    got, expected,
+                    "every event exactly once, ascending, for publish order {order:?}"
+                );
+
+                // Nothing further: duplicates and echoes must not leak out.
+                let leaked =
+                    tokio::time::timeout(std::time::Duration::from_millis(50), s.next()).await;
+                assert!(
+                    leaked.is_err(),
+                    "extra frame after the full sequence (publish order {order:?})"
+                );
+            });
+        }
     }
 
     /// Phase 1c (ADR 0052): ephemeral token chunks were never persisted
@@ -560,7 +803,7 @@ mod tests {
             None,
         ));
         for _ in 0..3 {
-            next_replay_idx(&mut s).await;
+            next_idx(&mut s).await;
         }
 
         // idx 0 is far below the cursor (2) — an ephemeral chunk must
