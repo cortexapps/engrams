@@ -241,6 +241,19 @@ pub(crate) fn merged_event_stream(
                 // INCLUDING the producer, so every local event reaches this
                 // bus twice.
                 Ok(_) => {}
+                // A lag means the bus dropped events this stream never
+                // delivered; the log still has them, so report the lag
+                // honestly and re-walk from the cursor.
+                //
+                // NOTE (measured, not assumed): the jump arm above ALREADY
+                // subsumes this. A `Lagged` always leaves the ring's newest
+                // entries readable, and the next one is by definition above
+                // the cursor — so it would trip the jump arm and re-walk one
+                // step later. Deleting `catching_up = true` here passes every
+                // test in this module. It stays because relying on that tokio
+                // ring property is a worse contract than saying what we mean,
+                // and because "a lag re-walks" should not be an emergent
+                // property of a different arm.
                 Err(RecvError::Lagged(n)) => {
                     yield Ok(MergedEvent::Lagged(n));
                     catching_up = true;
@@ -679,19 +692,103 @@ mod tests {
         }
     }
 
-    proptest::proptest! {
-        #![proptest_config(proptest::test_runner::Config {
-            cases: 64,
-            // In-crate unit test: source-relative persistence works; pin it
-            // anyway so a counterexample lands deterministically (ADR 0099 H3
-            // — a CI property failure means pin the case and fix it).
+    /// Shared config for the publish-order properties.
+    ///
+    /// ADR 0099 H3 pins a counterexample to a file. Each property gets its OWN
+    /// file: a shared one would replay one property's seed through the other's
+    /// strategy, where that seed no longer reproduces the case it was pinned
+    /// for.
+    fn order_prop_cfg(cases: u32, regressions: &'static str) -> proptest::test_runner::Config {
+        proptest::test_runner::Config {
+            cases,
             failure_persistence: Some(Box::new(
-                proptest::test_runner::FileFailurePersistence::Direct(
-                    "proptest-regressions/event_stream_order.txt",
-                ),
+                proptest::test_runner::FileFailurePersistence::Direct(regressions),
             )),
             ..proptest::test_runner::Config::default()
-        })]
+        }
+    }
+
+    fn order_prop_rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .expect("runtime")
+    }
+
+    /// One case of the publish-order property, shared by both properties
+    /// below — they differ only in where the walk ends.
+    ///
+    /// Seed `seeded` events and walk them. Append one more event per entry of
+    /// `order_keys`, then publish those to the bus in the order the keys sort
+    /// into; `echo` publishes each one twice.
+    ///
+    /// Asserts only what a client can observe: every event exactly once, in
+    /// ascending idx order, and nothing after the last one. Which arm
+    /// delivered a frame, and how many log reads it took, are not asserted.
+    async fn publish_order_case(seeded: usize, order_keys: &[u32], echo: bool) {
+        let extra = order_keys.len();
+        let meta = sim_meta();
+        let id = new_session(&meta).await;
+        for n in 0..seeded {
+            append(&meta, id, n).await;
+        }
+
+        let bus = SessionEventBus::default();
+        let mut s = Box::pin(merged_event_stream(
+            meta.clone(),
+            id,
+            bus.subscribe(id),
+            None,
+        ));
+        for _ in 0..seeded {
+            next_idx(&mut s).await;
+        }
+        // The cursor now sits at `seeded - 1`.
+
+        // The log is always contiguous and complete: idx allocation is one
+        // autocommit statement under a row lock on `sessions`, so same-session
+        // commit order equals idx order.
+        let mut appended = Vec::with_capacity(extra);
+        for n in 0..extra {
+            appended.push(append(&meta, id, seeded + n).await);
+        }
+
+        // Publish in an ARBITRARY order — the part production does not
+        // control. `echo` replays each publication, modelling the LISTEN echo
+        // of a local emit.
+        let mut order: Vec<usize> = (0..extra).collect();
+        order.sort_by_key(|&i| order_keys[i]);
+        for &i in &order {
+            bus.publish(id, live_at(appended[i]));
+            if echo {
+                bus.publish(id, live_at(appended[i]));
+            }
+        }
+
+        let mut got = Vec::with_capacity(extra);
+        while got.len() < extra {
+            if let Some(idx) = next_frame_idx(&mut s).await {
+                got.push(idx);
+            }
+        }
+
+        let expected: Vec<i64> = ((seeded as i64)..(seeded as i64 + extra as i64)).collect();
+        assert_eq!(
+            got, expected,
+            "every event exactly once, ascending, for publish order {order:?} \
+             (seeded {seeded}, echo {echo})"
+        );
+
+        // Nothing further: duplicates and echoes must not leak out.
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(50), s.next()).await;
+        assert!(
+            leaked.is_err(),
+            "extra frame after the full sequence (seeded {seeded}, publish order {order:?})"
+        );
+    }
+
+    proptest::proptest! {
+        #![proptest_config(order_prop_cfg(64, "proptest-regressions/event_stream_order.txt"))]
 
         /// THE property the example tests failed to state: whatever order the
         /// bus publishes in, the client receives every event exactly once, in
@@ -715,72 +812,40 @@ mod tests {
             order_keys in proptest::collection::vec(0u32..48, 1..10),
             echo in proptest::bool::ANY,
         ) {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_time()
-                .build()
-                .expect("runtime");
-            rt.block_on(async move {
-                let extra = order_keys.len();
-                let meta = sim_meta();
-                let id = new_session(&meta).await;
-                for n in 0..seeded {
-                    append(&meta, id, n).await;
-                }
+            order_prop_rt().block_on(publish_order_case(seeded, &order_keys, echo));
+        }
+    }
 
-                let bus = SessionEventBus::default();
-                let mut s = Box::pin(merged_event_stream(
-                    meta.clone(),
-                    id,
-                    bus.subscribe(id),
-                    None,
-                ));
-                for _ in 0..seeded {
-                    next_idx(&mut s).await;
-                }
-                // The cursor now sits at `seeded - 1`.
+    proptest::proptest! {
+        #![proptest_config(order_prop_cfg(
+            16,
+            "proptest-regressions/event_stream_order_page_boundary.txt",
+        ))]
 
-                // The log is always contiguous and complete: idx allocation
-                // is one autocommit statement under a row lock on
-                // `sessions`, so same-session commit order equals idx order.
-                let mut appended = Vec::with_capacity(extra);
-                for n in 0..extra {
-                    appended.push(append(&meta, id, seeded + n).await);
-                }
-
-                // Publish in an ARBITRARY order — the part production does
-                // not control. `echo` replays each publication, modelling
-                // the LISTEN echo of a local emit.
-                let mut order: Vec<usize> = (0..extra).collect();
-                order.sort_by_key(|&i| order_keys[i]);
-                for &i in &order {
-                    bus.publish(id, live_at(appended[i]));
-                    if echo {
-                        bus.publish(id, live_at(appended[i]));
-                    }
-                }
-
-                let mut got = Vec::with_capacity(extra);
-                while got.len() < extra {
-                    if let Some(idx) = next_frame_idx(&mut s).await {
-                        got.push(idx);
-                    }
-                }
-
-                let expected: Vec<i64> =
-                    ((seeded as i64)..(seeded as i64 + extra as i64)).collect();
-                assert_eq!(
-                    got, expected,
-                    "every event exactly once, ascending, for publish order {order:?}"
-                );
-
-                // Nothing further: duplicates and echoes must not leak out.
-                let leaked =
-                    tokio::time::timeout(std::time::Duration::from_millis(50), s.next()).await;
-                assert!(
-                    leaked.is_err(),
-                    "extra frame after the full sequence (publish order {order:?})"
-                );
-            });
+        /// The same property, with the walk ending ON a page boundary — the
+        /// one place the two states meet.
+        ///
+        /// The property above seeds a handful of events, so every case ends
+        /// the walk on a short first page. It never sees the seam. Here the
+        /// walk ends one event short of a full page, exactly on one, and one
+        /// past one. An exactly-full page keeps the walk going, so it costs an
+        /// extra empty read before the tail starts; a jump arriving then sends
+        /// it back for a THIRD read. That interleaving has no other coverage.
+        ///
+        /// 16 cases, not 64: each one seeds ~500 events. The distribution is
+        /// what matters here, not the count — the arbitrary-order property
+        /// above carries the volume.
+        #[test]
+        fn disorder_at_a_page_boundary_delivers_every_event_once_in_order(
+            seeded in proptest::prop_oneof![
+                proptest::strategy::Just(REPLAY_PAGE as usize - 1),
+                proptest::strategy::Just(REPLAY_PAGE as usize),
+                proptest::strategy::Just(REPLAY_PAGE as usize + 1),
+            ],
+            order_keys in proptest::collection::vec(0u32..48, 1..10),
+            echo in proptest::bool::ANY,
+        ) {
+            order_prop_rt().block_on(publish_order_case(seeded, &order_keys, echo));
         }
     }
 

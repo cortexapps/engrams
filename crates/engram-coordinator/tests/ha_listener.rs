@@ -1,11 +1,19 @@
-//! Live-Postgres integration test for Phase 3c HA.
+//! Live-Postgres integration tests for Phase 3c HA.
 //!
-//! Spins up two `AppState`s sharing a real Postgres, attaches an SSE
-//! subscriber to coord-A, and emits an event via coord-B's
-//! `AppState::emit`. The `pg_notify('session_events', ...)` fired by
-//! `append_session_event` reaches coord-A's `pg_listener` task, which
-//! re-broadcasts the typed `SessionEvent` into coord-A's local
-//! `SessionEventBus` so the subscriber sees it.
+//! Every test here spins up two `AppState`s sharing a real Postgres, each
+//! running its own `pg_listener`. That is the only place in the suite where
+//! the two-replica deployment is real rather than modelled.
+//!
+//! - `cross_replica_event_fan_out`: coord-B emits, and the
+//!   `pg_notify('session_events', ...)` fired by `append_session_event`
+//!   reaches coord-A's `pg_listener`, which re-broadcasts the typed
+//!   `SessionEvent` into coord-A's local `SessionEventBus`. Proves the bridge.
+//! - `cross_replica_stream_delivers_every_event_once_in_order` (ADR 0105):
+//!   the same fan-out under a real gRPC `StreamEvents` client, with the two
+//!   publishers interleaved so their delivery order genuinely inverts. Proves
+//!   the cursor.
+//! - the rest cover the ADR 0047 stateless-coordinator contract and the
+//!   broker-token FK ordering.
 //!
 //! `#[ignore]`'d by default — requires Postgres reachable at the URL
 //! pointed to by `ENGRAM_TEST_DATABASE_URL` (the local
@@ -107,6 +115,211 @@ async fn cross_replica_event_fan_out() {
     }
 }
 
+/// Bearer the app-gRPC server in this file is configured with.
+const APP_GRPC_TOKEN: &str = "ha-listener-app-grpc-token";
+
+/// ADR 0105, end to end against the thing that actually produces the disorder.
+///
+/// The unit tests in `api::events` publish to the bus by hand, and the property
+/// test MODELS an arbitrary publish order. Neither one runs the two real
+/// publishers. This does: two `AppState`s over one Postgres, each with its own
+/// `pg_listener`, and a real gRPC client on the real `StreamEvents` RPC.
+///
+/// The inversion is not scripted — it falls out of the deployment. A local
+/// `emit` publishes to the replica's own bus in-process; a peer's commit
+/// reaches that same bus only after a `NOTIFY` is delivered AND the listener
+/// re-fetches the row (`pg_listener.rs`). So emitting on B and then immediately
+/// on A puts A's higher idx on A's bus first.
+///
+/// Two assertions, both on what a client observes:
+///  1. the client receives every event exactly once, in ascending idx order;
+///  2. the raw bus order really was inverted — so the test cannot go quietly
+///     vacuous if the timing ever changes.
+#[tokio::test]
+#[ignore = "requires live Postgres at ENGRAM_TEST_DATABASE_URL"]
+async fn cross_replica_stream_delivers_every_event_once_in_order() {
+    use engram_protocol::app::session_service_client::SessionServiceClient;
+
+    // 25 pairs: one inversion is enough to fail a broken cursor, and 25 makes
+    // "not one of them inverted" a real signal rather than bad luck.
+    const ROUNDS: usize = 25;
+
+    let Some(db) = engram_testkit::pg::fresh_db().await else {
+        return;
+    };
+    let database_url = db.url.clone();
+    let meta: Arc<dyn MetadataStore> = Arc::new(db.store);
+
+    let session_id = meta
+        .create_session(SessionSpec {
+            image: "ha-listener-test:stream-order".into(),
+            mode: engram_core::types::session::SessionMode::Agent,
+        })
+        .await
+        .expect("create session");
+
+    let coord_a = build_app_state(meta.clone(), &database_url).await;
+    let coord_b = build_app_state(meta.clone(), &database_url).await;
+
+    // A raw subscriber on the same bus the client's stream reads from. It only
+    // records the order the two publishers deliver in — it is the evidence for
+    // assertion 2, never a substitute for the client.
+    let mut raw = coord_a.events.subscribe(session_id);
+
+    // Warm-up: Postgres delivers a NOTIFY only to channels listening AT notify
+    // time, so an emit before coord-A's listener is established is silently
+    // lost. Emit from B ONLY (a local emit on A would publish without the
+    // listener and prove nothing) until coord-A's bus sees one.
+    let warm_deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    let mut warmed = 0usize;
+    loop {
+        coord_b
+            .emit(session_id, event("warmup"))
+            .await
+            .expect("coord-b warmup emit");
+        warmed += 1;
+        match tokio::time::timeout(Duration::from_millis(300), raw.recv()).await {
+            Ok(_) => break,
+            Err(_) => assert!(
+                tokio::time::Instant::now() < warm_deadline,
+                "coord-A's listener never came up — LISTEN/NOTIFY fan-out is broken",
+            ),
+        }
+    }
+
+    let (addr, server) = serve(coord_a.clone()).await;
+    let mut client =
+        SessionServiceClient::with_interceptor(dial(addr).await, bearer(APP_GRPC_TOKEN));
+    let mut stream = client
+        .stream_events(engram_protocol::app::StreamEventsRequest {
+            session_id: session_id.to_string(),
+            since: None,
+        })
+        .await
+        .expect("stream_events")
+        .into_inner();
+
+    // Drain the warm-up rows so the server-side stream is provably PAST its
+    // initial walk and tailing the bus. Otherwise the walk would pick the
+    // interleaved events straight out of the log and the bus path — the thing
+    // under test — would carry nothing.
+    for _ in 0..warmed {
+        next_event_idx(&mut stream).await;
+    }
+    while tokio::time::timeout(Duration::from_millis(50), raw.recv())
+        .await
+        .is_ok()
+    {}
+
+    // The interleave. B commits first, A second — so A's own higher idx is on
+    // A's bus before the notification for B's lower one.
+    for _ in 0..ROUNDS {
+        coord_b
+            .emit(session_id, event("peer"))
+            .await
+            .expect("coord-b emit");
+        coord_a
+            .emit(session_id, event("local"))
+            .await
+            .expect("coord-a emit");
+    }
+
+    // 1. The client's view.
+    let first = warmed as i64;
+    let mut got = Vec::with_capacity(ROUNDS * 2);
+    for _ in 0..(ROUNDS * 2) {
+        got.push(next_event_idx(&mut stream).await);
+    }
+    let expected: Vec<i64> = (first..(first + (ROUNDS * 2) as i64)).collect();
+    assert_eq!(
+        got, expected,
+        "every event exactly once, in idx order, across two replicas"
+    );
+
+    // 2. The premise. Collect the raw bus order and require a STRICT descent:
+    //    `<=` would be satisfied by the LISTEN echo of a local emit, which is
+    //    a duplicate, not an inversion.
+    let mut bus_order = Vec::new();
+    while let Ok(Ok(ev)) = tokio::time::timeout(Duration::from_millis(100), raw.recv()).await {
+        bus_order.push(ev.idx);
+    }
+    let inversions = bus_order.windows(2).filter(|w| w[1] < w[0]).count();
+    assert!(
+        inversions > 0,
+        "the bus delivered in ascending order for all {ROUNDS} rounds ({bus_order:?}) — \
+         the premise this test rests on no longer holds, so it is not exercising \
+         out-of-order delivery. Do not delete it: find out why the ordering changed.",
+    );
+
+    server.abort();
+}
+
+/// A distinguishable durable event.
+fn event(tag: &str) -> engram_coordinator::state::SessionEvent {
+    engram_coordinator::state::SessionEvent::Stdout {
+        exec_id: tag.into(),
+        chunk: tag.into(),
+        bytes_start: 0,
+        bytes_end: tag.len() as u64,
+    }
+}
+
+/// Pull the next frame that carries an idx, skipping a lag notification (which
+/// has none, by design). Times out rather than hanging so a stalled stream
+/// names itself.
+async fn next_event_idx(stream: &mut tonic::Streaming<engram_protocol::app::SessionEvent>) -> i64 {
+    loop {
+        let frame = tokio::time::timeout(Duration::from_secs(10), stream.message())
+            .await
+            .expect("stream stalled — an event was neither delivered nor recoverable")
+            .expect("stream errored")
+            .expect("stream ended before delivering the tail");
+        if let Some(idx) = frame.idx {
+            return idx;
+        }
+        // A `lagged` frame: no idx, no cursor movement. Keep pulling.
+    }
+}
+
+/// Serve the real app-gRPC router on an ephemeral port.
+async fn serve(
+    state: Arc<engram_coordinator::AppState>,
+) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind ephemeral port");
+    let addr = listener.local_addr().expect("local addr");
+    let incoming = tonic::transport::server::TcpIncoming::from_listener(listener, true, None)
+        .expect("tcp incoming from listener");
+    let handle = tokio::spawn(async move {
+        let _ = engram_coordinator::grpc_app::server(state)
+            .serve_with_incoming(incoming)
+            .await;
+    });
+    (addr, handle)
+}
+
+async fn dial(addr: std::net::SocketAddr) -> tonic::transport::Channel {
+    tonic::transport::Endpoint::from_shared(format!("http://{addr}"))
+        .expect("endpoint uri")
+        .connect()
+        .await
+        .expect("dial app gRPC")
+}
+
+#[allow(clippy::result_large_err)]
+fn bearer(
+    token: &'static str,
+) -> impl FnMut(tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> + Clone {
+    move |mut req: tonic::Request<()>| {
+        req.metadata_mut().insert(
+            "authorization",
+            format!("Bearer {token}").parse().expect("ascii header"),
+        );
+        Ok(req)
+    }
+}
+
 async fn build_app_state(
     meta: Arc<dyn MetadataStore>,
     database_url: &str,
@@ -146,6 +359,10 @@ async fn build_app_state(
     };
     let cfg = CoordinatorConfig {
         database_url: database_url.to_string(),
+        // `grpc_app::server` fails closed on an empty allow-list; the
+        // two-replica stream test below serves the real app-gRPC surface off
+        // one of these AppStates.
+        app_grpc_tokens: vec![APP_GRPC_TOKEN.to_string()],
         ..CoordinatorConfig::default()
     };
     let registry = Arc::new(HostRegistry::new(meta.clone()));

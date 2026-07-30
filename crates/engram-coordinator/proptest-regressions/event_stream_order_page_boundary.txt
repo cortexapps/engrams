@@ -1,0 +1,13 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 277d67808f3fc86546af08db0448d09406e3d6d8f3234c2be221922db5f74870 # shrinks to seeded = 501, order_keys = [0], echo = false
+#
+# Origin: this case came from the ADR 0105 red check, not a live regression.
+# We set the tail arm back to `idx > cursor` on purpose; proptest shrank the
+# failure to a single event published just after the walk ends one past a page
+# boundary. It is pinned because it is the minimal boundary case, so it now
+# runs before any generated case.

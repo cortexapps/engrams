@@ -137,7 +137,7 @@ Therefore those events carry their true `recovery_epoch` and `rewound_at`
 from the log. The `Live` arm writes `(0, false)` instead. So the new
 behavior is more correct.
 
-### Why the lag repair is necessary
+### Why the lag repair is here, and what it actually does
 
 The stream subscribes to the bus before it reads the log. This order is an
 older rule. It stops the stream from losing events that arrive during a
@@ -153,8 +153,25 @@ A walk takes longer than one read. It makes many reads. The client must also
 receive each page. On a long session with a busy agent, more than 256 events
 can arrive during a walk. Then the bus drops its oldest events.
 
-So a walk without the lag repair replaces one known defect with a worse
-one. The lag repair is part of the fix. It is not an extension of the fix.
+**A red check corrected an earlier claim in this document.** We first wrote
+that the lag repair is a necessary part of the fix. We then deleted the line
+`catching_up = true` from the lag arm and ran the tests. Every test passed.
+
+The reason is the jump rule. A lag always leaves the newest bus entries
+readable. The next one that the stream reads is above the cursor, by
+definition. So it is a jump, and the jump rule already returns the loop to
+the catch-up state. The repair happens one step later. The client loses
+nothing.
+
+Two states of the walk are also self-healing for a different reason. Events
+that the bus drops during a walk are still in the log, below the point the
+walk has reached. A later page read collects them. So a lag during a walk
+cannot lose an event at all.
+
+We keep the lag arm. It says what we mean. The alternative depends on an
+internal property of the tokio ring buffer, and it makes "a lag re-walks" an
+accidental result of a different rule. Both the code and the tests record
+that the arm is redundant, so that nobody later mistakes it for load-bearing.
 
 ### A failed read is honest
 
@@ -198,8 +215,8 @@ not stall.
 **The wire format does not change.** The frames are the same. The kinds are
 the same. The `id:` rule is the same. So there is no proto change, no
 `WIRE_VERSION` change, no image re-bake, no host roll, and no skew window.
-Deploy the coordinator only. The changed files are two coordinator source
-files, two test files, and this document.
+Deploy the coordinator only. Two coordinator source files change. The rest of
+the change is tests and this document.
 
 **We retired `tokio_stream::wrappers::BroadcastStream` here.** The loop calls
 `recv()` instead. `recv()` reports a lag directly.
@@ -241,16 +258,40 @@ Each `next()` call has a timeout. This is deliberate. A short walk leaves
 the stream in the tail state. Then an unbounded `next()` waits forever. A
 test that waits forever reports a timeout. It does not name the defect.
 
-**We did two red checks.** First we set the walk back to one read
-(`catching_up = false`). Then
-`replay_to_live_seam_is_gap_free_and_dup_free` failed, and both walk tests
-stopped at 500 events. Second we set the tail test back to `idx > cursor`.
-Then `out_of_order_bus_event_walks_instead_of_skipping_the_hole` failed.
-Therefore the tests are not vacuous.
+Two property tests state the rule instead of choosing the input. For any
+publish order, with or without duplicates, the client gets every event once,
+in index order. Each one has its own pinned counterexample file (ADR 0099
+H3), because one file shared between two strategies replays a seed that no
+longer reproduces the case it was pinned for.
 
-`listen_echo_of_a_local_emit_is_dropped` passes under both tail rules. It
-guards a different regression: a return to a constant boundary, which the
-code used before this ADR.
+| property | what it varies |
+|---|---|
+| `any_bus_publish_order_delivers_every_event_once_in_order` | the publish order, over a short log |
+| `disorder_at_a_page_boundary_delivers_every_event_once_in_order` | the same, with the walk ending at `REPLAY_PAGE` minus one, exactly `REPLAY_PAGE`, and one more |
+
+The second property exists because the first one seeds only a few events. So
+every case of it ends the walk on a short first page. It never reaches the
+seam between the two states.
+
+### The red-check table
+
+We broke each rule in turn and recorded which tests failed. A test that
+fails for no break does not guard anything.
+
+| we broke | tests that failed |
+|---|---|
+| the walk reads one page only (`catching_up = false`) | `replay_walks_past_one_page`, `disorder_at_a_page_boundary_…` |
+| the tail forwards any jump (`idx > cursor`) | `out_of_order_bus_event_walks_…`, both properties, `cross_replica_stream_delivers_every_event_once_in_order` |
+| the lag arm does not re-walk | **none** (see "Why the lag repair is here") |
+
+This table replaced two tests. We wrote a test for a lag during a walk and a
+test for a lag hole wider than one page. Both passed under every break. So
+both were redundant, and we deleted them. A test whose comment claims a
+guard it does not give is worse than no test.
+
+`listen_echo_of_a_local_emit_is_dropped` also passes under both tail rules.
+We keep it for a different reason, which its comment states: it guards a
+return to a constant boundary, which is what the code used before this ADR.
 
 ### Review history
 
@@ -260,6 +301,41 @@ change moved the cursor to any bus index above it. That version fixed the
 the report against the code, and we confirmed the index-allocation order that
 makes the repair correct. The repair also removes the duplicate that
 `pg_listener` produces on the replica that emits an event.
+
+A later review of the tests themselves changed three more things. It removed
+two checks that pinned implementation instead of behavior: a helper that
+asserted which arm produced a frame, and an exact read count in the
+conformance scenario. It added the two-replica test below. And it produced the
+red-check table above, which deleted two tests and corrected this document's
+claim about the lag repair.
+
+### The two-replica test
+
+The tests above drive the loop directly. They publish to the bus by hand, or
+they model an arbitrary order. None of them runs the two real publishers.
+
+`cross_replica_stream_delivers_every_event_once_in_order`, in
+`crates/engram-coordinator/tests/ha_listener.rs`, does. It builds two
+`AppState` instances over one Postgres. Each one runs a real `pg_listener`.
+It serves the real app-gRPC surface off replica A and dials it with a real
+client. Then it emits on B and at once on A, 25 times.
+
+Nothing in the test scripts the disorder. A local emit reaches the replica's
+own bus in the same process. A peer's commit reaches that bus only after
+Postgres delivers a notification and the listener reads the row back. So A's
+higher index arrives first.
+
+The test makes two assertions. The client gets every event once, in index
+order. And the raw bus order contains a strict descent. The second assertion
+protects the first: if the timing ever changes and no round inverts, the test
+fails and says so, instead of passing while proving nothing.
+
+Red check: with the tail set to `idx > cursor`, the test fails. It stalls,
+because events are stranded. That is the correct failure. The client is
+waiting for an index that will never arrive.
+
+The lane needs no change. `ha_listener` is already in the Postgres-gated
+`--test` list of `ci.yml`.
 
 End-to-end test in `crates/engram-coordinator/tests/grpc_app.rs`:
 `session_stream_events_replays_past_one_page` calls the real `StreamEvents`
