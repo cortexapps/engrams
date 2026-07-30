@@ -196,25 +196,41 @@ impl app::session_service_server::SessionService for AppSessionService {
         let id = parse_session_id(&r.session_id)?;
 
         // proto3: `since` unset = from the start. We pass None so
-        // events_core treats it as the "all" sentinel (-1), resolved
-        // internally by merged_event_stream.
+        // merged_event_stream resolves it to the "all" sentinel (-1).
         let since: Option<i64> = r.since;
 
-        let (replayed, live_rx) = crate::api::events::events_core(&self.state, id, since)
+        // Existence check + bus subscription, in that order. The log reads
+        // live inside merged_event_stream (ADR 0105) — it walks the log to
+        // its tail rather than taking one capped page.
+        let live_rx = crate::api::events::events_core(&self.state, id)
             .await
             .map_err(into_status)?;
 
         // Thin map over the single shared merge stream. All
-        // dedupe/high-water/lag semantics live in merged_event_stream +
+        // cursor/dedupe/lag semantics live in merged_event_stream +
         // merged_to_parts (api/events.rs). This handler only converts the
         // transport-agnostic parts into proto SessionEvent messages.
-        let merged = crate::api::events::merged_event_stream(replayed, live_rx, since).map(|ev| {
-            let (idx, kind, payload_json) = crate::api::events::merged_to_parts(ev);
-            Ok(app::SessionEvent {
-                idx,
-                kind,
-                payload_json,
-            })
+        //
+        // ADR 0105: an `Err` item means the log read failed mid-walk. It
+        // becomes a Status so the client reconnects from its own
+        // Last-Event-ID — never a clean end, which would be
+        // indistinguishable from a complete transcript.
+        let merged = crate::api::events::merged_event_stream(
+            self.state.services.meta.clone(),
+            id,
+            live_rx,
+            since,
+        )
+        .map(|item| match item {
+            Ok(ev) => {
+                let (idx, kind, payload_json) = crate::api::events::merged_to_parts(ev);
+                Ok(app::SessionEvent {
+                    idx,
+                    kind,
+                    payload_json,
+                })
+            }
+            Err(e) => Err(into_status(e)),
         });
 
         // RAII teardown guard: when the stream is dropped (client
