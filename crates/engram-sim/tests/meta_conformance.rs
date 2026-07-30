@@ -2369,6 +2369,109 @@ async fn snapshot_totals_aggregate(ctx: &Ctx) {
 /// surviving outside-world side-effects,
 /// and bumps the recovery epoch only when something actually rolled back.
 /// Pins the D4 conformance obligation for the exclusion-list SQL change.
+/// ADR 0105: the event stream WALKS the log in pages, feeding each read's
+/// last idx back as the next `since`. That walk is only gap-free and
+/// dup-free if `list_session_events_since` treats the page boundary
+/// identically in both stores — a divergence between the sim's
+/// `.take(limit)` and SQL `LIMIT`/`ORDER BY` would silently break the walk
+/// in exactly one of them, which is the failure a single-store test cannot
+/// see.
+///
+/// The store method itself is unchanged by that ADR, so D4 does not compel
+/// this scenario; the new paging DEPENDS on the boundary agreeing, so it
+/// earns one anyway.
+async fn list_session_events_pages_without_gap_or_dup(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    let id = meta.create_session(spec("conf:paging")).await.unwrap();
+
+    // Deliberately not a multiple of the page size, so the walk ends on a
+    // SHORT page (the ordinary case) rather than an exactly-full one.
+    const TOTAL: i64 = 25;
+    const PAGE: i64 = 10;
+    for n in 0..TOTAL {
+        meta.append_session_event(id, "agent_message", serde_json::json!({ "n": n }))
+            .await
+            .unwrap();
+    }
+
+    // Walk exactly the way the stream does: read above the cursor, then
+    // advance the cursor to the last idx returned.
+    let mut cursor = -1i64;
+    let mut walked = Vec::new();
+    let mut reads = 0;
+    loop {
+        let page = meta
+            .list_session_events_since(id, cursor, PAGE)
+            .await
+            .unwrap();
+        reads += 1;
+        assert!(
+            page.len() as i64 <= PAGE,
+            "a page must never exceed the requested limit"
+        );
+        // Ascending order is what makes the cursor monotonic; assert it
+        // rather than trusting it.
+        assert!(
+            page.windows(2).all(|w| w[0].idx < w[1].idx),
+            "page must be in strictly ascending idx order"
+        );
+        let full = page.len() as i64 == PAGE;
+        for ev in &page {
+            assert!(
+                ev.idx > cursor,
+                "page must contain only events above `since`"
+            );
+            walked.push(ev.idx);
+        }
+        if let Some(last) = page.last() {
+            cursor = last.idx;
+        }
+        if !full {
+            break;
+        }
+        assert!(reads < 10, "walk failed to terminate");
+    }
+
+    let expected: Vec<i64> = (0..TOTAL).collect();
+    assert_eq!(
+        walked, expected,
+        "the walk reconstructs the whole log exactly once"
+    );
+    // We do NOT assert an exact read count. The number of reads is an
+    // implementation detail of the page size. The behavior that matters is
+    // above: no gap, no duplicate, and the walk terminates.
+
+    // At the tail, a further read returns nothing and must NOT rewind the
+    // cursor — the stream relies on this to stop walking.
+    let past_tail = meta
+        .list_session_events_since(id, cursor, PAGE)
+        .await
+        .unwrap();
+    assert!(past_tail.is_empty(), "no events past the tail");
+
+    // An exactly-full final page must also terminate: walking from a
+    // cursor that leaves precisely PAGE events behind takes one full read
+    // plus one empty one.
+    let boundary_cursor = TOTAL - 1 - PAGE;
+    let full_page = meta
+        .list_session_events_since(id, boundary_cursor, PAGE)
+        .await
+        .unwrap();
+    assert_eq!(
+        full_page.len() as i64,
+        PAGE,
+        "boundary page is exactly full"
+    );
+    let after_full = meta
+        .list_session_events_since(id, full_page.last().unwrap().idx, PAGE)
+        .await
+        .unwrap();
+    assert!(
+        after_full.is_empty(),
+        "an exactly-full final page is followed by an empty read, not a repeat"
+    );
+}
+
 async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     let meta = &ctx.meta;
     let id = meta.create_session(spec("conf:rewind")).await.unwrap();
@@ -2498,6 +2601,10 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
 conformance!(
     t_rewind_excludes_coordinator_facts,
     super::rewind_excludes_coordinator_facts
+);
+conformance!(
+    t_list_session_events_pages,
+    super::list_session_events_pages_without_gap_or_dup
 );
 conformance!(t_placement_no_fit, super::placement_no_fit);
 conformance!(

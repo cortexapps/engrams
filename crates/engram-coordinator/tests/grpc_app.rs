@@ -1140,3 +1140,75 @@ async fn session_list_events_paginates() {
 
     server.abort();
 }
+
+/// ADR 0105 end-to-end: `StreamEvents` must deliver a transcript LONGER
+/// than the replay page size over the real RPC.
+///
+/// This is the prod regression from session
+/// `eafd98b5-f748-484e-a27b-ed6de8343204`: the replay took ONE capped page
+/// and every event behind it became unreachable — not returned by the read
+/// (past the limit) and not on the live bus (already published). The web
+/// transcript, Slack and every CLI watcher share this RPC, so the coverage
+/// belongs at the transport, not just on the merge function.
+///
+/// The unit tests in `api::events` pin the state machine (page boundaries,
+/// the live seam, read failure, bus lag). This pins the wiring: handler →
+/// `events_core` → `merged_event_stream` → proto frames.
+#[tokio::test]
+async fn session_stream_events_replays_past_one_page() {
+    // Must exceed api::events::REPLAY_PAGE (500) or the test is vacuous.
+    const TOTAL: i64 = 1200;
+
+    let (state, meta) = test_state(vec![TEST_TOKEN.into()]);
+
+    let sid = meta
+        .create_session(SessionSpec {
+            image: "localhost:5001/demo:warm".to_string(),
+            mode: Default::default(),
+        })
+        .await
+        .expect("seed session");
+
+    for n in 0..TOTAL {
+        meta.append_session_event(sid, "agent_message", serde_json::json!({ "n": n }))
+            .await
+            .expect("append event");
+    }
+
+    let (addr, server) = serve(state).await;
+    let channel = dial(addr).await;
+    let mut client = app::session_service_client::SessionServiceClient::with_interceptor(
+        channel,
+        bearer(TEST_TOKEN),
+    );
+
+    let mut stream = client
+        .stream_events(app::StreamEventsRequest {
+            session_id: sid.to_string(),
+            since: None,
+        })
+        .await
+        .expect("StreamEvents opens")
+        .into_inner();
+
+    // Collect exactly the replay. The stream stays open on the live tail
+    // afterwards, so bound the wait: before ADR 0105 this stalled at 500
+    // and would otherwise hang instead of naming the defect.
+    let mut idxs = Vec::with_capacity(TOTAL as usize);
+    for _ in 0..TOTAL {
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(10), stream.message())
+            .await
+            .expect("StreamEvents stalled before the log tail — replay stopped short")
+            .expect("stream error")
+            .expect("stream ended before the log tail");
+        idxs.push(frame.idx.expect("durable replay frame carries an idx"));
+    }
+
+    let expected: Vec<i64> = (0..TOTAL).collect();
+    assert_eq!(
+        idxs, expected,
+        "the whole log arrives over the RPC, in idx order, no gap and no dup"
+    );
+
+    server.abort();
+}

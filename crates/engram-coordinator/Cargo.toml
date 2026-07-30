@@ -80,6 +80,11 @@ tempfile = "3"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
 [dev-dependencies]
+# ADR 0099 H3: the event-stream ordering property. Example tests all
+# published bus events in ascending order and so missed the out-of-order
+# interleaving two publishers can produce (ADR 0105); a property over
+# arbitrary publish orders is what covers that class.
+proptest.workspace = true
 engram-harness-proto.workspace = true
 engram-secrets-dev.workspace = true
 # ADR 0099 H1: per-test template-cloned Postgres databases for the
