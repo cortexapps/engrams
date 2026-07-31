@@ -646,6 +646,7 @@ pub(crate) fn build_observe_entries(
             graphql_field: o.graphql_field.clone(),
             data: o.data.clone(),
             fetchable: o.fetchable.clone(),
+            url_fallback: o.url_fallback.clone(),
         })
         .collect()
 }

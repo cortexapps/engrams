@@ -450,8 +450,11 @@ where
 
         let resp_buf = pump_and_observe(client_tls, upstream_tls, OBSERVE_RESPONSE_BUDGET).await;
         let parsed = observe::parse_response(&resp_buf);
+        // The GraphQL request variables feed the entries' `$.vars.*` extractors
+        // (mutation inputs the response won't echo); `None` for REST requests.
+        let gql_vars = parsed_graphql.as_ref().and_then(|p| p.variables.as_ref());
         for o in &firing {
-            if let Some(asset) = observe::evaluate(o, parsed.as_ref(), &method, &path) {
+            if let Some(asset) = observe::evaluate(o, parsed.as_ref(), &method, &path, gql_vars) {
                 sink(session_id, asset);
             }
         }

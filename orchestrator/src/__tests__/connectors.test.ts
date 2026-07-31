@@ -65,8 +65,14 @@ const githubGraphqlRaw = {
         kind: "issue",
         surface: "asset",
         success: { noGraphqlErrors: true },
-        data: { id: "$.resp.data.createIssue.issue.id" },
+        // GraphQL parity: `title` reads the request variables; the number is
+        // derived from the returned URL when the client didn't select it.
+        data: { id: "$.resp.data.createIssue.issue.id", title: "$.vars.input.title" },
         fetchable: { external: "$.resp.data.createIssue.issue.url" },
+        urlFallback: {
+          pattern: "https://github.com/{owner}/{name}/issues/{number:int}",
+          fields: { number: "{number}" },
+        },
       },
     },
   ],
@@ -265,6 +271,31 @@ describe("parseConnector", () => {
       operations: [{ grants: ["logs:read"], asset: { kind: "k", surface: "weird" } }],
     };
     expect(() => parseConnector(bad, "x")).toThrow(/surface/);
+  });
+
+  test("rejects a urlFallback with a bad pattern or an undeclared capture", () => {
+    const withFallback = (urlFallback: unknown) => ({
+      ...datadogRaw,
+      operations: [
+        { grants: ["logs:read"], asset: { kind: "k", surface: "asset", urlFallback } },
+      ],
+    });
+    expect(() => parseConnector(withFallback({ fields: {} }), "x")).toThrow(/pattern/);
+    expect(() => parseConnector(withFallback({ pattern: "https://x/{a}", fields: [] }), "x")).toThrow(/fields/);
+    // A field template referencing a capture the pattern doesn't declare is a
+    // silent no-derive at runtime — the loader rejects the typo up front.
+    expect(() =>
+      parseConnector(withFallback({ pattern: "https://x/{a}", fields: { f: "{typo}" } }), "x"),
+    ).toThrow(/\{typo\}/);
+    // The valid shape parses and is carried on the op.
+    const c = parseConnector(
+      withFallback({ pattern: "https://x/{a}/{n:int}", fields: { f: "{a}", n: "{n}" } }),
+      "x",
+    );
+    expect(c.operations[0]!.asset?.urlFallback).toEqual({
+      pattern: "https://x/{a}/{n:int}",
+      fields: { f: "{a}", n: "{n}" },
+    });
   });
 
   // ADR 0059: GraphQL operations.
@@ -514,6 +545,7 @@ describe("compileIntegrationPolicy — observes", () => {
           ["title", "$.resp.title"],
         ],
         fetchable: "$.resp.html_url",
+        url_fallback: null,
       },
     ]);
   });
@@ -562,7 +594,15 @@ describe("compileIntegrationPolicy — GraphQL (ADR 0059)", () => {
       success_no_graphql_errors: true,
       success_status_class: null,
     });
-    expect(policy.observes[0]!.data).toEqual([["id", "$.resp.data.createIssue.issue.id"]]);
+    expect(policy.observes[0]!.data).toEqual([
+      ["id", "$.resp.data.createIssue.issue.id"],
+      ["title", "$.vars.input.title"],
+    ]);
+    // GraphQL parity: the URL fallback compiles to the snake_case wire shape.
+    expect(policy.observes[0]!.url_fallback).toEqual({
+      pattern: "https://github.com/{owner}/{name}/issues/{number:int}",
+      fields: [["number", "{number}"]],
+    });
   });
 });
 
@@ -604,6 +644,29 @@ describe("on-disk registry", () => {
     expect(rest?.success_status_class).toBe("2xx");
     const gql = policy.observes.find((o) => o.graphql_field === "createIssue");
     expect(gql?.success_no_graphql_errors).toBe(true);
+  });
+
+  test("the shipped github createPullRequest observe reaches REST parity (vars + URL fallback)", () => {
+    // The gh regression: `gh pr create` selects only `pullRequest { id url }`,
+    // so the shipped GraphQL asset must source title/branches from the request
+    // variables and derive repo/number from the returned PR URL.
+    const policy = compileIntegrationPolicy(["github:pulls:write"]);
+    const gql = policy.observes.find((o) => o.graphql_field === "createPullRequest");
+    expect(gql).toBeDefined();
+    const data = new Map(gql!.data);
+    expect(data.get("title")).toBe("$.vars.input.title");
+    expect(data.get("head_branch")).toBe("$.vars.input.headRefName");
+    expect(data.get("base_branch")).toBe("$.vars.input.baseRefName");
+    expect(gql!.url_fallback).toEqual({
+      pattern: "https://github.com/{owner}/{name}/pull/{number:int}",
+      fields: [
+        ["repo", "{owner}/{name}"],
+        ["number", "{number}"],
+      ],
+    });
+    // Same-field REST parity: the REST create observe extracts the same keys.
+    const rest = policy.observes.find((o) => o.path_globs.includes("/repos/*/pulls"));
+    expect(new Set(rest!.data.map(([k]) => k))).toEqual(new Set(gql!.data.map(([k]) => k)));
   });
 });
 

@@ -122,7 +122,9 @@ pub struct IntegrationInject {
 /// parses the response and emits an
 /// `IntegrationAsset` (`provider`/`asset_kind`/`surface`) built from the `data`
 /// extractor map + optional `fetchable` URL extractor, gated by `success`.
-/// Extractor paths are `$.resp.<dotted>` / `$.req.method|path` / `$.status`.
+/// Extractor paths are `$.resp.<dotted>` / `$.req.method|path` / `$.status` /
+/// `$.vars.<dotted>` (the GraphQL request's `variables` — mutation inputs a
+/// GraphQL response won't echo; `None`-valued on REST requests).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct IntegrationObserve {
     pub hosts: Vec<String>,
@@ -158,6 +160,23 @@ pub struct IntegrationObserve {
     /// Extractor path producing an external URL, e.g. `"$.resp.html_url"`.
     #[serde(default)]
     pub fetchable: Option<String>,
+    /// Derive `data` fields the extractors missed from the extracted fetchable
+    /// URL (GraphQL parity — a GraphQL response echoes only the client's
+    /// selection set, but the URL is trusted response data). `#[serde(default)]`
+    /// so pre-existing persisted policies decode without it.
+    #[serde(default)]
+    pub url_fallback: Option<ObserveUrlFallback>,
+}
+
+/// The URL-derived fallback of an [`IntegrationObserve`]: `pattern` is matched
+/// against the whole fetchable URL (`{name}` captures a run of characters
+/// excluding `/`/`?`/`#`; `{name:int}` additionally requires an integer and
+/// emits a JSON number); `fields` are `(data field, template over captures)`
+/// pairs that fill only fields the response extractors missed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ObserveUrlFallback {
+    pub pattern: String,
+    pub fields: Vec<(String, String)>,
 }
 
 impl IntegrationPolicy {
@@ -270,6 +289,7 @@ mod tests {
                 graphql_field: "createIssue".into(),
                 data: vec![("id".into(), "$.resp.data.createIssue.issue.id".into())],
                 fetchable: None,
+                url_fallback: None,
             }],
             ..Default::default()
         };
@@ -312,6 +332,10 @@ mod tests {
                 graphql_field: String::new(),
                 data: vec![("number".into(), "$.resp.number".into())],
                 fetchable: Some("$.resp.html_url".into()),
+                url_fallback: Some(ObserveUrlFallback {
+                    pattern: "https://github.com/{owner}/{name}/issues/{number:int}".into(),
+                    fields: vec![("number".into(), "{number}".into())],
+                }),
             }],
             ..Default::default()
         };
@@ -325,6 +349,14 @@ mod tests {
         let json = r#"{"injects":[]}"#;
         let p = IntegrationPolicy::parse(json).unwrap().unwrap();
         assert!(p.observes.is_empty());
+    }
+
+    #[test]
+    fn observe_url_fallback_defaults_when_absent() {
+        // An observe persisted before the URL-fallback field (resume path) decodes.
+        let json = r#"{"observes":[{"hosts":["h"],"provider":"github","asset_kind":"issue","surface":"asset"}]}"#;
+        let p = IntegrationPolicy::parse(json).unwrap().unwrap();
+        assert_eq!(p.observes[0].url_fallback, None);
     }
 
     #[test]

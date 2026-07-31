@@ -147,4 +147,10 @@ pub struct EgressObserveEntry {
     pub graphql_field: String,
     pub data: Vec<(String, String)>,
     pub fetchable: Option<String>,
+    /// Derive `data` fields the extractors missed from the extracted fetchable
+    /// URL (GraphQL parity — see `IntegrationObserve::url_fallback`). Copied
+    /// straight through from the integration policy. `#[serde(default)]` for
+    /// resume-safety.
+    #[serde(default)]
+    pub url_fallback: Option<crate::types::integration::ObserveUrlFallback>,
 }
