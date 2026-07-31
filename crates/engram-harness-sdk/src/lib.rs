@@ -125,21 +125,36 @@ pub async fn serve(
         if engine.is_finished() {
             break;
         }
-        let Some(stream) = dial(&cfg).await else {
-            failures = failures.saturating_add(1);
-            let backoff = std::cmp::min(10, 1u64 << failures.min(4));
-            if failures.is_power_of_two() {
-                tracing::warn!(failures, backoff, "host unreachable; retrying indefinitely");
-            }
-            tokio::time::sleep(Duration::from_secs(backoff)).await;
-            continue;
-        };
+        // ADR 0108 A1: the dial runs INSIDE the SIGUSR1 select. A dial that
+        // hangs (vsock connect has no protocol-level timeout) must stay
+        // nudge-able — before this, a hung dial was the one state the
+        // reattach fallback could not break.
         let outcome = tokio::select! {
-            o = run_one_connection(stream, &cfg, &command_tx, &mut event_rx, &held, &reattach) => o,
+            o = async {
+                match tokio::time::timeout(DIAL_TIMEOUT, dial(&cfg)).await {
+                    Ok(Some(stream)) => {
+                        run_one_connection(stream, &cfg, &command_tx, &mut event_rx, &held, &reattach)
+                            .await
+                    }
+                    Ok(None) => ConnOutcome::DialFailed,
+                    Err(_) => {
+                        tracing::warn!(timeout_secs = DIAL_TIMEOUT.as_secs(), "dial timed out");
+                        ConnOutcome::DialFailed
+                    }
+                }
+            } => o,
             _ = reconnect_nudge.recv() => ConnOutcome::Dropped("SIGUSR1 reconnect nudge"),
         };
         match outcome {
             ConnOutcome::EngineDone | ConnOutcome::Superseded => break,
+            ConnOutcome::DialFailed => {
+                failures = failures.saturating_add(1);
+                let backoff = std::cmp::min(10, 1u64 << failures.min(4));
+                if failures.is_power_of_two() {
+                    tracing::warn!(failures, backoff, "host unreachable; retrying indefinitely");
+                }
+                tokio::time::sleep(Duration::from_secs(backoff)).await;
+            }
             ConnOutcome::Dropped(reason) => {
                 failures = 0;
                 tracing::warn!(reason, "harness connection dropped; reconnecting");
@@ -193,11 +208,27 @@ async fn dial(cfg: &ConnectionConfig) -> Option<(BoxedReader, BoxedWriter)> {
     }
 }
 
+/// ADR 0108 A1: bound on the dial. A vsock connect can hang with no error
+/// when the muxer is mid-churn; the bound turns that into a logged retry.
+const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ADR 0108 A1: bound on the attach write + ack read. The 2026-07-31
+/// incident: a post-checkpoint vsock `TRANSPORT_RESET` window swallowed the
+/// `HarnessAttach` frame, and both sides parked forever on unbounded reads —
+/// a 41-second silent zombie whose only escape was a coordinator SIGUSR1.
+/// vsock has no retransmit, so the ONLY correct remedy is to give up and
+/// redial. Generous: covers a slow host under load; a swallow self-heals in
+/// one window instead of a coordinator retry cycle.
+const ATTACH_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
 enum ConnOutcome {
     EngineDone,
     Rejected(String),
     Superseded,
     Dropped(&'static str),
+    /// The dial itself failed or timed out (distinct from `Rejected`: no
+    /// connection ever existed, so the host never saw us).
+    DialFailed,
 }
 
 async fn run_one_connection(
@@ -214,14 +245,21 @@ async fn run_one_connection(
         binding_epoch: cfg.binding_epoch,
         harness_version: cfg.harness_version.clone(),
     };
-    if write_msg(&mut writer, &attach).await.is_err() {
-        return ConnOutcome::Rejected("attach write failed".into());
-    }
-    match read_msg::<_, HarnessAttachAck>(&mut reader).await {
-        Ok(ack) if ack.ok => {}
-        Ok(ack) if ack.reject == Some(AttachReject::Superseded) => return ConnOutcome::Superseded,
-        Ok(ack) => return ConnOutcome::Rejected(ack.message.unwrap_or_default()),
-        Err(_) => return ConnOutcome::Rejected("attach ack read failed".into()),
+    let handshake = async {
+        if write_msg(&mut writer, &attach).await.is_err() {
+            return Err(ConnOutcome::Rejected("attach write failed".into()));
+        }
+        match read_msg::<_, HarnessAttachAck>(&mut reader).await {
+            Ok(ack) if ack.ok => Ok(()),
+            Ok(ack) if ack.reject == Some(AttachReject::Superseded) => Err(ConnOutcome::Superseded),
+            Ok(ack) => Err(ConnOutcome::Rejected(ack.message.unwrap_or_default())),
+            Err(_) => Err(ConnOutcome::Rejected("attach ack read failed".into())),
+        }
+    };
+    match tokio::time::timeout(ATTACH_HANDSHAKE_TIMEOUT, handshake).await {
+        Ok(Ok(())) => {}
+        Ok(Err(outcome)) => return outcome,
+        Err(_) => return ConnOutcome::Dropped("attach handshake timeout"),
     }
     reattach.notify_one();
     tokio::select! {
@@ -447,6 +485,48 @@ mod tests {
         .await;
         host_task.await.unwrap();
         assert!(matches!(outcome, ConnOutcome::Superseded));
+    }
+
+    /// ADR 0108 A1: an attach whose ack never arrives (the swallowed-
+    /// frame vsock window — the 2026-07-31 41-second zombie) must not
+    /// park the SDK forever. The handshake bound turns the hang into a
+    /// `Dropped` outcome; the serve loop answers with a fast redial —
+    /// no coordinator SIGUSR1 required.
+    #[tokio::test(start_paused = true)]
+    async fn attach_handshake_times_out_instead_of_hanging() {
+        let (client, mut host) = tokio::io::duplex(4096);
+        let (reader, writer) = tokio::io::split(client);
+        let cfg = ConnectionConfig {
+            connect: Some("unused".into()),
+            port: None,
+            session_id: SessionId::new(),
+            sandbox_id: SandboxId::new(),
+            binding_epoch: 1,
+            harness_version: "test".into(),
+        };
+        // The host reads the attach, then goes silent: it never acks
+        // and never closes — the exact black-hole shape.
+        let host_task = tokio::spawn(async move {
+            let _: HarnessAttach = read_msg(&mut host).await.unwrap();
+            std::future::pending::<()>().await;
+        });
+        let (command_tx, _) = mpsc::channel(1);
+        let (_, mut event_rx) = mpsc::channel(1);
+        let held = Arc::new(Mutex::new(None));
+        let outcome = run_one_connection(
+            (Box::new(reader), Box::new(writer)),
+            &cfg,
+            &command_tx,
+            &mut event_rx,
+            &held,
+            &Notify::new(),
+        )
+        .await;
+        host_task.abort();
+        assert!(
+            matches!(outcome, ConnOutcome::Dropped("attach handshake timeout")),
+            "a silent host must produce a bounded Dropped outcome",
+        );
     }
 
     #[test]
