@@ -90,4 +90,15 @@ mod tests {
         assert_eq!(d.egress.allow_hosts, vec!["api.openai.com", "chatgpt.com"]);
         assert_eq!(b.stamp_key, "harness-codex");
     }
+
+    #[test]
+    fn builtin_descriptors_declare_plan_mode() {
+        // ADR 0106: both built-ins declare the default/plan mode pair; the
+        // create surface and coordinator validation key off this.
+        for name in ["claude", "codex"] {
+            let d = builtin(name).unwrap().descriptor().unwrap();
+            assert_eq!(d.default_mode().expect("has a default mode").id, "default");
+            assert!(d.mode("plan").is_some(), "{name} declares plan mode");
+        }
+    }
 }

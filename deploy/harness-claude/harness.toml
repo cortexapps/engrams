@@ -58,6 +58,17 @@ id    = "haiku"
 label = "Claude Haiku 4.5"
 env   = { ANTHROPIC_MODEL = "claude-haiku-4-5" }
 
+# Session modes (ADR 0106). Pure declaration: mode selection rides prompts
+# (harness_mode) and the harness maps `plan` to `--permission-mode plan`.
+[[modes]]
+id      = "default"
+label   = "Build"
+default = true
+
+[[modes]]
+id    = "plan"
+label = "Plan"
+
 # Effort maps to Claude Code's own thinking-budget knob (MAX_THINKING_TOKENS) —
 # an opaque-to-the-API harness env, which is exactly what the descriptor exists
 # to abstract.

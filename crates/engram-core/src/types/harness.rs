@@ -60,6 +60,14 @@ pub struct HarnessDescriptor {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort: Vec<HarnessOption>,
 
+    /// Session modes this harness supports (ADR 0106), e.g. `plan`. Pure
+    /// declaration — a mode carries no env map. Mode selection rides prompts
+    /// (`harness_mode`) and each harness maps its own mode to native behavior;
+    /// the declaration only drives the create/composer pickers and coordinator
+    /// validation. A harness that declares no modes never shows the affordance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<HarnessMode>,
+
     /// Egress hosts the harness *itself* must reach to function — its model
     /// API and telemetry endpoints (ADR 0063 addendum). Concatenated into the
     /// session's deny-default egress allowlist at create, so profiles never
@@ -139,6 +147,34 @@ pub struct HarnessOption {
     pub env: BTreeMap<String, String>,
 }
 
+/// One session mode (ADR 0106). Unlike [`HarnessOption`] there is no env map:
+/// a mode is not an env selection — it rides prompts and the harness itself
+/// maps it to native behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMode {
+    /// Stable mode id — what `SendPromptRequest.harness_mode` carries
+    /// (e.g. `"plan"`).
+    pub id: String,
+
+    /// Human label for pickers; falls back to `id`
+    /// (see [`HarnessMode::display_label`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    /// Whether this is the mode a session starts in when none is selected. At
+    /// most one mode may set this.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default: bool,
+}
+
+impl HarnessMode {
+    /// Display label, falling back to the mode id.
+    pub fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -178,6 +214,7 @@ impl HarnessDescriptor {
         }
         validate_options("models", &self.models)?;
         validate_options("effort", &self.effort)?;
+        validate_modes(&self.modes)?;
         Ok(())
     }
 
@@ -189,6 +226,20 @@ impl HarnessDescriptor {
     /// The effort option with this id, if any.
     pub fn effort(&self, id: &str) -> Option<&HarnessOption> {
         self.effort.iter().find(|o| o.id == id)
+    }
+
+    /// The mode with this id, if any (ADR 0106).
+    pub fn mode(&self, id: &str) -> Option<&HarnessMode> {
+        self.modes.iter().find(|m| m.id == id)
+    }
+
+    /// The default mode: the one flagged `default`, else the first listed,
+    /// else `None` (a harness may declare no modes).
+    pub fn default_mode(&self) -> Option<&HarnessMode> {
+        self.modes
+            .iter()
+            .find(|m| m.default)
+            .or_else(|| self.modes.first())
     }
 
     /// The default model: the option flagged `default`, else the first listed,
@@ -250,6 +301,28 @@ fn validate_options(field: &str, opts: &[HarnessOption]) -> Result<(), String> {
     if defaults > 1 {
         return Err(format!(
             "harness.toml [[{field}]]: at most one option may be default ({defaults} found)"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_modes(modes: &[HarnessMode]) -> Result<(), String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut defaults = 0usize;
+    for m in modes {
+        if m.id.trim().is_empty() {
+            return Err("harness.toml [[modes]]: id must not be empty".into());
+        }
+        if !seen.insert(m.id.as_str()) {
+            return Err(format!("harness.toml [[modes]]: duplicate id {:?}", m.id));
+        }
+        if m.default {
+            defaults += 1;
+        }
+    }
+    if defaults > 1 {
+        return Err(format!(
+            "harness.toml [[modes]]: at most one mode may be default ({defaults} found)"
         ));
     }
     Ok(())
@@ -473,4 +546,67 @@ args = ["--serve", "--quiet"]
             );
         }
     }
+
+    #[test]
+    fn parses_modes_and_defaults_empty() {
+        let src = r#"
+name = "x"
+[[modes]]
+id = "default"
+label = "Build"
+default = true
+[[modes]]
+id = "plan"
+label = "Plan"
+"#;
+        let d = HarnessDescriptor::parse(src).unwrap();
+        assert_eq!(d.modes.len(), 2);
+        assert_eq!(d.default_mode().unwrap().id, "default");
+        assert_eq!(d.mode("plan").unwrap().display_label(), "Plan");
+        assert!(d.mode("bogus").is_none());
+
+        // Absent block → empty (older descriptors stay valid, no affordance).
+        let d = HarnessDescriptor::parse(CLAUDE).unwrap();
+        assert!(d.modes.is_empty());
+        assert!(d.default_mode().is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_or_multi_default_modes() {
+        let dup = r#"
+name = "x"
+[[modes]]
+id = "plan"
+[[modes]]
+id = "plan"
+"#;
+        let err = HarnessDescriptor::parse(dup).unwrap_err();
+        assert!(err.contains("duplicate id"), "{err}");
+
+        let two_defaults = r#"
+name = "x"
+[[modes]]
+id = "a"
+default = true
+[[modes]]
+id = "b"
+default = true
+"#;
+        let err = HarnessDescriptor::parse(two_defaults).unwrap_err();
+        assert!(err.contains("at most one mode may be default"), "{err}");
+    }
+
+    #[test]
+    fn rejects_env_on_a_mode() {
+        // A mode is a pure declaration (ADR 0106) — an env map is a schema
+        // error, not a silent no-op.
+        let src = r#"
+name = "x"
+[[modes]]
+id = "plan"
+env = { SOME_VAR = "1" }
+"#;
+        assert!(HarnessDescriptor::parse(src).is_err());
+    }
+
 }

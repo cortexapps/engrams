@@ -71,6 +71,9 @@ message HarnessDescriptor {
   // API / telemetry). Merged into the session's deny-default allowlist at
   // create; surfaced so the UI's "Reaches" receipts show the true egress set.
   HarnessEgress egress = 7;
+  // Session modes this harness supports (ADR 0106), e.g. plan. Pure
+  // declaration — no env map; mode selection rides prompts (harness_mode).
+  repeated HarnessMode modes = 8;
 }
 
 // The harness.toml `[egress]` block: exact hostnames + `*.domain` patterns,
@@ -107,6 +110,17 @@ message HarnessOption {
   bool default = 3;
   // Env vars this option sets, merged into the session's harness env.
   map<string, string> env = 4;
+}
+
+// One session mode (ADR 0106). Unlike HarnessOption there is no env map: a
+// mode is not an env selection — the harness itself maps it to native
+// behavior.
+message HarnessMode {
+  // Stable mode id the wire carries (e.g. "plan").
+  string id = 1;
+  optional string label = 2;
+  // The mode a session starts in when none is selected (at most one).
+  bool default = 3;
 }
 
 message GetHarnessRequest {

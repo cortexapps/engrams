@@ -31,6 +31,18 @@ id = "gpt-5.6-luna"
 label = "GPT-5.6 Luna"
 env = { ENGRAM_CODEX_MODEL = "gpt-5.6-luna" }
 
+# Session modes (ADR 0106). Pure declaration: mode selection rides prompts
+# (harness_mode) and the harness maps `plan` to a read-only turn sandbox plus
+# the injected exit_plan_mode tool.
+[[modes]]
+id      = "default"
+label   = "Build"
+default = true
+
+[[modes]]
+id    = "plan"
+label = "Plan"
+
 [[effort]]
 id = "medium"
 label = "Medium"
