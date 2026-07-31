@@ -284,13 +284,16 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
                 (
                     row.session.id,
                     row.session.status,
+                    row.session.host_id,
+                    row.session.sandbox_id,
                     row.mem_budget_mib,
                     i64::from(row.cpu_budget_vcpus),
                 )
             })
             .collect::<Vec<_>>()
     });
-    for (sid, status, mem_budget_mib, cpu_budget_vcpus) in sessions {
+    let hosts = world.host_world.hosts.lock();
+    for (sid, status, host_id, sandbox_id, mem_budget_mib, cpu_budget_vcpus) in sessions {
         if status == SessionState::Queued {
             if let Some(host) = world
                 .meta
@@ -303,21 +306,27 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
             }
             continue;
         }
-        let stable = matches!(
-            status,
+        let bound_sandbox_is_resident = match (host_id, sandbox_id) {
+            (Some(host_id), Some(sandbox_id)) => hosts
+                .get(&host_id)
+                .is_some_and(|host| host.up && host.sandboxes.contains_key(&sandbox_id)),
+            _ => false,
+        };
+        let stable = match status {
             SessionState::Active
                 // ADR 0101 C: a parked VM at rest is the ladder working
                 // as designed (host has headroom; the reaper holds the
                 // park until pressure or the hard TTL). `Evicting` stays
                 // UNSTABLE on purpose: post-ADR-0101-C it means a
                 // descent's settle never landed — exactly a violation.
-                | SessionState::Parked
-                | SessionState::Idle
+                | SessionState::Parked => bound_sandbox_is_resident,
+            SessionState::Idle
                 | SessionState::Completed
                 | SessionState::Failed
                 | SessionState::Dead
-                | SessionState::Created
-        );
+                | SessionState::Created => true,
+            _ => false,
+        };
         if !stable {
             return Err(Violation {
                 invariant: "quiescence-no-stragglers",
