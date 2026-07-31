@@ -6,20 +6,20 @@ package engram.app.v1;
 // The orchestrator authenticates users and supplies their opaque subject id;
 // the coordinator owns provider drivers, encrypted storage, and lifecycle.
 service OAuthCredentialService {
-  rpc BeginFlow(BeginOAuthFlowRequest) returns (BeginOAuthFlowResponse);
-  rpc GetFlow(GetOAuthFlowRequest) returns (GetOAuthFlowResponse);
-  rpc CancelFlow(CancelOAuthFlowRequest) returns (GetOAuthFlowResponse);
-  rpc ListCredentials(ListOAuthCredentialsRequest) returns (ListOAuthCredentialsResponse);
-  rpc Disconnect(DisconnectOAuthCredentialRequest) returns (OAuthCredentialMeta);
+  rpc BeginFlow(BeginFlowRequest) returns (BeginFlowResponse);
+  rpc GetFlow(GetFlowRequest) returns (GetFlowResponse);
+  rpc CancelFlow(CancelFlowRequest) returns (CancelFlowResponse);
+  rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
+  rpc Disconnect(DisconnectRequest) returns (DisconnectResponse);
 
   // Internal credential-control operations. Callers must additionally present
   // the session's broker token; the coordinator derives subject/provider from
   // the session binding and never accepts them from the harness.
   rpc FetchSessionCredential(FetchSessionCredentialRequest) returns (FetchSessionCredentialResponse);
-  rpc UpdateSessionCredential(UpdateSessionCredentialRequest) returns (FetchSessionCredentialResponse);
+  rpc UpdateSessionCredential(UpdateSessionCredentialRequest) returns (UpdateSessionCredentialResponse);
 }
 
-enum OAuthSubjectKind {
+enum OauthSubjectKind {
   OAUTH_SUBJECT_KIND_UNSPECIFIED = 0;
   OAUTH_SUBJECT_KIND_USER = 1;
   OAUTH_SUBJECT_KIND_CONNECTOR = 2;
@@ -27,33 +27,35 @@ enum OAuthSubjectKind {
 }
 
 message OAuthSubject {
-  OAuthSubjectKind kind = 1;
+  OauthSubjectKind kind = 1;
   string id = 2;
 }
 
-message BeginOAuthFlowRequest {
+message BeginFlowRequest {
   OAuthSubject subject = 1;
   string provider = 2;
 }
 
-message BeginOAuthFlowResponse {
+message BeginFlowResponse {
   OAuthFlow flow = 1;
   // Ephemeral: returned only by BeginFlow from the owning replica.
   string verification_url = 2;
   string user_code = 3;
 }
 
-message GetOAuthFlowRequest {
+message GetFlowRequest {
   OAuthSubject subject = 1;
   string flow_id = 2;
 }
 
-message GetOAuthFlowResponse { OAuthFlow flow = 1; }
+message GetFlowResponse { OAuthFlow flow = 1; }
 
-message CancelOAuthFlowRequest {
+message CancelFlowRequest {
   OAuthSubject subject = 1;
   string flow_id = 2;
 }
+
+message CancelFlowResponse { OAuthFlow flow = 1; }
 
 message OAuthFlow {
   string id = 1;
@@ -80,14 +82,16 @@ message OAuthCredentialMeta {
   string updated_at = 6;
 }
 
-message ListOAuthCredentialsRequest { OAuthSubject subject = 1; }
-message ListOAuthCredentialsResponse { repeated OAuthCredentialMeta credentials = 1; }
+message ListCredentialsRequest { OAuthSubject subject = 1; }
+message ListCredentialsResponse { repeated OAuthCredentialMeta credentials = 1; }
 
-message DisconnectOAuthCredentialRequest {
+message DisconnectRequest {
   OAuthSubject subject = 1;
   string provider = 2;
   int64 expected_version = 3;
 }
+
+message DisconnectResponse { OAuthCredentialMeta credential = 1; }
 
 message FetchSessionCredentialRequest {
   string session_id = 1;
@@ -105,4 +109,10 @@ message UpdateSessionCredentialRequest {
   string broker_token = 2;
   int64 expected_version = 3;
   bytes opaque_bundle = 4;
+}
+
+message UpdateSessionCredentialResponse {
+  string provider = 1;
+  int64 version = 2;
+  bytes opaque_bundle = 3;
 }

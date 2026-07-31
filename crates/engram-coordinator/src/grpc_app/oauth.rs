@@ -26,10 +26,10 @@ fn subject_from_proto(
     if subject.id.trim().is_empty() {
         return Err("subject id must not be empty");
     }
-    let kind = match app::OAuthSubjectKind::try_from(subject.kind) {
-        Ok(app::OAuthSubjectKind::OauthSubjectKindUser) => OAuthSubjectKind::User,
-        Ok(app::OAuthSubjectKind::OauthSubjectKindConnector) => OAuthSubjectKind::Connector,
-        Ok(app::OAuthSubjectKind::OauthSubjectKindMcp) => OAuthSubjectKind::Mcp,
+    let kind = match app::OauthSubjectKind::try_from(subject.kind) {
+        Ok(app::OauthSubjectKind::User) => OAuthSubjectKind::User,
+        Ok(app::OauthSubjectKind::Connector) => OAuthSubjectKind::Connector,
+        Ok(app::OauthSubjectKind::Mcp) => OAuthSubjectKind::Mcp,
         _ => return Err("subject kind is required"),
     };
     Ok((kind, subject.id))
@@ -114,8 +114,8 @@ fn oauth_status(error: OAuthServiceError) -> Status {
 impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthCredentialService {
     async fn begin_flow(
         &self,
-        req: Request<app::BeginOAuthFlowRequest>,
-    ) -> Result<Response<app::BeginOAuthFlowResponse>, Status> {
+        req: Request<app::BeginFlowRequest>,
+    ) -> Result<Response<app::BeginFlowResponse>, Status> {
         self.auth.check(&req)?;
         let req = req.into_inner();
         let begun = self
@@ -124,7 +124,7 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .begin(key(req.subject, req.provider).map_err(Status::invalid_argument)?)
             .await
             .map_err(oauth_status)?;
-        Ok(Response::new(app::BeginOAuthFlowResponse {
+        Ok(Response::new(app::BeginFlowResponse {
             flow: Some(flow_to_proto(begun.flow)),
             verification_url: begun.verification_url,
             user_code: begun.user_code,
@@ -133,8 +133,8 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
 
     async fn get_flow(
         &self,
-        req: Request<app::GetOAuthFlowRequest>,
-    ) -> Result<Response<app::GetOAuthFlowResponse>, Status> {
+        req: Request<app::GetFlowRequest>,
+    ) -> Result<Response<app::GetFlowResponse>, Status> {
         self.auth.check(&req)?;
         let req = req.into_inner();
         let (kind, id) = subject_from_proto(req.subject).map_err(Status::invalid_argument)?;
@@ -155,15 +155,15 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             )
             .await
             .map_err(oauth_status)?;
-        Ok(Response::new(app::GetOAuthFlowResponse {
+        Ok(Response::new(app::GetFlowResponse {
             flow: Some(flow_to_proto(flow)),
         }))
     }
 
     async fn cancel_flow(
         &self,
-        req: Request<app::CancelOAuthFlowRequest>,
-    ) -> Result<Response<app::GetOAuthFlowResponse>, Status> {
+        req: Request<app::CancelFlowRequest>,
+    ) -> Result<Response<app::CancelFlowResponse>, Status> {
         self.auth.check(&req)?;
         let req = req.into_inner();
         let (kind, id) = subject_from_proto(req.subject).map_err(Status::invalid_argument)?;
@@ -184,15 +184,15 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             )
             .await
             .map_err(oauth_status)?;
-        Ok(Response::new(app::GetOAuthFlowResponse {
+        Ok(Response::new(app::CancelFlowResponse {
             flow: Some(flow_to_proto(flow)),
         }))
     }
 
     async fn list_credentials(
         &self,
-        req: Request<app::ListOAuthCredentialsRequest>,
-    ) -> Result<Response<app::ListOAuthCredentialsResponse>, Status> {
+        req: Request<app::ListCredentialsRequest>,
+    ) -> Result<Response<app::ListCredentialsResponse>, Status> {
         self.auth.check(&req)?;
         let (kind, id) =
             subject_from_proto(req.into_inner().subject).map_err(Status::invalid_argument)?;
@@ -202,15 +202,15 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .list(kind, &id)
             .await
             .map_err(oauth_status)?;
-        Ok(Response::new(app::ListOAuthCredentialsResponse {
+        Ok(Response::new(app::ListCredentialsResponse {
             credentials: credentials.into_iter().map(credential_to_proto).collect(),
         }))
     }
 
     async fn disconnect(
         &self,
-        req: Request<app::DisconnectOAuthCredentialRequest>,
-    ) -> Result<Response<app::OAuthCredentialMeta>, Status> {
+        req: Request<app::DisconnectRequest>,
+    ) -> Result<Response<app::DisconnectResponse>, Status> {
         self.auth.check(&req)?;
         let req = req.into_inner();
         let row = self
@@ -222,7 +222,9 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             )
             .await
             .map_err(oauth_status)?;
-        Ok(Response::new(credential_to_proto(row)))
+        Ok(Response::new(app::DisconnectResponse {
+            credential: Some(credential_to_proto(row)),
+        }))
     }
 
     async fn fetch_session_credential(
@@ -260,7 +262,7 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
     async fn update_session_credential(
         &self,
         req: Request<app::UpdateSessionCredentialRequest>,
-    ) -> Result<Response<app::FetchSessionCredentialResponse>, Status> {
+    ) -> Result<Response<app::UpdateSessionCredentialResponse>, Status> {
         self.auth.check(&req)?;
         let req = req.into_inner();
         if req.opaque_bundle.len() > MAX_OAUTH_BUNDLE_BYTES {
@@ -287,7 +289,7 @@ impl app::o_auth_credential_service_server::OAuthCredentialService for AppOAuthC
             .update_session(session_id, req.expected_version, &req.opaque_bundle)
             .await
             .map_err(oauth_status)?;
-        Ok(Response::new(app::FetchSessionCredentialResponse {
+        Ok(Response::new(app::UpdateSessionCredentialResponse {
             provider,
             version,
             opaque_bundle,

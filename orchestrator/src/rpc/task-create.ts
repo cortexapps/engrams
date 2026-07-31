@@ -45,7 +45,7 @@ import {
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
-import { OAuthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import { oauthCredential as defaultOAuthCredential } from "../control-plane/client.ts";
 
 const log = rootLog.child({ component: "task" });
@@ -92,7 +92,7 @@ export interface SessionCreateInput {
   harness?: string;
   /** ADR 0106: provider + opaque owner only; never contains OAuth bytes. */
   oauthCredential?: {
-    subject: { kind: OAuthSubjectKind; id: string };
+    subject: { kind: OauthSubjectKind; id: string };
     provider: string;
   };
 }
@@ -140,7 +140,7 @@ export interface SessionCompileDeps {
   resolveAllUserTokens: () => Promise<Record<string, string>>;
   /** Resolve whether the human owner has a live provider connection. */
   hasOAuthCredential?: (provider: string) => Promise<boolean>;
-  oauthSubject?: { kind: OAuthSubjectKind; id: string };
+  oauthSubject?: { kind: OauthSubjectKind; id: string };
 }
 
 export interface SessionCompileOpts {
@@ -403,7 +403,7 @@ export interface CreateTaskDeps {
     getAll(userId: string): Promise<Record<string, string>>;
   };
   oauth?: {
-    listCredentials(req: { subject: { kind: OAuthSubjectKind; id: string } }): Promise<{
+    listCredentials(req: { subject: { kind: OauthSubjectKind; id: string } }): Promise<{
       credentials: Array<{ provider: string; connected: boolean }>;
     }>;
   };
@@ -525,10 +525,10 @@ export async function createSessionForExistingTask(
       ...(params.ownerUserId === undefined
         ? {}
         : {
-            oauthSubject: { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: params.ownerUserId },
+            oauthSubject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
             hasOAuthCredential: async (provider: string) => {
               const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
-                subject: { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: params.ownerUserId! },
+                subject: { kind: OauthSubjectKind.USER, id: params.ownerUserId! },
               });
               return response.credentials.some(
                 (credential) => credential.provider === provider && credential.connected,
@@ -641,10 +641,10 @@ export async function createTaskWithSession(
       harnessCatalog: deps.harnessCatalog,
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
       resolveAllUserTokens: () => deps.secrets.getAll(params.ownerUserId),
-      oauthSubject: { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: params.ownerUserId },
+      oauthSubject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
       hasOAuthCredential: async (provider: string) => {
         const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
-          subject: { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: params.ownerUserId },
+          subject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
         });
         return response.credentials.some(
           (credential) => credential.provider === provider && credential.connected,

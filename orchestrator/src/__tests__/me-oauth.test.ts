@@ -1,7 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { makeMeRoute, type OAuthCredentialClient } from "../routes/me.ts";
 import type { UserSecretStore } from "../db/user-secrets.ts";
-import { OAuthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 
 const secrets: UserSecretStore = {
   put: async () => {},
@@ -32,7 +32,7 @@ function appWith(oauth: OAuthCredentialClient) {
 
 describe("/me OAuth credentials", () => {
   test("uses only the authenticated user's subject for list and begin", async () => {
-    const subjects: Array<{ kind: OAuthSubjectKind; id: string }> = [];
+    const subjects: Array<{ kind: OauthSubjectKind; id: string }> = [];
     const oauth: OAuthCredentialClient = {
       listCredentials: async ({ subject }) => {
         subjects.push(subject);
@@ -69,8 +69,8 @@ describe("/me OAuth credentials", () => {
     expect(begun.status).toBe(200);
     expect(await begun.json()).toMatchObject({ userCode: "ABCD-EFGH" });
     expect(subjects).toEqual([
-      { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: "user-42" },
-      { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: "user-42" },
+      { kind: OauthSubjectKind.USER, id: "user-42" },
+      { kind: OauthSubjectKind.USER, id: "user-42" },
     ]);
   });
 

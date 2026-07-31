@@ -39,7 +39,7 @@ fn descriptor_to_proto(
                 provider: oauth.provider.clone(),
                 delivery: match oauth.delivery {
                     engram_core::types::harness::OAuthDelivery::OpaqueBundle => {
-                        app::OAuthDelivery::OauthDeliveryOpaqueBundle.into()
+                        app::OauthDelivery::OpaqueBundle.into()
                     }
                 },
             }),

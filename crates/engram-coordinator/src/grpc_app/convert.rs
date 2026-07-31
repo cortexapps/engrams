@@ -172,16 +172,14 @@ pub(crate) fn create_request_from_proto(
                     "oauth credential subject id and provider must not be empty".into(),
                 ));
             }
-            let subject_kind = match app::OAuthSubjectKind::try_from(subject.kind) {
-                Ok(app::OAuthSubjectKind::OauthSubjectKindUser) => {
+            let subject_kind = match app::OauthSubjectKind::try_from(subject.kind) {
+                Ok(app::OauthSubjectKind::User) => {
                     engram_core::types::oauth::OAuthSubjectKind::User
                 }
-                Ok(app::OAuthSubjectKind::OauthSubjectKindConnector) => {
+                Ok(app::OauthSubjectKind::Connector) => {
                     engram_core::types::oauth::OAuthSubjectKind::Connector
                 }
-                Ok(app::OAuthSubjectKind::OauthSubjectKindMcp) => {
-                    engram_core::types::oauth::OAuthSubjectKind::Mcp
-                }
+                Ok(app::OauthSubjectKind::Mcp) => engram_core::types::oauth::OAuthSubjectKind::Mcp,
                 _ => {
                     return Err(ApiError::BadRequest(
                         "oauth credential subject kind is required".into(),

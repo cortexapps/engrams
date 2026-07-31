@@ -31,7 +31,7 @@ import { HTTPException } from "hono/http-exception";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
 import { oauthCredential as defaultOAuthCredential } from "../control-plane/client.ts";
-import { OAuthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import type { GetSession } from "./guard.ts";
 
@@ -81,20 +81,20 @@ export interface MeDeps {
 
 export interface OAuthCredentialClient {
   beginFlow(req: {
-    subject: { kind: OAuthSubjectKind; id: string };
+    subject: { kind: OauthSubjectKind; id: string };
     provider: string;
   }): Promise<{
     flow?: { id: string; provider: string; status: string; expiresAt: string; errorCode?: string };
     verificationUrl: string;
     userCode: string;
   }>;
-  getFlow(req: { subject: { kind: OAuthSubjectKind; id: string }; flowId: string }): Promise<{
+  getFlow(req: { subject: { kind: OauthSubjectKind; id: string }; flowId: string }): Promise<{
     flow?: { id: string; provider: string; status: string; expiresAt: string; errorCode?: string };
   }>;
-  cancelFlow(req: { subject: { kind: OAuthSubjectKind; id: string }; flowId: string }): Promise<{
+  cancelFlow(req: { subject: { kind: OauthSubjectKind; id: string }; flowId: string }): Promise<{
     flow?: { id: string; provider: string; status: string; expiresAt: string; errorCode?: string };
   }>;
-  listCredentials(req: { subject: { kind: OAuthSubjectKind; id: string } }): Promise<{
+  listCredentials(req: { subject: { kind: OauthSubjectKind; id: string } }): Promise<{
     credentials: Array<{
       provider: string;
       version: bigint;
@@ -110,7 +110,7 @@ export interface OAuthCredentialClient {
     }>;
   }>;
   disconnect(req: {
-    subject: { kind: OAuthSubjectKind; id: string };
+    subject: { kind: OauthSubjectKind; id: string };
     provider: string;
     expectedVersion: bigint;
   }): Promise<unknown>;
@@ -177,7 +177,7 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   }
 
   const oauthSubject = (userId: string) => ({
-    kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER,
+    kind: OauthSubjectKind.USER,
     id: userId,
   });
 

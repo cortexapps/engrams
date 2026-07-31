@@ -10,16 +10,16 @@ import type { Message } from "@bufbuild/protobuf";
  * Describes the file engram/app/v1/oauth.proto.
  */
 export const file_engram_app_v1_oauth: GenFile = /*@__PURE__*/
-  fileDesc("ChllbmdyYW0vYXBwL3YxL29hdXRoLnByb3RvEg1lbmdyYW0uYXBwLnYxIkkKDE9BdXRoU3ViamVjdBItCgRraW5kGAEgASgOMh8uZW5ncmFtLmFwcC52MS5PQXV0aFN1YmplY3RLaW5kEgoKAmlkGAIgASgJIlcKFUJlZ2luT0F1dGhGbG93UmVxdWVzdBIsCgdzdWJqZWN0GAEgASgLMhsuZW5ncmFtLmFwcC52MS5PQXV0aFN1YmplY3QSEAoIcHJvdmlkZXIYAiABKAkibQoWQmVnaW5PQXV0aEZsb3dSZXNwb25zZRImCgRmbG93GAEgASgLMhguZW5ncmFtLmFwcC52MS5PQXV0aEZsb3cSGAoQdmVyaWZpY2F0aW9uX3VybBgCIAEoCRIRCgl1c2VyX2NvZGUYAyABKAkiVAoTR2V0T0F1dGhGbG93UmVxdWVzdBIsCgdzdWJqZWN0GAEgASgLMhsuZW5ncmFtLmFwcC52MS5PQXV0aFN1YmplY3QSDwoHZmxvd19pZBgCIAEoCSI+ChRHZXRPQXV0aEZsb3dSZXNwb25zZRImCgRmbG93GAEgASgLMhguZW5ncmFtLmFwcC52MS5PQXV0aEZsb3ciVwoWQ2FuY2VsT0F1dGhGbG93UmVxdWVzdBIsCgdzdWJqZWN0GAEgASgLMhsuZW5ncmFtLmFwcC52MS5PQXV0aFN1YmplY3QSDwoHZmxvd19pZBgCIAEoCSKJAQoJT0F1dGhGbG93EgoKAmlkGAEgASgJEhAKCHByb3ZpZGVyGAIgASgJEg4KBnN0YXR1cxgDIAEoCRIXCgplcnJvcl9jb2RlGAQgASgJSACIAQESEgoKZXhwaXJlc19hdBgFIAEoCRISCgp1cGRhdGVkX2F0GAYgASgJQg0KC19lcnJvcl9jb2RlIsQBChRPQXV0aEFjY291bnRNZXRhZGF0YRIZCgxkaXNwbGF5X25hbWUYASABKAlIAIgBARIWCglwbGFuX3R5cGUYAiABKAlIAYgBARIZCgx3b3Jrc3BhY2VfaWQYAyABKAlIAogBARIbCg53b3Jrc3BhY2VfbmFtZRgEIAEoCUgDiAEBQg8KDV9kaXNwbGF5X25hbWVCDAoKX3BsYW5fdHlwZUIPCg1fd29ya3NwYWNlX2lkQhEKD193b3Jrc3BhY2VfbmFtZSKpAQoTT0F1dGhDcmVkZW50aWFsTWV0YRIQCghwcm92aWRlchgBIAEoCRIPCgd2ZXJzaW9uGAIgASgDEhEKCWNvbm5lY3RlZBgDIAEoCBI0CgdhY2NvdW50GAQgASgLMiMuZW5ncmFtLmFwcC52MS5PQXV0aEFjY291bnRNZXRhZGF0YRISCgpjcmVhdGVkX2F0GAUgASgJEhIKCnVwZGF0ZWRfYXQYBiABKAkiSwobTGlzdE9BdXRoQ3JlZGVudGlhbHNSZXF1ZXN0EiwKB3N1YmplY3QYASABKAsyGy5lbmdyYW0uYXBwLnYxLk9BdXRoU3ViamVjdCJXChxMaXN0T0F1dGhDcmVkZW50aWFsc1Jlc3BvbnNlEjcKC2NyZWRlbnRpYWxzGAEgAygLMiIuZW5ncmFtLmFwcC52MS5PQXV0aENyZWRlbnRpYWxNZXRhInwKIERpc2Nvbm5lY3RPQXV0aENyZWRlbnRpYWxSZXF1ZXN0EiwKB3N1YmplY3QYASABKAsyGy5lbmdyYW0uYXBwLnYxLk9BdXRoU3ViamVjdBIQCghwcm92aWRlchgCIAEoCRIYChBleHBlY3RlZF92ZXJzaW9uGAMgASgDIkkKHUZldGNoU2Vzc2lvbkNyZWRlbnRpYWxSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFAoMYnJva2VyX3Rva2VuGAIgASgJIloKHkZldGNoU2Vzc2lvbkNyZWRlbnRpYWxSZXNwb25zZRIQCghwcm92aWRlchgBIAEoCRIPCgd2ZXJzaW9uGAIgASgDEhUKDW9wYXF1ZV9idW5kbGUYAyABKAwiewoeVXBkYXRlU2Vzc2lvbkNyZWRlbnRpYWxSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFAoMYnJva2VyX3Rva2VuGAIgASgJEhgKEGV4cGVjdGVkX3ZlcnNpb24YAyABKAMSFQoNb3BhcXVlX2J1bmRsZRgEIAEoDCqRAQoQT0F1dGhTdWJqZWN0S2luZBIiCh5PQVVUSF9TVUJKRUNUX0tJTkRfVU5TUEVDSUZJRUQQABIbChdPQVVUSF9TVUJKRUNUX0tJTkRfVVNFUhABEiAKHE9BVVRIX1NVQkpFQ1RfS0lORF9DT05ORUNUT1IQAhIaChZPQVVUSF9TVUJKRUNUX0tJTkRfTUNQEAMy3wUKFk9BdXRoQ3JlZGVudGlhbFNlcnZpY2USWAoJQmVnaW5GbG93EiQuZW5ncmFtLmFwcC52MS5CZWdpbk9BdXRoRmxvd1JlcXVlc3QaJS5lbmdyYW0uYXBwLnYxLkJlZ2luT0F1dGhGbG93UmVzcG9uc2USUgoHR2V0RmxvdxIiLmVuZ3JhbS5hcHAudjEuR2V0T0F1dGhGbG93UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuR2V0T0F1dGhGbG93UmVzcG9uc2USWAoKQ2FuY2VsRmxvdxIlLmVuZ3JhbS5hcHAudjEuQ2FuY2VsT0F1dGhGbG93UmVxdWVzdBojLmVuZ3JhbS5hcHAudjEuR2V0T0F1dGhGbG93UmVzcG9uc2USagoPTGlzdENyZWRlbnRpYWxzEiouZW5ncmFtLmFwcC52MS5MaXN0T0F1dGhDcmVkZW50aWFsc1JlcXVlc3QaKy5lbmdyYW0uYXBwLnYxLkxpc3RPQXV0aENyZWRlbnRpYWxzUmVzcG9uc2USYQoKRGlzY29ubmVjdBIvLmVuZ3JhbS5hcHAudjEuRGlzY29ubmVjdE9BdXRoQ3JlZGVudGlhbFJlcXVlc3QaIi5lbmdyYW0uYXBwLnYxLk9BdXRoQ3JlZGVudGlhbE1ldGESdQoWRmV0Y2hTZXNzaW9uQ3JlZGVudGlhbBIsLmVuZ3JhbS5hcHAudjEuRmV0Y2hTZXNzaW9uQ3JlZGVudGlhbFJlcXVlc3QaLS5lbmdyYW0uYXBwLnYxLkZldGNoU2Vzc2lvbkNyZWRlbnRpYWxSZXNwb25zZRJ3ChdVcGRhdGVTZXNzaW9uQ3JlZGVudGlhbBItLmVuZ3JhbS5hcHAudjEuVXBkYXRlU2Vzc2lvbkNyZWRlbnRpYWxSZXF1ZXN0Gi0uZW5ncmFtLmFwcC52MS5GZXRjaFNlc3Npb25DcmVkZW50aWFsUmVzcG9uc2ViBnByb3RvMw");
+  fileDesc("ChllbmdyYW0vYXBwL3YxL29hdXRoLnByb3RvEg1lbmdyYW0uYXBwLnYxIkkKDE9BdXRoU3ViamVjdBItCgRraW5kGAEgASgOMh8uZW5ncmFtLmFwcC52MS5PYXV0aFN1YmplY3RLaW5kEgoKAmlkGAIgASgJIlIKEEJlZ2luRmxvd1JlcXVlc3QSLAoHc3ViamVjdBgBIAEoCzIbLmVuZ3JhbS5hcHAudjEuT0F1dGhTdWJqZWN0EhAKCHByb3ZpZGVyGAIgASgJImgKEUJlZ2luRmxvd1Jlc3BvbnNlEiYKBGZsb3cYASABKAsyGC5lbmdyYW0uYXBwLnYxLk9BdXRoRmxvdxIYChB2ZXJpZmljYXRpb25fdXJsGAIgASgJEhEKCXVzZXJfY29kZRgDIAEoCSJPCg5HZXRGbG93UmVxdWVzdBIsCgdzdWJqZWN0GAEgASgLMhsuZW5ncmFtLmFwcC52MS5PQXV0aFN1YmplY3QSDwoHZmxvd19pZBgCIAEoCSI5Cg9HZXRGbG93UmVzcG9uc2USJgoEZmxvdxgBIAEoCzIYLmVuZ3JhbS5hcHAudjEuT0F1dGhGbG93IlIKEUNhbmNlbEZsb3dSZXF1ZXN0EiwKB3N1YmplY3QYASABKAsyGy5lbmdyYW0uYXBwLnYxLk9BdXRoU3ViamVjdBIPCgdmbG93X2lkGAIgASgJIjwKEkNhbmNlbEZsb3dSZXNwb25zZRImCgRmbG93GAEgASgLMhguZW5ncmFtLmFwcC52MS5PQXV0aEZsb3ciiQEKCU9BdXRoRmxvdxIKCgJpZBgBIAEoCRIQCghwcm92aWRlchgCIAEoCRIOCgZzdGF0dXMYAyABKAkSFwoKZXJyb3JfY29kZRgEIAEoCUgAiAEBEhIKCmV4cGlyZXNfYXQYBSABKAkSEgoKdXBkYXRlZF9hdBgGIAEoCUINCgtfZXJyb3JfY29kZSLEAQoUT0F1dGhBY2NvdW50TWV0YWRhdGESGQoMZGlzcGxheV9uYW1lGAEgASgJSACIAQESFgoJcGxhbl90eXBlGAIgASgJSAGIAQESGQoMd29ya3NwYWNlX2lkGAMgASgJSAKIAQESGwoOd29ya3NwYWNlX25hbWUYBCABKAlIA4gBAUIPCg1fZGlzcGxheV9uYW1lQgwKCl9wbGFuX3R5cGVCDwoNX3dvcmtzcGFjZV9pZEIRCg9fd29ya3NwYWNlX25hbWUiqQEKE09BdXRoQ3JlZGVudGlhbE1ldGESEAoIcHJvdmlkZXIYASABKAkSDwoHdmVyc2lvbhgCIAEoAxIRCgljb25uZWN0ZWQYAyABKAgSNAoHYWNjb3VudBgEIAEoCzIjLmVuZ3JhbS5hcHAudjEuT0F1dGhBY2NvdW50TWV0YWRhdGESEgoKY3JlYXRlZF9hdBgFIAEoCRISCgp1cGRhdGVkX2F0GAYgASgJIkYKFkxpc3RDcmVkZW50aWFsc1JlcXVlc3QSLAoHc3ViamVjdBgBIAEoCzIbLmVuZ3JhbS5hcHAudjEuT0F1dGhTdWJqZWN0IlIKF0xpc3RDcmVkZW50aWFsc1Jlc3BvbnNlEjcKC2NyZWRlbnRpYWxzGAEgAygLMiIuZW5ncmFtLmFwcC52MS5PQXV0aENyZWRlbnRpYWxNZXRhIm0KEURpc2Nvbm5lY3RSZXF1ZXN0EiwKB3N1YmplY3QYASABKAsyGy5lbmdyYW0uYXBwLnYxLk9BdXRoU3ViamVjdBIQCghwcm92aWRlchgCIAEoCRIYChBleHBlY3RlZF92ZXJzaW9uGAMgASgDIkwKEkRpc2Nvbm5lY3RSZXNwb25zZRI2CgpjcmVkZW50aWFsGAEgASgLMiIuZW5ncmFtLmFwcC52MS5PQXV0aENyZWRlbnRpYWxNZXRhIkkKHUZldGNoU2Vzc2lvbkNyZWRlbnRpYWxSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFAoMYnJva2VyX3Rva2VuGAIgASgJIloKHkZldGNoU2Vzc2lvbkNyZWRlbnRpYWxSZXNwb25zZRIQCghwcm92aWRlchgBIAEoCRIPCgd2ZXJzaW9uGAIgASgDEhUKDW9wYXF1ZV9idW5kbGUYAyABKAwiewoeVXBkYXRlU2Vzc2lvbkNyZWRlbnRpYWxSZXF1ZXN0EhIKCnNlc3Npb25faWQYASABKAkSFAoMYnJva2VyX3Rva2VuGAIgASgJEhgKEGV4cGVjdGVkX3ZlcnNpb24YAyABKAMSFQoNb3BhcXVlX2J1bmRsZRgEIAEoDCJbCh9VcGRhdGVTZXNzaW9uQ3JlZGVudGlhbFJlc3BvbnNlEhAKCHByb3ZpZGVyGAEgASgJEg8KB3ZlcnNpb24YAiABKAMSFQoNb3BhcXVlX2J1bmRsZRgDIAEoDCqRAQoQT2F1dGhTdWJqZWN0S2luZBIiCh5PQVVUSF9TVUJKRUNUX0tJTkRfVU5TUEVDSUZJRUQQABIbChdPQVVUSF9TVUJKRUNUX0tJTkRfVVNFUhABEiAKHE9BVVRIX1NVQkpFQ1RfS0lORF9DT05ORUNUT1IQAhIaChZPQVVUSF9TVUJKRUNUX0tJTkRfTUNQEAMyqwUKFk9BdXRoQ3JlZGVudGlhbFNlcnZpY2USTgoJQmVnaW5GbG93Eh8uZW5ncmFtLmFwcC52MS5CZWdpbkZsb3dSZXF1ZXN0GiAuZW5ncmFtLmFwcC52MS5CZWdpbkZsb3dSZXNwb25zZRJICgdHZXRGbG93Eh0uZW5ncmFtLmFwcC52MS5HZXRGbG93UmVxdWVzdBoeLmVuZ3JhbS5hcHAudjEuR2V0Rmxvd1Jlc3BvbnNlElEKCkNhbmNlbEZsb3cSIC5lbmdyYW0uYXBwLnYxLkNhbmNlbEZsb3dSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5DYW5jZWxGbG93UmVzcG9uc2USYAoPTGlzdENyZWRlbnRpYWxzEiUuZW5ncmFtLmFwcC52MS5MaXN0Q3JlZGVudGlhbHNSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5MaXN0Q3JlZGVudGlhbHNSZXNwb25zZRJRCgpEaXNjb25uZWN0EiAuZW5ncmFtLmFwcC52MS5EaXNjb25uZWN0UmVxdWVzdBohLmVuZ3JhbS5hcHAudjEuRGlzY29ubmVjdFJlc3BvbnNlEnUKFkZldGNoU2Vzc2lvbkNyZWRlbnRpYWwSLC5lbmdyYW0uYXBwLnYxLkZldGNoU2Vzc2lvbkNyZWRlbnRpYWxSZXF1ZXN0Gi0uZW5ncmFtLmFwcC52MS5GZXRjaFNlc3Npb25DcmVkZW50aWFsUmVzcG9uc2USeAoXVXBkYXRlU2Vzc2lvbkNyZWRlbnRpYWwSLS5lbmdyYW0uYXBwLnYxLlVwZGF0ZVNlc3Npb25DcmVkZW50aWFsUmVxdWVzdBouLmVuZ3JhbS5hcHAudjEuVXBkYXRlU2Vzc2lvbkNyZWRlbnRpYWxSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * @generated from message engram.app.v1.OAuthSubject
  */
 export type OAuthSubject = Message<"engram.app.v1.OAuthSubject"> & {
   /**
-   * @generated from field: engram.app.v1.OAuthSubjectKind kind = 1;
+   * @generated from field: engram.app.v1.OauthSubjectKind kind = 1;
    */
-  kind: OAuthSubjectKind;
+  kind: OauthSubjectKind;
 
   /**
    * @generated from field: string id = 2;
@@ -35,9 +35,9 @@ export const OAuthSubjectSchema: GenMessage<OAuthSubject> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_oauth, 0);
 
 /**
- * @generated from message engram.app.v1.BeginOAuthFlowRequest
+ * @generated from message engram.app.v1.BeginFlowRequest
  */
-export type BeginOAuthFlowRequest = Message<"engram.app.v1.BeginOAuthFlowRequest"> & {
+export type BeginFlowRequest = Message<"engram.app.v1.BeginFlowRequest"> & {
   /**
    * @generated from field: engram.app.v1.OAuthSubject subject = 1;
    */
@@ -50,16 +50,16 @@ export type BeginOAuthFlowRequest = Message<"engram.app.v1.BeginOAuthFlowRequest
 };
 
 /**
- * Describes the message engram.app.v1.BeginOAuthFlowRequest.
- * Use `create(BeginOAuthFlowRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.BeginFlowRequest.
+ * Use `create(BeginFlowRequestSchema)` to create a new message.
  */
-export const BeginOAuthFlowRequestSchema: GenMessage<BeginOAuthFlowRequest> = /*@__PURE__*/
+export const BeginFlowRequestSchema: GenMessage<BeginFlowRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_oauth, 1);
 
 /**
- * @generated from message engram.app.v1.BeginOAuthFlowResponse
+ * @generated from message engram.app.v1.BeginFlowResponse
  */
-export type BeginOAuthFlowResponse = Message<"engram.app.v1.BeginOAuthFlowResponse"> & {
+export type BeginFlowResponse = Message<"engram.app.v1.BeginFlowResponse"> & {
   /**
    * @generated from field: engram.app.v1.OAuthFlow flow = 1;
    */
@@ -79,16 +79,16 @@ export type BeginOAuthFlowResponse = Message<"engram.app.v1.BeginOAuthFlowRespon
 };
 
 /**
- * Describes the message engram.app.v1.BeginOAuthFlowResponse.
- * Use `create(BeginOAuthFlowResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.BeginFlowResponse.
+ * Use `create(BeginFlowResponseSchema)` to create a new message.
  */
-export const BeginOAuthFlowResponseSchema: GenMessage<BeginOAuthFlowResponse> = /*@__PURE__*/
+export const BeginFlowResponseSchema: GenMessage<BeginFlowResponse> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_oauth, 2);
 
 /**
- * @generated from message engram.app.v1.GetOAuthFlowRequest
+ * @generated from message engram.app.v1.GetFlowRequest
  */
-export type GetOAuthFlowRequest = Message<"engram.app.v1.GetOAuthFlowRequest"> & {
+export type GetFlowRequest = Message<"engram.app.v1.GetFlowRequest"> & {
   /**
    * @generated from field: engram.app.v1.OAuthSubject subject = 1;
    */
@@ -101,16 +101,16 @@ export type GetOAuthFlowRequest = Message<"engram.app.v1.GetOAuthFlowRequest"> &
 };
 
 /**
- * Describes the message engram.app.v1.GetOAuthFlowRequest.
- * Use `create(GetOAuthFlowRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.GetFlowRequest.
+ * Use `create(GetFlowRequestSchema)` to create a new message.
  */
-export const GetOAuthFlowRequestSchema: GenMessage<GetOAuthFlowRequest> = /*@__PURE__*/
+export const GetFlowRequestSchema: GenMessage<GetFlowRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_oauth, 3);
 
 /**
- * @generated from message engram.app.v1.GetOAuthFlowResponse
+ * @generated from message engram.app.v1.GetFlowResponse
  */
-export type GetOAuthFlowResponse = Message<"engram.app.v1.GetOAuthFlowResponse"> & {
+export type GetFlowResponse = Message<"engram.app.v1.GetFlowResponse"> & {
   /**
    * @generated from field: engram.app.v1.OAuthFlow flow = 1;
    */
@@ -118,16 +118,16 @@ export type GetOAuthFlowResponse = Message<"engram.app.v1.GetOAuthFlowResponse">
 };
 
 /**
- * Describes the message engram.app.v1.GetOAuthFlowResponse.
- * Use `create(GetOAuthFlowResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.GetFlowResponse.
+ * Use `create(GetFlowResponseSchema)` to create a new message.
  */
-export const GetOAuthFlowResponseSchema: GenMessage<GetOAuthFlowResponse> = /*@__PURE__*/
+export const GetFlowResponseSchema: GenMessage<GetFlowResponse> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_oauth, 4);
 
 /**
- * @generated from message engram.app.v1.CancelOAuthFlowRequest
+ * @generated from message engram.app.v1.CancelFlowRequest
  */
-export type CancelOAuthFlowRequest = Message<"engram.app.v1.CancelOAuthFlowRequest"> & {
+export type CancelFlowRequest = Message<"engram.app.v1.CancelFlowRequest"> & {
   /**
    * @generated from field: engram.app.v1.OAuthSubject subject = 1;
    */
@@ -140,11 +140,28 @@ export type CancelOAuthFlowRequest = Message<"engram.app.v1.CancelOAuthFlowReque
 };
 
 /**
- * Describes the message engram.app.v1.CancelOAuthFlowRequest.
- * Use `create(CancelOAuthFlowRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.CancelFlowRequest.
+ * Use `create(CancelFlowRequestSchema)` to create a new message.
  */
-export const CancelOAuthFlowRequestSchema: GenMessage<CancelOAuthFlowRequest> = /*@__PURE__*/
+export const CancelFlowRequestSchema: GenMessage<CancelFlowRequest> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_oauth, 5);
+
+/**
+ * @generated from message engram.app.v1.CancelFlowResponse
+ */
+export type CancelFlowResponse = Message<"engram.app.v1.CancelFlowResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.OAuthFlow flow = 1;
+   */
+  flow?: OAuthFlow;
+};
+
+/**
+ * Describes the message engram.app.v1.CancelFlowResponse.
+ * Use `create(CancelFlowResponseSchema)` to create a new message.
+ */
+export const CancelFlowResponseSchema: GenMessage<CancelFlowResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_oauth, 6);
 
 /**
  * @generated from message engram.app.v1.OAuthFlow
@@ -186,7 +203,7 @@ export type OAuthFlow = Message<"engram.app.v1.OAuthFlow"> & {
  * Use `create(OAuthFlowSchema)` to create a new message.
  */
 export const OAuthFlowSchema: GenMessage<OAuthFlow> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 6);
+  messageDesc(file_engram_app_v1_oauth, 7);
 
 /**
  * @generated from message engram.app.v1.OAuthAccountMetadata
@@ -218,7 +235,7 @@ export type OAuthAccountMetadata = Message<"engram.app.v1.OAuthAccountMetadata">
  * Use `create(OAuthAccountMetadataSchema)` to create a new message.
  */
 export const OAuthAccountMetadataSchema: GenMessage<OAuthAccountMetadata> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 7);
+  messageDesc(file_engram_app_v1_oauth, 8);
 
 /**
  * @generated from message engram.app.v1.OAuthCredentialMeta
@@ -260,12 +277,12 @@ export type OAuthCredentialMeta = Message<"engram.app.v1.OAuthCredentialMeta"> &
  * Use `create(OAuthCredentialMetaSchema)` to create a new message.
  */
 export const OAuthCredentialMetaSchema: GenMessage<OAuthCredentialMeta> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 8);
+  messageDesc(file_engram_app_v1_oauth, 9);
 
 /**
- * @generated from message engram.app.v1.ListOAuthCredentialsRequest
+ * @generated from message engram.app.v1.ListCredentialsRequest
  */
-export type ListOAuthCredentialsRequest = Message<"engram.app.v1.ListOAuthCredentialsRequest"> & {
+export type ListCredentialsRequest = Message<"engram.app.v1.ListCredentialsRequest"> & {
   /**
    * @generated from field: engram.app.v1.OAuthSubject subject = 1;
    */
@@ -273,16 +290,16 @@ export type ListOAuthCredentialsRequest = Message<"engram.app.v1.ListOAuthCreden
 };
 
 /**
- * Describes the message engram.app.v1.ListOAuthCredentialsRequest.
- * Use `create(ListOAuthCredentialsRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.ListCredentialsRequest.
+ * Use `create(ListCredentialsRequestSchema)` to create a new message.
  */
-export const ListOAuthCredentialsRequestSchema: GenMessage<ListOAuthCredentialsRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 9);
+export const ListCredentialsRequestSchema: GenMessage<ListCredentialsRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_oauth, 10);
 
 /**
- * @generated from message engram.app.v1.ListOAuthCredentialsResponse
+ * @generated from message engram.app.v1.ListCredentialsResponse
  */
-export type ListOAuthCredentialsResponse = Message<"engram.app.v1.ListOAuthCredentialsResponse"> & {
+export type ListCredentialsResponse = Message<"engram.app.v1.ListCredentialsResponse"> & {
   /**
    * @generated from field: repeated engram.app.v1.OAuthCredentialMeta credentials = 1;
    */
@@ -290,16 +307,16 @@ export type ListOAuthCredentialsResponse = Message<"engram.app.v1.ListOAuthCrede
 };
 
 /**
- * Describes the message engram.app.v1.ListOAuthCredentialsResponse.
- * Use `create(ListOAuthCredentialsResponseSchema)` to create a new message.
+ * Describes the message engram.app.v1.ListCredentialsResponse.
+ * Use `create(ListCredentialsResponseSchema)` to create a new message.
  */
-export const ListOAuthCredentialsResponseSchema: GenMessage<ListOAuthCredentialsResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 10);
+export const ListCredentialsResponseSchema: GenMessage<ListCredentialsResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_oauth, 11);
 
 /**
- * @generated from message engram.app.v1.DisconnectOAuthCredentialRequest
+ * @generated from message engram.app.v1.DisconnectRequest
  */
-export type DisconnectOAuthCredentialRequest = Message<"engram.app.v1.DisconnectOAuthCredentialRequest"> & {
+export type DisconnectRequest = Message<"engram.app.v1.DisconnectRequest"> & {
   /**
    * @generated from field: engram.app.v1.OAuthSubject subject = 1;
    */
@@ -317,11 +334,28 @@ export type DisconnectOAuthCredentialRequest = Message<"engram.app.v1.Disconnect
 };
 
 /**
- * Describes the message engram.app.v1.DisconnectOAuthCredentialRequest.
- * Use `create(DisconnectOAuthCredentialRequestSchema)` to create a new message.
+ * Describes the message engram.app.v1.DisconnectRequest.
+ * Use `create(DisconnectRequestSchema)` to create a new message.
  */
-export const DisconnectOAuthCredentialRequestSchema: GenMessage<DisconnectOAuthCredentialRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 11);
+export const DisconnectRequestSchema: GenMessage<DisconnectRequest> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_oauth, 12);
+
+/**
+ * @generated from message engram.app.v1.DisconnectResponse
+ */
+export type DisconnectResponse = Message<"engram.app.v1.DisconnectResponse"> & {
+  /**
+   * @generated from field: engram.app.v1.OAuthCredentialMeta credential = 1;
+   */
+  credential?: OAuthCredentialMeta;
+};
+
+/**
+ * Describes the message engram.app.v1.DisconnectResponse.
+ * Use `create(DisconnectResponseSchema)` to create a new message.
+ */
+export const DisconnectResponseSchema: GenMessage<DisconnectResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_oauth, 13);
 
 /**
  * @generated from message engram.app.v1.FetchSessionCredentialRequest
@@ -343,7 +377,7 @@ export type FetchSessionCredentialRequest = Message<"engram.app.v1.FetchSessionC
  * Use `create(FetchSessionCredentialRequestSchema)` to create a new message.
  */
 export const FetchSessionCredentialRequestSchema: GenMessage<FetchSessionCredentialRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 12);
+  messageDesc(file_engram_app_v1_oauth, 14);
 
 /**
  * @generated from message engram.app.v1.FetchSessionCredentialResponse
@@ -370,7 +404,7 @@ export type FetchSessionCredentialResponse = Message<"engram.app.v1.FetchSession
  * Use `create(FetchSessionCredentialResponseSchema)` to create a new message.
  */
 export const FetchSessionCredentialResponseSchema: GenMessage<FetchSessionCredentialResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 13);
+  messageDesc(file_engram_app_v1_oauth, 15);
 
 /**
  * @generated from message engram.app.v1.UpdateSessionCredentialRequest
@@ -402,37 +436,64 @@ export type UpdateSessionCredentialRequest = Message<"engram.app.v1.UpdateSessio
  * Use `create(UpdateSessionCredentialRequestSchema)` to create a new message.
  */
 export const UpdateSessionCredentialRequestSchema: GenMessage<UpdateSessionCredentialRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_oauth, 14);
+  messageDesc(file_engram_app_v1_oauth, 16);
 
 /**
- * @generated from enum engram.app.v1.OAuthSubjectKind
+ * @generated from message engram.app.v1.UpdateSessionCredentialResponse
  */
-export enum OAuthSubjectKind {
+export type UpdateSessionCredentialResponse = Message<"engram.app.v1.UpdateSessionCredentialResponse"> & {
+  /**
+   * @generated from field: string provider = 1;
+   */
+  provider: string;
+
+  /**
+   * @generated from field: int64 version = 2;
+   */
+  version: bigint;
+
+  /**
+   * @generated from field: bytes opaque_bundle = 3;
+   */
+  opaqueBundle: Uint8Array;
+};
+
+/**
+ * Describes the message engram.app.v1.UpdateSessionCredentialResponse.
+ * Use `create(UpdateSessionCredentialResponseSchema)` to create a new message.
+ */
+export const UpdateSessionCredentialResponseSchema: GenMessage<UpdateSessionCredentialResponse> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_oauth, 17);
+
+/**
+ * @generated from enum engram.app.v1.OauthSubjectKind
+ */
+export enum OauthSubjectKind {
   /**
    * @generated from enum value: OAUTH_SUBJECT_KIND_UNSPECIFIED = 0;
    */
-  OAUTH_SUBJECT_KIND_UNSPECIFIED = 0,
+  UNSPECIFIED = 0,
 
   /**
    * @generated from enum value: OAUTH_SUBJECT_KIND_USER = 1;
    */
-  OAUTH_SUBJECT_KIND_USER = 1,
+  USER = 1,
 
   /**
    * @generated from enum value: OAUTH_SUBJECT_KIND_CONNECTOR = 2;
    */
-  OAUTH_SUBJECT_KIND_CONNECTOR = 2,
+  CONNECTOR = 2,
 
   /**
    * @generated from enum value: OAUTH_SUBJECT_KIND_MCP = 3;
    */
-  OAUTH_SUBJECT_KIND_MCP = 3,
+  MCP = 3,
 }
 
 /**
- * Describes the enum engram.app.v1.OAuthSubjectKind.
+ * Describes the enum engram.app.v1.OauthSubjectKind.
  */
-export const OAuthSubjectKindSchema: GenEnum<OAuthSubjectKind> = /*@__PURE__*/
+export const OauthSubjectKindSchema: GenEnum<OauthSubjectKind> = /*@__PURE__*/
   enumDesc(file_engram_app_v1_oauth, 0);
 
 /**
@@ -448,40 +509,40 @@ export const OAuthCredentialService: GenService<{
    */
   beginFlow: {
     methodKind: "unary";
-    input: typeof BeginOAuthFlowRequestSchema;
-    output: typeof BeginOAuthFlowResponseSchema;
+    input: typeof BeginFlowRequestSchema;
+    output: typeof BeginFlowResponseSchema;
   },
   /**
    * @generated from rpc engram.app.v1.OAuthCredentialService.GetFlow
    */
   getFlow: {
     methodKind: "unary";
-    input: typeof GetOAuthFlowRequestSchema;
-    output: typeof GetOAuthFlowResponseSchema;
+    input: typeof GetFlowRequestSchema;
+    output: typeof GetFlowResponseSchema;
   },
   /**
    * @generated from rpc engram.app.v1.OAuthCredentialService.CancelFlow
    */
   cancelFlow: {
     methodKind: "unary";
-    input: typeof CancelOAuthFlowRequestSchema;
-    output: typeof GetOAuthFlowResponseSchema;
+    input: typeof CancelFlowRequestSchema;
+    output: typeof CancelFlowResponseSchema;
   },
   /**
    * @generated from rpc engram.app.v1.OAuthCredentialService.ListCredentials
    */
   listCredentials: {
     methodKind: "unary";
-    input: typeof ListOAuthCredentialsRequestSchema;
-    output: typeof ListOAuthCredentialsResponseSchema;
+    input: typeof ListCredentialsRequestSchema;
+    output: typeof ListCredentialsResponseSchema;
   },
   /**
    * @generated from rpc engram.app.v1.OAuthCredentialService.Disconnect
    */
   disconnect: {
     methodKind: "unary";
-    input: typeof DisconnectOAuthCredentialRequestSchema;
-    output: typeof OAuthCredentialMetaSchema;
+    input: typeof DisconnectRequestSchema;
+    output: typeof DisconnectResponseSchema;
   },
   /**
    * Internal credential-control operations. Callers must additionally present
@@ -501,7 +562,8 @@ export const OAuthCredentialService: GenService<{
   updateSessionCredential: {
     methodKind: "unary";
     input: typeof UpdateSessionCredentialRequestSchema;
-    output: typeof FetchSessionCredentialResponseSchema;
+    output: typeof UpdateSessionCredentialResponseSchema;
   },
 }> = /*@__PURE__*/
   serviceDesc(file_engram_app_v1_oauth, 0);
+

@@ -32,7 +32,7 @@ import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
-import { OAuthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -294,13 +294,13 @@ describe("compileSessionCreateInput", () => {
       },
       hasOAuthCredential: async (provider) => provider === "openai-codex",
       oauthSubject: {
-        kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER,
+        kind: OauthSubjectKind.USER,
         id: "user-1",
       },
     };
     const input = await compileSessionCreateInput(profile({ harness: "codex" }), codexDeps);
     expect(input.oauthCredential).toEqual({
-      subject: { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: "user-1" },
+      subject: { kind: OauthSubjectKind.USER, id: "user-1" },
       provider: "openai-codex",
     });
     expect(input.harnessEnv?.OPENAI_API_KEY).toBeUndefined();
@@ -328,7 +328,7 @@ describe("compileSessionCreateInput", () => {
       },
       hasOAuthCredential: async () => false,
       oauthSubject: {
-        kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER,
+        kind: OauthSubjectKind.USER,
         id: "user-1",
       },
     };

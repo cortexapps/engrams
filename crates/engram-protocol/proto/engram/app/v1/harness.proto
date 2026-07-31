@@ -104,10 +104,10 @@ message HarnessAuth {
 message HarnessOAuth {
   // Stable trusted-provider driver id (for example "openai-codex").
   string provider = 1;
-  OAuthDelivery delivery = 2;
+  OauthDelivery delivery = 2;
 }
 
-enum OAuthDelivery {
+enum OauthDelivery {
   OAUTH_DELIVERY_UNSPECIFIED = 0;
   // A bounded provider-owned credential cache, opaque to generic consumers.
   OAUTH_DELIVERY_OPAQUE_BUNDLE = 1;
