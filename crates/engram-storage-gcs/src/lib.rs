@@ -71,12 +71,22 @@ impl GcsBlobStorage {
         //   reuse keeps those off the TLS-handshake path.
         // No global request timeout here — bodies are GB-scale on the
         // streaming paths; per-attempt deadlines live in BlobClient.
-        let http = reqwest::Client::builder()
+        //
+        // Protocol: pooled HTTP/1.1 by default — bulk parallel chunk
+        // transfers get one TCP window each instead of sharing one
+        // h2 connection's flow control. `ENGRAM_GCS_HTTP2=1` opts in
+        // to ALPN h2 (multiplexed; fewer connections/handshakes) —
+        // A/B via the blobbench harness before flipping any default.
+        let mut builder = reqwest::Client::builder()
             .hickory_dns(true)
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_max_idle_per_host(64)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .tcp_keepalive(std::time::Duration::from_secs(30));
+        if !std::env::var("ENGRAM_GCS_HTTP2").is_ok_and(|v| v == "1") {
+            builder = builder.http1_only();
+        }
+        let http = builder
             .build()
             .map_err(|e| BlobError::Config(format!("gcs http client: {e}")))?;
         cfg.http = Some(reqwest_middleware::ClientBuilder::new(http).build());
@@ -150,6 +160,28 @@ fn map_http_err(e: GcsHttpError) -> BlobError {
 
 #[async_trait]
 impl BlobStorage for GcsBlobStorage {
+    /// Buffered PUT: the body is already in hand, so skip the trait
+    /// default's `put_streaming` bridge entirely — no mpsc pump task,
+    /// no chunked transfer encoding. `Bytes → reqwest::Body` is
+    /// refcounted (zero-copy) and carries Content-Length, which is
+    /// both cheaper per request and what GCS's simple-upload path
+    /// prefers. This is the chunk-upload hot path (sparse re-chunk,
+    /// NBD flush).
+    async fn put(&self, key: &str, body: bytes::Bytes) -> Result<u64, BlobError> {
+        let len = body.len() as u64;
+        let req = UploadObjectRequest {
+            bucket: self.bucket.clone(),
+            ..Default::default()
+        };
+        let upload_type = UploadType::Simple(Media::new(key.to_string()));
+        self.client
+            .upload_object(&req, body, &upload_type)
+            .await
+            .map_err(map_http_err)?;
+        tracing::debug!(bucket = %self.bucket, key = %key, bytes = len, "gcs put (sized)");
+        Ok(len)
+    }
+
     async fn put_streaming(&self, key: &str, mut body: ByteStream) -> Result<u64, BlobError> {
         // Bridge the inbound `ByteStream` (Send but not Sync — its
         // inner `Pin<Box<dyn Stream + Send>>` carries no Sync bound)

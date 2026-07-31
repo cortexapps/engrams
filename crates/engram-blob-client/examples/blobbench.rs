@@ -52,6 +52,19 @@ enum Layer {
     Client,
 }
 
+#[derive(Copy, Clone, Debug, ValueEnum)]
+enum Via {
+    /// The buffered ops (`put`/`get`) — the production chunk path:
+    /// sized PUT body, one-copy (or zero-copy) GET collect.
+    Buffered,
+    /// The streaming ops driven the way the buffered ops used to be
+    /// implemented: `put_streaming` over a one-frame stream (mpsc
+    /// pump + chunked encoding) and `get_streaming` drained into a
+    /// growth-doubling `BytesMut`. The A/B control for the buffered
+    /// overrides.
+    Streaming,
+}
+
 #[derive(Parser, Debug)]
 #[command(about = "manual blob-tier throughput harness (not a CI lane)")]
 struct Args {
@@ -62,6 +75,8 @@ struct Args {
     transport: Transport,
     #[arg(long, value_enum, default_value_t = Layer::Client)]
     layer: Layer,
+    #[arg(long, value_enum, default_value_t = Via::Buffered)]
+    via: Via,
     /// Object size in MiB (16 = the disk-chunk size; 0.5 MiB memory
     /// chunks can be approximated with 1).
     #[arg(long, default_value_t = 16)]
@@ -182,8 +197,8 @@ async fn main() {
         .collect();
 
     println!(
-        "blobbench: bucket={} transport={:?} layer={:?} object={}MiB count={} rounds={} run=blobbench/{run_id}/",
-        args.bucket, args.transport, args.layer, args.object_mib, args.count, args.rounds,
+        "blobbench: bucket={} transport={:?} layer={:?} via={:?} object={}MiB count={} rounds={} run=blobbench/{run_id}/",
+        args.bucket, args.transport, args.layer, args.via, args.object_mib, args.count, args.rounds,
     );
 
     let mut created: Vec<String> = Vec::new();
@@ -195,7 +210,16 @@ async fn main() {
                 let body = body.clone();
                 let key = format!("blobbench/{run_id}/c{c}/obj-{i:04}");
                 created.push(key.clone());
-                move || async move { store.put(&key, body).await.expect("put") }
+                let via = args.via;
+                move || async move {
+                    match via {
+                        Via::Buffered => store.put(&key, body).await.expect("put"),
+                        Via::Streaming => store
+                            .put_streaming(&key, engram_core::traits::ByteStream::from_bytes(body))
+                            .await
+                            .expect("put_streaming"),
+                    }
+                }
             })
             .collect();
         run_wave(format!("PUT c={c}"), c, tasks).await.print();
@@ -211,7 +235,24 @@ async fn main() {
             .map(|n| {
                 let store = store.clone();
                 let key = get_keys[n % get_keys.len()].clone();
-                move || async move { store.get(&key).await.expect("get").len() as u64 }
+                let via = args.via;
+                move || async move {
+                    match via {
+                        Via::Buffered => store.get(&key).await.expect("get").len() as u64,
+                        Via::Streaming => {
+                            // The pre-2026-07 collect: growth-doubling
+                            // BytesMut, no pre-size, no single-frame
+                            // shortcut.
+                            let mut stream =
+                                store.get_streaming(&key).await.expect("get_streaming");
+                            let mut buf = bytes::BytesMut::new();
+                            while let Some(chunk) = stream.next().await {
+                                buf.extend_from_slice(&chunk.expect("frame"));
+                            }
+                            buf.len() as u64
+                        }
+                    }
+                }
             })
             .collect();
         run_wave(format!("GET c={c}"), c, tasks).await.print();
