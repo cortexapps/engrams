@@ -6364,40 +6364,34 @@ mod adapter {
             assert_eq!(out["S?"], serde_json::json!("z"), "single → bare string");
         }
 
-        /// ADR 0107: fake claude for the plan-mode flows. Every invocation
-        /// records its argv to `invocations` and every stdin line to
-        /// `stdin_log`. The FIRST invocation reads one user message, fires
-        /// an ExitPlanMode tool_use, and parks (`tool_deferred`); later
-        /// invocations just log stdin and stay alive (the reject test
-        /// drives the re-fire through the hook socket directly; the approve
-        /// test asserts the injected build-turn message).
-        async fn write_plan_flow_fake_claude(
-            counter: &Path,
-            invocations: &Path,
-            stdin_log: &Path,
-        ) -> String {
+        /// ADR 0107: fake claude for the plan-mode flows. Branches on its
+        /// ARGV, not an invocation counter, so the mode-respawn choreography
+        /// is deterministic: a `--permission-mode plan` invocation reads one
+        /// user message (EOF-guarded), fires an ExitPlanMode tool_use, parks
+        /// (`tool_deferred`), and exits — the engine then respawns and its
+        /// bootstrap re-announces the park. A default invocation just logs
+        /// stdin lines (the build turn) and stays alive. Every invocation
+        /// appends its argv to `invocations` BEFORE touching anything else.
+        async fn write_plan_flow_fake_claude(invocations: &Path, stdin_log: &Path) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
             let body = format!(
                 "#!/bin/sh\n\
                  trap 'exit 0' INT TERM\n\
-                 n=0\n\
-                 if [ -f '{counter}' ]; then n=$(sed -n '1p' '{counter}'); fi\n\
-                 n=$((n + 1))\n\
-                 printf '%s\\n' \"$n\" > '{counter}'\n\
                  printf '%s\\n' \"$*\" >> '{invocations}'\n\
                  printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
-                 if [ \"$n\" -eq 1 ]; then\n\
-                   IFS= read -r line\n\
+                 case \"$*\" in\n\
+                 *'--permission-mode plan'*)\n\
+                   IFS= read -r line || exit 0\n\
                    printf '%s\\n' \"$line\" >> '{stdin_log}'\n\
                    sleep 0.3\n\
-                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-plan\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_plan\",\"name\":\"ExitPlanMode\",\"input\":{{\"plan\":\"# The plan\"}}}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-plan\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_plan\",\"name\":\"ExitPlanMode\",\"input\":{{\"plan\":\"the plan\"}}}}]}}}}'\n\
                    printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\n\
                    exit 0\n\
-                 fi\n\
+                   ;;\n\
+                 esac\n\
                  while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{stdin_log}'; done\n",
-                counter = counter.display(),
                 invocations = invocations.display(),
                 stdin_log = stdin_log.display(),
             );
@@ -6406,6 +6400,24 @@ mod adapter {
             perms.set_mode(0o755);
             std::fs::set_permissions(&path, perms).unwrap();
             path.to_string_lossy().into_owned()
+        }
+
+        /// Poll until the fake has recorded `n` invocations — the spawn/
+        /// SIGINT race otherwise loses argv lines (the CI-observed flake).
+        async fn wait_for_invocations(invocations: &Path, n: usize) {
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    let lines = std::fs::read_to_string(invocations)
+                        .map(|s| s.lines().count())
+                        .unwrap_or(0);
+                    if lines >= n {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(20)).await;
+                }
+            })
+            .await
+            .unwrap_or_else(|_| panic!("fake claude never reached {n} invocations"));
         }
 
         fn native_plan_tool() -> ManifestTool {
@@ -6428,10 +6440,9 @@ mod adapter {
         #[tokio::test]
         async fn plan_approve_flips_mode_and_injects_the_build_turn() {
             let nonce = uuid::Uuid::new_v4();
-            let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
             let invocations = std::env::temp_dir().join(format!("fake-claude-argv-{nonce}"));
             let stdin_log = std::env::temp_dir().join(format!("fake-claude-stdin-{nonce}"));
-            let script = write_plan_flow_fake_claude(&counter, &invocations, &stdin_log).await;
+            let script = write_plan_flow_fake_claude(&invocations, &stdin_log).await;
             let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "plan-approve").await;
             cli.tool_manifest = vec![native_plan_tool()];
             let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
@@ -6440,6 +6451,9 @@ mod adapter {
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
 
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            // The bootstrap Idle races the fake's startup — wait for its
+            // argv record so the mode-mismatch SIGINT cannot lose it.
+            wait_for_invocations(&invocations, 1).await;
             cmd_tx
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p-plan".into(),
@@ -6551,20 +6565,23 @@ mod adapter {
                 .expect("engine exits")
                 .expect("engine task does not panic");
 
-            // Argv trail: spawn 1 default, spawn 2 plan, spawn 3 default.
+            // Argv trail: default (idle) → plan (the parked turn; the fake
+            // exits after tool_deferred) → plan again (the EOF respawn whose
+            // bootstrap re-announces the park) → default (the build turn).
             let argvs = std::fs::read_to_string(&invocations).unwrap();
             let lines: Vec<&str> = argvs.lines().collect();
-            assert_eq!(lines.len(), 3, "three spawns: {argvs}");
+            assert_eq!(lines.len(), 4, "four spawns: {argvs}");
             assert!(!lines[0].contains("--permission-mode"));
             assert!(lines[1].contains("--permission-mode plan"));
-            assert!(!lines[2].contains("--permission-mode"));
+            assert!(lines[2].contains("--permission-mode plan"));
+            assert!(!lines[3].contains("--permission-mode"));
             // The build turn was injected as a user message.
             let stdin = std::fs::read_to_string(&stdin_log).unwrap();
             assert!(
                 stdin.contains("Your plan was approved"),
                 "build-turn message injected: {stdin}"
             );
-            for p in [&counter, &invocations, &stdin_log] {
+            for p in [&invocations, &stdin_log] {
                 let _ = std::fs::remove_file(p);
             }
             let _ = tokio::fs::remove_file(script).await;
@@ -6576,10 +6593,9 @@ mod adapter {
         #[tokio::test]
         async fn plan_reject_refires_with_deny_and_feedback() {
             let nonce = uuid::Uuid::new_v4();
-            let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
             let invocations = std::env::temp_dir().join(format!("fake-claude-argv-{nonce}"));
             let stdin_log = std::env::temp_dir().join(format!("fake-claude-stdin-{nonce}"));
-            let script = write_plan_flow_fake_claude(&counter, &invocations, &stdin_log).await;
+            let script = write_plan_flow_fake_claude(&invocations, &stdin_log).await;
             let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "plan-reject").await;
             cli.tool_manifest = vec![native_plan_tool()];
             let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
@@ -6588,6 +6604,7 @@ mod adapter {
             let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
 
             assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            wait_for_invocations(&invocations, 1).await;
             cmd_tx
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p-plan".into(),
@@ -6673,15 +6690,19 @@ mod adapter {
                 .await
                 .expect("engine exits")
                 .expect("engine task does not panic");
+            // Argv trail: default (idle) → plan (parked turn) → plan (EOF
+            // respawn park re-announce) → plan (the reject continuation).
             let argvs = std::fs::read_to_string(&invocations).unwrap();
             let lines: Vec<&str> = argvs.lines().collect();
+            assert_eq!(lines.len(), 4, "four spawns: {argvs}");
+            assert!(!lines[0].contains("--permission-mode"));
             assert!(
-                lines.len() >= 3
-                    && lines[1].contains("--permission-mode plan")
-                    && lines[2].contains("--permission-mode plan"),
-                "reject respawn stays in plan mode: {argvs}"
+                lines[1..]
+                    .iter()
+                    .all(|l| l.contains("--permission-mode plan")),
+                "reject respawns stay in plan mode: {argvs}"
             );
-            for p in [&counter, &invocations, &stdin_log] {
+            for p in [&invocations, &stdin_log] {
                 let _ = std::fs::remove_file(p);
             }
             let _ = tokio::fs::remove_file(script).await;
