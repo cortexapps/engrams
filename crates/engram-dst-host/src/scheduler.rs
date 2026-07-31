@@ -162,6 +162,15 @@ pub enum Step {
     /// re-hash, or R5's meta envelope) or TOLERATE it (the redundant published
     /// floor) — never a silent corrupt adopt.
     CorruptSpoolRecovery(usize, bool, usize),
+    /// #898: resume a terminally-finalized (destroyed) sandbox from its
+    /// finalize-published snapshot — the production-equivalent recovery
+    /// path the coordinator drives after eviction, decided by the REAL
+    /// `plan_resume_attach`. Restart no longer resurrects destroyed slots
+    /// as survivors, so THIS step is where a finalize that published the
+    /// wrong manifest (the #897 class) meets the acked-write oracle. No-op
+    /// unless the slot is terminally destroyed and non-pending; the swarm
+    /// resumes GATED (safe default), the ungated leg rides the G2 seeds.
+    FinalizedResume(usize),
 }
 
 impl Step {
@@ -204,6 +213,7 @@ impl Step {
             Step::SlotClaim(..) => "SlotClaim",
             Step::SlotPopulateTick => "SlotPopulateTick",
             Step::CorruptSpoolRecovery(..) => "CorruptSpoolRecovery",
+            Step::FinalizedResume(..) => "FinalizedResume",
         }
     }
 }
@@ -358,6 +368,10 @@ impl Sim {
                     let seam = self.rng.random_range(0..3u8);
                     Step::SigtermFlushParkedAt(idx, seam)
                 }
+                // #898: the graceful post-eviction resume belongs in the calm
+                // baseline (begin → ticks → destroy → resume → reads verify).
+                // Carved from the tail AdvanceTime band, not a re-weight.
+                109 => Step::FinalizedResume(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
             Profile::Chaos => match roll {
@@ -432,6 +446,10 @@ impl Sim {
                     let seam = self.rng.random_range(0..3u8);
                     Step::SigtermFlushParkedAt(idx, seam)
                 }
+                // #898: the post-eviction resume under chaos — the crash
+                // steps above interleave rolls between destroy and resume.
+                // Carved from the tail AdvanceTime band, not a re-weight.
+                112 => Step::FinalizedResume(self.rng.random_range(0..n)),
                 _ => Step::AdvanceTime(Duration::from_secs(self.rng.random_range(1..30))),
             },
         }
@@ -539,6 +557,14 @@ impl Sim {
                 // read) — like SpoolAdopt, it leaves the sandbox live, so no
                 // whole-host crash/restart bias.
                 self.host.corrupt_spool_recovery(idx, meta, offset).await?;
+            }
+            Step::FinalizedResume(idx) => {
+                // A dead host-agent serves no resume: the coordinator can only
+                // drive this against a live process (the crashed window's other
+                // steps no-op naturally on a None backend; this one would not).
+                if !self.crashed {
+                    self.host.finalized_resume(idx).await?;
+                }
             }
         }
         Ok(())
