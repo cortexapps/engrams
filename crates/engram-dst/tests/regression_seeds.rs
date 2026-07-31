@@ -393,6 +393,24 @@ fn issue_800_reserved_evac_over_reservation_smallest_calm_seed() {
     run_faithful(0, Profile::Calm, 1500);
 }
 
+/// Quiescence oracle finding `quiescence-no-op-mint`: the drain's forced
+/// host restart erased world sandboxes, but status-only stability accepted
+/// Active/Parked rows before their third missing-sandbox strike settled.
+/// Quiet rounds then released capacity and legitimately minted two CreateBoot
+/// ops. Requiring the bound sandbox to exist on its up host keeps draining
+/// through reconciliation before recording the op high-water mark.
+#[test]
+fn seed_33049837_quiescence_waits_for_missing_resident_reconcile() {
+    run(33049837, Profile::Chaos, 5000);
+}
+
+/// The same `quiescence-no-op-mint` oracle bug with seven queued sessions
+/// becoming placeable after the third missing-sandbox strike.
+#[test]
+fn seed_33058255_quiescence_waits_for_missing_resident_reconcile() {
+    run(33058255, Profile::Chaos, 5000);
+}
+
 /// Nightly seed 33058131: a drain evict acknowledged its source-host
 /// destroy, atomically detached the coordinator binding, and finished its
 /// op while the host-side teardown effect was still deferred. The next
