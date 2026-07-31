@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use engram_core::traits::{SecretContext, SessionFence};
 use engram_core::types::image::ImageConfig;
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
+use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -1034,7 +1035,7 @@ async fn boot_prepared(
                     let _ = st
                         .services
                         .meta
-                        .transition_session(session_id, SessionState::Failed)
+                        .transition_session(session_id, SessionState::Failed, BindingDisposition::Detach)
                         .await;
                     Err(e)
                 }

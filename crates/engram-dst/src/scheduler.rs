@@ -505,6 +505,7 @@ impl Sim {
                                     .transition_session(
                                         sid,
                                         engram_core::types::session::SessionState::Failed,
+                                        engram_core::types::BindingDisposition::Detach,
                                     )
                                     .await;
                                 continue;

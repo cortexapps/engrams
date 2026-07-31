@@ -57,6 +57,7 @@
 use std::time::Duration;
 
 use chrono::Utc;
+use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionState};
 
 use crate::api::snapshot::{finish_resume_to_active, FinishResumeOutcome};
@@ -265,7 +266,7 @@ async fn advance_one_claimed(
         match state
             .services
             .meta
-            .transition_session(session_id, SessionState::Idle)
+            .transition_session(session_id, SessionState::Idle, BindingDisposition::Retain)
             .await
         {
             Ok(prev) => {
@@ -591,7 +592,7 @@ async fn run_resume_pipeline(
             match state
                 .services
                 .meta
-                .transition_session(session_id, target)
+                .transition_session(session_id, target, BindingDisposition::RequireUnbound)
                 .await
             {
                 Ok(prev) => {

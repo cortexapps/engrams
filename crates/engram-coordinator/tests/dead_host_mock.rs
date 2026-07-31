@@ -10,6 +10,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -84,6 +85,7 @@ impl MetadataStore for MiniMeta {
         &self,
         id: SessionId,
         target: SessionState,
+        _disposition: BindingDisposition,
     ) -> Result<SessionState, MetaError> {
         let mut g = self.sessions.lock();
         let s = g.get_mut(&id).ok_or(MetaError::NotFound)?;
@@ -284,7 +286,9 @@ async fn seed_session(meta: &MiniMeta, host: HostId, status: SessionState) -> Se
     // does — no escape hatch — so the seed helper reaches each target
     // via the same transitions the running coord would.
     for step in legal_path_from_pending(status) {
-        meta.transition_session(id, *step).await.unwrap();
+        meta.transition_session(id, *step, BindingDisposition::Retain)
+            .await
+            .unwrap();
     }
     id
 }

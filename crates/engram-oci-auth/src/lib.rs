@@ -232,6 +232,7 @@ mod tests {
             &self,
             _: SessionId,
             target: SessionState,
+            _: engram_core::types::BindingDisposition,
         ) -> Result<SessionState, MetaError> {
             Ok(target)
         }

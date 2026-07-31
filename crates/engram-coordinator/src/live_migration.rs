@@ -39,6 +39,7 @@
 //! `Evacuating` (rung-1 rewind).
 
 use engram_core::types::snapshot::MigrationSourceInfo;
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::SandboxError;
 use engram_core::{HostId, SessionId};
@@ -385,7 +386,11 @@ pub async fn migrate_session_live(
     if let Err(e) = state
         .services
         .meta
-        .transition_session(session_id, SessionState::Evacuating)
+        .transition_session(
+            session_id,
+            SessionState::Evacuating,
+            BindingDisposition::Retain,
+        )
         .await
     {
         restore_task.abort();
@@ -547,7 +552,11 @@ pub async fn migrate_session_live(
         state
             .services
             .meta
-            .transition_session(session_id, SessionState::Created)
+            .transition_session(
+                session_id,
+                SessionState::Created,
+                BindingDisposition::Retain,
+            )
             .await
             .map_err(|e| format!("to Created: {e}"))?;
         Ok::<(), String>(())
@@ -830,7 +839,11 @@ pub async fn migrate_session_live(
             if state2
                 .services
                 .meta
-                .transition_session(session_id, SessionState::Evacuating)
+                .transition_session(
+                    session_id,
+                    SessionState::Evacuating,
+                    BindingDisposition::Retain,
+                )
                 .await
                 .is_ok()
             {
@@ -933,7 +946,7 @@ async fn parachute_or_kill(
     if let Err(e) = state
         .services
         .meta
-        .transition_session(session_id, SessionState::Failed)
+        .transition_session(session_id, SessionState::Failed, BindingDisposition::Detach)
         .await
     {
         tracing::warn!(%session_id, error = %e, "kill-on-parachute: transition to Failed failed");
@@ -958,7 +971,7 @@ async fn walk_back_to_active(state: &SharedState, session_id: SessionId) -> bool
         if let Err(e) = state
             .services
             .meta
-            .transition_session(session_id, target)
+            .transition_session(session_id, target, BindingDisposition::Retain)
             .await
         {
             tracing::warn!(%session_id, ?target, error = %e,

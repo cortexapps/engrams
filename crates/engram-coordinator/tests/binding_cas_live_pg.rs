@@ -23,6 +23,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -83,13 +84,13 @@ async fn seed_idle_unbound(meta: &Arc<dyn MetadataStore>) -> SessionId {
     meta.assign_session_sandbox(id, Some(sandbox))
         .await
         .expect("bind sandbox");
-    meta.transition_session(id, SessionState::Created)
+    meta.transition_session(id, SessionState::Created, BindingDisposition::Retain)
         .await
         .expect("pending->created");
-    meta.transition_session(id, SessionState::Active)
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("created->active");
-    meta.transition_session(id, SessionState::Idle)
+    meta.transition_session(id, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("active->idle");
     meta.assign_session_sandbox(id, None)
@@ -114,7 +115,7 @@ async fn guarded_rebind_rejects_bind_onto_terminated_row() {
 
     // Terminate wins the race: Idle -> Completed (legal terminal edge).
     let prev = meta
-        .transition_session(id, SessionState::Completed)
+        .transition_session(id, SessionState::Completed, BindingDisposition::Detach)
         .await
         .expect("idle->completed (terminate)");
     assert_eq!(prev, SessionState::Idle);

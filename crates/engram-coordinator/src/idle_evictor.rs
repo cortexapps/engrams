@@ -24,6 +24,7 @@
 
 use engram_core::traits::SandboxBackend;
 use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::{SandboxId, SessionId};
 
@@ -110,6 +111,7 @@ async fn park_paused_bookkeeping(
             session_id,
             ctx.fence(),
             SessionState::Evicting,
+            BindingDisposition::Retain,
         )
         .await?;
         let _ = state
@@ -129,8 +131,14 @@ async fn park_paused_bookkeeping(
     // intentionally retained); `evicting` is reserved for an actual
     // descent in flight. The rung stamp above is kept as host-ledger /
     // ascent metadata; lifecycle identity is the status.
-    crate::session_ops::transition_with_fence(state, session_id, ctx.fence(), SessionState::Parked)
-        .await?;
+    crate::session_ops::transition_with_fence(
+        state,
+        session_id,
+        ctx.fence(),
+        SessionState::Parked,
+        BindingDisposition::Retain,
+    )
+    .await?;
     let _ = state
         .emit_fenced(
             session_id,
@@ -345,6 +353,7 @@ async fn quarantine_reap_unevictable(
                 session_id,
                 ctx.fence(),
                 SessionState::HostLost,
+                BindingDisposition::Retain,
             )
             .await
             {
@@ -535,6 +544,7 @@ pub(crate) async fn run_evict_pipeline(
                 session_id,
                 ctx.fence(),
                 SessionState::HostLost,
+                BindingDisposition::RequireUnbound,
             )
             .await
             {
@@ -1042,7 +1052,13 @@ pub(crate) async fn run_evict_pipeline(
         session_id,
         ctx.fence(),
         target_state,
-        /*detach_sandbox=*/ target_state == SessionState::Idle,
+        // Post-#896: the Idle path detaches in the fused flip; Evacuating
+        // RETAINS the source binding until teardown is confirmed.
+        if target_state == SessionState::Idle {
+            BindingDisposition::Detach
+        } else {
+            BindingDisposition::Retain
+        },
         vec![
             crate::state::SessionEvent::SnapshotTaken {
                 snapshot_id: metadata.id,
@@ -1161,6 +1177,7 @@ async fn finish_eviction_d5(
             session_id,
             ctx.fence(),
             SessionState::Evicting,
+            BindingDisposition::Retain,
         )
         .await
         {
@@ -1392,7 +1409,11 @@ async fn scanner_advance_one(
         match state
             .services
             .meta
-            .transition_session(session_id, SessionState::HostLost)
+            .transition_session(
+                session_id,
+                SessionState::HostLost,
+                BindingDisposition::Retain,
+            )
             .await
         {
             Ok(prev) => {
@@ -1584,7 +1605,11 @@ async fn park_reaper_advance_one(
         match state
             .services
             .meta
-            .transition_session(session_id, SessionState::HostLost)
+            .transition_session(
+                session_id,
+                SessionState::HostLost,
+                BindingDisposition::RequireUnbound,
+            )
             .await
         {
             Ok(prev) => {
@@ -1680,7 +1705,11 @@ pub(crate) async fn descend_parked_session(
     match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Evicting)
+        .transition_session(
+            session_id,
+            SessionState::Evicting,
+            BindingDisposition::Retain,
+        )
         .await
     {
         Ok(prev) => {

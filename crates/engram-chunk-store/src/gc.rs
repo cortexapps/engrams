@@ -292,6 +292,7 @@ mod tests {
             &self,
             _id: SessionId,
             _target: SessionState,
+            _: engram_core::types::BindingDisposition,
         ) -> Result<SessionState, MetaError> {
             Err(MetaError::NotFound)
         }

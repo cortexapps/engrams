@@ -24,7 +24,8 @@ use engram_core::types::registry::{EnableJob, EnableJobState};
 use engram_core::types::registry::{EnabledImage, RegistryCredential, SessionSecrets};
 use engram_core::types::session::SandboxAssignment;
 use engram_core::types::session::{
-    DeleteHostOutcome, QueueOrigin, QueuedSession, Session, SessionSpec, SessionState,
+    BindingDisposition, DeleteHostOutcome, QueueOrigin, QueuedSession, Session, SessionSpec,
+    SessionState,
 };
 use engram_core::types::snapshot::SnapshotRecord;
 use engram_core::SandboxId;
@@ -343,6 +344,7 @@ impl MetadataStore for SimMetadataStore {
         &self,
         id: SessionId,
         target: SessionState,
+        disposition: BindingDisposition,
     ) -> Result<SessionState, MetaError> {
         self.gate()?;
         let now = self.now();
@@ -352,7 +354,18 @@ impl MetadataStore for SimMetadataStore {
         current
             .try_transition_to(target)
             .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        // #896 / ADR 0090 addendum: disposition legality under the same
+        // db lock — the PG twin's row-lock check.
+        if !target.binding_disposition_legal(row.session.sandbox_id.is_some(), disposition) {
+            return Err(MetaError::Conflict(format!(
+                "illegal binding disposition {disposition:?} into {} on a bound row",
+                target.as_str()
+            )));
+        }
         row.session.status = target;
+        if matches!(disposition, BindingDisposition::Detach) {
+            row.session.sandbox_id = None;
+        }
         let log_entry = super::TransitionLogEntry {
             session: id,
             from: current,
@@ -398,7 +411,10 @@ impl MetadataStore for SimMetadataStore {
         let Some(target) = session.status.terminal_target() else {
             return Ok(None);
         };
-        let prev = self.transition_session(id, target).await?;
+        // Terminal rows must not own (mirrors the trait default): Detach.
+        let prev = self
+            .transition_session(id, target, BindingDisposition::Detach)
+            .await?;
         Ok(Some((prev, target)))
     }
 
@@ -1461,6 +1477,7 @@ impl MetadataStore for SimMetadataStore {
         session_id: SessionId,
         epoch: i64,
         to: SessionState,
+        disposition: BindingDisposition,
     ) -> Result<Option<SessionState>, MetaError> {
         self.gate()?;
         let now = self.now();
@@ -1476,7 +1493,18 @@ impl MetadataStore for SimMetadataStore {
         current
             .try_transition_to(to)
             .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        // #896 / ADR 0090 addendum: disposition legality after the fence
+        // check, under the same lock (the PG twin's ordering).
+        if !to.binding_disposition_legal(row.session.sandbox_id.is_some(), disposition) {
+            return Err(MetaError::Conflict(format!(
+                "illegal binding disposition {disposition:?} into {} on a bound row",
+                to.as_str()
+            )));
+        }
         row.session.status = to;
+        if matches!(disposition, BindingDisposition::Detach) {
+            row.session.sandbox_id = None;
+        }
         let log_entry = super::TransitionLogEntry {
             session: session_id,
             from: current,
@@ -1514,7 +1542,7 @@ impl MetadataStore for SimMetadataStore {
         session_id: SessionId,
         epoch: i64,
         to: SessionState,
-        detach_sandbox: bool,
+        disposition: BindingDisposition,
         events: &[(String, serde_json::Value)],
     ) -> Result<Option<(SessionState, Vec<i64>)>, MetaError> {
         self.gate()?;
@@ -1531,10 +1559,18 @@ impl MetadataStore for SimMetadataStore {
         current
             .try_transition_to(to)
             .map_err(|e| MetaError::Conflict(e.to_string()))?;
+        // #896 / ADR 0090 addendum: disposition legality after the fence
+        // check, under the same lock (the PG twin's ordering).
+        if !to.binding_disposition_legal(row.session.sandbox_id.is_some(), disposition) {
+            return Err(MetaError::Conflict(format!(
+                "illegal binding disposition {disposition:?} into {} on a bound row",
+                to.as_str()
+            )));
+        }
         row.session.status = to;
         row.session.last_active_at = now;
         row.updated_at = now;
-        if detach_sandbox {
+        if matches!(disposition, BindingDisposition::Detach) {
             row.session.sandbox_id = None;
         }
         if to == SessionState::Evacuating {

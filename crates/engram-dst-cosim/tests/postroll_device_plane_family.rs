@@ -14,6 +14,7 @@
 //! allocator; only the world bookkeeping is sim.
 
 use engram_core::types::session::SessionState;
+use engram_core::types::BindingDisposition;
 use engram_dst_cosim::Cosim;
 
 /// The FIXED happy path: a rung-parked survivor the coordinator LISTS (an
@@ -75,7 +76,7 @@ async fn ungated_sweep_parks_the_live_held_survivor_then_reserves_zero_loss() {
     // reserves-host-memory, so the register-rehydrate list omits it (the exact
     // "survivor invisible to the coord list" 731df805/#769 shape). The VM
     // stays resident; its guest keeps holding the rootfs device open.
-    sim.force_session_state(session, SessionState::HostLost)
+    sim.force_session_state(session, SessionState::HostLost, BindingDisposition::Retain)
         .await;
     sim.roll_host().await;
 
@@ -95,7 +96,8 @@ async fn ungated_sweep_parks_the_live_held_survivor_then_reserves_zero_loss() {
 
     // Recovery: restore the survivor to a resident state so the coord list
     // names it again, then rehydrate re-serves it with zero device loss.
-    sim.force_session_state(session, SessionState::Active).await;
+    sim.force_session_state(session, SessionState::Active, BindingDisposition::Retain)
+        .await;
     sim.register_rehydrate(true).await;
     assert!(
         sim.served_by_current(session).await,
@@ -117,7 +119,7 @@ async fn unpause_gate_fires_on_a_disconnected_dead_guest_plane() {
     let sandbox = sim.sandbox_of(session).await.expect("bound sandbox");
 
     sim.park(session).await;
-    sim.force_session_state(session, SessionState::HostLost)
+    sim.force_session_state(session, SessionState::HostLost, BindingDisposition::Retain)
         .await;
     sim.roll_host().await;
     // The FC guest genuinely dies — it no longer holds the device node open.
@@ -169,7 +171,7 @@ async fn gap_a_record_invisible_survivor_is_quarantined_then_recovers_zero_loss(
     // the REAL coordinator listing OMITS it (the "survivor invisible to the coord
     // list" shape). Its LOCAL ChainHeadRecord is then LOST too (#769 gap A), so
     // the #739 local pass can't re-serve it either. The guest stays resident.
-    sim.force_session_state(session, SessionState::HostLost)
+    sim.force_session_state(session, SessionState::HostLost, BindingDisposition::Retain)
         .await;
     sim.roll_host().await;
     sim.lose_record(session).await;

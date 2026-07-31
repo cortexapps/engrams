@@ -1013,6 +1013,7 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: SessionState,
+            _: engram_core::types::BindingDisposition,
         ) -> Result<SessionState, engram_core::MetaError> {
             unreachable!()
         }

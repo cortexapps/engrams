@@ -14,6 +14,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 
 use engram_core::traits::MetadataStore;
@@ -40,10 +41,10 @@ async fn seed_active(meta: &Arc<dyn MetadataStore>) -> (SessionId, SandboxId) {
     meta.assign_session_sandbox(id, Some(sandbox))
         .await
         .expect("bind sandbox");
-    meta.transition_session(id, SessionState::Created)
+    meta.transition_session(id, SessionState::Created, BindingDisposition::Retain)
         .await
         .expect("pending->created");
-    meta.transition_session(id, SessionState::Active)
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("created->active");
     (id, sandbox)
@@ -61,7 +62,7 @@ async fn evicting_round_trip_counter_and_sweep() {
 
     // Pre-dirty the counter via a previous eviction cycle's bumps:
     // enter Evicting, bump twice, leave via Idle, resume to Active.
-    meta.transition_session(id, SessionState::Evicting)
+    meta.transition_session(id, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .expect("active->evicting (0050 CHECK must allow it)");
     assert_eq!(meta.bump_evict_attempts(id).await.expect("bump1"), 1);
@@ -76,7 +77,7 @@ async fn evicting_round_trip_counter_and_sweep() {
     assert_eq!(mine.1, 2, "sweep must carry the bumped count");
 
     // Pipeline terminal transition.
-    meta.transition_session(id, SessionState::Idle)
+    meta.transition_session(id, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("evicting->idle");
     assert!(
@@ -90,13 +91,13 @@ async fn evicting_round_trip_counter_and_sweep() {
     );
 
     // Re-entry resets the budget: resume to Active, evict again.
-    meta.transition_session(id, SessionState::Created)
+    meta.transition_session(id, SessionState::Created, BindingDisposition::Retain)
         .await
         .expect("idle->created (resume)");
-    meta.transition_session(id, SessionState::Active)
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("created->active");
-    meta.transition_session(id, SessionState::Evicting)
+    meta.transition_session(id, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .expect("active->evicting again");
     assert_eq!(
@@ -121,7 +122,7 @@ async fn evicting_round_trip_counter_and_sweep() {
 async fn evicting_sessions_listed_active_with_binding() {
     let Some(meta) = pg().await else { return };
     let (id, sandbox) = seed_active(&meta).await;
-    meta.transition_session(id, SessionState::Evicting)
+    meta.transition_session(id, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .expect("active->evicting");
 
@@ -144,10 +145,10 @@ async fn evicting_sessions_listed_active_with_binding() {
 async fn evicting_falls_back_to_host_lost() {
     let Some(meta) = pg().await else { return };
     let (id, _sandbox) = seed_active(&meta).await;
-    meta.transition_session(id, SessionState::Evicting)
+    meta.transition_session(id, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .expect("active->evicting");
-    meta.transition_session(id, SessionState::HostLost)
+    meta.transition_session(id, SessionState::HostLost, BindingDisposition::Retain)
         .await
         .expect("evicting->host_lost (budget exhaustion fallback)");
 }

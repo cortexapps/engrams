@@ -48,6 +48,7 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use chrono::{DateTime, Utc};
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::HostId;
 
@@ -253,7 +254,11 @@ async fn nominate(
     match state
         .services
         .meta
-        .transition_session(c.session_id, SessionState::Evicting)
+        .transition_session(
+            c.session_id,
+            SessionState::Evicting,
+            BindingDisposition::Retain,
+        )
         .await
     {
         Ok(prev) => {

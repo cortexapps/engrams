@@ -19,6 +19,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -63,7 +64,7 @@ async fn seed_active(meta: &Arc<SimMetadataStore>, host: HostId, sandbox: Sandbo
     meta.transition_session_created(id, sandbox)
         .await
         .expect("created");
-    meta.transition_session(id, SessionState::Active)
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("active");
     id

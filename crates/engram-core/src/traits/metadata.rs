@@ -14,8 +14,8 @@ use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
 };
 use crate::types::session::{
-    DeleteHostOutcome, QueuedDemand, QueuedSession, SandboxAssignment, Session, SessionSpec,
-    SessionState,
+    BindingDisposition, DeleteHostOutcome, QueuedDemand, QueuedSession, SandboxAssignment, Session,
+    SessionSpec, SessionState,
 };
 use crate::types::snapshot::SnapshotRecord;
 
@@ -660,9 +660,16 @@ pub trait MetadataStore: Send + Sync {
     /// Errors:
     /// - [`MetaError::NotFound`] — no row with this `id`.
     /// - [`MetaError::Conflict`] — the transition is not in the
-    ///   legality table. The message is the rendered
-    ///   [`crate::types::session::IllegalTransition`] so logs and HTTP
-    ///   bodies show both sides.
+    ///   legality table (message = the rendered
+    ///   [`crate::types::session::IllegalTransition`]), OR the
+    ///   `disposition` is illegal for the target on a bound row
+    ///   ([`SessionState::binding_disposition_legal`], #896 / ADR 0090
+    ///   addendum).
+    ///
+    /// `disposition` states what the flip does to `sandbox_id` — an
+    /// explicit, mandatory part of every transition, applied in the
+    /// SAME atomic write (`Detach` clears it; `host_id` is untouched so
+    /// resume affinity survives).
     ///
     /// Impls must do the SELECT and UPDATE under a single row-level
     /// lock to prevent two concurrent callers racing on the same
@@ -673,6 +680,7 @@ pub trait MetadataStore: Send + Sync {
         &self,
         id: SessionId,
         target: SessionState,
+        disposition: BindingDisposition,
     ) -> Result<SessionState, MetaError>;
 
     /// Force a session to its FSM-legal terminal state — the shared
@@ -697,7 +705,13 @@ pub trait MetadataStore: Send + Sync {
         let Some(target) = session.status.terminal_target() else {
             return Ok(None);
         };
-        let prev = self.transition_session(id, target).await?;
+        // Terminal rows must not own a sandbox: the caller (delete /
+        // give-up paths) has already destroyed or abandoned the VM, and
+        // an unbound terminal row is what authorizes the host-side
+        // ownership-oracle reap of any straggler.
+        let prev = self
+            .transition_session(id, target, BindingDisposition::Detach)
+            .await?;
         Ok(Some((prev, target)))
     }
 
@@ -1085,14 +1099,17 @@ pub trait MetadataStore: Send + Sync {
 
     /// Uniform fenced session-row transition: `transition_session` with
     /// `AND current_epoch = $e`. `Ok(false)` = fenced (0 rows) — the
-    /// caller stops silently, never retries, never compensates.
+    /// caller stops silently, never retries, never compensates. The
+    /// `disposition` contract is [`transition_session`]'s (#896): a
+    /// fenced-out write leaves the binding untouched.
     async fn fenced_transition_session(
         &self,
         session_id: SessionId,
         epoch: i64,
         to: crate::types::SessionState,
+        disposition: BindingDisposition,
     ) -> Result<Option<crate::types::SessionState>, MetaError> {
-        let _ = (session_id, epoch, to);
+        let _ = (session_id, epoch, to, disposition);
         Err(MetaError::Serialization(
             "fenced writes not supported by this store".into(),
         ))
@@ -1118,9 +1135,10 @@ pub trait MetadataStore: Send + Sync {
     /// `Err(Conflict)` (nothing committed). Callers own any post-commit
     /// side effects (in-process publish); `pg_notify` fires on commit.
     ///
-    /// `detach_sandbox = true` also clears `sandbox_id` in the SAME
-    /// update (`host_id` untouched — resume affinity survives, as with
-    /// the settle). The eviction flip detaches; doing it in a separate
+    /// `disposition` is [`transition_session`]'s binding contract
+    /// (#896): `Detach` clears `sandbox_id` in the SAME update
+    /// (`host_id` untouched — resume affinity survives, as with the
+    /// settle). The eviction flip detaches; doing it in a separate
     /// preceding write left a partial-failure window where the flip's
     /// rollback stranded an `evicting` session with no bound sandbox —
     /// which the scanner's retry resolves as HostLost instead of Idle.
@@ -1129,10 +1147,10 @@ pub trait MetadataStore: Send + Sync {
         session_id: SessionId,
         epoch: i64,
         to: crate::types::SessionState,
-        detach_sandbox: bool,
+        disposition: BindingDisposition,
         events: &[(String, serde_json::Value)],
     ) -> Result<Option<(crate::types::SessionState, Vec<i64>)>, MetaError> {
-        let _ = (session_id, epoch, to, detach_sandbox, events);
+        let _ = (session_id, epoch, to, disposition, events);
         Err(MetaError::Serialization(
             "fenced writes not supported by this store".into(),
         ))

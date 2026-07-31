@@ -37,6 +37,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use engram_core::traits::{Clock, MetadataStore, SystemClock};
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::{HostId, SandboxId, SessionId};
 use tokio::task::JoinHandle;
@@ -396,7 +397,11 @@ async fn flip_missing(
 
     // ADR 0015 M2 stage 1: Active -> HostLost (host went away).
     let prev = match meta
-        .transition_session(session_id, SessionState::HostLost)
+        .transition_session(
+            session_id,
+            SessionState::HostLost,
+            BindingDisposition::RequireUnbound,
+        )
         .await
     {
         Ok(p) => p,
@@ -439,7 +444,10 @@ async fn flip_missing(
         session.live_disk_manifest.is_some(),
     );
     crate::dead_host::note_unrecoverable_if_dead(new_status, latest_snapshot.as_ref(), session_id);
-    match meta.transition_session(session_id, new_status).await {
+    match meta
+        .transition_session(session_id, new_status, BindingDisposition::RequireUnbound)
+        .await
+    {
         Ok(host_lost_prev) => {
             emit_status_changed(meta, events, session_id, host_lost_prev, new_status, now).await;
             tracing::info!(
