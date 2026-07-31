@@ -143,7 +143,7 @@ export function SessionsRail() {
                         >
                           <Link to="/sessions/$id" params={{ id: r.id }} title={r.id}>
                             <span className="mt-0.5 shrink-0 text-[0.7rem] leading-none">
-                              <StatusGlyph status={r.status} />
+                              <StatusGlyph status={r.status} attention={r.needsAttention} />
                             </span>
                             <span className="flex min-w-0 flex-1 flex-col">
                               <span

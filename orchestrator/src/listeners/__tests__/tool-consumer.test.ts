@@ -23,6 +23,7 @@ function pendingRecorder() {
     markCompleted: async (sessionId, toolCallId, at) =>
       void completed.push({ sessionId, toolCallId, at }),
     find: async () => null,
+    listSessionIdsWithPendingSessionCalls: async () => [],
     listUnsubmittedSessionCallsBefore: async () => [],
   };
   return { store, requested, submitted, completed };

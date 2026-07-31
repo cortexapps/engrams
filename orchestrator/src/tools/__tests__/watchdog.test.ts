@@ -47,6 +47,7 @@ describe("pending tool-call watchdog", () => {
       markSubmitted: async () => {},
       markCompleted: async () => {},
       find: async () => null,
+      listSessionIdsWithPendingSessionCalls: async () => [],
       listUnsubmittedSessionCallsBefore: async (cutoff) => {
         queriedCutoffs.push(cutoff);
         return [stale];

@@ -237,6 +237,8 @@ const productionPendingCalls: PendingToolCallStore = {
     makePendingToolCallStore().markSubmitted(sessionId, toolCallId, at),
   markCompleted: (sessionId, toolCallId, at) =>
     makePendingToolCallStore().markCompleted(sessionId, toolCallId, at),
+  listSessionIdsWithPendingSessionCalls: () =>
+    makePendingToolCallStore().listSessionIdsWithPendingSessionCalls(),
   find: (sessionId, toolCallId) =>
     makePendingToolCallStore().find(sessionId, toolCallId),
   listUnsubmittedSessionCallsBefore: (cutoff) =>

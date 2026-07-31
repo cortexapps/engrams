@@ -23,6 +23,7 @@ test("tools.complete rejects an invalid output before the completer is called", 
       submittedAt: null,
       completedAt: null,
     }),
+    listSessionIdsWithPendingSessionCalls: async () => [],
     listUnsubmittedSessionCallsBefore: async () => [],
   };
   const registry = createToolRegistry({
