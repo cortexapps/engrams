@@ -58,22 +58,7 @@ impl GcsBlobStorage {
     /// the SDK turns up only a `// TODO emulator support` note). We
     /// thread it through explicitly here.
     pub async fn connect(bucket: impl Into<String>) -> Result<Self, BlobError> {
-        let mut cfg = if let Ok(host) = std::env::var("STORAGE_EMULATOR_HOST") {
-            // Emulator mode: anonymous auth + the override endpoint.
-            // Strip a trailing slash so requests don't double up.
-            let endpoint = host.trim_end_matches('/').to_string();
-            tracing::info!(endpoint, "gcs: using STORAGE_EMULATOR_HOST");
-            ClientConfig {
-                storage_endpoint: endpoint,
-                ..ClientConfig::default()
-            }
-            .anonymous()
-        } else {
-            ClientConfig::default()
-                .with_auth()
-                .await
-                .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))?
-        };
+        let mut cfg = Self::auth_config().await?;
         // Inject our own transport instead of the SDK's untuned default
         // (per TigerBeetle's object-storage-client findings, 2026-07):
         // - hickory async DNS: cached, TTL-aware, no getaddrinfo
@@ -99,6 +84,41 @@ impl GcsBlobStorage {
             client: Arc::new(Client::new(cfg)),
             bucket: bucket.into(),
         })
+    }
+
+    /// Baseline constructor on the SDK's DEFAULT transport (no
+    /// injected client: getaddrinfo DNS, unbounded connect, default
+    /// pool). Exists ONLY as the before/after control for
+    /// `engram-blob-client`'s `blobbench` harness — production and
+    /// dev code paths must use [`Self::connect`].
+    #[doc(hidden)]
+    pub async fn connect_untuned(bucket: impl Into<String>) -> Result<Self, BlobError> {
+        let cfg = Self::auth_config().await?;
+        Ok(Self {
+            client: Arc::new(Client::new(cfg)),
+            bucket: bucket.into(),
+        })
+    }
+
+    /// Shared auth/endpoint resolution: emulator (anonymous + the
+    /// `STORAGE_EMULATOR_HOST` endpoint — the SDK doesn't auto-honor
+    /// it) or ADC against production HTTPS.
+    async fn auth_config() -> Result<ClientConfig, BlobError> {
+        if let Ok(host) = std::env::var("STORAGE_EMULATOR_HOST") {
+            // Strip a trailing slash so requests don't double up.
+            let endpoint = host.trim_end_matches('/').to_string();
+            tracing::info!(endpoint, "gcs: using STORAGE_EMULATOR_HOST");
+            Ok(ClientConfig {
+                storage_endpoint: endpoint,
+                ..ClientConfig::default()
+            }
+            .anonymous())
+        } else {
+            ClientConfig::default()
+                .with_auth()
+                .await
+                .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))
+        }
     }
 }
 
