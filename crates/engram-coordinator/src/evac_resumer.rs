@@ -245,59 +245,21 @@ async fn advance_one_claimed(
         }
     };
 
-    // ADR 0090: `Evacuating` retains the outgoing binding until teardown
-    // is positively confirmed. The drain's evict op has already issued a
-    // best-effort destroy, but an acknowledged host verb can still have a
-    // durable, not-yet-applied effect. Restoring from the snapshot while
-    // that sandbox is alive would give this session two owners across the
-    // fleet. Re-issue the idempotent destroy through the source backend,
-    // then independently probe it. Only a negative probe (or host-side
-    // NotFound) authorizes the fenced binding clear below.
-    match (session.host_id, session.sandbox_id) {
-        (Some(source_host), Some(source_sandbox)) => {
-            confirm_source_teardown(state, source_host, source_sandbox, claim.fence()).await?;
-            match state
-                .services
-                .meta
-                .fenced_assign_sandbox(
-                    session_id,
-                    claim.fence().epoch as i64,
-                    None,
-                    Some(source_host),
-                )
-                .await
-            {
-                Ok(true) => {
-                    state.host_registry.invalidate_sandbox(source_sandbox);
-                    session.sandbox_id = None;
-                }
-                Ok(false) => {
-                    crate::metrics::note_fenced_write();
-                    return Ok(());
-                }
-                Err(e) => {
-                    return Err(
-                        format!("evac-resumer: clear confirmed-dead source binding: {e}").into(),
-                    );
-                }
-            }
-        }
-        (None, Some(source_sandbox)) => {
-            return Err(format!(
-                "evac-resumer: session {session_id} retains source sandbox {source_sandbox} \
-                 without a source host; refusing to release ownership"
-            )
-            .into());
-        }
-        (_, None) => {}
-    }
-
     // Retry budget exhausted → fall back to Idle so the user can
     // `/resume` manually. Idle is a legal target from Evacuating per
     // the legality table; the row's snapshot lineage is already
     // durable (it was captured before the pipeline marked the
     // session Evacuating in the evict pipeline), so /resume
-    // from Idle restores cleanly.
+    // from Idle restores cleanly. Checked BEFORE the teardown
+    // confirmation so a source that stays connected but can never
+    // positively confirm (its failures burn this same budget below)
+    // reaches this terminal instead of wedging Evacuating forever.
+    // The fallback may then leave the source binding IN PLACE — that
+    // is deliberate: ownership of an unconfirmed sandbox is never
+    // released here. A later /resume's guarded bind supersedes it,
+    // at which point the orphaned VM is coordinator-unowned and the
+    // host-side reconcile reaps it after the strike debounce (the
+    // ADR 0090 cleanup lane for unowned VMs).
     if attempts >= cfg.max_attempts {
         match state
             .services
@@ -339,6 +301,66 @@ async fn advance_one_claimed(
             .set_teleport_target(session_id, None)
             .await;
         return Ok(());
+    }
+
+    // ADR 0090: `Evacuating` retains the outgoing binding until teardown
+    // is positively confirmed. The drain's evict op has already issued a
+    // best-effort destroy, but an acknowledged host verb can still have a
+    // durable, not-yet-applied effect. Restoring from the snapshot while
+    // that sandbox is alive would give this session two owners across the
+    // fleet. Re-issue the idempotent destroy through the source backend,
+    // then independently probe it. Only a negative probe (or host-side
+    // NotFound) authorizes the fenced binding clear below.
+    match (session.host_id, session.sandbox_id) {
+        (Some(source_host), Some(source_sandbox)) => {
+            if let Err(e) =
+                confirm_source_teardown(state, source_host, source_sandbox, claim.fence()).await
+            {
+                // Confirmation failures burn the SAME budget as pipeline
+                // failures — without this, a persistently unconfirmable
+                // teardown never reaches the exhaustion fallback above and
+                // the session wedges with no terminal state.
+                let _ = state.services.meta.bump_evac_attempts(session_id).await;
+                return Err(e);
+            }
+            match state
+                .services
+                .meta
+                .fenced_assign_sandbox(
+                    session_id,
+                    claim.fence().epoch as i64,
+                    None,
+                    Some(source_host),
+                )
+                .await
+            {
+                Ok(true) => {
+                    state.host_registry.invalidate_sandbox(source_sandbox);
+                    session.sandbox_id = None;
+                }
+                Ok(false) => {
+                    crate::metrics::note_fenced_write();
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(
+                        format!("evac-resumer: clear confirmed-dead source binding: {e}").into(),
+                    );
+                }
+            }
+        }
+        (None, Some(source_sandbox)) => {
+            // Unconfirmable by construction — burn the budget so this
+            // (should-be-impossible) shape also reaches the exhaustion
+            // fallback instead of wedging.
+            let _ = state.services.meta.bump_evac_attempts(session_id).await;
+            return Err(format!(
+                "evac-resumer: session {session_id} retains source sandbox {source_sandbox} \
+                 without a source host; refusing to release ownership"
+            )
+            .into());
+        }
+        (_, None) => {}
     }
 
     // Bump pre-pipeline. A pipeline failure leaves the counter
@@ -393,6 +415,13 @@ async fn confirm_source_teardown(
         )
         .into()),
         Err(engram_core::SandboxError::NotFound) => Ok(()),
+        // An old host-agent mid-roll has no probe RPC (`Unimplemented` →
+        // `Unsupported`, per the HostClient trait doc). Proceed on the
+        // strength of the confirmed destroy above — the same "no probe
+        // available" posture `reconcile::flip_missing` documents. A drain
+        // is exactly when mixed agent versions exist; refusing here wedged
+        // every evacuation off a not-yet-rolled host.
+        Err(engram_core::SandboxError::Unsupported(_)) => Ok(()),
         Err(e) => Err(format!(
             "evac-resumer: source teardown probe for sandbox {source_sandbox} on host \
              {source_host} failed: {e}; retaining coordinator ownership"
