@@ -31,7 +31,7 @@ import type {
 import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
-import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
+import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -138,9 +138,9 @@ describe("compileSessionCreateInput", () => {
     expect(inp.mode).toBe("agent");
   });
 
-  test("sets the papercut system prompt with no extra harness env", async () => {
+  test("sets the base system prompt with no extra harness env", async () => {
     const inp = await compileSessionCreateInput(profile(), deps());
-    expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(PAPERCUT_SYSTEM_PROMPT);
+    expect(inp.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(BASE_SYSTEM_PROMPT);
   });
 
   test("enables private browser image observations only with the browser skill", async () => {
@@ -154,13 +154,13 @@ describe("compileSessionCreateInput", () => {
     expect(withoutBrowser.harnessEnv?.ENGRAM_BROWSER_VIEW_ENABLED).toBeUndefined();
   });
 
-  test("appends the papercut prompt after extraHarnessEnv's system prompt", async () => {
+  test("appends the base prompt after extraHarnessEnv's system prompt", async () => {
     const inp = await compileSessionCreateInput(profile({ envVars: { FOO: "bar" } }), deps(), {
       extraHarnessEnv: { ENGRAM_APPEND_SYSTEM_PROMPT: "be concise" },
     });
     expect(inp.harnessEnv).toMatchObject({
       FOO: "bar",
-      ENGRAM_APPEND_SYSTEM_PROMPT: `be concise\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+      ENGRAM_APPEND_SYSTEM_PROMPT: `be concise\n\n${BASE_SYSTEM_PROMPT}`,
     });
   });
 
@@ -659,7 +659,7 @@ describe("createTaskWithSession", () => {
     expect(out.sessionId).toBe("sess-1");
     expect(typeof out.taskId).toBe("string");
     expect((sessions.createReqs[0] as { harnessEnv?: Record<string, string> }).harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
-      `be concise\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+      `be concise\n\n${BASE_SYSTEM_PROMPT}`,
     );
     // records[0] = task, records[1] = primary task_session.
     expect(records[0]).toMatchObject({
@@ -868,7 +868,7 @@ describe("createSessionForExistingTask", () => {
     expect(request.prompt).toBeUndefined();
     expect(request.capabilities).toEqual(["github:contents:read@openai/engrams"]);
     expect(request.harnessEnv?.ENGRAM_APPEND_SYSTEM_PROMPT).toBe(
-      `finder system prompt\n\n${PAPERCUT_SYSTEM_PROMPT}`,
+      `finder system prompt\n\n${BASE_SYSTEM_PROMPT}`,
     );
   });
 
