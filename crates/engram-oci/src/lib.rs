@@ -162,15 +162,7 @@ impl OciClient {
         Self {
             inner,
             inner_http,
-            // http1_only: engram-storage-gcs compiles reqwest's
-            // `http2` feature into the workspace (its ALPN is
-            // env-gated there); without this pin that feature would
-            // silently flip this client's registry traffic to h2.
-            // Keep the wire behavior this path was validated on.
-            http: reqwest::Client::builder()
-                .http1_only()
-                .build()
-                .expect("reqwest client with static config"),
+            http: reqwest::Client::new(),
             head_tokens: Arc::new(Mutex::new(HashMap::new())),
             auth,
             blob_retry: BlobRetryConfig::default(),

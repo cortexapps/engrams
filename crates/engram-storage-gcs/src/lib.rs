@@ -72,24 +72,26 @@ impl GcsBlobStorage {
         // No global request timeout here — bodies are GB-scale on the
         // streaming paths; per-attempt deadlines live in BlobClient.
         //
-        // Protocol: pooled HTTP/1.1 by default — bulk parallel chunk
-        // transfers get one TCP window each instead of sharing one
-        // h2 connection's flow control. `ENGRAM_GCS_HTTP2=1` opts in
-        // to ALPN h2 for experiments, but blobbench (2026-07-31,
-        // n2-standard-16 → us-west2 GCS, 16 MiB objects, c=32)
-        // measured h2 4-5x WORSE on bulk transfer: GET 1914 → 378
-        // MiB/s, PUT 1497 → 474 MiB/s. Don't flip this default
-        // without re-measuring.
-        let mut builder = reqwest::Client::builder()
+        // Protocol: pooled HTTP/1.1, unconditionally — bulk parallel
+        // chunk transfers get one TCP window each instead of sharing
+        // one h2 connection's flow control. HTTP/2 was measured and
+        // REJECTED: blobbench (2026-07-31, n2-standard-16 → us-west2
+        // GCS, 16 MiB objects, c=32) put ALPN h2 at 4-5x worse on
+        // bulk transfer (GET 1914 → 378 MiB/s, PUT 1497 → 474
+        // MiB/s), so reqwest's `http2` feature is deliberately NOT
+        // enabled anywhere in the workspace — feature unification
+        // would silently flip every unpinned reqwest client
+        // (engram-oci's registry pulls included) to h2. The
+        // `http1_only()` here is belt-and-braces against the feature
+        // ever arriving transitively; to re-test h2, re-run blobbench
+        // with the feature enabled rather than trusting this number.
+        let http = reqwest::Client::builder()
             .hickory_dns(true)
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_max_idle_per_host(64)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
-            .tcp_keepalive(std::time::Duration::from_secs(30));
-        if !std::env::var("ENGRAM_GCS_HTTP2").is_ok_and(|v| v == "1") {
-            builder = builder.http1_only();
-        }
-        let http = builder
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .http1_only()
             .build()
             .map_err(|e| BlobError::Config(format!("gcs http client: {e}")))?;
         cfg.http = Some(reqwest_middleware::ClientBuilder::new(http).build());

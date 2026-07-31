@@ -24,7 +24,7 @@ google-cloud-storage = { version = "0.24", default-features = false, features = 
 # tuned reqwest client (async hickory DNS with caching instead of the
 # hidden getaddrinfo threadpool, bounded connect, sized keep-alive
 # pool) rather than taking the SDK's untuned default.
-reqwest = { workspace = true, features = ["hickory-dns", "http2"] }
+reqwest = { workspace = true, features = ["hickory-dns"] }
 reqwest-middleware = "0.4"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 
