@@ -458,7 +458,13 @@ pub fn evaluate(
             {
                 return None;
             }
+            // Repeated field names form a FALLBACK CHAIN: the first extractor
+            // that resolves wins (e.g. `title` → `$.resp.…title` then
+            // `$.vars.input.title` — response-first, request-vars supplement).
             for (field, path) in &entry.data {
+                if data.contains_key(field) {
+                    continue;
+                }
                 if let Some(v) = extract(
                     path,
                     resp.status,
@@ -771,17 +777,31 @@ mod tests {
         // `$.vars.*` (title, branches) + the URL fallback (repo, number).
         let e = ObserveEntry {
             success: SuccessRule::NoGraphqlErrors,
+            // The shipped shape: response-first with a `$.vars` fallback chain
+            // (repeated field names — first resolving extractor wins).
             data: vec![
                 (
                     "number".into(),
                     "$.resp.data.createPullRequest.pullRequest.number".into(),
+                ),
+                (
+                    "title".into(),
+                    "$.resp.data.createPullRequest.pullRequest.title".into(),
                 ),
                 ("title".into(), "$.vars.input.title".into()),
                 (
                     "repo".into(),
                     "$.resp.data.createPullRequest.pullRequest.repository.nameWithOwner".into(),
                 ),
+                (
+                    "head_branch".into(),
+                    "$.resp.data.createPullRequest.pullRequest.headRefName".into(),
+                ),
                 ("head_branch".into(), "$.vars.input.headRefName".into()),
+                (
+                    "base_branch".into(),
+                    "$.resp.data.createPullRequest.pullRequest.baseRefName".into(),
+                ),
                 ("base_branch".into(), "$.vars.input.baseRefName".into()),
             ],
             fetchable: Some("$.resp.data.createPullRequest.pullRequest.url".into()),
@@ -822,6 +842,55 @@ mod tests {
         assert_eq!(
             a.fetchable_url.as_deref(),
             Some("https://github.com/octo/engrams/pull/97")
+        );
+    }
+
+    #[test]
+    fn data_fallback_chain_takes_first_resolving_extractor() {
+        // The review finding on PR #904: a client that INLINES its mutation
+        // arguments (no `variables`) but selects the fields in the response
+        // must still get them — response-first, vars as the supplement.
+        let e = ObserveEntry {
+            data: vec![
+                ("title".into(), "$.resp.data.m.title".into()),
+                ("title".into(), "$.vars.input.title".into()),
+            ],
+            fetchable: None,
+            ..entry()
+        };
+        let respond = |body: &str| {
+            parse_response(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+        };
+
+        // Response carries the field, vars absent → response value.
+        let parsed = respond(r#"{"data":{"m":{"title":"from-resp"}}}"#);
+        let a = evaluate(&e, parsed.as_ref(), "POST", "/graphql", None).unwrap();
+        assert_eq!(
+            a.data.get("title"),
+            Some(&Value::String("from-resp".into()))
+        );
+
+        // Both present → the FIRST chain entry (response) wins.
+        let vars = serde_json::json!({"input": {"title": "from-vars"}});
+        let a = evaluate(&e, parsed.as_ref(), "POST", "/graphql", Some(&vars)).unwrap();
+        assert_eq!(
+            a.data.get("title"),
+            Some(&Value::String("from-resp".into()))
+        );
+
+        // Response missing the field → the vars fallback fills it.
+        let parsed = respond(r#"{"data":{"m":{"id":"X_1"}}}"#);
+        let a = evaluate(&e, parsed.as_ref(), "POST", "/graphql", Some(&vars)).unwrap();
+        assert_eq!(
+            a.data.get("title"),
+            Some(&Value::String("from-vars".into()))
         );
     }
 

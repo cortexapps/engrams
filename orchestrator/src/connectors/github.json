@@ -310,17 +310,17 @@
       "comment": "ADR 0059: GraphQL operations on POST /graphql. The same powers gate REST + GraphQL. Write mutations map precisely to their power; the minted token enforces the rest server-side. The query root-field set is curated against `gh`'s GraphQL traffic — unmapped fields default-deny.",
       "grants": ["pulls:write"],
       "match": { "operation": "mutation", "field": "createPullRequest" },
-      "comment": "REST-parity asset (the gh regression): a GraphQL response echoes only the client's selection set, and `gh pr create` selects just `pullRequest { id url }` — so title/branches come from the mutation's request variables ($.vars, required CreatePullRequestInput fields) and repo/number fall back to the returned PR URL. `number`/`repo` stay response-first for clients that DO select them.",
+      "comment": "REST-parity asset (the gh regression): a GraphQL response echoes only the client's selection set, and `gh pr create` selects just `pullRequest { id url }` — so every field is response-first with a fallback: title/branches fall back to the mutation's request variables ($.vars, required CreatePullRequestInput fields; absent when a client inlines its arguments) and repo/number fall back to the returned PR URL.",
       "asset": {
         "kind": "pull_request",
         "surface": "asset",
         "success": { "noGraphqlErrors": true },
         "data": {
           "number": "$.resp.data.createPullRequest.pullRequest.number",
-          "title": "$.vars.input.title",
+          "title": ["$.resp.data.createPullRequest.pullRequest.title", "$.vars.input.title"],
           "repo": "$.resp.data.createPullRequest.pullRequest.repository.nameWithOwner",
-          "head_branch": "$.vars.input.headRefName",
-          "base_branch": "$.vars.input.baseRefName"
+          "head_branch": ["$.resp.data.createPullRequest.pullRequest.headRefName", "$.vars.input.headRefName"],
+          "base_branch": ["$.resp.data.createPullRequest.pullRequest.baseRefName", "$.vars.input.baseRefName"]
         },
         "fetchable": { "external": "$.resp.data.createPullRequest.pullRequest.url" },
         "urlFallback": {
@@ -369,14 +369,14 @@
     {
       "grants": ["issues:write"],
       "match": { "operation": "mutation", "field": "createIssue" },
-      "comment": "REST-parity asset: `gh issue create` selects only `issue { id url }`, so the title comes from the request variables and the number falls back to the returned issue URL (number stays response-first for clients that select it).",
+      "comment": "REST-parity asset: `gh issue create` selects only `issue { id url }`, so the title falls back to the request variables and the number to the returned issue URL (both response-first for clients that select them).",
       "asset": {
         "kind": "issue",
         "surface": "asset",
         "success": { "noGraphqlErrors": true },
         "data": {
           "number": "$.resp.data.createIssue.issue.number",
-          "title": "$.vars.input.title"
+          "title": ["$.resp.data.createIssue.issue.title", "$.vars.input.title"]
         },
         "fetchable": { "external": "$.resp.data.createIssue.issue.url" },
         "urlFallback": {

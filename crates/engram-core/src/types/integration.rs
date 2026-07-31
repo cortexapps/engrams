@@ -155,6 +155,9 @@ pub struct IntegrationObserve {
     #[serde(default)]
     pub graphql_field: String,
     /// `(field name, extractor path)` pairs for the asset's `data` payload.
+    /// Repeated field names form a fallback chain — the proxy takes the first
+    /// extractor that resolves (the connector's `string[]` data values compile
+    /// to repeated pairs; the wire tuple shape is unchanged for resume-safety).
     #[serde(default)]
     pub data: Vec<(String, String)>,
     /// Extractor path producing an external URL, e.g. `"$.resp.html_url"`.

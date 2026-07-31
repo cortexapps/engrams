@@ -65,9 +65,13 @@ const githubGraphqlRaw = {
         kind: "issue",
         surface: "asset",
         success: { noGraphqlErrors: true },
-        // GraphQL parity: `title` reads the request variables; the number is
-        // derived from the returned URL when the client didn't select it.
-        data: { id: "$.resp.data.createIssue.issue.id", title: "$.vars.input.title" },
+        // GraphQL parity: `title` is a fallback chain (response-first, request
+        // variables as the supplement); the number is derived from the returned
+        // URL when the client didn't select it.
+        data: {
+          id: "$.resp.data.createIssue.issue.id",
+          title: ["$.resp.data.createIssue.issue.title", "$.vars.input.title"],
+        },
         fetchable: { external: "$.resp.data.createIssue.issue.url" },
         urlFallback: {
           pattern: "https://github.com/{owner}/{name}/issues/{number:int}",
@@ -271,6 +275,19 @@ describe("parseConnector", () => {
       operations: [{ grants: ["logs:read"], asset: { kind: "k", surface: "weird" } }],
     };
     expect(() => parseConnector(bad, "x")).toThrow(/surface/);
+  });
+
+  test("rejects malformed asset data extractor values", () => {
+    const withData = (data: unknown) => ({
+      ...datadogRaw,
+      operations: [{ grants: ["logs:read"], asset: { kind: "k", surface: "asset", data } }],
+    });
+    expect(() => parseConnector(withData({ f: [] }), "x")).toThrow(/asset\.data\.f/);
+    expect(() => parseConnector(withData({ f: [42] }), "x")).toThrow(/asset\.data\.f/);
+    expect(() => parseConnector(withData({ f: "" }), "x")).toThrow(/asset\.data\.f/);
+    // Both the single-path and chain forms parse.
+    const c = parseConnector(withData({ a: "$.resp.a", b: ["$.resp.b", "$.vars.b"] }), "x");
+    expect(c.operations[0]!.asset?.data).toEqual({ a: "$.resp.a", b: ["$.resp.b", "$.vars.b"] });
   });
 
   test("rejects a urlFallback with a bad pattern or an undeclared capture", () => {
@@ -594,8 +611,11 @@ describe("compileIntegrationPolicy — GraphQL (ADR 0059)", () => {
       success_no_graphql_errors: true,
       success_status_class: null,
     });
+    // A chained data value flattens to repeated [field, path] pairs in order
+    // (the proxy takes the first that resolves) — the wire shape is unchanged.
     expect(policy.observes[0]!.data).toEqual([
       ["id", "$.resp.data.createIssue.issue.id"],
+      ["title", "$.resp.data.createIssue.issue.title"],
       ["title", "$.vars.input.title"],
     ]);
     // GraphQL parity: the URL fallback compiles to the snake_case wire shape.
@@ -653,10 +673,22 @@ describe("on-disk registry", () => {
     const policy = compileIntegrationPolicy(["github:pulls:write"]);
     const gql = policy.observes.find((o) => o.graphql_field === "createPullRequest");
     expect(gql).toBeDefined();
-    const data = new Map(gql!.data);
-    expect(data.get("title")).toBe("$.vars.input.title");
-    expect(data.get("head_branch")).toBe("$.vars.input.headRefName");
-    expect(data.get("base_branch")).toBe("$.vars.input.baseRefName");
+    // title/branches are response-first fallback chains: `gh` selects only
+    // id+url (vars fills them), while a client that inlines its arguments but
+    // selects the fields still gets the response values (PR #904 review).
+    const pathsFor = (field: string) => gql!.data.filter(([k]) => k === field).map(([, p]) => p);
+    expect(pathsFor("title")).toEqual([
+      "$.resp.data.createPullRequest.pullRequest.title",
+      "$.vars.input.title",
+    ]);
+    expect(pathsFor("head_branch")).toEqual([
+      "$.resp.data.createPullRequest.pullRequest.headRefName",
+      "$.vars.input.headRefName",
+    ]);
+    expect(pathsFor("base_branch")).toEqual([
+      "$.resp.data.createPullRequest.pullRequest.baseRefName",
+      "$.vars.input.baseRefName",
+    ]);
     expect(gql!.url_fallback).toEqual({
       pattern: "https://github.com/{owner}/{name}/pull/{number:int}",
       fields: [

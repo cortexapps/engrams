@@ -363,6 +363,8 @@ pub struct ObserveEntry {
     pub success: SuccessRule,
     /// `(field name, extractor path)` pairs, e.g. `("number", "$.resp.number")`
     /// or `("title", "$.vars.input.title")` (GraphQL request variables).
+    /// Repeated field names form a fallback chain — the first extractor that
+    /// resolves wins (`observe::evaluate`).
     pub data: Vec<(String, String)>,
     /// Extractor path yielding an external URL, e.g. `"$.resp.html_url"`.
     pub fetchable: Option<String>,

@@ -95,12 +95,15 @@ export interface AssetUrlFallback {
   fields: Record<string, string>;
 }
 
-/** Response→asset map (consumed in Phase 4; validated + carried now). */
+/** Response→asset map (consumed in Phase 4; validated + carried now). A `data`
+ * value may be a single extractor path or a FALLBACK CHAIN (`string[]`, tried
+ * in order — the proxy takes the first path that resolves). Chains compile to
+ * repeated `[field, path]` wire pairs, keeping the wire shape unchanged. */
 export interface AssetSpec {
   kind: string;
   surface: "action" | "asset";
   success?: Record<string, unknown>;
-  data?: Record<string, string>;
+  data?: Record<string, string | string[]>;
   fetchable?: Record<string, string>;
   urlFallback?: AssetUrlFallback;
 }
@@ -956,11 +959,22 @@ export function parseConnector(raw: unknown, where: string): Connector {
         }
         urlFallback = { pattern: u.pattern, fields: u.fields as Record<string, string> };
       }
+      if (a.data !== undefined) {
+        if (typeof a.data !== "object" || a.data === null || Array.isArray(a.data)) {
+          fail(opWhere, '"asset.data" must be an object of field → extractor path(s)');
+        }
+        for (const [field, v] of Object.entries(a.data as Record<string, unknown>)) {
+          const chain = Array.isArray(v) ? v : [v];
+          if (chain.length === 0 || !chain.every((p) => typeof p === "string" && p)) {
+            fail(opWhere, `"asset.data.${field}" must be a non-empty extractor path or a non-empty array of them`);
+          }
+        }
+      }
       asset = {
         kind: a.kind,
         surface: a.surface,
         ...(a.success !== undefined ? { success: a.success as Record<string, unknown> } : {}),
-        ...(a.data !== undefined ? { data: a.data as Record<string, string> } : {}),
+        ...(a.data !== undefined ? { data: a.data as Record<string, string | string[]> } : {}),
         ...(a.fetchable !== undefined ? { fetchable: a.fetchable as Record<string, string> } : {}),
         ...(urlFallback ? { urlFallback } : {}),
       };
@@ -1255,7 +1269,11 @@ export function compileIntegrationPolicy(
           success_no_graphql_errors: a.success?.noGraphqlErrors === true,
           graphql_operation,
           graphql_field,
-          data: Object.entries(a.data ?? {}),
+          // A `string[]` data value is a fallback chain — flattened to repeated
+          // `[field, path]` pairs; the proxy takes the first path that resolves.
+          data: Object.entries(a.data ?? {}).flatMap(([field, v]): [string, string][] =>
+            (Array.isArray(v) ? v : [v]).map((path) => [field, path]),
+          ),
           fetchable: typeof fetchableExternal === "string" ? fetchableExternal : null,
           url_fallback: a.urlFallback
             ? { pattern: a.urlFallback.pattern, fields: Object.entries(a.urlFallback.fields) }
