@@ -314,19 +314,11 @@ async fn seed_active_session(
     meta.assign_session_host(session_id, Some(host_id))
         .await
         .expect("assign_session_host");
-    meta.assign_session_sandbox(session_id, Some(sandbox_id))
+    // create_session lands at Pending; bind via the production fused
+    // path (0108 forbids a bound Pending row), then drive to Active.
+    meta.transition_session_created(session_id, sandbox_id)
         .await
-        .expect("assign_session_sandbox");
-    // create_session lands at Pending; create_session_created is the
-    // production path that goes straight to Created. Drive the
-    // sequence so we end at Active for our tests.
-    meta.transition_session(
-        session_id,
-        SessionState::Created,
-        BindingDisposition::Retain,
-    )
-    .await
-    .expect("Pending → Created");
+        .expect("Pending → Created (fused bind)");
     meta.transition_session(session_id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("Created → Active");

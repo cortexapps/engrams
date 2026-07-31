@@ -81,10 +81,8 @@ async fn seed_idle_unbound(meta: &Arc<dyn MetadataStore>) -> SessionId {
         .await
         .expect("create");
     let sandbox = SandboxId::new();
-    meta.assign_session_sandbox(id, Some(sandbox))
-        .await
-        .expect("bind sandbox");
-    meta.transition_session(id, SessionState::Created, BindingDisposition::Retain)
+    // 0108: bind via the production fused path, never on a Pending row.
+    meta.transition_session_created(id, sandbox)
         .await
         .expect("pending->created");
     meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
