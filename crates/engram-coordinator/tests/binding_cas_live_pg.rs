@@ -180,7 +180,8 @@ async fn guarded_clear_does_not_null_a_fresh_rebind() {
         .await
         .expect("create");
     let sandbox_a = SandboxId::new();
-    meta.assign_session_sandbox(id, Some(sandbox_a))
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(id, sandbox_a)
         .await
         .expect("bind A");
 
@@ -222,7 +223,8 @@ async fn guarded_clear_fires_on_the_matching_sandbox() {
         .await
         .expect("create");
     let sandbox = SandboxId::new();
-    meta.assign_session_sandbox(id, Some(sandbox))
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(id, sandbox)
         .await
         .expect("bind");
 

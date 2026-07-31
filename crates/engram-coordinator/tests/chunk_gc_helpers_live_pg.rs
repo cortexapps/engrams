@@ -164,7 +164,8 @@ async fn list_live_session_disk_manifest_ids_picks_up_live_writes() {
         .await
         .expect("create session");
     let sandbox_id = SandboxId::new();
-    meta.assign_session_sandbox(session_id, Some(sandbox_id))
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(session_id, sandbox_id)
         .await
         .expect("assign sandbox");
 
