@@ -2708,6 +2708,13 @@ mod adapter {
                         // have emptied it (disarmed above, but re-check
                         // defensively) and the turn may have ended on its
                         // own (the boundary already consumed the prompt).
+                        // This MUST stay an arm of the else-chain below: the
+                        // chain's tail treats any unclaimed wake as the
+                        // max_run_secs turn deadline and KILLS claude — a
+                        // steer wake falling through would tear down the
+                        // very process it was steering (caught by CI round 2
+                        // on PR #903: the reap surfaced RunInterrupted +
+                        // Idle instead of the steered RunStarted).
                         steer_deadline = None;
                         if !shutting_down && interrupted_run.is_none() && !pending.is_empty() {
                             if let Some(rid) = turn.as_ref().map(|t| t.run_id.clone()) {
@@ -2721,8 +2728,9 @@ mod adapter {
                                 .await;
                             }
                         }
-                    }
-                    if interrupt_deadline.is_some_and(|d| Instant::now() >= d) && turn.is_some() {
+                    } else if interrupt_deadline.is_some_and(|d| Instant::now() >= d)
+                        && turn.is_some()
+                    {
                         // Phase 3 fallback: the `control_request` interrupt
                         // wasn't honored within grace (a claude build lacking
                         // the control frame). Escalate to SIGINT — claude
