@@ -21,10 +21,14 @@ tracing.workspace = true
 # we don't have to re-buffer on the GET side.
 google-cloud-storage = { version = "0.24", default-features = false, features = ["rustls-tls", "auth"] }
 # The SDK accepts an injected `ClientConfig.http` — we build our own
-# tuned reqwest client (async hickory DNS with caching instead of the
-# hidden getaddrinfo threadpool, bounded connect, sized keep-alive
-# pool) rather than taking the SDK's untuned default.
-reqwest = { workspace = true, features = ["hickory-dns"] }
+# tuned reqwest client (bounded connect, sized keep-alive pool,
+# pinned http1) rather than taking the SDK's untuned default. NO
+# extra reqwest features here: `hickory-dns` (like `http2`, see
+# lib.rs) unifies workspace-wide and flips the DEFAULT resolver for
+# every reqwest client off getaddrinfo — adopt deliberately with
+# k8s resolv.conf (ndots/search/hosts) validation, never as a side
+# effect.
+reqwest = { workspace = true }
 reqwest-middleware = "0.4"
 workspace-hack = { version = "0.1", path = "../../workspace-hack" }
 

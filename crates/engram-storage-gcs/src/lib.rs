@@ -61,14 +61,19 @@ impl GcsBlobStorage {
         let mut cfg = Self::auth_config().await?;
         // Inject our own transport instead of the SDK's untuned default
         // (per TigerBeetle's object-storage-client findings, 2026-07):
-        // - hickory async DNS: cached, TTL-aware, no getaddrinfo
-        //   threadpool hop on every fresh connection.
         // - bounded connect: a blackholed endpoint fails in 5 s and
         //   surfaces to the BlobClient retry layer, instead of pinning
         //   an attempt for the OS default (minutes).
         // - sized keep-alive pool: the sparse re-chunk and NBD flush
         //   fan out dozens of concurrent chunk ops; idle-connection
-        //   reuse keeps those off the TLS-handshake path.
+        //   reuse keeps those off the TLS-handshake path — and keeps
+        //   DNS off the hot path entirely, which is why hickory async
+        //   DNS was tried and RETIRED here: reqwest's `hickory-dns`
+        //   feature unifies workspace-wide and flips the DEFAULT
+        //   resolver for every reqwest client off getaddrinfo
+        //   (different ndots/search/hosts semantics under the k8s
+        //   fleet's resolv.conf) — the same silent-global reach as
+        //   the rejected `http2` feature below.
         // No global request timeout here — bodies are GB-scale on the
         // streaming paths; per-attempt deadlines live in BlobClient.
         //
@@ -86,7 +91,6 @@ impl GcsBlobStorage {
         // ever arriving transitively; to re-test h2, re-run blobbench
         // with the feature enabled rather than trusting this number.
         let http = reqwest::Client::builder()
-            .hickory_dns(true)
             .connect_timeout(std::time::Duration::from_secs(5))
             .pool_max_idle_per_host(64)
             .pool_idle_timeout(std::time::Duration::from_secs(90))
