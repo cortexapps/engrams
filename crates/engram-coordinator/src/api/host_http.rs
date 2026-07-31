@@ -29,6 +29,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use chrono::{DateTime, Utc};
 use engram_core::types::host::{HostCapacity, HostHeartbeat, HostMetadata, HostRecord, HostStatus};
+use engram_core::types::BindingDisposition;
 use engram_core::{HostId, SandboxId, SessionId, SessionState};
 use engram_harness_proto::HarnessEvent;
 use engram_protocol::heartbeat::{EnabledImageRef, HostCapacityReport, ManifestDigest};
@@ -999,7 +1000,11 @@ pub async fn heartbeat(
                 match state
                     .services
                     .meta
-                    .transition_session(*session_id, engram_core::types::SessionState::Unreachable)
+                    .transition_session(
+                        *session_id,
+                        engram_core::types::SessionState::Unreachable,
+                        BindingDisposition::Retain,
+                    )
                     .await
                 {
                     Ok(prev) => {

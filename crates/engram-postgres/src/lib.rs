@@ -18,10 +18,10 @@ use engram_core::traits::{
 };
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
 use engram_core::types::{
-    ArtifactRow, Capability, CaptureJobAssignment, CaptureJobReport, CaptureJobRow,
-    CaptureTerminalReport, ColdBaseRow, EnableJob, EnableJobState, EnabledImage, HostRecord,
-    HostStatus, NewCaptureJob, PersistedEvent, RegistryCredential, Session, SessionSecrets,
-    SessionSpec, SessionState, SnapshotRecord,
+    ArtifactRow, BindingDisposition, Capability, CaptureJobAssignment, CaptureJobReport,
+    CaptureJobRow, CaptureTerminalReport, ColdBaseRow, EnableJob, EnableJobState, EnabledImage,
+    HostRecord, HostStatus, NewCaptureJob, PersistedEvent, RegistryCredential, Session,
+    SessionSecrets, SessionSpec, SessionState, SnapshotRecord,
 };
 use engram_core::{CaptureJobId, HostId, MetaError, SandboxId, SessionId, SnapshotId};
 use row::col_err;
@@ -2224,6 +2224,7 @@ impl MetadataStore for PostgresStore {
         &self,
         id: SessionId,
         target: SessionState,
+        disposition: BindingDisposition,
     ) -> Result<SessionState, MetaError> {
         // SELECT-then-UPDATE under a row-level lock so two concurrent
         // callers can't both validate against the same pre-state. The
@@ -2232,7 +2233,7 @@ impl MetadataStore for PostgresStore {
         let mut tx = self.pool.begin().await.map_err(db_err)?;
         let row = sqlx::query(
             r#"
-            SELECT status FROM sessions WHERE id = $1 FOR UPDATE
+            SELECT status, sandbox_id FROM sessions WHERE id = $1 FOR UPDATE
             "#,
         )
         .bind(id.as_uuid())
@@ -2256,6 +2257,25 @@ impl MetadataStore for PostgresStore {
             );
             MetaError::Conflict(e.to_string())
         })?;
+        // #896 / ADR 0090 addendum: the binding disposition is checked
+        // under the SAME row lock as the state-pair legality — a bound
+        // row arriving where the disposition forbids it is a Conflict,
+        // never a silent write.
+        let arriving_bound: Option<uuid::Uuid> = row.try_get("sandbox_id").map_err(|e| {
+            MetaError::Serialization(format!("transition_session: read sandbox_id: {e}"))
+        })?;
+        if !target.binding_disposition_legal(arriving_bound.is_some(), disposition) {
+            tracing::warn!(
+                session_id = %id,
+                to = %target.as_str(),
+                ?disposition,
+                "rejected illegal binding disposition for bound row"
+            );
+            return Err(MetaError::Conflict(format!(
+                "illegal binding disposition {disposition:?} into {} on a bound row",
+                target.as_str()
+            )));
+        }
         // ADR 0018 commit 12b: entering Evacuating resets
         // `evac_attempts` to 0 so a fresh drain (operator or
         // dead-host detector) starts the scanner's retry budget
@@ -2277,6 +2297,7 @@ impl MetadataStore for PostgresStore {
                SET status = $2,
                    last_active_at = $3,
                    updated_at = $3,
+                   sandbox_id = CASE WHEN $4 THEN NULL ELSE sandbox_id END,
                    evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
                    evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
                    queued_at = CASE WHEN $2 = 'queued' THEN $3 ELSE queued_at END,
@@ -2289,6 +2310,7 @@ impl MetadataStore for PostgresStore {
         .bind(id.as_uuid())
         .bind(target.as_str())
         .bind(self.clock.now_utc())
+        .bind(matches!(disposition, BindingDisposition::Detach))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?;
@@ -7025,6 +7047,7 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         epoch: i64,
         to: SessionState,
+        disposition: BindingDisposition,
     ) -> Result<Option<SessionState>, MetaError> {
         // Same legality semantics as `transition_session` (SELECT-then-
         // UPDATE under the row lock, `try_transition_to` gating the
@@ -7033,13 +7056,14 @@ impl MetadataStore for PostgresStore {
         // write (0 rows because `current_epoch` moved) is `Ok(None)` —
         // the op executor was superseded and must stop silently.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let row =
-            sqlx::query("SELECT status, current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
-                .bind(session_id.as_uuid())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?
-                .ok_or(MetaError::NotFound)?;
+        let row = sqlx::query(
+            "SELECT status, current_epoch, sandbox_id FROM sessions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
         // ADR 0079 (review finding #3): the FENCE CHECK MUST PRECEDE the
         // legality check. A fenced executor whose successor already
         // transitioned would otherwise see the successor's *resulting*
@@ -7070,6 +7094,18 @@ impl MetadataStore for PostgresStore {
             );
             MetaError::Conflict(e.to_string())
         })?;
+        // #896 / ADR 0090 addendum: disposition legality under the same
+        // row lock (after the fence check — a fenced executor stops
+        // silently before any legality noise).
+        let arriving_bound: Option<uuid::Uuid> = row.try_get("sandbox_id").map_err(|e| {
+            MetaError::Serialization(format!("fenced_transition_session: read sandbox_id: {e}"))
+        })?;
+        if !to.binding_disposition_legal(arriving_bound.is_some(), disposition) {
+            return Err(MetaError::Conflict(format!(
+                "illegal binding disposition {disposition:?} into {} on a bound row",
+                to.as_str()
+            )));
+        }
         // The same UPDATE `transition_session` commits (counter resets
         // included), fenced by the epoch predicate.
         let n = sqlx::query(
@@ -7078,6 +7114,7 @@ impl MetadataStore for PostgresStore {
                SET status = $2,
                    last_active_at = $4,
                    updated_at = $4,
+                   sandbox_id = CASE WHEN $5 THEN NULL ELSE sandbox_id END,
                    evac_attempts = CASE WHEN $2 = 'evacuating' THEN 0 ELSE evac_attempts END,
                    evict_attempts = CASE WHEN $2 = 'evicting' THEN 0 ELSE evict_attempts END,
                    queued_at = CASE WHEN $2 = 'queued' THEN $4 ELSE queued_at END,
@@ -7091,6 +7128,7 @@ impl MetadataStore for PostgresStore {
         .bind(to.as_str())
         .bind(epoch)
         .bind(self.clock.now_utc())
+        .bind(matches!(disposition, BindingDisposition::Detach))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?
@@ -7112,7 +7150,7 @@ impl MetadataStore for PostgresStore {
         session_id: SessionId,
         epoch: i64,
         to: SessionState,
-        detach_sandbox: bool,
+        disposition: BindingDisposition,
         events: &[(String, serde_json::Value)],
     ) -> Result<Option<(SessionState, Vec<i64>)>, MetaError> {
         // `fenced_transition_session` with the event appends folded into
@@ -7123,13 +7161,14 @@ impl MetadataStore for PostgresStore {
         // pg_notify calls fire only on COMMIT, so subscribers never hear
         // about a rolled-back transition.
         let mut tx = self.pool.begin().await.map_err(db_err)?;
-        let row =
-            sqlx::query("SELECT status, current_epoch FROM sessions WHERE id = $1 FOR UPDATE")
-                .bind(session_id.as_uuid())
-                .fetch_optional(&mut *tx)
-                .await
-                .map_err(db_err)?
-                .ok_or(MetaError::NotFound)?;
+        let row = sqlx::query(
+            "SELECT status, current_epoch, sandbox_id FROM sessions WHERE id = $1 FOR UPDATE",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .ok_or(MetaError::NotFound)?;
         // Fence check BEFORE legality — same rationale as
         // `fenced_transition_session` (ADR 0079 review finding #3).
         let stored_epoch: i64 = row.try_get("current_epoch").map_err(|e| {
@@ -7155,6 +7194,19 @@ impl MetadataStore for PostgresStore {
             );
             MetaError::Conflict(e.to_string())
         })?;
+        // #896 / ADR 0090 addendum: disposition legality under the same
+        // row lock, after the fence check.
+        let arriving_bound: Option<uuid::Uuid> = row.try_get("sandbox_id").map_err(|e| {
+            MetaError::Serialization(format!(
+                "fenced_transition_session_with_events: read sandbox_id: {e}"
+            ))
+        })?;
+        if !to.binding_disposition_legal(arriving_bound.is_some(), disposition) {
+            return Err(MetaError::Conflict(format!(
+                "illegal binding disposition {disposition:?} into {} on a bound row",
+                to.as_str()
+            )));
+        }
         let now = self.clock.now_utc();
         let n = sqlx::query(
             r#"
@@ -7176,7 +7228,7 @@ impl MetadataStore for PostgresStore {
         .bind(to.as_str())
         .bind(epoch)
         .bind(now)
-        .bind(detach_sandbox)
+        .bind(matches!(disposition, BindingDisposition::Detach))
         .execute(&mut *tx)
         .await
         .map_err(db_err)?

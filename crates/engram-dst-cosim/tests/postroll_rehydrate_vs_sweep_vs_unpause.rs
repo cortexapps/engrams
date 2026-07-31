@@ -27,6 +27,7 @@
 //! gate) together is the rung-2 increment.
 
 use engram_core::types::session::SessionState;
+use engram_core::types::BindingDisposition;
 use engram_dst_cosim::Cosim;
 
 /// A `HostLost` survivor with a live VM but a dropped local binding must be
@@ -42,7 +43,7 @@ async fn hostlost_survivor_with_dropped_binding_is_repaired_not_reaped() {
 
     // The dead-host detector flips the session to HostLost; the VM survives
     // (pidfd-reattached). The coordinator row keeps sandbox_id + host_id.
-    sim.force_session_state(session, SessionState::HostLost)
+    sim.force_session_state(session, SessionState::HostLost, BindingDisposition::Retain)
         .await;
     // The host-agent rolled: its in-RAM binding table died, so reconcile has
     // no local binding for the surviving VM (the exact post-roll blind spot).
@@ -82,7 +83,8 @@ async fn terminal_sessions_leftover_vm_is_still_reaped() {
 
     // The session failed terminally, but its VM leaked and its local binding
     // is gone.
-    sim.force_session_state(session, SessionState::Failed).await;
+    sim.force_session_state(session, SessionState::Failed, BindingDisposition::Detach)
+        .await;
     sim.drop_local_binding(sandbox);
 
     for _ in 0..3 {

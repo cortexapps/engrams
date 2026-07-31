@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use engram_core::traits::SessionFence;
 use engram_core::types::session_op::{EnqueueOutcome, OpKind, OpState, SessionOp};
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::SessionId;
 use tokio::sync::Notify;
@@ -200,14 +201,19 @@ pub(crate) async fn transition_with_fence(
     session_id: SessionId,
     fence: SessionFence,
     to: SessionState,
+    disposition: BindingDisposition,
 ) -> Result<SessionState, engram_core::MetaError> {
     if fence.epoch == 0 {
-        return state.services.meta.transition_session(session_id, to).await;
+        return state
+            .services
+            .meta
+            .transition_session(session_id, to, disposition)
+            .await;
     }
     match state
         .services
         .meta
-        .fenced_transition_session(session_id, fence.epoch as i64, to)
+        .fenced_transition_session(session_id, fence.epoch as i64, to, disposition)
         .await?
     {
         Some(prev) => Ok(prev),
@@ -239,7 +245,7 @@ pub(crate) async fn transition_with_fence_emitting(
     session_id: SessionId,
     fence: SessionFence,
     to: SessionState,
-    detach_sandbox: bool,
+    disposition: BindingDisposition,
     events: Vec<crate::state::SessionEvent>,
 ) -> Result<SessionState, engram_core::MetaError> {
     debug_assert!(
@@ -251,13 +257,12 @@ pub(crate) async fn transition_with_fence_emitting(
     );
     if fence.epoch == 0 {
         // Unfenced interim path: plain transition, then plain appends —
-        // no fence exists to race, so the atomicity doesn't apply. (No
-        // unfenced caller detaches.)
-        debug_assert!(!detach_sandbox, "detach requires the fenced path");
+        // no fence exists to race, so the atomicity doesn't apply. The
+        // plain transition applies the same disposition contract (#896).
         let prev = state
             .services
             .meta
-            .transition_session(session_id, to)
+            .transition_session(session_id, to, disposition)
             .await?;
         for event in events {
             let _ = state.emit(session_id, event).await;
@@ -272,7 +277,7 @@ pub(crate) async fn transition_with_fence_emitting(
             session_id,
             fence.epoch as i64,
             to,
-            detach_sandbox,
+            disposition,
             &wire,
         )
         .await?

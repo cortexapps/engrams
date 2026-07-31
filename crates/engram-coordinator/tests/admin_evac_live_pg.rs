@@ -29,6 +29,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -313,16 +314,12 @@ async fn seed_active_session(
     meta.assign_session_host(session_id, Some(host_id))
         .await
         .expect("assign_session_host");
-    meta.assign_session_sandbox(session_id, Some(sandbox_id))
+    // create_session lands at Pending; bind via the production fused
+    // path (0108 forbids a bound Pending row), then drive to Active.
+    meta.transition_session_created(session_id, sandbox_id)
         .await
-        .expect("assign_session_sandbox");
-    // create_session lands at Pending; create_session_created is the
-    // production path that goes straight to Created. Drive the
-    // sequence so we end at Active for our tests.
-    meta.transition_session(session_id, SessionState::Created)
-        .await
-        .expect("Pending → Created");
-    meta.transition_session(session_id, SessionState::Active)
+        .expect("Pending → Created (fused bind)");
+    meta.transition_session(session_id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("Created → Active");
     session_id
@@ -385,9 +382,13 @@ async fn evacuate_dead_source_with_snapshot_uses_recorded_manifests() {
     let session_id = seed_active_session(&meta, dead_source, SandboxId::new()).await;
     ensure_host_row(&meta, target_host, "target").await;
     // Simulate dead_host.rs's first-stage flip: Active → HostLost.
-    meta.transition_session(session_id, SessionState::HostLost)
-        .await
-        .expect("Active → HostLost");
+    meta.transition_session(
+        session_id,
+        SessionState::HostLost,
+        BindingDisposition::Retain,
+    )
+    .await
+    .expect("Active → HostLost");
 
     // Record a recoverable snapshot for this session.
     let disk = seed_manifest(&rig.chunk_store, ManifestKind::Disk, "snap-disk").await;
@@ -465,9 +466,13 @@ async fn evacuate_dead_source_disk_only_records_memory_loss() {
         .await
         .expect("update_live_disk_manifest");
 
-    meta.transition_session(session_id, SessionState::HostLost)
-        .await
-        .expect("Active → HostLost");
+    meta.transition_session(
+        session_id,
+        SessionState::HostLost,
+        BindingDisposition::Retain,
+    )
+    .await
+    .expect("Active → HostLost");
 
     let session = meta.get_session(session_id).await.expect("get session");
     // ADR 0028 Fix B: disk-only recovery is a cold boot — the caller
@@ -510,9 +515,13 @@ async fn evacuate_dead_source_no_state_returns_no_recoverable() {
     registry.register(target_host, FakeBackend::new());
 
     let session_id = seed_active_session(&meta, dead_source, SandboxId::new()).await;
-    meta.transition_session(session_id, SessionState::HostLost)
-        .await
-        .expect("Active → HostLost");
+    meta.transition_session(
+        session_id,
+        SessionState::HostLost,
+        BindingDisposition::Retain,
+    )
+    .await
+    .expect("Active → HostLost");
 
     let session = meta.get_session(session_id).await.expect("get session");
     let result = evacuate_dead_source(
@@ -602,9 +611,13 @@ async fn evac_attempts_primitives_round_trip() {
     let session_id = seed_active_session(&meta, host_id, sandbox_id).await;
 
     // Active → Evacuating (legal, sets counter to 0)
-    meta.transition_session(session_id, SessionState::Evacuating)
-        .await
-        .expect("Active → Evacuating");
+    meta.transition_session(
+        session_id,
+        SessionState::Evacuating,
+        BindingDisposition::Retain,
+    )
+    .await
+    .expect("Active → Evacuating");
 
     let candidates = meta
         .list_evacuating_sessions()
@@ -629,7 +642,7 @@ async fn evac_attempts_primitives_round_trip() {
 
     // Transition out (Evacuating → Idle) — counter NOT reset (only
     // re-entry into Evacuating resets, per migration 0037's CASE).
-    meta.transition_session(session_id, SessionState::Idle)
+    meta.transition_session(session_id, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("Evacuating → Idle (budget-exhaustion fallback shape)");
     let candidates = meta.list_evacuating_sessions().await.unwrap();
@@ -645,15 +658,23 @@ async fn evac_attempts_primitives_round_trip() {
     meta.assign_session_sandbox(session_id, Some(SandboxId::new()))
         .await
         .unwrap();
-    meta.transition_session(session_id, SessionState::Created)
-        .await
-        .expect("Idle → Created");
-    meta.transition_session(session_id, SessionState::Active)
+    meta.transition_session(
+        session_id,
+        SessionState::Created,
+        BindingDisposition::Retain,
+    )
+    .await
+    .expect("Idle → Created");
+    meta.transition_session(session_id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("Created → Active");
-    meta.transition_session(session_id, SessionState::Evacuating)
-        .await
-        .expect("Active → Evacuating (second drain)");
+    meta.transition_session(
+        session_id,
+        SessionState::Evacuating,
+        BindingDisposition::Retain,
+    )
+    .await
+    .expect("Active → Evacuating (second drain)");
 
     let candidates = meta.list_evacuating_sessions().await.unwrap();
     let on_reentry = candidates.iter().find(|(s, _)| s.id == session_id).unwrap();
@@ -1048,7 +1069,7 @@ async fn delete_host_refuses_bound_then_idempotent() {
 
     // Move the session out of the bound set (Idle is not counted). Now
     // the host is drainable.
-    meta.transition_session(sid, SessionState::Idle)
+    meta.transition_session(sid, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("Active → Idle");
 

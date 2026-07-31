@@ -2178,6 +2178,7 @@ pub(crate) mod tests {
             &self,
             id: engram_core::SessionId,
             target: engram_core::types::SessionState,
+            _disposition: engram_core::types::BindingDisposition,
         ) -> Result<engram_core::types::SessionState, MetaError> {
             let mut s = self.session.lock();
             if id != s.id {
@@ -2845,11 +2846,14 @@ pub(crate) mod tests {
             session_id: SessionId,
             epoch: i64,
             to: engram_core::types::SessionState,
+            _disposition: engram_core::types::BindingDisposition,
         ) -> Result<Option<engram_core::types::SessionState>, MetaError> {
             if self.ops.current_epoch(session_id) != epoch {
                 return Ok(None);
             }
-            self.transition_session(session_id, to).await.map(Some)
+            self.transition_session(session_id, to, _disposition)
+                .await
+                .map(Some)
         }
 
         async fn fenced_transition_session_with_events(
@@ -2857,7 +2861,7 @@ pub(crate) mod tests {
             session_id: SessionId,
             epoch: i64,
             to: engram_core::types::SessionState,
-            detach_sandbox: bool,
+            _disposition: engram_core::types::BindingDisposition,
             events: &[(String, serde_json::Value)],
         ) -> Result<Option<(engram_core::types::SessionState, Vec<i64>)>, MetaError> {
             // In-memory "transaction": the fence gates once, then the flip
@@ -2868,8 +2872,10 @@ pub(crate) mod tests {
             if self.ops.current_epoch(session_id) != epoch {
                 return Ok(None);
             }
-            let prev = self.transition_session(session_id, to).await?;
-            if detach_sandbox {
+            let prev = self
+                .transition_session(session_id, to, _disposition)
+                .await?;
+            if matches!(_disposition, engram_core::types::BindingDisposition::Detach) {
                 self.session.lock().sandbox_id = None;
             }
             let mut indices = Vec::with_capacity(events.len());

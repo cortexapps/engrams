@@ -21,6 +21,7 @@ use engram_core::traits::storage::BlobStorage;
 use engram_core::traits::SessionFence;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionState};
 use engram_core::{MetaError, SandboxError, SandboxId, SessionId};
 use serde::Serialize;
@@ -931,38 +932,43 @@ pub(crate) async fn ascend_evicting_to_active_with(
             }
         }
     }
-    let result =
-        match crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active)
-            .await
-        {
-            Ok(prev) => {
-                ::metrics::counter!(crate::metrics::EVICTION_CANCELLED_TOTAL).increment(1);
-                tracing::info!(
-                    session_id = %id,
-                    park_rung = if parked_paused { 2 } else { 1 },
-                    "eviction cancelled — the user came back before/at the parking rung",
-                );
-                let _ = state
-                    .emit_fenced(
-                        id,
-                        fence,
-                        crate::state::SessionEvent::StatusChanged {
-                            from: prev,
-                            to: SessionState::Active,
-                            at: state.services.clock.now_utc(),
-                        },
-                    )
-                    .await;
-                Ok(true)
-            }
-            // Raced out of Evicting between our caller's read and the cancel
-            // (e.g. the evict op finished to Idle first), or — on the fenced
-            // path — a successor op re-claimed the session (the `fenced:`
-            // Conflict). Not an error; the caller re-dispatches on the fresh
-            // status.
-            Err(engram_core::MetaError::Conflict(_)) => Ok(false),
-            Err(e) => Err(ApiError::Internal(format!("cancel evict: {e}"))),
-        };
+    let result = match crate::session_ops::transition_with_fence(
+        state,
+        id,
+        fence,
+        SessionState::Active,
+        BindingDisposition::Retain,
+    )
+    .await
+    {
+        Ok(prev) => {
+            ::metrics::counter!(crate::metrics::EVICTION_CANCELLED_TOTAL).increment(1);
+            tracing::info!(
+                session_id = %id,
+                park_rung = if parked_paused { 2 } else { 1 },
+                "eviction cancelled — the user came back before/at the parking rung",
+            );
+            let _ = state
+                .emit_fenced(
+                    id,
+                    fence,
+                    crate::state::SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Active,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+            Ok(true)
+        }
+        // Raced out of Evicting between our caller's read and the cancel
+        // (e.g. the evict op finished to Idle first), or — on the fenced
+        // path — a successor op re-claimed the session (the `fenced:`
+        // Conflict). Not an error; the caller re-dispatches on the fresh
+        // status.
+        Err(engram_core::MetaError::Conflict(_)) => Ok(false),
+        Err(e) => Err(ApiError::Internal(format!("cancel evict: {e}"))),
+    };
     result
 }
 
@@ -1310,7 +1316,7 @@ async fn transition_to_dead_if_no_snapshot(
     match state
         .services
         .meta
-        .transition_session(id, SessionState::Dead)
+        .transition_session(id, SessionState::Dead, BindingDisposition::Detach)
         .await
     {
         Ok(prev) => {
@@ -1599,13 +1605,19 @@ pub async fn finish_resume_to_active(
         // transition failure PROPAGATES: reporting CreatedHarnessFailed
         // for a row that never left Idle would double the divergence.
         if session.status == SessionState::Idle {
-            crate::session_ops::transition_with_fence(state, id, fence, SessionState::Created)
-                .await
-                .map_err(|e| {
-                    ApiError::Internal(format!(
-                        "resume: parking harness-failed session at Created failed: {e}"
-                    ))
-                })?;
+            crate::session_ops::transition_with_fence(
+                state,
+                id,
+                fence,
+                SessionState::Created,
+                BindingDisposition::Retain,
+            )
+            .await
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "resume: parking harness-failed session at Created failed: {e}"
+                ))
+            })?;
             let _ = state
                 .emit_fenced(
                     id,
@@ -1620,8 +1632,14 @@ pub async fn finish_resume_to_active(
         }
         return Ok(FinishResumeOutcome::CreatedHarnessFailed(err));
     }
-    let prev_for_active =
-        crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active).await?;
+    let prev_for_active = crate::session_ops::transition_with_fence(
+        state,
+        id,
+        fence,
+        SessionState::Active,
+        BindingDisposition::Retain,
+    )
+    .await?;
     if emit_status {
         let now = state.services.clock.now_utc();
         // Review finding #6: fenced. Ok(None) (a successor re-claimed) is
@@ -2008,7 +2026,7 @@ async fn resume_from_fc_snapshot(
             let _ = state
                 .services
                 .meta
-                .transition_session(id, SessionState::Dead)
+                .transition_session(id, SessionState::Dead, BindingDisposition::Detach)
                 .await;
             return Err(ApiError::Gone(
                 "snapshot_invalidated: session can't be revived; \
@@ -3014,7 +3032,7 @@ mod evicting_gate_tests {
             flip_state
                 .services
                 .meta
-                .transition_session(id, SessionState::Idle)
+                .transition_session(id, SessionState::Idle, BindingDisposition::Detach)
                 .await
                 .expect("Evicting → Idle is a legal transition");
             assert!(flip_mini.ops.finish(
@@ -3067,7 +3085,7 @@ mod evicting_gate_tests {
             flip_state
                 .services
                 .meta
-                .transition_session(id, SessionState::Completed)
+                .transition_session(id, SessionState::Completed, BindingDisposition::Detach)
                 .await
                 .expect("Evicting → Completed is a legal transition");
             assert!(flip_mini.ops.finish(

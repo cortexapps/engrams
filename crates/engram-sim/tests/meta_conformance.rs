@@ -12,6 +12,7 @@
 //! and runs in CI's Postgres-gated step alongside the coordinator's
 //! live-PG lane.
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -639,31 +640,161 @@ async fn session_lifecycle(ctx: &Ctx) {
 
     // Pending -> Active is illegal.
     let err = meta
-        .transition_session(id, SessionState::Active)
+        .transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
 
     // Pending -> Failed is legal and returns the previous state.
     let prev = meta
-        .transition_session(id, SessionState::Failed)
+        .transition_session(id, SessionState::Failed, BindingDisposition::Detach)
         .await
         .unwrap();
     assert_eq!(prev, SessionState::Pending);
 
     // Terminal: no exits.
     let err = meta
-        .transition_session(id, SessionState::Queued)
+        .transition_session(id, SessionState::Queued, BindingDisposition::Detach)
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)));
 
     // Missing row.
     let err = meta
-        .transition_session(SessionId::new(), SessionState::Failed)
+        .transition_session(
+            SessionId::new(),
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::NotFound));
+}
+
+/// #896 / ADR 0090 addendum: the BindingDisposition contract — checked
+/// identically by both stores, under the same lock as state legality.
+async fn binding_disposition_contract(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    // A bound row: create -> Created (transition_session_created binds).
+    let id = meta.create_session(spec("conf:disposition")).await.unwrap();
+    let sb = engram_core::SandboxId::new();
+    meta.transition_session_created(id, sb).await.unwrap();
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
+        .await
+        .unwrap();
+
+    // (1) Retain into a forbidden target on a bound row => Conflict, and
+    // NOTHING committed (state and binding unchanged).
+    let err = meta
+        .transition_session(id, SessionState::Failed, BindingDisposition::Retain)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.status, SessionState::Active);
+    assert_eq!(s.sandbox_id, Some(sb));
+
+    // (4) RequireUnbound on a bound row => Conflict; on an unbound row it
+    // holds (checked further below on the evacuating->idle residue path).
+    let err = meta
+        .transition_session(
+            id,
+            SessionState::Evacuating,
+            BindingDisposition::RequireUnbound,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
+
+    // (3) The residue lane: Evacuating retains; Retain -> Idle keeps the
+    // binding (the ONE authorized bound-Idle arrival).
+    meta.transition_session(id, SessionState::Evacuating, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    let prev = meta
+        .transition_session(id, SessionState::Idle, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    assert_eq!(prev, SessionState::Evacuating);
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.status, SessionState::Idle);
+    assert_eq!(s.sandbox_id, Some(sb), "the residue retains the binding");
+
+    // (2) Detach into a terminal clears the binding in the SAME write and
+    // returns the previous state.
+    let prev = meta
+        .transition_session(id, SessionState::Dead, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert_eq!(prev, SessionState::Idle);
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.status, SessionState::Dead);
+    assert_eq!(s.sandbox_id, None, "Detach clears atomically with the flip");
+
+    // (5) The fenced variants: same contract under a matching epoch; a
+    // fenced-out write leaves state AND binding untouched.
+    let id2 = meta
+        .create_session(spec("conf:disposition-fenced"))
+        .await
+        .unwrap();
+    let sb2 = engram_core::SandboxId::new();
+    meta.transition_session_created(id2, sb2).await.unwrap();
+    let epoch = {
+        // Claim an op to establish a real epoch (the fenced predicate).
+        let out = meta
+            .op_enqueue_and_claim(id2, OpKind::Resume, serde_json::json!({}), None, "conf-pod")
+            .await
+            .unwrap();
+        match out {
+            EnqueueOutcome::Claimed(op) => op.epoch.unwrap(),
+            other => panic!("expected a claim, got {other:?}"),
+        }
+    };
+    let err = meta
+        .fenced_transition_session(
+            id2,
+            epoch,
+            SessionState::Completed,
+            BindingDisposition::Retain,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
+    let fenced = meta
+        .fenced_transition_session(
+            id2,
+            epoch + 1,
+            SessionState::Active,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(fenced.is_none(), "stale epoch is a silent stop");
+    let s = meta.get_session(id2).await.unwrap();
+    assert_eq!(
+        s.sandbox_id,
+        Some(sb2),
+        "a fenced-out write leaves the binding"
+    );
+    let prev = meta
+        .fenced_transition_session(id2, epoch, SessionState::Active, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    assert_eq!(prev, Some(SessionState::Created));
+    let prev = meta
+        .fenced_transition_session_with_events(
+            id2,
+            epoch,
+            SessionState::Completed,
+            BindingDisposition::Detach,
+            &[("status_changed".to_string(), serde_json::json!({}))],
+        )
+        .await
+        .unwrap();
+    assert!(prev.is_some());
+    let s = meta.get_session(id2).await.unwrap();
+    assert_eq!(s.status, SessionState::Completed);
+    assert_eq!(s.sandbox_id, None);
 }
 
 /// The dead-host straggler listing returns only HostLost sessions.
@@ -678,10 +809,10 @@ async fn list_host_lost_sessions(ctx: &Ctx) {
         .await
         .unwrap();
 
-    meta.transition_session(stranded, SessionState::Created)
+    meta.transition_session(stranded, SessionState::Created, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(stranded, SessionState::HostLost)
+    meta.transition_session(stranded, SessionState::HostLost, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -698,10 +829,10 @@ async fn list_host_lost_sessions(ctx: &Ctx) {
 async fn terminate_and_delta(ctx: &Ctx) {
     let meta = &ctx.meta;
     let id = meta.create_session(spec("conf:terminate")).await.unwrap();
-    meta.transition_session(id, SessionState::Created)
+    meta.transition_session(id, SessionState::Created, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(id, SessionState::Active)
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -821,7 +952,7 @@ async fn queue_fifo(ctx: &Ctx) {
     // list decodes it instead of erroring on NULL queue_origin.
     ctx.clock.advance(Duration::from_secs(5));
     let c = meta.create_session(spec("conf:q")).await.unwrap();
-    meta.transition_session(c, SessionState::Queued)
+    meta.transition_session(c, SessionState::Queued, BindingDisposition::Detach)
         .await
         .unwrap();
     let q = meta.list_queued_sessions_fifo().await.unwrap();
@@ -1113,17 +1244,22 @@ async fn fenced_transition(ctx: &Ctx) {
     let epoch = op.epoch.unwrap();
 
     assert!(meta
-        .fenced_transition_session(sid, epoch + 1, SessionState::Failed)
+        .fenced_transition_session(
+            sid,
+            epoch + 1,
+            SessionState::Failed,
+            BindingDisposition::Detach
+        )
         .await
         .unwrap()
         .is_none());
     let err = meta
-        .fenced_transition_session(sid, epoch, SessionState::Active)
+        .fenced_transition_session(sid, epoch, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)));
     let prev = meta
-        .fenced_transition_session(sid, epoch, SessionState::Failed)
+        .fenced_transition_session(sid, epoch, SessionState::Failed, BindingDisposition::Detach)
         .await
         .unwrap();
     assert_eq!(prev, Some(SessionState::Pending));
@@ -1152,7 +1288,8 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
         .await
         .unwrap();
     let sb = engram_core::SandboxId::new();
-    meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
+    // 0108: bind via the production fused path, never on a Pending row.
+    meta.transition_session_created(sid, sb).await.unwrap();
     let events = vec![
         ("evicted".to_string(), serde_json::json!({"at": "t0"})),
         (
@@ -1163,19 +1300,31 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
 
     // Stale epoch: silent None, nothing lands.
     assert!(meta
-        .fenced_transition_session_with_events(sid, epoch + 1, SessionState::Failed, true, &events)
+        .fenced_transition_session_with_events(
+            sid,
+            epoch + 1,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+            &events
+        )
         .await
         .unwrap()
         .is_none());
-    // Illegal transition (Pending → Active): Conflict, nothing lands.
+    // Illegal transition (Created → Idle): Conflict, nothing lands.
     let err = meta
-        .fenced_transition_session_with_events(sid, epoch, SessionState::Active, true, &events)
+        .fenced_transition_session_with_events(
+            sid,
+            epoch,
+            SessionState::Idle,
+            BindingDisposition::Detach,
+            &events,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)));
     assert_eq!(
         meta.get_session(sid).await.unwrap().status,
-        SessionState::Pending,
+        SessionState::Created,
         "rejected calls must not flip state",
     );
     let leaked = meta
@@ -1195,11 +1344,17 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
     // Matching epoch: the flip and both events land together, indices
     // contiguous with the baseline append.
     let (prev, idxs) = meta
-        .fenced_transition_session_with_events(sid, epoch, SessionState::Failed, true, &events)
+        .fenced_transition_session_with_events(
+            sid,
+            epoch,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+            &events,
+        )
         .await
         .unwrap()
         .expect("matching epoch must land");
-    assert_eq!(prev, SessionState::Pending);
+    assert_eq!(prev, SessionState::Created);
     assert_eq!(idxs, vec![baseline + 1, baseline + 2]);
     let settled = meta.get_session(sid).await.unwrap();
     assert_eq!(settled.status, SessionState::Failed);
@@ -1246,7 +1401,9 @@ async fn enqueue_evacuating_resume(ctx: &Ctx) {
         SessionState::Active,
         SessionState::Evacuating,
     ] {
-        meta.transition_session(sid, target).await.unwrap();
+        meta.transition_session(sid, target, BindingDisposition::Retain)
+            .await
+            .unwrap();
     }
 
     // Wrong epoch: no-op (a reclaimed-away zombie can't fork the machine).
@@ -1299,7 +1456,9 @@ async fn enqueue_evacuating_resume(ctx: &Ctx) {
         SessionState::Active,
         SessionState::Idle,
     ] {
-        meta.transition_session(other, target).await.unwrap();
+        meta.transition_session(other, target, BindingDisposition::Retain)
+            .await
+            .unwrap();
     }
     assert!(
         !meta
@@ -1672,10 +1831,8 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
     let bind = |sid, h| async move {
         meta.assign_session_host(sid, Some(h)).await.unwrap();
         let sb = engram_core::SandboxId::new();
-        meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
-        meta.transition_session(sid, SessionState::Created)
-            .await
-            .unwrap();
+        // 0108: the production fused Pending→Created bind.
+        meta.transition_session_created(sid, sb).await.unwrap();
         sb
     };
 
@@ -1694,7 +1851,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     let sb_active = bind(s_active, host).await;
-    meta.transition_session(s_active, SessionState::Active)
+    meta.transition_session(s_active, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
     meta.update_live_disk_manifest(s_active, sb_active, mref(m_a, 5))
@@ -1714,7 +1871,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     let sb_parked = bind(s_parked, host).await;
-    meta.transition_session(s_parked, SessionState::Active)
+    meta.transition_session(s_parked, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
     meta.update_live_disk_manifest(s_parked, sb_parked, mref(m_b, 2))
@@ -1730,7 +1887,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .record_snapshot(snap_with(s_parked, later, true, Some(mref(m_d, 1))))
         .await
         .unwrap());
-    meta.transition_session(s_parked, SessionState::Evicting)
+    meta.transition_session(s_parked, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -1745,16 +1902,20 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     let sb_c_parked = bind(s_c_parked, host).await;
-    meta.transition_session(s_c_parked, SessionState::Active)
+    meta.transition_session(s_c_parked, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
     meta.update_live_disk_manifest(s_c_parked, sb_c_parked, mref(m_g, 3))
         .await
         .unwrap();
-    meta.transition_session(s_c_parked, SessionState::Evicting)
-        .await
-        .unwrap();
-    meta.transition_session(s_c_parked, SessionState::Parked)
+    meta.transition_session(
+        s_c_parked,
+        SessionState::Evicting,
+        BindingDisposition::Retain,
+    )
+    .await
+    .unwrap();
+    meta.transition_session(s_c_parked, SessionState::Parked, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -1781,10 +1942,10 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     bind(s_idle, host).await;
-    meta.transition_session(s_idle, SessionState::Active)
+    meta.transition_session(s_idle, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(s_idle, SessionState::Idle)
+    meta.transition_session(s_idle, SessionState::Idle, BindingDisposition::Detach)
         .await
         .unwrap();
     meta.assign_session_sandbox(s_idle, None).await.unwrap();
@@ -1795,9 +1956,13 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     bind(s_elsewhere, other_host).await;
-    meta.transition_session(s_elsewhere, SessionState::Active)
-        .await
-        .unwrap();
+    meta.transition_session(
+        s_elsewhere,
+        SessionState::Active,
+        BindingDisposition::Retain,
+    )
+    .await
+    .unwrap();
 
     let mut rows = meta
         .list_resident_sandboxes_on_host_with_disk_manifest(host)
@@ -1873,17 +2038,15 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     let sid = meta.create_session(spec("conf:parked")).await.unwrap();
     meta.assign_session_host(sid, Some(host)).await.unwrap();
     let sb = engram_core::SandboxId::new();
-    meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
-    meta.transition_session(sid, SessionState::Created)
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(sid, sb).await.unwrap();
+    meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid, SessionState::Active)
+    meta.transition_session(sid, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid, SessionState::Evicting)
-        .await
-        .unwrap();
-    meta.transition_session(sid, SessionState::Parked)
+    meta.transition_session(sid, SessionState::Parked, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -1950,7 +2113,7 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     );
 
     // Descend: Parked → Evicting (the explicit nomination edge).
-    meta.transition_session(sid, SessionState::Evicting)
+    meta.transition_session(sid, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
     assert!(meta.list_parked_sessions().await.unwrap().is_empty());
@@ -2067,22 +2230,20 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     // RAM died with the host).
     let sid2 = meta.create_session(spec("conf:parked-lost")).await.unwrap();
     meta.assign_session_host(sid2, Some(host)).await.unwrap();
-    meta.assign_session_sandbox(sid2, Some(engram_core::SandboxId::new()))
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(sid2, engram_core::SandboxId::new())
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Created)
+    meta.transition_session(sid2, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Active)
+    meta.transition_session(sid2, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Evicting)
+    meta.transition_session(sid2, SessionState::Parked, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Parked)
-        .await
-        .unwrap();
-    meta.transition_session(sid2, SessionState::HostLost)
+    meta.transition_session(sid2, SessionState::HostLost, BindingDisposition::Retain)
         .await
         .unwrap();
     assert_eq!(
@@ -2098,6 +2259,10 @@ conformance!(
 );
 conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
+conformance!(
+    t_binding_disposition_contract,
+    super::binding_disposition_contract
+);
 conformance!(t_session_exec_event_at, super::session_exec_event_at);
 conformance!(
     t_session_exec_output_high_water,

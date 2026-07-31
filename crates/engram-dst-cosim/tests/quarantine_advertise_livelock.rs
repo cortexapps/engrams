@@ -24,6 +24,7 @@
 //! the ADR 0093 423-row pileup is the same signature.
 
 use engram_core::types::session::SessionState;
+use engram_core::types::BindingDisposition;
 use engram_dst_cosim::Cosim;
 
 /// Build the incident's end-state: a quarantined survivor (record-invisible
@@ -40,7 +41,7 @@ async fn wedge_created_park_over_quarantined_survivor(
     // coord list omits HostLost — not reserves-host-memory — and the local
     // ChainHeadRecord is lost), so the barrier QUARANTINES it.
     sim.park(session).await;
-    sim.force_session_state(session, SessionState::HostLost)
+    sim.force_session_state(session, SessionState::HostLost, BindingDisposition::Retain)
         .await;
     sim.roll_host().await;
     sim.lose_record(session).await;
@@ -54,7 +55,7 @@ async fn wedge_created_park_over_quarantined_survivor(
     // start_agent failed against the crippled VM → parked at Created, still
     // bound). `force_session_state` is the sanctioned shortcut for the
     // sequence's end-state.
-    sim.force_session_state(session, SessionState::Created)
+    sim.force_session_state(session, SessionState::Created, BindingDisposition::Retain)
         .await;
     (session, sandbox)
 }

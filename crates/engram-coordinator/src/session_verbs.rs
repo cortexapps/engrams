@@ -5,6 +5,7 @@
 //! family and every host RPC carries the op's epoch.
 
 use engram_core::types::session_op::OpKind;
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 
 use crate::error::ApiError;
@@ -129,8 +130,14 @@ async fn fail_wedged_created_session(ctx: &OpCtx<'_>, reason: &str) {
     {
         tracing::warn!(session_id = %id, error = %e, "harness_start_failed event failed");
     }
-    match crate::session_ops::transition_with_fence(state, id, ctx.fence(), SessionState::Failed)
-        .await
+    match crate::session_ops::transition_with_fence(
+        state,
+        id,
+        ctx.fence(),
+        SessionState::Failed,
+        BindingDisposition::Detach,
+    )
+    .await
     {
         Ok(prev) => {
             let _ = state
@@ -273,6 +280,7 @@ async fn resume_inner(ctx: &OpCtx<'_>) -> OpOutcome {
                 id,
                 ctx.fence(),
                 SessionState::Idle,
+                BindingDisposition::RequireUnbound,
             )
             .await
             {
@@ -640,6 +648,7 @@ async fn evict(ctx: &OpCtx<'_>) -> OpOutcome {
                         ctx.op.session_id,
                         ctx.fence(),
                         SessionState::HostLost,
+                        BindingDisposition::Retain,
                     )
                     .await
                     {
@@ -1070,6 +1079,7 @@ async fn create_boot(ctx: &OpCtx<'_>) -> OpOutcome {
                 id,
                 ctx.fence(),
                 SessionState::Failed,
+                BindingDisposition::Detach,
             )
             .await;
             return OpOutcome::Failed(
@@ -1118,6 +1128,7 @@ async fn create_boot(ctx: &OpCtx<'_>) -> OpOutcome {
                 id,
                 ctx.fence(),
                 SessionState::Failed,
+                BindingDisposition::Detach,
             )
             .await;
             ::metrics::counter!(crate::metrics::QUEUE_OUTCOME_TOTAL, "outcome" => "failed")
@@ -1167,8 +1178,14 @@ async fn create_boot_retry_or_fail(ctx: &OpCtx<'_>, reason: String) -> OpOutcome
     {
         tracing::warn!(session_id = %id, error = %e, "create_boot: boot_retry_exhausted event failed");
     }
-    match crate::session_ops::transition_with_fence(state, id, ctx.fence(), SessionState::Failed)
-        .await
+    match crate::session_ops::transition_with_fence(
+        state,
+        id,
+        ctx.fence(),
+        SessionState::Failed,
+        BindingDisposition::Detach,
+    )
+    .await
     {
         Ok(prev) => {
             let _ = state
@@ -1231,7 +1248,15 @@ async fn destroy(ctx: &OpCtx<'_>) -> OpOutcome {
     // (best-effort, can-take-seconds) destroy RPC below. Already
     // terminal = idempotent: skip the flip, still tidy up.
     if let Some(target) = session.status.terminal_target() {
-        match crate::session_ops::transition_with_fence(state, id, ctx.fence(), target).await {
+        match crate::session_ops::transition_with_fence(
+            state,
+            id,
+            ctx.fence(),
+            target,
+            BindingDisposition::Detach,
+        )
+        .await
+        {
             Ok(prev) => {
                 let _ = state
                     .emit_fenced(
@@ -1289,7 +1314,11 @@ async fn destroy(ctx: &OpCtx<'_>) -> OpOutcome {
         // (issue #211's guarded clear, subsumed): anything that
         // legitimately re-bound the row also re-claimed past us, so a
         // 0-row write here is exactly "leave it for the new owner".
-        // (Also clears the terminal row's dead-weight host affinity.)
+        // Post-#896 the terminal flip above already detached
+        // `sandbox_id` atomically (BindingDisposition::Detach); this
+        // write is now load-bearing ONLY for clearing the terminal
+        // row's dead-weight host affinity (`host_id`), which the
+        // disposition deliberately does not touch.
         match state
             .services
             .meta

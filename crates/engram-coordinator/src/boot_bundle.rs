@@ -305,6 +305,7 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: engram_core::types::SessionState,
+            _: engram_core::types::BindingDisposition,
         ) -> Result<engram_core::types::SessionState, MetaError> {
             unimplemented!()
         }

@@ -13,6 +13,7 @@
 //! plane and the sweep was never driven).
 
 use engram_core::types::session::SessionState;
+use engram_core::types::BindingDisposition;
 use engram_dst_cosim::Cosim;
 
 /// A bound HostLost row whose VM is ALIVE: the sweep DEFERS (ask-the-host,
@@ -26,7 +27,7 @@ async fn hostlost_bound_alive_vm_defers_then_settles_at_strike_cap() {
 
     // Dead-host detector flips the survivor to HostLost; the VM survives
     // (pidfd-reattached). The row keeps sandbox_id + host_id.
-    sim.force_session_state(session, SessionState::HostLost)
+    sim.force_session_state(session, SessionState::HostLost, BindingDisposition::Retain)
         .await;
     // Age the row well past the sweep's 60s min-age.
     sim.advance(120).await;
@@ -72,7 +73,7 @@ async fn hostlost_bound_vm_gone_settles_immediately_without_strikes() {
     let session = sim.boot_session().await;
     let sandbox = sim.sandbox_of(session).await.expect("bound sandbox");
 
-    sim.force_session_state(session, SessionState::HostLost)
+    sim.force_session_state(session, SessionState::HostLost, BindingDisposition::Retain)
         .await;
     sim.advance(120).await;
 

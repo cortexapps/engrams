@@ -29,6 +29,7 @@ use engram_core::types::evacuation::{EvacLoss, EvacReceipt};
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::session::{Session, SessionState};
 use engram_core::types::snapshot::{SnapshotMetadata, SnapshotRecord};
+use engram_core::types::BindingDisposition;
 use engram_core::{MetaError, SandboxError};
 
 use crate::host_registry::HostRegistry;
@@ -533,9 +534,13 @@ pub async fn evacuate_dead_source(
     meta.assign_session_sandbox(session_id, Some(new_sandbox_id))
         .await
         .map_err(EvacError::Rebind)?;
-    meta.transition_session(session_id, SessionState::Created)
-        .await
-        .map_err(EvacError::Rebind)?;
+    meta.transition_session(
+        session_id,
+        SessionState::Created,
+        BindingDisposition::Retain,
+    )
+    .await
+    .map_err(EvacError::Rebind)?;
 
     Ok(EvacReceipt {
         new_host_id: target_host,
@@ -758,7 +763,7 @@ mod tests {
         meta.transition_session_created(id, sandbox)
             .await
             .expect("created");
-        meta.transition_session(id, SessionState::Active)
+        meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
             .await
             .expect("active");
         if let Some(m) = live_disk {
@@ -768,7 +773,7 @@ mod tests {
                 .expect("live manifest");
             assert!(matches!(out, engram_core::traits::UpdateOutcome::Applied));
         }
-        meta.transition_session(id, SessionState::HostLost)
+        meta.transition_session(id, SessionState::HostLost, BindingDisposition::Retain)
             .await
             .expect("host_lost");
         meta.get_session(id).await.expect("staged")

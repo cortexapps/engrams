@@ -13,6 +13,7 @@
 //! will select is durable and at-or-above the eviction cursor* — the exact
 //! property issue #570 violates.
 
+use engram_core::types::BindingDisposition;
 use std::collections::{BTreeMap, HashMap};
 use std::time::Duration;
 
@@ -226,7 +227,11 @@ impl Cosim {
         let _ = self
             .world
             .meta
-            .transition_session(session_id, SessionState::Evicting)
+            .transition_session(
+                session_id,
+                SessionState::Evicting,
+                BindingDisposition::Retain,
+            )
             .await;
         let key = format!("evict:{session_id}");
         self.enqueue_and_drive(
@@ -919,8 +924,17 @@ impl Cosim {
 
     /// Force a session state transition (models the dead-host detector
     /// flipping a survivor to `HostLost` without going through the op path).
-    pub async fn force_session_state(&self, session_id: SessionId, to: SessionState) {
-        let _ = self.world.meta.transition_session(session_id, to).await;
+    pub async fn force_session_state(
+        &self,
+        session_id: SessionId,
+        to: SessionState,
+        disposition: BindingDisposition,
+    ) {
+        let _ = self
+            .world
+            .meta
+            .transition_session(session_id, to, disposition)
+            .await;
     }
 
     /// The eviction cursor recorded for a session (the capture point).

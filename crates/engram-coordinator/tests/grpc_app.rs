@@ -24,6 +24,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -358,7 +359,7 @@ async fn session_get_list_delete_round_trip() {
         .expect("seed live session");
     // Drive it to Active so list_active_sessions returns it.
     for target in [SessionState::Created, SessionState::Active] {
-        meta.transition_session(live_id, target)
+        meta.transition_session(live_id, target, BindingDisposition::Retain)
             .await
             .expect("transition to active");
     }
@@ -375,7 +376,7 @@ async fn session_get_list_delete_round_trip() {
         SessionState::Active,
         SessionState::Completed,
     ] {
-        meta.transition_session(dead_id, target)
+        meta.transition_session(dead_id, target, BindingDisposition::Retain)
             .await
             .expect("transition to completed");
     }
@@ -546,7 +547,7 @@ async fn complete_tool_call_rejects_terminal_session() {
         SessionState::Active,
         SessionState::Completed,
     ] {
-        meta.transition_session(session_id, target)
+        meta.transition_session(session_id, target, BindingDisposition::Retain)
             .await
             .expect("transition session");
     }

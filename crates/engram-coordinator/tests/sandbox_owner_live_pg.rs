@@ -19,6 +19,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -80,9 +81,11 @@ async fn seed_bound(
     meta.assign_session_host(id, Some(host))
         .await
         .expect("bind host");
-    meta.assign_session_sandbox(id, Some(sandbox))
+    // 0108: bind via the production fused path (Created), never on a
+    // Pending row.
+    meta.transition_session_created(id, sandbox)
         .await
-        .expect("bind sandbox");
+        .expect("bind sandbox (fused Pending → Created)");
     id
 }
 
@@ -126,7 +129,7 @@ async fn owner_query_ignores_terminal_rows() {
     let sandbox = SandboxId::new();
     let id = seed_bound(&meta, host, sandbox).await;
 
-    meta.transition_session(id, SessionState::Failed)
+    meta.transition_session(id, SessionState::Failed, BindingDisposition::Detach)
         .await
         .expect("pending->failed (the failed-create disposition)");
 

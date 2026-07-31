@@ -18,6 +18,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -259,14 +260,14 @@ async fn fenced_write_zero_rows_after_reclaim() {
     // `queue_origin` that poisons the queue_scanner_live_pg suite
     // sharing this database.)
     assert!(
-        meta.fenced_transition_session(sid, 1, SessionState::Created)
+        meta.fenced_transition_session(sid, 1, SessionState::Created, BindingDisposition::Retain)
             .await
             .expect("stale fenced transition")
             .is_none(),
         "epoch-1 transition must fence, not error",
     );
     let prev = meta
-        .fenced_transition_session(sid, 2, SessionState::Created)
+        .fenced_transition_session(sid, 2, SessionState::Created, BindingDisposition::Retain)
         .await
         .expect("fresh fenced transition")
         .expect("applied");
@@ -709,7 +710,7 @@ async fn fenced_transition_checks_fence_before_legality() {
 
     // Successor (epoch 2) transitions Pending -> Created.
     let prev = meta
-        .fenced_transition_session(sid, 2, SessionState::Created)
+        .fenced_transition_session(sid, 2, SessionState::Created, BindingDisposition::Retain)
         .await
         .expect("successor transition")
         .expect("applied");
@@ -719,7 +720,7 @@ async fn fenced_transition_checks_fence_before_legality() {
     // ILLEGAL. Pre-fix: legality ran first -> bare Conflict (Err). Post-
     // fix: the epoch mismatch is seen first -> Ok(None).
     let result = meta
-        .fenced_transition_session(sid, 1, SessionState::Idle)
+        .fenced_transition_session(sid, 1, SessionState::Idle, BindingDisposition::Detach)
         .await;
     assert!(
         matches!(result, Ok(None)),

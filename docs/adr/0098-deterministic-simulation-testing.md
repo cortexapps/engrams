@@ -1296,6 +1296,42 @@ subagents in isolated worktrees, one PR per row-item, orchestrated in waves;
 every subagent diff is reviewed in-session before human merge. The addendum
 is updated between waves (bookend convention).
 
+### Addendum (2026-07-31): the recoverability oracle + the transition-semantics conformance rule
+
+**The recoverability oracle (`quiescence-recovery-wedged`).** Every quiescence
+oracle to date was safety-shaped (single-ownership, no-op-mint, no-stragglers,
+acked-write durability). The #896 wedge was invisible to all of them because a
+dead-end row violates no safety property: an Idle session with a retained
+binding was "stable" by status, its resume op terminally Failed, the world
+converged green. The class is LIVENESS: a session resting in a
+recoverable-looking state whose documented affordance can never succeed
+(`RESUME_MAX_ATTEMPTS` exhaustion deliberately leaves op-Failed +
+session-Idle — correct, and previously invisible).
+
+The drain now runs a recovery pass after first convergence and before the
+op-mint high-water snapshot: for every session resting `Idle` or `Created`
+(the stability table's unconditional arms — its blind spot), drive the REAL
+Resume op (`recovery:{sid}` idempotency key), re-drain, and require each to
+land Active/terminal or complete its op (a completed resume that the world
+then legally moves on — an idle re-evict in the same drain — is recovery,
+not a wedge). The oracle's ops are deliberate mints (hence pre-snapshot) and
+are driven to rest (`no_op_dropped` holds). Non-vacuity: the #896 exhaustion
+residue under a permanently-deferred teardown wedges, and the oracle names it
+with the failed op's state/attempts/error (`tests/recovery_oracle.rs`).
+
+**The conformance rule, generalized (D4 for transition semantics).** D4's
+process rule — a `MetadataStore` change extends `meta_conformance.rs` in the
+same PR — now explicitly covers TRANSITION AND BINDING semantics: any change
+to `transition_session`'s disposition contract, a guarded-bind CAS, op
+step-recording, or a per-state binding expectation must land with (a) extended
+both-store conformance scenarios and (b) an updated row in the
+`binding_writer_inventory` ratchet (which textually inventories every
+binding-writer call site in the coordinator and fails on undeclared ones —
+the `driver_coverage_is_declared` pattern applied to ownership writes). The
+#896 lesson: a transition's binding semantics are cross-path contracts; the
+writer who changes one cannot see the readers who relied on it, so the change
+must be forced through the shared tables.
+
 ## Non-goals
 
 - No packet/socket-level network simulation — the trait seam is the boundary.

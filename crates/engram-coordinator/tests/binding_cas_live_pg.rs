@@ -23,6 +23,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 
 use chrono::Utc;
@@ -80,16 +81,14 @@ async fn seed_idle_unbound(meta: &Arc<dyn MetadataStore>) -> SessionId {
         .await
         .expect("create");
     let sandbox = SandboxId::new();
-    meta.assign_session_sandbox(id, Some(sandbox))
-        .await
-        .expect("bind sandbox");
-    meta.transition_session(id, SessionState::Created)
+    // 0108: bind via the production fused path, never on a Pending row.
+    meta.transition_session_created(id, sandbox)
         .await
         .expect("pending->created");
-    meta.transition_session(id, SessionState::Active)
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("created->active");
-    meta.transition_session(id, SessionState::Idle)
+    meta.transition_session(id, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("active->idle");
     meta.assign_session_sandbox(id, None)
@@ -114,7 +113,7 @@ async fn guarded_rebind_rejects_bind_onto_terminated_row() {
 
     // Terminate wins the race: Idle -> Completed (legal terminal edge).
     let prev = meta
-        .transition_session(id, SessionState::Completed)
+        .transition_session(id, SessionState::Completed, BindingDisposition::Detach)
         .await
         .expect("idle->completed (terminate)");
     assert_eq!(prev, SessionState::Idle);
@@ -181,7 +180,8 @@ async fn guarded_clear_does_not_null_a_fresh_rebind() {
         .await
         .expect("create");
     let sandbox_a = SandboxId::new();
-    meta.assign_session_sandbox(id, Some(sandbox_a))
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(id, sandbox_a)
         .await
         .expect("bind A");
 
@@ -223,7 +223,8 @@ async fn guarded_clear_fires_on_the_matching_sandbox() {
         .await
         .expect("create");
     let sandbox = SandboxId::new();
-    meta.assign_session_sandbox(id, Some(sandbox))
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(id, sandbox)
         .await
         .expect("bind");
 

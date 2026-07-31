@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use engram_core::traits::SessionFence;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
+use engram_core::types::BindingDisposition;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
 
@@ -423,7 +424,7 @@ pub(crate) async fn boot_on_reserved_host(
     let prev = match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Active)
+        .transition_session(session_id, SessionState::Active, BindingDisposition::Retain)
         .await
     {
         Ok(p) => p,
