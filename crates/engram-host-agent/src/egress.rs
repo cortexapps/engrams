@@ -317,6 +317,10 @@ pub fn register_policy(
             success,
             data: o.data,
             fetchable: o.fetchable,
+            url_fallback: o.url_fallback.map(|f| engram_egress_proxy::UrlFallback {
+                pattern: f.pattern,
+                fields: f.fields,
+            }),
         });
     }
     registry.register(engram_egress_proxy::SessionState {
@@ -403,6 +407,7 @@ mod tests {
                         graphql_field: String::new(),
                         data: vec![("number".into(), "$.resp.number".into())],
                         fetchable: Some("$.resp.html_url".into()),
+                        url_fallback: None,
                     },
                     // ADR 0059: a GraphQL observe (NoGraphqlErrors success rule).
                     EgressObserveEntry {
@@ -419,6 +424,10 @@ mod tests {
                         graphql_field: "createIssue".into(),
                         data: vec![("id".into(), "$.resp.data.createIssue.issue.id".into())],
                         fetchable: None,
+                        url_fallback: Some(engram_core::types::integration::ObserveUrlFallback {
+                            pattern: "https://github.com/{owner}/{name}/issues/{number:int}".into(),
+                            fields: vec![("number".into(), "{number}".into())],
+                        }),
                     },
                 ],
                 secret_mode: SecretMode::Broker,
@@ -483,5 +492,13 @@ mod tests {
             gql_obs.success,
             engram_egress_proxy::SuccessRule::NoGraphqlErrors
         ));
+        // GraphQL parity: the URL fallback rides through to the proxy entry.
+        let fb = gql_obs.url_fallback.as_ref().expect("url fallback present");
+        assert_eq!(
+            fb.pattern,
+            "https://github.com/{owner}/{name}/issues/{number:int}"
+        );
+        assert_eq!(fb.fields, vec![("number".into(), "{number}".into())]);
+        assert_eq!(state.observes[0].url_fallback, None);
     }
 }

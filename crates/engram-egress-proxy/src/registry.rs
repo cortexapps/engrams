@@ -361,10 +361,17 @@ pub struct ObserveEntry {
     pub asset_kind: String,
     pub surface: String,
     pub success: SuccessRule,
-    /// `(field name, extractor path)` pairs, e.g. `("number", "$.resp.number")`.
+    /// `(field name, extractor path)` pairs, e.g. `("number", "$.resp.number")`
+    /// or `("title", "$.vars.input.title")` (GraphQL request variables).
+    /// Repeated field names form a fallback chain — the first extractor that
+    /// resolves wins (`observe::evaluate`).
     pub data: Vec<(String, String)>,
     /// Extractor path yielding an external URL, e.g. `"$.resp.html_url"`.
     pub fetchable: Option<String>,
+    /// Derive `data` fields the extractors missed from the fetchable URL
+    /// (GraphQL parity — a response echoes only the client's selection set).
+    /// See [`crate::observe::UrlFallback`].
+    pub url_fallback: Option<crate::observe::UrlFallback>,
 }
 
 #[derive(Default)]
@@ -527,6 +534,7 @@ mod tests {
                 success: SuccessRule::StatusClass2xx,
                 data: vec![("number".into(), "$.resp.number".into())],
                 fetchable: Some("$.resp.html_url".into()),
+                url_fallback: None,
             }],
         }
     }

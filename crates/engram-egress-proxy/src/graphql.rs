@@ -28,16 +28,23 @@ use crate::registry::GraphqlOperation;
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ParsedGraphql {
     pub top_level: Vec<(GraphqlOperation, String)>,
+    /// The request's `variables` value, retained for the observe engine's
+    /// `$.vars.<dotted>` asset extractors (a GraphQL response echoes only the
+    /// client's selection set, so mutation *inputs* — title, branch names — are
+    /// often available nowhere else). Plays no part in gating, which stays
+    /// structural. `None` when the envelope carried no `variables`.
+    pub variables: Option<serde_json::Value>,
 }
 
-/// The JSON envelope of a GraphQL-over-HTTP request. We need only the query
-/// document + the optional operation selector; `variables` is ignored (gating is
-/// structural, not value-dependent).
+/// The JSON envelope of a GraphQL-over-HTTP request: the query document, the
+/// optional operation selector, and the `variables` value (carried through to
+/// `ParsedGraphql` for asset extraction; gating never reads it).
 #[derive(Deserialize)]
 struct GraphqlRequest {
     query: Option<String>,
     #[serde(rename = "operationName")]
     operation_name: Option<String>,
+    variables: Option<serde_json::Value>,
 }
 
 /// Parse a GraphQL HTTP request body into its selected operation's top-level
@@ -99,7 +106,10 @@ pub fn parse_request_body(body: &[u8]) -> Option<ParsedGraphql> {
     if top_level.is_empty() {
         return None; // nothing to authorize → deny
     }
-    Some(ParsedGraphql { top_level })
+    Some(ParsedGraphql {
+        top_level,
+        variables: req.variables,
+    })
 }
 
 #[cfg(test)]
@@ -253,6 +263,25 @@ mod tests {
     #[test]
     fn syntax_error_is_denied() {
         assert!(parse("mutation { ").is_none());
+    }
+
+    #[test]
+    fn variables_are_retained_for_asset_extraction() {
+        // The `gh pr create` envelope: query + variables. The variables value
+        // must survive parsing verbatim (the observe engine's `$.vars.*`
+        // extractors read it); its absence is `None`, not an error.
+        let vars = serde_json::json!({"input": {"title": "Fix", "headRefName": "b"}});
+        let raw = body(
+            &serde_json::json!({
+                "query": "mutation PullRequestCreate($input: CreatePullRequestInput!) { createPullRequest(input: $input) { pullRequest { id url } } }",
+                "variables": vars,
+            })
+            .to_string(),
+        );
+        let p = parse_request_body(&raw).unwrap();
+        assert_eq!(p.variables, Some(vars));
+
+        assert_eq!(parse("{ viewer { login } }").unwrap().variables, None);
     }
 
     #[test]

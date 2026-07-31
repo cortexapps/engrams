@@ -65,8 +65,18 @@ const githubGraphqlRaw = {
         kind: "issue",
         surface: "asset",
         success: { noGraphqlErrors: true },
-        data: { id: "$.resp.data.createIssue.issue.id" },
+        // GraphQL parity: `title` is a fallback chain (response-first, request
+        // variables as the supplement); the number is derived from the returned
+        // URL when the client didn't select it.
+        data: {
+          id: "$.resp.data.createIssue.issue.id",
+          title: ["$.resp.data.createIssue.issue.title", "$.vars.input.title"],
+        },
         fetchable: { external: "$.resp.data.createIssue.issue.url" },
+        urlFallback: {
+          pattern: "https://github.com/{owner}/{name}/issues/{number:int}",
+          fields: { number: "{number}" },
+        },
       },
     },
   ],
@@ -265,6 +275,44 @@ describe("parseConnector", () => {
       operations: [{ grants: ["logs:read"], asset: { kind: "k", surface: "weird" } }],
     };
     expect(() => parseConnector(bad, "x")).toThrow(/surface/);
+  });
+
+  test("rejects malformed asset data extractor values", () => {
+    const withData = (data: unknown) => ({
+      ...datadogRaw,
+      operations: [{ grants: ["logs:read"], asset: { kind: "k", surface: "asset", data } }],
+    });
+    expect(() => parseConnector(withData({ f: [] }), "x")).toThrow(/asset\.data\.f/);
+    expect(() => parseConnector(withData({ f: [42] }), "x")).toThrow(/asset\.data\.f/);
+    expect(() => parseConnector(withData({ f: "" }), "x")).toThrow(/asset\.data\.f/);
+    // Both the single-path and chain forms parse.
+    const c = parseConnector(withData({ a: "$.resp.a", b: ["$.resp.b", "$.vars.b"] }), "x");
+    expect(c.operations[0]!.asset?.data).toEqual({ a: "$.resp.a", b: ["$.resp.b", "$.vars.b"] });
+  });
+
+  test("rejects a urlFallback with a bad pattern or an undeclared capture", () => {
+    const withFallback = (urlFallback: unknown) => ({
+      ...datadogRaw,
+      operations: [
+        { grants: ["logs:read"], asset: { kind: "k", surface: "asset", urlFallback } },
+      ],
+    });
+    expect(() => parseConnector(withFallback({ fields: {} }), "x")).toThrow(/pattern/);
+    expect(() => parseConnector(withFallback({ pattern: "https://x/{a}", fields: [] }), "x")).toThrow(/fields/);
+    // A field template referencing a capture the pattern doesn't declare is a
+    // silent no-derive at runtime — the loader rejects the typo up front.
+    expect(() =>
+      parseConnector(withFallback({ pattern: "https://x/{a}", fields: { f: "{typo}" } }), "x"),
+    ).toThrow(/\{typo\}/);
+    // The valid shape parses and is carried on the op.
+    const c = parseConnector(
+      withFallback({ pattern: "https://x/{a}/{n:int}", fields: { f: "{a}", n: "{n}" } }),
+      "x",
+    );
+    expect(c.operations[0]!.asset?.urlFallback).toEqual({
+      pattern: "https://x/{a}/{n:int}",
+      fields: { f: "{a}", n: "{n}" },
+    });
   });
 
   // ADR 0059: GraphQL operations.
@@ -514,6 +562,7 @@ describe("compileIntegrationPolicy — observes", () => {
           ["title", "$.resp.title"],
         ],
         fetchable: "$.resp.html_url",
+        url_fallback: null,
       },
     ]);
   });
@@ -562,7 +611,18 @@ describe("compileIntegrationPolicy — GraphQL (ADR 0059)", () => {
       success_no_graphql_errors: true,
       success_status_class: null,
     });
-    expect(policy.observes[0]!.data).toEqual([["id", "$.resp.data.createIssue.issue.id"]]);
+    // A chained data value flattens to repeated [field, path] pairs in order
+    // (the proxy takes the first that resolves) — the wire shape is unchanged.
+    expect(policy.observes[0]!.data).toEqual([
+      ["id", "$.resp.data.createIssue.issue.id"],
+      ["title", "$.resp.data.createIssue.issue.title"],
+      ["title", "$.vars.input.title"],
+    ]);
+    // GraphQL parity: the URL fallback compiles to the snake_case wire shape.
+    expect(policy.observes[0]!.url_fallback).toEqual({
+      pattern: "https://github.com/{owner}/{name}/issues/{number:int}",
+      fields: [["number", "{number}"]],
+    });
   });
 });
 
@@ -604,6 +664,41 @@ describe("on-disk registry", () => {
     expect(rest?.success_status_class).toBe("2xx");
     const gql = policy.observes.find((o) => o.graphql_field === "createIssue");
     expect(gql?.success_no_graphql_errors).toBe(true);
+  });
+
+  test("the shipped github createPullRequest observe reaches REST parity (vars + URL fallback)", () => {
+    // The gh regression: `gh pr create` selects only `pullRequest { id url }`,
+    // so the shipped GraphQL asset must source title/branches from the request
+    // variables and derive repo/number from the returned PR URL.
+    const policy = compileIntegrationPolicy(["github:pulls:write"]);
+    const gql = policy.observes.find((o) => o.graphql_field === "createPullRequest");
+    expect(gql).toBeDefined();
+    // title/branches are response-first fallback chains: `gh` selects only
+    // id+url (vars fills them), while a client that inlines its arguments but
+    // selects the fields still gets the response values (PR #904 review).
+    const pathsFor = (field: string) => gql!.data.filter(([k]) => k === field).map(([, p]) => p);
+    expect(pathsFor("title")).toEqual([
+      "$.resp.data.createPullRequest.pullRequest.title",
+      "$.vars.input.title",
+    ]);
+    expect(pathsFor("head_branch")).toEqual([
+      "$.resp.data.createPullRequest.pullRequest.headRefName",
+      "$.vars.input.headRefName",
+    ]);
+    expect(pathsFor("base_branch")).toEqual([
+      "$.resp.data.createPullRequest.pullRequest.baseRefName",
+      "$.vars.input.baseRefName",
+    ]);
+    expect(gql!.url_fallback).toEqual({
+      pattern: "https://github.com/{owner}/{name}/pull/{number:int}",
+      fields: [
+        ["repo", "{owner}/{name}"],
+        ["number", "{number}"],
+      ],
+    });
+    // Same-field REST parity: the REST create observe extracts the same keys.
+    const rest = policy.observes.find((o) => o.path_globs.includes("/repos/*/pulls"));
+    expect(new Set(rest!.data.map(([k]) => k))).toEqual(new Set(gql!.data.map(([k]) => k)));
   });
 });
 
