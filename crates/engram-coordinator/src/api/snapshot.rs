@@ -1074,6 +1074,52 @@ pub(crate) async fn resume_from_idle(
     // oracle orphan reap GCs it. The compensation (and its blind destroy
     // of a possibly-healthy VM) is unrepresentable under step-resume.
 
+    // ADR 0090 (#896 review, HIGH): a budget-exhausted evacuation lands
+    // here Idle WITH its unconfirmed source binding still in place —
+    // ownership of a maybe-live sandbox is never released on a guess.
+    // The guarded bind below requires an unbound row, so run the SAME
+    // teardown-confirmation gate the evac resumer uses: re-issue the
+    // idempotent destroy, probe, and only a confirmed-gone source
+    // authorizes the fenced clear. Unconfirmable → 503-retryable (the
+    // dead-host lane clears the binding once the source host is declared
+    // dead; a healthy-but-lagging teardown confirms on a later attempt).
+    // Checked BEFORE the restore so we never create a VM we may have to
+    // abandon. Normal idle-evicted rows are unbound and skip this leg,
+    // as does a step-resume re-entry after the clear committed.
+    let mut session = session;
+    if let (Some(source_host), Some(source_sandbox)) = (session.host_id, session.sandbox_id) {
+        crate::evac_resumer::confirm_source_teardown(
+            state,
+            source_host,
+            source_sandbox,
+            ctx.fence(),
+        )
+        .await
+        .map_err(|e| {
+            ApiError::Unavailable(format!(
+                "resume: retained source binding could not be confirmed torn down: {e}"
+            ))
+        })?;
+        match state
+            .services
+            .meta
+            .fenced_assign_sandbox(id, ctx.fence().epoch as i64, None, Some(source_host))
+            .await
+        {
+            Ok(true) => {
+                state.host_registry.invalidate_sandbox(source_sandbox);
+                session.sandbox_id = None;
+            }
+            Ok(false) => {
+                crate::metrics::note_fenced_write();
+                return Err(ApiError::Conflict(
+                    "resume: fenced by a newer op while clearing the stale source binding".into(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+
     // ADR 0034 durability: walk the session's snapshots newest-first and
     // resume from the first one whose backing artifacts still exist. The
     // stored `recoverable` flag is set at capture time and can go stale
