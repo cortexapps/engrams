@@ -161,3 +161,54 @@ This does not change the recovery *mechanism* — the write loss was always
 possible on this path; the addendum only makes it observable instead of silent.
 The deeper fix (bounding the acked-but-unuploaded window itself) remains the NBD
 acked-write-loss work, out of scope here.
+## Addendum (2026-07-31): the binding-disposition contract (#896)
+
+PR #896's review cycle exposed the structural gap this ADR left open: the
+`sandbox_id` binding — ownership truth itself — was managed BESIDE the state
+machine, not in it. `transition_session` never touched the binding; callers
+composed separate `detach_sandbox` flags and blind assign calls. When the evict
+pipeline started retaining bindings into `Evacuating` (the confirmed-teardown
+gate above), the evac-exhaustion fallback silently inherited a binding into
+`Idle`, and the resume path — which had "Idle ⇒ unbound" baked into its guarded
+bind AND its crash-resume shortcut — either 409'd forever or false-finished the
+session Active onto a mid-teardown VM. Nothing enforced the invariant, so
+nothing failed loudly when it broke.
+
+**The contract.** Every session state transition now carries an explicit
+`BindingDisposition` (engram-core `types::session`), applied in the same atomic
+write as the flip and validated under the same row lock as state-pair legality:
+
+* `Detach` — clear `sandbox_id` with the flip (`host_id` untouched: resume
+  affinity survives). The caller destroyed or abandoned the VM. Always legal.
+* `Retain` — keep the binding. Legal only into the may-own states: Created,
+  Active, Unreachable, Parked, Evacuating, Evicting, HostLost — and Idle,
+  where a bound arrival is legal ONLY as the evac-exhaustion residue (below).
+* `RequireUnbound` — the caller believes an ownership gate already released
+  the binding; a bound arrival is a Conflict. This turns gate-ordering bugs
+  into loud failures instead of silent blind-releases (the anti-pattern this
+  ADR exists to prevent) or accidental retention.
+
+Enforcement is by-state at the stores (`binding_disposition_legal`, identical
+in PostgresStore and SimMetadataStore — D4-conformance-tested); the per-SITE
+discipline is held by the `binding_writer_inventory` ratchet test. The single
+authorized `Retain → Idle` site is the evac resumer's budget-exhaustion
+fallback: ownership of an UNCONFIRMED sandbox is never released on a guess, and
+the resume verb's stale-binding gate (`resume_from_idle`) is the sole consumer
+of that residue — it re-issues the idempotent destroy, probes, and performs the
+fenced clear only on confirmed absence.
+
+**The storage floor.** Migration 0108 adds `sessions_binding_state_check`:
+pending/queued/terminal rows must be unbound. This is deliberately the
+UNCONTESTED subset — it exists because the enum cannot see every writer. Four
+fused SQL status writers (`enqueue_session_resume`,
+`enqueue_evacuating_session_resume`, `settle_evicted_session_idle`,
+`place_queued_session`) and the blind `fenced_assign_sandbox` (epoch-only, no
+status guard) are policed by the CHECK alone. Follow-up (open): a status guard
+on `fenced_assign_sandbox` so a bind onto a terminal row fails in the store,
+not the constraint.
+
+**Detection.** The DST recoverability oracle (`quiescence-recovery-wedged`,
+ADR 0098 addendum of the same date) drives every resting Idle/Created
+session's Resume verb at quiescence — the dead-end-state class (safe forever,
+recoverable never) that motivated all of this is now nightly coverage, not
+review luck.
