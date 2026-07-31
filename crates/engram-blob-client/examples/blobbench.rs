@@ -38,8 +38,8 @@ enum Transport {
     /// The SDK's default reqwest client (getaddrinfo DNS, default
     /// pool) — the pre-2026-07 baseline.
     Untuned,
-    /// The production transport: hickory async DNS, bounded connect,
-    /// sized keep-alive pool.
+    /// The production transport: bounded connect, sized keep-alive
+    /// pool, pinned http1.
     Tuned,
 }
 

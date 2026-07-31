@@ -22,11 +22,12 @@
 //! (July 2026): don't scatter transport policy across call sites and
 //! SDK internals — own one client, make every wait bounded, and keep
 //! the whole stack simulable. We adopt what pays in a Rust/tokio
-//! deployment (single seam, bounded retry + deadlines, async DNS,
-//! tuned connection pool, fault-injection tests against the same
-//! trait the simulator drives) and skip what doesn't (an
+//! deployment (single seam, bounded retry + deadlines, tuned
+//! connection pool, fault-injection tests against the same trait
+//! the simulator drives) and skip what doesn't (an
 //! own-TLS/HTTP/io_uring stack is not where this system's blob-tier
-//! ceiling is).
+//! ceiling is; hickory async DNS and h2 were both measured/reasoned
+//! out — see `engram-storage-gcs`).
 //!
 //! ## Layering
 //!
