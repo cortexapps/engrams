@@ -21,6 +21,15 @@ export const QuestionsSchema = z.object({
 
 export const AnswersSchema = z.record(z.string(), z.array(z.string()));
 
+export const PlanSchema = z.object({
+  plan: z.string().describe("The complete implementation plan, as markdown"),
+});
+
+export const PlanDecisionSchema = z.object({
+  decision: z.enum(["approve", "reject"]),
+  feedback: z.string().optional(),
+});
+
 export interface BuiltinToolDeps {
   papercuts: PapercutStore;
 }
@@ -44,6 +53,29 @@ export function registerBuiltinTools(
     nativeBindings: {
       claude: "AskUserQuestion",
       codex: "requestUserInput",
+    },
+  });
+
+  // ADR 0106. Native-bound to claude ExitPlanMode; deliberately NO codex
+  // binding — codex and custom harnesses receive it as an injected dynamic
+  // tool through the generic deferred path.
+  registry.register({
+    name: "exit_plan_mode",
+    description:
+      "Present your finished implementation plan for user approval. " +
+      "Call this only in plan mode, with the complete plan as markdown. " +
+      "The user approves the plan (then implement it) or rejects it with " +
+      "feedback (then revise the plan).",
+    input: PlanSchema,
+    output: PlanDecisionSchema,
+    handling: "session",
+    execution: "deferred",
+    presenters: {
+      slack: "planEffect",
+      web: "PlanCard",
+    },
+    nativeBindings: {
+      claude: "ExitPlanMode",
     },
   });
 

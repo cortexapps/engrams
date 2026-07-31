@@ -74,6 +74,38 @@ describe("built-in tools", () => {
     });
   });
 
+  test("registers exit_plan_mode as a deferred session tool with a claude-only binding", () => {
+    const registry = createToolRegistry();
+    registerBuiltinTools(registry);
+
+    const tool = registry.get("exit_plan_mode");
+    expect(tool).toBeDefined();
+    expect(tool).toMatchObject({
+      handling: "session",
+      execution: "deferred",
+      // Deliberately no codex binding (ADR 0106): codex and custom harnesses
+      // receive the tool through the injected dynamic-tool path.
+      nativeBindings: {
+        claude: "ExitPlanMode",
+      },
+      presenters: {
+        slack: "planEffect",
+        web: "PlanCard",
+      },
+    });
+    expect(tool!.nativeBindings?.codex).toBeUndefined();
+    expect(tool!.input.parse({ plan: "# Plan\n\n1. Do the thing." })).toEqual({
+      plan: "# Plan\n\n1. Do the thing.",
+    });
+    expect(tool!.output.parse({ decision: "approve" })).toEqual({
+      decision: "approve",
+    });
+    expect(tool!.output.parse({ decision: "reject", feedback: "Cover tests." }))
+      .toEqual({ decision: "reject", feedback: "Cover tests." });
+    expect(() => tool!.output.parse({ decision: "maybe" })).toThrow();
+    expect(() => tool!.input.parse({})).toThrow();
+  });
+
   test("emits both native bindings and the canonical input schema", () => {
     const registry = createToolRegistry();
     registerBuiltinTools(registry);
@@ -81,6 +113,7 @@ describe("built-in tools", () => {
     const manifest = compileToolManifest(registry);
     expect(manifest.map((tool) => tool.name)).toEqual([
       "ask_user_question",
+      "exit_plan_mode",
       "papercut",
     ]);
     expect(manifest[0]).toEqual({
@@ -134,6 +167,7 @@ describe("built-in tools", () => {
     const manifest = compileToolManifest(registry, []);
     expect(manifest.map((tool) => tool.name)).toEqual([
       "ask_user_question",
+      "exit_plan_mode",
       "papercut",
     ]);
     expect(manifest.find((tool) => tool.name === "papercut")).toMatchObject({

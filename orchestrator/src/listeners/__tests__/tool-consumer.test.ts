@@ -101,6 +101,25 @@ describe("tool consumer", () => {
     ]);
   });
 
+  test("exit_plan_mode is bookkept as session-handled and never dispatched", async () => {
+    const pending = pendingRecorder();
+    const workflowIds: string[] = [];
+    const consumer = makeToolConsumer({
+      registry: registryFixture(),
+      pendingCalls: pending.store,
+      startWorkflow: async (_input, workflowId) => void workflowIds.push(workflowId),
+      now: () => new Date(0),
+    });
+
+    await consumer.handle(requested("exit_plan_mode", "call-plan"), {
+      sessionId: "session-1",
+    });
+    expect(workflowIds).toEqual([]);
+    expect(pending.requested.map((row) => [row.toolCallId, row.handling])).toEqual([
+      ["call-plan", "session"],
+    ]);
+  });
+
   test("unknown tools run bookkeeping without dispatch", async () => {
     const pending = pendingRecorder();
     const workflowIds: string[] = [];
