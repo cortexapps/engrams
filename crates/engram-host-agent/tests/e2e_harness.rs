@@ -508,6 +508,7 @@ async fn drive_harness(
         .send(engram_harness_proto::HarnessCommand::Prompt {
             prompt_id: uuid::Uuid::new_v4().to_string(),
             text: "say hi briefly".to_string(),
+            mode: None,
         })
         .await
         .expect("queue initial prompt over the wire");

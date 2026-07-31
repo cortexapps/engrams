@@ -717,6 +717,7 @@ async fn create_session_unknown_image_is_invalid_argument() {
             // ADR 0062: unused — this create fails at the unknown-image lookup
             // before harness resolution.
             harness: None,
+            harness_mode: None,
         })
         .await
         .expect_err("non-enabled image must error");

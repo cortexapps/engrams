@@ -95,7 +95,13 @@ impl HostClient for NoHost {
     }
     async fn bind_session(&self, _: SessionId, _: SandboxId, _: u64) {}
     async fn unbind_session(&self, _: SessionId) {}
-    async fn send_prompt(&self, _: SandboxId, _: String, _: String) -> Result<(), SandboxError> {
+    async fn send_prompt(
+        &self,
+        _: SandboxId,
+        _: String,
+        _: String,
+        _: Option<String>,
+    ) -> Result<(), SandboxError> {
         unreachable!()
     }
     async fn pause(&self, _: SandboxId, _: SessionFence) -> Result<(), SandboxError> {

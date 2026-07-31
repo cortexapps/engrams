@@ -571,7 +571,20 @@ async fn drive(
         }
         tokio::select! {
             command = commands.recv() => match command {
-                Some(HarnessCommand::Prompt { prompt_id, text }) => {
+                Some(HarnessCommand::Prompt { prompt_id, text, mode }) => {
+                    // ADR 0106 (Phase 4): latch the mode directive to the
+                    // workspace stamp. Behavior (per-turn sandbox params)
+                    // keys off the stamp in Phase 6.
+                    if let Some(mode) = &mode {
+                        let stamp = std::path::Path::new(
+                            engram_harness_sdk::mode_stamp::MODE_STAMP_FILE,
+                        );
+                        if let Err(e) =
+                            engram_harness_sdk::mode_stamp::write_mode_stamp(stamp, mode)
+                        {
+                            tracing::warn!(error = %e, %mode, "mode stamp write failed");
+                        }
+                    }
                     if !seen.insert(prompt_id.clone()) {
                         if let Some(turn) = server.persisted_prompts.get(&prompt_id) {
                             if turn.steered {
@@ -1755,6 +1768,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "hello".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -1885,6 +1899,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "remember".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -1943,6 +1958,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "remember".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2035,6 +2051,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "deploy".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2143,6 +2160,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-legacy".into(),
                 text: "deploy".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2241,6 +2259,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "remember".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2284,6 +2303,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "deploy".into(),
+                mode: None,
             })
             .await
             .unwrap();

@@ -103,9 +103,15 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        let note = crate::api::prompt::send_prompt_core(&self.state, id, r.prompt_id, r.text)
-            .await
-            .map_err(into_status)?;
+        let note = crate::api::prompt::send_prompt_core(
+            &self.state,
+            id,
+            r.prompt_id,
+            r.text,
+            r.harness_mode,
+        )
+        .await
+        .map_err(into_status)?;
         Ok(Response::new(app::SendPromptResponse {
             session_id: id.to_string(),
             note: note.to_string(),
@@ -705,6 +711,7 @@ mod tests {
             secrets: std::collections::HashMap::new(),
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         let api =
             super::super::convert::create_request_from_proto(r).expect("converter must succeed");
@@ -732,6 +739,7 @@ mod tests {
             secrets: std::collections::HashMap::new(),
             prompt_id: None,
             harness: Some("claude".into()),
+            harness_mode: None,
         };
         let api =
             super::super::convert::create_request_from_proto(r).expect("converter must succeed");
@@ -759,6 +767,7 @@ mod tests {
             secrets: std::collections::HashMap::new(),
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         // Same expression the RPC handler uses.
         let identity_env: std::collections::HashMap<String, String> =

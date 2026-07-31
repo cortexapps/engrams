@@ -142,6 +142,7 @@ async fn stream_events_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -288,6 +289,7 @@ async fn session_crud_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -412,6 +414,7 @@ async fn exec_streaming_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -539,6 +542,7 @@ async fn write_files_smoke() {
         harness_env: std::collections::HashMap::new(),
         prompt_id: None,
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -619,6 +623,7 @@ async fn snapshot_evict_resume_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -757,6 +762,7 @@ async fn get_artifact_not_found_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -835,6 +841,7 @@ async fn shell_relay_smoke() {
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = session_client

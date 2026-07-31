@@ -2437,7 +2437,21 @@ mod adapter {
                 }
                 cmd = cmd_rx.recv() => {
                     match cmd {
-                        Some(HarnessCommand::Prompt { prompt_id, text }) => {
+                        Some(HarnessCommand::Prompt { prompt_id, text, mode }) => {
+                            // ADR 0106 (Phase 4): latch the mode directive to
+                            // the workspace stamp — the durable source of
+                            // truth across evict/resume. Behavior (argv,
+                            // respawn) keys off the stamp in Phase 5.
+                            if let Some(mode) = &mode {
+                                let stamp = std::path::Path::new(
+                                    engram_harness_sdk::mode_stamp::MODE_STAMP_FILE,
+                                );
+                                if let Err(e) =
+                                    engram_harness_sdk::mode_stamp::write_mode_stamp(stamp, mode)
+                                {
+                                    tracing::warn!(error = %e, %mode, "mode stamp write failed");
+                                }
+                            }
                             if !seen_prompt_ids.insert(prompt_id.clone()) {
                                 // ADR 0052: a host replay (command-side
                                 // at-least-once) of a prompt we already
@@ -4284,6 +4298,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p-normal".into(),
                     text: "finish normally".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4401,6 +4416,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4419,6 +4435,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "second".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4441,6 +4458,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p3".into(),
                     text: "third".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4537,6 +4555,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4653,6 +4672,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4716,6 +4736,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4730,6 +4751,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "second".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4797,6 +4819,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "hi".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4813,6 +4836,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "hi".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4820,6 +4844,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "yo".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4869,6 +4894,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -4886,6 +4912,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p-second".into(),
                     text: "second".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5688,6 +5715,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p-deferred".into(),
                     text: "remember this".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5905,6 +5933,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p-alive".into(),
                     text: "remember this".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -6002,6 +6031,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p-fallback".into(),
                     text: "remember this".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();

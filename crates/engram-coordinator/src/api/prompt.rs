@@ -31,9 +31,34 @@ pub(crate) async fn send_prompt_core(
     id: SessionId,
     prompt_id: String,
     text: String,
+    // ADR 0106: optional session-mode directive riding this prompt (e.g.
+    // `plan`). Validated against the session harness's declared descriptor
+    // modes BEFORE any durable write it causes; rides the outbox payload and
+    // `HarnessCommand::Prompt.mode`.
+    harness_mode: Option<String>,
 ) -> Result<&'static str, ApiError> {
     if text.is_empty() {
         return Err(ApiError::BadRequest("`text` is required".into()));
+    }
+    let harness_mode = harness_mode.filter(|m| !m.is_empty());
+    if let Some(mode) = &harness_mode {
+        let harness = state
+            .services
+            .meta
+            .get_session_harness(id)
+            .await
+            .map_err(|e| ApiError::Internal(format!("session harness lookup: {e}")))?
+            .ok_or_else(|| {
+                ApiError::BadRequest(
+                    "harness_mode is only valid on an agent-mode session with a harness".into(),
+                )
+            })?;
+        let descriptor = crate::api::sessions::resolve_descriptor(state, &harness).await?;
+        if descriptor.mode(mode).is_none() {
+            return Err(ApiError::BadRequest(format!(
+                "harness `{harness}` does not declare mode `{mode}`"
+            )));
+        }
     }
     // Phase 1b: the client (web) mints `prompt_id` so it can correlate its
     // optimistic bubble with the server echo + `RunStarted{prompt_id}`
@@ -135,14 +160,37 @@ pub(crate) async fn send_prompt_core(
         tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
     }
 
+    // ADR 0106: the durable "the user selected mode M" fact — emitted only
+    // after validation, before the outbox row, so the mode marker's idx
+    // precedes the run it applies to. Coordinator-authoritative (excluded
+    // from rewind tombstoning). Best-effort like the receipts above.
+    if let Some(mode) = &harness_mode {
+        if let Err(e) = state
+            .emit(
+                id,
+                SessionEvent::HarnessModeChanged {
+                    mode: mode.clone(),
+                    at: now,
+                },
+            )
+            .await
+        {
+            tracing::warn!(session_id = %id, error = %e, "emit harness_mode_changed failed");
+        }
+    }
+
     // The durable enqueue. From here the command cannot be lost: the
     // delivery driver forwards it (resuming the session first if needed)
     // and redelivers until the harness's confirming event acks the row.
+    let payload = match &harness_mode {
+        Some(mode) => serde_json::json!({ "text": prompt_text, "mode": mode }),
+        None => serde_json::json!({ "text": prompt_text }),
+    };
     let row = engram_core::types::outbox::OutboxRow {
         prompt_id: prompt_id.clone(),
         session_id: id,
         kind: engram_core::types::outbox::OutboxKind::Prompt,
-        payload: serde_json::json!({ "text": prompt_text }),
+        payload,
         created_at: now,
         attempts: 0,
         not_before: now,
@@ -342,7 +390,7 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) = build_state_for_session(dead_session(id));
 
-        let err = send_prompt_core(&state, id, String::new(), "hello".into())
+        let err = send_prompt_core(&state, id, String::new(), "hello".into(), None)
             .await
             .expect_err("a Dead session cannot auto-resume");
         assert!(
@@ -375,11 +423,110 @@ mod tests {
         let id = SessionId::new();
         let (state, mini, _local) = build_state_for_session(dead_session(id));
 
-        let _ = send_prompt_core(&state, id, "client-pid-42".into(), "hello".into()).await;
+        let _ = send_prompt_core(&state, id, "client-pid-42".into(), "hello".into(), None).await;
 
         let events = mini.events.lock();
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].kind, "prompt_received");
         assert_eq!(events[0].payload["prompt_id"], "client-pid-42");
+    }
+
+    // -- ADR 0106: harness_mode validation + event + payload ------------
+
+    fn idle_session(id: SessionId) -> engram_core::types::Session {
+        engram_core::types::Session {
+            status: engram_core::types::SessionState::Idle,
+            ..dead_session(id)
+        }
+    }
+
+    /// An unknown mode is rejected BEFORE any durable write — no receipt,
+    /// no event, no outbox row. (The mode gate deliberately precedes the
+    /// unconditional `prompt_received` emit: a typo'd mode is a caller
+    /// error, not a user ask.)
+    #[tokio::test]
+    async fn unknown_harness_mode_is_rejected_with_no_side_effects() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
+        *mini.harness.lock() = Some("claude".into());
+
+        let err = send_prompt_core(
+            &state,
+            id,
+            "pid".into(),
+            "hello".into(),
+            Some("bogus".into()),
+        )
+        .await
+        .expect_err("unknown mode must be rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+        assert!(mini.events.lock().is_empty(), "no durable writes");
+        assert!(mini.outbox.lock().is_empty(), "no outbox row");
+    }
+
+    /// A mode on a harness-less session (dev_vm) is a BadRequest, not a
+    /// silent drop.
+    #[tokio::test]
+    async fn harness_mode_without_a_harness_is_rejected() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
+        assert!(mini.harness.lock().is_none());
+
+        let err = send_prompt_core(&state, id, "pid".into(), "hi".into(), Some("plan".into()))
+            .await
+            .expect_err("mode without a harness must be rejected");
+        assert!(matches!(err, ApiError::BadRequest(_)), "got {err:?}");
+    }
+
+    /// The happy path: a declared mode emits `harness_mode_changed` (after
+    /// the receipt + user echo, before the enqueue) and rides the outbox
+    /// Prompt payload so the deliver verb can forward it on
+    /// `HarnessCommand::Prompt.mode`.
+    #[tokio::test]
+    async fn declared_harness_mode_emits_the_event_and_rides_the_outbox_payload() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
+        *mini.harness.lock() = Some("claude".into());
+
+        send_prompt_core(
+            &state,
+            id,
+            "pid".into(),
+            "plan it".into(),
+            Some("plan".into()),
+        )
+        .await
+        .expect("declared mode is accepted");
+
+        let events = mini.events.lock();
+        let kinds: Vec<&str> = events.iter().map(|e| e.kind.as_str()).collect();
+        assert_eq!(
+            kinds,
+            vec!["prompt_received", "agent_message", "harness_mode_changed"]
+        );
+        assert_eq!(events[2].payload["mode"], "plan");
+
+        let outbox = mini.outbox.lock();
+        assert_eq!(outbox.len(), 1);
+        assert_eq!(outbox[0].payload["text"], "plan it");
+        assert_eq!(outbox[0].payload["mode"], "plan");
+    }
+
+    /// No mode → no `harness_mode_changed` event and no `mode` key in the
+    /// payload (the wire field stays `None`, meaning "no change").
+    #[tokio::test]
+    async fn absent_harness_mode_leaves_no_mode_trace() {
+        let id = SessionId::new();
+        let (state, mini, _local) = build_state_for_session(idle_session(id));
+
+        send_prompt_core(&state, id, "pid".into(), "hello".into(), None)
+            .await
+            .expect("plain prompt");
+
+        let events = mini.events.lock();
+        assert!(events.iter().all(|e| e.kind != "harness_mode_changed"));
+        let outbox = mini.outbox.lock();
+        assert_eq!(outbox.len(), 1);
+        assert!(outbox[0].payload.get("mode").is_none());
     }
 }

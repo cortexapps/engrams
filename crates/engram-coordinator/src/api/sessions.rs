@@ -612,6 +612,12 @@ pub struct CreateSessionRequest {
     /// (silent drop is a footgun).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// ADR 0106: session mode for the initial `prompt` (e.g. `plan`) —
+    /// create-time plan mode is just mode on the first prompt. Ignored when
+    /// `prompt` is unset; validated by `send_prompt_core` against the
+    /// selected harness's descriptor modes.
+    #[serde(default)]
+    pub harness_mode: Option<String>,
     /// Per-request secret values keyed by env-var name. Only
     /// honored under `SecretMode::Literal`; broker-mode images
     /// reject overrides.
@@ -910,6 +916,7 @@ async fn boot_prepared(
             session_id,
             format!("create:{session_id}"),
             text,
+            inputs.harness_mode.clone(),
         )
         .await
         {
@@ -1093,6 +1100,7 @@ pub(crate) async fn prepare_from_grpc(
         &req.image,
         req.mode,
         req.prompt.clone(),
+        req.harness_mode.clone(),
         req.secrets.clone(),
         // ADR 0098 D1: mint from the INJECTED entropy (in prod this is
         // `OsEntropy`, identical randomness; the deterministic simulator
@@ -1187,7 +1195,8 @@ pub(crate) async fn prepare_from_row(
         session.mode,
         // The initial prompt already lives in the outbox (enqueued at create);
         // the queued reboot only needs to bring the harness up so the delivery
-        // driver can forward it.
+        // driver can forward it. Same for its mode directive.
+        None,
         None,
         overrides,
         session.id,
@@ -1401,6 +1410,8 @@ async fn prepare_inner(
     image_uri: &str,
     mode: SessionMode,
     prompt: Option<String>,
+    // ADR 0106: the mode directive riding the create-time prompt.
+    harness_mode: Option<String>,
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
     // Issue #535 (a): the per-enabled-image boot bundle (manifest already
@@ -1614,6 +1625,7 @@ async fn prepare_inner(
             selected_harness,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
+            harness_mode,
         },
         memory_mib,
         cpu_budget_vcpus,
@@ -2008,6 +2020,38 @@ pub(crate) async fn inject_upload_env(
 /// - `Vsock` (FC/VZ): `--vsock-host <port>` for AF_VSOCK loopback into the host.
 ///
 /// The harness's descriptor `args` ride after the standard flags.
+/// Resolve a harness name to its parsed descriptor: built-in (embedded
+/// harness.toml) first, then the `harness_catalog` row. Built-ins win, so a
+/// custom row can never shadow one. Shared by `resolve_harness` (the full
+/// launch resolution) and the ADR 0106 `harness_mode` validation in
+/// `send_prompt_core`, so the two can never disagree on what a name means.
+pub(crate) async fn resolve_descriptor(
+    state: &SharedState,
+    name: &str,
+) -> Result<engram_core::types::harness::HarnessDescriptor, ApiError> {
+    if let Some(builtin) = crate::builtin_harness::builtin(name) {
+        return builtin
+            .descriptor()
+            .map_err(|e| ApiError::Internal(format!("built-in harness `{name}` descriptor: {e}")));
+    }
+    if let Some(row) = state
+        .services
+        .meta
+        .get_harness_by_name(name)
+        .await
+        .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
+    {
+        return row.descriptor().map_err(|e| {
+            ApiError::Internal(format!(
+                "stored harness.toml for `{name}` failed to parse: {e}"
+            ))
+        });
+    }
+    Err(ApiError::BadRequest(format!(
+        "harness `{name}` is not a built-in and is not registered in the catalog"
+    )))
+}
+
 pub(crate) async fn resolve_harness(
     state: &SharedState,
     selected_harness: Option<&str>,
@@ -2039,11 +2083,9 @@ pub(crate) async fn resolve_harness(
     // host-image `current_bundles` stamp + an embedded descriptor; a custom harness
     // rides the `harness_catalog` (its own squashfs, materialized like an uploaded
     // skill). Built-ins win, so a custom row can never shadow one.
-    let (descriptor, harness_sha) = if let Some(builtin) = crate::builtin_harness::builtin(name) {
-        let descriptor = builtin.descriptor().map_err(|e| {
-            ApiError::Internal(format!("built-in harness `{name}` descriptor: {e}"))
-        })?;
-        let sha = fleet_bundle_catalog(state)
+    let descriptor = resolve_descriptor(state, name).await?;
+    let harness_sha = if let Some(builtin) = crate::builtin_harness::builtin(name) {
+        fleet_bundle_catalog(state)
             .await?
             .get(builtin.stamp_key)
             .cloned()
@@ -2052,8 +2094,7 @@ pub(crate) async fn resolve_harness(
                     "built-in harness `{name}` squashfs (`{}`) is not staged on any host yet",
                     builtin.stamp_key
                 ))
-            })?;
-        (descriptor, sha)
+            })?
     } else if let Some(row) = state
         .services
         .meta
@@ -2061,12 +2102,7 @@ pub(crate) async fn resolve_harness(
         .await
         .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
     {
-        let descriptor = row.descriptor().map_err(|e| {
-            ApiError::Internal(format!(
-                "stored harness.toml for `{name}` failed to parse: {e}"
-            ))
-        })?;
-        (descriptor, row.squashfs_sha256)
+        row.squashfs_sha256
     } else {
         return Err(ApiError::BadRequest(format!(
             "harness `{name}` is not a built-in and is not registered in the catalog"

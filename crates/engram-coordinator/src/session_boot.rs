@@ -114,6 +114,10 @@ pub(crate) struct BootInputs {
     /// outbox via `send_prompt_core` — the same path every follow-up uses
     /// (ADR 0073). The boot pipeline itself no longer reads it.
     pub prompt: Option<String>,
+    /// ADR 0106: the session-mode directive riding the create-time initial
+    /// prompt (e.g. `plan`). Read together with `prompt` — meaningless
+    /// without one.
+    pub harness_mode: Option<String>,
 }
 
 /// The product of resolving a session's manifest / secrets / env /
@@ -198,6 +202,7 @@ pub(crate) async fn boot_on_reserved_host(
         // The create-time prompt was enqueued to the outbox by
         // `create_session_core`; the boot pipeline no longer delivers it.
         prompt: _,
+        harness_mode: _,
     } = inputs;
 
     // ADR 0056: the image ref doubles as the SecretContext for resolving the

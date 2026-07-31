@@ -128,6 +128,7 @@ pub async fn api_prompt(state: &SharedState, session_id: SessionId, prompt_id: &
         session_id: session_id.to_string(),
         text: "sim: a prompt".to_string(),
         prompt_id: prompt_id.to_string(),
+        harness_mode: None,
     });
     session_service(state).send_prompt(req).await.is_ok()
 }

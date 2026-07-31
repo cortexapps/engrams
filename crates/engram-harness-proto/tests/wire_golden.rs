@@ -269,6 +269,14 @@ fn cmd_prompt() -> HarnessCommand {
     HarnessCommand::Prompt {
         text: "do the thing".into(),
         prompt_id: "p1".into(),
+        mode: None,
+    }
+}
+fn cmd_prompt_with_mode() -> HarnessCommand {
+    HarnessCommand::Prompt {
+        text: "plan the thing".into(),
+        prompt_id: "p2".into(),
+        mode: Some("plan".into()),
     }
 }
 fn cmd_edit_queued() -> HarnessCommand {
@@ -376,6 +384,10 @@ fn harness_command_golden_and_variant_indices() {
     assert_golden("command_checkpoint", &cmd_checkpoint());
     assert_golden("command_shutdown", &cmd_shutdown());
     assert_golden("command_prompt", &cmd_prompt());
+    // ADR 0106 sanctioned flag-day break: `Prompt` gained `mode` —
+    // the command_prompt golden was regenerated in the same PR, shipped
+    // with the coordinator + host + harness-bundle deploy train.
+    assert_golden("command_prompt_with_mode", &cmd_prompt_with_mode());
     assert_golden("command_interrupt", &HarnessCommand::Interrupt);
     assert_golden("command_edit_queued", &cmd_edit_queued());
     assert_golden("command_dequeue_queued", &cmd_dequeue_queued());
@@ -562,6 +574,7 @@ fn regen_golden() {
     write("command_checkpoint", &cmd_checkpoint());
     write("command_shutdown", &cmd_shutdown());
     write("command_prompt", &cmd_prompt());
+    write("command_prompt_with_mode", &cmd_prompt_with_mode());
     write("command_interrupt", &HarnessCommand::Interrupt);
     write("command_edit_queued", &cmd_edit_queued());
     write("command_dequeue_queued", &cmd_dequeue_queued());

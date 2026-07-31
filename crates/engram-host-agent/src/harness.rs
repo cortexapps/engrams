@@ -358,6 +358,7 @@ impl HarnessHub {
         sandbox_id: SandboxId,
         prompt_id: String,
         text: String,
+        mode: Option<String>,
     ) -> Result<(), HarnessError> {
         // ADR 0073: fail fast when unattached. The coordinator's outbox
         // driver owns retries (and the reattach), and the mpsc handoff
@@ -368,6 +369,7 @@ impl HarnessHub {
             .send(HarnessFrame::Command(HarnessCommand::Prompt {
                 prompt_id,
                 text,
+                mode,
             }))
             .await
             .map_err(|_| HarnessError::WriterClosed)?;
@@ -1567,16 +1569,21 @@ mod tests {
         // to B's harness end. Before the fix the teardown dropped B's
         // cmd_tx, which made B's writer_loop exit and close the write
         // half — so this send would fail / never arrive.
-        hub.send_prompt(sandbox_id, "pid-B".into(), "hello-B".into())
+        hub.send_prompt(sandbox_id, "pid-B".into(), "hello-B".into(), None)
             .await
             .expect("send_prompt must reach B's live writer");
         let frame: HarnessFrame = read_msg(&mut b_r)
             .await
             .expect("B should receive the prompt");
         match frame {
-            HarnessFrame::Command(HarnessCommand::Prompt { text, prompt_id }) => {
+            HarnessFrame::Command(HarnessCommand::Prompt {
+                text,
+                prompt_id,
+                mode,
+            }) => {
                 assert_eq!(text, "hello-B");
                 assert_eq!(prompt_id, "pid-B");
+                assert_eq!(mode, None);
             }
             other => panic!("expected a Prompt frame at B, got {other:?}"),
         }

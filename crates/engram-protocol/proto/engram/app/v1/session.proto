@@ -182,6 +182,11 @@ message CreateSessionRequest {
   // /opt/engram/dyn/0/<harness>/<exec>. Required for an agent-mode session;
   // unset/ignored for dev_vm. Selection is per session, not baked into the image.
   optional string harness = 11;
+  // ADR 0106: session mode for the initial `prompt` (e.g. "plan") —
+  // create-time plan mode is just mode on the first prompt. Ignored when
+  // `prompt` is unset. Validated against the selected harness's descriptor.
+  // Not named `mode` — field 2 is the agent/dev_vm SessionMode.
+  optional string harness_mode = 12;
 }
 
 message CreateSessionResponse {
@@ -217,6 +222,11 @@ message SendPromptRequest {
   // RunStarted{prompt_id} and (if queued) PromptQueued/Edited/Dequeued.
   // The coord mints one if empty (back-compat / non-web callers).
   string prompt_id = 3;
+  // ADR 0106: session-mode directive that applies from this prompt's turn
+  // onward (e.g. "plan"). Validated against the session harness's declared
+  // descriptor modes; unset = no change. Not named `mode` — that name is the
+  // agent/dev_vm SessionMode on CreateSessionRequest/Session.
+  optional string harness_mode = 4;
 }
 
 message SendPromptResponse {

@@ -608,5 +608,4 @@ env = { SOME_VAR = "1" }
 "#;
         assert!(HarnessDescriptor::parse(src).is_err());
     }
-
 }

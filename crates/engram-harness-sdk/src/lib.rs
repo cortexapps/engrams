@@ -6,6 +6,7 @@
 
 pub mod browser_activity;
 pub mod browser_view;
+pub mod mode_stamp;
 pub mod parked;
 pub mod questions;
 

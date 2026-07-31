@@ -535,6 +535,7 @@ impl HostClient for SimHostClient {
         _sandbox_id: SandboxId,
         _prompt_id: String,
         _text: String,
+        _mode: Option<String>,
     ) -> Result<(), SandboxError> {
         self.maybe_hang().await;
         self.world.with_host(self.host_id, |_| Ok(()))

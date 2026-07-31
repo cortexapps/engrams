@@ -3974,6 +3974,9 @@ impl MetadataStore for SimMetadataStore {
             "harness_idle",
             "harness_parked",
             "durability_rollback",
+            // ADR 0106: a mode directive is user intent, not guest state — it
+            // stays true across a rewind (PG parity).
+            "harness_mode_changed",
         ];
 
         let (tombstoned, surviving_side_effects) = {
