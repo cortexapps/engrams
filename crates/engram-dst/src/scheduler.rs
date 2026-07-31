@@ -60,6 +60,12 @@ pub enum DriverKind {
     GcSweeps,
 }
 
+/// Drain-round bound (a backstop, not a budget — the loop breaks the
+/// instant the world is at rest) and the sub-TTL per-round advance; see
+/// the drain commentary in [`Sim::run`] for why 30s.
+const DRAIN_CAP: usize = 1000;
+const DRAIN_ADVANCE: Duration = Duration::from_secs(30);
+
 const DRIVERS: [DriverKind; 13] = [
     DriverKind::QueueScanner,
     DriverKind::Reconcile,
@@ -1061,6 +1067,141 @@ impl Sim {
         }
     }
 
+    /// One-to-`cap` full driver rounds (heartbeats → every driver on
+    /// every replica → a sub-TTL advance), breaking the instant the
+    /// invariant set + auditor are clean. The callers' final asserts
+    /// re-run the checks and surface the real violation if `cap` is hit
+    /// without converging.
+    async fn drain_rounds(&mut self, cap: usize) {
+        for _ in 0..cap {
+            self.execute(Step::HostHeartbeats).await;
+            for r in 0..self.world.replicas.len() {
+                for kind in DRIVERS {
+                    self.execute(Step::Driver(r, kind)).await;
+                }
+            }
+            self.execute(Step::AdvanceTime(DRAIN_ADVANCE)).await;
+            if invariants::check_quiescence(&self.world).is_ok()
+                && self.model.check(&self.world).is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// The recoverability oracle: quiescence is not only "nothing is
+    /// stuck mid-flight" — every session RESTING in a recoverable state
+    /// must actually be recoverable. Idle and Created are the stability
+    /// table's unconditional arms, which makes them its blind spot: a
+    /// row whose documented affordance (the Resume verb) can never
+    /// succeed converges cleanly without this — e.g. the #896
+    /// Idle-with-retained-binding residue pre-gate, or a resume budget
+    /// exhausted into op-Failed-session-Idle. Drive the REAL Resume op
+    /// for every such session and require each to either land
+    /// Active/terminal or complete its resume op (`Done` — the world
+    /// may legally move the session on afterwards, e.g. an idle
+    /// re-evict in this drain's later rounds). Callers run this BEFORE
+    /// the op high-water snapshot (its ops are deliberate mints) and it
+    /// drives them to rest (`no_op_dropped` holds at its end).
+    /// `pub(crate)`-visible for the non-vacuity proof in tests.
+    pub async fn drive_recovery_oracle(&mut self, cap: usize) -> Result<(), String> {
+        use engram_core::types::session::SessionState;
+        let resting: Vec<engram_core::SessionId> = self.world.meta.with_db(|db| {
+            db.sessions
+                .values()
+                .filter(|r| matches!(r.session.status, SessionState::Idle | SessionState::Created))
+                .map(|r| r.session.id)
+                .collect()
+        });
+        if resting.is_empty() {
+            return Ok(());
+        }
+        if let Some(state) = self.world.replicas.iter().find_map(|r| r.state.clone()) {
+            for sid in &resting {
+                // The Step::ResumeSession machinery, with a `recovery:`
+                // idempotency key so the oracle's op rows are
+                // self-identifying in a failure detail.
+                if let Ok(EnqueueOutcome::Claimed(op)) =
+                    engram_coordinator::session_ops::enqueue_claim(
+                        &state,
+                        *sid,
+                        OpKind::Resume,
+                        serde_json::json!({}),
+                        Some(&format!("recovery:{sid}")),
+                    )
+                    .await
+                {
+                    engram_coordinator::session_ops::drive_claimed(&state, op).await;
+                }
+                crate::workload::drain_detached().await;
+            }
+        }
+        self.drain_rounds(cap).await;
+        if let Err(v) = invariants::check_quiescence(&self.world) {
+            return Err(format!(
+                "quiescence (post-recovery-drive): {} — {}",
+                v.invariant, v.detail
+            ));
+        }
+        if let Err(v) = self.model.check(&self.world) {
+            return Err(format!(
+                "quiescence (post-recovery-drive): {} — {}",
+                v.invariant, v.detail
+            ));
+        }
+        for sid in &resting {
+            let status = self
+                .world
+                .meta
+                .with_db(|db| db.sessions.get(sid).map(|r| r.session.status));
+            let resume_done = self.world.meta.with_db(|db| {
+                db.session_ops
+                    .values()
+                    .filter(|op| {
+                        op.session_id == *sid
+                            && op.kind == OpKind::Resume
+                            && op.idempotency_key.as_deref() == Some(&format!("recovery:{sid}"))
+                    })
+                    .max_by_key(|op| op.id)
+                    .is_some_and(|op| op.state == engram_core::types::session_op::OpState::Done)
+            });
+            let recovered = resume_done
+                || matches!(
+                    status,
+                    Some(
+                        SessionState::Active
+                            | SessionState::Completed
+                            | SessionState::Failed
+                            | SessionState::Dead
+                    )
+                );
+            if !recovered {
+                let op_debug = self.world.meta.with_db(|db| {
+                    db.session_ops
+                        .values()
+                        .filter(|op| op.session_id == *sid && op.kind == OpKind::Resume)
+                        .max_by_key(|op| op.id)
+                        .map(|op| {
+                            format!(
+                                "op {} [{:?}] attempts {} err {:?}",
+                                op.id, op.state, op.attempts, op.error
+                            )
+                        })
+                        .unwrap_or_else(|| "no resume op row".to_string())
+                });
+                return Err(format!(
+                    "quiescence: quiescence-recovery-wedged — session {sid} rests at \
+                     {status:?} after a driven resume against a healed fleet ({op_debug}); \
+                     its documented recovery affordance cannot converge",
+                ));
+            }
+            // A recovered-to-Active session is an acked-live milestone
+            // the auditor tracks (same as Step::ResumeSession).
+            self.record_if_live(*sid);
+        }
+        Ok(())
+    }
+
     /// Run `steps` scheduler picks, then quiesce (faults off, generous
     /// time + full driver rounds) and check liveness. Takes `&mut self`
     /// so a failed run's world stays inspectable (trace + state dumps).
@@ -1143,25 +1284,7 @@ impl Sim {
         //    Exhausted-backoff ops (create_boot's 30-attempt growing
         //    backoff) still get the advances they need. The cap keeps total
         //    drain time well under the 24h snapshot-GC grace.
-        const DRAIN_CAP: usize = 1000;
-        const DRAIN_ADVANCE: Duration = Duration::from_secs(30);
-        for _ in 0..DRAIN_CAP {
-            self.execute(Step::HostHeartbeats).await;
-            for r in 0..self.world.replicas.len() {
-                for kind in DRIVERS {
-                    self.execute(Step::Driver(r, kind)).await;
-                }
-            }
-            self.execute(Step::AdvanceTime(DRAIN_ADVANCE)).await;
-            // Break the moment the world is fully at rest. The final asserts
-            // below re-run these and surface the real violation if the cap
-            // is hit without converging.
-            if invariants::check_quiescence(&self.world).is_ok()
-                && self.model.check(&self.world).is_ok()
-            {
-                break;
-            }
-        }
+        self.drain_rounds(DRAIN_CAP).await;
         if let Err(v) = invariants::check_quiescence(&self.world) {
             return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
         }
@@ -1170,6 +1293,7 @@ impl Sim {
         if let Err(v) = self.model.check(&self.world) {
             return Err(format!("quiescence: {} — {}", v.invariant, v.detail));
         }
+        self.drive_recovery_oracle(DRAIN_CAP).await?;
         // ADR 0101 C: op-mint quiescence — the livelock-class pin. The
         // statuses above being stable is NOT enough: the ADR 0077×0090
         // incident kept every status frozen and every op terminal while
