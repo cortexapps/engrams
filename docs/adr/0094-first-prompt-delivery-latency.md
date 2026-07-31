@@ -144,6 +144,10 @@ to boot + <100 ms.
    queued prompt runs). A second stdin `user` line does not interrupt.
    Whether the product wants true steering (interrupt-then-inject) is a
    separate decision; the mechanism is not lossy.
+   *Update 2026-07-31: the product decided — a mid-turn `Prompt` now
+   auto-fires the `control_request` interrupt and the queued prompt runs
+   back-to-back on the same warm process (prod incidents showed type-ahead
+   waiting 7–56 min for hour-long turns to end). See ADR 0052 decision 5.*
 
 ## Rejected alternatives (how we found it)
 

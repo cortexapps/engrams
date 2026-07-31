@@ -2160,6 +2160,21 @@ mod adapter {
                                 .await,
                         );
                     }
+                    // Steering: a respawn-surviving queue can hold more than
+                    // one prompt — same invariant as the result-marker
+                    // consumption site (queue non-empty ⇒ abort in flight).
+                    if !pending.is_empty() {
+                        if let Some(rid) = turn.as_ref().map(|t| t.run_id.clone()) {
+                            request_interrupt(
+                                &rid,
+                                &mut stdin,
+                                &child,
+                                &mut interrupted_run,
+                                &mut interrupt_deadline,
+                            )
+                            .await;
+                        }
+                    }
                 }
                 None => {
                     let parked = !deferred_calls.lock().await.is_empty();
@@ -2253,18 +2268,33 @@ mod adapter {
                                              hallucinated reply (ADR 0054 / 0089)"
                                         );
                                     }
-                                    if interrupted_run.as_deref() == Some(run_id.as_str()) {
-                                        // Phase 3: the `control_request` abort
-                                        // surfaced as a `result error_during_
-                                        // execution` — the process is STILL
-                                        // ALIVE. Report RunInterrupted, disarm
-                                        // the SIGINT-escalation deadline, and
-                                        // fall through to consume the next
-                                        // queued prompt on the same process.
+                                    let abort_requested =
+                                        interrupted_run.as_deref() == Some(run_id.as_str());
+                                    if abort_requested {
+                                        // Phase 3: an abort was requested for
+                                        // this run (operator interrupt, or a
+                                        // steering type-ahead) — disarm the
+                                        // SIGINT-escalation deadline whatever
+                                        // the marker says; the process is
+                                        // STILL ALIVE and falls through to
+                                        // consume the next queued prompt.
                                         interrupted_run = None;
                                         interrupt_deadline = None;
+                                    }
+                                    if abort_requested
+                                        && marker.subtype == "error_during_execution"
+                                    {
+                                        // The `control_request` abort landed.
                                         emit(evt_tx, HarnessEvent::RunInterrupted { run_id }).await;
                                     } else {
+                                        // Either no abort was requested, or
+                                        // the turn COMPLETED in the
+                                        // request→abort race window (claude
+                                        // then reads the stale frame between
+                                        // turns and acks it as a no-op).
+                                        // Reporting that run as interrupted
+                                        // would falsify a fully delivered
+                                        // completion, so trust the marker.
                                         emit(
                                             evt_tx,
                                             HarnessEvent::RunCompleted {
@@ -2348,6 +2378,30 @@ mod adapter {
                                                         )
                                                         .await,
                                                     );
+                                                }
+                                                // Steering: more type-ahead is
+                                                // stacked behind the prompt
+                                                // just consumed. The arrival-
+                                                // time interrupt only covered
+                                                // the run in flight *then* —
+                                                // re-arm so the tail never
+                                                // waits out a full run
+                                                // (invariant: queue non-empty
+                                                // ⇒ an abort is in flight).
+                                                if !pending.is_empty() {
+                                                    if let Some(rid) = turn
+                                                        .as_ref()
+                                                        .map(|t| t.run_id.clone())
+                                                    {
+                                                        request_interrupt(
+                                                            &rid,
+                                                            &mut stdin,
+                                                            &child,
+                                                            &mut interrupted_run,
+                                                            &mut interrupt_deadline,
+                                                        )
+                                                        .await;
+                                                    }
                                                 }
                                             }
                                             None => {
@@ -2477,6 +2531,33 @@ mod adapter {
                                     prompt_id: Some(prompt_id),
                                     text,
                                 });
+                                // Steering (ADR 0094 follow-through): a
+                                // prompt must not rot behind a long run —
+                                // prod showed 7–56 min waits behind
+                                // hour-long agentic turns. The CLI can't
+                                // redirect a running turn (ADR 0052:
+                                // "immediate steering = interrupt + queued
+                                // message"), so fire the in-band interrupt
+                                // now; the abort's `result` consumes this
+                                // queue entry back-to-back on the same warm
+                                // process (RunInterrupted →
+                                // RunStarted{prompt_id}). Not during a
+                                // Shutdown drain: the queue survives the
+                                // respawn and delivers there.
+                                if !shutting_down {
+                                    if let Some(rid) =
+                                        turn.as_ref().map(|t| t.run_id.clone())
+                                    {
+                                        request_interrupt(
+                                            &rid,
+                                            &mut stdin,
+                                            &child,
+                                            &mut interrupted_run,
+                                            &mut interrupt_deadline,
+                                        )
+                                        .await;
+                                    }
+                                }
                             }
                         }
                         Some(HarnessCommand::ToolResult { call_id, result_json }) => {
@@ -2562,29 +2643,14 @@ mod adapter {
                                 // control frame is escalated to SIGINT (the
                                 // fallback) so an interrupt can never wedge.
                                 let run_id = t.run_id.clone();
-                                interrupted_run = Some(run_id.clone());
-                                let request_id = format!("int-{}", uuid::Uuid::new_v4());
-                                match stdin.as_mut() {
-                                    Some(s) => match write_control_interrupt(s, &request_id).await {
-                                        Ok(()) => {
-                                            tracing::info!(%run_id, "interrupt: sent control_request; awaiting abort");
-                                            interrupt_deadline = Some(
-                                                Instant::now()
-                                                    + Duration::from_secs(INTERRUPT_GRACE_SECS),
-                                            );
-                                        }
-                                        Err(e) => {
-                                            tracing::warn!(%run_id, error = %e, "control_request write failed; SIGINT fallback");
-                                            sigint_child(&child);
-                                        }
-                                    },
-                                    None => {
-                                        // stdin already closed (a Shutdown is
-                                        // draining) — fall back to SIGINT.
-                                        tracing::warn!(%run_id, "interrupt with no stdin; SIGINT fallback");
-                                        sigint_child(&child);
-                                    }
-                                }
+                                request_interrupt(
+                                    &run_id,
+                                    &mut stdin,
+                                    &child,
+                                    &mut interrupted_run,
+                                    &mut interrupt_deadline,
+                                )
+                                .await;
                             } else {
                                 tracing::debug!("interrupt while idle; nothing to stop");
                             }
@@ -2884,6 +2950,51 @@ mod adapter {
         line.push('\n');
         stdin.write_all(line.as_bytes()).await?;
         stdin.flush().await
+    }
+
+    /// Request an abort of the in-flight run `run_id`: mark it so the
+    /// `result`/reap path closes it as interrupted, send the Phase-3
+    /// `control_request` (SIGINT fallback when stdin is unavailable), and
+    /// arm the escalation grace. Shared by the operator Interrupt and the
+    /// steering type-ahead paths.
+    ///
+    /// No-op while an abort is already in flight: one outstanding
+    /// interrupt reaches the next consumption boundary, and a second
+    /// `control_request` would sit stale in claude's stdin behind the
+    /// steered user message — aborting the very turn the first one was
+    /// clearing the way for.
+    async fn request_interrupt(
+        run_id: &str,
+        stdin: &mut Option<tokio::process::ChildStdin>,
+        child: &tokio::process::Child,
+        interrupted_run: &mut Option<String>,
+        interrupt_deadline: &mut Option<Instant>,
+    ) {
+        if interrupted_run.is_some() {
+            tracing::debug!(%run_id, "interrupt already in flight; not re-sending");
+            return;
+        }
+        *interrupted_run = Some(run_id.to_string());
+        let request_id = format!("int-{}", uuid::Uuid::new_v4());
+        match stdin.as_mut() {
+            Some(s) => match write_control_interrupt(s, &request_id).await {
+                Ok(()) => {
+                    tracing::info!(%run_id, "interrupt: sent control_request; awaiting abort");
+                    *interrupt_deadline =
+                        Some(Instant::now() + Duration::from_secs(INTERRUPT_GRACE_SECS));
+                }
+                Err(e) => {
+                    tracing::warn!(%run_id, error = %e, "control_request write failed; SIGINT fallback");
+                    sigint_child(child);
+                }
+            },
+            None => {
+                // stdin already closed (a Shutdown is draining) — fall
+                // back to SIGINT.
+                tracing::warn!(%run_id, "interrupt with no stdin; SIGINT fallback");
+                sigint_child(child);
+            }
+        }
     }
 
     /// Build the argv for the persistent streaming `claude`. `--input-
@@ -4333,6 +4444,13 @@ mod adapter {
         /// before emitting each turn's lines — so a turn stays IN FLIGHT
         /// long enough for the test to inject type-ahead/queue commands
         /// before the `result` arrives.
+        ///
+        /// Control-aware for the steering era: the fake is single-threaded,
+        /// so by the time it reads a `control_request` the turn it targeted
+        /// has already fully drained — the frame is STALE. Real claude reads
+        /// a stale interrupt between turns and acks it as a no-op (nothing
+        /// in flight to abort), so the fake answers with the ack only and
+        /// never an abort `result`.
         async fn write_slow_fake_claude(per_turn: &[&str], sleep_ms: u64) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
@@ -4340,7 +4458,13 @@ mod adapter {
             let secs = format!("{}.{:03}", sleep_ms / 1000, sleep_ms % 1000);
             let mut body = String::from("#!/bin/sh\n");
             body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
-            body.push_str("while IFS= read -r _line; do\n");
+            body.push_str("while IFS= read -r line; do\n");
+            body.push_str("  case \"$line\" in\n");
+            body.push_str("    *control_request*)\n");
+            body.push_str("      printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\"}}'\n");
+            body.push_str("      continue\n");
+            body.push_str("      ;;\n");
+            body.push_str("  esac\n");
             body.push_str(&format!("  sleep {secs}\n"));
             for l in per_turn {
                 body.push_str(&format!("  printf '%s\\n' '{l}'\n"));
@@ -4366,9 +4490,12 @@ mod adapter {
 
         // Phase 1b: a prompt arriving mid-turn is QUEUED (PromptQueued),
         // stays editable (PromptEdited) / cancellable (PromptDequeued)
-        // until the turn's `result` consumes the next queued prompt —
-        // whose `RunStarted` carries that prompt_id. A Dequeue after
-        // consumption is a no-op (single-writer).
+        // until the consumption boundary — whose `RunStarted` carries that
+        // prompt_id. A Dequeue after consumption is a no-op (single-writer).
+        // Steering era: queueing also fires the auto-interrupt, but this
+        // fake completes the turn during the race window (and acks the
+        // stale frame between turns), so the edit/cancel window here is the
+        // turn's natural remainder — the queue mechanics are identical.
         #[tokio::test]
         async fn queue_holds_edits_and_consumes_type_ahead() {
             // Each turn: sleep, then one assistant line + result.
@@ -4586,11 +4713,14 @@ mod adapter {
         /// (a `control_response` ack + a `result error_during_execution`)
         /// WITHOUT exiting — exactly claude's control-frame interrupt. It
         /// records its PID on each launch so a test can prove whether the
-        /// process was respawned.
-        async fn write_interrupt_aware_fake_claude(pidfile: &str) -> String {
+        /// process was respawned. `abort_delay_ms` holds the abort back —
+        /// a real turn takes time to unwind — giving a test a deterministic
+        /// window to stack more commands behind the in-flight interrupt.
+        async fn write_interrupt_aware_fake_claude(pidfile: &str, abort_delay_ms: u64) -> String {
             use std::os::unix::fs::PermissionsExt;
             let path =
                 std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let delay = format!("{}.{:03}", abort_delay_ms / 1000, abort_delay_ms % 1000);
             let mut body = String::from("#!/bin/sh\n");
             body.push_str(&format!("echo $$ > '{pidfile}'\n"));
             body.push_str("printf '%s\\n' '{\"type\":\"system\",\"subtype\":\"init\"}'\n");
@@ -4598,6 +4728,7 @@ mod adapter {
             body.push_str("  case \"$line\" in\n");
             body.push_str("    *control_request*)\n");
             body.push_str("      printf '%s\\n' '{\"type\":\"control_response\",\"response\":{\"subtype\":\"success\"}}'\n");
+            body.push_str(&format!("      sleep {delay}\n"));
             body.push_str("      printf '%s\\n' '{\"type\":\"result\",\"subtype\":\"error_during_execution\",\"is_error\":true}'\n");
             body.push_str("      ;;\n");
             body.push_str("    *)\n");
@@ -4634,7 +4765,7 @@ mod adapter {
         #[tokio::test]
         async fn control_request_interrupt_aborts_turn_without_respawn() {
             let pidfile = temp_pidfile();
-            let script = write_interrupt_aware_fake_claude(&pidfile).await;
+            let script = write_interrupt_aware_fake_claude(&pidfile, 0).await;
 
             let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(8);
             let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
@@ -4694,10 +4825,15 @@ mod adapter {
         // and crucially NO abnormal-exit / RunCompleted{ok:false}. (The old
         // SIGINT path respawned `--resume` into a context-less process and
         // misread its immediate exit as a crash — the "An error occurred".)
+        //
+        // Steering era: the queued prompt now fires the interrupt ITSELF, so
+        // the explicit Interrupt below lands while that abort is in flight —
+        // this test also proves the duplicate-interrupt guard (a redundant
+        // Interrupt is a no-op; the event sequence is unchanged).
         #[tokio::test]
         async fn interrupt_with_queued_message_steers_on_same_process() {
             let pidfile = temp_pidfile();
-            let script = write_interrupt_aware_fake_claude(&pidfile).await;
+            let script = write_interrupt_aware_fake_claude(&pidfile, 0).await;
 
             let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
             let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
@@ -4770,6 +4906,243 @@ mod adapter {
             let _ = tokio::time::timeout(Duration::from_secs(5), engine).await;
             let _ = tokio::fs::remove_file(&script).await;
             let _ = tokio::fs::remove_file(&pidfile).await;
+        }
+
+        // Steering (the ADR 0094 follow-through): a prompt arriving mid-turn
+        // AUTO-interrupts — no explicit Interrupt command anywhere — and runs
+        // back-to-back on the same warm process: PromptQueued →
+        // RunInterrupted{r1} → RunStarted{p2}, PID unchanged. This is the fix
+        // for type-ahead rotting behind a long agentic run (prod sessions
+        // waited 7–56 min for the running turn's result before this).
+        #[tokio::test]
+        async fn mid_turn_prompt_auto_steers_without_explicit_interrupt() {
+            let pidfile = temp_pidfile();
+            let script = write_interrupt_aware_fake_claude(&pidfile, 0).await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
+            let r1 = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "working").await;
+            let pid_before = read_pid(&pidfile).await;
+
+            // The ONLY stimulus: a type-ahead prompt.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "second".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+            ));
+            match evt_rx.recv().await {
+                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r1),
+                other => panic!("expected RunInterrupted, got {other:?}"),
+            }
+            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            assert_ne!(r1, r2, "the steered turn gets a fresh run_id");
+            assert_eq!(pid2.as_deref(), Some("p2"), "the queued prompt is consumed");
+            expect_agent_message(&mut evt_rx, "working").await;
+            assert_eq!(
+                pid_before,
+                read_pid(&pidfile).await,
+                "steering must run on the same warm process",
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), engine).await;
+            let _ = tokio::fs::remove_file(&script).await;
+            let _ = tokio::fs::remove_file(&pidfile).await;
+        }
+
+        // The steering invariant: queue non-empty ⇒ an abort is in flight.
+        // Two prompts stacked mid-turn steer SEQUENTIALLY: the second's
+        // arrival-time interrupt is suppressed (one abort already in
+        // flight), so the consumption boundary re-arms it against the first
+        // steered run — the tail never waits out a full run. The fake delays
+        // its abort 300ms, guaranteeing both prompts queue behind ONE
+        // in-flight interrupt.
+        #[tokio::test]
+        async fn stacked_type_ahead_steers_each_boundary() {
+            let pidfile = temp_pidfile();
+            let script = write_interrupt_aware_fake_claude(&pidfile, 300).await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
+            let r1 = expect_run_started(&mut evt_rx).await;
+            expect_agent_message(&mut evt_rx, "working").await;
+            let pid_before = read_pid(&pidfile).await;
+
+            // Both land inside the fake's 300ms abort delay.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "second".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+            ));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p3".into(),
+                    text: "third".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p3"
+            ));
+
+            // Boundary 1: r1 aborts, p2 starts — and because p3 is still
+            // queued, the engine re-arms the interrupt against p2's run.
+            match evt_rx.recv().await {
+                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r1),
+                other => panic!("expected RunInterrupted(r1), got {other:?}"),
+            }
+            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid2.as_deref(), Some("p2"));
+            expect_agent_message(&mut evt_rx, "working").await;
+
+            // Boundary 2: p2's run aborts in turn, p3 starts.
+            match evt_rx.recv().await {
+                Some(HarnessEvent::RunInterrupted { run_id }) => assert_eq!(run_id, r2),
+                other => panic!("expected RunInterrupted(r2), got {other:?}"),
+            }
+            let (r3, pid3) = expect_run_started_id(&mut evt_rx).await;
+            assert_eq!(pid3.as_deref(), Some("p3"));
+            assert_ne!(r2, r3);
+            expect_agent_message(&mut evt_rx, "working").await;
+
+            assert_eq!(
+                pid_before,
+                read_pid(&pidfile).await,
+                "the whole steer chain must stay on one warm process",
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(5), engine).await;
+            let _ = tokio::fs::remove_file(&script).await;
+            let _ = tokio::fs::remove_file(&pidfile).await;
+        }
+
+        // The steer→completion race: the turn's own `result` (success) beats
+        // the abort — claude then reads the stale `control_request` between
+        // turns and acks it as a no-op. The raced run must close as
+        // RunCompleted (an interrupt that never landed must not falsify a
+        // fully delivered completion) and the steered prompt still runs
+        // next, on the same process.
+        #[tokio::test]
+        async fn steer_raced_by_completion_reports_run_completed() {
+            let script = write_slow_fake_claude(
+                &[
+                    r#"{"type":"assistant","message":{"id":"m","content":[{"type":"text","text":"ok"}]}}"#,
+                    r#"{"type":"result","subtype":"success","is_error":false}"#,
+                ],
+                300,
+            )
+            .await;
+
+            let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessCommand>(16);
+            let (evt_tx, mut evt_rx) = mpsc::channel::<HarnessEvent>(64);
+            let reattach = Arc::new(Notify::new());
+            let engine = tokio::spawn(run_engine(
+                test_cli(script.clone()),
+                cmd_rx,
+                reattach.clone(),
+                evt_tx,
+            ));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p1".into(),
+                    text: "first".into(),
+                })
+                .await
+                .unwrap();
+            let r1 = expect_run_started(&mut evt_rx).await;
+
+            // Steer lands mid-sleep; the fake completes the turn anyway.
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p2".into(),
+                    text: "second".into(),
+                })
+                .await
+                .unwrap();
+            assert!(matches!(
+                evt_rx.recv().await,
+                Some(HarnessEvent::PromptQueued { prompt_id, .. }) if prompt_id == "p2"
+            ));
+
+            // r1 closes as COMPLETED — the marker (subtype success) wins
+            // over the requested-but-never-landed abort.
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let c1 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r1, c1, "a raced steer must not relabel a completed run");
+
+            // The steered prompt still consumes back-to-back.
+            let (r2, pid2) = expect_run_started_id(&mut evt_rx).await;
+            assert_ne!(r1, r2);
+            assert_eq!(pid2.as_deref(), Some("p2"));
+            expect_agent_message(&mut evt_rx, "ok").await;
+            let c2 = expect_run_completed(&mut evt_rx).await;
+            assert_eq!(r2, c2);
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 5 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let _ = tokio::fs::remove_file(&script).await;
         }
 
         #[tokio::test]
