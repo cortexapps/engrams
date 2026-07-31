@@ -66,6 +66,15 @@ pub enum OpOutcome {
     Done,
     /// Retryable failure: requeue with backoff.
     Retry(String),
+    /// ADR 0108 A5: retryable, with a caller-chosen delay instead of the
+    /// attempts-scaled backoff. For arms that KNOW their cadence — a
+    /// deliver waiting out a boot or an attach grace — the growing
+    /// backoff is wrong twice: the wait is not a failure, and the
+    /// inflated attempts counter then slows the retries that matter
+    /// (the 2026-07-31 incident recovered at a 40 s cadence for this
+    /// reason). The attempts counter still increments in the store;
+    /// only the pacing is fixed.
+    RetryAfter(Duration, String),
     /// Terminal failure.
     Failed(String),
     /// The op observed its cancel flag between steps and stopped at a
@@ -798,7 +807,10 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     };
     drop(heartbeat);
     let meta = &state.services.meta;
-    let terminal = !matches!(outcome, OpOutcome::Retry(_));
+    let terminal = !matches!(
+        outcome,
+        OpOutcome::Retry(_) | OpOutcome::RetryAfter(_, _)
+    );
     let finished_done = matches!(outcome, OpOutcome::Done);
     let _ = match outcome {
         OpOutcome::Done => meta.op_finish(op.id, epoch, OpState::Done, None).await,
@@ -812,6 +824,10 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, error = %e, "op deferred (retryable)");
             meta.op_requeue_with_backoff(op.id, epoch, backoff(op.attempts), &e)
                 .await
+        }
+        OpOutcome::RetryAfter(delay, e) => {
+            tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, delay_ms = delay.as_millis() as u64, error = %e, "op deferred (fixed cadence)");
+            meta.op_requeue_with_backoff(op.id, epoch, delay, &e).await
         }
     };
     // ADR 0079 + ADR 0094: the initial-prompt DELIVER op is deferred
@@ -852,6 +868,13 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             )
         };
         if wake {
+            // ADR 0108 A4: the boot/resume just completed, so the
+            // harness attach is expected within the grace window. Stamp
+            // it BEFORE the wake — the woken deliver consults the stamp
+            // and must never observe the pre-stamp state.
+            state
+                .attach_grace
+                .insert(op.session_id, state.services.clock.now_utc());
             if let Err(e) = meta
                 .op_wake_queued_kind(op.session_id, OpKind::Deliver)
                 .await
