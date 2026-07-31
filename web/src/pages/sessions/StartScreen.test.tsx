@@ -68,12 +68,12 @@ const CATALOG = [
   },
 ];
 
-function installTransport(opts: { harnessUserEnv?: boolean } = {}) {
+function installTransport(opts: { harnessUserEnv?: boolean; harnessOAuth?: boolean } = {}) {
   const created: Array<{ type: string; profileId: string; prompt?: string }> = [];
   const transport = createRouterTransport((router) => {
     // The harness catalog is only wired when a test needs the user-env
     // block: a single "claude" harness declaring a user credential + setup hint.
-    if (opts.harnessUserEnv) {
+    if (opts.harnessUserEnv || opts.harnessOAuth) {
       router.service(HarnessCatalogService, {
         listHarnesses: () => ({
           harnesses: [
@@ -83,10 +83,12 @@ function installTransport(opts: { harnessUserEnv?: boolean } = {}) {
               descriptor: {
                 name: "claude",
                 label: "Claude Code",
-                auth: {
-                  userEnv: "CLAUDE_CODE_OAUTH_TOKEN",
-                  userEnvHint: "Run `claude setup-token`.",
-                },
+                auth: opts.harnessOAuth
+                  ? { userOauth: { provider: "openai-codex", delivery: 1 } }
+                  : {
+                      userEnv: "CLAUDE_CODE_OAUTH_TOKEN",
+                      userEnvHint: "Run `claude setup-token`.",
+                    },
                 models: [],
                 effort: [],
               },
@@ -226,6 +228,49 @@ describe("StartScreen", () => {
       await user.type(screen.getByLabelText("Task"), "Do the thing.");
       expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true);
       await user.click(screen.getByTestId("launch-task"));
+      expect(created).toHaveLength(0);
+    } finally {
+      global.fetch = origFetch;
+    }
+  });
+
+  test("blocks launch and links to Credentials when OpenAI OAuth is disconnected", async () => {
+    const origFetch = global.fetch;
+    global.fetch = (async (url: string | URL | Request) => {
+      if (String(url).endsWith("/me/credentials")) {
+        return new Response(
+          JSON.stringify({
+            credentials: [
+              {
+                kind: "oauth",
+                provider: "openai-codex",
+                harnesses: [{ name: "codex", label: "Codex" }],
+                connected: false,
+              },
+            ],
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      }
+      if (String(url).endsWith("/me/harness-env")) {
+        return new Response(JSON.stringify({ vars: [] }), {
+          status: 200,
+          headers: { "content-type": "application/json" },
+        });
+      }
+      throw new Error(`unexpected fetch ${String(url)}`);
+    }) as typeof fetch;
+    try {
+      const { transport, created } = installTransport({ harnessOAuth: true });
+      renderWithProviders(<StartScreen />, { transport });
+      const user = userEvent.setup();
+
+      expect(await screen.findByText(/OpenAI is not connected/i)).toBeTruthy();
+      expect(screen.getByRole("link", { name: /add credential/i }).getAttribute("href")).toBe(
+        "/settings/credentials",
+      );
+      await user.type(screen.getByLabelText("Task"), "Do the thing.");
+      expect((screen.getByTestId("launch-task") as HTMLButtonElement).disabled).toBe(true);
       expect(created).toHaveLength(0);
     } finally {
       global.fetch = origFetch;

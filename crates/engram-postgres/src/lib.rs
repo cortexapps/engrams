@@ -1271,6 +1271,30 @@ impl MetadataStore for PostgresStore {
             .await
             .map_err(db_err)?;
         }
+        if let Some(binding) = &ws.oauth_binding {
+            let result = sqlx::query(
+                r#"
+                INSERT INTO session_oauth_bindings
+                    (session_id, subject_kind, subject_id, provider)
+                SELECT $1, $2, $3, $4
+                FROM oauth_credentials
+                WHERE subject_kind=$2 AND subject_id=$3 AND provider=$4
+                  AND revoked_at IS NULL
+                "#,
+            )
+            .bind(ws.session_id.as_uuid())
+            .bind(binding.key.subject_kind.as_str())
+            .bind(&binding.key.subject_id)
+            .bind(&binding.key.provider)
+            .execute(&mut *tx)
+            .await
+            .map_err(db_err)?;
+            if result.rows_affected() != 1 {
+                return Err(MetaError::Conflict(
+                    "session OAuth binding requires a live credential".into(),
+                ));
+            }
+        }
 
         tx.commit().await.map_err(db_err)?;
         if matches!(disposition, CreateDisposition::Queued) {
@@ -1497,6 +1521,339 @@ impl MetadataStore for PostgresStore {
                 .await;
         }
         Ok(deleted)
+    }
+
+    // ---- ADR 0106: subject-scoped OAuth credentials and flow state ----
+
+    async fn put_oauth_credential(
+        &self,
+        credential: engram_core::types::oauth::NewSealedOAuthCredential,
+        expected_version: Option<i64>,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        let now = self.clock.now_utc();
+        let metadata = serde_json::to_value(&credential.metadata)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?;
+        let row = if let Some(expected) = expected_version {
+            sqlx::query(
+                r#"
+                UPDATE oauth_credentials SET
+                    wrapped_dek = $4, nonce = $5, ciphertext = $6, key_id = $7,
+                    account_metadata = $8, version = version + 1,
+                    updated_at = $9, revoked_at = NULL
+                WHERE subject_kind = $1 AND subject_id = $2 AND provider = $3
+                  AND version = $10
+                RETURNING *
+                "#,
+            )
+            .bind(credential.key.subject_kind.as_str())
+            .bind(&credential.key.subject_id)
+            .bind(&credential.key.provider)
+            .bind(&credential.wrapped_dek)
+            .bind(&credential.nonce)
+            .bind(&credential.ciphertext)
+            .bind(&credential.key_id)
+            .bind(metadata)
+            .bind(now)
+            .bind(expected)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?
+        } else {
+            sqlx::query(
+                r#"
+                INSERT INTO oauth_credentials (
+                    subject_kind, subject_id, provider, wrapped_dek, nonce,
+                    ciphertext, key_id, account_metadata, version, created_at,
+                    updated_at, revoked_at
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,1,$9,$9,NULL)
+                ON CONFLICT (subject_kind, subject_id, provider) DO NOTHING
+                RETURNING *
+                "#,
+            )
+            .bind(credential.key.subject_kind.as_str())
+            .bind(&credential.key.subject_id)
+            .bind(&credential.key.provider)
+            .bind(&credential.wrapped_dek)
+            .bind(&credential.nonce)
+            .bind(&credential.ciphertext)
+            .bind(&credential.key_id)
+            .bind(metadata)
+            .bind(now)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?
+        };
+        match row {
+            Some(row) => oauth_credential_from_pg(&row),
+            None => Err(MetaError::Conflict(format!(
+                "OAuth credential CAS rejected for {}/{}/{}",
+                credential.key.subject_kind.as_str(),
+                credential.key.subject_id,
+                credential.key.provider
+            ))),
+        }
+    }
+
+    async fn get_oauth_credential(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+    ) -> Result<Option<engram_core::types::oauth::SealedOAuthCredential>, MetaError> {
+        sqlx::query(
+            "SELECT * FROM oauth_credentials WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3",
+        )
+        .bind(key.subject_kind.as_str())
+        .bind(&key.subject_id)
+        .bind(&key.provider)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?
+        .map(|row| oauth_credential_from_pg(&row))
+        .transpose()
+    }
+
+    async fn list_oauth_credentials(
+        &self,
+        subject_kind: engram_core::types::oauth::OAuthSubjectKind,
+        subject_id: &str,
+    ) -> Result<Vec<engram_core::types::oauth::SealedOAuthCredential>, MetaError> {
+        sqlx::query(
+            "SELECT * FROM oauth_credentials WHERE subject_kind=$1 AND subject_id=$2 ORDER BY provider",
+        )
+        .bind(subject_kind.as_str())
+        .bind(subject_id)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(db_err)?
+        .iter()
+        .map(oauth_credential_from_pg)
+        .collect()
+    }
+
+    async fn revoke_oauth_credential(
+        &self,
+        key: &engram_core::types::oauth::OAuthCredentialKey,
+        expected_version: i64,
+    ) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+        let row = sqlx::query(
+            r#"
+            UPDATE oauth_credentials SET revoked_at=$4, updated_at=$4,
+                version=version+1
+            WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3
+              AND version=$5 AND revoked_at IS NULL
+            RETURNING *
+            "#,
+        )
+        .bind(key.subject_kind.as_str())
+        .bind(&key.subject_id)
+        .bind(&key.provider)
+        .bind(self.clock.now_utc())
+        .bind(expected_version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        match row {
+            Some(row) => oauth_credential_from_pg(&row),
+            None => {
+                let exists: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM oauth_credentials WHERE subject_kind=$1 AND subject_id=$2 AND provider=$3)",
+                )
+                .bind(key.subject_kind.as_str())
+                .bind(&key.subject_id)
+                .bind(&key.provider)
+                .fetch_one(&self.pool)
+                .await
+                .map_err(db_err)?;
+                if exists {
+                    Err(MetaError::Conflict("OAuth credential CAS rejected".into()))
+                } else {
+                    Err(MetaError::NotFound)
+                }
+            }
+        }
+    }
+
+    async fn create_oauth_flow(
+        &self,
+        flow: engram_core::types::oauth::OAuthFlow,
+    ) -> Result<(), MetaError> {
+        let result = sqlx::query(
+            r#"
+            INSERT INTO oauth_flows (
+                id, subject_kind, subject_id, provider, owner_replica,
+                lease_expires_at, expires_at, status, error_code, created_at, updated_at
+            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)
+            "#,
+        )
+        .bind(flow.id)
+        .bind(flow.key.subject_kind.as_str())
+        .bind(&flow.key.subject_id)
+        .bind(&flow.key.provider)
+        .bind(&flow.owner_replica)
+        .bind(flow.lease_expires_at)
+        .bind(flow.expires_at)
+        .bind(flow.status.as_str())
+        .bind(&flow.error_code)
+        .bind(flow.created_at)
+        .bind(flow.updated_at)
+        .execute(&self.pool)
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e)
+                if e.as_database_error()
+                    .is_some_and(|e| e.is_unique_violation()) =>
+            {
+                Err(MetaError::Conflict(
+                    "an OAuth flow is already pending for this subject and provider".into(),
+                ))
+            }
+            Err(e) => Err(db_err(e)),
+        }
+    }
+
+    async fn get_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+    ) -> Result<Option<engram_core::types::oauth::OAuthFlow>, MetaError> {
+        sqlx::query("SELECT * FROM oauth_flows WHERE id=$1")
+            .bind(id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(db_err)?
+            .map(|row| oauth_flow_from_pg(&row))
+            .transpose()
+    }
+
+    async fn renew_oauth_flow_lease(
+        &self,
+        id: uuid::Uuid,
+        owner_replica: &str,
+        lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MetaError> {
+        let now = self.clock.now_utc();
+        let updated = sqlx::query(
+            r#"
+            UPDATE oauth_flows SET lease_expires_at=$3, updated_at=$4
+            WHERE id=$1 AND owner_replica=$2 AND status='pending'
+              AND lease_expires_at > $4 AND expires_at > $4
+            "#,
+        )
+        .bind(id)
+        .bind(owner_replica)
+        .bind(lease_expires_at)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if updated.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(MetaError::Conflict("OAuth flow owner lease changed".into()))
+        }
+    }
+
+    async fn get_session_oauth_binding(
+        &self,
+        session_id: SessionId,
+    ) -> Result<Option<engram_core::types::oauth::SessionOAuthBinding>, MetaError> {
+        let row: Option<(String, String, String)> = sqlx::query_as(
+            "SELECT subject_kind, subject_id, provider FROM session_oauth_bindings WHERE session_id=$1",
+        )
+        .bind(session_id.as_uuid())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(db_err)?;
+        row.map(|(kind, subject_id, provider)| {
+            use std::str::FromStr;
+            Ok(engram_core::types::oauth::SessionOAuthBinding {
+                session_id,
+                key: engram_core::types::oauth::OAuthCredentialKey {
+                    subject_kind: engram_core::types::oauth::OAuthSubjectKind::from_str(&kind)
+                        .map_err(MetaError::Serialization)?,
+                    subject_id,
+                    provider,
+                },
+            })
+        })
+        .transpose()
+    }
+
+    async fn finish_oauth_flow(
+        &self,
+        id: uuid::Uuid,
+        owner_replica: &str,
+        status: engram_core::types::oauth::OAuthFlowStatus,
+        error_code: Option<&str>,
+    ) -> Result<(), MetaError> {
+        if !status.is_terminal() {
+            return Err(MetaError::Conflict(
+                "flow finish status must be terminal".into(),
+            ));
+        }
+        let now = self.clock.now_utc();
+        let updated = sqlx::query(
+            r#"
+            UPDATE oauth_flows SET status=$3, error_code=$4, updated_at=$5
+            WHERE id=$1 AND owner_replica=$2 AND status='pending'
+              AND lease_expires_at > $5
+            "#,
+        )
+        .bind(id)
+        .bind(owner_replica)
+        .bind(status.as_str())
+        .bind(error_code)
+        .bind(now)
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        if updated.rows_affected() == 1 {
+            Ok(())
+        } else {
+            let exists: bool =
+                sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM oauth_flows WHERE id=$1)")
+                    .bind(id)
+                    .fetch_one(&self.pool)
+                    .await
+                    .map_err(db_err)?;
+            if exists {
+                Err(MetaError::Conflict(
+                    "OAuth flow owner lease or status changed".into(),
+                ))
+            } else {
+                Err(MetaError::NotFound)
+            }
+        }
+    }
+
+    async fn cleanup_oauth_flows(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        delete_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, MetaError> {
+        let mut tx = self.pool.begin().await.map_err(db_err)?;
+        let changed = sqlx::query(
+            r#"
+            UPDATE oauth_flows SET
+              status = CASE WHEN expires_at <= $1 THEN 'expired' ELSE 'owner_lost' END,
+              error_code = CASE WHEN expires_at <= $1 THEN 'flow_expired' ELSE 'owner_lost' END,
+              updated_at = $1
+            WHERE status='pending' AND (expires_at <= $1 OR lease_expires_at <= $1)
+            "#,
+        )
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(db_err)?
+        .rows_affected();
+        let deleted =
+            sqlx::query("DELETE FROM oauth_flows WHERE status <> 'pending' AND updated_at < $1")
+                .bind(delete_before)
+                .execute(&mut *tx)
+                .await
+                .map_err(db_err)?
+                .rows_affected();
+        tx.commit().await.map_err(db_err)?;
+        Ok(changed + deleted)
     }
 
     async fn apply_missing_sandbox_strikes(
@@ -8078,5 +8435,56 @@ fn outbox_row_from_pg(
         not_before: r.try_get("not_before").map_err(db_err)?,
         delivered_at: r.try_get("delivered_at").map_err(db_err)?,
         acked_at: r.try_get("acked_at").map_err(db_err)?,
+    })
+}
+
+fn oauth_credential_from_pg(
+    row: &sqlx::postgres::PgRow,
+) -> Result<engram_core::types::oauth::SealedOAuthCredential, MetaError> {
+    use std::str::FromStr;
+    let subject_kind: String = row.try_get("subject_kind").map_err(db_err)?;
+    let metadata: serde_json::Value = row.try_get("account_metadata").map_err(db_err)?;
+    Ok(engram_core::types::oauth::SealedOAuthCredential {
+        key: engram_core::types::oauth::OAuthCredentialKey {
+            subject_kind: engram_core::types::oauth::OAuthSubjectKind::from_str(&subject_kind)
+                .map_err(MetaError::Serialization)?,
+            subject_id: row.try_get("subject_id").map_err(db_err)?,
+            provider: row.try_get("provider").map_err(db_err)?,
+        },
+        wrapped_dek: row.try_get("wrapped_dek").map_err(db_err)?,
+        nonce: row.try_get("nonce").map_err(db_err)?,
+        ciphertext: row.try_get("ciphertext").map_err(db_err)?,
+        key_id: row.try_get("key_id").map_err(db_err)?,
+        metadata: serde_json::from_value(metadata)
+            .map_err(|e| MetaError::Serialization(e.to_string()))?,
+        version: row.try_get("version").map_err(db_err)?,
+        created_at: row.try_get("created_at").map_err(db_err)?,
+        updated_at: row.try_get("updated_at").map_err(db_err)?,
+        revoked_at: row.try_get("revoked_at").map_err(db_err)?,
+    })
+}
+
+fn oauth_flow_from_pg(
+    row: &sqlx::postgres::PgRow,
+) -> Result<engram_core::types::oauth::OAuthFlow, MetaError> {
+    use std::str::FromStr;
+    let subject_kind: String = row.try_get("subject_kind").map_err(db_err)?;
+    let status: String = row.try_get("status").map_err(db_err)?;
+    Ok(engram_core::types::oauth::OAuthFlow {
+        id: row.try_get("id").map_err(db_err)?,
+        key: engram_core::types::oauth::OAuthCredentialKey {
+            subject_kind: engram_core::types::oauth::OAuthSubjectKind::from_str(&subject_kind)
+                .map_err(MetaError::Serialization)?,
+            subject_id: row.try_get("subject_id").map_err(db_err)?,
+            provider: row.try_get("provider").map_err(db_err)?,
+        },
+        owner_replica: row.try_get("owner_replica").map_err(db_err)?,
+        lease_expires_at: row.try_get("lease_expires_at").map_err(db_err)?,
+        expires_at: row.try_get("expires_at").map_err(db_err)?,
+        status: engram_core::types::oauth::OAuthFlowStatus::from_str(&status)
+            .map_err(MetaError::Serialization)?,
+        error_code: row.try_get("error_code").map_err(db_err)?,
+        created_at: row.try_get("created_at").map_err(db_err)?,
+        updated_at: row.try_get("updated_at").map_err(db_err)?,
     })
 }

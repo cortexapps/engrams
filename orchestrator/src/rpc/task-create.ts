@@ -45,6 +45,8 @@ import {
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import { oauthCredential as defaultOAuthCredential } from "../control-plane/client.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -88,6 +90,11 @@ export interface SessionCreateInput {
    *  + execs (the proto `CreateSessionRequest.harness`). Resolved from the
    *  per-session override ?? profile ?? deployment default. */
   harness?: string;
+  /** ADR 0106: provider + opaque owner only; never contains OAuth bytes. */
+  oauthCredential?: {
+    subject: { kind: OauthSubjectKind; id: string };
+    provider: string;
+  };
 }
 
 /** One harness's catalog descriptor (the bits the compiler needs): the model +
@@ -100,7 +107,13 @@ export interface HarnessDescriptorView {
    *  `orgEnv` is the programmatic credential (B4, host-side resolved). The
    *  `*Hint` fields are free-text setup instructions surfaced to the user
    *  (e.g. "Run `claude setup-token`"). */
-  auth?: { userEnv?: string; orgEnv?: string; userEnvHint?: string; orgEnvHint?: string };
+  auth?: {
+    userEnv?: string;
+    userOauth?: { provider: string; delivery: number };
+    orgEnv?: string;
+    userEnvHint?: string;
+    orgEnvHint?: string;
+  };
   models: Array<{ id: string; default: boolean; env: Record<string, string> }>;
   effort: Array<{ id: string; default: boolean; env: Record<string, string> }>;
 }
@@ -125,6 +138,9 @@ export interface SessionCompileDeps {
    *  only when the profile sets includeUserTokens, to additionally carry the
    *  user's OTHER credentials into the sandbox. */
   resolveAllUserTokens: () => Promise<Record<string, string>>;
+  /** Resolve whether the human owner has a live provider connection. */
+  hasOAuthCredential?: (provider: string) => Promise<boolean>;
+  oauthSubject?: { kind: OauthSubjectKind; id: string };
 }
 
 export interface SessionCompileOpts {
@@ -209,8 +225,10 @@ export async function compileSessionCreateInput(
   // The human credential env-var name is the selected harness's declared
   // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
   const userEnv = descriptor?.auth?.userEnv;
+  const userOauth = descriptor?.auth?.userOauth;
   const orgEnv = descriptor?.auth?.orgEnv;
   let humanUserToken: string | undefined;
+  let oauthCredential: SessionCreateInput["oauthCredential"];
   if (isHuman) {
     // The declared user credential is MANDATORY for a human run — a
     // session without it boots unauthenticated. Always inject it, and BLOCK
@@ -224,11 +242,25 @@ export async function compileSessionCreateInput(
         throw new ConnectError(
           `${label} needs your ${userEnv} credential, which isn't set.` +
             (hint ? ` ${hint}` : "") +
-            ` Add it under Settings → Tokens, then start the task again.`,
+            ` Add it under Settings → Credentials, then start the task again.`,
           Code.FailedPrecondition,
         );
       }
       humanUserToken = userToken;
+    }
+    if (userOauth) {
+      const connected = await deps.hasOAuthCredential?.(userOauth.provider);
+      if (!connected || !deps.oauthSubject) {
+        const label = descriptor?.label || selectedHarness;
+        const hint = descriptor?.auth?.userEnvHint;
+        throw new ConnectError(
+          `${label} needs your ${userOauth.provider} connection.` +
+            (hint ? ` ${hint}` : "") +
+            ` Connect it under Settings → Credentials, then start the task again.`,
+          Code.FailedPrecondition,
+        );
+      }
+      oauthCredential = { subject: deps.oauthSubject, provider: userOauth.provider };
     }
     // The profile toggle additionally carries the user's OTHER saved tokens
     // (credentials for other harnesses / tools) into the sandbox.
@@ -338,6 +370,7 @@ export async function compileSessionCreateInput(
     harness: selectedHarness,
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
+    ...(oauthCredential != null ? { oauthCredential } : {}),
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
     ...(capabilities.length > 0 ? { capabilities } : {}),
     ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
@@ -368,6 +401,11 @@ export interface CreateTaskDeps {
   secrets: {
     get(userId: string, envVar: string): Promise<string | null>;
     getAll(userId: string): Promise<Record<string, string>>;
+  };
+  oauth?: {
+    listCredentials(req: { subject: { kind: OauthSubjectKind; id: string } }): Promise<{
+      credentials: Array<{ provider: string; connected: boolean }>;
+    }>;
   };
   db: Db;
   /** ADR 0064: port-exposure store for auto-minting `profile.portExposures`.
@@ -484,6 +522,19 @@ export async function createSessionForExistingTask(
         params.ownerUserId === undefined
           ? Promise.resolve({})
           : deps.secrets.getAll(params.ownerUserId),
+      ...(params.ownerUserId === undefined
+        ? {}
+        : {
+            oauthSubject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
+            hasOAuthCredential: async (provider: string) => {
+              const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
+                subject: { kind: OauthSubjectKind.USER, id: params.ownerUserId! },
+              });
+              return response.credentials.some(
+                (credential) => credential.provider === provider && credential.connected,
+              );
+            },
+          }),
     },
     {
       // An automation-owned review task has no human token; use the harness's
@@ -590,6 +641,15 @@ export async function createTaskWithSession(
       harnessCatalog: deps.harnessCatalog,
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
       resolveAllUserTokens: () => deps.secrets.getAll(params.ownerUserId),
+      oauthSubject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
+      hasOAuthCredential: async (provider: string) => {
+        const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
+          subject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
+        });
+        return response.credentials.some(
+          (credential) => credential.provider === provider && credential.connected,
+        );
+      },
     },
     {
       ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),

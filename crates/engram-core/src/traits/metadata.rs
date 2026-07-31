@@ -67,6 +67,9 @@ pub struct SessionCreateWriteSet {
     /// `reserve_and_persist_create` also mirrors `runtime_spec
     /// .selected_harness` into the pre-existing `sessions.harness` column.
     pub runtime_spec: crate::types::runtime_spec::RuntimeSpec,
+    /// ADR 0106: human OAuth authorization, containing only the provider and
+    /// opaque subject. Written atomically before a harness can attach.
+    pub oauth_binding: Option<crate::types::oauth::SessionOAuthBinding>,
 }
 
 /// One candidate host's fit verdict from
@@ -483,6 +486,99 @@ pub trait MetadataStore: Send + Sync {
     }
     async fn delete_org_secret(&self, _name: &str) -> Result<bool, MetaError> {
         Ok(false)
+    }
+
+    // ---- ADR 0106: subject-scoped OAuth credentials and short-lived flows ----
+
+    /// Insert a credential when `expected_version` is `None`, or update it iff
+    /// the current version matches. Successful writes increment monotonically;
+    /// revoked credentials can be reconnected through the same CAS path.
+    async fn put_oauth_credential(
+        &self,
+        _credential: crate::types::oauth::NewSealedOAuthCredential,
+        _expected_version: Option<i64>,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::Conflict(
+            "OAuth credential storage is not implemented".into(),
+        ))
+    }
+
+    async fn get_oauth_credential(
+        &self,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+    ) -> Result<Option<crate::types::oauth::SealedOAuthCredential>, MetaError> {
+        Ok(None)
+    }
+
+    async fn list_oauth_credentials(
+        &self,
+        _subject_kind: crate::types::oauth::OAuthSubjectKind,
+        _subject_id: &str,
+    ) -> Result<Vec<crate::types::oauth::SealedOAuthCredential>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    async fn revoke_oauth_credential(
+        &self,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+        _expected_version: i64,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::NotFound)
+    }
+
+    async fn create_oauth_flow(
+        &self,
+        _flow: crate::types::oauth::OAuthFlow,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict(
+            "OAuth flow storage is not implemented".into(),
+        ))
+    }
+
+    async fn get_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+    ) -> Result<Option<crate::types::oauth::OAuthFlow>, MetaError> {
+        Ok(None)
+    }
+
+    /// Extend a pending flow's owner lease. The owner id fences stale replicas.
+    async fn renew_oauth_flow_lease(
+        &self,
+        _id: uuid::Uuid,
+        _owner_replica: &str,
+        _lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::NotFound)
+    }
+
+    /// Owner-fenced status transition. A stale replica cannot complete or
+    /// cancel a flow after its lease moved or expired.
+    async fn finish_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _owner_replica: &str,
+        _status: crate::types::oauth::OAuthFlowStatus,
+        _error_code: Option<&str>,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::NotFound)
+    }
+
+    /// Deterministic cleanup step: marks pending expired/owner-lost flows and
+    /// deletes terminal rows beyond `delete_before`.
+    async fn cleanup_oauth_flows(
+        &self,
+        _now: chrono::DateTime<chrono::Utc>,
+        _delete_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
+    }
+
+    async fn get_session_oauth_binding(
+        &self,
+        _session_id: SessionId,
+    ) -> Result<Option<crate::types::oauth::SessionOAuthBinding>, MetaError> {
+        Ok(None)
     }
 
     /// ADR 0047 (replica-safe reconciler): apply one heartbeat's

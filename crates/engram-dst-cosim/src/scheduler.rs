@@ -133,6 +133,7 @@ impl Cosim {
                 None,
                 None,
             ),
+            oauth_binding: None,
         };
         let candidates = vec![self.world.host_id];
         let disp = self

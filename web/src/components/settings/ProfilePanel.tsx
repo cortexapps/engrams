@@ -55,7 +55,7 @@ export function ProfilePanel() {
               </span>
             )}
           </Row>
-          <Row label="Tokens">
+          <Row label="Credentials">
             <TokensSummary />
           </Row>
         </CardContent>
@@ -126,8 +126,8 @@ function TokensSummary() {
   return (
     <span className="text-sm">
       {saved} of {total} saved · managed under{" "}
-      <Link to="/settings/tokens" className="underline">
-        Tokens
+      <Link to="/settings/credentials" className="underline">
+        Credentials
       </Link>
     </span>
   );

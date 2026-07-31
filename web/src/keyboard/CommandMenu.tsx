@@ -55,7 +55,7 @@ const DESTS: Dest[] = [
   { to: "/operator/images", label: "Images", icon: Box, admin: true },
   { to: "/operator/registries", label: "Registries", icon: KeyRound, admin: true },
   { to: "/settings", label: "Settings · Profile", icon: User, leader: "," },
-  { to: "/settings/tokens", label: "Settings · Tokens", icon: KeySquare },
+  { to: "/settings/credentials", label: "Settings · Credentials", icon: KeySquare },
   { to: "/settings/members", label: "Settings · Members", icon: Users, admin: true },
 ];
 

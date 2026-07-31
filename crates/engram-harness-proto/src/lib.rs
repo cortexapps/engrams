@@ -512,7 +512,7 @@ pub struct CheckpointAck {
     pub message: Option<String>,
 }
 
-// ---- Forge bridge (ADR 0023) -------------------------------------------
+// ---- Session credential-control bridge (ADRs 0023, 0106) ---------------
 //
 // A *separate* guest→host channel from the harness one above: the
 // in-guest `GIT_ASKPASS` helper dials the host on `FORGE_VSOCK_PORT`,
@@ -522,8 +522,8 @@ pub struct CheckpointAck {
 // 4-byte-length + bincode framing (`read_msg`/`write_msg`).
 //
 // ADR 0056 P3 folded API access + PR-open onto the egress inject+observe
-// plane, so this bridge now carries ONLY the git-clone/push credential
-// (the one delivery the interceptor can't header-inject).
+// plane. ADR 0106 reuses this isolated, one-shot, session-authenticated
+// transport for opaque OAuth cache fetch/CAS without adding another VMM port.
 
 /// Vsock port the in-guest forge helper dials (guest→host). Distinct
 /// from the harness channel (1026), agentd exec (1024), and agentd
@@ -540,14 +540,21 @@ pub struct ForgeRequest {
     pub op: ForgeOp,
 }
 
-/// The forge operation requested. An enum for extensibility — ADR 0056 P3
-/// retired the PR-open op (PRs open via the egress inject+observe plane now),
-/// leaving the one credential op the interceptor can't deliver.
+/// The credential operation requested. The historical Forge name stays wire
+/// stable for already-baked guests; new operations are trailing variants.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ForgeOp {
     /// Mint a fresh git credential for `host` (optionally scoping the
     /// installation to `owner`). The reply is [`ForgeResponse::Credential`].
     FetchCredential { host: String, owner: Option<String> },
+    /// Fetch the OAuth credential bound to this session. The caller cannot
+    /// select a provider or subject; both come from the durable binding.
+    FetchOAuthCredential,
+    /// Publish a refreshed provider cache using compare-and-swap.
+    UpdateOAuthCredential {
+        expected_version: i64,
+        opaque_bundle: Vec<u8>,
+    },
 }
 
 /// The host's reply to a [`ForgeRequest`].
@@ -561,6 +568,11 @@ pub enum ForgeResponse {
     /// provider error — `message` is safe to surface to the guest.
     Error {
         message: String,
+    },
+    OAuthCredential {
+        provider: String,
+        version: i64,
+        opaque_bundle: Vec<u8>,
     },
 }
 

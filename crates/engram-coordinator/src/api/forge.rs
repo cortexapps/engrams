@@ -1,4 +1,4 @@
-//! ADR 0023 in-session forge seam.
+//! ADRs 0023 and 0106 in-session credential-control seam.
 //!
 //! One operation the in-guest `GIT_ASKPASS` helper invokes — mint a fresh
 //! git clone/push credential — reachable over two transports that share the
@@ -11,8 +11,9 @@
 //!   FC backend's forge listener fires this for each in-guest dial; we
 //!   read a [`ForgeRequest`], run the same core, write a [`ForgeResponse`].
 //!
-//! Either way the guest holds only its session-scoped broker token
-//! (`ENGRAM_FORGE_TOKEN`), never a deployment token.
+//! Either way the guest holds only a session-scoped broker token, never a
+//! deployment token. OAuth operations select no subject/provider from guest
+//! input: the coordinator resolves the durable session binding.
 //!
 //! ADR 0056 P3 folded PR-open onto the egress inject+observe plane, so this
 //! seam now carries ONLY the git credential — the one delivery the egress
@@ -184,6 +185,22 @@ pub async fn forge_forward(
     Json(process_request(&state, req).await)
 }
 
+/// Process-backend equivalent of the one-shot guest control channel. The
+/// broker token is session-scoped; the path id must also match the framed
+/// request so callers cannot accidentally cross session boundaries.
+pub async fn credential_control(
+    State(state): State<SharedState>,
+    Path(id): Path<SessionId>,
+    Json(req): Json<ForgeRequest>,
+) -> Json<ForgeResponse> {
+    if id != req.session_id {
+        return Json(ForgeResponse::Error {
+            message: "session mismatch".into(),
+        });
+    }
+    Json(process_request(&state, req).await)
+}
+
 // ---- vsock transport (Firecracker) -------------------------------------
 
 /// Handle one in-guest forge connection: read a [`ForgeRequest`], run
@@ -206,16 +223,27 @@ pub async fn handle_vsock_connection(state: SharedState, mut stream: HarnessByte
 }
 
 async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeResponse {
-    let integration = match authorize(state, req.session_id, &req.broker_token).await {
-        Ok(f) => f,
-        Err(d) => {
-            return ForgeResponse::Error {
-                message: d.message().into(),
-            }
-        }
-    };
+    if !crate::api::session_auth::authorize_broker_token(state, req.session_id, &req.broker_token)
+        .await
+    {
+        return ForgeResponse::Error {
+            message: "invalid or missing credential broker token".into(),
+        };
+    }
     match req.op {
         ForgeOp::FetchCredential { host, owner } => {
+            let integration = match state
+                .integrations
+                .resolve("github", &state.services.secrets)
+                .await
+            {
+                Some(integration) => integration,
+                None => {
+                    return ForgeResponse::Error {
+                        message: Denied::NoForge.message().into(),
+                    }
+                }
+            };
             match op_fetch_credential(state, req.session_id, &integration, Some(host), owner).await
             {
                 Ok(ScopedCredential::Basic {
@@ -227,5 +255,32 @@ async fn process_request(state: &SharedState, req: ForgeRequest) -> ForgeRespons
                 Err(message) => ForgeResponse::Error { message },
             }
         }
+        ForgeOp::FetchOAuthCredential => match state.oauth.fetch_session(req.session_id).await {
+            Ok((provider, version, opaque_bundle)) => ForgeResponse::OAuthCredential {
+                provider,
+                version,
+                opaque_bundle,
+            },
+            Err(error) => ForgeResponse::Error {
+                message: error.code().into(),
+            },
+        },
+        ForgeOp::UpdateOAuthCredential {
+            expected_version,
+            opaque_bundle,
+        } => match state
+            .oauth
+            .update_session(req.session_id, expected_version, &opaque_bundle)
+            .await
+        {
+            Ok((provider, version, opaque_bundle)) => ForgeResponse::OAuthCredential {
+                provider,
+                version,
+                opaque_bundle,
+            },
+            Err(error) => ForgeResponse::Error {
+                message: error.code().into(),
+            },
+        },
     }
 }

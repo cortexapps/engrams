@@ -619,6 +619,7 @@ impl Sim {
                         None,
                         None,
                     ),
+                    oauth_binding: None,
                 };
                 let candidates = self.world.host_ids.clone();
                 let disp = state

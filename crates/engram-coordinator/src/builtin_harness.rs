@@ -85,9 +85,38 @@ mod tests {
         let b = builtin("codex").expect("codex is built-in");
         let d = b.descriptor().expect("embedded codex harness.toml parses");
         assert_eq!(d.name, "codex");
-        assert_eq!(d.auth.user_env.as_deref(), Some("CODEX_ACCESS_TOKEN"));
+        assert!(d.auth.user_env.is_none());
+        assert_eq!(
+            d.auth
+                .user_oauth
+                .as_ref()
+                .map(|oauth| oauth.provider.as_str()),
+            Some("openai-codex")
+        );
         assert_eq!(d.auth.org_env.as_deref(), Some("CODEX_API_KEY"));
         assert_eq!(d.egress.allow_hosts, vec!["api.openai.com", "chatgpt.com"]);
+        assert_eq!(
+            d.models
+                .iter()
+                .map(|model| model.id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gpt-5.6-sol",
+                "gpt-5.6-terra",
+                "gpt-5.6-luna",
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex-spark",
+            ]
+        );
+        assert_eq!(
+            d.models
+                .iter()
+                .find(|model| model.default)
+                .map(|model| model.id.as_str()),
+            Some("gpt-5.6-sol")
+        );
         assert_eq!(b.stamp_key, "harness-codex");
     }
 }

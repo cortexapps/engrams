@@ -703,6 +703,7 @@ mod tests {
                 "tok-abc-123".to_string(),
             )]),
             secrets: std::collections::HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
         };
@@ -730,6 +731,7 @@ mod tests {
             prompt: None,
             harness_env: std::collections::HashMap::new(),
             secrets: std::collections::HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: Some("claude".into()),
         };
@@ -757,6 +759,7 @@ mod tests {
                 ("OTHER".to_string(), "v".to_string()),
             ]),
             secrets: std::collections::HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
         };

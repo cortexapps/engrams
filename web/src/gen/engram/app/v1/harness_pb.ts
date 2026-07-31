@@ -2,15 +2,15 @@
 // @generated from file engram/app/v1/harness.proto (package engram.app.v1, syntax proto3)
 /* eslint-disable */
 
-import type { GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv1";
-import { fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv1";
+import type { GenEnum, GenFile, GenMessage, GenService } from "@bufbuild/protobuf/codegenv1";
+import { enumDesc, fileDesc, messageDesc, serviceDesc } from "@bufbuild/protobuf/codegenv1";
 import type { Message } from "@bufbuild/protobuf";
 
 /**
  * Describes the file engram/app/v1/harness.proto.
  */
 export const file_engram_app_v1_harness: GenFile = /*@__PURE__*/
-  fileDesc("ChtlbmdyYW0vYXBwL3YxL2hhcm5lc3MucHJvdG8SDWVuZ3JhbS5hcHAudjEiRgoWUmVnaXN0ZXJIYXJuZXNzUmVxdWVzdBIMCgRuYW1lGAEgASgJEg8KB29jaV9yZWYYAiABKAkSDQoFb3duZXIYAyABKAkiSQoXUmVnaXN0ZXJIYXJuZXNzUmVzcG9uc2USLgoHaGFybmVzcxgBIAEoCzIdLmVuZ3JhbS5hcHAudjEuSGFybmVzc1N1bW1hcnkiFgoUTGlzdEhhcm5lc3Nlc1JlcXVlc3QiSQoVTGlzdEhhcm5lc3Nlc1Jlc3BvbnNlEjAKCWhhcm5lc3NlcxgBIAMoCzIdLmVuZ3JhbS5hcHAudjEuSGFybmVzc1N1bW1hcnkiZgoOSGFybmVzc1N1bW1hcnkSDAoEbmFtZRgBIAEoCRI0CgpkZXNjcmlwdG9yGAIgASgLMiAuZW5ncmFtLmFwcC52MS5IYXJuZXNzRGVzY3JpcHRvchIQCghidWlsdF9pbhgDIAEoCCKdAgoRSGFybmVzc0Rlc2NyaXB0b3ISDAoEbmFtZRgBIAEoCRISCgVsYWJlbBgCIAEoCUgAiAEBEigKBGF1dGgYAyABKAsyGi5lbmdyYW0uYXBwLnYxLkhhcm5lc3NBdXRoEiwKBm1vZGVscxgEIAMoCzIcLmVuZ3JhbS5hcHAudjEuSGFybmVzc09wdGlvbhIsCgZlZmZvcnQYBSADKAsyHC5lbmdyYW0uYXBwLnYxLkhhcm5lc3NPcHRpb24SGAoLZGVzY3JpcHRpb24YBiABKAlIAYgBARIsCgZlZ3Jlc3MYByABKAsyHC5lbmdyYW0uYXBwLnYxLkhhcm5lc3NFZ3Jlc3NCCAoGX2xhYmVsQg4KDF9kZXNjcmlwdGlvbiJBCg1IYXJuZXNzRWdyZXNzEhMKC2FsbG93X2hvc3RzGAEgAygJEhsKE2FsbG93X2hvc3RfcGF0dGVybnMYAiADKAkirQEKC0hhcm5lc3NBdXRoEhQKB29yZ19lbnYYASABKAlIAIgBARIVCgh1c2VyX2VudhgCIAEoCUgBiAEBEhkKDG9yZ19lbnZfaGludBgDIAEoCUgCiAEBEhoKDXVzZXJfZW52X2hpbnQYBCABKAlIA4gBAUIKCghfb3JnX2VudkILCglfdXNlcl9lbnZCDwoNX29yZ19lbnZfaGludEIQCg5fdXNlcl9lbnZfaGludCKqAQoNSGFybmVzc09wdGlvbhIKCgJpZBgBIAEoCRISCgVsYWJlbBgCIAEoCUgAiAEBEg8KB2RlZmF1bHQYAyABKAgSMgoDZW52GAQgAygLMiUuZW5ncmFtLmFwcC52MS5IYXJuZXNzT3B0aW9uLkVudkVudHJ5GioKCEVudkVudHJ5EgsKA2tleRgBIAEoCRINCgV2YWx1ZRgCIAEoCToCOAFCCAoGX2xhYmVsIiEKEUdldEhhcm5lc3NSZXF1ZXN0EgwKBG5hbWUYASABKAkiRAoSR2V0SGFybmVzc1Jlc3BvbnNlEi4KB2hhcm5lc3MYASABKAsyHS5lbmdyYW0uYXBwLnYxLkhhcm5lc3NTdW1tYXJ5IiQKFERlbGV0ZUhhcm5lc3NSZXF1ZXN0EgwKBG5hbWUYASABKAkiKAoVRGVsZXRlSGFybmVzc1Jlc3BvbnNlEg8KB2RlbGV0ZWQYASABKAgyhAMKFUhhcm5lc3NDYXRhbG9nU2VydmljZRJgCg9SZWdpc3Rlckhhcm5lc3MSJS5lbmdyYW0uYXBwLnYxLlJlZ2lzdGVySGFybmVzc1JlcXVlc3QaJi5lbmdyYW0uYXBwLnYxLlJlZ2lzdGVySGFybmVzc1Jlc3BvbnNlEloKDUxpc3RIYXJuZXNzZXMSIy5lbmdyYW0uYXBwLnYxLkxpc3RIYXJuZXNzZXNSZXF1ZXN0GiQuZW5ncmFtLmFwcC52MS5MaXN0SGFybmVzc2VzUmVzcG9uc2USUQoKR2V0SGFybmVzcxIgLmVuZ3JhbS5hcHAudjEuR2V0SGFybmVzc1JlcXVlc3QaIS5lbmdyYW0uYXBwLnYxLkdldEhhcm5lc3NSZXNwb25zZRJaCg1EZWxldGVIYXJuZXNzEiMuZW5ncmFtLmFwcC52MS5EZWxldGVIYXJuZXNzUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuRGVsZXRlSGFybmVzc1Jlc3BvbnNlYgZwcm90bzM");
+  fileDesc("ChtlbmdyYW0vYXBwL3YxL2hhcm5lc3MucHJvdG8SDWVuZ3JhbS5hcHAudjEiRgoWUmVnaXN0ZXJIYXJuZXNzUmVxdWVzdBIMCgRuYW1lGAEgASgJEg8KB29jaV9yZWYYAiABKAkSDQoFb3duZXIYAyABKAkiSQoXUmVnaXN0ZXJIYXJuZXNzUmVzcG9uc2USLgoHaGFybmVzcxgBIAEoCzIdLmVuZ3JhbS5hcHAudjEuSGFybmVzc1N1bW1hcnkiFgoUTGlzdEhhcm5lc3Nlc1JlcXVlc3QiSQoVTGlzdEhhcm5lc3Nlc1Jlc3BvbnNlEjAKCWhhcm5lc3NlcxgBIAMoCzIdLmVuZ3JhbS5hcHAudjEuSGFybmVzc1N1bW1hcnkiZgoOSGFybmVzc1N1bW1hcnkSDAoEbmFtZRgBIAEoCRI0CgpkZXNjcmlwdG9yGAIgASgLMiAuZW5ncmFtLmFwcC52MS5IYXJuZXNzRGVzY3JpcHRvchIQCghidWlsdF9pbhgDIAEoCCKdAgoRSGFybmVzc0Rlc2NyaXB0b3ISDAoEbmFtZRgBIAEoCRISCgVsYWJlbBgCIAEoCUgAiAEBEigKBGF1dGgYAyABKAsyGi5lbmdyYW0uYXBwLnYxLkhhcm5lc3NBdXRoEiwKBm1vZGVscxgEIAMoCzIcLmVuZ3JhbS5hcHAudjEuSGFybmVzc09wdGlvbhIsCgZlZmZvcnQYBSADKAsyHC5lbmdyYW0uYXBwLnYxLkhhcm5lc3NPcHRpb24SGAoLZGVzY3JpcHRpb24YBiABKAlIAYgBARIsCgZlZ3Jlc3MYByABKAsyHC5lbmdyYW0uYXBwLnYxLkhhcm5lc3NFZ3Jlc3NCCAoGX2xhYmVsQg4KDF9kZXNjcmlwdGlvbiJBCg1IYXJuZXNzRWdyZXNzEhMKC2FsbG93X2hvc3RzGAEgAygJEhsKE2FsbG93X2hvc3RfcGF0dGVybnMYAiADKAki3gEKC0hhcm5lc3NBdXRoEhQKB29yZ19lbnYYASABKAlIAIgBARIVCgh1c2VyX2VudhgCIAEoCUgBiAEBEhkKDG9yZ19lbnZfaGludBgDIAEoCUgCiAEBEhoKDXVzZXJfZW52X2hpbnQYBCABKAlIA4gBARIvCgp1c2VyX29hdXRoGAUgASgLMhsuZW5ncmFtLmFwcC52MS5IYXJuZXNzT0F1dGhCCgoIX29yZ19lbnZCCwoJX3VzZXJfZW52Qg8KDV9vcmdfZW52X2hpbnRCEAoOX3VzZXJfZW52X2hpbnQiUAoMSGFybmVzc09BdXRoEhAKCHByb3ZpZGVyGAEgASgJEi4KCGRlbGl2ZXJ5GAIgASgOMhwuZW5ncmFtLmFwcC52MS5PYXV0aERlbGl2ZXJ5IqoBCg1IYXJuZXNzT3B0aW9uEgoKAmlkGAEgASgJEhIKBWxhYmVsGAIgASgJSACIAQESDwoHZGVmYXVsdBgDIAEoCBIyCgNlbnYYBCADKAsyJS5lbmdyYW0uYXBwLnYxLkhhcm5lc3NPcHRpb24uRW52RW50cnkaKgoIRW52RW50cnkSCwoDa2V5GAEgASgJEg0KBXZhbHVlGAIgASgJOgI4AUIICgZfbGFiZWwiIQoRR2V0SGFybmVzc1JlcXVlc3QSDAoEbmFtZRgBIAEoCSJEChJHZXRIYXJuZXNzUmVzcG9uc2USLgoHaGFybmVzcxgBIAEoCzIdLmVuZ3JhbS5hcHAudjEuSGFybmVzc1N1bW1hcnkiJAoURGVsZXRlSGFybmVzc1JlcXVlc3QSDAoEbmFtZRgBIAEoCSIoChVEZWxldGVIYXJuZXNzUmVzcG9uc2USDwoHZGVsZXRlZBgBIAEoCCpRCg1PYXV0aERlbGl2ZXJ5Eh4KGk9BVVRIX0RFTElWRVJZX1VOU1BFQ0lGSUVEEAASIAocT0FVVEhfREVMSVZFUllfT1BBUVVFX0JVTkRMRRABMoQDChVIYXJuZXNzQ2F0YWxvZ1NlcnZpY2USYAoPUmVnaXN0ZXJIYXJuZXNzEiUuZW5ncmFtLmFwcC52MS5SZWdpc3Rlckhhcm5lc3NSZXF1ZXN0GiYuZW5ncmFtLmFwcC52MS5SZWdpc3Rlckhhcm5lc3NSZXNwb25zZRJaCg1MaXN0SGFybmVzc2VzEiMuZW5ncmFtLmFwcC52MS5MaXN0SGFybmVzc2VzUmVxdWVzdBokLmVuZ3JhbS5hcHAudjEuTGlzdEhhcm5lc3Nlc1Jlc3BvbnNlElEKCkdldEhhcm5lc3MSIC5lbmdyYW0uYXBwLnYxLkdldEhhcm5lc3NSZXF1ZXN0GiEuZW5ncmFtLmFwcC52MS5HZXRIYXJuZXNzUmVzcG9uc2USWgoNRGVsZXRlSGFybmVzcxIjLmVuZ3JhbS5hcHAudjEuRGVsZXRlSGFybmVzc1JlcXVlc3QaJC5lbmdyYW0uYXBwLnYxLkRlbGV0ZUhhcm5lc3NSZXNwb25zZWIGcHJvdG8z");
 
 /**
  * @generated from message engram.app.v1.RegisterHarnessRequest
@@ -255,6 +255,14 @@ export type HarnessAuth = Message<"engram.app.v1.HarnessAuth"> & {
    * @generated from field: optional string user_env_hint = 4;
    */
   userEnvHint?: string;
+
+  /**
+   * ADR 0106: reusable human OAuth connection. Mutually exclusive with
+   * user_env; its opaque payload is never projected through this catalog API.
+   *
+   * @generated from field: engram.app.v1.HarnessOAuth user_oauth = 5;
+   */
+  userOauth?: HarnessOAuth;
 };
 
 /**
@@ -263,6 +271,30 @@ export type HarnessAuth = Message<"engram.app.v1.HarnessAuth"> & {
  */
 export const HarnessAuthSchema: GenMessage<HarnessAuth> = /*@__PURE__*/
   messageDesc(file_engram_app_v1_harness, 7);
+
+/**
+ * @generated from message engram.app.v1.HarnessOAuth
+ */
+export type HarnessOAuth = Message<"engram.app.v1.HarnessOAuth"> & {
+  /**
+   * Stable trusted-provider driver id (for example "openai-codex").
+   *
+   * @generated from field: string provider = 1;
+   */
+  provider: string;
+
+  /**
+   * @generated from field: engram.app.v1.OauthDelivery delivery = 2;
+   */
+  delivery: OauthDelivery;
+};
+
+/**
+ * Describes the message engram.app.v1.HarnessOAuth.
+ * Use `create(HarnessOAuthSchema)` to create a new message.
+ */
+export const HarnessOAuthSchema: GenMessage<HarnessOAuth> = /*@__PURE__*/
+  messageDesc(file_engram_app_v1_harness, 8);
 
 /**
  * One model or effort option; env is the var(s) that select it.
@@ -302,7 +334,7 @@ export type HarnessOption = Message<"engram.app.v1.HarnessOption"> & {
  * Use `create(HarnessOptionSchema)` to create a new message.
  */
 export const HarnessOptionSchema: GenMessage<HarnessOption> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_harness, 8);
+  messageDesc(file_engram_app_v1_harness, 9);
 
 /**
  * @generated from message engram.app.v1.GetHarnessRequest
@@ -321,7 +353,7 @@ export type GetHarnessRequest = Message<"engram.app.v1.GetHarnessRequest"> & {
  * Use `create(GetHarnessRequestSchema)` to create a new message.
  */
 export const GetHarnessRequestSchema: GenMessage<GetHarnessRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_harness, 9);
+  messageDesc(file_engram_app_v1_harness, 10);
 
 /**
  * @generated from message engram.app.v1.GetHarnessResponse
@@ -338,7 +370,7 @@ export type GetHarnessResponse = Message<"engram.app.v1.GetHarnessResponse"> & {
  * Use `create(GetHarnessResponseSchema)` to create a new message.
  */
 export const GetHarnessResponseSchema: GenMessage<GetHarnessResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_harness, 10);
+  messageDesc(file_engram_app_v1_harness, 11);
 
 /**
  * @generated from message engram.app.v1.DeleteHarnessRequest
@@ -357,7 +389,7 @@ export type DeleteHarnessRequest = Message<"engram.app.v1.DeleteHarnessRequest">
  * Use `create(DeleteHarnessRequestSchema)` to create a new message.
  */
 export const DeleteHarnessRequestSchema: GenMessage<DeleteHarnessRequest> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_harness, 11);
+  messageDesc(file_engram_app_v1_harness, 12);
 
 /**
  * @generated from message engram.app.v1.DeleteHarnessResponse
@@ -377,7 +409,30 @@ export type DeleteHarnessResponse = Message<"engram.app.v1.DeleteHarnessResponse
  * Use `create(DeleteHarnessResponseSchema)` to create a new message.
  */
 export const DeleteHarnessResponseSchema: GenMessage<DeleteHarnessResponse> = /*@__PURE__*/
-  messageDesc(file_engram_app_v1_harness, 12);
+  messageDesc(file_engram_app_v1_harness, 13);
+
+/**
+ * @generated from enum engram.app.v1.OauthDelivery
+ */
+export enum OauthDelivery {
+  /**
+   * @generated from enum value: OAUTH_DELIVERY_UNSPECIFIED = 0;
+   */
+  UNSPECIFIED = 0,
+
+  /**
+   * A bounded provider-owned credential cache, opaque to generic consumers.
+   *
+   * @generated from enum value: OAUTH_DELIVERY_OPAQUE_BUNDLE = 1;
+   */
+  OPAQUE_BUNDLE = 1,
+}
+
+/**
+ * Describes the enum engram.app.v1.OauthDelivery.
+ */
+export const OauthDeliverySchema: GenEnum<OauthDelivery> = /*@__PURE__*/
+  enumDesc(file_engram_app_v1_harness, 0);
 
 /**
  * The harness catalog (ADR 0062): the registry of selectable agent harnesses,

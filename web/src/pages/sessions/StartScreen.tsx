@@ -35,6 +35,7 @@ import { useIntegrationCatalog } from "../../hooks/useIntegrations";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useHarnessEnv } from "../../hooks/useHarnessEnv";
+import { useCredentials } from "../../hooks/useCredentials";
 import { useTasksAsSessionList } from "../../hooks/useTasks";
 import { useNow } from "../../hooks/useNow";
 import {
@@ -110,6 +111,7 @@ export function StartScreen() {
   const { data: images } = useEnabledImages(true);
   const { data: harnesses } = useHarnessCatalog(true);
   const { data: harnessEnvVars } = useHarnessEnv(true);
+  const { data: credentials } = useCredentials(true);
   const { data: taskList } = useTasksAsSessionList({ scope: "mine", pageSize: 25 });
   const createTaskMutation = useMutation(createTask, {
     onSuccess: () =>
@@ -189,16 +191,28 @@ export function StartScreen() {
     : undefined;
 
   const effectiveUserEnv = effectiveHarness?.descriptor?.auth?.userEnv;
+  const effectiveOAuth = effectiveHarness?.descriptor?.auth?.userOauth?.provider;
   const userEnvHint = effectiveHarness?.descriptor?.auth?.userEnvHint;
   const userEnvMissing =
     !!effectiveUserEnv &&
     (harnessEnvVars?.some((v) => v.envVar === effectiveUserEnv && !v.present) ?? false);
+  const oauthMissing =
+    !!effectiveOAuth &&
+    !(
+      credentials?.some(
+        (credential) =>
+          credential.kind === "oauth" &&
+          credential.provider === effectiveOAuth &&
+          credential.connected,
+      ) ?? false
+    );
+  const credentialMissing = userEnvMissing || oauthMissing;
 
   const canLaunch =
-    !!selected && !!prompt.trim() && !createTaskMutation.isPending && !userEnvMissing;
+    !!selected && !!prompt.trim() && !createTaskMutation.isPending && !credentialMissing;
 
   const launch = async () => {
-    if (!selected || !prompt.trim() || createTaskMutation.isPending || userEnvMissing) return;
+    if (!selected || !prompt.trim() || createTaskMutation.isPending || credentialMissing) return;
     setError(null);
     try {
       const res = await createTaskMutation.mutateAsync({
@@ -282,17 +296,23 @@ export function StartScreen() {
             Start a task
           </Text>
 
-          {userEnvMissing && (
+          {credentialMissing && (
             <div className="flex flex-col gap-1.5 rounded-lg border border-instrument-caution/40 bg-secondary/60 px-3 py-2.5 text-sm">
               <div className="flex flex-wrap items-center justify-between gap-x-4 gap-y-1.5">
                 <span className="flex items-center gap-2">
                   <KeyRound className="size-4 shrink-0 text-instrument-caution" />
-                  No <code className="font-mono">{effectiveUserEnv}</code> saved —{" "}
-                  {effectiveHarness?.descriptor?.label || effectiveHarnessName} sessions need it to
-                  launch.
+                  {oauthMissing ? (
+                    <>OpenAI is not connected</>
+                  ) : (
+                    <>
+                      No <code className="font-mono">{effectiveUserEnv}</code> saved
+                    </>
+                  )}{" "}
+                  — {effectiveHarness?.descriptor?.label || effectiveHarnessName} sessions need it
+                  to launch.
                 </span>
                 <Link
-                  to="/settings/tokens"
+                  to="/settings/credentials"
                   className="shrink-0 font-medium underline underline-offset-4"
                 >
                   Add credential

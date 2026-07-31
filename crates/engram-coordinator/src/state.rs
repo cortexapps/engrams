@@ -832,6 +832,8 @@ pub struct AppState {
     /// is unset (the forge endpoints then 501). Kept here rather than on
     /// `Services` so the many test `Services` literals don't need touching.
     pub integrations: crate::integrations::IntegrationBroker,
+    /// ADR 0106: shared provider registry, sealed store, and active flow owner.
+    pub oauth: Arc<crate::oauth::OAuthManager>,
     // ADR 0051: the per-user auth runtime (`auth: Option<Arc<AuthRuntime>>`)
     // is removed. The coordinator no longer resolves human principals — the
     // orchestrator owns auth/authz and calls the coordinator over the trusted
@@ -896,6 +898,12 @@ impl AppState {
             services.clock.clone(),
         ));
         Self {
+            oauth: crate::oauth::OAuthManager::new(
+                services.meta.clone(),
+                services.kek.clone(),
+                services.clock.clone(),
+                services.entropy.clone(),
+            ),
             cfg,
             services,
             events,
