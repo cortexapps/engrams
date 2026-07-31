@@ -146,7 +146,24 @@ export type SystemMarker =
       manifest: string | null;
       reason: string;
       at: string;
-    };
+    }
+  // ADR 0107: the agent proposed a plan via the deferred `exit_plan_mode`
+  // tool. Rendered as an INTERACTIVE card — the doc + approve/reject while
+  // unresolved, a one-line receipt once decided. `resolution` folds in from
+  // the matching `tool_result_submitted`.
+  | {
+      kind: "plan";
+      toolCallId: string;
+      plan: string;
+      /** 1-based ordinal of this plan among the session's plan proposals. */
+      revision: number;
+      resolution: { approved: boolean; feedback: string | null; at: string } | null;
+      at: string;
+    }
+  // ADR 0107: a validated session-mode directive rode a prompt — a faint
+  // one-line marker narrating the transition ("planning — read-only" /
+  // "plan mode off").
+  | { kind: "mode"; mode: string; at: string };
 
 /** Footer carried in an assistant message's `metadata.custom.run` — the
  *  per-run receipt (`↳ read N · edited N · ran N`). */
@@ -180,6 +197,14 @@ export interface BuildMessagesResult {
    *  oldest→newest. Drives the composer's ↑-to-edit recall + cancel. Rebuilt
    *  purely from session events, so it survives refresh / multi-client. */
   queue: QueuedPrompt[];
+  /** ADR 0107: the newest unresolved plan proposal, if any — drives the
+   *  composer's review hint and the attention affordances. Null when every
+   *  plan is decided or none was ever proposed. */
+  pendingPlan: { toolCallId: string } | null;
+  /** ADR 0107: the session's current mode as derivable from the event log —
+   *  the latest `harness_mode_changed`, overridden to the default by a later
+   *  approved plan. Drives the composer chip. */
+  currentMode: string;
 }
 
 // ---- internal mutable drafts (assignable to ThreadMessageLike) --------
@@ -289,6 +314,39 @@ function parseCanonicalAnswers(resultJson: string): Record<string, string[]> | n
   }
 }
 
+/** ADR 0107: `exit_plan_mode` request args — `{plan: markdown}`. */
+function parsePlanArgs(argsJson: string): string | null {
+  try {
+    const raw: unknown = JSON.parse(argsJson);
+    if (typeof raw !== "object" || raw === null) return null;
+    const plan = (raw as Record<string, unknown>).plan;
+    return typeof plan === "string" && plan.length > 0 ? plan : null;
+  } catch {
+    return null;
+  }
+}
+
+/** ADR 0107: `exit_plan_mode` result — `{decision, feedback?}`. */
+function parsePlanResolution(
+  resultJson: string,
+  at: string,
+): { approved: boolean; feedback: string | null; at: string } | null {
+  try {
+    const raw: unknown = JSON.parse(resultJson);
+    if (typeof raw !== "object" || raw === null) return null;
+    const decision = (raw as Record<string, unknown>).decision;
+    if (decision !== "approve" && decision !== "reject") return null;
+    const feedback = (raw as Record<string, unknown>).feedback;
+    return {
+      approved: decision === "approve",
+      feedback: typeof feedback === "string" && feedback.trim().length > 0 ? feedback : null,
+      at,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseJsonValue(json: string): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(json) as unknown };
@@ -384,6 +442,7 @@ export function buildMessages(
 
   // Push a system "harness register" message carrying a marker payload. The
   // single text part is a plain-text fallback; the renderer reads `marker`.
+  let planRevision = 0;
   const pushSystem = (id: string, fallback: string, marker: SystemMarker) => {
     active = null;
     out.push({
@@ -423,6 +482,12 @@ export function buildMessages(
   // distinguished from real tool rows.
   const questionToolCallIds = new Set<string>();
   const answersByToolCallId = new Map<string, Record<string, string[]>>();
+  // ADR 0107: plan proposals + their folded decisions.
+  const planToolCallIds = new Set<string>();
+  const planResolutionByToolCallId = new Map<
+    string,
+    { approved: boolean; feedback: string | null; at: string }
+  >();
   const genericRequests = new Map<
     string,
     Extract<IndexedEvent["event"], { type: "tool_call_requested" }>
@@ -456,6 +521,9 @@ export function buildMessages(
       if (event.name === "ask_user_question" && parseCanonicalQuestions(event.args_json) !== null) {
         questionToolCallIds.add(event.tool_call_id);
       }
+      if (event.name === "exit_plan_mode" && parsePlanArgs(event.args_json) !== null) {
+        planToolCallIds.add(event.tool_call_id);
+      }
     } else if (event.type === "tool_call_started") {
       startedToolCallIds.add(event.tool_call_id);
     } else if (event.type === "tool_call_completed") {
@@ -482,6 +550,10 @@ export function buildMessages(
         const answers = parseCanonicalAnswers(event.result_json);
         if (answers) answersByToolCallId.set(event.tool_call_id, answers);
       }
+      if (planToolCallIds.has(event.tool_call_id)) {
+        const resolution = parsePlanResolution(event.result_json, event.at);
+        if (resolution) planResolutionByToolCallId.set(event.tool_call_id, resolution);
+      }
     }
   }
 
@@ -489,6 +561,15 @@ export function buildMessages(
     const { idx, event: ev } = indexed;
     const lenBefore = out.length;
     switch (ev.type) {
+      case "harness_mode_changed": {
+        pushSystem(`mode:${idx}`, `mode: ${ev.mode}`, {
+          kind: "mode",
+          mode: ev.mode,
+          at: ev.at,
+        });
+        break;
+      }
+
       case "run_started": {
         // The session is producing output — the transient "waking up" marker
         // has served its purpose; drop it BEFORE capturing runStartLen so the
@@ -622,6 +703,21 @@ export function buildMessages(
       }
 
       case "tool_call_requested": {
+        if (ev.name === "exit_plan_mode") {
+          const plan = parsePlanArgs(ev.args_json);
+          if (plan) {
+            planRevision += 1;
+            pushSystem(`tcr:${idx}`, "the agent proposed a plan", {
+              kind: "plan",
+              toolCallId: ev.tool_call_id,
+              plan,
+              revision: planRevision,
+              resolution: planResolutionByToolCallId.get(ev.tool_call_id) ?? null,
+              at: ev.at,
+            });
+          }
+          break;
+        }
         if (ev.name === "ask_user_question") {
           const questions = parseCanonicalQuestions(ev.args_json);
           if (questions) {
@@ -664,6 +760,8 @@ export function buildMessages(
         // resume) — its outcome is the card, not a tool part. `tool_name` is
         // blank on completed events, so match on the pre-scanned id set.
         if (questionToolCallIds.has(ev.tool_call_id)) break;
+        // ADR 0107: a plan's outcome is the card's receipt, not a tool row.
+        if (planToolCallIds.has(ev.tool_call_id)) break;
         const part = openTools.get(ev.tool_call_id);
         if (part) {
           part.result = ev.result_summary ?? undefined;
@@ -977,7 +1075,43 @@ export function buildMessages(
     summary,
   }));
 
-  return { messages: out as ThreadMessageLike[], isRunning, queue };
+  // ADR 0107: the newest unresolved plan (order-independent via the
+  // pre-scanned sets), suppressed on TERMINAL sessions — nothing can consume
+  // a decision there. A parked/idle session is exactly where a plan waits.
+  const sessionTerminal =
+    status === "completed" || status === "failed" || status === "dead" || status === "host_lost";
+  let pendingPlan: { toolCallId: string } | null = null;
+  if (!sessionTerminal) {
+    for (const { event } of events) {
+      if (
+        event.type === "tool_call_requested" &&
+        planToolCallIds.has(event.tool_call_id) &&
+        !planResolutionByToolCallId.has(event.tool_call_id)
+      ) {
+        pendingPlan = { toolCallId: event.tool_call_id };
+      }
+    }
+  }
+
+  // ADR 0107: latest mode directive, flipped back to the default by a later
+  // plan approval (the harness stamps the same transition guest-side).
+  let currentMode = "default";
+  let currentModeIdx = -1;
+  for (const { idx, event } of events) {
+    if (event.type === "harness_mode_changed") {
+      currentMode = event.mode;
+      currentModeIdx = idx;
+    } else if (
+      event.type === "tool_result_submitted" &&
+      planResolutionByToolCallId.get(event.tool_call_id)?.approved &&
+      idx > currentModeIdx
+    ) {
+      currentMode = "default";
+      currentModeIdx = idx;
+    }
+  }
+
+  return { messages: out as ThreadMessageLike[], isRunning, queue, pendingPlan, currentMode };
 }
 
 // Walk back from the tail (skipping durability markers, which don't imply

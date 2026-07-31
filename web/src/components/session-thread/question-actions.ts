@@ -18,6 +18,12 @@ export interface QuestionActions {
    */
   submitAnswer: (toolCallId: string, answers: Record<string, string[]>) => void;
   /**
+   * ADR 0107: complete any deferred session tool with an arbitrary canonical
+   * result (the PlanCard's approve/reject decision). `submitAnswer` is the
+   * question-shaped wrapper over the same CompleteToolCall mutation.
+   */
+  completeTool: (toolCallId: string, result: unknown) => void;
+  /**
    * tool_call_ids the user has answered this session but whose authoritative
    * resolving event hasn't landed yet — the card shows its receipt
    * optimistically. This remains useful for the browser response/SSE race and
@@ -31,6 +37,7 @@ export interface QuestionActions {
 
 export const QuestionActionsContext = createContext<QuestionActions>({
   submitAnswer: () => {},
+  completeTool: () => {},
   answeredToolCallIds: new Set(),
   sendBlocked: false,
 });

@@ -25,6 +25,7 @@ import {
   CopyIcon,
   CornerDownLeftIcon,
   Loader2Icon,
+  MapIcon,
   SquareIcon,
   XIcon,
 } from "lucide-react";
@@ -327,8 +328,19 @@ const Composer: FC = () => {
   // prompt can be ENQUEUED while a run is in flight (type-ahead), ⌘↵ works
   // mid-run, and Esc interrupts. `submitMode="none"` disables the primitive's
   // own keyboard submit so plain Enter stays a newline and our keydown owns ⌘↵.
-  const { submit, interrupt, sendBlocked, canRecall, recall, queued, removeQueued } =
-    useComposerActions();
+  const {
+    submit,
+    interrupt,
+    sendBlocked,
+    canRecall,
+    recall,
+    queued,
+    removeQueued,
+    mode,
+    setMode,
+    planPending,
+  } = useComposerActions();
+  const planMode = mode === "plan";
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const composer = useComposerRuntime();
   const text = useComposer((c) => c.text);
@@ -349,8 +361,10 @@ const Composer: FC = () => {
   // asked to keep that affordance regardless of text). ↑-recall is offered
   // only on an empty composer with something still queued. Both can coexist.
   const hints: string[] = [];
+  if (planPending) hints.push("the agent proposed a plan — review it above ↑");
   if (canRecall && isEmpty) hints.push("↑ to edit queued message");
   if (isRunning) hints.push("esc to interrupt");
+  if (planMode) hints.push("plan mode — a read-only design pass · ⇧Tab to switch");
   const hintLine = hints.length ? hints.join(" · ") : hint;
 
   return (
@@ -365,9 +379,11 @@ const Composer: FC = () => {
           // it isn't run-gated.
           submitMode="none"
           placeholder={
-            enterToSend
-              ? "Reply to the task…   (↵ to send, ⇧↵ for newline)"
-              : "Reply to the task…   (⌘↵ to send)"
+            planMode
+              ? "Describe what to plan — the agent explores, it won't edit…"
+              : enterToSend
+                ? "Reply to the task…   (↵ to send, ⇧↵ for newline)"
+                : "Reply to the task…   (⌘↵ to send)"
           }
           className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/80"
           rows={1}
@@ -380,6 +396,13 @@ const Composer: FC = () => {
                 submit(t);
                 composer.setText("");
               }
+              return;
+            }
+            // ADR 0107: ⇧Tab toggles plan mode (CLI parity). Forward Tab
+            // still leaves the field.
+            if (e.key === "Tab" && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
+              e.preventDefault();
+              setMode(planMode ? "default" : "plan");
               return;
             }
             // Esc interrupts the in-flight run, regardless of composer text. A
@@ -409,6 +432,20 @@ const Composer: FC = () => {
             }
           }}
         />
+        <TooltipIconButton
+          tooltip={planMode ? "Plan mode on (⇧Tab)" : "Plan first (⇧Tab)"}
+          side="top"
+          aria-pressed={planMode}
+          onClick={() => setMode(planMode ? "default" : "plan")}
+          className={
+            planMode
+              ? "h-7 w-auto gap-1 rounded-md bg-primary/10 px-2 text-xs font-medium text-primary animate-in fade-in zoom-in-95"
+              : "h-7 w-auto rounded-md px-1.5 text-muted-foreground/60"
+          }
+        >
+          <MapIcon className="size-3.5" />
+          {planMode && <span>Plan</span>}
+        </TooltipIconButton>
         <ComposerAction />
       </div>
       {hintLine && <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">{hintLine}</p>}

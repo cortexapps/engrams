@@ -15,9 +15,16 @@ export interface HarnessOverride {
   harness: string | null;
   model: string | null;
   effort: string | null;
+  /** ADR 0107: session mode for the initial prompt ("plan"); null = default. */
+  mode: string | null;
 }
 
-export const EMPTY_OVERRIDE: HarnessOverride = { harness: null, model: null, effort: null };
+export const EMPTY_OVERRIDE: HarnessOverride = {
+  harness: null,
+  model: null,
+  effort: null,
+  mode: null,
+};
 
 const INHERIT = "__inherit__";
 
@@ -60,7 +67,10 @@ export function SessionHarnessControls({
   const showHarness = (harnesses?.length ?? 0) > 1;
   const hasModels = (descriptor?.models.length ?? 0) > 0;
   const hasEffort = (descriptor?.effort.length ?? 0) > 0;
-  if (!showHarness && !hasModels && !hasEffort) return null;
+  // ADR 0107: only harnesses that declare a non-default mode get the picker.
+  const modes = (descriptor?.modes ?? []).filter((m) => m.id !== "default");
+  const hasModes = modes.length > 0;
+  if (!showHarness && !hasModels && !hasEffort && !hasModes) return null;
 
   const triggerClass =
     "h-7 w-auto gap-1 rounded-md border-0 bg-accent/60 px-2 text-xs font-medium text-muted-foreground hover:bg-accent focus:ring-1";
@@ -72,8 +82,9 @@ export function SessionHarnessControls({
           value={value.harness ?? INHERIT}
           disabled={disabled}
           onValueChange={(v) =>
-            // Harness changed → model/effort enums belong to it; clear the old ones.
-            onChange({ harness: v === INHERIT ? null : v, model: null, effort: null })
+            // Harness changed → model/effort/mode enums belong to it; clear
+            // the old ones.
+            onChange({ harness: v === INHERIT ? null : v, model: null, effort: null, mode: null })
           }
         >
           <SelectTrigger
@@ -112,6 +123,30 @@ export function SessionHarnessControls({
             {(descriptor?.models ?? []).map((m) => (
               <SelectItem key={m.id} value={m.id}>
                 {m.label || m.id}
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      )}
+
+      {hasModes && (
+        <Select
+          value={value.mode ?? INHERIT}
+          disabled={disabled}
+          onValueChange={(v) => onChange({ ...value, mode: v === INHERIT ? null : v })}
+        >
+          <SelectTrigger
+            aria-label="Mode"
+            data-testid="session-mode-select"
+            className={triggerClass}
+          >
+            <SelectValue placeholder="Mode" />
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value={INHERIT}>Build</SelectItem>
+            {modes.map((m) => (
+              <SelectItem key={m.id} value={m.id}>
+                {m.id === "plan" ? "Plan first" : m.label || m.id}
               </SelectItem>
             ))}
           </SelectContent>

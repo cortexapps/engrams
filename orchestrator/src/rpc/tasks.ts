@@ -120,6 +120,9 @@ export interface SessionsClient {
     // on dyn_0 + execs (proto CreateSessionRequest.harness). Resolved from
     // session override ?? profile ?? deployment default.
     harness?: string;
+    // ADR 0107: session mode for the initial prompt (e.g. "plan"); the
+    // coordinator validates it against the harness descriptor's modes.
+    harnessMode?: string;
   }): Promise<{ sessionId: string; status: string; imageVersion: string; kind: string }>;
   listSessions(req: Record<string, never>): Promise<{ sessions: Array<{ session?: Session | undefined }> }>;
   getSession(req: { sessionId: string }): Promise<{ session?: Session | undefined }>;
@@ -574,6 +577,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           ...(req.harness != null ? { harness: req.harness } : {}),
           ...(req.model != null ? { model: req.model } : {}),
           ...(req.effort != null ? { effort: req.effort } : {}),
+          ...(req.harnessMode != null ? { harnessMode: req.harnessMode } : {}),
         },
       );
 

@@ -1537,3 +1537,121 @@ describe("buildMessages — ADR 0054 Flavor A file changes", () => {
     expect(edit.isError).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// ADR 0107: plan cards, mode markers, and the derived mode/pending state.
+// ---------------------------------------------------------------------------
+
+describe("buildMessages — ADR 0107 plan mode", () => {
+  const planRequested = (toolCallId: string, plan = "# The plan"): SessionEvent => ({
+    type: "tool_call_requested",
+    run_id: "r1",
+    tool_call_id: toolCallId,
+    name: "exit_plan_mode",
+    args_json: JSON.stringify({ plan }),
+    at: AT,
+  });
+
+  test("an unresolved plan renders a plan marker and reports pendingPlan", () => {
+    const { messages, pendingPlan, currentMode } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        planRequested("t-plan"),
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const plan = messages
+      .map((m) => customMarker(m))
+      .find((mk): mk is Extract<SystemMarker, { kind: "plan" }> => mk?.kind === "plan");
+    expect(plan).toBeTruthy();
+    expect(plan!.plan).toBe("# The plan");
+    expect(plan!.revision).toBe(1);
+    expect(plan!.resolution).toBeNull();
+    expect(pendingPlan).toEqual({ toolCallId: "t-plan" });
+    expect(currentMode).toBe("plan");
+    // The mode directive renders its faint marker.
+    expect(messages.map((m) => customMarker(m)).some((mk) => mk?.kind === "mode")).toBe(true);
+  });
+
+  test("a resolved plan folds its decision, clears pendingPlan, and an approval flips the mode", () => {
+    const { messages, pendingPlan, currentMode } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        planRequested("t-plan"),
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "t-plan",
+          result_json: JSON.stringify({ decision: "approve" }),
+          at: AT2,
+        },
+        // The re-fire's completion is the card's receipt, not a tool row.
+        {
+          type: "tool_call_completed",
+          run_id: "r2",
+          tool_call_id: "t-plan",
+          tool_name: "exit_plan_mode",
+          ok: true,
+          duration_ms: 0,
+          result_summary: "approved",
+          at: AT2,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const plan = messages
+      .map((m) => customMarker(m))
+      .find((mk): mk is Extract<SystemMarker, { kind: "plan" }> => mk?.kind === "plan");
+    expect(plan!.resolution).toEqual({ approved: true, feedback: null, at: AT2 });
+    expect(pendingPlan).toBeNull();
+    expect(currentMode).toBe("default");
+    // No stray completed tool row for the plan id.
+    const toolRows = messages.flatMap((m) =>
+      typeof m.content === "string"
+        ? []
+        : m.content.filter(
+            (p) => p.type === "tool-call" && "toolCallId" in p && p.toolCallId === "t-plan",
+          ),
+    );
+    expect(toolRows).toHaveLength(0);
+  });
+
+  test("reject keeps plan mode and revisions number sequentially", () => {
+    const { messages, pendingPlan, currentMode } = buildMessages(
+      [
+        { idx: 0, event: { type: "harness_mode_changed", mode: "plan", at: AT } },
+        { idx: 1, event: planRequested("t-plan-1", "# v1") },
+        {
+          idx: 2,
+          event: {
+            type: "tool_result_submitted",
+            tool_call_id: "t-plan-1",
+            result_json: JSON.stringify({ decision: "reject", feedback: "add tests" }),
+            at: AT2,
+          },
+        },
+        { idx: 3, event: planRequested("t-plan-2", "# v2") },
+      ],
+      SID,
+      "idle",
+    );
+    const plans = messages
+      .map((m) => customMarker(m))
+      .filter((mk): mk is Extract<SystemMarker, { kind: "plan" }> => mk?.kind === "plan");
+    expect(plans).toHaveLength(2);
+    expect(plans[0]!.revision).toBe(1);
+    expect(plans[0]!.resolution).toEqual({ approved: false, feedback: "add tests", at: AT2 });
+    expect(plans[1]!.revision).toBe(2);
+    expect(plans[1]!.resolution).toBeNull();
+    expect(pendingPlan).toEqual({ toolCallId: "t-plan-2" });
+    expect(currentMode).toBe("plan");
+  });
+
+  test("a terminal session never reports a pending plan", () => {
+    const { pendingPlan } = buildMessages(indexed([planRequested("t-plan")]), SID, "dead");
+    expect(pendingPlan).toBeNull();
+  });
+});

@@ -5,6 +5,7 @@ import {
   DownloadIcon,
   ExternalLinkIcon,
   InfoIcon,
+  MapIcon,
   RotateCcwIcon,
   XIcon,
 } from "lucide-react";
@@ -19,6 +20,7 @@ import { useProviderIdentity } from "../../hooks/useIntegrations";
 import { API_BASE } from "../../lib/base";
 import { fmtBytes, hms } from "../transcriptFmt";
 import type { SystemMarker } from "./buildMessages";
+import { PlanCard } from "./PlanCard";
 import { UserQuestionCard } from "./UserQuestionCard";
 
 // The "harness register": non-message timeline events (durability markers,
@@ -49,9 +51,29 @@ export function SystemMessage() {
       return <DurabilityRollback marker={marker} />;
     case "user_question":
       return <UserQuestionCard marker={marker} />;
+    case "plan":
+      return <PlanCard marker={marker} />;
+    case "mode":
+      return <Mode marker={marker} />;
     case "note":
       return <Note text={fallback} />;
   }
+}
+
+// ADR 0107: a faint centered mode-transition marker in the durability
+// register — "planning — read-only" going in, "plan mode off" going out.
+function Mode({ marker }: { marker: Extract<SystemMarker, { kind: "mode" }> }) {
+  const label = marker.mode === "plan" ? "planning — read-only" : "plan mode off";
+  return (
+    <div className="flex items-center justify-center gap-2 py-1 text-xs text-muted-foreground">
+      <MapIcon className="size-3.5" />
+      <Text as="span" variant="label">
+        {label}
+      </Text>
+      <span aria-hidden>·</span>
+      <span className="font-mono tabular-nums">{hms(marker.at)}</span>
+    </div>
+  );
 }
 
 // ADR 0090 (2026-07-20 durability-rollback incident): a quarantined-survivor

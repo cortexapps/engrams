@@ -70,6 +70,8 @@ export function SessionThread({
     messages: serverMessages,
     isRunning,
     queue,
+    pendingPlan,
+    currentMode,
   } = useMemo(
     () => buildMessages(events, sessionId, status, streamingText),
     [events, sessionId, status, streamingText],
@@ -204,14 +206,16 @@ export function SessionThread({
 
   const sendBlocked = status ? SEND_BLOCKED.has(status) : false;
 
-  const submitAnswer = useCallback(
-    (toolCallId: string, answers: Record<string, string[]>) => {
+  // ADR 0107: the generic deferred-tool completion — questions and plan
+  // decisions ride the same CompleteToolCall + optimistic set.
+  const completeTool = useCallback(
+    (toolCallId: string, result: unknown) => {
       if (sendBlocked) return;
       setAnsweredToolCallIds((prev) => new Set(prev).add(toolCallId));
       const completion = completeToolCallMutation.mutateAsync({
         sessionId,
         toolCallId,
-        resultJson: JSON.stringify(answers),
+        resultJson: JSON.stringify(result),
       });
       completion.catch((err) => {
         setAnsweredToolCallIds((prev) => {
@@ -223,6 +227,11 @@ export function SessionThread({
       });
     },
     [sessionId, sendBlocked, completeToolCallMutation],
+  );
+
+  const submitAnswer = useCallback(
+    (toolCallId: string, answers: Record<string, string[]>) => completeTool(toolCallId, answers),
+    [completeTool],
   );
 
   // ADR 0052: ↑-in-empty-composer recall. Pull the most-recent still-queued
@@ -245,6 +254,17 @@ export function SessionThread({
   // run-gated send) so the composer can enqueue while a run is in flight. The
   // optimistic bubble (keyed by the client-minted prompt_id) covers the gap
   // until the server's role:user echo lands with the same id.
+  // ADR 0107: the composer's mode. The server truth is `currentMode`
+  // (derived from the event log); `modeOverride` is the user's not-yet-sent
+  // toggle. The next prompt carries `harnessMode` only when it CHANGES the
+  // mode, so a steady state never spams mode markers.
+  const [modeOverride, setModeOverride] = useState<string | null>(null);
+  const composerMode = modeOverride ?? currentMode;
+  const setMode = useCallback(
+    (next: string) => setModeOverride(next === currentMode ? null : next),
+    [currentMode],
+  );
+
   const submit = useCallback(
     (raw: string) => {
       const text = raw.trim();
@@ -255,13 +275,18 @@ export function SessionThread({
       // prompt_queued / run_started confirms which it is.
       setPending((p) => [...p, { sessionId, promptId, text, queued: isRunning }]);
       sentTextRef.current.set(promptId, text);
-      sendPromptMutation.mutateAsync({ sessionId, text, promptId }).catch((err) => {
-        // Send failed: drop the optimistic entry so it isn't stuck.
-        setPending((p) => p.filter((e) => e.promptId !== promptId));
-        console.warn("sendPrompt failed", err);
-      });
+      const harnessMode =
+        modeOverride !== null && modeOverride !== currentMode ? modeOverride : undefined;
+      setModeOverride(null);
+      sendPromptMutation
+        .mutateAsync({ sessionId, text, promptId, ...(harnessMode ? { harnessMode } : {}) })
+        .catch((err) => {
+          // Send failed: drop the optimistic entry so it isn't stuck.
+          setPending((p) => p.filter((e) => e.promptId !== promptId));
+          console.warn("sendPrompt failed", err);
+        });
     },
-    [sessionId, sendPromptMutation, isRunning],
+    [sessionId, sendPromptMutation, isRunning, modeOverride, currentMode],
   );
 
   // Cancel a specific queued message (the rail's × button): dequeue it server-
@@ -312,10 +337,13 @@ export function SessionThread({
             recall: recallQueued,
             queued: railItems,
             removeQueued,
+            mode: composerMode,
+            setMode,
+            planPending: pendingPlan != null,
           }}
         >
           <QuestionActionsContext.Provider
-            value={{ submitAnswer, answeredToolCallIds, sendBlocked }}
+            value={{ submitAnswer, completeTool, answeredToolCallIds, sendBlocked }}
           >
             <TooltipProvider>
               <Thread />

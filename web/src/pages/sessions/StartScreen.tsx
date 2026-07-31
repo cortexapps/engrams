@@ -224,6 +224,7 @@ export function StartScreen() {
         ...(harnessOverride.harness ? { harness: harnessOverride.harness } : {}),
         ...(harnessOverride.model ? { model: harnessOverride.model } : {}),
         ...(harnessOverride.effort ? { effort: harnessOverride.effort } : {}),
+        ...(harnessOverride.mode ? { harnessMode: harnessOverride.mode } : {}),
       });
       writeLastProfileId(selected.id);
       const sessionId = res.task?.sessions[0]?.sessionId;

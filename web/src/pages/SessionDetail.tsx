@@ -1,6 +1,22 @@
 import { useParams } from "@tanstack/react-router";
-import { Fragment, useEffect, useRef, useState, type ComponentType, type ReactNode } from "react";
-import { Activity, Code2, GitPullRequestArrow, Globe, Pencil, SquareTerminal } from "lucide-react";
+import {
+  Fragment,
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ComponentType,
+  type ReactNode,
+} from "react";
+import {
+  Activity,
+  Code2,
+  GitPullRequestArrow,
+  Globe,
+  Map,
+  Pencil,
+  SquareTerminal,
+} from "lucide-react";
 import type { ImperativePanelHandle } from "react-resizable-panels";
 import { useSession } from "../hooks/useSessions";
 import { useSessionEvents } from "../hooks/useSessionEvents";
@@ -223,6 +239,15 @@ export function SessionDetail() {
     />
   );
 
+  // ADR 0107: the Plan tab appears once the session has proposed a plan.
+  const hasPlan = useMemo(
+    () =>
+      events.some(
+        (e) => e.event.type === "tool_call_requested" && e.event.name === "exit_plan_mode",
+      ),
+    [events],
+  );
+
   const paneTabDefs: {
     id: PaneTabId;
     label: string;
@@ -231,6 +256,7 @@ export function SessionDetail() {
     { id: "shell", label: "Shell", icon: SquareTerminal },
     ...(browserEnabled ? [{ id: "browser", label: "Browser", icon: Globe } as const] : []),
     ...(ideEnabled ? [{ id: "ide", label: "IDE", icon: Code2 } as const] : []),
+    ...(hasPlan ? [{ id: "plan", label: "Plan", icon: Map } as const] : []),
     { id: "side-effects", label: "Side effects", icon: GitPullRequestArrow },
     { id: "diagnostics", label: "Diagnostics", icon: Activity },
   ];
