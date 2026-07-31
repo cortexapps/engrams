@@ -555,6 +555,144 @@ mod tests {
         assert!(matches!(events[7], HarnessEvent::Idle));
     }
 
+    /// ADR 0107: the plan-flow tail — plan prompt parks on exit_plan_mode,
+    /// reject re-parks under a new call id, approve runs the build turn.
+    #[tokio::test]
+    async fn plan_flow_parks_revises_on_reject_and_builds_on_approve() {
+        let (host_side, harness_side) = tokio::io::duplex(1 << 16);
+        let session_id = SessionId::new();
+        let mut cfg = NoopConfig::for_session(session_id);
+        cfg.tool_calls = 0;
+        cfg.agent_message_template = String::new();
+        cfg.plan_flow = true;
+
+        let host_task = tokio::spawn(async move {
+            let (mut hr, mut hw) = tokio::io::split(host_side);
+            let attach: HarnessAttach = read_msg(&mut hr).await.unwrap();
+            assert_eq!(attach.session_id, session_id);
+            write_msg(
+                &mut hw,
+                &HarnessAttachAck {
+                    ok: true,
+                    reject: None,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+
+            // Drain the fixed-shape run (RunStarted + Idle with 0 tool calls).
+            loop {
+                match read_msg::<_, HarnessFrame>(&mut hr).await.unwrap() {
+                    HarnessFrame::Event(HarnessEvent::Idle) => break,
+                    HarnessFrame::Event(_) => {}
+                    HarnessFrame::Command(_) => panic!("harness never sends commands"),
+                }
+            }
+
+            // A plan-mode prompt parks on a synthetic exit_plan_mode.
+            write_msg(
+                &mut hw,
+                &HarnessFrame::Command(HarnessCommand::Prompt {
+                    prompt_id: "p-plan".into(),
+                    text: "plan it".into(),
+                    mode: Some("plan".into()),
+                }),
+            )
+            .await
+            .unwrap();
+            let mut first_call = String::new();
+            loop {
+                match read_msg::<_, HarnessFrame>(&mut hr).await.unwrap() {
+                    HarnessFrame::Event(HarnessEvent::ToolCallRequested {
+                        call_id, name, ..
+                    }) => {
+                        assert_eq!(name, "exit_plan_mode");
+                        first_call = call_id;
+                    }
+                    HarnessFrame::Event(HarnessEvent::Parked) => break,
+                    HarnessFrame::Event(_) => {}
+                    HarnessFrame::Command(_) => unreachable!(),
+                }
+            }
+            assert!(!first_call.is_empty());
+
+            // Reject → a fresh park under a NEW call id.
+            write_msg(
+                &mut hw,
+                &HarnessFrame::Command(HarnessCommand::ToolResult {
+                    call_id: first_call.clone(),
+                    result_json: r#"{"decision":"reject","feedback":"add tests"}"#.into(),
+                }),
+            )
+            .await
+            .unwrap();
+            let mut second_call = String::new();
+            let mut rejected_completion = false;
+            loop {
+                match read_msg::<_, HarnessFrame>(&mut hr).await.unwrap() {
+                    HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
+                        tool_call_id,
+                        ok,
+                        ..
+                    }) if tool_call_id == first_call => {
+                        assert!(!ok);
+                        rejected_completion = true;
+                    }
+                    HarnessFrame::Event(HarnessEvent::ToolCallRequested { call_id, .. }) => {
+                        second_call = call_id;
+                    }
+                    HarnessFrame::Event(HarnessEvent::Parked) => break,
+                    HarnessFrame::Event(_) => {}
+                    HarnessFrame::Command(_) => unreachable!(),
+                }
+            }
+            assert!(rejected_completion);
+            assert_ne!(second_call, first_call);
+
+            // Approve → the completion ack + a synthetic build turn.
+            write_msg(
+                &mut hw,
+                &HarnessFrame::Command(HarnessCommand::ToolResult {
+                    call_id: second_call.clone(),
+                    result_json: r#"{"decision":"approve"}"#.into(),
+                }),
+            )
+            .await
+            .unwrap();
+            let mut approved_completion = false;
+            let mut build_ran = false;
+            loop {
+                match read_msg::<_, HarnessFrame>(&mut hr).await.unwrap() {
+                    HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
+                        tool_call_id,
+                        ok,
+                        ..
+                    }) if tool_call_id == second_call => {
+                        assert!(ok);
+                        approved_completion = true;
+                    }
+                    HarnessFrame::Event(HarnessEvent::AgentMessage { text, .. }) => {
+                        assert!(text.contains("approved plan"));
+                        build_ran = true;
+                    }
+                    HarnessFrame::Event(HarnessEvent::Idle) => break,
+                    HarnessFrame::Event(_) => {}
+                    HarnessFrame::Command(_) => unreachable!(),
+                }
+            }
+            assert!(approved_completion && build_ran);
+            drop(hw);
+        });
+
+        let outcome = run(harness_side, cfg).await.unwrap();
+        assert!(matches!(
+            outcome,
+            NoopOutcome::EmittedAndPeerClosed | NoopOutcome::Shutdown
+        ));
+        host_task.await.unwrap();
+    }
+
     #[tokio::test]
     async fn noop_returns_attach_rejected_when_host_acks_false() {
         let (host_side, harness_side) = tokio::io::duplex(1 << 16);

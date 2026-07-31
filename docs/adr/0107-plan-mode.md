@@ -1,6 +1,9 @@
 # ADR 0107: Plan mode — a harness-agnostic read-only design pass with an approval gate
 
-Status: 2026-07-31 — **Proposed.**
+Status: 2026-07-31 — **Accepted.** Implemented end to end on PR #927 (one
+commit per phase; see §Implementation record). Renumbered from 0106 after
+PR #902 concurrently claimed that number (and `CreateSessionRequest`
+field 12 — `harness_mode` moved to 13).
 
 Builds on ADR 0089 (the generic tool protocol: registry, native bindings,
 deferred session tools, two-phase completion), ADR 0063 (harness descriptors),
@@ -220,8 +223,48 @@ until a harness emits it; the interim window where codex could call an
 uninjected-but-manifested tool is mitigated by the tool description and by
 keeping the phases in one release train.
 
+## Implementation record (2026-07-31, PR #927)
+
+One commit per phase. As-built divergences from the proposal:
+
+- **ADR renumber**: 0106 → 0107 (PR #902 collision; `harness_mode` is
+  `CreateSessionRequest` field 13, not 12).
+- **Claude approve delivery is engine-owned, not drain-owned**: the approve
+  result is never stashed. `run_engine` keeps `pending_plan_approvals`
+  across the respawn and the spawn bootstrap injects the build turn +
+  explicit `ToolCallCompleted` — deterministic, and the CLI's spontaneous
+  self-continuation (spike finding 5) never races a stale stash.
+- **Bridge round-trip set is manifest-derived**: the hardcoded
+  AskUserQuestion filter became "every `nativeBindings.claude` name in
+  ENGRAM_TOOLS ∪ `mcp__engrams__*`", with the AUQ literal as the
+  corrupt-env fallback. New bindings need no bridge change.
+- **Codex build turn rides the queue**: approve answers the parked JSON-RPC
+  call, emits the explicit completion, interrupts the read-only turn, and
+  QUEUES the build prompt — `turn/completed` consumes it and `start_turn`
+  re-reads the flipped stamp (the sticky `sandboxPolicy` override is
+  re-sent every turn by design).
+- **Attention is derived, not written**: task rows never store
+  `awaiting_review`. The task list derives it at read time from the
+  `pending_tool_calls` ledger (requested-but-unsubmitted session-handled
+  call on a live primary session), so it can never go stale and it covers
+  `ask_user_question` for free.
+- **Headless policy simplified per review**: auto-approve keys on "the
+  task exists and has no human creator" — no per-automation policy knob.
+- **Coverage**: claude fake-engine tests (approve/reject argv + stamp
+  trails, deterministic argv-branching fake), codex scripted-app-server
+  tests (read-only plan turn params, outside-plan rejection), a noop
+  duplex test of the full park → reject → revise → approve → build
+  choreography (the harness-independent e2e), coordinator live-PG mode
+  tests, sim/PG rewind conformance, web buildMessages/PlanCard/contract
+  tests. A real-CLI stack e2e needs provider keys the CI lane does not
+  have; the noop choreography + the Phase 0 spike record stand in.
+
 ## Open questions
 
-- Landlock availability in the FC guest kernel for codex `readOnly` turns.
+- Landlock availability in the FC guest kernel for codex `readOnly` turns
+  (verify on the dev VM before leaning on the sandbox as the sole
+  enforcement for codex).
 - Whether the pinned claude 2.1.185 can move forward once the ADR 0054 AUQ
   regression is re-validated; plan mode does not depend on it either way.
+- Interactive Slack plan approval (needs a generic Slack presenter
+  dispatcher; notification-with-link is the current scope).
