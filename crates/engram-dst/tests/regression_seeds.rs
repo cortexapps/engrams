@@ -392,3 +392,19 @@ fn issue_790_evict_resume_snapshot_safety_faithful() {
 fn issue_800_reserved_evac_over_reservation_smallest_calm_seed() {
     run_faithful(0, Profile::Calm, 1500);
 }
+
+/// Nightly seed 33058131: a drain evict acknowledged its source-host
+/// destroy, atomically detached the coordinator binding, and finished its
+/// op while the host-side teardown effect was still deferred. The next
+/// EvacResumer claim saw an unowned `Evacuating` row and restored a second
+/// sandbox on a peer, violating ADR 0090 single ownership at step 79.
+///
+/// The fix keeps the outgoing sandbox bound through `Evacuating`. The
+/// resumer re-issues the idempotent destroy and independently probes the
+/// source; only confirmed absence permits the fenced binding clear and peer
+/// restore. This full nightly-shape pin covers the 80-step firing and its
+/// eventual convergence after the deferred host effect is delivered.
+#[test]
+fn seed_33058131_evacuation_waits_for_confirmed_source_teardown() {
+    run(33058131, Profile::Chaos, 5000);
+}

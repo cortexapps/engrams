@@ -229,7 +229,7 @@ async fn advance_one_claimed(
     // sandbox onto a terminal row (defeating the orphan reap) — the same
     // failure the guarded binds in `bind_resumed_session` reject, caught
     // earlier so we never create the VM in the first place.
-    match state.services.meta.get_session(session_id).await {
+    let mut session = match state.services.meta.get_session(session_id).await {
         Ok(s) if s.status != SessionState::Evacuating => {
             tracing::info!(
                 %session_id,
@@ -239,10 +239,57 @@ async fn advance_one_claimed(
             );
             return Ok(());
         }
-        Ok(_) => {}
+        Ok(s) => s,
         Err(e) => {
             return Err(format!("evac-resumer: re-read session state after claim: {e}").into());
         }
+    };
+
+    // ADR 0090: `Evacuating` retains the outgoing binding until teardown
+    // is positively confirmed. The drain's evict op has already issued a
+    // best-effort destroy, but an acknowledged host verb can still have a
+    // durable, not-yet-applied effect. Restoring from the snapshot while
+    // that sandbox is alive would give this session two owners across the
+    // fleet. Re-issue the idempotent destroy through the source backend,
+    // then independently probe it. Only a negative probe (or host-side
+    // NotFound) authorizes the fenced binding clear below.
+    match (session.host_id, session.sandbox_id) {
+        (Some(source_host), Some(source_sandbox)) => {
+            confirm_source_teardown(state, source_host, source_sandbox, claim.fence()).await?;
+            match state
+                .services
+                .meta
+                .fenced_assign_sandbox(
+                    session_id,
+                    claim.fence().epoch as i64,
+                    None,
+                    Some(source_host),
+                )
+                .await
+            {
+                Ok(true) => {
+                    state.host_registry.invalidate_sandbox(source_sandbox);
+                    session.sandbox_id = None;
+                }
+                Ok(false) => {
+                    crate::metrics::note_fenced_write();
+                    return Ok(());
+                }
+                Err(e) => {
+                    return Err(
+                        format!("evac-resumer: clear confirmed-dead source binding: {e}").into(),
+                    );
+                }
+            }
+        }
+        (None, Some(source_sandbox)) => {
+            return Err(format!(
+                "evac-resumer: session {session_id} retains source sandbox {source_sandbox} \
+                 without a source host; refusing to release ownership"
+            )
+            .into());
+        }
+        (_, None) => {}
     }
 
     // Retry budget exhausted → fall back to Idle so the user can
@@ -309,6 +356,49 @@ async fn advance_one_claimed(
 
     run_resume_pipeline(state, session, claim.fence()).await?;
     Ok(())
+}
+
+async fn confirm_source_teardown(
+    state: &SharedState,
+    source_host: engram_core::HostId,
+    source_sandbox: engram_core::SandboxId,
+    fence: engram_core::traits::SessionFence,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let backend = state.host_registry.backend_of(source_host).ok_or_else(|| {
+        format!(
+            "evac-resumer: source host {source_host} is not connected; retaining ownership of \
+             sandbox {source_sandbox}"
+        )
+    })?;
+
+    match backend.destroy(source_sandbox, fence).await {
+        Ok(()) => {}
+        Err(engram_core::SandboxError::NotFound) => return Ok(()),
+        Err(e) => {
+            return Err(format!(
+                "evac-resumer: source destroy for sandbox {source_sandbox} on host \
+                 {source_host} was not confirmed: {e}"
+            )
+            .into());
+        }
+    }
+
+    match backend.probe_sandbox(source_sandbox).await {
+        Ok(probe) if !probe.known_to_backend && !probe.process_alive => Ok(()),
+        Ok(probe) => Err(format!(
+            "evac-resumer: source sandbox {source_sandbox} on host {source_host} still owns \
+             the session after destroy acknowledgement (known={}, alive={}); retaining \
+             coordinator ownership",
+            probe.known_to_backend, probe.process_alive,
+        )
+        .into()),
+        Err(engram_core::SandboxError::NotFound) => Ok(()),
+        Err(e) => Err(format!(
+            "evac-resumer: source teardown probe for sandbox {source_sandbox} on host \
+             {source_host} failed: {e}; retaining coordinator ownership"
+        )
+        .into()),
+    }
 }
 
 async fn run_resume_pipeline(

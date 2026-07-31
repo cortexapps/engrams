@@ -1007,10 +1007,11 @@ pub(crate) async fn run_evict_pipeline(
         return Ok(EvictOutcome::Fenced);
     }
 
-    // Step 3 + 3c fused (PG, Idle-before-destroy): the authoritative
-    // unbind (ADR 0047 — no in-memory registry to drop; `host_id` is
-    // untouched so the resume path's origin-affinity hint survives)
-    // rides the SAME transaction as the flip, via `detach_sandbox`. A
+    // Step 3 + 3c fused (PG, Idle-before-destroy): for the Idle path, the
+    // authoritative unbind (ADR 0047 — no in-memory registry to drop;
+    // `host_id` is untouched so the resume path's origin-affinity hint
+    // survives) rides the SAME transaction as the flip, via
+    // `detach_sandbox`. A
     // separate preceding detach left a partial-failure window: the flip
     // rolls back, the detach has already committed, and the scanner's
     // retry finds an `evicting` row with no bound sandbox — the
@@ -1019,6 +1020,14 @@ pub(crate) async fn run_evict_pipeline(
     // commits, the reconciler will no-op on every subsequent
     // heartbeat for this session because the reconcile pass keys
     // on Active status only.
+    //
+    // Evacuating deliberately RETAINS the source binding. A successful
+    // destroy RPC is not sufficient ownership proof: the host may have
+    // durably accepted the verb while its teardown effect is still pending.
+    // The evac resumer re-destroys, probes the source, and clears this
+    // binding under its claim only after the sandbox is confirmed gone.
+    // Until then ADR 0090's coordinator truth continues to own the outgoing
+    // VM, so no replacement can be restored alongside it.
     //
     // The transition's own facts (`snapshot_taken`, `evicted`, the final
     // `status_changed`) ride the SAME store transaction: the flip makes
@@ -1033,7 +1042,7 @@ pub(crate) async fn run_evict_pipeline(
         session_id,
         ctx.fence(),
         target_state,
-        /*detach_sandbox=*/ true,
+        /*detach_sandbox=*/ target_state == SessionState::Idle,
         vec![
             crate::state::SessionEvent::SnapshotTaken {
                 snapshot_id: metadata.id,
