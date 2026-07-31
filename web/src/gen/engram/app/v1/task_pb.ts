@@ -71,7 +71,7 @@ export type CreateTaskRequest = Message<"engram.app.v1.CreateTaskRequest"> & {
   effort?: string;
 
   /**
-   * ADR 0106: session mode for the initial prompt (e.g. "plan"). Passed
+   * ADR 0107: session mode for the initial prompt (e.g. "plan"). Passed
    * through to CreateSessionRequest.harness_mode; validated against the
    * selected harness's descriptor modes.
    *

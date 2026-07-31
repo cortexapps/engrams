@@ -31,7 +31,7 @@ pub(crate) async fn send_prompt_core(
     id: SessionId,
     prompt_id: String,
     text: String,
-    // ADR 0106: optional session-mode directive riding this prompt (e.g.
+    // ADR 0107: optional session-mode directive riding this prompt (e.g.
     // `plan`). Validated against the session harness's declared descriptor
     // modes BEFORE any durable write it causes; rides the outbox payload and
     // `HarnessCommand::Prompt.mode`.
@@ -160,7 +160,7 @@ pub(crate) async fn send_prompt_core(
         tracing::warn!(session_id = %id, error = %e, "emit user prompt event failed");
     }
 
-    // ADR 0106: the durable "the user selected mode M" fact — emitted only
+    // ADR 0107: the durable "the user selected mode M" fact — emitted only
     // after validation, before the outbox row, so the mode marker's idx
     // precedes the run it applies to. Coordinator-authoritative (excluded
     // from rewind tombstoning). Best-effort like the receipts above.
@@ -431,7 +431,7 @@ mod tests {
         assert_eq!(events[0].payload["prompt_id"], "client-pid-42");
     }
 
-    // -- ADR 0106: harness_mode validation + event + payload ------------
+    // -- ADR 0107: harness_mode validation + event + payload ------------
 
     fn idle_session(id: SessionId) -> engram_core::types::Session {
         engram_core::types::Session {

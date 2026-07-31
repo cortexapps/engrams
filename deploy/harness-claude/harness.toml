@@ -58,7 +58,7 @@ id    = "haiku"
 label = "Claude Haiku 4.5"
 env   = { ANTHROPIC_MODEL = "claude-haiku-4-5" }
 
-# Session modes (ADR 0106). Pure declaration: mode selection rides prompts
+# Session modes (ADR 0107). Pure declaration: mode selection rides prompts
 # (harness_mode) and the harness maps `plan` to `--permission-mode plan`.
 [[modes]]
 id      = "default"

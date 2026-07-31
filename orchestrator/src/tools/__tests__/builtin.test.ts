@@ -83,7 +83,7 @@ describe("built-in tools", () => {
     expect(tool).toMatchObject({
       handling: "session",
       execution: "deferred",
-      // Deliberately no codex binding (ADR 0106): codex and custom harnesses
+      // Deliberately no codex binding (ADR 0107): codex and custom harnesses
       // receive the tool through the injected dynamic-tool path.
       nativeBindings: {
         claude: "ExitPlanMode",

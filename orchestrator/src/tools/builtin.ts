@@ -56,7 +56,7 @@ export function registerBuiltinTools(
     },
   });
 
-  // ADR 0106. Native-bound to claude ExitPlanMode; deliberately NO codex
+  // ADR 0107. Native-bound to claude ExitPlanMode; deliberately NO codex
   // binding — codex and custom harnesses receive it as an injected dynamic
   // tool through the generic deferred path.
   registry.register({

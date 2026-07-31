@@ -612,7 +612,7 @@ pub struct CreateSessionRequest {
     /// (silent drop is a footgun).
     #[serde(default)]
     pub prompt: Option<String>,
-    /// ADR 0106: session mode for the initial `prompt` (e.g. `plan`) —
+    /// ADR 0107: session mode for the initial `prompt` (e.g. `plan`) —
     /// create-time plan mode is just mode on the first prompt. Ignored when
     /// `prompt` is unset; validated by `send_prompt_core` against the
     /// selected harness's descriptor modes.
@@ -644,6 +644,10 @@ pub struct CreateSessionRequest {
     /// `argv` the backend execs. `None` for a dev-VM session.
     #[serde(default)]
     pub selected_harness: Option<String>,
+    /// ADR 0106: provider/subject only. The gRPC adapter constructs this from
+    /// the trusted orchestrator request; it never contains OAuth material.
+    #[serde(skip)]
+    pub oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 }
 
 #[derive(Serialize)]
@@ -723,7 +727,7 @@ pub(crate) async fn create_session_core(
             return result;
         }
     };
-    let result = boot_prepared(state, prepared, start).await;
+    let result = boot_prepared(state, prepared, start, req.oauth_credential.clone()).await;
     let kind = match &result {
         Ok(body) => body.kind,
         Err(_) => "unknown",
@@ -764,6 +768,7 @@ async fn boot_prepared(
     // commit — the coordinator-owned serial prefix ahead of the
     // (now-concurrent, host-side) restore work.
     create_start: std::time::Duration,
+    oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         inputs,
@@ -888,6 +893,8 @@ async fn boot_prepared(
             // not a re-derivation-drift source, so it is not persisted here.
             None,
         ),
+        oauth_binding: oauth_credential
+            .map(|key| engram_core::types::oauth::SessionOAuthBinding { session_id, key }),
     };
 
     let disposition = state
@@ -1410,7 +1417,7 @@ async fn prepare_inner(
     image_uri: &str,
     mode: SessionMode,
     prompt: Option<String>,
-    // ADR 0106: the mode directive riding the create-time prompt.
+    // ADR 0107: the mode directive riding the create-time prompt.
     harness_mode: Option<String>,
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
@@ -1999,9 +2006,11 @@ pub(crate) async fn inject_upload_env(
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {
         return;
     };
-    env.insert("ENGRAM_UPLOAD_TOKEN".into(), token);
+    env.insert("ENGRAM_UPLOAD_TOKEN".into(), token.clone());
+    env.insert("ENGRAM_CREDENTIAL_BROKER_TOKEN".into(), token);
     if let Some(ep) = loopback_endpoint(state) {
-        env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep);
+        env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep.clone());
+        env.insert("ENGRAM_CREDENTIAL_ENDPOINT".into(), ep);
     }
 }
 
@@ -2023,7 +2032,7 @@ pub(crate) async fn inject_upload_env(
 /// Resolve a harness name to its parsed descriptor: built-in (embedded
 /// harness.toml) first, then the `harness_catalog` row. Built-ins win, so a
 /// custom row can never shadow one. Shared by `resolve_harness` (the full
-/// launch resolution) and the ADR 0106 `harness_mode` validation in
+/// launch resolution) and the ADR 0107 `harness_mode` validation in
 /// `send_prompt_core`, so the two can never disagree on what a name means.
 pub(crate) async fn resolve_descriptor(
     state: &SharedState,

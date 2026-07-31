@@ -222,19 +222,42 @@ pub fn checkpoint_ack() -> impl Strategy<Value = CheckpointAck> {
 }
 
 pub fn forge_request() -> impl Strategy<Value = ForgeRequest> {
-    (session_id(), s(), s(), opt_s()).prop_map(|(session_id, broker_token, host, owner)| {
-        ForgeRequest {
-            session_id,
-            broker_token,
-            op: ForgeOp::FetchCredential { host, owner },
-        }
+    (session_id(), s(), forge_op()).prop_map(|(session_id, broker_token, op)| ForgeRequest {
+        session_id,
+        broker_token,
+        op,
     })
+}
+
+fn forge_op() -> impl Strategy<Value = ForgeOp> {
+    prop_oneof![
+        (s(), opt_s()).prop_map(|(host, owner)| ForgeOp::FetchCredential { host, owner }),
+        Just(ForgeOp::FetchOAuthCredential),
+        (any::<i64>(), proptest::collection::vec(any::<u8>(), 0..64)).prop_map(
+            |(expected_version, opaque_bundle)| ForgeOp::UpdateOAuthCredential {
+                expected_version,
+                opaque_bundle,
+            }
+        ),
+    ]
 }
 
 pub fn forge_response() -> impl Strategy<Value = ForgeResponse> {
     prop_oneof![
         (s(), s())
             .prop_map(|(username, password)| ForgeResponse::Credential { username, password }),
+        (
+            s(),
+            any::<i64>(),
+            proptest::collection::vec(any::<u8>(), 0..64)
+        )
+            .prop_map(|(provider, version, opaque_bundle)| {
+                ForgeResponse::OAuthCredential {
+                    provider,
+                    version,
+                    opaque_bundle,
+                }
+            }),
         s().prop_map(|message| ForgeResponse::Error { message }),
     ]
 }
@@ -357,12 +380,15 @@ fn _exhaustiveness_attach_reject(r: &AttachReject) {
 fn _exhaustiveness_forge_op(o: &ForgeOp) {
     match o {
         ForgeOp::FetchCredential { .. } => {}
+        ForgeOp::FetchOAuthCredential => {}
+        ForgeOp::UpdateOAuthCredential { .. } => {}
     }
 }
 
 fn _exhaustiveness_forge_response(r: &ForgeResponse) {
     match r {
         ForgeResponse::Credential { .. } => {}
+        ForgeResponse::OAuthCredential { .. } => {}
         ForgeResponse::Error { .. } => {}
     }
 }

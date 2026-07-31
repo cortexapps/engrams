@@ -20,6 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         "proto/engram/app/v1/mount_catalog.proto",
         "proto/engram/app/v1/harness.proto",
         "proto/engram/app/v1/org_secret.proto",
+        "proto/engram/app/v1/oauth.proto",
         "proto/engram/app/v1/mint.proto",
         "proto/engram/app/v1/integration_op.proto",
         // secret.proto removed in ADR 0051 Drip A: the orchestrator owns the

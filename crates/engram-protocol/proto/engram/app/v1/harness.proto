@@ -71,7 +71,7 @@ message HarnessDescriptor {
   // API / telemetry). Merged into the session's deny-default allowlist at
   // create; surfaced so the UI's "Reaches" receipts show the true egress set.
   HarnessEgress egress = 7;
-  // Session modes this harness supports (ADR 0106), e.g. plan. Pure
+  // Session modes this harness supports (ADR 0107), e.g. plan. Pure
   // declaration — no env map; mode selection rides prompts (harness_mode).
   repeated HarnessMode modes = 8;
 }
@@ -99,6 +99,21 @@ message HarnessAuth {
   // `claude setup-token`"), shown on the settings + create surfaces so a user
   // knows how to obtain it. Never a secret.
   optional string user_env_hint = 4;
+  // ADR 0106: reusable human OAuth connection. Mutually exclusive with
+  // user_env; its opaque payload is never projected through this catalog API.
+  HarnessOAuth user_oauth = 5;
+}
+
+message HarnessOAuth {
+  // Stable trusted-provider driver id (for example "openai-codex").
+  string provider = 1;
+  OauthDelivery delivery = 2;
+}
+
+enum OauthDelivery {
+  OAUTH_DELIVERY_UNSPECIFIED = 0;
+  // A bounded provider-owned credential cache, opaque to generic consumers.
+  OAUTH_DELIVERY_OPAQUE_BUNDLE = 1;
 }
 
 // One model or effort option; env is the var(s) that select it.
@@ -112,7 +127,7 @@ message HarnessOption {
   map<string, string> env = 4;
 }
 
-// One session mode (ADR 0106). Unlike HarnessOption there is no env map: a
+// One session mode (ADR 0107). Unlike HarnessOption there is no env map: a
 // mode is not an env selection — the harness itself maps it to native
 // behavior.
 message HarnessMode {

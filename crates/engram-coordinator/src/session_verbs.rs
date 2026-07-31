@@ -951,7 +951,7 @@ async fn forward_outbox_row(
                     .and_then(|t| t.as_str())
                     .unwrap_or_default()
                     .to_string();
-                // ADR 0106: the optional mode directive riding this prompt.
+                // ADR 0107: the optional mode directive riding this prompt.
                 let mode = row
                     .payload
                     .get("mode")

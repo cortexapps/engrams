@@ -77,6 +77,7 @@ async fn enqueue(
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[], 0)
@@ -112,6 +113,7 @@ async fn reserve(
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     match meta
         .reserve_and_persist_create(ws, candidates, affinity_len)

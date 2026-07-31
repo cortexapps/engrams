@@ -366,7 +366,7 @@ pub enum SessionEvent {
         reason: String,
         at: DateTime<Utc>,
     },
-    /// ADR 0106: a validated session-mode directive rode a prompt (e.g.
+    /// ADR 0107: a validated session-mode directive rode a prompt (e.g.
     /// `plan`). Coordinator-authoritative — the user genuinely selected the
     /// mode — so `rewind_session_to_cursor` excludes this kind from its
     /// tombstone UPDATE, like `prompt_received`. The web derives the current
@@ -842,6 +842,8 @@ pub struct AppState {
     /// is unset (the forge endpoints then 501). Kept here rather than on
     /// `Services` so the many test `Services` literals don't need touching.
     pub integrations: crate::integrations::IntegrationBroker,
+    /// ADR 0106: shared provider registry, sealed store, and active flow owner.
+    pub oauth: Arc<crate::oauth::OAuthManager>,
     // ADR 0051: the per-user auth runtime (`auth: Option<Arc<AuthRuntime>>`)
     // is removed. The coordinator no longer resolves human principals — the
     // orchestrator owns auth/authz and calls the coordinator over the trusted
@@ -906,6 +908,12 @@ impl AppState {
             services.clock.clone(),
         ));
         Self {
+            oauth: crate::oauth::OAuthManager::new(
+                services.meta.clone(),
+                services.kek.clone(),
+                services.clock.clone(),
+                services.entropy.clone(),
+            ),
             cfg,
             services,
             events,
@@ -1971,7 +1979,7 @@ pub(crate) mod tests {
         /// rows on the floor, which would make any deliver-ordering
         /// assertion vacuous.
         pub(crate) outbox: PlMutex<Vec<engram_core::types::outbox::OutboxRow>>,
-        /// ADR 0106: the session's persisted harness selection, so
+        /// ADR 0107: the session's persisted harness selection, so
         /// `send_prompt_core`'s `harness_mode` validation is exercisable
         /// (the trait default returns `None`, which rejects every mode).
         pub(crate) harness: PlMutex<Option<String>>,

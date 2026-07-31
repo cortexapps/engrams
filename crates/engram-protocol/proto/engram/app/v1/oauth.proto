@@ -1,0 +1,118 @@
+syntax = "proto3";
+
+package engram.app.v1;
+
+// ADR 0106: trusted-orchestrator API for subject-scoped OAuth connections.
+// The orchestrator authenticates users and supplies their opaque subject id;
+// the coordinator owns provider drivers, encrypted storage, and lifecycle.
+service OAuthCredentialService {
+  rpc BeginFlow(BeginFlowRequest) returns (BeginFlowResponse);
+  rpc GetFlow(GetFlowRequest) returns (GetFlowResponse);
+  rpc CancelFlow(CancelFlowRequest) returns (CancelFlowResponse);
+  rpc ListCredentials(ListCredentialsRequest) returns (ListCredentialsResponse);
+  rpc Disconnect(DisconnectRequest) returns (DisconnectResponse);
+
+  // Internal credential-control operations. Callers must additionally present
+  // the session's broker token; the coordinator derives subject/provider from
+  // the session binding and never accepts them from the harness.
+  rpc FetchSessionCredential(FetchSessionCredentialRequest) returns (FetchSessionCredentialResponse);
+  rpc UpdateSessionCredential(UpdateSessionCredentialRequest) returns (UpdateSessionCredentialResponse);
+}
+
+enum OauthSubjectKind {
+  OAUTH_SUBJECT_KIND_UNSPECIFIED = 0;
+  OAUTH_SUBJECT_KIND_USER = 1;
+  OAUTH_SUBJECT_KIND_CONNECTOR = 2;
+  OAUTH_SUBJECT_KIND_MCP = 3;
+}
+
+message OAuthSubject {
+  OauthSubjectKind kind = 1;
+  string id = 2;
+}
+
+message BeginFlowRequest {
+  OAuthSubject subject = 1;
+  string provider = 2;
+}
+
+message BeginFlowResponse {
+  OAuthFlow flow = 1;
+  // Ephemeral: returned only by BeginFlow from the owning replica.
+  string verification_url = 2;
+  string user_code = 3;
+}
+
+message GetFlowRequest {
+  OAuthSubject subject = 1;
+  string flow_id = 2;
+}
+
+message GetFlowResponse { OAuthFlow flow = 1; }
+
+message CancelFlowRequest {
+  OAuthSubject subject = 1;
+  string flow_id = 2;
+}
+
+message CancelFlowResponse { OAuthFlow flow = 1; }
+
+message OAuthFlow {
+  string id = 1;
+  string provider = 2;
+  string status = 3;
+  optional string error_code = 4;
+  string expires_at = 5;
+  string updated_at = 6;
+}
+
+message OAuthAccountMetadata {
+  optional string display_name = 1;
+  optional string plan_type = 2;
+  optional string workspace_id = 3;
+  optional string workspace_name = 4;
+}
+
+message OAuthCredentialMeta {
+  string provider = 1;
+  int64 version = 2;
+  bool connected = 3;
+  OAuthAccountMetadata account = 4;
+  string created_at = 5;
+  string updated_at = 6;
+}
+
+message ListCredentialsRequest { OAuthSubject subject = 1; }
+message ListCredentialsResponse { repeated OAuthCredentialMeta credentials = 1; }
+
+message DisconnectRequest {
+  OAuthSubject subject = 1;
+  string provider = 2;
+  int64 expected_version = 3;
+}
+
+message DisconnectResponse { OAuthCredentialMeta credential = 1; }
+
+message FetchSessionCredentialRequest {
+  string session_id = 1;
+  string broker_token = 2;
+}
+
+message FetchSessionCredentialResponse {
+  string provider = 1;
+  int64 version = 2;
+  bytes opaque_bundle = 3;
+}
+
+message UpdateSessionCredentialRequest {
+  string session_id = 1;
+  string broker_token = 2;
+  int64 expected_version = 3;
+  bytes opaque_bundle = 4;
+}
+
+message UpdateSessionCredentialResponse {
+  string provider = 1;
+  int64 version = 2;
+  bytes opaque_bundle = 3;
+}

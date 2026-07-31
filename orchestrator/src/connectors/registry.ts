@@ -80,13 +80,32 @@ export function isGraphqlMatch(m: HttpMatch | GraphqlMatch): m is GraphqlMatch {
   return (m as GraphqlMatch).operation !== undefined;
 }
 
-/** Response→asset map (consumed in Phase 4; validated + carried now). */
+/**
+ * URL-derived fallback for asset fields (GraphQL parity). A GraphQL response
+ * echoes only the client's selection set (`gh pr create` selects just
+ * `id`+`url`), so fields a REST response would carry can be absent from the
+ * body while still encoded in the returned URL. `pattern` is matched against
+ * the whole extracted fetchable URL — `{name}` captures one run of characters
+ * excluding `/`/`?`/`#`, `{name:int}` additionally requires an integer (and
+ * emits a JSON number) — and `fields` renders data fields from the captures,
+ * filling ONLY fields the response extractors missed (never overwriting).
+ */
+export interface AssetUrlFallback {
+  pattern: string;
+  fields: Record<string, string>;
+}
+
+/** Response→asset map (consumed in Phase 4; validated + carried now). A `data`
+ * value may be a single extractor path or a FALLBACK CHAIN (`string[]`, tried
+ * in order — the proxy takes the first path that resolves). Chains compile to
+ * repeated `[field, path]` wire pairs, keeping the wire shape unchanged. */
 export interface AssetSpec {
   kind: string;
   surface: "action" | "asset";
   success?: Record<string, unknown>;
-  data?: Record<string, string>;
+  data?: Record<string, string | string[]>;
   fetchable?: Record<string, string>;
+  urlFallback?: AssetUrlFallback;
 }
 
 export interface Operation {
@@ -324,9 +343,13 @@ export interface IntegrationObserveJson {
   graphql_operation: string;
   /** ADR 0059: GraphQL top-level field this observe fires on; empty = REST. */
   graphql_field: string;
-  /** `[field, extractorPath]` pairs (serde `Vec<(String, String)>`). */
+  /** `[field, extractorPath]` pairs (serde `Vec<(String, String)>`). Paths may
+   * read the response (`$.resp.*`) or the GraphQL request variables (`$.vars.*`). */
   data: [string, string][];
   fetchable: string | null;
+  /** URL-derived fallback fields (serde `Option<ObserveUrlFallback>`) — see
+   * {@link AssetUrlFallback}. */
+  url_fallback: { pattern: string; fields: [string, string][] } | null;
 }
 /** ADR 0057: the profile's egress network allow-list (snake_case wire shape). */
 export interface IntegrationNetworkJson {
@@ -906,12 +929,54 @@ export function parseConnector(raw: unknown, where: string): Connector {
       const a = op.asset as Record<string, unknown>;
       if (typeof a.kind !== "string" || !a.kind) fail(opWhere, '"asset.kind" must be a non-empty string');
       if (a.surface !== "action" && a.surface !== "asset") fail(opWhere, '"asset.surface" must be "action" or "asset"');
+      let urlFallback: AssetUrlFallback | undefined;
+      if (a.urlFallback !== undefined) {
+        if (typeof a.urlFallback !== "object" || a.urlFallback === null) {
+          fail(opWhere, '"asset.urlFallback" must be an object');
+        }
+        const u = a.urlFallback as Record<string, unknown>;
+        if (typeof u.pattern !== "string" || !u.pattern) {
+          fail(opWhere, '"asset.urlFallback.pattern" must be a non-empty string');
+        }
+        if (typeof u.fields !== "object" || u.fields === null || Array.isArray(u.fields)) {
+          fail(opWhere, '"asset.urlFallback.fields" must be an object of field → template');
+        }
+        // Developer-error guard: a field template may reference only captures the
+        // pattern declares (a typo here would silently derive nothing at runtime —
+        // the proxy's URL fallback is deliberately fail-soft).
+        const captureNames = (t: string) =>
+          [...t.matchAll(/\{([A-Za-z0-9_]+)(?::int)?\}/g)].map((m) => m[1] ?? "");
+        const declared = new Set(captureNames(u.pattern));
+        for (const [field, template] of Object.entries(u.fields as Record<string, unknown>)) {
+          if (typeof template !== "string" || !template) {
+            fail(opWhere, `"asset.urlFallback.fields.${field}" must be a non-empty string`);
+          }
+          for (const name of captureNames(template)) {
+            if (!declared.has(name)) {
+              fail(opWhere, `"asset.urlFallback.fields.${field}" references {${name}}, which the pattern does not capture`);
+            }
+          }
+        }
+        urlFallback = { pattern: u.pattern, fields: u.fields as Record<string, string> };
+      }
+      if (a.data !== undefined) {
+        if (typeof a.data !== "object" || a.data === null || Array.isArray(a.data)) {
+          fail(opWhere, '"asset.data" must be an object of field → extractor path(s)');
+        }
+        for (const [field, v] of Object.entries(a.data as Record<string, unknown>)) {
+          const chain = Array.isArray(v) ? v : [v];
+          if (chain.length === 0 || !chain.every((p) => typeof p === "string" && p)) {
+            fail(opWhere, `"asset.data.${field}" must be a non-empty extractor path or a non-empty array of them`);
+          }
+        }
+      }
       asset = {
         kind: a.kind,
         surface: a.surface,
         ...(a.success !== undefined ? { success: a.success as Record<string, unknown> } : {}),
-        ...(a.data !== undefined ? { data: a.data as Record<string, string> } : {}),
+        ...(a.data !== undefined ? { data: a.data as Record<string, string | string[]> } : {}),
         ...(a.fetchable !== undefined ? { fetchable: a.fetchable as Record<string, string> } : {}),
+        ...(urlFallback ? { urlFallback } : {}),
       };
     }
     return { grants, ...(match ? { match } : {}), ...(asset ? { asset } : {}) };
@@ -1204,8 +1269,15 @@ export function compileIntegrationPolicy(
           success_no_graphql_errors: a.success?.noGraphqlErrors === true,
           graphql_operation,
           graphql_field,
-          data: Object.entries(a.data ?? {}),
+          // A `string[]` data value is a fallback chain — flattened to repeated
+          // `[field, path]` pairs; the proxy takes the first path that resolves.
+          data: Object.entries(a.data ?? {}).flatMap(([field, v]): [string, string][] =>
+            (Array.isArray(v) ? v : [v]).map((path) => [field, path]),
+          ),
           fetchable: typeof fetchableExternal === "string" ? fetchableExternal : null,
+          url_fallback: a.urlFallback
+            ? { pattern: a.urlFallback.pattern, fields: Object.entries(a.urlFallback.fields) }
+            : null,
         };
         const key = JSON.stringify(entry);
         if (!seenObserve.has(key)) {

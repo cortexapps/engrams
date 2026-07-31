@@ -2001,17 +2001,22 @@ mod tests {
         };
         b.start_agent(id, agent).await.unwrap();
 
-        // Wait for the agent to write its pid file. Real-world race
-        // budgets are tiny here; a few hundred ms is plenty.
+        // Wait for the agent to write its pid file. Poll for CONTENT, not
+        // existence: `echo $$ > file` opens (creates) the file before the
+        // write lands, so an existence check can observe an empty file and
+        // the parse below dies with `ParseIntError { kind: Empty }` (flaked
+        // in CI 2026-07-31). Real-world race budgets are tiny here; a few
+        // hundred ms is plenty.
         let pid_path = b.cwd_for(id).join(pid_file);
+        let mut pid_contents = String::new();
         for _ in 0..50 {
-            if pid_path.exists() {
+            pid_contents = fs::read_to_string(&pid_path).unwrap_or_default();
+            if !pid_contents.trim().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let pid: i32 = fs::read_to_string(&pid_path)
-            .expect("agent should have written its pid")
+        let pid: i32 = pid_contents
             .trim()
             .parse()
             .expect("pid file should contain an integer");

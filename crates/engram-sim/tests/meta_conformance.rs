@@ -917,6 +917,7 @@ async fn queue_fifo(ctx: &Ctx) {
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     // No candidate hosts: both dispositions are Queued.
     let a = SessionId::new();
@@ -2252,7 +2253,205 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     );
 }
 
+/// ADR 0106: OAuth rows have identical subject isolation, version/CAS,
+/// revocation, owner fencing, and deterministic cleanup in PG and SimMeta.
+async fn oauth_credential_and_flow(ctx: &Ctx) {
+    use engram_core::types::oauth::{
+        NewSealedOAuthCredential, OAuthAccountMetadata, OAuthCredentialKey, OAuthFlow,
+        OAuthFlowStatus, OAuthSubjectKind,
+    };
+
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::User,
+        subject_id: "user-a".into(),
+        provider: "openai-codex".into(),
+    };
+    let candidate = |account: &str, byte: u8| NewSealedOAuthCredential {
+        key: key.clone(),
+        wrapped_dek: vec![byte; 32],
+        nonce: vec![byte; 12],
+        ciphertext: vec![byte; 8],
+        key_id: "test-kek".into(),
+        metadata: OAuthAccountMetadata {
+            account_id: account.into(),
+            display_name: Some("Test User".into()),
+            plan_type: Some("personal".into()),
+            workspace_id: None,
+            workspace_name: None,
+        },
+    };
+
+    let first = ctx
+        .meta
+        .put_oauth_credential(candidate("acct-a", 1), None)
+        .await
+        .unwrap();
+    assert_eq!(first.version, 1);
+    assert!(first.revoked_at.is_none());
+    assert!(matches!(
+        ctx.meta
+            .put_oauth_credential(candidate("acct-a", 2), None)
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    let second = ctx
+        .meta
+        .put_oauth_credential(candidate("acct-a", 2), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(second.version, 2);
+    assert!(matches!(
+        ctx.meta
+            .put_oauth_credential(candidate("acct-a", 3), Some(1))
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+
+    let other_subject = ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::User, "user-b")
+        .await
+        .unwrap();
+    assert!(
+        other_subject.is_empty(),
+        "subjects cannot enumerate one another"
+    );
+    let listed = ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::User, "user-a")
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, key);
+
+    let revoked = ctx
+        .meta
+        .revoke_oauth_credential(&key, second.version)
+        .await
+        .unwrap();
+    assert_eq!(revoked.version, 3);
+    assert!(revoked.revoked_at.is_some());
+    assert!(matches!(
+        ctx.meta.revoke_oauth_credential(&key, second.version).await,
+        Err(MetaError::Conflict(_))
+    ));
+    let reconnected = ctx
+        .meta
+        .put_oauth_credential(candidate("acct-a", 4), Some(revoked.version))
+        .await
+        .unwrap();
+    assert_eq!(reconnected.version, 4);
+    assert!(reconnected.revoked_at.is_none());
+
+    let now = ctx.clock.now_utc();
+    let flow_id = uuid::Uuid::parse_str("10600000-0000-4000-8000-000000000001").unwrap();
+    let flow = OAuthFlow {
+        id: flow_id,
+        key: key.clone(),
+        owner_replica: "replica-a".into(),
+        lease_expires_at: now + chrono::Duration::seconds(5),
+        expires_at: now + chrono::Duration::seconds(30),
+        status: OAuthFlowStatus::Pending,
+        error_code: None,
+        created_at: now,
+        updated_at: now,
+    };
+    ctx.meta.create_oauth_flow(flow.clone()).await.unwrap();
+    assert!(matches!(
+        ctx.meta.create_oauth_flow(flow).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(matches!(
+        ctx.meta
+            .finish_oauth_flow(flow_id, "replica-b", OAuthFlowStatus::Cancelled, None)
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(matches!(
+        ctx.meta
+            .renew_oauth_flow_lease(flow_id, "replica-b", now + chrono::Duration::seconds(10),)
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    ctx.meta
+        .renew_oauth_flow_lease(flow_id, "replica-a", now + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(6));
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(
+                ctx.clock.now_utc(),
+                ctx.clock.now_utc() - chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap(),
+        0,
+        "a renewed owner lease stays pending"
+    );
+    ctx.clock.advance(Duration::from_secs(5));
+    let cleanup_now = ctx.clock.now_utc();
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(cleanup_now, cleanup_now - chrono::Duration::hours(1))
+            .await
+            .unwrap(),
+        1
+    );
+    let lost = ctx.meta.get_oauth_flow(flow_id).await.unwrap().unwrap();
+    assert_eq!(lost.status, OAuthFlowStatus::OwnerLost);
+    assert_eq!(lost.error_code.as_deref(), Some("owner_lost"));
+
+    let expires_id = uuid::Uuid::parse_str("10600000-0000-4000-8000-000000000002").unwrap();
+    let expires_now = ctx.clock.now_utc();
+    ctx.meta
+        .create_oauth_flow(OAuthFlow {
+            id: expires_id,
+            key: key.clone(),
+            owner_replica: "replica-a".into(),
+            lease_expires_at: expires_now + chrono::Duration::seconds(30),
+            expires_at: expires_now + chrono::Duration::seconds(5),
+            status: OAuthFlowStatus::Pending,
+            error_code: None,
+            created_at: expires_now,
+            updated_at: expires_now,
+        })
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(6));
+    let expires_cleanup = ctx.clock.now_utc();
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(
+                expires_cleanup,
+                expires_cleanup - chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let expired = ctx.meta.get_oauth_flow(expires_id).await.unwrap().unwrap();
+    assert_eq!(expired.status, OAuthFlowStatus::Expired);
+    assert_eq!(expired.error_code.as_deref(), Some("flow_expired"));
+
+    ctx.clock.advance(Duration::from_secs(3601));
+    let delete_now = ctx.clock.now_utc();
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(delete_now, delete_now - chrono::Duration::hours(1))
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(ctx.meta.get_oauth_flow(flow_id).await.unwrap().is_none());
+    assert!(ctx.meta.get_oauth_flow(expires_id).await.unwrap().is_none());
+}
+
 conformance!(t_broker_token_flow, super::broker_token_flow);
+conformance!(
+    t_oauth_credential_and_flow,
+    super::oauth_credential_and_flow
+);
 conformance!(
     t_parked_lifecycle_and_eviction_settle,
     super::parked_lifecycle_and_eviction_settle
@@ -2340,6 +2539,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     let d = meta
         .reserve_and_persist_create(ws(with_op), &[host], 0)
@@ -2687,7 +2887,7 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     meta.append_session_event(id, "harness_idle", serde_json::json!({}))
         .await
         .unwrap();
-    // ADR 0106: a mode directive is user intent — it survives a rewind.
+    // ADR 0107: a mode directive is user intent — it survives a rewind.
     meta.append_session_event(
         id,
         "harness_mode_changed",

@@ -1,4 +1,4 @@
-# ADR 0106: Plan mode — a harness-agnostic read-only design pass with an approval gate
+# ADR 0107: Plan mode — a harness-agnostic read-only design pass with an approval gate
 
 Status: 2026-07-31 — **Proposed.**
 

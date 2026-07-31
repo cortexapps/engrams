@@ -663,7 +663,7 @@ message SendHarnessPromptRequest {
   // Phase 1b: client/coord-minted id correlating this prompt with its
   // RunStarted{prompt_id} and (while queued) PromptQueued/Edited/Dequeued.
   string prompt_id = 3;
-  // ADR 0106: optional session-mode directive riding this prompt (e.g.
+  // ADR 0107: optional session-mode directive riding this prompt (e.g.
   // "plan"); forwarded verbatim on HarnessCommand::Prompt.mode.
   optional string harness_mode = 4;
 }

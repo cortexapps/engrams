@@ -1,4 +1,4 @@
-//! The session-mode stamp (ADR 0106).
+//! The session-mode stamp (ADR 0107).
 //!
 //! A `HarnessCommand::Prompt.mode` directive is latched to a file on the
 //! workspace disk — the thing snapshots preserve — because process env is

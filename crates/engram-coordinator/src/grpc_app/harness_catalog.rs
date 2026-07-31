@@ -35,6 +35,14 @@ fn descriptor_to_proto(
             user_env: d.auth.user_env.clone(),
             org_env_hint: d.auth.org_env_hint.clone(),
             user_env_hint: d.auth.user_env_hint.clone(),
+            user_oauth: d.auth.user_oauth.as_ref().map(|oauth| app::HarnessOAuth {
+                provider: oauth.provider.clone(),
+                delivery: match oauth.delivery {
+                    engram_core::types::harness::OAuthDelivery::OpaqueBundle => {
+                        app::OauthDelivery::OpaqueBundle.into()
+                    }
+                },
+            }),
         }),
         models: d.models.iter().map(option_to_proto).collect(),
         effort: d.effort.iter().map(option_to_proto).collect(),

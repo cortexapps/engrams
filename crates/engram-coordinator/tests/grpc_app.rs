@@ -713,6 +713,7 @@ async fn create_session_unknown_image_is_invalid_argument() {
             prompt: None,
             harness_env: HashMap::new(),
             secrets: HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             // ADR 0062: unused — this create fails at the unknown-image lookup
             // before harness resolution.

@@ -138,6 +138,7 @@ async fn stream_events_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
@@ -285,6 +286,7 @@ async fn session_crud_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
@@ -410,6 +412,7 @@ async fn exec_streaming_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
@@ -540,6 +543,7 @@ async fn write_files_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         harness: None,
         harness_mode: None,
@@ -619,6 +623,7 @@ async fn snapshot_evict_resume_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
@@ -758,6 +763,7 @@ async fn get_artifact_not_found_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
@@ -837,6 +843,7 @@ async fn shell_relay_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.

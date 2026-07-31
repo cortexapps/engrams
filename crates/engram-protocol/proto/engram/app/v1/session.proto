@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package engram.app.v1;
 
+import "engram/app/v1/oauth.proto";
+
 // The orchestrator-facing app contract (ADR 0051 §2.3, rev 2026-06-10).
 // The caller is a single trusted service (bearer-authed); there is no
 // per-user anything here. Attribution and authz live in the orchestrator.
@@ -182,11 +184,19 @@ message CreateSessionRequest {
   // /opt/engram/dyn/0/<harness>/<exec>. Required for an agent-mode session;
   // unset/ignored for dev_vm. Selection is per session, not baked into the image.
   optional string harness = 11;
-  // ADR 0106: session mode for the initial `prompt` (e.g. "plan") —
+  // ADR 0106: human OAuth binding. Contains no credential bytes; the
+  // coordinator verifies a live subject connection and persists it atomically.
+  OAuthCredentialBinding oauth_credential = 12;
+  // ADR 0107: session mode for the initial `prompt` (e.g. "plan") —
   // create-time plan mode is just mode on the first prompt. Ignored when
   // `prompt` is unset. Validated against the selected harness's descriptor.
   // Not named `mode` — field 2 is the agent/dev_vm SessionMode.
-  optional string harness_mode = 12;
+  optional string harness_mode = 13;
+}
+
+message OAuthCredentialBinding {
+  OAuthSubject subject = 1;
+  string provider = 2;
 }
 
 message CreateSessionResponse {
@@ -222,7 +232,7 @@ message SendPromptRequest {
   // RunStarted{prompt_id} and (if queued) PromptQueued/Edited/Dequeued.
   // The coord mints one if empty (back-compat / non-web callers).
   string prompt_id = 3;
-  // ADR 0106: session-mode directive that applies from this prompt's turn
+  // ADR 0107: session-mode directive that applies from this prompt's turn
   // onward (e.g. "plan"). Validated against the session harness's declared
   // descriptor modes; unset = no change. Not named `mode` — that name is the
   // agent/dev_vm SessionMode on CreateSessionRequest/Session.

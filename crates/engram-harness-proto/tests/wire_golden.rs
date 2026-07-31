@@ -384,7 +384,7 @@ fn harness_command_golden_and_variant_indices() {
     assert_golden("command_checkpoint", &cmd_checkpoint());
     assert_golden("command_shutdown", &cmd_shutdown());
     assert_golden("command_prompt", &cmd_prompt());
-    // ADR 0106 sanctioned flag-day break: `Prompt` gained `mode` —
+    // ADR 0107 sanctioned flag-day break: `Prompt` gained `mode` —
     // the command_prompt golden was regenerated in the same PR, shipped
     // with the coordinator + host + harness-bundle deploy train.
     assert_golden("command_prompt_with_mode", &cmd_prompt_with_mode());
@@ -436,6 +436,19 @@ fn forge_op_golden_and_variant_indices() {
     };
     assert_golden("forge_op_fetch_credential", &fetch);
     assert_variant_index(&fetch, 0, "ForgeOp::FetchCredential");
+    assert_variant_index(
+        &ForgeOp::FetchOAuthCredential,
+        1,
+        "ForgeOp::FetchOAuthCredential",
+    );
+    assert_variant_index(
+        &ForgeOp::UpdateOAuthCredential {
+            expected_version: 7,
+            opaque_bundle: vec![1, 2, 3],
+        },
+        2,
+        "ForgeOp::UpdateOAuthCredential",
+    );
 }
 
 #[test]
@@ -450,6 +463,15 @@ fn forge_response_golden_and_variant_indices() {
     assert_golden("forge_response_credential", &cred);
     assert_golden("forge_response_error", &err);
     assert_variant_index(&cred, 0, "ForgeResponse::Credential");
+    assert_variant_index(
+        &ForgeResponse::OAuthCredential {
+            provider: "openai-codex".into(),
+            version: 7,
+            opaque_bundle: vec![1, 2, 3],
+        },
+        2,
+        "ForgeResponse::OAuthCredential",
+    );
     // ADR 0056 P3 removed `PullRequest` (was index 1); `Error` shifts 2 → 1.
     // A wire break the host↔harness golden is designed to flag — intentional,
     // gated on session images re-baking with the new agentd.

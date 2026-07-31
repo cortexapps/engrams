@@ -1,6 +1,6 @@
 name = "codex"
 label = "Codex"
-description = "OpenAI Codex coding agent. Human runs use a ChatGPT-backed access token; programmatic runs use an organization API key."
+description = "OpenAI Codex coding agent. Human runs use a managed ChatGPT connection; programmatic runs use an organization API key."
 exec = "harness"
 
 # Hosts the harness itself must reach (ADR 0063 addendum): api.openai.com for
@@ -10,16 +10,20 @@ allow_hosts = ["api.openai.com", "chatgpt.com"]
 
 [auth]
 org_env = "CODEX_API_KEY"
-org_env_hint = "An admin sets an org secret named CODEX_API_KEY (an OpenAI API key). It authenticates programmatic runs — Slack, cron, and API-triggered sessions."
-user_env = "CODEX_ACCESS_TOKEN"
-# Setup instructions shown on the settings + create surfaces.
-user_env_hint = "Sign in with `codex login`, then paste the access token from ~/.codex/auth.json. It's required before you can start an interactive Codex session."
+org_env_hint = "An admin sets an org secret named CODEX_API_KEY (an OpenAI API key). It authenticates service-account, cron, and API-triggered sessions. Human-owned Slack tasks use that user's connection."
+user_env_hint = "Connect your ChatGPT account in Settings → Credentials. Personal and managed workspaces are supported; Enterprise admins must enable device-code login."
 
+[auth.user_oauth]
+provider = "openai-codex"
+delivery = "opaque_bundle"
+
+# Picker-visible catalog returned by the pinned Codex app-server's `model/list`.
+# Keep this snapshot in lockstep with the CLI pin in fetch-codex.sh.
 [[models]]
-id = "gpt-5.6"
-label = "GPT-5.6"
+id = "gpt-5.6-sol"
+label = "GPT-5.6 Sol"
 default = true
-env = { ENGRAM_CODEX_MODEL = "gpt-5.6" }
+env = { ENGRAM_CODEX_MODEL = "gpt-5.6-sol" }
 
 [[models]]
 id = "gpt-5.6-terra"
@@ -31,7 +35,27 @@ id = "gpt-5.6-luna"
 label = "GPT-5.6 Luna"
 env = { ENGRAM_CODEX_MODEL = "gpt-5.6-luna" }
 
-# Session modes (ADR 0106). Pure declaration: mode selection rides prompts
+[[models]]
+id = "gpt-5.5"
+label = "GPT-5.5"
+env = { ENGRAM_CODEX_MODEL = "gpt-5.5" }
+
+[[models]]
+id = "gpt-5.4"
+label = "GPT-5.4"
+env = { ENGRAM_CODEX_MODEL = "gpt-5.4" }
+
+[[models]]
+id = "gpt-5.4-mini"
+label = "GPT-5.4 Mini"
+env = { ENGRAM_CODEX_MODEL = "gpt-5.4-mini" }
+
+[[models]]
+id = "gpt-5.3-codex-spark"
+label = "GPT-5.3 Codex Spark"
+env = { ENGRAM_CODEX_MODEL = "gpt-5.3-codex-spark" }
+
+# Session modes (ADR 0107). Pure declaration: mode selection rides prompts
 # (harness_mode) and the harness maps `plan` to a read-only turn sandbox plus
 # the injected exit_plan_mode tool.
 [[modes]]

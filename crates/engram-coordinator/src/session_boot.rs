@@ -114,7 +114,7 @@ pub(crate) struct BootInputs {
     /// outbox via `send_prompt_core` — the same path every follow-up uses
     /// (ADR 0073). The boot pipeline itself no longer reads it.
     pub prompt: Option<String>,
-    /// ADR 0106: the session-mode directive riding the create-time initial
+    /// ADR 0107: the session-mode directive riding the create-time initial
     /// prompt (e.g. `plan`). Read together with `prompt` — meaningless
     /// without one.
     pub harness_mode: Option<String>,
@@ -651,6 +651,7 @@ pub(crate) fn build_observe_entries(
             graphql_field: o.graphql_field.clone(),
             data: o.data.clone(),
             fetchable: o.fetchable.clone(),
+            url_fallback: o.url_fallback.clone(),
         })
         .collect()
 }
