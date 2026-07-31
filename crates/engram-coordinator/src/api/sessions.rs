@@ -638,6 +638,10 @@ pub struct CreateSessionRequest {
     /// `argv` the backend execs. `None` for a dev-VM session.
     #[serde(default)]
     pub selected_harness: Option<String>,
+    /// ADR 0106: provider/subject only. The gRPC adapter constructs this from
+    /// the trusted orchestrator request; it never contains OAuth material.
+    #[serde(skip)]
+    pub oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 }
 
 #[derive(Serialize)]
@@ -717,7 +721,7 @@ pub(crate) async fn create_session_core(
             return result;
         }
     };
-    let result = boot_prepared(state, prepared, start).await;
+    let result = boot_prepared(state, prepared, start, req.oauth_credential.clone()).await;
     let kind = match &result {
         Ok(body) => body.kind,
         Err(_) => "unknown",
@@ -758,6 +762,7 @@ async fn boot_prepared(
     // commit — the coordinator-owned serial prefix ahead of the
     // (now-concurrent, host-side) restore work.
     create_start: std::time::Duration,
+    oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         inputs,
@@ -882,6 +887,8 @@ async fn boot_prepared(
             // not a re-derivation-drift source, so it is not persisted here.
             None,
         ),
+        oauth_binding: oauth_credential
+            .map(|key| engram_core::types::oauth::SessionOAuthBinding { session_id, key }),
     };
 
     let disposition = state
@@ -1987,9 +1994,11 @@ pub(crate) async fn inject_upload_env(
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {
         return;
     };
-    env.insert("ENGRAM_UPLOAD_TOKEN".into(), token);
+    env.insert("ENGRAM_UPLOAD_TOKEN".into(), token.clone());
+    env.insert("ENGRAM_CREDENTIAL_BROKER_TOKEN".into(), token);
     if let Some(ep) = loopback_endpoint(state) {
-        env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep);
+        env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep.clone());
+        env.insert("ENGRAM_CREDENTIAL_ENDPOINT".into(), ep);
     }
 }
 

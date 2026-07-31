@@ -121,6 +121,7 @@ fn bare_write_set(
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     }
 }
 
@@ -269,6 +270,7 @@ async fn reserve_and_persist_create_commits_the_full_write_set_together() {
             Some("claude".into()),
             None,
         ),
+        oauth_binding: None,
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[host], 0)

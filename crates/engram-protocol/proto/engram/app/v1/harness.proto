@@ -96,6 +96,21 @@ message HarnessAuth {
   // `claude setup-token`"), shown on the settings + create surfaces so a user
   // knows how to obtain it. Never a secret.
   optional string user_env_hint = 4;
+  // ADR 0106: reusable human OAuth connection. Mutually exclusive with
+  // user_env; its opaque payload is never projected through this catalog API.
+  HarnessOAuth user_oauth = 5;
+}
+
+message HarnessOAuth {
+  // Stable trusted-provider driver id (for example "openai-codex").
+  string provider = 1;
+  OAuthDelivery delivery = 2;
+}
+
+enum OAuthDelivery {
+  OAUTH_DELIVERY_UNSPECIFIED = 0;
+  // A bounded provider-owned credential cache, opaque to generic consumers.
+  OAUTH_DELIVERY_OPAQUE_BUNDLE = 1;
 }
 
 // One model or effort option; env is the var(s) that select it.

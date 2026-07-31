@@ -18,6 +18,7 @@ mod image;
 mod integration_op;
 mod mint;
 mod mount_catalog;
+mod oauth;
 mod org_secret;
 mod port_relay;
 mod session;
@@ -36,6 +37,7 @@ pub use image::AppImageService;
 pub use integration_op::AppIntegrationOpService;
 pub use mint::AppMintService;
 pub use mount_catalog::AppMountCatalogService;
+pub use oauth::AppOAuthCredentialService;
 pub use org_secret::AppOrgSecretService;
 pub use port_relay::AppPortRelayService;
 pub use session::AppSessionService;
@@ -224,9 +226,20 @@ pub fn server(state: SharedState) -> tonic::transport::server::Router {
         )
         // ADR 0057: the admin-managed, KEK-sealed org secret store.
         .add_service(app::org_secret_service_server::OrgSecretServiceServer::new(
-            AppOrgSecretService { state, auth },
+            AppOrgSecretService {
+                state: state.clone(),
+                auth: auth.clone(),
+            },
         ))
+        .add_service(
+            app::o_auth_credential_service_server::OAuthCredentialServiceServer::new(
+                AppOAuthCredentialService { state, auth },
+            )
+            .max_decoding_message_size(MAX_OAUTH_CONTROL_MESSAGE_BYTES),
+        )
 }
+
+const MAX_OAUTH_CONTROL_MESSAGE_BYTES: usize = crate::oauth::MAX_OAUTH_BUNDLE_BYTES + 16 * 1024;
 
 #[cfg(test)]
 mod reflection_tests {
@@ -436,6 +449,7 @@ mod convention {
         ("org_secret.rs", include_str!("org_secret.rs")),
         ("mint.rs", include_str!("mint.rs")),
         ("integration_op.rs", include_str!("integration_op.rs")),
+        ("oauth.rs", include_str!("oauth.rs")),
     ];
 
     /// Files under `src/grpc_app/` that are deliberately NOT listed in

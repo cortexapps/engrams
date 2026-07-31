@@ -142,6 +142,7 @@ pub(crate) fn create_request_from_proto(
         // empty), so threading the client id for the FIRST message is a
         // deferred refinement; acknowledge the drop here.
         prompt_id: _,
+        oauth_credential,
     } = r;
     let mode = match mode.as_str() {
         "" | "agent" => SessionMode::Agent,
@@ -161,6 +162,39 @@ pub(crate) fn create_request_from_proto(
     // malformed capability), not a silent drop.
     let integration_policy = engram_core::types::IntegrationPolicy::parse(&integration_policy_json)
         .map_err(|e| ApiError::BadRequest(format!("invalid integration_policy_json: {e}")))?;
+    let oauth_credential = oauth_credential
+        .map(|binding| {
+            let subject = binding.subject.ok_or_else(|| {
+                ApiError::BadRequest("oauth_credential.subject is required".into())
+            })?;
+            if subject.id.trim().is_empty() || binding.provider.trim().is_empty() {
+                return Err(ApiError::BadRequest(
+                    "oauth credential subject id and provider must not be empty".into(),
+                ));
+            }
+            let subject_kind = match app::OAuthSubjectKind::try_from(subject.kind) {
+                Ok(app::OAuthSubjectKind::OauthSubjectKindUser) => {
+                    engram_core::types::oauth::OAuthSubjectKind::User
+                }
+                Ok(app::OAuthSubjectKind::OauthSubjectKindConnector) => {
+                    engram_core::types::oauth::OAuthSubjectKind::Connector
+                }
+                Ok(app::OAuthSubjectKind::OauthSubjectKindMcp) => {
+                    engram_core::types::oauth::OAuthSubjectKind::Mcp
+                }
+                _ => {
+                    return Err(ApiError::BadRequest(
+                        "oauth credential subject kind is required".into(),
+                    ))
+                }
+            };
+            Ok(engram_core::types::oauth::OAuthCredentialKey {
+                subject_kind,
+                subject_id: subject.id,
+                provider: binding.provider,
+            })
+        })
+        .transpose()?;
     Ok(CreateSessionRequest {
         image: image_uri,
         mode,
@@ -170,6 +204,7 @@ pub(crate) fn create_request_from_proto(
         capabilities,
         integration_policy,
         selected_harness: harness,
+        oauth_credential,
     })
 }
 

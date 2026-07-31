@@ -266,8 +266,15 @@ const profileRoute = createRoute({
 });
 const tokensRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
-  path: "tokens",
+  path: "credentials",
   component: TokensPanel,
+});
+const legacyTokensRoute = createRoute({
+  getParentRoute: () => settingsLayoutRoute,
+  path: "tokens",
+  beforeLoad: () => {
+    throw redirect({ to: "/settings/credentials" });
+  },
 });
 const membersRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
@@ -374,6 +381,7 @@ export const routeTree = rootRoute.addChildren([
       settingsIndexRoute,
       profileRoute,
       tokensRoute,
+      legacyTokensRoute,
       membersRoute,
       secretsRoute,
       apiKeysRoute,

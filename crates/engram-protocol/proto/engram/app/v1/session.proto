@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package engram.app.v1;
 
+import "engram/app/v1/oauth.proto";
+
 // The orchestrator-facing app contract (ADR 0051 §2.3, rev 2026-06-10).
 // The caller is a single trusted service (bearer-authed); there is no
 // per-user anything here. Attribution and authz live in the orchestrator.
@@ -182,6 +184,14 @@ message CreateSessionRequest {
   // /opt/engram/dyn/0/<harness>/<exec>. Required for an agent-mode session;
   // unset/ignored for dev_vm. Selection is per session, not baked into the image.
   optional string harness = 11;
+  // ADR 0106: human OAuth binding. Contains no credential bytes; the
+  // coordinator verifies a live subject connection and persists it atomically.
+  OAuthCredentialBinding oauth_credential = 12;
+}
+
+message OAuthCredentialBinding {
+  OAuthSubject subject = 1;
+  string provider = 2;
 }
 
 message CreateSessionResponse {

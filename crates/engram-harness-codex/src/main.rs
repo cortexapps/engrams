@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use engram_core::{SandboxId, SessionId};
-use engram_harness_proto::{AgentRole, FileChange, HarnessCommand, HarnessEvent};
+use engram_harness_proto::{
+    read_msg, write_msg, AgentRole, FileChange, ForgeOp, ForgeRequest, ForgeResponse,
+    HarnessCommand, HarnessEvent, FORGE_VSOCK_PORT,
+};
 use engram_harness_sdk::browser_view;
 use engram_harness_sdk::parked::{ParkedCall, ParkedCallKind, ParkedCallStore};
 use engram_harness_sdk::questions::{Answers, Question, QuestionOption};
@@ -13,12 +16,14 @@ use engram_harness_sdk::{emit, Channels, ConnectionConfig, QueuedPrompt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 const DEFAULT_CODEX_HOME: &str = "/workspace/.engrams/codex";
 const THREAD_ID_FILE: &str = "/workspace/.engrams/codex-thread-id";
 const PARKED_CALLS_FILE: &str = "/workspace/.engrams/codex-parked-calls.json";
 const MAX_SUMMARY: usize = 4096;
+const MAX_OAUTH_BUNDLE_BYTES: usize = 256 * 1024;
+const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 
 type ToolManifest = Vec<ManifestTool>;
 
@@ -158,6 +163,12 @@ struct Cli {
     /// Test seam for the durable correlation table.
     #[arg(skip)]
     parked_calls_file: Option<PathBuf>,
+    /// Test-only service-account credential; production reads CODEX_API_KEY.
+    #[arg(skip)]
+    test_api_key: Option<String>,
+    /// Test-only credential broker override.
+    #[arg(skip)]
+    test_credential_control: Option<CredentialControl>,
 }
 
 impl Cli {
@@ -227,7 +238,191 @@ struct AppServer {
     persisted_prompts: HashMap<String, PersistedTurn>,
     buffered: VecDeque<Value>,
     stderr_task: Option<tokio::task::JoinHandle<Vec<String>>>,
+    oauth_watcher: Option<tokio::task::JoinHandle<()>>,
+    _oauth_home: Option<tempfile::TempDir>,
     generation: u64,
+}
+
+#[derive(Clone)]
+struct CredentialControl {
+    session_id: SessionId,
+    broker_token: String,
+    endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialControl")
+            .field("session_id", &self.session_id)
+            .field("endpoint", &self.endpoint)
+            .field("broker_token", &"[redacted]")
+            .finish()
+    }
+}
+
+struct OAuthSession {
+    control: CredentialControl,
+    version: i64,
+    last_payload: Vec<u8>,
+}
+
+fn codex_app_server_command(bin: &Path, runtime_home: &Path) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .args(["app-server", "--stdio"])
+        .env("CODEX_HOME", runtime_home)
+        .env("CODEX_NON_INTERACTIVE", "1")
+        // Authentication is delivered over the trusted app-server/control
+        // protocols. Neither provider credentials nor the session broker
+        // capability may be inherited by the child process environment.
+        .env_remove("CODEX_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ENGRAM_CREDENTIAL_BROKER_TOKEN")
+        .env_remove("ENGRAM_CREDENTIAL_ENDPOINT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
+impl CredentialControl {
+    fn from_env(session_id: SessionId) -> Result<Self, String> {
+        let broker_token = std::env::var("ENGRAM_CREDENTIAL_BROKER_TOKEN")
+            .map_err(|_| "OpenAI is not connected for this session".to_string())?;
+        Ok(Self {
+            session_id,
+            broker_token,
+            endpoint: std::env::var("ENGRAM_CREDENTIAL_ENDPOINT").ok(),
+        })
+    }
+
+    async fn exchange(&self, op: ForgeOp) -> Result<ForgeResponse, String> {
+        let request = ForgeRequest {
+            session_id: self.session_id,
+            broker_token: self.broker_token.clone(),
+            op,
+        };
+        if let Some(endpoint) = &self.endpoint {
+            let url = format!(
+                "{}/api/v1/sessions/{}/credential-control",
+                endpoint.trim_end_matches('/'),
+                self.session_id
+            );
+            return reqwest::Client::new()
+                .post(url)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|_| "credential control request failed".to_string())?
+                .error_for_status()
+                .map_err(|_| "credential control request was rejected".to_string())?
+                .json()
+                .await
+                .map_err(|_| "credential control response was malformed".to_string());
+        }
+        let transport = engram_transport::from_env()
+            .map_err(|_| "credential control transport unavailable".to_string())?;
+        let mut stream = transport
+            .dial(FORGE_VSOCK_PORT)
+            .await
+            .map_err(|_| "credential control connection failed".to_string())?;
+        write_msg(&mut stream, &request)
+            .await
+            .map_err(|_| "credential control request failed".to_string())?;
+        read_msg(&mut stream)
+            .await
+            .map_err(|_| "credential control response was malformed".to_string())
+    }
+}
+
+impl OAuthSession {
+    async fn fetch(session_id: SessionId) -> Result<Self, String> {
+        Self::fetch_from(CredentialControl::from_env(session_id)?).await
+    }
+
+    async fn fetch_from(control: CredentialControl) -> Result<Self, String> {
+        match control.exchange(ForgeOp::FetchOAuthCredential).await? {
+            ForgeResponse::OAuthCredential {
+                provider,
+                version,
+                opaque_bundle,
+            } if provider == OPENAI_CODEX_PROVIDER
+                && !opaque_bundle.is_empty()
+                && opaque_bundle.len() <= MAX_OAUTH_BUNDLE_BYTES =>
+            {
+                Ok(Self {
+                    control,
+                    version,
+                    last_payload: opaque_bundle,
+                })
+            }
+            ForgeResponse::Error { message } => {
+                Err(format!("OAuth credential unavailable: {message}"))
+            }
+            _ => Err("credential control returned an invalid OpenAI cache".into()),
+        }
+    }
+
+    async fn sync_cache(&mut self, path: &Path) -> Result<(), String> {
+        let metadata = match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("could not inspect refreshed OAuth cache".into()),
+        };
+        if !metadata.file_type().is_file() || metadata.len() as usize > MAX_OAUTH_BUNDLE_BYTES {
+            let _ = remove_auth_cache(path).await;
+            return Err("refreshed OAuth cache was rejected".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                let _ = remove_auth_cache(path).await;
+                return Err("refreshed OAuth cache permissions were rejected".into());
+            }
+        }
+        let payload = tokio::fs::read(path)
+            .await
+            .map_err(|_| "could not read refreshed OAuth cache".to_string())?;
+        if payload.is_empty() {
+            let _ = remove_auth_cache(path).await;
+            return Err("refreshed OAuth cache was empty".into());
+        }
+        if payload != self.last_payload {
+            let response = self
+                .control
+                .exchange(ForgeOp::UpdateOAuthCredential {
+                    expected_version: self.version,
+                    opaque_bundle: payload.clone(),
+                })
+                .await;
+            let removal = remove_auth_cache(path).await;
+            match response? {
+                ForgeResponse::OAuthCredential {
+                    provider,
+                    version,
+                    opaque_bundle,
+                } if provider == OPENAI_CODEX_PROVIDER => {
+                    self.version = version;
+                    self.last_payload = opaque_bundle;
+                }
+                ForgeResponse::Error { message } if message == "version_conflict" => {
+                    // The winning cache is fetched on the next app-server
+                    // restart boundary; never overwrite it with stale state.
+                    tracing::warn!("OAuth cache refresh lost a version race; deferring to restart");
+                }
+                ForgeResponse::Error { message } => {
+                    return Err(format!("OAuth cache refresh rejected: {message}"));
+                }
+                _ => return Err("credential control returned an invalid refresh response".into()),
+            }
+            removal?;
+            return Ok(());
+        }
+        remove_auth_cache(path).await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +498,9 @@ async fn run_engine(
                     outcome,
                     DriveOutcome::Shutdown | DriveOutcome::ChannelClosed
                 ) {
+                    if let Some(watcher) = server.oauth_watcher.take() {
+                        watcher.abort();
+                    }
                     // ChildStdin::shutdown() only flushes — dropping the
                     // handle is what closes the pipe and delivers the EOF
                     // the app-server exits on. Without it every drain ate
@@ -319,6 +517,9 @@ async fn run_engine(
                         let _ = child.wait().await;
                     }
                     return ExitCode::SUCCESS;
+                }
+                if let Some(watcher) = server.oauth_watcher.take() {
+                    watcher.abort();
                 }
                 let _ = server.child.start_kill();
                 let _ = server.child.wait().await;
@@ -340,22 +541,96 @@ async fn run_engine(
     }
 }
 
+async fn write_auth_cache(path: &Path, payload: &[u8]) -> Result<(), String> {
+    if payload.is_empty() || payload.len() > MAX_OAUTH_BUNDLE_BYTES {
+        return Err("OAuth cache size rejected".into());
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|_| "could not create private OAuth cache".to_string())?;
+    file.write_all(payload)
+        .await
+        .map_err(|_| "could not write OAuth cache".to_string())?;
+    file.flush()
+        .await
+        .map_err(|_| "could not flush OAuth cache".to_string())
+}
+
+async fn remove_auth_cache(path: &Path) -> Result<(), String> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("could not remove OAuth cache".into()),
+    }
+}
+
+fn spawn_oauth_watcher(
+    oauth: Arc<Mutex<OAuthSession>>,
+    auth_path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = oauth.lock().await.sync_cache(&auth_path).await {
+                // Error strings are deliberately provider-independent and never
+                // include cache bytes, JSON-RPC messages, or token values.
+                tracing::warn!(%error, "could not synchronize refreshed OAuth cache");
+            }
+        }
+    })
+}
+
 impl AppServer {
     async fn spawn(cli: &Cli, generation: u64) -> Result<Self, String> {
-        tokio::fs::create_dir_all(&cli.codex_home)
-            .await
-            .map_err(|e| format!("create CODEX_HOME: {e}"))?;
-        ensure_skills_link(&cli.codex_home).await;
+        let api_key = cli
+            .test_api_key
+            .clone()
+            .or_else(|| std::env::var("CODEX_API_KEY").ok());
+        let oauth = if api_key.is_none() {
+            Some(match cli.test_credential_control.clone() {
+                Some(control) => OAuthSession::fetch_from(control).await?,
+                None => OAuthSession::fetch(cli.session_id).await?,
+            })
+        } else {
+            None
+        };
+        let oauth_home = if oauth.is_some() {
+            let dir = tempfile::Builder::new()
+                .prefix("engram-codex-oauth-")
+                .tempdir()
+                .map_err(|_| "could not create private Codex home".to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "could not protect private Codex home".to_string())?;
+            }
+            Some(dir)
+        } else {
+            tokio::fs::create_dir_all(&cli.codex_home)
+                .await
+                .map_err(|e| format!("create CODEX_HOME: {e}"))?;
+            None
+        };
+        let runtime_home = oauth_home
+            .as_ref()
+            .map_or_else(|| cli.codex_home.clone(), |dir| dir.path().to_path_buf());
+        ensure_skills_link(&runtime_home).await;
+        let auth_path = runtime_home.join("auth.json");
+        if let Some(oauth) = &oauth {
+            write_auth_cache(&auth_path, &oauth.last_payload).await?;
+        }
         let bin = cli.codex_bin.clone().unwrap_or_else(resolve_codex_bin);
-        let mut command = Command::new(&bin);
-        command
-            .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", &cli.codex_home)
-            .env("CODEX_NON_INTERACTIVE", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut command = codex_app_server_command(&bin, &runtime_home);
         let mut child = command.spawn().map_err(|e| format!("spawn {bin:?}: {e}"))?;
         let stdin = child.stdin.take().ok_or("app-server stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("app-server stdout unavailable")?;
@@ -369,6 +644,8 @@ impl AppServer {
             persisted_prompts: HashMap::new(),
             buffered: VecDeque::new(),
             stderr_task: Some(engram_harness_sdk::spawn_stderr_tail(stderr, 64, true)),
+            oauth_watcher: None,
+            _oauth_home: oauth_home,
             generation,
         };
         server
@@ -378,22 +655,30 @@ impl AppServer {
             )
             .await?;
         server.notify("initialized", json!({})).await?;
-        if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
+        if let Some(api_key) = api_key {
             server
                 .request_wait(
                     "account/login/start",
                     json!({"type":"apiKey","apiKey":api_key}),
                 )
                 .await?;
+        } else {
+            let response = server
+                .request_wait("account/read", json!({"refreshToken":true}))
+                .await?;
+            if response
+                .pointer("/result/account/type")
+                .and_then(Value::as_str)
+                != Some("chatgpt")
+            {
+                return Err("Codex did not load managed ChatGPT authentication".into());
+            }
         }
-        // Codex persists API-key login material to CODEX_HOME/auth.json. The
-        // app-server keeps the selected credential in memory, so remove the
-        // file before any model-controlled command can inspect the workspace.
-        // A fresh wrapper re-authenticates from the selected Engram env var.
-        match tokio::fs::remove_file(cli.codex_home.join("auth.json")).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(%error, "could not remove Codex credential cache"),
+        let oauth = oauth.map(|oauth| Arc::new(Mutex::new(oauth)));
+        if let Some(oauth) = &oauth {
+            oauth.lock().await.sync_cache(&auth_path).await?;
+        } else if let Err(error) = remove_auth_cache(&auth_path).await {
+            tracing::warn!(%error, "could not remove Codex credential cache");
         }
         let prior = tokio::fs::read_to_string(cli.thread_id_file())
             .await
@@ -418,6 +703,9 @@ impl AppServer {
             .to_owned();
         server.persisted_prompts = persisted_prompts(&response);
         persist_thread_id(cli.thread_id_file(), &server.thread_id).await?;
+        if let Some(oauth) = oauth {
+            server.oauth_watcher = Some(spawn_oauth_watcher(oauth, auth_path));
+        }
         Ok(server)
     }
 
@@ -1559,7 +1847,7 @@ fn thread_params() -> Value {
         "sandbox": "danger-full-access",
         "config": {
             "shell_environment_policy": {
-                "exclude": ["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME"]
+                "exclude": ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME", "ENGRAM_CREDENTIAL_BROKER_TOKEN", "ENGRAM_CREDENTIAL_ENDPOINT"]
             }
         }
     });
@@ -1648,6 +1936,68 @@ done
         (script, record)
     }
 
+    async fn write_fake_oauth_codex() -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!("fake-codex-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let script = base.join("codex");
+        let record = base.join("requests.jsonl");
+        let body = format!(
+            r#"#!/bin/sh
+record='{}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$record"
+  id=$(printf '%s\n' "$line" | jq -r '.id // empty')
+  method=$(printf '%s\n' "$line" | jq -r '.method // empty')
+  case "$method" in
+    initialize) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+    account/read) printf '{{"id":%s,"result":{{"account":{{"type":"chatgpt","email":"person@example.com","planType":"plus"}}}}}}\n' "$id" ;;
+    thread/start)
+      if [ -e "$CODEX_HOME/auth.json" ]; then printf '%s\n' 'AUTH_CACHE_LEAKED' >> "$record"; fi
+      printf '{{"id":%s,"result":{{"thread":{{"id":"t1","turns":[]}}}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+            record.display()
+        );
+        tokio::fs::write(&script, body).await.unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, record)
+    }
+
+    async fn serve_one_oauth_fetch(payload: Vec<u8>) -> String {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 64 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            let body = serde_json::to_vec(&ForgeResponse::OAuthCredential {
+                provider: OPENAI_CODEX_PROVIDER.into(),
+                version: 1,
+                opaque_bundle: payload,
+            })
+            .unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        format!("http://{address}")
+    }
+
     async fn write_crashing_question_fake() -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
@@ -1716,6 +2066,8 @@ done
             thread_id_file: None,
             tool_manifest: manifest_from_env(),
             parked_calls_file: Some(parked_calls_file),
+            test_api_key: Some("test-api-key".into()),
+            test_credential_control: None,
         }
     }
 
@@ -1783,6 +2135,41 @@ done
         completed.expect("fake app-server prompt turn timed out");
 
         engine.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_cache_is_imported_and_removed_before_thread_start() {
+        let payload = serde_json::to_vec(&json!({
+            "auth_mode":"chatgpt",
+            "OPENAI_API_KEY":null,
+            "tokens":{
+                "access_token":"access-secret",
+                "refresh_token":"refresh-secret",
+                "account_id":"acct-1"
+            }
+        }))
+        .unwrap();
+        let endpoint = serve_one_oauth_fetch(payload).await;
+        let (script, record) = write_fake_oauth_codex().await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("unused-home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.test_api_key = None;
+        cli.test_credential_control = Some(CredentialControl {
+            session_id: cli.session_id,
+            broker_token: "session-broker-token".into(),
+            endpoint: Some(endpoint),
+        });
+
+        let mut server = AppServer::spawn(&cli, 1).await.unwrap();
+        if let Some(watcher) = server.oauth_watcher.take() {
+            watcher.abort();
+        }
+        let requests = tokio::fs::read_to_string(record).await.unwrap();
+        assert!(requests.contains("account/read"));
+        assert!(requests.contains("thread/start"));
+        assert!(!requests.contains("AUTH_CACHE_LEAKED"));
+        assert!(!requests.contains("access-secret"));
     }
 
     #[tokio::test]
@@ -2550,15 +2937,32 @@ done
             .and_then(Value::as_array)
             .unwrap();
         for name in [
-            "CODEX_ACCESS_TOKEN",
             "CODEX_API_KEY",
             "OPENAI_API_KEY",
             "CODEX_HOME",
+            "ENGRAM_CREDENTIAL_BROKER_TOKEN",
+            "ENGRAM_CREDENTIAL_ENDPOINT",
         ] {
             assert!(excluded.iter().any(|value| value == name));
         }
         assert_eq!(params.get("approvalPolicy"), Some(&json!("never")));
         assert_eq!(params.get("sandbox"), Some(&json!("danger-full-access")));
+    }
+
+    #[test]
+    fn app_server_child_environment_removes_all_credentials() {
+        let command = codex_app_server_command(Path::new("codex"), Path::new("/tmp/codex-home"));
+        for name in [
+            "CODEX_API_KEY",
+            "OPENAI_API_KEY",
+            "ENGRAM_CREDENTIAL_BROKER_TOKEN",
+            "ENGRAM_CREDENTIAL_ENDPOINT",
+        ] {
+            assert!(command
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == name && value.is_none()));
+        }
     }
 
     #[tokio::test]

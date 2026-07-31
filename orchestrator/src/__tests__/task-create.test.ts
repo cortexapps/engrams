@@ -32,6 +32,7 @@ import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import { OAuthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -270,6 +271,81 @@ describe("compileSessionCreateInput", () => {
       env_var: ORG_ENV,
       mode: "literal",
     });
+  });
+
+  test("binds a human Codex OAuth connection without putting OAuth bytes in harnessEnv", async () => {
+    const codexDeps: SessionCompileDeps = {
+      ...deps(null),
+      harnessCatalog: {
+        listHarnesses: async () => ({
+          harnesses: [{
+            name: "codex",
+            descriptor: {
+              label: "Codex",
+              auth: {
+                userOauth: { provider: "openai-codex", delivery: 1 },
+                orgEnv: "CODEX_API_KEY",
+              },
+              models: [],
+              effort: [],
+            },
+          }],
+        }),
+      },
+      hasOAuthCredential: async (provider) => provider === "openai-codex",
+      oauthSubject: {
+        kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER,
+        id: "user-1",
+      },
+    };
+    const input = await compileSessionCreateInput(profile({ harness: "codex" }), codexDeps);
+    expect(input.oauthCredential).toEqual({
+      subject: { kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER, id: "user-1" },
+      provider: "openai-codex",
+    });
+    expect(input.harnessEnv?.OPENAI_API_KEY).toBeUndefined();
+    expect(JSON.stringify(input.harnessEnv)).not.toContain("openai-codex");
+  });
+
+  test("blocks disconnected human Codex but keeps the service-account API-key path", async () => {
+    const codexDeps: SessionCompileDeps = {
+      ...deps(null),
+      harnessCatalog: {
+        listHarnesses: async () => ({
+          harnesses: [{
+            name: "codex",
+            descriptor: {
+              label: "Codex",
+              auth: {
+                userOauth: { provider: "openai-codex", delivery: 1 },
+                orgEnv: "CODEX_API_KEY",
+              },
+              models: [],
+              effort: [],
+            },
+          }],
+        }),
+      },
+      hasOAuthCredential: async () => false,
+      oauthSubject: {
+        kind: OAuthSubjectKind.OAUTH_SUBJECT_KIND_USER,
+        id: "user-1",
+      },
+    };
+    await expect(
+      compileSessionCreateInput(profile({ harness: "codex" }), codexDeps),
+    ).rejects.toThrow(/Settings → Credentials/);
+
+    const serviceInput = await compileSessionCreateInput(
+      profile({ harness: "codex" }),
+      codexDeps,
+      { programmatic: true },
+    );
+    expect(serviceInput.oauthCredential).toBeUndefined();
+    const policy = JSON.parse(serviceInput.integrationPolicyJson!) as {
+      secrets?: Array<{ env_var: string }>;
+    };
+    expect(policy.secrets?.some((secret) => secret.env_var === "CODEX_API_KEY")).toBe(true);
   });
 
   test("passes the prompt through when set", async () => {

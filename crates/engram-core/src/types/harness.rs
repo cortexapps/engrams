@@ -1,8 +1,8 @@
 //! The harness descriptor (`harness.toml`) — ADR 0063.
 //!
 //! A harness-agnostic declaration each harness ships inside its bundle,
-//! describing its *environment contract*: the credential env-var names (an
-//! org/programmatic one + an optional user/interactive one) and the model /
+//! describing its *credential contract*: an org/programmatic env-var plus an
+//! optional user env-var or OAuth connection, and the model /
 //! effort enums, where each option maps to the env var(s) that select it.
 //! ADR 0062's harness catalog stores this verbatim so the orchestrator/web can
 //! render pickers and derive the (formerly Claude-hardcoded) env wiring without
@@ -87,8 +87,8 @@ impl HarnessEgress {
     }
 }
 
-/// Credential env-var names. A credential is one var, so these are plain
-/// strings (unlike the per-option model/effort env maps).
+/// Credential contract. A harness may expose one human credential mechanism:
+/// an env-var secret or a reusable OAuth connection (ADR 0106).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessAuth {
@@ -102,6 +102,11 @@ pub struct HarnessAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_env: Option<String>,
 
+    /// OAuth connection for human sessions. Mutually exclusive with
+    /// [`Self::user_env`]; OAuth payloads never enter the harness env map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_oauth: Option<HarnessOAuth>,
+
     /// Free-text setup instructions for the org credential, surfaced to admins.
     /// Not validated — human guidance, never a secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +117,26 @@ pub struct HarnessAuth {
     /// user knows how to obtain it. Not validated, never a secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_env_hint: Option<String>,
+}
+
+/// A harness's reusable human OAuth requirement. `provider` addresses a
+/// trusted coordinator driver; the bundle is opaque outside that driver and
+/// its bound harness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessOAuth {
+    /// Stable driver id (for example `openai-codex`).
+    pub provider: String,
+
+    /// How the credential is delivered to the harness. V1 intentionally has
+    /// one mode so future connector/MCP consumers share the same vocabulary.
+    pub delivery: OAuthDelivery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthDelivery {
+    OpaqueBundle,
 }
 
 /// One model or effort option. `env` is the set of env vars (with values) that
@@ -175,6 +200,15 @@ impl HarnessDescriptor {
         }
         if let Some(v) = &self.auth.user_env {
             validate_env_name(v).map_err(|e| format!("harness.toml [auth] user_env: {e}"))?;
+        }
+        if self.auth.user_env.is_some() && self.auth.user_oauth.is_some() {
+            return Err(
+                "harness.toml [auth]: user_env and user_oauth are mutually exclusive".into(),
+            );
+        }
+        if let Some(oauth) = &self.auth.user_oauth {
+            validate_stable_id(&oauth.provider)
+                .map_err(|e| format!("harness.toml [auth.user_oauth] provider: {e}"))?;
         }
         validate_options("models", &self.models)?;
         validate_options("effort", &self.effort)?;
@@ -274,6 +308,20 @@ fn validate_env_name(name: &str) -> Result<(), String> {
     Ok(())
 }
 
+fn validate_stable_id(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || !value.as_bytes()[0].is_ascii_lowercase()
+    {
+        return Err(format!(
+            "invalid stable id {value:?} (expected [a-z][a-z0-9-]*)"
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -351,6 +399,39 @@ org_env_hint = "Set an org secret KEY."
             d.auth.org_env_hint.as_deref(),
             Some("Set an org secret KEY.")
         );
+    }
+
+    #[test]
+    fn parses_oauth_and_rejects_two_human_mechanisms() {
+        let oauth = HarnessDescriptor::parse(
+            r#"
+name = "codex"
+[auth.user_oauth]
+provider = "openai-codex"
+delivery = "opaque_bundle"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            oauth.auth.user_oauth,
+            Some(HarnessOAuth {
+                provider: "openai-codex".into(),
+                delivery: OAuthDelivery::OpaqueBundle,
+            })
+        );
+
+        let err = HarnessDescriptor::parse(
+            r#"
+name = "bad"
+[auth]
+user_env = "TOKEN"
+[auth.user_oauth]
+provider = "openai-codex"
+delivery = "opaque_bundle"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     #[test]

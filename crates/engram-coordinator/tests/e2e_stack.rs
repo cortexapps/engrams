@@ -214,6 +214,7 @@ impl Driver {
             prompt: None,
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
         };
@@ -234,6 +235,7 @@ impl Driver {
             prompt: None,
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
         };
@@ -271,6 +273,7 @@ impl Driver {
             prompt: prompt.map(str::to_string),
             secrets: HashMap::new(),
             harness_env,
+            oauth_credential: None,
             prompt_id: None,
             // The built-in `claude` needs no registration — it resolves from the
             // host `current_bundles` stamp (∪ the catalog) by name.
@@ -291,9 +294,10 @@ impl Driver {
             prompt: None,
             secrets: HashMap::new(),
             harness_env: HashMap::from([(
-                "CODEX_ACCESS_TOKEN".to_string(),
+                "CODEX_API_KEY".to_string(),
                 "bogus-e2e-token".to_string(),
             )]),
+            oauth_credential: None,
             prompt_id: None,
             harness: Some("codex".to_string()),
         };
