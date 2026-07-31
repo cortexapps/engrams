@@ -56,6 +56,13 @@ pub struct NoopConfig {
     pub sandbox_id: SandboxId,
     /// ADR 0067 attach token (generation half).
     pub binding_epoch: u64,
+    /// ADR 0107: opt-in plan-flow tail. After the fixed-shape run the
+    /// harness becomes minimally prompt-reactive: a Prompt whose `mode` is
+    /// `plan` emits the exit_plan_mode park choreography; the ToolResult
+    /// decision either starts a synthetic build turn (approve) or a fresh
+    /// plan park (reject); any other Prompt echoes one assistant turn. This
+    /// is what keeps the stack e2e harness-independent.
+    pub plan_flow: bool,
 }
 
 impl NoopConfig {
@@ -71,6 +78,7 @@ impl NoopConfig {
             send_run_completed: false,
             sandbox_id: SandboxId::new(),
             binding_epoch: 1,
+            plan_flow: false,
         }
     }
 }
@@ -134,6 +142,10 @@ where
     // Shutdown so we can short-circuit. Using a tokio::sync::watch
     // keeps the main loop's cancellation cheap.
     let (shutdown_tx, mut shutdown_rx) = tokio::sync::watch::channel(false);
+    // ADR 0107: when the plan-flow tail is on, the reader forwards the
+    // commands the tail reacts to.
+    let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<HarnessCommand>();
+    let forward_commands = cfg.plan_flow;
     let mut reader_only = reader;
     let reader_task = tokio::spawn(async move {
         loop {
@@ -146,12 +158,12 @@ where
                     // Noop has no transcript to flush; ack via the
                     // writer channel implicitly.
                 }
-                Ok(HarnessFrame::Command(HarnessCommand::Prompt { .. })) => {
-                    // Noop ignores prompts — its run shape is fixed
-                    // by the config. A real adapter would queue the
-                    // prompt and start a new run after the current
-                    // Idle. Tests for the prompt path use
-                    // engram-harness-claude or a fixture noop.
+                Ok(HarnessFrame::Command(cmd @ HarnessCommand::Prompt { .. })) => {
+                    // Fixed-shape by default; with `plan_flow` the tail
+                    // loop consumes prompts after the scripted run.
+                    if forward_commands {
+                        let _ = cmd_tx.send(cmd);
+                    }
                 }
                 Ok(HarnessFrame::Command(HarnessCommand::Interrupt)) => {
                     // Noop has no in-flight child to SIGINT — nothing
@@ -163,9 +175,12 @@ where
                     // Phase 1b queue mutations. Noop has a fixed run shape
                     // and never queues, so there's nothing to edit/cancel.
                 }
-                Ok(HarnessFrame::Command(HarnessCommand::ToolResult { .. })) => {
-                    // ADR 0089: noop never requests a registered tool, so it
-                    // has no pending call that could consume this result.
+                Ok(HarnessFrame::Command(cmd @ HarnessCommand::ToolResult { .. })) => {
+                    // ADR 0089: fixed-shape noop never requests a registered
+                    // tool; the ADR 0107 plan-flow tail does.
+                    if forward_commands {
+                        let _ = cmd_tx.send(cmd);
+                    }
                 }
                 Ok(HarnessFrame::Event(_)) => {
                     // Host shouldn't send Events; ignore.
@@ -255,10 +270,31 @@ where
     // sticks around in case the host wants it to suspend or shut
     // down. For tests the parent typically drops its end after
     // assertions; the reader_task notices EOF and we observe Shutdown
-    // through the watch channel.
+    // through the watch channel. With `plan_flow` this tail also
+    // consumes forwarded prompts/results (ADR 0107).
+    let mut plan_seq: u32 = 0;
+    let mut awaiting_plan_call: Option<String> = None;
     while !*shutdown_rx.borrow() {
-        if shutdown_rx.changed().await.is_err() {
-            break;
+        tokio::select! {
+            changed = shutdown_rx.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            cmd = cmd_rx.recv(), if cfg.plan_flow => {
+                let Some(cmd) = cmd else { break };
+                if plan_flow_step(
+                    &mut writer,
+                    cmd,
+                    &mut plan_seq,
+                    &mut awaiting_plan_call,
+                )
+                .await
+                .is_err()
+                {
+                    break;
+                }
+            }
         }
     }
     reader_task.abort();
@@ -267,6 +303,160 @@ where
     } else {
         Ok(NoopOutcome::EmittedAndPeerClosed)
     }
+}
+
+/// ADR 0107: one reactive step of the plan-flow tail. A `plan`-mode prompt
+/// parks on a synthetic `exit_plan_mode` call; the decision either starts a
+/// synthetic build turn (approve) or a fresh plan park (reject); any other
+/// prompt echoes one assistant turn. Mirrors the real adapters' event
+/// choreography closely enough for the stack e2e to assert on the trail.
+async fn plan_flow_step<W: tokio::io::AsyncWrite + Unpin>(
+    writer: &mut W,
+    cmd: HarnessCommand,
+    plan_seq: &mut u32,
+    awaiting_plan_call: &mut Option<String>,
+) -> std::io::Result<()> {
+    use engram_harness_proto::AgentRole;
+    match cmd {
+        HarnessCommand::Prompt {
+            prompt_id, mode, ..
+        } => {
+            let run_id = format!("noop-plan-run-{}", *plan_seq);
+            write_msg(
+                writer,
+                &HarnessFrame::Event(HarnessEvent::RunStarted {
+                    run_id: run_id.clone(),
+                    prompt_summary: None,
+                    prompt_id: Some(prompt_id),
+                }),
+            )
+            .await?;
+            if mode.as_deref() == Some("plan") || awaiting_plan_call.is_some() {
+                let call_id = format!("noop-plan-{}", *plan_seq);
+                *plan_seq += 1;
+                *awaiting_plan_call = Some(call_id.clone());
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::ToolCallRequested {
+                        run_id: run_id.clone(),
+                        call_id,
+                        name: "exit_plan_mode".into(),
+                        args_json: r##"{"plan":"# Noop plan\n\n1. Do the thing."}"##.into(),
+                    }),
+                )
+                .await?;
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::RunCompleted { run_id, ok: true }),
+                )
+                .await?;
+                write_msg(writer, &HarnessFrame::Event(HarnessEvent::Parked)).await?;
+            } else {
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::AgentMessage {
+                        run_id: run_id.clone(),
+                        message_id: format!("noop-echo-{run_id}"),
+                        role: AgentRole::Assistant,
+                        text: "noop turn".into(),
+                    }),
+                )
+                .await?;
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::RunCompleted { run_id, ok: true }),
+                )
+                .await?;
+                write_msg(writer, &HarnessFrame::Event(HarnessEvent::Idle)).await?;
+            }
+        }
+        HarnessCommand::ToolResult {
+            call_id,
+            result_json,
+        } => {
+            if awaiting_plan_call.as_deref() != Some(call_id.as_str()) {
+                return Ok(());
+            }
+            let approved = engram_harness_sdk::plan::parse_plan_decision(&result_json)
+                .map(|decision| decision.approved())
+                .unwrap_or(false);
+            write_msg(
+                writer,
+                &HarnessFrame::Event(HarnessEvent::ToolCallCompleted {
+                    run_id: String::new(),
+                    tool_call_id: call_id,
+                    tool_name: "exit_plan_mode".into(),
+                    ok: approved,
+                    duration_ms: 0,
+                    result_summary: Some(if approved { "approved" } else { "rejected" }.into()),
+                }),
+            )
+            .await?;
+            *awaiting_plan_call = None;
+            if approved {
+                let run_id = format!("noop-build-run-{}", *plan_seq);
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::RunStarted {
+                        run_id: run_id.clone(),
+                        prompt_summary: None,
+                        prompt_id: None,
+                    }),
+                )
+                .await?;
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::AgentMessage {
+                        run_id: run_id.clone(),
+                        message_id: format!("noop-build-{run_id}"),
+                        role: AgentRole::Assistant,
+                        text: "implementing the approved plan (noop)".into(),
+                    }),
+                )
+                .await?;
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::RunCompleted { run_id, ok: true }),
+                )
+                .await?;
+                write_msg(writer, &HarnessFrame::Event(HarnessEvent::Idle)).await?;
+            } else {
+                // Rejected: a fresh plan park under a new call id (the
+                // revision cycle).
+                let run_id = format!("noop-plan-run-{}", *plan_seq);
+                let call_id = format!("noop-plan-{}", *plan_seq);
+                *plan_seq += 1;
+                *awaiting_plan_call = Some(call_id.clone());
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::RunStarted {
+                        run_id: run_id.clone(),
+                        prompt_summary: None,
+                        prompt_id: None,
+                    }),
+                )
+                .await?;
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::ToolCallRequested {
+                        run_id: run_id.clone(),
+                        call_id,
+                        name: "exit_plan_mode".into(),
+                        args_json: r##"{"plan":"# Noop plan (revised)\n\n1. Do the thing.\n2. Add tests."}"##.into(),
+                    }),
+                )
+                .await?;
+                write_msg(
+                    writer,
+                    &HarnessFrame::Event(HarnessEvent::RunCompleted { run_id, ok: true }),
+                )
+                .await?;
+                write_msg(writer, &HarnessFrame::Event(HarnessEvent::Parked)).await?;
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 #[derive(Debug)]

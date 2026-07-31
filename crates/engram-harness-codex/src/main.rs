@@ -163,6 +163,9 @@ struct Cli {
     /// Test seam for the durable correlation table.
     #[arg(skip)]
     parked_calls_file: Option<PathBuf>,
+    /// Test seam for the ADR 0107 session-mode stamp.
+    #[arg(skip)]
+    mode_stamp_file: Option<PathBuf>,
     /// Test-only service-account credential; production reads CODEX_API_KEY.
     #[arg(skip)]
     test_api_key: Option<String>,
@@ -182,6 +185,12 @@ impl Cli {
         self.parked_calls_file
             .as_deref()
             .unwrap_or_else(|| Path::new(PARKED_CALLS_FILE))
+    }
+
+    fn mode_stamp_file(&self) -> &Path {
+        self.mode_stamp_file
+            .as_deref()
+            .unwrap_or_else(|| Path::new(engram_harness_sdk::mode_stamp::MODE_STAMP_FILE))
     }
 }
 
@@ -231,6 +240,9 @@ async fn main() -> ExitCode {
 
 struct AppServer {
     child: Child,
+    /// ADR 0107: the session-mode stamp path — read at every turn start so
+    /// per-turn params (sandbox, plan preamble) follow the latch.
+    mode_stamp_path: PathBuf,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
     next_id: i64,
@@ -637,6 +649,7 @@ impl AppServer {
         let stderr = child.stderr.take().ok_or("app-server stderr unavailable")?;
         let mut server = Self {
             child,
+            mode_stamp_path: cli.mode_stamp_file().to_path_buf(),
             stdin,
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
@@ -860,16 +873,14 @@ async fn drive(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(HarnessCommand::Prompt { prompt_id, text, mode }) => {
-                    // ADR 0107 (Phase 4): latch the mode directive to the
-                    // workspace stamp. Behavior (per-turn sandbox params)
-                    // keys off the stamp in Phase 6.
+                    // ADR 0107: latch the mode directive to the workspace
+                    // stamp; every subsequent turn start reads it (per-turn
+                    // sandbox + preamble — codex never respawns for a mode).
                     if let Some(mode) = &mode {
-                        let stamp = std::path::Path::new(
-                            engram_harness_sdk::mode_stamp::MODE_STAMP_FILE,
-                        );
-                        if let Err(e) =
-                            engram_harness_sdk::mode_stamp::write_mode_stamp(stamp, mode)
-                        {
+                        if let Err(e) = engram_harness_sdk::mode_stamp::write_mode_stamp(
+                            &server.mode_stamp_path,
+                            mode,
+                        ) {
                             tracing::warn!(error = %e, %mode, "mode stamp write failed");
                         }
                     }
@@ -943,8 +954,11 @@ async fn drive(
                     route_tool_result(
                         server,
                         parked,
-                        &mut pending,
-                        &active,
+                        RouteCtx {
+                            pending: &mut pending,
+                            active: &active,
+                            queued,
+                        },
                         events,
                         &call_id,
                         result_json,
@@ -1021,13 +1035,46 @@ async fn drive(
     }
 }
 
+/// ADR 0107: the harness-owned plan-turn preamble. Codex has no native plan
+/// permission mode; the read-only turn sandbox is the enforcement and this
+/// contract tells the model how the pass ends.
+const PLAN_MODE_PREAMBLE: &str = "You are in plan mode: a read-only design pass. \
+    Explore the repository and design an implementation plan. Do not modify files \
+    and do not run mutating commands. When your plan is complete, call the \
+    exit_plan_mode tool with the full plan as markdown and wait for the review \
+    decision.";
+
+/// ADR 0107: the synthesized build turn after an approval (the plan turn is
+/// interrupted; this fresh turn starts under the flipped, full-access stamp).
+const PLAN_APPROVED_MESSAGE: &str =
+    "Your plan was approved. Implement it now, following the plan you presented.";
+
 async fn start_turn(server: &mut AppServer, prompt: &QueuedPrompt) -> Result<i64, String> {
+    // ADR 0107: per-turn mode application — no respawn, ever. The stamp is
+    // read fresh at every turn start; `sandboxPolicy` is an explicit
+    // override each time BECAUSE the app-server treats it as sticky ("this
+    // turn and subsequent turns"), so the build turn after an approval must
+    // restore the external-sandbox policy itself.
+    let plan_mode =
+        engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path) == "plan";
+    let text = if plan_mode {
+        format!("{PLAN_MODE_PREAMBLE}\n\n{}", prompt.text)
+    } else {
+        prompt.text.clone()
+    };
+    let sandbox = if plan_mode {
+        // Codex's own OS sandbox enforces read-only inside the VM; network
+        // stays on (the VM egress proxy is the real gate).
+        json!({"type":"readOnly","networkAccess":true})
+    } else {
+        json!({"type":"externalSandbox","networkAccess":"enabled"})
+    };
     let mut params = json!({
         "threadId":server.thread_id,
         "clientUserMessageId":prompt.prompt_id,
-        "input":[{"type":"text","text":prompt.text}],
+        "input":[{"type":"text","text":text}],
         "approvalPolicy":"never",
-        "sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"},
+        "sandboxPolicy":sandbox,
     });
     if let Ok(effort) = std::env::var("ENGRAM_CODEX_EFFORT") {
         params["effort"] = json!(effort);
@@ -1075,6 +1122,25 @@ async fn handle_dynamic_tool_call(
             .await;
         return;
     };
+    if tool.name == "exit_plan_mode"
+        && engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path) != "plan"
+    {
+        // ADR 0107: outside plan mode the exit tool is a protocol error, not
+        // a park — nothing is waiting to review a plan.
+        let _ = server
+            .respond(
+                request_id,
+                json!({
+                    "success": false,
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": "exit_plan_mode is only valid in plan mode; continue with the task"
+                    }]
+                }),
+            )
+            .await;
+        return;
+    }
     if tool.name == browser_view::TOOL_NAME {
         let result = params
             .pointer("/arguments/path")
@@ -1146,21 +1212,131 @@ async fn handle_dynamic_tool_call(
     }
 }
 
+/// The drive-loop state `route_tool_result` mutates — bundled (like
+/// `ToolContext`) so the signature stays within clippy's argument budget as
+/// the plan-mode routing grew it.
+struct RouteCtx<'a> {
+    pending: &'a mut HashMap<i64, Pending>,
+    active: &'a Option<String>,
+    queued: &'a mut VecDeque<QueuedPrompt>,
+}
+
 async fn route_tool_result(
     server: &mut AppServer,
     parked: &mut ParkedCallStore,
-    pending: &mut HashMap<i64, Pending>,
-    active: &Option<String>,
+    ctx: RouteCtx<'_>,
     events: &mpsc::Sender<HarnessEvent>,
     call_id: &str,
     result_json: String,
 ) {
+    let RouteCtx {
+        pending,
+        active,
+        queued,
+    } = ctx;
     let Some(call) = parked.get(call_id).cloned() else {
         tracing::error!(%call_id, "ToolResult has no parked Codex call");
         return;
     };
     if call.kind != ParkedCallKind::DynamicTool {
         tracing::error!(%call_id, kind = ?call.kind, "ToolResult does not match a dynamic tool call");
+        return;
+    }
+    // ADR 0107: an approved plan flips the stamp FIRST, so every turn that
+    // starts after this point (the live build turn below, or the
+    // stale-generation follow-up) reads full access. A reject leaves the
+    // plan stamp and rides the ordinary respond-in-place path: the model
+    // sees `{decision:"reject", feedback}` as the tool result and keeps
+    // planning in the same read-only turn.
+    let plan_approval = (call.tool_name == "exit_plan_mode")
+        .then(|| engram_harness_sdk::plan::parse_plan_decision(&result_json))
+        .flatten()
+        .filter(|decision| decision.approved());
+    if plan_approval.is_some() {
+        if let Err(error) = engram_harness_sdk::mode_stamp::write_mode_stamp(
+            &server.mode_stamp_path,
+            engram_harness_sdk::mode_stamp::DEFAULT_MODE,
+        ) {
+            tracing::error!(%error, %call_id, "mode stamp flip on plan approval failed");
+        }
+    }
+    if let Some(decision) = plan_approval {
+        if call.request_generation == server.generation && !call.request_id.is_null() {
+            // Live parked call: acknowledge it, interrupt the read-only plan
+            // turn, and queue the build turn — turn/completed consumes the
+            // queue, and start_turn reads the flipped stamp (full access).
+            let _ = decision;
+            if let Err(error) = server
+                .respond(
+                    call.request_id.clone(),
+                    json!({
+                        "success": true,
+                        "contentItems": [{
+                            "type": "inputText",
+                            "text": "Plan approved. A fresh build turn starts next."
+                        }]
+                    }),
+                )
+                .await
+            {
+                tracing::error!(%error, %call_id, "could not answer approved exit_plan_mode");
+            }
+            if let Err(error) = parked.take(call_id) {
+                tracing::error!(%error, %call_id, "could not retire approved plan call");
+            }
+            emit(
+                events,
+                HarnessEvent::ToolCallCompleted {
+                    run_id: active.clone().unwrap_or_default(),
+                    tool_call_id: call_id.to_owned(),
+                    tool_name: call.tool_name.clone(),
+                    ok: true,
+                    duration_ms: 0,
+                    result_summary: Some("approved".to_string()),
+                },
+            )
+            .await;
+            if let Some(turn_id) = active.as_deref() {
+                match server
+                    .send_request(
+                        "turn/interrupt",
+                        json!({"threadId": server.thread_id, "turnId": turn_id}),
+                    )
+                    .await
+                {
+                    Ok(id) => {
+                        pending.insert(id, Pending::Interrupt);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %call_id, "could not interrupt the plan turn");
+                    }
+                }
+            }
+            queued.push_back(QueuedPrompt {
+                prompt_id: format!("plan-approved-{}", uuid::Uuid::new_v4()),
+                text: PLAN_APPROVED_MESSAGE.to_string(),
+            });
+            return;
+        }
+        // Stale generation (harness respawned since the park): the follow-up
+        // machinery delivers the approval as a fresh user turn — which now
+        // starts full-access because the stamp already flipped.
+        let completion = FollowUpCompletion::Tool {
+            name: call.tool_name.clone(),
+            result_summary: result_json,
+        };
+        if let Err(error) = send_follow_up(
+            server,
+            active,
+            pending,
+            call_id,
+            PLAN_APPROVED_MESSAGE.to_string(),
+            completion,
+        )
+        .await
+        {
+            tracing::error!(%error, %call_id, "could not deliver plan approval as user message");
+        }
         return;
     }
     let native_question =
@@ -2079,6 +2255,9 @@ done
             thread_id_file: None,
             tool_manifest: manifest_from_env(),
             parked_calls_file: Some(parked_calls_file),
+            mode_stamp_file: Some(
+                std::env::temp_dir().join(format!("codex-mode-stamp-{}", uuid::Uuid::new_v4())),
+            ),
             test_api_key: Some("test-api-key".into()),
             test_credential_control: None,
         }
@@ -2319,6 +2498,121 @@ done
         })
         .await;
         assert!(idle.is_err(), "a parked open turn must not emit Idle");
+        engine.abort();
+    }
+
+    /// ADR 0107: a `plan` mode directive makes the turn start read-only
+    /// with the harness-owned preamble — per-turn params, no respawn.
+    #[tokio::test]
+    async fn plan_mode_prompt_starts_a_read_only_turn_with_preamble() {
+        let (script, record) = write_fake_codex(&[]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-plan".into(),
+                text: "plan the feature".into(),
+                mode: Some("plan".into()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::RunStarted { .. })) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("plan turn starts");
+
+        let requests = recorded_requests(&record).await;
+        let turn = requests
+            .iter()
+            .find(|request| request.get("method") == Some(&json!("turn/start")))
+            .expect("turn/start recorded");
+        assert_eq!(
+            turn.pointer("/params/sandboxPolicy/type"),
+            Some(&json!("readOnly")),
+            "plan turns run under codex's read-only sandbox"
+        );
+        let text = turn
+            .pointer("/params/input/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.starts_with("You are in plan mode"), "preamble: {text}");
+        assert!(text.contains("plan the feature"), "prompt rides: {text}");
+        engine.abort();
+    }
+
+    /// ADR 0107: exit_plan_mode outside plan mode is answered in place as a
+    /// protocol error — never parked, never surfaced as a pending call.
+    #[tokio::test]
+    async fn exit_plan_mode_outside_plan_mode_is_rejected_in_place() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft plan"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, record) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"exit_plan_mode","description":"Present the plan","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        let parked_path = cli.parked_calls_file().to_path_buf();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "just build it".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+
+        let requested = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(HarnessEvent::ToolCallRequested { .. }) => break true,
+                    Some(_) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            requested.is_err() || !requested.unwrap(),
+            "a non-plan exit_plan_mode call must not become a pending tool call"
+        );
+        let requests = recorded_requests(&record).await;
+        let response = requests
+            .iter()
+            .find(|request| {
+                request.get("id") == Some(&json!(77)) && request.get("result").is_some()
+            })
+            .expect("in-place JSON-RPC response recorded");
+        assert_eq!(
+            response.pointer("/result/success"),
+            Some(&json!(false)),
+            "rejected as a protocol error"
+        );
+        let parked = ParkedCallStore::open(parked_path).unwrap().all();
+        assert!(parked.is_empty(), "never parked: {parked:?}");
         engine.abort();
     }
 

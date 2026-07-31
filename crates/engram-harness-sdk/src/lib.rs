@@ -8,6 +8,7 @@ pub mod browser_activity;
 pub mod browser_view;
 pub mod mode_stamp;
 pub mod parked;
+pub mod plan;
 pub mod questions;
 
 use std::collections::{HashSet, VecDeque};

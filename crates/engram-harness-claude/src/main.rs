@@ -712,7 +712,7 @@ mod adapter {
                         // surfaces the reason and keeps planning; the denied
                         // tool's own stream tool_result acks the outbox row.
                         deferred_calls.lock().await.remove(&req.tool_use_id);
-                        let reason = super::parse_plan_decision(&result_json)
+                        let reason = engram_harness_sdk::plan::parse_plan_decision(&result_json)
                             .map(|decision| decision.reject_reason())
                             .unwrap_or_else(|| {
                                 "Plan rejected by the reviewer. Revise the plan and present it \
@@ -2809,7 +2809,7 @@ mod adapter {
                             let is_plan_call = known_tool.as_deref() == Some("exit_plan_mode")
                                 || known_tool.is_none();
                             if is_plan_call {
-                                if let Some(decision) = parse_plan_decision(&result_json) {
+                                if let Some(decision) = engram_harness_sdk::plan::parse_plan_decision(&result_json) {
                                     if decision.approved() {
                                         deferred_calls.lock().await.remove(&call_id);
                                         if let Err(e) =
@@ -3221,40 +3221,6 @@ mod adapter {
     /// that proposed it.
     const PLAN_APPROVED_MESSAGE: &str =
         "Your plan was approved. Implement it now, following the plan you presented.";
-
-    /// The `exit_plan_mode` result payload (ADR 0107): the orchestrator
-    /// zod-validates `{decision: "approve"|"reject", feedback?}` before it
-    /// ever reaches the wire; this parse re-checks tolerantly so an
-    /// unrecognized shape falls back to the generic stash path instead of
-    /// misclassifying.
-    #[derive(serde::Deserialize)]
-    struct PlanDecision {
-        decision: String,
-        #[serde(default)]
-        feedback: Option<String>,
-    }
-
-    impl PlanDecision {
-        fn approved(&self) -> bool {
-            self.decision == "approve"
-        }
-
-        /// The reason the hook denies a re-fired ExitPlanMode with — the
-        /// reviewer's feedback, or a generic revision ask.
-        fn reject_reason(&self) -> String {
-            match self.feedback.as_deref().filter(|f| !f.trim().is_empty()) {
-                Some(feedback) => format!("Plan rejected by the reviewer: {feedback}"),
-                None => "Plan rejected by the reviewer. Revise the plan and present it again."
-                    .to_string(),
-            }
-        }
-    }
-
-    fn parse_plan_decision(result_json: &str) -> Option<PlanDecision> {
-        serde_json::from_str::<PlanDecision>(result_json)
-            .ok()
-            .filter(|d| d.decision == "approve" || d.decision == "reject")
-    }
 
     fn fallback_delivery_message(stale_results: &[(String, String)]) -> String {
         let mut lines = vec!["Results for the deferred tool call(s) you made earlier:".to_string()];
