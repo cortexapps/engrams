@@ -256,10 +256,11 @@ async fn advance_one_claimed(
     // reaches this terminal instead of wedging Evacuating forever.
     // The fallback may then leave the source binding IN PLACE — that
     // is deliberate: ownership of an unconfirmed sandbox is never
-    // released here. A later /resume's guarded bind supersedes it,
-    // at which point the orphaned VM is coordinator-unowned and the
-    // host-side reconcile reaps it after the strike debounce (the
-    // ADR 0090 cleanup lane for unowned VMs).
+    // released here. The `/resume` this hands off to runs the SAME
+    // confirmation gate (`resume_from_idle`'s stale-binding leg) and
+    // performs the fenced clear itself once the source is confirmed
+    // gone — or fails 503-retryable until the dead-host lane clears
+    // the binding. Ownership release stays behind one gate.
     if attempts >= cfg.max_attempts {
         match state
             .services
@@ -380,7 +381,7 @@ async fn advance_one_claimed(
     Ok(())
 }
 
-async fn confirm_source_teardown(
+pub(crate) async fn confirm_source_teardown(
     state: &SharedState,
     source_host: engram_core::HostId,
     source_sandbox: engram_core::SandboxId,
