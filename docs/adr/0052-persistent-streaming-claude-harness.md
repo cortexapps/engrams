@@ -100,10 +100,13 @@ pipe survives a UFFD restore before Track C relies on it.
    writes one to claude's stdin at the consumption boundary (turn `result` for
    type-ahead; after a `control_request` interrupt for immediate steer).
    *Update 2026-07-31: immediate steer is now the DEFAULT — a prompt arriving
-   mid-turn auto-fires the `control_request` interrupt (one abort in flight
-   max; re-armed at each consumption boundary while the queue is non-empty),
-   so type-ahead no longer waits out a long agentic run. A turn that completes
-   in the race window closes as `RunCompleted` (the marker's subtype decides);
+   mid-turn ARMS a debounced `control_request` interrupt (`STEER_DEBOUNCE_MS`;
+   one abort in flight max; re-armed at each consumption boundary while the
+   queue is non-empty), so type-ahead no longer waits out a long agentic run.
+   The debounce is the cancel affordance: a written control frame cannot be
+   recalled, so a dequeue that empties the queue inside the window disarms the
+   steer and the running turn is never touched. A turn that completes in the
+   race window closes as `RunCompleted` (the marker's subtype decides);
    claude acks the stale frame between turns as a no-op.* The
    queue is reflected upward over the existing channel (no new authoritative
    store): `HarnessCommand` gains `EditQueued`/`DequeueQueued` (down);
