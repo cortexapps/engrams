@@ -573,3 +573,26 @@ pub const SESSION_RESUME_PLACEMENT_TOTAL: &str = "engram_session_resume_total";
 /// initial prompt (no `prompt_id`, no receipt row) never contributes a
 /// sample.
 pub const PROMPT_TO_RUN_STARTED_SECONDS: &str = "engram_prompt_to_run_started_seconds";
+
+/// Counter (ADR 0108). Operator interrupts forwarded to the harness,
+/// labeled `source` — who asked. The wire field is free-form, but the
+/// label value is normalized to a BOUNDED vocabulary (the cardinality
+/// convention above forbids unbounded label values from clients):
+/// `esc` / `stop-button` / `aui-cancel` / `unattributed` (empty source
+/// from an old client) / `other` (any unrecognized label — the paired
+/// `info!` log carries the raw value for forensics). Exists because a
+/// 2026-07-31 phantom interrupt (an ungated library Esc handler) was
+/// untraceable: the interrupt path logged and counted nothing.
+pub const INTERRUPTS_TOTAL: &str = "engram_interrupts_total";
+
+/// Normalize a wire `source` to the bounded `source` label vocabulary
+/// documented on [`INTERRUPTS_TOTAL`].
+pub fn interrupt_source_label(source: &str) -> &'static str {
+    match source {
+        "" => "unattributed",
+        "esc" => "esc",
+        "stop-button" => "stop-button",
+        "aui-cancel" => "aui-cancel",
+        _ => "other",
+    }
+}

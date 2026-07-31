@@ -14,9 +14,9 @@ import {
   dequeueQueuedPrompt as dequeueQueuedPromptMethod,
   completeToolCall as completeToolCallMethod,
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
-import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
+import { buildMessages } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
-import { ComposerActionsContext } from "./composer-actions";
+import { ComposerActionsContext, type InterruptSource } from "./composer-actions";
 import { QuestionActionsContext } from "./question-actions";
 import type { IndexedEvent, SessionState } from "../../lib/types";
 
@@ -127,6 +127,18 @@ export function SessionThread({
     }
     return s;
   }, [events]);
+  // ADR 0108 (held-echo UX): prompt_ids whose durable user echo has landed.
+  // buildMessages now renders an unconsumed, unqueued echo as a pending bubble
+  // keyed by its prompt_id — the optimistic bubble (same id) must yield to it,
+  // or assistant-ui sees a duplicate message id.
+  const echoedPromptIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const { event } of events) {
+      if (event.type === "agent_message" && event.role === "user" && event.prompt_id)
+        s.add(event.prompt_id);
+    }
+    return s;
+  }, [events]);
   // Server-confirmed queue membership (from `prompt_queued`, surfaced via
   // buildMessages' `queue`). An optimistic "immediate" send the server actually
   // queued (a run started just as it landed) moves to the rail once this knows.
@@ -150,7 +162,8 @@ export function SessionThread({
           e.sessionId === sessionId &&
           !e.queued &&
           !consumedPromptIds.has(e.promptId) &&
-          !queuedPromptIds.has(e.promptId),
+          !queuedPromptIds.has(e.promptId) &&
+          !echoedPromptIds.has(e.promptId),
       )
       .map((e) => ({
         role: "user",
@@ -159,7 +172,7 @@ export function SessionThread({
         metadata: { custom: { pending: true } },
       }));
     return optimistic.length ? [...serverMessages, ...optimistic] : serverMessages;
-  }, [serverMessages, pending, consumedPromptIds, queuedPromptIds, sessionId]);
+  }, [serverMessages, pending, consumedPromptIds, queuedPromptIds, echoedPromptIds, sessionId]);
 
   // The composer's queued-message rail (Claude-Code style): everything submitted
   // but not yet consumed into the conversation. Server-confirmed queue first
@@ -302,16 +315,33 @@ export function SessionThread({
     [sessionId, dequeueQueuedMutation],
   );
 
-  // ADR 0052/0030: interrupt the in-flight run (Esc / the Stop button). No-op
-  // once idle/terminal — the endpoint would 409 on the unbound sandbox. The
+  // ADR 0052/0030/0108: interrupt the in-flight run (Esc / the Stop button /
+  // the assistant-ui cancel adapter). Two gates, both required, so a phantom
+  // interrupt cannot fire from a page that is not visibly running:
+  //   1. client run state — the thread must believe a run is live (the same
+  //      `isRunning` the composer's Stop/Esc affordances key on);
+  //   2. session status — only states where a live run can exist. Never
+  //      `undefined` (page load) and never host_lost/idle/terminal (the
+  //      endpoint would 409 on the unbound sandbox anyway).
+  // `source` attributes the caller on InterruptRequest.source. The
   // run_interrupted event arrives over SSE and closes the run; a queued
   // message (if any) then runs next per the harness's consume-on-result.
-  const interrupt = useCallback(() => {
-    if (status && INACTIVE_STATUSES.has(status)) return;
-    interruptMutation
-      .mutateAsync({ sessionId })
-      .catch((err) => console.warn("interrupt failed", err));
-  }, [sessionId, status, interruptMutation]);
+  const interrupt = useCallback(
+    (source: InterruptSource) => {
+      if (!isRunning) {
+        console.debug("interrupt suppressed: no run is live", { source, status });
+        return;
+      }
+      if (status !== "active" && status !== "created" && status !== "evicting") {
+        console.debug("interrupt suppressed: session status has no live run", { source, status });
+        return;
+      }
+      interruptMutation
+        .mutateAsync({ sessionId, source })
+        .catch((err) => console.warn("interrupt failed", err));
+    },
+    [sessionId, status, isRunning, interruptMutation],
+  );
 
   const runtime = useExternalStoreRuntime({
     messages,
@@ -322,7 +352,9 @@ export function SessionThread({
     // it can enqueue mid-run); these adapters keep any assistant-ui-internal
     // submit/cancel path consistent with our own.
     onNew: async (message) => submit(appendText(message)),
-    onCancel: async () => interrupt(),
+    // Still reachable through the runtime's cancel API with cancelOnEscape
+    // off; gated inside `interrupt` like every other caller (ADR 0108).
+    onCancel: async () => interrupt("aui-cancel"),
   });
 
   return (
