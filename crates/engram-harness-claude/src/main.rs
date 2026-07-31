@@ -314,6 +314,22 @@ mod adapter {
         /// clap argument; tests inject a fixture directly.
         #[arg(skip)]
         pub tool_manifest: ToolManifest,
+
+        /// Test seam for the ADR 0107 session-mode stamp. Production always
+        /// uses the fixed in-VM path
+        /// (`engram_harness_sdk::mode_stamp::MODE_STAMP_FILE`); parallel
+        /// engine tests each get an isolated temp path.
+        #[arg(skip)]
+        pub mode_stamp_file: Option<String>,
+    }
+
+    /// The ADR 0107 session-mode stamp path (test seam aware).
+    fn mode_stamp_path(cli: &Cli) -> &Path {
+        Path::new(
+            cli.mode_stamp_file
+                .as_deref()
+                .unwrap_or(engram_harness_sdk::mode_stamp::MODE_STAMP_FILE),
+        )
     }
 
     /// Resolve the `claude` binary path. If the user supplied
@@ -591,9 +607,18 @@ mod adapter {
         #[derive(serde::Serialize, serde::Deserialize)]
         #[serde(tag = "verdict", rename_all = "snake_case")]
         pub enum HookVerdict {
-            Answer { answers: Answers },
+            Answer {
+                answers: Answers,
+            },
             Defer,
             Allow,
+            /// ADR 0107: deny with a reason the model reads as a retryable
+            /// tool error. Used to answer a re-fired ExitPlanMode with the
+            /// reviewer's rejection feedback — the CLI's native
+            /// keep-planning affordance.
+            Deny {
+                reason: String,
+            },
         }
 
         /// Accept loop: one transient hook client per connection, each
@@ -680,23 +705,40 @@ mod adapter {
                 } else if let Some(result_json) =
                     results_in_hand.lock().await.remove(&req.tool_use_id)
                 {
-                    match serde_json::from_str::<Answers>(&result_json) {
-                        Ok(answers) => {
-                            deferred_calls.lock().await.remove(&req.tool_use_id);
-                            HookVerdict::Answer { answers }
-                        }
-                        Err(error) => {
-                            tracing::error!(
-                                %error,
-                                tool_use_id = %req.tool_use_id,
-                                tool_name = %tool_name,
-                                "native tool result is not a canonical answer map"
-                            );
-                            results_in_hand
-                                .lock()
-                                .await
-                                .insert(req.tool_use_id.clone(), result_json);
-                            HookVerdict::Defer
+                    if tool_name == "exit_plan_mode" {
+                        // ADR 0107: only REJECT results are ever stashed for
+                        // a re-fire (the engine consumes approvals before the
+                        // respawn). Deny with the feedback: the plan-mode CLI
+                        // surfaces the reason and keeps planning; the denied
+                        // tool's own stream tool_result acks the outbox row.
+                        deferred_calls.lock().await.remove(&req.tool_use_id);
+                        let reason = super::parse_plan_decision(&result_json)
+                            .map(|decision| decision.reject_reason())
+                            .unwrap_or_else(|| {
+                                "Plan rejected by the reviewer. Revise the plan and present it \
+                                 again."
+                                    .to_string()
+                            });
+                        HookVerdict::Deny { reason }
+                    } else {
+                        match serde_json::from_str::<Answers>(&result_json) {
+                            Ok(answers) => {
+                                deferred_calls.lock().await.remove(&req.tool_use_id);
+                                HookVerdict::Answer { answers }
+                            }
+                            Err(error) => {
+                                tracing::error!(
+                                    %error,
+                                    tool_use_id = %req.tool_use_id,
+                                    tool_name = %tool_name,
+                                    "native tool result is not a canonical answer map"
+                                );
+                                results_in_hand
+                                    .lock()
+                                    .await
+                                    .insert(req.tool_use_id.clone(), result_json);
+                                HookVerdict::Defer
+                            }
                         }
                     }
                 } else {
@@ -737,11 +779,23 @@ mod adapter {
                         );
                     }
                     if first_request {
+                        // AUQ re-canonicalizes through the shared `Question`
+                        // type (its serde renames make the shape byte-faithful
+                        // to the registry schema). Every other native binding
+                        // (ADR 0107: ExitPlanMode's `{plan, planFilePath}`)
+                        // forwards the CLI's tool_input verbatim — the
+                        // registry input schema is the contract, extra CLI
+                        // fields ride along for the presenter to ignore.
+                        let args_json = if tool_name == "ask_user_question" {
+                            serde_json::json!({"questions": req.questions}).to_string()
+                        } else {
+                            req.tool_input.to_string()
+                        };
                         event = Some(HarnessEvent::ToolCallRequested {
                             run_id,
                             call_id: req.tool_use_id.clone(),
                             name: tool_name,
-                            args_json: serde_json::json!({"questions": req.questions}).to_string(),
+                            args_json,
                         });
                     }
                     HookVerdict::Defer
@@ -865,11 +919,29 @@ mod adapter {
                 serde_json::from_str(&input).unwrap_or(serde_json::Value::Null);
             let tool_name = v.get("tool_name").and_then(|s| s.as_str()).unwrap_or("");
 
+            // ADR 0107: the CLI reports its live permission mode on every
+            // fire — trust it over the stamp (the stamp drives argv; the fire
+            // reflects what this process actually runs under).
+            let plan_mode = v
+                .get("permission_mode")
+                .and_then(|s| s.as_str())
+                .is_some_and(|m| m == "plan");
+
             // Claude's own process-local cwd tracker has regressed across CLI
             // releases. Make the session cwd a harness guarantee by rewriting
             // Bash input through the same supported updatedInput surface used
             // for AskUserQuestion answers.
             if tool_name == "Bash" {
+                if plan_mode {
+                    // ADR 0107 backstop: an `allow` would override the CLI's
+                    // own plan-mode gating (a rewrite rides an allow), letting
+                    // mutating bash through a read-only design pass. Return
+                    // NO OPINION so the CLI's plan-mode permission system
+                    // decides. Cost: cwd continuity is not rewritten during
+                    // plan turns — acceptable, plan turns only explore.
+                    println!("{{}}");
+                    return std::process::ExitCode::SUCCESS;
+                }
                 let tool_input = v
                     .get("tool_input")
                     .cloned()
@@ -884,13 +956,37 @@ mod adapter {
 
             // Ordinary built-ins (including ToolSearch) → allow. Manifest MCP
             // tools MUST round-trip so the main process can apply their sync /
-            // deferred policy and emit the generic request event.
+            // deferred policy and emit the generic request event, and so must
+            // every built-in with a manifest native binding (ADR 0089/0107:
+            // AskUserQuestion, ExitPlanMode, …) — the set is derived from
+            // ENGRAM_TOOLS so a new binding needs no bridge change.
             // This remains the
             // `--dangerously-skip-permissions` replacement: the VM is still
             // the safety boundary, but the decision is now explicit and
             // auditable.
             let is_manifest_mcp = tool_name.starts_with("mcp__engrams__");
-            if tool_name != "AskUserQuestion" && !is_manifest_mcp {
+            if !native_roundtrip_names().contains(tool_name) && !is_manifest_mcp {
+                // ADR 0107 backstop: while the CLI reports plan mode, deny
+                // write-class built-ins outright — EXCEPT the plan document
+                // itself, which plan mode legitimately writes under
+                // `~/.claude/plans/`.
+                if plan_mode && matches!(tool_name, "Write" | "Edit" | "MultiEdit" | "NotebookEdit")
+                {
+                    let file_path = v
+                        .get("tool_input")
+                        .and_then(|input| input.get("file_path"))
+                        .and_then(|p| p.as_str())
+                        .unwrap_or("");
+                    if file_path.contains("/.claude/plans/") {
+                        print_allow();
+                    } else {
+                        print_deny(
+                            "plan mode: file modifications are blocked; explore and write \
+                             the plan document only",
+                        );
+                    }
+                    return std::process::ExitCode::SUCCESS;
+                }
                 print_allow();
                 return std::process::ExitCode::SUCCESS;
             }
@@ -945,6 +1041,9 @@ mod adapter {
                     println!("{out}");
                 }
                 Some(HookVerdict::Allow) => print_allow(),
+                // ADR 0107: a rejected plan comes back as deny + the
+                // reviewer's feedback — the plan-mode CLI keeps planning.
+                Some(HookVerdict::Deny { reason }) => print_deny(&reason),
                 // Only a verdict durably registered by the main harness may
                 // defer. A missing hook socket would otherwise strand an
                 // invisible call forever, so deny visibly and let Claude see
@@ -957,6 +1056,21 @@ mod adapter {
 
         /// Resolve only an existing absolute directory. A corrupt/stale
         /// tracker must never become generated shell input.
+        /// The set of built-in tool names that must round-trip to the main
+        /// harness: every manifest native binding (`nativeBindings.claude`),
+        /// derived from ENGRAM_TOOLS (the bridge inherits claude's env, which
+        /// inherits the harness's). Falls back to the AUQ literal when the
+        /// env is absent or corrupt so the load-bearing question path can
+        /// never be silently allowed through.
+        pub(super) fn native_roundtrip_names() -> std::collections::HashSet<String> {
+            let mut names: std::collections::HashSet<String> = super::manifest_from_env()
+                .iter()
+                .filter_map(|tool| tool.native_bindings.claude.clone())
+                .collect();
+            names.insert("AskUserQuestion".to_string());
+            names
+        }
+
         pub(super) fn tracked_bash_cwd(tracker: &Path) -> PathBuf {
             let tracked = std::fs::read_to_string(tracker).ok().and_then(|raw| {
                 let path = PathBuf::from(raw.trim_end_matches(['\r', '\n']));
@@ -1660,6 +1774,14 @@ mod adapter {
         // transcript. Owned here so all deferred paths span respawns.
         let duplicate_deferred_ids: hook_server::DuplicateDeferredIds =
             Arc::new(tokio::sync::Mutex::new(HashSet::new()));
+        // ADR 0107: approved plan call_ids awaiting their synthesized build
+        // turn. The approve path deliberately avoids the id-stable re-fire (a
+        // non-plan respawn never re-fires ExitPlanMode) — instead the next
+        // spawn injects "your plan was approved" as a fresh user turn and
+        // acks each call with an explicit ToolCallCompleted. Owned here so a
+        // crash between the flip and the spawn falls back to outbox
+        // redelivery (the stamp flip is idempotent).
+        let mut pending_plan_approvals: Vec<String> = Vec::new();
         write_hook_settings().await;
         let self_exe =
             std::env::current_exe().unwrap_or_else(|_| PathBuf::from("engram-harness-claude"));
@@ -1751,6 +1873,7 @@ mod adapter {
                 &current_run_id,
                 &scrub_msg_ids,
                 &duplicate_deferred_ids,
+                &mut pending_plan_approvals,
                 mcp_config_path,
             )
             .await
@@ -2033,6 +2156,9 @@ mod adapter {
         // `run_engine` so it survives a respawn; populated at turn-end here.
         scrub_msg_ids: &Arc<tokio::sync::Mutex<HashSet<String>>>,
         duplicate_deferred_ids: &hook_server::DuplicateDeferredIds,
+        // ADR 0107: approved plan call_ids to deliver as a synthesized build
+        // turn at this spawn (see `run_engine`'s owner comment).
+        pending_plan_approvals: &mut Vec<String>,
         mcp_config_path: Option<&str>,
     ) -> SessionOutcome {
         // A socket call outside a turn must carry the wire-mandated empty
@@ -2043,10 +2169,22 @@ mod adapter {
         // the agent's system prompt. Read per spawn — it is constant for the
         // process, and a respawn must re-apply it.
         let append_system_prompt = std::env::var("ENGRAM_APPEND_SYSTEM_PROMPT").ok();
-        let argv = build_claude_argv(&resume_id, append_system_prompt.as_deref(), mcp_config_path);
+        // ADR 0107: the latched session mode. The STAMP (not process env,
+        // which reverts to create-time values after evict/resume) decides
+        // this process's permission mode; a mid-session mode directive that
+        // disagrees with `process_mode` forces a clean respawn at the next
+        // turn boundary so this read re-runs.
+        let process_mode = engram_harness_sdk::mode_stamp::read_mode_stamp(mode_stamp_path(cli));
+        let argv = build_claude_argv(
+            &resume_id,
+            append_system_prompt.as_deref(),
+            mcp_config_path,
+            &process_mode,
+        );
         tracing::info!(
             ?argv,
             resume = resume_id.is_some(),
+            mode = %process_mode,
             "spawning persistent claude"
         );
 
@@ -2167,7 +2305,35 @@ mod adapter {
         // with no matching pending tool leaves a continuation turn with no
         // output until `max_run_secs` or the next command; rare, and the
         // session stays command-responsive.)
-        if !results_in_hand.lock().await.is_empty() {
+        if !pending_plan_approvals.is_empty() {
+            // ADR 0107: the approve delivery. This process was respawned with
+            // the stamp already flipped off `plan`, so the CLI never re-fires
+            // the deferred ExitPlanMode (spike-confirmed) — inject the
+            // approval as a fresh user turn immediately, before the CLI can
+            // self-continue, and ack each drained call explicitly (no re-fire
+            // ⇒ no stream tool_result ⇒ the coordinator outbox row would
+            // otherwise redeliver forever).
+            if let Some(s) = stdin.as_mut() {
+                let approvals = std::mem::take(pending_plan_approvals);
+                let ft =
+                    start_turn(evt_tx, s, cli, None, PLAN_APPROVED_MESSAGE, current_run_id).await;
+                for call_id in approvals {
+                    emit(
+                        evt_tx,
+                        HarnessEvent::ToolCallCompleted {
+                            run_id: ft.run_id.clone(),
+                            tool_call_id: call_id,
+                            tool_name: "exit_plan_mode".to_string(),
+                            ok: true,
+                            duration_ms: 0,
+                            result_summary: Some("approved".to_string()),
+                        },
+                    )
+                    .await;
+                }
+                turn = Some(ft);
+            }
+        } else if !results_in_hand.lock().await.is_empty() {
             turn = Some(start_continuation_turn(evt_tx, cli, current_run_id).await);
         } else {
             // Kick off the first queued prompt (an initial prompt, or a
@@ -2379,6 +2545,30 @@ mod adapter {
                                         }
                                     } else {
                                         match pending.pop_front() {
+                                            // ADR 0107: the consumption
+                                            // boundary is where a latched
+                                            // mode change takes effect — if
+                                            // the stamp no longer matches
+                                            // this process's permission
+                                            // mode, respawn before the next
+                                            // turn instead of starting it
+                                            // under the wrong mode.
+                                            Some(qp)
+                                                if engram_harness_sdk::mode_stamp::read_mode_stamp(
+                                                    mode_stamp_path(cli),
+                                                ) != process_mode =>
+                                            {
+                                                tracing::info!(
+                                                    prompt_id =
+                                                        qp.prompt_id.as_deref().unwrap_or(""),
+                                                    current = %process_mode,
+                                                    "mode change at consumption boundary: clean respawn"
+                                                );
+                                                pending.push_front(qp);
+                                                resuming_for_deferred = true;
+                                                sigint_child(&child);
+                                                break;
+                                            }
                                             Some(qp) => {
                                                 if let Some(s) = stdin.as_mut() {
                                                     turn = Some(
@@ -2497,20 +2687,22 @@ mod adapter {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(HarnessCommand::Prompt { prompt_id, text, mode }) => {
-                            // ADR 0107 (Phase 4): latch the mode directive to
-                            // the workspace stamp — the durable source of
-                            // truth across evict/resume. Behavior (argv,
-                            // respawn) keys off the stamp in Phase 5.
+                            // ADR 0107: latch the mode directive to the
+                            // workspace stamp — the durable source of truth
+                            // across evict/resume. The stamp decides the NEXT
+                            // spawn's argv; a directive that disagrees with
+                            // this process's mode forces a clean respawn at a
+                            // turn boundary.
                             if let Some(mode) = &mode {
-                                let stamp = std::path::Path::new(
-                                    engram_harness_sdk::mode_stamp::MODE_STAMP_FILE,
-                                );
-                                if let Err(e) =
-                                    engram_harness_sdk::mode_stamp::write_mode_stamp(stamp, mode)
-                                {
+                                if let Err(e) = engram_harness_sdk::mode_stamp::write_mode_stamp(
+                                    mode_stamp_path(cli),
+                                    mode,
+                                ) {
                                     tracing::warn!(error = %e, %mode, "mode stamp write failed");
                                 }
                             }
+                            let mode_mismatch =
+                                mode.as_deref().is_some_and(|m| m != process_mode);
                             if !seen_prompt_ids.insert(prompt_id.clone()) {
                                 // ADR 0052: a host replay (command-side
                                 // at-least-once) of a prompt we already
@@ -2518,6 +2710,27 @@ mod adapter {
                                 // double-run.
                                 tracing::debug!(%prompt_id, "duplicate prompt (replay); ignoring");
                             } else if turn.is_none() {
+                                if mode_mismatch {
+                                    // Idle under the wrong permission mode:
+                                    // park the prompt at the queue head and
+                                    // respawn — the fresh process reads the
+                                    // stamp and starts this turn under the
+                                    // requested mode (`--resume` keeps the
+                                    // conversation).
+                                    tracing::info!(
+                                        %prompt_id,
+                                        requested = mode.as_deref().unwrap_or(""),
+                                        current = %process_mode,
+                                        "mode change: clean respawn before this prompt"
+                                    );
+                                    pending.push_front(QueuedPrompt {
+                                        prompt_id: Some(prompt_id),
+                                        text,
+                                    });
+                                    resuming_for_deferred = true;
+                                    sigint_child(&child);
+                                    break;
+                                }
                                 // Idle: start the run immediately.
                                 if let Some(s) = stdin.as_mut() {
                                     turn = Some(
@@ -2563,20 +2776,70 @@ mod adapter {
                                 // same warm process (RunInterrupted →
                                 // RunStarted{prompt_id}). Not during a
                                 // Shutdown drain: the queue survives the
-                                // respawn and delivers there.
-                                if !shutting_down {
+                                // respawn and delivers there. Not on a mode
+                                // mismatch either (ADR 0107): steering
+                                // injects into the RUNNING turn under the
+                                // OLD permission mode — let the prompt queue
+                                // and the turn-boundary mismatch check
+                                // respawn into the requested mode instead.
+                                if !shutting_down && !mode_mismatch {
                                     arm_steer(&mut steer_deadline, &interrupted_run);
                                 }
                             }
                         }
                         Some(HarnessCommand::ToolResult { call_id, result_json }) => {
-                            let known_deferred =
-                                deferred_calls.lock().await.contains_key(&call_id);
+                            let known_tool = deferred_calls
+                                .lock()
+                                .await
+                                .get(&call_id)
+                                .map(|call| call.tool_name.clone());
+                            // ADR 0107: an APPROVED plan is consumed by the
+                            // engine, never stashed for a hook re-fire — a
+                            // non-plan respawn does not re-fire ExitPlanMode
+                            // (spike-confirmed), so the stash would rot.
+                            // Flip the stamp, respawn, and let the spawn
+                            // bootstrap inject the build turn + explicit
+                            // completion. A REJECT keeps the plan stamp and
+                            // takes the ordinary stash → `--resume` →
+                            // id-stable re-fire path; the hook answers it
+                            // deny + feedback (the CLI's native
+                            // keep-planning affordance). The unknown-call_id
+                            // arm (post-eviction fresh harness) is covered
+                            // by parsing the decision shape.
+                            let is_plan_call = known_tool.as_deref() == Some("exit_plan_mode")
+                                || known_tool.is_none();
+                            if is_plan_call {
+                                if let Some(decision) = parse_plan_decision(&result_json) {
+                                    if decision.approved() {
+                                        deferred_calls.lock().await.remove(&call_id);
+                                        if let Err(e) =
+                                            engram_harness_sdk::mode_stamp::write_mode_stamp(
+                                                mode_stamp_path(cli),
+                                                engram_harness_sdk::mode_stamp::DEFAULT_MODE,
+                                            )
+                                        {
+                                            tracing::warn!(
+                                                error = %e,
+                                                "mode stamp flip on plan approval failed"
+                                            );
+                                        }
+                                        tracing::info!(
+                                            %call_id,
+                                            "plan approved: mode flipped; respawning for the build turn"
+                                        );
+                                        pending_plan_approvals.push(call_id);
+                                        resuming_for_deferred = true;
+                                        sigint_child(&child);
+                                        break;
+                                    }
+                                }
+                            }
                             // A live parked MCP bridge is a synchronous call:
                             // serve it in place. Deferred hooks never open the
                             // bridge until their id-stable resume re-fire, so
                             // every other result is stashed before SIGINT and
                             // consumed only after transcript scrub + --resume.
+                            let known_deferred = known_tool.is_some();
                             let delivered = mcp_server::route_tool_result(
                                 &call_id,
                                 result_json,
@@ -2952,6 +3215,47 @@ mod adapter {
 
     /// Render results as a plain user message when Claude abandons an id-stable
     /// deferred re-fire. The explicit completion event still retires each row.
+    /// ADR 0107: the synthesized build turn injected after a plan approval
+    /// (the approve path never re-fires ExitPlanMode — see the ToolResult
+    /// arm). The plan itself is already in the conversation from the turn
+    /// that proposed it.
+    const PLAN_APPROVED_MESSAGE: &str =
+        "Your plan was approved. Implement it now, following the plan you presented.";
+
+    /// The `exit_plan_mode` result payload (ADR 0107): the orchestrator
+    /// zod-validates `{decision: "approve"|"reject", feedback?}` before it
+    /// ever reaches the wire; this parse re-checks tolerantly so an
+    /// unrecognized shape falls back to the generic stash path instead of
+    /// misclassifying.
+    #[derive(serde::Deserialize)]
+    struct PlanDecision {
+        decision: String,
+        #[serde(default)]
+        feedback: Option<String>,
+    }
+
+    impl PlanDecision {
+        fn approved(&self) -> bool {
+            self.decision == "approve"
+        }
+
+        /// The reason the hook denies a re-fired ExitPlanMode with — the
+        /// reviewer's feedback, or a generic revision ask.
+        fn reject_reason(&self) -> String {
+            match self.feedback.as_deref().filter(|f| !f.trim().is_empty()) {
+                Some(feedback) => format!("Plan rejected by the reviewer: {feedback}"),
+                None => "Plan rejected by the reviewer. Revise the plan and present it again."
+                    .to_string(),
+            }
+        }
+    }
+
+    fn parse_plan_decision(result_json: &str) -> Option<PlanDecision> {
+        serde_json::from_str::<PlanDecision>(result_json)
+            .ok()
+            .filter(|d| d.decision == "approve" || d.decision == "reject")
+    }
+
     fn fallback_delivery_message(stale_results: &[(String, String)]) -> String {
         let mut lines = vec!["Results for the deferred tool call(s) you made earlier:".to_string()];
         for (call_id, result_json) in stale_results {
@@ -3063,6 +3367,12 @@ mod adapter {
         resume_id: &Option<String>,
         append_system_prompt: Option<&str>,
         mcp_config_path: Option<&str>,
+        // ADR 0107: the latched session mode (from the workspace stamp, read
+        // per spawn). `plan` maps to the CLI's native plan permission mode;
+        // anything else adds no flag. Changing mode therefore = a clean
+        // respawn with `--resume`, which the engine drives off stamp
+        // mismatches.
+        mode: &str,
     ) -> Vec<String> {
         let mut argv = vec![
             "--print".to_string(),
@@ -3086,6 +3396,14 @@ mod adapter {
             "--settings".into(),
             HOOK_SETTINGS_FILE.into(),
         ];
+        if mode == "plan" {
+            // ADR 0107: native plan mode — the CLI runs its own read-only
+            // planning discipline and calls ExitPlanMode, which the hook
+            // bridge defers onto the generic tool seam. The bridge also
+            // backstops write tools while the fire reports plan mode.
+            argv.push("--permission-mode".into());
+            argv.push("plan".into());
+        }
         if let Some(id) = resume_id {
             argv.push("--resume".into());
             argv.push(id.clone());
@@ -3766,8 +4084,12 @@ mod adapter {
         // turns a set value into `--append-system-prompt <value>`.
         #[test]
         fn argv_carries_append_system_prompt_when_set() {
-            let argv =
-                build_claude_argv(&None, Some("You were triggered from a Slack thread."), None);
+            let argv = build_claude_argv(
+                &None,
+                Some("You were triggered from a Slack thread."),
+                None,
+                "default",
+            );
             let pos = argv
                 .iter()
                 .position(|a| a == "--append-system-prompt")
@@ -3781,7 +4103,7 @@ mod adapter {
         #[test]
         fn argv_omits_append_system_prompt_when_absent_or_empty() {
             for v in [None, Some("")] {
-                let argv = build_claude_argv(&None, v, None);
+                let argv = build_claude_argv(&None, v, None, "default");
                 assert!(
                     !argv.iter().any(|a| a == "--append-system-prompt"),
                     "flag must be absent for {v:?}",
@@ -3789,9 +4111,29 @@ mod adapter {
             }
         }
 
+        // ADR 0107: `plan` (and only `plan`) maps to the CLI's native
+        // permission mode; the mode comes from the workspace stamp per spawn.
+        #[test]
+        fn argv_carries_permission_mode_plan_only_for_plan() {
+            let argv = build_claude_argv(&None, None, None, "plan");
+            let pos = argv
+                .iter()
+                .position(|a| a == "--permission-mode")
+                .expect("plan mode sets the flag");
+            assert_eq!(argv.get(pos + 1).map(String::as_str), Some("plan"));
+
+            for mode in ["default", "", "build"] {
+                let argv = build_claude_argv(&None, None, None, mode);
+                assert!(
+                    !argv.iter().any(|a| a == "--permission-mode"),
+                    "no permission-mode flag for {mode:?}",
+                );
+            }
+        }
+
         #[test]
         fn argv_carries_strict_mcp_config_when_injected_tools_exist() {
-            let argv = build_claude_argv(&None, None, Some("/tmp/mcp-config.json"));
+            let argv = build_claude_argv(&None, None, Some("/tmp/mcp-config.json"), "default");
             let pos = argv
                 .iter()
                 .position(|arg| arg == "--mcp-config")
@@ -3808,7 +4150,7 @@ mod adapter {
 
         #[test]
         fn argv_omits_mcp_flags_without_injected_tools() {
-            let argv = build_claude_argv(&None, None, None);
+            let argv = build_claude_argv(&None, None, None, "default");
             assert!(!argv.iter().any(|arg| arg == "--mcp-config"));
             assert!(!argv.iter().any(|arg| arg == "--strict-mcp-config"));
         }
@@ -4495,6 +4837,15 @@ mod adapter {
                         .into_owned(),
                 ),
                 tool_manifest: Vec::new(),
+                // Isolated per test for the same reason as session_id_file:
+                // a shared stamp leaks one test's latched mode into
+                // another's first spawn.
+                mode_stamp_file: Some(
+                    std::env::temp_dir()
+                        .join(format!("mode-stamp-{}", uuid::Uuid::new_v4()))
+                        .to_string_lossy()
+                        .into_owned(),
+                ),
             }
         }
 
@@ -5001,6 +5352,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5013,6 +5365,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "second".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5070,6 +5423,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5082,6 +5436,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "second".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5093,6 +5448,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p3".into(),
                     text: "third".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5170,6 +5526,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5180,6 +5537,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "second".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5240,6 +5598,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p1".into(),
                     text: "first".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -5251,6 +5610,7 @@ mod adapter {
                 .send(HarnessCommand::Prompt {
                     prompt_id: "p2".into(),
                     text: "second".into(),
+                    mode: None,
                 })
                 .await
                 .unwrap();
@@ -6036,6 +6396,329 @@ mod adapter {
             let out = hook_bridge::denormalize(&questions, &a);
             assert_eq!(out["M?"], serde_json::json!(["x", "y"]), "multi → array");
             assert_eq!(out["S?"], serde_json::json!("z"), "single → bare string");
+        }
+
+        /// ADR 0107: fake claude for the plan-mode flows. Every invocation
+        /// records its argv to `invocations` and every stdin line to
+        /// `stdin_log`. The FIRST invocation reads one user message, fires
+        /// an ExitPlanMode tool_use, and parks (`tool_deferred`); later
+        /// invocations just log stdin and stay alive (the reject test
+        /// drives the re-fire through the hook socket directly; the approve
+        /// test asserts the injected build-turn message).
+        async fn write_plan_flow_fake_claude(
+            counter: &Path,
+            invocations: &Path,
+            stdin_log: &Path,
+        ) -> String {
+            use std::os::unix::fs::PermissionsExt;
+            let path =
+                std::env::temp_dir().join(format!("fake-claude-{}.sh", uuid::Uuid::new_v4()));
+            let body = format!(
+                "#!/bin/sh\n\
+                 trap 'exit 0' INT TERM\n\
+                 n=0\n\
+                 if [ -f '{counter}' ]; then n=$(sed -n '1p' '{counter}'); fi\n\
+                 n=$((n + 1))\n\
+                 printf '%s\\n' \"$n\" > '{counter}'\n\
+                 printf '%s\\n' \"$*\" >> '{invocations}'\n\
+                 printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\"}}'\n\
+                 if [ \"$n\" -eq 1 ]; then\n\
+                   IFS= read -r line\n\
+                   printf '%s\\n' \"$line\" >> '{stdin_log}'\n\
+                   sleep 0.3\n\
+                   printf '%s\\n' '{{\"type\":\"assistant\",\"message\":{{\"id\":\"m-plan\",\"content\":[{{\"type\":\"tool_use\",\"id\":\"toolu_plan\",\"name\":\"ExitPlanMode\",\"input\":{{\"plan\":\"# The plan\"}}}}]}}}}'\n\
+                   printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"terminal_reason\":\"tool_deferred\"}}'\n\
+                   exit 0\n\
+                 fi\n\
+                 while IFS= read -r line; do printf '%s\\n' \"$line\" >> '{stdin_log}'; done\n",
+                counter = counter.display(),
+                invocations = invocations.display(),
+                stdin_log = stdin_log.display(),
+            );
+            tokio::fs::write(&path, body).await.unwrap();
+            let mut perms = std::fs::metadata(&path).unwrap().permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&path, perms).unwrap();
+            path.to_string_lossy().into_owned()
+        }
+
+        fn native_plan_tool() -> ManifestTool {
+            ManifestTool {
+                name: "exit_plan_mode".into(),
+                description: "Present your finished implementation plan.".into(),
+                input_schema: serde_json::json!({"type":"object"}),
+                execution: ToolExecution::Deferred,
+                native_bindings: NativeBindings {
+                    claude: Some("ExitPlanMode".into()),
+                },
+            }
+        }
+
+        /// The full ADR 0107 approve flow: an idle prompt with a `plan`
+        /// directive respawns into `--permission-mode plan`; ExitPlanMode
+        /// defers and parks; the approve result flips the stamp, respawns
+        /// WITHOUT the plan flag, injects the build turn, and acks the call
+        /// with an explicit ToolCallCompleted.
+        #[tokio::test]
+        async fn plan_approve_flips_mode_and_injects_the_build_turn() {
+            let nonce = uuid::Uuid::new_v4();
+            let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
+            let invocations = std::env::temp_dir().join(format!("fake-claude-argv-{nonce}"));
+            let stdin_log = std::env::temp_dir().join(format!("fake-claude-stdin-{nonce}"));
+            let script = write_plan_flow_fake_claude(&counter, &invocations, &stdin_log).await;
+            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "plan-approve").await;
+            cli.tool_manifest = vec![native_plan_tool()];
+            let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel(64);
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-plan".into(),
+                    text: "plan the feature".into(),
+                    mode: Some("plan".into()),
+                })
+                .await
+                .unwrap();
+            // The idle mode mismatch (default process, plan stamp) respawns
+            // BEFORE the turn starts; the second invocation runs the prompt.
+            let _ = tokio::time::timeout(Duration::from_secs(8), expect_run_started(&mut evt_rx))
+                .await
+                .expect("respawned process starts the plan turn");
+            assert_eq!(
+                engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
+                "plan"
+            );
+
+            assert!(matches!(
+                hook_fire_named(
+                    &hook,
+                    "toolu_plan",
+                    "ExitPlanMode",
+                    serde_json::json!({"plan":"# The plan"}),
+                )
+                .await,
+                hook_server::HookVerdict::Defer
+            ));
+            let requested = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    match evt_rx.recv().await {
+                        Some(HarnessEvent::ToolCallRequested {
+                            call_id,
+                            name,
+                            args_json,
+                            ..
+                        }) => break (call_id, name, args_json),
+                        Some(_) => {}
+                        None => panic!("event channel closed before ToolCallRequested"),
+                    }
+                }
+            })
+            .await
+            .expect("hook defer emits the generic request");
+            assert_eq!(requested.0, "toolu_plan");
+            assert_eq!(requested.1, "exit_plan_mode");
+            // Non-AUQ bindings forward the CLI tool_input verbatim.
+            assert_eq!(
+                serde_json::from_str::<Value>(&requested.2).unwrap()["plan"],
+                "# The plan"
+            );
+
+            // Park announcements: turn-end + the respawned process.
+            let mut parked = 0;
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while parked < 2 {
+                    match evt_rx.recv().await {
+                        Some(HarnessEvent::Parked) => parked += 1,
+                        Some(_) => {}
+                        None => panic!("channel closed before park"),
+                    }
+                }
+            })
+            .await
+            .expect("parks after the defer");
+
+            cmd_tx
+                .send(HarnessCommand::ToolResult {
+                    call_id: "toolu_plan".into(),
+                    result_json: r#"{"decision":"approve"}"#.into(),
+                })
+                .await
+                .unwrap();
+            let (run_id, prompt_id) =
+                tokio::time::timeout(Duration::from_secs(8), expect_run_started_id(&mut evt_rx))
+                    .await
+                    .expect("approval spawns the build turn");
+            assert_eq!(prompt_id, None, "synthesized turn has no prompt_id");
+            match tokio::time::timeout(Duration::from_secs(5), evt_rx.recv())
+                .await
+                .expect("completion event")
+            {
+                Some(HarnessEvent::ToolCallCompleted {
+                    run_id: completed_run,
+                    tool_call_id,
+                    tool_name,
+                    ok,
+                    ..
+                }) => {
+                    assert_eq!(completed_run, run_id);
+                    assert_eq!(tool_call_id, "toolu_plan");
+                    assert_eq!(tool_name, "exit_plan_mode");
+                    assert!(ok);
+                }
+                other => panic!("expected the explicit ToolCallCompleted, got {other:?}"),
+            }
+            assert_eq!(
+                engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
+                engram_harness_sdk::mode_stamp::DEFAULT_MODE,
+                "approval flips the stamp"
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+
+            // Argv trail: spawn 1 default, spawn 2 plan, spawn 3 default.
+            let argvs = std::fs::read_to_string(&invocations).unwrap();
+            let lines: Vec<&str> = argvs.lines().collect();
+            assert_eq!(lines.len(), 3, "three spawns: {argvs}");
+            assert!(!lines[0].contains("--permission-mode"));
+            assert!(lines[1].contains("--permission-mode plan"));
+            assert!(!lines[2].contains("--permission-mode"));
+            // The build turn was injected as a user message.
+            let stdin = std::fs::read_to_string(&stdin_log).unwrap();
+            assert!(
+                stdin.contains("Your plan was approved"),
+                "build-turn message injected: {stdin}"
+            );
+            for p in [&counter, &invocations, &stdin_log] {
+                let _ = std::fs::remove_file(p);
+            }
+            let _ = tokio::fs::remove_file(script).await;
+        }
+
+        /// The reject flow: the stamp stays `plan`, the respawned plan-mode
+        /// process re-fires ExitPlanMode id-stably, and the hook answers it
+        /// deny + the reviewer's feedback.
+        #[tokio::test]
+        async fn plan_reject_refires_with_deny_and_feedback() {
+            let nonce = uuid::Uuid::new_v4();
+            let counter = std::env::temp_dir().join(format!("fake-claude-count-{nonce}"));
+            let invocations = std::env::temp_dir().join(format!("fake-claude-argv-{nonce}"));
+            let stdin_log = std::env::temp_dir().join(format!("fake-claude-stdin-{nonce}"));
+            let script = write_plan_flow_fake_claude(&counter, &invocations, &stdin_log).await;
+            let (mut cli, hook, _mcp) = deferred_engine_cli(script.clone(), "plan-reject").await;
+            cli.tool_manifest = vec![native_plan_tool()];
+            let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
+            let (cmd_tx, cmd_rx) = mpsc::channel(8);
+            let (evt_tx, mut evt_rx) = mpsc::channel(64);
+            let engine = tokio::spawn(run_engine(cli, cmd_rx, Arc::new(Notify::new()), evt_tx));
+
+            assert!(matches!(evt_rx.recv().await, Some(HarnessEvent::Idle)));
+            cmd_tx
+                .send(HarnessCommand::Prompt {
+                    prompt_id: "p-plan".into(),
+                    text: "plan the feature".into(),
+                    mode: Some("plan".into()),
+                })
+                .await
+                .unwrap();
+            let _ = tokio::time::timeout(Duration::from_secs(8), expect_run_started(&mut evt_rx))
+                .await
+                .expect("respawned process starts the plan turn");
+            assert!(matches!(
+                hook_fire_named(
+                    &hook,
+                    "toolu_plan",
+                    "ExitPlanMode",
+                    serde_json::json!({"plan":"# The plan"}),
+                )
+                .await,
+                hook_server::HookVerdict::Defer
+            ));
+            let mut parked = 0;
+            tokio::time::timeout(Duration::from_secs(8), async {
+                while parked < 2 {
+                    match evt_rx.recv().await {
+                        Some(HarnessEvent::Parked) => parked += 1,
+                        Some(_) => {}
+                        None => panic!("channel closed before park"),
+                    }
+                }
+            })
+            .await
+            .expect("parks after the defer");
+
+            cmd_tx
+                .send(HarnessCommand::ToolResult {
+                    call_id: "toolu_plan".into(),
+                    result_json: r#"{"decision":"reject","feedback":"also add tests"}"#.into(),
+                })
+                .await
+                .unwrap();
+            // The reject stash respawns a CONTINUATION turn (still plan mode).
+            let (_run, prompt_id) =
+                tokio::time::timeout(Duration::from_secs(8), expect_run_started_id(&mut evt_rx))
+                    .await
+                    .expect("reject stash resumes a continuation turn");
+            assert_eq!(prompt_id, None);
+            match hook_fire_named(
+                &hook,
+                "toolu_plan",
+                "ExitPlanMode",
+                serde_json::json!({"plan":"# The plan"}),
+            )
+            .await
+            {
+                hook_server::HookVerdict::Deny { reason } => {
+                    assert!(
+                        reason.contains("also add tests"),
+                        "feedback rides: {reason}"
+                    );
+                }
+                other => panic!(
+                    "re-fired ExitPlanMode must be denied with feedback, got {other:?}",
+                    other = match other {
+                        hook_server::HookVerdict::Answer { .. } => "Answer",
+                        hook_server::HookVerdict::Defer => "Defer",
+                        hook_server::HookVerdict::Allow => "Allow",
+                        hook_server::HookVerdict::Deny { .. } => "Deny",
+                    }
+                ),
+            }
+            assert_eq!(
+                engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
+                "plan",
+                "reject keeps the plan stamp"
+            );
+
+            cmd_tx
+                .send(HarnessCommand::Shutdown { grace_secs: 1 })
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), engine)
+                .await
+                .expect("engine exits")
+                .expect("engine task does not panic");
+            let argvs = std::fs::read_to_string(&invocations).unwrap();
+            let lines: Vec<&str> = argvs.lines().collect();
+            assert!(
+                lines.len() >= 3
+                    && lines[1].contains("--permission-mode plan")
+                    && lines[2].contains("--permission-mode plan"),
+                "reject respawn stays in plan mode: {argvs}"
+            );
+            for p in [&counter, &invocations, &stdin_log] {
+                let _ = std::fs::remove_file(p);
+            }
+            let _ = tokio::fs::remove_file(script).await;
         }
 
         async fn write_deferred_refire_fake_claude(counter: &Path) -> String {
