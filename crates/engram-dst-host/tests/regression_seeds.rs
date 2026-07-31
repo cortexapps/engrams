@@ -1346,9 +1346,8 @@ async fn scheduler_driven_slot_accounting_holds_across_claim_release_interleavin
 // A handful of chaos seeds run at full length: with ReconcileTick +
 // DropLocalBinding + RevokeOwnership in the menu, these keep the acked-write
 // AND reconcile None-arm oracles exercised across randomized interleavings
-// forever. No known-bad seed today (the extraction is behaviour-preserving) —
-// these are the standing regression net; a future sim-found failure gets its
-// seed pinned here with the finding + fix.
+// forever. These are the short standing regression net; sim-found failures
+// are pinned separately below with the finding + fix.
 
 async fn run_pinned(seed: u64, profile: Profile, steps: u64) {
     let mut sim = Sim::new(seed, profile).await;
@@ -1375,6 +1374,29 @@ async fn pinned_chaos_seeds_hold_all_oracles() {
         run_pinned(seed, Profile::Chaos, 200).await;
     }
 }
+
+/// Eviction-finalize deterministic-ref collision finding: a store-ahead
+/// manifest at base.next_version() must not be mistaken for the finalizer's
+/// own prior publish. These ten seeds cover the acked-write-loss interleaving.
+macro_rules! eviction_finalize_collision_seed {
+    ($name:ident, $seed:expr) => {
+        #[tokio::test(start_paused = true)]
+        async fn $name() {
+            run_pinned($seed, Profile::Chaos, 4000).await;
+        }
+    };
+}
+
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9914890, 9_914_890);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9915386, 9_915_386);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9915840, 9_915_840);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9916337, 9_916_337);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9917283, 9_917_283);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9916843, 9_916_843);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9917801, 9_917_801);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9918262, 9_918_262);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9918738, 9_918_738);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9919204, 9_919_204);
 
 // ───────── G2: the survivor-invisibility family — capture + resume ─────────
 //
