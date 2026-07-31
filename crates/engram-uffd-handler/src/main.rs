@@ -710,48 +710,16 @@ mod linux {
         Ok(())
     }
 
-    /// `ENGRAM_BLOB_BACKEND` (default `local`) decides backend.
-    /// Mirrors the convention every other Engram crate uses (see
-    /// `engram_rootfs_materializer`, `engram_coordinator::blob`,
-    /// `engram_host_agent::blob`).
-    ///
-    /// Local-mode blob root resolves from `ENGRAM_LOCAL_PATH/blobs`
-    /// to match `engram_host_agent::blob::from_env` exactly — that
-    /// way the chunked-memory bytes the host-agent's PooledBackend
-    /// just wrote land at the same place this handler reads them
-    /// from. `_cache_root` is the L1 NVMe cache (separate dir);
-    /// reads first hit it, miss falls through to the blob root.
+    /// `ENGRAM_BLOB_BACKEND` (default `local`) decides backend, via
+    /// the one shared client (`engram_blob_client::from_env` — retry,
+    /// deadlines, and metrics included; a dropped GET here would EIO
+    /// a guest page-in). Local-mode blob root resolves from
+    /// `ENGRAM_LOCAL_PATH/blobs`, the same place the host-agent's
+    /// PooledBackend writes. `_cache_root` is the L1 NVMe cache
+    /// (separate dir); reads first hit it, miss falls through to the
+    /// blob root.
     async fn pick_blob_backend(_cache_root: &Path) -> Result<Arc<dyn BlobStorage>, String> {
-        let backend = std::env::var("ENGRAM_BLOB_BACKEND")
-            .unwrap_or_else(|_| "local".to_string())
-            .to_lowercase();
-        match backend.as_str() {
-            "local" => {
-                let root = std::env::var("ENGRAM_LOCAL_PATH")
-                    .unwrap_or_else(|_| "./var/engram".to_string());
-                let blobs_dir = std::path::PathBuf::from(root).join("blobs");
-                tokio::fs::create_dir_all(&blobs_dir)
-                    .await
-                    .map_err(|e| format!("create local blob root {}: {e}", blobs_dir.display()))?;
-                tracing::info!(path = %blobs_dir.display(), "blob backend: local");
-                Ok(Arc::new(engram_storage_local::LocalBlobStorage::new(
-                    blobs_dir,
-                )))
-            }
-            "gcs" => {
-                let bucket = std::env::var("ENGRAM_GCS_BUCKET").map_err(|_| {
-                    "ENGRAM_BLOB_BACKEND=gcs requires ENGRAM_GCS_BUCKET".to_string()
-                })?;
-                tracing::info!(bucket = %bucket, "blob backend: gcs");
-                let store = engram_storage_gcs::GcsBlobStorage::connect(bucket)
-                    .await
-                    .map_err(|e| format!("gcs connect: {e}"))?;
-                Ok(Arc::new(store))
-            }
-            other => Err(format!(
-                "unknown ENGRAM_BLOB_BACKEND={other}; expected `local` or `gcs`"
-            )),
-        }
+        engram_blob_client::from_env().await
     }
 
     async fn load_trace_via_blob(

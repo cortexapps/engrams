@@ -296,7 +296,7 @@ async fn main() -> Result<(), HostAgentError> {
     // the same `BlobStorage` the coordinator's chunk store (the
     // enable-time materializer) writes to (a shared GCS bucket in
     // prod, a shared `local_path` in dev).
-    let blob = engram_host_agent::blob::from_env()
+    let blob = engram_blob_client::from_env()
         .await
         .map_err(|e| HostAgentError::Config(format!("blob backend: {e}")))?;
 

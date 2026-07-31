@@ -45,6 +45,7 @@ members = [
     "crates/engram-storage-local",
     "crates/engram-storage-s3",
     "crates/engram-storage-gcs",
+    "crates/engram-blob-client",
     "workspace-hack",
 ]
 
@@ -118,6 +119,7 @@ engram-oci-auth = { path = "crates/engram-oci-auth" }
 engram-storage-local = { path = "crates/engram-storage-local" }
 engram-storage-s3 = { path = "crates/engram-storage-s3" }
 engram-storage-gcs = { path = "crates/engram-storage-gcs" }
+engram-blob-client = { path = "crates/engram-blob-client" }
 engram-chunk-store = { path = "crates/engram-chunk-store" }
 engram-telemetry = { path = "crates/engram-telemetry" }
 

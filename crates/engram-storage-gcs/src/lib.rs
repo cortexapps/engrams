@@ -58,7 +58,7 @@ impl GcsBlobStorage {
     /// the SDK turns up only a `// TODO emulator support` note). We
     /// thread it through explicitly here.
     pub async fn connect(bucket: impl Into<String>) -> Result<Self, BlobError> {
-        let cfg = if let Ok(host) = std::env::var("STORAGE_EMULATOR_HOST") {
+        let mut cfg = if let Ok(host) = std::env::var("STORAGE_EMULATOR_HOST") {
             // Emulator mode: anonymous auth + the override endpoint.
             // Strip a trailing slash so requests don't double up.
             let endpoint = host.trim_end_matches('/').to_string();
@@ -74,6 +74,27 @@ impl GcsBlobStorage {
                 .await
                 .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))?
         };
+        // Inject our own transport instead of the SDK's untuned default
+        // (per TigerBeetle's object-storage-client findings, 2026-07):
+        // - hickory async DNS: cached, TTL-aware, no getaddrinfo
+        //   threadpool hop on every fresh connection.
+        // - bounded connect: a blackholed endpoint fails in 5 s and
+        //   surfaces to the BlobClient retry layer, instead of pinning
+        //   an attempt for the OS default (minutes).
+        // - sized keep-alive pool: the sparse re-chunk and NBD flush
+        //   fan out dozens of concurrent chunk ops; idle-connection
+        //   reuse keeps those off the TLS-handshake path.
+        // No global request timeout here — bodies are GB-scale on the
+        // streaming paths; per-attempt deadlines live in BlobClient.
+        let http = reqwest::Client::builder()
+            .hickory_dns(true)
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .pool_max_idle_per_host(64)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .build()
+            .map_err(|e| BlobError::Config(format!("gcs http client: {e}")))?;
+        cfg.http = Some(reqwest_middleware::ClientBuilder::new(http).build());
         Ok(Self {
             client: Arc::new(Client::new(cfg)),
             bucket: bucket.into(),

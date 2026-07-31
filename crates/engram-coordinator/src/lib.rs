@@ -11,7 +11,6 @@ use engram_core::traits::{BlobStorage, HostClient, MetadataStore, SecretStore};
 
 pub mod api;
 pub mod base_snapshot_retention;
-pub mod blob;
 pub mod boot_bundle;
 pub mod builtin_harness;
 pub mod bundle_gc;

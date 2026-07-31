@@ -608,9 +608,11 @@ and OCI auth end-to-end.
 
 ### Shipped
 
-- ✅ `engram_host_agent::blob::from_env()` mirrors
-  `engram_coordinator::blob::from_env`. Reads
-  `ENGRAM_BLOB_BACKEND={local,gcs}` + `ENGRAM_GCS_BUCKET`.
+- ✅ Blob-backend selection from env. Reads
+  `ENGRAM_BLOB_BACKEND={local,gcs}` + `ENGRAM_GCS_BUCKET`. (The
+  per-binary `blob::from_env` selectors this shipped as later
+  consolidated into `engram_blob_client::from_env` — retry,
+  deadlines, and metrics included.)
 - ✅ Host-agent main.rs constructs `ChunkStore` + `ChunkCache` +
   materialize_dir at `<work_dir>/`, wires
   `HostAgent::with_chunk_store(...)` / `with_chunk_cache(...)` /
@@ -794,9 +796,10 @@ manual validation pass with two real processes.
 
 **Required work**:
 
-- ✅ **`engram_host_agent::blob::from_env()`** mirroring coord's
-  selector. `local` (default) + `gcs`; fails closed on
-  misconfiguration. Shipped in `80d6841` with unit tests.
+- ✅ **Host-agent blob-backend selector** mirroring coord's.
+  `local` (default) + `gcs`; fails closed on misconfiguration.
+  Shipped in `80d6841` with unit tests. (Both selectors later
+  consolidated into `engram_blob_client::from_env`.)
 - ✅ **Host-agent main.rs reads blob backend from env** + constructs
   `ChunkStore` + materialize_dir at `<work_dir>/chunked-rootfs/`.
 - ✅ **`HostAgent::with_chunk_store(cs, dir)` call** threads through
