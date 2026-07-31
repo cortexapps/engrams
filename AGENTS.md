@@ -107,6 +107,12 @@ trigger in the required workflow.
 
 ## Conventions
 
+**Writing**
+- Adhere to **ASD-STE100** (Simplified Technical English) in all communications, including
+  written artifacts (ADRs, commit messages, PR descriptions), code comments, and messages
+  with the user. The product ships the same rule to every session
+  (`WRITING_STYLE_SYSTEM_PROMPT` in `orchestrator/src/prompts/base.ts`).
+
 **Commits & ADRs**
 - One logical change per commit; don't bundle unrelated changes.
 - Substantive work gets **ADR bookends**: author the ADR (`Proposed`) before code, update it

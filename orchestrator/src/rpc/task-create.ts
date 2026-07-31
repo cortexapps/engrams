@@ -44,7 +44,7 @@ import {
 } from "../connectors/registry.ts";
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
-import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
+import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -282,7 +282,7 @@ export async function compileSessionCreateInput(
   for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) harness[k] = v;
   harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
     harness.ENGRAM_APPEND_SYSTEM_PROMPT,
-    PAPERCUT_SYSTEM_PROMPT,
+    BASE_SYSTEM_PROMPT,
   ].filter(Boolean).join("\n\n");
   // ADR 0097: the browser bundle carries a local image-observation tool. It
   // is harness-native (not a connector capability) and is enabled only when
