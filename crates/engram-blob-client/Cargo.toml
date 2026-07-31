@@ -1,0 +1,32 @@
+[package]
+name = "engram-blob-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "THE blob-tier client: backend selection + bounded retry, per-attempt deadlines, and metrics as one encapsulated layer."
+
+[lints]
+workspace = true
+
+[dependencies]
+engram-core.workspace = true
+engram-storage-gcs.workspace = true
+engram-storage-local.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+metrics.workspace = true
+tokio = { workspace = true, features = ["time", "fs"] }
+tracing.workspace = true
+workspace-hack = { version = "0.1", path = "../../workspace-hack" }
+
+[dev-dependencies]
+engram-testkit.workspace = true
+futures.workspace = true
+tempfile = "3"
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "sync"] }
+# blobbench (examples/blobbench.rs) only — the manual before/after
+# throughput harness. Not a CI lane; compiled by --all-targets so it
+# can't rot.
+clap.workspace = true
+cpu-time = "1"

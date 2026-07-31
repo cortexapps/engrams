@@ -112,12 +112,30 @@ pub trait BlobStorage: Send + Sync {
 
     /// Convenience for small payloads. Drains the streaming body.
     /// Don't use on snapshot-sized bodies — it OOMs at scale.
+    ///
+    /// Collects frames first and coalesces once at exact size (a
+    /// single-frame body is returned as-is, zero-copy) — the naive
+    /// `BytesMut::new()` + extend loop paid amortized-doubling
+    /// realloc copies on every 16 MiB chunk GET, measurable CPU on
+    /// the blob tier's hottest read path.
     async fn get(&self, key: &str) -> Result<Bytes, BlobError> {
         use futures::StreamExt;
         let mut stream = self.get_streaming(key).await?;
-        let mut buf = bytes::BytesMut::new();
+        let mut frames: Vec<Bytes> = Vec::new();
+        let mut total = 0usize;
         while let Some(chunk) = stream.next().await {
-            buf.extend_from_slice(&chunk?);
+            let frame = chunk?;
+            if !frame.is_empty() {
+                total += frame.len();
+                frames.push(frame);
+            }
+        }
+        if frames.len() == 1 {
+            return Ok(frames.remove(0));
+        }
+        let mut buf = bytes::BytesMut::with_capacity(total);
+        for frame in frames {
+            buf.extend_from_slice(&frame);
         }
         Ok(buf.freeze())
     }
