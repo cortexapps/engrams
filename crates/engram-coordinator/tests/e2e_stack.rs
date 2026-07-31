@@ -655,6 +655,7 @@ impl Driver {
         let req = app::StreamEventsRequest {
             session_id: sid.to_string(),
             since: None, // from the start
+            durable_only: false,
         };
         let mut stream = match self.sess.stream_events(req).await {
             Ok(r) => r.into_inner(),

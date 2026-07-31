@@ -164,11 +164,18 @@ pub(crate) enum MergedEvent {
 /// end. A truncated stream that looks complete is the whole defect class
 /// this function exists to prevent; the client must reconnect from its own
 /// cursor instead.
+///
+/// `durable_only` (ADR 0108 B): suppress ephemeral frames. A cursor-based
+/// consumer (the orchestrator SessionListener) has no use for idx-less
+/// token chunks, and every idx-less frame it receives must be the `lagged`
+/// sentinel — so `Lagged` still passes with the flag set. Unset keeps
+/// today's behavior: chunks flow to the SSE passthrough and the browser.
 pub(crate) fn merged_event_stream(
     meta: Arc<dyn MetadataStore>,
     id: SessionId,
     mut live: tokio::sync::broadcast::Receiver<IndexedEvent>,
     since: Option<i64>,
+    durable_only: bool,
 ) -> impl Stream<Item = Result<MergedEvent, ApiError>> + Send {
     use tokio::sync::broadcast::error::RecvError;
 
@@ -208,7 +215,14 @@ pub(crate) fn merged_event_stream(
                 // Phase 1c: ephemeral chunks were never persisted and hold
                 // no meaningful idx — pass through without touching the
                 // cursor, so they can't advance a client's Last-Event-ID.
-                Ok(indexed) if indexed.ephemeral => yield Ok(MergedEvent::Live(indexed)),
+                // ADR 0108 B: a durable-only subscriber drops them here
+                // instead; the `Lagged` arm below is the one idx-less frame
+                // such a subscriber must still receive.
+                Ok(indexed) if indexed.ephemeral => {
+                    if !durable_only {
+                        yield Ok(MergedEvent::Live(indexed));
+                    }
+                }
                 // EXACTLY the next event: contiguity holds, so forwarding it
                 // keeps the cursor's meaning ("everything up to here was
                 // delivered") true. This is the common case.
@@ -416,6 +430,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
 
         let mut seen = Vec::with_capacity(TOTAL);
@@ -446,6 +461,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
 
         // Drain page one, leaving the walk suspended mid-log.
@@ -494,6 +510,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
 
         for _ in 0..REPLAY_PAGE {
@@ -535,6 +552,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
 
         // Walk the short log, then sit in the tail.
@@ -608,6 +626,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
         for _ in 0..3 {
             next_idx(&mut s).await;
@@ -656,6 +675,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
         assert_eq!(next_idx(&mut s).await, 0);
 
@@ -739,6 +759,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
         for _ in 0..seeded {
             next_idx(&mut s).await;
@@ -866,6 +887,7 @@ mod tests {
             id,
             bus.subscribe(id),
             None,
+            false,
         ));
         for _ in 0..3 {
             next_idx(&mut s).await;
@@ -894,6 +916,85 @@ mod tests {
             Some(Ok(MergedEvent::Live(ev))) => assert_eq!(ev.idx, 3),
             _ => panic!("cursor was disturbed by an ephemeral chunk"),
         }
+    }
+
+    /// ADR 0108 B: a `durable_only` subscriber must never receive an
+    /// ephemeral chunk — but durable events and the `lagged` sentinel (the
+    /// one idx-less frame a cursor-based consumer needs) must still flow.
+    /// The unset-flag behavior is guarded by
+    /// [`ephemeral_chunk_bypasses_the_cursor_gate`] above.
+    #[tokio::test]
+    async fn durable_only_suppresses_chunks_but_delivers_events_and_lag() {
+        const CAP: usize = 8;
+        const BURST: i64 = 20;
+
+        let meta = sim_meta();
+        let id = new_session(&meta).await;
+        for n in 0..3 {
+            append(&meta, id, n).await;
+        }
+
+        // A small bus so the lag leg below provably overflows it.
+        let bus = SessionEventBus::new(CAP);
+        let mut s = Box::pin(merged_event_stream(
+            meta.clone(),
+            id,
+            bus.subscribe(id),
+            None,
+            true,
+        ));
+        for _ in 0..3 {
+            next_idx(&mut s).await;
+        }
+
+        // An ephemeral chunk must be dropped server-side: the next poll
+        // must not resolve.
+        bus.publish(
+            id,
+            IndexedEvent {
+                idx: 0,
+                event: chunk_event(),
+                ephemeral: true,
+            },
+        );
+        let leaked = tokio::time::timeout(std::time::Duration::from_millis(50), s.next()).await;
+        assert!(leaked.is_err(), "durable_only leaked an ephemeral chunk");
+
+        // A durable event still flows, and the dropped chunk did not
+        // disturb the cursor.
+        let fresh = append(&meta, id, 3).await;
+        bus.publish(id, live_at(fresh));
+        match s.next().await {
+            Some(Ok(MergedEvent::Live(ev))) => assert_eq!(ev.idx, 3),
+            _ => panic!("durable event did not reach the durable_only subscriber"),
+        }
+
+        // The lagged sentinel still passes: overflow the bus without
+        // polling, then expect Lagged before the backfill.
+        for n in 4..(4 + BURST) {
+            let idx = append(&meta, id, n as usize).await;
+            bus.publish(id, live_at(idx));
+        }
+        assert!(
+            BURST > CAP as i64,
+            "burst must exceed bus depth or no lag occurs"
+        );
+        match s.next().await {
+            Some(Ok(MergedEvent::Lagged(n))) => assert!(n > 0, "lag reports a positive count"),
+            other => panic!(
+                "durable_only must still deliver the lagged sentinel, got {:?}",
+                other.map(|r| r.map(|ev| merged_to_parts(ev).1))
+            ),
+        }
+
+        // ...and the hole refills from the log as usual.
+        let last = 3 + BURST;
+        let mut seen = Vec::new();
+        for _ in 4..=last {
+            seen.push(next_idx(&mut s).await);
+        }
+        let expected: Vec<i64> = (4..=last).collect();
+        assert_eq!(seen, expected, "the lag backfill is unaffected by the flag");
     }
 
     #[test]
