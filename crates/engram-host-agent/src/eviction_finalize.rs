@@ -82,7 +82,7 @@ use crate::checkpoint::CheckpointRecord;
 /// Default cap on redrive attempts before a finalize job is quarantined.
 /// Overridable via `ENGRAM_EVICTION_FINALIZE_MAX_ATTEMPTS`.
 const DEFAULT_MAX_ATTEMPTS: u32 = 10;
-/// The disk manifest publish's own version-conflict retry budget —
+/// The finalize manifest publish's version-conflict retry budget —
 /// mirrors `ChunkedDiskBackend::flush_upload`'s `MAX_FLUSH_RETRIES`.
 const MAX_MANIFEST_PUBLISH_RETRIES: u32 = 32;
 /// ADR 0101 A: upload fan-out for the eviction-final disk publish —
@@ -372,6 +372,47 @@ async fn read_disk_pending_chunks(
     Ok(out)
 }
 
+/// Publish deterministic finalize content without conflating an occupied
+/// version with an identical prior publish.
+async fn publish_manifest_collision_safe(
+    chunk_store: &ChunkStore,
+    deterministic_ref: ManifestRef,
+    manifest: &Manifest,
+) -> Result<ManifestRef, engram_chunk_store::ChunkStoreError> {
+    let mut attempt_ref = deterministic_ref;
+    let mut attempts = 0u32;
+    loop {
+        attempts += 1;
+        match chunk_store.put_manifest(attempt_ref, manifest).await {
+            Ok(()) => return Ok(attempt_ref),
+            Err(engram_chunk_store::ChunkStoreError::VersionConflict {
+                latest,
+                attempted,
+                manifest_id,
+            }) => {
+                if attempt_ref == deterministic_ref && attempted == deterministic_ref.version {
+                    let existing = chunk_store.get_manifest(deterministic_ref).await?;
+                    if existing == *manifest {
+                        return Ok(deterministic_ref);
+                    }
+                }
+                if attempts >= MAX_MANIFEST_PUBLISH_RETRIES {
+                    return Err(engram_chunk_store::ChunkStoreError::VersionConflict {
+                        latest,
+                        attempted,
+                        manifest_id,
+                    });
+                }
+                attempt_ref = ManifestRef {
+                    manifest_id,
+                    version: latest + 1,
+                };
+            }
+            Err(e) => return Err(e),
+        }
+    }
+}
+
 /// Publish a disk manifest by layering `chunks` onto `base_manifest`,
 /// with retry-on-version-conflict — the redrive-safe equivalent of
 /// `ChunkedDiskBackend::flush_upload`'s manifest rebuild, minus the live
@@ -455,51 +496,10 @@ async fn publish_disk_manifest(
         annotations: serde_json::Value::Null,
     };
 
-    // The FIRST attempt always targets this same deterministic version
-    // (derived purely from `base_manifest`, same as `run_memory_leg`'s
-    // `next_ref = prev_ref.next_version()`). That means a conflict on
-    // THIS SPECIFIC attempt can only mean a prior crash-redrive already
-    // published this exact content (a crash between that `put_manifest`
-    // and this leg's stage-bump persist) — idempotent success, not a
-    // race, exactly like `run_memory_leg`'s `attempted == next_ref.version`
-    // arm. Only bump-and-retry on a conflict against a LATER, non-
-    // deterministic `attempt_ref` (this loop's own prior bump), where a
-    // genuine concurrent writer is the more plausible explanation.
     let deterministic_ref = base_manifest.next_version();
-    let mut attempt_ref = deterministic_ref;
-    let mut attempts = 0u32;
-    loop {
-        attempts += 1;
-        match chunk_store.put_manifest(attempt_ref, &new_manifest).await {
-            Ok(()) => return Ok(attempt_ref),
-            Err(engram_chunk_store::ChunkStoreError::VersionConflict { attempted, .. })
-                if attempt_ref == deterministic_ref && attempted == deterministic_ref.version =>
-            {
-                return Ok(deterministic_ref);
-            }
-            Err(engram_chunk_store::ChunkStoreError::VersionConflict {
-                latest,
-                manifest_id,
-                ..
-            }) => {
-                if attempts >= MAX_MANIFEST_PUBLISH_RETRIES {
-                    return Err(SandboxError::Snapshot(format!(
-                        "eviction finalize disk manifest {manifest_id}: version conflict \
-                         after {attempts} attempts (latest {latest})"
-                    )));
-                }
-                attempt_ref = ManifestRef {
-                    manifest_id,
-                    version: latest + 1,
-                };
-            }
-            Err(e) => {
-                return Err(SandboxError::Snapshot(format!(
-                    "eviction finalize: put disk manifest: {e}"
-                )))
-            }
-        }
-    }
+    publish_manifest_collision_safe(chunk_store, deterministic_ref, &new_manifest)
+        .await
+        .map_err(|e| SandboxError::Snapshot(format!("eviction finalize: put disk manifest: {e}")))
 }
 
 /// The disk leg's publish work — pure (no stage/record mutation):
@@ -575,9 +575,9 @@ async fn disk_leg_work(
 /// re-chunk + publish the memory manifest and patch the FC sidecar.
 /// Returns the published ref (`None` = diff-less capture / chunk store
 /// disabled) and the consumed input file to best-effort-delete once the
-/// stage bump is durable (finding 1). Idempotent from any point: the
-/// manifest targets the deterministic `next_ref`, so a redo of an
-/// already-published attempt lands in the `VersionConflict` success arm.
+/// stage bump is durable (finding 1). Idempotent from any point: an
+/// exact prior publish is reused, while a different occupant at the
+/// deterministic ref is preserved and the capture publishes at latest+1.
 async fn memory_leg_work(
     f: &EvictionFinalizer,
     record: &EvictionFinalizeRecord,
@@ -601,26 +601,11 @@ async fn memory_leg_work(
                     .await
                     .map_err(|e| SandboxError::Snapshot(format!("sparse re-chunk: {e}")))?;
                 let next_ref = prev_ref.next_version();
-                match chunk_store.put_manifest(next_ref, &next).await {
-                    Ok(()) => {}
-                    // Finding 2: `put_manifest` conflicts exactly when the
-                    // (manifest_id, version) key already exists — and we
-                    // always target the deterministic `next_ref`, so a
-                    // conflict here can only mean a prior attempt already
-                    // published this exact content (a crash between that
-                    // `put_manifest` and the stage-bump persist).
-                    // That's idempotent success, not a real race.
-                    Err(engram_chunk_store::ChunkStoreError::VersionConflict {
-                        attempted, ..
-                    }) if attempted == next_ref.version => {}
-                    Err(e) => {
-                        return Err(SandboxError::Snapshot(format!(
-                            "put manifest {next_ref}: {e}"
-                        )))
-                    }
-                }
+                let published_ref = publish_manifest_collision_safe(chunk_store, next_ref, &next)
+                    .await
+                    .map_err(|e| SandboxError::Snapshot(format!("put manifest {next_ref}: {e}")))?;
                 consumed = Some(diff_path);
-                Some(next_ref)
+                Some(published_ref)
             } else {
                 // No diff on disk and the memory stage hasn't persisted
                 // (the caller's ladder guard skips this leg once it has)
@@ -1239,15 +1224,8 @@ mod tests {
             .is_err());
     }
 
-    /// Correction-pass item C (T7): `publish_disk_manifest`'s
-    /// idempotent-redrive arm (this file, ~line 404) — a `VersionConflict`
-    /// at the FIRST-attempt deterministic ref (`base_manifest.next_version()`)
-    /// can only mean a prior crash-redrive already published this exact
-    /// content, so it must return `Ok(deterministic_ref)` rather than
-    /// erroring or bumping to a new version. No fake store needed: a REAL
-    /// `ChunkStore` genuinely returns `VersionConflict` when a manifest
-    /// already exists at that `(manifest_id, version)` key, so this seeds
-    /// that conflict directly rather than mocking one.
+    /// An exact prior publish at the deterministic ref is an idempotent
+    /// redrive and reuses that ref.
     #[tokio::test]
     async fn publish_disk_manifest_conflict_at_deterministic_ref_is_idempotent_success() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1308,19 +1286,69 @@ mod tests {
         );
     }
 
-    // T7 (correction-pass item C, PR #566 review): the MEMORY leg's
-    // mirror-image arm (~line 535, inside `run_memory_leg`) is NOT
-    // factored into a standalone helper the way the disk leg's
-    // `publish_disk_manifest` is — exercising it needs a full
-    // `EvictionFinalizeRecord` + `EvictionFinalizer`, a real binary
-    // `memory.diff` file `crate::checkpoint::dirty_ranges` can parse, and
-    // a prev-manifest whose content matches what
-    // `ChunkStore::update_for_dirty_ranges_sparse` deterministically
-    // recomputes — meaningfully more scaffolding than the disk leg's
-    // direct-call test above (which needed no scaffolding beyond a real
-    // `ChunkStore`). Left untested here; the right longer-term fix is
-    // extracting `run_memory_leg`'s publish arm into a standalone
-    // `publish_memory_manifest` helper mirroring `publish_disk_manifest`,
-    // which would make it just as cheaply testable — but that's a
-    // production-code refactor, out of scope for this test-only pass.
+    #[tokio::test]
+    async fn publish_disk_manifest_different_deterministic_occupant_publishes_at_latest_plus_one() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (chunk_store, base_ref) = disk_store_with_empty_base(tmp.path()).await;
+
+        let dest = tmp.path().join("capture");
+        let staged_bytes = Bytes::from(vec![0xaa; 4096]);
+        let staged_hash = ChunkHash::of(&staged_bytes);
+        persist_disk_pending_chunks(&dest, &[(0, staged_hash, staged_bytes)])
+            .await
+            .expect("stage authoritative capture chunk");
+        let mut record = record_with_one_staged_chunk(dest, base_ref, staged_hash);
+        let finalizer = finalizer_over(&chunk_store, tmp.path(), &record);
+
+        let occupant_bytes = Bytes::from(vec![0x11; 4096]);
+        let occupant_hash = chunk_store
+            .put_chunk(&occupant_bytes)
+            .await
+            .expect("put occupant chunk");
+        let deterministic_ref = base_ref.next_version();
+        let occupant = Manifest {
+            schema_version: engram_chunk_store::manifest::MANIFEST_SCHEMA_VERSION,
+            kind: ManifestKind::Disk,
+            chunk_size: engram_chunk_store::manifest::ChunkSize::bytes(4096),
+            total_bytes: 4096,
+            chunks: vec![ChunkRef {
+                offset: 0,
+                hash: occupant_hash,
+            }],
+            parent: Some(base_ref),
+            working_set_trace: None,
+            annotations: serde_json::Value::Null,
+        };
+        chunk_store
+            .put_manifest(deterministic_ref, &occupant)
+            .await
+            .expect("seed a different manifest at the deterministic ref");
+
+        assert!(matches!(
+            run_eviction_finalize_attempt(&finalizer, &mut record).await,
+            FinalizeAttempt::Completed
+        ));
+        let result = record
+            .disk_manifest
+            .expect("finalize persisted the authoritative disk ref");
+
+        assert_eq!(result, deterministic_ref.next_version());
+        let published = chunk_store
+            .get_manifest(result)
+            .await
+            .expect("get authoritative capture manifest");
+        for (idx, hash) in &record.disk_pending.as_ref().unwrap().chunks {
+            assert!(published
+                .chunks
+                .iter()
+                .any(|chunk| chunk.offset == (*idx as u64) * 4096 && chunk.hash == *hash));
+        }
+        assert_eq!(
+            chunk_store
+                .get_manifest(deterministic_ref)
+                .await
+                .expect("get original occupant"),
+            occupant
+        );
+    }
 }

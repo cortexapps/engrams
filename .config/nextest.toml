@@ -48,3 +48,10 @@ slow-timeout = { period = "60s", terminate-after = 10 }
 [[profile.default.overrides]]
 filter = "binary(migration_source) | binary(two_host_live_teleport)"
 slow-timeout = { period = "60s", terminate-after = 10 }
+
+# The eviction-finalize collision pins replay ten 4,000-step chaos runs. Each
+# completes under the default cap in isolation, but concurrent full-workspace
+# load can push an individual debug test past three minutes.
+[[profile.default.overrides]]
+filter = "package(engram-dst-host) & binary(regression_seeds)"
+slow-timeout = { period = "60s", terminate-after = 10 }

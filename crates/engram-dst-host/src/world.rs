@@ -1335,16 +1335,15 @@ impl SimHost {
                     .map_err(|e| format!("sandbox {idx}: spool adoption refused: {e}"))?;
             } else {
                 // Stale refusal (an older divergence than the durable tier).
-                // ORACLE (af28cac4, 2026-07-21): refusing is only SAFE when
+                // Refusing is only SAFE when
                 // the durable tier already covers every spooled write — true
                 // for a legitimately-superseded spool (a later flush /
                 // eviction finalize published past it) by tag monotonicity.
                 // A refused spool holding a tag ABOVE the published floor
-                // means something published AROUND a live export — the
-                // detached-final-flush race, where the spool was stamped
-                // before a racing publish landed — and discarding it rolls
-                // an acked write back under the live guest. Loud, never a
-                // silent discard of the only newer copy.
+                // means a durable-manifest advance failed to cover a spooled
+                // write, and discarding it rolls an acked write back under the
+                // live guest. Loud, never a silent discard of the only newer
+                // copy.
                 for (chunk_idx, bytes) in &chunks {
                     let tag = decode_tag(bytes);
                     let floor = self
@@ -1356,7 +1355,8 @@ impl SimHost {
                             "sandbox {idx}: stale-refused spool (stamped {spool_ref}, durable \
                              {rebuild_ref}) holds chunk {chunk_idx} tag {tag} above the \
                              published floor {floor} — refusing it rolls back an acked write \
-                             whose only copy was the spool (the af28cac4 detached-flush race)"
+                             whose only copy was the spool (a durable-manifest advance failed \
+                             to cover it)"
                         ));
                     }
                 }
