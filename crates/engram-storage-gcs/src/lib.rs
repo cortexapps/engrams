@@ -75,8 +75,11 @@ impl GcsBlobStorage {
         // Protocol: pooled HTTP/1.1 by default — bulk parallel chunk
         // transfers get one TCP window each instead of sharing one
         // h2 connection's flow control. `ENGRAM_GCS_HTTP2=1` opts in
-        // to ALPN h2 (multiplexed; fewer connections/handshakes) —
-        // A/B via the blobbench harness before flipping any default.
+        // to ALPN h2 for experiments, but blobbench (2026-07-31,
+        // n2-standard-16 → us-west2 GCS, 16 MiB objects, c=32)
+        // measured h2 4-5x WORSE on bulk transfer: GET 1914 → 378
+        // MiB/s, PUT 1497 → 474 MiB/s. Don't flip this default
+        // without re-measuring.
         let mut builder = reqwest::Client::builder()
             .hickory_dns(true)
             .connect_timeout(std::time::Duration::from_secs(5))
