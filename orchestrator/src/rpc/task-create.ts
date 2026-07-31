@@ -3,9 +3,9 @@
  * (ADR 0053/0055/0056/0057; extracted in ADR 0060 P2.7, unified here).
  *
  * `createTaskWithSession` is the ONE path that turns a profile into a running
- * agent: compile the CreateSession request, create the upstream session, then
- * persist the `task` + primary `task_session` rows atomically (compensating by
- * deleting the orphan session if the DB write fails). Both the TaskService
+ * agent: compile the CreateSession request, reserve its ID, persist the `task`
+ * + primary `task_session` authorization snapshot, then boot the upstream
+ * session (compensating both stores if the boot fails). Both the TaskService
  * CreateTask RPC (UI chat tasks) and the external-trigger ThreadControlPlane
  * (ADR 0060 Slack threads) call it, so a triggered session runs with the SAME
  * capabilities/network/secrets/skills as a UI task (no new privilege path) and
@@ -18,6 +18,7 @@
  */
 
 import { ConnectError, Code } from "@connectrpc/connect";
+import { and, eq } from "drizzle-orm";
 import type { NodePgDatabase } from "drizzle-orm/node-postgres";
 
 import { log as rootLog } from "../log.ts";
@@ -45,6 +46,20 @@ import {
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import {
+  makeIntegrationConnectionStore,
+  type IntegrationConnectionStore,
+} from "../db/integration-connections.ts";
+import {
+  makeProfileLaunchGrantStore,
+  type ProfileLaunchGrantStore,
+} from "../db/profile-launch-grants.ts";
+import {
+  grantsToCapabilities,
+  legacyCapabilityGrant,
+  resolveIntegrationGrants,
+} from "../integrations/grants.ts";
+import { appendGooglePolicy } from "../integrations/google-policy.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -77,6 +92,8 @@ export type Db = NodePgDatabase<typeof schema>;
 /** The control-plane CreateSession request the orchestrator compiles. Mirrors
  *  the `SessionsClient.createSession` request shape (rpc/tasks.ts). */
 export interface SessionCreateInput {
+  /** ADR 0107: reserved before boot so the authorization snapshot exists. */
+  requestedSessionId?: string;
   imageUri: string;
   mode: string;
   prompt?: string;
@@ -84,6 +101,8 @@ export interface SessionCreateInput {
   selectedSkills?: string[];
   capabilities?: string[];
   integrationPolicyJson?: string;
+  /** Immutable connection authority persisted before coordinator boot. */
+  integrationGrants?: ProfileRow["integrationGrants"];
   /** ADR 0062/0063: the selected harness (catalog name) the coordinator mounts
    *  + execs (the proto `CreateSessionRequest.harness`). Resolved from the
    *  per-session override ?? profile ?? deployment default. */
@@ -125,6 +144,7 @@ export interface SessionCompileDeps {
    *  only when the profile sets includeUserTokens, to additionally carry the
    *  user's OTHER credentials into the sandbox. */
   resolveAllUserTokens: () => Promise<Record<string, string>>;
+  connections: IntegrationConnectionStore;
 }
 
 export interface SessionCompileOpts {
@@ -237,21 +257,43 @@ export async function compileSessionCreateInput(
     }
   }
   const registry = await loadRegistry(deps.connectors);
-  const capabilities = opts.capabilityOverride !== undefined
-    ? [...opts.capabilityOverride]
-    : [...new Set([
-      ...profile.capabilities,
-      ...(opts.extraCapabilities ?? []),
-    ])];
+  const resolvedProfileGrants = await resolveIntegrationGrants(
+    profile.integrationGrants,
+    deps.connections,
+  );
+  const profileCapabilities = grantsToCapabilities(resolvedProfileGrants);
+  const effectiveGrants = opts.capabilityOverride !== undefined
+    ? opts.capabilityOverride.map(legacyCapabilityGrant)
+    : [
+        ...profile.integrationGrants,
+        ...(opts.extraCapabilities ?? []).map(legacyCapabilityGrant),
+      ];
+  const resolvedEffectiveGrants = await resolveIntegrationGrants(
+    effectiveGrants,
+    deps.connections,
+  );
+  const hasGoogleCloud = resolvedEffectiveGrants.some(({ connection }) => connection.provider === "gcp");
+  const capabilities = grantsToCapabilities(resolvedEffectiveGrants);
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
   // profile-owned surface: extra integration grants do not add model tools.
   const surfacedCapabilities = opts.capabilityOverride !== undefined
     ? capabilities
-    : profile.capabilities;
+    : profileCapabilities;
   const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
-  if (cliPlan.enabled.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(cliPlan.enabled);
+  const enabledCli = [
+    ...cliPlan.enabled,
+    ...(hasGoogleCloud
+      ? [{
+          provider: "gcp",
+          displayName: "Google Cloud",
+          bins: ["gcloud", "gke-gcloud-auth-plugin", "kubectl", "ssh", "mutagen"],
+          doc: "Use brokered metadata ADC. Do not log in or create credentials. Use IAP for SSH.",
+        }]
+      : []),
+  ];
+  if (enabledCli.length > 0) harness.ENGRAM_CLI_INTEGRATIONS = JSON.stringify(enabledCli);
   const toolManifest = compileToolManifest(
     deps.toolRegistry ?? productionTools,
     surfacedCapabilities,
@@ -287,7 +329,16 @@ export async function compileSessionCreateInput(
   // ADR 0097: the browser bundle carries a local image-observation tool. It
   // is harness-native (not a connector capability) and is enabled only when
   // the corresponding skill is mounted into this session.
-  const selectedSkills = [...new Set([...profile.skills, ...cliPlan.bundles])];
+  if (hasGoogleCloud) {
+    harness.GCE_METADATA_HOST = "127.0.0.1:13338";
+    harness.GCE_METADATA_IP = "127.0.0.1";
+    harness.CLOUDSDK_CORE_CHECK_GCE_METADATA = "true";
+  }
+  const selectedSkills = [...new Set([
+    ...profile.skills,
+    ...cliPlan.bundles,
+    ...(hasGoogleCloud ? ["integrations-cli"] : []),
+  ])];
   if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
   else delete harness.ENGRAM_BROWSER_VIEW_ENABLED;
 
@@ -313,6 +364,7 @@ export async function compileSessionCreateInput(
     network: opts.networkOverride ?? profile.network,
     secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
   });
+  appendGooglePolicy(policy, resolvedEffectiveGrants);
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
   // never leaves the coordinator (ADR 0057), so we can't read it here — instead
@@ -341,6 +393,7 @@ export async function compileSessionCreateInput(
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
     ...(capabilities.length > 0 ? { capabilities } : {}),
     ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
+    integrationGrants: effectiveGrants,
   };
 }
 
@@ -362,6 +415,9 @@ export interface CreateTaskDeps {
   connectors: CustomConnectorSource;
   harnessCatalog: HarnessCatalogClient;
   sessions: TaskSessionsClient;
+  /** Injected IDs keep create ordering deterministic in tests. */
+  newTaskId?: () => string;
+  newSessionId?: () => string;
   /** The owner's per-user harness token store: `get` resolves one env var (the
    *  selected harness's `user_env`); `getAll` resolves every saved token (the
    *  includeUserTokens carry). */
@@ -376,6 +432,8 @@ export interface CreateTaskDeps {
   /** ADR 0031 §7: owner identity lookup for git commit attribution.
    *  Defaults to a Drizzle store over `db` when omitted. */
   users?: UserIdentityStore;
+  connections?: IntegrationConnectionStore;
+  launchGrants?: ProfileLaunchGrantStore;
 }
 
 export interface CreateTaskParams {
@@ -386,6 +444,8 @@ export interface CreateTaskParams {
   /** The owner is a service-account principal (API key) — forces the
    *  programmatic (org-credential) compile path; see SessionCompileOpts. */
   ownerIsServiceAccount?: boolean;
+  /** Administrators have implicit access to restricted profiles. */
+  ownerIsAdmin?: boolean;
   /** The profile to start from; must be active (else NotFound). */
   profileId: string;
   title?: string | null;
@@ -408,6 +468,8 @@ export interface CreateSessionForExistingTaskParams {
   profileId: string;
   role: string;
   ownerUserId?: string;
+  /** Stable non-human principal used for restricted-profile launch grants. */
+  launchPrincipalId?: string;
   prompt?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
@@ -420,6 +482,8 @@ export interface CreateSessionForExistingTaskParams {
   /** Optional caller context; the existing task already owns its durable
    *  source metadata, so this path does not insert or update it. */
   source?: Record<string, unknown>;
+  /** Administrators have implicit access to restricted profiles. */
+  ownerIsAdmin?: boolean;
 }
 
 export interface CreateSessionForExistingTaskDeps extends Omit<CreateTaskDeps, "profiles"> {
@@ -454,6 +518,18 @@ export async function createSessionForExistingTask(
   if (!profile) {
     throw new ConnectError("profile not found or archived", Code.NotFound);
   }
+  const launchPrincipalId = params.ownerUserId ?? params.launchPrincipalId;
+  if (
+    profile.launchAccess === "restricted" &&
+    !params.ownerIsAdmin &&
+    (launchPrincipalId === undefined ||
+      !(await (deps.launchGrants ?? makeProfileLaunchGrantStore(deps.db)).canLaunch(
+        profile.id,
+        launchPrincipalId,
+      )))
+  ) {
+    throw new ConnectError("profile launch is not granted", Code.PermissionDenied);
+  }
 
   let owner: { name: string; email: string } | undefined;
   if (params.ownerUserId !== undefined) {
@@ -484,6 +560,7 @@ export async function createSessionForExistingTask(
         params.ownerUserId === undefined
           ? Promise.resolve({})
           : deps.secrets.getAll(params.ownerUserId),
+      connections: deps.connections ?? makeIntegrationConnectionStore(deps.db),
     },
     {
       // An automation-owned review task has no human token; use the harness's
@@ -507,50 +584,60 @@ export async function createSessionForExistingTask(
     },
   );
 
-  // When prompt is omitted (as it is for the finder), the session boots idle so
-  // deterministic bootstrap can finish before the separately checkpointed
-  // SendPrompt wakes it.
-  const created = await deps.sessions.createSession(sessionInput);
-  try {
-    await deps.db.transaction(async (tx) => {
-      await tx.insert(taskSessionTable).values({
-        taskId: params.taskId,
-        sessionId: created.sessionId,
-        role: params.role,
-        profileId: profile.id,
-        // Persist the effective granted capabilities so the tool-exec gate
-        // honors a capabilityOverride (review workers) rather than re-deriving
-        // from the profile, which may not carry them.
-        capabilities: sessionInput.capabilities ?? [],
-      });
-      if (params.registerListener === true) {
-        await tx.insert(sessionListenerTable).values({
-          sessionId: created.sessionId,
-        });
-      }
+  // ADR 0107: publish the immutable authorization snapshot before coordinator
+  // boot. The host-side token broker can now authorize the first VM request.
+  const sessionId = deps.newSessionId?.() ?? crypto.randomUUID();
+  sessionInput.requestedSessionId = sessionId;
+  await deps.db.transaction(async (tx) => {
+    await tx.insert(taskSessionTable).values({
+      taskId: params.taskId,
+      sessionId,
+      role: params.role,
+      profileId: profile.id,
+      capabilities: sessionInput.capabilities ?? [],
+      integrationGrants: sessionInput.integrationGrants ?? [],
+      ...(launchPrincipalId ? { integrationPrincipalId: launchPrincipalId } : {}),
     });
+  });
+
+  try {
+    // When prompt is omitted (as it is for the finder), the session boots idle
+    // so deterministic bootstrap can finish before SendPrompt wakes it.
+    const created = await deps.sessions.createSession(sessionInput);
+    if (created.sessionId !== sessionId) {
+      throw new Error("coordinator returned a different reserved session ID");
+    }
+    if (params.registerListener === true) {
+      await deps.db.transaction(async (tx) => {
+        await tx.insert(sessionListenerTable).values({ sessionId });
+      });
+    }
   } catch (err) {
     try {
-      await deps.sessions.deleteSession({ sessionId: created.sessionId });
+      await deps.sessions.deleteSession({ sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId: created.sessionId, err: delErr },
-        "task-create: failed to delete orphan session after task-session persist failure",
+        { sessionId, err: delErr },
+        "task-create: failed to delete reserved session after create failure",
       );
     }
+    await deps.db.transaction(async (tx) => {
+      await tx
+        .delete(taskSessionTable)
+        .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
+    });
     throw err;
   }
 
-  evictOwnerCacheEntry(created.sessionId);
-  return { sessionId: created.sessionId };
+  evictOwnerCacheEntry(sessionId);
+  return { sessionId };
 }
 
 /**
  * Create a task and its primary session in one atomic operation. Loads the
  * active profile (NotFound if missing/archived), compiles the CreateSession
- * request, creates the upstream session, then persists the task + task_session
- * rows in one transaction. If the DB write fails the orphan session is deleted
- * (best-effort) before rethrowing so a retry starts clean.
+ * request, then persists the task and its immutable authorization snapshot
+ * before coordinator boot. A failed boot removes both records.
  *
  * This is the SINGLE create path — authorization (who may create) is the
  * caller's concern; this primitive only does the mechanical create + persist.
@@ -562,6 +649,16 @@ export async function createTaskWithSession(
   const profile = await deps.profiles.getActive(params.profileId);
   if (!profile) {
     throw new ConnectError("profile not found or archived", Code.NotFound);
+  }
+  if (
+    profile.launchAccess === "restricted" &&
+    !params.ownerIsAdmin &&
+    !(await (deps.launchGrants ?? makeProfileLaunchGrantStore(deps.db)).canLaunch(
+      profile.id,
+      params.ownerUserId,
+    ))
+  ) {
+    throw new ConnectError("profile launch is not granted", Code.PermissionDenied);
   }
 
   // ADR 0031 §7: resolve the owner's identity for git commit attribution.
@@ -590,6 +687,7 @@ export async function createTaskWithSession(
       harnessCatalog: deps.harnessCatalog,
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
       resolveAllUserTokens: () => deps.secrets.getAll(params.ownerUserId),
+      connections: deps.connections ?? makeIntegrationConnectionStore(deps.db),
     },
     {
       ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),
@@ -602,55 +700,58 @@ export async function createTaskWithSession(
     },
   );
 
-  const created = await deps.sessions.createSession(sessionInput);
+  const taskId = deps.newTaskId?.() ?? crypto.randomUUID();
+  const sessionId = deps.newSessionId?.() ?? crypto.randomUUID();
+  sessionInput.requestedSessionId = sessionId;
 
-  const taskId = crypto.randomUUID();
+  // ADR 0107: the broker must see this snapshot before the VM can make its
+  // first credentialed request. Listener registration remains post-boot.
+  await deps.db.transaction(async (tx) => {
+    await tx.insert(taskTable).values({
+      id: taskId,
+      type: params.type,
+      title: params.title ?? truncatePrompt(params.prompt),
+      status: "open",
+      createdByUserId: params.ownerUserId,
+      source: params.source ?? {},
+    });
+    await tx.insert(taskSessionTable).values({
+      taskId,
+      sessionId,
+      role: "primary",
+      profileId: profile.id,
+      capabilities: sessionInput.capabilities ?? [],
+      integrationGrants: sessionInput.integrationGrants ?? [],
+      integrationPrincipalId: params.ownerUserId,
+    });
+    if (params.slackThreadWorkflowId !== undefined) {
+      await tx.insert(slackSessionTable).values({
+        sessionId,
+        threadWfId: params.slackThreadWorkflowId,
+      });
+    }
+  });
+
   try {
+    const created = await deps.sessions.createSession(sessionInput);
+    if (created.sessionId !== sessionId) {
+      throw new Error("coordinator returned a different reserved session ID");
+    }
     await deps.db.transaction(async (tx) => {
-      await tx.insert(taskTable).values({
-        id: taskId,
-        type: params.type,
-        // Initial (default) title = the truncated prompt. A harness AI title
-        // later overrides it (via task.suggested_title + the buildTask
-        // derivation) unless the user sets a sticky custom title. A caller-
-        // supplied `params.title` still wins when present (e.g. a trigger that
-        // names the task explicitly).
-        title: params.title ?? truncatePrompt(params.prompt),
-        status: "open",
-        createdByUserId: params.ownerUserId,
-        source: params.source ?? {},
-      });
-      await tx.insert(taskSessionTable).values({
-        taskId,
-        sessionId: created.sessionId,
-        role: "primary",
-        profileId: profile.id,
-        // See createSessionForExistingTask: persist the effective granted
-        // capabilities so the tool-exec gate honors overrides/extras.
-        capabilities: sessionInput.capabilities ?? [],
-      });
-      if (params.slackThreadWorkflowId !== undefined) {
-        await tx.insert(slackSessionTable).values({
-          sessionId: created.sessionId,
-          threadWfId: params.slackThreadWorkflowId,
-        });
-      }
-      // Register last: once this transaction commits, every consumer-specific
-      // binding and the task/profile context are already visible.
-      await tx.insert(sessionListenerTable).values({
-        sessionId: created.sessionId,
-      });
+      await tx.insert(sessionListenerTable).values({ sessionId });
     });
   } catch (err) {
-    // Compensate: drop the orphan session so a retry starts clean.
     try {
-      await deps.sessions.deleteSession({ sessionId: created.sessionId });
+      await deps.sessions.deleteSession({ sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId: created.sessionId, err: delErr },
-        "task-create: failed to delete orphan session after task-persist failure",
+        { sessionId, err: delErr },
+        "task-create: failed to delete reserved session after create failure",
       );
     }
+    await deps.db.transaction(async (tx) => {
+      await tx.delete(taskTable).where(eq(taskTable.id, taskId));
+    });
     throw err;
   }
 
@@ -662,7 +763,7 @@ export async function createTaskWithSession(
     for (const port of profile.portExposures) {
       try {
         await store.createOrGet({
-          sessionId: created.sessionId,
+          sessionId,
           port,
           label: "",
           ownerUserId: params.ownerUserId,
@@ -670,7 +771,7 @@ export async function createTaskWithSession(
         });
       } catch (e) {
         log.warn(
-          { sessionId: created.sessionId, port, err: e },
+          { sessionId, port, err: e },
           "task-create: auto-expose port failed (continuing)",
         );
       }
@@ -679,7 +780,7 @@ export async function createTaskWithSession(
 
   // A just-created session must not be served a stale null from the owner
   // negative-cache window (authz/resolve.ts).
-  evictOwnerCacheEntry(created.sessionId);
+  evictOwnerCacheEntry(sessionId);
 
-  return { taskId, sessionId: created.sessionId };
+  return { taskId, sessionId };
 }

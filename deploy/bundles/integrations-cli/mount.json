@@ -27,7 +27,35 @@
         "bin/airtable",
         "bin/figma",
         "bin/discord",
-        "bin/shopify"
+        "bin/shopify",
+        "bin/gcloud",
+        "bin/gke-gcloud-auth-plugin",
+        "bin/kubectl",
+        "bin/ssh",
+        "bin/ssh-keygen",
+        "bin/scp",
+        "bin/mutagen"
+      ],
+      "requires_env": "ENGRAM_CLI_INTEGRATIONS"
+    },
+    {
+      "name": "dev-vm",
+      "bins": [
+        "bin/gcloud",
+        "bin/ssh",
+        "bin/ssh-keygen",
+        "bin/scp",
+        "bin/mutagen"
+      ],
+      "requires_env": "ENGRAM_CLI_INTEGRATIONS"
+    },
+    {
+      "name": "engrams-prod-ops",
+      "bins": [
+        "bin/gcloud",
+        "bin/gke-gcloud-auth-plugin",
+        "bin/kubectl",
+        "bin/ssh"
       ],
       "requires_env": "ENGRAM_CLI_INTEGRATIONS"
     }

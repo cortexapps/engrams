@@ -159,6 +159,8 @@ const PUBLIC_PATHS: ReadonlySet<string> = new Set([
   "/api/v1/integrations/slack/events",
   "/api/v1/integrations/slack/interactivity",
   "/api/v1/integrations/github/events",
+  "/api/v1/integrations/google-cloud/oidc/.well-known/openid-configuration",
+  "/api/v1/integrations/google-cloud/oidc/jwks",
   "/api/auth/device/code",
   "/api/auth/device/token",
 ]);

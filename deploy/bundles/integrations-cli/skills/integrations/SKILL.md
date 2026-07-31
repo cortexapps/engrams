@@ -1,6 +1,6 @@
 ---
 name: integrations
-description: Third-party integration CLIs (e.g. gh for GitHub, glab for GitLab, stripe for Stripe, pup for Datadog, linear for Linear, slack for Slack) are available in this session, authenticated automatically by the engrams platform. Use when you need to interact with a connected service from the command line. Run `engrams-integrations` to see which are enabled and how to use each.
+description: Third-party integration CLIs and Google Cloud tools are available in this session and authenticate through the engrams host broker. Use them only with the profile's existing connection grants.
 ---
 
 # Integration CLIs
@@ -11,6 +11,12 @@ connected — for example `gh` (GitHub), `glab` (GitLab), `stripe` (Stripe),
 handle real credentials**: each tool carries a harmless placeholder token, and the
 engrams egress proxy injects the real, capability-scoped credential on the wire.
 Do not paste, export, or `login` with real API tokens — it's already wired.
+
+Google Cloud sessions include `gcloud`, `gke-gcloud-auth-plugin`, `kubectl`,
+`ssh`, and `mutagen`. Use metadata-style Application Default Credentials. Do
+not run `gcloud auth login`, create a credential file, or request a service
+account key. Use IAP tunnelling for every Compute Engine SSH connection. The skill cannot select
+a connection or expand its profile grants or endpoints.
 
 ## See what's enabled (and how to use it)
 

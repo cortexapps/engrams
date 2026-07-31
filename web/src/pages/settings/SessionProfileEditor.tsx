@@ -37,6 +37,7 @@ import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
+import { useIntegrationConnections } from "../../hooks/useIntegrations";
 import {
   useConnectorViews,
   type ConnectorView,
@@ -82,6 +83,18 @@ const linesOf = (text: string) =>
 
 const optionId = (value: string | null | undefined): string | null => value?.trim() || null;
 
+const GOOGLE_OPERATIONS = [
+  ["compute.instances.get", "Describe Compute Engine instances"],
+  ["compute.instances.start", "Start Compute Engine instances"],
+  ["compute.instances.stop", "Stop Compute Engine instances"],
+  ["logging.entries.list", "Read Cloud Logging entries"],
+  ["trace.traces.list", "Read Cloud Trace"],
+  ["container.clusters.get", "Get GKE cluster credentials"],
+  ["iap.tunnel", "Open IAP tunnels"],
+  ["gke.api.call", "Call the configured GKE API server"],
+  ["api.call", "Call configured Google APIs"],
+] as const;
+
 const schema = z.object({
   name: z.string().trim().min(1, "Name the profile first"),
   description: z.string(),
@@ -96,7 +109,15 @@ const schema = z.object({
   designation: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
-  capabilities: z.array(z.string()),
+  integrationGrants: z.array(
+    z.object({
+      connectionId: z.string(),
+      operation: z.string(),
+      resourceConstraints: z.array(z.string()),
+    }),
+  ),
+  launchAccess: z.enum(["organization", "restricted"]),
+  launchPrincipalIdsText: z.string(),
   envRows: z.array(z.custom<EnvRow>()),
   networkDefault: z.enum(["deny", "allow"]),
   allowHostsText: z.string(),
@@ -120,7 +141,9 @@ const EMPTY: ProfileFormValues = {
   designation: false,
   includeUserTokens: false,
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
+  launchAccess: "organization",
+  launchPrincipalIdsText: "",
   envRows: [],
   networkDefault: "deny",
   allowHostsText: "",
@@ -138,6 +161,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { data: harnesses } = useHarnessCatalog(true);
   const { data: skillCatalog } = useSkills();
   const { data: orgSecretNames } = useOrgSecretNames();
+  const { data: connectionData } = useIntegrationConnections();
   const { views } = useConnectorViews();
   const create = useCreateProfile();
   const update = useUpdateProfile();
@@ -153,7 +177,14 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { control, setValue, watch, reset, handleSubmit, formState } = form;
 
   // Live draft — the policy rail and derived network recompute as these change.
-  const capabilities = watch("capabilities");
+  const integrationGrants = watch("integrationGrants");
+  const capabilities = integrationGrants.flatMap((grant) => {
+    if (!grant.connectionId.startsWith("legacy:")) return [];
+    const provider = grant.connectionId.slice("legacy:".length);
+    return grant.resourceConstraints.length === 0
+      ? [`${provider}:${grant.operation}`]
+      : grant.resourceConstraints.map((resource) => `${provider}:${grant.operation}@${resource}`);
+  });
   const skills = watch("skills");
   const includeUserTokens = watch("includeUserTokens");
   const imageId = watch("imageId");
@@ -188,7 +219,13 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       designation: p.designation === "pr_reviewer",
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
-      capabilities: p.capabilities ?? [],
+      integrationGrants: (p.integrationGrants ?? []).map((grant) => ({
+        connectionId: grant.connectionId,
+        operation: grant.operation,
+        resourceConstraints: [...grant.resourceConstraints],
+      })),
+      launchAccess: p.launchAccess === "restricted" ? "restricted" : "organization",
+      launchPrincipalIdsText: (p.launchPrincipalIds ?? []).join("\n"),
       envRows: mapToEnvRows(p.envVars),
       networkDefault: p.network?.default === "allow" ? "allow" : "deny",
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
@@ -259,28 +296,53 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     [capabilities, network, secretRows, views, harnessDescriptor],
   );
   const connected = views.filter((v) => v.status === "connected");
+  const googleConnections = (connectionData?.connections ?? []).filter(
+    (connection) => connection.provider === "gcp" && connection.enabled,
+  );
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
   // --- capability helpers (enable→select) -----------------------------------
-  const setCaps = (next: string[]) => setValue("capabilities", next, { shouldDirty: true });
+  const setGrants = (next: typeof integrationGrants) =>
+    setValue("integrationGrants", next, { shouldDirty: true });
   const capOn = (provider: string, action: string) => {
-    const cap = `${provider}:${action}`;
-    return capabilities.some((x) => x === cap || x.startsWith(`${cap}@`));
+    return integrationGrants.some(
+      (grant) => grant.connectionId === `legacy:${provider}` && grant.operation === action,
+    );
   };
   const toggleCap = (provider: string, action: string, on: boolean) => {
-    const cap = `${provider}:${action}`;
-    const without = capabilities.filter((x) => x !== cap && !x.startsWith(`${cap}@`));
-    setCaps(on ? [...without, cap] : without);
+    const connectionId = `legacy:${provider}`;
+    const without = integrationGrants.filter(
+      (grant) => grant.connectionId !== connectionId || grant.operation !== action,
+    );
+    setGrants(
+      on ? [...without, { connectionId, operation: action, resourceConstraints: [] }] : without,
+    );
   };
   const enableProvider = (v: ConnectorView) => {
     const reads = v.capabilities.filter((c) => c.access === "read");
-    const pick = (reads.length ? reads : v.capabilities.slice(0, 1)).map(
-      (c) => `${v.provider}:${c.action}`,
-    );
-    setCaps([...new Set([...capabilities, ...pick])]);
+    const pick = reads.length ? reads : v.capabilities.slice(0, 1);
+    const next = [...integrationGrants];
+    for (const cap of pick) {
+      if (!capOn(v.provider, cap.action)) {
+        next.push({
+          connectionId: `legacy:${v.provider}`,
+          operation: cap.action,
+          resourceConstraints: [],
+        });
+      }
+    }
+    setGrants(next);
   };
   const disableProvider = (v: ConnectorView) =>
-    setCaps(capabilities.filter((x) => !x.startsWith(`${v.provider}:`)));
+    setGrants(integrationGrants.filter((grant) => grant.connectionId !== `legacy:${v.provider}`));
+
+  const toggleConnectionOperation = (connectionId: string, operation: string, on: boolean) => {
+    const without = integrationGrants.filter(
+      (grant) => grant.connectionId !== connectionId || grant.operation !== operation,
+    );
+    setGrants(on ? [...without, { connectionId, operation, resourceConstraints: [] }] : without);
+    if (on) setValue("launchAccess", "restricted", { shouldDirty: true });
+  };
 
   const onSubmit = async (vals: ProfileFormValues) => {
     const payload = {
@@ -294,7 +356,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       isDefault: vals.isDefault,
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
-      capabilities: vals.capabilities,
+      integrationGrants: vals.integrationGrants,
+      launchAccess: vals.launchAccess,
+      launchPrincipalIds: linesOf(vals.launchPrincipalIdsText),
       envVars: envRowsToMap(vals.envRows),
       network: {
         default: vals.networkDefault,
@@ -602,7 +666,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
             title="Integrations"
             sub="Enable an integration to bind its credential and open its egress — then choose exactly which powers sessions get."
           >
-            {connected.length === 0 ? (
+            {connected.length === 0 && googleConnections.length === 0 ? (
               <EmptyIntegrations />
             ) : (
               <div className="flex flex-col gap-3">
@@ -672,6 +736,86 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                     </div>
                   );
                 })}
+                {googleConnections.map((connection) => {
+                  const selectedOperations = GOOGLE_OPERATIONS.filter(([operation]) =>
+                    integrationGrants.some(
+                      (grant) =>
+                        grant.connectionId === connection.id && grant.operation === operation,
+                    ),
+                  );
+                  return (
+                    <div
+                      key={connection.id}
+                      className="overflow-hidden rounded-md border bg-background"
+                    >
+                      <div className="flex items-center gap-3 bg-blue-600/[0.06] px-3.5 py-3">
+                        <span className="flex size-8 items-center justify-center rounded-md bg-blue-600 text-xs font-semibold text-white">
+                          GC
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <div className="text-[0.92rem] font-semibold">
+                            {connection.displayName}
+                          </div>
+                          <div className="truncate font-mono text-[0.7rem] text-muted-foreground">
+                            {connection.googleCloud?.serviceAccountEmail}
+                          </div>
+                        </div>
+                        <Text
+                          variant="label"
+                          tone={selectedOperations.length ? "inherit" : "muted"}
+                        >
+                          {selectedOperations.length} granted
+                        </Text>
+                      </div>
+                      <div className="divide-y border-t">
+                        {GOOGLE_OPERATIONS.map(([operation, label]) => {
+                          const checked = selectedOperations.some(([value]) => value === operation);
+                          return (
+                            <label
+                              key={operation}
+                              className="flex cursor-pointer items-center gap-3 px-3.5 py-2.5 text-sm"
+                            >
+                              <Switch
+                                checked={checked}
+                                aria-label={`${connection.displayName} ${label}`}
+                                onCheckedChange={(value) =>
+                                  toggleConnectionOperation(connection.id, operation, value)
+                                }
+                              />
+                              <span className="flex-1">{label}</span>
+                              <code className="text-[10px] text-muted-foreground">{operation}</code>
+                            </label>
+                          );
+                        })}
+                      </div>
+                    </div>
+                  );
+                })}
+                {integrationGrants.some((grant) =>
+                  googleConnections.some((connection) => connection.id === grant.connectionId),
+                ) && (
+                  <Controller
+                    control={control}
+                    name="launchPrincipalIdsText"
+                    render={({ field }) => (
+                      <Field>
+                        <FieldLabel htmlFor="launch-principals">
+                          Allowed profile launch principals
+                        </FieldLabel>
+                        <Textarea
+                          id="launch-principals"
+                          rows={3}
+                          placeholder="One user or automation principal ID per line"
+                          {...field}
+                        />
+                        <FieldDescription>
+                          Administrators are always allowed. Google Cloud profiles are restricted to
+                          this list.
+                        </FieldDescription>
+                      </Field>
+                    )}
+                  />
+                )}
                 <Button
                   asChild
                   variant="ghost"

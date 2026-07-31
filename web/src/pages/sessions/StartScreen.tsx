@@ -166,7 +166,17 @@ export function StartScreen() {
   const policy: DerivedPolicy | null = selected
     ? derivePolicy(
         {
-          capabilities: selected.capabilities ?? [],
+          capabilities: (selected.integrationGrants ?? []).flatMap((grant) => {
+            const provider = grant.connectionId.startsWith("legacy:")
+              ? grant.connectionId.slice("legacy:".length)
+              : null;
+            if (!provider) return [];
+            return grant.resourceConstraints.length === 0
+              ? [`${provider}:${grant.operation}`]
+              : grant.resourceConstraints.map(
+                  (resource) => `${provider}:${grant.operation}@${resource}`,
+                );
+          }),
           network: {
             default: selected.network?.default === "allow" ? "allow" : "deny",
             allowHosts: selected.network?.allowHosts ?? [],

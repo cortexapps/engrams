@@ -51,7 +51,11 @@ interface ProfileLike {
   icon: string;
   imageId: string;
   archived: boolean;
-  capabilities: string[];
+  integrationGrants: Array<{
+    connectionId: string;
+    operation: string;
+    resourceConstraints: string[];
+  }>;
   network?: { default: string; allowHosts: string[]; allowHostPatterns: string[] };
   /** Default harness (catalog name) — resolves the harness's own egress hosts. */
   harness?: string | null;
@@ -86,7 +90,15 @@ function Row({
   const harnessEgress = harnesses?.find((h) => h.name === p.harness)?.descriptor?.egress;
   const policy = derivePolicy(
     {
-      capabilities: p.capabilities ?? [],
+      capabilities: (p.integrationGrants ?? []).flatMap((grant) => {
+        if (!grant.connectionId.startsWith("legacy:")) return [];
+        const provider = grant.connectionId.slice("legacy:".length);
+        return grant.resourceConstraints.length === 0
+          ? [`${provider}:${grant.operation}`]
+          : grant.resourceConstraints.map(
+              (resource) => `${provider}:${grant.operation}@${resource}`,
+            );
+      }),
       network: {
         default: p.network?.default === "allow" ? "allow" : "deny",
         allowHosts: p.network?.allowHosts ?? [],

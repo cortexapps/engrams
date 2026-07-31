@@ -339,6 +339,9 @@ coord_env = {
     # coord needs these — the host-agent has no app-gRPC surface.
     'ENGRAM_APP_GRPC_ADDR': env_or('ENGRAM_APP_GRPC_ADDR', '127.0.0.1:50061'),
     'ENGRAM_APP_GRPC_TOKENS': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
+    # ADR 0107: the coordinator calls the host-only Google token broker with
+    # the same explicit bearer that the local orchestrator validates.
+    'ENGRAM_GOOGLE_BROKER_BEARER': env_or('ENGRAM_APP_GRPC_TOKENS', 'dev-app-grpc-token'),
     'ENGRAM_MODE': 'coordinator' if dev_split else 'all',
     'ENGRAM_SANDBOX_BACKEND': sandbox_backend,
     'ENGRAM_SANDBOX_WORK_DIR': './var/sandboxes',

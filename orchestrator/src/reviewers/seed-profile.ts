@@ -2,6 +2,7 @@ import { isUniqueViolation } from "../db/pg-errors.ts";
 import type { ProfileStore } from "../db/profiles.ts";
 import { DEFAULT_PROFILE_NETWORK } from "../db/schema.ts";
 import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
+import { legacyCapabilityGrant } from "../integrations/grants.ts";
 
 export const PR_REVIEWER_DESIGNATION = "pr_reviewer";
 
@@ -44,7 +45,8 @@ export async function seedReviewerProfile(
         // token has no credential wiring and the workflow's clone fails with
         // "could not read Username for 'https://github.com'".
         skills: ["skills"],
-        capabilities: [PR_REVIEW_CAPABILITY],
+        integrationGrants: [legacyCapabilityGrant(PR_REVIEW_CAPABILITY)],
+        launchAccess: "organization",
         network: DEFAULT_PROFILE_NETWORK,
         secrets: [],
         isDefault: false,

@@ -1,0 +1,4 @@
+#!/bin/sh
+set -eu
+here="$(dirname "$(readlink -f "$0")")"
+exec "$here/../google-cloud-sdk/bin/gke-gcloud-auth-plugin" "$@"

@@ -166,6 +166,7 @@ export function makeAutomationTaskCreator(
       const { sessionId } = await createSession()({
         taskId,
         profileId: prepared.profileId,
+        launchPrincipalId: `automation:${input.automationId}`,
         role: "primary",
         prompt: prepared.prompt,
         registerListener: true,

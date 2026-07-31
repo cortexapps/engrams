@@ -17,4 +17,13 @@ describe("GitHub webhook IAP exemption", () => {
     expect(isIapPublicPath("/api/v1/hooks/my-hook/extra", "POST")).toBe(false);
     expect(isIapPublicPath("/api/v1/hooks/Bad_Slug", "POST")).toBe(false);
   });
+
+  test("publishes only the exact Google WIF discovery and JWKS paths", () => {
+    expect(isIapPublicPath(
+      "/api/v1/integrations/google-cloud/oidc/.well-known/openid-configuration",
+    )).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/google-cloud/oidc/jwks")).toBe(true);
+    expect(isIapPublicPath("/api/v1/integrations/google-cloud/oidc/token")).toBe(false);
+    expect(isIapPublicPath("/api/v1/integrations/google-cloud/oidc/jwks/extra")).toBe(false);
+  });
 });

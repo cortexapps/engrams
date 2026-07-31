@@ -356,6 +356,9 @@ async fn run(args: Args) -> std::io::Result<()> {
     // it can't steal an exit status a synchronous `try_wait()`/`wait()`
     // elsewhere is relying on.
     engram_agentd::reaper::spawn();
+    // ADR 0107: harmless metadata-style ADC. It contains no Google credential;
+    // sessions without an authorized GCP connection cannot use the placeholder.
+    tokio::spawn(engram_agentd::google_metadata::run());
 
     // ADR 0015 M1: one supervisor owns the harness child process
     // across the lifetime of the agent. Shared across all

@@ -182,6 +182,10 @@ message CreateSessionRequest {
   // /opt/engram/dyn/0/<harness>/<exec>. Required for an agent-mode session;
   // unset/ignored for dev_vm. Selection is per session, not baked into the image.
   optional string harness = 11;
+  // ADR 0107: the trusted orchestrator reserves this immutable ID before it
+  // stores the task-session authorization snapshot. Public HTTP callers cannot
+  // select session IDs.
+  optional string requested_session_id = 12;
 }
 
 message CreateSessionResponse {

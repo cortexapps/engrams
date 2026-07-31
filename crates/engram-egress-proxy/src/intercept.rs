@@ -17,8 +17,8 @@
 //!   hide a placeholder past the 1 MiB mark would need cooperation
 //!   from the upstream service to receive it, which is the same
 //!   threat model SSRF protections deal with elsewhere.
-//! - **HTTP/1.1 only.** ALPN advertises only `http/1.1`; an upstream
-//!   that wants H2 will fall back. H2 substitution lands later.
+//! - **HTTP/1.1 and HTTP/2.** HTTP/2 streams are gated independently and keep
+//!   the brokered authorization header on the host side. This includes gRPC.
 //! - **Reqs vs responses.** We rewrite client→upstream only.
 //!   Responses stream back as-is (Cloudflare etc. may stuff things
 //!   in headers but they don't carry our placeholders).
@@ -60,6 +60,7 @@ const GRAPHQL_REQUEST_BODY_BUDGET: usize = 256 * 1024;
 pub enum InterceptError {
     Io(std::io::Error),
     Tls(rustls::Error),
+    H2(h2::Error),
     Mint(crate::cert_mint::MintError),
     Resolve(ResolveError),
     Violation {
@@ -82,6 +83,8 @@ pub enum InterceptError {
     },
     InjectHeader(crate::inject::InjectHeaderError),
     InvalidServerName(String),
+    InvalidInjectedHeader(String),
+    CredentialRequestRejected,
 }
 
 impl std::fmt::Display for InterceptError {
@@ -89,6 +92,7 @@ impl std::fmt::Display for InterceptError {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Tls(e) => write!(f, "tls: {e}"),
+            Self::H2(e) => write!(f, "http2: {e}"),
             Self::Mint(e) => write!(f, "mint: {e}"),
             Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Violation { placeholder } => {
@@ -108,6 +112,12 @@ impl std::fmt::Display for InterceptError {
             }
             Self::InjectHeader(e) => write!(f, "credential injection rejected: {e}"),
             Self::InvalidServerName(s) => write!(f, "invalid SNI `{s}`"),
+            Self::InvalidInjectedHeader(name) => {
+                write!(f, "invalid injected HTTP header `{name}`")
+            }
+            Self::CredentialRequestRejected => {
+                write!(f, "credential-producing Google API request rejected")
+            }
         }
     }
 }
@@ -123,6 +133,12 @@ impl From<std::io::Error> for InterceptError {
 impl From<rustls::Error> for InterceptError {
     fn from(e: rustls::Error) -> Self {
         Self::Tls(e)
+    }
+}
+
+impl From<h2::Error> for InterceptError {
+    fn from(e: h2::Error) -> Self {
+        Self::H2(e)
     }
 }
 
@@ -149,84 +165,21 @@ impl From<ResolveError> for InterceptError {
 /// connections.
 pub fn build_server_config(mint: Arc<CertMint>) -> Arc<ServerConfig> {
     let resolver = SniResolver { mint };
-    let cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(cfg)
 }
 
-/// Build a rustls client config that trusts the host's normal trust
-/// store (via webpki-roots-equivalent rustls-native-roots... but
-/// we don't depend on that crate). We use the system trust store
-/// indirectly: rustls accepts whatever the OS offers. For now,
-/// load from `webpki-roots` is the simplest. But to avoid yet
-/// another dep we use rustls's *empty* root store and the upstream
-/// connection skips verification. **WARNING**: this is acceptable
-/// only because:
-///   - the proxy runs on the host (not inside the VM);
-///   - the upstream IP is resolved by the host's resolver;
-///   - we're MITM'ing already, so cert verification on the upstream
-///     side is the *host*'s responsibility, and the host is the TCB.
-///
-/// Even so, "skip verification" is a footgun. We use rustls's
-/// dangerous `with_custom_certificate_verifier` that always returns
-/// success. TODO before production rollout: load the host's system
-/// trust store via `rustls-native-certs` so the upstream cert is
-/// actually verified against real roots.
+/// Build a rustls client config with Mozilla's WebPKI roots. Upstream identity
+/// verification is mandatory before the proxy can attach a host-side secret.
 pub fn build_client_config() -> Arc<ClientConfig> {
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::DigitallySignedStruct;
-    use rustls::SignatureScheme;
-
-    #[derive(Debug)]
-    struct SkipVerification;
-    impl ServerCertVerifier for SkipVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-        fn verify_tls12_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn verify_tls13_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-                SignatureScheme::ED25519,
-            ]
-        }
-    }
-
-    let cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerification))
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    let mut cfg = ClientConfig::builder()
+        .with_root_certificates(roots)
         .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(cfg)
 }
 
@@ -292,6 +245,26 @@ where
         .map_err(|_| InterceptError::InvalidServerName(sni.to_string()))?;
     let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
 
+    let client_protocol = client_tls.get_ref().1.alpn_protocol();
+    let upstream_protocol = upstream_tls.get_ref().1.alpn_protocol();
+    if client_protocol == Some(b"h2") {
+        if upstream_protocol != Some(b"h2") {
+            return Err(InterceptError::Tls(rustls::Error::General(
+                "upstream did not negotiate HTTP/2".into(),
+            )));
+        }
+        return run_h2(
+            client_tls,
+            upstream_tls,
+            sni,
+            secrets,
+            injects,
+            session_id,
+            refresher,
+        )
+        .await;
+    }
+
     // Buffer the request prefix up to SCAN_BUDGET, scan for
     // violations + substitute placeholders, then forward + bidir
     // copy the rest.
@@ -323,6 +296,11 @@ where
     } else {
         None
     };
+    if let Some((method, path)) = &req_line {
+        if rejects_google_credential_request(sni, method, path) {
+            return Err(InterceptError::CredentialRequestRejected);
+        }
+    }
 
     // ADR 0059: is this request destined for a declared GraphQL endpoint? (Any
     // inject/observe entry that carries a GraphQL matcher AND whose path glob
@@ -396,11 +374,14 @@ where
         // WS4: re-mint any near-expiry minted credential BEFORE injecting it, so a
         // long-lived session never sends a stale (expired ~1h post-boot)
         // installation token — the campaign's reads-401/writes-succeed asymmetry.
-        // Single-flighted per entry; on refresh failure the stale secret is kept
-        // (see `InjectEntry::refresh_if_stale`). Static entries are a no-op.
+        // Single-flighted per entry. Generic providers keep a still-present
+        // stale secret on refresh failure. Google entries revalidate on every
+        // request and fail closed so connection disablement is immediate.
         if let Some(refresher) = refresher {
             for e in &matched {
-                e.refresh_if_stale(session_id, refresher).await;
+                if !e.refresh_for_request(session_id, refresher).await {
+                    return Err(InterceptError::CredentialRequestRejected);
+                }
             }
         }
         prefix = inject::inject_headers(prefix, &matched)?;
@@ -480,6 +461,201 @@ where
     let _ = client_tls.shutdown().await;
     let _ = upstream_tls.shutdown().await;
     Ok(())
+}
+
+/// Forward one HTTP/2 connection. Every stream gets an independent policy
+/// decision and authorization overwrite, so gRPC cannot reuse an approved
+/// stream to reach a second method.
+async fn run_h2<C, U>(
+    client_tls: C,
+    upstream_tls: U,
+    sni: &str,
+    secrets: &[&SecretEntry],
+    injects: &[&InjectEntry],
+    session_id: SessionId,
+    refresher: Option<&dyn InjectRefresher>,
+) -> Result<(), InterceptError>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut inbound = h2::server::handshake(client_tls).await?;
+    let (mut outbound, connection) = h2::client::handshake(upstream_tls).await?;
+    let upstream = tokio::spawn(connection);
+
+    while let Some(request) = inbound.accept().await {
+        let (request, mut respond) = request?;
+        let method = request.method().as_str().to_string();
+        let path = request
+            .uri()
+            .path_and_query()
+            .map_or_else(|| "/".to_string(), ToString::to_string);
+        if rejects_google_credential_request(sni, &method, &path) {
+            return Err(InterceptError::CredentialRequestRejected);
+        }
+
+        let matched: Vec<&InjectEntry> = injects
+            .iter()
+            .copied()
+            .filter(|entry| entry.policy.graphql.is_none() && entry.policy.allows(&method, &path))
+            .collect();
+        if !injects.is_empty() && matched.is_empty() {
+            return Err(InterceptError::RequestRejected { method, path });
+        }
+        if let Some(refresher) = refresher {
+            for entry in &matched {
+                if !entry.refresh_for_request(session_id, refresher).await {
+                    return Err(InterceptError::CredentialRequestRejected);
+                }
+            }
+        }
+
+        let (mut parts, mut request_body) = request.into_parts();
+        inject_h2_headers(&mut parts.headers, &matched)?;
+        if h2_headers_contain_disallowed_placeholder(&parts.headers, sni, secrets) {
+            return Err(InterceptError::Violation {
+                placeholder: "redacted".to_string(),
+            });
+        }
+
+        outbound = outbound.ready().await?;
+        let request_end = request_body.is_end_stream();
+        let request = http::Request::from_parts(parts, ());
+        let (response, mut upstream_body) = outbound.send_request(request, request_end)?;
+        let forward_request = async move {
+            if !request_end {
+                while let Some(data) = request_body.data().await {
+                    let data = data?;
+                    let len = data.len();
+                    request_body.flow_control().release_capacity(len)?;
+                    upstream_body.send_data(data, false)?;
+                }
+                if let Some(trailers) = request_body.trailers().await? {
+                    upstream_body.send_trailers(trailers)?;
+                } else {
+                    upstream_body.send_data(bytes::Bytes::new(), true)?;
+                }
+            }
+            Ok::<(), h2::Error>(())
+        };
+
+        let forward_response = async move {
+            let response = response.await?;
+            let (parts, mut response_body) = response.into_parts();
+            let response_end = response_body.is_end_stream();
+            let mut client_body =
+                respond.send_response(http::Response::from_parts(parts, ()), response_end)?;
+            if !response_end {
+                while let Some(data) = response_body.data().await {
+                    let data = data?;
+                    let len = data.len();
+                    response_body.flow_control().release_capacity(len)?;
+                    client_body.send_data(data, false)?;
+                }
+                if let Some(trailers) = response_body.trailers().await? {
+                    client_body.send_trailers(trailers)?;
+                } else {
+                    client_body.send_data(bytes::Bytes::new(), true)?;
+                }
+            }
+            Ok::<(), h2::Error>(())
+        };
+        tokio::try_join!(forward_request, forward_response)?;
+    }
+
+    upstream.abort();
+    Ok(())
+}
+
+fn inject_h2_headers(
+    headers: &mut http::HeaderMap,
+    entries: &[&InjectEntry],
+) -> Result<(), InterceptError> {
+    let mut rendered: Vec<(http::HeaderName, http::HeaderValue)> = Vec::new();
+    for entry in entries {
+        let name = http::HeaderName::from_bytes(entry.header_name.as_bytes())
+            .map_err(|_| InterceptError::InvalidInjectedHeader(entry.header_name.clone()))?;
+        let value =
+            http::HeaderValue::from_str(&entry.header_template.replace("{}", &entry.secret()))
+                .map_err(|_| InterceptError::InvalidInjectedHeader(entry.header_name.clone()))?;
+        if let Some((_, existing)) = rendered.iter().find(|(candidate, _)| candidate == name) {
+            if existing != value {
+                return Err(InterceptError::InjectHeader(
+                    crate::inject::InjectHeaderError::ConflictingValues {
+                        header_name: entry.header_name.clone(),
+                    },
+                ));
+            }
+            continue;
+        }
+        rendered.push((name, value));
+    }
+    for (name, value) in rendered {
+        headers.remove(&name);
+        headers.insert(name, value);
+    }
+    Ok(())
+}
+
+fn h2_headers_contain_disallowed_placeholder(
+    headers: &http::HeaderMap,
+    sni: &str,
+    secrets: &[&SecretEntry],
+) -> bool {
+    headers.values().any(|value| {
+        value.to_str().is_ok_and(|value| {
+            secrets
+                .iter()
+                .any(|secret| value.contains(&secret.placeholder) && !secret.allow.matches(sni))
+        })
+    })
+}
+
+/// Google STS and OAuth are never guest surfaces. IAM credential minting is
+/// denied even when an administrator selects a broad googleapis.com endpoint.
+fn rejects_google_credential_request(sni: &str, method: &str, path: &str) -> bool {
+    if sni.eq_ignore_ascii_case("sts.googleapis.com")
+        || sni.eq_ignore_ascii_case("oauth2.googleapis.com")
+        || sni.eq_ignore_ascii_case("accounts.google.com")
+        || sni.eq_ignore_ascii_case("securetoken.googleapis.com")
+        || sni.eq_ignore_ascii_case("iamcredentials.googleapis.com")
+    {
+        return true;
+    }
+    let path = path.to_ascii_lowercase();
+    let operation_path = path.split('?').next().unwrap_or(&path);
+    if sni.to_ascii_lowercase().ends_with(".googleapis.com")
+        && [
+            ":generateaccesstoken",
+            ":generateidtoken",
+            ":signblob",
+            ":signjwt",
+        ]
+        .iter()
+        .any(|operation| operation_path.ends_with(operation))
+    {
+        return true;
+    }
+    if sni.eq_ignore_ascii_case("www.googleapis.com")
+        && path.starts_with("/oauth2/")
+        && path
+            .split('?')
+            .next()
+            .is_some_and(|value| value.ends_with("/token"))
+    {
+        return true;
+    }
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+    (sni.eq_ignore_ascii_case("iam.googleapis.com")
+        && (path.contains("/serviceaccountkeys")
+            || (path.contains("/serviceaccounts/")
+                && path.split('?').next().is_some_and(|p| p.ends_with("/keys")))))
+        || (sni.eq_ignore_ascii_case("identitytoolkit.googleapis.com")
+            && [":signin", ":signup"]
+                .iter()
+                .any(|operation| path.contains(operation)))
 }
 
 /// ADR 0059: GraphQL set-coverage gate. Returns the inject entries whose auth
@@ -630,4 +806,183 @@ where
     let _ = client_wr.shutdown().await;
     c2u.abort();
     resp_buf
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::policy::HostList;
+    use crate::registry::{RefreshableCred, RequestPolicy};
+
+    #[test]
+    fn denies_google_credential_production_surfaces() {
+        assert!(rejects_google_credential_request(
+            "sts.googleapis.com",
+            "POST",
+            "/v1/token"
+        ));
+        assert!(rejects_google_credential_request(
+            "oauth2.googleapis.com",
+            "GET",
+            "/token"
+        ));
+        assert!(rejects_google_credential_request(
+            "accounts.google.com",
+            "GET",
+            "/o/oauth2/auth"
+        ));
+        assert!(rejects_google_credential_request(
+            "www.googleapis.com",
+            "POST",
+            "/oauth2/v4/token"
+        ));
+        for method in [
+            ":generateAccessToken",
+            ":generateIdToken",
+            ":signBlob",
+            ":signJwt",
+        ] {
+            assert!(rejects_google_credential_request(
+                "iamcredentials.googleapis.com",
+                "POST",
+                &format!("/v1/projects/-/serviceAccounts/a@example.com{method}")
+            ));
+        }
+        assert!(rejects_google_credential_request(
+            "iam.googleapis.com",
+            "POST",
+            "/v1/projects/-/serviceAccounts/a@example.com:signJwt"
+        ));
+        assert!(rejects_google_credential_request(
+            "iam.googleapis.com",
+            "POST",
+            "/v1/projects/p/serviceAccounts/a/keys"
+        ));
+        assert!(rejects_google_credential_request(
+            "identitytoolkit.googleapis.com",
+            "POST",
+            "/v1/accounts:signInWithCustomToken"
+        ));
+        assert!(!rejects_google_credential_request(
+            "compute.googleapis.com",
+            "POST",
+            "/compute/v1/projects/p/zones/z/instances/i/start"
+        ));
+    }
+
+    #[test]
+    fn h2_authorization_is_overwritten() {
+        let entry = InjectEntry {
+            header_name: "authorization".into(),
+            header_template: "Bearer {}".into(),
+            allow: HostList::from_manifest(&["compute.googleapis.com".into()], &[]).unwrap(),
+            policy: RequestPolicy::default(),
+            mint_provider: "gcp|c|compute.instances.get|compute.googleapis.com".into(),
+            cred: RefreshableCred::new("host-token".into(), None),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            "authorization",
+            http::HeaderValue::from_static("Bearer guest-value"),
+        );
+        inject_h2_headers(&mut headers, &[&entry]).unwrap();
+        assert_eq!(headers.get("authorization").unwrap(), "Bearer host-token");
+    }
+
+    #[tokio::test]
+    async fn proxies_a_grpc_style_h2_request_with_host_authorization() {
+        let (guest_io, proxy_guest_io) = tokio::io::duplex(16 * 1024);
+        let (proxy_upstream_io, upstream_io) = tokio::io::duplex(16 * 1024);
+
+        let proxy = tokio::spawn(async move {
+            let entry = InjectEntry {
+                header_name: "authorization".into(),
+                header_template: "Bearer {}".into(),
+                allow: HostList::from_manifest(&["logging.googleapis.com".into()], &[]).unwrap(),
+                policy: RequestPolicy {
+                    methods: vec!["POST".into()],
+                    path_globs: vec![
+                        "segment:/google.logging.v2.LoggingServiceV2/ListLogEntries".into()
+                    ],
+                    graphql: None,
+                },
+                mint_provider: "gcp|c|logging.entries.list|logging.googleapis.com".into(),
+                cred: RefreshableCred::new("host-token".into(), None),
+            };
+            run_h2(
+                proxy_guest_io,
+                proxy_upstream_io,
+                "logging.googleapis.com",
+                &[],
+                &[&entry],
+                SessionId::new(),
+                None,
+            )
+            .await
+        });
+
+        let upstream = tokio::spawn(async move {
+            let mut server = h2::server::handshake(upstream_io).await.unwrap();
+            let (request, mut respond) = server.accept().await.unwrap().unwrap();
+            assert_eq!(request.method(), http::Method::POST);
+            assert_eq!(
+                request.uri().path(),
+                "/google.logging.v2.LoggingServiceV2/ListLogEntries"
+            );
+            assert_eq!(
+                request.headers().get("authorization").unwrap(),
+                "Bearer host-token"
+            );
+            assert_eq!(
+                request.headers().get("content-type").unwrap(),
+                "application/grpc"
+            );
+            let mut body = request.into_body();
+            let data = body.data().await.unwrap().unwrap();
+            body.flow_control().release_capacity(data.len()).unwrap();
+            assert_eq!(data, bytes::Bytes::from_static(b"grpc-request"));
+
+            let response = http::Response::builder()
+                .status(200)
+                .header("content-type", "application/grpc")
+                .body(())
+                .unwrap();
+            let mut response_body = respond.send_response(response, false).unwrap();
+            response_body
+                .send_data(bytes::Bytes::from_static(b"grpc-response"), true)
+                .unwrap();
+            // Keep polling the server connection until the proxy closes it so
+            // the queued response frames reach the guest.
+            while server.accept().await.is_some() {}
+        });
+
+        let (mut guest, guest_connection) = h2::client::handshake(guest_io).await.unwrap();
+        let guest_connection = tokio::spawn(guest_connection);
+        guest = guest.ready().await.unwrap();
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("https://logging.googleapis.com/google.logging.v2.LoggingServiceV2/ListLogEntries")
+            .header("content-type", "application/grpc")
+            .header("authorization", "Bearer guest-token")
+            .body(())
+            .unwrap();
+        let (response, mut request_body) = guest.send_request(request, false).unwrap();
+        request_body
+            .send_data(bytes::Bytes::from_static(b"grpc-request"), true)
+            .unwrap();
+        let response = response.await.unwrap();
+        assert_eq!(response.status(), 200);
+        let mut response_body = response.into_body();
+        let data = response_body.data().await.unwrap().unwrap();
+        response_body
+            .flow_control()
+            .release_capacity(data.len())
+            .unwrap();
+        assert_eq!(data, bytes::Bytes::from_static(b"grpc-response"));
+
+        drop(guest);
+        guest_connection.abort();
+        upstream.await.unwrap();
+        proxy.abort();
+    }
 }

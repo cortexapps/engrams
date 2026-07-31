@@ -35,7 +35,7 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
@@ -103,9 +103,16 @@ fn inject_entry(secret: &str, methods: &[&str], paths: &[&str]) -> InjectEntry {
 ///   - Accepts one connection
 ///   - Reads the entire request body, stuffs it into the captured
 ///     Mutex, sends a 200 OK, closes
-async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
-    // Self-signed leaf for "fake-upstream"; the proxy's client
-    // config skips verification, so the cert chain doesn't matter.
+fn fake_upstream_tls() -> (ServerConfig, Arc<rustls::ClientConfig>) {
+    let mut ca_params = CertificateParams::default();
+    ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![
+        rcgen::KeyUsagePurpose::KeyCertSign,
+        rcgen::KeyUsagePurpose::CrlSign,
+    ];
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
     let mut params = CertificateParams::new(vec!["fake-upstream".to_string()]).unwrap();
     params.distinguished_name = {
         let mut dn = DistinguishedName::new();
@@ -114,14 +121,29 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
     };
     params.subject_alt_names = vec![SanType::DnsName("fake-upstream".try_into().unwrap())];
     let kp = KeyPair::generate().unwrap();
-    let cert = params.self_signed(&kp).unwrap();
+    let cert = params.signed_by(&kp, &ca_cert, &ca_key).unwrap();
     let cert_der = CertificateDer::from(cert.der().to_vec());
     let key_der: PrivateKeyDer<'static> =
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(kp.serialize_der()));
     let cfg = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(
+            vec![cert_der, CertificateDer::from(ca_cert.der().to_vec())],
+            key_der,
+        )
         .unwrap();
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(CertificateDer::from(ca_cert.der().to_vec()))
+        .unwrap();
+    let client = rustls::ClientConfig::builder()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+    (cfg, Arc::new(client))
+}
+
+async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> (SocketAddr, Arc<rustls::ClientConfig>) {
+    let (cfg, client_cfg) = fake_upstream_tls();
     let acceptor = TlsAcceptor::from(Arc::new(cfg));
 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -129,7 +151,9 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut tls = acceptor.accept(stream).await.unwrap();
+        let Ok(mut tls) = acceptor.accept(stream).await else {
+            return;
+        };
         // Drain until we see the HTTP headers terminator. A single
         // `read()` is not enough — the proxy can flush the rewritten
         // request across several TLS records, and which boundary a
@@ -156,7 +180,18 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
             .await;
         let _ = tls.shutdown().await;
     });
-    addr
+    (addr, client_cfg)
+}
+
+#[tokio::test]
+async fn production_client_config_rejects_an_untrusted_upstream() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let (upstream_addr, _test_client_config) = fake_upstream(captured).await;
+    let connector = TlsConnector::from(build_client_config());
+    let stream = TcpStream::connect(upstream_addr).await.unwrap();
+    let server_name: rustls::pki_types::ServerName<'static> = "fake-upstream".try_into().unwrap();
+    let result = connector.connect(server_name, stream).await;
+    assert!(result.is_err(), "a private test CA must not be trusted");
 }
 
 #[tokio::test]
@@ -164,10 +199,8 @@ async fn substitutes_placeholder_in_intercept_path() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
 
     // Client: connect to a localhost listener that the proxy
     // accepts on. We use a duplex pipe to avoid a third TCP
@@ -262,10 +295,8 @@ async fn violation_returned_when_placeholder_targets_disallowed_host() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
 
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
@@ -344,10 +375,8 @@ async fn injects_header_on_allowed_request() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
@@ -418,11 +447,9 @@ async fn keep_alive_second_request_cannot_bypass_the_gate() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
     // The fake upstream honors `Connection: close`: one response, then EOF.
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
@@ -541,10 +568,8 @@ async fn guest_upgrade_header_cannot_reopen_the_bypass() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     let inj = inject_entry("dd-secret-xyz", &["GET"], &["/api/v2/logs*"]);
@@ -646,10 +671,8 @@ async fn rejects_request_shape_outside_policy() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     // Only GET /api/v2/logs* is allowed; the client tries POST /api/v2/metrics.
@@ -711,10 +734,8 @@ async fn reject_writes_no_response_to_the_guest() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     // Only GET /api/v2/logs* is allowed; the guest attempts a DELETE (the
@@ -794,10 +815,8 @@ async fn near_expiry_inject_is_reminted_before_forwarding() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     // A minted github inject whose token expires in 2 min — inside the 5-min
@@ -866,30 +885,20 @@ async fn near_expiry_inject_is_reminted_before_forwarding() {
 
 /// A TLS upstream that captures the request head, then replies with the given
 /// response bytes and closes. Used by the observe tests to return a JSON body.
-async fn fake_upstream_resp(captured: Arc<Mutex<Vec<u8>>>, response: Vec<u8>) -> SocketAddr {
-    let mut params = CertificateParams::new(vec!["fake-upstream".to_string()]).unwrap();
-    params.distinguished_name = {
-        let mut dn = DistinguishedName::new();
-        dn.push(DnType::CommonName, "fake-upstream");
-        dn
-    };
-    params.subject_alt_names = vec![SanType::DnsName("fake-upstream".try_into().unwrap())];
-    let kp = KeyPair::generate().unwrap();
-    let cert = params.self_signed(&kp).unwrap();
-    let cert_der = CertificateDer::from(cert.der().to_vec());
-    let key_der: PrivateKeyDer<'static> =
-        PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(kp.serialize_der()));
-    let cfg = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
-        .unwrap();
+async fn fake_upstream_resp(
+    captured: Arc<Mutex<Vec<u8>>>,
+    response: Vec<u8>,
+) -> (SocketAddr, Arc<rustls::ClientConfig>) {
+    let (cfg, client_cfg) = fake_upstream_tls();
     let acceptor = TlsAcceptor::from(Arc::new(cfg));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
 
     tokio::spawn(async move {
         let (stream, _) = listener.accept().await.unwrap();
-        let mut tls = acceptor.accept(stream).await.unwrap();
+        let Ok(mut tls) = acceptor.accept(stream).await else {
+            return;
+        };
         let mut buf = Vec::new();
         let mut tmp = [0u8; 8192];
         loop {
@@ -908,7 +917,7 @@ async fn fake_upstream_resp(captured: Arc<Mutex<Vec<u8>>>, response: Vec<u8>) ->
         let _ = tls.write_all(&response).await;
         let _ = tls.shutdown().await;
     });
-    addr
+    (addr, client_cfg)
 }
 
 // ADR 0056 Phase 4: a request matching an observe spec gets its response parsed
@@ -919,8 +928,6 @@ async fn observes_response_and_emits_asset() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let body = r#"{"number":42,"title":"Bug","html_url":"http://x/i/42"}"#;
     let response = format!(
         "HTTP/1.1 201 Created\r\nContent-Length: {}\r\n\r\n{}",
@@ -929,7 +936,7 @@ async fn observes_response_and_emits_asset() {
     )
     .into_bytes();
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream_resp(captured.clone(), response).await;
+    let (upstream_addr, client_cfg) = fake_upstream_resp(captured.clone(), response).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     let observe = ObserveEntry {
@@ -1030,11 +1037,9 @@ async fn failed_status_emits_no_asset() {
     let ca = ca();
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
-
     let response = b"HTTP/1.1 422 Unprocessable Entity\r\nContent-Length: 2\r\n\r\n{}".to_vec();
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream_resp(captured.clone(), response).await;
+    let (upstream_addr, client_cfg) = fake_upstream_resp(captured.clone(), response).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     let observe = ObserveEntry {
@@ -1169,9 +1174,8 @@ async fn run_graphql_inject(
 ) -> (Result<(), InterceptError>, Vec<u8>) {
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, client_cfg) = fake_upstream(captured.clone()).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
     let resolver = Arc::new(StaticResolver::new().with("fake-upstream", upstream_addr));
     let proxy_task = tokio::spawn(async move {
@@ -1410,9 +1414,8 @@ async fn run_graphql_observe(
 ) -> Vec<ObservedAsset> {
     let mint = Arc::new(CertMint::new(ca.clone()));
     let server_cfg = build_server_config(mint);
-    let client_cfg = build_client_config();
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream_resp(captured.clone(), upstream_response).await;
+    let (upstream_addr, client_cfg) = fake_upstream_resp(captured.clone(), upstream_response).await;
     let (client_to_proxy, proxy_from_client) = tokio::io::duplex(64 * 1024);
 
     let collected: Arc<Mutex<Vec<(SessionId, ObservedAsset)>>> = Arc::new(Mutex::new(Vec::new()));

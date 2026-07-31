@@ -32,6 +32,8 @@ import type { ImagesClient } from "../rpc/profiles.ts";
 import type { UserIdentity, UserIdentityStore } from "../db/users.ts";
 import { createToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
+import { legacyCapabilityGrant } from "../integrations/grants.ts";
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -51,7 +53,8 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
+  launchAccess: "organization",
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,
@@ -83,6 +86,30 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
   }),
 });
 
+const fakeConnections = (): IntegrationConnectionStore => ({
+  list: async () => [],
+  get: async (id) => {
+    const provider = id.startsWith("legacy:") ? id.slice("legacy:".length) : "gcp";
+    return {
+      id,
+      alias: id.replace(":", "-"),
+      provider,
+      displayName: provider,
+      config: {},
+      enabled: true,
+      testedAt: new Date(0),
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    };
+  },
+  create: async () => { throw new Error("unused"); },
+  update: async () => { throw new Error("unused"); },
+  delete: async () => { throw new Error("unused"); },
+  markTested: async () => { throw new Error("unused"); },
+  setEnabled: async () => { throw new Error("unused"); },
+  ensureLegacy: async () => {},
+});
+
 // Default the user token to present ("tok") — a human (chat) run now BLOCKS when
 // the harness's declared user_env is unset, so tests exercising other
 // seams must have a token unless they specifically test the block.
@@ -93,6 +120,7 @@ const deps = (
 ): SessionCompileDeps => ({
   images: { listEnabledImages: async () => ({ images }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  connections: fakeConnections(),
   harnessCatalog: fakeHarnessCatalog(),
   resolveUserToken: async () => token,
   resolveAllUserTokens: async () => allTokens,
@@ -225,6 +253,7 @@ describe("compileSessionCreateInput", () => {
       },
       resolveUserToken: async (envVar) => (envVar === "OPENCODE_TOKEN" ? "tok-123" : null),
       resolveAllUserTokens: async () => ({}),
+      connections: fakeConnections(),
     };
     const inp = await compileSessionCreateInput(profile({ includeUserTokens: true }), customDeps);
     expect(inp.harnessEnv?.OPENCODE_TOKEN).toBe("tok-123");
@@ -361,7 +390,7 @@ describe("compileSessionCreateInput", () => {
     });
 
     const inp = await compileSessionCreateInput(
-      profile({ capabilities: ["memory:write"] }),
+      profile({ integrationGrants: [legacyCapabilityGrant("memory:write")] }),
       { ...deps(), toolRegistry },
     );
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
@@ -383,6 +412,41 @@ describe("compileSessionCreateInput", () => {
 
     const inp = await compileSessionCreateInput(profile(), { ...deps(), toolRegistry });
     expect(inp.harnessEnv?.ENGRAM_TOOLS).toBeUndefined();
+  });
+
+  test("Google Cloud grants mount the brokered CLI bundle and metadata ADC", async () => {
+    const connections = fakeConnections();
+    connections.get = async (id) => ({
+      id,
+      alias: "dev-vm",
+      provider: "gcp",
+      displayName: "Dev VM",
+      config: {
+        workloadIdentityProvider:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/dev",
+        serviceAccountEmail: "dev-vm@example-project.iam.gserviceaccount.com",
+        endpoints: ["compute.googleapis.com", "tunnel.cloudproxy.app"],
+      },
+      enabled: true,
+      testedAt: new Date(0),
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    });
+    const input = await compileSessionCreateInput(
+      profile({
+        integrationGrants: [{
+          connectionId: "connection-gcp",
+          operation: "compute.instances.get",
+          resourceConstraints: [],
+        }],
+        launchAccess: "restricted",
+      }),
+      { ...deps(), connections },
+    );
+
+    expect(input.selectedSkills).toContain("integrations-cli");
+    expect(input.harnessEnv?.GCE_METADATA_HOST).toBe("127.0.0.1:13338");
+    expect(input.harnessEnv?.ENGRAM_CLI_INTEGRATIONS).toContain('"provider":"gcp"');
   });
 
   test("extra capabilities widen integration grants but never the tool manifest", async () => {
@@ -410,7 +474,7 @@ describe("compileSessionCreateInput", () => {
     });
 
     const inp = await compileSessionCreateInput(
-      profile({ capabilities: ["engram:pr_review"] }),
+      profile({ integrationGrants: [legacyCapabilityGrant("engram:pr_review")] }),
       { ...deps(), toolRegistry },
       { extraCapabilities: [cloneCapability, cloneCapability] },
     );
@@ -451,7 +515,7 @@ describe("compileSessionCreateInput", () => {
 
     const inp = await compileSessionCreateInput(
       profile({
-        capabilities: ["github:pulls:write"],
+        integrationGrants: [legacyCapabilityGrant("github:pulls:write")],
         network: {
           default: "allow",
           allowHosts: ["profile.example.com"],
@@ -574,10 +638,10 @@ function recordingDb(
   throwOnTx = false,
   failInsertAt?: number,
 ): Db {
+  let insertCount = 0;
   return {
     transaction: async (fn: (tx: unknown) => Promise<unknown>) => {
       if (throwOnTx) throw new Error("db boom");
-      let insertCount = 0;
       const tx = {
         insert: () => ({
           values: async (v: Record<string, unknown>) => {
@@ -586,6 +650,7 @@ function recordingDb(
             records.push(v);
           },
         }),
+        delete: () => ({ where: async () => undefined }),
       };
       return fn(tx);
     },
@@ -616,11 +681,13 @@ const createDeps = (
     profileOver?: Partial<ProfileRow>;
     portExposures?: PortExposureStore;
     users?: CreateTaskDeps["users"];
+    launchGrants?: CreateTaskDeps["launchGrants"];
   } = {},
 ): CreateTaskDeps => ({
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
   images: { listEnabledImages: async () => ({ images: [{ id: "img-1", imageUri: "uri-1" }] }) } as unknown as ImagesClient,
   connectors: { list: async () => [] },
+  connections: fakeConnections(),
   harnessCatalog: fakeHarnessCatalog(),
   sessions,
   // Token present by default so human (chat) creates don't hit the block.
@@ -629,7 +696,10 @@ const createDeps = (
   // Default to "unknown user" so tests exercising other seams don't hit the
   // real Drizzle fallback against the fake Db.
   users: opts.users ?? fakeUsers(),
+  newTaskId: () => "task-1",
+  newSessionId: () => "sess-1",
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
+  ...(opts.launchGrants ? { launchGrants: opts.launchGrants } : {}),
 });
 
 describe("createTaskWithSession", () => {
@@ -668,7 +738,12 @@ describe("createTaskWithSession", () => {
       status: "open",
       source: { provider: "slack", team: "T1" },
     });
-    expect(records[1]).toMatchObject({ sessionId: "sess-1", role: "primary", profileId: "p1" });
+    expect(records[1]).toMatchObject({
+      sessionId: "sess-1",
+      role: "primary",
+      profileId: "p1",
+      integrationPrincipalId: "user-1",
+    });
     expect(records[2]).toEqual({ sessionId: "sess-1", threadWfId: "thread-wf-1" });
     expect(records[3]).toEqual({ sessionId: "sess-1" });
   });
@@ -710,7 +785,23 @@ describe("createTaskWithSession", () => {
     expect(sessions.createReqs).toHaveLength(0);
   });
 
-  test("compensates by deleting the orphan session when the DB write fails", async () => {
+  test("blocks a user without an explicit restricted-profile launch grant", async () => {
+    const sessions = fakeSessions();
+    await expect(createTaskWithSession(
+      createDeps(sessions, recordingDb([]), {
+        profileOver: { launchAccess: "restricted" },
+        launchGrants: {
+          listForProfiles: async () => new Map(),
+          replace: async () => {},
+          canLaunch: async () => false,
+        },
+      }),
+      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
+    )).rejects.toThrow(/launch is not granted/);
+    expect(sessions.createReqs).toHaveLength(0);
+  });
+
+  test("does not start a session when authorization snapshot persistence fails", async () => {
     const sessions = fakeSessions();
     await expect(
       createTaskWithSession(createDeps(sessions, recordingDb([], true)), {
@@ -719,7 +810,8 @@ describe("createTaskWithSession", () => {
         profileId: "p1",
       }),
     ).rejects.toThrow(/db boom/);
-    expect(sessions.deletedIds).toEqual(["sess-1"]);
+    expect(sessions.createReqs).toHaveLength(0);
+    expect(sessions.deletedIds).toEqual([]);
   });
 
   test("compensates when listener registration fails inside the task transaction", async () => {
@@ -834,6 +926,55 @@ describe("createTaskWithSession", () => {
 });
 
 describe("createSessionForExistingTask", () => {
+  test("uses an explicit automation principal for restricted-profile launch", async () => {
+    const sessions = fakeSessions();
+    const checked: string[] = [];
+    const records: Record<string, unknown>[] = [];
+    await createSessionForExistingTask(
+      createDeps(sessions, recordingDb(records), {
+        profileOver: { launchAccess: "restricted" },
+        launchGrants: {
+          listForProfiles: async () => new Map(),
+          replace: async () => {},
+          canLaunch: async (_profileId: string, principalId: string) => {
+            checked.push(principalId);
+            return principalId === "automation:nightly";
+          },
+        },
+      }),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "primary",
+        launchPrincipalId: "automation:nightly",
+      },
+    );
+    expect(checked).toEqual(["automation:nightly"]);
+    expect(sessions.createReqs).toHaveLength(1);
+    expect(records[0]?.integrationPrincipalId).toBe("automation:nightly");
+  });
+
+  test("blocks an automation principal without a restricted-profile launch grant", async () => {
+    const sessions = fakeSessions();
+    await expect(createSessionForExistingTask(
+      createDeps(sessions, recordingDb([]), {
+        profileOver: { launchAccess: "restricted" },
+        launchGrants: {
+          listForProfiles: async () => new Map(),
+          replace: async () => {},
+          canLaunch: async () => false,
+        },
+      }),
+      {
+        taskId: "task-existing",
+        profileId: "p1",
+        role: "primary",
+        launchPrincipalId: "automation:untrusted",
+      },
+    )).rejects.toThrow(/launch is not granted/);
+    expect(sessions.createReqs).toHaveLength(0);
+  });
+
   test("creates promptlessly and leaves listener registration off by default", async () => {
     const records: Record<string, unknown>[] = [];
     const sessions = fakeSessions();
@@ -859,6 +1000,11 @@ describe("createSessionForExistingTask", () => {
       role: "finder",
       profileId: "p1",
       capabilities: ["github:contents:read@openai/engrams"],
+      integrationGrants: [{
+        connectionId: "legacy:github",
+        operation: "contents:read",
+        resourceConstraints: ["openai/engrams"],
+      }],
     }]);
     const request = sessions.createReqs[0] as {
       prompt?: string;
@@ -892,6 +1038,7 @@ describe("createSessionForExistingTask", () => {
         role: "verifier",
         profileId: "p1",
         capabilities: [],
+        integrationGrants: [],
       },
       { sessionId: "sess-1" },
     ]);
@@ -899,10 +1046,11 @@ describe("createSessionForExistingTask", () => {
 
   test("threads policy clamps into the existing-task session compiler", async () => {
     const sessions = fakeSessions();
+    const records: Record<string, unknown>[] = [];
     await createSessionForExistingTask(
-      createDeps(sessions, recordingDb([]), {
+      createDeps(sessions, recordingDb(records), {
         profileOver: {
-          capabilities: ["github:pulls:write"],
+          integrationGrants: [legacyCapabilityGrant("github:pulls:write")],
           envVars: { PROFILE_PAT: "must-drop" },
           network: {
             default: "allow",
@@ -955,6 +1103,14 @@ describe("createSessionForExistingTask", () => {
       "api.github.com",
     ]);
     expect(policy.secrets.some((secret) => secret.secret_ref === "PROFILE_PAT")).toBe(false);
+    expect(records[0]?.integrationGrants).toEqual([
+      { connectionId: "legacy:engram", operation: "pr_review", resourceConstraints: [] },
+      {
+        connectionId: "legacy:github",
+        operation: "contents:read",
+        resourceConstraints: ["openai/engrams"],
+      },
+    ]);
   });
 
   test("compensates when requested listener registration fails", async () => {
@@ -971,12 +1127,13 @@ describe("createSessionForExistingTask", () => {
     expect(sessions.deletedIds).toEqual(["sess-1"]);
   });
 
-  test("deletes the orphan session when task_session persistence fails", async () => {
+  test("does not start a session when task_session persistence fails", async () => {
     const sessions = fakeSessions();
     await expect(createSessionForExistingTask(
       createDeps(sessions, recordingDb([], true)),
       { taskId: "task-existing", profileId: "p1", role: "finder" },
     )).rejects.toThrow(/db boom/);
-    expect(sessions.deletedIds).toEqual(["sess-1"]);
+    expect(sessions.createReqs).toHaveLength(0);
+    expect(sessions.deletedIds).toEqual([]);
   });
 });

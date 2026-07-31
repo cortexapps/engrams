@@ -7,34 +7,36 @@ gRPC, fake-gcs-server for the blob backend, NBD-served chunked
 rootfs, local OCI registry, and the web SPA — bound to localhost
 on the VM, with auth disabled.
 
-It's the same `just dev` you run on a laptop: one orchestrator (Tilt),
+It is the same `just dev` used elsewhere: one orchestrator (Tilt),
 backend auto-detected per host (ADR 0024). On the dev-vm the probe finds
 `/dev/kvm` and selects Firecracker + the prod-shape split topology; no
 flag, no per-arch recipe. Tilt comes from the nix devShell.
 
-The recipes assume the [`dev-vm` Claude skill](../.claude/skills/dev-vm/SKILL.md)
-is installed (Mutagen sync, `gcloud` SSH config). All commands
-below run **on the dev VM** unless noted otherwise.
+Run these workflows from an Engrams session whose restricted profile grants the
+dev VM Google Cloud connection. The session bundle supplies `gcloud`, OpenSSH,
+and Mutagen. Google authentication uses brokered metadata ADC. Do not run
+`gcloud auth login`, import a credential file, create a service-account key, or
+depend on a laptop Google login.
 
 ## TL;DR
 
 ```bash
-# laptop side
-bash .claude/skills/dev-vm/scripts/start.sh         # boot the VM
-bash .claude/skills/dev-vm/scripts/sync-start.sh    # start Mutagen
+# Use the exact project and zone from the connection grant.
+gcloud compute instances start engram-dev \
+  --project <project-id> --zone <zone>
 
-# dev-vm side — `just dev` (tilt up) is long-running, so launch it in
-# tmux: SSH-spawned foreground jobs die on disconnect.
-bash .claude/skills/dev-vm/scripts/ssh.sh \
-  "tmux new-session -d -s engram 'cd ~/engrams && nix develop --command just dev'"
+# Every SSH connection uses IAP. Long-running jobs belong in tmux.
+gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+  --tunnel-through-iap \
+  --command "tmux new-session -d -s engram 'cd ~/engrams && nix develop --command just dev'"
 
-# bake the Claude demo image + create a session (once the stack is up)
-bash .claude/skills/dev-vm/scripts/run.sh just bake-demo
-bash .claude/skills/dev-vm/scripts/run.sh just integration-session
+# Run one command on the VM.
+gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+  --tunnel-through-iap --command 'cd ~/engrams && nix develop --command just integration-test'
 
-# laptop side — port-forward + open
-bash .claude/skills/dev-vm/scripts/portforward.sh   # web 5173, coord 8090, registry 5001, tilt 10350
-open http://localhost:5173        # SPA      |  http://localhost:10350  # Tilt UI
+# Forward the web and Tilt ports into this session when needed.
+gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+  --tunnel-through-iap -- -N -L 5173:localhost:5173 -L 10350:localhost:10350
 ```
 
 ## What gets brought up
@@ -63,47 +65,49 @@ needs.
 
 ## Daily workflow
 
-1. **First time on a fresh VM**: see the [dev-vm skill's "Fresh VM"
-   workflow](../.claude/skills/dev-vm/SKILL.md). Bootstraps Mutagen,
-   installs Firecracker + nix, caches the FC test artifacts.
+1. **First time on a fresh VM**: use a separately reviewed bootstrap task. The
+   runtime connection does not grant VM creation, IAM changes, or service-account
+   key creation. Install Firecracker and Nix on the VM, then cache the FC test
+   artifacts.
 
 2. **Start of day**:
    ```bash
-   bash .claude/skills/dev-vm/scripts/start.sh
-   bash .claude/skills/dev-vm/scripts/sync-start.sh
-   bash .claude/skills/dev-vm/scripts/ssh.sh \
-     "tmux new-session -d -s engram 'cd ~/engrams && nix develop --command just dev'"
-   bash .claude/skills/dev-vm/scripts/portforward.sh   # laptop, foreground
+   gcloud compute instances start engram-dev --project <project-id> --zone <zone>
+   gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+     --tunnel-through-iap \
+     --command "tmux new-session -d -s engram 'cd ~/engrams && nix develop --command just dev'"
    ```
    Watch progress at http://localhost:10350 (Tilt UI) once port-forwarded.
 
 3. **Iterate on a session**:
    ```bash
-   bash .claude/skills/dev-vm/scripts/run.sh just bake-demo          # build + bake the Claude image
-   bash .claude/skills/dev-vm/scripts/run.sh just integration-session # create (or reuse) a session
-   curl localhost:8090/sessions
-   open http://localhost:5173
+   gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+     --tunnel-through-iap \
+     --command 'cd ~/engrams && nix develop --command just bake-demo'
+   gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+     --tunnel-through-iap \
+     --command 'cd ~/engrams && nix develop --command just integration-session'
    ```
 
-4. **After code changes**: Mutagen syncs the source tree automatically.
-   Rebuild + restart a single process from the Tilt UI (click its
-   "rebuild") at http://localhost:10350, or restart the whole stack by
-   killing + relaunching the tmux session.
+4. **After code changes**: run Mutagen through a session-local SSH configuration
+   whose `ProxyCommand` is `gcloud compute start-iap-tunnel ...
+   --listen-on-stdin`. Do not use a public address or `gcloud compute
+   config-ssh`. Rebuild one process from Tilt or restart the tmux session.
 
 5. **Reset to a clean slate** (drops DB volumes, fake-gcs bucket,
    sandbox state, baked images):
    ```bash
-   bash .claude/skills/dev-vm/scripts/run.sh bash -c '
-     tilt down || true
-     docker compose -f deploy/docker-compose.dev.yml -f deploy/docker-compose.linux.yml down -v
-     sudo rm -rf var/host-sandboxes var/host-sandboxes-b var/engram var/sandboxes'
+   gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+     --tunnel-through-iap --command \
+     'cd ~/engrams && tilt down; docker compose -f deploy/docker-compose.dev.yml -f deploy/docker-compose.linux.yml down -v'
    ```
    (`var/host-sandboxes*` are root-owned — the host-agent ran under sudo.)
 
 6. **End of day**:
    ```bash
-   bash .claude/skills/dev-vm/scripts/ssh.sh "tmux kill-session -t engram"
-   bash .claude/skills/dev-vm/scripts/stop.sh
+   gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+     --tunnel-through-iap --command 'tmux kill-session -t engram'
+   gcloud compute instances stop engram-dev --project <project-id> --zone <zone>
    ```
 
 ## Recipes at a glance
@@ -121,7 +125,9 @@ needs.
 ## Smoke-test the loop
 
 ```bash
-bash .claude/skills/dev-vm/scripts/run.sh just integration-test
+gcloud compute ssh engram-dev --project <project-id> --zone <zone> \
+  --tunnel-through-iap \
+  --command 'cd ~/engrams && nix develop --command just integration-test'
 ```
 
 Times bake, enable+cascade, and session create. Expected on the
@@ -150,10 +156,9 @@ dev-vm with a warm fake-gcs bucket:
   in some scenarios. If you hit it, set `ENGRAM_SKIP_WEB=1` (drops the
   web resource) or run `CI=true pnpm install` once in `web/`.
 
-- **Mutagen sync stalls** if you've edited a large untracked dir
-  (e.g. `target/` getting excluded after the fact). Check with
-  `.claude/skills/dev-vm/scripts/sync-status.sh`; force-reconcile
-  with `sync-flush.sh`.
+- **Mutagen sync stalls** if a large untracked directory was added before its
+  ignore rule. Use `mutagen sync list` and `mutagen sync flush <name>` through
+  the session-local IAP SSH configuration.
 
 - **`./var/host-sandboxes*/` is root-owned** because the host-agent
   runs under `sudo`. The reset snippet above uses `sudo rm -rf`. Don't

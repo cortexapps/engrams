@@ -14,7 +14,7 @@
 # symlinks onto PATH. Auth is brokered: each CLI carries a harmless placeholder
 # and the egress proxy injects the real credential host-side (ADR 0056/0057).
 name = "integrations-cli"
-description = "Integration CLIs (gh, glab, stripe, pup, + per-provider wrappers) + a discovery skill; binaries run on the base image's glibc."
+description = "Integration CLIs, Google Cloud and GKE tools, SSH, Mutagen, and a discovery skill; binaries run on the base image's glibc."
 
 [versions]
 # GitHub CLI — a static Go binary (no glibc deps).
@@ -27,3 +27,8 @@ pup = "1.4.0"
 glab = "1.105.0"
 # Stripe CLI — a static Go binary from github.com/stripe/stripe-cli releases.
 stripe = "1.43.2"
+# Google Cloud CLI versioned archive. The build installs the GKE auth plugin
+# into this self-contained SDK tree.
+gcloud = "577.0.0"
+kubectl = "1.36.1"
+mutagen = "0.18.1"

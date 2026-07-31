@@ -710,7 +710,7 @@ pub(crate) async fn resolve_inject_entries(
             // but the HEADER (name + rendered value) is the integration's — so the
             // auth scheme is the provider's, not hardcoded by the policy compiler.
             // The scoped credential never enters the guest.
-            match mint_inject_header(state, &inj.mint_provider, &caps).await {
+            match mint_inject_header(state, session_id, &inj.mint_provider, &caps).await {
                 Some((h, expires_at)) => engram_core::types::egress::EgressInjectEntry {
                     secret: h.value,
                     header_name: h.name,
@@ -794,12 +794,16 @@ pub(crate) async fn resolve_inject_entries(
 /// SigV4).
 async fn mint_inject_header(
     state: &SharedState,
+    session_id: SessionId,
     provider: &str,
     caps: &[engram_core::types::Capability],
 ) -> Option<(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
 )> {
+    if provider.starts_with("gcp|") {
+        return mint_google_inject_header(session_id, provider).await;
+    }
     let engine = state
         .integrations
         .resolve(provider, &state.services.secrets)
@@ -840,6 +844,118 @@ async fn mint_inject_header(
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleBrokerRequest<'a> {
+    session_id: String,
+    connection_id: &'a str,
+    operation: &'a str,
+    target: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GoogleBrokerResponse {
+    access_token: String,
+    expires_at: String,
+}
+
+/// Ask the orchestrator's WIF broker for a short-lived Google token. The
+/// marker contains only connection authority, never a credential. The token
+/// travels from one host-side process to another and is injected by the egress
+/// proxy; it never enters the guest.
+async fn mint_google_inject_header(
+    session_id: SessionId,
+    marker: &str,
+) -> Option<(
+    engram_core::traits::InjectHeader,
+    chrono::DateTime<chrono::Utc>,
+)> {
+    let mut parts = marker.split('|');
+    if parts.next() != Some("gcp") {
+        return None;
+    }
+    let (Some(connection_id), Some(operation), Some(target), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        tracing::warn!("invalid Google WIF mint marker");
+        return None;
+    };
+    let base = match std::env::var("ENGRAM_ORCHESTRATOR_INTERNAL_URL") {
+        Ok(value) if !value.trim().is_empty() => value.trim_end_matches('/').to_string(),
+        _ => {
+            tracing::warn!("Google WIF requested but ENGRAM_ORCHESTRATOR_INTERNAL_URL is unset");
+            return None;
+        }
+    };
+    let bearer = match std::env::var("ENGRAM_GOOGLE_BROKER_BEARER") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            tracing::warn!("Google WIF requested but no broker bearer is configured");
+            return None;
+        }
+    };
+    let response = match reqwest::Client::new()
+        .post(format!(
+            "{base}/internal/v1/integrations/google-cloud/token"
+        ))
+        .bearer_auth(bearer.trim())
+        .json(&GoogleBrokerRequest {
+            session_id: session_id.to_string(),
+            connection_id,
+            operation,
+            target,
+        })
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::warn!(
+                %session_id,
+                connection_id,
+                operation,
+                target,
+                status = %response.status(),
+                "Google WIF broker rejected token request"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                %session_id,
+                connection_id,
+                operation,
+                target,
+                %error,
+                "Google WIF broker request failed"
+            );
+            return None;
+        }
+    };
+    let payload = match response.json::<GoogleBrokerResponse>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "Google WIF broker returned an invalid response");
+            return None;
+        }
+    };
+    let expires_at = match payload.expires_at.parse::<chrono::DateTime<chrono::Utc>>() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "Google WIF broker returned an invalid expiry");
+            return None;
+        }
+    };
+    Some((
+        engram_core::traits::InjectHeader {
+            name: "Authorization".to_string(),
+            value: format!("Bearer {}", payload.access_token),
+        },
+        expires_at,
+    ))
+}
+
 /// WS4: re-mint the egress inject header for a single provider on demand — the
 /// reusable core the proxy-refresh route (`POST /hosts/:id/sessions/:sid/
 /// inject/refresh`) runs when the proxy's minted credential nears expiry. Fetches
@@ -861,7 +977,7 @@ pub(crate) async fn refresh_inject_header(
         .get_session_capabilities(session_id)
         .await
         .unwrap_or_default();
-    mint_inject_header(state, provider, &caps).await
+    mint_inject_header(state, session_id, provider, &caps).await
 }
 
 // Issue #535 (b): `persist_integration_policy` (ADR 0056 B′) retired — the

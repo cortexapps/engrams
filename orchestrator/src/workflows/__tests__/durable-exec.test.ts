@@ -73,7 +73,12 @@ const reviewerProfile: ProfileRow = {
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: ["engram:pr_review"],
+  integrationGrants: [{
+    connectionId: "legacy:engram",
+    operation: "pr_review",
+    resourceConstraints: [],
+  }],
+  launchAccess: "organization",
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,

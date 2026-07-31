@@ -48,6 +48,8 @@ import {
 } from "../db/schema.ts";
 import { eq, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
+import { legacyCapabilityGrant } from "../integrations/grants.ts";
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 
 // ---------------------------------------------------------------------------
 // DB gate (same pattern as db.test.ts)
@@ -132,9 +134,10 @@ function makeFakeSessions(opts: {
       if (opts.createShouldThrow) throw new Error("upstream create failed");
       const next = created.shift();
       if (!next) throw new Error("No more fake sessions in queue");
-      byId.set(next.id, next);
+      const sessionId = req.requestedSessionId ?? next.id;
+      byId.set(sessionId, { ...next, id: sessionId });
       return {
-        sessionId: next.id,
+        sessionId,
         status: next.status,
         imageVersion: req.imageUri,
         kind: "user",
@@ -241,7 +244,8 @@ function makeFakeProfiles(opts?: {
     includeUserTokens: opts?.includeUserTokens ?? false,
     envVars: opts?.envVars ?? {},
     skills: opts?.skills ?? [],
-    capabilities: opts?.capabilities ?? [],
+    integrationGrants: (opts?.capabilities ?? []).map(legacyCapabilityGrant),
+    launchAccess: "organization",
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
     isDefault: false,
@@ -540,6 +544,27 @@ interface TestServer {
   close: () => Promise<void>;
 }
 
+const fakeConnections: IntegrationConnectionStore = {
+  list: async () => [],
+  get: async (id) => ({
+    id,
+    alias: id.replace(":", "-"),
+    provider: id.startsWith("legacy:") ? id.slice(7) : "gcp",
+    displayName: id,
+    config: {},
+    enabled: true,
+    testedAt: new Date(0),
+    createdAt: new Date(0),
+    updatedAt: new Date(0),
+  }),
+  create: async () => { throw new Error("unused"); },
+  update: async () => { throw new Error("unused"); },
+  delete: async () => { throw new Error("unused"); },
+  markTested: async () => { throw new Error("unused"); },
+  setEnabled: async () => { throw new Error("unused"); },
+  ensureLegacy: async () => {},
+};
+
 async function spawnServer(deps: TaskDeps): Promise<TestServer> {
   const app = new Hono();
   app.notFound((c) => c.json({ error: "not found" }, 404));
@@ -555,6 +580,7 @@ async function spawnServer(deps: TaskDeps): Promise<TestServer> {
     // harness's declared user_env, so default to a permissive token store; a
     // test overrides `secrets` to exercise the block or a specific token.
     secrets: makeSeededTokens(),
+    connections: fakeConnections,
     ...deps,
   };
   const srv = buildServer(app, (router) => {
@@ -693,6 +719,8 @@ function listSessionRef(
     role: "primary",
     profileId: null,
     capabilities: null,
+    integrationGrants: null,
+    integrationPrincipalId: null,
     createdAt: new Date("2026-01-01T00:00:00.000Z"),
   };
 }
@@ -1579,13 +1607,13 @@ describe("TaskService — member scoping: orphan sessions excluded from member L
 });
 
 // ---------------------------------------------------------------------------
-// 6. Compensation path — upstream create OK + DB insert fails
+// 6. Authorization snapshot persistence fails before upstream create
 // ---------------------------------------------------------------------------
 
 const TX_ERROR_MESSAGE = "forced DB failure for compensation test";
 
-describe("TaskService — compensation: upstream OK + DB fail → DeleteSession called", () => {
-  test("DB insert failure triggers upstream DeleteSession", async () => {
+describe("TaskService — authorization snapshot persistence", () => {
+  test("DB insert failure prevents upstream session creation", async () => {
     const fakeSessionId = `comp-sess-${Date.now()}`;
     const fakeSessions = makeFakeSessions({
       created: [
@@ -1648,8 +1676,8 @@ describe("TaskService — compensation: upstream OK + DB fail → DeleteSession 
         throw new Error(`Unexpected error type: ${String(caughtErr)}`);
       }
 
-      // Compensation: upstream session should have been deleted.
-      expect(fakeSessions.deletedIds).toContain(fakeSessionId);
+      expect(fakeSessions.createReqs).toHaveLength(0);
+      expect(fakeSessions.deletedIds).toHaveLength(0);
     } finally {
       await srv.close();
     }

@@ -16,6 +16,7 @@ import { ConnectSheet } from "@/components/integrations/ConnectSheet";
 import { CustomConnectorModal } from "@/components/integrations/CustomConnectorModal";
 import { ProviderCard } from "@/components/integrations/ProviderCard";
 import { CategoryFilter } from "@/components/integrations/CategoryFilter";
+import { GoogleCloudConnections } from "@/components/integrations/GoogleCloudConnections";
 import { useConnectorViews, type ConnectorView } from "@/components/integrations/useConnectorViews";
 import { PageHeading } from "../page-heading";
 
@@ -65,6 +66,8 @@ export function IntegrationsPanel() {
           </Button>
         }
       />
+
+      <GoogleCloudConnections />
 
       <div className="flex flex-wrap items-center gap-2.5 border-b pb-4">
         <div className="relative min-w-[200px] flex-1">

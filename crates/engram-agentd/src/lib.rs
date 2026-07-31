@@ -19,6 +19,7 @@ pub mod cacerts;
 pub mod clock;
 pub mod exec_journal;
 pub mod forge;
+pub mod google_metadata;
 pub mod handler;
 pub mod harness_supervisor;
 pub mod ide;

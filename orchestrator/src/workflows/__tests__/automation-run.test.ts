@@ -278,6 +278,7 @@ describe("automation task creator", () => {
     expect(sessionInput).toEqual({
       taskId: "task-1",
       profileId: "profile-1",
+      launchPrincipalId: "automation:automation-1",
       role: "primary",
       prompt: "Do the work",
       registerListener: true,

@@ -85,6 +85,8 @@ import {
   type HarnessCatalogClient,
 } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
+import type { ProfileLaunchGrantStore } from "../db/profile-launch-grants.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -100,6 +102,7 @@ export type { Db } from "./task-create.ts";
 /** Subset of SessionService client used by TaskService. */
 export interface SessionsClient {
   createSession(req: {
+    requestedSessionId?: string;
     imageUri: string;
     mode: string;
     prompt?: string;
@@ -150,6 +153,8 @@ export interface TaskDeps {
   portExposures?: PortExposureStore;
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
+  connections?: IntegrationConnectionStore;
+  launchGrants?: ProfileLaunchGrantStore;
   /** Register a session for stream-listener scanner discovery. */
   db?: Db;
 }
@@ -559,6 +564,8 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           secrets: resolveSecrets(),
           portExposures: resolvePortExposures(),
           users: resolveUsers(),
+          ...(deps?.connections ? { connections: deps.connections } : {}),
+          ...(deps?.launchGrants ? { launchGrants: deps.launchGrants } : {}),
           db: getDbFn(),
         },
         {
@@ -568,6 +575,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           // harness token — compile the org-credential path (ADR 0063 B4)
           // even though the task type is "chat".
           ownerIsServiceAccount: user.serviceAccount,
+          ownerIsAdmin: user.role === "admin",
           profileId: req.profileId,
           title: req.title ?? null,
           ...(req.prompt != null ? { prompt: req.prompt } : {}),

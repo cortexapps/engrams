@@ -133,6 +133,39 @@ impl InjectEntry {
             ),
         }
     }
+
+    /// Revalidate Google WIF authority on every request. The broker can return a
+    /// cached Google token, but it first checks the live connection enabled
+    /// state. A denied or failed refresh is fail-closed so connection
+    /// disablement is an immediate kill switch for active sessions.
+    pub async fn refresh_for_request(
+        &self,
+        session_id: SessionId,
+        refresher: &dyn InjectRefresher,
+    ) -> bool {
+        if !self.mint_provider.starts_with("gcp|") {
+            self.refresh_if_stale(session_id, refresher).await;
+            return true;
+        }
+        let _guard = self.cred.refreshing.lock().await;
+        match refresher.refresh(session_id, &self.mint_provider).await {
+            Some(fresh) => {
+                *self.cred.current.write() = CredState {
+                    secret: fresh.secret,
+                    expires_at: Some(fresh.expires_at),
+                };
+                true
+            }
+            None => {
+                tracing::warn!(
+                    provider = %self.mint_provider,
+                    %session_id,
+                    "Google WIF request revalidation failed; denying request",
+                );
+                false
+            }
+        }
+    }
 }
 
 /// WS4: the mutable, single-flighted credential behind an [`InjectEntry`]. Reads
@@ -277,8 +310,17 @@ impl RequestPolicy {
     }
 
     /// Glob path match over the whole path; empty `path_globs` = any path.
+    /// An internal `segment:` prefix makes each `*` stop at `/`. Google Cloud
+    /// policies use this stricter form so a resource segment cannot absorb a
+    /// nested API action.
     pub fn path_matches(&self, path: &str) -> bool {
-        self.path_globs.is_empty() || self.path_globs.iter().any(|p| glob_match(p, path))
+        self.path_globs.is_empty()
+            || self.path_globs.iter().any(|pattern| {
+                pattern.strip_prefix("segment:").map_or_else(
+                    || glob_match(pattern, path),
+                    |pattern| segment_glob_match(pattern, path),
+                )
+            })
     }
 }
 
@@ -287,6 +329,15 @@ impl RequestPolicy {
 /// recursion blow-up). `*` is the only metacharacter — connector match paths use
 /// nothing else.
 fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_with(pattern, text, true)
+}
+
+/// Google resource-path glob: `*` matches within one `/`-delimited segment.
+fn segment_glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_with(pattern, text, false)
+}
+
+fn glob_match_with(pattern: &str, text: &str, star_matches_slash: bool) -> bool {
     let p = pattern.as_bytes();
     let t = text.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -302,6 +353,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             ti += 1;
         } else if let Some(s) = star {
             // Mismatch under a `*`: let the `*` swallow one more char of `text`.
+            if !star_matches_slash && t[star_ti] == b'/' {
+                return false;
+            }
             pi = s + 1;
             star_ti += 1;
             ti = star_ti;
@@ -684,6 +738,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn google_entry_revalidates_even_while_token_is_fresh() {
+        let e = InjectEntry {
+            mint_provider: "gcp|connection-1|compute.instances.get|compute.googleapis.com".into(),
+            ..mint_entry("current", Some(Utc::now() + Duration::hours(1)))
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "revalidated".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+            }),
+        };
+        assert!(e.refresh_for_request(SessionId::new(), &r).await);
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "revalidated");
+    }
+
+    #[tokio::test]
+    async fn google_entry_denies_when_live_revalidation_fails() {
+        let e = InjectEntry {
+            mint_provider: "gcp|connection-1|compute.instances.get|compute.googleapis.com".into(),
+            ..mint_entry(
+                "still-valid-but-disabled",
+                Some(Utc::now() + Duration::hours(1)),
+            )
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: None,
+        };
+        assert!(!e.refresh_for_request(SessionId::new(), &r).await);
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "still-valid-but-disabled");
+    }
+
+    #[tokio::test]
     async fn near_expiry_minted_entry_refreshes() {
         // Inside the 5-min window → re-mint and adopt the fresh secret.
         let e = mint_entry("stale", Some(Utc::now() + Duration::minutes(2)));
@@ -750,5 +840,16 @@ mod tests {
         // A bare `*` mid-pattern that must backtrack to a later literal.
         assert!(glob_match("/a/*/b", "/a/x/y/b"));
         assert!(!glob_match("/a/*/b", "/a/x/y/c"));
+
+        // Google resource patterns use segment globs. A resource wildcard must
+        // not authorize a nested action or subresource.
+        assert!(segment_glob_match(
+            "/compute/v1/projects/*/zones/*/instances/*",
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1"
+        ));
+        assert!(!segment_glob_match(
+            "/compute/v1/projects/*/zones/*/instances/*",
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1/start"
+        ));
     }
 }

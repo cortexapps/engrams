@@ -596,6 +596,11 @@ pub(crate) async fn load_session_secrets(
 
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
+    /// ADR 0107: trusted app-gRPC callers can reserve an ID so their external
+    /// authorization snapshot exists before the VM starts. The public JSON
+    /// surface cannot set this field.
+    #[serde(skip)]
+    pub requested_session_id: Option<SessionId>,
     /// Which baked image to boot. Required.
     pub image: ImageRef,
     /// How the session uses the image (ADR 0021 P1.3). Defaults to
@@ -1094,11 +1099,11 @@ pub(crate) async fn prepare_from_grpc(
         req.mode,
         req.prompt.clone(),
         req.secrets.clone(),
-        // ADR 0098 D1: mint from the INJECTED entropy (in prod this is
-        // `OsEntropy`, identical randomness; the deterministic simulator
-        // needs the id to be seed-derived). A raw `SessionId::new()` here
-        // was a determinism leak — the session id diverged every replay.
-        SessionId::from(state.services.entropy.uuid()),
+        // ADR 0107: the trusted orchestrator reserves the ID before boot so it
+        // can persist the immutable authorization snapshot first. Other create
+        // paths keep using injected entropy for deterministic replay.
+        req.requested_session_id
+            .unwrap_or_else(|| SessionId::from(state.services.entropy.uuid())),
         bundle,
         req.selected_skills.clone(),
         req.capabilities.clone(),

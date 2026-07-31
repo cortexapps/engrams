@@ -132,6 +132,7 @@ async fn stream_events_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".to_string(),
@@ -278,6 +279,7 @@ async fn session_crud_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".to_string(),
@@ -402,6 +404,7 @@ async fn exec_streaming_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
@@ -531,6 +534,7 @@ async fn write_files_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),
@@ -609,6 +613,7 @@ async fn snapshot_evict_resume_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri: image_uri.clone(),
         mode: "dev_vm".into(),
@@ -747,6 +752,7 @@ async fn get_artifact_not_found_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),
@@ -825,6 +831,7 @@ async fn shell_relay_smoke() {
     let mut create_req = tonic::Request::new(app::CreateSessionRequest {
         capabilities: Vec::new(),
         integration_policy_json: String::new(),
+        requested_session_id: None,
         selected_skills: Vec::new(),
         image_uri,
         mode: "dev_vm".into(),

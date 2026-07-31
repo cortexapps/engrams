@@ -1,4 +1,4 @@
-# No-IAP BackendConfig for the orchestrator's public Slack webhooks.
+# No-IAP BackendConfig for the orchestrator's narrowly public endpoints.
 #
 # Apply this alongside the Helm release (same namespace), then point the
 # orchestrator Service at it with the annotation in values-iap.yaml.example:
@@ -23,9 +23,8 @@
 # while everything else — including the primary orchestrator Service — stays
 # IAP-capable.
 #
-# Safe to expose without IAP: the orchestrator verifies every webhook with the
-# Slack signing secret + a 5-minute timestamp window (`isValidSlackRequest`,
-# ADR 0060) before doing any work. Slack's signature is the auth.
+# Safe to expose without IAP: webhook handlers verify provider signatures, and
+# ADR 0107 exposes only exact read-only Google OIDC discovery and JWKS paths.
 apiVersion: cloud.google.com/v1
 kind: BackendConfig
 metadata:
