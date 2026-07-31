@@ -1,4 +1,8 @@
 import { DBOS } from "@dbos-inc/dbos-sdk";
+import { eq } from "drizzle-orm";
+
+import { getDb } from "../db/client.ts";
+import { task as taskTable, taskSession as taskSessionTable } from "../db/schema.ts";
 
 import type { CuratedEvent } from "../control-plane/session-events.ts";
 import { log as rootLog } from "../log.ts";
@@ -20,6 +24,15 @@ export interface ToolConsumerDeps {
   pendingCalls: PendingToolCallStore;
   startWorkflow: ToolWorkflowStarter;
   now: () => Date;
+  /** ADR 0107 headless policy: true when the session's task exists and has no
+   *  human owner (an automation). Absent = never auto-approve. */
+  sessionIsOwnerless?: (sessionId: string) => Promise<boolean>;
+  /** The internal completer (`tools.complete`) the auto-approve rides. */
+  completeSessionTool?: (
+    sessionId: string,
+    toolCallId: string,
+    result: unknown,
+  ) => Promise<void>;
 }
 
 interface ToolCallRequestedPayload {
@@ -121,6 +134,36 @@ export function makeToolConsumer(deps: ToolConsumerDeps): SessionConsumer {
       const requested = parseToolCallRequested(event);
       if (!requested) return;
       const tool = deps.registry.get(requested.name);
+      // ADR 0107 headless policy: a plan proposed in an OWNERLESS session
+      // (an automation — nobody is watching) auto-approves immediately, so
+      // a cron session gets plan-then-implement instead of parking forever.
+      // The plan stays in session_events as a durable, reviewable record.
+      // Best-effort + idempotent: a redelivered request re-runs the same
+      // complete, which the completion guard treats as already-submitted.
+      if (
+        tool?.handling === "session" &&
+        requested.name === "exit_plan_mode" &&
+        deps.sessionIsOwnerless &&
+        deps.completeSessionTool
+      ) {
+        try {
+          if (await deps.sessionIsOwnerless(ctx.sessionId)) {
+            log.info(
+              { sessionId: ctx.sessionId, toolCallId: requested.toolCallId },
+              "auto-approving exit_plan_mode for an ownerless (automation) task",
+            );
+            await deps.completeSessionTool(ctx.sessionId, requested.toolCallId, {
+              decision: "approve",
+            });
+          }
+        } catch (err) {
+          log.error(
+            { sessionId: ctx.sessionId, toolCallId: requested.toolCallId, err },
+            "exit_plan_mode auto-approve failed; the plan stays parked",
+          );
+        }
+        return;
+      }
       if (!tool || tool.handling !== "handled") return;
 
       const input: ToolExecInput = {
@@ -161,5 +204,18 @@ export function makeProductionToolConsumer(): SessionConsumer {
     startWorkflow: async (input, workflowId) => {
       await DBOS.startWorkflow(toolExecWorkflow, { workflowID: workflowId })(input);
     },
+    sessionIsOwnerless: async (sessionId) => {
+      const rows = await getDb()
+        .select({ createdByUserId: taskTable.createdByUserId })
+        .from(taskSessionTable)
+        .innerJoin(taskTable, eq(taskSessionTable.taskId, taskTable.id))
+        .where(eq(taskSessionTable.sessionId, sessionId))
+        .limit(1);
+      // Only a REAL task row with no human creator counts — a session with
+      // no task at all is not an automation, just unattributed.
+      return rows.length > 0 && rows[0]!.createdByUserId == null;
+    },
+    completeSessionTool: (sessionId, toolCallId, result) =>
+      productionTools.complete(sessionId, toolCallId, result),
   });
 }

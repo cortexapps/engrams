@@ -471,6 +471,8 @@ export interface CreateSessionForExistingTaskParams {
   role: string;
   ownerUserId?: string;
   prompt?: string;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
   networkOverride?: ProfileNetwork;
@@ -565,6 +567,7 @@ export async function createSessionForExistingTask(
       // programmatic credential while still creating the session promptless.
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
       ...(params.capabilityOverride !== undefined
         ? { capabilityOverride: params.capabilityOverride }

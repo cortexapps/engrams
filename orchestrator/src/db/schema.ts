@@ -589,6 +589,8 @@ export interface CreateTaskAutomationAction {
   promptTemplate: string;
   titleTemplate?: string;
   includeEventContext: boolean;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
 }
 
 export type AutomationAction = CreateTaskAutomationAction;

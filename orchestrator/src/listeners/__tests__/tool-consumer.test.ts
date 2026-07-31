@@ -121,6 +121,40 @@ describe("tool consumer", () => {
     ]);
   });
 
+  // ADR 0107 headless policy: ownerless (automation) tasks auto-approve.
+  test("exit_plan_mode auto-approves when the session's task is ownerless", async () => {
+    const pending = pendingRecorder();
+    const completions: Array<{ sessionId: string; toolCallId: string; result: unknown }> = [];
+    const consumer = makeToolConsumer({
+      registry: registryFixture(),
+      pendingCalls: pending.store,
+      startWorkflow: async () => {},
+      now: () => new Date(0),
+      sessionIsOwnerless: async (sessionId) => sessionId === "session-cron",
+      completeSessionTool: async (sessionId, toolCallId, result) =>
+        void completions.push({ sessionId, toolCallId, result }),
+    });
+
+    await consumer.handle(requested("exit_plan_mode", "call-cron"), {
+      sessionId: "session-cron",
+    });
+    expect(completions).toEqual([
+      { sessionId: "session-cron", toolCallId: "call-cron", result: { decision: "approve" } },
+    ]);
+
+    // An OWNED session parks and waits for the human.
+    await consumer.handle(requested("exit_plan_mode", "call-human"), {
+      sessionId: "session-human",
+    });
+    expect(completions).toHaveLength(1);
+
+    // Questions are never auto-answered, ownerless or not.
+    await consumer.handle(requested("ask_user_question", "call-q"), {
+      sessionId: "session-cron",
+    });
+    expect(completions).toHaveLength(1);
+  });
+
   test("unknown tools run bookkeeping without dispatch", async () => {
     const pending = pendingRecorder();
     const workflowIds: string[] = [];
