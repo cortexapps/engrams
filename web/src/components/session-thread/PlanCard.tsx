@@ -13,6 +13,7 @@ import { Card, CardContent } from "@/components/ui/card";
 import { Text } from "@/components/ui/text";
 import { Textarea } from "@/components/ui/textarea";
 import { Markdown } from "@/components/Markdown";
+import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
 import { cn } from "@/lib/utils";
 import { hms } from "../transcriptFmt";
 import type { SystemMarker } from "./buildMessages";
@@ -38,6 +39,9 @@ function planTitle(plan: string): string {
 
 export function PlanCard({ marker }: { marker: PlanMarker }) {
   const { completeTool, answeredToolCallIds, sendBlocked } = useQuestionActions();
+  // Feedback is a message to the agent, so it obeys the same send chord the
+  // composer does (the user's Enter-to-send preference), not a hardcoded ⌘↵.
+  const [enterToSend] = useEnterToSend();
   const [feedbackOpen, setFeedbackOpen] = useState(false);
   const [feedback, setFeedback] = useState("");
   // Optimistic verdict while the RPC + wake round-trips (the VM may take
@@ -96,7 +100,7 @@ export function PlanCard({ marker }: { marker: PlanMarker }) {
               placeholder="What should change?"
               onChange={(e) => setFeedback(e.target.value)}
               onKeyDown={(e) => {
-                if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                if (isSubmitKey(e, enterToSend)) {
                   e.preventDefault();
                   decide("reject");
                 } else if (e.key === "Escape") {
@@ -113,7 +117,9 @@ export function PlanCard({ marker }: { marker: PlanMarker }) {
               <Button size="sm" variant="ghost" onClick={() => setFeedbackOpen(false)}>
                 Cancel
               </Button>
-              <span className="ml-auto text-xs italic text-muted-foreground">⌘↵ to send</span>
+              <span className="ml-auto text-xs italic text-muted-foreground">
+                {enterToSend ? "↵ to send" : "⌘↵ to send"}
+              </span>
             </div>
           </div>
         ) : (

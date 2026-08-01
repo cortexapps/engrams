@@ -25,7 +25,6 @@ import {
   CopyIcon,
   CornerDownLeftIcon,
   Loader2Icon,
-  MapIcon,
   SquareIcon,
   XIcon,
 } from "lucide-react";
@@ -43,6 +42,7 @@ import {
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
 import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
+import { ModeChip } from "@/components/ModeChip";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -318,6 +318,12 @@ const QueuedRail: FC<{
   );
 };
 
+// ADR 0107: mid-session the composer offers the one alternate mode plan mode.
+// (The start screen drives its chip from the harness descriptor; a live session
+// has no catalog fetch, and the coordinator rejects a mode the harness never
+// declared, so an undeclared plan mode fails loudly rather than silently.)
+const PLAN_MODE = [{ id: "plan", label: "Plan" }];
+
 const Composer: FC = () => {
   const status = useSessionStatus();
   const banner = status ? COMPOSER_BANNER[status] : undefined;
@@ -364,7 +370,7 @@ const Composer: FC = () => {
   if (planPending) hints.push("the agent proposed a plan — review it above ↑");
   if (canRecall && isEmpty) hints.push("↑ to edit queued message");
   if (isRunning) hints.push("esc to interrupt");
-  if (planMode) hints.push("plan mode — a read-only design pass · ⇧Tab to switch");
+  if (planMode) hints.push("plan mode — a read-only design pass");
   const hintLine = hints.length ? hints.join(" · ") : hint;
 
   return (
@@ -398,13 +404,6 @@ const Composer: FC = () => {
               }
               return;
             }
-            // ADR 0107: ⇧Tab toggles plan mode (CLI parity). Forward Tab
-            // still leaves the field.
-            if (e.key === "Tab" && e.shiftKey && !e.metaKey && !e.ctrlKey && !e.altKey) {
-              e.preventDefault();
-              setMode(planMode ? "default" : "plan");
-              return;
-            }
             // Esc interrupts the in-flight run, regardless of composer text. A
             // queued message (if any) then auto-runs next per the harness's
             // consume-on-result.
@@ -432,20 +431,11 @@ const Composer: FC = () => {
             }
           }}
         />
-        <TooltipIconButton
-          tooltip={planMode ? "Plan mode on (⇧Tab)" : "Plan first (⇧Tab)"}
-          side="top"
-          aria-pressed={planMode}
-          onClick={() => setMode(planMode ? "default" : "plan")}
-          className={
-            planMode
-              ? "h-7 w-auto gap-1 rounded-md bg-primary/10 px-2 text-xs font-medium text-primary animate-in fade-in zoom-in-95"
-              : "h-7 w-auto rounded-md px-1.5 text-muted-foreground/60"
-          }
-        >
-          <MapIcon className="size-3.5" />
-          {planMode && <span>Plan</span>}
-        </TooltipIconButton>
+        <ModeChip
+          modes={PLAN_MODE}
+          value={planMode ? "plan" : null}
+          onChange={(next) => setMode(next ?? "default")}
+        />
         <ComposerAction />
       </div>
       {hintLine && <p className="mt-1.5 px-2 text-xs text-muted-foreground italic">{hintLine}</p>}

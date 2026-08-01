@@ -37,7 +37,7 @@ export interface ComposerActions {
   removeQueued: (promptId: string) => void;
   /** ADR 0107: the composer's effective session mode ("default" | "plan"). */
   mode: string;
-  /** ADR 0107: set the mode for the NEXT prompt (⇧Tab / the chip). */
+  /** ADR 0107: set the mode for the NEXT prompt (the plan chip). */
   setMode: (next: string) => void;
   /** ADR 0107: a proposed plan is awaiting the user's review. */
   planPending: boolean;
