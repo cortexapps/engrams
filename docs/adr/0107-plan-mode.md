@@ -190,9 +190,9 @@ Summarized here; the full UX spec lives with the web-tier phase.
   collapse to one-line receipts, so reject → revise cycles stay calm. A
   read-only WorkPane "Plan" tab renders the full document with a revision
   switcher.
-- **Composer**: a `⊹ Plan` chip + Shift+Tab toggle; mode rides the next
-  SendPrompt. Faint thread markers narrate transitions ("planning —
-  read-only", "plan approved — building").
+- **Composer**: a `⊹ Plan` chip; mode rides the next SendPrompt. Faint thread
+  markers narrate transitions ("planning — read-only", "plan approved —
+  building").
 - **Attention**: the contracted-but-never-set task status `awaiting_review`
   (task.proto, orchestrator schema) is set by the tool-consumer when a
   session-handled call parks an owned task, cleared on completion. The rail,
@@ -243,6 +243,15 @@ One commit per phase. As-built divergences from the proposal:
   QUEUES the build prompt — `turn/completed` consumes it and `start_turn`
   re-reads the flipped stamp (the sticky `sandboxPolicy` override is
   re-sent every turn by design).
+- **Codex REJECT also rides the queue** (found in live use, sessions
+  fe3cd981 + 98111e00): the tool-result channel is not a steer for codex.
+  Answering the parked call `success: true` with the raw decision JSON, and
+  then answering it `success: false` with the reviewer's words in
+  `contentItems`, BOTH made the model narrate "Plan submitted for review."
+  and end the turn. A reject is now symmetric with an approve — answer the
+  call, interrupt, and queue the feedback as a fresh user turn — with the
+  stamp left at `plan`, so the revision turn is still read-only. Claude
+  needs none of this: `deny` + reason is its native keep-planning verdict.
 - **Attention is derived, not written**: task rows never store
   `awaiting_review`. The task list derives it at read time from the
   `pending_tool_calls` ledger (requested-but-unsubmitted session-handled
@@ -258,6 +267,15 @@ One commit per phase. As-built divergences from the proposal:
   tests, sim/PG rewind conformance, web buildMessages/PlanCard/contract
   tests. A real-CLI stack e2e needs provider keys the CI lane does not
   have; the noop choreography + the Phase 0 spike record stand in.
+- **Mode is a chip, not a keybinding**: Shift+Tab was proposed for CLI
+  parity but it is the browser's reverse-focus key, so hijacking it cost
+  keyboard navigation and did not read as a mode switch anyway. Mode now
+  lives only in `ModeChip` — a lit toggle for one alternate mode, a menu
+  for several — shared by the start screen and the session composer. The
+  capability selectors (harness/model/effort) became quiet text buttons
+  showing the value the launch will actually use ("Claude Opus 5", not
+  "Default model"), which is the shape Codex and the Claude desktop app
+  both converged on.
 
 ## Open questions
 

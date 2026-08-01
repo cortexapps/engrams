@@ -1049,6 +1049,20 @@ const PLAN_MODE_PREAMBLE: &str = "You are in plan mode: a read-only design pass.
 const PLAN_APPROVED_MESSAGE: &str =
     "Your plan was approved. Implement it now, following the plan you presented.";
 
+/// ADR 0107: a rejection is delivered the same way an approval is — as a
+/// fresh user turn, not as a tool result. Answering the parked call is not
+/// sufficient: codex reads a failed dynamic-tool result as "the tool did not
+/// work", narrates a summary, and ends the turn (session 98111e00 did exactly
+/// that with `success: false` plus the reviewer's words in `contentItems`).
+/// The stamp stays `plan`, so the revision turn is still read-only.
+fn plan_changes_requested_message(decision: &engram_harness_sdk::plan::PlanDecision) -> String {
+    format!(
+        "{} Revise the plan now and call exit_plan_mode again with the updated \
+         markdown. Stay in plan mode: do not modify files.",
+        decision.reject_reason()
+    )
+}
+
 async fn start_turn(server: &mut AppServer, prompt: &QueuedPrompt) -> Result<i64, String> {
     // ADR 0107: per-turn mode application — no respawn, ever. The stamp is
     // read fresh at every turn start; `sandboxPolicy` is an explicit
@@ -1247,24 +1261,21 @@ async fn route_tool_result(
     }
     // ADR 0107: an approved plan flips the stamp FIRST, so every turn that
     // starts after this point (the live build turn below, or the
-    // stale-generation follow-up) reads full access. A reject leaves the
-    // plan stamp and rides the ordinary respond-in-place path: the model
-    // sees `{decision:"reject", feedback}` as the tool result and keeps
-    // planning in the same read-only turn.
+    // stale-generation follow-up) reads full access. A reject leaves the plan
+    // stamp in place, so its revision turn stays read-only.
     let plan_decision = (call.tool_name == "exit_plan_mode")
         .then(|| engram_harness_sdk::plan::parse_plan_decision(&result_json))
         .flatten();
-    // ADR 0107: a REJECT must read as a FAILED call with the reviewer's
-    // feedback as the reason — the session fe3cd981 regression: answering it
-    // `success: true` with raw decision JSON made the model narrate "plan
-    // submitted" and end the turn instead of revising. Mirrors the claude
-    // adapter's deny-with-reason semantics.
+    // ADR 0107: a REJECT ends the plan turn and starts a new one carrying the
+    // reviewer's words — the only channel codex reliably acts on. Two earlier
+    // shapes both failed: `success: true` with the raw decision JSON (session
+    // fe3cd981) and `success: false` with the feedback in `contentItems`
+    // (session 98111e00) each made the model narrate "plan submitted" and stop.
     if let Some(decision) = plan_decision.as_ref().filter(|d| !d.approved()) {
-        let text = format!(
-            "{} Revise the plan now and call exit_plan_mode again with the              updated markdown. Stay in plan mode and do not modify files.",
-            decision.reject_reason()
-        );
+        let text = plan_changes_requested_message(decision);
         if call.request_generation == server.generation && !call.request_id.is_null() {
+            // Answer the parked call so the app-server is not left waiting,
+            // then interrupt and queue the revision turn.
             if let Err(error) = server
                 .respond(
                     call.request_id.clone(),
@@ -1281,6 +1292,40 @@ async fn route_tool_result(
             if let Err(error) = parked.take(call_id) {
                 tracing::error!(%error, %call_id, "could not retire rejected plan call");
             }
+            // Own the completion rather than wait for codex's own item update:
+            // the interrupt below can land first and drop it.
+            emit(
+                events,
+                HarnessEvent::ToolCallCompleted {
+                    run_id: active.clone().unwrap_or_default(),
+                    tool_call_id: call_id.to_owned(),
+                    tool_name: call.tool_name.clone(),
+                    ok: false,
+                    duration_ms: 0,
+                    result_summary: Some("changes requested".to_string()),
+                },
+            )
+            .await;
+            if let Some(turn_id) = active.as_deref() {
+                match server
+                    .send_request(
+                        "turn/interrupt",
+                        json!({"threadId": server.thread_id, "turnId": turn_id}),
+                    )
+                    .await
+                {
+                    Ok(id) => {
+                        pending.insert(id, Pending::Interrupt);
+                    }
+                    Err(error) => {
+                        tracing::error!(%error, %call_id, "could not interrupt the rejected plan turn");
+                    }
+                }
+            }
+            queued.push_back(QueuedPrompt {
+                prompt_id: format!("plan-changes-{}", uuid::Uuid::new_v4()),
+                text,
+            });
             return;
         }
         // Stale generation: deliver the revision ask as a follow-up user turn
@@ -2149,6 +2194,10 @@ mod tests {
     thread/start|thread/resume)
       printf '{"id":%s,"result":{"thread":{"id":"t1","turns":[]}}}\n' "$id"
       ;;
+    turn/interrupt)
+      printf '{"id":%s,"result":{}}\n' "$id"
+      printf '{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn-1","status":"completed"}}}\n'
+      ;;
     turn/start)
       printf '{"id":%s,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}\n' "$id"
 "#,
@@ -2664,7 +2713,7 @@ done
     /// as a FAILED call carrying the reviewer's feedback — a success-shaped
     /// response made the model narrate "plan submitted" and end the turn.
     #[tokio::test]
-    async fn plan_reject_answers_the_parked_call_as_failure_with_feedback() {
+    async fn plan_reject_starts_a_revision_turn_carrying_the_feedback() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft"},"threadId":"t1","turnId":"turn-1"}}"#;
         let (script, record) = write_fake_codex(&[tool_call]).await;
         let base = script.parent().unwrap().to_path_buf();
@@ -2743,6 +2792,38 @@ done
         })
         .await
         .expect("reject response recorded");
+
+        // ...and the feedback must come back as a fresh read-only turn. The
+        // tool result alone is not a steer: codex reads a failed dynamic call
+        // as "the tool did not work" and ends the turn (session 98111e00).
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let requests = recorded_requests(&record).await;
+                if let Some(revision) = requests.iter().find(|request| {
+                    request.get("method") == Some(&json!("turn/start"))
+                        && request
+                            .pointer("/params/input/0/text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| text.contains("Update the README.md"))
+                }) {
+                    assert_eq!(
+                        revision.pointer("/params/sandboxPolicy/type"),
+                        Some(&json!("readOnly")),
+                        "the revision turn stays in plan mode: {revision}"
+                    );
+                    assert!(
+                        requests
+                            .iter()
+                            .any(|r| r.get("method") == Some(&json!("turn/interrupt"))),
+                        "the rejected plan turn is interrupted first"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("revision turn started with the reviewer's feedback");
         engine.abort();
     }
 
