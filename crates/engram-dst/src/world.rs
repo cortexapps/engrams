@@ -99,6 +99,20 @@ pub enum HarnessPhase {
     },
     /// Registered on the hub: `send_prompt` succeeds.
     Attached,
+    /// ADR 0108 A8 (prod 7eddce62, the fourth stall shape): the link is
+    /// DEAD but the hub has not reaped the handle yet. The hub view
+    /// ([`SimHostWorld::harness_attached`]) still reports it attached,
+    /// so a heartbeat counts it in the `attached` set and `send_prompt`
+    /// is ACCEPTED (Ok) — but the socket has no reader: the accepted
+    /// prompt is never recorded, so the pump never echoes `run_started`
+    /// for it, and no Idle announcement occurs. The hub notices at
+    /// `reap_due` (the scheduled reap): from then on the handle is gone
+    /// — `harness_attached` is false, `send_prompt` answers `NotFound`,
+    /// and the normal recovery path (reattach → dial → Attached)
+    /// applies. Only a long-pause severance enters here (the fault
+    /// knob [`SimHostWorld::sever_attach_stale`]); destroy/crash
+    /// severances stay immediate.
+    Stale { reap_due: tokio::time::Instant },
 }
 
 /// The attach plane's shared state. A separate mutex from `hosts`; lock
@@ -113,6 +127,12 @@ pub struct AttachPlane {
     /// The scheduled dial latency — the attach-delayed-by-N fault knob.
     /// Default mirrors the observed 50–200 ms production lag.
     delay: std::time::Duration,
+    /// How long a [`HarnessPhase::Stale`] handle survives before the
+    /// hub notices the dead link and reaps it — a knob like `delay`.
+    /// The window must be BOUNDED: an unreaped stale handle would
+    /// silence both `NotFound` recovery and the A8 heartbeat repair
+    /// forever. Sampled at severance time.
+    reap_window: std::time::Duration,
     /// Hosts whose NEWLY scheduled dials are swallowed (the fault is
     /// sampled at schedule time; healing the flag does not revive an
     /// already-swallowed dial — only a nudge does, as in production).
@@ -142,6 +162,7 @@ impl Default for AttachPlane {
             next_serial: 0,
             harness: BTreeMap::new(),
             delay: std::time::Duration::from_millis(200),
+            reap_window: std::time::Duration::from_secs(5),
             swallowed_hosts: BTreeSet::new(),
             delivered: Vec::new(),
             nudges: BTreeMap::new(),
@@ -386,6 +407,64 @@ impl SimHostWorld {
         self.attach.lock().delay = delay;
     }
 
+    /// Set the stale-handle reap window — how long a severed link stays
+    /// advertised on the hub before the reap. Applies to severances
+    /// armed AFTER the call.
+    pub fn set_attach_reap_window(&self, window: std::time::Duration) {
+        self.attach.lock().reap_window = window;
+    }
+
+    /// The long-pause severance fault (prod 7eddce62): kill the harness
+    /// link of an ATTACHED sandbox while the hub keeps advertising the
+    /// handle. Returns `true` if the handle went Stale. Only `Attached`
+    /// can go stale — a dial has no established link to sever, and a
+    /// second severance must not extend the reap window. Destroy/crash
+    /// severances keep their immediate behavior (`apply_effect` /
+    /// `drop_host_harness`) — they never route through Stale.
+    pub fn sever_attach_stale(&self, sandbox: SandboxId) -> bool {
+        let mut plane = self.attach.lock();
+        let reap_due = tokio::time::Instant::now() + plane.reap_window;
+        match plane.harness.get_mut(&sandbox) {
+            Some((_, phase)) => match phase {
+                HarnessPhase::Attached => {
+                    *phase = HarnessPhase::Stale { reap_due };
+                    true
+                }
+                HarnessPhase::Dialing { .. } | HarnessPhase::Stale { .. } => false,
+            },
+            None => false,
+        }
+    }
+
+    /// Reap due Stale handles: the hub notices the dead link and drops
+    /// the registration. From this moment `harness_attached` is false
+    /// and `send_prompt` answers `NotFound` — the disagreement window
+    /// the A8 heartbeat repair keys on OPENS here (prod: the six
+    /// disagreement heartbeats fired only after the hub noticed).
+    /// Driven from the scheduler's per-step pump, so the reap lands
+    /// deterministically at a step boundary.
+    pub fn reap_due_stale_handles(&self) {
+        let now = tokio::time::Instant::now();
+        self.attach
+            .lock()
+            .harness
+            .retain(|_, (_, phase)| match phase {
+                HarnessPhase::Stale { reap_due } => *reap_due > now,
+                HarnessPhase::Dialing { .. } | HarnessPhase::Attached => true,
+            });
+    }
+
+    /// Whether this sandbox's handle is Stale (link dead, hub not yet
+    /// reaped) — scenario observability.
+    pub fn harness_stale(&self, sandbox: SandboxId) -> bool {
+        match self.attach.lock().harness.get(&sandbox) {
+            Some((_, HarnessPhase::Stale { .. })) => true,
+            Some((_, HarnessPhase::Attached)) | Some((_, HarnessPhase::Dialing { .. })) | None => {
+                false
+            }
+        }
+    }
+
     /// Opt into the attach-completion Idle announcement (the A3 signal)
     /// — see the `announce` field note for why the swarm defaults off.
     pub fn set_attach_announce(&self, on: bool) {
@@ -455,7 +534,9 @@ impl SimHostWorld {
                         due,
                         swallowed,
                     } => (!swallowed && due <= now).then_some((serial, *sandbox, *host)),
-                    HarnessPhase::Attached => None,
+                    // A Stale handle has no dial in flight; its only
+                    // exits are the reap and a nudge.
+                    HarnessPhase::Attached | HarnessPhase::Stale { .. } => None,
                 })
                 .collect();
             due.sort_by_key(|(serial, _, _)| *serial);
@@ -484,10 +565,12 @@ impl SimHostWorld {
         let mut plane = self.attach.lock();
         for (serial, sandbox, owner) in validated {
             let current = plane.harness.get(&sandbox).map(|(_, p)| p.clone());
-            let still_this_dial = matches!(
-                current,
-                Some(HarnessPhase::Dialing { serial: s, .. }) if s == serial
-            );
+            // Exhaustive — a new phase must decide here, not silently
+            // lose the committing dial.
+            let still_this_dial = match current {
+                Some(HarnessPhase::Dialing { serial: s, .. }) => s == serial,
+                Some(HarnessPhase::Attached) | Some(HarnessPhase::Stale { .. }) | None => false,
+            };
             if !still_this_dial {
                 continue;
             }
@@ -507,21 +590,51 @@ impl SimHostWorld {
         completed
     }
 
-    /// World truth for the attach-disagreement oracle and the sim
-    /// `send_prompt` gate: only an `Attached` harness accepts the relay.
+    /// The HUB's advertised view: does it hold a registered handle for
+    /// this sandbox? A `Stale` handle IS attached here — the hub has
+    /// not noticed the dead link yet, which is the whole 7eddce62
+    /// shape: the heartbeat `attached` set carries it, `send_prompt`
+    /// is accepted, and the attach-disagreement oracle stays quiet
+    /// until the reap opens the window (as in prod, where the alarm
+    /// fired only after the hub noticed).
     pub fn harness_attached(&self, sandbox: SandboxId) -> bool {
-        matches!(
-            self.attach.lock().harness.get(&sandbox),
-            Some((_, HarnessPhase::Attached))
-        )
+        match self.attach.lock().harness.get(&sandbox) {
+            Some((_, HarnessPhase::Attached)) | Some((_, HarnessPhase::Stale { .. })) => true,
+            Some((_, HarnessPhase::Dialing { .. })) | None => false,
+        }
     }
 
-    /// The current in-flight dial's serial (None when attached/absent).
+    /// The current in-flight dial's serial (None when attached, stale,
+    /// or absent).
     pub fn dial_serial(&self, sandbox: SandboxId) -> Option<u64> {
         match self.attach.lock().harness.get(&sandbox) {
             Some((_, HarnessPhase::Dialing { serial, .. })) => Some(*serial),
-            Some((_, HarnessPhase::Attached)) | None => None,
+            Some((_, HarnessPhase::Attached)) | Some((_, HarnessPhase::Stale { .. })) | None => {
+                None
+            }
         }
+    }
+
+    /// ADR 0108 A8: the two sandbox sets a host heartbeat carries —
+    /// `running` (the backend's list) and `attached` (the hub's
+    /// advertised handles, [`Self::harness_attached`]'s view). A Stale
+    /// handle is IN `attached`: the disagreement `harness_desync::
+    /// run_once` repairs opens only at reap. Hosts lock is taken and
+    /// released BEFORE the attach lock (lock order: hosts → attach).
+    pub fn heartbeat_sets(&self, host: HostId) -> (BTreeSet<SandboxId>, BTreeSet<SandboxId>) {
+        let running: BTreeSet<SandboxId> = {
+            let hosts = self.hosts.lock();
+            hosts
+                .get(&host)
+                .map(|h| h.sandboxes.keys().copied().collect())
+                .unwrap_or_default()
+        };
+        let attached = running
+            .iter()
+            .copied()
+            .filter(|s| self.harness_attached(*s))
+            .collect();
+        (running, attached)
     }
 
     /// How many dial nudges (`start_agent` calls / SIGUSR1-equivalents)
@@ -535,19 +648,28 @@ impl SimHostWorld {
             .unwrap_or(0)
     }
 
-    /// Record a prompt an Attached harness accepted; the scheduler's
-    /// pump echoes `run_started{prompt_id}` for it (the confirming event
-    /// that retires the outbox row).
-    fn record_delivered_prompt(
+    /// The hub relay gate for `send_prompt`: exhaustive over the phase,
+    /// so a new phase is a compile-checked delivery decision here.
+    /// `Attached` accepts and records the prompt for the pump's
+    /// `run_started` echo (the confirming event that retires the outbox
+    /// row). `Stale` ACCEPTS (the hub still advertises the handle —
+    /// `Ok` into a socket with no reader, prod 7eddce62) but records
+    /// NOTHING: no echo ever follows. Dialing/absent answer `NotFound`.
+    fn hub_accept_prompt(
         &self,
         sandbox: SandboxId,
         owner: Option<SessionId>,
         prompt_id: String,
-    ) {
-        self.attach
-            .lock()
-            .delivered
-            .push((sandbox, owner, prompt_id));
+    ) -> Result<(), SandboxError> {
+        let mut plane = self.attach.lock();
+        match plane.harness.get(&sandbox) {
+            Some((_, HarnessPhase::Attached)) => {
+                plane.delivered.push((sandbox, owner, prompt_id));
+                Ok(())
+            }
+            Some((_, HarnessPhase::Stale { .. })) => Ok(()),
+            Some((_, HarnessPhase::Dialing { .. })) | None => Err(SandboxError::NotFound),
+        }
     }
 
     /// Drain the accepted prompts awaiting their `run_started` echo.
@@ -819,24 +941,18 @@ impl HostClient for SimHostClient {
         _mode: Option<String>,
     ) -> Result<(), SandboxError> {
         self.maybe_hang().await;
-        // ADR 0108 E: the hub gate. The VM existing is NOT enough — only
-        // an `Attached` harness accepts the relay; an unknown sandbox
-        // and an unattached harness both answer `NotFound`, exactly the
-        // ambiguity the coordinator's attach grace (A4) resolves.
+        // ADR 0108 E: the hub gate. The VM existing is NOT enough — the
+        // relay is decided by the harness phase (`hub_accept_prompt`):
+        // an unknown sandbox and an un-dialed harness answer `NotFound`
+        // (the ambiguity the coordinator's attach grace, A4, resolves);
+        // a Stale handle answers Ok into a dead socket (A8).
         let owner = self
             .world
             .with_host(self.host_id, |h| match h.sandboxes.get(&sandbox_id) {
                 Some(owner) => Ok(*owner),
                 None => Err(SandboxError::NotFound),
             })?;
-        if !self.world.harness_attached(sandbox_id) {
-            return Err(SandboxError::NotFound);
-        }
-        // The accepted prompt awaits the sim guest's `run_started` echo
-        // (the scheduler's pump), which retires the outbox row.
-        self.world
-            .record_delivered_prompt(sandbox_id, owner, prompt_id);
-        Ok(())
+        self.world.hub_accept_prompt(sandbox_id, owner, prompt_id)
     }
 }
 

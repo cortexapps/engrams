@@ -709,6 +709,24 @@ impl Sim {
                         ))
                         .await;
                     let _ = state.services.meta.touch_host_heartbeat(id, hb).await;
+                    // ADR 0108 A8: the real heartbeat handler runs the
+                    // harness-desync REPAIR right after the heartbeat
+                    // write (api/host_http.rs). The swarm BYPASSES that
+                    // HTTP handler, so drive the extracted pure step
+                    // here with the same two sets the wire heartbeat
+                    // carries. A Stale handle is IN `attached` (the
+                    // hub's view), so the repair only sees the
+                    // disagreement once the reap fires — as in prod.
+                    // Same empty-gate as the handler. No entropy draw
+                    // and, absent waiting rows, no store write: existing
+                    // swarm seeds keep their traces.
+                    let (running, attached) = self.world.host_world.heartbeat_sets(id);
+                    if !running.is_empty() {
+                        let _ = engram_coordinator::harness_desync::run_once(
+                            &state, id, &running, &attached,
+                        )
+                        .await;
+                    }
                     // Re-register on every live replica (the register
                     // endpoint's in-memory half).
                     for r in self.world.replicas.iter() {
@@ -1403,11 +1421,14 @@ impl Sim {
 /// 1. Reap any tasks the step detached (`session_ops::enqueue` drives
 ///    ops off the caller's future) so their world effects land inside
 ///    the step — deterministic on the current-thread runtime.
-/// 2. Complete due attach dials: the harness registers on the hub and
+/// 2. Reap due Stale harness handles (ADR 0108 A8): the hub notices a
+///    long-dead link on its bounded window; the reap opens the
+///    running-but-unattached disagreement the heartbeat repair fixes.
+/// 3. Complete due attach dials: the harness registers on the hub and
 ///    announces Idle through the real ingestion route — the A3 attach
 ///    signal (`op_wake_queued_kind(Deliver)` + the outbox-shim notify
 ///    fire inside the sink).
-/// 3. Echo `run_started{prompt_id}` for every prompt an attached harness
+/// 4. Echo `run_started{prompt_id}` for every prompt an attached harness
 ///    accepted — the confirming event that retires the outbox row (in
 ///    production the guest harness emits it; the sim guest is this
 ///    pump).
@@ -1419,6 +1440,11 @@ impl Sim {
 /// replica is up, mirroring the harness's own event retry.
 async fn pump_harness_plane(world: &SimWorld) {
     crate::workload::drain_detached().await;
+    // ADR 0108 A8: reap due Stale handles first — from this step on a
+    // reaped handle is out of the hub's `attached` set and answers
+    // `NotFound`, which opens the disagreement window the heartbeat
+    // repair keys on.
+    world.host_world.reap_due_stale_handles();
     let state = world.replicas.iter().find_map(|r| r.state.clone());
     let announce = world.host_world.attach_announce();
     for (sandbox, owner) in world.host_world.complete_due_attaches() {

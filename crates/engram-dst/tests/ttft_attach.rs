@@ -16,6 +16,11 @@
 //!     1 s cadence WITHOUT the destructive reattach.
 //!   - A5: known waits (pre-Active, the grace) use
 //!     `OpOutcome::RetryAfter` so they never inflate the backoff.
+//!   - A8: fresh attach evidence recalls waiting outbox rows
+//!     (`outbox_make_due` at the attach signal, before the A3 wake),
+//!     and the heartbeat running-vs-attached disagreement is a REPAIR
+//!     (`harness_desync::run_once` — the prod-7eddce62 stale-handle
+//!     shape, pinned below).
 //!
 //! Scenarios hand-drive `Sim::execute` (the pinned-regression pattern —
 //! an exact interleaving, not a swarm pick). Everything runs on the
@@ -38,13 +43,17 @@ fn rt() -> tokio::runtime::Runtime {
         .expect("current-thread runtime")
 }
 
-/// The 2026-07-31 create shape: reserve the session, enqueue the prompt
-/// while the session is still Pending (outbox row + Deliver op exist
-/// BEFORE the boot completes — the deliver's first attempt defers on
-/// the A5 fixed cadence), then drive the real CreateBoot op inline.
-/// Returns (session, sandbox, host) with the session Active and the
-/// harness dial in flight.
-async fn create_with_prompt(sim: &mut Sim, prompt_id: &str) -> (SessionId, SandboxId, HostId) {
+/// Reserve + boot one session to Active with the real CreateBoot op.
+/// `create_prompt`: `Some` enqueues the prompt while the session is
+/// still Pending (the 2026-07-31 create shape — outbox row + Deliver
+/// op exist BEFORE the boot completes; the deliver's first attempt
+/// defers on the A5 fixed cadence); `None` boots clean (the 7eddce62
+/// steady-state shape). Returns (session, sandbox, host) with the
+/// session Active and the harness dial in flight.
+async fn boot_session(
+    sim: &mut Sim,
+    create_prompt: Option<&str>,
+) -> (SessionId, SandboxId, HostId) {
     sim.execute(Step::HostHeartbeats).await;
     let state = sim.world.replicas[0]
         .state
@@ -75,14 +84,17 @@ async fn create_with_prompt(sim: &mut Sim, prompt_id: &str) -> (SessionId, Sandb
         matches!(disp, CreateDisposition::Placed(_)),
         "the fresh sim fleet must fit the create"
     );
-    // The create-time prompt through the real gRPC handler: durable
-    // outbox row + a detached Deliver op. The drain runs that op to its
-    // first deferral ("session is pending" — the A5 known-wait arm).
-    assert!(
-        workload::api_prompt(&state, session_id, prompt_id).await,
-        "the create-time prompt must ack"
-    );
-    workload::drain_detached().await;
+    if let Some(prompt_id) = create_prompt {
+        // The create-time prompt through the real gRPC handler: durable
+        // outbox row + a detached Deliver op. The drain runs that op to
+        // its first deferral ("session is pending" — the A5 known-wait
+        // arm).
+        assert!(
+            workload::api_prompt(&state, session_id, prompt_id).await,
+            "the create-time prompt must ack"
+        );
+        workload::drain_detached().await;
+    }
     // The boot, inline (Step::CreateSession's machinery). Its completion
     // stamps the attach grace and wakes the sibling Deliver op (A4/ADR
     // 0094) — the exact moment the incident's race began. The prompt's
@@ -125,6 +137,34 @@ async fn create_with_prompt(sim: &mut Sim, prompt_id: &str) -> (SessionId, Sandb
     )
 }
 
+/// The 2026-07-31 create shape (see [`boot_session`]).
+async fn create_with_prompt(sim: &mut Sim, prompt_id: &str) -> (SessionId, SandboxId, HostId) {
+    boot_session(sim, Some(prompt_id)).await
+}
+
+/// The 7eddce62 steady state: session Active, harness ATTACHED, no
+/// outstanding prompt. Advances past the default 200 ms dial delay so
+/// the pump completes the attach (and announces Idle when the scenario
+/// opted in).
+async fn create_active_attached(sim: &mut Sim) -> (SessionId, SandboxId, HostId) {
+    let (session_id, sandbox, host) = boot_session(sim, None).await;
+    sim.execute(Step::AdvanceTime(Duration::from_millis(300)))
+        .await;
+    assert!(
+        sim.world.host_world.harness_attached(sandbox),
+        "the dial completes at the default 200 ms delay"
+    );
+    (session_id, sandbox, host)
+}
+
+/// The durable outbox row for a prompt (cloned world truth).
+fn outbox_row(sim: &Sim, prompt_id: &str) -> engram_core::types::outbox::OutboxRow {
+    sim.world
+        .meta
+        .with_db(|db| db.outbox.get(prompt_id).cloned())
+        .expect("outbox row exists")
+}
+
 /// The most recent Deliver op row for a session:
 /// (state, error, not_before).
 fn deliver_op(
@@ -154,10 +194,10 @@ fn prompt_acked(sim: &Sim, prompt_id: &str) -> bool {
 
 /// The incident interleaving with the fixes: the attach lands AFTER the
 /// woken Deliver op's first attempt. The mid-grace `NotFound` defers
-/// WITHOUT a destructive reattach (A4), the Idle announcement wakes the
-/// deliver ahead of its cadence (A3), and the prompt is delivered +
-/// acked about one grace-cadence second after the attach — not 40+
-/// seconds of accumulated backoff.
+/// WITHOUT a destructive reattach (A4); the Idle announcement recalls
+/// the deferred row (A8) and wakes the deliver (A3), so the prompt is
+/// delivered + acked IMMEDIATELY at the attach — not after the row's
+/// deferral cadence, and not after 40+ seconds of accumulated backoff.
 #[test]
 fn regression_2026_07_31_attach_race_delivers_on_the_attach_signal() {
     rt().block_on(async {
@@ -209,27 +249,33 @@ fn regression_2026_07_31_attach_race_delivers_on_the_attach_signal() {
         assert!(!prompt_acked(&sim, prompt_id));
 
         // 600 ms later the dial completes; the pump announces Idle
-        // through the real ingestion route. A3: the sink wakes the
-        // backed-off deliver — its not_before is pulled to NOW, ahead
-        // of the 1 s cadence it was deferred on.
+        // through the real ingestion route. A3+A8: the sink RECALLS the
+        // session's waiting rows (`outbox_make_due`, before the op
+        // wake) and wakes the backed-off deliver — BOTH the row and the
+        // op are due NOW. Pre-A8 only the op was woken and delivery
+        // still waited out the row's 1 s deferral cadence; the recall
+        // removes that last wait.
         sim.execute(Step::AdvanceTime(Duration::from_millis(600)))
             .await;
         assert!(sim.world.host_world.harness_attached(sandbox));
+        let now = engram_core::traits::Clock::now_utc(&*sim.world.clock);
         let (_, _, op_not_before) = deliver_op(&sim, sid).expect("deliver op exists");
+        assert!(
+            op_not_before.expect("queued op has not_before") <= now,
+            "the attach signal must wake the deliver op NOW"
+        );
         let row_not_before = sim
             .world
             .meta
             .with_db(|db| db.outbox.get(prompt_id).map(|r| r.not_before))
             .expect("outbox row");
         assert!(
-            op_not_before.expect("queued op has not_before") < row_not_before,
-            "the attach signal must wake the deliver op AHEAD of the row's 1 s cadence"
+            row_not_before <= now,
+            "A8: the attach signal must recall the deferred row NOW — no cadence wait"
         );
 
-        // The row re-becomes due at its fixed 1 s cadence; the next
-        // executor pass forwards it and the harness echo acks it.
-        sim.execute(Step::AdvanceTime(Duration::from_millis(500)))
-            .await;
+        // The next executor pass forwards immediately and the harness
+        // echo acks — no further time advance needed.
         sim.execute(Step::Driver(0, DriverKind::SessionOps)).await;
         assert!(
             prompt_acked(&sim, prompt_id),
@@ -238,8 +284,8 @@ fn regression_2026_07_31_attach_race_delivers_on_the_attach_signal() {
         let elapsed =
             engram_core::traits::Clock::now_utc(&*sim.world.clock).signed_duration_since(t0);
         assert!(
-            elapsed <= chrono::Duration::seconds(2),
-            "TTFT must be attach + one grace cadence (~1.1 s), got {}ms",
+            elapsed <= chrono::Duration::seconds(1),
+            "TTFT must be attach-bounded (~0.6 s dial) with zero cadence tax, got {}ms",
             elapsed.num_milliseconds()
         );
         assert_eq!(
@@ -409,5 +455,205 @@ fn attach_disagreement_oracle_fires_on_a_black_holed_attach() {
             .check_step(&sim.world)
             .expect_err("a 31 s attach disagreement must fire");
         assert_eq!(violation.invariant, "attach-disagreement");
+    });
+}
+
+/// The prod-7eddce62 fourth stall shape (ADR 0108 A8), pinned. In prod:
+/// a 27-minute rung-2 park killed the harness vsock link while the hub
+/// still advertised the handle; the un-park took 120 ms; `send_prompt`
+/// returned Ok into the dead socket; the row waited out the full 30 s
+/// ACK_TIMEOUT. The world models no VM pause, so the severance is
+/// injected directly with the Stale fault (the documented entry point —
+/// destroy/crash severances stay immediate). Under test, both A8 call
+/// sites on this branch:
+///   - the heartbeat disagreement is a REPAIR: `harness_desync::
+///     run_once` (driven by the sim's heartbeat step, mirroring the
+///     real handler) recalls the waiting row and enqueues the Deliver
+///     op the moment the reap opens the disagreement;
+///   - fresh attach evidence recalls waiting rows at the state.rs call
+///     site: the recovery Idle announcement pulls the failure-deferred
+///     row due ahead of its backoff (`outbox_make_due` before the A3
+///     op wake).
+///
+/// The stall must be bounded by the reap window + the heartbeat
+/// cadence, never by ACK_TIMEOUT.
+#[test]
+fn regression_7eddce62_stale_handle_heartbeat_repair_recalls_the_row() {
+    rt().block_on(async {
+        tokio::time::pause();
+        let mut sim = Sim::new(0x010C, Profile::Calm);
+        sim.world.host_world.set_attach_announce(true);
+        // The hub must notice the dead link within 5 s of severance.
+        sim.world
+            .host_world
+            .set_attach_reap_window(Duration::from_secs(5));
+        let (sid, sandbox, host) = create_active_attached(&mut sim).await;
+        let state = sim.world.replicas[0]
+            .state
+            .clone()
+            .expect("replica 0 is up");
+
+        // The long-pause severance. The hub still advertises the
+        // handle: the heartbeat `attached` derivation must carry it,
+        // so NO disagreement exists yet (as in prod — the alarm fired
+        // only after the hub noticed).
+        assert!(sim.world.host_world.sever_attach_stale(sandbox));
+        assert!(sim.world.host_world.harness_stale(sandbox));
+        assert!(
+            sim.world.host_world.harness_attached(sandbox),
+            "a Stale handle IS attached in the hub's view"
+        );
+
+        // The prompt arrives; the prompt path's direct Deliver op
+        // forwards Ok into the dead socket.
+        let prompt_id = "ttft-stale-prompt";
+        let t_prompt = engram_core::traits::Clock::now_utc(&*sim.world.clock);
+        assert!(workload::api_prompt(&state, sid, prompt_id).await);
+        workload::drain_detached().await;
+        let row = outbox_row(&sim, prompt_id);
+        assert!(
+            row.delivered_at.is_some(),
+            "the forward returned Ok — the row is marked delivered"
+        );
+        assert_eq!(row.attempts, 1, "delivery attempts bumped exactly once");
+        assert!(row.acked_at.is_none());
+        // NON-VACUITY (the pre-repair shape): the row's only self-
+        // recovery is its ACK deadline, a full ACK_TIMEOUT (30 s) out —
+        // exactly the ttft-liveness bound. Without the A8 recall no
+        // redelivery can run before the oracle fires (proven end-to-end
+        // by ttft_liveness_oracle_fires_on_a_stale_handle_without_the_repair).
+        assert_eq!(
+            row.not_before,
+            t_prompt + chrono::Duration::seconds(30),
+            "the delivered row waits a full ACK_TIMEOUT"
+        );
+
+        // A dead socket produces no run_started echo, and no Idle
+        // announcement occurs while the handle is Stale.
+        sim.execute(Step::AdvanceTime(Duration::from_secs(1))).await;
+        assert!(!prompt_acked(&sim, prompt_id), "no echo from a dead link");
+        assert!(sim.world.host_world.harness_stale(sandbox));
+
+        // The reap fires within its window: the hub drops the handle
+        // and the running-but-unattached disagreement opens.
+        sim.execute(Step::AdvanceTime(Duration::from_secs(4))).await;
+        assert!(
+            !sim.world.host_world.harness_attached(sandbox),
+            "the hub reaped the stale handle at its window"
+        );
+
+        // The next heartbeat runs the A8 repair (`harness_desync::
+        // run_once` right after `touch_host_heartbeat`): the row is
+        // recalled off its ACK deadline and a Deliver op is enqueued
+        // and driven. The forward answers NotFound on the reaped
+        // handle, so the op retries on the short failure backoff — the
+        // normal recovery path has begun.
+        sim.execute(Step::HostHeartbeats).await;
+        let row = outbox_row(&sim, prompt_id);
+        assert!(row.acked_at.is_none());
+        assert!(
+            row.not_before < t_prompt + chrono::Duration::seconds(30),
+            "the repair recalled the row off its 30 s ACK deadline"
+        );
+        let (op_state, _, _) = deliver_op(&sim, sid).expect("the repair enqueued a Deliver op");
+        assert_eq!(
+            op_state,
+            OpState::Queued,
+            "the deliver retries behind the NotFound on the reaped handle"
+        );
+
+        // Recovery: the destructive remedy re-establishes the harness.
+        // (Sim DevVm sessions resolve no AgentSpec —
+        // `reattach_harness_in_place` returns Ok(false) — so issue the
+        // SIGUSR1-equivalent nudge directly, the swallowed-attach
+        // scenario's documented pattern.) Dial → Attached → Idle
+        // announcement.
+        sim.world.host_world.nudge_attach(host, sandbox);
+        sim.execute(Step::AdvanceTime(Duration::from_millis(300)))
+            .await;
+        assert!(sim.world.host_world.harness_attached(sandbox));
+
+        // A8 at the STATE.RS call site (distinct from the heartbeat
+        // one): the Idle announcement recalled the failure-deferred row
+        // ahead of its backoff — a delivered-but-unacked row never
+        // waits out a deadline once the harness provably attached.
+        let now = engram_core::traits::Clock::now_utc(&*sim.world.clock);
+        let row = outbox_row(&sim, prompt_id);
+        assert!(row.acked_at.is_none());
+        assert!(
+            row.not_before <= now,
+            "the attach signal made the row due NOW, ahead of its backoff"
+        );
+
+        // The woken deliver forwards on the live link; the pump's echo
+        // acks the row within the same step.
+        sim.execute(Step::Driver(0, DriverKind::SessionOps)).await;
+        assert!(
+            prompt_acked(&sim, prompt_id),
+            "delivered + acked on the re-established link"
+        );
+
+        // Total stall: 1 s (echo check) + 4 s (reap window remainder)
+        // + heartbeat + 0.3 s (re-dial) — bounded by the reap window
+        // plus the heartbeat cadence, NOT by the 30 s ACK_TIMEOUT.
+        let elapsed =
+            engram_core::traits::Clock::now_utc(&*sim.world.clock).signed_duration_since(t_prompt);
+        assert!(
+            elapsed <= chrono::Duration::seconds(10),
+            "stall bounded by reap window + heartbeat cadence, got {}ms",
+            elapsed.num_milliseconds()
+        );
+        invariants::check_quiescence(&sim.world)
+            .expect("quiescent after the repair-driven recovery");
+    });
+}
+
+/// NON-VACUITY for the A8 repair: the SAME severance with the repair
+/// never driven — no HostHeartbeats step runs, and the heartbeat step
+/// is the swarm's only `harness_desync::run_once` call site — leaves
+/// the delivered row parked on its full ACK_TIMEOUT deadline, and the
+/// ttft-liveness oracle fires at its 30 s bound: the incident stall,
+/// reproduced. No test-only switch in production code is needed: a
+/// heartbeat-free timeline IS the repair-neutralized world.
+#[test]
+fn ttft_liveness_oracle_fires_on_a_stale_handle_without_the_repair() {
+    rt().block_on(async {
+        tokio::time::pause();
+        let mut sim = Sim::new(0x010D, Profile::Calm);
+        sim.world.host_world.set_attach_announce(true);
+        sim.world
+            .host_world
+            .set_attach_reap_window(Duration::from_secs(5));
+        let (sid, sandbox, _host) = create_active_attached(&mut sim).await;
+        let state = sim.world.replicas[0]
+            .state
+            .clone()
+            .expect("replica 0 is up");
+        assert!(sim.world.host_world.sever_attach_stale(sandbox));
+        let prompt_id = "ttft-stale-unrepaired-prompt";
+        assert!(workload::api_prompt(&state, sid, prompt_id).await);
+        workload::drain_detached().await;
+        assert_eq!(outbox_row(&sim, prompt_id).attempts, 1);
+
+        // 29 virtual seconds of a live but heartbeat-free coordinator:
+        // the reap fires at 5 s, but with no heartbeat there is no
+        // repair — nothing recalls the row before its ACK deadline.
+        for _ in 0..29 {
+            sim.execute(Step::AdvanceTime(Duration::from_secs(1))).await;
+            sim.execute(Step::Driver(0, DriverKind::SessionOps)).await;
+        }
+        assert!(
+            !sim.world.host_world.harness_attached(sandbox),
+            "reaped and never re-established"
+        );
+        invariants::ttft_liveness(&sim.world).expect("29 s in, the row is still within the bound");
+        let row = outbox_row(&sim, prompt_id);
+        assert_eq!(row.attempts, 1, "no redelivery beat the ACK deadline");
+        assert!(row.acked_at.is_none());
+
+        sim.execute(Step::AdvanceTime(Duration::from_secs(2))).await;
+        let violation = invariants::ttft_liveness(&sim.world)
+            .expect_err("31 s of Active-with-unacked-prompt is the incident stall");
+        assert_eq!(violation.invariant, "ttft-liveness");
     });
 }
