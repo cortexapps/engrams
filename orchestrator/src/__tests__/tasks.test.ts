@@ -1923,11 +1923,10 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
       // observed on both the REST create and the GraphQL createIssue mutation.
       expect(policy.injects.length).toBeGreaterThan(0);
       expect(policy.injects.every((i: {
-        mint_source: { kind: string; connection_id?: string; provider?: string } | null;
+        mint_source: { connection: { connection_id: string; provider: string } } | null;
       }) =>
-        i.mint_source?.kind === "connection" &&
-          i.mint_source.connection_id === "default-github" &&
-          i.mint_source.provider === "github"
+        i.mint_source?.connection.connection_id === "default-github" &&
+          i.mint_source.connection.provider === "github"
       )).toBe(true);
       expect(policy.observes.length).toBeGreaterThan(0);
       expect(

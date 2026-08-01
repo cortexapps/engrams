@@ -61,8 +61,15 @@ pub struct IntegrationPolicy {
 /// Every source names the configured connection selected by the profile. The
 /// provider is explicit routing metadata; callers never infer it from the
 /// opaque connection ID. Neither field contains a credential.
+///
+/// Externally tagged (JSON `{"connection": {...}}`), NOT `#[serde(tag)]`:
+/// this enum rides `EgressInjectEntry.mint_source` on the coord ↔ host
+/// bincode wire, and bincode cannot DECODE an internally-tagged enum
+/// (`deserialize_any`) — the same footgun the `CaptureEnvValue` wire-strip
+/// pin in `wire_golden.rs` documents. Here a strip is not an option: the
+/// egress proxy needs the mint authority at refresh time.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum CredentialMintSource {
     Connection {
         connection_id: String,

@@ -305,10 +305,13 @@ export interface Connector {
 // ---------------------------------------------------------------------------
 
 /** One Plane-B injection, snake_case to match the Rust serde shape. */
+/** Externally-tagged to match the Rust serde shape — the enum also crosses
+ * the coord ↔ host bincode wire, which cannot decode a `kind`-tagged form. */
 export type CredentialMintSourceJson = {
-  kind: "connection";
-  connection_id: string;
-  provider: string;
+  connection: {
+    connection_id: string;
+    provider: string;
+  };
 };
 
 export interface IntegrationInjectJson {
@@ -1249,9 +1252,10 @@ export function compileIntegrationPolicy(
           header_template: "",
           secret_ref: "",
           mint_source: {
-            kind: "connection",
-            connection_id: grant.connectionId,
-            provider: connector.provider,
+            connection: {
+              connection_id: grant.connectionId,
+              provider: connector.provider,
+            },
           },
           methods,
           path_globs,
