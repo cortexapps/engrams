@@ -1741,17 +1741,21 @@ mod tests {
             )
             .await
             .unwrap();
+        // Wait for a PARSEABLE pid, not merely for the file to exist: `>`
+        // creates child.pid before `printf` writes to it, so an existence-only
+        // poll reads an empty file and panics with ParseIntError::Empty.
         let child_pid_path = b.cwd_for(id).join("child.pid");
+        let mut child_pid = None;
         for _ in 0..100 {
-            if child_pid_path.exists() {
+            child_pid = fs::read_to_string(&child_pid_path)
+                .ok()
+                .and_then(|raw| raw.trim().parse::<i32>().ok());
+            if child_pid.is_some() {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        let child_pid = fs::read_to_string(&child_pid_path)
-            .expect("shell should publish its child pid")
-            .parse::<i32>()
-            .unwrap();
+        let child_pid = child_pid.expect("shell should publish its child pid");
 
         b.cancel_exec(id, "cancel-ticket".into()).await.unwrap();
         let (_, _, exit) =
@@ -2001,17 +2005,22 @@ mod tests {
         };
         b.start_agent(id, agent).await.unwrap();
 
-        // Wait for the agent to write its pid file. Real-world race
-        // budgets are tiny here; a few hundred ms is plenty.
+        // Wait for the agent to write its pid file. Poll for CONTENT, not
+        // existence: `echo $$ > file` opens (creates) the file before the
+        // write lands, so an existence check can observe an empty file and
+        // the parse below dies with `ParseIntError { kind: Empty }` (flaked
+        // in CI 2026-07-31). Real-world race budgets are tiny here; a few
+        // hundred ms is plenty.
         let pid_path = b.cwd_for(id).join(pid_file);
+        let mut pid_contents = String::new();
         for _ in 0..50 {
-            if pid_path.exists() {
+            pid_contents = fs::read_to_string(&pid_path).unwrap_or_default();
+            if !pid_contents.trim().is_empty() {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-        let pid: i32 = fs::read_to_string(&pid_path)
-            .expect("agent should have written its pid")
+        let pid: i32 = pid_contents
             .trim()
             .parse()
             .expect("pid file should contain an integer");

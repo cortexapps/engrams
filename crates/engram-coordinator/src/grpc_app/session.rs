@@ -103,9 +103,15 @@ impl app::session_service_server::SessionService for AppSessionService {
         self.auth.check(&req)?;
         let r = req.into_inner();
         let id = parse_session_id(&r.session_id)?;
-        let note = crate::api::prompt::send_prompt_core(&self.state, id, r.prompt_id, r.text)
-            .await
-            .map_err(into_status)?;
+        let note = crate::api::prompt::send_prompt_core(
+            &self.state,
+            id,
+            r.prompt_id,
+            r.text,
+            r.harness_mode,
+        )
+        .await
+        .map_err(into_status)?;
         Ok(Response::new(app::SendPromptResponse {
             session_id: id.to_string(),
             note: note.to_string(),
@@ -171,8 +177,9 @@ impl app::session_service_server::SessionService for AppSessionService {
         req: Request<app::InterruptRequest>,
     ) -> Result<Response<app::InterruptResponse>, Status> {
         self.auth.check(&req)?;
-        let id = parse_session_id(&req.get_ref().session_id)?;
-        let note = crate::api::interrupt::interrupt_core(&self.state, id)
+        let r = req.into_inner();
+        let id = parse_session_id(&r.session_id)?;
+        let note = crate::api::interrupt::interrupt_core(&self.state, id, &r.source)
             .await
             .map_err(into_status)?;
         Ok(Response::new(app::InterruptResponse {
@@ -215,11 +222,16 @@ impl app::session_service_server::SessionService for AppSessionService {
         // becomes a Status so the client reconnects from its own
         // Last-Event-ID — never a clean end, which would be
         // indistinguishable from a complete transcript.
+        // ADR 0108 B: `durable_only` suppresses ephemeral chunk frames
+        // server-side; the `lagged` sentinel still passes. The flag is
+        // applied inside merged_event_stream so all frame-suppression
+        // semantics stay next to the cursor/lag semantics (ADR 0105).
         let merged = crate::api::events::merged_event_stream(
             self.state.services.meta.clone(),
             id,
             live_rx,
             since,
+            r.durable_only,
         )
         .map(|item| match item {
             Ok(ev) => {
@@ -703,8 +715,10 @@ mod tests {
                 "tok-abc-123".to_string(),
             )]),
             secrets: std::collections::HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         let api =
             super::super::convert::create_request_from_proto(r).expect("converter must succeed");
@@ -730,8 +744,10 @@ mod tests {
             prompt: None,
             harness_env: std::collections::HashMap::new(),
             secrets: std::collections::HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: Some("claude".into()),
+            harness_mode: None,
         };
         let api =
             super::super::convert::create_request_from_proto(r).expect("converter must succeed");
@@ -757,8 +773,10 @@ mod tests {
                 ("OTHER".to_string(), "v".to_string()),
             ]),
             secrets: std::collections::HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         // Same expression the RPC handler uses.
         let identity_env: std::collections::HashMap<String, String> =

@@ -60,6 +60,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use engram_core::traits::{MetadataStore, SessionFence};
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::{HostId, MetaError};
 
@@ -445,7 +446,10 @@ pub async fn host_lost_straggler_sweep(
             session.live_disk_manifest.is_some(),
         );
         note_unrecoverable_if_dead(target, snapshot.as_ref(), session.id);
-        match meta.transition_session(session.id, target).await {
+        match meta
+            .transition_session(session.id, target, BindingDisposition::RequireUnbound)
+            .await
+        {
             Ok(prev) => {
                 emit_status_changed(meta, &state.events, session.id, prev, target, now).await;
                 ::metrics::counter!(crate::metrics::HOST_LOST_STRAGGLERS_SETTLED_TOTAL)
@@ -778,7 +782,10 @@ async fn evict_host_locked(
         let target = recovery_target(has_recoverable_snapshot, has_live_manifest);
         note_unrecoverable_if_dead(target, snapshot.as_ref(), *session_id);
 
-        match meta.transition_session(*session_id, target).await {
+        match meta
+            .transition_session(*session_id, target, BindingDisposition::RequireUnbound)
+            .await
+        {
             Ok(prev) => {
                 emit_status_changed(
                     meta,
@@ -949,6 +956,7 @@ mod tests {
             _sandbox_id: SandboxId,
             _prompt_id: String,
             _text: String,
+            _mode: Option<String>,
         ) -> Result<(), SandboxError> {
             unimplemented!()
         }

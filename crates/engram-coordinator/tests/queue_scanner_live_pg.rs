@@ -22,6 +22,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -76,6 +77,7 @@ async fn enqueue(
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     let disposition = meta
         .reserve_and_persist_create(ws, &[], 0)
@@ -111,6 +113,7 @@ async fn reserve(
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     match meta
         .reserve_and_persist_create(ws, candidates, affinity_len)
@@ -826,13 +829,13 @@ async fn resume_origin_timeout_returns_to_idle() {
     // needed — transition_session is a pure DB flip), then park it back
     // in the queue as a resume.
     let sid = meta.create_session(spec()).await.expect("create");
-    meta.transition_session(sid, SessionState::Created)
+    meta.transition_session(sid, SessionState::Created, BindingDisposition::Retain)
         .await
         .expect("Pending->Created");
-    meta.transition_session(sid, SessionState::Active)
+    meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("Created->Active");
-    meta.transition_session(sid, SessionState::Idle)
+    meta.transition_session(sid, SessionState::Idle, BindingDisposition::Detach)
         .await
         .expect("Active->Idle");
     let landed = meta
@@ -939,7 +942,7 @@ async fn notify_placement_changed_fires_at_every_site() {
         .expect("fits");
     assert_eq!(placed, host);
     let prev = meta
-        .transition_session(sid, SessionState::Failed)
+        .transition_session(sid, SessionState::Failed, BindingDisposition::Detach)
         .await
         .expect("Pending->Failed");
     assert_eq!(prev, SessionState::Pending);
@@ -1105,7 +1108,7 @@ async fn scanner_wakes_on_notify_and_places_within_the_wake_not_the_fallback() {
     state
         .services
         .meta
-        .transition_session(filler, SessionState::Failed)
+        .transition_session(filler, SessionState::Failed, BindingDisposition::Detach)
         .await
         .expect("free the filler");
 

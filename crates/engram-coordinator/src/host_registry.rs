@@ -834,9 +834,10 @@ impl HostClient for HostRegistry {
         sandbox_id: SandboxId,
         prompt_id: String,
         text: String,
+        mode: Option<String>,
     ) -> Result<(), SandboxError> {
         let (_, backend) = self.resolve_owner(sandbox_id).await?;
-        backend.send_prompt(sandbox_id, prompt_id, text).await
+        backend.send_prompt(sandbox_id, prompt_id, text, mode).await
     }
 
     async fn edit_queued_prompt(
@@ -1013,6 +1014,7 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: SessionState,
+            _: engram_core::types::BindingDisposition,
         ) -> Result<SessionState, engram_core::MetaError> {
             unreachable!()
         }

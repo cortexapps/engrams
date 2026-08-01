@@ -21,6 +21,7 @@ use engram_core::traits::storage::BlobStorage;
 use engram_core::traits::SessionFence;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionState};
 use engram_core::{MetaError, SandboxError, SandboxId, SessionId};
 use serde::Serialize;
@@ -121,6 +122,8 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         id,
         session_env,
         b.config.workdir.clone(),
+        // Resume: the mode was validated when its prompt was accepted.
+        None,
     )
     .await
     .ok()
@@ -931,38 +934,43 @@ pub(crate) async fn ascend_evicting_to_active_with(
             }
         }
     }
-    let result =
-        match crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active)
-            .await
-        {
-            Ok(prev) => {
-                ::metrics::counter!(crate::metrics::EVICTION_CANCELLED_TOTAL).increment(1);
-                tracing::info!(
-                    session_id = %id,
-                    park_rung = if parked_paused { 2 } else { 1 },
-                    "eviction cancelled — the user came back before/at the parking rung",
-                );
-                let _ = state
-                    .emit_fenced(
-                        id,
-                        fence,
-                        crate::state::SessionEvent::StatusChanged {
-                            from: prev,
-                            to: SessionState::Active,
-                            at: state.services.clock.now_utc(),
-                        },
-                    )
-                    .await;
-                Ok(true)
-            }
-            // Raced out of Evicting between our caller's read and the cancel
-            // (e.g. the evict op finished to Idle first), or — on the fenced
-            // path — a successor op re-claimed the session (the `fenced:`
-            // Conflict). Not an error; the caller re-dispatches on the fresh
-            // status.
-            Err(engram_core::MetaError::Conflict(_)) => Ok(false),
-            Err(e) => Err(ApiError::Internal(format!("cancel evict: {e}"))),
-        };
+    let result = match crate::session_ops::transition_with_fence(
+        state,
+        id,
+        fence,
+        SessionState::Active,
+        BindingDisposition::Retain,
+    )
+    .await
+    {
+        Ok(prev) => {
+            ::metrics::counter!(crate::metrics::EVICTION_CANCELLED_TOTAL).increment(1);
+            tracing::info!(
+                session_id = %id,
+                park_rung = if parked_paused { 2 } else { 1 },
+                "eviction cancelled — the user came back before/at the parking rung",
+            );
+            let _ = state
+                .emit_fenced(
+                    id,
+                    fence,
+                    crate::state::SessionEvent::StatusChanged {
+                        from: prev,
+                        to: SessionState::Active,
+                        at: state.services.clock.now_utc(),
+                    },
+                )
+                .await;
+            Ok(true)
+        }
+        // Raced out of Evicting between our caller's read and the cancel
+        // (e.g. the evict op finished to Idle first), or — on the fenced
+        // path — a successor op re-claimed the session (the `fenced:`
+        // Conflict). Not an error; the caller re-dispatches on the fresh
+        // status.
+        Err(engram_core::MetaError::Conflict(_)) => Ok(false),
+        Err(e) => Err(ApiError::Internal(format!("cancel evict: {e}"))),
+    };
     result
 }
 
@@ -1073,6 +1081,52 @@ pub(crate) async fn resume_from_idle(
     // leaves a VM no session row references — the host's ownership-
     // oracle orphan reap GCs it. The compensation (and its blind destroy
     // of a possibly-healthy VM) is unrepresentable under step-resume.
+
+    // ADR 0090 (#896 review, HIGH): a budget-exhausted evacuation lands
+    // here Idle WITH its unconfirmed source binding still in place —
+    // ownership of a maybe-live sandbox is never released on a guess.
+    // The guarded bind below requires an unbound row, so run the SAME
+    // teardown-confirmation gate the evac resumer uses: re-issue the
+    // idempotent destroy, probe, and only a confirmed-gone source
+    // authorizes the fenced clear. Unconfirmable → 503-retryable (the
+    // dead-host lane clears the binding once the source host is declared
+    // dead; a healthy-but-lagging teardown confirms on a later attempt).
+    // Checked BEFORE the restore so we never create a VM we may have to
+    // abandon. Normal idle-evicted rows are unbound and skip this leg,
+    // as does a step-resume re-entry after the clear committed.
+    let mut session = session;
+    if let (Some(source_host), Some(source_sandbox)) = (session.host_id, session.sandbox_id) {
+        crate::evac_resumer::confirm_source_teardown(
+            state,
+            source_host,
+            source_sandbox,
+            ctx.fence(),
+        )
+        .await
+        .map_err(|e| {
+            ApiError::Unavailable(format!(
+                "resume: retained source binding could not be confirmed torn down: {e}"
+            ))
+        })?;
+        match state
+            .services
+            .meta
+            .fenced_assign_sandbox(id, ctx.fence().epoch as i64, None, Some(source_host))
+            .await
+        {
+            Ok(true) => {
+                state.host_registry.invalidate_sandbox(source_sandbox);
+                session.sandbox_id = None;
+            }
+            Ok(false) => {
+                crate::metrics::note_fenced_write();
+                return Err(ApiError::Conflict(
+                    "resume: fenced by a newer op while clearing the stale source binding".into(),
+                ));
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
 
     // ADR 0034 durability: walk the session's snapshots newest-first and
     // resume from the first one whose backing artifacts still exist. The
@@ -1264,7 +1318,7 @@ async fn transition_to_dead_if_no_snapshot(
     match state
         .services
         .meta
-        .transition_session(id, SessionState::Dead)
+        .transition_session(id, SessionState::Dead, BindingDisposition::Detach)
         .await
     {
         Ok(prev) => {
@@ -1553,13 +1607,19 @@ pub async fn finish_resume_to_active(
         // transition failure PROPAGATES: reporting CreatedHarnessFailed
         // for a row that never left Idle would double the divergence.
         if session.status == SessionState::Idle {
-            crate::session_ops::transition_with_fence(state, id, fence, SessionState::Created)
-                .await
-                .map_err(|e| {
-                    ApiError::Internal(format!(
-                        "resume: parking harness-failed session at Created failed: {e}"
-                    ))
-                })?;
+            crate::session_ops::transition_with_fence(
+                state,
+                id,
+                fence,
+                SessionState::Created,
+                BindingDisposition::Retain,
+            )
+            .await
+            .map_err(|e| {
+                ApiError::Internal(format!(
+                    "resume: parking harness-failed session at Created failed: {e}"
+                ))
+            })?;
             let _ = state
                 .emit_fenced(
                     id,
@@ -1574,8 +1634,14 @@ pub async fn finish_resume_to_active(
         }
         return Ok(FinishResumeOutcome::CreatedHarnessFailed(err));
     }
-    let prev_for_active =
-        crate::session_ops::transition_with_fence(state, id, fence, SessionState::Active).await?;
+    let prev_for_active = crate::session_ops::transition_with_fence(
+        state,
+        id,
+        fence,
+        SessionState::Active,
+        BindingDisposition::Retain,
+    )
+    .await?;
     if emit_status {
         let now = state.services.clock.now_utc();
         // Review finding #6: fenced. Ok(None) (a successor re-claimed) is
@@ -1962,7 +2028,7 @@ async fn resume_from_fc_snapshot(
             let _ = state
                 .services
                 .meta
-                .transition_session(id, SessionState::Dead)
+                .transition_session(id, SessionState::Dead, BindingDisposition::Detach)
                 .await;
             return Err(ApiError::Gone(
                 "snapshot_invalidated: session can't be revived; \
@@ -2968,7 +3034,7 @@ mod evicting_gate_tests {
             flip_state
                 .services
                 .meta
-                .transition_session(id, SessionState::Idle)
+                .transition_session(id, SessionState::Idle, BindingDisposition::Detach)
                 .await
                 .expect("Evicting → Idle is a legal transition");
             assert!(flip_mini.ops.finish(
@@ -3021,7 +3087,7 @@ mod evicting_gate_tests {
             flip_state
                 .services
                 .meta
-                .transition_session(id, SessionState::Completed)
+                .transition_session(id, SessionState::Completed, BindingDisposition::Detach)
                 .await
                 .expect("Evicting → Completed is a legal transition");
             assert!(flip_mini.ops.finish(

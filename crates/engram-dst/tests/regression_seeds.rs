@@ -392,3 +392,184 @@ fn issue_790_evict_resume_snapshot_safety_faithful() {
 fn issue_800_reserved_evac_over_reservation_smallest_calm_seed() {
     run_faithful(0, Profile::Calm, 1500);
 }
+
+/// Quiescence oracle finding `quiescence-no-op-mint`: the drain's forced
+/// host restart erased world sandboxes, but status-only stability accepted
+/// Active/Parked rows before their third missing-sandbox strike settled.
+/// Quiet rounds then released capacity and legitimately minted two CreateBoot
+/// ops. Requiring the bound sandbox to exist on its up host keeps draining
+/// through reconciliation before recording the op high-water mark.
+#[test]
+fn seed_33049837_quiescence_waits_for_missing_resident_reconcile() {
+    run(33049837, Profile::Chaos, 5000);
+}
+
+/// The same `quiescence-no-op-mint` oracle bug with seven queued sessions
+/// becoming placeable after the third missing-sandbox strike.
+#[test]
+fn seed_33058255_quiescence_waits_for_missing_resident_reconcile() {
+    run(33058255, Profile::Chaos, 5000);
+}
+
+/// Nightly seed 33058131: a drain evict acknowledged its source-host
+/// destroy, atomically detached the coordinator binding, and finished its
+/// op while the host-side teardown effect was still deferred. The next
+/// EvacResumer claim saw an unowned `Evacuating` row and restored a second
+/// sandbox on a peer, violating ADR 0090 single ownership at step 79.
+///
+/// The fix keeps the outgoing sandbox bound through `Evacuating`. The
+/// resumer re-issues the idempotent destroy and independently probes the
+/// source; only confirmed absence permits the fenced binding clear and peer
+/// restore. This full nightly-shape pin covers the 80-step firing and its
+/// eventual convergence after the deferred host effect is delivered.
+#[test]
+fn seed_33058131_evacuation_waits_for_confirmed_source_teardown() {
+    run(33058131, Profile::Chaos, 5000);
+}
+
+/// #896 review (HIGH): a budget-exhausted evacuation deliberately leaves
+/// the row Idle WITH its unconfirmed source binding — ownership is never
+/// released on a guess. That residue must stay RECOVERABLE: the resume
+/// verb's stale-binding gate re-issues the idempotent destroy, probes,
+/// and only a confirmed-gone source authorizes the fenced clear + restore.
+/// While the source may still be live the gate refuses (503, op retries)
+/// rather than double-booting; pre-gate, the guarded bind 409'd forever
+/// and the row was permanently un-resumable.
+#[test]
+fn issue_896_resume_gate_recovers_idle_row_with_retained_source_binding() {
+    use engram_core::types::session::SessionState;
+    use engram_dst::{DriverKind, Step};
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_time()
+        .build()
+        .unwrap();
+    rt.block_on(async {
+        tokio::time::pause();
+        let mut sim = Sim::new(896, Profile::Calm).with_faithful_hosts();
+
+        // Fleet up; one session booted to Active with a real bound VM.
+        sim.execute(Step::HostHeartbeats).await;
+        sim.execute(Step::CreateSession).await;
+        for h in 0..3 {
+            sim.execute(Step::HostCheckpoint(h)).await;
+        }
+        let (sid, source_host, stale_sandbox) = sim
+            .world
+            .meta
+            .with_db(|db| {
+                db.sessions.values().find_map(|r| {
+                    (r.session.status == SessionState::Active).then_some((
+                        r.session.id,
+                        r.session.host_id?,
+                        r.session.sandbox_id?,
+                    ))
+                })
+            })
+            .expect("one Active session with a bound sandbox after create");
+        let source_idx = sim
+            .world
+            .host_ids
+            .iter()
+            .position(|h| *h == source_host)
+            .expect("source host index");
+
+        // The exhaustion residue, surgically: the row lands Idle with the
+        // source binding retained while the source VM is still resident.
+        sim.world.meta.with_db_mut(|db| {
+            db.sessions
+                .get_mut(&sid)
+                .expect("session row")
+                .session
+                .status = SessionState::Idle;
+        });
+
+        let owned = |sim: &Sim| {
+            let hosts = sim.world.host_world.hosts.lock();
+            hosts
+                .values()
+                .flat_map(|h| h.sandboxes.values())
+                .filter(|o| **o == Some(sid))
+                .count()
+        };
+        assert_eq!(owned(&sim), 1, "the stale source VM is resident pre-resume");
+
+        // Phase 1 — the source's teardown effect is DEFERRED (the exact
+        // #883 shape): the gate's re-issued destroy queues, the probe still
+        // answers alive, and the resume must REFUSE — binding intact, no
+        // second VM, single ownership holds.
+        sim.execute(Step::DeferHost(source_idx, true)).await;
+        sim.execute(Step::ResumeSession).await;
+        for _ in 0..3 {
+            for r in 0..2 {
+                sim.execute(Step::Driver(r, DriverKind::SessionOps)).await;
+            }
+            sim.execute(Step::AdvanceTime(std::time::Duration::from_secs(5)))
+                .await;
+        }
+        let (status, binding) = sim.world.meta.with_db(|db| {
+            let r = db.sessions.get(&sid).expect("session row");
+            (r.session.status, r.session.sandbox_id)
+        });
+        assert_eq!(
+            binding,
+            Some(stale_sandbox),
+            "an unconfirmable teardown must NOT release the source binding",
+        );
+        assert_ne!(
+            status,
+            SessionState::Active,
+            "the resume must refuse while the source may still be live",
+        );
+        assert_eq!(
+            owned(&sim),
+            1,
+            "single ownership must hold while the gate refuses (no double boot)",
+        );
+
+        // Phase 2 — the deferred teardown lands. The gate now confirms the
+        // source gone, performs the fenced clear, and the restore proceeds.
+        sim.execute(Step::DeferHost(source_idx, false)).await;
+        sim.execute(Step::DeliverEffects).await;
+        let mut resumed = false;
+        for _ in 0..40 {
+            for r in 0..2 {
+                sim.execute(Step::Driver(r, DriverKind::SessionOps)).await;
+            }
+            sim.execute(Step::AdvanceTime(std::time::Duration::from_secs(5)))
+                .await;
+            assert!(
+                owned(&sim) <= 1,
+                "single ownership must hold at every step of the recovery",
+            );
+            let (status, binding) = sim.world.meta.with_db(|db| {
+                let r = db.sessions.get(&sid).expect("session row");
+                (r.session.status, r.session.sandbox_id)
+            });
+            if status == SessionState::Active {
+                assert_ne!(
+                    binding,
+                    Some(stale_sandbox),
+                    "the resumed session must ride a fresh sandbox, not the stale one",
+                );
+                resumed = true;
+                break;
+            }
+        }
+        assert!(
+            resumed,
+            "the Idle row with a retained (confirmed-dead) source binding must \
+             be recoverable via /resume — the pre-gate 409-forever wedge",
+        );
+        let stale_present = sim
+            .world
+            .host_world
+            .hosts
+            .lock()
+            .values()
+            .any(|h| h.sandboxes.contains_key(&stale_sandbox));
+        assert!(
+            !stale_present,
+            "the confirmed teardown removed the stale source VM",
+        );
+    });
+}

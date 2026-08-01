@@ -58,26 +58,86 @@ impl GcsBlobStorage {
     /// the SDK turns up only a `// TODO emulator support` note). We
     /// thread it through explicitly here.
     pub async fn connect(bucket: impl Into<String>) -> Result<Self, BlobError> {
-        let cfg = if let Ok(host) = std::env::var("STORAGE_EMULATOR_HOST") {
-            // Emulator mode: anonymous auth + the override endpoint.
-            // Strip a trailing slash so requests don't double up.
-            let endpoint = host.trim_end_matches('/').to_string();
-            tracing::info!(endpoint, "gcs: using STORAGE_EMULATOR_HOST");
-            ClientConfig {
-                storage_endpoint: endpoint,
-                ..ClientConfig::default()
-            }
-            .anonymous()
-        } else {
-            ClientConfig::default()
-                .with_auth()
-                .await
-                .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))?
-        };
+        let mut cfg = Self::auth_config().await?;
+        // Inject our own transport instead of the SDK's untuned default
+        // (per TigerBeetle's object-storage-client findings, 2026-07):
+        // - bounded connect: a blackholed endpoint fails in 5 s and
+        //   surfaces to the BlobClient retry layer, instead of pinning
+        //   an attempt for the OS default (minutes).
+        // - sized keep-alive pool: the sparse re-chunk and NBD flush
+        //   fan out dozens of concurrent chunk ops; idle-connection
+        //   reuse keeps those off the TLS-handshake path — and keeps
+        //   DNS off the hot path entirely, which is why hickory async
+        //   DNS was tried and RETIRED here: reqwest's `hickory-dns`
+        //   feature unifies workspace-wide and flips the DEFAULT
+        //   resolver for every reqwest client off getaddrinfo
+        //   (different ndots/search/hosts semantics under the k8s
+        //   fleet's resolv.conf) — the same silent-global reach as
+        //   the rejected `http2` feature below.
+        // No global request timeout here — bodies are GB-scale on the
+        // streaming paths; per-attempt deadlines live in BlobClient.
+        //
+        // Protocol: pooled HTTP/1.1, unconditionally — bulk parallel
+        // chunk transfers get one TCP window each instead of sharing
+        // one h2 connection's flow control. HTTP/2 was measured and
+        // REJECTED: blobbench (2026-07-31, n2-standard-16 → us-west2
+        // GCS, 16 MiB objects, c=32) put ALPN h2 at 4-5x worse on
+        // bulk transfer (GET 1914 → 378 MiB/s, PUT 1497 → 474
+        // MiB/s), so reqwest's `http2` feature is deliberately NOT
+        // enabled anywhere in the workspace — feature unification
+        // would silently flip every unpinned reqwest client
+        // (engram-oci's registry pulls included) to h2. The
+        // `http1_only()` here is belt-and-braces against the feature
+        // ever arriving transitively; to re-test h2, re-run blobbench
+        // with the feature enabled rather than trusting this number.
+        let http = reqwest::Client::builder()
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .pool_max_idle_per_host(64)
+            .pool_idle_timeout(std::time::Duration::from_secs(90))
+            .tcp_keepalive(std::time::Duration::from_secs(30))
+            .http1_only()
+            .build()
+            .map_err(|e| BlobError::Config(format!("gcs http client: {e}")))?;
+        cfg.http = Some(reqwest_middleware::ClientBuilder::new(http).build());
         Ok(Self {
             client: Arc::new(Client::new(cfg)),
             bucket: bucket.into(),
         })
+    }
+
+    /// Baseline constructor on the SDK's DEFAULT transport (no
+    /// injected client: getaddrinfo DNS, unbounded connect, default
+    /// pool). Exists ONLY as the before/after control for
+    /// `engram-blob-client`'s `blobbench` harness — production and
+    /// dev code paths must use [`Self::connect`].
+    #[doc(hidden)]
+    pub async fn connect_untuned(bucket: impl Into<String>) -> Result<Self, BlobError> {
+        let cfg = Self::auth_config().await?;
+        Ok(Self {
+            client: Arc::new(Client::new(cfg)),
+            bucket: bucket.into(),
+        })
+    }
+
+    /// Shared auth/endpoint resolution: emulator (anonymous + the
+    /// `STORAGE_EMULATOR_HOST` endpoint — the SDK doesn't auto-honor
+    /// it) or ADC against production HTTPS.
+    async fn auth_config() -> Result<ClientConfig, BlobError> {
+        if let Ok(host) = std::env::var("STORAGE_EMULATOR_HOST") {
+            // Strip a trailing slash so requests don't double up.
+            let endpoint = host.trim_end_matches('/').to_string();
+            tracing::info!(endpoint, "gcs: using STORAGE_EMULATOR_HOST");
+            Ok(ClientConfig {
+                storage_endpoint: endpoint,
+                ..ClientConfig::default()
+            }
+            .anonymous())
+        } else {
+            ClientConfig::default()
+                .with_auth()
+                .await
+                .map_err(|e| BlobError::Config(format!("gcs auth: {e}")))
+        }
     }
 }
 
@@ -109,6 +169,28 @@ fn map_http_err(e: GcsHttpError) -> BlobError {
 
 #[async_trait]
 impl BlobStorage for GcsBlobStorage {
+    /// Buffered PUT: the body is already in hand, so skip the trait
+    /// default's `put_streaming` bridge entirely — no mpsc pump task,
+    /// no chunked transfer encoding. `Bytes → reqwest::Body` is
+    /// refcounted (zero-copy) and carries Content-Length, which is
+    /// both cheaper per request and what GCS's simple-upload path
+    /// prefers. This is the chunk-upload hot path (sparse re-chunk,
+    /// NBD flush).
+    async fn put(&self, key: &str, body: bytes::Bytes) -> Result<u64, BlobError> {
+        let len = body.len() as u64;
+        let req = UploadObjectRequest {
+            bucket: self.bucket.clone(),
+            ..Default::default()
+        };
+        let upload_type = UploadType::Simple(Media::new(key.to_string()));
+        self.client
+            .upload_object(&req, body, &upload_type)
+            .await
+            .map_err(map_http_err)?;
+        tracing::debug!(bucket = %self.bucket, key = %key, bytes = len, "gcs put (sized)");
+        Ok(len)
+    }
+
     async fn put_streaming(&self, key: &str, mut body: ByteStream) -> Result<u64, BlobError> {
         // Bridge the inbound `ByteStream` (Send but not Sync — its
         // inner `Pin<Box<dyn Stream + Send>>` carries no Sync bound)

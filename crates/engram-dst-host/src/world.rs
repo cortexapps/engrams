@@ -339,6 +339,13 @@ impl SimEvictionSandbox {
     pub fn destroyed(&self) -> Vec<SandboxId> {
         self.destroyed.lock().clone()
     }
+
+    /// Consume the destroy record for `id`: a finalized-snapshot resume
+    /// re-created the sandbox, so it is a live VM again — not a terminal
+    /// corpse the recovery legs must keep refusing to rebuild.
+    pub fn forget(&self, id: SandboxId) {
+        self.destroyed.lock().retain(|d| *d != id);
+    }
 }
 
 #[async_trait::async_trait]
@@ -609,6 +616,19 @@ impl SimHost {
             .contains_key(&self.sandboxes[idx].sandbox_id)
     }
 
+    /// #898: was slot `idx`'s VM terminally destroyed by a completed
+    /// eviction finalize? The destroy record is coordinator-side truth
+    /// ([`SimHost::destroyer`] survives process rolls), so every recovery
+    /// leg must consult it: production rehydrates only coordinator-provided
+    /// survivors with a resident rootfs, and a terminally destroyed sandbox
+    /// is neither. Only a finalized-snapshot resume
+    /// ([`resume_finalized`](Self::resume_finalized)) re-creates it.
+    fn terminally_destroyed(&self, idx: usize) -> bool {
+        self.destroyer
+            .destroyed()
+            .contains(&self.sandboxes[idx].sandbox_id)
+    }
+
     fn next_tag(&mut self) -> u64 {
         self.next_tag += 1;
         self.next_tag
@@ -815,7 +835,10 @@ impl SimHost {
     /// the spool into it — exactly the successor path, driven against the
     /// same host.
     pub async fn spool_adopt(&mut self, idx: usize) -> Result<(), String> {
-        if idx >= self.sandboxes.len() || self.finalize_pending(idx) {
+        if idx >= self.sandboxes.len()
+            || self.finalize_pending(idx)
+            || self.terminally_destroyed(idx)
+        {
             return Ok(());
         }
         // Capture the live tier first — losslessness gate.
@@ -927,7 +950,10 @@ impl SimHost {
     /// FREE in the fresh post-roll pool, so `claim`'s fast path takes it with
     /// no retry (safe under paused tokio).
     async fn reserve_and_serve(&mut self, idx: usize) -> Result<(), String> {
-        if self.sandboxes[idx].served_by == Some(self.generation) || self.finalize_pending(idx) {
+        if self.sandboxes[idx].served_by == Some(self.generation)
+            || self.finalize_pending(idx)
+            || self.terminally_destroyed(idx)
+        {
             return Ok(());
         }
         let device = self.sandboxes[idx].nbd_device.clone();
@@ -1227,6 +1253,15 @@ impl SimHost {
             {
                 continue;
             }
+            // #898: a terminally-finalized sandbox was DESTROYED — production
+            // restart rehydrates only coordinator-provided survivors with a
+            // resident rootfs, and this is neither. Rebuilding it here was
+            // the resurrection channel that mis-surfaced the #897 finalize
+            // bug through a recovery path production cannot take; the honest
+            // detection path is [`Step::FinalizedResume`].
+            if self.terminally_destroyed(idx) {
+                continue;
+            }
             if self.sandboxes[idx].backend.is_none() {
                 self.rebuild(idx).await?;
             }
@@ -1335,16 +1370,15 @@ impl SimHost {
                     .map_err(|e| format!("sandbox {idx}: spool adoption refused: {e}"))?;
             } else {
                 // Stale refusal (an older divergence than the durable tier).
-                // ORACLE (af28cac4, 2026-07-21): refusing is only SAFE when
+                // Refusing is only SAFE when
                 // the durable tier already covers every spooled write — true
                 // for a legitimately-superseded spool (a later flush /
                 // eviction finalize published past it) by tag monotonicity.
                 // A refused spool holding a tag ABOVE the published floor
-                // means something published AROUND a live export — the
-                // detached-final-flush race, where the spool was stamped
-                // before a racing publish landed — and discarding it rolls
-                // an acked write back under the live guest. Loud, never a
-                // silent discard of the only newer copy.
+                // means a durable-manifest advance failed to cover a spooled
+                // write, and discarding it rolls an acked write back under the
+                // live guest. Loud, never a silent discard of the only newer
+                // copy.
                 for (chunk_idx, bytes) in &chunks {
                     let tag = decode_tag(bytes);
                     let floor = self
@@ -1356,7 +1390,8 @@ impl SimHost {
                             "sandbox {idx}: stale-refused spool (stamped {spool_ref}, durable \
                              {rebuild_ref}) holds chunk {chunk_idx} tag {tag} above the \
                              published floor {floor} — refusing it rolls back an acked write \
-                             whose only copy was the spool (the af28cac4 detached-flush race)"
+                             whose only copy was the spool (a durable-manifest advance failed \
+                             to cover it)"
                         ));
                     }
                 }
@@ -1846,7 +1881,21 @@ impl SimHost {
         let plan = engram_host_core::plan_resume_attach(!poisoned, true, poisoned);
         match plan {
             engram_host_core::ResumeAttachPlan::Attach => {
-                self.rebuild(idx).await?;
+                // #898: a resume boots a FRESH sandbox from the finalize-
+                // published manifest (the coordinator-provided ref) — it
+                // never walks the survivor rehydrate path, so no spool read
+                // here. A standing spool belongs to the destroyed
+                // incarnation; later survivor rebuilds still meet it through
+                // the honest lineage/floor gate.
+                let backend = build_backend(
+                    &self.store,
+                    self.fs.cache_dir(),
+                    idx,
+                    self.sandboxes[idx].rebuild_ref(),
+                )
+                .await;
+                self.sandboxes[idx].backend = Some(Arc::new(backend));
+                self.destroyer.forget(self.sandboxes[idx].sandbox_id);
                 Ok(ResumeOutcome::Attached)
             }
             engram_host_core::ResumeAttachPlan::RefuseStaleLiteral if gated => {
@@ -1875,6 +1924,24 @@ impl SimHost {
         }
     }
 
+    /// Swarm entry for [`Step::FinalizedResume`](crate::Step::FinalizedResume):
+    /// no-op unless slot `idx` is a terminally-destroyed, non-pending finalize
+    /// target — the only state the coordinator drives a post-eviction resume
+    /// for. The swarm resumes GATED (the #743 guard on — safe default, like
+    /// `RegisterRehydrate`); the adversarial ungated leg rides the G2 seeds.
+    pub async fn finalized_resume(&mut self, idx: usize) -> Result<(), String> {
+        if idx >= self.sandboxes.len()
+            || self.sandboxes[idx].backend.is_some()
+            || self.finalize_pending(idx)
+            || !self.terminally_destroyed(idx)
+        {
+            return Ok(());
+        }
+        self.resume_finalized(idx, /*gated=*/ true)
+            .await
+            .map(|_| ())
+    }
+
     /// One finalize redrive attempt for slot `idx` — the REAL production
     /// loop body (`run_eviction_finalize_attempt`): a sleep-free pass over
     /// the legs + the retry/quarantine verdict. Backoff is modeled by the
@@ -1901,6 +1968,8 @@ impl SimHost {
                 // resume leg must reckon with.
                 self.sandboxes[idx].poisoned_snapshot = record.disk_manifest.is_none();
                 if let Some(published) = record.disk_manifest {
+                    self.assert_finalize_covers_staging(idx, &record, published)
+                        .await?;
                     self.sandboxes[idx].published_ref = Some(published);
                     self.mark_flush_published(idx, published).await?;
                 }
@@ -1911,6 +1980,53 @@ impl SimHost {
             }
             FinalizeAttempt::RetryAfter(_backoff) => {
                 self.in_flight.insert(idx, record);
+            }
+        }
+        Ok(())
+    }
+
+    /// ORACLE (#898 — the #897 laundering class made first-class): a
+    /// COMPLETED finalize claims durability for every write it drained —
+    /// the VM is destroyed and the staging deleted on the strength of the
+    /// published manifest. Decode that manifest and require it to cover
+    /// every staged chunk; a completed finalize whose publish omits one
+    /// (e.g. a different-content store-ahead occupant accepted at the
+    /// deterministic ref) rolled back an acked write. Loud at the moment
+    /// of the lie — detection no longer depends on a later recovery leg
+    /// (the old accidental resurrection channel) tripping over the gap.
+    async fn assert_finalize_covers_staging(
+        &self,
+        idx: usize,
+        record: &EvictionFinalizeRecord,
+        published: ManifestRef,
+    ) -> Result<(), String> {
+        let Some(pending) = record.disk_pending.as_ref() else {
+            return Ok(());
+        };
+        let manifest = self
+            .store
+            .get_manifest(published)
+            .await
+            .map_err(|e| format!("finalize-coverage get_manifest sandbox {idx}: {e}"))?;
+        for (chunk_idx, hash) in &pending.chunks {
+            let offset = (*chunk_idx as u64) * CHUNK_SIZE;
+            let covered = manifest
+                .chunks
+                .iter()
+                .any(|c| c.offset == offset && c.hash == *hash);
+            if !covered {
+                let tag = self
+                    .store
+                    .get_chunk(*hash)
+                    .await
+                    .map(|b| decode_tag(&b))
+                    .unwrap_or(0);
+                return Err(format!(
+                    "sandbox {idx}: completed finalize published {published} but staged \
+                     chunk {chunk_idx} tag {tag} is absent from it — the finalize's \
+                     durability claim (VM destroyed, staging deleted) does not cover an \
+                     acked write (the #897 deterministic-ref laundering class)"
+                ));
             }
         }
         Ok(())

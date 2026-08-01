@@ -94,6 +94,7 @@ use std::time::Duration;
 
 use chrono::Utc;
 use engram_core::types::session::{QueueOrigin, QueuedSession, SessionState};
+use engram_core::types::BindingDisposition;
 use engram_core::SessionId;
 use tokio::sync::Notify;
 
@@ -686,7 +687,11 @@ async fn dequeue_resume(state: &SharedState, q: &QueuedSession) {
     match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Idle)
+        .transition_session(
+            session_id,
+            SessionState::Idle,
+            BindingDisposition::RequireUnbound,
+        )
         .await
     {
         Ok(prev) => {
@@ -745,7 +750,11 @@ async fn fail_queued_create_image_gone(state: &SharedState, q: &QueuedSession) -
     match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Failed)
+        .transition_session(
+            session_id,
+            SessionState::Failed,
+            BindingDisposition::RequireUnbound,
+        )
         .await
     {
         Ok(prev) => emit_from(state, session_id, prev, SessionState::Failed).await,
@@ -783,7 +792,11 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
             let prev = match state
                 .services
                 .meta
-                .transition_session(session_id, SessionState::Failed)
+                .transition_session(
+                    session_id,
+                    SessionState::Failed,
+                    BindingDisposition::RequireUnbound,
+                )
                 .await
             {
                 Ok(prev) => prev,
@@ -849,7 +862,11 @@ async fn time_out_session(state: &SharedState, q: &QueuedSession) {
         QueueOrigin::Resume => match state
             .services
             .meta
-            .transition_session(session_id, SessionState::Idle)
+            .transition_session(
+                session_id,
+                SessionState::Idle,
+                BindingDisposition::RequireUnbound,
+            )
             .await
         {
             Ok(prev) => emit_from(state, session_id, prev, SessionState::Idle).await,

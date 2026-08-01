@@ -78,6 +78,9 @@ async fn run_inner(sub: &str, rest: &[String]) -> Result<String, String> {
         // GIT_ASKPASS prints the password; the username comes from git
         // config (`credential.<host>.username = x-access-token`).
         ForgeResponse::Credential { password, .. } => Ok(password),
+        ForgeResponse::OAuthCredential { .. } => {
+            Err("host returned OAuth credential to git helper".into())
+        }
         ForgeResponse::Error { message } => Err(message),
     }
 }

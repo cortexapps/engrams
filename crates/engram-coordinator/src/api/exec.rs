@@ -570,6 +570,7 @@ mod tests {
             _sandbox_id: SandboxId,
             _prompt_id: String,
             _text: String,
+            _mode: Option<String>,
         ) -> Result<(), SandboxError> {
             unreachable!("exec-core tests never send prompts")
         }
@@ -622,9 +623,13 @@ mod tests {
         meta.transition_session_created(session_id, sandbox_id)
             .await
             .expect("bind exec test sandbox");
-        meta.transition_session(session_id, SessionState::Active)
-            .await
-            .expect("activate exec test session");
+        meta.transition_session(
+            session_id,
+            SessionState::Active,
+            engram_core::types::BindingDisposition::Retain,
+        )
+        .await
+        .expect("activate exec test session");
         (session_id, sandbox_id)
     }
 

@@ -1,8 +1,8 @@
 //! The harness descriptor (`harness.toml`) — ADR 0063.
 //!
 //! A harness-agnostic declaration each harness ships inside its bundle,
-//! describing its *environment contract*: the credential env-var names (an
-//! org/programmatic one + an optional user/interactive one) and the model /
+//! describing its *credential contract*: an org/programmatic env-var plus an
+//! optional user env-var or OAuth connection, and the model /
 //! effort enums, where each option maps to the env var(s) that select it.
 //! ADR 0062's harness catalog stores this verbatim so the orchestrator/web can
 //! render pickers and derive the (formerly Claude-hardcoded) env wiring without
@@ -60,6 +60,14 @@ pub struct HarnessDescriptor {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub effort: Vec<HarnessOption>,
 
+    /// Session modes this harness supports (ADR 0107), e.g. `plan`. Pure
+    /// declaration — a mode carries no env map. Mode selection rides prompts
+    /// (`harness_mode`) and each harness maps its own mode to native behavior;
+    /// the declaration only drives the create/composer pickers and coordinator
+    /// validation. A harness that declares no modes never shows the affordance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub modes: Vec<HarnessMode>,
+
     /// Egress hosts the harness *itself* must reach to function — its model
     /// API and telemetry endpoints (ADR 0063 addendum). Concatenated into the
     /// session's deny-default egress allowlist at create, so profiles never
@@ -87,8 +95,8 @@ impl HarnessEgress {
     }
 }
 
-/// Credential env-var names. A credential is one var, so these are plain
-/// strings (unlike the per-option model/effort env maps).
+/// Credential contract. A harness may expose one human credential mechanism:
+/// an env-var secret or a reusable OAuth connection (ADR 0106).
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct HarnessAuth {
@@ -102,6 +110,11 @@ pub struct HarnessAuth {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_env: Option<String>,
 
+    /// OAuth connection for human sessions. Mutually exclusive with
+    /// [`Self::user_env`]; OAuth payloads never enter the harness env map.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_oauth: Option<HarnessOAuth>,
+
     /// Free-text setup instructions for the org credential, surfaced to admins.
     /// Not validated — human guidance, never a secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -112,6 +125,26 @@ pub struct HarnessAuth {
     /// user knows how to obtain it. Not validated, never a secret.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_env_hint: Option<String>,
+}
+
+/// A harness's reusable human OAuth requirement. `provider` addresses a
+/// trusted coordinator driver; the bundle is opaque outside that driver and
+/// its bound harness.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessOAuth {
+    /// Stable driver id (for example `openai-codex`).
+    pub provider: String,
+
+    /// How the credential is delivered to the harness. V1 intentionally has
+    /// one mode so future connector/MCP consumers share the same vocabulary.
+    pub delivery: OAuthDelivery,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OAuthDelivery {
+    OpaqueBundle,
 }
 
 /// One org-secret delivery specification attached to a model or effort option.
@@ -163,6 +196,34 @@ pub struct HarnessOption {
     pub secrets: Vec<HarnessOptionSecret>,
 }
 
+/// One session mode (ADR 0107). Unlike [`HarnessOption`] there is no env map:
+/// a mode is not an env selection — it rides prompts and the harness itself
+/// maps it to native behavior.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HarnessMode {
+    /// Stable mode id — what `SendPromptRequest.harness_mode` carries
+    /// (e.g. `"plan"`).
+    pub id: String,
+
+    /// Human label for pickers; falls back to `id`
+    /// (see [`HarnessMode::display_label`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+
+    /// Whether this is the mode a session starts in when none is selected. At
+    /// most one mode may set this.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub default: bool,
+}
+
+impl HarnessMode {
+    /// Display label, falling back to the mode id.
+    pub fn display_label(&self) -> &str {
+        self.label.as_deref().unwrap_or(&self.id)
+    }
+}
+
 fn is_false(b: &bool) -> bool {
     !*b
 }
@@ -200,8 +261,18 @@ impl HarnessDescriptor {
         if let Some(v) = &self.auth.user_env {
             validate_env_name(v).map_err(|e| format!("harness.toml [auth] user_env: {e}"))?;
         }
+        if self.auth.user_env.is_some() && self.auth.user_oauth.is_some() {
+            return Err(
+                "harness.toml [auth]: user_env and user_oauth are mutually exclusive".into(),
+            );
+        }
+        if let Some(oauth) = &self.auth.user_oauth {
+            validate_stable_id(&oauth.provider)
+                .map_err(|e| format!("harness.toml [auth.user_oauth] provider: {e}"))?;
+        }
         validate_options("models", &self.models, &self.auth)?;
         validate_options("effort", &self.effort, &self.auth)?;
+        validate_modes(&self.modes)?;
         Ok(())
     }
 
@@ -213,6 +284,20 @@ impl HarnessDescriptor {
     /// The effort option with this id, if any.
     pub fn effort(&self, id: &str) -> Option<&HarnessOption> {
         self.effort.iter().find(|o| o.id == id)
+    }
+
+    /// The mode with this id, if any (ADR 0107).
+    pub fn mode(&self, id: &str) -> Option<&HarnessMode> {
+        self.modes.iter().find(|m| m.id == id)
+    }
+
+    /// The default mode: the one flagged `default`, else the first listed,
+    /// else `None` (a harness may declare no modes).
+    pub fn default_mode(&self) -> Option<&HarnessMode> {
+        self.modes
+            .iter()
+            .find(|m| m.default)
+            .or_else(|| self.modes.first())
     }
 
     /// The default model: the option flagged `default`, else the first listed,
@@ -370,6 +455,28 @@ fn validate_options(field: &str, opts: &[HarnessOption], auth: &HarnessAuth) -> 
     Ok(())
 }
 
+fn validate_modes(modes: &[HarnessMode]) -> Result<(), String> {
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut defaults = 0usize;
+    for m in modes {
+        if m.id.trim().is_empty() {
+            return Err("harness.toml [[modes]]: id must not be empty".into());
+        }
+        if !seen.insert(m.id.as_str()) {
+            return Err(format!("harness.toml [[modes]]: duplicate id {:?}", m.id));
+        }
+        if m.default {
+            defaults += 1;
+        }
+    }
+    if defaults > 1 {
+        return Err(format!(
+            "harness.toml [[modes]]: at most one mode may be default ({defaults} found)"
+        ));
+    }
+    Ok(())
+}
+
 /// A POSIX-ish env var name: `[A-Za-z_][A-Za-z0-9_]*` (the same shape the
 /// orchestrator validates env-var names against).
 fn validate_env_name(name: &str) -> Result<(), String> {
@@ -384,6 +491,20 @@ fn validate_env_name(name: &str) -> Result<(), String> {
     if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
         return Err(format!(
             "invalid env var name {name:?} (only [A-Za-z0-9_] allowed)"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_stable_id(value: &str) -> Result<(), String> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || !value.as_bytes()[0].is_ascii_lowercase()
+    {
+        return Err(format!(
+            "invalid stable id {value:?} (expected [a-z][a-z0-9-]*)"
         ));
     }
     Ok(())
@@ -466,6 +587,39 @@ org_env_hint = "Set an org secret KEY."
             d.auth.org_env_hint.as_deref(),
             Some("Set an org secret KEY.")
         );
+    }
+
+    #[test]
+    fn parses_oauth_and_rejects_two_human_mechanisms() {
+        let oauth = HarnessDescriptor::parse(
+            r#"
+name = "codex"
+[auth.user_oauth]
+provider = "openai-codex"
+delivery = "opaque_bundle"
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            oauth.auth.user_oauth,
+            Some(HarnessOAuth {
+                provider: "openai-codex".into(),
+                delivery: OAuthDelivery::OpaqueBundle,
+            })
+        );
+
+        let err = HarnessDescriptor::parse(
+            r#"
+name = "bad"
+[auth]
+user_env = "TOKEN"
+[auth.user_oauth]
+provider = "openai-codex"
+delivery = "opaque_bundle"
+"#,
+        )
+        .unwrap_err();
+        assert!(err.contains("mutually exclusive"), "{err}");
     }
 
     #[test]
@@ -734,5 +888,67 @@ args = ["--serve", "--quiet"]
                 "exec {bad:?} should be rejected"
             );
         }
+    }
+
+    #[test]
+    fn parses_modes_and_defaults_empty() {
+        let src = r#"
+name = "x"
+[[modes]]
+id = "default"
+label = "Build"
+default = true
+[[modes]]
+id = "plan"
+label = "Plan"
+"#;
+        let d = HarnessDescriptor::parse(src).unwrap();
+        assert_eq!(d.modes.len(), 2);
+        assert_eq!(d.default_mode().unwrap().id, "default");
+        assert_eq!(d.mode("plan").unwrap().display_label(), "Plan");
+        assert!(d.mode("bogus").is_none());
+
+        // Absent block → empty (older descriptors stay valid, no affordance).
+        let d = HarnessDescriptor::parse(CLAUDE).unwrap();
+        assert!(d.modes.is_empty());
+        assert!(d.default_mode().is_none());
+    }
+
+    #[test]
+    fn rejects_duplicate_or_multi_default_modes() {
+        let dup = r#"
+name = "x"
+[[modes]]
+id = "plan"
+[[modes]]
+id = "plan"
+"#;
+        let err = HarnessDescriptor::parse(dup).unwrap_err();
+        assert!(err.contains("duplicate id"), "{err}");
+
+        let two_defaults = r#"
+name = "x"
+[[modes]]
+id = "a"
+default = true
+[[modes]]
+id = "b"
+default = true
+"#;
+        let err = HarnessDescriptor::parse(two_defaults).unwrap_err();
+        assert!(err.contains("at most one mode may be default"), "{err}");
+    }
+
+    #[test]
+    fn rejects_env_on_a_mode() {
+        // A mode is a pure declaration (ADR 0107) — an env map is a schema
+        // error, not a silent no-op.
+        let src = r#"
+name = "x"
+[[modes]]
+id = "plan"
+env = { SOME_VAR = "1" }
+"#;
+        assert!(HarnessDescriptor::parse(src).is_err());
     }
 }

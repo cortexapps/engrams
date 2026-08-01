@@ -10,6 +10,7 @@
 //!      sweep; it is deferred for the reattach machinery until the
 //!      serving-strike cap, then settles (convergence — oracle #8's shape).
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -58,10 +59,10 @@ async fn seed_bound_host_lost(
     meta.transition_session_created(sid, sandbox)
         .await
         .expect("created");
-    meta.transition_session(sid, SessionState::Active)
+    meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
         .await
         .expect("active");
-    meta.transition_session(sid, SessionState::HostLost)
+    meta.transition_session(sid, SessionState::HostLost, BindingDisposition::Retain)
         .await
         .expect("host-lost (bindings intact)");
     sid

@@ -68,6 +68,13 @@ pub enum SessionState {
     /// (the recoverable PG snapshot row, written by the heartbeat
     /// reconcile after HEAD-checking the manifests) — never on the
     /// host-local capture alone.
+    ///
+    /// Normally unbound (`sandbox_id` cleared by the evict pipeline's
+    /// fused flip), with ONE documented exception (#896, ADR 0090
+    /// addendum): the evac resumer's budget-exhaustion fallback arrives
+    /// here with the UNCONFIRMED source binding retained — ownership is
+    /// never released on a guess. The resume verb's stale-binding gate
+    /// (`resume_from_idle`) is the sole consumer of that residue.
     Idle,
     /// Heartbeat-loss against the bound host. Non-terminal: the
     /// dead-host detector's second stage moves it onward —
@@ -91,8 +98,11 @@ pub enum SessionState {
     /// `POST /api/admin/hosts/:id/drain`) — ADR 0044 K3. As of ADR
     /// 0045 Phase A the dead-host detector no longer routes here (the
     /// reactive auto-evac is retired), and `HostLost → Evacuating` is
-    /// no longer a legal edge. Sandbox + host bindings are nulled out
-    /// same as `Idle` — the session is recoverable but not running.
+    /// no longer a legal edge. Post-#896 the source binding is
+    /// RETAINED through `Evacuating` (ADR 0090: a destroy
+    /// acknowledgement is not ownership proof) — the evac resumer
+    /// clears it under its claim only after the source teardown is
+    /// positively confirmed.
     Evacuating,
     /// ADR 0034: durable idle-eviction intent marker. The candidates
     /// handler (or the PG detection backstop) transitions
@@ -371,6 +381,73 @@ impl fmt::Display for IllegalTransition {
 }
 
 impl std::error::Error for IllegalTransition {}
+
+/// What a session state transition does to the row's `sandbox_id`
+/// binding — an explicit, mandatory part of every transition (#896,
+/// ADR 0090 addendum). The binding used to be managed BESIDE the state
+/// machine (separate `detach_sandbox` flags and blind assign calls),
+/// which let one caller change a state's binding expectations while
+/// another silently relied on the old ones — the #896 dead-end row.
+///
+/// Store-level enforcement is by-state
+/// ([`SessionState::binding_disposition_legal`]); the per-SITE
+/// discipline (e.g. `Retain` into `Idle` is authorized ONLY for the
+/// evac-exhaustion residue) is held by the binding-writer inventory
+/// test and the ADR 0090 addendum — a store cannot know its caller.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum BindingDisposition {
+    /// Clear `sandbox_id` in the same atomic write as the flip
+    /// (`host_id` untouched — resume affinity survives). Idempotent on
+    /// an unbound row. The caller destroyed/abandoned the VM or is
+    /// flipping to a state that must not own one.
+    Detach,
+    /// Leave the binding exactly as-is. Legal only into states that may
+    /// own a sandbox; arriving bound at Pending/Queued/terminals with
+    /// `Retain` is a Conflict.
+    Retain,
+    /// The caller believes an ownership gate already released the
+    /// binding; arriving bound is a Conflict. Turns gate-ordering bugs
+    /// into loud failures instead of silent blind-releases (the ADR
+    /// 0090 anti-pattern) or accidental retention.
+    RequireUnbound,
+}
+
+impl SessionState {
+    /// Store-level legality of `disposition` when arriving at `self`
+    /// (the TARGET state) on a row whose binding is currently
+    /// `arriving_bound`. Checked by both stores inside the same
+    /// transaction/lock as the state-pair legality; a violation is a
+    /// `Conflict`, never a silent write.
+    pub const fn binding_disposition_legal(
+        self,
+        arriving_bound: bool,
+        disposition: BindingDisposition,
+    ) -> bool {
+        if !arriving_bound {
+            // Nothing to dispose of: Detach is an idempotent no-op,
+            // Retain retains nothing, RequireUnbound holds.
+            return true;
+        }
+        match disposition {
+            BindingDisposition::Detach => true,
+            BindingDisposition::RequireUnbound => false,
+            BindingDisposition::Retain => matches!(
+                self,
+                SessionState::Created
+                    | SessionState::Active
+                    | SessionState::Unreachable
+                    | SessionState::Parked
+                    | SessionState::Evacuating
+                    | SessionState::Evicting
+                    | SessionState::HostLost
+                    // The #896 evac-exhaustion residue: ownership of an
+                    // UNCONFIRMED sandbox is never released on a guess;
+                    // the resume verb's stale-binding gate consumes it.
+                    | SessionState::Idle
+            ),
+        }
+    }
+}
 
 /// Full OCI reference (registry host + repo path + tag) for the
 /// image this session boots from. Examples:
@@ -868,6 +945,46 @@ mod tests {
                     assert_eq!(got, Err(IllegalTransition { from, to }));
                 }
             }
+        }
+    }
+
+    /// The binding-disposition legality table (#896, ADR 0090 addendum):
+    /// exhaustive over (target, arriving_bound, disposition). The
+    /// bound-retaining target set is spelled here in full so widening it
+    /// is a deliberate, reviewed diff of this test too.
+    #[test]
+    fn binding_disposition_table_is_exhaustive() {
+        use BindingDisposition::*;
+        use SessionState::*;
+        let retain_ok: &[SessionState] = &[
+            Created,
+            Active,
+            Unreachable,
+            Parked,
+            Evacuating,
+            Evicting,
+            HostLost,
+            // The #896 evac-exhaustion residue lane.
+            Idle,
+        ];
+        for target in all_states() {
+            // An unbound row: every disposition is legal (Detach is an
+            // idempotent no-op; RequireUnbound holds).
+            for d in [Detach, Retain, RequireUnbound] {
+                assert!(
+                    target.binding_disposition_legal(false, d),
+                    "unbound arrival must always be legal ({target:?}, {d:?})"
+                );
+            }
+            // A bound row: Detach always legal; RequireUnbound never;
+            // Retain only into the may-own set.
+            assert!(target.binding_disposition_legal(true, Detach));
+            assert!(!target.binding_disposition_legal(true, RequireUnbound));
+            assert_eq!(
+                target.binding_disposition_legal(true, Retain),
+                retain_ok.contains(&target),
+                "Retain-while-bound into {target:?}"
+            );
         }
     }
 

@@ -47,6 +47,7 @@
 //! decision is `BTreeMap`/index-ordered. The replay-twice self-check
 //! (`tests/swarm_replay.rs` + the CLI) is the determinism guard.
 
+use engram_core::types::BindingDisposition;
 use rand::Rng;
 use rand_chacha::rand_core::SeedableRng;
 use rand_chacha::ChaCha8Rng;
@@ -339,14 +340,20 @@ impl CosimSwarm {
                 if let Some(s) = self.session(slot) {
                     if self.sim.session_state(s).await == Some(SessionState::Active) {
                         self.sim
-                            .force_session_state(s, SessionState::HostLost)
+                            .force_session_state(
+                                s,
+                                SessionState::HostLost,
+                                BindingDisposition::Retain,
+                            )
                             .await;
                     }
                 }
             }
             Step::ForceTerminal(slot) => {
                 if let Some(s) = self.session(slot) {
-                    self.sim.force_session_state(s, SessionState::Failed).await;
+                    self.sim
+                        .force_session_state(s, SessionState::Failed, BindingDisposition::Detach)
+                        .await;
                 }
             }
             Step::FinalizePending => self.sim.finalize_pending().await,

@@ -38,7 +38,7 @@ engram-chunk-store.workspace = true
 engram-substrate-proto.workspace = true
 engram-migrate-proto.workspace = true
 engram-storage-local.workspace = true
-engram-storage-gcs.workspace = true
+engram-blob-client.workspace = true
 engram-egress-proxy.workspace = true
 engram-oci.workspace = true
 # ADR 0080 §C: host-side materialization of standard docker images —

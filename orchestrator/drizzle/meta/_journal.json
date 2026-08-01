@@ -295,6 +295,20 @@
       "when": 1785183845717,
       "tag": "0041_review_one_active_per_target",
       "breakpoints": true
+    },
+    {
+      "idx": 42,
+      "version": "7",
+      "when": 1785528000000,
+      "tag": "0042_remove_codex_access_token",
+      "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1785599431533,
+      "tag": "0043_round_mercury",
+      "breakpoints": true
     }
   ]
 }

@@ -138,10 +138,12 @@ async fn stream_events_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -159,6 +161,7 @@ async fn stream_events_smoke() {
     let mut stream_req = tonic::Request::new(app::StreamEventsRequest {
         session_id: session_id.clone(),
         since: None,
+        durable_only: false,
     });
     stream_req.set_timeout(rpc_timeout);
     let mut stream = client
@@ -204,6 +207,7 @@ async fn stream_events_smoke() {
     let mut reopen_req = tonic::Request::new(app::StreamEventsRequest {
         session_id: session_id.clone(),
         since: Some(last_idx),
+        durable_only: false,
     });
     reopen_req.set_timeout(rpc_timeout);
     let mut reopen_stream = client
@@ -284,10 +288,12 @@ async fn session_crud_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -408,10 +414,12 @@ async fn exec_streaming_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let create_resp = client
@@ -537,8 +545,10 @@ async fn write_files_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -615,10 +625,12 @@ async fn snapshot_evict_resume_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -753,10 +765,12 @@ async fn get_artifact_not_found_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = client
@@ -831,10 +845,12 @@ async fn shell_relay_smoke() {
         prompt: None,
         secrets: std::collections::HashMap::new(),
         harness_env: std::collections::HashMap::new(),
+        oauth_credential: None,
         prompt_id: None,
         // ADR 0062: this smoke uses an enabled image; under the new model an
         // agent-mode create needs a catalog harness, so these run as dev_vm.
         harness: None,
+        harness_mode: None,
     });
     create_req.set_timeout(rpc_timeout);
     let session_id = session_client

@@ -2,6 +2,8 @@ syntax = "proto3";
 
 package engram.app.v1;
 
+import "engram/app/v1/oauth.proto";
+
 // The orchestrator-facing app contract (ADR 0051 §2.3, rev 2026-06-10).
 // The caller is a single trusted service (bearer-authed); there is no
 // per-user anything here. Attribution and authz live in the orchestrator.
@@ -182,6 +184,19 @@ message CreateSessionRequest {
   // /opt/engram/dyn/0/<harness>/<exec>. Required for an agent-mode session;
   // unset/ignored for dev_vm. Selection is per session, not baked into the image.
   optional string harness = 11;
+  // ADR 0106: human OAuth binding. Contains no credential bytes; the
+  // coordinator verifies a live subject connection and persists it atomically.
+  OAuthCredentialBinding oauth_credential = 12;
+  // ADR 0107: session mode for the initial `prompt` (e.g. "plan") —
+  // create-time plan mode is just mode on the first prompt. Ignored when
+  // `prompt` is unset. Validated against the selected harness's descriptor.
+  // Not named `mode` — field 2 is the agent/dev_vm SessionMode.
+  optional string harness_mode = 13;
+}
+
+message OAuthCredentialBinding {
+  OAuthSubject subject = 1;
+  string provider = 2;
 }
 
 message CreateSessionResponse {
@@ -217,6 +232,11 @@ message SendPromptRequest {
   // RunStarted{prompt_id} and (if queued) PromptQueued/Edited/Dequeued.
   // The coord mints one if empty (back-compat / non-web callers).
   string prompt_id = 3;
+  // ADR 0107: session-mode directive that applies from this prompt's turn
+  // onward (e.g. "plan"). Validated against the session harness's declared
+  // descriptor modes; unset = no change. Not named `mode` — that name is the
+  // agent/dev_vm SessionMode on CreateSessionRequest/Session.
+  optional string harness_mode = 4;
 }
 
 message SendPromptResponse {
@@ -227,6 +247,12 @@ message SendPromptResponse {
 
 message InterruptRequest {
   string session_id = 1;
+  // ADR 0108: who asked for the interrupt. Free-form label from the
+  // caller ("esc", "stop-button", "aui-cancel", "steer", "cli", ...).
+  // The coordinator logs and counts it; it does not change behavior.
+  // Attribution exists because a 2026-07-31 phantom interrupt took an
+  // hour of archaeology to trace to an ungated library Esc handler.
+  string source = 2;
 }
 
 message InterruptResponse {
@@ -277,6 +303,12 @@ message StreamEventsRequest {
   // (callers translate the HTTP -1 sentinel to unset; proto3 default 0
   // would silently skip idx 0).
   optional int64 since = 2;
+  // ADR 0108 B: suppress ephemeral frames (agent_message_chunk) server-
+  // side. Cursor-based consumers (the orchestrator SessionListener) set
+  // this: every frame they receive then carries an idx, except the
+  // `lagged` sentinel. Unset = today's behavior (chunks flow) — the SSE
+  // passthrough and the browser depend on that.
+  bool durable_only = 3;
 }
 
 // The typed event ENVELOPE. payload_json is NORMATIVELY the JSON object

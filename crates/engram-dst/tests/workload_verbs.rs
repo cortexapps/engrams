@@ -20,10 +20,15 @@ fn rt() -> tokio::runtime::Runtime {
 }
 
 /// Boot exactly one session to Active and return its id (the shared
-/// fixture — mirrors `model_oracle.rs`).
+/// fixture — mirrors `model_oracle.rs`). The one-second advance lets the
+/// harness dial complete (ADR 0108 E: attach lands ~200 ms after
+/// `start_agent`) so `Step::Prompt`, which targets attached sessions,
+/// finds it.
 async fn boot_one_active(sim: &mut Sim) -> engram_core::SessionId {
     sim.execute(Step::HostHeartbeats).await;
     sim.execute(Step::CreateSession).await;
+    sim.execute(Step::AdvanceTime(std::time::Duration::from_secs(1)))
+        .await;
     sim.world
         .meta
         .with_db(|db| {

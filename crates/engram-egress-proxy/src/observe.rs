@@ -13,8 +13,21 @@
 //! parsing fails** — a marked side effect must never occur without an event.
 //!
 //! Scope (ADR §5): HTTP/1.1 only; identity bodies (no gzip/br); a small
-//! `$.resp.*` / `$.req.*` / `$.status` extractor. Bodies are bounded by the
-//! caller's response buffer.
+//! `$.resp.*` / `$.req.*` / `$.status` / `$.vars.*` extractor. Bodies are
+//! bounded by the caller's response buffer.
+//!
+//! **GraphQL parity.** A REST create returns the full object, but a GraphQL
+//! response echoes only the client's *selection set* (`gh pr create` selects
+//! just `id`+`url`), so response-path extraction alone can never match REST.
+//! Two first-class mechanisms close the gap:
+//!   - `$.vars.<dotted>` extracts from the request's GraphQL `variables`. These
+//!     are guest-authored, but they are the exact inputs the upstream accepted
+//!     (the asset is only emitted after the success rule confirms the side
+//!     effect) — the same values a REST response would echo back.
+//!   - [`UrlFallback`] derives fields the response didn't carry from the
+//!     *observed* fetchable URL (trusted response data), e.g. the PR number
+//!     and repo out of `https://github.com/{owner}/{name}/pull/{number:int}`.
+//!     Fallback only: it never overwrites an extracted field.
 
 use std::sync::Arc;
 
@@ -230,15 +243,162 @@ fn has_graphql_errors(body: Option<&Value>) -> bool {
         .is_some_and(|a| !a.is_empty())
 }
 
-/// Evaluate one extractor path against the response. Supports `$.status`,
-/// `$.req.method`, `$.req.path`, `$.resp` (whole body), and `$.resp.<dotted>`
-/// (nested object keys). Returns `None` if the path doesn't resolve.
+/// First-class URL-derived fallback for asset fields. A GraphQL response
+/// carries only the client's selection set, so fields like the PR number may
+/// be absent from the body while still being encoded in the returned URL —
+/// which IS trusted response data. `pattern` is matched against the whole
+/// extracted fetchable URL; `{name}` captures one non-empty run of characters
+/// excluding `/`, `?`, `#`, and `{name:int}` additionally requires a base-10
+/// integer (emitted as a JSON number). `fields` renders `(data field,
+/// template)` pairs over the captures. Fail-soft everywhere: a malformed
+/// pattern or a non-matching URL fills nothing (the asset still ships), and
+/// derived values never overwrite a field the extractors already produced.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct UrlFallback {
+    pub pattern: String,
+    pub fields: Vec<(String, String)>,
+}
+
+/// One token of a parsed [`UrlFallback`] pattern or field template.
+enum UrlTok<'a> {
+    Lit(&'a str),
+    Cap { name: &'a str, int: bool },
+}
+
+/// Tokenize a `{name}` / `{name:int}` template. `None` on a malformed template:
+/// an unterminated `{`, an empty or non-`[A-Za-z0-9_]` name, or two adjacent
+/// captures (ambiguous — there is no literal to delimit where one ends).
+fn parse_url_template(template: &str) -> Option<Vec<UrlTok<'_>>> {
+    let mut toks = Vec::new();
+    let mut rest = template;
+    while !rest.is_empty() {
+        match rest.find('{') {
+            None => {
+                toks.push(UrlTok::Lit(rest));
+                break;
+            }
+            Some(0) => {
+                let end = rest.find('}')?;
+                let inner = &rest[1..end];
+                let (name, int) = match inner.strip_suffix(":int") {
+                    Some(n) => (n, true),
+                    None => (inner, false),
+                };
+                if name.is_empty()
+                    || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_')
+                    || matches!(toks.last(), Some(UrlTok::Cap { .. }))
+                {
+                    return None;
+                }
+                toks.push(UrlTok::Cap { name, int });
+                rest = &rest[end + 1..];
+            }
+            Some(i) => {
+                toks.push(UrlTok::Lit(&rest[..i]));
+                rest = &rest[i..];
+            }
+        }
+    }
+    Some(toks)
+}
+
+impl UrlFallback {
+    /// Match `url` against the pattern and render every field template whose
+    /// captures resolved. `(field, value)` pairs; empty on any failure.
+    fn derive(&self, url: &str) -> Vec<(String, Value)> {
+        let Some(toks) = parse_url_template(&self.pattern) else {
+            return Vec::new();
+        };
+        // Match: a capture spans up to the next literal's first occurrence
+        // (captures can't contain `/`, so segment-shaped patterns stay exact).
+        let mut caps: Vec<(&str, &str, bool)> = Vec::new();
+        let mut pos = 0;
+        for (i, tok) in toks.iter().enumerate() {
+            match tok {
+                UrlTok::Lit(l) => {
+                    if !url[pos..].starts_with(l) {
+                        return Vec::new();
+                    }
+                    pos += l.len();
+                }
+                UrlTok::Cap { name, int } => {
+                    let end = match toks.get(i + 1) {
+                        Some(UrlTok::Lit(next)) => match url[pos..].find(next) {
+                            Some(off) => pos + off,
+                            None => return Vec::new(),
+                        },
+                        // Adjacent captures are rejected at parse; a capture is
+                        // otherwise last and takes the remainder.
+                        Some(UrlTok::Cap { .. }) => return Vec::new(),
+                        None => url.len(),
+                    };
+                    let val = &url[pos..end];
+                    if val.is_empty()
+                        || val.contains(['/', '?', '#'])
+                        || (*int && val.parse::<u64>().is_err())
+                    {
+                        return Vec::new();
+                    }
+                    caps.push((name, val, *int));
+                    pos = end;
+                }
+            }
+        }
+        if pos != url.len() {
+            return Vec::new();
+        }
+
+        let mut out = Vec::new();
+        'fields: for (field, template) in &self.fields {
+            let Some(ttoks) = parse_url_template(template) else {
+                continue;
+            };
+            // A template that is exactly one capture of an `:int` pattern
+            // capture emits a JSON number; every other shape renders a string.
+            if let [UrlTok::Cap { name, .. }] = ttoks.as_slice() {
+                if let Some((_, val, int)) = caps.iter().find(|(n, _, _)| n == name) {
+                    let value = if *int {
+                        match val.parse::<u64>() {
+                            Ok(n) => Value::from(n),
+                            Err(_) => continue, // unreachable: validated at match
+                        }
+                    } else {
+                        Value::String((*val).to_string())
+                    };
+                    out.push((field.clone(), value));
+                }
+                continue;
+            }
+            let mut rendered = String::new();
+            for tok in &ttoks {
+                match tok {
+                    UrlTok::Lit(l) => rendered.push_str(l),
+                    UrlTok::Cap { name, .. } => {
+                        match caps.iter().find(|(n, _, _)| n == name) {
+                            Some((_, val, _)) => rendered.push_str(val),
+                            None => continue 'fields, // unknown capture → skip field
+                        }
+                    }
+                }
+            }
+            out.push((field.clone(), Value::String(rendered)));
+        }
+        out
+    }
+}
+
+/// Evaluate one extractor path against the request/response. Supports
+/// `$.status`, `$.req.method`, `$.req.path`, `$.resp` (whole body) /
+/// `$.resp.<dotted>` (nested object keys), and `$.vars` / `$.vars.<dotted>`
+/// (the GraphQL request's `variables` — `None` for REST requests). Returns
+/// `None` if the path doesn't resolve.
 fn extract(
     path: &str,
     status: u16,
     method: &str,
     req_path: &str,
     body: Option<&Value>,
+    gql_vars: Option<&Value>,
 ) -> Option<Value> {
     let rest = path.strip_prefix("$.")?;
     match rest {
@@ -247,13 +407,16 @@ fn extract(
         "req.path" => return Some(Value::String(req_path.to_string())),
         _ => {}
     }
-    let resp_path = rest.strip_prefix("resp")?;
-    let body = body?;
-    if resp_path.is_empty() {
-        return Some(body.clone());
+    let (root, dotted) = if let Some(p) = rest.strip_prefix("vars") {
+        (gql_vars?, p)
+    } else {
+        (body?, rest.strip_prefix("resp")?)
+    };
+    if dotted.is_empty() {
+        return Some(root.clone());
     }
-    let mut cur = body;
-    for key in resp_path.strip_prefix('.')?.split('.') {
+    let mut cur = root;
+    for key in dotted.strip_prefix('.')?.split('.') {
         cur = cur.get(key)?;
     }
     Some(cur.clone())
@@ -265,11 +428,17 @@ fn extract(
 /// passes but the `data`/`fetchable` map extracts nothing (non-JSON body, missed
 /// paths) — or when the response is wholly unparseable — a **coarse** asset is
 /// emitted (`_status`/`_method`/`_path`) so the invariant holds.
+///
+/// `gql_vars` is the request's GraphQL `variables` (the `$.vars.*` extractor
+/// source); `None` for REST requests. After extraction, the entry's
+/// [`UrlFallback`] fills any still-missing `data` fields from the extracted
+/// fetchable URL — fallback only, never overwriting an extracted value.
 pub fn evaluate(
     entry: &ObserveEntry,
     parsed: Option<&ParsedResponse>,
     method: &str,
     req_path: &str,
+    gql_vars: Option<&Value>,
 ) -> Option<ObservedAsset> {
     let mut data = Map::new();
     let mut fetchable_url = None;
@@ -289,14 +458,39 @@ pub fn evaluate(
             {
                 return None;
             }
+            // Repeated field names form a FALLBACK CHAIN: the first extractor
+            // that resolves wins (e.g. `title` → `$.resp.…title` then
+            // `$.vars.input.title` — response-first, request-vars supplement).
             for (field, path) in &entry.data {
-                if let Some(v) = extract(path, resp.status, method, req_path, body_json.as_ref()) {
+                if data.contains_key(field) {
+                    continue;
+                }
+                if let Some(v) = extract(
+                    path,
+                    resp.status,
+                    method,
+                    req_path,
+                    body_json.as_ref(),
+                    gql_vars,
+                ) {
                     data.insert(field.clone(), v);
                 }
             }
             if let Some(p) = &entry.fetchable {
-                fetchable_url = extract(p, resp.status, method, req_path, body_json.as_ref())
-                    .and_then(|v| v.as_str().map(str::to_string));
+                fetchable_url = extract(
+                    p,
+                    resp.status,
+                    method,
+                    req_path,
+                    body_json.as_ref(),
+                    gql_vars,
+                )
+                .and_then(|v| v.as_str().map(str::to_string));
+            }
+            if let (Some(fb), Some(url)) = (&entry.url_fallback, fetchable_url.as_deref()) {
+                for (field, value) in fb.derive(url) {
+                    data.entry(field).or_insert(value);
+                }
             }
             if data.is_empty() && fetchable_url.is_none() {
                 // Coarse: parsed + success but nothing mapped.
@@ -345,6 +539,7 @@ mod tests {
                 ("title".into(), "$.resp.title".into()),
             ],
             fetchable: Some("$.resp.html_url".into()),
+            url_fallback: None,
         }
     }
 
@@ -374,7 +569,7 @@ mod tests {
     fn extract_paths() {
         let body: Value = serde_json::json!({"number": 42, "meta": {"page": {"total_count": 7}}});
         assert_eq!(
-            extract("$.resp.number", 200, "POST", "/p", Some(&body)),
+            extract("$.resp.number", 200, "POST", "/p", Some(&body), None),
             Some(Value::from(42))
         );
         assert_eq!(
@@ -383,23 +578,63 @@ mod tests {
                 200,
                 "POST",
                 "/p",
-                Some(&body)
+                Some(&body),
+                None
             ),
             Some(Value::from(7))
         );
         assert_eq!(
-            extract("$.status", 201, "POST", "/p", Some(&body)),
+            extract("$.status", 201, "POST", "/p", Some(&body), None),
             Some(Value::from(201))
         );
         assert_eq!(
-            extract("$.req.method", 200, "POST", "/p", Some(&body)),
+            extract("$.req.method", 200, "POST", "/p", Some(&body), None),
             Some(Value::String("POST".into()))
         );
         assert_eq!(
-            extract("$.resp.missing", 200, "POST", "/p", Some(&body)),
+            extract("$.resp.missing", 200, "POST", "/p", Some(&body), None),
             None
         );
-        assert_eq!(extract("$.resp.number", 200, "POST", "/p", None), None);
+        assert_eq!(
+            extract("$.resp.number", 200, "POST", "/p", None, None),
+            None
+        );
+    }
+
+    #[test]
+    fn extract_vars_paths() {
+        // `$.vars.*` reads the GraphQL request variables; absent vars (REST) → None.
+        let vars: Value = serde_json::json!({"input": {"title": "Fix", "headRefName": "b"}});
+        assert_eq!(
+            extract(
+                "$.vars.input.title",
+                200,
+                "POST",
+                "/graphql",
+                None,
+                Some(&vars)
+            ),
+            Some(Value::String("Fix".into()))
+        );
+        assert_eq!(
+            extract("$.vars", 200, "POST", "/graphql", None, Some(&vars)),
+            Some(vars.clone())
+        );
+        assert_eq!(
+            extract(
+                "$.vars.input.missing",
+                200,
+                "POST",
+                "/graphql",
+                None,
+                Some(&vars)
+            ),
+            None
+        );
+        assert_eq!(
+            extract("$.vars.input.title", 200, "POST", "/graphql", None, None),
+            None
+        );
     }
 
     #[test]
@@ -448,7 +683,7 @@ mod tests {
     fn evaluate_rich_asset_on_success() {
         let raw = b"HTTP/1.1 201 Created\r\nContent-Length: 58\r\n\r\n{\"number\":42,\"title\":\"Bug\",\"html_url\":\"http://x/i/42\"}";
         let parsed = parse_response(raw);
-        let a = evaluate(&entry(), parsed.as_ref(), "POST", "/repos/x/issues").unwrap();
+        let a = evaluate(&entry(), parsed.as_ref(), "POST", "/repos/x/issues", None).unwrap();
         assert_eq!(a.provider, "github");
         assert_eq!(a.asset_kind, "issue");
         assert_eq!(a.data.get("number"), Some(&Value::from(42)));
@@ -460,7 +695,7 @@ mod tests {
     fn evaluate_drops_on_failed_success_rule() {
         let raw = b"HTTP/1.1 422 Unprocessable\r\nContent-Length: 2\r\n\r\n{}";
         let parsed = parse_response(raw);
-        assert!(evaluate(&entry(), parsed.as_ref(), "POST", "/repos/x/issues").is_none());
+        assert!(evaluate(&entry(), parsed.as_ref(), "POST", "/repos/x/issues", None).is_none());
     }
 
     #[test]
@@ -468,7 +703,7 @@ mod tests {
         // 200 but a non-JSON body → the data map extracts nothing → coarse asset.
         let raw = b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nhi";
         let parsed = parse_response(raw);
-        let a = evaluate(&entry(), parsed.as_ref(), "POST", "/repos/x/issues").unwrap();
+        let a = evaluate(&entry(), parsed.as_ref(), "POST", "/repos/x/issues", None).unwrap();
         assert_eq!(a.data.get("_status"), Some(&Value::from(200u16)));
         assert_eq!(
             a.data.get("_path"),
@@ -479,8 +714,215 @@ mod tests {
 
     #[test]
     fn evaluate_coarse_on_unparseable_response() {
-        let a = evaluate(&entry(), None, "POST", "/repos/x/issues").unwrap();
+        let a = evaluate(&entry(), None, "POST", "/repos/x/issues", None).unwrap();
         assert_eq!(a.data.get("_method"), Some(&Value::String("POST".into())));
         assert!(!a.data.contains_key("_status"));
+    }
+
+    fn pr_fallback() -> UrlFallback {
+        UrlFallback {
+            pattern: "https://github.com/{owner}/{name}/pull/{number:int}".into(),
+            fields: vec![
+                ("repo".into(), "{owner}/{name}".into()),
+                ("number".into(), "{number}".into()),
+            ],
+        }
+    }
+
+    #[test]
+    fn url_fallback_derives_typed_fields() {
+        let got = pr_fallback().derive("https://github.com/octo/engrams/pull/97");
+        assert_eq!(
+            got,
+            vec![
+                ("repo".into(), Value::String("octo/engrams".into())),
+                ("number".into(), Value::from(97u64)), // `:int` → JSON number
+            ]
+        );
+    }
+
+    #[test]
+    fn url_fallback_rejects_non_matching_urls() {
+        let fb = pr_fallback();
+        // Wrong shape, non-integer capture, trailing garbage, query string.
+        assert!(fb
+            .derive("https://github.com/octo/engrams/issues/97")
+            .is_empty());
+        assert!(fb
+            .derive("https://github.com/octo/engrams/pull/abc")
+            .is_empty());
+        assert!(fb
+            .derive("https://github.com/octo/engrams/pull/97/files")
+            .is_empty());
+        assert!(fb
+            .derive("https://github.com/octo/engrams/pull/97?w=1")
+            .is_empty());
+    }
+
+    #[test]
+    fn url_fallback_malformed_pattern_fills_nothing() {
+        for pattern in ["https://x/{unclosed", "https://x/{}/y", "https://x/{a}{b}"] {
+            let fb = UrlFallback {
+                pattern: pattern.into(),
+                fields: vec![("f".into(), "{a}".into())],
+            };
+            assert!(fb.derive("https://x/v/y").is_empty(), "pattern `{pattern}`");
+        }
+    }
+
+    #[test]
+    fn evaluate_graphql_parity_via_vars_and_url_fallback() {
+        // The `gh pr create` shape: the mutation selected only id+url, so the
+        // body carries neither number, title, nor repo. Parity comes from
+        // `$.vars.*` (title, branches) + the URL fallback (repo, number).
+        let e = ObserveEntry {
+            success: SuccessRule::NoGraphqlErrors,
+            // The shipped shape: response-first with a `$.vars` fallback chain
+            // (repeated field names — first resolving extractor wins).
+            data: vec![
+                (
+                    "number".into(),
+                    "$.resp.data.createPullRequest.pullRequest.number".into(),
+                ),
+                (
+                    "title".into(),
+                    "$.resp.data.createPullRequest.pullRequest.title".into(),
+                ),
+                ("title".into(), "$.vars.input.title".into()),
+                (
+                    "repo".into(),
+                    "$.resp.data.createPullRequest.pullRequest.repository.nameWithOwner".into(),
+                ),
+                (
+                    "head_branch".into(),
+                    "$.resp.data.createPullRequest.pullRequest.headRefName".into(),
+                ),
+                ("head_branch".into(), "$.vars.input.headRefName".into()),
+                (
+                    "base_branch".into(),
+                    "$.resp.data.createPullRequest.pullRequest.baseRefName".into(),
+                ),
+                ("base_branch".into(), "$.vars.input.baseRefName".into()),
+            ],
+            fetchable: Some("$.resp.data.createPullRequest.pullRequest.url".into()),
+            url_fallback: Some(pr_fallback()),
+            ..entry()
+        };
+        let body = r#"{"data":{"createPullRequest":{"pullRequest":{"id":"PR_1","url":"https://github.com/octo/engrams/pull/97"}}}}"#;
+        let raw = format!(
+            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let parsed = parse_response(raw.as_bytes());
+        let vars = serde_json::json!({"input": {
+            "repositoryId": "R_1",
+            "title": "Fix the flux capacitor",
+            "headRefName": "fix-flux",
+            "baseRefName": "main",
+        }});
+        let a = evaluate(&e, parsed.as_ref(), "POST", "/graphql", Some(&vars)).unwrap();
+        assert_eq!(
+            a.data.get("title"),
+            Some(&Value::String("Fix the flux capacitor".into()))
+        );
+        assert_eq!(
+            a.data.get("head_branch"),
+            Some(&Value::String("fix-flux".into()))
+        );
+        assert_eq!(
+            a.data.get("base_branch"),
+            Some(&Value::String("main".into()))
+        );
+        assert_eq!(
+            a.data.get("repo"),
+            Some(&Value::String("octo/engrams".into()))
+        );
+        assert_eq!(a.data.get("number"), Some(&Value::from(97u64)));
+        assert_eq!(
+            a.fetchable_url.as_deref(),
+            Some("https://github.com/octo/engrams/pull/97")
+        );
+    }
+
+    #[test]
+    fn data_fallback_chain_takes_first_resolving_extractor() {
+        // The review finding on PR #904: a client that INLINES its mutation
+        // arguments (no `variables`) but selects the fields in the response
+        // must still get them — response-first, vars as the supplement.
+        let e = ObserveEntry {
+            data: vec![
+                ("title".into(), "$.resp.data.m.title".into()),
+                ("title".into(), "$.vars.input.title".into()),
+            ],
+            fetchable: None,
+            ..entry()
+        };
+        let respond = |body: &str| {
+            parse_response(
+                format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+                    body.len(),
+                    body
+                )
+                .as_bytes(),
+            )
+        };
+
+        // Response carries the field, vars absent → response value.
+        let parsed = respond(r#"{"data":{"m":{"title":"from-resp"}}}"#);
+        let a = evaluate(&e, parsed.as_ref(), "POST", "/graphql", None).unwrap();
+        assert_eq!(
+            a.data.get("title"),
+            Some(&Value::String("from-resp".into()))
+        );
+
+        // Both present → the FIRST chain entry (response) wins.
+        let vars = serde_json::json!({"input": {"title": "from-vars"}});
+        let a = evaluate(&e, parsed.as_ref(), "POST", "/graphql", Some(&vars)).unwrap();
+        assert_eq!(
+            a.data.get("title"),
+            Some(&Value::String("from-resp".into()))
+        );
+
+        // Response missing the field → the vars fallback fills it.
+        let parsed = respond(r#"{"data":{"m":{"id":"X_1"}}}"#);
+        let a = evaluate(&e, parsed.as_ref(), "POST", "/graphql", Some(&vars)).unwrap();
+        assert_eq!(
+            a.data.get("title"),
+            Some(&Value::String("from-vars".into()))
+        );
+    }
+
+    #[test]
+    fn url_fallback_never_overwrites_extracted_fields() {
+        // A client that DID select `number` gets the response value even when
+        // the URL would derive something else (fallback fills, never clobbers).
+        let e = ObserveEntry {
+            data: vec![("number".into(), "$.resp.number".into())],
+            fetchable: Some("$.resp.html_url".into()),
+            url_fallback: Some(pr_fallback()),
+            ..entry()
+        };
+        let body = r#"{"number":42,"html_url":"https://github.com/octo/engrams/pull/97"}"#;
+        let raw = format!(
+            "HTTP/1.1 201 Created\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let parsed = parse_response(raw.as_bytes());
+        let a = evaluate(
+            &e,
+            parsed.as_ref(),
+            "POST",
+            "/repos/octo/engrams/pulls",
+            None,
+        )
+        .unwrap();
+        assert_eq!(a.data.get("number"), Some(&Value::from(42)));
+        assert_eq!(
+            a.data.get("repo"),
+            Some(&Value::String("octo/engrams".into()))
+        );
     }
 }

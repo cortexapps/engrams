@@ -14,8 +14,8 @@ use crate::types::registry::{
     EnableJob, EnableJobState, EnabledImage, RegistryCredential, SessionSecrets,
 };
 use crate::types::session::{
-    DeleteHostOutcome, QueuedDemand, QueuedSession, SandboxAssignment, Session, SessionSpec,
-    SessionState,
+    BindingDisposition, DeleteHostOutcome, QueuedDemand, QueuedSession, SandboxAssignment, Session,
+    SessionSpec, SessionState,
 };
 use crate::types::snapshot::SnapshotRecord;
 
@@ -67,6 +67,9 @@ pub struct SessionCreateWriteSet {
     /// `reserve_and_persist_create` also mirrors `runtime_spec
     /// .selected_harness` into the pre-existing `sessions.harness` column.
     pub runtime_spec: crate::types::runtime_spec::RuntimeSpec,
+    /// ADR 0106: human OAuth authorization, containing only the provider and
+    /// opaque subject. Written atomically before a harness can attach.
+    pub oauth_binding: Option<crate::types::oauth::SessionOAuthBinding>,
 }
 
 /// One candidate host's fit verdict from
@@ -485,6 +488,99 @@ pub trait MetadataStore: Send + Sync {
         Ok(false)
     }
 
+    // ---- ADR 0106: subject-scoped OAuth credentials and short-lived flows ----
+
+    /// Insert a credential when `expected_version` is `None`, or update it iff
+    /// the current version matches. Successful writes increment monotonically;
+    /// revoked credentials can be reconnected through the same CAS path.
+    async fn put_oauth_credential(
+        &self,
+        _credential: crate::types::oauth::NewSealedOAuthCredential,
+        _expected_version: Option<i64>,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::Conflict(
+            "OAuth credential storage is not implemented".into(),
+        ))
+    }
+
+    async fn get_oauth_credential(
+        &self,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+    ) -> Result<Option<crate::types::oauth::SealedOAuthCredential>, MetaError> {
+        Ok(None)
+    }
+
+    async fn list_oauth_credentials(
+        &self,
+        _subject_kind: crate::types::oauth::OAuthSubjectKind,
+        _subject_id: &str,
+    ) -> Result<Vec<crate::types::oauth::SealedOAuthCredential>, MetaError> {
+        Ok(Vec::new())
+    }
+
+    async fn revoke_oauth_credential(
+        &self,
+        _key: &crate::types::oauth::OAuthCredentialKey,
+        _expected_version: i64,
+    ) -> Result<crate::types::oauth::SealedOAuthCredential, MetaError> {
+        Err(MetaError::NotFound)
+    }
+
+    async fn create_oauth_flow(
+        &self,
+        _flow: crate::types::oauth::OAuthFlow,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::Conflict(
+            "OAuth flow storage is not implemented".into(),
+        ))
+    }
+
+    async fn get_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+    ) -> Result<Option<crate::types::oauth::OAuthFlow>, MetaError> {
+        Ok(None)
+    }
+
+    /// Extend a pending flow's owner lease. The owner id fences stale replicas.
+    async fn renew_oauth_flow_lease(
+        &self,
+        _id: uuid::Uuid,
+        _owner_replica: &str,
+        _lease_expires_at: chrono::DateTime<chrono::Utc>,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::NotFound)
+    }
+
+    /// Owner-fenced status transition. A stale replica cannot complete or
+    /// cancel a flow after its lease moved or expired.
+    async fn finish_oauth_flow(
+        &self,
+        _id: uuid::Uuid,
+        _owner_replica: &str,
+        _status: crate::types::oauth::OAuthFlowStatus,
+        _error_code: Option<&str>,
+    ) -> Result<(), MetaError> {
+        Err(MetaError::NotFound)
+    }
+
+    /// Deterministic cleanup step: marks pending expired/owner-lost flows and
+    /// deletes terminal rows beyond `delete_before`.
+    async fn cleanup_oauth_flows(
+        &self,
+        _now: chrono::DateTime<chrono::Utc>,
+        _delete_before: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, MetaError> {
+        Ok(0)
+    }
+
+    async fn get_session_oauth_binding(
+        &self,
+        _session_id: SessionId,
+    ) -> Result<Option<crate::types::oauth::SessionOAuthBinding>, MetaError> {
+        Ok(None)
+    }
+
     /// ADR 0047 (replica-safe reconciler): apply one heartbeat's
     /// missing-sandbox strike accounting on the session rows. Sessions
     /// whose sandbox WAS in the heartbeat get their counter reset;
@@ -660,9 +756,16 @@ pub trait MetadataStore: Send + Sync {
     /// Errors:
     /// - [`MetaError::NotFound`] — no row with this `id`.
     /// - [`MetaError::Conflict`] — the transition is not in the
-    ///   legality table. The message is the rendered
-    ///   [`crate::types::session::IllegalTransition`] so logs and HTTP
-    ///   bodies show both sides.
+    ///   legality table (message = the rendered
+    ///   [`crate::types::session::IllegalTransition`]), OR the
+    ///   `disposition` is illegal for the target on a bound row
+    ///   ([`SessionState::binding_disposition_legal`], #896 / ADR 0090
+    ///   addendum).
+    ///
+    /// `disposition` states what the flip does to `sandbox_id` — an
+    /// explicit, mandatory part of every transition, applied in the
+    /// SAME atomic write (`Detach` clears it; `host_id` is untouched so
+    /// resume affinity survives).
     ///
     /// Impls must do the SELECT and UPDATE under a single row-level
     /// lock to prevent two concurrent callers racing on the same
@@ -673,6 +776,7 @@ pub trait MetadataStore: Send + Sync {
         &self,
         id: SessionId,
         target: SessionState,
+        disposition: BindingDisposition,
     ) -> Result<SessionState, MetaError>;
 
     /// Force a session to its FSM-legal terminal state — the shared
@@ -697,7 +801,13 @@ pub trait MetadataStore: Send + Sync {
         let Some(target) = session.status.terminal_target() else {
             return Ok(None);
         };
-        let prev = self.transition_session(id, target).await?;
+        // Terminal rows must not own a sandbox: the caller (delete /
+        // give-up paths) has already destroyed or abandoned the VM, and
+        // an unbound terminal row is what authorizes the host-side
+        // ownership-oracle reap of any straggler.
+        let prev = self
+            .transition_session(id, target, BindingDisposition::Detach)
+            .await?;
         Ok(Some((prev, target)))
     }
 
@@ -1085,14 +1195,17 @@ pub trait MetadataStore: Send + Sync {
 
     /// Uniform fenced session-row transition: `transition_session` with
     /// `AND current_epoch = $e`. `Ok(false)` = fenced (0 rows) — the
-    /// caller stops silently, never retries, never compensates.
+    /// caller stops silently, never retries, never compensates. The
+    /// `disposition` contract is [`transition_session`]'s (#896): a
+    /// fenced-out write leaves the binding untouched.
     async fn fenced_transition_session(
         &self,
         session_id: SessionId,
         epoch: i64,
         to: crate::types::SessionState,
+        disposition: BindingDisposition,
     ) -> Result<Option<crate::types::SessionState>, MetaError> {
-        let _ = (session_id, epoch, to);
+        let _ = (session_id, epoch, to, disposition);
         Err(MetaError::Serialization(
             "fenced writes not supported by this store".into(),
         ))
@@ -1118,9 +1231,10 @@ pub trait MetadataStore: Send + Sync {
     /// `Err(Conflict)` (nothing committed). Callers own any post-commit
     /// side effects (in-process publish); `pg_notify` fires on commit.
     ///
-    /// `detach_sandbox = true` also clears `sandbox_id` in the SAME
-    /// update (`host_id` untouched — resume affinity survives, as with
-    /// the settle). The eviction flip detaches; doing it in a separate
+    /// `disposition` is [`transition_session`]'s binding contract
+    /// (#896): `Detach` clears `sandbox_id` in the SAME update
+    /// (`host_id` untouched — resume affinity survives, as with the
+    /// settle). The eviction flip detaches; doing it in a separate
     /// preceding write left a partial-failure window where the flip's
     /// rollback stranded an `evicting` session with no bound sandbox —
     /// which the scanner's retry resolves as HostLost instead of Idle.
@@ -1129,10 +1243,10 @@ pub trait MetadataStore: Send + Sync {
         session_id: SessionId,
         epoch: i64,
         to: crate::types::SessionState,
-        detach_sandbox: bool,
+        disposition: BindingDisposition,
         events: &[(String, serde_json::Value)],
     ) -> Result<Option<(crate::types::SessionState, Vec<i64>)>, MetaError> {
-        let _ = (session_id, epoch, to, detach_sandbox, events);
+        let _ = (session_id, epoch, to, disposition, events);
         Err(MetaError::Serialization(
             "fenced writes not supported by this store".into(),
         ))
@@ -1220,6 +1334,23 @@ pub trait MetadataStore: Send + Sync {
     ) -> Result<(), MetaError> {
         let _ = (prompt_id, delay);
         Ok(())
+    }
+
+    /// The inverse of `outbox_defer`: pull every waiting un-acked row
+    /// for a session back to due (`not_before := now`), for when fresh
+    /// evidence (an attach signal, a heartbeat disagreement) proves the
+    /// wait is pointless — e.g. a row waiting out `ACK_TIMEOUT` after a
+    /// forward into a dead harness link (prod 7eddce62). Returns the
+    /// number of rows moved. Two REQUIRED properties: (a) `attempts` is
+    /// NEVER bumped — this cancels a provably-pointless wait, it is not
+    /// a delivery try, and a bump would inflate `failure_backoff` for
+    /// the very retry being made prompt; (b) only rows with
+    /// `not_before > now` move, so the call is idempotent across
+    /// repeated heartbeats and never touches a row already due.
+    /// Default (mocks): moves nothing.
+    async fn outbox_make_due(&self, session_id: SessionId) -> Result<u64, MetaError> {
+        let _ = session_id;
+        Ok(0)
     }
 
     /// Terminal ack: the confirming harness event was ingested.

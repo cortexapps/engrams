@@ -107,9 +107,21 @@ trigger in the required workflow.
 
 ## Conventions
 
+**Writing**
+- Adhere to **ASD-STE100** (Simplified Technical English) in all communications, including
+  written artifacts (ADRs, commit messages, PR descriptions), code comments, and messages
+  with the user. The product ships the same rule to every session
+  (`WRITING_STYLE_SYSTEM_PROMPT` in `orchestrator/src/prompts/base.ts`).
+
 **Commits & ADRs**
 - One logical change per commit; don't bundle unrelated changes.
-- Substantive work gets **ADR bookends**: author the ADR (`Proposed`) before code, update it
+- **ADRs are for large architectural changes only** — a new crate/service, a new backend or
+  trait seam, a schema / wire-protocol / on-disk-format change, a cross-cutting invariant, or
+  a decision that later work has to build on. A feature, a fix, a refactor, a test, or a
+  tooling change does **not** get one: the commit message and the PR description carry the
+  reasoning. When in doubt, ship without one — an ADR nobody needed is worse than a good
+  commit message, because it dilutes the set future readers have to grep.
+- **When an ADR is warranted it gets bookends**: author it (`Proposed`) before code, update it
   between phases with divergences/pitfalls, flip to `Accepted` at the end with the commit
   chain. ADRs are numbered sequentially and are the record for non-obvious decisions.
 

@@ -71,6 +71,10 @@ message CreateTaskAutomationAction {
   string prompt_template = 2;
   optional string title_template = 3;
   bool include_event_context = 4;
+  // ADR 0107: session mode for the created session's initial prompt (e.g.
+  // "plan"). An ownerless (automation) plan auto-approves — the plan lands
+  // in the transcript as a reviewable record before the build runs.
+  optional string harness_mode = 5;
 }
 
 message CreateAutomationRequest {

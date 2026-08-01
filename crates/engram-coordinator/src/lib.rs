@@ -11,7 +11,6 @@ use engram_core::traits::{BlobStorage, HostClient, MetadataStore, SecretStore};
 
 pub mod api;
 pub mod base_snapshot_retention;
-pub mod blob;
 pub mod boot_bundle;
 pub mod builtin_harness;
 pub mod bundle_gc;
@@ -26,6 +25,7 @@ pub mod evac_resumer;
 pub mod evacuation;
 pub mod grpc_app;
 pub mod harness_catalog;
+pub mod harness_desync;
 pub mod harness_paths;
 pub mod host_registry;
 pub mod idle_detector;
@@ -34,6 +34,7 @@ pub mod integration_ops;
 pub mod integrations;
 pub mod live_migration;
 pub mod metrics;
+pub mod oauth;
 pub mod org_secrets;
 pub mod outbox_delivery;
 pub mod pg_listener;
@@ -164,6 +165,7 @@ pub async fn run_with_registry_and_local(
     let mut app = AppState::new_with_registry(cfg.clone(), services, host_registry);
     app.integrations = integrations;
     let state = Arc::new(app);
+    crate::oauth::spawn_cleanup(state.oauth.clone(), state.subscribe_shutdown());
     if let Some((host_id, backend)) = in_proc_local {
         state.register_local_host(host_id, backend);
     }

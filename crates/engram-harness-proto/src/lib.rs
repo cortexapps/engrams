@@ -449,7 +449,21 @@ pub enum HarnessCommand {
     /// the single-writer owner of that queue and writes it to the agent
     /// only at the consumption boundary. Engram is opaque to the agent's
     /// internal session shape — `text` is just plumbed through.
-    Prompt { text: String, prompt_id: String },
+    ///
+    /// `mode` (ADR 0107) is an optional session-mode directive that
+    /// applies from this prompt's turn onward (e.g. `plan`). The harness
+    /// latches it to `/workspace/.engrams/mode` — the latch, not this
+    /// field, is the durable source of truth across evict/resume — and
+    /// maps it to native behavior at the turn boundary. `None` means "no
+    /// change". Adding this field was a sanctioned positional-bincode
+    /// wire break (ADR 0089 P5d shape), re-pinned in
+    /// tests/wire_golden.rs and shipped with a same-train coordinator +
+    /// host + harness-bundle deploy.
+    Prompt {
+        text: String,
+        prompt_id: String,
+        mode: Option<String>,
+    },
     /// ADR 0030: operator interrupt — stop the in-flight run but keep
     /// the session alive. The adapter SIGINTs its current child (for
     /// Claude: the per-prompt `claude` process), emits
@@ -512,7 +526,7 @@ pub struct CheckpointAck {
     pub message: Option<String>,
 }
 
-// ---- Forge bridge (ADR 0023) -------------------------------------------
+// ---- Session credential-control bridge (ADRs 0023, 0106) ---------------
 //
 // A *separate* guest→host channel from the harness one above: the
 // in-guest `GIT_ASKPASS` helper dials the host on `FORGE_VSOCK_PORT`,
@@ -522,8 +536,8 @@ pub struct CheckpointAck {
 // 4-byte-length + bincode framing (`read_msg`/`write_msg`).
 //
 // ADR 0056 P3 folded API access + PR-open onto the egress inject+observe
-// plane, so this bridge now carries ONLY the git-clone/push credential
-// (the one delivery the interceptor can't header-inject).
+// plane. ADR 0107 reuses this isolated, one-shot, session-authenticated
+// transport for opaque OAuth cache fetch/CAS without adding another VMM port.
 
 /// Vsock port the in-guest forge helper dials (guest→host). Distinct
 /// from the harness channel (1026), agentd exec (1024), and agentd
@@ -540,14 +554,21 @@ pub struct ForgeRequest {
     pub op: ForgeOp,
 }
 
-/// The forge operation requested. An enum for extensibility — ADR 0056 P3
-/// retired the PR-open op (PRs open via the egress inject+observe plane now),
-/// leaving the one credential op the interceptor can't deliver.
+/// The credential operation requested. The historical Forge name stays wire
+/// stable for already-baked guests; new operations are trailing variants.
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub enum ForgeOp {
     /// Mint a fresh git credential for `host` (optionally scoping the
     /// installation to `owner`). The reply is [`ForgeResponse::Credential`].
     FetchCredential { host: String, owner: Option<String> },
+    /// Fetch the OAuth credential bound to this session. The caller cannot
+    /// select a provider or subject; both come from the durable binding.
+    FetchOAuthCredential,
+    /// Publish a refreshed provider cache using compare-and-swap.
+    UpdateOAuthCredential {
+        expected_version: i64,
+        opaque_bundle: Vec<u8>,
+    },
 }
 
 /// The host's reply to a [`ForgeRequest`].
@@ -561,6 +582,11 @@ pub enum ForgeResponse {
     /// provider error — `message` is safe to surface to the guest.
     Error {
         message: String,
+    },
+    OAuthCredential {
+        provider: String,
+        version: i64,
+        opaque_bundle: Vec<u8>,
     },
 }
 
@@ -844,6 +870,12 @@ mod tests {
         round_trip(HarnessFrame::Command(HarnessCommand::Prompt {
             prompt_id: "p1".into(),
             text: "do the thing".into(),
+            mode: None,
+        }));
+        round_trip(HarnessFrame::Command(HarnessCommand::Prompt {
+            prompt_id: "p2".into(),
+            text: "plan the thing".into(),
+            mode: Some("plan".into()),
         }));
         round_trip(HarnessFrame::Command(HarnessCommand::EditQueued {
             prompt_id: "p1".into(),

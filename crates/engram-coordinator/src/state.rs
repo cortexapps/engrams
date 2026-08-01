@@ -366,6 +366,15 @@ pub enum SessionEvent {
         reason: String,
         at: DateTime<Utc>,
     },
+    /// ADR 0107: a validated session-mode directive rode a prompt (e.g.
+    /// `plan`). Coordinator-authoritative — the user genuinely selected the
+    /// mode — so `rewind_session_to_cursor` excludes this kind from its
+    /// tombstone UPDATE, like `prompt_received`. The web derives the current
+    /// mode chip from the latest of these plus plan-approval results.
+    HarnessModeChanged {
+        mode: String,
+        at: DateTime<Utc>,
+    },
 }
 
 /// ADR 0045 F1: why a rung-1 recovery rewound the transcript. Drives the
@@ -451,6 +460,7 @@ impl SessionEvent {
             Self::StatusChanged { .. } => "status_changed",
             Self::PromptReceived { .. } => "prompt_received",
             Self::ToolResultSubmitted { .. } => "tool_result_submitted",
+            Self::HarnessModeChanged { .. } => "harness_mode_changed",
             Self::ExecStarted { .. } => "exec_started",
             Self::ExecCompleted { .. } => "exec_completed",
             Self::Stdout { .. } => "stdout",
@@ -798,6 +808,15 @@ pub struct AppState {
     pub boot_bundles: Arc<crate::boot_bundle::BootBundleCache>,
     /// ADR 0073: wakes the outbox delivery driver on local enqueues.
     pub outbox_wake: Arc<tokio::sync::Notify>,
+    /// ADR 0108 A4: sessions whose boot/resume op just completed — the
+    /// harness attach is expected within `ATTACH_GRACE_SECS`. Inside the
+    /// window, a `NotFound` from `send_prompt` means "not attached YET",
+    /// and the deliver verb defers briefly instead of firing the
+    /// destructive `start_agent` reattach (which SIGUSR1s the very
+    /// harness that is mid-attach — the 2026-07-31 boot race).
+    /// In-memory on purpose: pods are stateless, and losing a stamp on
+    /// restart only means one pre-fix-shaped reattach, not corruption.
+    pub attach_grace: Arc<DashMap<SessionId, chrono::DateTime<chrono::Utc>>>,
     /// ADR 0079: wakes the session-op executor on `pg_notify('session_ops', …)`.
     pub session_ops_wake: Arc<tokio::sync::Notify>,
     /// Bound address of the harness TCP listener (set by `lib::run`
@@ -832,6 +851,8 @@ pub struct AppState {
     /// is unset (the forge endpoints then 501). Kept here rather than on
     /// `Services` so the many test `Services` literals don't need touching.
     pub integrations: crate::integrations::IntegrationBroker,
+    /// ADR 0106: shared provider registry, sealed store, and active flow owner.
+    pub oauth: Arc<crate::oauth::OAuthManager>,
     // ADR 0051: the per-user auth runtime (`auth: Option<Arc<AuthRuntime>>`)
     // is removed. The coordinator no longer resolves human principals — the
     // orchestrator owns auth/authz and calls the coordinator over the trusted
@@ -882,11 +903,15 @@ impl AppState {
             std::env::temp_dir().join(format!("engram-coord-bindings-{}", std::process::id()));
         let bindings = engram_host_agent::bindings::BindingStore::open(bindings_dir)
             .expect("open coordinator binding store");
+        // Created before the hub: the harness event sink wakes the
+        // outbox shim on attach signals (ADR 0108 A3).
+        let outbox_wake = Arc::new(tokio::sync::Notify::new());
         let harness_hub = Arc::new(HarnessHub::new(
             harness_event_sink(
                 events.clone(),
                 services.meta.clone(),
                 services.clock.clone(),
+                outbox_wake.clone(),
             ),
             bindings,
         ));
@@ -896,6 +921,12 @@ impl AppState {
             services.clock.clone(),
         ));
         Self {
+            oauth: crate::oauth::OAuthManager::new(
+                services.meta.clone(),
+                services.kek.clone(),
+                services.clock.clone(),
+                services.entropy.clone(),
+            ),
             cfg,
             services,
             events,
@@ -904,7 +935,8 @@ impl AppState {
             boot_bundles,
             // ADR 0073: local fast-path wake for the outbox delivery
             // driver (the PG NOTIFY covers cross-pod).
-            outbox_wake: Arc::new(tokio::sync::Notify::new()),
+            outbox_wake,
+            attach_grace: Arc::new(DashMap::new()),
             session_ops_wake: Arc::new(tokio::sync::Notify::new()),
             harness_listen_addr: parking_lot::Mutex::new(None),
             reconciler,
@@ -1181,6 +1213,7 @@ fn harness_event_sink(
     events: Arc<SessionEventBus>,
     meta: Arc<dyn engram_core::traits::MetadataStore>,
     clock: Arc<dyn engram_core::traits::Clock>,
+    outbox_wake: Arc<tokio::sync::Notify>,
 ) -> EventSink {
     // Per-session cache of the most-recent forwarded event kind. Used
     // to drop a `harness_idle` or `harness_parked` that would land
@@ -1193,6 +1226,7 @@ fn harness_event_sink(
         let meta = meta.clone();
         let clock = clock.clone();
         let last_kind = last_kind.clone();
+        let outbox_wake = outbox_wake.clone();
         Box::new(Box::pin(async move {
             // Forward every harness event into session_events for live
             // SSE / Web UI / Slackbot timeline. ADR 0005 retired the
@@ -1244,6 +1278,50 @@ fn harness_event_sink(
                 } else {
                     None
                 };
+
+            // ADR 0108 A3: an Idle/Parked announcement is the ATTACH
+            // signal — the harness (re)announced its waiting state on a
+            // live connection. Wake any backed-off Deliver op now:
+            // delivery keys on the attach, never on a boot milestone or
+            // a poll cadence (the 2026-07-31 50 s gap was a Deliver op
+            // racing the attach and then waiting out an inflated
+            // backoff). This MUST run before the back-to-back dedupe
+            // below: a re-announce after a reattach is exactly the
+            // signal the incident waited 41 s for, and it is exactly
+            // the shape the dedupe drops from the log.
+            if matches!(kind, "harness_idle" | "harness_parked") {
+                // ADR 0108 A8: a harness that just announced Idle can
+                // take a prompt NOW — a row waiting out ACK_TIMEOUT
+                // from a forward into a dead link has no reason to
+                // keep waiting. Without this recall the wake below
+                // finds nothing due and no-ops; the row then sits out
+                // the full timeout (prod 7eddce62: 35.5 s after a
+                // 120 ms un-park).
+                if let Err(e) = meta.outbox_make_due(session_id).await {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        error = %e,
+                        "outbox make-due on attach signal failed (ack timeout backstops)",
+                    );
+                }
+                if let Err(e) = meta
+                    .op_wake_queued_kind(
+                        session_id,
+                        engram_core::types::session_op::OpKind::Deliver,
+                    )
+                    .await
+                {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        error = %e,
+                        "deliver wake on attach signal failed (poll backstops)",
+                    );
+                }
+                // The shim scan enqueues a Deliver op when rows are due
+                // and none is queued; a wake with nothing due is a
+                // no-op.
+                outbox_wake.notify_one();
+            }
 
             // Drop a back-to-back duplicate waiting-state marker. The
             // upstream TTL bookkeeping in HarnessHub::reader_loop
@@ -1961,6 +2039,10 @@ pub(crate) mod tests {
         /// rows on the floor, which would make any deliver-ordering
         /// assertion vacuous.
         pub(crate) outbox: PlMutex<Vec<engram_core::types::outbox::OutboxRow>>,
+        /// ADR 0107: the session's persisted harness selection, so
+        /// `send_prompt_core`'s `harness_mode` validation is exercisable
+        /// (the trait default returns `None`, which rejects every mode).
+        pub(crate) harness: PlMutex<Option<String>>,
     }
 
     /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
@@ -2019,6 +2101,7 @@ pub(crate) mod tests {
                 acked_outbox: PlMutex::new(Vec::new()),
                 ops: engram_core::types::session_op::InMemoryOpLog::default(),
                 outbox: PlMutex::new(Vec::new()),
+                harness: PlMutex::new(None),
             }
         }
     }
@@ -2178,6 +2261,7 @@ pub(crate) mod tests {
             &self,
             id: engram_core::SessionId,
             target: engram_core::types::SessionState,
+            _disposition: engram_core::types::BindingDisposition,
         ) -> Result<engram_core::types::SessionState, MetaError> {
             let mut s = self.session.lock();
             if id != s.id {
@@ -2532,6 +2616,12 @@ pub(crate) mod tests {
                 None => Ok(true),
             }
         }
+        async fn get_session_harness(
+            &self,
+            _session_id: SessionId,
+        ) -> Result<Option<String>, MetaError> {
+            Ok(self.harness.lock().clone())
+        }
         async fn outbox_enqueue(
             &self,
             row: &engram_core::types::outbox::OutboxRow,
@@ -2597,6 +2687,21 @@ pub(crate) mod tests {
                     chrono::Utc::now() + chrono::Duration::milliseconds(delay.as_millis() as i64);
             }
             Ok(())
+        }
+        /// ADR 0108 A8: honest make-due semantics (no attempts bump,
+        /// `not_before > now` only) so the harness-desync repair test
+        /// can assert rows actually move — the trait default returns 0,
+        /// which would make that assertion vacuous.
+        async fn outbox_make_due(&self, session_id: SessionId) -> Result<u64, MetaError> {
+            let now = chrono::Utc::now();
+            let mut moved = 0u64;
+            for r in self.outbox.lock().iter_mut() {
+                if r.session_id == session_id && r.acked_at.is_none() && r.not_before > now {
+                    r.not_before = now;
+                    moved += 1;
+                }
+            }
+            Ok(moved)
         }
         async fn list_session_events_since(
             &self,
@@ -2845,11 +2950,14 @@ pub(crate) mod tests {
             session_id: SessionId,
             epoch: i64,
             to: engram_core::types::SessionState,
+            _disposition: engram_core::types::BindingDisposition,
         ) -> Result<Option<engram_core::types::SessionState>, MetaError> {
             if self.ops.current_epoch(session_id) != epoch {
                 return Ok(None);
             }
-            self.transition_session(session_id, to).await.map(Some)
+            self.transition_session(session_id, to, _disposition)
+                .await
+                .map(Some)
         }
 
         async fn fenced_transition_session_with_events(
@@ -2857,7 +2965,7 @@ pub(crate) mod tests {
             session_id: SessionId,
             epoch: i64,
             to: engram_core::types::SessionState,
-            detach_sandbox: bool,
+            _disposition: engram_core::types::BindingDisposition,
             events: &[(String, serde_json::Value)],
         ) -> Result<Option<(engram_core::types::SessionState, Vec<i64>)>, MetaError> {
             // In-memory "transaction": the fence gates once, then the flip
@@ -2868,8 +2976,10 @@ pub(crate) mod tests {
             if self.ops.current_epoch(session_id) != epoch {
                 return Ok(None);
             }
-            let prev = self.transition_session(session_id, to).await?;
-            if detach_sandbox {
+            let prev = self
+                .transition_session(session_id, to, _disposition)
+                .await?;
+            if matches!(_disposition, engram_core::types::BindingDisposition::Detach) {
                 self.session.lock().sandbox_id = None;
             }
             let mut indices = Vec::with_capacity(events.len());
@@ -3051,6 +3161,7 @@ pub(crate) mod tests {
             bus.clone(),
             meta.clone(),
             Arc::new(engram_core::traits::SystemClock::new()),
+            Arc::new(tokio::sync::Notify::new()),
         );
 
         // Three back-to-back idles: only the first should land.
@@ -3150,8 +3261,12 @@ pub(crate) mod tests {
         let sandbox_id = engram_core::SandboxId::new();
 
         let bus = Arc::new(SessionEventBus::default());
-        let sink =
-            super::harness_event_sink(bus, meta, Arc::new(engram_core::traits::SystemClock::new()));
+        let sink = super::harness_event_sink(
+            bus,
+            meta,
+            Arc::new(engram_core::traits::SystemClock::new()),
+            Arc::new(tokio::sync::Notify::new()),
+        );
 
         sink(
             session_id,
@@ -3229,6 +3344,7 @@ pub(crate) mod tests {
             events,
             meta,
             Arc::new(engram_core::traits::SystemClock::new()),
+            Arc::new(tokio::sync::Notify::new()),
         );
         let sandbox_id = engram_core::SandboxId::new();
 

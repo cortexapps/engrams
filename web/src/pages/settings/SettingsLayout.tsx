@@ -30,7 +30,7 @@ import { cn } from "@/lib/utils";
 // Operator section; Settings now holds your own account and org-wide membership.
 const MINE: NavItem[] = [
   { to: "/settings/profile", label: "Profile", icon: UserCircle },
-  { to: "/settings/tokens", label: "Tokens", icon: KeyRound },
+  { to: "/settings/credentials", label: "Credentials", icon: KeyRound },
 ];
 const ORG: NavItem[] = [
   { to: "/settings/members", label: "Members", icon: Users },

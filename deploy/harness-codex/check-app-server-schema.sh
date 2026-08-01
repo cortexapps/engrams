@@ -16,6 +16,10 @@ for schema in \
   v2/AgentMessageDeltaNotification.json \
   v2/FileChangePatchUpdatedNotification.json \
   v2/ThreadNameUpdatedNotification.json \
+  v2/LoginAccountParams.json \
+  v2/LoginAccountResponse.json \
+  v2/GetAccountResponse.json \
+  v2/AccountLoginCompletedNotification.json \
   ToolRequestUserInputParams.json \
   v1/InitializeParams.json \
   DynamicToolCallParams.json \
@@ -30,7 +34,26 @@ jq -e '.properties.threadId and .properties.threadName' "$out/v2/ThreadNameUpdat
 jq -e '.definitions.TurnStatus.enum | contains(["completed", "failed", "interrupted", "inProgress"])' \
   "$out/ServerNotification.json" >/dev/null
 
-# ADR 0089 P3, pinned from live codex 0.144.1 generated schemas.
+# ADR 0106: the only accepted human-auth path is Codex-managed ChatGPT
+# device authorization. `chatgptAuthTokens` may remain in Codex's generated
+# schema, but Engrams deliberately neither requires nor invokes it.
+jq -e 'any(.oneOf[]; .properties.type.enum == ["chatgptDeviceCode"])' \
+  "$out/v2/LoginAccountParams.json" >/dev/null
+jq -e 'any(.oneOf[];
+  (.properties.type.enum == ["chatgptDeviceCode"]) and
+  (.required | contains(["loginId", "userCode", "verificationUrl"])))' \
+  "$out/v2/LoginAccountResponse.json" >/dev/null
+jq -e '
+  (.required | contains(["requiresOpenaiAuth"])) and
+  any(.definitions.Account.oneOf[];
+    (.properties.type.enum == ["chatgpt"]) and
+    (.required | contains(["email", "planType"]))) and
+  (.definitions.PlanType.enum | contains(["free", "plus", "pro", "business", "enterprise"]))
+' "$out/v2/GetAccountResponse.json" >/dev/null
+jq -e '.required | contains(["success"])' \
+  "$out/v2/AccountLoginCompletedNotification.json" >/dev/null
+
+# ADR 0089 P3, pinned from live codex 0.146.0 generated schemas.
 jq -e '.definitions.InitializeCapabilities.properties.experimentalApi.type == "boolean"' \
   "$out/v1/InitializeParams.json" >/dev/null
 jq -e '

@@ -45,8 +45,12 @@ import {
 } from "../connectors/registry.ts";
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
-import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
-import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
+import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
+import {
+  oauthCredential as defaultOAuthCredential,
+  orgSecret as defaultOrgSecret,
+} from "../control-plane/client.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -90,6 +94,13 @@ export interface SessionCreateInput {
    *  + execs (the proto `CreateSessionRequest.harness`). Resolved from the
    *  per-session override ?? profile ?? deployment default. */
   harness?: string;
+  /** ADR 0106: provider + opaque owner only; never contains OAuth bytes. */
+  oauthCredential?: {
+    subject: { kind: OauthSubjectKind; id: string };
+    provider: string;
+  };
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
 }
 
 /** One harness's catalog descriptor (the bits the compiler needs): the model +
@@ -102,7 +113,13 @@ export interface HarnessDescriptorView {
    *  `orgEnv` is the programmatic credential (B4, host-side resolved). The
    *  `*Hint` fields are free-text setup instructions surfaced to the user
    *  (e.g. "Run `claude setup-token`"). */
-  auth?: { userEnv?: string; orgEnv?: string; userEnvHint?: string; orgEnvHint?: string };
+  auth?: {
+    userEnv?: string;
+    userOauth?: { provider: string; delivery: number };
+    orgEnv?: string;
+    userEnvHint?: string;
+    orgEnvHint?: string;
+  };
   models: Array<{
     id: string;
     default: boolean;
@@ -127,6 +144,8 @@ export interface HarnessDescriptorView {
       hostPatterns: string[];
     }>;
   }>;
+  /** ADR 0107: declared session modes (pure declaration — no env). */
+  modes?: Array<{ id: string; default: boolean }>;
 }
 export interface HarnessCatalogClient {
   listHarnesses(req: Record<string, never>): Promise<{
@@ -157,10 +176,16 @@ export interface SessionCompileDeps {
   /** Name-only org-secret lookup used to reject unresolved descriptor refs.
    *  Production uses the control-plane client; tests may inject a fake. */
   orgSecret?: OrgSecretNameClient;
+  /** Resolve whether the human owner has a live provider connection. */
+  hasOAuthCredential?: (provider: string) => Promise<boolean>;
+  oauthSubject?: { kind: OauthSubjectKind; id: string };
 }
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** ADR 0107: session mode riding the initial prompt (e.g. "plan").
+   *  Validated against the selected harness's declared modes. */
+  harnessMode?: string;
   /** Per-session integration grants layered on top of the profile. These may
    *  affect the bound capabilities and integration policy, but never the tool
    *  manifest (for example, a scoped clone credential). */
@@ -259,6 +284,20 @@ export async function compileSessionCreateInput(
     }
   }
 
+  // ADR 0107: a create-time session mode must be one the harness declares.
+  // The coordinator re-validates; failing fast here gives the create surface
+  // a clean error instead of a queued-then-rejected first prompt.
+  if (
+    opts.harnessMode != null &&
+    descriptor != null &&
+    !(descriptor.modes ?? []).some((mode) => mode.id === opts.harnessMode)
+  ) {
+    throw new ConnectError(
+      `harness \`${selectedHarness}\` does not declare mode \`${opts.harnessMode}\``,
+      Code.InvalidArgument,
+    );
+  }
+
   // Strict-by-principal credentials (ADR 0063 B4, amended): a human-owned task
   // carries the owner's per-user token; a service-account-created task carries
   // the org secret. They are mutually exclusive — never both. The PRINCIPAL
@@ -275,8 +314,10 @@ export async function compileSessionCreateInput(
   // The human credential env-var name is the selected harness's declared
   // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
   const userEnv = descriptor?.auth?.userEnv;
+  const userOauth = descriptor?.auth?.userOauth;
   const orgEnv = descriptor?.auth?.orgEnv;
   let humanUserToken: string | undefined;
+  let oauthCredential: SessionCreateInput["oauthCredential"];
   if (isHuman) {
     // The declared user credential is MANDATORY for a human run — a
     // session without it boots unauthenticated. Always inject it, and BLOCK
@@ -290,11 +331,25 @@ export async function compileSessionCreateInput(
         throw new ConnectError(
           `${label} needs your ${userEnv} credential, which isn't set.` +
             (hint ? ` ${hint}` : "") +
-            ` Add it under Settings → Tokens, then start the task again.`,
+            ` Add it under Settings → Credentials, then start the task again.`,
           Code.FailedPrecondition,
         );
       }
       humanUserToken = userToken;
+    }
+    if (userOauth) {
+      const connected = await deps.hasOAuthCredential?.(userOauth.provider);
+      if (!connected || !deps.oauthSubject) {
+        const label = descriptor?.label || selectedHarness;
+        const hint = descriptor?.auth?.userEnvHint;
+        throw new ConnectError(
+          `${label} needs your ${userOauth.provider} connection.` +
+            (hint ? ` ${hint}` : "") +
+            ` Connect it under Settings → Credentials, then start the task again.`,
+          Code.FailedPrecondition,
+        );
+      }
+      oauthCredential = { subject: deps.oauthSubject, provider: userOauth.provider };
     }
     // The profile toggle additionally carries the user's OTHER saved tokens
     // (credentials for other harnesses / tools) into the sandbox.
@@ -350,7 +405,7 @@ export async function compileSessionCreateInput(
   }
   harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
     harness.ENGRAM_APPEND_SYSTEM_PROMPT,
-    PAPERCUT_SYSTEM_PROMPT,
+    BASE_SYSTEM_PROMPT,
   ].filter(Boolean).join("\n\n");
   // ADR 0097: the browser bundle carries a local image-observation tool. It
   // is harness-native (not a connector capability) and is enabled only when
@@ -415,7 +470,9 @@ export async function compileSessionCreateInput(
     mode: "agent",
     harness: selectedHarness,
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
+    ...(opts.harnessMode != null ? { harnessMode: opts.harnessMode } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
+    ...(oauthCredential != null ? { oauthCredential } : {}),
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
     ...(capabilities.length > 0 ? { capabilities } : {}),
     ...(integrationPolicyJson != null ? { integrationPolicyJson } : {}),
@@ -447,6 +504,11 @@ export interface CreateTaskDeps {
     get(userId: string, envVar: string): Promise<string | null>;
     getAll(userId: string): Promise<Record<string, string>>;
   };
+  oauth?: {
+    listCredentials(req: { subject: { kind: OauthSubjectKind; id: string } }): Promise<{
+      credentials: Array<{ provider: string; connected: boolean }>;
+    }>;
+  };
   db: Db;
   /** ADR 0064: port-exposure store for auto-minting `profile.portExposures`.
    *  Defaults to a Drizzle store over `db` when omitted. */
@@ -472,6 +534,8 @@ export interface CreateTaskParams {
   harness?: string;
   model?: string;
   effort?: string;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
   /** Type-specific trigger ref recorded on the task row (operator-visible). */
   source?: Record<string, unknown>;
   /** Extra harness env merged LAST — e.g. the trigger's
@@ -487,6 +551,8 @@ export interface CreateSessionForExistingTaskParams {
   role: string;
   ownerUserId?: string;
   prompt?: string;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
   networkOverride?: ProfileNetwork;
@@ -562,12 +628,26 @@ export async function createSessionForExistingTask(
         params.ownerUserId === undefined
           ? Promise.resolve({})
           : deps.secrets.getAll(params.ownerUserId),
+      ...(params.ownerUserId === undefined
+        ? {}
+        : {
+            oauthSubject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
+            hasOAuthCredential: async (provider: string) => {
+              const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
+                subject: { kind: OauthSubjectKind.USER, id: params.ownerUserId! },
+              });
+              return response.credentials.some(
+                (credential) => credential.provider === provider && credential.connected,
+              );
+            },
+          }),
     },
     {
       // An automation-owned review task has no human token; use the harness's
       // programmatic credential while still creating the session promptless.
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
       ...(params.capabilityOverride !== undefined
         ? { capabilityOverride: params.capabilityOverride }
@@ -668,6 +748,15 @@ export async function createTaskWithSession(
       harnessCatalog: deps.harnessCatalog,
       resolveUserToken: (envVar) => deps.secrets.get(params.ownerUserId, envVar),
       resolveAllUserTokens: () => deps.secrets.getAll(params.ownerUserId),
+      oauthSubject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
+      hasOAuthCredential: async (provider: string) => {
+        const response = await (deps.oauth ?? defaultOAuthCredential).listCredentials({
+          subject: { kind: OauthSubjectKind.USER, id: params.ownerUserId },
+        });
+        return response.credentials.some(
+          (credential) => credential.provider === provider && credential.connected,
+        );
+      },
     },
     {
       ...(params.ownerIsServiceAccount ? { programmatic: true } : {}),
@@ -675,6 +764,7 @@ export async function createTaskWithSession(
       ...(params.harness != null ? { harness: params.harness } : {}),
       ...(params.model != null ? { model: params.model } : {}),
       ...(params.effort != null ? { effort: params.effort } : {}),
+      ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.extraHarnessEnv ? { extraHarnessEnv: params.extraHarnessEnv } : {}),
       ...(owner ? { owner } : {}),
     },

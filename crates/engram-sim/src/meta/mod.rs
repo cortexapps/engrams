@@ -214,6 +214,14 @@ pub struct SimDb {
     /// `session_broker_tokens`, PK `session_id`).
     pub broker_tokens:
         std::collections::BTreeMap<SessionId, engram_core::types::registry::SessionBrokerToken>,
+    /// ADR 0106: sealed payloads keyed by opaque subject + provider.
+    pub oauth_credentials: std::collections::BTreeMap<
+        engram_core::types::oauth::OAuthCredentialKey,
+        engram_core::types::oauth::SealedOAuthCredential,
+    >,
+    pub oauth_flows: std::collections::BTreeMap<uuid::Uuid, engram_core::types::oauth::OAuthFlow>,
+    pub session_oauth_bindings:
+        std::collections::BTreeMap<SessionId, engram_core::types::oauth::SessionOAuthBinding>,
     /// ADR 0045 live-migration teleport pin (PG: `sessions.
     /// teleport_target_host_id` + `_set_at`). Present only while a pin is
     /// set. The sim runs no teleport workload today, but the boot/rebind

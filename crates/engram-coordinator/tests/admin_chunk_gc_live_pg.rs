@@ -192,10 +192,11 @@ async fn pin_set_covers_all_three_sources_and_dry_run_is_pure() {
         .await
         .expect("create session");
     let sandbox_id = SandboxId::new();
+    // 0108: bind via the production fused path, never on a Pending row.
     rig.meta
-        .assign_session_sandbox(session_id, Some(sandbox_id))
+        .transition_session_created(session_id, sandbox_id)
         .await
-        .expect("assign sandbox");
+        .expect("assign sandbox (fused Pending → Created)");
     rig.meta
         .update_live_disk_manifest(session_id, sandbox_id, session_disk)
         .await

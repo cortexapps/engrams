@@ -948,6 +948,7 @@ async fn observes_response_and_emits_asset() {
             ("title".into(), "$.resp.title".into()),
         ],
         fetchable: Some("$.resp.html_url".into()),
+        url_fallback: None,
     };
 
     let collected: Arc<Mutex<Vec<(SessionId, ObservedAsset)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1050,6 +1051,7 @@ async fn failed_status_emits_no_asset() {
         success: SuccessRule::StatusClass2xx,
         data: vec![("number".into(), "$.resp.number".into())],
         fetchable: None,
+        url_fallback: None,
     };
 
     let collected: Arc<Mutex<Vec<(SessionId, ObservedAsset)>>> = Arc::new(Mutex::new(Vec::new()));
@@ -1141,6 +1143,7 @@ fn graphql_observe_entry(op: GraphqlOperation, field: &str) -> ObserveEntry {
         success: SuccessRule::NoGraphqlErrors,
         data: vec![("id".into(), "$.resp.data.createIssue.issue.id".into())],
         fetchable: None,
+        url_fallback: None,
     }
 }
 
@@ -1474,6 +1477,90 @@ async fn graphql_observe_emits_on_no_errors() {
         assets[0].data.get("id"),
         Some(&serde_json::json!("I_1")),
         "asset id extracted from $.resp.data.createIssue.issue.id",
+    );
+}
+
+// The `gh pr create` regression: its createPullRequest mutation selects only
+// `pullRequest { id url }`, so the response body carries none of the card
+// fields. Parity with the REST asset comes from the request VARIABLES
+// (`$.vars.input.*` → title/branches) + the URL fallback (repo/number derived
+// from the returned PR URL) — end to end through the real intercept path.
+#[tokio::test]
+async fn graphql_observe_reaches_rest_parity_for_gh_pr_create() {
+    let ca = ca();
+    let observe = ObserveEntry {
+        allow: HostList::from_manifest(&["fake-upstream".into()], &[]).unwrap(),
+        policy: RequestPolicy {
+            methods: vec!["POST".into()],
+            path_globs: vec!["/graphql".into()],
+            graphql: Some(GraphqlMatch {
+                operation: GraphqlOperation::Mutation,
+                field: "createPullRequest".into(),
+            }),
+        },
+        provider: "github".into(),
+        asset_kind: "pull_request".into(),
+        surface: "asset".into(),
+        success: SuccessRule::NoGraphqlErrors,
+        data: vec![
+            (
+                "number".into(),
+                "$.resp.data.createPullRequest.pullRequest.number".into(),
+            ),
+            ("title".into(), "$.vars.input.title".into()),
+            (
+                "repo".into(),
+                "$.resp.data.createPullRequest.pullRequest.repository.nameWithOwner".into(),
+            ),
+            ("head_branch".into(), "$.vars.input.headRefName".into()),
+            ("base_branch".into(), "$.vars.input.baseRefName".into()),
+        ],
+        fetchable: Some("$.resp.data.createPullRequest.pullRequest.url".into()),
+        url_fallback: Some(engram_egress_proxy::UrlFallback {
+            pattern: "https://github.com/{owner}/{name}/pull/{number:int}".into(),
+            fields: vec![
+                ("repo".into(), "{owner}/{name}".into()),
+                ("number".into(), "{number}".into()),
+            ],
+        }),
+    };
+    // The exact envelope `gh` sends: named single mutation + variables.
+    let envelope = serde_json::json!({
+        "query": "mutation PullRequestCreate($input: CreatePullRequestInput!) { createPullRequest(input: $input) { pullRequest { id url } } }",
+        "variables": {"input": {
+            "repositoryId": "R_1",
+            "title": "Fix the flux capacitor",
+            "headRefName": "fix-flux",
+            "baseRefName": "main",
+        }},
+    })
+    .to_string();
+    let req = graphql_post(&envelope);
+    let body = r#"{"data":{"createPullRequest":{"pullRequest":{"id":"PR_1","url":"https://github.com/octo/engrams/pull/97"}}}}"#;
+    let response = format!(
+        "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        body
+    )
+    .into_bytes();
+    let assets = run_graphql_observe(ca, observe, req, response).await;
+    assert_eq!(assets.len(), 1, "exactly one asset emitted");
+    let a = &assets[0];
+    assert_eq!(a.asset_kind, "pull_request");
+    assert_eq!(
+        a.data.get("title"),
+        Some(&serde_json::json!("Fix the flux capacitor"))
+    );
+    assert_eq!(
+        a.data.get("head_branch"),
+        Some(&serde_json::json!("fix-flux"))
+    );
+    assert_eq!(a.data.get("base_branch"), Some(&serde_json::json!("main")));
+    assert_eq!(a.data.get("repo"), Some(&serde_json::json!("octo/engrams")));
+    assert_eq!(a.data.get("number"), Some(&serde_json::json!(97)));
+    assert_eq!(
+        a.fetchable_url.as_deref(),
+        Some("https://github.com/octo/engrams/pull/97")
     );
 }
 

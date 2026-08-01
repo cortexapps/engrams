@@ -214,8 +214,10 @@ impl Driver {
             prompt: None,
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         self.create_session_retrying(req, "dev_vm").await
     }
@@ -234,8 +236,10 @@ impl Driver {
             prompt: None,
             secrets: HashMap::new(),
             harness_env: HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         self.create_session_retrying(req, "dev_vm + skills").await
     }
@@ -271,10 +275,12 @@ impl Driver {
             prompt: prompt.map(str::to_string),
             secrets: HashMap::new(),
             harness_env,
+            oauth_credential: None,
             prompt_id: None,
             // The built-in `claude` needs no registration — it resolves from the
             // host `current_bundles` stamp (∪ the catalog) by name.
             harness: Some("claude".to_string()),
+            harness_mode: None,
         };
         self.create_session_retrying(req, "claude").await
     }
@@ -291,11 +297,13 @@ impl Driver {
             prompt: None,
             secrets: HashMap::new(),
             harness_env: HashMap::from([(
-                "CODEX_ACCESS_TOKEN".to_string(),
+                "CODEX_API_KEY".to_string(),
                 "bogus-e2e-token".to_string(),
             )]),
+            oauth_credential: None,
             prompt_id: None,
             harness: Some("codex".to_string()),
+            harness_mode: None,
         };
         self.create_session_retrying(req, "codex").await
     }
@@ -647,6 +655,7 @@ impl Driver {
         let req = app::StreamEventsRequest {
             session_id: sid.to_string(),
             since: None, // from the start
+            durable_only: false,
         };
         let mut stream = match self.sess.stream_events(req).await {
             Ok(r) => r.into_inner(),

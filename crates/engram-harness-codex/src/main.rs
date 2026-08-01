@@ -5,7 +5,10 @@ use std::sync::Arc;
 
 use clap::Parser;
 use engram_core::{SandboxId, SessionId};
-use engram_harness_proto::{AgentRole, FileChange, HarnessCommand, HarnessEvent};
+use engram_harness_proto::{
+    read_msg, write_msg, AgentRole, FileChange, ForgeOp, ForgeRequest, ForgeResponse,
+    HarnessCommand, HarnessEvent, FORGE_VSOCK_PORT,
+};
 use engram_harness_sdk::browser_view;
 use engram_harness_sdk::parked::{ParkedCall, ParkedCallKind, ParkedCallStore};
 use engram_harness_sdk::questions::{Answers, Question, QuestionOption};
@@ -13,12 +16,14 @@ use engram_harness_sdk::{emit, Channels, ConnectionConfig, QueuedPrompt};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
-use tokio::sync::{mpsc, Notify};
+use tokio::sync::{mpsc, Mutex, Notify};
 
 const DEFAULT_CODEX_HOME: &str = "/workspace/.engrams/codex";
 const THREAD_ID_FILE: &str = "/workspace/.engrams/codex-thread-id";
 const PARKED_CALLS_FILE: &str = "/workspace/.engrams/codex-parked-calls.json";
 const MAX_SUMMARY: usize = 4096;
+const MAX_OAUTH_BUNDLE_BYTES: usize = 256 * 1024;
+const OPENAI_CODEX_PROVIDER: &str = "openai-codex";
 
 type ToolManifest = Vec<ManifestTool>;
 
@@ -158,6 +163,15 @@ struct Cli {
     /// Test seam for the durable correlation table.
     #[arg(skip)]
     parked_calls_file: Option<PathBuf>,
+    /// Test seam for the ADR 0107 session-mode stamp.
+    #[arg(skip)]
+    mode_stamp_file: Option<PathBuf>,
+    /// Test-only service-account credential; production reads CODEX_API_KEY.
+    #[arg(skip)]
+    test_api_key: Option<String>,
+    /// Test-only credential broker override.
+    #[arg(skip)]
+    test_credential_control: Option<CredentialControl>,
 }
 
 impl Cli {
@@ -171,6 +185,12 @@ impl Cli {
         self.parked_calls_file
             .as_deref()
             .unwrap_or_else(|| Path::new(PARKED_CALLS_FILE))
+    }
+
+    fn mode_stamp_file(&self) -> &Path {
+        self.mode_stamp_file
+            .as_deref()
+            .unwrap_or_else(|| Path::new(engram_harness_sdk::mode_stamp::MODE_STAMP_FILE))
     }
 }
 
@@ -220,6 +240,9 @@ async fn main() -> ExitCode {
 
 struct AppServer {
     child: Child,
+    /// ADR 0107: the session-mode stamp path — read at every turn start so
+    /// per-turn params (sandbox, plan preamble) follow the latch.
+    mode_stamp_path: PathBuf,
     stdin: ChildStdin,
     lines: Lines<BufReader<ChildStdout>>,
     next_id: i64,
@@ -227,7 +250,191 @@ struct AppServer {
     persisted_prompts: HashMap<String, PersistedTurn>,
     buffered: VecDeque<Value>,
     stderr_task: Option<tokio::task::JoinHandle<Vec<String>>>,
+    oauth_watcher: Option<tokio::task::JoinHandle<()>>,
+    _oauth_home: Option<tempfile::TempDir>,
     generation: u64,
+}
+
+#[derive(Clone)]
+struct CredentialControl {
+    session_id: SessionId,
+    broker_token: String,
+    endpoint: Option<String>,
+}
+
+impl std::fmt::Debug for CredentialControl {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("CredentialControl")
+            .field("session_id", &self.session_id)
+            .field("endpoint", &self.endpoint)
+            .field("broker_token", &"[redacted]")
+            .finish()
+    }
+}
+
+struct OAuthSession {
+    control: CredentialControl,
+    version: i64,
+    last_payload: Vec<u8>,
+}
+
+fn codex_app_server_command(bin: &Path, runtime_home: &Path) -> Command {
+    let mut command = Command::new(bin);
+    command
+        .args(["app-server", "--stdio"])
+        .env("CODEX_HOME", runtime_home)
+        .env("CODEX_NON_INTERACTIVE", "1")
+        // Authentication is delivered over the trusted app-server/control
+        // protocols. Neither provider credentials nor the session broker
+        // capability may be inherited by the child process environment.
+        .env_remove("CODEX_API_KEY")
+        .env_remove("OPENAI_API_KEY")
+        .env_remove("ENGRAM_CREDENTIAL_BROKER_TOKEN")
+        .env_remove("ENGRAM_CREDENTIAL_ENDPOINT")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true);
+    command
+}
+
+impl CredentialControl {
+    fn from_env(session_id: SessionId) -> Result<Self, String> {
+        let broker_token = std::env::var("ENGRAM_CREDENTIAL_BROKER_TOKEN")
+            .map_err(|_| "OpenAI is not connected for this session".to_string())?;
+        Ok(Self {
+            session_id,
+            broker_token,
+            endpoint: std::env::var("ENGRAM_CREDENTIAL_ENDPOINT").ok(),
+        })
+    }
+
+    async fn exchange(&self, op: ForgeOp) -> Result<ForgeResponse, String> {
+        let request = ForgeRequest {
+            session_id: self.session_id,
+            broker_token: self.broker_token.clone(),
+            op,
+        };
+        if let Some(endpoint) = &self.endpoint {
+            let url = format!(
+                "{}/api/v1/sessions/{}/credential-control",
+                endpoint.trim_end_matches('/'),
+                self.session_id
+            );
+            return reqwest::Client::new()
+                .post(url)
+                .json(&request)
+                .send()
+                .await
+                .map_err(|_| "credential control request failed".to_string())?
+                .error_for_status()
+                .map_err(|_| "credential control request was rejected".to_string())?
+                .json()
+                .await
+                .map_err(|_| "credential control response was malformed".to_string());
+        }
+        let transport = engram_transport::from_env()
+            .map_err(|_| "credential control transport unavailable".to_string())?;
+        let mut stream = transport
+            .dial(FORGE_VSOCK_PORT)
+            .await
+            .map_err(|_| "credential control connection failed".to_string())?;
+        write_msg(&mut stream, &request)
+            .await
+            .map_err(|_| "credential control request failed".to_string())?;
+        read_msg(&mut stream)
+            .await
+            .map_err(|_| "credential control response was malformed".to_string())
+    }
+}
+
+impl OAuthSession {
+    async fn fetch(session_id: SessionId) -> Result<Self, String> {
+        Self::fetch_from(CredentialControl::from_env(session_id)?).await
+    }
+
+    async fn fetch_from(control: CredentialControl) -> Result<Self, String> {
+        match control.exchange(ForgeOp::FetchOAuthCredential).await? {
+            ForgeResponse::OAuthCredential {
+                provider,
+                version,
+                opaque_bundle,
+            } if provider == OPENAI_CODEX_PROVIDER
+                && !opaque_bundle.is_empty()
+                && opaque_bundle.len() <= MAX_OAUTH_BUNDLE_BYTES =>
+            {
+                Ok(Self {
+                    control,
+                    version,
+                    last_payload: opaque_bundle,
+                })
+            }
+            ForgeResponse::Error { message } => {
+                Err(format!("OAuth credential unavailable: {message}"))
+            }
+            _ => Err("credential control returned an invalid OpenAI cache".into()),
+        }
+    }
+
+    async fn sync_cache(&mut self, path: &Path) -> Result<(), String> {
+        let metadata = match tokio::fs::symlink_metadata(path).await {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(_) => return Err("could not inspect refreshed OAuth cache".into()),
+        };
+        if !metadata.file_type().is_file() || metadata.len() as usize > MAX_OAUTH_BUNDLE_BYTES {
+            let _ = remove_auth_cache(path).await;
+            return Err("refreshed OAuth cache was rejected".into());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                let _ = remove_auth_cache(path).await;
+                return Err("refreshed OAuth cache permissions were rejected".into());
+            }
+        }
+        let payload = tokio::fs::read(path)
+            .await
+            .map_err(|_| "could not read refreshed OAuth cache".to_string())?;
+        if payload.is_empty() {
+            let _ = remove_auth_cache(path).await;
+            return Err("refreshed OAuth cache was empty".into());
+        }
+        if payload != self.last_payload {
+            let response = self
+                .control
+                .exchange(ForgeOp::UpdateOAuthCredential {
+                    expected_version: self.version,
+                    opaque_bundle: payload.clone(),
+                })
+                .await;
+            let removal = remove_auth_cache(path).await;
+            match response? {
+                ForgeResponse::OAuthCredential {
+                    provider,
+                    version,
+                    opaque_bundle,
+                } if provider == OPENAI_CODEX_PROVIDER => {
+                    self.version = version;
+                    self.last_payload = opaque_bundle;
+                }
+                ForgeResponse::Error { message } if message == "version_conflict" => {
+                    // The winning cache is fetched on the next app-server
+                    // restart boundary; never overwrite it with stale state.
+                    tracing::warn!("OAuth cache refresh lost a version race; deferring to restart");
+                }
+                ForgeResponse::Error { message } => {
+                    return Err(format!("OAuth cache refresh rejected: {message}"));
+                }
+                _ => return Err("credential control returned an invalid refresh response".into()),
+            }
+            removal?;
+            return Ok(());
+        }
+        remove_auth_cache(path).await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -303,6 +510,9 @@ async fn run_engine(
                     outcome,
                     DriveOutcome::Shutdown | DriveOutcome::ChannelClosed
                 ) {
+                    if let Some(watcher) = server.oauth_watcher.take() {
+                        watcher.abort();
+                    }
                     // ChildStdin::shutdown() only flushes — dropping the
                     // handle is what closes the pipe and delivers the EOF
                     // the app-server exits on. Without it every drain ate
@@ -319,6 +529,9 @@ async fn run_engine(
                         let _ = child.wait().await;
                     }
                     return ExitCode::SUCCESS;
+                }
+                if let Some(watcher) = server.oauth_watcher.take() {
+                    watcher.abort();
                 }
                 let _ = server.child.start_kill();
                 let _ = server.child.wait().await;
@@ -340,28 +553,103 @@ async fn run_engine(
     }
 }
 
+async fn write_auth_cache(path: &Path, payload: &[u8]) -> Result<(), String> {
+    if payload.is_empty() || payload.len() > MAX_OAUTH_BUNDLE_BYTES {
+        return Err("OAuth cache size rejected".into());
+    }
+    let mut options = tokio::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(path)
+        .await
+        .map_err(|_| "could not create private OAuth cache".to_string())?;
+    file.write_all(payload)
+        .await
+        .map_err(|_| "could not write OAuth cache".to_string())?;
+    file.flush()
+        .await
+        .map_err(|_| "could not flush OAuth cache".to_string())
+}
+
+async fn remove_auth_cache(path: &Path) -> Result<(), String> {
+    match tokio::fs::remove_file(path).await {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err("could not remove OAuth cache".into()),
+    }
+}
+
+fn spawn_oauth_watcher(
+    oauth: Arc<Mutex<OAuthSession>>,
+    auth_path: PathBuf,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(std::time::Duration::from_millis(250));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            if let Err(error) = oauth.lock().await.sync_cache(&auth_path).await {
+                // Error strings are deliberately provider-independent and never
+                // include cache bytes, JSON-RPC messages, or token values.
+                tracing::warn!(%error, "could not synchronize refreshed OAuth cache");
+            }
+        }
+    })
+}
+
 impl AppServer {
     async fn spawn(cli: &Cli, generation: u64) -> Result<Self, String> {
-        tokio::fs::create_dir_all(&cli.codex_home)
-            .await
-            .map_err(|e| format!("create CODEX_HOME: {e}"))?;
-        ensure_skills_link(&cli.codex_home).await;
+        let api_key = cli
+            .test_api_key
+            .clone()
+            .or_else(|| std::env::var("CODEX_API_KEY").ok());
+        let oauth = if api_key.is_none() {
+            Some(match cli.test_credential_control.clone() {
+                Some(control) => OAuthSession::fetch_from(control).await?,
+                None => OAuthSession::fetch(cli.session_id).await?,
+            })
+        } else {
+            None
+        };
+        let oauth_home = if oauth.is_some() {
+            let dir = tempfile::Builder::new()
+                .prefix("engram-codex-oauth-")
+                .tempdir()
+                .map_err(|_| "could not create private Codex home".to_string())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700))
+                    .map_err(|_| "could not protect private Codex home".to_string())?;
+            }
+            Some(dir)
+        } else {
+            tokio::fs::create_dir_all(&cli.codex_home)
+                .await
+                .map_err(|e| format!("create CODEX_HOME: {e}"))?;
+            None
+        };
+        let runtime_home = oauth_home
+            .as_ref()
+            .map_or_else(|| cli.codex_home.clone(), |dir| dir.path().to_path_buf());
+        ensure_skills_link(&runtime_home).await;
+        let auth_path = runtime_home.join("auth.json");
+        if let Some(oauth) = &oauth {
+            write_auth_cache(&auth_path, &oauth.last_payload).await?;
+        }
         let bin = cli.codex_bin.clone().unwrap_or_else(resolve_codex_bin);
-        let mut command = Command::new(&bin);
-        command
-            .args(["app-server", "--stdio"])
-            .env("CODEX_HOME", &cli.codex_home)
-            .env("CODEX_NON_INTERACTIVE", "1")
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .kill_on_drop(true);
+        let mut command = codex_app_server_command(&bin, &runtime_home);
         let mut child = command.spawn().map_err(|e| format!("spawn {bin:?}: {e}"))?;
         let stdin = child.stdin.take().ok_or("app-server stdin unavailable")?;
         let stdout = child.stdout.take().ok_or("app-server stdout unavailable")?;
         let stderr = child.stderr.take().ok_or("app-server stderr unavailable")?;
         let mut server = Self {
             child,
+            mode_stamp_path: cli.mode_stamp_file().to_path_buf(),
             stdin,
             lines: BufReader::new(stdout).lines(),
             next_id: 1,
@@ -369,6 +657,8 @@ impl AppServer {
             persisted_prompts: HashMap::new(),
             buffered: VecDeque::new(),
             stderr_task: Some(engram_harness_sdk::spawn_stderr_tail(stderr, 64, true)),
+            oauth_watcher: None,
+            _oauth_home: oauth_home,
             generation,
         };
         server
@@ -378,22 +668,30 @@ impl AppServer {
             )
             .await?;
         server.notify("initialized", json!({})).await?;
-        if let Ok(api_key) = std::env::var("CODEX_API_KEY") {
+        if let Some(api_key) = api_key {
             server
                 .request_wait(
                     "account/login/start",
                     json!({"type":"apiKey","apiKey":api_key}),
                 )
                 .await?;
+        } else {
+            let response = server
+                .request_wait("account/read", json!({"refreshToken":true}))
+                .await?;
+            if response
+                .pointer("/result/account/type")
+                .and_then(Value::as_str)
+                != Some("chatgpt")
+            {
+                return Err("Codex did not load managed ChatGPT authentication".into());
+            }
         }
-        // Codex persists API-key login material to CODEX_HOME/auth.json. The
-        // app-server keeps the selected credential in memory, so remove the
-        // file before any model-controlled command can inspect the workspace.
-        // A fresh wrapper re-authenticates from the selected Engram env var.
-        match tokio::fs::remove_file(cli.codex_home.join("auth.json")).await {
-            Ok(()) => {}
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => tracing::warn!(%error, "could not remove Codex credential cache"),
+        let oauth = oauth.map(|oauth| Arc::new(Mutex::new(oauth)));
+        if let Some(oauth) = &oauth {
+            oauth.lock().await.sync_cache(&auth_path).await?;
+        } else if let Err(error) = remove_auth_cache(&auth_path).await {
+            tracing::warn!(%error, "could not remove Codex credential cache");
         }
         let prior = tokio::fs::read_to_string(cli.thread_id_file())
             .await
@@ -418,6 +716,9 @@ impl AppServer {
             .to_owned();
         server.persisted_prompts = persisted_prompts(&response);
         persist_thread_id(cli.thread_id_file(), &server.thread_id).await?;
+        if let Some(oauth) = oauth {
+            server.oauth_watcher = Some(spawn_oauth_watcher(oauth, auth_path));
+        }
         Ok(server)
     }
 
@@ -490,8 +791,7 @@ async fn drive(
 ) -> DriveOutcome {
     let mut active: Option<String> = None;
     let mut pending = HashMap::<i64, Pending>::new();
-    let mut interrupt_deadline: Option<tokio::time::Instant> = None;
-    let mut interrupt_requested = false;
+    let mut interrupt = InterruptWatchdog::default();
     emit(events, HarnessEvent::Idle).await;
     let mut index = 0;
     while index < queued.len() {
@@ -564,14 +864,17 @@ async fn drive(
             )
             .await;
             if completed {
-                interrupt_deadline = None;
-                interrupt_requested = false;
+                interrupt.disarm();
             }
             continue;
         }
         tokio::select! {
             command = commands.recv() => match command {
-                Some(HarnessCommand::Prompt { prompt_id, text }) => {
+                Some(HarnessCommand::Prompt { prompt_id, text, mode }) => {
+                    // ADR 0107: the directive rides the PROMPT and is latched
+                    // in `start_turn` — not here. Latching on arrival let a
+                    // later queued prompt's mode decide an earlier prompt's
+                    // turn (PR #927 review).
                     if !seen.insert(prompt_id.clone()) {
                         if let Some(turn) = server.persisted_prompts.get(&prompt_id) {
                             if turn.steered {
@@ -594,8 +897,28 @@ async fn drive(
                         }
                         continue;
                     }
-                    let prompt = QueuedPrompt { prompt_id, text };
-                    if let Some(turn_id) = active.as_deref() {
+                    let prompt = QueuedPrompt {
+                        prompt_id,
+                        text,
+                        mode,
+                    };
+                    // ADR 0107: a prompt that CHANGES the mode must not be
+                    // steered into the running turn — that turn's sandbox was
+                    // fixed when it started, so a plan-mode prompt injected
+                    // into a full-access turn would run with write access (PR
+                    // #927 review). Interrupt instead; `turn/completed` drains
+                    // the queue and `start_turn` applies the new mode.
+                    let mode_change = prompt.mode.as_deref().is_some_and(|m| {
+                        m != engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path)
+                    });
+                    if let (Some(turn_id), true) = (active.clone(), mode_change) {
+                        emit(events, HarnessEvent::PromptQueued {
+                            prompt_id: prompt.prompt_id.clone(),
+                            summary: Some(engram_harness_sdk::truncate_utf8(&prompt.text, 1024)),
+                        }).await;
+                        queued.push_back(prompt);
+                        interrupt_turn(server, &mut pending, &mut interrupt, &turn_id, "mode change").await;
+                    } else if let Some(turn_id) = active.as_deref() {
                         let id = server.send_request("turn/steer", json!({
                             "threadId": server.thread_id,
                             "expectedTurnId": turn_id,
@@ -631,19 +954,21 @@ async fn drive(
                         emit(events, HarnessEvent::PromptDequeued { prompt_id }).await;
                     }
                 }
-                Some(HarnessCommand::Interrupt) => if let Some(turn_id) = active.as_deref() {
-                    if let Ok(id) = server.send_request("turn/interrupt", json!({"threadId":server.thread_id,"turnId":turn_id})).await {
-                        pending.insert(id, Pending::Interrupt);
-                        interrupt_requested = true;
-                        interrupt_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
+                Some(HarnessCommand::Interrupt) => {
+                    if let Some(turn_id) = active.clone() {
+                        interrupt_turn(server, &mut pending, &mut interrupt, &turn_id, "operator interrupt").await;
                     }
-                },
+                }
                 Some(HarnessCommand::ToolResult { call_id, result_json }) => {
                     route_tool_result(
                         server,
                         parked,
-                        &mut pending,
-                        &active,
+                        RouteCtx {
+                            pending: &mut pending,
+                            active: &active,
+                            queued,
+                            interrupt: &mut interrupt,
+                        },
                         events,
                         &call_id,
                         result_json,
@@ -656,14 +981,14 @@ async fn drive(
             },
             _ = reattach.notified() => if active.is_none() { emit(events, HarnessEvent::Idle).await; },
             _ = async {
-                match interrupt_deadline {
+                match interrupt.deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
                 tracing::warn!("Codex did not confirm interrupt within 10s; terminating app-server");
                 let _ = server.child.start_kill();
-                interrupt_deadline = None;
+                interrupt.disarm();
             },
             message = server.read() => match message {
                 Ok(Some(value)) => {
@@ -678,8 +1003,7 @@ async fn drive(
                         ToolContext { parked, manifest },
                     ).await;
                     if completed {
-                        interrupt_deadline = None;
-                        interrupt_requested = false;
+                        interrupt.disarm();
                     }
                 },
                 Ok(None) | Err(_) => {
@@ -706,7 +1030,7 @@ async fn drive(
                             format!("Codex app-server exited unexpectedly; resuming the persisted thread. stderr tail:\n{}", engram_harness_sdk::truncate_utf8(&tail.join("\n"), MAX_SUMMARY))
                         };
                         emit(events, HarnessEvent::AgentMessage { run_id: run_id.clone(), message_id: format!("abnormal-{}", uuid::Uuid::new_v4()), role: AgentRole::System, text: detail }).await;
-                        if interrupt_requested {
+                        if interrupt.requested {
                             emit(events, HarnessEvent::RunInterrupted { run_id }).await;
                         } else {
                             emit(events, HarnessEvent::RunCompleted { run_id, ok: false }).await;
@@ -720,13 +1044,65 @@ async fn drive(
     }
 }
 
+/// ADR 0107: the harness-owned plan-turn preamble. Codex has no native plan
+/// permission mode; the read-only turn sandbox is the enforcement and this
+/// contract tells the model how the pass ends.
+const PLAN_MODE_PREAMBLE: &str = "You are in plan mode: a read-only design pass. \
+    Explore the repository and design an implementation plan. Do not modify files \
+    and do not run mutating commands. When your plan is complete, call the \
+    exit_plan_mode tool with the full plan as markdown and wait for the review \
+    decision.";
+
+/// ADR 0107: the synthesized build turn after an approval (the plan turn is
+/// interrupted; this fresh turn starts under the flipped, full-access stamp).
+const PLAN_APPROVED_MESSAGE: &str =
+    "Your plan was approved. Implement it now, following the plan you presented.";
+
+/// ADR 0107: a rejection is delivered the same way an approval is — as a
+/// fresh user turn, not as a tool result. Answering the parked call is not
+/// sufficient: codex reads a failed dynamic-tool result as "the tool did not
+/// work", narrates a summary, and ends the turn (session 98111e00 did exactly
+/// that with `success: false` plus the reviewer's words in `contentItems`).
+/// The stamp stays `plan`, so the revision turn is still read-only. The text
+/// itself is shared with the claude adapter's deny + fallback paths.
+use engram_harness_sdk::plan::changes_requested_message as plan_changes_requested_message;
+
 async fn start_turn(server: &mut AppServer, prompt: &QueuedPrompt) -> Result<i64, String> {
+    // ADR 0107: per-turn mode application — no respawn, ever. The stamp is
+    // read fresh at every turn start; `sandboxPolicy` is an explicit
+    // override each time BECAUSE the app-server treats it as sticky ("this
+    // turn and subsequent turns"), so the build turn after an approval must
+    // restore the external-sandbox policy itself.
+    // ADR 0107: latch THIS prompt's directive at the moment its turn starts —
+    // not when the command arrived — so a queued prompt runs under the mode it
+    // was sent with. `None` inherits the session's current mode.
+    if let Some(mode) = prompt.mode.as_deref().filter(|m| !m.is_empty()) {
+        if let Err(error) =
+            engram_harness_sdk::mode_stamp::write_mode_stamp(&server.mode_stamp_path, mode)
+        {
+            tracing::warn!(%error, %mode, "mode stamp write failed");
+        }
+    }
+    let plan_mode =
+        engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path) == "plan";
+    let text = if plan_mode {
+        format!("{PLAN_MODE_PREAMBLE}\n\n{}", prompt.text)
+    } else {
+        prompt.text.clone()
+    };
+    let sandbox = if plan_mode {
+        // Codex's own OS sandbox enforces read-only inside the VM; network
+        // stays on (the VM egress proxy is the real gate).
+        json!({"type":"readOnly","networkAccess":true})
+    } else {
+        json!({"type":"externalSandbox","networkAccess":"enabled"})
+    };
     let mut params = json!({
         "threadId":server.thread_id,
         "clientUserMessageId":prompt.prompt_id,
-        "input":[{"type":"text","text":prompt.text}],
+        "input":[{"type":"text","text":text}],
         "approvalPolicy":"never",
-        "sandboxPolicy":{"type":"externalSandbox","networkAccess":"enabled"},
+        "sandboxPolicy":sandbox,
     });
     if let Ok(effort) = std::env::var("ENGRAM_CODEX_EFFORT") {
         params["effort"] = json!(effort);
@@ -774,6 +1150,28 @@ async fn handle_dynamic_tool_call(
             .await;
         return;
     };
+    if tool.name == "exit_plan_mode"
+        && engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path) != "plan"
+    {
+        // ADR 0107: outside plan mode the exit tool is a protocol error, not
+        // a park — nothing is waiting to review a plan.
+        let _ = server
+            .respond(
+                request_id,
+                json!({
+                    "success": false,
+                    "contentItems": [{
+                        "type": "inputText",
+                        "text": "Not in plan mode — no reviewer is waiting for a plan, so this \
+                call did nothing. Tell the user: if they want an approval-gated plan, they can \
+                turn on Plan mode (the plan chip next to the composer, or Shift+Tab) and ask \
+                again. Then continue with the task as normal."
+                    }]
+                }),
+            )
+            .await;
+        return;
+    }
     if tool.name == browser_view::TOOL_NAME {
         let result = params
             .pointer("/arguments/path")
@@ -845,21 +1243,242 @@ async fn handle_dynamic_tool_call(
     }
 }
 
+/// The drive-loop state `route_tool_result` mutates — bundled (like
+/// `ToolContext`) so the signature stays within clippy's argument budget as
+/// the plan-mode routing grew it.
+struct RouteCtx<'a> {
+    pending: &'a mut HashMap<i64, Pending>,
+    active: &'a Option<String>,
+    queued: &'a mut VecDeque<QueuedPrompt>,
+    /// A plan decision interrupts the read-only turn; that interrupt has to
+    /// arm the watchdog like every other one.
+    interrupt: &'a mut InterruptWatchdog,
+}
+
+/// How long codex gets to confirm a `turn/interrupt` before the app-server is
+/// force-killed. "Codex did not confirm" is a real, handled failure mode.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The `turn/interrupt` watchdog.
+///
+/// Every interrupt MUST arm it: if codex never answers, `active` never clears,
+/// the queue never drains, and the session wedges — holding, say, an approved
+/// plan that will never build. PR #927 shipped three interrupt sites (mode
+/// change, plan approve, plan reject) that recorded the pending request but
+/// left the deadline unarmed, reopening exactly the window the watchdog
+/// exists to close. Hence `interrupt_turn`: the send and the arm are one
+/// operation, so a new call site cannot forget half of it.
+#[derive(Default)]
+struct InterruptWatchdog {
+    requested: bool,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl InterruptWatchdog {
+    fn arm(&mut self) {
+        self.requested = true;
+        self.deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+    }
+
+    /// The turn ended (or the kill fired): stop watching.
+    fn disarm(&mut self) {
+        self.requested = false;
+        self.deadline = None;
+    }
+}
+
+/// Ask codex to end `turn_id` and start the clock. The ONLY way to interrupt.
+async fn interrupt_turn(
+    server: &mut AppServer,
+    pending: &mut HashMap<i64, Pending>,
+    watchdog: &mut InterruptWatchdog,
+    turn_id: &str,
+    reason: &str,
+) {
+    match server
+        .send_request(
+            "turn/interrupt",
+            json!({"threadId": server.thread_id, "turnId": turn_id}),
+        )
+        .await
+    {
+        Ok(id) => {
+            pending.insert(id, Pending::Interrupt);
+            watchdog.arm();
+        }
+        Err(error) => tracing::error!(%error, %reason, "could not request a turn interrupt"),
+    }
+}
+
 async fn route_tool_result(
     server: &mut AppServer,
     parked: &mut ParkedCallStore,
-    pending: &mut HashMap<i64, Pending>,
-    active: &Option<String>,
+    ctx: RouteCtx<'_>,
     events: &mpsc::Sender<HarnessEvent>,
     call_id: &str,
     result_json: String,
 ) {
+    let RouteCtx {
+        pending,
+        active,
+        queued,
+        interrupt,
+    } = ctx;
     let Some(call) = parked.get(call_id).cloned() else {
         tracing::error!(%call_id, "ToolResult has no parked Codex call");
         return;
     };
     if call.kind != ParkedCallKind::DynamicTool {
         tracing::error!(%call_id, kind = ?call.kind, "ToolResult does not match a dynamic tool call");
+        return;
+    }
+    // ADR 0107: an approved plan flips the stamp FIRST, so every turn that
+    // starts after this point (the live build turn below, or the
+    // stale-generation follow-up) reads full access. A reject leaves the plan
+    // stamp in place, so its revision turn stays read-only.
+    let plan_decision = (call.tool_name == "exit_plan_mode")
+        .then(|| engram_harness_sdk::plan::parse_plan_decision(&result_json))
+        .flatten();
+    // ADR 0107: a REJECT ends the plan turn and starts a new one carrying the
+    // reviewer's words — the only channel codex reliably acts on. Two earlier
+    // shapes both failed: `success: true` with the raw decision JSON (session
+    // fe3cd981) and `success: false` with the feedback in `contentItems`
+    // (session 98111e00) each made the model narrate "plan submitted" and stop.
+    if let Some(decision) = plan_decision.as_ref().filter(|d| !d.approved()) {
+        let text = plan_changes_requested_message(decision);
+        if call.request_generation == server.generation && !call.request_id.is_null() {
+            // Answer the parked call so the app-server is not left waiting,
+            // then interrupt and queue the revision turn.
+            if let Err(error) = server
+                .respond(
+                    call.request_id.clone(),
+                    json!({
+                        "success": false,
+                        "contentItems": [{"type": "inputText", "text": text}]
+                    }),
+                )
+                .await
+            {
+                tracing::error!(%error, %call_id, "could not answer rejected exit_plan_mode");
+                return;
+            }
+            if let Err(error) = parked.take(call_id) {
+                tracing::error!(%error, %call_id, "could not retire rejected plan call");
+            }
+            // Own the completion rather than wait for codex's own item update:
+            // the interrupt below can land first and drop it.
+            emit(
+                events,
+                HarnessEvent::ToolCallCompleted {
+                    run_id: active.clone().unwrap_or_default(),
+                    tool_call_id: call_id.to_owned(),
+                    tool_name: call.tool_name.clone(),
+                    ok: false,
+                    duration_ms: 0,
+                    result_summary: Some("changes requested".to_string()),
+                },
+            )
+            .await;
+            if let Some(turn_id) = active.clone() {
+                interrupt_turn(server, pending, interrupt, &turn_id, "plan rejected").await;
+            }
+            queued.push_back(QueuedPrompt {
+                prompt_id: format!("plan-changes-{}", uuid::Uuid::new_v4()),
+                text,
+                // Inherit: the stamp is still `plan`, so the revision turn
+                // stays read-only.
+                mode: None,
+            });
+            return;
+        }
+        // Stale generation: deliver the revision ask as a follow-up user turn
+        // (the stamp is still `plan`, so it starts read-only).
+        let completion = FollowUpCompletion::Tool {
+            name: call.tool_name.clone(),
+            result_summary: result_json,
+        };
+        if let Err(error) = send_follow_up(server, active, pending, call_id, text, completion).await
+        {
+            tracing::error!(%error, %call_id, "could not deliver plan rejection as user message");
+        }
+        return;
+    }
+    let plan_approval = plan_decision.filter(|decision| decision.approved());
+    if plan_approval.is_some() {
+        if let Err(error) = engram_harness_sdk::mode_stamp::write_mode_stamp(
+            &server.mode_stamp_path,
+            engram_harness_sdk::mode_stamp::DEFAULT_MODE,
+        ) {
+            tracing::error!(%error, %call_id, "mode stamp flip on plan approval failed");
+        }
+    }
+    if let Some(decision) = plan_approval {
+        if call.request_generation == server.generation && !call.request_id.is_null() {
+            // Live parked call: acknowledge it, interrupt the read-only plan
+            // turn, and queue the build turn — turn/completed consumes the
+            // queue, and start_turn reads the flipped stamp (full access).
+            let _ = decision;
+            if let Err(error) = server
+                .respond(
+                    call.request_id.clone(),
+                    json!({
+                        "success": true,
+                        "contentItems": [{
+                            "type": "inputText",
+                            "text": "Plan approved. A fresh build turn starts next."
+                        }]
+                    }),
+                )
+                .await
+            {
+                tracing::error!(%error, %call_id, "could not answer approved exit_plan_mode");
+            }
+            if let Err(error) = parked.take(call_id) {
+                tracing::error!(%error, %call_id, "could not retire approved plan call");
+            }
+            emit(
+                events,
+                HarnessEvent::ToolCallCompleted {
+                    run_id: active.clone().unwrap_or_default(),
+                    tool_call_id: call_id.to_owned(),
+                    tool_name: call.tool_name.clone(),
+                    ok: true,
+                    duration_ms: 0,
+                    result_summary: Some("approved".to_string()),
+                },
+            )
+            .await;
+            if let Some(turn_id) = active.clone() {
+                interrupt_turn(server, pending, interrupt, &turn_id, "plan approved").await;
+            }
+            queued.push_back(QueuedPrompt {
+                prompt_id: format!("plan-approved-{}", uuid::Uuid::new_v4()),
+                text: PLAN_APPROVED_MESSAGE.to_string(),
+                // Inherit: the approve handler already flipped the stamp to
+                // the default, so the build turn starts full-access.
+                mode: None,
+            });
+            return;
+        }
+        // Stale generation (harness respawned since the park): the follow-up
+        // machinery delivers the approval as a fresh user turn — which now
+        // starts full-access because the stamp already flipped.
+        let completion = FollowUpCompletion::Tool {
+            name: call.tool_name.clone(),
+            result_summary: result_json,
+        };
+        if let Err(error) = send_follow_up(
+            server,
+            active,
+            pending,
+            call_id,
+            PLAN_APPROVED_MESSAGE.to_string(),
+            completion,
+        )
+        .await
+        {
+            tracing::error!(%error, %call_id, "could not deliver plan approval as user message");
+        }
         return;
     }
     let native_question =
@@ -980,6 +1599,8 @@ async fn send_follow_up(
             &QueuedPrompt {
                 prompt_id: client_id,
                 text,
+                // Inherit: a late tool result never changes the session mode.
+                mode: None,
             },
         )
         .await?
@@ -1559,7 +2180,7 @@ fn thread_params() -> Value {
         "sandbox": "danger-full-access",
         "config": {
             "shell_environment_policy": {
-                "exclude": ["CODEX_ACCESS_TOKEN", "CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME"]
+                "exclude": ["CODEX_API_KEY", "OPENAI_API_KEY", "CODEX_HOME", "ENGRAM_CREDENTIAL_BROKER_TOKEN", "ENGRAM_CREDENTIAL_ENDPOINT"]
             }
         }
     });
@@ -1628,6 +2249,10 @@ mod tests {
     thread/start|thread/resume)
       printf '{"id":%s,"result":{"thread":{"id":"t1","turns":[]}}}\n' "$id"
       ;;
+    turn/interrupt)
+      printf '{"id":%s,"result":{}}\n' "$id"
+      printf '{"method":"turn/completed","params":{"threadId":"t1","turn":{"id":"turn-1","status":"completed"}}}\n'
+      ;;
     turn/start)
       printf '{"id":%s,"result":{"turn":{"id":"turn-1","status":"inProgress"}}}\n' "$id"
 "#,
@@ -1646,6 +2271,68 @@ done
         permissions.set_mode(0o755);
         std::fs::set_permissions(&script, permissions).unwrap();
         (script, record)
+    }
+
+    async fn write_fake_oauth_codex() -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let base = std::env::temp_dir().join(format!("fake-codex-{}", uuid::Uuid::new_v4()));
+        tokio::fs::create_dir_all(&base).await.unwrap();
+        let script = base.join("codex");
+        let record = base.join("requests.jsonl");
+        let body = format!(
+            r#"#!/bin/sh
+record='{}'
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$record"
+  id=$(printf '%s\n' "$line" | jq -r '.id // empty')
+  method=$(printf '%s\n' "$line" | jq -r '.method // empty')
+  case "$method" in
+    initialize) printf '{{"id":%s,"result":{{}}}}\n' "$id" ;;
+    account/read) printf '{{"id":%s,"result":{{"account":{{"type":"chatgpt","email":"person@example.com","planType":"plus"}}}}}}\n' "$id" ;;
+    thread/start)
+      if [ -e "$CODEX_HOME/auth.json" ]; then printf '%s\n' 'AUTH_CACHE_LEAKED' >> "$record"; fi
+      printf '{{"id":%s,"result":{{"thread":{{"id":"t1","turns":[]}}}}}}\n' "$id"
+      ;;
+  esac
+done
+"#,
+            record.display()
+        );
+        tokio::fs::write(&script, body).await.unwrap();
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
+        (script, record)
+    }
+
+    async fn serve_one_oauth_fetch(payload: Vec<u8>) -> String {
+        use tokio::io::AsyncReadExt as _;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 64 * 1024];
+            let read = stream.read(&mut request).await.unwrap();
+            assert!(read > 0);
+            let body = serde_json::to_vec(&ForgeResponse::OAuthCredential {
+                provider: OPENAI_CODEX_PROVIDER.into(),
+                version: 1,
+                opaque_bundle: payload,
+            })
+            .unwrap();
+            stream
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            stream.write_all(&body).await.unwrap();
+        });
+        format!("http://{address}")
     }
 
     async fn write_crashing_question_fake() -> (PathBuf, PathBuf) {
@@ -1716,6 +2403,11 @@ done
             thread_id_file: None,
             tool_manifest: manifest_from_env(),
             parked_calls_file: Some(parked_calls_file),
+            mode_stamp_file: Some(
+                std::env::temp_dir().join(format!("codex-mode-stamp-{}", uuid::Uuid::new_v4())),
+            ),
+            test_api_key: Some("test-api-key".into()),
+            test_credential_control: None,
         }
     }
 
@@ -1755,6 +2447,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "hello".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -1783,6 +2476,41 @@ done
         completed.expect("fake app-server prompt turn timed out");
 
         engine.abort();
+    }
+
+    #[tokio::test]
+    async fn oauth_cache_is_imported_and_removed_before_thread_start() {
+        let payload = serde_json::to_vec(&json!({
+            "auth_mode":"chatgpt",
+            "OPENAI_API_KEY":null,
+            "tokens":{
+                "access_token":"access-secret",
+                "refresh_token":"refresh-secret",
+                "account_id":"acct-1"
+            }
+        }))
+        .unwrap();
+        let endpoint = serve_one_oauth_fetch(payload).await;
+        let (script, record) = write_fake_oauth_codex().await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("unused-home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.test_api_key = None;
+        cli.test_credential_control = Some(CredentialControl {
+            session_id: cli.session_id,
+            broker_token: "session-broker-token".into(),
+            endpoint: Some(endpoint),
+        });
+
+        let mut server = AppServer::spawn(&cli, 1).await.unwrap();
+        if let Some(watcher) = server.oauth_watcher.take() {
+            watcher.abort();
+        }
+        let requests = tokio::fs::read_to_string(record).await.unwrap();
+        assert!(requests.contains("account/read"));
+        assert!(requests.contains("thread/start"));
+        assert!(!requests.contains("AUTH_CACHE_LEAKED"));
+        assert!(!requests.contains("access-secret"));
     }
 
     #[tokio::test]
@@ -1885,6 +2613,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "remember".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -1920,6 +2649,269 @@ done
         engine.abort();
     }
 
+    /// ADR 0107: a `plan` mode directive makes the turn start read-only
+    /// with the harness-owned preamble — per-turn params, no respawn.
+    #[tokio::test]
+    async fn plan_mode_prompt_starts_a_read_only_turn_with_preamble() {
+        let (script, record) = write_fake_codex(&[]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-plan".into(),
+                text: "plan the feature".into(),
+                mode: Some("plan".into()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(event_rx.recv().await, Some(HarnessEvent::RunStarted { .. })) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("plan turn starts");
+
+        let requests = recorded_requests(&record).await;
+        let turn = requests
+            .iter()
+            .find(|request| request.get("method") == Some(&json!("turn/start")))
+            .expect("turn/start recorded");
+        assert_eq!(
+            turn.pointer("/params/sandboxPolicy/type"),
+            Some(&json!("readOnly")),
+            "plan turns run under codex's read-only sandbox"
+        );
+        let text = turn
+            .pointer("/params/input/0/text")
+            .and_then(Value::as_str)
+            .unwrap();
+        assert!(text.starts_with("You are in plan mode"), "preamble: {text}");
+        assert!(text.contains("plan the feature"), "prompt rides: {text}");
+        engine.abort();
+    }
+
+    /// ADR 0107: exit_plan_mode outside plan mode is answered in place as a
+    /// protocol error — never parked, never surfaced as a pending call.
+    #[tokio::test]
+    async fn exit_plan_mode_outside_plan_mode_is_rejected_in_place() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft plan"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, record) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"exit_plan_mode","description":"Present the plan","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        let parked_path = cli.parked_calls_file().to_path_buf();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-1".into(),
+                text: "just build it".into(),
+                mode: None,
+            })
+            .await
+            .unwrap();
+
+        let requested = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match event_rx.recv().await {
+                    Some(HarnessEvent::ToolCallRequested { .. }) => break true,
+                    Some(_) => {}
+                    None => break false,
+                }
+            }
+        })
+        .await;
+        assert!(
+            requested.is_err() || !requested.unwrap(),
+            "a non-plan exit_plan_mode call must not become a pending tool call"
+        );
+        let requests = recorded_requests(&record).await;
+        let response = requests
+            .iter()
+            .find(|request| {
+                request.get("id") == Some(&json!(77)) && request.get("result").is_some()
+            })
+            .expect("in-place JSON-RPC response recorded");
+        assert_eq!(
+            response.pointer("/result/success"),
+            Some(&json!(false)),
+            "rejected as a protocol error"
+        );
+        let parked = ParkedCallStore::open(parked_path).unwrap().all();
+        assert!(parked.is_empty(), "never parked: {parked:?}");
+        engine.abort();
+    }
+
+    /// ADR 0107 (session fe3cd981 regression): a REJECT decision must land
+    /// as a FAILED call carrying the reviewer's feedback — a success-shaped
+    /// response made the model narrate "plan submitted" and end the turn.
+    /// PR #927 review: three interrupt sites recorded the pending request but
+    /// never armed the deadline, so a codex that went quiet after an interrupt
+    /// left `active` set, the queue undrained, and the session wedged holding
+    /// an approved plan. The structural guard is that `interrupt_turn` is the
+    /// only way to interrupt — this pins the state it maintains.
+    #[tokio::test]
+    async fn interrupt_watchdog_arms_on_request_and_disarms_when_the_turn_ends() {
+        let mut watchdog = InterruptWatchdog::default();
+        assert!(!watchdog.requested, "idle: nothing to watch");
+        assert!(watchdog.deadline.is_none());
+
+        watchdog.arm();
+        assert!(watchdog.requested, "an interrupt is outstanding");
+        let deadline = watchdog.deadline.expect("armed");
+        assert!(
+            deadline > tokio::time::Instant::now(),
+            "the kill is scheduled, not immediate"
+        );
+        assert!(
+            deadline <= tokio::time::Instant::now() + INTERRUPT_GRACE,
+            "and it is bounded by the grace"
+        );
+
+        // `turn/completed` (or the force-kill) closes the window; a stale
+        // deadline would kill a healthy app-server on the next turn.
+        watchdog.disarm();
+        assert!(!watchdog.requested);
+        assert!(watchdog.deadline.is_none());
+    }
+
+    #[tokio::test]
+    async fn plan_reject_starts_a_revision_turn_carrying_the_feedback() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, record) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"exit_plan_mode","description":"Present the plan","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        // Latch plan mode so the call parks instead of being rejected in place.
+        engram_harness_sdk::mode_stamp::write_mode_stamp(cli.mode_stamp_file(), "plan").unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-plan".into(),
+                text: "plan it".into(),
+                mode: Some("plan".into()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await,
+                    Some(HarnessEvent::ToolCallRequested { ref call_id, .. }) if call_id == "call-plan"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("plan call parks");
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "call-plan".into(),
+                result_json: r#"{"decision":"reject","feedback":"Update the README.md to say that tests are needed"}"#.into(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let requests = recorded_requests(&record).await;
+                if let Some(response) = requests.iter().find(|request| {
+                    request.get("id") == Some(&json!(77)) && request.get("result").is_some()
+                }) {
+                    assert_eq!(
+                        response.pointer("/result/success"),
+                        Some(&json!(false)),
+                        "a rejected plan is a FAILED call: {response}"
+                    );
+                    let text = response
+                        .pointer("/result/contentItems/0/text")
+                        .and_then(Value::as_str)
+                        .unwrap();
+                    assert!(
+                        text.contains("Update the README.md"),
+                        "feedback rides: {text}"
+                    );
+                    assert!(
+                        text.contains("call exit_plan_mode again"),
+                        "revision ask: {text}"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("reject response recorded");
+
+        // ...and the feedback must come back as a fresh read-only turn. The
+        // tool result alone is not a steer: codex reads a failed dynamic call
+        // as "the tool did not work" and ends the turn (session 98111e00).
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let requests = recorded_requests(&record).await;
+                if let Some(revision) = requests.iter().find(|request| {
+                    request.get("method") == Some(&json!("turn/start"))
+                        && request
+                            .pointer("/params/input/0/text")
+                            .and_then(Value::as_str)
+                            .is_some_and(|text| text.contains("Update the README.md"))
+                }) {
+                    assert_eq!(
+                        revision.pointer("/params/sandboxPolicy/type"),
+                        Some(&json!("readOnly")),
+                        "the revision turn stays in plan mode: {revision}"
+                    );
+                    assert!(
+                        requests
+                            .iter()
+                            .any(|r| r.get("method") == Some(&json!("turn/interrupt"))),
+                        "the rejected plan turn is interrupted first"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("revision turn started with the reviewer's feedback");
+        engine.abort();
+    }
+
     #[tokio::test]
     async fn sync_dynamic_tool_call_emits_request_and_routes_result() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-1","tool":"save_memory","arguments":{"text":"remember this"},"threadId":"t1","turnId":"turn-1"}}"#;
@@ -1943,6 +2935,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "remember".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2035,6 +3028,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "deploy".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2143,6 +3137,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-legacy".into(),
                 text: "deploy".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2241,6 +3236,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "remember".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2284,6 +3280,7 @@ done
             .send(HarnessCommand::Prompt {
                 prompt_id: "prompt-1".into(),
                 text: "deploy".into(),
+                mode: None,
             })
             .await
             .unwrap();
@@ -2550,15 +3547,32 @@ done
             .and_then(Value::as_array)
             .unwrap();
         for name in [
-            "CODEX_ACCESS_TOKEN",
             "CODEX_API_KEY",
             "OPENAI_API_KEY",
             "CODEX_HOME",
+            "ENGRAM_CREDENTIAL_BROKER_TOKEN",
+            "ENGRAM_CREDENTIAL_ENDPOINT",
         ] {
             assert!(excluded.iter().any(|value| value == name));
         }
         assert_eq!(params.get("approvalPolicy"), Some(&json!("never")));
         assert_eq!(params.get("sandbox"), Some(&json!("danger-full-access")));
+    }
+
+    #[test]
+    fn app_server_child_environment_removes_all_credentials() {
+        let command = codex_app_server_command(Path::new("codex"), Path::new("/tmp/codex-home"));
+        for name in [
+            "CODEX_API_KEY",
+            "OPENAI_API_KEY",
+            "ENGRAM_CREDENTIAL_BROKER_TOKEN",
+            "ENGRAM_CREDENTIAL_ENDPOINT",
+        ] {
+            assert!(command
+                .as_std()
+                .get_envs()
+                .any(|(key, value)| key == name && value.is_none()));
+        }
     }
 
     #[tokio::test]

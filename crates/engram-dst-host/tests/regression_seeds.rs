@@ -819,9 +819,11 @@ async fn snapshot_begin_idempotent_under_pending_finalize() {
     );
 
     // Terminal completes and releases the lockout; a fresh capture (after
-    // the sandbox is rebuilt/resumed) mints a fresh snapshot.
+    // the coordinator-driven finalized resume re-creates the sandbox — a
+    // restart no longer resurrects the destroyed slot, #898) mints a fresh
+    // snapshot.
     host.finalize_tick(0).await.unwrap();
-    host.restart().await.unwrap();
+    host.finalized_resume(0).await.unwrap();
     host.guest_write(0, 4).await.unwrap();
     let engram_dst_host::CaptureOutcome::Began(third) = host.snapshot_begin(0).await.unwrap()
     else {
@@ -1346,9 +1348,8 @@ async fn scheduler_driven_slot_accounting_holds_across_claim_release_interleavin
 // A handful of chaos seeds run at full length: with ReconcileTick +
 // DropLocalBinding + RevokeOwnership in the menu, these keep the acked-write
 // AND reconcile None-arm oracles exercised across randomized interleavings
-// forever. No known-bad seed today (the extraction is behaviour-preserving) —
-// these are the standing regression net; a future sim-found failure gets its
-// seed pinned here with the finding + fix.
+// forever. These are the short standing regression net; sim-found failures
+// are pinned separately below with the finding + fix.
 
 async fn run_pinned(seed: u64, profile: Profile, steps: u64) {
     let mut sim = Sim::new(seed, profile).await;
@@ -1375,6 +1376,29 @@ async fn pinned_chaos_seeds_hold_all_oracles() {
         run_pinned(seed, Profile::Chaos, 200).await;
     }
 }
+
+/// Eviction-finalize deterministic-ref collision finding: a store-ahead
+/// manifest at base.next_version() must not be mistaken for the finalizer's
+/// own prior publish. These ten seeds cover the acked-write-loss interleaving.
+macro_rules! eviction_finalize_collision_seed {
+    ($name:ident, $seed:expr) => {
+        #[tokio::test(start_paused = true)]
+        async fn $name() {
+            run_pinned($seed, Profile::Chaos, 4000).await;
+        }
+    };
+}
+
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9914890, 9_914_890);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9915386, 9_915_386);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9915840, 9_915_840);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9916337, 9_916_337);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9917283, 9_917_283);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9916843, 9_916_843);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9917801, 9_917_801);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9918262, 9_918_262);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9918738, 9_918_738);
+eviction_finalize_collision_seed!(eviction_finalize_collision_seed_9919204, 9_919_204);
 
 // ───────── G2: the survivor-invisibility family — capture + resume ─────────
 //
@@ -1880,4 +1904,90 @@ async fn a_valid_but_corrupt_spool_marker_is_rejected_not_trusted() {
         err.to_string().contains("checksum"),
         "the R5 envelope names the content-hash gap: {err}",
     );
+}
+
+// ────────────── #898: the finalize durability claim + resume leg ──────────────
+//
+// The #897 laundering class through its PRODUCTION-shaped detection paths.
+// Pre-#897 the nightly seeds caught it only because destroyed sandboxes were
+// resurrected as survivors on Restart and tripped over their stale spools —
+// a recovery path production cannot take. This pin drives the honest pair:
+// the finalize-coverage oracle fires AT completion if the published manifest
+// omits a staged chunk, and `FinalizedResume` (the coordinator-driven
+// post-eviction resume) proves the resumed guest reads every acked write.
+
+/// A store-ahead orphan occupies the finalize's deterministic ref; the
+/// completed finalize must publish PAST it (never launder it), the destroyed
+/// slot must stay destroyed across restarts, and the finalized resume must
+/// serve every acked write.
+#[tokio::test(start_paused = true)]
+async fn finalize_publishes_past_store_ahead_orphan_and_resume_covers_acked_writes() {
+    let mut host = scenario_host(0, 1).await;
+    let base_version = host.sandboxes[0].base_ref.version;
+
+    // Floor raised over an acked write: published v(base+1).
+    host.guest_write(0, 0).await.unwrap();
+    host.flush_tick(0).await.unwrap();
+
+    // The store-ahead orphan: a REAL flush parked between put_manifest and
+    // the rebase, aborted, process dead — v(base+2) exists in blob storage
+    // with content (chunk 2) the durable pointer never advanced over.
+    host.flush_pre_rebase_crash(0).await.unwrap();
+    host.restart().await.unwrap();
+
+    // A fresh acked write (chunk 1 — absent from the orphan), drained into
+    // the finalize's durable staging.
+    host.guest_write(0, 1).await.unwrap();
+    assert!(matches!(
+        host.snapshot_begin(0).await.unwrap(),
+        engram_dst_host::CaptureOutcome::Began(_)
+    ));
+    for _ in 0..SIM_FINALIZE_MAX_ATTEMPTS {
+        host.finalize_tick(0).await.unwrap();
+        if host.pending_finalizes.is_empty() {
+            break;
+        }
+    }
+    assert!(host.pending_finalizes.is_empty(), "the finalize completed");
+
+    // The laundering assert: the finalize's deterministic first target was
+    // the orphan's v(base+2); a different-content occupant must push the
+    // authoritative capture to v(base+3) — returning v(base+2) is the #897
+    // bug (and the finalize-coverage oracle inside finalize_tick fires).
+    let published = host.sandboxes[0]
+        .published_ref
+        .expect("a completed finalize publishes the durable pointer");
+    assert_eq!(
+        published.version,
+        base_version + 3,
+        "the capture manifest must publish PAST the store-ahead orphan",
+    );
+
+    // The terminal-skip: the destroyed sandbox is NOT a survivor — no
+    // recovery leg may rebuild it across a roll.
+    host.abrupt_crash().await.unwrap();
+    host.restart().await.unwrap();
+    assert!(
+        host.sandboxes[0].backend.is_none(),
+        "a terminally-finalized sandbox must never be resurrected by restart",
+    );
+    host.spool_adopt(0).await.unwrap();
+    assert!(
+        host.sandboxes[0].backend.is_none(),
+        "spool adoption must not resurrect a terminally-finalized sandbox",
+    );
+
+    // The production recovery leg: the coordinator-driven finalized resume
+    // attaches from the published capture manifest, and the guest reads
+    // every acked write back (chunk 1's drained tag, chunk 0's flushed tag).
+    host.finalized_resume(0).await.unwrap();
+    assert!(
+        host.sandboxes[0].backend.is_some(),
+        "the finalized resume re-creates the sandbox",
+    );
+    host.guest_read(0, 0).await.unwrap();
+    host.guest_read(0, 1).await.unwrap();
+    invariants::check(&host)
+        .await
+        .unwrap_or_else(|v| panic!("{} — {}", v.invariant, v.detail));
 }

@@ -166,9 +166,15 @@ impl BootBundleCache {
             .list_active_hosts()
             .await
             .map_err(|e| ApiError::Internal(format!("list_active_hosts for skill resolve: {e}")))?;
+        // During a rolling deploy (and especially local dev, where restarted
+        // agents reuse the same loopback address) PG can briefly contain more
+        // than one non-empty catalog. Prefer the freshest heartbeat instead of
+        // depending on the store's otherwise-unspecified row order; choosing a
+        // stale generation can pin a bundle that has already been collected.
         let catalog: HashMap<String, String> = hosts
             .iter()
-            .find(|h| !h.current_bundles.is_empty())
+            .filter(|h| !h.current_bundles.is_empty())
+            .max_by_key(|h| h.last_heartbeat_at)
             .map(|h| {
                 h.current_bundles
                     .iter()
@@ -305,6 +311,7 @@ mod tests {
             &self,
             _: engram_core::SessionId,
             _: engram_core::types::SessionState,
+            _: engram_core::types::BindingDisposition,
         ) -> Result<engram_core::types::SessionState, MetaError> {
             unimplemented!()
         }
@@ -466,9 +473,12 @@ mod tests {
         }
         async fn list_active_hosts(&self) -> Result<Vec<HostRecord>, MetaError> {
             self.list_hosts_calls.fetch_add(1, Ordering::SeqCst);
-            Ok(vec![HostRecord {
+            let fresh_at = chrono::Utc::now();
+            let host = |hostname: &str,
+                        last_heartbeat_at: chrono::DateTime<chrono::Utc>,
+                        sha256: &str| HostRecord {
                 id: HostId::new(),
-                hostname: "h1".into(),
+                hostname: hostname.into(),
                 cloud_metadata: Default::default(),
                 capacity: engram_core::types::HostCapacity {
                     total_gb: 0,
@@ -479,19 +489,27 @@ mod tests {
                 },
                 utilization: Default::default(),
                 status: HostStatus::Ready,
-                last_heartbeat_at: chrono::Utc::now(),
+                last_heartbeat_at,
                 host_addr: None,
                 ready_images: Vec::new(),
                 current_bundles: vec![engram_core::types::sandbox::AuxBundleRef {
                     drive_id: "claude".into(),
-                    sha256: "sha256:cafe".into(),
+                    sha256: sha256.into(),
                 }],
                 cordoned: false,
                 total_vcpus: 4,
                 wire_version: 1,
                 stages_images: false,
                 capabilities: engram_core::types::host::HostCapabilities::default(),
-            }])
+            };
+            Ok(vec![
+                host(
+                    "stale",
+                    fresh_at - chrono::Duration::minutes(1),
+                    "sha256:stale",
+                ),
+                host("fresh", fresh_at, "sha256:cafe"),
+            ])
         }
     }
 
@@ -523,6 +541,7 @@ mod tests {
         let a = cache.fleet_catalog(&meta).await.unwrap();
         let b = cache.fleet_catalog(&meta).await.unwrap();
         assert_eq!(a, b);
+        assert_eq!(a.get("claude").map(String::as_str), Some("sha256:cafe"));
         assert_eq!(meta.list_hosts_calls.load(Ordering::SeqCst), 1);
     }
 

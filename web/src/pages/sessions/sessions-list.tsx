@@ -169,7 +169,7 @@ export function SessionRow({
         className="flex items-center gap-3 px-3 py-2.5 outline-none transition-colors hover:bg-accent/60 focus-visible:bg-accent/60 focus-visible:ring-2 focus-visible:ring-ring/50 focus-visible:ring-inset"
       >
         <span className="inline-flex w-3 shrink-0 justify-center text-[0.7rem] leading-none">
-          <StatusGlyph status={s.status} />
+          <StatusGlyph status={s.status} attention={s.needsAttention} />
         </span>
         {/* Identity: the title carries the row (falling back to the short id
             when unnamed); the image trails as the recessive "what kind" descriptor. */}
@@ -201,7 +201,15 @@ export function SessionRow({
             )}
           </span>
         )}
-        <span className="w-20 shrink-0 text-xs text-muted-foreground">{statusLabel(s.status)}</span>
+        <span
+          className={
+            s.needsAttention
+              ? "w-20 shrink-0 text-xs text-instrument-caution"
+              : "w-20 shrink-0 text-xs text-muted-foreground"
+          }
+        >
+          {s.needsAttention ? "needs review" : statusLabel(s.status)}
+        </span>
         <span className="w-9 shrink-0 text-right font-mono text-xs tabular-nums text-muted-foreground">
           {relativeTime(s.last_active_at, now)}
         </span>

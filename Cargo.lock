@@ -710,6 +710,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "773648b94d0e5d620f64f280777445740e61fe701025087ec8b57f45c791888b"
 
 [[package]]
+name = "cpu-time"
+version = "1.0.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e9e393a7668fe1fad3075085b86c781883000b4ede868f43627b34a87c8b7ded"
+dependencies = [
+ "libc",
+ "winapi",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1064,6 +1074,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "engram-blob-client"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "clap",
+ "cpu-time",
+ "engram-core",
+ "engram-storage-gcs",
+ "engram-storage-local",
+ "engram-testkit",
+ "futures",
+ "metrics",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "workspace-hack",
+]
+
+[[package]]
 name = "engram-chunk-store"
 version = "0.1.0"
 dependencies = [
@@ -1131,6 +1161,7 @@ dependencies = [
  "chrono",
  "clap",
  "dashmap",
+ "engram-blob-client",
  "engram-chunk-store",
  "engram-core",
  "engram-crypto",
@@ -1149,7 +1180,6 @@ dependencies = [
  "engram-secrets-dev",
  "engram-secrets-gcp",
  "engram-sim",
- "engram-storage-gcs",
  "engram-storage-local",
  "engram-telemetry",
  "engram-testkit",
@@ -1396,7 +1426,10 @@ dependencies = [
  "engram-core",
  "engram-harness-proto",
  "engram-harness-sdk",
+ "engram-transport",
+ "reqwest",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -1411,6 +1444,7 @@ dependencies = [
  "clap",
  "engram-core",
  "engram-harness-proto",
+ "engram-harness-sdk",
  "engram-transport",
  "serde",
  "tokio",
@@ -1463,6 +1497,7 @@ dependencies = [
  "clap",
  "crc32c",
  "dashmap",
+ "engram-blob-client",
  "engram-chunk-store",
  "engram-cloud-static",
  "engram-core",
@@ -1478,7 +1513,6 @@ dependencies = [
  "engram-sandbox-process",
  "engram-sandbox-vz",
  "engram-secrets-gcp",
- "engram-storage-gcs",
  "engram-storage-local",
  "engram-substrate-proto",
  "engram-telemetry",
@@ -1865,6 +1899,8 @@ dependencies = [
  "engram-core",
  "futures",
  "google-cloud-storage",
+ "reqwest",
+ "reqwest-middleware",
  "tempfile",
  "tokio",
  "tracing",
@@ -1957,10 +1993,10 @@ version = "0.1.0"
 dependencies = [
  "bytes",
  "chrono",
+ "engram-blob-client",
  "engram-chunk-store",
  "engram-core",
  "engram-migrate-proto",
- "engram-storage-gcs",
  "engram-storage-local",
  "engram-substrate-proto",
  "engram-telemetry",

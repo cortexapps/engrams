@@ -32,6 +32,8 @@ export interface PreparedAutomationRun {
   profileId: string;
   prompt: string;
   title: string | null;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
 }
 
 export interface AutomationTaskCreator {
@@ -168,6 +170,7 @@ export function makeAutomationTaskCreator(
         profileId: prepared.profileId,
         role: "primary",
         prompt: prepared.prompt,
+        ...(prepared.harnessMode != null ? { harnessMode: prepared.harnessMode } : {}),
         registerListener: true,
         // No owner and no policy overrides: the shared compiler keeps profile
         // secrets, env, capabilities, and network policy intact.
@@ -235,6 +238,9 @@ export async function automationRunWorkflowImpl(
           profileId: automation.action.profileId,
           prompt: rendered.prompt,
           title,
+          ...(automation.action.harnessMode != null
+            ? { harnessMode: automation.action.harnessMode }
+            : {}),
         };
       },
       "renderAutomationAction",

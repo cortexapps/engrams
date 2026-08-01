@@ -24,6 +24,7 @@
 // tests drive a live system; wall clock/OS entropy here is input, not a decision source (ADR 0098 D1)
 #![allow(clippy::disallowed_methods)]
 
+use engram_core::types::BindingDisposition;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -358,7 +359,7 @@ async fn session_get_list_delete_round_trip() {
         .expect("seed live session");
     // Drive it to Active so list_active_sessions returns it.
     for target in [SessionState::Created, SessionState::Active] {
-        meta.transition_session(live_id, target)
+        meta.transition_session(live_id, target, BindingDisposition::Retain)
             .await
             .expect("transition to active");
     }
@@ -375,7 +376,7 @@ async fn session_get_list_delete_round_trip() {
         SessionState::Active,
         SessionState::Completed,
     ] {
-        meta.transition_session(dead_id, target)
+        meta.transition_session(dead_id, target, BindingDisposition::Retain)
             .await
             .expect("transition to completed");
     }
@@ -546,7 +547,7 @@ async fn complete_tool_call_rejects_terminal_session() {
         SessionState::Active,
         SessionState::Completed,
     ] {
-        meta.transition_session(session_id, target)
+        meta.transition_session(session_id, target, BindingDisposition::Retain)
             .await
             .expect("transition session");
     }
@@ -712,10 +713,12 @@ async fn create_session_unknown_image_is_invalid_argument() {
             prompt: None,
             harness_env: HashMap::new(),
             secrets: HashMap::new(),
+            oauth_credential: None,
             prompt_id: None,
             // ADR 0062: unused — this create fails at the unknown-image lookup
             // before harness resolution.
             harness: None,
+            harness_mode: None,
         })
         .await
         .expect_err("non-enabled image must error");
@@ -1186,6 +1189,7 @@ async fn session_stream_events_replays_past_one_page() {
         .stream_events(app::StreamEventsRequest {
             session_id: sid.to_string(),
             since: None,
+            durable_only: false,
         })
         .await
         .expect("StreamEvents opens")

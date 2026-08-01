@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use engram_core::traits::{SecretContext, SessionFence};
 use engram_core::types::image::ImageConfig;
 use engram_core::types::session::{split_image_ref, ImageRef, SessionMode};
+use engram_core::types::BindingDisposition;
 use engram_core::types::{Session, SessionSpec, SessionState};
 use engram_core::SessionId;
 use serde::{Deserialize, Serialize};
@@ -611,6 +612,12 @@ pub struct CreateSessionRequest {
     /// (silent drop is a footgun).
     #[serde(default)]
     pub prompt: Option<String>,
+    /// ADR 0107: session mode for the initial `prompt` (e.g. `plan`) —
+    /// create-time plan mode is just mode on the first prompt. Ignored when
+    /// `prompt` is unset; validated by `send_prompt_core` against the
+    /// selected harness's descriptor modes.
+    #[serde(default)]
+    pub harness_mode: Option<String>,
     /// Per-request secret values keyed by env-var name. Only
     /// honored under `SecretMode::Literal`; broker-mode images
     /// reject overrides.
@@ -637,6 +644,10 @@ pub struct CreateSessionRequest {
     /// `argv` the backend execs. `None` for a dev-VM session.
     #[serde(default)]
     pub selected_harness: Option<String>,
+    /// ADR 0106: provider/subject only. The gRPC adapter constructs this from
+    /// the trusted orchestrator request; it never contains OAuth material.
+    #[serde(skip)]
+    pub oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 }
 
 #[derive(Serialize)]
@@ -716,7 +727,7 @@ pub(crate) async fn create_session_core(
             return result;
         }
     };
-    let result = boot_prepared(state, prepared, start).await;
+    let result = boot_prepared(state, prepared, start, req.oauth_credential.clone()).await;
     let kind = match &result {
         Ok(body) => body.kind,
         Err(_) => "unknown",
@@ -757,6 +768,7 @@ async fn boot_prepared(
     // commit — the coordinator-owned serial prefix ahead of the
     // (now-concurrent, host-side) restore work.
     create_start: std::time::Duration,
+    oauth_credential: Option<engram_core::types::oauth::OAuthCredentialKey>,
 ) -> Result<CreateSessionResponse, ApiError> {
     let crate::session_boot::PreparedBoot {
         inputs,
@@ -881,6 +893,8 @@ async fn boot_prepared(
             // not a re-derivation-drift source, so it is not persisted here.
             None,
         ),
+        oauth_binding: oauth_credential
+            .map(|key| engram_core::types::oauth::SessionOAuthBinding { session_id, key }),
     };
 
     let disposition = state
@@ -909,6 +923,7 @@ async fn boot_prepared(
             session_id,
             format!("create:{session_id}"),
             text,
+            inputs.harness_mode.clone(),
         )
         .await
         {
@@ -1034,7 +1049,7 @@ async fn boot_prepared(
                     let _ = st
                         .services
                         .meta
-                        .transition_session(session_id, SessionState::Failed)
+                        .transition_session(session_id, SessionState::Failed, BindingDisposition::Detach)
                         .await;
                     Err(e)
                 }
@@ -1092,6 +1107,7 @@ pub(crate) async fn prepare_from_grpc(
         &req.image,
         req.mode,
         req.prompt.clone(),
+        req.harness_mode.clone(),
         req.secrets.clone(),
         // ADR 0098 D1: mint from the INJECTED entropy (in prod this is
         // `OsEntropy`, identical randomness; the deterministic simulator
@@ -1186,7 +1202,8 @@ pub(crate) async fn prepare_from_row(
         session.mode,
         // The initial prompt already lives in the outbox (enqueued at create);
         // the queued reboot only needs to bring the harness up so the delivery
-        // driver can forward it.
+        // driver can forward it. Same for its mode directive.
+        None,
         None,
         overrides,
         session.id,
@@ -1400,6 +1417,8 @@ async fn prepare_inner(
     image_uri: &str,
     mode: SessionMode,
     prompt: Option<String>,
+    // ADR 0107: the mode directive riding the create-time prompt.
+    harness_mode: Option<String>,
     secret_overrides: Option<HashMap<String, String>>,
     session_id: SessionId,
     // Issue #535 (a): the per-enabled-image boot bundle (manifest already
@@ -1532,6 +1551,7 @@ async fn prepare_inner(
         session_id,
         session_env.clone(),
         config.workdir.clone(),
+        harness_mode.as_deref(),
     )
     .await?
     {
@@ -1613,6 +1633,7 @@ async fn prepare_inner(
             selected_harness,
             deferred_session_secrets,
             prompt: prompt.filter(|s| !s.is_empty()),
+            harness_mode,
         },
         memory_mib,
         cpu_budget_vcpus,
@@ -1986,9 +2007,11 @@ pub(crate) async fn inject_upload_env(
     let Some(token) = get_or_mint_broker_token(state, session_id).await else {
         return;
     };
-    env.insert("ENGRAM_UPLOAD_TOKEN".into(), token);
+    env.insert("ENGRAM_UPLOAD_TOKEN".into(), token.clone());
+    env.insert("ENGRAM_CREDENTIAL_BROKER_TOKEN".into(), token);
     if let Some(ep) = loopback_endpoint(state) {
-        env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep);
+        env.insert("ENGRAM_UPLOAD_ENDPOINT".into(), ep.clone());
+        env.insert("ENGRAM_CREDENTIAL_ENDPOINT".into(), ep);
     }
 }
 
@@ -2007,6 +2030,61 @@ pub(crate) async fn inject_upload_env(
 /// - `Vsock` (FC/VZ): `--vsock-host <port>` for AF_VSOCK loopback into the host.
 ///
 /// The harness's descriptor `args` ride after the standard flags.
+/// Resolve a harness name to its parsed descriptor: built-in (embedded
+/// harness.toml) first, then the `harness_catalog` row. Built-ins win, so a
+/// custom row can never shadow one. Shared by `resolve_harness` (the full
+/// launch resolution) and the ADR 0107 `harness_mode` validation in
+/// `send_prompt_core`, so the two can never disagree on what a name means.
+pub(crate) async fn resolve_descriptor(
+    state: &SharedState,
+    name: &str,
+) -> Result<engram_core::types::harness::HarnessDescriptor, ApiError> {
+    if let Some(builtin) = crate::builtin_harness::builtin(name) {
+        return builtin
+            .descriptor()
+            .map_err(|e| ApiError::Internal(format!("built-in harness `{name}` descriptor: {e}")));
+    }
+    if let Some(row) = state
+        .services
+        .meta
+        .get_harness_by_name(name)
+        .await
+        .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
+    {
+        return row.descriptor().map_err(|e| {
+            ApiError::Internal(format!(
+                "stored harness.toml for `{name}` failed to parse: {e}"
+            ))
+        });
+    }
+    Err(ApiError::BadRequest(format!(
+        "harness `{name}` is not a built-in and is not registered in the catalog"
+    )))
+}
+
+/// ADR 0107: is `requested` a mode this harness declares?
+///
+/// Both entry points share it: `send_prompt_core` (every prompt) and
+/// `resolve_harness` (the create path, BEFORE the session row is committed —
+/// the create enqueues its first prompt best-effort so an infra failure never
+/// fails the create, which means a validation error raised there would be
+/// swallowed and the prompt lost behind a 200).
+pub(crate) fn validate_harness_mode(
+    descriptor: &engram_core::types::harness::HarnessDescriptor,
+    harness: &str,
+    requested: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(mode) = requested.filter(|m| !m.is_empty()) else {
+        return Ok(());
+    };
+    if descriptor.mode(mode).is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "harness `{harness}` does not declare mode `{mode}`"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn resolve_harness(
     state: &SharedState,
     selected_harness: Option<&str>,
@@ -2014,6 +2092,13 @@ pub(crate) async fn resolve_harness(
     session_id: SessionId,
     session_env: HashMap<String, String>,
     workdir: Option<String>,
+    // ADR 0107: the create-time mode directive, validated HERE — before the
+    // session row is committed. `send_prompt_core` validates it too, but the
+    // create path enqueues the first prompt best-effort (an infra failure must
+    // not fail the create), so a validation error there would be swallowed and
+    // the user's first prompt would vanish with a 200. Resume passes None: its
+    // mode was validated when the prompt that carried it was accepted.
+    harness_mode: Option<&str>,
 ) -> Result<
     Option<(
         engram_core::types::sandbox::AgentSpec,
@@ -2038,11 +2123,10 @@ pub(crate) async fn resolve_harness(
     // host-image `current_bundles` stamp + an embedded descriptor; a custom harness
     // rides the `harness_catalog` (its own squashfs, materialized like an uploaded
     // skill). Built-ins win, so a custom row can never shadow one.
-    let (descriptor, harness_sha) = if let Some(builtin) = crate::builtin_harness::builtin(name) {
-        let descriptor = builtin.descriptor().map_err(|e| {
-            ApiError::Internal(format!("built-in harness `{name}` descriptor: {e}"))
-        })?;
-        let sha = fleet_bundle_catalog(state)
+    let descriptor = resolve_descriptor(state, name).await?;
+    validate_harness_mode(&descriptor, name, harness_mode)?;
+    let harness_sha = if let Some(builtin) = crate::builtin_harness::builtin(name) {
+        fleet_bundle_catalog(state)
             .await?
             .get(builtin.stamp_key)
             .cloned()
@@ -2051,8 +2135,7 @@ pub(crate) async fn resolve_harness(
                     "built-in harness `{name}` squashfs (`{}`) is not staged on any host yet",
                     builtin.stamp_key
                 ))
-            })?;
-        (descriptor, sha)
+            })?
     } else if let Some(row) = state
         .services
         .meta
@@ -2060,12 +2143,7 @@ pub(crate) async fn resolve_harness(
         .await
         .map_err(|e| ApiError::Internal(format!("harness catalog lookup for `{name}`: {e}")))?
     {
-        let descriptor = row.descriptor().map_err(|e| {
-            ApiError::Internal(format!(
-                "stored harness.toml for `{name}` failed to parse: {e}"
-            ))
-        })?;
-        (descriptor, row.squashfs_sha256)
+        row.squashfs_sha256
     } else {
         return Err(ApiError::BadRequest(format!(
             "harness `{name}` is not a built-in and is not registered in the catalog"
@@ -2439,5 +2517,47 @@ mod tests {
         assert!(policy.network_allow_hosts.is_empty());
         assert!(policy.network_allow_host_patterns.is_empty());
         assert!(policy.secrets.is_empty());
+    }
+
+    /// ADR 0107 (PR #927 review): the create path enqueues its first prompt
+    /// best-effort — an infra failure must not fail the create. That means a
+    /// mode-validation error raised from inside the enqueue would be swallowed
+    /// and the user's first prompt would vanish behind a 200, so create
+    /// validates the mode itself, before the session row is committed. Both
+    /// entry points call this one function.
+    #[test]
+    fn harness_mode_is_validated_against_the_declared_modes() {
+        let descriptor = engram_core::types::harness::HarnessDescriptor {
+            name: "claude".into(),
+            modes: vec![
+                engram_core::types::harness::HarnessMode {
+                    id: "default".into(),
+                    label: None,
+                    default: true,
+                },
+                engram_core::types::harness::HarnessMode {
+                    id: "plan".into(),
+                    label: Some("Plan".into()),
+                    default: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_harness_mode(&descriptor, "claude", Some("plan")).is_ok());
+        // Absent / empty = "no directive", not an invalid one.
+        assert!(validate_harness_mode(&descriptor, "claude", None).is_ok());
+        assert!(validate_harness_mode(&descriptor, "claude", Some("")).is_ok());
+        let err = validate_harness_mode(&descriptor, "claude", Some("paln"))
+            .expect_err("a typo'd mode is a caller error, not a silent default");
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("paln")),
+            "the rejection names the mode: {err:?}"
+        );
+        // A harness that declares NO modes rejects every directive.
+        let bare = engram_core::types::harness::HarnessDescriptor {
+            name: "custom".into(),
+            ..Default::default()
+        };
+        assert!(validate_harness_mode(&bare, "custom", Some("plan")).is_err());
     }
 }

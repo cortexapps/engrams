@@ -12,6 +12,7 @@
 //! and runs in CI's Postgres-gated step alongside the coordinator's
 //! live-PG lane.
 
+use engram_core::types::BindingDisposition;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -639,31 +640,161 @@ async fn session_lifecycle(ctx: &Ctx) {
 
     // Pending -> Active is illegal.
     let err = meta
-        .transition_session(id, SessionState::Active)
+        .transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
 
     // Pending -> Failed is legal and returns the previous state.
     let prev = meta
-        .transition_session(id, SessionState::Failed)
+        .transition_session(id, SessionState::Failed, BindingDisposition::Detach)
         .await
         .unwrap();
     assert_eq!(prev, SessionState::Pending);
 
     // Terminal: no exits.
     let err = meta
-        .transition_session(id, SessionState::Queued)
+        .transition_session(id, SessionState::Queued, BindingDisposition::Detach)
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)));
 
     // Missing row.
     let err = meta
-        .transition_session(SessionId::new(), SessionState::Failed)
+        .transition_session(
+            SessionId::new(),
+            SessionState::Failed,
+            BindingDisposition::Detach,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::NotFound));
+}
+
+/// #896 / ADR 0090 addendum: the BindingDisposition contract — checked
+/// identically by both stores, under the same lock as state legality.
+async fn binding_disposition_contract(ctx: &Ctx) {
+    let meta = &ctx.meta;
+    // A bound row: create -> Created (transition_session_created binds).
+    let id = meta.create_session(spec("conf:disposition")).await.unwrap();
+    let sb = engram_core::SandboxId::new();
+    meta.transition_session_created(id, sb).await.unwrap();
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
+        .await
+        .unwrap();
+
+    // (1) Retain into a forbidden target on a bound row => Conflict, and
+    // NOTHING committed (state and binding unchanged).
+    let err = meta
+        .transition_session(id, SessionState::Failed, BindingDisposition::Retain)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.status, SessionState::Active);
+    assert_eq!(s.sandbox_id, Some(sb));
+
+    // (4) RequireUnbound on a bound row => Conflict; on an unbound row it
+    // holds (checked further below on the evacuating->idle residue path).
+    let err = meta
+        .transition_session(
+            id,
+            SessionState::Evacuating,
+            BindingDisposition::RequireUnbound,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
+
+    // (3) The residue lane: Evacuating retains; Retain -> Idle keeps the
+    // binding (the ONE authorized bound-Idle arrival).
+    meta.transition_session(id, SessionState::Evacuating, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    let prev = meta
+        .transition_session(id, SessionState::Idle, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    assert_eq!(prev, SessionState::Evacuating);
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.status, SessionState::Idle);
+    assert_eq!(s.sandbox_id, Some(sb), "the residue retains the binding");
+
+    // (2) Detach into a terminal clears the binding in the SAME write and
+    // returns the previous state.
+    let prev = meta
+        .transition_session(id, SessionState::Dead, BindingDisposition::Detach)
+        .await
+        .unwrap();
+    assert_eq!(prev, SessionState::Idle);
+    let s = meta.get_session(id).await.unwrap();
+    assert_eq!(s.status, SessionState::Dead);
+    assert_eq!(s.sandbox_id, None, "Detach clears atomically with the flip");
+
+    // (5) The fenced variants: same contract under a matching epoch; a
+    // fenced-out write leaves state AND binding untouched.
+    let id2 = meta
+        .create_session(spec("conf:disposition-fenced"))
+        .await
+        .unwrap();
+    let sb2 = engram_core::SandboxId::new();
+    meta.transition_session_created(id2, sb2).await.unwrap();
+    let epoch = {
+        // Claim an op to establish a real epoch (the fenced predicate).
+        let out = meta
+            .op_enqueue_and_claim(id2, OpKind::Resume, serde_json::json!({}), None, "conf-pod")
+            .await
+            .unwrap();
+        match out {
+            EnqueueOutcome::Claimed(op) => op.epoch.unwrap(),
+            other => panic!("expected a claim, got {other:?}"),
+        }
+    };
+    let err = meta
+        .fenced_transition_session(
+            id2,
+            epoch,
+            SessionState::Completed,
+            BindingDisposition::Retain,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, MetaError::Conflict(_)), "got {err:?}");
+    let fenced = meta
+        .fenced_transition_session(
+            id2,
+            epoch + 1,
+            SessionState::Active,
+            BindingDisposition::Detach,
+        )
+        .await
+        .unwrap();
+    assert!(fenced.is_none(), "stale epoch is a silent stop");
+    let s = meta.get_session(id2).await.unwrap();
+    assert_eq!(
+        s.sandbox_id,
+        Some(sb2),
+        "a fenced-out write leaves the binding"
+    );
+    let prev = meta
+        .fenced_transition_session(id2, epoch, SessionState::Active, BindingDisposition::Retain)
+        .await
+        .unwrap();
+    assert_eq!(prev, Some(SessionState::Created));
+    let prev = meta
+        .fenced_transition_session_with_events(
+            id2,
+            epoch,
+            SessionState::Completed,
+            BindingDisposition::Detach,
+            &[("status_changed".to_string(), serde_json::json!({}))],
+        )
+        .await
+        .unwrap();
+    assert!(prev.is_some());
+    let s = meta.get_session(id2).await.unwrap();
+    assert_eq!(s.status, SessionState::Completed);
+    assert_eq!(s.sandbox_id, None);
 }
 
 /// The dead-host straggler listing returns only HostLost sessions.
@@ -678,10 +809,10 @@ async fn list_host_lost_sessions(ctx: &Ctx) {
         .await
         .unwrap();
 
-    meta.transition_session(stranded, SessionState::Created)
+    meta.transition_session(stranded, SessionState::Created, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(stranded, SessionState::HostLost)
+    meta.transition_session(stranded, SessionState::HostLost, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -698,10 +829,10 @@ async fn list_host_lost_sessions(ctx: &Ctx) {
 async fn terminate_and_delta(ctx: &Ctx) {
     let meta = &ctx.meta;
     let id = meta.create_session(spec("conf:terminate")).await.unwrap();
-    meta.transition_session(id, SessionState::Created)
+    meta.transition_session(id, SessionState::Created, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(id, SessionState::Active)
+    meta.transition_session(id, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -786,6 +917,7 @@ async fn queue_fifo(ctx: &Ctx) {
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     // No candidate hosts: both dispositions are Queued.
     let a = SessionId::new();
@@ -821,7 +953,7 @@ async fn queue_fifo(ctx: &Ctx) {
     // list decodes it instead of erroring on NULL queue_origin.
     ctx.clock.advance(Duration::from_secs(5));
     let c = meta.create_session(spec("conf:q")).await.unwrap();
-    meta.transition_session(c, SessionState::Queued)
+    meta.transition_session(c, SessionState::Queued, BindingDisposition::Detach)
         .await
         .unwrap();
     let q = meta.list_queued_sessions_fifo().await.unwrap();
@@ -1113,17 +1245,22 @@ async fn fenced_transition(ctx: &Ctx) {
     let epoch = op.epoch.unwrap();
 
     assert!(meta
-        .fenced_transition_session(sid, epoch + 1, SessionState::Failed)
+        .fenced_transition_session(
+            sid,
+            epoch + 1,
+            SessionState::Failed,
+            BindingDisposition::Detach
+        )
         .await
         .unwrap()
         .is_none());
     let err = meta
-        .fenced_transition_session(sid, epoch, SessionState::Active)
+        .fenced_transition_session(sid, epoch, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)));
     let prev = meta
-        .fenced_transition_session(sid, epoch, SessionState::Failed)
+        .fenced_transition_session(sid, epoch, SessionState::Failed, BindingDisposition::Detach)
         .await
         .unwrap();
     assert_eq!(prev, Some(SessionState::Pending));
@@ -1152,7 +1289,8 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
         .await
         .unwrap();
     let sb = engram_core::SandboxId::new();
-    meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
+    // 0108: bind via the production fused path, never on a Pending row.
+    meta.transition_session_created(sid, sb).await.unwrap();
     let events = vec![
         ("evicted".to_string(), serde_json::json!({"at": "t0"})),
         (
@@ -1163,19 +1301,31 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
 
     // Stale epoch: silent None, nothing lands.
     assert!(meta
-        .fenced_transition_session_with_events(sid, epoch + 1, SessionState::Failed, true, &events)
+        .fenced_transition_session_with_events(
+            sid,
+            epoch + 1,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+            &events
+        )
         .await
         .unwrap()
         .is_none());
-    // Illegal transition (Pending → Active): Conflict, nothing lands.
+    // Illegal transition (Created → Idle): Conflict, nothing lands.
     let err = meta
-        .fenced_transition_session_with_events(sid, epoch, SessionState::Active, true, &events)
+        .fenced_transition_session_with_events(
+            sid,
+            epoch,
+            SessionState::Idle,
+            BindingDisposition::Detach,
+            &events,
+        )
         .await
         .unwrap_err();
     assert!(matches!(err, MetaError::Conflict(_)));
     assert_eq!(
         meta.get_session(sid).await.unwrap().status,
-        SessionState::Pending,
+        SessionState::Created,
         "rejected calls must not flip state",
     );
     let leaked = meta
@@ -1195,11 +1345,17 @@ async fn fenced_transition_with_events(ctx: &Ctx) {
     // Matching epoch: the flip and both events land together, indices
     // contiguous with the baseline append.
     let (prev, idxs) = meta
-        .fenced_transition_session_with_events(sid, epoch, SessionState::Failed, true, &events)
+        .fenced_transition_session_with_events(
+            sid,
+            epoch,
+            SessionState::Failed,
+            BindingDisposition::Detach,
+            &events,
+        )
         .await
         .unwrap()
         .expect("matching epoch must land");
-    assert_eq!(prev, SessionState::Pending);
+    assert_eq!(prev, SessionState::Created);
     assert_eq!(idxs, vec![baseline + 1, baseline + 2]);
     let settled = meta.get_session(sid).await.unwrap();
     assert_eq!(settled.status, SessionState::Failed);
@@ -1246,7 +1402,9 @@ async fn enqueue_evacuating_resume(ctx: &Ctx) {
         SessionState::Active,
         SessionState::Evacuating,
     ] {
-        meta.transition_session(sid, target).await.unwrap();
+        meta.transition_session(sid, target, BindingDisposition::Retain)
+            .await
+            .unwrap();
     }
 
     // Wrong epoch: no-op (a reclaimed-away zombie can't fork the machine).
@@ -1299,7 +1457,9 @@ async fn enqueue_evacuating_resume(ctx: &Ctx) {
         SessionState::Active,
         SessionState::Idle,
     ] {
-        meta.transition_session(other, target).await.unwrap();
+        meta.transition_session(other, target, BindingDisposition::Retain)
+            .await
+            .unwrap();
     }
     assert!(
         !meta
@@ -1315,7 +1475,9 @@ async fn enqueue_evacuating_resume(ctx: &Ctx) {
 }
 
 /// Outbox: due-ness rides not_before on the shared clock; ack is
-/// once-only; delivered rows can't be deleted as undelivered.
+/// once-only; delivered rows can't be deleted as undelivered;
+/// make_due (ADR 0108 A8) recalls exactly the waiting un-acked rows,
+/// idempotently and without an attempts bump.
 async fn outbox_flow(ctx: &Ctx) {
     let meta = &ctx.meta;
     let sid = meta.create_session(spec("conf:outbox")).await.unwrap();
@@ -1359,6 +1521,55 @@ async fn outbox_flow(ctx: &Ctx) {
     );
     assert!(meta.outbox_ack("p-1").await.unwrap());
     assert!(!meta.outbox_ack("p-1").await.unwrap(), "ack is once-only");
+    assert!(meta.outbox_next_due(sid).await.unwrap().is_none());
+
+    // ADR 0108: `outbox_make_due` — the inverse of defer. Stage a
+    // deferred row (p-2), a delivered-but-unacked row (p-3), and an
+    // already-due row (p-4); p-1 above is acked. make_due must pull
+    // exactly the two waiting rows, bump no `attempts`, and be a
+    // no-op on a repeat call.
+    let now = ctx.clock.now_utc();
+    for (i, pid) in ["p-2", "p-3", "p-4"].iter().enumerate() {
+        meta.outbox_enqueue(&engram_core::types::outbox::OutboxRow {
+            prompt_id: (*pid).into(),
+            session_id: sid,
+            kind: engram_core::types::outbox::OutboxKind::Prompt,
+            payload: serde_json::json!({"text": "hi"}),
+            // Staggered so per-row assertions below can walk
+            // next_due order deterministically on both stores.
+            created_at: now + chrono::Duration::milliseconds(i as i64),
+            attempts: 0,
+            not_before: now,
+            delivered_at: None,
+            acked_at: None,
+        })
+        .await
+        .unwrap();
+    }
+    meta.outbox_defer("p-2", Duration::from_secs(60))
+        .await
+        .unwrap(); // attempts -> 1
+    meta.outbox_mark_delivered("p-3", Duration::from_secs(30))
+        .await
+        .unwrap(); // attempts -> 1
+    assert_eq!(
+        meta.outbox_make_due(sid).await.unwrap(),
+        2,
+        "make_due moves the deferred + the delivered-unacked row; not the due row, not the acked row"
+    );
+    assert_eq!(
+        meta.outbox_make_due(sid).await.unwrap(),
+        0,
+        "idempotent: nothing left with a future not_before"
+    );
+    // Walk next_due (oldest created_at first): every row is due NOW
+    // and make_due changed no `attempts`.
+    for (pid, attempts) in [("p-2", 1), ("p-3", 1), ("p-4", 0)] {
+        let due = meta.outbox_next_due(sid).await.unwrap().expect("due row");
+        assert_eq!(due.prompt_id, pid);
+        assert_eq!(due.attempts, attempts, "make_due must not bump attempts");
+        assert!(meta.outbox_ack(pid).await.unwrap());
+    }
     assert!(meta.outbox_next_due(sid).await.unwrap().is_none());
 }
 
@@ -1672,10 +1883,8 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
     let bind = |sid, h| async move {
         meta.assign_session_host(sid, Some(h)).await.unwrap();
         let sb = engram_core::SandboxId::new();
-        meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
-        meta.transition_session(sid, SessionState::Created)
-            .await
-            .unwrap();
+        // 0108: the production fused Pending→Created bind.
+        meta.transition_session_created(sid, sb).await.unwrap();
         sb
     };
 
@@ -1694,7 +1903,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     let sb_active = bind(s_active, host).await;
-    meta.transition_session(s_active, SessionState::Active)
+    meta.transition_session(s_active, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
     meta.update_live_disk_manifest(s_active, sb_active, mref(m_a, 5))
@@ -1714,7 +1923,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     let sb_parked = bind(s_parked, host).await;
-    meta.transition_session(s_parked, SessionState::Active)
+    meta.transition_session(s_parked, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
     meta.update_live_disk_manifest(s_parked, sb_parked, mref(m_b, 2))
@@ -1730,7 +1939,7 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .record_snapshot(snap_with(s_parked, later, true, Some(mref(m_d, 1))))
         .await
         .unwrap());
-    meta.transition_session(s_parked, SessionState::Evicting)
+    meta.transition_session(s_parked, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -1745,16 +1954,20 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     let sb_c_parked = bind(s_c_parked, host).await;
-    meta.transition_session(s_c_parked, SessionState::Active)
+    meta.transition_session(s_c_parked, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
     meta.update_live_disk_manifest(s_c_parked, sb_c_parked, mref(m_g, 3))
         .await
         .unwrap();
-    meta.transition_session(s_c_parked, SessionState::Evicting)
-        .await
-        .unwrap();
-    meta.transition_session(s_c_parked, SessionState::Parked)
+    meta.transition_session(
+        s_c_parked,
+        SessionState::Evicting,
+        BindingDisposition::Retain,
+    )
+    .await
+    .unwrap();
+    meta.transition_session(s_c_parked, SessionState::Parked, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -1781,10 +1994,10 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     bind(s_idle, host).await;
-    meta.transition_session(s_idle, SessionState::Active)
+    meta.transition_session(s_idle, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(s_idle, SessionState::Idle)
+    meta.transition_session(s_idle, SessionState::Idle, BindingDisposition::Detach)
         .await
         .unwrap();
     meta.assign_session_sandbox(s_idle, None).await.unwrap();
@@ -1795,9 +2008,13 @@ async fn resident_sandboxes_rehydrate_list(ctx: &Ctx) {
         .await
         .unwrap();
     bind(s_elsewhere, other_host).await;
-    meta.transition_session(s_elsewhere, SessionState::Active)
-        .await
-        .unwrap();
+    meta.transition_session(
+        s_elsewhere,
+        SessionState::Active,
+        BindingDisposition::Retain,
+    )
+    .await
+    .unwrap();
 
     let mut rows = meta
         .list_resident_sandboxes_on_host_with_disk_manifest(host)
@@ -1873,17 +2090,15 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     let sid = meta.create_session(spec("conf:parked")).await.unwrap();
     meta.assign_session_host(sid, Some(host)).await.unwrap();
     let sb = engram_core::SandboxId::new();
-    meta.assign_session_sandbox(sid, Some(sb)).await.unwrap();
-    meta.transition_session(sid, SessionState::Created)
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(sid, sb).await.unwrap();
+    meta.transition_session(sid, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid, SessionState::Active)
+    meta.transition_session(sid, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid, SessionState::Evicting)
-        .await
-        .unwrap();
-    meta.transition_session(sid, SessionState::Parked)
+    meta.transition_session(sid, SessionState::Parked, BindingDisposition::Retain)
         .await
         .unwrap();
 
@@ -1950,7 +2165,7 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     );
 
     // Descend: Parked → Evicting (the explicit nomination edge).
-    meta.transition_session(sid, SessionState::Evicting)
+    meta.transition_session(sid, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
     assert!(meta.list_parked_sessions().await.unwrap().is_empty());
@@ -2067,22 +2282,20 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     // RAM died with the host).
     let sid2 = meta.create_session(spec("conf:parked-lost")).await.unwrap();
     meta.assign_session_host(sid2, Some(host)).await.unwrap();
-    meta.assign_session_sandbox(sid2, Some(engram_core::SandboxId::new()))
+    // 0108: the production fused Pending→Created bind.
+    meta.transition_session_created(sid2, engram_core::SandboxId::new())
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Created)
+    meta.transition_session(sid2, SessionState::Active, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Active)
+    meta.transition_session(sid2, SessionState::Evicting, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Evicting)
+    meta.transition_session(sid2, SessionState::Parked, BindingDisposition::Retain)
         .await
         .unwrap();
-    meta.transition_session(sid2, SessionState::Parked)
-        .await
-        .unwrap();
-    meta.transition_session(sid2, SessionState::HostLost)
+    meta.transition_session(sid2, SessionState::HostLost, BindingDisposition::Retain)
         .await
         .unwrap();
     assert_eq!(
@@ -2091,13 +2304,215 @@ async fn parked_lifecycle_and_eviction_settle(ctx: &Ctx) {
     );
 }
 
+/// ADR 0106: OAuth rows have identical subject isolation, version/CAS,
+/// revocation, owner fencing, and deterministic cleanup in PG and SimMeta.
+async fn oauth_credential_and_flow(ctx: &Ctx) {
+    use engram_core::types::oauth::{
+        NewSealedOAuthCredential, OAuthAccountMetadata, OAuthCredentialKey, OAuthFlow,
+        OAuthFlowStatus, OAuthSubjectKind,
+    };
+
+    let key = OAuthCredentialKey {
+        subject_kind: OAuthSubjectKind::User,
+        subject_id: "user-a".into(),
+        provider: "openai-codex".into(),
+    };
+    let candidate = |account: &str, byte: u8| NewSealedOAuthCredential {
+        key: key.clone(),
+        wrapped_dek: vec![byte; 32],
+        nonce: vec![byte; 12],
+        ciphertext: vec![byte; 8],
+        key_id: "test-kek".into(),
+        metadata: OAuthAccountMetadata {
+            account_id: account.into(),
+            display_name: Some("Test User".into()),
+            plan_type: Some("personal".into()),
+            workspace_id: None,
+            workspace_name: None,
+        },
+    };
+
+    let first = ctx
+        .meta
+        .put_oauth_credential(candidate("acct-a", 1), None)
+        .await
+        .unwrap();
+    assert_eq!(first.version, 1);
+    assert!(first.revoked_at.is_none());
+    assert!(matches!(
+        ctx.meta
+            .put_oauth_credential(candidate("acct-a", 2), None)
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    let second = ctx
+        .meta
+        .put_oauth_credential(candidate("acct-a", 2), Some(1))
+        .await
+        .unwrap();
+    assert_eq!(second.version, 2);
+    assert!(matches!(
+        ctx.meta
+            .put_oauth_credential(candidate("acct-a", 3), Some(1))
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+
+    let other_subject = ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::User, "user-b")
+        .await
+        .unwrap();
+    assert!(
+        other_subject.is_empty(),
+        "subjects cannot enumerate one another"
+    );
+    let listed = ctx
+        .meta
+        .list_oauth_credentials(OAuthSubjectKind::User, "user-a")
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].key, key);
+
+    let revoked = ctx
+        .meta
+        .revoke_oauth_credential(&key, second.version)
+        .await
+        .unwrap();
+    assert_eq!(revoked.version, 3);
+    assert!(revoked.revoked_at.is_some());
+    assert!(matches!(
+        ctx.meta.revoke_oauth_credential(&key, second.version).await,
+        Err(MetaError::Conflict(_))
+    ));
+    let reconnected = ctx
+        .meta
+        .put_oauth_credential(candidate("acct-a", 4), Some(revoked.version))
+        .await
+        .unwrap();
+    assert_eq!(reconnected.version, 4);
+    assert!(reconnected.revoked_at.is_none());
+
+    let now = ctx.clock.now_utc();
+    let flow_id = uuid::Uuid::parse_str("10600000-0000-4000-8000-000000000001").unwrap();
+    let flow = OAuthFlow {
+        id: flow_id,
+        key: key.clone(),
+        owner_replica: "replica-a".into(),
+        lease_expires_at: now + chrono::Duration::seconds(5),
+        expires_at: now + chrono::Duration::seconds(30),
+        status: OAuthFlowStatus::Pending,
+        error_code: None,
+        created_at: now,
+        updated_at: now,
+    };
+    ctx.meta.create_oauth_flow(flow.clone()).await.unwrap();
+    assert!(matches!(
+        ctx.meta.create_oauth_flow(flow).await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(matches!(
+        ctx.meta
+            .finish_oauth_flow(flow_id, "replica-b", OAuthFlowStatus::Cancelled, None)
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    assert!(matches!(
+        ctx.meta
+            .renew_oauth_flow_lease(flow_id, "replica-b", now + chrono::Duration::seconds(10),)
+            .await,
+        Err(MetaError::Conflict(_))
+    ));
+    ctx.meta
+        .renew_oauth_flow_lease(flow_id, "replica-a", now + chrono::Duration::seconds(10))
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(6));
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(
+                ctx.clock.now_utc(),
+                ctx.clock.now_utc() - chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap(),
+        0,
+        "a renewed owner lease stays pending"
+    );
+    ctx.clock.advance(Duration::from_secs(5));
+    let cleanup_now = ctx.clock.now_utc();
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(cleanup_now, cleanup_now - chrono::Duration::hours(1))
+            .await
+            .unwrap(),
+        1
+    );
+    let lost = ctx.meta.get_oauth_flow(flow_id).await.unwrap().unwrap();
+    assert_eq!(lost.status, OAuthFlowStatus::OwnerLost);
+    assert_eq!(lost.error_code.as_deref(), Some("owner_lost"));
+
+    let expires_id = uuid::Uuid::parse_str("10600000-0000-4000-8000-000000000002").unwrap();
+    let expires_now = ctx.clock.now_utc();
+    ctx.meta
+        .create_oauth_flow(OAuthFlow {
+            id: expires_id,
+            key: key.clone(),
+            owner_replica: "replica-a".into(),
+            lease_expires_at: expires_now + chrono::Duration::seconds(30),
+            expires_at: expires_now + chrono::Duration::seconds(5),
+            status: OAuthFlowStatus::Pending,
+            error_code: None,
+            created_at: expires_now,
+            updated_at: expires_now,
+        })
+        .await
+        .unwrap();
+    ctx.clock.advance(Duration::from_secs(6));
+    let expires_cleanup = ctx.clock.now_utc();
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(
+                expires_cleanup,
+                expires_cleanup - chrono::Duration::hours(1),
+            )
+            .await
+            .unwrap(),
+        1
+    );
+    let expired = ctx.meta.get_oauth_flow(expires_id).await.unwrap().unwrap();
+    assert_eq!(expired.status, OAuthFlowStatus::Expired);
+    assert_eq!(expired.error_code.as_deref(), Some("flow_expired"));
+
+    ctx.clock.advance(Duration::from_secs(3601));
+    let delete_now = ctx.clock.now_utc();
+    assert_eq!(
+        ctx.meta
+            .cleanup_oauth_flows(delete_now, delete_now - chrono::Duration::hours(1))
+            .await
+            .unwrap(),
+        2
+    );
+    assert!(ctx.meta.get_oauth_flow(flow_id).await.unwrap().is_none());
+    assert!(ctx.meta.get_oauth_flow(expires_id).await.unwrap().is_none());
+}
+
 conformance!(t_broker_token_flow, super::broker_token_flow);
+conformance!(
+    t_oauth_credential_and_flow,
+    super::oauth_credential_and_flow
+);
 conformance!(
     t_parked_lifecycle_and_eviction_settle,
     super::parked_lifecycle_and_eviction_settle
 );
 conformance!(t_teleport_target_flow, super::teleport_target_flow);
 conformance!(t_session_lifecycle, super::session_lifecycle);
+conformance!(
+    t_binding_disposition_contract,
+    super::binding_disposition_contract
+);
 conformance!(t_session_exec_event_at, super::session_exec_event_at);
 conformance!(
     t_session_exec_output_high_water,
@@ -2175,6 +2590,7 @@ async fn stale_pending_reservation(ctx: &Ctx) {
         capabilities: Vec::new(),
         integration_policy_json: None,
         runtime_spec: engram_core::types::runtime_spec::RuntimeSpec::new(Vec::new(), None, None),
+        oauth_binding: None,
     };
     let d = meta
         .reserve_and_persist_create(ws(with_op), &[host], 0)
@@ -2522,6 +2938,14 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     meta.append_session_event(id, "harness_idle", serde_json::json!({}))
         .await
         .unwrap();
+    // ADR 0107: a mode directive is user intent — it survives a rewind.
+    meta.append_session_event(
+        id,
+        "harness_mode_changed",
+        serde_json::json!({"mode": "plan"}),
+    )
+    .await
+    .unwrap();
     // ADR 0090: the durability-rollback marker is a coordinator fact that
     // survives the very rewind it warns about — it must NOT tombstone.
     meta.append_session_event(
@@ -2542,7 +2966,8 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     // Only the guest-derived events roll back (agent_message,
     // integration_asset, tool_call_started, file_shared = 4); the
     // coordinator facts (prompt_received, resume_started, harness_idle,
-    // durability_rollback) + the anchor status_changed survive.
+    // harness_mode_changed, durability_rollback) + the anchor
+    // status_changed survive.
     assert_eq!(summary.rolled_back, 4, "rolled_back count");
     assert_eq!(summary.through_idx, cursor, "through_idx is the cursor");
     assert_eq!(summary.recovery_epoch, 1, "epoch bumped once");
@@ -2569,6 +2994,7 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
                 | "harness_idle"
                 | "status_changed"
                 | "durability_rollback"
+                | "harness_mode_changed"
         );
         assert_eq!(
             e.rewound_at.is_none(),

@@ -53,6 +53,7 @@ fn all_step_representatives() -> Vec<Step> {
         Step::SlotClaim(0),
         Step::SlotPopulateTick,
         Step::CorruptSpoolRecovery(0, true, 0),
+        Step::FinalizedResume(0),
     ]
 }
 
@@ -94,6 +95,7 @@ const EXPECTED: &[&str] = &[
     "SlotClaim",
     "SlotPopulateTick",
     "CorruptSpoolRecovery",
+    "FinalizedResume",
 ];
 
 #[test]

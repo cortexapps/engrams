@@ -30,6 +30,7 @@ use std::collections::HashMap;
 use engram_core::traits::SessionFence;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
+use engram_core::types::BindingDisposition;
 use engram_core::types::SnapshotId;
 use engram_core::{HostId, SandboxId, SessionId};
 
@@ -113,6 +114,10 @@ pub(crate) struct BootInputs {
     /// outbox via `send_prompt_core` — the same path every follow-up uses
     /// (ADR 0073). The boot pipeline itself no longer reads it.
     pub prompt: Option<String>,
+    /// ADR 0107: the session-mode directive riding the create-time initial
+    /// prompt (e.g. `plan`). Read together with `prompt` — meaningless
+    /// without one.
+    pub harness_mode: Option<String>,
 }
 
 /// The product of resolving a session's manifest / secrets / env /
@@ -197,6 +202,7 @@ pub(crate) async fn boot_on_reserved_host(
         // The create-time prompt was enqueued to the outbox by
         // `create_session_core`; the boot pipeline no longer delivers it.
         prompt: _,
+        harness_mode: _,
     } = inputs;
 
     // ADR 0056: the image ref doubles as the SecretContext for resolving the
@@ -453,7 +459,7 @@ pub(crate) async fn boot_on_reserved_host(
     let prev = match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Active)
+        .transition_session(session_id, SessionState::Active, BindingDisposition::Retain)
         .await
     {
         Ok(p) => p,
@@ -675,6 +681,7 @@ pub(crate) fn build_observe_entries(
             graphql_field: o.graphql_field.clone(),
             data: o.data.clone(),
             fetchable: o.fetchable.clone(),
+            url_fallback: o.url_fallback.clone(),
         })
         .collect()
 }

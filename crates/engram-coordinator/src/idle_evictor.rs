@@ -24,6 +24,7 @@
 
 use engram_core::traits::SandboxBackend;
 use engram_core::types::snapshot::SnapshotRecord;
+use engram_core::types::BindingDisposition;
 use engram_core::types::SessionState;
 use engram_core::{SandboxId, SessionId};
 
@@ -110,6 +111,7 @@ async fn park_paused_bookkeeping(
             session_id,
             ctx.fence(),
             SessionState::Evicting,
+            BindingDisposition::Retain,
         )
         .await?;
         let _ = state
@@ -129,8 +131,14 @@ async fn park_paused_bookkeeping(
     // intentionally retained); `evicting` is reserved for an actual
     // descent in flight. The rung stamp above is kept as host-ledger /
     // ascent metadata; lifecycle identity is the status.
-    crate::session_ops::transition_with_fence(state, session_id, ctx.fence(), SessionState::Parked)
-        .await?;
+    crate::session_ops::transition_with_fence(
+        state,
+        session_id,
+        ctx.fence(),
+        SessionState::Parked,
+        BindingDisposition::Retain,
+    )
+    .await?;
     let _ = state
         .emit_fenced(
             session_id,
@@ -345,6 +353,7 @@ async fn quarantine_reap_unevictable(
                 session_id,
                 ctx.fence(),
                 SessionState::HostLost,
+                BindingDisposition::Retain,
             )
             .await
             {
@@ -535,6 +544,7 @@ pub(crate) async fn run_evict_pipeline(
                 session_id,
                 ctx.fence(),
                 SessionState::HostLost,
+                BindingDisposition::RequireUnbound,
             )
             .await
             {
@@ -657,9 +667,13 @@ pub(crate) async fn run_evict_pipeline(
     if target_state == SessionState::Idle {
         // ADR 0074 rung 2 (parked-paused): if the host has memory
         // headroom, PAUSE the VM in place instead of snapshot+destroy.
-        // Frees CPU (not RAM), keeps the harness alive in RAM, and lets
-        // a returning user un-pause in <100ms rather than pay a full
-        // 12.2s-p50 rebuild. Under real memory pressure this branch is
+        // Frees CPU (not RAM) and lets a returning user un-pause in
+        // <100ms rather than pay a full 12.2s-p50 rebuild. The harness
+        // PROCESS stays in RAM, but the vsock link does NOT survive a
+        // long pause, and the hub can still advertise a stale handle
+        // at un-park — a forward then lands in a socket with no reader
+        // (prod 7eddce62). The ADR 0108 A8 attach-signal row recall +
+        // heartbeat disagreement repair bound that damage. Under real memory pressure this branch is
         // skipped and the full eviction below runs (rung 4). Only the
         // idle-evict path parks; drain/evac (Evacuating) always captures.
         // `allow_park == false` is the reaper's DESCENT path (already
@@ -1007,10 +1021,11 @@ pub(crate) async fn run_evict_pipeline(
         return Ok(EvictOutcome::Fenced);
     }
 
-    // Step 3 + 3c fused (PG, Idle-before-destroy): the authoritative
-    // unbind (ADR 0047 — no in-memory registry to drop; `host_id` is
-    // untouched so the resume path's origin-affinity hint survives)
-    // rides the SAME transaction as the flip, via `detach_sandbox`. A
+    // Step 3 + 3c fused (PG, Idle-before-destroy): for the Idle path, the
+    // authoritative unbind (ADR 0047 — no in-memory registry to drop;
+    // `host_id` is untouched so the resume path's origin-affinity hint
+    // survives) rides the SAME transaction as the flip, via
+    // `detach_sandbox`. A
     // separate preceding detach left a partial-failure window: the flip
     // rolls back, the detach has already committed, and the scanner's
     // retry finds an `evicting` row with no bound sandbox — the
@@ -1019,6 +1034,14 @@ pub(crate) async fn run_evict_pipeline(
     // commits, the reconciler will no-op on every subsequent
     // heartbeat for this session because the reconcile pass keys
     // on Active status only.
+    //
+    // Evacuating deliberately RETAINS the source binding. A successful
+    // destroy RPC is not sufficient ownership proof: the host may have
+    // durably accepted the verb while its teardown effect is still pending.
+    // The evac resumer re-destroys, probes the source, and clears this
+    // binding under its claim only after the sandbox is confirmed gone.
+    // Until then ADR 0090's coordinator truth continues to own the outgoing
+    // VM, so no replacement can be restored alongside it.
     //
     // The transition's own facts (`snapshot_taken`, `evicted`, the final
     // `status_changed`) ride the SAME store transaction: the flip makes
@@ -1033,7 +1056,13 @@ pub(crate) async fn run_evict_pipeline(
         session_id,
         ctx.fence(),
         target_state,
-        /*detach_sandbox=*/ true,
+        // Post-#896: the Idle path detaches in the fused flip; Evacuating
+        // RETAINS the source binding until teardown is confirmed.
+        if target_state == SessionState::Idle {
+            BindingDisposition::Detach
+        } else {
+            BindingDisposition::Retain
+        },
         vec![
             crate::state::SessionEvent::SnapshotTaken {
                 snapshot_id: metadata.id,
@@ -1152,6 +1181,7 @@ async fn finish_eviction_d5(
             session_id,
             ctx.fence(),
             SessionState::Evicting,
+            BindingDisposition::Retain,
         )
         .await
         {
@@ -1383,7 +1413,11 @@ async fn scanner_advance_one(
         match state
             .services
             .meta
-            .transition_session(session_id, SessionState::HostLost)
+            .transition_session(
+                session_id,
+                SessionState::HostLost,
+                BindingDisposition::Retain,
+            )
             .await
         {
             Ok(prev) => {
@@ -1575,7 +1609,11 @@ async fn park_reaper_advance_one(
         match state
             .services
             .meta
-            .transition_session(session_id, SessionState::HostLost)
+            .transition_session(
+                session_id,
+                SessionState::HostLost,
+                BindingDisposition::RequireUnbound,
+            )
             .await
         {
             Ok(prev) => {
@@ -1671,7 +1709,11 @@ pub(crate) async fn descend_parked_session(
     match state
         .services
         .meta
-        .transition_session(session_id, SessionState::Evicting)
+        .transition_session(
+            session_id,
+            SessionState::Evicting,
+            BindingDisposition::Retain,
+        )
         .await
     {
         Ok(prev) => {
@@ -2417,8 +2459,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2648,8 +2693,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2872,8 +2920,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -3199,8 +3250,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4316,8 +4370,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4585,8 +4642,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 

@@ -30,6 +30,8 @@ import { Hono } from "hono";
 import { HTTPException } from "hono/http-exception";
 import { makeUserSecretStore, type UserSecretStore } from "../db/user-secrets.ts";
 import { harnessCatalog as defaultHarnessCatalog } from "../control-plane/client.ts";
+import { oauthCredential as defaultOAuthCredential } from "../control-plane/client.ts";
+import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import { getSessionFromHeaders } from "../auth/session.ts";
 import type { GetSession } from "./guard.ts";
 
@@ -44,7 +46,14 @@ export interface HarnessCatalogReader {
   listHarnesses(req: Record<string, never>): Promise<{
     harnesses: Array<{
       name: string;
-      descriptor?: { label?: string; auth?: { userEnv?: string; userEnvHint?: string } };
+      descriptor?: {
+        label?: string;
+        auth?: {
+          userEnv?: string;
+          userEnvHint?: string;
+          userOauth?: { provider: string };
+        };
+      };
     }>;
   }>;
 }
@@ -67,6 +76,44 @@ export interface MeDeps {
   secrets?: UserSecretStore;
   harnessCatalog?: HarnessCatalogReader;
   getSession?: GetSession;
+  oauth?: OAuthCredentialClient;
+}
+
+export interface OAuthCredentialClient {
+  beginFlow(req: {
+    subject: { kind: OauthSubjectKind; id: string };
+    provider: string;
+  }): Promise<{
+    flow?: { id: string; provider: string; status: string; expiresAt: string; errorCode?: string };
+    verificationUrl: string;
+    userCode: string;
+  }>;
+  getFlow(req: { subject: { kind: OauthSubjectKind; id: string }; flowId: string }): Promise<{
+    flow?: { id: string; provider: string; status: string; expiresAt: string; errorCode?: string };
+  }>;
+  cancelFlow(req: { subject: { kind: OauthSubjectKind; id: string }; flowId: string }): Promise<{
+    flow?: { id: string; provider: string; status: string; expiresAt: string; errorCode?: string };
+  }>;
+  listCredentials(req: { subject: { kind: OauthSubjectKind; id: string } }): Promise<{
+    credentials: Array<{
+      provider: string;
+      version: bigint;
+      connected: boolean;
+      account?: {
+        displayName?: string;
+        planType?: string;
+        workspaceId?: string;
+        workspaceName?: string;
+      };
+      createdAt: string;
+      updatedAt: string;
+    }>;
+  }>;
+  disconnect(req: {
+    subject: { kind: OauthSubjectKind; id: string };
+    provider: string;
+    expectedVersion: bigint;
+  }): Promise<unknown>;
 }
 
 // ---------------------------------------------------------------------------
@@ -81,6 +128,8 @@ export function makeMeRoute(deps?: MeDeps): Hono {
   const resolveStore = (): UserSecretStore => deps?.secrets ?? makeUserSecretStore();
   const resolveCatalog = (): HarnessCatalogReader =>
     deps?.harnessCatalog ?? (defaultHarnessCatalog as unknown as HarnessCatalogReader);
+  const resolveOAuth = (): OAuthCredentialClient =>
+    deps?.oauth ?? defaultOAuthCredential;
 
   const resolveSession: GetSession =
     deps?.getSession ??
@@ -112,6 +161,25 @@ export function makeMeRoute(deps?: MeDeps): Hono {
     }
     return union;
   }
+
+  async function oauthUnion(): Promise<Map<string, EnvVarEntry>> {
+    const { harnesses } = await resolveCatalog().listHarnesses({});
+    const union = new Map<string, EnvVarEntry>();
+    for (const h of harnesses) {
+      const provider = h.descriptor?.auth?.userOauth?.provider;
+      if (!provider) continue;
+      const entry = union.get(provider) ?? { harnesses: [] };
+      entry.harnesses.push({ name: h.name, label: h.descriptor?.label || h.name });
+      if (!entry.hint && h.descriptor?.auth?.userEnvHint) entry.hint = h.descriptor.auth.userEnvHint;
+      union.set(provider, entry);
+    }
+    return union;
+  }
+
+  const oauthSubject = (userId: string) => ({
+    kind: OauthSubjectKind.USER,
+    id: userId,
+  });
 
   // GET /api/v1/me/harness-env — the env vars the registered harnesses ask for,
   // each with whether the caller has set it. This is the settings-page list.
@@ -163,6 +231,101 @@ export function makeMeRoute(deps?: MeDeps): Hono {
       throw new HTTPException(404, { message: `no registered harness declares ${envVar}` });
     }
     await resolveStore().delete(user.id, envVar);
+    return new Response(null, { status: 204 });
+  });
+
+  // ADR 0106: unified credential read surface. Secret-env entries retain the
+  // existing sealed-value flow; OAuth entries expose metadata and lifecycle.
+  app.get("/api/v1/me/credentials", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const [envVars, providers, oauthRows] = await Promise.all([
+      userEnvUnion(),
+      oauthUnion(),
+      resolveOAuth().listCredentials({ subject: oauthSubject(user.id) }),
+    ]);
+    const byProvider = new Map(oauthRows.credentials.map((row) => [row.provider, row]));
+    const secretEntries = await Promise.all(
+      [...envVars.entries()].map(async ([envVar, entry]) => ({
+        kind: "secret_env" as const,
+        envVar,
+        harnesses: entry.harnesses,
+        ...(entry.hint ? { hint: entry.hint } : {}),
+        connected: await resolveStore().has(user.id, envVar),
+      })),
+    );
+    const oauthEntries = [...providers.entries()].map(([provider, entry]) => {
+      const row = byProvider.get(provider);
+      return {
+        kind: "oauth" as const,
+        provider,
+        harnesses: entry.harnesses,
+        ...(entry.hint ? { hint: entry.hint } : {}),
+        connected: row?.connected ?? false,
+        ...(row
+          ? {
+              version: Number(row.version),
+              account: row.account,
+              createdAt: row.createdAt,
+              updatedAt: row.updatedAt,
+            }
+          : {}),
+      };
+    });
+    return c.json({ credentials: [...oauthEntries, ...secretEntries] });
+  });
+
+  app.post("/api/v1/me/credentials/:provider/connect", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const provider = c.req.param("provider");
+    if (!(await oauthUnion()).has(provider)) {
+      throw new HTTPException(404, { message: `no registered harness declares ${provider}` });
+    }
+    const response = await resolveOAuth().beginFlow({
+      subject: oauthSubject(user.id),
+      provider,
+    });
+    if (!response.flow) throw new HTTPException(502, { message: "OAuth provider returned no flow" });
+    return c.json({
+      flow: response.flow,
+      verificationUrl: response.verificationUrl,
+      userCode: response.userCode,
+    });
+  });
+
+  app.get("/api/v1/me/credentials/flows/:flowId", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const response = await resolveOAuth().getFlow({
+      subject: oauthSubject(user.id),
+      flowId: c.req.param("flowId"),
+    });
+    if (!response.flow) throw new HTTPException(404, { message: "OAuth flow not found" });
+    return c.json({ flow: response.flow });
+  });
+
+  app.post("/api/v1/me/credentials/flows/:flowId/cancel", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const response = await resolveOAuth().cancelFlow({
+      subject: oauthSubject(user.id),
+      flowId: c.req.param("flowId"),
+    });
+    if (!response.flow) throw new HTTPException(404, { message: "OAuth flow not found" });
+    return c.json({ flow: response.flow });
+  });
+
+  app.delete("/api/v1/me/credentials/:provider", async (c) => {
+    const user = await requireUser(c.req.raw.headers);
+    const provider = c.req.param("provider");
+    if (!(await oauthUnion()).has(provider)) {
+      throw new HTTPException(404, { message: `no registered harness declares ${provider}` });
+    }
+    const rows = await resolveOAuth().listCredentials({ subject: oauthSubject(user.id) });
+    const row = rows.credentials.find((credential) => credential.provider === provider);
+    if (!row || !row.connected) return new Response(null, { status: 204 });
+    await resolveOAuth().disconnect({
+      subject: oauthSubject(user.id),
+      provider,
+      expectedVersion: row.version,
+    });
     return new Response(null, { status: 204 });
   });
 

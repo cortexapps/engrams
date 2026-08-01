@@ -299,6 +299,11 @@ pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_tota
 /// belt-and-braces liveness alarm (was the desync watchdog's job).
 /// Alert on a sustained nonzero rate.
 pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disagreement_total";
+/// Counter (ADR 0108 A8). Sessions the heartbeat disagreement REPAIR
+/// re-drove: waiting outbox rows recalled to due + a Deliver op
+/// enqueued, for an Active session whose sandbox the host reports
+/// RUNNING with no attached harness (prod 7eddce62).
+pub const HARNESS_DESYNC_REDRIVEN_TOTAL: &str = "engram_harness_desync_redriven_total";
 /// Counter (ADR 0073). Rows terminally acked by a confirming event.
 pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";
 /// Counter (ADR 0073). Delivery attempts deferred to backoff.
@@ -573,3 +578,26 @@ pub const SESSION_RESUME_PLACEMENT_TOTAL: &str = "engram_session_resume_total";
 /// initial prompt (no `prompt_id`, no receipt row) never contributes a
 /// sample.
 pub const PROMPT_TO_RUN_STARTED_SECONDS: &str = "engram_prompt_to_run_started_seconds";
+
+/// Counter (ADR 0108). Operator interrupts forwarded to the harness,
+/// labeled `source` — who asked. The wire field is free-form, but the
+/// label value is normalized to a BOUNDED vocabulary (the cardinality
+/// convention above forbids unbounded label values from clients):
+/// `esc` / `stop-button` / `aui-cancel` / `unattributed` (empty source
+/// from an old client) / `other` (any unrecognized label — the paired
+/// `info!` log carries the raw value for forensics). Exists because a
+/// 2026-07-31 phantom interrupt (an ungated library Esc handler) was
+/// untraceable: the interrupt path logged and counted nothing.
+pub const INTERRUPTS_TOTAL: &str = "engram_interrupts_total";
+
+/// Normalize a wire `source` to the bounded `source` label vocabulary
+/// documented on [`INTERRUPTS_TOTAL`].
+pub fn interrupt_source_label(source: &str) -> &'static str {
+    match source {
+        "" => "unattributed",
+        "esc" => "esc",
+        "stop-button" => "stop-button",
+        "aui-cancel" => "aui-cancel",
+        _ => "other",
+    }
+}

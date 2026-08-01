@@ -72,6 +72,17 @@ secrets = [
   { ref = "openrouter.api_key", env = "OPENROUTER_API_KEY",   mode = "broker", hosts = ["openrouter.ai"] },
 ]
 
+# Session modes (ADR 0107). Pure declaration: mode selection rides prompts
+# (harness_mode) and the harness maps `plan` to `--permission-mode plan`.
+[[modes]]
+id      = "default"
+label   = "Build"
+default = true
+
+[[modes]]
+id    = "plan"
+label = "Plan"
+
 # Effort maps to Claude Code's own thinking-budget knob (MAX_THINKING_TOKENS) —
 # an opaque-to-the-API harness env, which is exactly what the descriptor exists
 # to abstract.

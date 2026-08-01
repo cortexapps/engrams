@@ -11,9 +11,14 @@ WORKDIR /src
 # and bindgen needs libclang. Same pair host-agent.Dockerfile installs
 # for the same crate (ADR 0044 K2).
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    pkg-config libssl-dev ca-certificates protobuf-compiler clang libclang-dev \
+    pkg-config libssl-dev ca-certificates curl protobuf-compiler clang libclang-dev \
     && rm -rf /var/lib/apt/lists/*
 COPY . .
+ARG TARGETARCH
+RUN case "$TARGETARCH" in amd64) codex_arch=x86_64 ;; arm64) codex_arch=aarch64 ;; \
+      *) echo "unsupported Codex architecture: $TARGETARCH" >&2; exit 1 ;; esac \
+    && deploy/harness-codex/fetch-codex.sh "$codex_arch" /tmp/codex-package \
+    && cp /tmp/codex-package/bin/codex /tmp/codex
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/src/target \
     cargo build --release -p engram-coordinator \
@@ -30,6 +35,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates squashfs-tools \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=builder /tmp/engram-coordinator /usr/local/bin/engram-coordinator
+COPY --from=builder /tmp/codex /usr/local/bin/codex
 COPY deploy/migrations /opt/engram/migrations
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/engram-coordinator"]

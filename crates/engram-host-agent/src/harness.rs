@@ -358,6 +358,7 @@ impl HarnessHub {
         sandbox_id: SandboxId,
         prompt_id: String,
         text: String,
+        mode: Option<String>,
     ) -> Result<(), HarnessError> {
         // ADR 0073: fail fast when unattached. The coordinator's outbox
         // driver owns retries (and the reattach), and the mpsc handoff
@@ -368,6 +369,7 @@ impl HarnessHub {
             .send(HarnessFrame::Command(HarnessCommand::Prompt {
                 prompt_id,
                 text,
+                mode,
             }))
             .await
             .map_err(|_| HarnessError::WriterClosed)?;
@@ -512,6 +514,45 @@ impl HarnessHub {
     }
 }
 
+/// ADR 0108 A1: bound on the handshake read. A connection whose
+/// `HarnessAttach` frame was swallowed (the post-checkpoint vsock RX-gate
+/// window, PR #596's named-latent arm) would otherwise park the accept
+/// task forever — an unlogged fd + task leak per occurrence. The SDK
+/// gives up and redials at 5 s; 10 s here keeps the host strictly more
+/// patient, so a slow-but-live guest is never cut off by the host first.
+const ATTACH_READ_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// ADR 0108 A2: generation-ordered registration. Insert only when the
+/// slot is empty or held by an OLDER generation. Returns false when a
+/// newer connection already owns the slot — the caller must close
+/// without acking.
+fn register_generation_ordered(
+    inner: &HubInner,
+    sandbox_id: SandboxId,
+    handle: ConnectionHandle,
+) -> bool {
+    let mut conns = inner.connections.lock();
+    match conns.get(&sandbox_id) {
+        Some(existing) if existing.generation > handle.generation => false,
+        _ => {
+            conns.insert(sandbox_id, handle);
+            true
+        }
+    }
+}
+
+async fn read_attach_bounded<R: AsyncRead + Unpin>(
+    reader: &mut R,
+) -> std::io::Result<HarnessAttach> {
+    match tokio::time::timeout(ATTACH_READ_TIMEOUT, read_msg::<_, HarnessAttach>(reader)).await {
+        Ok(result) => result,
+        Err(_) => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            "attach frame never arrived within the handshake bound",
+        )),
+    }
+}
+
 async fn run_connection<S>(
     inner: Arc<HubInner>,
     sandbox_id: SandboxId,
@@ -522,7 +563,7 @@ async fn run_connection<S>(
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
 
-    let attach: HarnessAttach = match read_msg(&mut reader).await {
+    let attach: HarnessAttach = match read_attach_bounded(&mut reader).await {
         Ok(a) => a,
         Err(e) => {
             tracing::debug!(error = %e, sandbox_id = %sandbox_id, "harness handshake read failed");
@@ -578,7 +619,7 @@ where
     S: AsyncRead + AsyncWrite + Send + Unpin + 'static,
 {
     let (mut reader, mut writer) = tokio::io::split(stream);
-    let attach: HarnessAttach = match read_msg(&mut reader).await {
+    let attach: HarnessAttach = match read_attach_bounded(&mut reader).await {
         Ok(a) => a,
         Err(e) => {
             tracing::debug!(error = %e, "harness handshake read failed (no session bound)");
@@ -673,23 +714,6 @@ async fn drive_attached<R, W>(
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
-    let ack = HarnessAttachAck {
-        ok: true,
-        reject: None,
-        message: None,
-    };
-    if let Err(e) = write_msg(&mut writer, &ack).await {
-        tracing::debug!(error = %e, "harness ack write failed");
-        return;
-    }
-
-    tracing::debug!(
-        session_id = %attach.session_id,
-        sandbox_id = %sandbox_id,
-        harness_version = %attach.harness_version,
-        "harness attached",
-    );
-
     let (cmd_tx, cmd_rx) = mpsc::channel::<HarnessFrame>(32);
     // Issue #218: stamp this connection with a per-hub-unique
     // generation BEFORE the insert. On reconnect (agentd kills the old
@@ -708,7 +732,52 @@ async fn drive_attached<R, W>(
         pending_checkpoint: Mutex::new(None),
         generation: my_generation,
     };
-    inner.connections.lock().insert(sandbox_id, handle);
+    // ADR 0108 A2, invariant 2 — "ack implies registered": the insert
+    // happens BEFORE the ack write, so when the SDK reads `ok: true`
+    // the hub can already route to this connection. And the insert is
+    // generation-ORDERED: the mint and the insert are separated by a
+    // lock acquisition, so a slower task holding an older generation
+    // can lose the lock race to a newer one — an unconditional insert
+    // would let the loser clobber the winner (the #218 guard covers
+    // only removal). An older generation backs off and closes; its
+    // guest side sees EOF and redials against the surviving winner.
+    if !register_generation_ordered(&inner, sandbox_id, handle) {
+        tracing::debug!(
+            session_id = %attach.session_id,
+            sandbox_id = %sandbox_id,
+            generation = my_generation,
+            "stale connection lost the registration race; closing unacked",
+        );
+        return;
+    }
+
+    let ack = HarnessAttachAck {
+        ok: true,
+        reject: None,
+        message: None,
+    };
+    if let Err(e) = write_msg(&mut writer, &ack).await {
+        tracing::debug!(error = %e, "harness ack write failed");
+        // We registered but the peer can never learn it: undo, guarded
+        // by our own generation (a newer connection may already own the
+        // entry).
+        let mut conns = inner.connections.lock();
+        let still_ours = conns
+            .get(&sandbox_id)
+            .map(|h| h.generation == my_generation)
+            .unwrap_or(false);
+        if still_ours {
+            conns.remove(&sandbox_id);
+        }
+        return;
+    }
+
+    tracing::debug!(
+        session_id = %attach.session_id,
+        sandbox_id = %sandbox_id,
+        harness_version = %attach.harness_version,
+        "harness attached",
+    );
     // ADR 0073 phase 3: no TTL bookkeeping here. Idle detection reads
     // the durable event log coordinator-side (idle_detector.rs), which
     // inherits the seed-at-attach lesson structurally: a session's
@@ -1428,6 +1497,115 @@ mod tests {
 
     // ADR 0016 §A.1.5a — eviction in-flight gate -----------------
 
+    /// ADR 0108 A2, invariant 2 — "ack implies registered": the hub
+    /// inserts the connection BEFORE it writes `ok: true`. The instant
+    /// the SDK reads the ack, `send_prompt` can route. Before the
+    /// reorder there was a window (ack on the wire, insert not yet
+    /// run) where a fast prompt bounced `NotAttached` off an acked
+    /// harness.
+    #[tokio::test]
+    async fn ack_implies_registered() {
+        let (sink, _) = collecting_sink();
+        let hub = test_hub(sink);
+        let sandbox_id = SandboxId::new();
+        let session_id = SessionId::new();
+        hub.bind_session(session_id, sandbox_id, 1).expect("bind");
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, Some(session_id), host_side);
+        let (mut r, mut w) = tokio::io::split(harness_side);
+        write_msg(
+            &mut w,
+            &HarnessAttach {
+                session_id,
+                sandbox_id,
+                binding_epoch: 1,
+                harness_version: "test/0.1".into(),
+            },
+        )
+        .await
+        .expect("attach");
+        let ack: HarnessAttachAck = read_msg(&mut r).await.expect("ack");
+        assert!(ack.ok, "attach should succeed");
+        // Deliberately NO wait_until here: the ack on the wire IS the
+        // proof the insert already ran (same task poll, insert strictly
+        // precedes the ack write).
+        assert!(
+            hub.is_attached(sandbox_id),
+            "an acked connection must already be registered",
+        );
+    }
+
+    /// ADR 0108 A2: generation-ordered insert. The generation mint and
+    /// the map insert are separated by a lock acquisition, so a task
+    /// holding an OLDER generation can run its insert after a newer
+    /// task's. The ordered insert refuses the stale write; the newer
+    /// connection keeps the slot. (The #218 guard covers only removal —
+    /// this closes the symmetric insert hole.)
+    #[tokio::test]
+    async fn stale_generation_cannot_clobber_newer_registration() {
+        let (sink, _) = collecting_sink();
+        let hub = test_hub(sink);
+        let sandbox_id = SandboxId::new();
+        let (tx_new, _rx_new) = mpsc::channel::<HarnessFrame>(1);
+        let (tx_old, _rx_old) = mpsc::channel::<HarnessFrame>(1);
+        let old_gen = hub.inner.next_gen.fetch_add(1, Ordering::Relaxed);
+        let new_gen = hub.inner.next_gen.fetch_add(1, Ordering::Relaxed);
+        // The newer generation wins the lock race and registers first.
+        assert!(register_generation_ordered(
+            &hub.inner,
+            sandbox_id,
+            ConnectionHandle {
+                cmd_tx: tx_new,
+                pending_checkpoint: Mutex::new(None),
+                generation: new_gen,
+            },
+        ));
+        // The stale task's late insert is refused...
+        assert!(!register_generation_ordered(
+            &hub.inner,
+            sandbox_id,
+            ConnectionHandle {
+                cmd_tx: tx_old,
+                pending_checkpoint: Mutex::new(None),
+                generation: old_gen,
+            },
+        ));
+        // ...and the newer connection keeps the slot.
+        assert_eq!(
+            hub.inner
+                .connections
+                .lock()
+                .get(&sandbox_id)
+                .map(|h| h.generation),
+            Some(new_gen),
+        );
+    }
+
+    /// ADR 0108 A1: a connection that never sends its attach frame (the
+    /// swallowed-frame shape from the vsock RX-gate window) must not
+    /// park the accept task forever. The host cuts it at the handshake
+    /// bound; the guest side observes EOF — its cue to redial.
+    #[tokio::test(start_paused = true)]
+    async fn silent_connection_is_cut_at_the_handshake_bound() {
+        use tokio::io::AsyncReadExt;
+        let (sink, _) = collecting_sink();
+        let hub = test_hub(sink);
+        let sandbox_id = SandboxId::new();
+        let (host_side, harness_side) = duplex_pair();
+        hub.accept_connection(sandbox_id, None, host_side);
+        // Send nothing. Keep our write half open so the only EOF source
+        // is the host cutting the connection. Paused time auto-advances
+        // past the bound.
+        let (mut r, _w) = tokio::io::split(harness_side);
+        let mut buf = [0u8; 1];
+        let n = tokio::time::timeout(Duration::from_secs(60), r.read(&mut buf))
+            .await
+            .expect("host must cut the silent connection at the handshake bound")
+            .expect("EOF should be clean");
+        assert_eq!(n, 0, "expected EOF, not data");
+        assert!(!hub.is_attached(sandbox_id));
+    }
+
     /// Regression for issue #218: a stale connection's teardown must
     /// never remove the registration a newer reconnect installed under
     /// the same `sandbox_id`.
@@ -1567,16 +1745,21 @@ mod tests {
         // to B's harness end. Before the fix the teardown dropped B's
         // cmd_tx, which made B's writer_loop exit and close the write
         // half — so this send would fail / never arrive.
-        hub.send_prompt(sandbox_id, "pid-B".into(), "hello-B".into())
+        hub.send_prompt(sandbox_id, "pid-B".into(), "hello-B".into(), None)
             .await
             .expect("send_prompt must reach B's live writer");
         let frame: HarnessFrame = read_msg(&mut b_r)
             .await
             .expect("B should receive the prompt");
         match frame {
-            HarnessFrame::Command(HarnessCommand::Prompt { text, prompt_id }) => {
+            HarnessFrame::Command(HarnessCommand::Prompt {
+                text,
+                prompt_id,
+                mode,
+            }) => {
                 assert_eq!(text, "hello-B");
                 assert_eq!(prompt_id, "pid-B");
+                assert_eq!(mode, None);
             }
             other => panic!("expected a Prompt frame at B, got {other:?}"),
         }

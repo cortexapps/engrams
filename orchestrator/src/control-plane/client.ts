@@ -22,6 +22,7 @@ import { FleetService } from "../gen/engram/app/v1/fleet_pb.ts";
 import { MountCatalogService } from "../gen/engram/app/v1/mount_catalog_pb.ts";
 import { HarnessCatalogService } from "../gen/engram/app/v1/harness_pb.ts";
 import { OrgSecretService } from "../gen/engram/app/v1/org_secret_pb.ts";
+import { OAuthCredentialService } from "../gen/engram/app/v1/oauth_pb.ts";
 import { MintService } from "../gen/engram/app/v1/mint_pb.ts";
 import { IntegrationOpService } from "../gen/engram/app/v1/integration_op_pb.ts";
 
@@ -48,6 +49,9 @@ export const harnessCatalog = createClient(HarnessCatalogService, controlPlaneTr
 
 /** OrgSecretService client — admin-managed, KEK-sealed org secret store (ADR 0057). */
 export const orgSecret = createClient(OrgSecretService, controlPlaneTransport);
+
+/** OAuthCredentialService client — subject-scoped OAuth lifecycle (ADR 0106). */
+export const oauthCredential = createClient(OAuthCredentialService, controlPlaneTransport);
 
 /** MintService client — read-only mint-kind registry / Plane-A form metadata (ADR 0057 C3). */
 export const mint = createClient(MintService, controlPlaneTransport);
