@@ -112,17 +112,19 @@ env:
   HARNESS_PLATFORM: linux-x86_64
 
 jobs:
-  # Change-detection for the expensive, NON-REQUIRED e2e lane. Reuses the
+  # Change-detection for the expensive e2e lane. Reuses the
   # same cargo-dep-closure detector as bake-images.yml so "any crate in
   # the e2e binaries' release closure" is expressed precisely (a glob
-  # filter can't). Only the `e2e` output is consumed here; the rest are
-  # emitted for free. The e2e jobs gate on this for pull_request events;
-  # push-to-main and merge_group always run them (see their `if:`).
+  # filter can't). The e2e jobs consume the aggregate gate plus a selective
+  # PR matrix; the other outputs are emitted for free. Push-to-main and
+  # merge_group always run the full matrix (see the job's `if:` and matrix).
   detect:
     name: detect changed lanes
     runs-on: blacksmith-2vcpu-ubuntu-2404
     outputs:
       e2e: ${{ steps.lanes.outputs.e2e }}
+      e2e_matrix: ${{ steps.lanes.outputs.e2e_matrix }}
+      e2e_full_matrix: ${{ steps.lanes.outputs.e2e_full_matrix }}
       # PR test lanes — each gates the matching job below. A CI-workflow or
       # detector change sets all of these (see detect-rebake-lanes.py), so a
       # change to how CI runs re-runs everything.
@@ -1456,7 +1458,7 @@ jobs:
   # `bake-harness-claude-artifact` workflow artifact, packed into the
   # host `current_bundles` stamp (ENGRAM_HARNESS_CLAUDE_TREE +
   # `just bundles-squashfs`), and resolved from there per session.
-  # Runs the three flows in `e2e_stack.rs`.
+  # Runs the selected flows in `e2e_stack.rs`.
   #
   # `needs:` only lists jobs whose *artifacts* this lane downloads
   # (artifacts-e2e-stack's release binaries, bake-harness-claude-artifact's
@@ -1481,16 +1483,20 @@ jobs:
   # ------------------------------------------------------------------
   test-e2e-stack:
     name: e2e stack ${{ matrix.variant }} (coord app-gRPC → FC)
-    # Two variants of the same prod-shape stack (egress proxy on — the proven
-    # config), driven over the coordinator's app-gRPC surface (ADR 0051 Drip E
-    # removed the web-facing REST surface the suite used to drive):
+    # The detector selects from three variants of the same prod-shape stack
+    # (egress proxy on — the proven config):
     #   - suite: single host. Runs every e2e_stack test EXCEPT the two-host
-    #     evacuation test (incl. the egress-dependent claude auth test, which
-    #     a single host serves reliably).
+    #     evacuation test, the orchestrator automation tests, and the
+    #     quarantined Claude auth test.
     #   - teleport: two hosts (host-a + host-b). Runs ONLY the two-host
     #     evacuation test, which drives `FleetService.EvacuateSession` (the
     #     teleport primitive on the app-gRPC surface, ADR 0051) and asserts the
     #     session relocates off the source host with its disk byte-identical.
+    #   - orchestrator: single host. Runs only the webhook and cron automation
+    #     scenarios that call the orchestrator's public RPC and HTTP surfaces.
+    #
+    # A core-stack change selects all three variants. An orchestrator-only PR
+    # selects only the orchestrator variant.
     #
     # ADR 0051 restored this two-host coverage as
     # `e2e_two_host_evacuate_preserves_sentinel` (replacing the deleted REST
@@ -1502,23 +1508,7 @@ jobs:
     # only the CI Gate, never the matrix-suffixed job names directly.
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - variant: suite
-            two_hosts: ""
-            expect_two_hosts: ""
-            # Excludes the two-host evacuation test (the `teleport` variant runs it)
-            # and `e2e_claude_with_bogus_key…` — quarantined per #403. The
-            # CLI-version hypothesis is now RULED OUT: an un-quarantine attempt
-            # (2026-07-17, run 29557516643) timed out identically at 180s on the
-            # PINNED 2.1.185 — run_started never arrives after prompt delivery,
-            # so the fault is in the harness spawn/auth path, not a CLI message-
-            # shape drift. Fresh evidence on #403; re-add when actually fixed.
-            nextest_filter: "test(/e2e_/) - test(e2e_two_host_evacuate_preserves_sentinel) - test(e2e_claude_with_bogus_key_surfaces_anthropic_auth_error)"
-          - variant: teleport
-            two_hosts: "1"
-            expect_two_hosts: "1"
-            nextest_filter: "test(e2e_two_host_evacuate_preserves_sentinel)"
+      matrix: ${{ fromJSON(github.event_name == 'pull_request' && needs.detect.outputs.e2e_matrix || needs.detect.outputs.e2e_full_matrix) }}
     # Path-gate: run on any e2e-relevant change, and always on merge_group +
     # push-to-main. On changes that can't affect e2e it skips, which the CI Gate
     # treats as OK (so gating it doesn't wedge non-coord PRs).
