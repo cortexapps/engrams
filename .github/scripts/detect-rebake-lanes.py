@@ -365,10 +365,10 @@ def main():
         or any_path(changed, BAKE_ALL_PATHS)
     )
     # The expensive e2e stack has two scopes. The core scope covers the Rust
-    # stack and its setup inputs. The orchestrator scope adds the two
-    # automation scenarios that call the orchestrator's public surface. Keep
-    # them separate so an orchestrator-only PR does not also run the unrelated
-    # coordinator suite and two-host evacuation variant.
+    # stack and its setup inputs, including the two automation scenarios. The
+    # orchestrator-only scope runs those scenarios in their own stack. This
+    # keeps the normal full posture at two stacks while an orchestrator-only PR
+    # does not also run the unrelated coordinator and evacuation scenarios.
     e2e_core = (
         bool(cc & e2e_closure)
         or any_path(changed, E2E_PATHS)
@@ -386,7 +386,7 @@ def main():
             "two_hosts": "",
             "expect_two_hosts": "",
             "nextest_filter": (
-                "test(/e2e_/) - test(/e2e_automation_/) "
+                "test(/e2e_/) "
                 "- test(e2e_two_host_evacuate_preserves_sentinel) "
                 "- test(e2e_claude_with_bogus_key_surfaces_anthropic_auth_error)"
             ),
@@ -404,14 +404,17 @@ def main():
         "expect_two_hosts": "",
         "nextest_filter": "test(/e2e_automation_/)",
     }]
-    e2e_matrix = []
+    # Core changes use the normal two-stack posture. Only an orchestrator-only
+    # change needs the dedicated orchestrator variant.
     if e2e_core:
-        e2e_matrix.extend(e2e_core_matrix)
-    if e2e_orchestrator:
-        e2e_matrix.extend(e2e_orchestrator_matrix)
+        e2e_matrix = e2e_core_matrix
+    elif e2e_orchestrator:
+        e2e_matrix = e2e_orchestrator_matrix
+    else:
+        e2e_matrix = []
     # Pushes to main and merge-group runs retain the full e2e posture even if
     # their single-commit path set would select only one PR variant.
-    e2e_full_matrix = e2e_core_matrix + e2e_orchestrator_matrix
+    e2e_full_matrix = e2e_core_matrix
 
     # ── PR test-lane gating ────────────────────────────────────────────
     ci_self = any_path(changed, CI_SELF_PATHS)

@@ -1486,17 +1486,19 @@ jobs:
     # The detector selects from three variants of the same prod-shape stack
     # (egress proxy on — the proven config):
     #   - suite: single host. Runs every e2e_stack test EXCEPT the two-host
-    #     evacuation test, the orchestrator automation tests, and the
-    #     quarantined Claude auth test.
+    #     evacuation test and the quarantined Claude auth test. This includes
+    #     the orchestrator automation tests in the normal full posture.
     #   - teleport: two hosts (host-a + host-b). Runs ONLY the two-host
     #     evacuation test, which drives `FleetService.EvacuateSession` (the
     #     teleport primitive on the app-gRPC surface, ADR 0051) and asserts the
     #     session relocates off the source host with its disk byte-identical.
     #   - orchestrator: single host. Runs only the webhook and cron automation
     #     scenarios that call the orchestrator's public RPC and HTTP surfaces.
+    #     The detector uses this variant only for an orchestrator-only PR.
     #
-    # A core-stack change selects all three variants. An orchestrator-only PR
-    # selects only the orchestrator variant.
+    # A core-stack change selects suite and teleport. An orchestrator-only PR
+    # selects only orchestrator. Push and merge-group runs use suite and
+    # teleport, so the full posture stays at two concurrent stacks.
     #
     # ADR 0051 restored this two-host coverage as
     # `e2e_two_host_evacuate_preserves_sentinel` (replacing the deleted REST
