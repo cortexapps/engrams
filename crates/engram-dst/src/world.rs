@@ -73,6 +73,83 @@ pub struct QueuedEffect {
     pub effect: Effect,
 }
 
+// --- ADR 0108 E: the harness-attach plane ---------------------------
+
+/// One simulated harness connection's phase (ADR 0108 E: `Dialing →
+/// Attached`, with a nudge dropping either back into `Dialing`).
+///
+/// Production splits "VM ready" from "harness attached": the harness
+/// dials its vsock connection 50–200 ms AFTER `start_agent` returns, and
+/// the host hub answers `send_prompt` `NotFound` until the registration
+/// lands. Pre-0108 the sim collapsed the two into one atomic condition
+/// (`send_prompt` succeeded whenever the host was up), so the 2026-07-31
+/// boot/attach race class was structurally invisible.
+#[derive(Debug, Clone)]
+pub enum HarnessPhase {
+    /// `start_agent` (or a resume-time re-dial) was issued; the dial
+    /// completes at `due`. `swallowed` = the attach frame was lost (the
+    /// ADR 0108 vsock black-hole fault): the dial NEVER completes until
+    /// a nudge reschedules it. `serial` identifies THIS dial — a nudge
+    /// replaces it, so an unchanged serial proves an in-flight dial was
+    /// left alone.
+    Dialing {
+        serial: u64,
+        due: tokio::time::Instant,
+        swallowed: bool,
+    },
+    /// Registered on the hub: `send_prompt` succeeds.
+    Attached,
+}
+
+/// The attach plane's shared state. A separate mutex from `hosts`; lock
+/// order is always hosts → attach (never nested the other way).
+#[derive(Debug)]
+pub struct AttachPlane {
+    next_serial: u64,
+    /// Per-sandbox harness phase, tagged with the owning host. Entries
+    /// for destroyed sandboxes are purged on destroy/crash and validated
+    /// again at dial completion (a dead machine's dial dies with it).
+    harness: BTreeMap<SandboxId, (HostId, HarnessPhase)>,
+    /// The scheduled dial latency — the attach-delayed-by-N fault knob.
+    /// Default mirrors the observed 50–200 ms production lag.
+    delay: std::time::Duration,
+    /// Hosts whose NEWLY scheduled dials are swallowed (the fault is
+    /// sampled at schedule time; healing the flag does not revive an
+    /// already-swallowed dial — only a nudge does, as in production).
+    swallowed_hosts: BTreeSet<HostId>,
+    /// Prompts an Attached harness accepted (`send_prompt` Ok), awaiting
+    /// the sim guest's `run_started` echo (drained by the scheduler's
+    /// harness pump).
+    delivered: Vec<(SandboxId, Option<SessionId>, String)>,
+    /// Dial nudges per sandbox (every `start_agent`/SIGUSR1-equivalent
+    /// bumps this) — observability for the no-destructive-reattach
+    /// assertions in the pinned regression scenarios.
+    nudges: BTreeMap<SandboxId, u32>,
+    /// When true, a completed attach ANNOUNCES Idle through the real
+    /// ingestion route (the ADR 0108 A3 attach signal). Scenario opt-in,
+    /// default false: swarm-wide announcements mark every Active session
+    /// soft-idle-eligible (`classify` keys on `last_event_kind ==
+    /// harness_idle`), which multiplies evict/resume churn across long
+    /// chaos seeds far past their step budgets AND exposes the two
+    /// coordinator wedges documented at `Step::Prompt` — re-enable
+    /// swarm-wide when those land (ADR 0108 E follow-up).
+    announce: bool,
+}
+
+impl Default for AttachPlane {
+    fn default() -> Self {
+        Self {
+            next_serial: 0,
+            harness: BTreeMap::new(),
+            delay: std::time::Duration::from_millis(200),
+            swallowed_hosts: BTreeSet::new(),
+            delivered: Vec::new(),
+            nudges: BTreeMap::new(),
+            announce: false,
+        }
+    }
+}
+
 /// Deferred host-effects, keyed by a monotonic serial so delivery order
 /// (and the seeded reorder fault) is deterministic. `deferred` is the set
 /// of hosts whose verbs currently enqueue instead of applying inline.
@@ -87,6 +164,9 @@ pub struct EffectQueue {
 pub struct SimHostWorld {
     pub hosts: Mutex<BTreeMap<HostId, SimHostState>>,
     pub effects: Mutex<EffectQueue>,
+    /// ADR 0108 E: the harness-attach plane (dial scheduling + hub
+    /// registration + the accepted-prompt echo queue).
+    pub attach: Mutex<AttachPlane>,
     /// This world's PRIVATE blob "bucket" — a deterministic in-memory
     /// [`MemBlobStorage`](engram_sim::MemBlobStorage) (ADR 0098 D5 +
     /// determinism-audit item 7). Every replica's `Services.blob`/`chunk_store`
@@ -115,6 +195,7 @@ impl Default for SimHostWorld {
         Self {
             hosts: Mutex::new(BTreeMap::new()),
             effects: Mutex::new(EffectQueue::default()),
+            attach: Mutex::new(AttachPlane::default()),
             blob: Arc::new(engram_sim::MemBlobStorage::new()),
         }
     }
@@ -186,6 +267,12 @@ impl SimHostWorld {
     /// effect never resurrects a restarted host's cleared VM set; a stale
     /// destroy is a harmless no-op).
     fn apply_effect(&self, host: HostId, effect: &Effect) {
+        // ADR 0108 E: a destroyed VM takes its harness connection (and
+        // any in-flight dial) with it. Done BEFORE the hosts lock —
+        // lock order is hosts → attach, never nested the other way.
+        if let Effect::Destroy { sandbox } = effect {
+            self.attach.lock().harness.remove(sandbox);
+        }
         let mut hosts = self.hosts.lock();
         let Some(h) = hosts.get_mut(&host) else {
             return;
@@ -289,6 +376,189 @@ impl SimHostWorld {
     /// cleared VM set).
     pub fn drop_host_pending(&self, host: HostId) {
         self.effects.lock().pending.retain(|_, qe| qe.host != host);
+    }
+
+    // --- ADR 0108 E: harness-attach plane control ---------------------
+
+    /// Set the dial latency — the attach-delayed-by-N fault. Applies to
+    /// dials scheduled AFTER the call.
+    pub fn set_attach_delay(&self, delay: std::time::Duration) {
+        self.attach.lock().delay = delay;
+    }
+
+    /// Opt into the attach-completion Idle announcement (the A3 signal)
+    /// — see the `announce` field note for why the swarm defaults off.
+    pub fn set_attach_announce(&self, on: bool) {
+        self.attach.lock().announce = on;
+    }
+
+    /// Whether completed attaches announce Idle (read by the pump).
+    pub fn attach_announce(&self) -> bool {
+        self.attach.lock().announce
+    }
+
+    /// Arm/heal the swallowed-attach fault on one host. Sampled at dial
+    /// SCHEDULE time: healing the flag never revives an already-swallowed
+    /// dial — only a nudge does (production: vsock does not retransmit;
+    /// the lost attach frame needs a SIGUSR1 re-dial).
+    pub fn set_attach_swallowed(&self, host: HostId, on: bool) {
+        let mut plane = self.attach.lock();
+        if on {
+            plane.swallowed_hosts.insert(host);
+        } else {
+            plane.swallowed_hosts.remove(&host);
+        }
+    }
+
+    /// The SIGUSR1-equivalent nudge every `start_agent` issues (and a
+    /// restore's captured-warm harness issues for itself): an in-flight
+    /// dial is DROPPED and restarted; an established connection is
+    /// dropped and re-dialed. The fresh dial samples the host's CURRENT
+    /// swallow flag and the current delay.
+    pub fn nudge_attach(&self, host: HostId, sandbox: SandboxId) {
+        let mut plane = self.attach.lock();
+        let serial = plane.next_serial;
+        plane.next_serial += 1;
+        let due = tokio::time::Instant::now() + plane.delay;
+        let swallowed = plane.swallowed_hosts.contains(&host);
+        plane.harness.insert(
+            sandbox,
+            (
+                host,
+                HarnessPhase::Dialing {
+                    serial,
+                    due,
+                    swallowed,
+                },
+            ),
+        );
+        *plane.nudges.entry(sandbox).or_default() += 1;
+    }
+
+    /// Complete every due, un-swallowed dial: flip it to `Attached` and
+    /// return `(sandbox, owner-session)` in dial-schedule order so the
+    /// scheduler's pump can announce Idle through the real ingestion
+    /// route (the ADR 0108 A3 attach signal). A dial whose host/sandbox
+    /// died since is discarded — the connection died with the machine.
+    pub fn complete_due_attaches(&self) -> Vec<(SandboxId, Option<SessionId>)> {
+        let now = tokio::time::Instant::now();
+        // Pass 1 (attach lock): collect due dials. Exhaustive match — a
+        // new phase must be handled here, not silently skipped.
+        let due: Vec<(u64, SandboxId, HostId)> = {
+            let plane = self.attach.lock();
+            let mut due: Vec<(u64, SandboxId, HostId)> = plane
+                .harness
+                .iter()
+                .filter_map(|(sandbox, (host, phase))| match *phase {
+                    HarnessPhase::Dialing {
+                        serial,
+                        due,
+                        swallowed,
+                    } => (!swallowed && due <= now).then_some((serial, *sandbox, *host)),
+                    HarnessPhase::Attached => None,
+                })
+                .collect();
+            due.sort_by_key(|(serial, _, _)| *serial);
+            due
+        };
+        if due.is_empty() {
+            return Vec::new();
+        }
+        // Pass 2 (hosts lock): validate against world truth + resolve the
+        // owner for the Idle announcement.
+        let validated: Vec<(u64, SandboxId, Option<Option<SessionId>>)> = {
+            let hosts = self.hosts.lock();
+            due.into_iter()
+                .map(|(serial, sandbox, host)| {
+                    let owner = hosts
+                        .get(&host)
+                        .filter(|h| h.up)
+                        .and_then(|h| h.sandboxes.get(&sandbox).copied());
+                    (serial, sandbox, owner)
+                })
+                .collect()
+        };
+        // Pass 3 (attach lock): commit. Re-check the serial — a nudge
+        // between passes replaced the dial and must win.
+        let mut completed = Vec::new();
+        let mut plane = self.attach.lock();
+        for (serial, sandbox, owner) in validated {
+            let current = plane.harness.get(&sandbox).map(|(_, p)| p.clone());
+            let still_this_dial = matches!(
+                current,
+                Some(HarnessPhase::Dialing { serial: s, .. }) if s == serial
+            );
+            if !still_this_dial {
+                continue;
+            }
+            match owner {
+                Some(owner) => {
+                    if let Some((_, phase)) = plane.harness.get_mut(&sandbox) {
+                        *phase = HarnessPhase::Attached;
+                    }
+                    completed.push((sandbox, owner));
+                }
+                // Host down or sandbox gone: the dial dies.
+                None => {
+                    plane.harness.remove(&sandbox);
+                }
+            }
+        }
+        completed
+    }
+
+    /// World truth for the attach-disagreement oracle and the sim
+    /// `send_prompt` gate: only an `Attached` harness accepts the relay.
+    pub fn harness_attached(&self, sandbox: SandboxId) -> bool {
+        matches!(
+            self.attach.lock().harness.get(&sandbox),
+            Some((_, HarnessPhase::Attached))
+        )
+    }
+
+    /// The current in-flight dial's serial (None when attached/absent).
+    pub fn dial_serial(&self, sandbox: SandboxId) -> Option<u64> {
+        match self.attach.lock().harness.get(&sandbox) {
+            Some((_, HarnessPhase::Dialing { serial, .. })) => Some(*serial),
+            Some((_, HarnessPhase::Attached)) | None => None,
+        }
+    }
+
+    /// How many dial nudges (`start_agent` calls / SIGUSR1-equivalents)
+    /// this sandbox has received.
+    pub fn attach_nudges(&self, sandbox: SandboxId) -> u32 {
+        self.attach
+            .lock()
+            .nudges
+            .get(&sandbox)
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Record a prompt an Attached harness accepted; the scheduler's
+    /// pump echoes `run_started{prompt_id}` for it (the confirming event
+    /// that retires the outbox row).
+    fn record_delivered_prompt(
+        &self,
+        sandbox: SandboxId,
+        owner: Option<SessionId>,
+        prompt_id: String,
+    ) {
+        self.attach
+            .lock()
+            .delivered
+            .push((sandbox, owner, prompt_id));
+    }
+
+    /// Drain the accepted prompts awaiting their `run_started` echo.
+    pub fn take_delivered_prompts(&self) -> Vec<(SandboxId, Option<SessionId>, String)> {
+        std::mem::take(&mut self.attach.lock().delivered)
+    }
+
+    /// A dead host machine severs its harness plane: every connection and
+    /// in-flight dial on it dies (crash AND restart).
+    pub fn drop_host_harness(&self, host: HostId) {
+        self.attach.lock().harness.retain(|_, (h, _)| *h != host);
     }
 }
 
@@ -452,6 +722,11 @@ impl HostClient for SimHostClient {
         self.world.require_up(self.host_id)?;
         self.world
             .record_effect(self.host_id, Effect::Create { sandbox: id });
+        // ADR 0108 E: a snapshot restore resumes a captured-warm harness
+        // (ADR 0037) which re-dials on the vsock epoch bump — schedule
+        // the dial now, independent of any later `start_agent` (which
+        // would nudge/replace it harmlessly).
+        self.world.nudge_attach(self.host_id, id);
         Ok(id)
     }
 
@@ -469,7 +744,13 @@ impl HostClient for SimHostClient {
             } else {
                 Err(SandboxError::NotFound)
             }
-        })
+        })?;
+        // ADR 0108 E: a successful `start_agent` begins the harness dial
+        // (fresh spawn) or SIGUSR1-nudges an existing one (drop +
+        // re-dial). Registration is NOT synchronous with the verb — it
+        // lands after the sim-scheduled dial delay.
+        self.world.nudge_attach(self.host_id, id);
+        Ok(())
     }
 
     /// The boot pipeline's actual restore leg (fresh create = restore
@@ -532,13 +813,30 @@ impl HostClient for SimHostClient {
 
     async fn send_prompt(
         &self,
-        _sandbox_id: SandboxId,
-        _prompt_id: String,
+        sandbox_id: SandboxId,
+        prompt_id: String,
         _text: String,
         _mode: Option<String>,
     ) -> Result<(), SandboxError> {
         self.maybe_hang().await;
-        self.world.with_host(self.host_id, |_| Ok(()))
+        // ADR 0108 E: the hub gate. The VM existing is NOT enough — only
+        // an `Attached` harness accepts the relay; an unknown sandbox
+        // and an unattached harness both answer `NotFound`, exactly the
+        // ambiguity the coordinator's attach grace (A4) resolves.
+        let owner = self
+            .world
+            .with_host(self.host_id, |h| match h.sandboxes.get(&sandbox_id) {
+                Some(owner) => Ok(*owner),
+                None => Err(SandboxError::NotFound),
+            })?;
+        if !self.world.harness_attached(sandbox_id) {
+            return Err(SandboxError::NotFound);
+        }
+        // The accepted prompt awaits the sim guest's `run_started` echo
+        // (the scheduler's pump), which retires the outbox row.
+        self.world
+            .record_delivered_prompt(sandbox_id, owner, prompt_id);
+        Ok(())
     }
 }
 

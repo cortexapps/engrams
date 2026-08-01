@@ -284,6 +284,34 @@ impl Sim {
         &self.model
     }
 
+    /// Enqueue an op and drive this session's due head inline. Pre-0108
+    /// every workload enqueue here claimed inline (`Claimed`) because
+    /// nothing else was ever queued on the session; with the harness
+    /// plane (ADR 0108 E) a backed-off Deliver op can sit QUEUED, so the
+    /// enqueue lands BEHIND it (`Queued`). `drive_session` then claims
+    /// the due head — the backed-off deliver is gated out by its
+    /// `not_before` — which is the op just enqueued, preserving the
+    /// arms' drive-inline-within-the-step semantics.
+    async fn enqueue_and_drive(
+        state: &engram_coordinator::state::SharedState,
+        session_id: SessionId,
+        kind: OpKind,
+        payload: serde_json::Value,
+        key: Option<&str>,
+    ) {
+        match engram_coordinator::session_ops::enqueue_claim(state, session_id, kind, payload, key)
+            .await
+        {
+            Ok(EnqueueOutcome::Claimed(op)) => {
+                engram_coordinator::session_ops::drive_claimed(state, op).await;
+            }
+            Ok(EnqueueOutcome::Queued(_)) => {
+                engram_coordinator::session_ops::drive_session(state, session_id).await;
+            }
+            Ok(EnqueueOutcome::Duplicate) | Err(_) => {}
+        }
+    }
+
     fn pick(&mut self) -> Step {
         // #800: the DrainHost arms draw their host index from WORLD entropy
         // (never `self.rng`, the scheduler pick stream), so folding the drain
@@ -403,8 +431,20 @@ impl Sim {
     /// hand-drive an exact interleaving (the dst-host pattern) instead of
     /// relying on a swarm pick to reproduce it; the swarm path calls this
     /// with `pick()`'s output.
+    ///
+    /// After every step the world's harness plane is pumped (ADR 0108 E):
+    /// due attach dials complete and announce Idle through the real
+    /// ingestion route (the A3 attach signal), and prompts an attached
+    /// harness accepted echo `run_started` (the confirming event that
+    /// retires the outbox row). Time only moves inside steps, so pumping
+    /// at the step boundary keeps attach completion deterministic.
     pub async fn execute(&mut self, step: Step) {
         self.report.trace.push(format!("{step:?}"));
+        self.apply(step).await;
+        pump_harness_plane(&self.world).await;
+    }
+
+    async fn apply(&mut self, step: Step) {
         match step {
             Step::AdvanceTime(d) => self.world.clock.advance(d).await,
             Step::Driver(r, kind) => {
@@ -512,18 +552,14 @@ impl Sim {
                             }
                             let key = format!("boot-recover:{sid}");
                             // The sim never detach-spawns mutating work; drive inside the step.
-                            if let Ok(EnqueueOutcome::Claimed(op)) =
-                                engram_coordinator::session_ops::enqueue_claim(
-                                    &state,
-                                    sid,
-                                    OpKind::CreateBoot,
-                                    serde_json::json!({ "recovered": true }),
-                                    Some(&key),
-                                )
-                                .await
-                            {
-                                engram_coordinator::session_ops::drive_claimed(&state, op).await;
-                            }
+                            Self::enqueue_and_drive(
+                                &state,
+                                sid,
+                                OpKind::CreateBoot,
+                                serde_json::json!({ "recovered": true }),
+                                Some(&key),
+                            )
+                            .await;
                         }
                     }
                     DriverKind::IdleDetector => {
@@ -628,18 +664,14 @@ impl Sim {
                     .reserve_and_persist_create(ws, &candidates, 0)
                     .await;
                 if matches!(disp, Ok(CreateDisposition::Placed(_))) {
-                    if let Ok(EnqueueOutcome::Claimed(op)) =
-                        engram_coordinator::session_ops::enqueue_claim(
-                            &state,
-                            session_id,
-                            OpKind::CreateBoot,
-                            serde_json::json!({}),
-                            Some(&format!("create:{session_id}")),
-                        )
-                        .await
-                    {
-                        engram_coordinator::session_ops::drive_claimed(&state, op).await;
-                    }
+                    Self::enqueue_and_drive(
+                        &state,
+                        session_id,
+                        OpKind::CreateBoot,
+                        serde_json::json!({}),
+                        Some(&format!("create:{session_id}")),
+                    )
+                    .await;
                 }
                 if disp.is_ok() {
                     self.report.sessions_created += 1;
@@ -701,8 +733,10 @@ impl Sim {
                         h.up = false;
                     }
                 }
-                // A crashed machine severs its in-flight RPC effects.
+                // A crashed machine severs its in-flight RPC effects and
+                // its harness plane (connections + in-flight dials).
                 self.world.host_world.drop_host_pending(id);
+                self.world.host_world.drop_host_harness(id);
             }
             Step::RestartHost(i) => {
                 let id = self.world.host_ids[i];
@@ -715,8 +749,10 @@ impl Sim {
                     }
                 }
                 // In-flight effects for the old boot die with it — never
-                // resurrected onto the freshly-cleared VM set.
+                // resurrected onto the freshly-cleared VM set. Harness
+                // connections/dials likewise die with the machine.
                 self.world.host_world.drop_host_pending(id);
+                self.world.host_world.drop_host_harness(id);
             }
             Step::CrashReplica(i) => {
                 self.world.replicas[i].state = None;
@@ -813,18 +849,14 @@ impl Sim {
                         .map(|r| r.session.id)
                 });
                 let Some(sid) = idle else { return };
-                if let Ok(EnqueueOutcome::Claimed(op)) =
-                    engram_coordinator::session_ops::enqueue_claim(
-                        &state,
-                        sid,
-                        OpKind::Resume,
-                        serde_json::json!({}),
-                        Some(&format!("resume:{sid}")),
-                    )
-                    .await
-                {
-                    engram_coordinator::session_ops::drive_claimed(&state, op).await;
-                }
+                Self::enqueue_and_drive(
+                    &state,
+                    sid,
+                    OpKind::Resume,
+                    serde_json::json!({}),
+                    Some(&format!("resume:{sid}")),
+                )
+                .await;
                 // A resume that re-established the session to Active is an
                 // acked live milestone the auditor tracks.
                 self.record_if_live(sid);
@@ -869,14 +901,43 @@ impl Sim {
                 // prompt→deliver→ack loop over the real surface:
                 //   1. send_prompt (gRPC)  → durable outbox row
                 //   2. the real Deliver op → forward to the host relay
-                //   3. run_started (real-wire harness event) → outbox_ack
-                // Active-only + closing the ack: an unacked outbox row
-                // redelivers forever (no real guest harness emits the ack),
-                // so a prompted session that later leaves Active would leave
-                // a Deliver op retrying against a perpetually-due row
-                // ("scanner owns recovery") — a real wedge (finding in the
-                // report). Acking the row here retires it, so the Deliver leg
-                // is exercised without folding that wedge into the lane.
+                //   3. `send_prompt` reaches an ATTACHED sim harness (ADR
+                //      0108 E) → the pump echoes `run_started{prompt_id}`
+                //      through the real ingestion route → outbox_ack
+                // Pre-0108 the ack was synthesized here unconditionally
+                // (no guest harness existed to emit it); the attach plane
+                // closes the loop world-side, so a delivery that defers
+                // (harness still dialing, session evicted mid-flight) is
+                // retired by the SAME confirming event production uses,
+                // whenever the deliver ladder actually lands the prompt.
+                // SCOPE (two real coordinator wedges, found by the ADR
+                // 0108 E model split): the SWARM keeps the pre-0108
+                // posture of retiring the row inside the step (the
+                // synthetic `run_started` below), because an outbox row
+                // that stays unacked past its step leaves a QUEUED
+                // Deliver op behind, and two delivery-path holes then
+                // livelock a chaos world:
+                //  1. `op_enqueue_and_claim_exclusive` treats ANY queued
+                //     op as a busy lane, so the EvacResumer's claim-or-
+                //     give-up can never acquire an Evacuating session
+                //     that holds an undelivered prompt — the evacuation
+                //     starves forever while the deliver retries "its
+                //     scanner owns recovery" (seed 33058131, deliver
+                //     attempts 500+ at quiescence).
+                //  2. The deliver verb's Evicting rung-ascent cancels the
+                //     queued evict op each retry, so an Evicting session
+                //     whose VM vanished (host restart) never accumulates
+                //     the 20-attempt evict budget that routes it to the
+                //     #762 HostLost fallback — deliver, a fresh-minted
+                //     evict, and a "runs after the evict" resume cycle
+                //     forever (chaos seed 3, deliver attempts 500+).
+                // Both need coordinator fixes (due-gated exclusive claim /
+                // ascent that respects the evict budget) + the ADR 0098
+                // D4 conformance pass — a follow-up outside workstream E.
+                // Until then the attach-race and swallowed-attach paths
+                // (rows that DO outlive delivery attempts) are covered by
+                // the hand-driven pinned scenarios in tests/ttft_attach.rs,
+                // where the deliver ladder runs without those two faults.
                 let target = self.world.meta.with_db(|db| {
                     db.sessions
                         .values()
@@ -893,22 +954,24 @@ impl Sim {
                 let acked = crate::workload::api_prompt(&state, sid, &prompt_id).await;
                 crate::workload::drain_detached().await;
                 if acked {
-                    // Drive the real Deliver op inline (the session is Active
-                    // → forward_outbox_row reaches the host relay).
-                    if let Ok(EnqueueOutcome::Claimed(op)) =
-                        engram_coordinator::session_ops::enqueue_claim(
-                            &state,
-                            sid,
-                            OpKind::Deliver,
-                            serde_json::json!({}),
-                            None,
-                        )
-                        .await
-                    {
-                        engram_coordinator::session_ops::drive_claimed(&state, op).await;
-                    }
+                    // Drive the real Deliver op inline. An attached harness
+                    // forwards (and the pump's echo ingests a real
+                    // `run_started`); a still-dialing harness exercises the
+                    // A4 grace arm and defers.
+                    Self::enqueue_and_drive(
+                        &state,
+                        sid,
+                        OpKind::Deliver,
+                        serde_json::json!({}),
+                        None,
+                    )
+                    .await;
                     crate::workload::drain_detached().await;
-                    // The confirming harness event retires the outbox row.
+                    // The synthetic confirming event retires the row within
+                    // the step (see the SCOPE note above). When the forward
+                    // already succeeded, the pump's echo re-ingests the same
+                    // prompt_id: `outbox_ack` is idempotent and the extra
+                    // event row is deterministic.
                     let at = state.services.clock.now_utc();
                     crate::workload::api_run_started(&state, sid, sandbox, &prompt_id, at).await;
                     crate::workload::drain_detached().await;
@@ -996,18 +1059,14 @@ impl Sim {
                 // single-step-per-pick model) is exercised end-to-end by the
                 // dedicated tests/api_surface.rs instead; here we drive its
                 // Destroy op + teardown, the state-mutating heart.
-                if let Ok(EnqueueOutcome::Claimed(op)) =
-                    engram_coordinator::session_ops::enqueue_claim(
-                        &state,
-                        sid,
-                        OpKind::Destroy,
-                        serde_json::json!({}),
-                        Some(&format!("destroy:{sid}")),
-                    )
-                    .await
-                {
-                    engram_coordinator::session_ops::drive_claimed(&state, op).await;
-                }
+                Self::enqueue_and_drive(
+                    &state,
+                    sid,
+                    OpKind::Destroy,
+                    serde_json::json!({}),
+                    Some(&format!("destroy:{sid}")),
+                )
+                .await;
                 crate::workload::drain_detached().await;
                 // Record the acked destroy only once CONFIRMED (row gone or
                 // terminal), so the never-resurrect assertion keys on a
@@ -1049,20 +1108,16 @@ impl Sim {
                     if st != engram_core::types::SessionState::Active {
                         continue;
                     }
-                    if let Ok(EnqueueOutcome::Claimed(op)) =
-                        engram_coordinator::session_ops::enqueue_claim(
-                            &state,
-                            sid,
-                            OpKind::Evict,
-                            serde_json::json!({
-                                "target": "evacuating", "allow_park": false, "nominated": false
-                            }),
-                            Some(&format!("drain-evict:{sid}")),
-                        )
-                        .await
-                    {
-                        engram_coordinator::session_ops::drive_claimed(&state, op).await;
-                    }
+                    Self::enqueue_and_drive(
+                        &state,
+                        sid,
+                        OpKind::Evict,
+                        serde_json::json!({
+                            "target": "evacuating", "allow_park": false, "nominated": false
+                        }),
+                        Some(&format!("drain-evict:{sid}")),
+                    )
+                    .await;
                 }
                 crate::workload::drain_detached().await;
             }
@@ -1123,18 +1178,14 @@ impl Sim {
                 // The Step::ResumeSession machinery, with a `recovery:`
                 // idempotency key so the oracle's op rows are
                 // self-identifying in a failure detail.
-                if let Ok(EnqueueOutcome::Claimed(op)) =
-                    engram_coordinator::session_ops::enqueue_claim(
-                        &state,
-                        *sid,
-                        OpKind::Resume,
-                        serde_json::json!({}),
-                        Some(&format!("recovery:{sid}")),
-                    )
-                    .await
-                {
-                    engram_coordinator::session_ops::drive_claimed(&state, op).await;
-                }
+                Self::enqueue_and_drive(
+                    &state,
+                    *sid,
+                    OpKind::Resume,
+                    serde_json::json!({}),
+                    Some(&format!("recovery:{sid}")),
+                )
+                .await;
                 crate::workload::drain_detached().await;
             }
         }
@@ -1343,6 +1394,61 @@ impl Sim {
 
     pub fn report_mut(&mut self) -> &mut SimReport {
         &mut self.report
+    }
+}
+
+/// ADR 0108 E: drive the world's harness plane one step, at the END of
+/// every executed step (see [`Sim::execute`]).
+///
+/// 1. Reap any tasks the step detached (`session_ops::enqueue` drives
+///    ops off the caller's future) so their world effects land inside
+///    the step — deterministic on the current-thread runtime.
+/// 2. Complete due attach dials: the harness registers on the hub and
+///    announces Idle through the real ingestion route — the A3 attach
+///    signal (`op_wake_queued_kind(Deliver)` + the outbox-shim notify
+///    fire inside the sink).
+/// 3. Echo `run_started{prompt_id}` for every prompt an attached harness
+///    accepted — the confirming event that retires the outbox row (in
+///    production the guest harness emits it; the sim guest is this
+///    pump).
+///
+/// With no live replica the Idle announcement / echo is LOST (the
+/// coordinator was down when the harness spoke) — the attach still
+/// completes world-side, and delivery converges via the poll cadence,
+/// as in production. Accepted-prompt echoes are left queued until a
+/// replica is up, mirroring the harness's own event retry.
+async fn pump_harness_plane(world: &SimWorld) {
+    crate::workload::drain_detached().await;
+    let state = world.replicas.iter().find_map(|r| r.state.clone());
+    let announce = world.host_world.attach_announce();
+    for (sandbox, owner) in world.host_world.complete_due_attaches() {
+        // The Idle announcement is scenario-opt-in (see the
+        // `AttachPlane::announce` note): the swarm completes attaches
+        // silently, so delivery keys on the grace cadence / poll there,
+        // while the pinned ttft_attach scenarios enable the real A3
+        // signal path.
+        if !announce {
+            continue;
+        }
+        let (Some(state), Some(session)) = (state.as_ref(), owner) else {
+            continue;
+        };
+        let at = state.services.clock.now_utc();
+        crate::workload::api_emit_harness_idle(state, session, sandbox, at).await;
+        crate::workload::drain_detached().await;
+    }
+    if let Some(state) = state.as_ref() {
+        for (sandbox, owner, prompt_id) in world.host_world.take_delivered_prompts() {
+            let Some(session) = owner else {
+                // Delivered to a sandbox the world never saw bound — no
+                // session to ingest against; the row redelivers after
+                // its ack timeout.
+                continue;
+            };
+            let at = state.services.clock.now_utc();
+            crate::workload::api_run_started(state, session, sandbox, &prompt_id, at).await;
+            crate::workload::drain_detached().await;
+        }
     }
 }
 
