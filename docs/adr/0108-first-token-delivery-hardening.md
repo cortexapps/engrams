@@ -1,6 +1,18 @@
 # 0108 — First-token delivery hardening
 
-Status: Proposed (2026-07-31)
+Status: Accepted (2026-08-01) — PRs #934 (A1–A5, A8, B, C, D) and #935
+(Workstream E), merged and verified in production the same day.
+
+Production verification (fresh deploy, freshly-rolled hosts — the exact
+condition behind the original incidents): create-with-prompt TTFT 0.96 s
+end-to-end with `run_started` 53 ms after the attach announcement (was
+~50 s); parked-session prompt→`run_started` 72 ms (was 35.5 s); zero
+`StreamEvents` reconnect-storm lines across a 45-minute window that
+included a listener-attached generation (was ~5/s); interrupt
+attribution live on both replicas (`engram_interrupts_total{source}`,
+with an organic `stop-button` event recorded alongside the probe). A
+probe interrupt that raced a natural completion closed the run as
+`RunCompleted`, confirming the truthful-marker semantics.
 
 ## Context
 
@@ -193,11 +205,13 @@ the attach gating, dial faults, and both oracles are always on.
 
 ## Rollout
 
-One PR carries this ADR (Proposed) plus A1–A5, B, the interrupt-attribution
-fixes, the held-echo UX fix, and the E oracles for the shipped pieces. Each
-logical change is its own commit.
+Shipped as a two-PR stack: #934 carried this ADR plus A1–A5, A8, B, the
+interrupt-attribution fixes, and the held-echo UX fix; #935 carried
+Workstream E. Each logical change is its own commit.
 
-A6 (the prompt rides `start_agent`; needs the in-guest consumer, a harness
-re-bake, and the exactly-once oracle) and A7 (vsock severance watch,
-ping/pong liveness, the Firecracker RX-gate arm) land as the follow-up
-phase. That phase flips this ADR to Accepted.
+Follow-up work, deliberately outside this ADR's acceptance: A6 (the
+prompt rides `start_agent`; needs the in-guest consumer, a harness
+re-bake, and the exactly-once oracle), A7 (vsock severance watch,
+ping/pong liveness, the Firecracker RX-gate arm), and the two swarm-found
+livelocks recorded above. A6/A7 get their own ADR if they change the
+architecture beyond what is described here.
