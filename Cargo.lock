@@ -1363,6 +1363,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "webpki-roots 1.0.7",
  "workspace-hack",
 ]
 
