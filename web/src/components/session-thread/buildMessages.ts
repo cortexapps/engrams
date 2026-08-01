@@ -447,6 +447,9 @@ export function buildMessages(
   // Push a system "harness register" message carrying a marker payload. The
   // single text part is a plain-text fallback; the renderer reads `marker`.
   let planRevision = 0;
+  // ADR 0107: is the session in plan mode AT THIS POINT in the walk (mode
+  // directives set it; an approved plan returns to the default).
+  let planModeOn = false;
   const planAttemptToolCallIds = new Set<string>();
   const pushSystem = (id: string, fallback: string, marker: SystemMarker) => {
     active = null;
@@ -567,6 +570,7 @@ export function buildMessages(
     const lenBefore = out.length;
     switch (ev.type) {
       case "harness_mode_changed": {
+        planModeOn = ev.mode === "plan";
         pushSystem(`mode:${idx}`, `mode: ${ev.mode}`, {
           kind: "mode",
           mode: ev.mode,
@@ -654,18 +658,24 @@ export function buildMessages(
       }
 
       case "tool_call_started": {
-        // ADR 0107: an exit_plan_mode call with NO generic request behind it
-        // is the out-of-mode rejection (the harness answered it in place).
-        // A failed tool row reads as breakage; a hint reads as guidance.
+        // ADR 0107: an exit_plan_mode call with NO generic request behind it.
+        // While plan mode is OFF that is the out-of-mode rejection (the
+        // harness answered it in place) and a hint reads better than a failed
+        // tool row. While plan mode is ON it is the CLI re-calling a tool
+        // whose first call is already parked (session 4a70374e) — the card
+        // covers it, and telling the user to "turn on the plan chip" when it
+        // is already on is nonsense. Drop the row either way.
         if (
           canonicalToolName(ev.tool_name) === "exit_plan_mode" &&
           !genericRequests.has(ev.tool_call_id)
         ) {
           planAttemptToolCallIds.add(ev.tool_call_id);
-          pushSystem(`plan-attempt:${idx}`, "the agent drafted a plan outside plan mode", {
-            kind: "plan_attempt",
-            at: ev.at,
-          });
+          if (!planModeOn) {
+            pushSystem(`plan-attempt:${idx}`, "the agent drafted a plan outside plan mode", {
+              kind: "plan_attempt",
+              at: ev.at,
+            });
+          }
           break;
         }
         // #64389: Claude may narrate multiple AskUserQuestion tool_use rows for
@@ -781,6 +791,9 @@ export function buildMessages(
 
       // Folded onto its generic request row/card by the pre-scan.
       case "tool_result_submitted":
+        // ADR 0107: an approved plan returns the session to the default mode
+        // (the harness flips the same stamp guest-side).
+        if (planResolutionByToolCallId.get(ev.tool_call_id)?.approved) planModeOn = false;
         break;
 
       case "tool_call_completed": {
@@ -866,11 +879,22 @@ export function buildMessages(
         // (or other trailing marker) ended the turn, `active` is null and the
         // run may have no assistant bubble at all — don't synthesize an empty
         // one just to hold a footer (it would render as a stray ✗ receipt).
+        // EVERY bubble this run produced has to leave "running" — not just the
+        // one carrying the receipt. A system marker mid-run (a plan card, a
+        // question) nulls `active`, so the next part opens a NEW bubble and the
+        // earlier ones would keep spinning their tool rows forever after the
+        // run ended: session 4a70374e showed "Waiting for tool: ToolSearch"
+        // beside a finished turn.
+        const settled: ThreadMessageLike["status"] = ok
+          ? { type: "complete", reason: "stop" }
+          : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
+        for (let i = runStartLen; i < out.length; i++) {
+          const m = out[i]!;
+          if (m.role === "assistant" && m.status?.type === "running") m.status = settled;
+        }
         const a = active ?? runAssistant();
         if (a) {
-          a.status = ok
-            ? { type: "complete", reason: "stop" }
-            : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
+          a.status = settled;
           a.metadata = { custom: { ...a.metadata?.custom, run: footer } };
         }
         active = null;
@@ -1088,7 +1112,16 @@ export function buildMessages(
     else a.content.push({ type: "text", text: streamingText });
   }
 
-  const isRunning = !sessionInactive && (runOpen || tailAwaiting(out));
+  // A deferred call awaiting a HUMAN is the opposite of working: the agent is
+  // blocked on the reviewer, not thinking. Codex keeps its app-server turn open
+  // across the park, so `runOpen` stays true and the composer showed "working…"
+  // (plus a live Stop button) under a plan card asking for a decision — session
+  // 676b367f. `harness_parked` never reaches the client, so derive it from the
+  // ledger the cards already read.
+  const awaitingDecision =
+    [...planToolCallIds].some((id) => !planResolutionByToolCallId.has(id)) ||
+    [...questionToolCallIds].some((id) => !answersByToolCallId.has(id));
+  const isRunning = !sessionInactive && !awaitingDecision && (runOpen || tailAwaiting(out));
 
   // Give the working indicator somewhere to live when we're running but the
   // tail isn't already a running assistant message (e.g. the user just sent

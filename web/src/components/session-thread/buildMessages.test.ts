@@ -1732,4 +1732,125 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
     );
     expect(toolParts).toHaveLength(0);
   });
+
+  // Session 4a70374e: the CLI called exit_plan_mode a SECOND time while the
+  // first call was already parked. The second start has no request behind it,
+  // which used to read as "the agent planned with plan mode off" — telling the
+  // user to turn on a chip that was already on.
+  test("a re-call while plan mode is ON is not an out-of-mode attempt", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-plan-2",
+          tool_name: "exit_plan_mode",
+          args_summary: null,
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+    const kinds = messages.map((m) => customMarker(m)?.kind).filter(Boolean);
+    expect(kinds).toContain("plan");
+    expect(kinds).not.toContain("plan_attempt");
+  });
+
+  // Session 4a70374e: a plan card mid-run nulls `active`, so the next tool
+  // opened a NEW assistant bubble that `run_completed` never closed — its tool
+  // row span on "Waiting for tool: ToolSearch" beside a finished turn.
+  test("a completed run settles every bubble it produced, not just the last", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-ts",
+          tool_name: "ToolSearch",
+          args_summary: "{}",
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "t-ts",
+          tool_name: "ToolSearch",
+          ok: true,
+          duration_ms: 4,
+          result_summary: "",
+          at: AT,
+        },
+        // A second card moves `active` off the ToolSearch bubble, and the
+        // closing message opens a third — so run_completed would otherwise
+        // settle only that last one and leave the ToolSearch bubble spinning.
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan-b",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P2" }),
+          at: AT,
+        },
+        {
+          type: "agent_message",
+          role: "assistant",
+          text: "done",
+          run_id: "r1",
+          message_id: "m1",
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT },
+      ]),
+      SID,
+      "active",
+    );
+    const stillRunning = messages.filter(
+      (m) => m.role === "assistant" && m.status?.type === "running",
+    );
+    expect(stillRunning).toHaveLength(0);
+  });
+
+  // Session 676b367f: codex holds its app-server turn open across the park, so
+  // `runOpen` stayed true and the composer showed "working…" (with a live Stop)
+  // under a card asking the reviewer for a decision.
+  test("a session awaiting a plan decision is not running", () => {
+    const { isRunning } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+    expect(isRunning).toBe(false);
+  });
 });
