@@ -625,6 +625,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         profiles,
         imagesClient,
         resolveUsers(),
+        pendingCallsStore,
       );
       return { task: loaded };
     },
@@ -862,6 +863,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         profiles,
         imagesClient,
         resolveUsers(),
+        pendingCallsStore,
       );
       return { task: loaded };
     },
@@ -993,6 +995,7 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
         profiles,
         imagesClient,
         resolveUsers(),
+        pendingCallsStore,
       );
       return { task: loaded };
     },
