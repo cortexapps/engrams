@@ -55,9 +55,28 @@ export function SystemMessage() {
       return <PlanCard marker={marker} />;
     case "mode":
       return <Mode marker={marker} />;
+    case "plan_attempt":
+      return <PlanAttempt marker={marker} />;
     case "note":
       return <Note text={fallback} />;
   }
+}
+
+// ADR 0107: the agent drafted a plan outside plan mode — the harness
+// rejected the call in place (nothing is waiting to review it). A quiet
+// hint pointing at the real affordance.
+function PlanAttempt({ marker }: { marker: Extract<SystemMarker, { kind: "plan_attempt" }> }) {
+  return (
+    <div className="flex items-center justify-center gap-2 py-1 text-center text-xs text-muted-foreground italic">
+      <MapIcon className="size-3.5 shrink-0" />
+      <span>
+        the agent drafted a plan, but plan mode was off — turn it on (⇧Tab or the plan chip) to get
+        reviewable plan cards
+      </span>
+      <span aria-hidden>·</span>
+      <span className="font-mono not-italic tabular-nums">{hms(marker.at)}</span>
+    </div>
+  );
 }
 
 // ADR 0107: a faint centered mode-transition marker in the durability

@@ -1655,3 +1655,72 @@ describe("buildMessages — ADR 0107 plan mode", () => {
     expect(pendingPlan).toBeNull();
   });
 });
+
+describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
+  test("an exit_plan_mode start with no generic request becomes a hint marker, not a tool row", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-attempt",
+          tool_name: "exit_plan_mode",
+          args_summary: '{"plan":"a plan"}',
+          at: AT,
+        },
+        {
+          type: "tool_call_completed",
+          run_id: "r1",
+          tool_call_id: "t-attempt",
+          tool_name: "exit_plan_mode",
+          ok: false,
+          duration_ms: 1,
+          result_summary: null,
+          at: AT,
+        },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const attempt = messages.map((m) => customMarker(m)).find((mk) => mk?.kind === "plan_attempt");
+    expect(attempt).toBeTruthy();
+    const toolRows = messages.flatMap((m) =>
+      typeof m.content === "string"
+        ? []
+        : m.content.filter(
+            (p) => p.type === "tool-call" && "toolCallId" in p && p.toolCallId === "t-attempt",
+          ),
+    );
+    expect(toolRows).toHaveLength(0);
+  });
+
+  test("a REAL plan request still renders the card, never the attempt hint", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "# P" }),
+          at: AT,
+        },
+        {
+          type: "tool_call_started",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          tool_name: "exit_plan_mode",
+          args_summary: null,
+          at: AT,
+        },
+      ]),
+      SID,
+      "idle",
+    );
+    const kinds = messages.map((m) => customMarker(m)?.kind).filter(Boolean);
+    expect(kinds).toContain("plan");
+    expect(kinds).not.toContain("plan_attempt");
+  });
+});

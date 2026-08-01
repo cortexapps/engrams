@@ -1134,7 +1134,10 @@ async fn handle_dynamic_tool_call(
                     "success": false,
                     "contentItems": [{
                         "type": "inputText",
-                        "text": "exit_plan_mode is only valid in plan mode; continue with the task"
+                        "text": "Not in plan mode — no reviewer is waiting for a plan, so this \
+                call did nothing. Tell the user: if they want an approval-gated plan, they can \
+                turn on Plan mode (the plan chip next to the composer, or Shift+Tab) and ask \
+                again. Then continue with the task as normal."
                     }]
                 }),
             )

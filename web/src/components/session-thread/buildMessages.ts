@@ -163,7 +163,11 @@ export type SystemMarker =
   // ADR 0107: a validated session-mode directive rode a prompt — a faint
   // one-line marker narrating the transition ("planning — read-only" /
   // "plan mode off").
-  | { kind: "mode"; mode: string; at: string };
+  | { kind: "mode"; mode: string; at: string }
+  // ADR 0107: the agent called exit_plan_mode OUTSIDE plan mode (the harness
+  // rejected it in place — no park, no card). Rendered as a hint marker
+  // instead of a dead failed-tool row.
+  | { kind: "plan_attempt"; at: string };
 
 /** Footer carried in an assistant message's `metadata.custom.run` — the
  *  per-run receipt (`↳ read N · edited N · ran N`). */
@@ -443,6 +447,7 @@ export function buildMessages(
   // Push a system "harness register" message carrying a marker payload. The
   // single text part is a plain-text fallback; the renderer reads `marker`.
   let planRevision = 0;
+  const planAttemptToolCallIds = new Set<string>();
   const pushSystem = (id: string, fallback: string, marker: SystemMarker) => {
     active = null;
     out.push({
@@ -649,6 +654,20 @@ export function buildMessages(
       }
 
       case "tool_call_started": {
+        // ADR 0107: an exit_plan_mode call with NO generic request behind it
+        // is the out-of-mode rejection (the harness answered it in place).
+        // A failed tool row reads as breakage; a hint reads as guidance.
+        if (
+          canonicalToolName(ev.tool_name) === "exit_plan_mode" &&
+          !genericRequests.has(ev.tool_call_id)
+        ) {
+          planAttemptToolCallIds.add(ev.tool_call_id);
+          pushSystem(`plan-attempt:${idx}`, "the agent drafted a plan outside plan mode", {
+            kind: "plan_attempt",
+            at: ev.at,
+          });
+          break;
+        }
         // #64389: Claude may narrate multiple AskUserQuestion tool_use rows for
         // one real deferred request. A start is phantom only when its tool maps
         // to a deferred request seen in this transcript (or the native binding),
@@ -760,8 +779,10 @@ export function buildMessages(
         // resume) — its outcome is the card, not a tool part. `tool_name` is
         // blank on completed events, so match on the pre-scanned id set.
         if (questionToolCallIds.has(ev.tool_call_id)) break;
-        // ADR 0107: a plan's outcome is the card's receipt, not a tool row.
+        // ADR 0107: a plan's outcome is the card's receipt, not a tool row;
+        // an out-of-mode attempt's outcome is its hint marker.
         if (planToolCallIds.has(ev.tool_call_id)) break;
+        if (planAttemptToolCallIds.has(ev.tool_call_id)) break;
         const part = openTools.get(ev.tool_call_id);
         if (part) {
           part.result = ev.result_summary ?? undefined;
