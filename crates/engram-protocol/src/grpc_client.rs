@@ -797,11 +797,13 @@ impl GrpcHostClient {
         sandbox_id: SandboxId,
         prompt_id: String,
         text: String,
+        harness_mode: Option<String>,
     ) -> Result<(), SandboxError> {
         let req = SendHarnessPromptRequest {
             sandbox_id: sandbox_id.as_uuid().as_bytes().to_vec(),
             text,
             prompt_id,
+            harness_mode,
         };
         self.inner
             .clone()
@@ -1712,8 +1714,10 @@ impl HostClient for GrpcHostClient {
         sandbox_id: SandboxId,
         prompt_id: String,
         text: String,
+        mode: Option<String>,
     ) -> Result<(), SandboxError> {
-        self.send_harness_prompt(sandbox_id, prompt_id, text).await
+        self.send_harness_prompt(sandbox_id, prompt_id, text, mode)
+            .await
     }
 
     async fn edit_queued_prompt(

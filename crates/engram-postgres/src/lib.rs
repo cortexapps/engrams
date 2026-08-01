@@ -4881,7 +4881,7 @@ impl MetadataStore for PostgresStore {
                    'status_changed', 'snapshot_taken', 'evicted',
                    'resumed', 'resume_started', 'recovered_from_checkpoint',
                    'prompt_received', 'harness_idle', 'harness_parked',
-                   'durability_rollback'
+                   'durability_rollback', 'harness_mode_changed'
                )
             "#,
         )

@@ -370,9 +370,10 @@ impl HostClient for LocalHostClient {
         sandbox_id: SandboxId,
         prompt_id: String,
         text: String,
+        mode: Option<String>,
     ) -> Result<(), SandboxError> {
         self.harness_hub
-            .send_prompt(sandbox_id, prompt_id, text)
+            .send_prompt(sandbox_id, prompt_id, text, mode)
             .await
             .map_err(harness_err_to_sandbox)
     }

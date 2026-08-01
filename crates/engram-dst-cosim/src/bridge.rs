@@ -237,6 +237,7 @@ impl HostClient for CosimHostClient {
         _sandbox_id: SandboxId,
         _prompt_id: String,
         _text: String,
+        _mode: Option<String>,
     ) -> Result<(), SandboxError> {
         Ok(())
     }

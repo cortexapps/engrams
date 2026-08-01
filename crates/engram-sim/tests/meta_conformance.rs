@@ -2887,6 +2887,14 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     meta.append_session_event(id, "harness_idle", serde_json::json!({}))
         .await
         .unwrap();
+    // ADR 0107: a mode directive is user intent — it survives a rewind.
+    meta.append_session_event(
+        id,
+        "harness_mode_changed",
+        serde_json::json!({"mode": "plan"}),
+    )
+    .await
+    .unwrap();
     // ADR 0090: the durability-rollback marker is a coordinator fact that
     // survives the very rewind it warns about — it must NOT tombstone.
     meta.append_session_event(
@@ -2907,7 +2915,8 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
     // Only the guest-derived events roll back (agent_message,
     // integration_asset, tool_call_started, file_shared = 4); the
     // coordinator facts (prompt_received, resume_started, harness_idle,
-    // durability_rollback) + the anchor status_changed survive.
+    // harness_mode_changed, durability_rollback) + the anchor
+    // status_changed survive.
     assert_eq!(summary.rolled_back, 4, "rolled_back count");
     assert_eq!(summary.through_idx, cursor, "through_idx is the cursor");
     assert_eq!(summary.recovery_epoch, 1, "epoch bumped once");
@@ -2934,6 +2943,7 @@ async fn rewind_excludes_coordinator_facts(ctx: &Ctx) {
                 | "harness_idle"
                 | "status_changed"
                 | "durability_rollback"
+                | "harness_mode_changed"
         );
         assert_eq!(
             e.rewound_at.is_none(),

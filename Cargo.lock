@@ -1444,6 +1444,7 @@ dependencies = [
  "clap",
  "engram-core",
  "engram-harness-proto",
+ "engram-harness-sdk",
  "engram-transport",
  "serde",
  "tokio",

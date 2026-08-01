@@ -6,7 +6,9 @@
 
 pub mod browser_activity;
 pub mod browser_view;
+pub mod mode_stamp;
 pub mod parked;
+pub mod plan;
 pub mod questions;
 
 use std::collections::{HashSet, VecDeque};
@@ -277,6 +279,14 @@ async fn pump_events<W: AsyncWrite + Unpin>(
 pub struct QueuedPrompt {
     pub prompt_id: String,
     pub text: String,
+    /// ADR 0107: the mode directive THIS prompt carried, applied when its turn
+    /// starts. It rides the prompt rather than a process-global latch because
+    /// the queue holds several prompts under type-ahead: latching on arrival
+    /// let a later prompt's mode decide an earlier prompt's turn, including
+    /// the unsafe direction where a prompt sent during a read-only pass ran
+    /// with full write access (PR #927 review). `None` inherits the session's
+    /// current mode rather than resetting it.
+    pub mode: Option<String>,
 }
 
 #[derive(Default)]
@@ -286,11 +296,15 @@ pub struct PromptQueue {
 }
 
 impl PromptQueue {
-    pub fn accept(&mut self, prompt_id: String, text: String) -> bool {
+    pub fn accept(&mut self, prompt_id: String, text: String, mode: Option<String>) -> bool {
         if !self.seen.insert(prompt_id.clone()) {
             return false;
         }
-        self.pending.push_back(QueuedPrompt { prompt_id, text });
+        self.pending.push_back(QueuedPrompt {
+            prompt_id,
+            text,
+            mode,
+        });
         true
     }
 
@@ -353,14 +367,39 @@ mod tests {
     #[test]
     fn prompt_queue_deduplicates_and_remains_editable() {
         let mut queue = PromptQueue::default();
-        assert!(queue.accept("p1".into(), "first".into()));
-        assert!(!queue.accept("p1".into(), "replay".into()));
+        assert!(queue.accept("p1".into(), "first".into(), None));
+        assert!(!queue.accept("p1".into(), "replay".into(), None));
         assert!(queue.edit("p1", "edited".into()));
         assert_eq!(queue.pop_front().unwrap().text, "edited");
 
-        assert!(queue.accept("p2".into(), "remove me".into()));
+        assert!(queue.accept("p2".into(), "remove me".into(), None));
         assert!(queue.remove("p2"));
         assert!(queue.pop_front().is_none());
+    }
+
+    /// ADR 0107 (PR #927 review): the mode has to ride the PROMPT. Latching a
+    /// process-global stamp on arrival meant a later queued prompt's mode
+    /// decided an earlier one's turn — and in the unsafe direction, a prompt
+    /// sent during a read-only pass ran with full write access because a later
+    /// prompt had switched back to build.
+    #[test]
+    fn a_queued_prompt_keeps_the_mode_it_was_sent_with() {
+        let mut queue = PromptQueue::default();
+        // A is sent during a plan pass (no directive: inherit plan).
+        assert!(queue.accept("a".into(), "audit the code".into(), None));
+        // B switches back to build.
+        assert!(queue.accept("b".into(), "now fix it".into(), Some("default".into())));
+
+        let a = queue.pop_front().expect("A first");
+        assert_eq!(a.prompt_id, "a");
+        assert_eq!(a.mode, None, "A carries no directive — it inherits plan");
+        let b = queue.pop_front().expect("B second");
+        assert_eq!(b.prompt_id, "b");
+        assert_eq!(
+            b.mode.as_deref(),
+            Some("default"),
+            "B's switch belongs to B's turn, not A's"
+        );
     }
 
     #[test]

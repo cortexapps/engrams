@@ -951,10 +951,16 @@ async fn forward_outbox_row(
                     .and_then(|t| t.as_str())
                     .unwrap_or_default()
                     .to_string();
+                // ADR 0107: the optional mode directive riding this prompt.
+                let mode = row
+                    .payload
+                    .get("mode")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m.to_string());
                 state
                     .services
                     .host
-                    .send_prompt(sandbox_id, row.prompt_id.clone(), text)
+                    .send_prompt(sandbox_id, row.prompt_id.clone(), text, mode)
                     .await
             }
             OutboxKind::Answer => unreachable!("legacy answer rows retire before forwarding"),

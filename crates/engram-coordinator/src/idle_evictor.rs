@@ -2455,8 +2455,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2686,8 +2689,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -2910,8 +2916,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -3237,8 +3246,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4354,8 +4366,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 
@@ -4623,8 +4638,11 @@ mod tests {
                 sandbox_id: engram_core::SandboxId,
                 prompt_id: String,
                 text: String,
+                _mode: Option<String>,
             ) -> Result<(), engram_core::SandboxError> {
-                self.inner.send_prompt(sandbox_id, prompt_id, text).await
+                self.inner
+                    .send_prompt(sandbox_id, prompt_id, text, _mode)
+                    .await
             }
         }
 

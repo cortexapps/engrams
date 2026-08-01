@@ -187,6 +187,11 @@ message CreateSessionRequest {
   // ADR 0106: human OAuth binding. Contains no credential bytes; the
   // coordinator verifies a live subject connection and persists it atomically.
   OAuthCredentialBinding oauth_credential = 12;
+  // ADR 0107: session mode for the initial `prompt` (e.g. "plan") —
+  // create-time plan mode is just mode on the first prompt. Ignored when
+  // `prompt` is unset. Validated against the selected harness's descriptor.
+  // Not named `mode` — field 2 is the agent/dev_vm SessionMode.
+  optional string harness_mode = 13;
 }
 
 message OAuthCredentialBinding {
@@ -227,6 +232,11 @@ message SendPromptRequest {
   // RunStarted{prompt_id} and (if queued) PromptQueued/Edited/Dequeued.
   // The coord mints one if empty (back-compat / non-web callers).
   string prompt_id = 3;
+  // ADR 0107: session-mode directive that applies from this prompt's turn
+  // onward (e.g. "plan"). Validated against the session harness's declared
+  // descriptor modes; unset = no change. Not named `mode` — that name is the
+  // agent/dev_vm SessionMode on CreateSessionRequest/Session.
+  optional string harness_mode = 4;
 }
 
 message SendPromptResponse {

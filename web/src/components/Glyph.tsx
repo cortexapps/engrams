@@ -21,12 +21,16 @@ export interface GlyphProps {
   status: SessionState;
   /** Override beat (e.g. event ticker doesn't pulse). */
   beat?: boolean;
+  /** ADR 0107: the session is waiting on the USER (a plan awaiting review,
+   * an unanswered question). Keeps the lifecycle shape but re-tones amber
+   * and joins the heartbeat — impossible to miss on a muted rail. */
+  attention?: boolean;
 }
 
-export function StatusGlyph({ status, beat = true }: GlyphProps) {
+export function StatusGlyph({ status, beat = true, attention = false }: GlyphProps) {
   const glyph = glyphFor(status);
-  const tone = toneFor(status);
-  const isLive = beat && status === "active";
+  const tone = attention ? "var(--instrument-caution)" : toneFor(status);
+  const isLive = beat && (status === "active" || attention);
 
   return (
     <motion.span
@@ -37,7 +41,7 @@ export function StatusGlyph({ status, beat = true }: GlyphProps) {
       transition={{ duration: 0.35, ease: "easeOut" }}
       className={`inline-block leading-none ${isLive ? "animate-pulse motion-reduce:animate-none" : ""}`}
       style={{ color: tone }}
-      aria-label={status}
+      aria-label={attention ? `${status} — waiting on you` : status}
     >
       {glyph}
     </motion.span>

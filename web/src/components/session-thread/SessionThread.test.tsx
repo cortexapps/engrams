@@ -292,6 +292,121 @@ describe("SessionThread", () => {
     expect(await screen.findByText("saving…")).toBeTruthy();
   });
 
+  // ADR 0107: the plan card's decisions ride the SAME CompleteToolCall path.
+  test("a plan card approves through CompleteToolCall with the canonical decision", async () => {
+    let completed: { sessionId: string; toolCallId: string; resultJson: string } | null = null;
+    const transport = createRouterTransport((router) => {
+      router.service(SessionService, {
+        completeToolCall: (req) => {
+          completed = {
+            sessionId: req.sessionId,
+            toolCallId: req.toolCallId,
+            resultJson: req.resultJson,
+          };
+          return { sessionId: req.sessionId, note: "ok" };
+        },
+      });
+    });
+    const user = userEvent.setup();
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "tool_call_requested",
+            run_id: "r1",
+            tool_call_id: "t-plan",
+            name: "exit_plan_mode",
+            args_json: JSON.stringify({ plan: "# Ship it\n\n1. Do the thing." }),
+            at: AT,
+          },
+        ])}
+      />,
+      { transport },
+    );
+
+    expect(await screen.findByText("plan ready — awaiting your review")).toBeTruthy();
+    expect(screen.getByText("Ship it")).toBeTruthy();
+    await user.click(screen.getByRole("button", { name: "Approve & build" }));
+
+    await waitFor(() => expect(completed).not.toBeNull());
+    expect(completed).toEqual({
+      sessionId: "s1",
+      toolCallId: "t-plan",
+      resultJson: JSON.stringify({ decision: "approve" }),
+    });
+    expect(await screen.findByText("starting build…")).toBeTruthy();
+  });
+
+  test("a plan card rejects with feedback riding the decision", async () => {
+    let completed: { resultJson: string } | null = null;
+    const transport = createRouterTransport((router) => {
+      router.service(SessionService, {
+        completeToolCall: (req) => {
+          completed = { resultJson: req.resultJson };
+          return { sessionId: req.sessionId, note: "ok" };
+        },
+      });
+    });
+    const user = userEvent.setup();
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "tool_call_requested",
+            run_id: "r1",
+            tool_call_id: "t-plan",
+            name: "exit_plan_mode",
+            args_json: JSON.stringify({ plan: "# Draft" }),
+            at: AT,
+          },
+        ])}
+      />,
+      { transport },
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Request changes" }));
+    await user.type(screen.getByPlaceholderText("What should change?"), "also add tests");
+    await user.click(screen.getByRole("button", { name: "Send feedback" }));
+
+    await waitFor(() => expect(completed).not.toBeNull());
+    expect(completed).toEqual({
+      resultJson: JSON.stringify({ decision: "reject", feedback: "also add tests" }),
+    });
+    expect(await screen.findByText("sending feedback…")).toBeTruthy();
+  });
+
+  test("a resolved plan renders as a receipt with the reviewer's feedback", async () => {
+    renderWithProviders(
+      <SessionThread
+        sessionId="s1"
+        status="idle"
+        events={indexed([
+          {
+            type: "tool_call_requested",
+            run_id: "r1",
+            tool_call_id: "t-plan",
+            name: "exit_plan_mode",
+            args_json: JSON.stringify({ plan: "# Draft" }),
+            at: AT,
+          },
+          {
+            type: "tool_result_submitted",
+            tool_call_id: "t-plan",
+            result_json: JSON.stringify({ decision: "reject", feedback: "cover tests" }),
+            at: AT2,
+          },
+        ])}
+      />,
+    );
+    expect(await screen.findByText("changes requested")).toBeTruthy();
+    expect(screen.getByText(/cover tests/)).toBeTruthy();
+    expect(screen.queryByRole("button", { name: "Approve & build" })).toBeNull();
+  });
+
   test("an unanswered non-question generic call shows a waiting tool affordance", async () => {
     renderWithProviders(
       <SessionThread

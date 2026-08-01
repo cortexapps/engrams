@@ -35,6 +35,12 @@ export interface ComposerActions {
   queued: { promptId: string; text: string }[];
   /** Cancel one queued message (the rail's × button) — fires `DequeueQueued`. */
   removeQueued: (promptId: string) => void;
+  /** ADR 0107: the composer's effective session mode ("default" | "plan"). */
+  mode: string;
+  /** ADR 0107: set the mode for the NEXT prompt (the plan chip). */
+  setMode: (next: string) => void;
+  /** ADR 0107: a proposed plan is awaiting the user's review. */
+  planPending: boolean;
 }
 
 export const ComposerActionsContext = createContext<ComposerActions>({
@@ -45,6 +51,9 @@ export const ComposerActionsContext = createContext<ComposerActions>({
   recall: () => null,
   queued: [],
   removeQueued: () => {},
+  mode: "default",
+  setMode: () => {},
+  planPending: false,
 });
 
 export const useComposerActions = (): ComposerActions => useContext(ComposerActionsContext);

@@ -137,6 +137,8 @@ pub(crate) fn create_request_from_proto(
         integration_policy_json,
         // ADR 0062: the per-session harness selection (a catalog key).
         harness,
+        // ADR 0107: the initial prompt's mode directive (e.g. "plan").
+        harness_mode,
         // Phase 1b: the initial prompt's client prompt_id. The create path
         // delivers the initial prompt via send_prompt (which mints one when
         // empty), so threading the client id for the FIRST message is a
@@ -197,6 +199,7 @@ pub(crate) fn create_request_from_proto(
         image: image_uri,
         mode,
         prompt,
+        harness_mode,
         secrets,
         selected_skills,
         capabilities,

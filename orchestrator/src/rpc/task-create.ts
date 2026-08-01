@@ -95,6 +95,8 @@ export interface SessionCreateInput {
     subject: { kind: OauthSubjectKind; id: string };
     provider: string;
   };
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
 }
 
 /** One harness's catalog descriptor (the bits the compiler needs): the model +
@@ -116,6 +118,8 @@ export interface HarnessDescriptorView {
   };
   models: Array<{ id: string; default: boolean; env: Record<string, string> }>;
   effort: Array<{ id: string; default: boolean; env: Record<string, string> }>;
+  /** ADR 0107: declared session modes (pure declaration — no env). */
+  modes?: Array<{ id: string; default: boolean }>;
 }
 export interface HarnessCatalogClient {
   listHarnesses(req: Record<string, never>): Promise<{
@@ -145,6 +149,9 @@ export interface SessionCompileDeps {
 
 export interface SessionCompileOpts {
   prompt?: string;
+  /** ADR 0107: session mode riding the initial prompt (e.g. "plan").
+   *  Validated against the selected harness's declared modes. */
+  harnessMode?: string;
   /** Per-session integration grants layered on top of the profile. These may
    *  affect the bound capabilities and integration policy, but never the tool
    *  manifest (for example, a scoped clone credential). */
@@ -207,6 +214,20 @@ export async function compileSessionCreateInput(
   const selectedHarness = opts.harness ?? profile.harness ?? DEFAULT_HARNESS;
   const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
+
+  // ADR 0107: a create-time session mode must be one the harness declares.
+  // The coordinator re-validates; failing fast here gives the create surface
+  // a clean error instead of a queued-then-rejected first prompt.
+  if (
+    opts.harnessMode != null &&
+    descriptor != null &&
+    !(descriptor.modes ?? []).some((mode) => mode.id === opts.harnessMode)
+  ) {
+    throw new ConnectError(
+      `harness \`${selectedHarness}\` does not declare mode \`${opts.harnessMode}\``,
+      Code.InvalidArgument,
+    );
+  }
 
   // Strict-by-principal credentials (ADR 0063 B4, amended): a human-owned task
   // carries the owner's per-user token; a service-account-created task carries
@@ -369,6 +390,7 @@ export async function compileSessionCreateInput(
     mode: "agent",
     harness: selectedHarness,
     ...(opts.prompt != null ? { prompt: opts.prompt } : {}),
+    ...(opts.harnessMode != null ? { harnessMode: opts.harnessMode } : {}),
     ...(harnessEnv != null ? { harnessEnv } : {}),
     ...(oauthCredential != null ? { oauthCredential } : {}),
     ...(selectedSkills.length > 0 ? { selectedSkills } : {}),
@@ -432,6 +454,8 @@ export interface CreateTaskParams {
   harness?: string;
   model?: string;
   effort?: string;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
   /** Type-specific trigger ref recorded on the task row (operator-visible). */
   source?: Record<string, unknown>;
   /** Extra harness env merged LAST — e.g. the trigger's
@@ -447,6 +471,8 @@ export interface CreateSessionForExistingTaskParams {
   role: string;
   ownerUserId?: string;
   prompt?: string;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  harnessMode?: string;
   extraCapabilities?: readonly string[];
   capabilityOverride?: readonly string[];
   networkOverride?: ProfileNetwork;
@@ -541,6 +567,7 @@ export async function createSessionForExistingTask(
       // programmatic credential while still creating the session promptless.
       ...(params.ownerUserId === undefined ? { programmatic: true } : {}),
       ...(params.prompt != null ? { prompt: params.prompt } : {}),
+      ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.extraCapabilities ? { extraCapabilities: params.extraCapabilities } : {}),
       ...(params.capabilityOverride !== undefined
         ? { capabilityOverride: params.capabilityOverride }
@@ -657,6 +684,7 @@ export async function createTaskWithSession(
       ...(params.harness != null ? { harness: params.harness } : {}),
       ...(params.model != null ? { model: params.model } : {}),
       ...(params.effort != null ? { effort: params.effort } : {}),
+      ...(params.harnessMode != null ? { harnessMode: params.harnessMode } : {}),
       ...(params.extraHarnessEnv ? { extraHarnessEnv: params.extraHarnessEnv } : {}),
       ...(owner ? { owner } : {}),
     },

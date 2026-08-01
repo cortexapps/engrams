@@ -366,6 +366,15 @@ pub enum SessionEvent {
         reason: String,
         at: DateTime<Utc>,
     },
+    /// ADR 0107: a validated session-mode directive rode a prompt (e.g.
+    /// `plan`). Coordinator-authoritative — the user genuinely selected the
+    /// mode — so `rewind_session_to_cursor` excludes this kind from its
+    /// tombstone UPDATE, like `prompt_received`. The web derives the current
+    /// mode chip from the latest of these plus plan-approval results.
+    HarnessModeChanged {
+        mode: String,
+        at: DateTime<Utc>,
+    },
 }
 
 /// ADR 0045 F1: why a rung-1 recovery rewound the transcript. Drives the
@@ -451,6 +460,7 @@ impl SessionEvent {
             Self::StatusChanged { .. } => "status_changed",
             Self::PromptReceived { .. } => "prompt_received",
             Self::ToolResultSubmitted { .. } => "tool_result_submitted",
+            Self::HarnessModeChanged { .. } => "harness_mode_changed",
             Self::ExecStarted { .. } => "exec_started",
             Self::ExecCompleted { .. } => "exec_completed",
             Self::Stdout { .. } => "stdout",
@@ -1969,6 +1979,10 @@ pub(crate) mod tests {
         /// rows on the floor, which would make any deliver-ordering
         /// assertion vacuous.
         pub(crate) outbox: PlMutex<Vec<engram_core::types::outbox::OutboxRow>>,
+        /// ADR 0107: the session's persisted harness selection, so
+        /// `send_prompt_core`'s `harness_mode` validation is exercisable
+        /// (the trait default returns `None`, which rejects every mode).
+        pub(crate) harness: PlMutex<Option<String>>,
     }
 
     /// Alias so `clippy::type_complexity` stays happy on MiniMeta's
@@ -2027,6 +2041,7 @@ pub(crate) mod tests {
                 acked_outbox: PlMutex::new(Vec::new()),
                 ops: engram_core::types::session_op::InMemoryOpLog::default(),
                 outbox: PlMutex::new(Vec::new()),
+                harness: PlMutex::new(None),
             }
         }
     }
@@ -2540,6 +2555,12 @@ pub(crate) mod tests {
                 // as "newly acked" — the pre-pass-2 behavior.
                 None => Ok(true),
             }
+        }
+        async fn get_session_harness(
+            &self,
+            _session_id: SessionId,
+        ) -> Result<Option<String>, MetaError> {
+            Ok(self.harness.lock().clone())
         }
         async fn outbox_enqueue(
             &self,

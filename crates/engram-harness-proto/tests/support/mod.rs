@@ -161,7 +161,13 @@ pub fn harness_command() -> impl Strategy<Value = HarnessCommand> {
     prop_oneof![
         checkpoint_reason().prop_map(|reason| HarnessCommand::Checkpoint { reason }),
         any::<u32>().prop_map(|grace_secs| HarnessCommand::Shutdown { grace_secs }),
-        (s(), s()).prop_map(|(text, prompt_id)| HarnessCommand::Prompt { text, prompt_id }),
+        (s(), s(), proptest::option::of(s())).prop_map(|(text, prompt_id, mode)| {
+            HarnessCommand::Prompt {
+                text,
+                prompt_id,
+                mode,
+            }
+        }),
         Just(HarnessCommand::Interrupt),
         (s(), s()).prop_map(|(prompt_id, text)| HarnessCommand::EditQueued { prompt_id, text }),
         s().prop_map(|prompt_id| HarnessCommand::DequeueQueued { prompt_id }),

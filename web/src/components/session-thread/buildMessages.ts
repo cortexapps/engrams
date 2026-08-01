@@ -146,7 +146,28 @@ export type SystemMarker =
       manifest: string | null;
       reason: string;
       at: string;
-    };
+    }
+  // ADR 0107: the agent proposed a plan via the deferred `exit_plan_mode`
+  // tool. Rendered as an INTERACTIVE card — the doc + approve/reject while
+  // unresolved, a one-line receipt once decided. `resolution` folds in from
+  // the matching `tool_result_submitted`.
+  | {
+      kind: "plan";
+      toolCallId: string;
+      plan: string;
+      /** 1-based ordinal of this plan among the session's plan proposals. */
+      revision: number;
+      resolution: { approved: boolean; feedback: string | null; at: string } | null;
+      at: string;
+    }
+  // ADR 0107: a validated session-mode directive rode a prompt — a faint
+  // one-line marker narrating the transition ("planning — read-only" /
+  // "plan mode off").
+  | { kind: "mode"; mode: string; at: string }
+  // ADR 0107: the agent called exit_plan_mode OUTSIDE plan mode (the harness
+  // rejected it in place — no park, no card). Rendered as a hint marker
+  // instead of a dead failed-tool row.
+  | { kind: "plan_attempt"; at: string };
 
 /** Footer carried in an assistant message's `metadata.custom.run` — the
  *  per-run receipt (`↳ read N · edited N · ran N`). */
@@ -180,6 +201,14 @@ export interface BuildMessagesResult {
    *  oldest→newest. Drives the composer's ↑-to-edit recall + cancel. Rebuilt
    *  purely from session events, so it survives refresh / multi-client. */
   queue: QueuedPrompt[];
+  /** ADR 0107: the newest unresolved plan proposal, if any — drives the
+   *  composer's review hint and the attention affordances. Null when every
+   *  plan is decided or none was ever proposed. */
+  pendingPlan: { toolCallId: string } | null;
+  /** ADR 0107: the session's current mode as derivable from the event log —
+   *  the latest `harness_mode_changed`, overridden to the default by a later
+   *  approved plan. Drives the composer chip. */
+  currentMode: string;
 }
 
 // ---- internal mutable drafts (assignable to ThreadMessageLike) --------
@@ -289,6 +318,39 @@ function parseCanonicalAnswers(resultJson: string): Record<string, string[]> | n
   }
 }
 
+/** ADR 0107: `exit_plan_mode` request args — `{plan: markdown}`. */
+function parsePlanArgs(argsJson: string): string | null {
+  try {
+    const raw: unknown = JSON.parse(argsJson);
+    if (typeof raw !== "object" || raw === null) return null;
+    const plan = (raw as Record<string, unknown>).plan;
+    return typeof plan === "string" && plan.length > 0 ? plan : null;
+  } catch {
+    return null;
+  }
+}
+
+/** ADR 0107: `exit_plan_mode` result — `{decision, feedback?}`. */
+function parsePlanResolution(
+  resultJson: string,
+  at: string,
+): { approved: boolean; feedback: string | null; at: string } | null {
+  try {
+    const raw: unknown = JSON.parse(resultJson);
+    if (typeof raw !== "object" || raw === null) return null;
+    const decision = (raw as Record<string, unknown>).decision;
+    if (decision !== "approve" && decision !== "reject") return null;
+    const feedback = (raw as Record<string, unknown>).feedback;
+    return {
+      approved: decision === "approve",
+      feedback: typeof feedback === "string" && feedback.trim().length > 0 ? feedback : null,
+      at,
+    };
+  } catch {
+    return null;
+  }
+}
+
 function parseJsonValue(json: string): { ok: true; value: unknown } | { ok: false } {
   try {
     return { ok: true, value: JSON.parse(json) as unknown };
@@ -384,6 +446,14 @@ export function buildMessages(
 
   // Push a system "harness register" message carrying a marker payload. The
   // single text part is a plain-text fallback; the renderer reads `marker`.
+  let planRevision = 0;
+  // ADR 0107: is the session in plan mode AT THIS POINT in the walk (mode
+  // directives set it; an approved plan returns to the default).
+  let planModeOn = false;
+  // ADR 0107: did a plan decision land in THIS run? Its interrupt is a handoff
+  // to the revision/build turn, not a cancellation.
+  let planHandoff = false;
+  const planAttemptToolCallIds = new Set<string>();
   const pushSystem = (id: string, fallback: string, marker: SystemMarker) => {
     active = null;
     out.push({
@@ -423,6 +493,12 @@ export function buildMessages(
   // distinguished from real tool rows.
   const questionToolCallIds = new Set<string>();
   const answersByToolCallId = new Map<string, Record<string, string[]>>();
+  // ADR 0107: plan proposals + their folded decisions.
+  const planToolCallIds = new Set<string>();
+  const planResolutionByToolCallId = new Map<
+    string,
+    { approved: boolean; feedback: string | null; at: string }
+  >();
   const genericRequests = new Map<
     string,
     Extract<IndexedEvent["event"], { type: "tool_call_requested" }>
@@ -456,6 +532,9 @@ export function buildMessages(
       if (event.name === "ask_user_question" && parseCanonicalQuestions(event.args_json) !== null) {
         questionToolCallIds.add(event.tool_call_id);
       }
+      if (event.name === "exit_plan_mode" && parsePlanArgs(event.args_json) !== null) {
+        planToolCallIds.add(event.tool_call_id);
+      }
     } else if (event.type === "tool_call_started") {
       startedToolCallIds.add(event.tool_call_id);
     } else if (event.type === "tool_call_completed") {
@@ -482,6 +561,10 @@ export function buildMessages(
         const answers = parseCanonicalAnswers(event.result_json);
         if (answers) answersByToolCallId.set(event.tool_call_id, answers);
       }
+      if (planToolCallIds.has(event.tool_call_id)) {
+        const resolution = parsePlanResolution(event.result_json, event.at);
+        if (resolution) planResolutionByToolCallId.set(event.tool_call_id, resolution);
+      }
     }
   }
 
@@ -489,6 +572,16 @@ export function buildMessages(
     const { idx, event: ev } = indexed;
     const lenBefore = out.length;
     switch (ev.type) {
+      case "harness_mode_changed": {
+        planModeOn = ev.mode === "plan";
+        pushSystem(`mode:${idx}`, `mode: ${ev.mode}`, {
+          kind: "mode",
+          mode: ev.mode,
+          at: ev.at,
+        });
+        break;
+      }
+
       case "run_started": {
         // The session is producing output — the transient "waking up" marker
         // has served its purpose; drop it BEFORE capturing runStartLen so the
@@ -496,6 +589,7 @@ export function buildMessages(
         clearWaking();
         tally = { reads: 0, edits: 0, ran: 0, other: 0 };
         runOpen = true;
+        planHandoff = false;
         active = null;
         runStartLen = out.length;
         if (ev.prompt_id) {
@@ -568,6 +662,26 @@ export function buildMessages(
       }
 
       case "tool_call_started": {
+        // ADR 0107: an exit_plan_mode call with NO generic request behind it.
+        // While plan mode is OFF that is the out-of-mode rejection (the
+        // harness answered it in place) and a hint reads better than a failed
+        // tool row. While plan mode is ON it is the CLI re-calling a tool
+        // whose first call is already parked (session 4a70374e) — the card
+        // covers it, and telling the user to "turn on the plan chip" when it
+        // is already on is nonsense. Drop the row either way.
+        if (
+          canonicalToolName(ev.tool_name) === "exit_plan_mode" &&
+          !genericRequests.has(ev.tool_call_id)
+        ) {
+          planAttemptToolCallIds.add(ev.tool_call_id);
+          if (!planModeOn) {
+            pushSystem(`plan-attempt:${idx}`, "the agent drafted a plan outside plan mode", {
+              kind: "plan_attempt",
+              at: ev.at,
+            });
+          }
+          break;
+        }
         // #64389: Claude may narrate multiple AskUserQuestion tool_use rows for
         // one real deferred request. A start is phantom only when its tool maps
         // to a deferred request seen in this transcript (or the native binding),
@@ -580,7 +694,16 @@ export function buildMessages(
           (nativeQuestion || mapsToObservedDeferred) &&
           !genericRequests.has(ev.tool_call_id) &&
           !completedToolCallIds.has(ev.tool_call_id);
-        if (questionToolCallIds.has(ev.tool_call_id) || phantom) break;
+        // A deferred plan/question call is REPRESENTED BY ITS CARD. Rendering
+        // the raw tool row too is not just redundant: the matching completion
+        // is suppressed below, so the row would spin on "Waiting for tool"
+        // forever beside a card that has already resolved.
+        if (
+          questionToolCallIds.has(ev.tool_call_id) ||
+          planToolCallIds.has(ev.tool_call_id) ||
+          phantom
+        )
+          break;
         bump(classifyTool(ev.tool_name));
         const a = ensureAssistant(ev.at);
         // ADR 0054 Flavor A: a Write/Edit/MultiEdit that produced a successful
@@ -622,6 +745,21 @@ export function buildMessages(
       }
 
       case "tool_call_requested": {
+        if (ev.name === "exit_plan_mode") {
+          const plan = parsePlanArgs(ev.args_json);
+          if (plan) {
+            planRevision += 1;
+            pushSystem(`tcr:${idx}`, "the agent proposed a plan", {
+              kind: "plan",
+              toolCallId: ev.tool_call_id,
+              plan,
+              revision: planRevision,
+              resolution: planResolutionByToolCallId.get(ev.tool_call_id) ?? null,
+              at: ev.at,
+            });
+          }
+          break;
+        }
         if (ev.name === "ask_user_question") {
           const questions = parseCanonicalQuestions(ev.args_json);
           if (questions) {
@@ -657,6 +795,11 @@ export function buildMessages(
 
       // Folded onto its generic request row/card by the pre-scan.
       case "tool_result_submitted":
+        // ADR 0107: an approved plan returns the session to the default mode
+        // (the harness flips the same stamp guest-side).
+        if (planResolutionByToolCallId.get(ev.tool_call_id)?.approved) planModeOn = false;
+        // Either decision hands the turn off (see the run-end arm).
+        if (planToolCallIds.has(ev.tool_call_id)) planHandoff = true;
         break;
 
       case "tool_call_completed": {
@@ -664,6 +807,10 @@ export function buildMessages(
         // resume) — its outcome is the card, not a tool part. `tool_name` is
         // blank on completed events, so match on the pre-scanned id set.
         if (questionToolCallIds.has(ev.tool_call_id)) break;
+        // ADR 0107: a plan's outcome is the card's receipt, not a tool row;
+        // an out-of-mode attempt's outcome is its hint marker.
+        if (planToolCallIds.has(ev.tool_call_id)) break;
+        if (planAttemptToolCallIds.has(ev.tool_call_id)) break;
         const part = openTools.get(ev.tool_call_id);
         if (part) {
           part.result = ev.result_summary ?? undefined;
@@ -723,8 +870,14 @@ export function buildMessages(
 
       case "run_completed":
       case "run_interrupted": {
-        const interrupted = ev.type === "run_interrupted";
-        const ok = interrupted ? false : ev.ok;
+        // ADR 0107: a plan decision ENDS the read-only turn by design — the
+        // codex adapter interrupts it and starts the revision/build turn from
+        // the queue. That is a handoff, not a cancellation, and rendering it
+        // as red "interrupted" told the reviewer their approval broke
+        // something (session 3728924b). The plan receipt already narrates the
+        // transition; the run just closes normally.
+        const interrupted = ev.type === "run_interrupted" && !planHandoff;
+        const ok = interrupted ? false : ev.type === "run_interrupted" || ev.ok;
         const footer: RunFooter = {
           reads: tally?.reads ?? 0,
           edits: tally?.edits ?? 0,
@@ -738,11 +891,22 @@ export function buildMessages(
         // (or other trailing marker) ended the turn, `active` is null and the
         // run may have no assistant bubble at all — don't synthesize an empty
         // one just to hold a footer (it would render as a stray ✗ receipt).
+        // EVERY bubble this run produced has to leave "running" — not just the
+        // one carrying the receipt. A system marker mid-run (a plan card, a
+        // question) nulls `active`, so the next part opens a NEW bubble and the
+        // earlier ones would keep spinning their tool rows forever after the
+        // run ended: session 4a70374e showed "Waiting for tool: ToolSearch"
+        // beside a finished turn.
+        const settled: ThreadMessageLike["status"] = ok
+          ? { type: "complete", reason: "stop" }
+          : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
+        for (let i = runStartLen; i < out.length; i++) {
+          const m = out[i]!;
+          if (m.role === "assistant" && m.status?.type === "running") m.status = settled;
+        }
         const a = active ?? runAssistant();
         if (a) {
-          a.status = ok
-            ? { type: "complete", reason: "stop" }
-            : { type: "incomplete", reason: interrupted ? "cancelled" : "error" };
+          a.status = settled;
           a.metadata = { custom: { ...a.metadata?.custom, run: footer } };
         }
         active = null;
@@ -960,7 +1124,16 @@ export function buildMessages(
     else a.content.push({ type: "text", text: streamingText });
   }
 
-  const isRunning = !sessionInactive && (runOpen || tailAwaiting(out));
+  // A deferred call awaiting a HUMAN is the opposite of working: the agent is
+  // blocked on the reviewer, not thinking. Codex keeps its app-server turn open
+  // across the park, so `runOpen` stays true and the composer showed "working…"
+  // (plus a live Stop button) under a plan card asking for a decision — session
+  // 676b367f. `harness_parked` never reaches the client, so derive it from the
+  // ledger the cards already read.
+  const awaitingDecision =
+    [...planToolCallIds].some((id) => !planResolutionByToolCallId.has(id)) ||
+    [...questionToolCallIds].some((id) => !answersByToolCallId.has(id));
+  const isRunning = !sessionInactive && !awaitingDecision && (runOpen || tailAwaiting(out));
 
   // Give the working indicator somewhere to live when we're running but the
   // tail isn't already a running assistant message (e.g. the user just sent
@@ -977,7 +1150,43 @@ export function buildMessages(
     summary,
   }));
 
-  return { messages: out as ThreadMessageLike[], isRunning, queue };
+  // ADR 0107: the newest unresolved plan (order-independent via the
+  // pre-scanned sets), suppressed on TERMINAL sessions — nothing can consume
+  // a decision there. A parked/idle session is exactly where a plan waits.
+  const sessionTerminal =
+    status === "completed" || status === "failed" || status === "dead" || status === "host_lost";
+  let pendingPlan: { toolCallId: string } | null = null;
+  if (!sessionTerminal) {
+    for (const { event } of events) {
+      if (
+        event.type === "tool_call_requested" &&
+        planToolCallIds.has(event.tool_call_id) &&
+        !planResolutionByToolCallId.has(event.tool_call_id)
+      ) {
+        pendingPlan = { toolCallId: event.tool_call_id };
+      }
+    }
+  }
+
+  // ADR 0107: latest mode directive, flipped back to the default by a later
+  // plan approval (the harness stamps the same transition guest-side).
+  let currentMode = "default";
+  let currentModeIdx = -1;
+  for (const { idx, event } of events) {
+    if (event.type === "harness_mode_changed") {
+      currentMode = event.mode;
+      currentModeIdx = idx;
+    } else if (
+      event.type === "tool_result_submitted" &&
+      planResolutionByToolCallId.get(event.tool_call_id)?.approved &&
+      idx > currentModeIdx
+    ) {
+      currentMode = "default";
+      currentModeIdx = idx;
+    }
+  }
+
+  return { messages: out as ThreadMessageLike[], isRunning, queue, pendingPlan, currentMode };
 }
 
 // Walk back from the tail (skipping durability markers, which don't imply

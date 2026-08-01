@@ -217,6 +217,7 @@ impl Driver {
             oauth_credential: None,
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         self.create_session_retrying(req, "dev_vm").await
     }
@@ -238,6 +239,7 @@ impl Driver {
             oauth_credential: None,
             prompt_id: None,
             harness: None,
+            harness_mode: None,
         };
         self.create_session_retrying(req, "dev_vm + skills").await
     }
@@ -278,6 +280,7 @@ impl Driver {
             // The built-in `claude` needs no registration — it resolves from the
             // host `current_bundles` stamp (∪ the catalog) by name.
             harness: Some("claude".to_string()),
+            harness_mode: None,
         };
         self.create_session_retrying(req, "claude").await
     }
@@ -300,6 +303,7 @@ impl Driver {
             oauth_credential: None,
             prompt_id: None,
             harness: Some("codex".to_string()),
+            harness_mode: None,
         };
         self.create_session_retrying(req, "codex").await
     }

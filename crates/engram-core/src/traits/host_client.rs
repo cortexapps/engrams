@@ -424,15 +424,18 @@ pub trait HostClient: Send + Sync {
     /// `prompt_id` is the client/coord-minted id that correlates this
     /// prompt with its eventual `RunStarted{prompt_id}` (and, if queued
     /// behind an in-flight run, the `PromptQueued`/`PromptEdited`/
-    /// `PromptDequeued` events). `SandboxError::NotFound` if no harness is
-    /// bound (call `ensure_active` upstream to auto-resume). Other errors
-    /// come from the underlying writer dropping or the harness
-    /// disconnecting mid-send.
+    /// `PromptDequeued` events). `mode` (ADR 0107) is the optional
+    /// session-mode directive riding this prompt, forwarded verbatim on
+    /// `HarnessCommand::Prompt.mode`. `SandboxError::NotFound` if no
+    /// harness is bound (call `ensure_active` upstream to auto-resume).
+    /// Other errors come from the underlying writer dropping or the
+    /// harness disconnecting mid-send.
     async fn send_prompt(
         &self,
         sandbox_id: SandboxId,
         prompt_id: String,
         text: String,
+        mode: Option<String>,
     ) -> Result<(), SandboxError>;
 
     /// Phase 1b: edit a still-queued type-ahead prompt on the attached
