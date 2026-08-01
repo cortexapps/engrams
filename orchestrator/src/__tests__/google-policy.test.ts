@@ -87,7 +87,7 @@ describe("Google egress policy", () => {
       path_globs: [
         "segment:/compute/v1/projects/prod/zones/us-central1-a/instances/engram-dev/start",
       ],
-      mint_source: { kind: "connection", connection_id: "connection-1" },
+      mint_source: { connection: { connection_id: "connection-1" } },
     });
   });
 

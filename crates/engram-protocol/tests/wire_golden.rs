@@ -50,8 +50,11 @@ use std::path::PathBuf;
 
 use chrono::DateTime;
 use engram_core::types::cow_state::{CowState, CowStateRecord};
-use engram_core::types::egress::{EgressSecretEntry, SessionEgressPolicy};
+use engram_core::types::egress::{
+    EgressInjectEntry, EgressObserveEntry, EgressSecretEntry, SessionEgressPolicy,
+};
 use engram_core::types::image::{NetworkDefault, NetworkPolicy, SecretMode};
+use engram_core::types::integration::CredentialMintSource;
 use engram_core::types::manifest::ManifestRef;
 use engram_core::types::sandbox::{
     AgentSpec, AuxBundleRef, AuxRoDrive, CpuLimit, DiskLimit, MemoryLimit, SandboxSpec,
@@ -241,6 +244,55 @@ fn session_egress_policy() -> SessionEgressPolicy {
     }
 }
 
+/// The engrams-review outage (2026-08-01): every field of the inject/observe
+/// ENTRY types populated — most importantly `mint_source: Some(..)`, which the
+/// empty-`injects` golden above can never exercise. `CredentialMintSource` was
+/// internally tagged (#931); bincode ENCODED that as a map but could never
+/// DECODE it (`deserialize_any`), so every policy carrying a minted inject —
+/// every GitHub PR-review session — failed host-side at boot. Wire v22 made it
+/// externally tagged; this fixture pins the populated-entry encoding so the
+/// entry types can't silently drop off the corpus again.
+fn session_egress_policy_minted() -> SessionEgressPolicy {
+    SessionEgressPolicy {
+        injects: vec![EgressInjectEntry {
+            secret: "ghs_minted".into(),
+            header_name: "authorization".into(),
+            header_template: "Bearer {}".into(),
+            allow_hosts: vec!["api.github.com".into()],
+            allow_host_patterns: vec![],
+            methods: vec!["POST".into()],
+            path_globs: vec!["/graphql".into()],
+            graphql_operation: "mutation".into(),
+            graphql_field: "createIssue".into(),
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "github-default".into(),
+                provider: "github".into(),
+            }),
+            expires_at: Some(DateTime::from_timestamp(1_770_003_600, 0).unwrap()),
+        }],
+        observes: vec![EgressObserveEntry {
+            allow_hosts: vec!["api.github.com".into()],
+            allow_host_patterns: vec![],
+            methods: vec!["POST".into()],
+            path_globs: vec!["/repos/*/issues".into()],
+            provider: "github".into(),
+            asset_kind: "issue".into(),
+            surface: "asset".into(),
+            success_status_class: Some("2xx".into()),
+            success_no_graphql_errors: false,
+            graphql_operation: String::new(),
+            graphql_field: String::new(),
+            data: vec![("number".into(), "$.resp.number".into())],
+            fetchable: Some("$.resp.html_url".into()),
+            url_fallback: Some(engram_core::types::integration::ObserveUrlFallback {
+                pattern: "https://github.com/{owner}/{name}/issues/{number:int}".into(),
+                fields: vec![("number".into(), "{number}".into())],
+            }),
+        }],
+        ..session_egress_policy()
+    }
+}
+
 fn cow_state() -> CowState {
     CowState {
         disk_manifest: fixed_manifest_ref(0x40, 7),
@@ -312,6 +364,10 @@ fn struct_payloads_golden() {
     // SessionEgressPolicy / CowState / CowStateRecord don't derive
     // `PartialEq`; pin their encoded bytes (field-order regression catch).
     assert_golden_no_eq("session_egress_policy", &session_egress_policy());
+    assert_golden_no_eq(
+        "session_egress_policy_minted",
+        &session_egress_policy_minted(),
+    );
     assert_golden_no_eq("cow_state", &cow_state());
     assert_golden_no_eq(
         "cow_state_record",
@@ -355,6 +411,17 @@ fn nested_enum_variant_indices() {
     assert_golden("secret_mode_broker", &SecretMode::Broker);
     assert_variant_index(&SecretMode::Literal, 0, "SecretMode::Literal");
     assert_variant_index(&SecretMode::Broker, 1, "SecretMode::Broker");
+
+    // CredentialMintSource rides EgressInjectEntry.mint_source on the wire
+    // (v22, externally tagged — see the minted-policy fixture).
+    assert_variant_index(
+        &CredentialMintSource::Connection {
+            connection_id: "github-default".into(),
+            provider: "github".into(),
+        },
+        0,
+        "CredentialMintSource::Connection",
+    );
 
     assert_golden("network_default_allow", &NetworkDefault::Allow);
     assert_golden("network_default_deny", &NetworkDefault::Deny);
@@ -471,8 +538,13 @@ fn wire_version_pinned() {
     // Refused terminal. No bincode payload changed.
     // 20 -> 21: ADR 0109 — `SessionEgressPolicy.google_adc` is a trailing
     // bincode field. The session-egress-policy golden was regenerated.
+    // 21 -> 22: `CredentialMintSource` becomes externally tagged — the
+    // internally-tagged form (#931) could never bincode-DECODE, so every
+    // minted-inject policy failed host-side at boot (the engrams-review
+    // outage, 2026-08-01). No existing golden changes bytes (the broken
+    // `Some` shape never had one); the minted-policy golden is ADDED.
     assert_eq!(
-        WIRE_VERSION, 21,
+        WIRE_VERSION, 22,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }
@@ -509,6 +581,10 @@ fn regen_golden() {
         },
     );
     write("session_egress_policy", &session_egress_policy());
+    write(
+        "session_egress_policy_minted",
+        &session_egress_policy_minted(),
+    );
     write("cow_state", &cow_state());
     write(
         "cow_state_record",
@@ -569,6 +645,29 @@ fn regen_golden() {
     );
     write("wire_write_files_request", &wire_write_files_request());
     write("wire_write_files_response", &wire_write_files_response());
+}
+
+/// The engrams-review outage (2026-08-01): the internally-tagged
+/// `CredentialMintSource` (#931) bincode-ENCODED fine but could never DECODE
+/// (`deserialize_any`), so the encode-only golden pin above was green while
+/// every minted-inject policy failed host-side. This test pins the DECODE leg:
+/// a populated `Some(mint_source)` + `Some(expires_at)` must round-trip.
+/// `SessionEgressPolicy` has no `PartialEq`, so assert the fields that carry
+/// the regression.
+#[test]
+fn minted_inject_policy_bincode_round_trips() {
+    let policy = session_egress_policy_minted();
+    let bytes = bincode::serialize(&policy).expect("bincode encode minted policy");
+    let back: SessionEgressPolicy =
+        bincode::deserialize(&bytes).expect("bincode decode minted policy");
+    assert_eq!(back.injects.len(), 1);
+    assert_eq!(back.injects[0].mint_source, policy.injects[0].mint_source);
+    assert_eq!(back.injects[0].expires_at, policy.injects[0].expires_at);
+    assert_eq!(back.observes.len(), 1);
+    assert_eq!(
+        back.observes[0].url_fallback,
+        policy.observes[0].url_fallback
+    );
 }
 
 /// ADR 0080 prod regression (dev-brain enable): `WarmConfig.env` holds

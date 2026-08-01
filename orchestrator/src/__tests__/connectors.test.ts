@@ -452,9 +452,10 @@ describe("compileIntegrationPolicy", () => {
     // empty in the compiled policy.
     expect(injects[0]).toMatchObject({
       mint_source: {
-        kind: "connection",
-        connection_id: "test-github",
-        provider: "github",
+        connection: {
+          connection_id: "test-github",
+          provider: "github",
+        },
       },
       secret_ref: "",
       header_name: "",
@@ -570,9 +571,10 @@ describe("compileIntegrationPolicy — observes", () => {
     expect(policy.injects).toHaveLength(1);
     expect(policy.injects[0]).toMatchObject({
       mint_source: {
-        kind: "connection",
-        connection_id: "test-github",
-        provider: "github",
+        connection: {
+          connection_id: "test-github",
+          provider: "github",
+        },
       },
     });
     expect(policy.observes).toEqual([
@@ -611,9 +613,10 @@ describe("compileIntegrationPolicy — GraphQL (ADR 0059)", () => {
     const gql = policy.injects.find((i) => i.graphql_field === "mergePullRequest");
     expect(gql).toMatchObject({
       mint_source: {
-        kind: "connection",
-        connection_id: "test-github",
-        provider: "github",
+        connection: {
+          connection_id: "test-github",
+          provider: "github",
+        },
       },
       methods: ["POST"],
       path_globs: ["/graphql"],
@@ -690,9 +693,8 @@ describe("on-disk registry", () => {
     // emits a minted inject for github.
     expect(policy.injects.length).toBeGreaterThan(0);
     expect(policy.injects.every((i) =>
-      i.mint_source?.kind === "connection" &&
-        i.mint_source.connection_id === "test-github" &&
-        i.mint_source.provider === "github"
+      i.mint_source?.connection.connection_id === "test-github" &&
+        i.mint_source.connection.provider === "github"
     )).toBe(true);
     // Two issue assets are observed: the REST create (POST /repos/*/issues, gated by
     // the 2xx status) and the GraphQL createIssue mutation (gated by noGraphqlErrors).

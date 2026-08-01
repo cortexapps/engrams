@@ -133,9 +133,10 @@ export function appendGooglePolicy(
         header_template: "",
         secret_ref: "",
         mint_source: {
-          kind: "connection",
-          connection_id: connection.id,
-          provider: connection.provider,
+          connection: {
+            connection_id: connection.id,
+            provider: connection.provider,
+          },
         },
         methods: curated?.methods ?? [],
         path_globs: constrainedPaths(
@@ -148,8 +149,8 @@ export function appendGooglePolicy(
       };
       const conflict = policy.injects.find((candidate) =>
         candidate.hosts.includes(host) &&
-        candidate.mint_source?.kind === "connection" &&
-        candidate.mint_source.connection_id !== connection.id &&
+        candidate.mint_source != null &&
+        candidate.mint_source.connection.connection_id !== connection.id &&
         matchersOverlap(candidate, entry)
       );
       if (conflict) {
