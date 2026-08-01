@@ -680,7 +680,16 @@ export function buildMessages(
           (nativeQuestion || mapsToObservedDeferred) &&
           !genericRequests.has(ev.tool_call_id) &&
           !completedToolCallIds.has(ev.tool_call_id);
-        if (questionToolCallIds.has(ev.tool_call_id) || phantom) break;
+        // A deferred plan/question call is REPRESENTED BY ITS CARD. Rendering
+        // the raw tool row too is not just redundant: the matching completion
+        // is suppressed below, so the row would spin on "Waiting for tool"
+        // forever beside a card that has already resolved.
+        if (
+          questionToolCallIds.has(ev.tool_call_id) ||
+          planToolCallIds.has(ev.tool_call_id) ||
+          phantom
+        )
+          break;
         bump(classifyTool(ev.tool_name));
         const a = ensureAssistant(ev.at);
         // ADR 0054 Flavor A: a Write/Edit/MultiEdit that produced a successful

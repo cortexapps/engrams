@@ -1722,5 +1722,14 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
     const kinds = messages.map((m) => customMarker(m)?.kind).filter(Boolean);
     expect(kinds).toContain("plan");
     expect(kinds).not.toContain("plan_attempt");
+    // The card IS the call. Its raw tool row must not also render: the
+    // matching completion is suppressed, so the row would spin on "Waiting
+    // for tool" forever next to a card the reviewer has already resolved.
+    const toolParts = messages.flatMap((m) =>
+      (Array.isArray(m.content) ? m.content : []).filter(
+        (part) => part.type === "tool-call" && part.toolCallId === "t-plan",
+      ),
+    );
+    expect(toolParts).toHaveLength(0);
   });
 });
