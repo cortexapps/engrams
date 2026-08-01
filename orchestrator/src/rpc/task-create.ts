@@ -41,10 +41,12 @@ import {
   policyHasContent,
   loadRegistry,
   type CustomConnectorSource,
+  type IntegrationSecretJson,
 } from "../connectors/registry.ts";
 import { compileToolManifest } from "../tools/manifest.ts";
 import { tools as productionTools, type ToolRegistry } from "../tools/registry.ts";
 import { PAPERCUT_SYSTEM_PROMPT } from "../tools/papercut-prompt.ts";
+import { orgSecret as defaultOrgSecret } from "../control-plane/client.ts";
 
 const log = rootLog.child({ component: "task" });
 
@@ -101,13 +103,40 @@ export interface HarnessDescriptorView {
    *  `*Hint` fields are free-text setup instructions surfaced to the user
    *  (e.g. "Run `claude setup-token`"). */
   auth?: { userEnv?: string; orgEnv?: string; userEnvHint?: string; orgEnvHint?: string };
-  models: Array<{ id: string; default: boolean; env: Record<string, string> }>;
-  effort: Array<{ id: string; default: boolean; env: Record<string, string> }>;
+  models: Array<{
+    id: string;
+    default: boolean;
+    env: Record<string, string>;
+    secrets?: Array<{
+      ref: string;
+      env: string;
+      mode: string;
+      hosts: string[];
+      hostPatterns: string[];
+    }>;
+  }>;
+  effort: Array<{
+    id: string;
+    default: boolean;
+    env: Record<string, string>;
+    secrets?: Array<{
+      ref: string;
+      env: string;
+      mode: string;
+      hosts: string[];
+      hostPatterns: string[];
+    }>;
+  }>;
 }
 export interface HarnessCatalogClient {
   listHarnesses(req: Record<string, never>): Promise<{
     harnesses: Array<{ name: string; descriptor?: HarnessDescriptorView }>;
   }>;
+}
+
+/** Name-only slice of OrgSecretService. Secret values never cross this seam. */
+export interface OrgSecretNameClient {
+  listSecrets(req: Record<string, never>): Promise<{ secrets: Array<{ name: string }> }>;
 }
 
 export interface SessionCompileDeps {
@@ -125,6 +154,9 @@ export interface SessionCompileDeps {
    *  only when the profile sets includeUserTokens, to additionally carry the
    *  user's OTHER credentials into the sandbox. */
   resolveAllUserTokens: () => Promise<Record<string, string>>;
+  /** Name-only org-secret lookup used to reject unresolved descriptor refs.
+   *  Production uses the control-plane client; tests may inject a fake. */
+  orgSecret?: OrgSecretNameClient;
 }
 
 export interface SessionCompileOpts {
@@ -153,8 +185,9 @@ export interface SessionCompileOpts {
   harness?: string;
   model?: string;
   effort?: string;
-  /** Extra harness env merged LAST (highest precedence) — e.g. the trigger's
-   *  ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). */
+  /** Extra harness env with the highest configurable precedence — e.g. the
+   *  trigger's ENGRAM_APPEND_SYSTEM_PROMPT (ADR 0060). Native auth names are
+   *  ignored, and the principal-owned human user token is applied afterward. */
   extraHarnessEnv?: Record<string, string>;
   /** The initiating human's identity for git commit attribution (ADR 0031 §7),
    *  stamped as ENGRAM_USER_NAME/ENGRAM_USER_EMAIL — the guest writes them into
@@ -191,6 +224,40 @@ export async function compileSessionCreateInput(
   const selectedHarness = opts.harness ?? profile.harness ?? DEFAULT_HARNESS;
   const { harnesses } = await deps.harnessCatalog.listHarnesses({});
   const descriptor = harnesses.find((h) => h.name === selectedHarness)?.descriptor;
+  const modelId =
+    opts.model ?? profile.model ?? descriptor?.models.find((m) => m.default)?.id ?? descriptor?.models[0]?.id;
+  const effortId =
+    opts.effort ?? profile.effort ?? descriptor?.effort.find((e) => e.default)?.id ?? descriptor?.effort[0]?.id;
+  const modelOption = descriptor?.models.find((m) => m.id === modelId);
+  const effortOption = descriptor?.effort.find((e) => e.id === effortId);
+  const optionSecrets = [
+    ...(modelOption === undefined
+      ? []
+      : (modelOption.secrets ?? []).map((secret) => ({
+        optionKind: "model" as const,
+        optionId: modelOption.id,
+        ...secret,
+      }))),
+    ...(effortOption === undefined
+      ? []
+      : (effortOption.secrets ?? []).map((secret) => ({
+        optionKind: "effort" as const,
+        optionId: effortOption.id,
+        ...secret,
+      }))),
+  ];
+  if (optionSecrets.length > 0) {
+    const client: OrgSecretNameClient = deps.orgSecret ?? defaultOrgSecret;
+    const available = new Set((await client.listSecrets({})).secrets.map((secret) => secret.name));
+    for (const secret of optionSecrets) {
+      if (!available.has(secret.ref)) {
+        throw new ConnectError(
+          `${secret.optionKind} option ${secret.optionId} references missing org secret ${secret.ref}`,
+          Code.FailedPrecondition,
+        );
+      }
+    }
+  }
 
   // Strict-by-principal credentials (ADR 0063 B4, amended): a human-owned task
   // carries the owner's per-user token; a service-account-created task carries
@@ -202,9 +269,8 @@ export async function compileSessionCreateInput(
   const isHuman = !opts.programmatic;
 
   // General harness env, lowest → highest precedence: other user tokens < CLI
-  // dummy env < profile env_vars < model env < effort env < git attribution <
-  // trigger extras. The selected harness's principal credential is applied
-  // LAST below, outside this precedence chain. NEVER log values.
+  // dummy env < profile env_vars < strip native auth names < model env < effort
+  // env < git attribution < trigger extras < human user token. NEVER log values.
   const harness: Record<string, string> = {};
   // The human credential env-var name is the selected harness's declared
   // `user_env` (ADR 0063 — no longer the hardcoded CLAUDE_CODE_OAUTH_TOKEN).
@@ -260,18 +326,18 @@ export async function compileSessionCreateInput(
   if (!opts.dropProfileSecretsAndEnv) {
     for (const [k, v] of Object.entries(profile.envVars)) harness[k] = v;
   }
+  // Native credential names are principal-authoritative, so erase anything
+  // carried by user tokens, CLI dummy env, or profile env before descriptor
+  // options run. A model may deliberately restore org_env as "" to disable the
+  // native credential, but a descriptor may never supply it.
+  if (userEnv) delete harness[userEnv];
+  if (orgEnv) delete harness[orgEnv];
   // ADR 0063: the selected model/effort map to env vars via the harness
-  // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in env_vars).
-  if (descriptor) {
-    const modelId =
-      opts.model ?? profile.model ?? descriptor.models.find((m) => m.default)?.id ?? descriptor.models[0]?.id;
-    const effortId =
-      opts.effort ?? profile.effort ?? descriptor.effort.find((e) => e.default)?.id ?? descriptor.effort[0]?.id;
-    const modelEnv = descriptor.models.find((m) => m.id === modelId)?.env ?? {};
-    const effortEnv = descriptor.effort.find((e) => e.id === effortId)?.env ?? {};
-    for (const [k, v] of Object.entries(modelEnv)) harness[k] = v;
-    for (const [k, v] of Object.entries(effortEnv)) harness[k] = v;
-  }
+  // descriptor (an explicit picker wins over a stale ANTHROPIC_MODEL in
+  // env_vars). Option env values are always plain literals; secret delivery is
+  // carried separately in the integration policy.
+  for (const [k, v] of Object.entries(modelOption?.env ?? {})) harness[k] = v;
+  for (const [k, v] of Object.entries(effortOption?.env ?? {})) harness[k] = v;
   // ADR 0031 §7: git commit attribution — the initiating human authors the
   // in-session commits (the guest turns these into /etc/gitconfig's [user]
   // block). Orchestrator-authoritative, so it beats profile env_vars.
@@ -279,7 +345,9 @@ export async function compileSessionCreateInput(
     harness.ENGRAM_USER_NAME = opts.owner.name;
     harness.ENGRAM_USER_EMAIL = opts.owner.email;
   }
-  for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) harness[k] = v;
+  for (const [k, v] of Object.entries(opts.extraHarnessEnv ?? {})) {
+    if (k !== userEnv && k !== orgEnv) harness[k] = v;
+  }
   harness.ENGRAM_APPEND_SYSTEM_PROMPT = [
     harness.ENGRAM_APPEND_SYSTEM_PROMPT,
     PAPERCUT_SYSTEM_PROMPT,
@@ -291,20 +359,9 @@ export async function compileSessionCreateInput(
   if (selectedSkills.includes("browser")) harness.ENGRAM_BROWSER_VIEW_ENABLED = "1";
   else delete harness.ENGRAM_BROWSER_VIEW_ENABLED;
 
-  // The selected harness's credential is PRINCIPAL-authoritative, not profile
-  // configuration. A human run always gets exactly its required per-user
-  // `user_env`, applied after every configurable env layer so an admin profile,
-  // model, or trigger cannot replace it. A programmatic run gets `org_env`
-  // exclusively from the host-side org-secret policy below, so strip both auth
-  // names from the orchestrator-provided env. This also preserves the strict
-  // invariant that a session never receives both credential tiers.
-  if (isHuman) {
-    if (orgEnv) delete harness[orgEnv];
-    if (userEnv && humanUserToken !== undefined) harness[userEnv] = humanUserToken;
-  } else {
-    if (userEnv) delete harness[userEnv];
-    if (orgEnv) delete harness[orgEnv];
-  }
+  // The human credential remains the final, principal-authoritative env write,
+  // so no descriptor or trigger can replace it.
+  if (isHuman && userEnv && humanUserToken !== undefined) harness[userEnv] = humanUserToken;
   const harnessEnv = Object.keys(harness).length > 0 ? harness : undefined;
 
   // Per-session integration policy (caps + network + secrets), shipped only
@@ -313,15 +370,36 @@ export async function compileSessionCreateInput(
     network: opts.networkOverride ?? profile.network,
     secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
   });
+  for (const optionSecret of optionSecrets) {
+    const mode = optionSecret.mode;
+    if (mode !== "literal" && mode !== "broker") {
+      throw new ConnectError(
+        `${optionSecret.optionKind} option ${optionSecret.optionId} has invalid secret mode ${mode}`,
+        Code.FailedPrecondition,
+      );
+    }
+    const secret: IntegrationSecretJson = {
+      secret_ref: optionSecret.ref,
+      env_var: optionSecret.env,
+      mode,
+      allow_hosts: optionSecret.hosts ?? [],
+      allow_host_patterns: optionSecret.hostPatterns ?? [],
+    };
+    policy.secrets.push(secret);
+  }
   // ADR 0063 B4: a programmatic task (cron / Slack / API) authenticates the
   // harness with the ORG credential, not a per-user token. The org-secret value
   // never leaves the coordinator (ADR 0057), so we can't read it here — instead
   // append a literal secret-inject naming the org secret (named after the env
   // var by convention; admins create an org secret `ANTHROPIC_API_KEY`). It
   // ships in integration_policy_json and is resolved host-side by
-  // resolve_policy_secrets; an unresolvable ref is skipped+warned there (the
-  // session still boots).
-  if (!isHuman && orgEnv) {
+  // resolve_policy_secrets. An effective model that explicitly sets org_env to
+  // "" deliberately disables this native inject.
+  const modelDisablesNativeOrgCredential =
+    orgEnv !== undefined &&
+    modelOption !== undefined &&
+    Object.prototype.hasOwnProperty.call(modelOption.env, orgEnv);
+  if (!isHuman && orgEnv && !modelDisablesNativeOrgCredential) {
     policy.secrets.push({
       secret_ref: orgEnv,
       env_var: orgEnv,

@@ -98,7 +98,17 @@ message HarnessAuth {
   optional string user_env_hint = 4;
 }
 
-// One model or effort option; env is the var(s) that select it.
+// One option-secret delivery specification. Carries org-secret names and
+// broker hosts only, never a secret value.
+message HarnessOptionSecret {
+  string ref = 1;
+  string env = 2;
+  string mode = 3;
+  repeated string hosts = 4;
+  repeated string host_patterns = 5;
+}
+
+// One model or effort option; env is the literal var(s) that select it.
 message HarnessOption {
   // Stable option id the wire carries (e.g. "opus").
   string id = 1;
@@ -107,6 +117,8 @@ message HarnessOption {
   bool default = 3;
   // Env vars this option sets, merged into the session's harness env.
   map<string, string> env = 4;
+  // Org-secret names and their guest delivery rules. Never secret values.
+  repeated HarnessOptionSecret secrets = 5;
 }
 
 message GetHarnessRequest {

@@ -58,6 +58,20 @@ id    = "haiku"
 label = "Claude Haiku 4.5"
 env   = { ANTHROPIC_MODEL = "claude-haiku-4-5" }
 
+# The per-option `secrets` list carries credential names only, never values.
+# In broker mode the guest holds a placeholder while the proxy substitutes the
+# real key only on requests to `openrouter.ai`.
+[[models]]
+id    = "glm-5.2"
+label = "GLM 5.2 (OpenRouter)"
+env   = { ANTHROPIC_MODEL = "z-ai/glm-5.2",
+          ANTHROPIC_BASE_URL = "https://openrouter.ai/api",
+          ANTHROPIC_API_KEY = "" }
+secrets = [
+  { ref = "openrouter.api_key", env = "ANTHROPIC_AUTH_TOKEN", mode = "broker", hosts = ["openrouter.ai"] },
+  { ref = "openrouter.api_key", env = "OPENROUTER_API_KEY",   mode = "broker", hosts = ["openrouter.ai"] },
+]
+
 # Effort maps to Claude Code's own thinking-budget knob (MAX_THINKING_TOKENS) —
 # an opaque-to-the-API harness env, which is exactly what the descriptor exists
 # to abstract.
