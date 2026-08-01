@@ -493,9 +493,13 @@ describe("compileSessionCreateInput", () => {
 
     expect(inp.capabilities).toEqual(["engram:pr_review", cloneCapability]);
     const policy = JSON.parse(inp.integrationPolicyJson!) as {
-      injects?: Array<{ mint_provider: string }>;
+      injects?: Array<{ mint_source: { kind: string; provider?: string } | null }>;
     };
-    expect(policy.injects?.some((entry) => entry.mint_provider === "github")).toBe(true);
+    expect(
+      policy.injects?.some(
+        (entry) => entry.mint_source?.kind === "provider" && entry.mint_source.provider === "github",
+      ),
+    ).toBe(true);
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
   });

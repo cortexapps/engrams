@@ -93,7 +93,7 @@ fn inject_entry(secret: &str, methods: &[&str], paths: &[&str]) -> InjectEntry {
             path_globs: paths.iter().map(|s| s.to_string()).collect(),
             graphql: None,
         },
-        mint_provider: String::new(),
+        mint_source: None,
         cred: engram_egress_proxy::RefreshableCred::new(secret.into(), None),
     }
 }
@@ -781,7 +781,11 @@ struct FreshRefresher;
 
 #[async_trait::async_trait]
 impl InjectRefresher for FreshRefresher {
-    async fn refresh(&self, _s: SessionId, _p: &str) -> Option<RefreshedInject> {
+    async fn refresh(
+        &self,
+        _s: SessionId,
+        _source: &engram_core::types::integration::CredentialMintSource,
+    ) -> Option<RefreshedInject> {
         Some(RefreshedInject {
             secret: "fresh-token".into(),
             expires_at: chrono::Utc::now() + chrono::Duration::hours(1),
@@ -811,7 +815,11 @@ async fn near_expiry_inject_is_reminted_before_forwarding() {
             path_globs: vec!["/user".into()],
             graphql: None,
         },
-        mint_provider: "github".into(),
+        mint_source: Some(
+            engram_core::types::integration::CredentialMintSource::Provider {
+                provider: "github".into(),
+            },
+        ),
         cred: RefreshableCred::new(
             "stale-token".into(),
             Some(chrono::Utc::now() + chrono::Duration::minutes(2)),
@@ -1119,7 +1127,7 @@ fn graphql_inject_entry(secret: &str, op: GraphqlOperation, field: &str) -> Inje
                 field: field.into(),
             }),
         },
-        mint_provider: String::new(),
+        mint_source: None,
         cred: engram_egress_proxy::RefreshableCred::new(secret.into(), None),
     }
 }

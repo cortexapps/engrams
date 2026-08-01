@@ -1836,7 +1836,7 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
           header_name: "DD-API-KEY",
           header_template: "{}",
           secret_ref: "datadog-api-key",
-          mint_provider: "",
+          mint_source: null,
           methods: ["GET"],
           path_globs: ["/api/v1/slo*"],
           graphql_operation: "",
@@ -1847,7 +1847,7 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
           header_name: "DD-APPLICATION-KEY",
           header_template: "{}",
           secret_ref: "datadog-app-key",
-          mint_provider: "",
+          mint_source: null,
           methods: ["GET"],
           path_globs: ["/api/v1/slo*"],
           graphql_operation: "",
@@ -1880,7 +1880,12 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
       // GraphQL mutations (ADR 0059); each a minted inject. The issue asset is
       // observed on both the REST create and the GraphQL createIssue mutation.
       expect(policy.injects.length).toBeGreaterThan(0);
-      expect(policy.injects.every((i: { mint_provider: string }) => i.mint_provider === "github")).toBe(true);
+      expect(
+        policy.injects.every(
+          (i: { mint_source: { kind: string; provider?: string } | null }) =>
+            i.mint_source?.kind === "provider" && i.mint_source.provider === "github",
+        ),
+      ).toBe(true);
       expect(policy.observes.length).toBeGreaterThan(0);
       expect(
         policy.observes.every(

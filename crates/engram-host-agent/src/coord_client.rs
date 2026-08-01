@@ -255,14 +255,14 @@ impl HttpCoordClient {
         &self,
         host_id: HostId,
         session_id: SessionId,
-        mint_provider: &str,
+        mint_source: &engram_core::types::integration::CredentialMintSource,
     ) -> Result<RefreshInjectResponse, CoordError> {
         let url = self.endpoint(&format!(
             "/hosts/{host_id}/sessions/{session_id}/inject/refresh"
         ));
         let builder = self.http.post(&url);
         let req = RefreshInjectRequest {
-            mint_provider: mint_provider.to_string(),
+            mint_source: mint_source.clone(),
         };
         let resp = self
             .auth(builder, &req)
@@ -699,11 +699,11 @@ pub struct IdleEvictionCandidatesResponse {
     pub failed: usize,
 }
 
-/// WS4: request body for the inject-refresh route — the mint provider whose
-/// credential the proxy needs re-minted.
+/// WS4: request body for the inject-refresh route — the source whose credential
+/// the proxy needs re-minted.
 #[derive(Serialize)]
 pub struct RefreshInjectRequest {
-    pub mint_provider: String,
+    pub mint_source: engram_core::types::integration::CredentialMintSource,
 }
 
 /// WS4: the coord's re-minted inject credential — the fresh rendered header

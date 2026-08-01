@@ -305,6 +305,11 @@ export interface Connector {
 // ---------------------------------------------------------------------------
 
 /** One Plane-B injection, snake_case to match the Rust serde shape. */
+export type CredentialMintSourceJson = {
+  kind: "provider";
+  provider: string;
+};
+
 export interface IntegrationInjectJson {
   hosts: string[];
   header_name: string;
@@ -312,13 +317,13 @@ export interface IntegrationInjectJson {
   /** Static-secret source (inject connectors). Empty for a mint entry. */
   secret_ref: string;
   /**
-   * ADR 0056 amendment: when non-empty, the coordinator MINTS this inject's value
-   * via the IntegrationBroker for this provider (scoped to the session's caps)
+   * ADR 0056 amendment: when present, the coordinator MINTS this inject's value
+   * through this credential source (scoped to the session's caps)
    * instead of resolving `secret_ref`. This is how a *mint* connector rides the
    * same egress inject plane as a static-secret one; the token never enters the
    * guest. Mutually exclusive with `secret_ref`.
    */
-  mint_provider: string;
+  mint_source: CredentialMintSourceJson | null;
   methods: string[];
   path_globs: string[];
   /** ADR 0059: GraphQL operation type for body-parsed gating ("query" |
@@ -1214,7 +1219,7 @@ export function compileIntegrationPolicy(
             header_name: inj.header,
             header_template: inj.template ?? "{}",
             secret_ref: inj.secretRef,
-            mint_provider: "",
+            mint_source: null,
             methods,
             path_globs,
             graphql_operation,
@@ -1239,7 +1244,7 @@ export function compileIntegrationPolicy(
           header_name: "",
           header_template: "",
           secret_ref: "",
-          mint_provider: connector.provider,
+          mint_source: { kind: "provider", provider: connector.provider },
           methods,
           path_globs,
           graphql_operation,

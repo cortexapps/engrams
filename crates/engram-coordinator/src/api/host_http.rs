@@ -1568,9 +1568,9 @@ pub async fn integration_asset_ingest(
 
 #[derive(Deserialize)]
 pub struct RefreshInjectRequest {
-    /// The mint provider whose credential to re-mint (e.g. `"github"`) — the
-    /// value the egress proxy stored on the inject entry at boot.
-    pub mint_provider: String,
+    /// The source that minted the credential. The egress proxy stores this
+    /// routing metadata on the inject entry at boot.
+    pub mint_source: engram_core::types::integration::CredentialMintSource,
 }
 
 #[derive(Serialize)]
@@ -1599,24 +1599,19 @@ pub async fn refresh_inject(
     Path((host_id, session_id)): Path<(HostId, SessionId)>,
     Json(req): Json<RefreshInjectRequest>,
 ) -> Result<Json<RefreshInjectResponse>, ApiError> {
-    if req.mint_provider.is_empty() {
-        return Err(ApiError::BadRequest(
-            "mint_provider is required for an inject refresh".into(),
-        ));
-    }
     let (header, expires_at) =
-        crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_provider)
+        crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_source)
             .await
             .ok_or_else(|| {
                 ApiError::Internal(format!(
-                    "inject refresh for provider {} on session {session_id} could not be minted",
-                    req.mint_provider
+                    "inject refresh for source {:?} on session {session_id} could not be minted",
+                    req.mint_source
                 ))
             })?;
     tracing::debug!(
         %host_id,
         %session_id,
-        provider = %req.mint_provider,
+        source = ?req.mint_source,
         %expires_at,
         "re-minted egress inject credential for the proxy",
     );
