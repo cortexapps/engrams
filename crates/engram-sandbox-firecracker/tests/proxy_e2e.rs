@@ -250,10 +250,12 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         Arc::new(engram_egress_proxy::StaticResolver::new().with(TEST_HOST, upstream_addr));
 
     let proxy_port: u16 = 19443;
+    let metadata_port: u16 = 19338;
     let proxy_bind: SocketAddr = format!("0.0.0.0:{proxy_port}").parse().unwrap();
     let mut proxy_cfg = engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
     proxy_cfg.resolver = resolver;
     proxy_cfg.upstream_test_roots = Some(upstream_test_roots);
+    proxy_cfg.metadata_bind_addr = Some(format!("0.0.0.0:{metadata_port}").parse().unwrap());
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
     // Bind synchronously (ADR 0083) — the listener is up before serve
     // spawns, so no sleep-to-wait-for-bind is needed.
@@ -308,6 +310,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     cfg.egress_proxy_port = Some(proxy_port);
+    cfg.egress_metadata_port = Some(metadata_port);
     let backend = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     backend.host_startup().await.expect("host_startup");
 
@@ -359,6 +362,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         secrets: vec![secret],
         injects: Vec::new(),
         observes: Vec::new(),
+        google_adc: true,
     });
 
     // PID-1's env doesn't carry a PATH; child execs need one to
@@ -411,7 +415,10 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
                 "echo '1.2.3.4 {TEST_HOST}' >> /etc/hosts && \
                  curl -sS --max-time 10 \
                  -H 'Authorization: Bearer engram_ph_e2e_xxx' \
-                 https://{TEST_HOST}/v1/test"
+                 https://{TEST_HOST}/v1/test && printf '\n' && \
+                 curl -sS --max-time 10 \
+                 -H 'Metadata-Flavor: Google' \
+                 http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
             ),
         ],
         stdin: None,
@@ -471,5 +478,9 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     assert!(
         !body.contains("engram_ph_e2e_xxx"),
         "placeholder must not survive into the upstream payload; got: {body}",
+    );
+    assert!(
+        stdout.contains(engram_egress_proxy::metadata::PLACEHOLDER_TOKEN),
+        "guest metadata discovery should receive only the placeholder token; got: {stdout}",
     );
 }

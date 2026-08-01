@@ -9119,6 +9119,11 @@ impl SandboxBackend for PooledBackend {
         self.session_bindings.insert(sandbox_id, session_id);
 
         let Some(egress) = self.egress.as_ref() else {
+            if policy.google_adc {
+                return Err(SandboxError::InvalidSpec(
+                    "Google ADC requires a host egress proxy".into(),
+                ));
+            }
             // No proxy attached — egress is unfiltered. The
             // coordinator may still send policy frames (the
             // coordinator-side codepath doesn't know whether a host
@@ -9848,6 +9853,33 @@ mod tests {
     use engram_core::types::sandbox::{CpuLimit, DiskLimit, MemoryLimit};
     use engram_sandbox_process::ProcessBackend;
 
+    #[tokio::test]
+    async fn google_adc_requires_the_local_egress_proxy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let inner: Arc<dyn SandboxBackend> =
+            Arc::new(ProcessBackend::new(tmp.path().join("sandboxes")));
+        let pooled = PooledBackend::new(inner);
+
+        let error = pooled
+            .notify_session_policy(SessionEgressPolicy {
+                session_id: SessionId::new(),
+                sandbox_id: SandboxId::new(),
+                guest_ip: std::net::Ipv4Addr::LOCALHOST,
+                network_allow_hosts: Vec::new(),
+                network_allow_host_patterns: Vec::new(),
+                allow_all: false,
+                secrets: Vec::new(),
+                injects: Vec::new(),
+                observes: Vec::new(),
+                google_adc: true,
+                secret_mode: engram_core::types::image::SecretMode::Broker,
+            })
+            .await
+            .expect_err("Google ADC must fail closed without an egress proxy");
+
+        assert!(error.to_string().contains("requires a host egress proxy"));
+    }
+
     /// ADR 0101 B: the adaptive candidacy glue over the pacing maps —
     /// the pure controller (`next_epoch_after`) is tested in
     /// `checkpoint.rs`; this pins the map-driven wiring around it: a
@@ -10150,10 +10182,10 @@ mod tests {
             network_allow_hosts: vec!["accounts.google.com".into()],
             network_allow_host_patterns: vec!["*.auth0.com".into()],
             allow_all: false,
-            google_adc: false,
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -10173,10 +10205,10 @@ mod tests {
             network_allow_hosts: Vec::new(),
             network_allow_host_patterns: Vec::new(),
             allow_all: true,
-            google_adc: false,
             secrets: Vec::new(),
             injects: Vec::new(),
             observes: Vec::new(),
+            google_adc: false,
             secret_mode: engram_core::types::image::SecretMode::Literal,
         };
         let registry = engram_egress_proxy::Registry::new();
@@ -13603,7 +13635,7 @@ mod tests {
             // registry, and a fixed DNS port would collide across the
             // parallel suite now that a bind failure is fatal (ADR 0083).
             let bind: std::net::SocketAddr = "127.0.0.1:0".parse().unwrap();
-            let egress = HostEgress::spawn(source, bind, None, None, None)
+            let egress = HostEgress::spawn(source, bind, None, None, None, None)
                 .await
                 .expect("spawn egress");
             (egress, dir)
@@ -13622,10 +13654,10 @@ mod tests {
                 network_allow_hosts: allow.iter().map(|s| s.to_string()).collect(),
                 network_allow_host_patterns: Vec::new(),
                 allow_all: false,
-                google_adc: false,
                 secrets: Vec::new(),
                 injects: Vec::new(),
                 observes: Vec::new(),
+                google_adc: false,
                 secret_mode: SecretMode::Literal,
             }
         }

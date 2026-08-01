@@ -130,16 +130,16 @@ impl VmConfig {
         self
     }
 
-    /// ADR 0096 D6: pass the host egress proxy + DNS ports to the guest
-    /// as `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline. Env-form
+    /// ADR 0096 D6: pass the host egress, DNS, and metadata-proxy ports
+    /// as `ENGRAM_EGRESS=<proxy>:<dns>:<metadata>` on the kernel cmdline. Env-form
     /// (UPPERCASE=value) so the kernel hands it to PID 1's environment
     /// (a dotted param would be swallowed as a module option); the init
     /// shim reads it and installs the in-guest DNAT redirect. `None` is
     /// a no-op.
-    pub fn with_egress_ports(mut self, ports: Option<(u16, u16)>) -> Self {
-        if let Some((proxy, dns)) = ports {
+    pub fn with_egress_ports(mut self, ports: Option<(u16, u16, u16)>) -> Self {
+        if let Some((proxy, dns, metadata)) = ports {
             self.kernel_cmdline
-                .push_str(&format!(" ENGRAM_EGRESS={proxy}:{dns}"));
+                .push_str(&format!(" ENGRAM_EGRESS={proxy}:{dns}:{metadata}"));
         }
         self
     }

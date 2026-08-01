@@ -89,10 +89,10 @@ async fn host_startup_no_proxy_is_idempotent_and_lacks_redirect() {
     }
     cleanup();
 
-    host_startup(None, None, None)
+    host_startup(None, None, None, None)
         .await
         .expect("first host_startup");
-    host_startup(None, None, None)
+    host_startup(None, None, None, None)
         .await
         .expect("second host_startup");
 
@@ -141,7 +141,7 @@ async fn host_startup_with_proxy_adds_redirect_and_default_deny() {
     }
     cleanup();
 
-    host_startup(Some(9443), None, None)
+    host_startup(Some(9443), None, None, None)
         .await
         .expect("host_startup");
 
@@ -186,7 +186,7 @@ async fn host_startup_installs_established_accept_before_host_input_drop() {
     }
     cleanup();
 
-    host_startup(Some(9443), Some(5353), None)
+    host_startup(Some(9443), Some(5353), None, None)
         .await
         .expect("host_startup");
 
@@ -244,7 +244,7 @@ async fn host_startup_installs_guest_otlp_pinhole_before_host_input_drop() {
     }
     cleanup();
 
-    host_startup(Some(9443), Some(5353), Some(4317))
+    host_startup(Some(9443), Some(5353), None, Some(4317))
         .await
         .expect("host_startup");
 
@@ -278,7 +278,7 @@ async fn host_startup_installs_guest_otlp_pinhole_before_host_input_drop() {
     );
 
     // Idempotency: re-applying must not double the pinhole.
-    host_startup(Some(9443), Some(5353), Some(4317))
+    host_startup(Some(9443), Some(5353), None, Some(4317))
         .await
         .expect("second host_startup");
     let dump2 = iptables_save();
@@ -326,7 +326,7 @@ async fn host_startup_redirects_warm_path_via_vh_engr() {
     // came from our REDIRECT, not some other process.
     let proxy_port: u16 = 28443;
 
-    host_startup(Some(proxy_port), Some(5353), None)
+    host_startup(Some(proxy_port), Some(5353), None, None)
         .await
         .expect("host_startup");
 

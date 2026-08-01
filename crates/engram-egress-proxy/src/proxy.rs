@@ -55,6 +55,9 @@ pub struct ProxyConfig {
     /// channel. Production sets `Some(0.0.0.0:53)` and pairs it
     /// with iptables `REDIRECT VM→{udp,tcp}/53 → :53`.
     pub dns_bind_addr: Option<SocketAddr>,
+    /// Where the Google metadata-compatible ADC endpoint listens. `None`
+    /// disables it.
+    pub metadata_bind_addr: Option<SocketAddr>,
     /// Upstream resolver the DNS proxy forwards allowed queries to.
     /// Defaults to Cloudflare's 1.1.1.1:53.
     pub dns_upstream: SocketAddr,
@@ -89,6 +92,7 @@ impl ProxyConfig {
             // host-agent's `--egress-dns-port`. Iptables REDIRECTs
             // guest {udp,tcp}/53 to this port.
             dns_bind_addr: Some("0.0.0.0:5353".parse().expect("dns bind default parses")),
+            metadata_bind_addr: None,
             dns_upstream: dns::DEFAULT_UPSTREAM
                 .parse()
                 .expect("dns upstream default parses"),
@@ -143,7 +147,13 @@ impl Proxy {
         } else {
             None
         };
-        Ok(Listeners { tcp, dns })
+        let metadata = match self.cfg.metadata_bind_addr {
+            Some(addr) => Some(TcpListener::bind(addr).await.inspect_err(|error| {
+                tracing::error!(%addr, %error, "metadata bind failed");
+            })?),
+            None => None,
+        };
+        Ok(Listeners { tcp, dns, metadata })
     }
 
     /// Run the accept loop forever on already-bound listeners. The DNS
@@ -151,7 +161,7 @@ impl Proxy {
     /// accept loop itself terminates (it shouldn't — accept errors are
     /// logged and retried).
     pub async fn serve(self, listeners: Listeners) {
-        let Listeners { tcp, dns } = listeners;
+        let Listeners { tcp, dns, metadata } = listeners;
         tracing::info!(addr = ?tcp.local_addr().ok(), "engram-egress-proxy listening");
 
         // The filtering DNS proxy: serve loops for the already-bound
@@ -169,6 +179,14 @@ impl Proxy {
             tokio::spawn(async move {
                 if let Err(e) = dns::serve_tcp(dns_tcp, registry_for_tcp, upstream).await {
                     tracing::error!(error = %e, "DNS/tcp serve loop ended");
+                }
+            });
+        }
+        if let Some(listener) = metadata {
+            let registry = self.cfg.registry.clone();
+            tokio::spawn(async move {
+                if let Err(error) = crate::metadata::serve(listener, registry).await {
+                    tracing::error!(%error, "metadata serve loop ended");
                 }
             });
         }
@@ -213,6 +231,7 @@ impl Proxy {
 pub struct Listeners {
     tcp: TcpListener,
     dns: Option<(Arc<UdpSocket>, TcpListener)>,
+    metadata: Option<TcpListener>,
 }
 
 impl Listeners {
@@ -344,6 +363,17 @@ async fn handle(
                         session_id = %session.session_id,
                         sni = %sni, reason,
                         "egress rejected — graphql operation not permitted by integration policy",
+                    );
+                    Ok(())
+                }
+                Err(intercept::InterceptError::CredentialRequestRejected { method, path }) => {
+                    tracing::warn!(
+                        session_id = %session.session_id,
+                        target = %sni,
+                        %method,
+                        %path,
+                        outcome = "denied",
+                        "egress rejected credential-producing Google API request",
                     );
                     Ok(())
                 }
