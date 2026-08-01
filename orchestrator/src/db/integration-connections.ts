@@ -1,6 +1,6 @@
 /** Named integration connection store (ADR 0109). */
 
-import { asc, eq } from "drizzle-orm";
+import { and, asc, eq } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import { integrationConnection as connectionTable } from "./schema.ts";
@@ -16,6 +16,7 @@ export interface IntegrationConnectionRow {
   alias: string;
   provider: string;
   displayName: string;
+  isDefault: boolean;
   config: Record<string, unknown>;
   enabled: boolean;
   testedAt: Date | null;
@@ -33,12 +34,13 @@ export interface IntegrationConnectionInput {
 export interface IntegrationConnectionStore {
   list(): Promise<IntegrationConnectionRow[]>;
   get(id: string): Promise<IntegrationConnectionRow | null>;
+  getDefault(provider: string): Promise<IntegrationConnectionRow | null>;
   create(input: IntegrationConnectionInput): Promise<IntegrationConnectionRow>;
   update(id: string, input: Omit<IntegrationConnectionInput, "provider">): Promise<IntegrationConnectionRow | null>;
   delete(id: string): Promise<boolean>;
   markTested(id: string, testedAt: Date): Promise<IntegrationConnectionRow | null>;
   setEnabled(id: string, enabled: boolean): Promise<IntegrationConnectionRow | null>;
-  ensureLegacy(provider: string, displayName: string): Promise<void>;
+  ensureDefault(provider: string, displayName: string): Promise<IntegrationConnectionRow>;
 }
 
 function toRow(r: typeof connectionTable.$inferSelect): IntegrationConnectionRow {
@@ -47,6 +49,7 @@ function toRow(r: typeof connectionTable.$inferSelect): IntegrationConnectionRow
     alias: r.alias,
     provider: r.provider,
     displayName: r.displayName,
+    isDefault: r.isDefault,
     config: (r.config ?? {}) as Record<string, unknown>,
     enabled: r.enabled,
     testedAt: r.testedAt ?? null,
@@ -58,6 +61,18 @@ function toRow(r: typeof connectionTable.$inferSelect): IntegrationConnectionRow
 export function makeIntegrationConnectionStore(
   db: ReturnType<typeof getDb> = getDb(),
 ): IntegrationConnectionStore {
+  async function getDefault(provider: string): Promise<IntegrationConnectionRow | null> {
+    const rows = await db
+      .select()
+      .from(connectionTable)
+      .where(and(
+        eq(connectionTable.provider, provider),
+        eq(connectionTable.isDefault, true),
+      ))
+      .limit(1);
+    return rows[0] ? toRow(rows[0]) : null;
+  }
+
   return {
     async list() {
       return (await db.select().from(connectionTable).orderBy(asc(connectionTable.alias))).map(toRow);
@@ -71,6 +86,8 @@ export function makeIntegrationConnectionStore(
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
     },
+
+    getDefault,
 
     async create(input) {
       const rows = await db
@@ -115,16 +132,24 @@ export function makeIntegrationConnectionStore(
       return rows[0] ? toRow(rows[0]) : null;
     },
 
-    async ensureLegacy(provider, displayName) {
+    async ensureDefault(provider, displayName) {
+      const existing = await getDefault(provider);
+      if (existing) return existing;
       await db.insert(connectionTable).values({
-        id: `legacy:${provider}`,
-        alias: `legacy-${provider}`,
+        id: crypto.randomUUID(),
+        alias: `${provider}-default`,
         provider,
         displayName,
+        isDefault: true,
         config: {},
         enabled: true,
         testedAt: new Date(0),
       }).onConflictDoNothing();
+      const created = await getDefault(provider);
+      if (!created) {
+        throw new Error(`failed to create default integration connection for "${provider}"`);
+      }
+      return created;
     },
   };
 }

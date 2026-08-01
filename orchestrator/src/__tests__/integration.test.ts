@@ -137,12 +137,34 @@ function fakeConnectionStore(seed: IntegrationConnectionRow[] = []): Integration
     async get(id) {
       return rows.get(id) ?? null;
     },
+    async getDefault(provider) {
+      const existing = [...rows.values()].find((row) =>
+        row.provider === provider && row.isDefault
+      );
+      if (existing) return existing;
+      const now = new Date("2026-07-31T12:00:00Z");
+      const row: IntegrationConnectionRow = {
+        id: `default-${provider}`,
+        alias: `${provider}-default`,
+        provider,
+        displayName: `${provider} default`,
+        isDefault: true,
+        config: {},
+        enabled: true,
+        testedAt: new Date(0),
+        createdAt: now,
+        updatedAt: now,
+      };
+      rows.set(row.id, row);
+      return row;
+    },
     async create(input) {
       sequence += 1;
       const now = new Date("2026-07-31T12:00:00Z");
       const row: IntegrationConnectionRow = {
         id: `connection-${sequence}`,
         ...input,
+        isDefault: false,
         enabled: false,
         testedAt: null,
         createdAt: now,
@@ -181,7 +203,9 @@ function fakeConnectionStore(seed: IntegrationConnectionRow[] = []): Integration
       rows.set(id, row);
       return row;
     },
-    async ensureLegacy() {},
+    async ensureDefault(provider) {
+      return (await this.getDefault(provider))!;
+    },
   };
 }
 
@@ -339,6 +363,25 @@ describe("IntegrationService (native)", () => {
     }
   });
 
+  test("a provider default connection cannot be deleted", async () => {
+    const connections = fakeConnectionStore();
+    await connections.ensureDefault("github", "GitHub (default)");
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: fakeStore().store,
+      connections,
+      profiles: noProfiles,
+    });
+    try {
+      await expectErr(
+        s.client.deleteConnection({ id: "default-github" }),
+        Code.FailedPrecondition,
+      );
+    } finally {
+      await s.close();
+    }
+  });
+
   test("ListConnectors merges built-in seeds (read-only) with custom rows", async () => {
     const custom: ConnectorRow = {
       provider: "customco",
@@ -363,13 +406,19 @@ describe("IntegrationService (native)", () => {
 
   test("UpsertConnector validates + stores a custom connector", async () => {
     const { store, rec } = fakeStore();
-    const s = await spawn({ getSession: makeGetSession("a", "admin"), connectors: store });
+    const connections = fakeConnectionStore();
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      connectors: store,
+      connections,
+    });
     try {
       const r = await s.client.upsertConnector({ configJson: CUSTOM });
       expect(rec.upserts).toHaveLength(1);
       expect(rec.upserts[0]!.provider).toBe("customco");
       expect(r.connector?.provider).toBe("customco");
       expect(r.connector?.builtin).toBe(false);
+      expect((await connections.getDefault("customco"))?.id).toBe("default-customco");
     } finally {
       await s.close();
     }
@@ -472,6 +521,7 @@ describe("GetIntegrationCatalog (member-readable)", () => {
       const r = await mem.client.getIntegrationCatalog({});
       const by = new Map(r.providers.map((p) => [p.provider, p]));
       expect(by.get("github")?.display?.name).toBe("GitHub");
+      expect(by.get("github")?.defaultConnectionId).toBe("default-github");
       expect(by.get("github")?.display?.icon?.mono).toBe("GH");
       expect(by.get("datadog")?.credentialSource).toBe("inject");
       const ghCaps = new Map(by.get("github")!.capabilities.map((c) => [c.action, c]));

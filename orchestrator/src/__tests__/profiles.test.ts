@@ -8,12 +8,15 @@ import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
 import { ProfileIntegrationGrantSchema, ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
 import type { MountCatalogClient } from "../skills/catalog.ts";
 import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
-import { legacyCapabilityGrant } from "../integrations/grants.ts";
+import { capabilityGrant } from "../integrations/grants.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import type { ProfileLaunchGrantStore } from "../db/profile-launch-grants.ts";
 
 const protoGrant = (capability: string) =>
-  create(ProfileIntegrationGrantSchema, legacyCapabilityGrant(capability));
+  create(ProfileIntegrationGrantSchema, capabilityGrant(
+    capability,
+    `default-${capability.slice(0, capability.indexOf(":"))}`,
+  ));
 
 /** Fake catalog whose live uploaded skills are `uploadedNames` (builtins are implicit). */
 const fakeCatalog = (uploadedNames: string[] = []): MountCatalogClient => ({
@@ -121,23 +124,25 @@ async function spawn(deps: ProfileDeps) {
   };
   const connections: IntegrationConnectionStore = {
     list: async () => [],
-    get: async (id) => id.startsWith("legacy:") ? {
+    get: async (id) => id.startsWith("default-") ? {
       id,
-      alias: id.replace(":", "-"),
-      provider: id.slice(7),
+      alias: id,
+      provider: id.slice(8),
       displayName: id,
+      isDefault: true,
       config: {},
       enabled: true,
       testedAt: new Date(0),
       createdAt: new Date(0),
       updatedAt: new Date(0),
     } : null,
+    getDefault: async (provider) => connections.get(`default-${provider}`),
     create: async () => { throw new Error("unused"); },
     update: async () => { throw new Error("unused"); },
     delete: async () => { throw new Error("unused"); },
     markTested: async () => { throw new Error("unused"); },
     setEnabled: async () => { throw new Error("unused"); },
-    ensureLegacy: async () => {},
+    ensureDefault: async (provider) => (await connections.get(`default-${provider}`))!,
   };
   const withCatalog: ProfileDeps = {
     harnessCatalog: fakeHarnessCatalog(),
@@ -349,7 +354,7 @@ describe("ProfileService — auth + field filtering", () => {
         s.client.createProfile({
           name: "x", description: "", icon: "Bot", imageId: "img-1", harness: "claude",
           includeUserTokens: false, envVars: {},
-          integrationGrants: [{ connectionId: "legacy:github", operation: "", resourceConstraints: [] }],
+          integrationGrants: [{ connectionId: "default-github", operation: "", resourceConstraints: [] }],
         }),
         Code.InvalidArgument,
       );
@@ -424,6 +429,7 @@ describe("ProfileService — auth + field filtering", () => {
         alias: "prod-readonly",
         provider: "gcp",
         displayName: "Production read only",
+        isDefault: false,
         config: {
           workloadIdentityProvider:
             "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
@@ -435,12 +441,13 @@ describe("ProfileService — auth + field filtering", () => {
         createdAt: new Date(0),
         updatedAt: new Date(0),
       } : null,
+      getDefault: async () => null,
       create: async () => { throw new Error("unused"); },
       update: async () => { throw new Error("unused"); },
       delete: async () => { throw new Error("unused"); },
       markTested: async () => { throw new Error("unused"); },
       setEnabled: async () => { throw new Error("unused"); },
-      ensureLegacy: async () => {},
+      ensureDefault: async () => { throw new Error("unused"); },
     };
     const s = await spawn({
       getSession: makeGetSession("a", "admin"),

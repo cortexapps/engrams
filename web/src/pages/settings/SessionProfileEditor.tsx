@@ -37,7 +37,7 @@ import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
-import { legacyCapabilitiesForGrants } from "../../lib/profileIntegrations";
+import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import {
   useConnectorViews,
   type ConnectorView,
@@ -165,7 +165,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
 
   // Live draft — the policy rail and derived network recompute as these change.
   const integrationGrants = watch("integrationGrants");
-  const capabilities = legacyCapabilitiesForGrants(integrationGrants);
+  const capabilities = defaultCapabilitiesForGrants(integrationGrants, views);
   const skills = watch("skills");
   const includeUserTokens = watch("includeUserTokens");
   const imageId = watch("imageId");
@@ -282,13 +282,12 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   // --- capability helpers (enable→select) -----------------------------------
   const setGrants = (next: typeof integrationGrants) =>
     setValue("integrationGrants", next, { shouldDirty: true });
-  const capOn = (provider: string, action: string) => {
+  const capOn = (connectionId: string, action: string) => {
     return integrationGrants.some(
-      (grant) => grant.connectionId === `legacy:${provider}` && grant.operation === action,
+      (grant) => grant.connectionId === connectionId && grant.operation === action,
     );
   };
-  const toggleCap = (provider: string, action: string, on: boolean) => {
-    const connectionId = `legacy:${provider}`;
+  const toggleCap = (connectionId: string, action: string, on: boolean) => {
     const without = integrationGrants.filter(
       (grant) => grant.connectionId !== connectionId || grant.operation !== action,
     );
@@ -301,9 +300,9 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     const pick = reads.length ? reads : v.capabilities.slice(0, 1);
     const next = [...integrationGrants];
     for (const cap of pick) {
-      if (!capOn(v.provider, cap.action)) {
+      if (!capOn(v.defaultConnectionId, cap.action)) {
         next.push({
-          connectionId: `legacy:${v.provider}`,
+          connectionId: v.defaultConnectionId,
           operation: cap.action,
           resourceConstraints: [],
         });
@@ -312,7 +311,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     setGrants(next);
   };
   const disableProvider = (v: ConnectorView) =>
-    setGrants(integrationGrants.filter((grant) => grant.connectionId !== `legacy:${v.provider}`));
+    setGrants(integrationGrants.filter((grant) => grant.connectionId !== v.defaultConnectionId));
 
   const onSubmit = async (vals: ProfileFormValues) => {
     const payload = {
@@ -642,7 +641,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               <div className="flex flex-col gap-3">
                 {connected.map((v) => {
                   const grantedCount = v.capabilities.filter((c) =>
-                    capOn(v.provider, c.action),
+                    capOn(v.defaultConnectionId, c.action),
                   ).length;
                   const on = grantedCount > 0;
                   return (
@@ -698,8 +697,10 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                         <div className="border-t">
                           <PowerSelector
                             view={v}
-                            isOn={(action) => capOn(v.provider, action)}
-                            onToggle={(action, value) => toggleCap(v.provider, action, value)}
+                            isOn={(action) => capOn(v.defaultConnectionId, action)}
+                            onToggle={(action, value) =>
+                              toggleCap(v.defaultConnectionId, action, value)
+                            }
                           />
                         </div>
                       )}

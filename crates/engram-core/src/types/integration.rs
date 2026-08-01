@@ -58,15 +58,16 @@ pub struct IntegrationPolicy {
 
 /// Host-side authority used to mint a short-lived credential for one inject.
 ///
-/// A built-in provider resolves an [`Integration`] engine, such as the GitHub
-/// App integration. A named connection delegates minting to the orchestrator,
-/// which resolves the immutable connection snapshot stored for the session.
-/// Neither form contains a credential.
+/// Every source names the configured connection selected by the profile. The
+/// provider is explicit routing metadata; callers never infer it from the
+/// opaque connection ID. Neither field contains a credential.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CredentialMintSource {
-    Provider { provider: String },
-    Connection { connection_id: String },
+    Connection {
+        connection_id: String,
+        provider: String,
+    },
 }
 
 /// ADR 0057: one profile-defined secret the session injects. The value lives in
@@ -106,8 +107,8 @@ pub struct IntegrationInject {
     #[serde(default)]
     pub secret_ref: String,
     /// When present, the inject value is minted through the shared credential
-    /// broker instead of read from `secret_ref`. The source can be a built-in
-    /// provider, such as GitHub, or a named connection, such as Google Cloud.
+    /// broker instead of read from `secret_ref`. The source always names the
+    /// selected connection, including existing singleton providers.
     /// Mutually exclusive with `secret_ref`. NEVER a value.
     #[serde(default)]
     pub mint_source: Option<CredentialMintSource>,
@@ -289,7 +290,8 @@ mod tests {
                 header_name: String::new(),
                 header_template: String::new(),
                 secret_ref: String::new(),
-                mint_source: Some(CredentialMintSource::Provider {
+                mint_source: Some(CredentialMintSource::Connection {
+                    connection_id: "github-default".into(),
                     provider: "github".into(),
                 }),
                 methods: vec!["POST".into()],

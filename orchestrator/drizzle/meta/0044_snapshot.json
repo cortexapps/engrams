@@ -996,6 +996,13 @@
           "primaryKey": false,
           "notNull": true
         },
+        "is_default": {
+          "name": "is_default",
+          "type": "boolean",
+          "primaryKey": false,
+          "notNull": true,
+          "default": false
+        },
         "config": {
           "name": "config",
           "type": "jsonb",
@@ -1043,6 +1050,22 @@
             }
           ],
           "isUnique": false,
+          "concurrently": false,
+          "method": "btree",
+          "with": {}
+        },
+        "integration_connection_provider_default_unique": {
+          "name": "integration_connection_provider_default_unique",
+          "columns": [
+            {
+              "expression": "provider",
+              "isExpression": false,
+              "asc": true,
+              "nulls": "last"
+            }
+          ],
+          "isUnique": true,
+          "where": "is_default",
           "concurrently": false,
           "method": "btree",
           "with": {}

@@ -132,7 +132,11 @@ export function appendGooglePolicy(
         header_name: "",
         header_template: "",
         secret_ref: "",
-        mint_source: { kind: "connection", connection_id: connection.id },
+        mint_source: {
+          kind: "connection",
+          connection_id: connection.id,
+          provider: connection.provider,
+        },
         methods: curated?.methods ?? [],
         path_globs: constrainedPaths(
           grant.operation,

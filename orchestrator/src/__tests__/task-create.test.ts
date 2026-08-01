@@ -34,7 +34,12 @@ import { createToolRegistry } from "../tools/registry.ts";
 import { BASE_SYSTEM_PROMPT } from "../prompts/base.ts";
 import { OauthSubjectKind } from "../gen/engram/app/v1/oauth_pb.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
-import { legacyCapabilityGrant } from "../integrations/grants.ts";
+import { capabilityGrant } from "../integrations/grants.ts";
+
+function defaultGrant(capability: string) {
+  const provider = capability.slice(0, capability.indexOf(":"));
+  return capabilityGrant(capability, `default-${provider}`);
+}
 
 // The claude harness declares this as its `auth.user_env` (see fakeHarnessCatalog);
 // the compiler injects the user token under this name (ADR 0063 — descriptor-driven).
@@ -90,12 +95,13 @@ const fakeHarnessCatalog = (): HarnessCatalogClient => ({
 const fakeConnections = (): IntegrationConnectionStore => ({
   list: async () => [],
   get: async (id) => {
-    const provider = id.startsWith("legacy:") ? id.slice("legacy:".length) : "gcp";
+    const provider = id.startsWith("default-") ? id.slice("default-".length) : "gcp";
     return {
       id,
-      alias: id.replace(":", "-"),
+      alias: id,
       provider,
       displayName: provider,
+      isDefault: id.startsWith("default-"),
       config: {},
       enabled: true,
       testedAt: new Date(0),
@@ -103,12 +109,13 @@ const fakeConnections = (): IntegrationConnectionStore => ({
       updatedAt: new Date(0),
     };
   },
+  getDefault: async (provider) => fakeConnections().get(`default-${provider}`),
   create: async () => { throw new Error("unused"); },
   update: async () => { throw new Error("unused"); },
   delete: async () => { throw new Error("unused"); },
   markTested: async () => { throw new Error("unused"); },
   setEnabled: async () => { throw new Error("unused"); },
-  ensureLegacy: async () => {},
+  ensureDefault: async (provider) => (await fakeConnections().get(`default-${provider}`))!,
 });
 
 // Default the user token to present ("tok") — a human (chat) run now BLOCKS when
@@ -466,7 +473,7 @@ describe("compileSessionCreateInput", () => {
     });
 
     const inp = await compileSessionCreateInput(
-      profile({ integrationGrants: [legacyCapabilityGrant("memory:write")] }),
+      profile({ integrationGrants: [defaultGrant("memory:write")] }),
       { ...deps(), toolRegistry },
     );
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
@@ -497,6 +504,7 @@ describe("compileSessionCreateInput", () => {
       alias: "dev-vm",
       provider: "gcp",
       displayName: "Dev VM",
+      isDefault: false,
       config: {
         workloadIdentityProvider:
           "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/dev",
@@ -576,17 +584,21 @@ describe("compileSessionCreateInput", () => {
     });
 
     const inp = await compileSessionCreateInput(
-      profile({ integrationGrants: [legacyCapabilityGrant("engram:pr_review")] }),
+      profile({ integrationGrants: [defaultGrant("engram:pr_review")] }),
       { ...deps(), toolRegistry },
       { extraCapabilities: [cloneCapability, cloneCapability] },
     );
 
     expect(inp.capabilities).toEqual(["engram:pr_review", cloneCapability]);
     const policy = JSON.parse(inp.integrationPolicyJson!) as {
-      injects?: Array<{ mint_source: { kind: string; provider?: string } | null }>;
+      injects?: Array<{
+        mint_source: { kind: string; connection_id?: string; provider?: string } | null;
+      }>;
     };
     expect(policy.injects?.some((entry) =>
-      entry.mint_source?.kind === "provider" && entry.mint_source.provider === "github"
+      entry.mint_source?.kind === "connection" &&
+        entry.mint_source.connection_id === "default-github" &&
+        entry.mint_source.provider === "github"
     )).toBe(true);
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
@@ -619,7 +631,7 @@ describe("compileSessionCreateInput", () => {
 
     const inp = await compileSessionCreateInput(
       profile({
-        integrationGrants: [legacyCapabilityGrant("github:pulls:write")],
+        integrationGrants: [defaultGrant("github:pulls:write")],
         network: {
           default: "allow",
           allowHosts: ["profile.example.com"],
@@ -1105,13 +1117,13 @@ describe("createSessionForExistingTask", () => {
       profileId: "p1",
       capabilities: ["github:contents:read@openai/engrams"],
       integrationGrants: [{
-        connectionId: "legacy:github",
+        connectionId: "default-github",
         operation: "contents:read",
         resourceConstraints: ["openai/engrams"],
       }],
       integrationConnections: [{
-        id: "legacy:github",
-        alias: "legacy-github",
+        id: "default-github",
+        alias: "default-github",
         provider: "github",
         displayName: "github",
         config: {},
@@ -1162,7 +1174,7 @@ describe("createSessionForExistingTask", () => {
     await createSessionForExistingTask(
       createDeps(sessions, recordingDb(records), {
         profileOver: {
-          integrationGrants: [legacyCapabilityGrant("github:pulls:write")],
+          integrationGrants: [defaultGrant("github:pulls:write")],
           envVars: { PROFILE_PAT: "must-drop" },
           network: {
             default: "allow",
@@ -1216,9 +1228,9 @@ describe("createSessionForExistingTask", () => {
     ]);
     expect(policy.secrets.some((secret) => secret.secret_ref === "PROFILE_PAT")).toBe(false);
     expect(records[0]?.integrationGrants).toEqual([
-      { connectionId: "legacy:engram", operation: "pr_review", resourceConstraints: [] },
+      { connectionId: "default-engram", operation: "pr_review", resourceConstraints: [] },
       {
-        connectionId: "legacy:github",
+        connectionId: "default-github",
         operation: "contents:read",
         resourceConstraints: ["openai/engrams"],
       },

@@ -48,7 +48,12 @@ import {
 } from "../db/schema.ts";
 import { eq, sql, type SQL } from "drizzle-orm";
 import { PgDialect } from "drizzle-orm/pg-core";
-import { legacyCapabilityGrant } from "../integrations/grants.ts";
+import { capabilityGrant } from "../integrations/grants.ts";
+
+function defaultGrant(capability: string) {
+  const provider = capability.slice(0, capability.indexOf(":"));
+  return capabilityGrant(capability, `default-${provider}`);
+}
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 
 // ---------------------------------------------------------------------------
@@ -247,7 +252,7 @@ function makeFakeProfiles(opts?: {
     includeUserTokens: opts?.includeUserTokens ?? false,
     envVars: opts?.envVars ?? {},
     skills: opts?.skills ?? [],
-    integrationGrants: (opts?.capabilities ?? []).map(legacyCapabilityGrant),
+    integrationGrants: (opts?.capabilities ?? []).map(defaultGrant),
     launchAccess: "organization",
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
@@ -551,21 +556,23 @@ const fakeConnections: IntegrationConnectionStore = {
   list: async () => [],
   get: async (id) => ({
     id,
-    alias: id.replace(":", "-"),
-    provider: id.startsWith("legacy:") ? id.slice(7) : "gcp",
+    alias: id,
+    provider: id.startsWith("default-") ? id.slice(8) : "gcp",
     displayName: id,
+    isDefault: id.startsWith("default-"),
     config: {},
     enabled: true,
     testedAt: new Date(0),
     createdAt: new Date(0),
     updatedAt: new Date(0),
   }),
+  getDefault: async (provider) => fakeConnections.get(`default-${provider}`),
   create: async () => { throw new Error("unused"); },
   update: async () => { throw new Error("unused"); },
   delete: async () => { throw new Error("unused"); },
   markTested: async () => { throw new Error("unused"); },
   setEnabled: async () => { throw new Error("unused"); },
-  ensureLegacy: async () => {},
+  ensureDefault: async (provider) => (await fakeConnections.get(`default-${provider}`))!,
 };
 
 async function spawnServer(deps: TaskDeps): Promise<TestServer> {
@@ -1916,8 +1923,12 @@ describe("TaskService — principal-authoritative harness credentials (ADR 0053/
       // GraphQL mutations (ADR 0059); each a minted inject. The issue asset is
       // observed on both the REST create and the GraphQL createIssue mutation.
       expect(policy.injects.length).toBeGreaterThan(0);
-      expect(policy.injects.every((i: { mint_source: { kind: string; provider?: string } | null }) =>
-        i.mint_source?.kind === "provider" && i.mint_source.provider === "github"
+      expect(policy.injects.every((i: {
+        mint_source: { kind: string; connection_id?: string; provider?: string } | null;
+      }) =>
+        i.mint_source?.kind === "connection" &&
+          i.mint_source.connection_id === "default-github" &&
+          i.mint_source.provider === "github"
       )).toBe(true);
       expect(policy.observes.length).toBeGreaterThan(0);
       expect(

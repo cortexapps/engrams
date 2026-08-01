@@ -19,6 +19,7 @@ function grant(operation: string, resourceConstraints: string[] = []): ResolvedI
       alias: "prod-readonly",
       provider: "gcp",
       displayName: "Production read only",
+      isDefault: false,
       config: {
         workloadIdentityProvider: "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
         serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
@@ -42,6 +43,9 @@ describe("Google egress policy", () => {
       async get() {
         return connection;
       },
+      async getDefault() {
+        return null;
+      },
       async create() {
         return connection;
       },
@@ -57,7 +61,9 @@ describe("Google egress policy", () => {
       async setEnabled() {
         return connection;
       },
-      async ensureLegacy() {},
+      async ensureDefault() {
+        return connection;
+      },
     };
     await expect(resolveIntegrationGrants(
       [{

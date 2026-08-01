@@ -24,7 +24,7 @@ const BUGFIX = {
   envVars: {},
   skills: [],
   integrationGrants: [
-    { connectionId: "legacy:github", operation: "pulls:write", resourceConstraints: [] },
+    { connectionId: "connection-github", operation: "pulls:write", resourceConstraints: [] },
   ],
   secrets: [],
 };
@@ -58,6 +58,7 @@ const NETONLY = {
 const CATALOG = [
   {
     provider: "github",
+    defaultConnectionId: "connection-github",
     credentialSource: "mint",
     hosts: ["api.github.com"],
     display: {

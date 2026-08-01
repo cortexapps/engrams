@@ -45,8 +45,10 @@ The compiler keeps this tuple intact while it produces the immutable session
 policy. Session launch also stores a non-secret snapshot of each selected
 connection. Later connection edits do not change that session snapshot.
 
-Existing provider credentials become deterministic default connections. Existing
-profile capabilities migrate to structured grants on those connections. The
+Existing provider credentials receive ordinary default connections with opaque
+IDs. Existing profile capabilities migrate to structured grants on those
+connections. Migration state is not encoded in connection IDs or runtime
+branches. The
 coordinator can continue to persist its provider capability projection for
 provider-specific token scoping, but it is no longer the profile API.
 
@@ -82,11 +84,12 @@ coordinator. The coordinator accepts that requested UUID from its authenticated
 orchestrator client. On a create failure, the orchestrator removes the provisional
 rows. It registers event listeners only after the coordinator accepts the create.
 
-ADR 0056's mint path uses a typed credential source. GitHub App credentials use
-a built-in provider source. Google Cloud uses a named-connection source. Both
-sources return the same `ScopedCredential` shape and use the same boot, refresh,
-header-rendering, and host-proxy injection code. There is no encoded provider
-marker and no Google branch in the host agent or guest agent.
+ADR 0056's mint path uses a typed connection source. GitHub App credentials and
+Google Cloud both carry the opaque connection ID selected by the profile. The
+provider is separate routing metadata and is never inferred from that ID. Both
+return the same `ScopedCredential` shape and use the same boot, refresh,
+header-rendering, and host-proxy injection code. There is no Google branch in
+the host agent or guest agent.
 
 The coordinator calls one authenticated orchestrator-internal connection
 credential endpoint when a named source needs a credential. The broker resolves

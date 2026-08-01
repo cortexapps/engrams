@@ -68,8 +68,9 @@ export const uploadConnectorLogo = IntegrationService.method.uploadConnectorLogo
 export const testConnector = IntegrationService.method.testConnector;
 
 /**
- * ADR 0109: named credential instances. The first provider is Google Cloud;
- * its config contains no private key or other long-lived credential.
+ * ADR 0109: configured credential instances. Existing providers expose an
+ * ordinary default connection; the first provider with user-created named
+ * connections is Google Cloud, whose config contains no private key.
  *
  * @generated from rpc engram.app.v1.IntegrationService.ListConnections
  */

@@ -1,4 +1,4 @@
-/** Named integration grant validation and legacy policy projection (ADR 0109). */
+/** Connection-aware integration grant validation and policy projection (ADR 0109). */
 
 import { ConnectError, Code } from "@connectrpc/connect";
 
@@ -92,8 +92,14 @@ export function profileNeedsRestrictedLaunch(
   return resolved.some(({ connection }) => connection.provider === "gcp");
 }
 
-/** Convert a pre-ADR flat capability into its deterministic migrated grant. */
-export function legacyCapabilityGrant(capability: string): ProfileIntegrationGrant {
+interface ParsedCapabilityGrant {
+  provider: string;
+  operation: string;
+  resourceConstraints: string[];
+}
+
+/** Parse the flat capability inputs still used by internal workflow overrides. */
+function parseCapabilityGrant(capability: string): ParsedCapabilityGrant {
   const at = capability.indexOf("@");
   const unscoped = at === -1 ? capability : capability.slice(0, at);
   const separator = unscoped.indexOf(":");
@@ -101,8 +107,49 @@ export function legacyCapabilityGrant(capability: string): ProfileIntegrationGra
     throw new Error(`invalid legacy capability "${capability}"`);
   }
   return {
-    connectionId: `legacy:${unscoped.slice(0, separator)}`,
+    provider: unscoped.slice(0, separator),
     operation: unscoped.slice(separator + 1),
     resourceConstraints: at === -1 ? [] : [capability.slice(at + 1)],
   };
+}
+
+/** Bind one flat capability to an explicit connection. Test fixtures use this
+ * helper too; production authority never derives a connection ID from a
+ * provider name. */
+export function capabilityGrant(
+  capability: string,
+  connectionId: string,
+): ProfileIntegrationGrant {
+  const parsed = parseCapabilityGrant(capability);
+  return {
+    connectionId,
+    operation: parsed.operation,
+    resourceConstraints: parsed.resourceConstraints,
+  };
+}
+
+/** Resolve internal flat capability overrides through each provider's real
+ * default connection. */
+export async function defaultConnectionGrants(
+  capabilities: readonly string[],
+  connections: IntegrationConnectionStore,
+): Promise<ProfileIntegrationGrant[]> {
+  const parsed = capabilities.map(parseCapabilityGrant);
+  const providers = [...new Set(parsed.map((capability) => capability.provider))];
+  const defaults = await Promise.all(providers.map(async (provider) => {
+    const connection = await connections.getDefault(provider);
+    if (!connection) {
+      throw new ConnectError(
+        `default integration connection for "${provider}" does not exist`,
+        Code.FailedPrecondition,
+      );
+    }
+    return [provider, connection.id] as const;
+  }));
+  const byProvider = new Map(defaults);
+  return parsed.map((capability) => ({
+    connectionId: byProvider.get(capability.provider)!,
+    operation: capability.operation,
+    resourceConstraints: capability.resourceConstraints,
+  }));
 }

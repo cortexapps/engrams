@@ -246,7 +246,8 @@ mod tests {
         let req = b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\n\r\n".to_vec();
         let mut first = entry("Authorization", "Bearer {}", "first-mint");
         first.mint_source = Some(
-            engram_core::types::integration::CredentialMintSource::Provider {
+            engram_core::types::integration::CredentialMintSource::Connection {
+                connection_id: "github-default".into(),
                 provider: "github".into(),
             },
         );

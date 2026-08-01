@@ -58,8 +58,8 @@ import {
   type ProfileLaunchGrantStore,
 } from "../db/profile-launch-grants.ts";
 import {
+  defaultConnectionGrants,
   grantsToCapabilities,
-  legacyCapabilityGrant,
   resolveIntegrationGrants,
 } from "../integrations/grants.ts";
 import { appendGooglePolicy } from "../integrations/google-policy.ts";
@@ -318,12 +318,13 @@ export async function compileSessionCreateInput(
     deps.connections,
   );
   const profileCapabilities = grantsToCapabilities(resolvedProfileGrants);
+  const overrideGrants = await defaultConnectionGrants(
+    opts.capabilityOverride ?? opts.extraCapabilities ?? [],
+    deps.connections,
+  );
   const effectiveGrants = opts.capabilityOverride !== undefined
-    ? opts.capabilityOverride.map(legacyCapabilityGrant)
-    : [
-        ...profile.integrationGrants,
-        ...(opts.extraCapabilities ?? []).map(legacyCapabilityGrant),
-      ];
+    ? overrideGrants
+    : [...profile.integrationGrants, ...overrideGrants];
   const resolvedEffectiveGrants = await resolveIntegrationGrants(
     effectiveGrants,
     deps.connections,
@@ -423,7 +424,12 @@ export async function compileSessionCreateInput(
 
   // Per-session integration policy (caps + network + secrets), shipped only
   // when it carries content.
-  const policy = compileIntegrationPolicy(capabilities, registry, {
+  const policy = compileIntegrationPolicy(resolvedEffectiveGrants.map(({ grant, connection }) => ({
+    connectionId: connection.id,
+    provider: connection.provider,
+    operation: grant.operation,
+    resourceConstraints: grant.resourceConstraints,
+  })), registry, {
     network: opts.networkOverride ?? profile.network,
     secrets: opts.dropProfileSecretsAndEnv ? [] : profile.secrets,
   });

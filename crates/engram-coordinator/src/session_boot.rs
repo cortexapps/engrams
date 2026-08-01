@@ -801,7 +801,7 @@ pub(crate) async fn resolve_inject_entries(
     (out, failures)
 }
 
-/// ADR 0056 amendment: resolve a *mint* provider's egress inject header — mint a
+/// ADR 0056 amendment: resolve a connection's egress inject header — mint a
 /// credential scoped to the session's caps, then let the integration render it
 /// into a header (`Integration::inject_header`, e.g. github → `Bearer`). The
 /// scoped credential never enters the guest. Returns the rendered header AND the
@@ -818,9 +818,13 @@ async fn mint_inject_header(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
 )> {
-    let CredentialMintSource::Provider { provider } = source else {
-        return mint_connection_inject_header(session_id, source).await;
-    };
+    let CredentialMintSource::Connection {
+        connection_id,
+        provider,
+    } = source;
+    if provider == "gcp" {
+        return mint_remote_connection_inject_header(session_id, connection_id).await;
+    }
     let engine = state
         .integrations
         .resolve(provider, &state.services.secrets)
@@ -879,16 +883,13 @@ struct ConnectionBrokerResponse {
 /// Ask the orchestrator's generic connection broker for a short-lived
 /// credential. Provider-specific exchange stays behind that broker. The
 /// credential travels only between host-side processes.
-async fn mint_connection_inject_header(
+async fn mint_remote_connection_inject_header(
     session_id: SessionId,
-    source: &CredentialMintSource,
+    connection_id: &str,
 ) -> Option<(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
 )> {
-    let CredentialMintSource::Connection { connection_id } = source else {
-        return None;
-    };
     let base = match std::env::var("ENGRAM_ORCHESTRATOR_INTERNAL_URL") {
         Ok(value) if !value.trim().is_empty() => value.trim_end_matches('/').to_string(),
         _ => {

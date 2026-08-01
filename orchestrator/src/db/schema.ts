@@ -789,8 +789,9 @@ export const connector = pgTable("connector", {
     .$onUpdate(() => new Date()),
 });
 
-/** ADR 0109: a named credential instance. Google Cloud config is non-secret;
- * other providers use deterministic default connections during migration. */
+/** ADR 0109: one configured provider identity. Existing singleton providers
+ * receive an ordinary default connection; IDs never encode provider or
+ * migration state. Google Cloud config is non-secret. */
 export const integrationConnection = pgTable(
   "integration_connection",
   {
@@ -798,6 +799,7 @@ export const integrationConnection = pgTable(
     alias: text("alias").notNull().unique(),
     provider: text("provider").notNull(),
     displayName: text("display_name").notNull(),
+    isDefault: boolean("is_default").notNull().default(false),
     config: jsonb("config").$type<Record<string, unknown>>().notNull().default({}),
     enabled: boolean("enabled").notNull().default(false),
     testedAt: timestamp("tested_at", { withTimezone: true }),
@@ -807,7 +809,12 @@ export const integrationConnection = pgTable(
       .defaultNow()
       .$onUpdate(() => new Date()),
   },
-  (t) => [index("integration_connection_provider_idx").on(t.provider)],
+  (t) => [
+    index("integration_connection_provider_idx").on(t.provider),
+    uniqueIndex("integration_connection_provider_default_unique")
+      .on(t.provider)
+      .where(sql`is_default`),
+  ],
 );
 
 /** KEK-sealed private keys for the deployment OIDC issuer (ADR 0109). */

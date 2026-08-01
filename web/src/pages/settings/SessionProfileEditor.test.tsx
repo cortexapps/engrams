@@ -215,7 +215,7 @@ describe("SessionProfileEditor (edit)", () => {
         envVars: { ANTHROPIC_MODEL: "claude-x" },
         integrationGrants: [
           {
-            connectionId: "legacy:github",
+            connectionId: "connection-github",
             operation: "issues:read",
             resourceConstraints: [],
           },
@@ -289,7 +289,7 @@ describe("SessionProfileEditor (edit)", () => {
       envVars: { ANTHROPIC_MODEL: "claude-x" },
       integrationGrants: [
         {
-          connectionId: "legacy:github",
+          connectionId: "connection-github",
           operation: "issues:read",
           resourceConstraints: [],
         },

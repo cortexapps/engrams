@@ -37,8 +37,9 @@ service IntegrationService {
   // credential to test before sealing (inject: the single value under any key;
   // mint: the field map); empty tests the stored credential.
   rpc TestConnector(TestConnectorRequest) returns (TestConnectorResponse);
-  // ADR 0109: named credential instances. The first provider is Google Cloud;
-  // its config contains no private key or other long-lived credential.
+  // ADR 0109: configured credential instances. Existing providers expose an
+  // ordinary default connection; the first provider with user-created named
+  // connections is Google Cloud, whose config contains no private key.
   rpc ListConnections(ListConnectionsRequest) returns (ListConnectionsResponse);
   rpc CreateConnection(CreateConnectionRequest) returns (CreateConnectionResponse);
   rpc UpdateConnection(UpdateConnectionRequest) returns (UpdateConnectionResponse);
@@ -68,6 +69,7 @@ message IntegrationConnection {
   string created_at = 7;
   string updated_at = 8;
   GoogleCloudConnectionConfig google_cloud = 9;
+  bool is_default = 10;
 }
 
 message ListConnectionsRequest {}
@@ -179,6 +181,9 @@ message ProviderCatalogEntry {
   string credential_source = 3; // "mint" | "inject"
   repeated string hosts = 4;
   repeated CatalogCapability capabilities = 5;
+  // Stable opaque ID for the provider's existing singleton credential slot.
+  // New multi-connection surfaces list their instances separately.
+  string default_connection_id = 6;
 }
 
 message GetIntegrationCatalogRequest {}

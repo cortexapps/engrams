@@ -1,27 +1,30 @@
 import { describe, expect, it } from "vitest";
 
-import { legacyCapabilitiesForGrants } from "./profileIntegrations";
+import { defaultCapabilitiesForGrants } from "./profileIntegrations";
 
-describe("legacyCapabilitiesForGrants", () => {
-  it("projects migrated connector grants and ignores named cloud connections", () => {
+describe("defaultCapabilitiesForGrants", () => {
+  it("projects default connector grants and ignores other named connections", () => {
     expect(
-      legacyCapabilitiesForGrants([
-        {
-          connectionId: "legacy:github",
-          operation: "issues:read",
-          resourceConstraints: [],
-        },
-        {
-          connectionId: "legacy:github",
-          operation: "repos:read",
-          resourceConstraints: ["cortexapps/engrams", "cortexapps/cortex"],
-        },
-        {
-          connectionId: "gcp-prod",
-          operation: "compute.instances.get",
-          resourceConstraints: [],
-        },
-      ]),
+      defaultCapabilitiesForGrants(
+        [
+          {
+            connectionId: "connection-github",
+            operation: "issues:read",
+            resourceConstraints: [],
+          },
+          {
+            connectionId: "connection-github",
+            operation: "repos:read",
+            resourceConstraints: ["cortexapps/engrams", "cortexapps/cortex"],
+          },
+          {
+            connectionId: "gcp-prod",
+            operation: "compute.instances.get",
+            resourceConstraints: [],
+          },
+        ],
+        [{ provider: "github", defaultConnectionId: "connection-github" }],
+      ),
     ).toEqual([
       "github:issues:read",
       "github:repos:read@cortexapps/engrams",

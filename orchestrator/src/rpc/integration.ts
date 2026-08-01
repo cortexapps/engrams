@@ -176,6 +176,7 @@ function connectionToProto(row: IntegrationConnectionRow) {
     alias: row.alias,
     provider: row.provider,
     displayName: row.displayName,
+    isDefault: row.isDefault,
     enabled: row.enabled,
     testedAt: row.testedAt?.toISOString() ?? "",
     createdAt: row.createdAt.toISOString(),
@@ -354,6 +355,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         );
       }
       const row = await connectors.upsert(parsed.provider, raw);
+      await connections.ensureDefault(parsed.provider, `${parsed.display.name} (default)`);
       // The next loadRegistry() must see the new connector.
       invalidateRegistry();
       return {
@@ -391,21 +393,31 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       await requireUser(ctx, getSession);
       const registry = await loadRegistry(connectors);
       const withLogo = new Set(await connectorLogos.listProviders());
-      const providers = buildProviderCatalog(registry).map((e) => ({
-        provider: e.provider,
-        display: {
-          name: e.display.name,
-          category: e.display.category,
-          blurb: e.display.blurb,
-          icon: {
-            mono: e.display.icon.mono,
-            color: e.display.icon.color,
-            logo: withLogo.has(e.provider) ? logoUrl(e.provider) : "",
+      const providers = await Promise.all(buildProviderCatalog(registry).map(async (e) => {
+        const defaultConnection = await connections.getDefault(e.provider);
+        if (!defaultConnection) {
+          throw new ConnectError(
+            `default integration connection for "${e.provider}" is unavailable`,
+            Code.Internal,
+          );
+        }
+        return {
+          provider: e.provider,
+          display: {
+            name: e.display.name,
+            category: e.display.category,
+            blurb: e.display.blurb,
+            icon: {
+              mono: e.display.icon.mono,
+              color: e.display.icon.color,
+              logo: withLogo.has(e.provider) ? logoUrl(e.provider) : "",
+            },
           },
-        },
-        credentialSource: e.credentialSource,
-        hosts: e.hosts,
-        capabilities: e.capabilities.map((c) => ({ action: c.action, access: c.access, asset: c.asset ?? "" })),
+          credentialSource: e.credentialSource,
+          hosts: e.hosts,
+          capabilities: e.capabilities.map((c) => ({ action: c.action, access: c.access, asset: c.asset ?? "" })),
+          defaultConnectionId: defaultConnection.id,
+        };
       }));
       return { providers };
     },
@@ -553,6 +565,13 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
 
     async deleteConnection(req, ctx) {
       await requireAdmin(ctx, getSession);
+      const connection = await connections.get(req.id);
+      if (connection?.isDefault) {
+        throw new ConnectError(
+          "a provider's default connection cannot be deleted",
+          Code.FailedPrecondition,
+        );
+      }
       const referenced = (await profiles.list({ includeArchived: true })).some(
         (profile) => profile.integrationGrants.some((grant) => grant.connectionId === req.id),
       );

@@ -816,7 +816,8 @@ async fn near_expiry_inject_is_reminted_before_forwarding() {
             graphql: None,
         },
         mint_source: Some(
-            engram_core::types::integration::CredentialMintSource::Provider {
+            engram_core::types::integration::CredentialMintSource::Connection {
+                connection_id: "github-default".into(),
                 provider: "github".into(),
             },
         ),

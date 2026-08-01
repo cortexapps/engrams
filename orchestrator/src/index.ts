@@ -72,7 +72,8 @@ import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts"
 import { makeEnrollmentStore } from "./db/enrollments.ts";
 import { makeProfileStore } from "./db/profiles.ts";
 import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
-import { connectorRegistry } from "./connectors/registry.ts";
+import { makeConnectorStore } from "./db/connectors.ts";
+import { loadRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
@@ -257,13 +258,14 @@ setReviewIngressControlPlane(reviewControlPlane);
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
 const integrationConnections = makeIntegrationConnectionStore(getDb());
+const configuredConnectors = await loadRegistry(makeConnectorStore(getDb()));
 await Promise.all([
-  ...[...connectorRegistry().values()].map((connector) =>
-    integrationConnections.ensureLegacy(connector.provider, `${connector.display.name} (default)`),
+  ...[...configuredConnectors.values()].map((connector) =>
+    integrationConnections.ensureDefault(connector.provider, `${connector.display.name} (default)`),
   ),
-  integrationConnections.ensureLegacy("engram", "Engrams tools"),
+  integrationConnections.ensureDefault("engram", "Engrams tools"),
 ]);
-void seedReviewerProfile(makeProfileStore(getDb()), log).catch((err) =>
+void seedReviewerProfile(makeProfileStore(getDb()), integrationConnections, log).catch((err) =>
   log.error({ err }, "reviewer profile seed failed"),
 );
 if (process.env.ENGRAM_DEV_TOOLS === "1") registerDevTools();

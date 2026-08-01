@@ -1,8 +1,9 @@
 import { isUniqueViolation } from "../db/pg-errors.ts";
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
 import type { ProfileStore } from "../db/profiles.ts";
 import { DEFAULT_PROFILE_NETWORK } from "../db/schema.ts";
 import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
-import { legacyCapabilityGrant } from "../integrations/grants.ts";
+import { capabilityGrant } from "../integrations/grants.ts";
 
 export const PR_REVIEWER_DESIGNATION = "pr_reviewer";
 
@@ -15,6 +16,7 @@ export interface ReviewerProfileSeedLogger {
 /** Best-effort bootstrap of the system profile used by the PR review workflow. */
 export async function seedReviewerProfile(
   store: ProfileStore,
+  connections: IntegrationConnectionStore,
   log: ReviewerProfileSeedLogger,
 ): Promise<void> {
   if (await store.getByDesignation(PR_REVIEWER_DESIGNATION)) return;
@@ -25,6 +27,10 @@ export async function seedReviewerProfile(
       "reviewer profile not seeded: configure an org default profile first, then it seeds on next boot (or designate one manually)",
     );
     return;
+  }
+  const engramsConnection = await connections.getDefault("engram");
+  if (!engramsConnection) {
+    throw new Error("default Engrams integration connection is unavailable");
   }
 
   try {
@@ -45,7 +51,7 @@ export async function seedReviewerProfile(
         // token has no credential wiring and the workflow's clone fails with
         // "could not read Username for 'https://github.com'".
         skills: ["skills"],
-        integrationGrants: [legacyCapabilityGrant(PR_REVIEW_CAPABILITY)],
+        integrationGrants: [capabilityGrant(PR_REVIEW_CAPABILITY, engramsConnection.id)],
         launchAccess: "organization",
         network: DEFAULT_PROFILE_NETWORK,
         secrets: [],

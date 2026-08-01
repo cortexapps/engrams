@@ -74,7 +74,7 @@ const reviewerProfile: ProfileRow = {
   envVars: {},
   skills: [],
   integrationGrants: [{
-    connectionId: "legacy:engram",
+    connectionId: "connection-engram",
     operation: "pr_review",
     resourceConstraints: [],
   }],

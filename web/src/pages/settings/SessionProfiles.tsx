@@ -28,7 +28,7 @@ import {
 import { ProfileIcon } from "../../components/profiles/ProfileIcon";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
 import { derivePolicy } from "../../lib/profilePolicy";
-import { legacyCapabilitiesForGrants } from "../../lib/profileIntegrations";
+import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { PageHeading } from "../../components/page-heading";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -91,7 +91,7 @@ function Row({
   const harnessEgress = harnesses?.find((h) => h.name === p.harness)?.descriptor?.egress;
   const policy = derivePolicy(
     {
-      capabilities: legacyCapabilitiesForGrants(p.integrationGrants ?? []),
+      capabilities: defaultCapabilitiesForGrants(p.integrationGrants ?? [], views),
       network: {
         default: p.network?.default === "allow" ? "allow" : "deny",
         allowHosts: p.network?.allowHosts ?? [],

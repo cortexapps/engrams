@@ -19,6 +19,7 @@ export interface ConnectorCapabilityView {
 
 export interface ConnectorView {
   provider: string;
+  defaultConnectionId: string;
   name: string;
   category: string;
   blurb: string;
@@ -52,13 +53,14 @@ export function useConnectorViews(): ConnectorViewsResult {
     const fb = fallbackIdentity(e.provider);
     const row = rowByProvider.get(e.provider);
     const used = allProfiles.filter((p) =>
-      (p.integrationGrants ?? []).some((grant) => grant.connectionId === `legacy:${e.provider}`),
+      (p.integrationGrants ?? []).some((grant) => grant.connectionId === e.defaultConnectionId),
     );
     // Logo precedence (matches useProviderIdentity): bundled built-in →
     // uploaded overlay → monogram.
     const logo = builtinLogo(e.provider) ?? (e.display?.icon?.logo || undefined);
     return {
       provider: e.provider,
+      defaultConnectionId: e.defaultConnectionId,
       name: e.display?.name || fb.name,
       category: e.display?.category || fb.category,
       blurb: e.display?.blurb ?? "",
@@ -101,6 +103,7 @@ export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView
     const logo = builtinLogo(e.provider) ?? (e.display?.icon?.logo || undefined);
     return {
       provider: e.provider,
+      defaultConnectionId: e.defaultConnectionId,
       name: e.display?.name || fb.name,
       category: e.display?.category || fb.category,
       blurb: e.display?.blurb ?? "",

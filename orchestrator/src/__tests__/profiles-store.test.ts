@@ -113,8 +113,8 @@ describe("ProfileStore", () => {
       envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
       skills: ["skills"],
       integrationGrants: [
-        { connectionId: "legacy:github", operation: "issues:write", resourceConstraints: [] },
-        { connectionId: "legacy:datadog", operation: "metrics:read", resourceConstraints: [] },
+        { connectionId: "connection-github", operation: "issues:write", resourceConstraints: [] },
+        { connectionId: "connection-datadog", operation: "metrics:read", resourceConstraints: [] },
       ],
       launchAccess: "organization" as const,
       network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
