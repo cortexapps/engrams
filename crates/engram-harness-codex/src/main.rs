@@ -1251,10 +1251,51 @@ async fn route_tool_result(
     // plan stamp and rides the ordinary respond-in-place path: the model
     // sees `{decision:"reject", feedback}` as the tool result and keeps
     // planning in the same read-only turn.
-    let plan_approval = (call.tool_name == "exit_plan_mode")
+    let plan_decision = (call.tool_name == "exit_plan_mode")
         .then(|| engram_harness_sdk::plan::parse_plan_decision(&result_json))
-        .flatten()
-        .filter(|decision| decision.approved());
+        .flatten();
+    // ADR 0107: a REJECT must read as a FAILED call with the reviewer's
+    // feedback as the reason — the session fe3cd981 regression: answering it
+    // `success: true` with raw decision JSON made the model narrate "plan
+    // submitted" and end the turn instead of revising. Mirrors the claude
+    // adapter's deny-with-reason semantics.
+    if let Some(decision) = plan_decision.as_ref().filter(|d| !d.approved()) {
+        let text = format!(
+            "{} Revise the plan now and call exit_plan_mode again with the              updated markdown. Stay in plan mode and do not modify files.",
+            decision.reject_reason()
+        );
+        if call.request_generation == server.generation && !call.request_id.is_null() {
+            if let Err(error) = server
+                .respond(
+                    call.request_id.clone(),
+                    json!({
+                        "success": false,
+                        "contentItems": [{"type": "inputText", "text": text}]
+                    }),
+                )
+                .await
+            {
+                tracing::error!(%error, %call_id, "could not answer rejected exit_plan_mode");
+                return;
+            }
+            if let Err(error) = parked.take(call_id) {
+                tracing::error!(%error, %call_id, "could not retire rejected plan call");
+            }
+            return;
+        }
+        // Stale generation: deliver the revision ask as a follow-up user turn
+        // (the stamp is still `plan`, so it starts read-only).
+        let completion = FollowUpCompletion::Tool {
+            name: call.tool_name.clone(),
+            result_summary: result_json,
+        };
+        if let Err(error) = send_follow_up(server, active, pending, call_id, text, completion).await
+        {
+            tracing::error!(%error, %call_id, "could not deliver plan rejection as user message");
+        }
+        return;
+    }
+    let plan_approval = plan_decision.filter(|decision| decision.approved());
     if plan_approval.is_some() {
         if let Err(error) = engram_harness_sdk::mode_stamp::write_mode_stamp(
             &server.mode_stamp_path,
@@ -2616,6 +2657,92 @@ done
         );
         let parked = ParkedCallStore::open(parked_path).unwrap().all();
         assert!(parked.is_empty(), "never parked: {parked:?}");
+        engine.abort();
+    }
+
+    /// ADR 0107 (session fe3cd981 regression): a REJECT decision must land
+    /// as a FAILED call carrying the reviewer's feedback — a success-shaped
+    /// response made the model narrate "plan submitted" and end the turn.
+    #[tokio::test]
+    async fn plan_reject_answers_the_parked_call_as_failure_with_feedback() {
+        let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft"},"threadId":"t1","turnId":"turn-1"}}"#;
+        let (script, record) = write_fake_codex(&[tool_call]).await;
+        let base = script.parent().unwrap().to_path_buf();
+        let mut cli = test_cli(script, base.join("home"));
+        cli.thread_id_file = Some(base.join("thread-id"));
+        cli.tool_manifest = parse_tool_manifest(
+            r#"[{"name":"exit_plan_mode","description":"Present the plan","inputSchema":{"type":"object"},"execution":"deferred","nativeBindings":{}}]"#,
+        )
+        .unwrap();
+        // Latch plan mode so the call parks instead of being rejected in place.
+        engram_harness_sdk::mode_stamp::write_mode_stamp(cli.mode_stamp_file(), "plan").unwrap();
+        let (command_tx, command_rx) = mpsc::channel(8);
+        let (event_tx, mut event_rx) = mpsc::channel(16);
+        let engine = tokio::spawn(run_engine(
+            cli,
+            command_rx,
+            Arc::new(Notify::new()),
+            event_tx,
+        ));
+        command_tx
+            .send(HarnessCommand::Prompt {
+                prompt_id: "prompt-plan".into(),
+                text: "plan it".into(),
+                mode: Some("plan".into()),
+            })
+            .await
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                if matches!(
+                    event_rx.recv().await,
+                    Some(HarnessEvent::ToolCallRequested { ref call_id, .. }) if call_id == "call-plan"
+                ) {
+                    break;
+                }
+            }
+        })
+        .await
+        .expect("plan call parks");
+
+        command_tx
+            .send(HarnessCommand::ToolResult {
+                call_id: "call-plan".into(),
+                result_json: r#"{"decision":"reject","feedback":"Update the README.md to say that tests are needed"}"#.into(),
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            loop {
+                let requests = recorded_requests(&record).await;
+                if let Some(response) = requests.iter().find(|request| {
+                    request.get("id") == Some(&json!(77)) && request.get("result").is_some()
+                }) {
+                    assert_eq!(
+                        response.pointer("/result/success"),
+                        Some(&json!(false)),
+                        "a rejected plan is a FAILED call: {response}"
+                    );
+                    let text = response
+                        .pointer("/result/contentItems/0/text")
+                        .and_then(Value::as_str)
+                        .unwrap();
+                    assert!(
+                        text.contains("Update the README.md"),
+                        "feedback rides: {text}"
+                    );
+                    assert!(
+                        text.contains("call exit_plan_mode again"),
+                        "revision ask: {text}"
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
+        })
+        .await
+        .expect("reject response recorded");
         engine.abort();
     }
 
