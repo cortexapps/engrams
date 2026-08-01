@@ -72,6 +72,19 @@ pub struct IntegrationSecret {
     pub allow_host_patterns: Vec<String>,
 }
 
+/// The authority that mints a short-lived credential for an egress inject.
+///
+/// This type replaces the provider-name string marker so future credential
+/// sources can use the same broker and refresh path without overloading a
+/// provider identifier. It contains routing metadata only. It never contains a
+/// credential value.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialMintSource {
+    /// Mint through the built-in integration provider registry.
+    Provider { provider: String },
+}
+
 /// One Plane-B injection: on an outbound request to `hosts` matching the
 /// request policy (`methods` + `path_globs`), the proxy injects
 /// `header_name: <header_template with "{}" → the resolved secret>`. The
@@ -84,17 +97,17 @@ pub struct IntegrationInject {
     pub header_template: String,
     /// A `SecretStore` reference (e.g. `"datadog-api-key"`) the coordinator
     /// resolves to a value host-side. NEVER a secret value itself. Empty when
-    /// this is a `mint_provider` entry (the value is minted, not stored).
+    /// this is a `mint_source` entry (the value is minted, not stored).
     #[serde(default)]
     pub secret_ref: String,
-    /// ADR 0056 amendment: when non-empty, the inject value is **minted** — the
-    /// coordinator resolves it via the `IntegrationBroker` for this provider,
+    /// ADR 0056 amendment: when present, the inject value is **minted** — the
+    /// coordinator resolves it through the named credential source,
     /// scoped to the session's bound capabilities, instead of from `secret_ref`.
     /// This is how a *mint* provider (e.g. github) rides the same egress inject
     /// plane as a static-secret (*inject*) provider; the scoped token never
     /// enters the guest. Mutually exclusive with `secret_ref`. NEVER a value.
     #[serde(default)]
-    pub mint_provider: String,
+    pub mint_source: Option<CredentialMintSource>,
     /// Request shapes this injection gates + applies to. Empty = any.
     #[serde(default)]
     pub methods: Vec<String>,
@@ -251,7 +264,7 @@ mod tests {
                 header_name: "DD-API-KEY".into(),
                 header_template: "{}".into(),
                 secret_ref: "datadog-api-key".into(),
-                mint_provider: String::new(),
+                mint_source: None,
                 methods: vec!["GET".into()],
                 path_globs: vec!["/api/v2/logs*".into()],
                 graphql_operation: String::new(),
@@ -273,7 +286,9 @@ mod tests {
                 header_name: String::new(),
                 header_template: String::new(),
                 secret_ref: String::new(),
-                mint_provider: "github".into(),
+                mint_source: Some(CredentialMintSource::Provider {
+                    provider: "github".into(),
+                }),
                 methods: vec!["POST".into()],
                 path_globs: vec!["/graphql".into()],
                 graphql_operation: "mutation".into(),

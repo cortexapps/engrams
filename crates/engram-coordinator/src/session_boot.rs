@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 
 use engram_core::traits::SessionFence;
+use engram_core::types::integration::CredentialMintSource;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
 use engram_core::types::BindingDisposition;
@@ -689,7 +690,7 @@ pub(crate) async fn resolve_inject_entries(
     };
     // ADR 0056 amendment: mint entries scope their token to the session's bound
     // capabilities. Fetch them once, only when a mint entry is actually present.
-    let caps = if policy.injects.iter().any(|i| !i.mint_provider.is_empty()) {
+    let caps = if policy.injects.iter().any(|i| i.mint_source.is_some()) {
         match state
             .services
             .meta
@@ -711,12 +712,12 @@ pub(crate) async fn resolve_inject_entries(
     };
     let mut out = Vec::with_capacity(policy.injects.len());
     for inj in &policy.injects {
-        let entry = if !inj.mint_provider.is_empty() {
+        let entry = if let Some(mint_source) = &inj.mint_source {
             // Minted: the GATING is policy-owned (this entry's hosts/methods/paths),
             // but the HEADER (name + rendered value) is the integration's — so the
             // auth scheme is the provider's, not hardcoded by the policy compiler.
             // The scoped credential never enters the guest.
-            match mint_inject_header(state, &inj.mint_provider, &caps).await {
+            match mint_inject_header(state, mint_source, &caps).await {
                 Some((h, expires_at)) => engram_core::types::egress::EgressInjectEntry {
                     secret: h.value,
                     header_name: h.name,
@@ -732,7 +733,7 @@ pub(crate) async fn resolve_inject_entries(
                     // WS4: a minted entry is refreshable — the proxy re-mints via
                     // its InjectRefresher near `expires_at` (this provider is the
                     // one the refresh route re-runs the mint for).
-                    mint_provider: inj.mint_provider.clone(),
+                    mint_source: Some(mint_source.clone()),
                     expires_at: Some(expires_at),
                 },
                 None => {
@@ -781,7 +782,7 @@ pub(crate) async fn resolve_inject_entries(
                 graphql_operation: inj.graphql_operation.clone(),
                 graphql_field: inj.graphql_field.clone(),
                 // WS4: a static secret is not refreshable (empty provider, no TTL).
-                mint_provider: String::new(),
+                mint_source: None,
                 expires_at: None,
             }
         };
@@ -800,12 +801,13 @@ pub(crate) async fn resolve_inject_entries(
 /// SigV4).
 async fn mint_inject_header(
     state: &SharedState,
-    provider: &str,
+    source: &CredentialMintSource,
     caps: &[engram_core::types::Capability],
 ) -> Option<(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
 )> {
+    let CredentialMintSource::Provider { provider } = source;
     let engine = state
         .integrations
         .resolve(provider, &state.services.secrets)
@@ -813,7 +815,7 @@ async fn mint_inject_header(
     // Scope the mint to this provider's caps; owner from a cap's `@owner/repo`.
     let scoped: Vec<engram_core::types::Capability> = caps
         .iter()
-        .filter(|c| c.provider == provider)
+        .filter(|c| c.provider == provider.as_str())
         .cloned()
         .collect();
     let owner = scoped
@@ -856,7 +858,7 @@ async fn mint_inject_header(
 pub(crate) async fn refresh_inject_header(
     state: &SharedState,
     session_id: SessionId,
-    provider: &str,
+    source: &CredentialMintSource,
 ) -> Option<(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
@@ -867,7 +869,7 @@ pub(crate) async fn refresh_inject_header(
         .get_session_capabilities(session_id)
         .await
         .unwrap_or_default();
-    mint_inject_header(state, provider, &caps).await
+    mint_inject_header(state, source, &caps).await
 }
 
 // Issue #535 (b): `persist_integration_policy` (ADR 0056 B′) retired — the

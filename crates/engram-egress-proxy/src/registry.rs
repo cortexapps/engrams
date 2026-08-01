@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Duration, Utc};
+use engram_core::types::integration::CredentialMintSource;
 use engram_core::SessionId;
 use parking_lot::RwLock;
 
@@ -72,8 +73,8 @@ pub struct SecretEntry {
 /// `header_name: <header_template with "{}" → secret>`. The secret lives
 /// only in this struct, on the host.
 ///
-/// WS4: the credential is *refreshable*. A minted entry (`mint_provider`
-/// non-empty) carries a short-lived credential (a GitHub App installation
+/// WS4: the credential is *refreshable*. A minted entry (`mint_source`
+/// present) carries a short-lived credential (a GitHub App installation
 /// token, ~1h TTL) that the proxy re-mints via its [`InjectRefresher`] seam
 /// near expiry — closing the campaign's reads-401/writes-succeed asymmetry
 /// where the boot-time inject token was minted ONCE and went stale ~1h later.
@@ -86,10 +87,10 @@ pub struct InjectEntry {
     pub allow: HostList,
     /// Request shapes this injection gates + applies to.
     pub policy: RequestPolicy,
-    /// WS4: the mint provider whose credential this injects (e.g. `"github"`),
-    /// or empty for a static/non-refreshable secret. Non-empty ⇒ the proxy
+    /// WS4: the source that minted this credential, or `None` for a static,
+    /// non-refreshable secret. A present source means that the proxy
     /// re-mints `cred` via the [`InjectRefresher`] near expiry.
-    pub mint_provider: String,
+    pub mint_source: Option<CredentialMintSource>,
     /// WS4: the refreshable credential cell. [`Self::secret`] reads the current
     /// value; [`Self::refresh_if_stale`] re-mints it (single-flighted) when a
     /// near-expiry request arrives. The secret lives only here, on the host.
@@ -106,10 +107,13 @@ impl InjectEntry {
     /// re-mint it via `refresher`, single-flighted so concurrent connections
     /// re-mint at most once. On refresh failure the STALE secret is kept — a
     /// request under a stale token 401s (recoverable), whereas dropping the
-    /// request is not. A no-op for a static entry (empty `mint_provider`) or one
+    /// request is not. A no-op for a static entry (no `mint_source`) or one
     /// still comfortably inside its validity window.
     pub async fn refresh_if_stale(&self, session_id: SessionId, refresher: &dyn InjectRefresher) {
-        if self.mint_provider.is_empty() || self.cred.fresh_enough() {
+        let Some(mint_source) = &self.mint_source else {
+            return;
+        };
+        if self.cred.fresh_enough() {
             return;
         }
         // Single-flight: hold the async guard across the re-mint. Late arrivals
@@ -118,7 +122,7 @@ impl InjectEntry {
         if self.cred.fresh_enough() {
             return; // another connection refreshed while we waited
         }
-        match refresher.refresh(session_id, &self.mint_provider).await {
+        match refresher.refresh(session_id, mint_source).await {
             Some(fresh) => {
                 *self.cred.current.write() = CredState {
                     secret: fresh.secret,
@@ -126,7 +130,7 @@ impl InjectEntry {
                 };
             }
             None => tracing::warn!(
-                provider = %self.mint_provider,
+                source = ?mint_source,
                 %session_id,
                 "egress inject refresh failed; keeping the stale credential \
                  (a 401 is recoverable; a dropped request is not)",
@@ -183,9 +187,13 @@ impl RefreshableCred {
 /// the proxy AWAITS the fresh secret before injecting it.
 #[async_trait]
 pub trait InjectRefresher: Send + Sync {
-    /// Re-mint the credential for `mint_provider` on `session_id`. `None` ⇒ the
+    /// Re-mint the credential for `mint_source` on `session_id`. `None` means the
     /// refresh failed (the caller keeps the stale secret).
-    async fn refresh(&self, session_id: SessionId, mint_provider: &str) -> Option<RefreshedInject>;
+    async fn refresh(
+        &self,
+        session_id: SessionId,
+        mint_source: &CredentialMintSource,
+    ) -> Option<RefreshedInject>;
 }
 
 /// WS4: the result of an [`InjectRefresher::refresh`] — the fresh rendered header
@@ -518,7 +526,7 @@ mod tests {
                     path_globs: vec!["/api/v2/logs*".into()],
                     graphql: None,
                 },
-                mint_provider: String::new(),
+                mint_source: None,
                 cred: RefreshableCred::new("dd-secret".into(), None),
             }],
             observes: vec![ObserveEntry {
@@ -642,7 +650,11 @@ mod tests {
 
     #[async_trait]
     impl InjectRefresher for StubRefresher {
-        async fn refresh(&self, _s: SessionId, _p: &str) -> Option<RefreshedInject> {
+        async fn refresh(
+            &self,
+            _s: SessionId,
+            _source: &CredentialMintSource,
+        ) -> Option<RefreshedInject> {
             self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             self.result.clone()
         }
@@ -654,16 +666,18 @@ mod tests {
             header_template: "Bearer {}".into(),
             allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
             policy: RequestPolicy::default(),
-            mint_provider: "github".into(),
+            mint_source: Some(CredentialMintSource::Provider {
+                provider: "github".into(),
+            }),
             cred: RefreshableCred::new(secret.into(), expires_at),
         }
     }
 
     #[tokio::test]
     async fn static_entry_never_refreshes() {
-        // Empty mint_provider (a static secret) is a no-op even with a refresher.
+        // No mint source means a static secret, even when a refresher is present.
         let e = InjectEntry {
-            mint_provider: String::new(),
+            mint_source: None,
             ..mint_entry("static", None)
         };
         let r = StubRefresher {

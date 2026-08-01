@@ -83,8 +83,8 @@ pub fn inject_headers(
             // policy entry. Values need not be byte-identical, but the same
             // provider + rendering template represents one credential class
             // for this session. Static or cross-provider conflicts stay fatal.
-            let equivalent_mint = !entry.mint_provider.is_empty()
-                && entry.mint_provider == existing_entry.mint_provider
+            let equivalent_mint = entry.mint_source.is_some()
+                && entry.mint_source == existing_entry.mint_source
                 && entry.header_template == existing_entry.header_template;
             if existing_value != &value && !equivalent_mint {
                 return Err(InjectHeaderError::ConflictingValues {
@@ -158,7 +158,7 @@ mod tests {
             header_template: template.into(),
             allow: HostList::from_manifest(&["api.datadoghq.com".into()], &[]).unwrap(),
             policy: RequestPolicy::default(),
-            mint_provider: String::new(),
+            mint_source: None,
             cred: crate::registry::RefreshableCred::new(secret.into(), None),
         }
     }
@@ -245,9 +245,13 @@ mod tests {
     fn coalesces_equivalent_minted_credentials_with_distinct_values() {
         let req = b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\n\r\n".to_vec();
         let mut first = entry("Authorization", "Bearer {}", "first-mint");
-        first.mint_provider = "github".into();
+        first.mint_source = Some(
+            engram_core::types::integration::CredentialMintSource::Provider {
+                provider: "github".into(),
+            },
+        );
         let mut second = entry("authorization", "Bearer {}", "second-mint");
-        second.mint_provider = "github".into();
+        second.mint_source = first.mint_source.clone();
 
         let out = inject_headers(req, &[&first, &second]).unwrap();
         let text = std::str::from_utf8(&out).unwrap();
