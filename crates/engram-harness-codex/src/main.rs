@@ -791,8 +791,7 @@ async fn drive(
 ) -> DriveOutcome {
     let mut active: Option<String> = None;
     let mut pending = HashMap::<i64, Pending>::new();
-    let mut interrupt_deadline: Option<tokio::time::Instant> = None;
-    let mut interrupt_requested = false;
+    let mut interrupt = InterruptWatchdog::default();
     emit(events, HarnessEvent::Idle).await;
     let mut index = 0;
     while index < queued.len() {
@@ -865,8 +864,7 @@ async fn drive(
             )
             .await;
             if completed {
-                interrupt_deadline = None;
-                interrupt_requested = false;
+                interrupt.disarm();
             }
             continue;
         }
@@ -913,19 +911,13 @@ async fn drive(
                     let mode_change = prompt.mode.as_deref().is_some_and(|m| {
                         m != engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path)
                     });
-                    if let (Some(turn_id), true) = (active.as_deref(), mode_change) {
+                    if let (Some(turn_id), true) = (active.clone(), mode_change) {
                         emit(events, HarnessEvent::PromptQueued {
                             prompt_id: prompt.prompt_id.clone(),
                             summary: Some(engram_harness_sdk::truncate_utf8(&prompt.text, 1024)),
                         }).await;
                         queued.push_back(prompt);
-                        match server.send_request(
-                            "turn/interrupt",
-                            json!({"threadId": server.thread_id, "turnId": turn_id}),
-                        ).await {
-                            Ok(id) => { pending.insert(id, Pending::Interrupt); }
-                            Err(error) => tracing::error!(%error, "could not interrupt for a mode change"),
-                        }
+                        interrupt_turn(server, &mut pending, &mut interrupt, &turn_id, "mode change").await;
                     } else if let Some(turn_id) = active.as_deref() {
                         let id = server.send_request("turn/steer", json!({
                             "threadId": server.thread_id,
@@ -962,13 +954,11 @@ async fn drive(
                         emit(events, HarnessEvent::PromptDequeued { prompt_id }).await;
                     }
                 }
-                Some(HarnessCommand::Interrupt) => if let Some(turn_id) = active.as_deref() {
-                    if let Ok(id) = server.send_request("turn/interrupt", json!({"threadId":server.thread_id,"turnId":turn_id})).await {
-                        pending.insert(id, Pending::Interrupt);
-                        interrupt_requested = true;
-                        interrupt_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(10));
+                Some(HarnessCommand::Interrupt) => {
+                    if let Some(turn_id) = active.clone() {
+                        interrupt_turn(server, &mut pending, &mut interrupt, &turn_id, "operator interrupt").await;
                     }
-                },
+                }
                 Some(HarnessCommand::ToolResult { call_id, result_json }) => {
                     route_tool_result(
                         server,
@@ -977,6 +967,7 @@ async fn drive(
                             pending: &mut pending,
                             active: &active,
                             queued,
+                            interrupt: &mut interrupt,
                         },
                         events,
                         &call_id,
@@ -990,14 +981,14 @@ async fn drive(
             },
             _ = reattach.notified() => if active.is_none() { emit(events, HarnessEvent::Idle).await; },
             _ = async {
-                match interrupt_deadline {
+                match interrupt.deadline {
                     Some(deadline) => tokio::time::sleep_until(deadline).await,
                     None => std::future::pending::<()>().await,
                 }
             } => {
                 tracing::warn!("Codex did not confirm interrupt within 10s; terminating app-server");
                 let _ = server.child.start_kill();
-                interrupt_deadline = None;
+                interrupt.disarm();
             },
             message = server.read() => match message {
                 Ok(Some(value)) => {
@@ -1012,8 +1003,7 @@ async fn drive(
                         ToolContext { parked, manifest },
                     ).await;
                     if completed {
-                        interrupt_deadline = None;
-                        interrupt_requested = false;
+                        interrupt.disarm();
                     }
                 },
                 Ok(None) | Err(_) => {
@@ -1040,7 +1030,7 @@ async fn drive(
                             format!("Codex app-server exited unexpectedly; resuming the persisted thread. stderr tail:\n{}", engram_harness_sdk::truncate_utf8(&tail.join("\n"), MAX_SUMMARY))
                         };
                         emit(events, HarnessEvent::AgentMessage { run_id: run_id.clone(), message_id: format!("abnormal-{}", uuid::Uuid::new_v4()), role: AgentRole::System, text: detail }).await;
-                        if interrupt_requested {
+                        if interrupt.requested {
                             emit(events, HarnessEvent::RunInterrupted { run_id }).await;
                         } else {
                             emit(events, HarnessEvent::RunCompleted { run_id, ok: false }).await;
@@ -1260,6 +1250,64 @@ struct RouteCtx<'a> {
     pending: &'a mut HashMap<i64, Pending>,
     active: &'a Option<String>,
     queued: &'a mut VecDeque<QueuedPrompt>,
+    /// A plan decision interrupts the read-only turn; that interrupt has to
+    /// arm the watchdog like every other one.
+    interrupt: &'a mut InterruptWatchdog,
+}
+
+/// How long codex gets to confirm a `turn/interrupt` before the app-server is
+/// force-killed. "Codex did not confirm" is a real, handled failure mode.
+const INTERRUPT_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// The `turn/interrupt` watchdog.
+///
+/// Every interrupt MUST arm it: if codex never answers, `active` never clears,
+/// the queue never drains, and the session wedges — holding, say, an approved
+/// plan that will never build. PR #927 shipped three interrupt sites (mode
+/// change, plan approve, plan reject) that recorded the pending request but
+/// left the deadline unarmed, reopening exactly the window the watchdog
+/// exists to close. Hence `interrupt_turn`: the send and the arm are one
+/// operation, so a new call site cannot forget half of it.
+#[derive(Default)]
+struct InterruptWatchdog {
+    requested: bool,
+    deadline: Option<tokio::time::Instant>,
+}
+
+impl InterruptWatchdog {
+    fn arm(&mut self) {
+        self.requested = true;
+        self.deadline = Some(tokio::time::Instant::now() + INTERRUPT_GRACE);
+    }
+
+    /// The turn ended (or the kill fired): stop watching.
+    fn disarm(&mut self) {
+        self.requested = false;
+        self.deadline = None;
+    }
+}
+
+/// Ask codex to end `turn_id` and start the clock. The ONLY way to interrupt.
+async fn interrupt_turn(
+    server: &mut AppServer,
+    pending: &mut HashMap<i64, Pending>,
+    watchdog: &mut InterruptWatchdog,
+    turn_id: &str,
+    reason: &str,
+) {
+    match server
+        .send_request(
+            "turn/interrupt",
+            json!({"threadId": server.thread_id, "turnId": turn_id}),
+        )
+        .await
+    {
+        Ok(id) => {
+            pending.insert(id, Pending::Interrupt);
+            watchdog.arm();
+        }
+        Err(error) => tracing::error!(%error, %reason, "could not request a turn interrupt"),
+    }
 }
 
 async fn route_tool_result(
@@ -1274,6 +1322,7 @@ async fn route_tool_result(
         pending,
         active,
         queued,
+        interrupt,
     } = ctx;
     let Some(call) = parked.get(call_id).cloned() else {
         tracing::error!(%call_id, "ToolResult has no parked Codex call");
@@ -1330,21 +1379,8 @@ async fn route_tool_result(
                 },
             )
             .await;
-            if let Some(turn_id) = active.as_deref() {
-                match server
-                    .send_request(
-                        "turn/interrupt",
-                        json!({"threadId": server.thread_id, "turnId": turn_id}),
-                    )
-                    .await
-                {
-                    Ok(id) => {
-                        pending.insert(id, Pending::Interrupt);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, %call_id, "could not interrupt the rejected plan turn");
-                    }
-                }
+            if let Some(turn_id) = active.clone() {
+                interrupt_turn(server, pending, interrupt, &turn_id, "plan rejected").await;
             }
             queued.push_back(QueuedPrompt {
                 prompt_id: format!("plan-changes-{}", uuid::Uuid::new_v4()),
@@ -1412,21 +1448,8 @@ async fn route_tool_result(
                 },
             )
             .await;
-            if let Some(turn_id) = active.as_deref() {
-                match server
-                    .send_request(
-                        "turn/interrupt",
-                        json!({"threadId": server.thread_id, "turnId": turn_id}),
-                    )
-                    .await
-                {
-                    Ok(id) => {
-                        pending.insert(id, Pending::Interrupt);
-                    }
-                    Err(error) => {
-                        tracing::error!(%error, %call_id, "could not interrupt the plan turn");
-                    }
-                }
+            if let Some(turn_id) = active.clone() {
+                interrupt_turn(server, pending, interrupt, &turn_id, "plan approved").await;
             }
             queued.push_back(QueuedPrompt {
                 prompt_id: format!("plan-approved-{}", uuid::Uuid::new_v4()),
@@ -2744,6 +2767,36 @@ done
     /// ADR 0107 (session fe3cd981 regression): a REJECT decision must land
     /// as a FAILED call carrying the reviewer's feedback — a success-shaped
     /// response made the model narrate "plan submitted" and end the turn.
+    /// PR #927 review: three interrupt sites recorded the pending request but
+    /// never armed the deadline, so a codex that went quiet after an interrupt
+    /// left `active` set, the queue undrained, and the session wedged holding
+    /// an approved plan. The structural guard is that `interrupt_turn` is the
+    /// only way to interrupt — this pins the state it maintains.
+    #[tokio::test]
+    async fn interrupt_watchdog_arms_on_request_and_disarms_when_the_turn_ends() {
+        let mut watchdog = InterruptWatchdog::default();
+        assert!(!watchdog.requested, "idle: nothing to watch");
+        assert!(watchdog.deadline.is_none());
+
+        watchdog.arm();
+        assert!(watchdog.requested, "an interrupt is outstanding");
+        let deadline = watchdog.deadline.expect("armed");
+        assert!(
+            deadline > tokio::time::Instant::now(),
+            "the kill is scheduled, not immediate"
+        );
+        assert!(
+            deadline <= tokio::time::Instant::now() + INTERRUPT_GRACE,
+            "and it is bounded by the grace"
+        );
+
+        // `turn/completed` (or the force-kill) closes the window; a stale
+        // deadline would kill a healthy app-server on the next turn.
+        watchdog.disarm();
+        assert!(!watchdog.requested);
+        assert!(watchdog.deadline.is_none());
+    }
+
     #[tokio::test]
     async fn plan_reject_starts_a_revision_turn_carrying_the_feedback() {
         let tool_call = r#"{"id":77,"method":"item/tool/call","params":{"callId":"call-plan","tool":"exit_plan_mode","arguments":{"plan":"draft"},"threadId":"t1","turnId":"turn-1"}}"#;
