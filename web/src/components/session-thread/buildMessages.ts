@@ -450,6 +450,9 @@ export function buildMessages(
   // ADR 0107: is the session in plan mode AT THIS POINT in the walk (mode
   // directives set it; an approved plan returns to the default).
   let planModeOn = false;
+  // ADR 0107: did a plan decision land in THIS run? Its interrupt is a handoff
+  // to the revision/build turn, not a cancellation.
+  let planHandoff = false;
   const planAttemptToolCallIds = new Set<string>();
   const pushSystem = (id: string, fallback: string, marker: SystemMarker) => {
     active = null;
@@ -586,6 +589,7 @@ export function buildMessages(
         clearWaking();
         tally = { reads: 0, edits: 0, ran: 0, other: 0 };
         runOpen = true;
+        planHandoff = false;
         active = null;
         runStartLen = out.length;
         if (ev.prompt_id) {
@@ -794,6 +798,8 @@ export function buildMessages(
         // ADR 0107: an approved plan returns the session to the default mode
         // (the harness flips the same stamp guest-side).
         if (planResolutionByToolCallId.get(ev.tool_call_id)?.approved) planModeOn = false;
+        // Either decision hands the turn off (see the run-end arm).
+        if (planToolCallIds.has(ev.tool_call_id)) planHandoff = true;
         break;
 
       case "tool_call_completed": {
@@ -864,8 +870,14 @@ export function buildMessages(
 
       case "run_completed":
       case "run_interrupted": {
-        const interrupted = ev.type === "run_interrupted";
-        const ok = interrupted ? false : ev.ok;
+        // ADR 0107: a plan decision ENDS the read-only turn by design — the
+        // codex adapter interrupts it and starts the revision/build turn from
+        // the queue. That is a handoff, not a cancellation, and rendering it
+        // as red "interrupted" told the reviewer their approval broke
+        // something (session 3728924b). The plan receipt already narrates the
+        // transition; the run just closes normally.
+        const interrupted = ev.type === "run_interrupted" && !planHandoff;
+        const ok = interrupted ? false : ev.type === "run_interrupted" || ev.ok;
         const footer: RunFooter = {
           reads: tally?.reads ?? 0,
           edits: tally?.edits ?? 0,

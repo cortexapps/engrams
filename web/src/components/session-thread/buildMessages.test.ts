@@ -1831,6 +1831,51 @@ describe("buildMessages — ADR 0107 out-of-mode plan attempt", () => {
     expect(stillRunning).toHaveLength(0);
   });
 
+  // Session 3728924b: the codex adapter interrupts the read-only turn to hand
+  // off to the revision/build turn. Rendering that as red "interrupted" told
+  // the reviewer their approval had broken something.
+  test("a plan decision's handoff interrupt is not an interruption", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "harness_mode_changed", mode: "plan", at: AT },
+        { type: "run_started", run_id: "r1", prompt_id: "p1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "r1",
+          message_id: "a1",
+          role: "assistant",
+          text: "here is the plan",
+          at: AT,
+        },
+        {
+          type: "tool_call_requested",
+          run_id: "r1",
+          tool_call_id: "t-plan",
+          name: "exit_plan_mode",
+          args_json: JSON.stringify({ plan: "P" }),
+          at: AT,
+        },
+        {
+          type: "tool_result_submitted",
+          tool_call_id: "t-plan",
+          result_json: JSON.stringify({ decision: "approve" }),
+          at: AT,
+        },
+        { type: "run_interrupted", run_id: "r1", at: AT2 },
+      ]),
+      SID,
+      "active",
+    );
+    const footers = messages
+      .map((m) => m.metadata?.custom?.run as RunFooter | undefined)
+      .filter(Boolean) as RunFooter[];
+    expect(footers.some((f) => f.interrupted)).toBe(false);
+    const cancelled = messages.filter(
+      (m) => m.status?.type === "incomplete" && m.status.reason === "cancelled",
+    );
+    expect(cancelled).toHaveLength(0);
+  });
+
   // Session 676b367f: codex holds its app-server turn open across the park, so
   // `runOpen` stayed true and the composer showed "working…" (with a live Stop)
   // under a card asking the reviewer for a decision.
