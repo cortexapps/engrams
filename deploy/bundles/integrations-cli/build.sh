@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # ADR 0058: build the `integrations-cli` RO bundle — the shared CLI toolbox for
-# connected integrations. The GitHub CLI (`gh`, a static Go binary) + Datadog pup
-# (`pup`, the official Datadog CLI for agents, a glibc Rust binary), plus the
-# `integrations` discovery skill and the `engrams-integrations` helper. The binaries run with the base image's
-# own glibc (no bundled libc/loader/libstdc++ — see the build_tree note); the
-# bundle targets a full glibc base, the same constraint as the binaries.
+# connected integrations. It includes the provider CLIs, the `integrations`
+# discovery skill, and the `engrams-integrations` helper. Most binaries run with
+# the base image's own glibc. The `gcloud` archive also brings its pinned Python
+# runtime and required shared libraries.
 #
 # Auth is brokered (ADR 0056/0057): each CLI carries only a harmless placeholder
 # token in its env; the egress proxy injects the real, capability-scoped
@@ -21,6 +20,7 @@
 #   bin/glab                  fetched static Go binary (GitLab CLI)
 #   bin/stripe                fetched static Go binary (Stripe CLI)
 #   bin/pup                   fetched glibc Rust binary (Datadog CLI for agents)
+#   bin/gcloud                wrapper for the pinned Google Cloud CLI archive
 #   bin/<provider>            committed POSIX-sh + curl connector wrappers (linear,
 #                             jira, sentry, pd, … — brokered auth, copied in)
 #   bin/engrams-integrations  the discovery helper (committed; copied in)
@@ -40,6 +40,7 @@ GH_VERSION="${GH_VERSION:-2.62.0}"
 PUP_VERSION="${PUP_VERSION:-1.4.0}"
 GLAB_VERSION="${GLAB_VERSION:-1.105.0}"
 STRIPE_VERSION="${STRIPE_VERSION:-1.43.2}"
+GCLOUD_VERSION="${GCLOUD_VERSION:-577.0.0}"
 
 build_tree() {
     local dest="$1"
@@ -64,24 +65,25 @@ build_tree() {
         -e PUP_VERSION="$PUP_VERSION" \
         -e GLAB_VERSION="$GLAB_VERSION" \
         -e STRIPE_VERSION="$STRIPE_VERSION" \
+        -e GCLOUD_VERSION="$GCLOUD_VERSION" \
         -e HOST_UID="$(id -u)" \
         -e HOST_GID="$(id -g)" \
         debian:bookworm-slim bash -euo pipefail -c '
         export DEBIAN_FRONTEND=noninteractive
         apt-get update -qq
-        apt-get install -y -qq --no-install-recommends curl ca-certificates tar
+        apt-get install -y -qq --no-install-recommends curl ca-certificates tar python3
         rm -rf /var/lib/apt/lists/*
 
         ARCH="$(dpkg --print-architecture)"   # amd64 | arm64
         case "$ARCH" in
-            amd64) GH_ARCH=amd64; PUP_ARCH=x86_64; GLAB_ARCH=amd64; STRIPE_ARCH=x86_64 ;;
-            arm64) GH_ARCH=arm64; PUP_ARCH=arm64;  GLAB_ARCH=arm64; STRIPE_ARCH=arm64 ;;
+            amd64) GH_ARCH=amd64; PUP_ARCH=x86_64; GLAB_ARCH=amd64; STRIPE_ARCH=x86_64; GCLOUD_ARCH=x86_64; GCLOUD_SHA256=0b32d330446ce7b0f57f253e7efab4636c18fb1f87a3ac31c6c3f2a2a697525e ;;
+            arm64) GH_ARCH=arm64; PUP_ARCH=arm64;  GLAB_ARCH=arm64; STRIPE_ARCH=arm64; GCLOUD_ARCH=arm; GCLOUD_SHA256=dbac26bdf80d72b5d13538e3a215dcbfe2781edfd2d69723effbeef3839cffb8 ;;
             *) echo "unsupported arch $ARCH" >&2; exit 1 ;;
         esac
 
         mkdir -p /out/bin
 
-        # The two CLIs go straight into bin/ and run with the base image s own
+        # Provider CLIs go straight into bin/ and run with the base image s own
         # glibc — NO bundled libc / loader / libstdc++. gh is a static Go binary
         # (runs anywhere); pup is a glibc Rust binary that dynamically links the
         # base s libc (+ libgcc_s) and runs directly on any full glibc base. We
@@ -120,6 +122,44 @@ build_tree() {
         cp "$(find /tmp/stripe -type f -name stripe | head -1)" /out/bin/stripe
         chmod 0755 /out/bin/stripe
 
+        # 5) Google Cloud CLI. The versioned archive is a
+        # self-contained SDK tree, so the wrapper can locate it relative to the
+        # read-only bundle mount without a login or credential file.
+        curl -fsSL "https://storage.googleapis.com/cloud-sdk-release/google-cloud-cli-${GCLOUD_VERSION}-linux-${GCLOUD_ARCH}.tar.gz" \
+            -o /tmp/google-cloud-cli.tar.gz
+        echo "$GCLOUD_SHA256  /tmp/google-cloud-cli.tar.gz" | sha256sum -c -
+        tar -xzf /tmp/google-cloud-cli.tar.gz -C /out
+        # ARM archives do not include Python. Ship one runtime on both arches
+        # so the bundle has the same contract on every host architecture.
+        mkdir -p /out/python/bin /out/python/lib
+        cp /usr/bin/python3.11 /out/python/bin/
+        ln -s python3.11 /out/python/bin/python3
+        cp -a /usr/lib/python3.11 /out/python/lib/
+
+        # Ship the Python runtime non-glibc shared libraries too. Never put
+        # glibc libraries in this directory: the wrapper adds it to the dynamic
+        # library search path, and a bundled libc can make even the base image s
+        # /bin/sh fail before gcloud starts.
+        mkdir -p /out/lib
+        {
+            ldd /usr/bin/python3.11
+            find /usr/lib/python3.11/lib-dynload -type f -name "*.so" -exec ldd {} \;
+        } | awk '\''/=> \/.* \(/{print $3}'\'' | sort -u | while read -r library; do
+            case "${library##*/}" in
+                libc.so.*|libm.so.*|libpthread.so.*|libdl.so.*|librt.so.*|\
+                libresolv.so.*|libutil.so.*|libanl.so.*|libnss_*.so.*|ld-linux*.so.*)
+                    continue
+                    ;;
+            esac
+            cp -L "$library" /out/lib/
+        done
+
+        # Fail the bundle build if the pinned SDK cannot start with only the
+        # Python runtime and shared libraries that the bundle will contain.
+        CLOUDSDK_PYTHON=/out/python/bin/python3 \
+            LD_LIBRARY_PATH=/out/lib \
+            /out/google-cloud-sdk/bin/gcloud --version >/dev/null
+
         chown -R "$HOST_UID:$HOST_GID" /out
     '
 
@@ -133,6 +173,8 @@ build_tree() {
     # (stage/pack), like the other bundles.
     cp "$here/bin/engrams-integrations" "$dest/bin/engrams-integrations"
     chmod 0755 "$dest/bin/engrams-integrations"
+    cp "$here/bin/gcloud" "$dest/bin/gcloud"
+    chmod 0755 "$dest/bin/gcloud"
     # The Slack CLI is a committed POSIX-sh + curl wrapper (no fetched binary):
     # auth is brokered, so it just calls the Slack Web API and the proxy injects
     # the bot token host-side.

@@ -163,6 +163,10 @@ TF_HELM_PATHS = ["deploy/terraform/", "deploy/helm/"]
 # agentd, a compiled crate OUTSIDE this path, which needs the explicit
 # agentd_changed closure term below.)
 BUNDLES_PATHS = ["deploy/bundles/"]
+# The shared integration CLI bundle downloads and assembles provider binaries in
+# Docker. Build it directly in CI when its inputs change; the development and
+# e2e staging recipe intentionally lets optional bundle failures degrade.
+INTEGRATIONS_CLI_PATHS = ["deploy/bundles/integrations-cli/"]
 # The node-assets image's OWN inputs (ADR 0044 K2): its Dockerfile and the fetch
 # script that pins the firecracker version + the engram guest-kernel release +
 # stages the RO bundles. The FC-fork binary (fc_fork lane) and the bundle
@@ -446,6 +450,7 @@ def main():
     test_cli = ci_self or proto or any_path(changed, CLI_PATHS)
     # buf only lints/breaking-checks/codegen-drifts the protos.
     test_buf = ci_self or proto
+    test_integrations_cli = ci_self or any_path(changed, INTEGRATIONS_CLI_PATHS)
     # ADR 0098 P9: the host-sim swarm — its binary's own release closure.
     test_host_sim = ci_self or bool(cc & host_sim_closure)
     # ADR 0098 R-CoSim: the coordinator↔host boundary sim — its own (spanning)
@@ -486,7 +491,8 @@ def main():
     print(f"-> test_rust={test_rust} test_cross={test_cross} test_fc={test_fc} "
           f"test_web={test_web} test_orchestrator={test_orchestrator} "
           f"test_cli={test_cli} test_buf={test_buf} ci_self={ci_self} proto={proto} "
-          f"test_host_sim={test_host_sim} test_cosim={test_cosim}",
+          f"test_host_sim={test_host_sim} test_cosim={test_cosim} "
+          f"test_integrations_cli={test_integrations_cli}",
           file=sys.stderr)
     print(f"-> images_matrix={images_matrix}", file=sys.stderr)
     print(f"-> e2e_matrix={e2e_matrix}", file=sys.stderr)
@@ -519,6 +525,7 @@ def main():
             f.write(f"test_buf={b(test_buf)}\n")
             f.write(f"test_host_sim={b(test_host_sim)}\n")
             f.write(f"test_cosim={b(test_cosim)}\n")
+            f.write(f"test_integrations_cli={b(test_integrations_cli)}\n")
             # Per-image bake matrix (JSON array → fromJSON in bake-images.yml).
             f.write(f"images_matrix={json.dumps(images_matrix)}\n")
 
