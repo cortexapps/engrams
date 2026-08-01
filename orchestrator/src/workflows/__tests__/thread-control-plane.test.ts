@@ -30,7 +30,6 @@ const profileRow = (): ProfileRow => ({
   envVars: {},
   skills: [],
   integrationGrants: [],
-  launchAccess: "organization",
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: true,

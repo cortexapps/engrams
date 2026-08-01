@@ -90,7 +90,6 @@ import {
 } from "./task-create.ts";
 import { makeConnectorStore } from "../db/connectors.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
-import type { ProfileLaunchGrantStore } from "../db/profile-launch-grants.ts";
 
 // Re-export ImagesClient so downstream modules (image-guard, tests) can import
 // it from tasks.ts. The canonical declaration lives in rpc/profiles.ts.
@@ -161,7 +160,6 @@ export interface TaskDeps {
   /** Owner identity lookup for git attribution and task read enrichment. */
   users?: UserIdentityStore;
   connections?: IntegrationConnectionStore;
-  launchGrants?: ProfileLaunchGrantStore;
   /** Register a session for stream-listener scanner discovery. */
   db?: Db;
   /** ADR 0107: the pending-tool-call ledger, for the awaiting_review derivation. */
@@ -605,7 +603,6 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           portExposures: resolvePortExposures(),
           users: resolveUsers(),
           ...(deps?.connections ? { connections: deps.connections } : {}),
-          ...(deps?.launchGrants ? { launchGrants: deps.launchGrants } : {}),
           db: getDbFn(),
         },
         {
@@ -615,7 +612,6 @@ export function registerTasks(router: ConnectRouter, deps?: TaskDeps): void {
           // harness token — compile the org-credential path (ADR 0063 B4)
           // even though the task type is "chat".
           ownerIsServiceAccount: user.serviceAccount,
-          ownerIsAdmin: user.role === "admin",
           profileId: req.profileId,
           title: req.title ?? null,
           ...(req.prompt != null ? { prompt: req.prompt } : {}),

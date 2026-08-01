@@ -72,10 +72,6 @@ message Profile {
   // ADR 0109: named connection + operation + resource authority. The
   // connection fixes the provider identity used by the session.
   repeated ProfileIntegrationGrant integration_grants = 21;
-  // "organization" | "restricted". Google Cloud profiles must be restricted.
-  string launch_access = 22;
-  // Principals allowed to launch a restricted profile. Admins are implicit.
-  repeated string launch_principal_ids = 23;
 }
 
 message ProfileIntegrationGrant {
@@ -162,8 +158,6 @@ message CreateProfileRequest {
   // ADR 0100: system-role marker (see Profile.designation). Admin-only.
   optional string designation = 16;
   repeated ProfileIntegrationGrant integration_grants = 17;
-  string launch_access = 18;
-  repeated string launch_principal_ids = 19;
 }
 
 message CreateProfileResponse {
@@ -195,8 +189,6 @@ message UpdateProfileRequest {
   // ADR 0100: system-role marker (see Profile.designation). Admin-only.
   optional string designation = 17;
   repeated ProfileIntegrationGrant integration_grants = 18;
-  string launch_access = 19;
-  repeated string launch_principal_ids = 20;
 }
 
 message UpdateProfileResponse {

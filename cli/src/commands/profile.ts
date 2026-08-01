@@ -27,8 +27,6 @@ function profileJson(p: Profile) {
       operation: grant.operation,
       resource_constraints: grant.resourceConstraints,
     })),
-    launch_access: p.launchAccess,
-    launch_principal_ids: p.launchPrincipalIds,
     archived: p.archived,
     is_default: p.isDefault,
     created_at: p.createdAt,
@@ -74,8 +72,6 @@ export async function get(c: Clients, id: string, json: boolean): Promise<void> 
     ["image_id", p.imageId],
     ["skills", p.skills.join(", ")],
     ["integration_grants", p.integrationGrants.map(formatIntegrationGrant).join(", ")],
-    ["launch_access", p.launchAccess],
-    ["launch_principal_ids", p.launchPrincipalIds.join(", ")],
     ["default", p.isDefault ? "yes" : undefined],
     ["created_at", p.createdAt],
   ]);

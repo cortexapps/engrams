@@ -86,12 +86,6 @@ export function grantsToCapabilities(
   return [...capabilities];
 }
 
-export function profileNeedsRestrictedLaunch(
-  resolved: readonly ResolvedIntegrationGrant[],
-): boolean {
-  return resolved.some(({ connection }) => connection.provider === "gcp");
-}
-
 interface ParsedCapabilityGrant {
   provider: string;
   operation: string;

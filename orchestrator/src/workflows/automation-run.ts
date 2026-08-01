@@ -168,7 +168,7 @@ export function makeAutomationTaskCreator(
       const { sessionId } = await createSession()({
         taskId,
         profileId: prepared.profileId,
-        launchPrincipalId: `automation:${input.automationId}`,
+        integrationPrincipalId: `automation:${input.automationId}`,
         role: "primary",
         prompt: prepared.prompt,
         ...(prepared.harnessMode != null ? { harnessMode: prepared.harnessMode } : {}),

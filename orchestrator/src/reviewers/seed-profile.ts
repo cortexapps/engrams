@@ -52,7 +52,6 @@ export async function seedReviewerProfile(
         // "could not read Username for 'https://github.com'".
         skills: ["skills"],
         integrationGrants: [capabilityGrant(PR_REVIEW_CAPABILITY, engramsConnection.id)],
-        launchAccess: "organization",
         network: DEFAULT_PROFILE_NETWORK,
         secrets: [],
         isDefault: false,

@@ -54,10 +54,6 @@ import {
   type IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
 import {
-  makeProfileLaunchGrantStore,
-  type ProfileLaunchGrantStore,
-} from "../db/profile-launch-grants.ts";
-import {
   defaultConnectionGrants,
   grantsToCapabilities,
   resolveIntegrationGrants,
@@ -519,7 +515,6 @@ export interface CreateTaskDeps {
    *  Defaults to a Drizzle store over `db` when omitted. */
   users?: UserIdentityStore;
   connections?: IntegrationConnectionStore;
-  launchGrants?: ProfileLaunchGrantStore;
 }
 
 export interface CreateTaskParams {
@@ -530,8 +525,6 @@ export interface CreateTaskParams {
   /** The owner is a service-account principal (API key) — forces the
    *  programmatic (org-credential) compile path; see SessionCompileOpts. */
   ownerIsServiceAccount?: boolean;
-  /** Administrators have implicit access to restricted profiles. */
-  ownerIsAdmin?: boolean;
   /** The profile to start from; must be active (else NotFound). */
   profileId: string;
   title?: string | null;
@@ -556,8 +549,8 @@ export interface CreateSessionForExistingTaskParams {
   profileId: string;
   role: string;
   ownerUserId?: string;
-  /** Stable non-human principal used for restricted-profile launch grants. */
-  launchPrincipalId?: string;
+  /** Stable principal stamped into the immutable integration snapshot. */
+  integrationPrincipalId?: string;
   prompt?: string;
   /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
   harnessMode?: string;
@@ -572,8 +565,6 @@ export interface CreateSessionForExistingTaskParams {
   /** Optional caller context; the existing task already owns its durable
    *  source metadata, so this path does not insert or update it. */
   source?: Record<string, unknown>;
-  /** Administrators have implicit access to restricted profiles. */
-  ownerIsAdmin?: boolean;
 }
 
 export interface CreateSessionForExistingTaskDeps extends Omit<CreateTaskDeps, "profiles"> {
@@ -608,18 +599,7 @@ export async function createSessionForExistingTask(
   if (!profile) {
     throw new ConnectError("profile not found or archived", Code.NotFound);
   }
-  const launchPrincipalId = params.ownerUserId ?? params.launchPrincipalId;
-  if (
-    profile.launchAccess === "restricted" &&
-    !params.ownerIsAdmin &&
-    (launchPrincipalId === undefined ||
-      !(await (deps.launchGrants ?? makeProfileLaunchGrantStore(deps.db)).canLaunch(
-        profile.id,
-        launchPrincipalId,
-      )))
-  ) {
-    throw new ConnectError("profile launch is not granted", Code.PermissionDenied);
-  }
+  const integrationPrincipalId = params.ownerUserId ?? params.integrationPrincipalId;
 
   let owner: { name: string; email: string } | undefined;
   if (params.ownerUserId !== undefined) {
@@ -701,7 +681,7 @@ export async function createSessionForExistingTask(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
-      ...(launchPrincipalId ? { integrationPrincipalId: launchPrincipalId } : {}),
+      ...(integrationPrincipalId ? { integrationPrincipalId } : {}),
     });
   });
 
@@ -755,17 +735,6 @@ export async function createTaskWithSession(
   if (!profile) {
     throw new ConnectError("profile not found or archived", Code.NotFound);
   }
-  if (
-    profile.launchAccess === "restricted" &&
-    !params.ownerIsAdmin &&
-    !(await (deps.launchGrants ?? makeProfileLaunchGrantStore(deps.db)).canLaunch(
-      profile.id,
-      params.ownerUserId,
-    ))
-  ) {
-    throw new ConnectError("profile launch is not granted", Code.PermissionDenied);
-  }
-
   // ADR 0031 §7: resolve the owner's identity for git commit attribution.
   // Service-account owners (API-key creates) are skipped — their synthetic
   // `apikey+…@service.local` email is not a valid commit author (GitHub

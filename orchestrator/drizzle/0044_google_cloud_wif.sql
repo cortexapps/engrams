@@ -24,15 +24,7 @@ CREATE TABLE "integration_oidc_key" (
 	"publish_until" timestamp with time zone
 );
 --> statement-breakpoint
-CREATE TABLE "profile_launch_grant" (
-	"profile_id" text NOT NULL,
-	"principal_id" text NOT NULL,
-	"created_at" timestamp with time zone DEFAULT now() NOT NULL,
-	CONSTRAINT "profile_launch_grant_profile_id_principal_id_pk" PRIMARY KEY("profile_id","principal_id")
-);
---> statement-breakpoint
 ALTER TABLE "profile" ADD COLUMN "integration_grants" jsonb DEFAULT '[]'::jsonb NOT NULL;--> statement-breakpoint
-ALTER TABLE "profile" ADD COLUMN "launch_access" text DEFAULT 'organization' NOT NULL;--> statement-breakpoint
 ALTER TABLE "task_session" ADD COLUMN "integration_grants" jsonb;--> statement-breakpoint
 ALTER TABLE "task_session" ADD COLUMN "integration_connections" jsonb;--> statement-breakpoint
 ALTER TABLE "task_session" ADD COLUMN "integration_principal_id" text;--> statement-breakpoint
@@ -132,9 +124,7 @@ FROM (
 ) AS source
 WHERE target."task_id" = source."task_id"
 	AND target."session_id" = source."session_id";--> statement-breakpoint
-ALTER TABLE "profile_launch_grant" ADD CONSTRAINT "profile_launch_grant_profile_id_profile_id_fk" FOREIGN KEY ("profile_id") REFERENCES "public"."profile"("id") ON DELETE cascade ON UPDATE no action;--> statement-breakpoint
 CREATE INDEX "integration_connection_provider_idx" ON "integration_connection" USING btree ("provider");--> statement-breakpoint
 CREATE UNIQUE INDEX "integration_connection_provider_default_unique" ON "integration_connection" USING btree ("provider") WHERE is_default;--> statement-breakpoint
 CREATE UNIQUE INDEX "integration_oidc_key_active_unique" ON "integration_oidc_key" USING btree ("state") WHERE state = 'active';--> statement-breakpoint
-CREATE INDEX "profile_launch_grant_principal_idx" ON "profile_launch_grant" USING btree ("principal_id");--> statement-breakpoint
 ALTER TABLE "profile" DROP COLUMN "capabilities";

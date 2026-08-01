@@ -28,7 +28,6 @@ import {
   type ProfileNetwork,
   type ProfileSecret,
   type ProfileIntegrationGrant,
-  type ProfileLaunchAccess,
 } from "../db/schema.ts";
 import {
   images as defaultImages,
@@ -53,12 +52,7 @@ import {
   type IntegrationConnectionStore,
 } from "../db/integration-connections.ts";
 import {
-  makeProfileLaunchGrantStore,
-  type ProfileLaunchGrantStore,
-} from "../db/profile-launch-grants.ts";
-import {
   grantsToCapabilities,
-  profileNeedsRestrictedLaunch,
   resolveIntegrationGrants,
   type ResolvedIntegrationGrant,
 } from "../integrations/grants.ts";
@@ -97,7 +91,6 @@ export interface ProfileDeps {
   connectors?: CustomConnectorSource;
   toolCapabilities?: Set<string>;
   connections?: IntegrationConnectionStore;
-  launchGrants?: ProfileLaunchGrantStore;
 }
 
 function headersOf(ctx: HandlerContext): Headers {
@@ -111,7 +104,7 @@ async function requireUser(ctx: HandlerContext, getSession: GetSession): Promise
 }
 
 /** Map a ProfileRow to the proto Profile. env_vars included only when admin. */
-function toProto(row: ProfileRow, isAdmin: boolean, launchPrincipalIds: string[]): Profile {
+function toProto(row: ProfileRow, isAdmin: boolean): Profile {
   return {
     id: row.id,
     name: row.name,
@@ -128,8 +121,6 @@ function toProto(row: ProfileRow, isAdmin: boolean, launchPrincipalIds: string[]
       operation: grant.operation,
       resourceConstraints: grant.resourceConstraints,
     })),
-    launchAccess: row.launchAccess,
-    launchPrincipalIds: isAdmin ? launchPrincipalIds : [],
     // ADR 0057: network + secrets describe access/config (the secret VALUES
     // live in the org store, never here), so they're member-visible like skills.
     network: row.network,
@@ -244,7 +235,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
   // fails.
   const connectors: CustomConnectorSource = deps?.connectors ?? { list: () => makeConnectorStore(getDb()).list() };
   const connections = deps?.connections ?? makeIntegrationConnectionStore(getDb());
-  const launchGrants = deps?.launchGrants ?? makeProfileLaunchGrantStore(getDb());
   // Resolve the production registry lazily: ProfileService is registered before
   // startup registers all built-in tools.
   const toolCapabilities = (): Set<string> =>
@@ -372,23 +362,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
     }));
   }
 
-  function normalizeLaunchAccess(value: string): ProfileLaunchAccess {
-    if (value === "restricted") return "restricted";
-    if (value === "" || value === "organization") return "organization";
-    throw new ConnectError('launch_access must be "organization" or "restricted"', Code.InvalidArgument);
-  }
-
-  function normalizeLaunchPrincipalIds(values: readonly string[]): string[] {
-    const normalized = [...new Set(values.map((value) => value.trim()))].sort();
-    if (normalized.some((value) => value === "" || value.length > 255)) {
-      throw new ConnectError(
-        "launch principal IDs must contain 1-255 characters",
-        Code.InvalidArgument,
-      );
-    }
-    return normalized;
-  }
-
   router.service(ProfileService, {
     async listProfiles(req, ctx) {
       const user = await requireUser(ctx, getSession);
@@ -397,16 +370,9 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       const isAdmin = user.role === "admin";
       // include_archived is admin-only; silently forced false for members.
       const includeArchived = isAdmin && req.includeArchived;
-      let rows = await store.list({ includeArchived });
-      const grantsByProfile = await launchGrants.listForProfiles(rows.map((row) => row.id));
-      if (!isAdmin) {
-        rows = rows.filter(
-          (row) => row.launchAccess === "organization" ||
-            (grantsByProfile.get(row.id) ?? []).includes(user.id),
-        );
-      }
+      const rows = await store.list({ includeArchived });
       return {
-        profiles: rows.map((row) => toProto(row, isAdmin, grantsByProfile.get(row.id) ?? [])),
+        profiles: rows.map((row) => toProto(row, isAdmin)),
       };
     },
 
@@ -420,11 +386,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
       if (!row || (row.deletedAt != null && !isAdmin)) {
         throw new ConnectError("not found", Code.NotFound);
       }
-      const launchPrincipalIds = (await launchGrants.listForProfiles([row.id])).get(row.id) ?? [];
-      if (!isAdmin && row.launchAccess === "restricted" && !launchPrincipalIds.includes(user.id)) {
-        throw new ConnectError("not found", Code.NotFound);
-      }
-      return { profile: toProto(row, isAdmin, launchPrincipalIds) };
+      return { profile: toProto(row, isAdmin) };
     },
 
     async createProfile(req, ctx) {
@@ -444,14 +406,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         await loadRegistry(connectors),
         toolCapabilities(),
       );
-      const launchAccess = normalizeLaunchAccess(req.launchAccess);
-      const launchPrincipalIds = normalizeLaunchPrincipalIds(req.launchPrincipalIds ?? []);
-      if (profileNeedsRestrictedLaunch(resolvedGrants) && launchAccess !== "restricted") {
-        throw new ConnectError(
-          "profiles with Google Cloud grants must have restricted launch access",
-          Code.InvalidArgument,
-        );
-      }
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
@@ -468,7 +422,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
         integrationGrants,
-        launchAccess,
         network,
         secrets,
         isDefault: req.isDefault,
@@ -481,8 +434,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         await store.setDesignation(row.id, req.designation);
         row = (await store.get(row.id)) ?? row;
       }
-      await launchGrants.replace(row.id, launchPrincipalIds);
-      return { profile: toProto(row, true, launchPrincipalIds) };
+      return { profile: toProto(row, true) };
     },
 
     async updateProfile(req, ctx) {
@@ -502,14 +454,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         await loadRegistry(connectors),
         toolCapabilities(),
       );
-      const launchAccess = normalizeLaunchAccess(req.launchAccess);
-      const launchPrincipalIds = normalizeLaunchPrincipalIds(req.launchPrincipalIds ?? []);
-      if (profileNeedsRestrictedLaunch(resolvedGrants) && launchAccess !== "restricted") {
-        throw new ConnectError(
-          "profiles with Google Cloud grants must have restricted launch access",
-          Code.InvalidArgument,
-        );
-      }
       const network = normalizeNetwork(req.network);
       const secrets = normalizeSecrets(req.secrets ?? []);
       assertNetworkValid(network);
@@ -526,7 +470,6 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         envVars: req.envVars ?? {},
         skills: req.skills ?? [],
         integrationGrants,
-        launchAccess,
         network,
         secrets,
         isDefault: req.isDefault,
@@ -540,8 +483,7 @@ export function registerProfiles(router: ConnectRouter, deps?: ProfileDeps): voi
         await store.setDesignation(req.id, req.designation || null);
         row = (await store.get(req.id)) ?? row;
       }
-      await launchGrants.replace(row.id, launchPrincipalIds);
-      return { profile: toProto(row, true, launchPrincipalIds) };
+      return { profile: toProto(row, true) };
     },
 
     async deleteProfile(req, ctx) {

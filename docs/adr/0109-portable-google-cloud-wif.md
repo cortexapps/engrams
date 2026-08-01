@@ -48,16 +48,12 @@ connection. Later connection edits do not change that session snapshot.
 Existing provider credentials receive ordinary default connections with opaque
 IDs. Existing profile capabilities migrate to structured grants on those
 connections. Migration state is not encoded in connection IDs or runtime
-branches. The
-coordinator can continue to persist its provider capability projection for
-provider-specific token scoping, but it is no longer the profile API.
-
-### Restricted profiles
-
-A profile can be organization-readable or restricted. A restricted profile has
-explicit principal launch grants. Administrators can always launch it. A profile
-that binds a Google Cloud connection must be restricted. Profile list, get, and
-task create all enforce the same rule on the server.
+branches. The coordinator can continue to persist its provider capability
+projection for provider-specific token scoping, but it is no longer the profile
+API. Google
+Cloud connections follow the same organization-wide profile authorization model
+as existing integrations. User-scoped integration identities are a separate
+future concern.
 
 ### WIF-only authentication
 
@@ -147,8 +143,8 @@ headers.
 
 ## Phasing
 
-1. Add named connections, structured grants, restricted profile launch grants,
-   and the orchestrator-selected session UUID.
+1. Add named connections, structured grants, and the orchestrator-selected
+   session UUID.
 2. Add the OIDC issuer, signing-key rotation, WIF broker, and Google connector.
 3. Add metadata compatibility, verified upstream TLS, HTTP/2, and credential API
    denials in the egress proxy.

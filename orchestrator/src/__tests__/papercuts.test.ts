@@ -83,7 +83,6 @@ function profileRow(overrides: Partial<ProfileRow> = {}): ProfileRow {
     envVars: {},
     skills: [],
     integrationGrants: [],
-    launchAccess: "organization",
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
     isDefault: false,

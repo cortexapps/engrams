@@ -253,7 +253,6 @@ function makeFakeProfiles(opts?: {
     envVars: opts?.envVars ?? {},
     skills: opts?.skills ?? [],
     integrationGrants: (opts?.capabilities ?? []).map(defaultGrant),
-    launchAccess: "organization",
     network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
     secrets: [],
     isDefault: false,

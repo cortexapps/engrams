@@ -165,7 +165,6 @@ const reviewerProfile = (id: string): ProfileRow => ({
     operation: "pr_review",
     resourceConstraints: [],
   }],
-  launchAccess: "organization",
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,

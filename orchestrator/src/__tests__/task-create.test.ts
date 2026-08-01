@@ -60,7 +60,6 @@ const profile = (over: Partial<ProfileRow> = {}): ProfileRow => ({
   envVars: {},
   skills: [],
   integrationGrants: [],
-  launchAccess: "organization",
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,
@@ -523,7 +522,6 @@ describe("compileSessionCreateInput", () => {
           operation: "compute.instances.get",
           resourceConstraints: [],
         }],
-        launchAccess: "restricted",
       }),
       { ...deps(), connections },
     );
@@ -553,7 +551,6 @@ describe("compileSessionCreateInput", () => {
           operation: "compute.instances.get",
           resourceConstraints: [],
         }],
-        launchAccess: "restricted",
       }),
       { ...deps(), connections },
     )).rejects.toThrow('integration connection "connection-gcp" is disabled');
@@ -797,7 +794,6 @@ const createDeps = (
     profileOver?: Partial<ProfileRow>;
     portExposures?: PortExposureStore;
     users?: CreateTaskDeps["users"];
-    launchGrants?: CreateTaskDeps["launchGrants"];
   } = {},
 ): CreateTaskDeps => ({
   profiles: fakeProfiles(opts.active ?? true, opts.profileOver ?? {}),
@@ -815,7 +811,6 @@ const createDeps = (
   newTaskId: () => "task-1",
   newSessionId: () => "sess-1",
   ...(opts.portExposures ? { portExposures: opts.portExposures } : {}),
-  ...(opts.launchGrants ? { launchGrants: opts.launchGrants } : {}),
 });
 
 describe("createTaskWithSession", () => {
@@ -898,22 +893,6 @@ describe("createTaskWithSession", () => {
     await expect(
       createTaskWithSession(deps, { type: "chat", ownerUserId: "u", profileId: "p1" }),
     ).rejects.toThrow(/CLAUDE_CODE_OAUTH_TOKEN/);
-    expect(sessions.createReqs).toHaveLength(0);
-  });
-
-  test("blocks a user without an explicit restricted-profile launch grant", async () => {
-    const sessions = fakeSessions();
-    await expect(createTaskWithSession(
-      createDeps(sessions, recordingDb([]), {
-        profileOver: { launchAccess: "restricted" },
-        launchGrants: {
-          listForProfiles: async () => new Map(),
-          replace: async () => {},
-          canLaunch: async () => false,
-        },
-      }),
-      { type: "chat", ownerUserId: "user-1", profileId: "p1" },
-    )).rejects.toThrow(/launch is not granted/);
     expect(sessions.createReqs).toHaveLength(0);
   });
 
@@ -1042,53 +1021,20 @@ describe("createTaskWithSession", () => {
 });
 
 describe("createSessionForExistingTask", () => {
-  test("uses an explicit automation principal for restricted-profile launch", async () => {
+  test("stamps an explicit automation principal into the integration snapshot", async () => {
     const sessions = fakeSessions();
-    const checked: string[] = [];
     const records: Record<string, unknown>[] = [];
     await createSessionForExistingTask(
-      createDeps(sessions, recordingDb(records), {
-        profileOver: { launchAccess: "restricted" },
-        launchGrants: {
-          listForProfiles: async () => new Map(),
-          replace: async () => {},
-          canLaunch: async (_profileId: string, principalId: string) => {
-            checked.push(principalId);
-            return principalId === "automation:nightly";
-          },
-        },
-      }),
+      createDeps(sessions, recordingDb(records)),
       {
         taskId: "task-existing",
         profileId: "p1",
         role: "primary",
-        launchPrincipalId: "automation:nightly",
+        integrationPrincipalId: "automation:nightly",
       },
     );
-    expect(checked).toEqual(["automation:nightly"]);
     expect(sessions.createReqs).toHaveLength(1);
     expect(records[0]?.integrationPrincipalId).toBe("automation:nightly");
-  });
-
-  test("blocks an automation principal without a restricted-profile launch grant", async () => {
-    const sessions = fakeSessions();
-    await expect(createSessionForExistingTask(
-      createDeps(sessions, recordingDb([]), {
-        profileOver: { launchAccess: "restricted" },
-        launchGrants: {
-          listForProfiles: async () => new Map(),
-          replace: async () => {},
-          canLaunch: async () => false,
-        },
-      }),
-      {
-        taskId: "task-existing",
-        profileId: "p1",
-        role: "primary",
-        launchPrincipalId: "automation:untrusted",
-      },
-    )).rejects.toThrow(/launch is not granted/);
-    expect(sessions.createReqs).toHaveLength(0);
   });
 
   test("creates promptlessly and leaves listener registration off by default", async () => {

@@ -543,8 +543,6 @@ export interface IntegrationConnectionSnapshot {
   config: Record<string, unknown>;
 }
 
-export type ProfileLaunchAccess = "organization" | "restricted";
-
 export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   default: "deny",
   allowHosts: [],
@@ -581,9 +579,6 @@ export const profile = pgTable(
       .$type<ProfileIntegrationGrant[]>()
       .notNull()
       .default([]),
-    // Restricted profiles are visible and launchable only by administrators or
-    // principals in profile_launch_grant. Google Cloud profiles must use this.
-    launchAccess: text("launch_access").$type<ProfileLaunchAccess>().notNull().default("organization"),
     // ADR 0057: egress network allow-list (deny by default) + secrets this
     // profile's sessions get, lifted off the image manifest. Additive in B1;
     // compiled into the per-session SessionPolicy + consumed at boot in B2.
@@ -612,23 +607,6 @@ export const profile = pgTable(
     uniqueIndex("profile_designation_unique")
       .on(t.designation)
       .where(sql`designation is not null`),
-  ],
-);
-
-export const profileLaunchGrant = pgTable(
-  "profile_launch_grant",
-  {
-    profileId: text("profile_id")
-      .notNull()
-      .references(() => profile.id, { onDelete: "cascade" }),
-    // User IDs and stable automation principals (for example,
-    // `automation:<id>`) share this namespace. Do not add a user FK.
-    principalId: text("principal_id").notNull(),
-    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  },
-  (t) => [
-    primaryKey({ columns: [t.profileId, t.principalId] }),
-    index("profile_launch_grant_principal_idx").on(t.principalId),
   ],
 );
 

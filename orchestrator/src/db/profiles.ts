@@ -15,7 +15,6 @@ import {
   type ProfileNetwork,
   type ProfileSecret,
   type ProfileIntegrationGrant,
-  type ProfileLaunchAccess,
 } from "./schema.ts";
 
 export interface ProfileRow {
@@ -36,7 +35,6 @@ export interface ProfileRow {
   skills: string[];
   // ADR 0109: structured named-connection authority.
   integrationGrants: ProfileIntegrationGrant[];
-  launchAccess: ProfileLaunchAccess;
   // ADR 0057: profile-defined egress allow-list + injected secrets.
   network: ProfileNetwork;
   secrets: ProfileSecret[];
@@ -64,7 +62,6 @@ export interface ProfileInput {
   envVars: Record<string, string>;
   skills: string[];
   integrationGrants: ProfileIntegrationGrant[];
-  launchAccess: ProfileLaunchAccess;
   network: ProfileNetwork;
   secrets: ProfileSecret[];
   isDefault: boolean;
@@ -108,7 +105,6 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     envVars: (r.envVars ?? {}) as Record<string, string>,
     skills: (r.skills ?? []) as string[],
     integrationGrants: (r.integrationGrants ?? []) as ProfileIntegrationGrant[],
-    launchAccess: r.launchAccess,
     network: (r.network ?? DEFAULT_PROFILE_NETWORK) as ProfileNetwork,
     secrets: (r.secrets ?? []) as ProfileSecret[],
     isDefault: r.isDefault,

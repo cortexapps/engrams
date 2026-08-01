@@ -10,7 +10,6 @@ import type { MountCatalogClient } from "../skills/catalog.ts";
 import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
 import { capabilityGrant } from "../integrations/grants.ts";
 import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
-import type { ProfileLaunchGrantStore } from "../db/profile-launch-grants.ts";
 
 const protoGrant = (capability: string) =>
   create(ProfileIntegrationGrantSchema, capabilityGrant(
@@ -116,12 +115,6 @@ async function spawn(deps: ProfileDeps) {
   // ADR 0063: a profile always validates its harness against the catalog —
   // default to the fake so tests don't reach the live (coord) client. Specific
   // tests can still override.
-  const launchRows = new Map<string, string[]>();
-  const launchGrants: ProfileLaunchGrantStore = {
-    listForProfiles: async (ids) => new Map(ids.map((id) => [id, launchRows.get(id) ?? []])),
-    replace: async (id, principalIds) => { launchRows.set(id, [...principalIds]); },
-    canLaunch: async (id, principalId) => (launchRows.get(id) ?? []).includes(principalId),
-  };
   const connections: IntegrationConnectionStore = {
     list: async () => [],
     get: async (id) => id.startsWith("default-") ? {
@@ -147,7 +140,6 @@ async function spawn(deps: ProfileDeps) {
   const withCatalog: ProfileDeps = {
     harnessCatalog: fakeHarnessCatalog(),
     connections,
-    launchGrants,
     ...deps,
   };
   const transport = createRouterTransport((router) => registerProfiles(router, withCatalog));
@@ -165,7 +157,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
   harness: "claude", model: null, effort: null,
-  includeUserTokens: false, envVars: { K: "V" }, skills: [], integrationGrants: [], launchAccess: "organization", createdAt: new Date(0), updatedAt: new Date(0),
+  includeUserTokens: false, envVars: { K: "V" }, skills: [], integrationGrants: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   isDefault: false,
   portExposures: [],
@@ -421,7 +413,7 @@ describe("ProfileService — auth + field filtering", () => {
     } finally { await s.close(); }
   });
 
-  test("Google Cloud grants require a restricted profile and a known endpoint-backed operation", async () => {
+  test("Google Cloud grants require a known endpoint-backed operation", async () => {
     const googleConnections: IntegrationConnectionStore = {
       list: async () => [],
       get: async (id) => id === "gcp-1" ? {
@@ -471,17 +463,15 @@ describe("ProfileService — auth + field filtering", () => {
       }],
     };
     try {
-      await expectErr(s.client.createProfile(request), Code.InvalidArgument);
       await expectErr(s.client.createProfile({
         ...request,
-        launchAccess: "restricted",
         integrationGrants: [{
           connectionId: "gcp-1",
           operation: "unknown.operation",
           resourceConstraints: [],
         }],
       }), Code.InvalidArgument);
-      const created = await s.client.createProfile({ ...request, launchAccess: "restricted" });
+      const created = await s.client.createProfile(request);
       expect(created.profile?.integrationGrants[0]?.operation).toBe("compute.instances.get");
     } finally {
       await s.close();

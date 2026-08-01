@@ -1781,13 +1781,6 @@
           "notNull": true,
           "default": "'[]'::jsonb"
         },
-        "launch_access": {
-          "name": "launch_access",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "'organization'"
-        },
         "network": {
           "name": "network",
           "type": "jsonb",
@@ -1863,76 +1856,6 @@
       },
       "foreignKeys": {},
       "compositePrimaryKeys": {},
-      "uniqueConstraints": {},
-      "policies": {},
-      "checkConstraints": {},
-      "isRLSEnabled": false
-    },
-    "public.profile_launch_grant": {
-      "name": "profile_launch_grant",
-      "schema": "",
-      "columns": {
-        "profile_id": {
-          "name": "profile_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "principal_id": {
-          "name": "principal_id",
-          "type": "text",
-          "primaryKey": false,
-          "notNull": true
-        },
-        "created_at": {
-          "name": "created_at",
-          "type": "timestamp with time zone",
-          "primaryKey": false,
-          "notNull": true,
-          "default": "now()"
-        }
-      },
-      "indexes": {
-        "profile_launch_grant_principal_idx": {
-          "name": "profile_launch_grant_principal_idx",
-          "columns": [
-            {
-              "expression": "principal_id",
-              "isExpression": false,
-              "asc": true,
-              "nulls": "last"
-            }
-          ],
-          "isUnique": false,
-          "concurrently": false,
-          "method": "btree",
-          "with": {}
-        }
-      },
-      "foreignKeys": {
-        "profile_launch_grant_profile_id_profile_id_fk": {
-          "name": "profile_launch_grant_profile_id_profile_id_fk",
-          "tableFrom": "profile_launch_grant",
-          "tableTo": "profile",
-          "columnsFrom": [
-            "profile_id"
-          ],
-          "columnsTo": [
-            "id"
-          ],
-          "onDelete": "cascade",
-          "onUpdate": "no action"
-        }
-      },
-      "compositePrimaryKeys": {
-        "profile_launch_grant_profile_id_principal_id_pk": {
-          "name": "profile_launch_grant_profile_id_principal_id_pk",
-          "columns": [
-            "profile_id",
-            "principal_id"
-          ]
-        }
-      },
       "uniqueConstraints": {},
       "policies": {},
       "checkConstraints": {},
