@@ -147,6 +147,7 @@ axum = { version = "0.7", features = ["macros", "ws"] }
 tower = "0.5"
 tower-http = { version = "0.6", features = ["trace", "cors"] }
 hyper = "1"
+h2 = "0.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "stream"] }
 http = "1"
 tokio-tungstenite = { version = "0.21", default-features = false, features = ["connect"] }

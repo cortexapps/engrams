@@ -93,12 +93,12 @@ fn build_client_config() -> Arc<rustls::ClientConfig> {
         }
     }
 
-    Arc::new(
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(TestOnlyVerifier))
-            .with_no_client_auth(),
-    )
+    let mut config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(TestOnlyVerifier))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+    Arc::new(config)
 }
 
 fn entry(placeholder: &str, real: &str, allow: &[&str]) -> SecretEntry {
@@ -127,15 +127,21 @@ async fn tls_client_to(
         .unwrap()
         .unwrap();
     roots.add(cert_der).unwrap();
-    let cli_cfg = rustls::ClientConfig::builder()
+    let mut cli_cfg = rustls::ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    // Exercise the production negotiation path: the guest can use H2, while
+    // the HTTP/1.1 fixture upstream does not select ALPN. The proxy must mirror
+    // that upstream result instead of promising H2 to this client.
+    cli_cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     let connector = TlsConnector::from(Arc::new(cli_cfg));
     let server_name: rustls::pki_types::ServerName<'static> = "fake-upstream".try_into().unwrap();
-    connector
+    let stream = connector
         .connect(server_name, client_to_proxy)
         .await
-        .unwrap()
+        .unwrap();
+    assert_eq!(stream.get_ref().1.alpn_protocol(), None);
+    stream
 }
 
 // ADR 0056: a Plane-B injection allowing `GET /api/v2/logs*` on
