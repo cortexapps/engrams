@@ -30,6 +30,22 @@ impl PlanDecision {
     }
 }
 
+/// What a rejected plan must say to the model, on EVERY delivery path: the
+/// claude hook's deny verdict, claude's abandoned-re-fire fallback message, and
+/// codex's revision turn.
+///
+/// A verdict alone is not enough. "Plan rejected by the reviewer: <feedback>"
+/// got the model to re-propose a byte-identical plan (session 93869a67), and on
+/// codex the same shape ended the turn outright (fe3cd981, 98111e00). The
+/// imperative — revise, call the tool again, stay read-only — is load-bearing.
+pub fn changes_requested_message(decision: &PlanDecision) -> String {
+    format!(
+        "{} Revise the plan now and call exit_plan_mode again with the updated \
+         markdown. Stay in plan mode: do not modify files.",
+        decision.reject_reason()
+    )
+}
+
 pub fn parse_plan_decision(result_json: &str) -> Option<PlanDecision> {
     serde_json::from_str::<PlanDecision>(result_json)
         .ok()

@@ -75,7 +75,9 @@ export function ModeChip({
               onClick={() => onChange(active ? null : only.id)}
             >
               <MapIcon className="size-3.5" />
-              {active ? only.label : <span className="sr-only">{only.label}</span>}
+              {/* The off state is the icon alone; `aria-label` + `aria-pressed`
+                  already name it, so an sr-only label would double-announce. */}
+              {active && only.label}
             </button>
           </TooltipTrigger>
           <TooltipContent side="top">

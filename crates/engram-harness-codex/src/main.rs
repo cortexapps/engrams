@@ -1054,14 +1054,9 @@ const PLAN_APPROVED_MESSAGE: &str =
 /// sufficient: codex reads a failed dynamic-tool result as "the tool did not
 /// work", narrates a summary, and ends the turn (session 98111e00 did exactly
 /// that with `success: false` plus the reviewer's words in `contentItems`).
-/// The stamp stays `plan`, so the revision turn is still read-only.
-fn plan_changes_requested_message(decision: &engram_harness_sdk::plan::PlanDecision) -> String {
-    format!(
-        "{} Revise the plan now and call exit_plan_mode again with the updated \
-         markdown. Stay in plan mode: do not modify files.",
-        decision.reject_reason()
-    )
-}
+/// The stamp stays `plan`, so the revision turn is still read-only. The text
+/// itself is shared with the claude adapter's deny + fallback paths.
+use engram_harness_sdk::plan::changes_requested_message as plan_changes_requested_message;
 
 async fn start_turn(server: &mut AppServer, prompt: &QueuedPrompt) -> Result<i64, String> {
     // ADR 0107: per-turn mode application — no respawn, ever. The stamp is

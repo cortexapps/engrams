@@ -243,6 +243,21 @@ One commit per phase. As-built divergences from the proposal:
   QUEUES the build prompt — `turn/completed` consumes it and `start_turn`
   re-reads the flipped stamp (the sticky `sandboxPolicy` override is
   re-sent every turn by design).
+- **A rejection is an INSTRUCTION, on every delivery path** (found in live
+  use). ADR 0089's deferred-tool delivery is two-tier, and AUQ already
+  solved the hard half: tier 1 answers the id-stable re-fire inside the
+  hook, and tier 2 fires when the turn ends with the result still stashed
+  (`is_delivery_resume`) — it drains the result into a fresh user message
+  plus an explicit `ToolCallCompleted` so the outbox row retires. Tier 2 is
+  the normal case for a plan, because a parked plan sitting in front of a
+  human gets idle-evicted and the respawned CLI mints a new `tool_use_id`.
+  Plan mode inherited both tiers for free but stated only a VERDICT
+  ("Plan rejected by the reviewer: …"): session 93869a67 re-proposed a
+  byte-identical plan, and tier 2's generic `- <id>: {json}` rendering is a
+  data dump. One shared `plan::changes_requested_message` — verdict plus
+  "revise now, call exit_plan_mode again, stay in plan mode" — now backs
+  claude's deny verdict, claude's tier-2 fallback (which became tool-aware),
+  and codex's revision turn.
 - **Codex REJECT also rides the queue** (found in live use, sessions
   fe3cd981 + 98111e00): the tool-result channel is not a steer for codex.
   Answering the parked call `success: true` with the raw decision JSON, and

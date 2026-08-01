@@ -713,7 +713,9 @@ mod adapter {
                         // tool's own stream tool_result acks the outbox row.
                         deferred_calls.lock().await.remove(&req.tool_use_id);
                         let reason = engram_harness_sdk::plan::parse_plan_decision(&result_json)
-                            .map(|decision| decision.reject_reason())
+                            .map(|decision| {
+                                engram_harness_sdk::plan::changes_requested_message(&decision)
+                            })
                             .unwrap_or_else(|| {
                                 "Plan rejected by the reviewer. Revise the plan and present it \
                                  again."
@@ -2511,7 +2513,10 @@ mod adapter {
                                         };
                                     if !stale_results.is_empty() {
                                         if let Some(s) = stdin.as_mut() {
-                                            let text = fallback_delivery_message(&stale_results);
+                                            let text = fallback_delivery_message(
+                                                &stale_results,
+                                                &stale_result_names,
+                                            );
                                             let ft = start_turn(
                                                 evt_tx, s, cli, None, &text, current_run_id,
                                             )
@@ -3222,10 +3227,27 @@ mod adapter {
     const PLAN_APPROVED_MESSAGE: &str =
         "Your plan was approved. Implement it now, following the plan you presented.";
 
-    fn fallback_delivery_message(stale_results: &[(String, String)]) -> String {
+    /// `names` maps call_id → manifest tool name, so a drained result can be
+    /// rendered as the thing it MEANS rather than as raw JSON. ADR 0107: a
+    /// rejected plan reaches the model here whenever the respawned CLI never
+    /// re-fired the original id, and "- <id>: {\"decision\":\"reject\"…}" is
+    /// not an instruction — it reads as a data dump and the model moves on.
+    fn fallback_delivery_message(
+        stale_results: &[(String, String)],
+        names: &HashMap<String, String>,
+    ) -> String {
         let mut lines = vec!["Results for the deferred tool call(s) you made earlier:".to_string()];
         for (call_id, result_json) in stale_results {
-            lines.push(format!("- {call_id}: {result_json}"));
+            let plan_reject = (names.get(call_id).map(String::as_str) == Some("exit_plan_mode"))
+                .then(|| engram_harness_sdk::plan::parse_plan_decision(result_json))
+                .flatten()
+                .filter(|decision| !decision.approved());
+            match plan_reject {
+                Some(decision) => lines.push(engram_harness_sdk::plan::changes_requested_message(
+                    &decision,
+                )),
+                None => lines.push(format!("- {call_id}: {result_json}")),
+            }
         }
         lines.join("\n")
     }
@@ -5871,6 +5893,42 @@ mod adapter {
             }
         }
 
+        /// ADR 0107 tier 2 (the AUQ abandoned-re-fire fallback): when the
+        /// respawned CLI never re-fires the original `tool_use_id` — the
+        /// normal case, because a parked plan sitting in front of a human gets
+        /// idle-evicted — the reject reaches the model through THIS message.
+        /// Rendered as raw JSON it reads as a data dump and the model moves on.
+        #[test]
+        fn plan_reject_fallback_asks_for_a_revision_instead_of_dumping_json() {
+            let stale = vec![(
+                "toolu_plan".to_string(),
+                r#"{"decision":"reject","feedback":"also add a README"}"#.to_string(),
+            )];
+            let names = HashMap::from([("toolu_plan".to_string(), "exit_plan_mode".to_string())]);
+            let text = fallback_delivery_message(&stale, &names);
+            assert!(text.contains("also add a README"), "feedback rides: {text}");
+            assert!(
+                text.contains("call exit_plan_mode again"),
+                "the revision ask rides: {text}"
+            );
+            assert!(
+                !text.contains(r#"{"decision""#),
+                "the raw decision JSON is not the message: {text}"
+            );
+        }
+
+        /// An APPROVE never reaches tier 2 (the engine consumes it before the
+        /// respawn), and every other deferred tool keeps the generic dump —
+        /// an answer map is self-explanatory, a verdict is not.
+        #[test]
+        fn non_plan_results_keep_the_generic_fallback_rendering() {
+            let stale = vec![("toolu_q".to_string(), r#"{"Pick one":["yes"]}"#.to_string())];
+            let names = HashMap::from([("toolu_q".to_string(), "ask_user_question".to_string())]);
+            let text = fallback_delivery_message(&stale, &names);
+            assert!(text.contains("- toolu_q: "), "generic rendering: {text}");
+            assert!(!text.contains("exit_plan_mode"), "no plan ask: {text}");
+        }
+
         #[test]
         fn native_question_completion_uses_canonical_tool_name() {
             let mut event = HarnessEvent::ToolCallCompleted {
@@ -6664,6 +6722,13 @@ mod adapter {
                     assert!(
                         reason.contains("also add tests"),
                         "feedback rides: {reason}"
+                    );
+                    // A verdict alone is not enough: session 93869a67 got
+                    // "Plan rejected by the reviewer: …" and re-proposed the
+                    // byte-identical plan. The ask has to be explicit.
+                    assert!(
+                        reason.contains("call exit_plan_mode again"),
+                        "the revision ask rides: {reason}"
                     );
                 }
                 other => panic!(
