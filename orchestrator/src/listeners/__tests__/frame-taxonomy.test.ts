@@ -73,6 +73,8 @@ const WIRE_FRAME_KINDS: Readonly<Record<string, FrameClass>> = {
   user_question: "durable",
   question_answered: "durable",
   file_changed: "durable",
+  // ADR 0107: mode directives (the plan chip + thread mode markers).
+  harness_mode_changed: "durable",
   // Ephemeral: Phase 1c token chunks (ADR 0052) — idx-less, never
   // persisted. Suppressed server-side when durableOnly is set, but an old
   // coordinator under deploy skew still sends them.
