@@ -47,6 +47,9 @@ vi.mock("../../hooks/useSkills", () => ({
   useUploadSkill: () => ({ mutateAsync: uploadSkill, isPending: false }),
 }));
 vi.mock("../../hooks/useOrgSecrets", () => ({ useOrgSecretNames: () => ({ data: [] }) }));
+vi.mock("../../hooks/useIntegrations", () => ({
+  useIntegrationConnections: () => ({ data: { connections: [] } }),
+}));
 // The editor derives its policy rail + connected-connector cards from the joined
 // catalog; mock it so the test needs no QueryClient/transport.
 vi.mock("../../components/integrations/useConnectorViews", () => ({
