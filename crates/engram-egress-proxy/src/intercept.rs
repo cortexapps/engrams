@@ -12,19 +12,20 @@
 //!   for policy evaluation and credential replacement. It forces one request
 //!   per connection. A later transport-hardening layer will replace this with
 //!   framed, streaming request processing.
-//! - **HTTP/1.1 only.** ALPN advertises only `http/1.1`; an upstream
-//!   that wants H2 will fall back. H2 substitution lands later.
+//! - **HTTP/1.1 and HTTP/2.** Each HTTP/2 stream gets an independent policy
+//!   decision. This preserves the same credential boundary for gRPC.
 //! - **Response safety.** A host-issued credential must not reach the guest,
 //!   even when an upstream reflects it. The adapter strips content negotiation,
 //!   rejects encoded responses, and redacts credential bytes across chunks.
 
 use std::sync::Arc;
 
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ServerConfig};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_rustls::{LazyConfigAcceptor, TlsConnector};
 
 use engram_core::SessionId;
 
@@ -55,6 +56,7 @@ const GRAPHQL_REQUEST_BODY_BUDGET: usize = 256 * 1024;
 pub enum InterceptError {
     Io(std::io::Error),
     Tls(rustls::Error),
+    H2(h2::Error),
     Mint(crate::cert_mint::MintError),
     Resolve(ResolveError),
     Violation {
@@ -80,6 +82,7 @@ pub enum InterceptError {
     },
     InjectHeader(crate::inject::InjectHeaderError),
     InvalidServerName(String),
+    InvalidInjectedHeader(String),
 }
 
 impl std::fmt::Display for InterceptError {
@@ -87,6 +90,7 @@ impl std::fmt::Display for InterceptError {
         match self {
             Self::Io(e) => write!(f, "io: {e}"),
             Self::Tls(e) => write!(f, "tls: {e}"),
+            Self::H2(e) => write!(f, "http2: {e}"),
             Self::Mint(e) => write!(f, "mint: {e}"),
             Self::Resolve(e) => write!(f, "resolve: {e}"),
             Self::Violation { placeholder } => {
@@ -109,6 +113,9 @@ impl std::fmt::Display for InterceptError {
             }
             Self::InjectHeader(e) => write!(f, "credential injection rejected: {e}"),
             Self::InvalidServerName(s) => write!(f, "invalid SNI `{s}`"),
+            Self::InvalidInjectedHeader(name) => {
+                write!(f, "invalid injected HTTP header `{name}`")
+            }
         }
     }
 }
@@ -124,6 +131,12 @@ impl From<std::io::Error> for InterceptError {
 impl From<rustls::Error> for InterceptError {
     fn from(e: rustls::Error) -> Self {
         Self::Tls(e)
+    }
+}
+
+impl From<h2::Error> for InterceptError {
+    fn from(e: h2::Error) -> Self {
+        Self::H2(e)
     }
 }
 
@@ -150,9 +163,10 @@ impl From<ResolveError> for InterceptError {
 /// connections.
 pub fn build_server_config(mint: Arc<CertMint>) -> Arc<ServerConfig> {
     let resolver = SniResolver { mint };
-    let cfg = ServerConfig::builder()
+    let mut cfg = ServerConfig::builder()
         .with_no_client_auth()
         .with_cert_resolver(Arc::new(resolver));
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(cfg)
 }
 
@@ -168,9 +182,10 @@ pub fn build_client_config() -> Arc<ClientConfig> {
 /// [`build_client_config`]. Full-network tests use a private CA so they can
 /// exercise certificate verification without external network access.
 pub fn build_client_config_with_roots(roots: rustls::RootCertStore) -> Arc<ClientConfig> {
-    let cfg = ClientConfig::builder()
+    let mut cfg = ClientConfig::builder()
         .with_root_certificates(roots)
         .with_no_client_auth();
+    cfg.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
     Arc::new(cfg)
 }
 
@@ -220,21 +235,63 @@ pub async fn run<C>(
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
-    // Stitch the peeked bytes back onto the client stream so the
-    // TLS acceptor sees the full ClientHello from byte 0.
+    // Stitch the peeked bytes back onto the client stream so the TLS acceptor
+    // sees the full ClientHello from byte 0. Stop after parsing the hello: the
+    // upstream must select a protocol before this leg promises one to the
+    // guest. Otherwise an H2-capable guest and an HTTP/1.1-only upstream can
+    // leave the proxy with two incompatible TLS legs.
     let stitched = Replayed::new(peeked, client_stream);
-    let acceptor = TlsAcceptor::from(server_cfg);
-    let mut client_tls = acceptor.accept(stitched).await?;
+    let start = LazyConfigAcceptor::new(rustls::server::Acceptor::default(), stitched).await?;
+    let guest_protocols: Vec<Vec<u8>> = start
+        .client_hello()
+        .alpn()
+        .into_iter()
+        .flatten()
+        .map(<[u8]>::to_vec)
+        .collect();
 
     // Resolve upstream by SNI on the host's resolver. The SNI
     // doubles as the ServerName for the upstream TLS handshake —
     // that's the host the cert chain should authenticate.
     let upstream_addr = resolver.resolve(sni, port).await?;
     let upstream_tcp = TcpStream::connect(upstream_addr).await?;
-    let connector = TlsConnector::from(client_cfg);
+    let mut connection_client_cfg = (*client_cfg).clone();
+    connection_client_cfg
+        .alpn_protocols
+        .retain(|protocol| guest_protocols.contains(protocol));
+    let connector = TlsConnector::from(Arc::new(connection_client_cfg));
     let server_name: ServerName<'static> = ServerName::try_from(sni.to_string())
         .map_err(|_| InterceptError::InvalidServerName(sni.to_string()))?;
     let mut upstream_tls = connector.connect(server_name, upstream_tcp).await?;
+
+    let upstream_protocol = upstream_tls.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+    let mut connection_server_cfg = (*server_cfg).clone();
+    connection_server_cfg.alpn_protocols = upstream_protocol.iter().cloned().collect();
+    let mut client_tls = start.into_stream(Arc::new(connection_server_cfg)).await?;
+    let client_protocol = client_tls.get_ref().1.alpn_protocol();
+    let upstream_protocol = upstream_protocol.as_deref();
+    if client_protocol != upstream_protocol {
+        return Err(InterceptError::Tls(rustls::Error::General(
+            "client and upstream negotiated different application protocols".into(),
+        )));
+    }
+    if client_protocol == Some(b"h2") {
+        return run_h2(
+            client_tls,
+            upstream_tls,
+            H2Context {
+                sni,
+                port,
+                secrets,
+                injects,
+                observes,
+                session_id,
+                sink,
+                refresher,
+            },
+        )
+        .await;
+    }
 
     // Buffer the request prefix up to SCAN_BUDGET, scan for
     // violations + substitute placeholders, then forward + bidir
@@ -467,6 +524,494 @@ where
         copy_redacting_response(&mut upstream_read, &mut client_write, &response_redactions);
     tokio::try_join!(request, response)?;
     Ok(())
+}
+
+/// Data shared by every stream on one authenticated HTTP/2 connection.
+struct H2Context<'a> {
+    sni: &'a str,
+    port: u16,
+    secrets: &'a [&'a SecretEntry],
+    injects: &'a [&'a InjectEntry],
+    observes: &'a [&'a ObserveEntry],
+    session_id: SessionId,
+    sink: Option<&'a ObserveSink>,
+    refresher: Option<&'a dyn InjectRefresher>,
+}
+
+/// Forward one HTTP/2 connection. A denied stream gets its own response. Other
+/// streams continue, and slow streams do not block new policy decisions.
+async fn run_h2<C, U>(
+    client_tls: C,
+    upstream_tls: U,
+    context: H2Context<'_>,
+) -> Result<(), InterceptError>
+where
+    C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+{
+    let mut inbound = h2::server::handshake(client_tls).await?;
+    let (outbound, connection) = h2::client::handshake(upstream_tls).await?;
+    let upstream = tokio::spawn(connection);
+    let mut active = FuturesUnordered::new();
+    let mut accepting = true;
+
+    while accepting || !active.is_empty() {
+        tokio::select! {
+            incoming = inbound.accept(), if accepting => {
+                match incoming {
+                    Some(Ok((request, respond))) => {
+                        active.push(process_h2_stream(
+                            request,
+                            respond,
+                            outbound.clone(),
+                            &context,
+                        ));
+                    }
+                    Some(Err(error)) => return Err(error.into()),
+                    None => accepting = false,
+                }
+            }
+            completed = active.next(), if !active.is_empty() => {
+                if let Some(Err(error)) = completed {
+                    tracing::warn!(
+                        %error,
+                        %context.session_id,
+                        target = context.sni,
+                        "HTTP/2 stream forwarding failed",
+                    );
+                }
+            }
+        }
+    }
+
+    upstream.abort();
+    let _ = upstream.await;
+    Ok(())
+}
+
+async fn process_h2_stream(
+    request: http::Request<h2::RecvStream>,
+    mut respond: h2::server::SendResponse<bytes::Bytes>,
+    mut outbound: h2::client::SendRequest<bytes::Bytes>,
+    context: &H2Context<'_>,
+) -> Result<(), InterceptError> {
+    let method = request.method().as_str().to_string();
+    let path = request
+        .uri()
+        .path_and_query()
+        .map_or_else(|| "/".to_string(), ToString::to_string);
+    let is_graphql = context
+        .injects
+        .iter()
+        .any(|entry| entry.policy.graphql.is_some() && entry.policy.path_matches(&path))
+        || context
+            .observes
+            .iter()
+            .any(|entry| entry.policy.graphql.is_some() && entry.policy.path_matches(&path));
+
+    let (mut parts, mut request_body) = request.into_parts();
+    let (buffered_body, request_trailers, parsed_graphql) = if is_graphql {
+        match read_h2_body(&mut request_body, GRAPHQL_REQUEST_BODY_BUDGET).await {
+            Ok((body, trailers)) => {
+                let parsed = match graphql::parse_request_body(&body) {
+                    Some(parsed) => parsed,
+                    None => {
+                        deny_h2(&mut respond, http::StatusCode::BAD_REQUEST)?;
+                        return Ok(());
+                    }
+                };
+                (Some(body), trailers, Some(parsed))
+            }
+            Err(_) => {
+                deny_h2(&mut respond, http::StatusCode::PAYLOAD_TOO_LARGE)?;
+                return Ok(());
+            }
+        }
+    } else {
+        (None, None, None)
+    };
+
+    let matched: Vec<&InjectEntry> = if let Some(document) = &parsed_graphql {
+        match gate_graphql_injects(context.injects, &method, &path, document) {
+            Some(entries) => entries,
+            None => {
+                deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
+                return Ok(());
+            }
+        }
+    } else {
+        context
+            .injects
+            .iter()
+            .copied()
+            .filter(|entry| entry.policy.graphql.is_none() && entry.policy.allows(&method, &path))
+            .collect()
+    };
+    if !context.injects.is_empty() && matched.is_empty() {
+        deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
+        return Ok(());
+    }
+    if let Some(refresher) = context.refresher {
+        for entry in &matched {
+            entry.refresh_if_stale(context.session_id, refresher).await;
+        }
+    }
+
+    let firing: Vec<&ObserveEntry> = context
+        .observes
+        .iter()
+        .copied()
+        .filter(|entry| match (&entry.policy.graphql, &parsed_graphql) {
+            (Some(graphql_match), Some(document)) => {
+                entry.policy.method_matches(&method)
+                    && entry.policy.path_matches(&path)
+                    && document
+                        .top_level
+                        .iter()
+                        .any(|(operation, field)| graphql_match.matches(*operation, field))
+            }
+            (None, _) => entry.policy.allows(&method, &path),
+            (Some(_), None) => false,
+        })
+        .collect();
+
+    transform_h2_headers(&mut parts.headers, context.sni, context.secrets)?;
+    inject_h2_headers(&mut parts.headers, &matched)?;
+    let response_redactions = response_redactions(context.sni, context.secrets, &matched);
+    if !response_redactions.is_empty() || !firing.is_empty() {
+        parts.headers.remove(http::header::ACCEPT_ENCODING);
+        parts.headers.remove("grpc-accept-encoding");
+    }
+    if context
+        .secrets
+        .iter()
+        .any(|entry| entry.allow.matches(context.sni))
+    {
+        parts.headers.remove(http::header::CONTENT_LENGTH);
+    }
+
+    let authority = upstream_authority(context.sni, context.port);
+    let mut uri_parts = parts.uri.into_parts();
+    uri_parts.authority = Some(
+        authority
+            .parse()
+            .map_err(|_| InterceptError::InvalidServerName(authority.clone()))?,
+    );
+    parts.uri = http::Uri::from_parts(uri_parts)
+        .map_err(|_| InterceptError::InvalidServerName(authority))?;
+    parts.headers.remove(http::header::HOST);
+
+    outbound = outbound.ready().await?;
+    let request_end = buffered_body.is_none() && request_body.is_end_stream();
+    let (response, mut upstream_body) =
+        outbound.send_request(http::Request::from_parts(parts, ()), request_end)?;
+
+    let forward_request = async {
+        if let Some(body) = buffered_body {
+            let body = transform_complete(body, context.sni, context.secrets)?;
+            let end = request_trailers.is_none();
+            send_h2_data(&mut upstream_body, body.into(), end).await?;
+            if let Some(mut trailers) = request_trailers {
+                transform_h2_headers(&mut trailers, context.sni, context.secrets)?;
+                upstream_body.send_trailers(trailers)?;
+            }
+        } else if !request_end {
+            let mut transformer = PlaceholderTransformer::new(context.sni, context.secrets);
+            while let Some(data) = request_body.data().await {
+                let data = data?;
+                let len = data.len();
+                request_body.flow_control().release_capacity(len)?;
+                let output = transformer.push(&data, false)?;
+                if !output.is_empty() {
+                    send_h2_data(&mut upstream_body, output.into(), false).await?;
+                }
+            }
+            let tail = transformer.push(&[], true)?;
+            if !tail.is_empty() {
+                send_h2_data(&mut upstream_body, tail.into(), false).await?;
+            }
+            if let Some(mut trailers) = request_body.trailers().await? {
+                transform_h2_headers(&mut trailers, context.sni, context.secrets)?;
+                upstream_body.send_trailers(trailers)?;
+            } else {
+                send_h2_data(&mut upstream_body, bytes::Bytes::new(), true).await?;
+            }
+        }
+        Ok::<(), InterceptError>(())
+    };
+
+    let forward_response = async {
+        let response = response.await?;
+        let status = response.status().as_u16();
+        let (mut response_parts, mut response_body) = response.into_parts();
+        if (!response_redactions.is_empty() || !firing.is_empty())
+            && !h2_response_is_inspectable(&response_parts.headers)
+        {
+            deny_h2(&mut respond, http::StatusCode::BAD_GATEWAY)?;
+            return Ok(());
+        }
+        redact_h2_headers(&mut response_parts.headers, &response_redactions);
+        let response_end = response_body.is_end_stream();
+        let mut client_body =
+            respond.send_response(http::Response::from_parts(response_parts, ()), response_end)?;
+        let mut redactor = ByteRedactor::new(&response_redactions);
+        let mut observed_body = Vec::new();
+        if !response_end {
+            while let Some(data) = response_body.data().await {
+                let data = data?;
+                let len = data.len();
+                response_body.flow_control().release_capacity(len)?;
+                let output = redactor.push(&data, false);
+                if observed_body.len() < OBSERVE_RESPONSE_BUDGET {
+                    let take = (OBSERVE_RESPONSE_BUDGET - observed_body.len()).min(output.len());
+                    observed_body.extend_from_slice(&output[..take]);
+                }
+                if !output.is_empty() {
+                    send_h2_data(&mut client_body, output.into(), false).await?;
+                }
+            }
+            let tail = redactor.push(&[], true);
+            if observed_body.len() < OBSERVE_RESPONSE_BUDGET {
+                let take = (OBSERVE_RESPONSE_BUDGET - observed_body.len()).min(tail.len());
+                observed_body.extend_from_slice(&tail[..take]);
+            }
+            if !tail.is_empty() {
+                send_h2_data(&mut client_body, tail.into(), false).await?;
+            }
+            if let Some(mut trailers) = response_body.trailers().await? {
+                redact_h2_headers(&mut trailers, &response_redactions);
+                client_body.send_trailers(trailers)?;
+            } else {
+                send_h2_data(&mut client_body, bytes::Bytes::new(), true).await?;
+            }
+        }
+
+        if let Some(sink) = context.sink {
+            let parsed = observe::ParsedResponse {
+                status,
+                body: observed_body,
+            };
+            let variables = parsed_graphql
+                .as_ref()
+                .and_then(|document| document.variables.as_ref());
+            for entry in &firing {
+                if let Some(asset) =
+                    observe::evaluate(entry, Some(&parsed), &method, &path, variables)
+                {
+                    sink(context.session_id, asset);
+                }
+            }
+        }
+        Ok::<(), InterceptError>(())
+    };
+
+    tokio::try_join!(forward_request, forward_response)?;
+    Ok(())
+}
+
+fn deny_h2(
+    respond: &mut h2::server::SendResponse<bytes::Bytes>,
+    status: http::StatusCode,
+) -> Result<(), InterceptError> {
+    let response = http::Response::builder()
+        .status(status)
+        .body(())
+        .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error.to_string()))?;
+    respond.send_response(response, true)?;
+    Ok(())
+}
+
+async fn read_h2_body(
+    body: &mut h2::RecvStream,
+    budget: usize,
+) -> Result<(Vec<u8>, Option<http::HeaderMap>), InterceptError> {
+    let mut output = Vec::new();
+    while let Some(data) = body.data().await {
+        let data = data?;
+        let len = data.len();
+        body.flow_control().release_capacity(len)?;
+        if output.len().saturating_add(len) > budget {
+            return Err(InterceptError::GraphqlRejected {
+                reason: "body exceeds limit",
+            });
+        }
+        output.extend_from_slice(&data);
+    }
+    Ok((output, body.trailers().await?))
+}
+
+async fn send_h2_data(
+    stream: &mut h2::SendStream<bytes::Bytes>,
+    mut data: bytes::Bytes,
+    end_stream: bool,
+) -> Result<(), InterceptError> {
+    if data.is_empty() {
+        stream.send_data(data, end_stream)?;
+        return Ok(());
+    }
+    while !data.is_empty() {
+        stream.reserve_capacity(data.len());
+        let capacity = futures_util::future::poll_fn(|cx| stream.poll_capacity(cx))
+            .await
+            .ok_or_else(|| {
+                std::io::Error::new(std::io::ErrorKind::BrokenPipe, "HTTP/2 stream closed")
+            })??;
+        let take = capacity.min(data.len());
+        let chunk = data.split_to(take);
+        stream.send_data(chunk, end_stream && data.is_empty())?;
+    }
+    Ok(())
+}
+
+fn transform_complete(
+    value: Vec<u8>,
+    sni: &str,
+    secrets: &[&SecretEntry],
+) -> Result<Vec<u8>, InterceptError> {
+    if let Some(placeholder) = scan_for_violation(&value, sni, secrets) {
+        return Err(InterceptError::Violation {
+            placeholder: placeholder.to_string(),
+        });
+    }
+    Ok(substitute(value, sni, secrets))
+}
+
+fn transform_h2_headers(
+    headers: &mut http::HeaderMap,
+    sni: &str,
+    secrets: &[&SecretEntry],
+) -> Result<(), InterceptError> {
+    for (name, value) in headers.iter_mut() {
+        let transformed = transform_complete(value.as_bytes().to_vec(), sni, secrets)?;
+        if transformed != value.as_bytes() {
+            *value = http::HeaderValue::from_bytes(&transformed)
+                .map_err(|_| InterceptError::InvalidInjectedHeader(name.to_string()))?;
+        }
+    }
+    Ok(())
+}
+
+fn inject_h2_headers(
+    headers: &mut http::HeaderMap,
+    entries: &[&InjectEntry],
+) -> Result<(), InterceptError> {
+    for (name, value) in inject::rendered_headers(entries)? {
+        let name = http::HeaderName::from_bytes(name.as_bytes())
+            .map_err(|_| InterceptError::InvalidInjectedHeader(name.clone()))?;
+        let value = http::HeaderValue::from_str(&value)
+            .map_err(|_| InterceptError::InvalidInjectedHeader(name.to_string()))?;
+        headers.remove(&name);
+        headers.insert(name, value);
+    }
+    Ok(())
+}
+
+fn response_redactions(
+    sni: &str,
+    secrets: &[&SecretEntry],
+    injects: &[&InjectEntry],
+) -> Vec<Vec<u8>> {
+    let mut values: Vec<Vec<u8>> = secrets
+        .iter()
+        .filter(|entry| entry.allow.matches(sni))
+        .map(|entry| entry.real_value.as_bytes().to_vec())
+        .chain(injects.iter().map(|entry| entry.secret().into_bytes()))
+        .filter(|value| !value.is_empty())
+        .collect();
+    values.sort_unstable();
+    values.dedup();
+    values
+}
+
+fn redact_h2_headers(headers: &mut http::HeaderMap, needles: &[Vec<u8>]) {
+    for value in headers.values_mut() {
+        let mut bytes = value.as_bytes().to_vec();
+        redact_bytes(&mut bytes, needles);
+        if bytes != value.as_bytes() {
+            if let Ok(redacted) = http::HeaderValue::from_bytes(&bytes) {
+                *value = redacted;
+            }
+        }
+    }
+}
+
+fn h2_response_is_inspectable(headers: &http::HeaderMap) -> bool {
+    [http::header::CONTENT_ENCODING.as_str(), "grpc-encoding"]
+        .iter()
+        .all(|name| {
+            headers.get_all(*name).iter().all(|value| {
+                value
+                    .to_str()
+                    .is_ok_and(|value| value.eq_ignore_ascii_case("identity"))
+            })
+        })
+}
+
+struct PlaceholderTransformer<'a> {
+    sni: &'a str,
+    secrets: &'a [&'a SecretEntry],
+    pending: Vec<u8>,
+    keep: usize,
+}
+
+impl<'a> PlaceholderTransformer<'a> {
+    fn new(sni: &'a str, secrets: &'a [&'a SecretEntry]) -> Self {
+        Self {
+            sni,
+            secrets,
+            pending: Vec::new(),
+            keep: secrets
+                .iter()
+                .map(|entry| entry.placeholder.len())
+                .filter(|length| *length > 0)
+                .max()
+                .unwrap_or(1)
+                .saturating_sub(1),
+        }
+    }
+
+    fn push(&mut self, input: &[u8], final_chunk: bool) -> Result<Vec<u8>, InterceptError> {
+        self.pending.extend_from_slice(input);
+        let process_limit = if final_chunk {
+            self.pending.len()
+        } else {
+            self.pending.len().saturating_sub(self.keep)
+        };
+        let mut output = Vec::new();
+        let mut cursor = 0;
+        while cursor < process_limit {
+            let next = self
+                .secrets
+                .iter()
+                .filter_map(|entry| {
+                    let needle = entry.placeholder.as_bytes();
+                    if needle.is_empty() {
+                        return None;
+                    }
+                    self.pending[cursor..]
+                        .windows(needle.len())
+                        .position(|candidate| candidate == needle)
+                        .map(|offset| (cursor + offset, *entry))
+                })
+                .filter(|(start, _)| *start < process_limit)
+                .min_by_key(|(start, _)| *start);
+            let Some((start, entry)) = next else {
+                output.extend_from_slice(&self.pending[cursor..process_limit]);
+                cursor = process_limit;
+                break;
+            };
+            output.extend_from_slice(&self.pending[cursor..start]);
+            if !entry.allow.matches(self.sni) {
+                return Err(InterceptError::Violation {
+                    placeholder: entry.placeholder.clone(),
+                });
+            }
+            output.extend_from_slice(entry.real_value.as_bytes());
+            cursor = start + entry.placeholder.len();
+        }
+        self.pending.drain(..cursor);
+        Ok(output)
+    }
 }
 
 fn upstream_authority(sni: &str, port: u16) -> String {
@@ -857,6 +1402,8 @@ where
 #[cfg(test)]
 mod hardening_tests {
     use super::*;
+    use crate::policy::HostList;
+    use crate::registry::{RefreshableCred, RequestPolicy};
 
     #[test]
     fn binds_authority_to_sni_and_removes_duplicates() {
@@ -897,5 +1444,165 @@ mod hardening_tests {
         assert!(!response_headers_are_inspectable(
             b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip"
         ));
+    }
+
+    #[test]
+    fn substitutes_placeholders_across_h2_data_frames() {
+        let secret = SecretEntry {
+            placeholder: "guest-placeholder".into(),
+            real_value: "host-secret".into(),
+            allow: HostList::from_manifest(&["api.example".into()], &[]).unwrap(),
+        };
+        let secrets = [&secret];
+        let mut transformer = PlaceholderTransformer::new("api.example", &secrets);
+        let mut output = transformer.push(b"before-guest-", false).unwrap();
+        output.extend(transformer.push(b"placeholder-after", false).unwrap());
+        output.extend(transformer.push(&[], true).unwrap());
+        assert_eq!(output, b"before-host-secret-after");
+    }
+
+    #[tokio::test]
+    async fn h2_denial_and_slow_stream_do_not_block_an_allowed_stream() {
+        let (guest_io, proxy_guest_io) = tokio::io::duplex(64 * 1024);
+        let (proxy_upstream_io, upstream_io) = tokio::io::duplex(64 * 1024);
+        let release_slow = Arc::new(tokio::sync::Notify::new());
+        let upstream_release = release_slow.clone();
+
+        let proxy = tokio::spawn(async move {
+            let secret = SecretEntry {
+                placeholder: "guest-placeholder".into(),
+                real_value: "host-secret".into(),
+                allow: HostList::from_manifest(&["api.example".into()], &[]).unwrap(),
+            };
+            let inject = InjectEntry {
+                header_name: "authorization".into(),
+                header_template: "Bearer {}".into(),
+                allow: HostList::from_manifest(&["api.example".into()], &[]).unwrap(),
+                policy: RequestPolicy {
+                    methods: vec!["POST".into()],
+                    path_globs: vec!["/slow".into(), "/fast".into()],
+                    graphql: None,
+                },
+                mint_source: None,
+                cred: RefreshableCred::new("host-token".into(), None),
+            };
+            run_h2(
+                proxy_guest_io,
+                proxy_upstream_io,
+                H2Context {
+                    sni: "api.example",
+                    port: 443,
+                    secrets: &[&secret],
+                    injects: &[&inject],
+                    observes: &[],
+                    session_id: SessionId::new(),
+                    sink: None,
+                    refresher: None,
+                },
+            )
+            .await
+        });
+
+        let upstream = tokio::spawn(async move {
+            let mut server = h2::server::handshake(upstream_io).await.unwrap();
+            for _ in 0..2 {
+                let (request, mut respond) = server.accept().await.unwrap().unwrap();
+                let release = upstream_release.clone();
+                tokio::spawn(async move {
+                    assert_eq!(request.uri().authority().unwrap(), "api.example");
+                    assert_eq!(
+                        request.headers().get("authorization").unwrap(),
+                        "Bearer host-token"
+                    );
+                    let path = request.uri().path().to_string();
+                    let mut body = request.into_body();
+                    let mut request_data = Vec::new();
+                    while let Some(data) = body.data().await {
+                        let data = data.unwrap();
+                        body.flow_control().release_capacity(data.len()).unwrap();
+                        request_data.extend_from_slice(&data);
+                    }
+                    if path == "/slow" {
+                        release.notified().await;
+                    } else {
+                        assert_eq!(path, "/fast");
+                        assert_eq!(request_data, b"host-secret");
+                    }
+                    let response = http::Response::builder()
+                        .status(200)
+                        .header("x-reflected-token", "host-token")
+                        .body(())
+                        .unwrap();
+                    let mut response_body = respond.send_response(response, false).unwrap();
+                    response_body
+                        .send_data(bytes::Bytes::from_static(b"host-secret|host-token"), true)
+                        .unwrap();
+                });
+            }
+            while server.accept().await.is_some() {}
+        });
+
+        let (mut guest, guest_connection) = h2::client::handshake(guest_io).await.unwrap();
+        let guest_connection = tokio::spawn(guest_connection);
+
+        guest = guest.ready().await.unwrap();
+        let slow = http::Request::builder()
+            .method("POST")
+            .uri("https://attacker.example/slow")
+            .header("authorization", "Bearer guest-token")
+            .body(())
+            .unwrap();
+        let (slow_response, _) = guest.send_request(slow, true).unwrap();
+
+        guest = guest.ready().await.unwrap();
+        let denied = http::Request::builder()
+            .method("POST")
+            .uri("https://attacker.example/denied")
+            .body(())
+            .unwrap();
+        let (denied_response, _) = guest.send_request(denied, true).unwrap();
+        assert_eq!(denied_response.await.unwrap().status(), 403);
+
+        guest = guest.ready().await.unwrap();
+        let fast = http::Request::builder()
+            .method("POST")
+            .uri("https://attacker.example/fast")
+            .header("authorization", "Bearer guest-token")
+            .body(())
+            .unwrap();
+        let (fast_response, mut fast_body) = guest.send_request(fast, false).unwrap();
+        fast_body
+            .send_data(bytes::Bytes::from_static(b"guest-"), false)
+            .unwrap();
+        fast_body
+            .send_data(bytes::Bytes::from_static(b"placeholder"), true)
+            .unwrap();
+        let fast_response = tokio::time::timeout(std::time::Duration::from_secs(1), fast_response)
+            .await
+            .expect("fast stream must not wait for the slow stream")
+            .unwrap();
+        assert_eq!(fast_response.status(), 200);
+        assert_eq!(
+            fast_response.headers().get("x-reflected-token").unwrap(),
+            "**********"
+        );
+        let mut response_body = fast_response.into_body();
+        let mut response_data = Vec::new();
+        while let Some(data) = response_body.data().await {
+            let data = data.unwrap();
+            response_body
+                .flow_control()
+                .release_capacity(data.len())
+                .unwrap();
+            response_data.extend_from_slice(&data);
+        }
+        assert_eq!(response_data, b"***********|**********");
+
+        release_slow.notify_waiters();
+        assert_eq!(slow_response.await.unwrap().status(), 200);
+        drop(guest);
+        guest_connection.abort();
+        upstream.abort();
+        proxy.abort();
     }
 }

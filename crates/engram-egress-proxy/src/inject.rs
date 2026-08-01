@@ -71,6 +71,29 @@ pub fn inject_headers(
     // entries commonly carry the same Authorization credential. Coalesce equal
     // rendered values so a multi-field query still emits exactly one HTTP header;
     // reject conflicting values instead of letting entry order choose a token.
+    let rendered = rendered_headers(entries)?;
+    let insert_at = end + 2; // just past the CRLF terminating the request line
+                             // Drop any existing header line whose name we're about to inject. The request
+                             // line is untouched, so `insert_at` is stable across the strip.
+    let prefix = strip_named_headers(&prefix, insert_at, entries);
+    let mut out = Vec::with_capacity(prefix.len() + 96 * rendered.len());
+    out.extend_from_slice(&prefix[..insert_at]);
+    for (name, value) in rendered {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(&prefix[insert_at..]);
+    Ok(out)
+}
+
+/// Render and coalesce the host-side headers for one authorized request. Both
+/// HTTP adapters use this function so conflict handling cannot drift by
+/// protocol.
+pub fn rendered_headers(
+    entries: &[&InjectEntry],
+) -> Result<Vec<(String, String)>, InjectHeaderError> {
     let mut rendered: Vec<(&InjectEntry, String)> = Vec::with_capacity(entries.len());
     for entry in entries {
         let value = entry.header_template.replace("{}", &entry.secret());
@@ -95,20 +118,10 @@ pub fn inject_headers(
         }
         rendered.push((entry, value));
     }
-    let insert_at = end + 2; // just past the CRLF terminating the request line
-                             // Drop any existing header line whose name we're about to inject. The request
-                             // line is untouched, so `insert_at` is stable across the strip.
-    let prefix = strip_named_headers(&prefix, insert_at, entries);
-    let mut out = Vec::with_capacity(prefix.len() + 96 * rendered.len());
-    out.extend_from_slice(&prefix[..insert_at]);
-    for (entry, value) in rendered {
-        out.extend_from_slice(entry.header_name.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(&prefix[insert_at..]);
-    Ok(out)
+    Ok(rendered
+        .into_iter()
+        .map(|(entry, value)| (entry.header_name.clone(), value))
+        .collect())
 }
 
 /// Rebuild the request with any header line whose name (case-insensitively)
