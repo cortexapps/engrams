@@ -9,7 +9,8 @@
  * Form stack matches the house pattern (SecretsPanel, ImagesPanel): a single
  * react-hook-form `useForm` + zodResolver drives the draft; scalar fields are
  * labeled `Field`s; the collection editors (powers, skills, env, secrets) are
- * controlled via watch/setValue. Layout is the house shadcn settings shape —
+ * controlled via `useFieldValue` (useController — NOT watch/setValue; see its
+ * doc comment). Layout is the house shadcn settings shape —
  * each section a `Card`, the policy rail a `Card` that sticks via a wrapper
  * (never `position: sticky` on the rounded/overflow-hidden card itself — that
  * combo clips the corners in Chromium).
@@ -17,7 +18,7 @@
 
 import { useEffect, useMemo, useState } from "react";
 import { useNavigate, useParams, Link } from "@tanstack/react-router";
-import { Controller, useForm } from "react-hook-form";
+import { Controller, useController, useForm, type Control } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import * as z from "zod";
 import { toast } from "sonner";
@@ -108,6 +109,27 @@ const schema = z.object({
 });
 type ProfileFormValues = z.infer<typeof schema>;
 
+/**
+ * Read/write one form field that has no registered input behind it — the row
+ * editors (`envRows`, `secretRows`), the multi-selects (`skills`,
+ * `capabilities`), and `portExposures`.
+ *
+ * These MUST go through `useController`, not `watch(name)` + `setValue(name, v)`.
+ * Measured on react-hook-form 7.83: with no registered field behind the name,
+ * a `setValue` that changes the array's LENGTH lands, and a `setValue` that
+ * edits a row IN PLACE is discarded — the form neither stores it nor re-renders.
+ * So adding and removing rows worked while picking an org secret in a secret row
+ * silently did nothing, and the profile saved with `secrets: []`. `useController`
+ * registers the field, so every write lands and notifies.
+ */
+function useFieldValue<K extends keyof ProfileFormValues>(
+  control: Control<ProfileFormValues>,
+  name: K,
+): [ProfileFormValues[K], (next: ProfileFormValues[K]) => void] {
+  const { field } = useController({ control, name });
+  return [field.value as ProfileFormValues[K], field.onChange];
+}
+
 const EMPTY: ProfileFormValues = {
   name: "",
   description: "",
@@ -153,17 +175,19 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { control, setValue, watch, reset, handleSubmit, formState } = form;
 
   // Live draft — the policy rail and derived network recompute as these change.
-  const capabilities = watch("capabilities");
-  const skills = watch("skills");
+  // The five below have no registered input, so they ride useController (see
+  // useFieldValue): a bare watch/setValue pair drops in-place row edits.
+  const [capabilities, setCapabilities] = useFieldValue(control, "capabilities");
+  const [skills, setSkills] = useFieldValue(control, "skills");
+  const [envRows, setEnvRows] = useFieldValue(control, "envRows");
+  const [secretRows, setSecretRows] = useFieldValue(control, "secretRows");
+  const [portExposures, setPortExposures] = useFieldValue(control, "portExposures");
   const includeUserTokens = watch("includeUserTokens");
   const imageId = watch("imageId");
   // ADR 0062/0063: the selected harness's descriptor drives the model/effort
   // option lists (they're enums on the harness, not free-form).
   const harness = watch("harness");
   const harnessDescriptor = harnesses?.find((h) => h.name === harness)?.descriptor;
-  const envRows = watch("envRows");
-  const secretRows = watch("secretRows");
-  const portExposures = watch("portExposures");
   const networkDefault = watch("networkDefault");
   const allowHostsText = watch("allowHostsText");
   const allowPatternsText = watch("allowPatternsText");
@@ -212,8 +236,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
     const known = new Set(skillCatalog.map((s) => s.name));
     const current = form.getValues("skills");
     const pruned = current.filter((s) => known.has(s));
-    if (pruned.length !== current.length) setValue("skills", pruned);
-  }, [skillCatalog, existing, form, setValue]);
+    if (pruned.length !== current.length) setSkills(pruned);
+  }, [skillCatalog, existing, form, setSkills]);
 
   // Default to the first enabled image in create mode (don't clobber a choice).
   useEffect(() => {
@@ -262,7 +286,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
   // --- capability helpers (enable→select) -----------------------------------
-  const setCaps = (next: string[]) => setValue("capabilities", next, { shouldDirty: true });
+  const setCaps = setCapabilities;
   const capOn = (provider: string, action: string) => {
     const cap = `${provider}:${action}`;
     return capabilities.some((x) => x === cap || x.startsWith(`${cap}@`));
@@ -785,18 +809,18 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                 <Advanced
                   skillCatalog={skillCatalog ?? []}
                   skills={skills}
-                  setSkills={(s) => setValue("skills", s, { shouldDirty: true })}
+                  setSkills={setSkills}
                   envRows={envRows}
-                  setEnvRows={(r) => setValue("envRows", r, { shouldDirty: true })}
+                  setEnvRows={setEnvRows}
                   secretRows={secretRows}
-                  setSecretRows={(r) => setValue("secretRows", r, { shouldDirty: true })}
+                  setSecretRows={setSecretRows}
                   orgSecretNames={orgSecretNames ?? []}
                   includeUserTokens={includeUserTokens}
                   setIncludeUserTokens={(b) =>
                     setValue("includeUserTokens", b, { shouldDirty: true })
                   }
                   portExposures={portExposures}
-                  setPortExposures={(p) => setValue("portExposures", p, { shouldDirty: true })}
+                  setPortExposures={setPortExposures}
                 />
               </CardContent>
             )}
