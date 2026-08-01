@@ -1290,6 +1290,20 @@ fn harness_event_sink(
             // signal the incident waited 41 s for, and it is exactly
             // the shape the dedupe drops from the log.
             if matches!(kind, "harness_idle" | "harness_parked") {
+                // ADR 0108 A8: a harness that just announced Idle can
+                // take a prompt NOW — a row waiting out ACK_TIMEOUT
+                // from a forward into a dead link has no reason to
+                // keep waiting. Without this recall the wake below
+                // finds nothing due and no-ops; the row then sits out
+                // the full timeout (prod 7eddce62: 35.5 s after a
+                // 120 ms un-park).
+                if let Err(e) = meta.outbox_make_due(session_id).await {
+                    tracing::debug!(
+                        session_id = %session_id,
+                        error = %e,
+                        "outbox make-due on attach signal failed (ack timeout backstops)",
+                    );
+                }
                 if let Err(e) = meta
                     .op_wake_queued_kind(
                         session_id,
@@ -2673,6 +2687,21 @@ pub(crate) mod tests {
                     chrono::Utc::now() + chrono::Duration::milliseconds(delay.as_millis() as i64);
             }
             Ok(())
+        }
+        /// ADR 0108 A8: honest make-due semantics (no attempts bump,
+        /// `not_before > now` only) so the harness-desync repair test
+        /// can assert rows actually move — the trait default returns 0,
+        /// which would make that assertion vacuous.
+        async fn outbox_make_due(&self, session_id: SessionId) -> Result<u64, MetaError> {
+            let now = chrono::Utc::now();
+            let mut moved = 0u64;
+            for r in self.outbox.lock().iter_mut() {
+                if r.session_id == session_id && r.acked_at.is_none() && r.not_before > now {
+                    r.not_before = now;
+                    moved += 1;
+                }
+            }
+            Ok(moved)
         }
         async fn list_session_events_since(
             &self,

@@ -2289,6 +2289,24 @@ impl MetadataStore for SimMetadataStore {
         Ok(())
     }
 
+    /// Inverse of `outbox_defer`: `not_before := now` for waiting
+    /// un-acked rows. Never bumps `attempts` (not a delivery try);
+    /// the `not_before > now` predicate keeps it idempotent and off
+    /// already-due rows — same semantics as the PG UPDATE.
+    async fn outbox_make_due(&self, session_id: SessionId) -> Result<u64, MetaError> {
+        self.gate()?;
+        let now = self.now();
+        let mut db = self.db.lock();
+        let mut moved = 0u64;
+        for r in db.outbox.values_mut() {
+            if r.session_id == session_id && r.acked_at.is_none() && r.not_before > now {
+                r.not_before = now;
+                moved += 1;
+            }
+        }
+        Ok(moved)
+    }
+
     async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
         self.gate()?;
         let now = self.now();

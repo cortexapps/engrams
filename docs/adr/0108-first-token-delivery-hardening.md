@@ -33,6 +33,17 @@ stacked defects. Each defect was a reasonable fix for an earlier problem.
    had already inflated. Recovery took 41 seconds and was set by a backoff
    counter, not by the data path.
 
+A fourth stall shape surfaced in production after A1–A5 shipped (session
+7eddce62): a prompt to a session parked for 27 minutes un-parked the VM in
+120 ms, but the harness vsock link had died during the pause while the host
+hub still advertised the handle. `send_prompt` returned Ok into a socket
+with no reader, so the outbox row was marked delivered and waited out the
+full 30 s ACK_TIMEOUT before the retry hit `NotFound` and re-established
+the harness in 70 ms. A1–A5 all key on signals this shape never produces:
+there is no failed attempt to back off from, no boot milestone, and the
+attach signal alone only wakes an op that finds the row still gated by
+`not_before`.
+
 Two latent holes surfaced during the same investigation:
 
 - The issue-#218 generation guard protects only connection *removal*. A stale
@@ -91,6 +102,19 @@ established and then lost, never inside an attach grace window.
   black-holed established connection is detected without a coordinator
   SIGUSR1. Continue the RX-gate hardening in the vendored Firecracker for the
   snapshot-create arm.
+- **A8** Coordinator: fresh attach evidence recalls waiting outbox rows.
+  A new store primitive, `outbox_make_due`, is the inverse of
+  `outbox_defer`: it pulls every un-acked row with a future `not_before`
+  back to due. It never bumps `attempts` (a recall is not a delivery try)
+  and it is idempotent (`not_before > now` only). Two call sites: the A3
+  attach signal calls it before the op wake, so the wake finds the row
+  due; and the heartbeat disagreement check becomes a repair —
+  `harness_desync::run_once` recalls the rows and enqueues the Deliver op
+  directly for each Active session whose sandbox is running but not
+  hub-attached. `run_once` is a pure step over two sandbox sets, so the
+  DST swarm drives it without the HTTP handler. This promotes the
+  disagreement signal from the alarm-only metric this ADR previously left
+  as follow-up (Workstream E's cosim oracle) to a production repair.
 
 ### Workstream B — stream contract
 

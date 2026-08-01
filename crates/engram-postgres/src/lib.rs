@@ -3349,6 +3349,26 @@ impl MetadataStore for PostgresStore {
         Ok(())
     }
 
+    async fn outbox_make_due(&self, session_id: SessionId) -> Result<u64, MetaError> {
+        // No `attempts` bump: this cancels a provably-pointless wait
+        // (e.g. an ACK_TIMEOUT armed by a forward into a dead harness
+        // link, prod 7eddce62); it is not a delivery try, and a bump
+        // would inflate `failure_backoff` for the very retry being
+        // made prompt. The `not_before > $2` predicate makes the call
+        // idempotent across repeated heartbeats and never touches a
+        // row already due.
+        let res = sqlx::query(
+            "UPDATE session_outbox SET not_before = $2
+             WHERE session_id = $1 AND acked_at IS NULL AND not_before > $2",
+        )
+        .bind(session_id.as_uuid())
+        .bind(self.clock.now_utc())
+        .execute(&self.pool)
+        .await
+        .map_err(db_err)?;
+        Ok(res.rows_affected())
+    }
+
     async fn outbox_ack(&self, prompt_id: &str) -> Result<bool, MetaError> {
         let res = sqlx::query(
             "UPDATE session_outbox SET acked_at = $2

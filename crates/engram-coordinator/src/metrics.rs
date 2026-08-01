@@ -299,6 +299,11 @@ pub const EVICTION_PARK_DESCEND_TOTAL: &str = "engram_eviction_park_descend_tota
 /// belt-and-braces liveness alarm (was the desync watchdog's job).
 /// Alert on a sustained nonzero rate.
 pub const HARNESS_ATTACH_DISAGREEMENT_TOTAL: &str = "engram_harness_attach_disagreement_total";
+/// Counter (ADR 0108 A8). Sessions the heartbeat disagreement REPAIR
+/// re-drove: waiting outbox rows recalled to due + a Deliver op
+/// enqueued, for an Active session whose sandbox the host reports
+/// RUNNING with no attached harness (prod 7eddce62).
+pub const HARNESS_DESYNC_REDRIVEN_TOTAL: &str = "engram_harness_desync_redriven_total";
 /// Counter (ADR 0073). Rows terminally acked by a confirming event.
 pub const OUTBOX_ACKED_TOTAL: &str = "engram_outbox_acked_total";
 /// Counter (ADR 0073). Delivery attempts deferred to backoff.
