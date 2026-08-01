@@ -693,6 +693,44 @@ mod adapter {
                         ("ask_user_question".to_string(), ToolExecution::Deferred)
                     })
                 });
+            /// Take the stashed result this re-fire should consume.
+            ///
+            /// The exact `tool_use_id` is the normal key. But a respawned CLI
+            /// mints a NEW id for the same intent, so an id-keyed lookup misses
+            /// and the call parks a second time — session 5661c75f ended up
+            /// with two unresolvable `exit_plan_mode` rows: a duplicate review
+            /// card, an inflated revision count, and `awaiting_review` that can
+            /// never clear.
+            ///
+            /// So `exit_plan_mode` also matches by TOOL: at most one plan is
+            /// ever under review per session, and a plan drafted before the
+            /// reviewer's feedback arrived is exactly the plan that feedback is
+            /// about. AUQ deliberately does NOT retarget — its answers are keyed
+            /// to the questions that were asked, so delivering them to a
+            /// different call would be a mis-answer, and its generic fallback
+            /// already covers the abandoned re-fire.
+            async fn take_stashed_result(
+                results_in_hand: &mcp_server::ResultsInHand,
+                deferred_calls: &DeferredCalls,
+                tool_use_id: &str,
+                tool_name: &str,
+            ) -> Option<(String, String)> {
+                let mut results = results_in_hand.lock().await;
+                if let Some(result_json) = results.remove(tool_use_id) {
+                    return Some((tool_use_id.to_string(), result_json));
+                }
+                if tool_name != "exit_plan_mode" {
+                    return None;
+                }
+                let calls = deferred_calls.lock().await;
+                let stashed_id = results
+                    .keys()
+                    .find(|id| calls.get(*id).is_some_and(|c| c.tool_name == tool_name))
+                    .cloned()?;
+                let result_json = results.remove(&stashed_id)?;
+                Some((stashed_id, result_json))
+            }
+
             if let Some((tool_name, execution)) = native_binding {
                 let mut event = None;
                 let verdict = if execution == ToolExecution::Sync {
@@ -702,16 +740,37 @@ mod adapter {
                         "sync native binding is unsupported; allowing the built-in"
                     );
                     HookVerdict::Allow
-                } else if let Some(result_json) =
-                    results_in_hand.lock().await.remove(&req.tool_use_id)
+                } else if let Some((stashed_id, result_json)) = take_stashed_result(
+                    &results_in_hand,
+                    &deferred_calls,
+                    &req.tool_use_id,
+                    &tool_name,
+                )
+                .await
                 {
                     if tool_name == "exit_plan_mode" {
+                        // The stash may have been keyed by an EARLIER call id
+                        // (see `take_stashed_result`); ack whichever one it
+                        // was, or its outbox row redelivers forever.
+                        if stashed_id != req.tool_use_id {
+                            event = Some(HarnessEvent::ToolCallCompleted {
+                                run_id: current_run_id.lock().await.clone().unwrap_or_default(),
+                                tool_call_id: stashed_id.clone(),
+                                tool_name: tool_name.clone(),
+                                ok: false,
+                                duration_ms: 0,
+                                result_summary: Some("changes requested".to_string()),
+                            });
+                        }
                         // ADR 0107: only REJECT results are ever stashed for
                         // a re-fire (the engine consumes approvals before the
                         // respawn). Deny with the feedback: the plan-mode CLI
                         // surfaces the reason and keeps planning; the denied
                         // tool's own stream tool_result acks the outbox row.
-                        deferred_calls.lock().await.remove(&req.tool_use_id);
+                        let mut calls = deferred_calls.lock().await;
+                        calls.remove(&req.tool_use_id);
+                        calls.remove(&stashed_id);
+                        drop(calls);
                         let reason = engram_harness_sdk::plan::parse_plan_decision(&result_json)
                             .map(|decision| {
                                 engram_harness_sdk::plan::changes_requested_message(&decision)
@@ -6710,9 +6769,13 @@ mod adapter {
                     .await
                     .expect("reject stash resumes a continuation turn");
             assert_eq!(prompt_id, None);
+            // A respawned CLI mints a NEW tool_use_id for the re-fire — the
+            // production case, because a parked plan gets idle-evicted while
+            // the human reads it. Session 5661c75f parked this a SECOND time
+            // and left an unresolvable row behind.
             match hook_fire_named(
                 &hook,
-                "toolu_plan",
+                "toolu_plan_refire",
                 "ExitPlanMode",
                 serde_json::json!({"plan":"# The plan"}),
             )
@@ -6746,6 +6809,25 @@ mod adapter {
                 "plan",
                 "reject keeps the plan stamp"
             );
+            // The ORIGINAL call is the one the coordinator is waiting on, so
+            // the retargeted deny must retire it — otherwise its outbox row
+            // redelivers forever and its review card never resolves.
+            tokio::time::timeout(Duration::from_secs(8), async {
+                loop {
+                    match evt_rx.recv().await {
+                        Some(HarnessEvent::ToolCallCompleted {
+                            tool_call_id, ok, ..
+                        }) if tool_call_id == "toolu_plan" => {
+                            assert!(!ok, "a rejected plan is not a successful call");
+                            break;
+                        }
+                        Some(_) => {}
+                        None => panic!("channel closed before the original call was retired"),
+                    }
+                }
+            })
+            .await
+            .expect("the retargeted deny retires the original plan call");
 
             cmd_tx
                 .send(HarnessCommand::Shutdown { grace_secs: 1 })
