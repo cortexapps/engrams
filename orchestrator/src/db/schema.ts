@@ -112,6 +112,15 @@ export const pendingToolCall = pgTable(
       t.toolCallId,
     ),
     index("pending_tool_calls_session_idx").on(t.sessionId),
+    // ADR 0107 (PR #927 review): the task list derives `awaiting_review` from
+    // "session-handled and unsubmitted" on every load, and this table is
+    // append-only (rows are marked, never deleted). Without a matching index
+    // that predicate seq-scans every tool call ever made, on a polled hot
+    // path. PARTIAL, so it stays the size of the currently-parked set rather
+    // than the history.
+    index("pending_tool_calls_awaiting_idx")
+      .on(t.sessionId)
+      .where(sql`${t.handling} = 'session' AND ${t.submittedAt} IS NULL`),
   ],
 );
 
