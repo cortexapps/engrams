@@ -365,6 +365,7 @@ mod tests {
                 network_allow_hosts: vec![],
                 network_allow_host_patterns: vec![],
                 allow_all: false,
+                google_adc: false,
                 secrets: vec![],
                 injects: vec![
                     EgressInjectEntry {

@@ -80,6 +80,18 @@ export const taskSession = pgTable(
     // these so an override is honored; NULL means a legacy row → fall back to
     // the profile's capabilities.
     capabilities: jsonb("capabilities").$type<string[]>(),
+    // ADR 0109: immutable connection/operation/resource authority used to
+    // authorize host-side credential refresh. This keeps the identity tied to
+    // the operation after the profile changes. Null means a pre-ADR row.
+    integrationGrants: jsonb("integration_grants").$type<ProfileIntegrationGrant[]>(),
+    // Immutable configured identities used by the grants above. Credential
+    // refresh reads this snapshot, not the mutable connection table.
+    integrationConnections: jsonb("integration_connections")
+      .$type<IntegrationConnectionSnapshot[]>(),
+    // Immutable user or automation principal that received this authorization
+    // snapshot. This makes broker audit records attributable without consulting
+    // mutable workflow state.
+    integrationPrincipalId: text("integration_principal_id"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [
@@ -514,6 +526,25 @@ export interface ProfileSecret {
   allowHostPatterns: string[];
 }
 
+/** ADR 0109: one named-connection grant. The connection fixes the provider
+ * identity; the operation and resource constraints stay associated with it. */
+export interface ProfileIntegrationGrant {
+  connectionId: string;
+  operation: string;
+  resourceConstraints: string[];
+}
+
+/** Immutable non-secret connection configuration stamped onto a session. */
+export interface IntegrationConnectionSnapshot {
+  id: string;
+  alias: string;
+  provider: string;
+  displayName: string;
+  config: Record<string, unknown>;
+}
+
+export type ProfileLaunchAccess = "organization" | "restricted";
+
 export const DEFAULT_PROFILE_NETWORK: ProfileNetwork = {
   default: "deny",
   allowHosts: [],
@@ -543,11 +574,16 @@ export const profile = pgTable(
     // ["skills", "browser"]). Resolved by the coordinator to reserved-slot
     // mounts at session create. Empty = base session (no skills).
     skills: jsonb("skills").$type<string[]>().notNull().default([]),
-    // ADR 0056: integration capabilities ("provider:action[@resource]") this
-    // profile's sessions are granted. Passed to the coordinator at session create
-    // (CreateSessionRequest.capabilities), which binds + (later) clamps. Empty =
-    // no third-party integration access.
-    capabilities: jsonb("capabilities").$type<string[]>().notNull().default([]),
+    // ADR 0109: structured integration authority. Unlike the retired flat
+    // capability array, this preserves which configured identity an operation
+    // uses and keeps its resource constraints attached.
+    integrationGrants: jsonb("integration_grants")
+      .$type<ProfileIntegrationGrant[]>()
+      .notNull()
+      .default([]),
+    // Restricted profiles are visible and launchable only by administrators or
+    // principals in profile_launch_grant. Google Cloud profiles must use this.
+    launchAccess: text("launch_access").$type<ProfileLaunchAccess>().notNull().default("organization"),
     // ADR 0057: egress network allow-list (deny by default) + secrets this
     // profile's sessions get, lifted off the image manifest. Additive in B1;
     // compiled into the per-session SessionPolicy + consumed at boot in B2.
@@ -576,6 +612,23 @@ export const profile = pgTable(
     uniqueIndex("profile_designation_unique")
       .on(t.designation)
       .where(sql`designation is not null`),
+  ],
+);
+
+export const profileLaunchGrant = pgTable(
+  "profile_launch_grant",
+  {
+    profileId: text("profile_id")
+      .notNull()
+      .references(() => profile.id, { onDelete: "cascade" }),
+    // User IDs and stable automation principals (for example,
+    // `automation:<id>`) share this namespace. Do not add a user FK.
+    principalId: text("principal_id").notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [
+    primaryKey({ columns: [t.profileId, t.principalId] }),
+    index("profile_launch_grant_principal_idx").on(t.principalId),
   ],
 );
 
@@ -735,6 +788,48 @@ export const connector = pgTable("connector", {
     .defaultNow()
     .$onUpdate(() => new Date()),
 });
+
+/** ADR 0109: a named credential instance. Google Cloud config is non-secret;
+ * other providers use deterministic default connections during migration. */
+export const integrationConnection = pgTable(
+  "integration_connection",
+  {
+    id: text("id").primaryKey(),
+    alias: text("alias").notNull().unique(),
+    provider: text("provider").notNull(),
+    displayName: text("display_name").notNull(),
+    config: jsonb("config").$type<Record<string, unknown>>().notNull().default({}),
+    enabled: boolean("enabled").notNull().default(false),
+    testedAt: timestamp("tested_at", { withTimezone: true }),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true })
+      .notNull()
+      .defaultNow()
+      .$onUpdate(() => new Date()),
+  },
+  (t) => [index("integration_connection_provider_idx").on(t.provider)],
+);
+
+/** KEK-sealed private keys for the deployment OIDC issuer (ADR 0109). */
+export const integrationOidcKey = pgTable(
+  "integration_oidc_key",
+  {
+    kid: text("kid").primaryKey(),
+    publicJwk: jsonb("public_jwk").$type<Record<string, unknown>>().notNull(),
+    wrappedDek: bytea("wrapped_dek").notNull(),
+    nonce: bytea("nonce").notNull(),
+    ciphertext: bytea("ciphertext").notNull(),
+    keyId: text("key_id").notNull(),
+    state: text("state").$type<"active" | "retiring">().notNull(),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    publishUntil: timestamp("publish_until", { withTimezone: true }),
+  },
+  (t) => [
+    uniqueIndex("integration_oidc_key_active_unique")
+      .on(t.state)
+      .where(sql`state = 'active'`),
+  ],
+);
 
 // ---------------------------------------------------------------------------
 // Connector logo (redesign): optional uploaded brand mark, keyed by provider.

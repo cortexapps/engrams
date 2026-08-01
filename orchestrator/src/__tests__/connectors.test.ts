@@ -424,7 +424,7 @@ describe("compileIntegrationPolicy", () => {
   test("a mint capability compiles to a minted inject (ADR 0056 amendment)", () => {
     // A mint connector now rides the SAME egress inject plane as an inject one;
     // the coordinator resolves the value by minting (scoped to caps) instead of a
-    // static secret. The marker is `mint_source` + an empty `secret_ref`.
+    // static secret. The typed mint source accompanies an empty `secret_ref`.
     const injects = compileIntegrationPolicy(["github:issues:write"], reg).injects;
     expect(injects).toHaveLength(1);
     // Gating + the mint marker are policy-owned; the header is filled
@@ -657,11 +657,9 @@ describe("on-disk registry", () => {
     // endpoints AND the GraphQL createIssue/updateIssue/… mutations (ADR 0059); each
     // emits a minted inject for github.
     expect(policy.injects.length).toBeGreaterThan(0);
-    expect(
-      policy.injects.every(
-        (i) => i.mint_source?.kind === "provider" && i.mint_source.provider === "github",
-      ),
-    ).toBe(true);
+    expect(policy.injects.every((i) =>
+      i.mint_source?.kind === "provider" && i.mint_source.provider === "github"
+    )).toBe(true);
     // Two issue assets are observed: the REST create (POST /repos/*/issues, gated by
     // the 2xx status) and the GraphQL createIssue mutation (gated by noGraphqlErrors).
     expect(policy.observes.every((o) => o.provider === "github" && o.asset_kind === "issue")).toBe(true);

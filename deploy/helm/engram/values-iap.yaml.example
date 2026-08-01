@@ -108,6 +108,14 @@ web:
           - path: /api/v1/integrations/github/events
             pathType: Exact
             service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          # Google WIF must fetch these two public, read-only OIDC documents.
+          # No token or credential endpoint is exposed on this backend.
+          - path: /api/v1/integrations/google-cloud/oidc/.well-known/openid-configuration
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
+          - path: /api/v1/integrations/google-cloud/oidc/jwks
+            pathType: Exact
+            service: '{{ include "engram.orchestrator.fullname" . }}-webhooks'
           # Dynamic automation hooks need a Prefix rule at the load balancer;
           # the orchestrator's IAP bridge remains the exact POST + one-slug
           # application boundary within this no-IAP prefix (ADR 0102).

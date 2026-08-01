@@ -736,6 +736,7 @@ export function makeReviewControlPlane(
       const created = await createExistingSession({
         taskId: input.taskId,
         profileId,
+        launchPrincipalId: "automation:pr-review",
         role: "finder",
         capabilityOverride: REVIEW_CAPABILITIES(input.repo),
         networkOverride: REVIEW_NETWORK,
@@ -865,6 +866,7 @@ export function makeReviewControlPlane(
       const created = await createExistingSession({
         taskId: input.taskId,
         profileId,
+        launchPrincipalId: "automation:pr-review",
         role: "verifier",
         capabilityOverride: REVIEW_CAPABILITIES(input.repo),
         networkOverride: REVIEW_NETWORK,

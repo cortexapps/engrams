@@ -145,6 +145,15 @@ spec:
                   name: {{ $agSecret }}
                   key: {{ $agKey }}
             {{- end }}
+            {{- if .Values.web.enabled }}
+            # ADR 0109: host-only bearer for coordinator calls to the connection
+            # credential broker. It must match the orchestrator's validated bearer.
+            - name: ENGRAM_CONNECTION_BROKER_BEARER
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Values.orchestrator.databaseSecret.existingSecret }}
+                  key: {{ .Values.orchestrator.databaseSecret.bearerKey }}
+            {{- end }}
             {{- if eq .Values.forge.provider "github" }}
             # ADR 0023: the GitHub App private key (PEM). The coord reads
             # ENGRAM_GITHUB_APP_PRIVATE_KEY in preference to a key path.

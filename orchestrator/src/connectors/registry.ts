@@ -305,10 +305,9 @@ export interface Connector {
 // ---------------------------------------------------------------------------
 
 /** One Plane-B injection, snake_case to match the Rust serde shape. */
-export type CredentialMintSourceJson = {
-  kind: "provider";
-  provider: string;
-};
+export type CredentialMintSourceJson =
+  | { kind: "provider"; provider: string }
+  | { kind: "connection"; connection_id: string };
 
 export interface IntegrationInjectJson {
   hosts: string[];
@@ -316,13 +315,7 @@ export interface IntegrationInjectJson {
   header_template: string;
   /** Static-secret source (inject connectors). Empty for a mint entry. */
   secret_ref: string;
-  /**
-   * ADR 0056 amendment: when present, the coordinator MINTS this inject's value
-   * through this credential source (scoped to the session's caps)
-   * instead of resolving `secret_ref`. This is how a *mint* connector rides the
-   * same egress inject plane as a static-secret one; the token never enters the
-   * guest. Mutually exclusive with `secret_ref`.
-   */
+  /** Host-side mint authority. `null` means a static `secret_ref` inject. */
   mint_source: CredentialMintSourceJson | null;
   methods: string[];
   path_globs: string[];
@@ -378,6 +371,7 @@ export interface IntegrationPolicyJson {
   // these). Mirrors engram_core::types::IntegrationPolicy.
   network: IntegrationNetworkJson;
   secrets: IntegrationSecretJson[];
+  google_adc: boolean;
 }
 
 /** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
@@ -400,7 +394,8 @@ export function policyHasContent(p: IntegrationPolicyJson): boolean {
     p.secrets.length > 0 ||
     p.network.allow_hosts.length > 0 ||
     p.network.allow_host_patterns.length > 0 ||
-    p.network.default === "allow"
+    p.network.default === "allow" ||
+    p.google_adc
   );
 }
 
@@ -1313,7 +1308,7 @@ export function compileIntegrationPolicy(
     allow_hosts: s.allowHosts ?? [],
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
-  return { injects, observes, network, secrets };
+  return { injects, observes, network, secrets, google_adc: false };
 }
 
 // ---------------------------------------------------------------------------

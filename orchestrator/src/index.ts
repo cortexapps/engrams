@@ -20,6 +20,8 @@ import slackInteractivityRoute from "./routes/slack-interactivity.ts";
 import githubEventsRoute from "./routes/github-events.ts";
 import hooksRoute from "./routes/hooks.ts";
 import reviewsDispatchRoute from "./routes/reviews-dispatch.ts";
+import { makeGoogleOidcRoute } from "./routes/google-oidc.ts";
+import { makeConnectionCredentialBrokerRoute } from "./routes/connection-credential-broker.ts";
 // Importing registers the Slack adapter on the generic SDK seam.
 import "./integrations/slack.ts";
 import { makeShellRoute } from "./routes/shell.ts";
@@ -69,6 +71,8 @@ import { makeReviewStore } from "./db/reviews.ts";
 import { makeReviewTargetHydrationStore } from "./db/review-target-hydration.ts";
 import { makeEnrollmentStore } from "./db/enrollments.ts";
 import { makeProfileStore } from "./db/profiles.ts";
+import { makeIntegrationConnectionStore } from "./db/integration-connections.ts";
+import { connectorRegistry } from "./connectors/registry.ts";
 import { tools } from "./tools/registry.ts";
 import { renderReviewer } from "./reviewers/render.ts";
 import { seedReviewerProfile } from "./reviewers/seed-profile.ts";
@@ -110,6 +114,11 @@ app.route("/", authRoute);
 // Public auth posture for the SPA login page (which doors are open). Sits
 // alongside the better-auth mount; unauthenticated by design (pre-login).
 app.route("/", authConfigRoute);
+// ADR 0109: public OIDC metadata for customer WIF providers. No session or
+// credential data is returned from these endpoints.
+app.route("/", makeGoogleOidcRoute());
+// Host-only broker endpoint. The control-plane bearer authenticates callers.
+app.route("/", makeConnectionCredentialBrokerRoute());
 // ADR 0051 Task 20: browser-native HTTP legs (SSE events, artifact bytes, /me/harness-env).
 app.route("/", eventsRoute);
 app.route("/", artifactsRoute);
@@ -247,6 +256,13 @@ setReviewIngressControlPlane(reviewControlPlane);
 // before DBOS launches so manifest compilation and tool execution see them.
 registerBuiltinTools(tools, { papercuts: makePapercutStore(getDb()) });
 registerReviewTools(tools, { reviews: makeReviewStore(getDb()) });
+const integrationConnections = makeIntegrationConnectionStore(getDb());
+await Promise.all([
+  ...[...connectorRegistry().values()].map((connector) =>
+    integrationConnections.ensureLegacy(connector.provider, `${connector.display.name} (default)`),
+  ),
+  integrationConnections.ensureLegacy("engram", "Engrams tools"),
+]);
 void seedReviewerProfile(makeProfileStore(getDb()), log).catch((err) =>
   log.error({ err }, "reviewer profile seed failed"),
 );

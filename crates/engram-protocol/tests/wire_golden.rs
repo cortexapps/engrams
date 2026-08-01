@@ -235,6 +235,9 @@ fn session_egress_policy() -> SessionEgressPolicy {
         injects: vec![],
         observes: vec![],
         secret_mode: SecretMode::Broker,
+        // ADR 0109: the host exposes metadata-style ADC only for sessions
+        // whose immutable launch policy enables Google Cloud.
+        google_adc: true,
     }
 }
 
@@ -466,8 +469,10 @@ fn wire_version_pinned() {
     // golden is byte-identical.
     // 19 -> 20: ADR 0103 review hardening — ExecFrame gains the proto-native
     // Refused terminal. No bincode payload changed.
+    // 20 -> 21: ADR 0109 — `SessionEgressPolicy.google_adc` is a trailing
+    // bincode field. The session-egress-policy golden was regenerated.
     assert_eq!(
-        WIRE_VERSION, 20,
+        WIRE_VERSION, 21,
         "WIRE_VERSION changed — confirm payload goldens were regenerated too"
     );
 }

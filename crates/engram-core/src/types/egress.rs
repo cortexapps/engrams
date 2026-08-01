@@ -57,6 +57,10 @@ pub struct SessionEgressPolicy {
     /// request's real response. `#[serde(default)]` so older policies decode.
     #[serde(default)]
     pub observes: Vec<EgressObserveEntry>,
+    /// Whether this session can use the host-side Google metadata-compatible
+    /// ADC endpoint. The endpoint returns only an opaque placeholder token.
+    #[serde(default)]
+    pub google_adc: bool,
     /// Image's secret delivery mode. The proxy uses this to decide
     /// whether to MITM (`Broker`) or just SNI-filter (`Literal`).
     pub secret_mode: SecretMode,
@@ -99,8 +103,8 @@ pub struct EgressInjectEntry {
     /// ADR 0059: the GraphQL top-level field this inject authorizes; empty = REST.
     #[serde(default)]
     pub graphql_field: String,
-    /// WS4 (ADR 0056 amendment): the source that minted this credential, or
-    /// `None` for a static, non-refreshable secret. Minted entries carry a short-lived credential — the egress
+    /// The authority used to mint this entry, or `None` for a static secret.
+    /// Minted entries carry a short-lived credential — the egress
     /// proxy re-mints it via its `InjectRefresher` seam near `expires_at` so a
     /// long-lived session doesn't keep injecting an installation token that
     /// expired ~1h after boot (the campaign's reads-401/writes-succeed
