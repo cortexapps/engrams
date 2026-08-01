@@ -54,11 +54,7 @@ pub(crate) async fn send_prompt_core(
                 )
             })?;
         let descriptor = crate::api::sessions::resolve_descriptor(state, &harness).await?;
-        if descriptor.mode(mode).is_none() {
-            return Err(ApiError::BadRequest(format!(
-                "harness `{harness}` does not declare mode `{mode}`"
-            )));
-        }
+        crate::api::sessions::validate_harness_mode(&descriptor, &harness, Some(mode))?;
     }
     // Phase 1b: the client (web) mints `prompt_id` so it can correlate its
     // optimistic bubble with the server echo + `RunStarted{prompt_id}`

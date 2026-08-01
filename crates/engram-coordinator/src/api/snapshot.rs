@@ -122,6 +122,8 @@ pub(crate) async fn resolve_resume_agent_and_policy(
         id,
         session_env,
         b.config.workdir.clone(),
+        // Resume: the mode was validated when its prompt was accepted.
+        None,
     )
     .await
     .ok()

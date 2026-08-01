@@ -1551,6 +1551,7 @@ async fn prepare_inner(
         session_id,
         session_env.clone(),
         config.workdir.clone(),
+        harness_mode.as_deref(),
     )
     .await?
     {
@@ -2061,6 +2062,29 @@ pub(crate) async fn resolve_descriptor(
     )))
 }
 
+/// ADR 0107: is `requested` a mode this harness declares?
+///
+/// Both entry points share it: `send_prompt_core` (every prompt) and
+/// `resolve_harness` (the create path, BEFORE the session row is committed —
+/// the create enqueues its first prompt best-effort so an infra failure never
+/// fails the create, which means a validation error raised there would be
+/// swallowed and the prompt lost behind a 200).
+pub(crate) fn validate_harness_mode(
+    descriptor: &engram_core::types::harness::HarnessDescriptor,
+    harness: &str,
+    requested: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(mode) = requested.filter(|m| !m.is_empty()) else {
+        return Ok(());
+    };
+    if descriptor.mode(mode).is_none() {
+        return Err(ApiError::BadRequest(format!(
+            "harness `{harness}` does not declare mode `{mode}`"
+        )));
+    }
+    Ok(())
+}
+
 pub(crate) async fn resolve_harness(
     state: &SharedState,
     selected_harness: Option<&str>,
@@ -2068,6 +2092,13 @@ pub(crate) async fn resolve_harness(
     session_id: SessionId,
     session_env: HashMap<String, String>,
     workdir: Option<String>,
+    // ADR 0107: the create-time mode directive, validated HERE — before the
+    // session row is committed. `send_prompt_core` validates it too, but the
+    // create path enqueues the first prompt best-effort (an infra failure must
+    // not fail the create), so a validation error there would be swallowed and
+    // the user's first prompt would vanish with a 200. Resume passes None: its
+    // mode was validated when the prompt that carried it was accepted.
+    harness_mode: Option<&str>,
 ) -> Result<
     Option<(
         engram_core::types::sandbox::AgentSpec,
@@ -2093,6 +2124,7 @@ pub(crate) async fn resolve_harness(
     // rides the `harness_catalog` (its own squashfs, materialized like an uploaded
     // skill). Built-ins win, so a custom row can never shadow one.
     let descriptor = resolve_descriptor(state, name).await?;
+    validate_harness_mode(&descriptor, name, harness_mode)?;
     let harness_sha = if let Some(builtin) = crate::builtin_harness::builtin(name) {
         fleet_bundle_catalog(state)
             .await?
@@ -2485,5 +2517,47 @@ mod tests {
         assert!(policy.network_allow_hosts.is_empty());
         assert!(policy.network_allow_host_patterns.is_empty());
         assert!(policy.secrets.is_empty());
+    }
+
+    /// ADR 0107 (PR #927 review): the create path enqueues its first prompt
+    /// best-effort — an infra failure must not fail the create. That means a
+    /// mode-validation error raised from inside the enqueue would be swallowed
+    /// and the user's first prompt would vanish behind a 200, so create
+    /// validates the mode itself, before the session row is committed. Both
+    /// entry points call this one function.
+    #[test]
+    fn harness_mode_is_validated_against_the_declared_modes() {
+        let descriptor = engram_core::types::harness::HarnessDescriptor {
+            name: "claude".into(),
+            modes: vec![
+                engram_core::types::harness::HarnessMode {
+                    id: "default".into(),
+                    label: None,
+                    default: true,
+                },
+                engram_core::types::harness::HarnessMode {
+                    id: "plan".into(),
+                    label: Some("Plan".into()),
+                    default: false,
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(validate_harness_mode(&descriptor, "claude", Some("plan")).is_ok());
+        // Absent / empty = "no directive", not an invalid one.
+        assert!(validate_harness_mode(&descriptor, "claude", None).is_ok());
+        assert!(validate_harness_mode(&descriptor, "claude", Some("")).is_ok());
+        let err = validate_harness_mode(&descriptor, "claude", Some("paln"))
+            .expect_err("a typo'd mode is a caller error, not a silent default");
+        assert!(
+            matches!(err, ApiError::BadRequest(ref m) if m.contains("paln")),
+            "the rejection names the mode: {err:?}"
+        );
+        // A harness that declares NO modes rejects every directive.
+        let bare = engram_core::types::harness::HarnessDescriptor {
+            name: "custom".into(),
+            ..Default::default()
+        };
+        assert!(validate_harness_mode(&bare, "custom", Some("plan")).is_err());
     }
 }
