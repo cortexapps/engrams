@@ -390,6 +390,9 @@ export function buildMessages(
   // CONSUMPTION position, so a message queued mid-run lands AFTER the turn it
   // was queued during (not above it). While still queued it lives by the
   // composer — `SessionThread` renders the `queue` there (Claude-Code style).
+  // An echo still held at end-of-stream (delivery gap: no run_started yet,
+  // not queued) renders as a PENDING tail bubble instead of being withheld
+  // (ADR 0108 — see the post-loop render).
   const heldUserText = new Map<string, { text: string; at: string }>();
 
   // ADR 0052: the harness-owned queue, mirrored from events. prompt_id →
@@ -524,8 +527,16 @@ export function buildMessages(
   // order-independent: run_started finds it whether the echo came before or
   // after. (A recalled prompt has no run_started, so it still never renders.)
   const userEchoByPromptId = new Map<string, string>();
+  // ADR 0108 (held-echo UX): prompt_ids consumed ANYWHERE in the stream
+  // (run_started or prompt_steered), pre-scanned so the trailing pending
+  // render below cannot double-emit a bubble for an echo that lands AFTER its
+  // run_started (the 68c70a65 inversion — the loop re-holds that echo).
+  const consumedPromptIds = new Set<string>();
   for (const { event } of events) {
     if (event.type === "user_question") questionToolCallIds.add(event.tool_call_id);
+    else if (event.type === "run_started" && event.prompt_id)
+      consumedPromptIds.add(event.prompt_id);
+    else if (event.type === "prompt_steered") consumedPromptIds.add(event.prompt_id);
     else if (event.type === "tool_call_requested") {
       genericRequests.set(event.tool_call_id, event);
       requestedToolNames.add(event.name);
@@ -1090,6 +1101,27 @@ export function buildMessages(
       for (let i = lenBefore; i < out.length; i++) markRewound(out[i]!);
       if (active) markRewound(active);
     }
+  }
+
+  // ADR 0108 (held-echo UX): a held echo whose consuming run_started has not
+  // arrived must not leave the user's own message invisible (the delivery-gap
+  // "No activity yet" incident). An unconsumed, un-queued echo renders at the
+  // tail as a PENDING user bubble — grey via `custom.pending` (the same
+  // mechanism as the optimistic/type-ahead bubbles) plus a "delivering…"
+  // affordance via `custom.delivering`. When its run_started lands, the loop
+  // above consumes it at the consumption point instead: same id, so the
+  // bubble transitions in place. Rail-queued prompts stay OUT of the thread
+  // (the composer rail owns them), and a consumed prompt_id never re-renders
+  // here (the inversion guard) — the prompt_id dedup contract holds.
+  for (const [promptId, held] of heldUserText) {
+    if (queued.has(promptId) || consumedPromptIds.has(promptId)) continue;
+    out.push({
+      role: "user",
+      content: [{ type: "text", text: held.text }],
+      id: promptId,
+      createdAt: new Date(held.at),
+      metadata: { custom: { pending: true, delivering: true } },
+    });
   }
 
   // Bug fix (mid-turn eviction): the session's authoritative status wins over

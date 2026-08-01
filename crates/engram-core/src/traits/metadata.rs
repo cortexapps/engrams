@@ -1336,6 +1336,23 @@ pub trait MetadataStore: Send + Sync {
         Ok(())
     }
 
+    /// The inverse of `outbox_defer`: pull every waiting un-acked row
+    /// for a session back to due (`not_before := now`), for when fresh
+    /// evidence (an attach signal, a heartbeat disagreement) proves the
+    /// wait is pointless — e.g. a row waiting out `ACK_TIMEOUT` after a
+    /// forward into a dead harness link (prod 7eddce62). Returns the
+    /// number of rows moved. Two REQUIRED properties: (a) `attempts` is
+    /// NEVER bumped — this cancels a provably-pointless wait, it is not
+    /// a delivery try, and a bump would inflate `failure_backoff` for
+    /// the very retry being made prompt; (b) only rows with
+    /// `not_before > now` move, so the call is idempotent across
+    /// repeated heartbeats and never touches a row already due.
+    /// Default (mocks): moves nothing.
+    async fn outbox_make_due(&self, session_id: SessionId) -> Result<u64, MetaError> {
+        let _ = session_id;
+        Ok(0)
+    }
+
     /// Terminal ack: the confirming harness event was ingested.
     /// Returns whether a row was newly acked (false = unknown id or
     /// already acked — both fine; acks are at-least-once too).

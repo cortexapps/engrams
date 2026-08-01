@@ -1189,6 +1189,7 @@ async fn session_stream_events_replays_past_one_page() {
         .stream_events(app::StreamEventsRequest {
             session_id: sid.to_string(),
             since: None,
+            durable_only: false,
         })
         .await
         .expect("StreamEvents opens")

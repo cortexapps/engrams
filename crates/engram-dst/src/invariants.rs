@@ -4,6 +4,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use engram_core::traits::Clock as _;
 use engram_core::types::session::{QueueOrigin, SessionState};
 use engram_core::SessionId;
 
@@ -15,9 +16,28 @@ pub struct Violation {
     pub detail: String,
 }
 
+/// ADR 0108 E: how long coordinator-Active + world-sandbox-running +
+/// no-harness-attached may persist before it is the incident's silent
+/// zombie (a black-holed attach nobody notices). Generous: the default
+/// dial delay is 200 ms and every time advance completes due dials, so
+/// a healthy attach window never approaches this.
+const ATTACH_DISAGREEMENT_BOUND_SECS: i64 = 30;
+
+/// ADR 0108 E: how long an Active session may sit on an unacked prompt
+/// outbox row before the delivery path counts as stalled (TTFT
+/// liveness). Generous — sized like the drain's 30 s rounds; a
+/// converging delivery (attach signal, grace cadence, poll, or the
+/// resume-for-delivery ladder) retires the row well inside it once the
+/// world is healed. Checked at quiescence: mid-drain a young/backing-off
+/// row only prolongs the drain, never fails the run.
+const TTFT_BOUND_SECS: i64 = 30;
+
 #[derive(Default)]
 pub struct Oracles {
     epochs: BTreeMap<SessionId, (i64, i64, i64)>,
+    /// First step at which each session was OBSERVED in the attach
+    /// disagreement (Active + sandbox running + harness unattached).
+    attach_disagreement_since: BTreeMap<SessionId, chrono::DateTime<chrono::Utc>>,
 }
 
 impl Oracles {
@@ -32,6 +52,71 @@ impl Oracles {
         self.epoch_monotonicity(world)?;
         sandbox_owners_agree(world)?;
         snapshot_safety(world)?;
+        self.attach_disagreement(world)?;
+        Ok(())
+    }
+
+    /// ADR 0108 E: the attach-disagreement oracle. The coordinator
+    /// believes the session is Active, the world host reports its bound
+    /// sandbox running, and no harness is attached. That is a legal
+    /// TRANSIENT (the dial is in flight) but must never persist: past
+    /// the bound it is the 2026-07-31 zombie — a black-holed attach
+    /// with every component convinced someone else owns the wait.
+    /// Stateful: the window is measured from the first step that
+    /// OBSERVES the disagreement, against the WORLD clock (skew-free).
+    ///
+    /// Lives here — the coordinator swarm, against the sim host model —
+    /// because `engram-dst-cosim`'s host side runs the real host-agent
+    /// flows with no harness-hub model to disagree with; promoting this
+    /// to a cosim oracle needs that hub model first (ADR 0108 E
+    /// follow-up).
+    fn attach_disagreement(&mut self, world: &SimWorld) -> Result<(), Violation> {
+        let now = world.clock.now_utc();
+        let rows: Vec<(
+            SessionId,
+            Option<engram_core::HostId>,
+            Option<engram_core::SandboxId>,
+        )> = world.meta.with_db(|db| {
+            db.sessions
+                .values()
+                .filter(|r| r.session.status == SessionState::Active)
+                .map(|r| (r.session.id, r.session.host_id, r.session.sandbox_id))
+                .collect()
+        });
+        let mut disagreeing = BTreeSet::new();
+        for (sid, host_id, sandbox_id) in rows {
+            let (Some(host_id), Some(sandbox_id)) = (host_id, sandbox_id) else {
+                continue;
+            };
+            let running = {
+                let hosts = world.host_world.hosts.lock();
+                hosts
+                    .get(&host_id)
+                    .is_some_and(|h| h.up && h.sandboxes.contains_key(&sandbox_id))
+            };
+            if !running || world.host_world.harness_attached(sandbox_id) {
+                continue;
+            }
+            disagreeing.insert(sid);
+            let since = *self.attach_disagreement_since.entry(sid).or_insert(now);
+            let age = now.signed_duration_since(since);
+            if age > chrono::Duration::seconds(ATTACH_DISAGREEMENT_BOUND_SECS) {
+                return Err(Violation {
+                    invariant: "attach-disagreement",
+                    detail: format!(
+                        "session {sid} is Active with sandbox {sandbox_id} running on host \
+                         {host_id} but NO harness attached for {}s (> {}s) — the silent-zombie \
+                         attach gap (ADR 0108)",
+                        age.num_seconds(),
+                        ATTACH_DISAGREEMENT_BOUND_SECS,
+                    ),
+                });
+            }
+        }
+        // Sessions no longer disagreeing (attached, moved, or gone)
+        // reset their window.
+        self.attach_disagreement_since
+            .retain(|sid, _| disagreeing.contains(sid));
         Ok(())
     }
 
@@ -277,6 +362,7 @@ fn bound_sessions_point_at_live_hosts(world: &SimWorld) -> Result<(), Violation>
 pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
     no_op_dropped(world)?;
     no_orphan_sandboxes(world)?;
+    ttft_liveness(world)?;
     let sessions = world.meta.with_db(|db| {
         db.sessions
             .values()
@@ -335,6 +421,55 @@ pub fn check_quiescence(world: &SimWorld) -> Result<(), Violation> {
         }
     }
     Ok(())
+}
+
+/// ADR 0108 E: the TTFT liveness oracle. A session that is Active while
+/// a prompt outbox row for it sits unacked past [`TTFT_BOUND_SECS`] has
+/// a stalled delivery path — the exact 2026-07-31 symptom (prompt
+/// durable, session Active, `run_started` nowhere). The row is retired
+/// only by the confirming `run_started{prompt_id}` harness event, so
+/// this bounds the WHOLE chain: attach signal → deliver forward →
+/// harness accept → echo. Ages are measured against the world clock;
+/// `created_at` is stamped by a (possibly skewed) replica clock, which
+/// can inflate the observed age — tolerable because the check runs
+/// inside `check_quiescence`, where a converging row gets acked across
+/// the drain rounds before the final verdict and only a genuinely stuck
+/// row is still unacked. `pub` for the non-vacuity proof in tests.
+pub fn ttft_liveness(world: &SimWorld) -> Result<(), Violation> {
+    use engram_core::types::outbox::OutboxKind;
+    let now = world.clock.now_utc();
+    world.meta.with_db(|db| {
+        for row in db.outbox.values() {
+            if row.kind != OutboxKind::Prompt || row.acked_at.is_some() {
+                continue;
+            }
+            let Some(session) = db.sessions.get(&row.session_id) else {
+                continue;
+            };
+            if session.session.status != SessionState::Active {
+                // Non-Active sessions are the deliver ladder's job
+                // (resume-for-delivery); quiescence's op/straggler
+                // checks hold that path to a terminal instead.
+                continue;
+            }
+            let age = now.signed_duration_since(row.created_at);
+            if age > chrono::Duration::seconds(TTFT_BOUND_SECS) {
+                return Err(Violation {
+                    invariant: "ttft-liveness",
+                    detail: format!(
+                        "session {} is Active but prompt {} is unacked {}s after enqueue \
+                         (> {}s, attempts {}) — first-token delivery stalled (ADR 0108)",
+                        row.session_id,
+                        row.prompt_id,
+                        age.num_seconds(),
+                        TTFT_BOUND_SECS,
+                        row.attempts,
+                    ),
+                });
+            }
+        }
+        Ok(())
+    })
 }
 
 /// ADR 0101 C oracle (the livelock-class pin): the highest `session_ops`

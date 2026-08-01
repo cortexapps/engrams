@@ -11,12 +11,17 @@ import { createContext, useContext } from "react";
  * (type-ahead) mid-run, and gives the Send⇄Stop button, ⌘↵, and Esc one shared
  * source of truth.
  */
+/** ADR 0108: who asked for the interrupt. Threaded to the coordinator on
+ *  `InterruptRequest.source` so a phantom interrupt is attributable. */
+export type InterruptSource = "esc" | "stop-button" | "aui-cancel";
+
 export interface ComposerActions {
   /** Submit `text`. Idle → starts a run; mid-run → the harness QUEUES it
    *  (type-ahead). No-op on blank text; the caller clears the composer. */
   submit: (text: string) => void;
-  /** Interrupt the in-flight run (Esc / the Stop button). No-op when idle. */
-  interrupt: () => void;
+  /** Interrupt the in-flight run (Esc / the Stop button). No-op unless the
+   *  client believes a run is live. `source` attributes the caller. */
+  interrupt: (source: InterruptSource) => void;
   /** Terminal session (completed/failed/dead/host_lost) — Send is disabled. */
   sendBlocked: boolean;
   /** Is there a still-queued prompt the user can recall (↑)? */

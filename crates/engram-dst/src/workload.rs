@@ -220,11 +220,11 @@ pub async fn api_rename(
 /// Real-wire HTTP host-ingestion of a `run_started` harness event carrying
 /// the prompt's id — the CONFIRMING event that retires the durable outbox
 /// row (ADR 0073, via the sink's `outbox_ack`). In production the harness
-/// emits this when it begins the forwarded prompt; the sim emits it to
-/// close the prompt→deliver→ack loop so an unacked row does not redeliver
-/// forever (there is no real guest harness). Without this ack, a prompted
-/// session that later leaves Active leaves a Deliver op retrying against a
-/// perpetually-due row — the wedge the swarm surfaced.
+/// emits this when it begins the forwarded prompt; since ADR 0108 E the
+/// sim "guest" is the scheduler's harness pump, which calls this for every
+/// prompt an ATTACHED sim harness accepted (`send_prompt` Ok) — closing
+/// the prompt→attach→deliver→ack loop with the same confirming event
+/// production uses. Also called directly by single-shot tests.
 pub async fn api_run_started(
     state: &SharedState,
     session_id: SessionId,

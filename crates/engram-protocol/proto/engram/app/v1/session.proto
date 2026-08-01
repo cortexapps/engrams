@@ -247,6 +247,12 @@ message SendPromptResponse {
 
 message InterruptRequest {
   string session_id = 1;
+  // ADR 0108: who asked for the interrupt. Free-form label from the
+  // caller ("esc", "stop-button", "aui-cancel", "steer", "cli", ...).
+  // The coordinator logs and counts it; it does not change behavior.
+  // Attribution exists because a 2026-07-31 phantom interrupt took an
+  // hour of archaeology to trace to an ungated library Esc handler.
+  string source = 2;
 }
 
 message InterruptResponse {
@@ -297,6 +303,12 @@ message StreamEventsRequest {
   // (callers translate the HTTP -1 sentinel to unset; proto3 default 0
   // would silently skip idx 0).
   optional int64 since = 2;
+  // ADR 0108 B: suppress ephemeral frames (agent_message_chunk) server-
+  // side. Cursor-based consumers (the orchestrator SessionListener) set
+  // this: every frame they receive then carries an idx, except the
+  // `lagged` sentinel. Unset = today's behavior (chunks flow) — the SSE
+  // passthrough and the browser depend on that.
+  bool durable_only = 3;
 }
 
 // The typed event ENVELOPE. payload_json is NORMATIVELY the JSON object

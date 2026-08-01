@@ -161,6 +161,7 @@ async fn stream_events_smoke() {
     let mut stream_req = tonic::Request::new(app::StreamEventsRequest {
         session_id: session_id.clone(),
         since: None,
+        durable_only: false,
     });
     stream_req.set_timeout(rpc_timeout);
     let mut stream = client
@@ -206,6 +207,7 @@ async fn stream_events_smoke() {
     let mut reopen_req = tonic::Request::new(app::StreamEventsRequest {
         session_id: session_id.clone(),
         since: Some(last_idx),
+        durable_only: false,
     });
     reopen_req.set_timeout(rpc_timeout);
     let mut reopen_stream = client

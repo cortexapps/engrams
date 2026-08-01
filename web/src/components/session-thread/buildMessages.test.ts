@@ -633,6 +633,89 @@ describe("buildMessages — Phase 1b queued/optimistic greying", () => {
       id: "p1",
       content: [{ type: "text", text: "are you there?" }],
     });
+    // The inversion guard: the loop re-holds the late echo, but a consumed
+    // prompt_id must not ALSO render a trailing pending bubble (dup id crash).
+    expect(real(messages).filter((m) => m.id === "p1")).toHaveLength(1);
+  });
+
+  // ADR 0108 (held-echo UX): during a delivery gap (echo landed, no
+  // run_started yet, not queued) the user's message must be VISIBLE — a
+  // pending grey bubble with the delivering affordance — instead of the page
+  // showing "No activity yet" with the user's own prompt withheld.
+  test("an unconsumed, unqueued prompt_id echo renders as a pending 'delivering' bubble", () => {
+    const { messages, isRunning } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "hello?",
+          prompt_id: "p1",
+          at: AT,
+        },
+      ]),
+      SID,
+      "active",
+    );
+    const user = real(messages).find((m) => m.role === "user");
+    expect(user).toMatchObject({
+      role: "user",
+      id: "p1",
+      content: [{ type: "text", text: "hello?" }],
+    });
+    expect(user?.metadata?.custom?.pending).toBe(true);
+    expect(user?.metadata?.custom?.delivering).toBe(true);
+    // A delivering prompt is awaited work — the composer shows the run state.
+    expect(isRunning).toBe(true);
+  });
+
+  test("the pending bubble transitions to normal (same id) once run_started consumes it", () => {
+    const { messages } = buildMessages(
+      indexed([
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u1",
+          role: "user",
+          text: "hello?",
+          prompt_id: "p1",
+          at: AT,
+        },
+        { type: "run_started", run_id: "r1", prompt_summary: null, prompt_id: "p1", at: AT2 },
+        { type: "run_completed", run_id: "r1", ok: true, at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    const users = real(messages).filter((m) => m.role === "user");
+    // Exactly one bubble, keyed by prompt_id, no longer pending.
+    expect(users).toHaveLength(1);
+    expect(users[0]!.id).toBe("p1");
+    expect(users[0]!.metadata?.custom?.pending).toBeUndefined();
+    expect(users[0]!.metadata?.custom?.delivering).toBeUndefined();
+  });
+
+  test("a dequeued (recalled) echo still never renders", () => {
+    const { messages } = buildMessages(
+      indexed([
+        { type: "run_started", run_id: "r1", prompt_summary: null, at: AT },
+        {
+          type: "agent_message",
+          run_id: "",
+          message_id: "u2",
+          role: "user",
+          text: "never mind",
+          prompt_id: "p2",
+          at: AT2,
+        },
+        { type: "prompt_queued", prompt_id: "p2", summary: "never mind", at: AT2 },
+        { type: "prompt_dequeued", prompt_id: "p2", at: AT2 },
+      ]),
+      SID,
+      "idle",
+    );
+    expect(messages.some((m) => m.id === "p2")).toBe(false);
   });
 });
 

@@ -88,6 +88,9 @@ const ThreadMessage: FC = () => {
   // pressing Enter and landing authoritatively in the conversation log;
   // it shows here greyed and transitions in place to solid on consumption.
   const pending = useAuiState((s) => s.message.metadata.custom?.pending === true);
+  // ADR 0108: a durable user echo whose consuming run_started has not landed
+  // yet (delivery gap) — pending grey plus a "delivering…" caption.
+  const delivering = useAuiState((s) => s.message.metadata.custom?.delivering === true);
   const inner =
     role === "system" ? (
       <SystemMessage />
@@ -110,9 +113,16 @@ const ThreadMessage: FC = () => {
     return (
       <div
         className="opacity-50 transition-opacity"
-        title="Pending — not yet in the conversation log"
+        title={
+          delivering
+            ? "Delivering — the run has not started yet"
+            : "Pending — not yet in the conversation log"
+        }
       >
         {inner}
+        {delivering && (
+          <p className="mt-1 text-right text-xs text-muted-foreground italic">delivering…</p>
+        )}
       </div>
     );
   }
@@ -384,6 +394,11 @@ const Composer: FC = () => {
           // submits. submitMode="none" leaves submit entirely to our keydown so
           // it isn't run-gated.
           submitMode="none"
+          // ADR 0108: the library default is a DOCUMENT-level capture-phase
+          // Esc handler with no isRunning gate — it fired a phantom interrupt
+          // from an idle page and double-fired next to our own Esc handler
+          // below. Our keydown handler is the single Esc path.
+          cancelOnEscape={false}
           placeholder={
             planMode
               ? "Describe what to plan — the agent explores, it won't edit…"
@@ -409,7 +424,7 @@ const Composer: FC = () => {
             // consume-on-result.
             if (e.key === "Escape" && isRunning) {
               e.preventDefault();
-              interrupt();
+              interrupt("esc");
               return;
             }
             // Plain ↑ on an empty composer recalls the newest queued message.
@@ -467,7 +482,7 @@ const ComposerAction: FC = () => {
         size="icon"
         className="size-8 rounded-full"
         aria-label="Stop the run"
-        onClick={() => interrupt()}
+        onClick={() => interrupt("stop-button")}
       >
         <SquareIcon className="size-3 fill-current" />
       </TooltipIconButton>

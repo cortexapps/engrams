@@ -176,6 +176,11 @@ export function makeProductionListenerManager(): ListenerManager {
             {
               sessionId: id,
               ...(since >= 0n ? { since } : {}),
+              // ADR 0108 B: this consumer is cursor-based; ephemeral chunk
+              // frames carry no idx and are suppressed server-side. Old
+              // coordinators ignore the flag — the listener's lag test
+              // must therefore still tolerate idx-less chunk frames.
+              durableOnly: true,
             },
             { signal: abort.signal },
           );
