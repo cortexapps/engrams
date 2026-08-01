@@ -21,7 +21,7 @@ use engram_core::SessionId;
 use engram_egress_proxy::ca::Ca;
 use engram_egress_proxy::cert_mint::CertMint;
 use engram_egress_proxy::intercept::{
-    self, build_client_config, build_server_config, InterceptError,
+    self, build_client_config as production_client_config, build_server_config, InterceptError,
 };
 use engram_egress_proxy::observe::{ObserveSink, ObservedAsset};
 use engram_egress_proxy::policy::HostList;
@@ -35,13 +35,70 @@ use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::TcpListener;
+use tokio::net::{TcpListener, TcpStream};
 use tokio_rustls::TlsAcceptor;
 use tokio_rustls::TlsConnector;
 
 fn ca() -> Arc<Ca> {
     let tmp = tempfile::tempdir().unwrap().keep();
     Arc::new(Ca::load_or_generate(&tmp).unwrap())
+}
+
+/// Most protocol tests use a private loopback fixture. They inject a test-only
+/// verifier directly into `intercept::run`; production always uses
+/// `production_client_config`, which is tested separately below.
+fn build_client_config() -> Arc<rustls::ClientConfig> {
+    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+    use rustls::{DigitallySignedStruct, SignatureScheme};
+
+    #[derive(Debug)]
+    struct TestOnlyVerifier;
+    impl ServerCertVerifier for TestOnlyVerifier {
+        fn verify_server_cert(
+            &self,
+            _: &CertificateDer<'_>,
+            _: &[CertificateDer<'_>],
+            _: &ServerName<'_>,
+            _: &[u8],
+            _: UnixTime,
+        ) -> Result<ServerCertVerified, rustls::Error> {
+            Ok(ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Ok(HandshakeSignatureValid::assertion())
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            vec![
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::ED25519,
+            ]
+        }
+    }
+
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TestOnlyVerifier))
+            .with_no_client_auth(),
+    )
 }
 
 fn entry(placeholder: &str, real: &str, allow: &[&str]) -> SecretEntry {
@@ -157,6 +214,16 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
         let _ = tls.shutdown().await;
     });
     addr
+}
+
+#[tokio::test]
+async fn production_client_config_rejects_an_untrusted_upstream() {
+    let captured = Arc::new(Mutex::new(Vec::new()));
+    let upstream_addr = fake_upstream(captured).await;
+    let connector = TlsConnector::from(production_client_config());
+    let stream = TcpStream::connect(upstream_addr).await.unwrap();
+    let server_name: rustls::pki_types::ServerName<'static> = "fake-upstream".try_into().unwrap();
+    assert!(connector.connect(server_name, stream).await.is_err());
 }
 
 #[tokio::test]

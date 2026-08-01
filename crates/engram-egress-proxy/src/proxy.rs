@@ -68,6 +68,9 @@ pub struct ProxyConfig {
     /// expiry — the pre-WS4 behaviour). The host-agent wires this to its coord
     /// client; tests pass a stub.
     pub inject_refresher: Option<Arc<dyn InjectRefresher>>,
+    /// Extra trust roots for hermetic full-network tests. Production leaves
+    /// this empty and uses the built-in WebPKI roots.
+    pub upstream_test_roots: Option<rustls::RootCertStore>,
 }
 
 impl ProxyConfig {
@@ -91,6 +94,7 @@ impl ProxyConfig {
                 .expect("dns upstream default parses"),
             observe_sink: None,
             inject_refresher: None,
+            upstream_test_roots: None,
         }
     }
 }
@@ -104,7 +108,10 @@ pub struct Proxy {
 impl Proxy {
     pub fn new(cfg: ProxyConfig) -> Self {
         let server_cfg = intercept::build_server_config(cfg.mint.clone());
-        let client_cfg = intercept::build_client_config();
+        let client_cfg = cfg.upstream_test_roots.clone().map_or_else(
+            intercept::build_client_config,
+            intercept::build_client_config_with_roots,
+        );
         Self {
             cfg,
             server_cfg,

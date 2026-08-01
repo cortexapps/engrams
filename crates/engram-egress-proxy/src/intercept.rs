@@ -3,25 +3,20 @@
 //! For Intercept decisions: terminate TLS with a per-SNI leaf cert
 //! signed by our CA (which the guest already trusts via the substrate
 //! install), decrypt incoming requests, scan/substitute placeholders,
-//! re-encrypt to upstream. Responses stream back unchanged.
+//! re-encrypt to upstream. Credential-bearing responses are forced to identity
+//! encoding and redacted before they return to the guest.
 //!
 //! Notes on shape:
 //!
-//! - **Length-Content limits.** A naïve implementation buffers the
-//!   entire request in memory before substituting, which makes
-//!   chunked or streaming uploads (image gen, file upload) blow up.
-//!   We cap the buffered prefix at 1 MiB; once we cross that mark
-//!   without seeing a placeholder, we stop scanning and stream
-//!   through. The intuition: secrets are short (<200 bytes) and
-//!   appear in headers or small JSON bodies; an attacker trying to
-//!   hide a placeholder past the 1 MiB mark would need cooperation
-//!   from the upstream service to receive it, which is the same
-//!   threat model SSRF protections deal with elsewhere.
+//! - **Request buffering.** The HTTP/1 adapter buffers a bounded request prefix
+//!   for policy evaluation and credential replacement. It forces one request
+//!   per connection. A later transport-hardening layer will replace this with
+//!   framed, streaming request processing.
 //! - **HTTP/1.1 only.** ALPN advertises only `http/1.1`; an upstream
 //!   that wants H2 will fall back. H2 substitution lands later.
-//! - **Reqs vs responses.** We rewrite client→upstream only.
-//!   Responses stream back as-is (Cloudflare etc. may stuff things
-//!   in headers but they don't carry our placeholders).
+//! - **Response safety.** A host-issued credential must not reach the guest,
+//!   even when an upstream reflects it. The adapter strips content negotiation,
+//!   rejects encoded responses, and redacts credential bytes across chunks.
 
 use std::sync::Arc;
 
@@ -73,6 +68,9 @@ pub enum InterceptError {
     },
     /// ADR 0056: an inject-gated request had no parseable HTTP/1.1 request line.
     MalformedRequest,
+    /// The request target can carry an authority only in proxy form. This proxy
+    /// authenticates the authority through SNI, so it accepts only origin form.
+    InvalidRequestTarget,
     /// ADR 0059: a GraphQL request to a gated endpoint was rejected — the body was
     /// unparseable / over-cap / unsupported framing, or its operation+field isn't
     /// permitted by the integration policy. `reason` is a static tag for logs
@@ -98,7 +96,10 @@ impl std::fmt::Display for InterceptError {
                 write!(f, "request rejected by integration policy: {method} {path}")
             }
             Self::MalformedRequest => {
-                write!(f, "malformed request line on an inject-gated host")
+                write!(f, "malformed HTTP/1.1 request line")
+            }
+            Self::InvalidRequestTarget => {
+                write!(f, "request target is not in origin form")
             }
             Self::GraphqlRejected { reason } => {
                 write!(
@@ -155,77 +156,20 @@ pub fn build_server_config(mint: Arc<CertMint>) -> Arc<ServerConfig> {
     Arc::new(cfg)
 }
 
-/// Build a rustls client config that trusts the host's normal trust
-/// store (via webpki-roots-equivalent rustls-native-roots... but
-/// we don't depend on that crate). We use the system trust store
-/// indirectly: rustls accepts whatever the OS offers. For now,
-/// load from `webpki-roots` is the simplest. But to avoid yet
-/// another dep we use rustls's *empty* root store and the upstream
-/// connection skips verification. **WARNING**: this is acceptable
-/// only because:
-///   - the proxy runs on the host (not inside the VM);
-///   - the upstream IP is resolved by the host's resolver;
-///   - we're MITM'ing already, so cert verification on the upstream
-///     side is the *host*'s responsibility, and the host is the TCB.
-///
-/// Even so, "skip verification" is a footgun. We use rustls's
-/// dangerous `with_custom_certificate_verifier` that always returns
-/// success. TODO before production rollout: load the host's system
-/// trust store via `rustls-native-certs` so the upstream cert is
-/// actually verified against real roots.
+/// Build the production upstream TLS config from Mozilla's WebPKI roots.
+/// A host-side credential is attached only after rustls authenticates the
+/// upstream certificate for the SNI-selected server name.
 pub fn build_client_config() -> Arc<ClientConfig> {
-    use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-    use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
-    use rustls::DigitallySignedStruct;
-    use rustls::SignatureScheme;
+    let roots = rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    build_client_config_with_roots(roots)
+}
 
-    #[derive(Debug)]
-    struct SkipVerification;
-    impl ServerCertVerifier for SkipVerification {
-        fn verify_server_cert(
-            &self,
-            _end_entity: &CertificateDer<'_>,
-            _intermediates: &[CertificateDer<'_>],
-            _server_name: &ServerName<'_>,
-            _ocsp_response: &[u8],
-            _now: UnixTime,
-        ) -> Result<ServerCertVerified, rustls::Error> {
-            Ok(ServerCertVerified::assertion())
-        }
-        fn verify_tls12_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn verify_tls13_signature(
-            &self,
-            _: &[u8],
-            _: &CertificateDer<'_>,
-            _: &DigitallySignedStruct,
-        ) -> Result<HandshakeSignatureValid, rustls::Error> {
-            Ok(HandshakeSignatureValid::assertion())
-        }
-        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-            vec![
-                SignatureScheme::ECDSA_NISTP256_SHA256,
-                SignatureScheme::ECDSA_NISTP384_SHA384,
-                SignatureScheme::RSA_PSS_SHA256,
-                SignatureScheme::RSA_PSS_SHA384,
-                SignatureScheme::RSA_PSS_SHA512,
-                SignatureScheme::RSA_PKCS1_SHA256,
-                SignatureScheme::RSA_PKCS1_SHA384,
-                SignatureScheme::RSA_PKCS1_SHA512,
-                SignatureScheme::ED25519,
-            ]
-        }
-    }
-
+/// Build an upstream TLS config from an explicit trust store. Production uses
+/// [`build_client_config`]. Full-network tests use a private CA so they can
+/// exercise certificate verification without external network access.
+pub fn build_client_config_with_roots(roots: rustls::RootCertStore) -> Arc<ClientConfig> {
     let cfg = ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(Arc::new(SkipVerification))
+        .with_root_certificates(roots)
         .with_no_client_auth();
     Arc::new(cfg)
 }
@@ -316,10 +260,20 @@ where
         }
     }
 
+    // Policy and upstream TLS identity are selected by SNI. Bind the cleartext
+    // HTTP authority to that same name before any credential is attached.
+    prefix = bind_http1_authority(prefix, &upstream_authority(sni, port));
+
+    let parsed_request_line =
+        inject::request_line(&prefix).ok_or(InterceptError::MalformedRequest)?;
+    if !request_target_is_origin_form(&parsed_request_line.1) {
+        return Err(InterceptError::InvalidRequestTarget);
+    }
+
     // Parse the request line once if any inject/observe gating needs it
     // (method + path are stable across header injection + substitution).
     let req_line = if !injects.is_empty() || !observes.is_empty() {
-        inject::request_line(&prefix)
+        Some(parsed_request_line)
     } else {
         None
     };
@@ -374,6 +328,15 @@ where
     // REST: gate by (method, path) glob. GraphQL: every top-level field must be
     // covered by some granted GraphQL inject (set coverage). A request matching no
     // injection is rejected — the operation isn't permitted on this host.
+    // Any host-side credential that this request can send must be removed from
+    // the response. This includes both injected credentials and static secrets
+    // that replace guest placeholders.
+    let mut response_redactions: Vec<Vec<u8>> = secrets
+        .iter()
+        .filter(|entry| entry.allow.matches(sni))
+        .map(|entry| entry.real_value.as_bytes().to_vec())
+        .filter(|secret| !secret.is_empty())
+        .collect();
     if !injects.is_empty() {
         let (method, path) = req_line.clone().ok_or(InterceptError::MalformedRequest)?;
         let matched: Vec<&InjectEntry> = if let Some(doc) = &parsed_graphql {
@@ -403,6 +366,14 @@ where
                 e.refresh_if_stale(session_id, refresher).await;
             }
         }
+        response_redactions.extend(
+            matched
+                .iter()
+                .map(|entry| entry.secret().into_bytes())
+                .filter(|secret| !secret.is_empty()),
+        );
+        response_redactions.sort_unstable();
+        response_redactions.dedup();
         prefix = inject::inject_headers(prefix, &matched)?;
     }
 
@@ -448,7 +419,13 @@ where
         upstream_tls.write_all(&prefix).await?;
         upstream_tls.flush().await?;
 
-        let resp_buf = pump_and_observe(client_tls, upstream_tls, OBSERVE_RESPONSE_BUDGET).await;
+        let resp_buf = pump_and_observe(
+            client_tls,
+            upstream_tls,
+            OBSERVE_RESPONSE_BUDGET,
+            &response_redactions,
+        )
+        .await?;
         let parsed = observe::parse_response(&resp_buf);
         // The GraphQL request variables feed the entries' `$.vars.*` extractors
         // (mutation inputs the response won't echo); `None` for REST requests.
@@ -466,7 +443,13 @@ where
     // `Connection: close` so a keep-alive client can't ride request #2 through
     // ungated with the guest's placeholder credential (see
     // `observe::force_connection_close`).
-    prefix = observe::force_connection_close(prefix);
+    prefix = if response_redactions.is_empty() {
+        observe::force_connection_close(prefix)
+    } else {
+        // Identity encoding makes the response inspectable and also forces the
+        // connection closed. A non-identity response is rejected below.
+        observe::prepare_observed_request(prefix)
+    };
     upstream_tls.write_all(&prefix).await?;
     upstream_tls.flush().await?;
 
@@ -474,15 +457,205 @@ where
     // bytes-after-prefix (no further substitution — a request body mid-stream
     // is fine, a second request dies with the connection), upstream→client
     // is everything.
-    tokio::io::copy_bidirectional(&mut client_tls, &mut upstream_tls).await?;
-
-    // Explicit close_notify on both sides. Without this rustls
-    // peers see "peer closed without close_notify" when they read
-    // the trailing bytes — that's noisy in logs and causes tests
-    // (legitimately checking for clean shutdown) to fail.
-    let _ = client_tls.shutdown().await;
-    let _ = upstream_tls.shutdown().await;
+    let (mut client_read, mut client_write) = tokio::io::split(client_tls);
+    let (mut upstream_read, mut upstream_write) = tokio::io::split(upstream_tls);
+    let request = async {
+        tokio::io::copy(&mut client_read, &mut upstream_write).await?;
+        upstream_write.shutdown().await
+    };
+    let response =
+        copy_redacting_response(&mut upstream_read, &mut client_write, &response_redactions);
+    tokio::try_join!(request, response)?;
     Ok(())
+}
+
+fn upstream_authority(sni: &str, port: u16) -> String {
+    if port == 443 {
+        sni.to_string()
+    } else {
+        format!("{sni}:{port}")
+    }
+}
+
+fn request_target_is_origin_form(target: &str) -> bool {
+    target == "*" || target.starts_with('/')
+}
+
+/// Replace every guest-supplied Host header with the SNI-authenticated
+/// authority. Duplicate or mixed-case Host headers cannot select a different
+/// virtual host after policy evaluation.
+fn bind_http1_authority(prefix: Vec<u8>, authority: &str) -> Vec<u8> {
+    let Some(request_line_end) = prefix.windows(2).position(|value| value == b"\r\n") else {
+        return prefix;
+    };
+    let insert_at = request_line_end + 2;
+    let mut out = Vec::with_capacity(prefix.len() + authority.len() + 8);
+    out.extend_from_slice(&prefix[..insert_at]);
+    out.extend_from_slice(b"Host: ");
+    out.extend_from_slice(authority.as_bytes());
+    out.extend_from_slice(b"\r\n");
+
+    let mut cursor = insert_at;
+    loop {
+        let Some(relative_end) = prefix[cursor..]
+            .windows(2)
+            .position(|value| value == b"\r\n")
+        else {
+            out.extend_from_slice(&prefix[cursor..]);
+            break;
+        };
+        let line_end = cursor + relative_end;
+        let line = &prefix[cursor..line_end];
+        if line.is_empty() {
+            out.extend_from_slice(&prefix[cursor..]);
+            break;
+        }
+        let name = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .map_or(line, |colon| &line[..colon]);
+        if !name.eq_ignore_ascii_case(b"host") {
+            out.extend_from_slice(&prefix[cursor..line_end + 2]);
+        }
+        cursor = line_end + 2;
+    }
+    out
+}
+
+struct ByteRedactor {
+    needles: Vec<Vec<u8>>,
+    tail: Vec<u8>,
+    keep: usize,
+}
+
+impl ByteRedactor {
+    fn new(needles: &[Vec<u8>]) -> Self {
+        Self {
+            needles: needles.to_vec(),
+            tail: Vec::new(),
+            keep: needles
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(1)
+                .saturating_sub(1),
+        }
+    }
+
+    fn push(&mut self, input: &[u8], final_chunk: bool) -> Vec<u8> {
+        self.tail.extend_from_slice(input);
+        redact_bytes(&mut self.tail, &self.needles);
+        let emit = if final_chunk {
+            self.tail.len()
+        } else {
+            self.tail.len().saturating_sub(self.keep)
+        };
+        self.tail.drain(..emit).collect()
+    }
+}
+
+fn redact_bytes(value: &mut [u8], needles: &[Vec<u8>]) {
+    for needle in needles.iter().filter(|needle| !needle.is_empty()) {
+        let mut start = 0;
+        while start + needle.len() <= value.len() {
+            let Some(relative) = value[start..]
+                .windows(needle.len())
+                .position(|candidate| candidate == needle)
+            else {
+                break;
+            };
+            let found = start + relative;
+            value[found..found + needle.len()].fill(b'*');
+            start = found + needle.len();
+        }
+    }
+}
+
+const RESPONSE_HEADER_BUDGET: usize = 64 * 1024;
+
+fn response_headers_are_inspectable(headers: &[u8]) -> bool {
+    let text = String::from_utf8_lossy(headers);
+    text.lines().all(|line| {
+        line.split_once(':').is_none_or(|(name, value)| {
+            !name.trim().eq_ignore_ascii_case("content-encoding")
+                || value.trim().eq_ignore_ascii_case("identity")
+        })
+    })
+}
+
+async fn read_response_prefix<R>(reader: &mut R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut prefix = Vec::with_capacity(4096);
+    while prefix.len() < RESPONSE_HEADER_BUDGET {
+        let mut chunk = [0_u8; 4096];
+        let read = reader.read(&mut chunk).await?;
+        if read == 0 {
+            break;
+        }
+        prefix.extend_from_slice(&chunk[..read]);
+        if prefix.windows(4).any(|value| value == b"\r\n\r\n") {
+            return Ok(prefix);
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        "upstream response headers exceed the inspection limit",
+    ))
+}
+
+async fn copy_redacting_response<R, W>(
+    reader: &mut R,
+    writer: &mut W,
+    needles: &[Vec<u8>],
+) -> std::io::Result<()>
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    if needles.is_empty() {
+        tokio::io::copy(reader, writer).await?;
+        return writer.shutdown().await;
+    }
+
+    let prefix = read_response_prefix(reader).await?;
+    let headers_end = prefix
+        .windows(4)
+        .position(|value| value == b"\r\n\r\n")
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "incomplete response headers",
+            )
+        })?;
+    if !response_headers_are_inspectable(&prefix[..headers_end]) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "credential-bearing response uses an unsupported content encoding",
+        ));
+    }
+
+    let mut redactor = ByteRedactor::new(needles);
+    let first = redactor.push(&prefix, false);
+    if !first.is_empty() {
+        writer.write_all(&first).await?;
+    }
+    let mut buffer = [0_u8; 8192];
+    loop {
+        let read = reader.read(&mut buffer).await?;
+        if read == 0 {
+            let tail = redactor.push(&[], true);
+            if !tail.is_empty() {
+                writer.write_all(&tail).await?;
+            }
+            return writer.shutdown().await;
+        }
+        let redacted = redactor.push(&buffer[..read], false);
+        if !redacted.is_empty() {
+            writer.write_all(&redacted).await?;
+        }
+    }
 }
 
 /// ADR 0059: GraphQL set-coverage gate. Returns the inject entries whose auth
@@ -597,7 +770,12 @@ const OBSERVE_RESPONSE_BUDGET: usize = 256 * 1024;
 /// withholds its response pending the request body can't deadlock us. Returns
 /// the tapped response bytes once the upstream closes (forced promptly by the
 /// `Connection: close` we set on the request).
-async fn pump_and_observe<C, U>(client_tls: C, upstream_tls: U, budget: usize) -> Vec<u8>
+async fn pump_and_observe<C, U>(
+    client_tls: C,
+    upstream_tls: U,
+    budget: usize,
+    response_redactions: &[Vec<u8>],
+) -> Result<Vec<u8>, InterceptError>
 where
     C: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     U: AsyncRead + AsyncWrite + Unpin + Send + 'static,
@@ -614,23 +792,110 @@ where
         let _ = up_wr.shutdown().await;
     });
 
-    let mut resp_buf = Vec::new();
-    let mut tmp = [0u8; 8192];
-    loop {
-        let n = match up_rd.read(&mut tmp).await {
-            Ok(0) | Err(_) => break,
-            Ok(n) => n,
-        };
-        if client_wr.write_all(&tmp[..n]).await.is_err() {
-            break;
+    let response_result = async {
+        let mut resp_buf = Vec::new();
+        let mut redactor = ByteRedactor::new(response_redactions);
+        if !response_redactions.is_empty() {
+            let prefix = read_response_prefix(&mut up_rd).await?;
+            let headers_end = prefix
+                .windows(4)
+                .position(|value| value == b"\r\n\r\n")
+                .ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "incomplete response headers",
+                    )
+                })?;
+            if !response_headers_are_inspectable(&prefix[..headers_end]) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "credential-bearing response uses an unsupported content encoding",
+                )
+                .into());
+            }
+            let redacted = redactor.push(&prefix, false);
+            client_wr.write_all(&redacted).await?;
+            resp_buf.extend_from_slice(&redacted[..redacted.len().min(budget)]);
         }
-        if resp_buf.len() < budget {
-            let take = (budget - resp_buf.len()).min(n);
-            resp_buf.extend_from_slice(&tmp[..take]);
+        let mut tmp = [0u8; 8192];
+        loop {
+            let n = match up_rd.read(&mut tmp).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => n,
+            };
+            let output = if response_redactions.is_empty() {
+                tmp[..n].to_vec()
+            } else {
+                redactor.push(&tmp[..n], false)
+            };
+            if client_wr.write_all(&output).await.is_err() {
+                break;
+            }
+            if resp_buf.len() < budget {
+                let take = (budget - resp_buf.len()).min(output.len());
+                resp_buf.extend_from_slice(&output[..take]);
+            }
         }
+        if !response_redactions.is_empty() {
+            let tail = redactor.push(&[], true);
+            client_wr.write_all(&tail).await?;
+            if resp_buf.len() < budget {
+                let take = (budget - resp_buf.len()).min(tail.len());
+                resp_buf.extend_from_slice(&tail[..take]);
+            }
+        }
+        let _ = client_wr.flush().await;
+        let _ = client_wr.shutdown().await;
+        Ok::<_, InterceptError>(resp_buf)
     }
-    let _ = client_wr.flush().await;
-    let _ = client_wr.shutdown().await;
+    .await;
     c2u.abort();
-    resp_buf
+    let _ = c2u.await;
+    response_result
+}
+
+#[cfg(test)]
+mod hardening_tests {
+    use super::*;
+
+    #[test]
+    fn binds_authority_to_sni_and_removes_duplicates() {
+        let request = b"GET /v1 HTTP/1.1\r\nHost: allowed.example\r\nhOsT: attacker.example\r\nAccept: */*\r\n\r\n".to_vec();
+        let bound = bind_http1_authority(request, "api.example");
+        let text = String::from_utf8(bound).unwrap();
+        assert_eq!(text.to_ascii_lowercase().matches("host:").count(), 1);
+        assert!(text.contains("Host: api.example\r\n"));
+        assert!(!text.contains("attacker.example"));
+    }
+
+    #[test]
+    fn rejects_absolute_form_request_targets() {
+        let target = inject::request_line(
+            b"GET https://attacker.example/v1 HTTP/1.1\r\nHost: api.example\r\n\r\n",
+        )
+        .unwrap()
+        .1;
+        assert!(!request_target_is_origin_form(&target));
+        assert!(request_target_is_origin_form("/v1?value=ok"));
+        assert!(request_target_is_origin_form("*"));
+    }
+
+    #[test]
+    fn redacts_credentials_across_arbitrary_chunks() {
+        let mut redactor = ByteRedactor::new(&[b"host-token".to_vec()]);
+        let mut output = redactor.push(b"before-host-", false);
+        output.extend(redactor.push(b"token-after", false));
+        output.extend(redactor.push(&[], true));
+        assert_eq!(output, b"before-**********-after");
+    }
+
+    #[test]
+    fn rejects_encoded_credential_responses() {
+        assert!(response_headers_are_inspectable(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: identity"
+        ));
+        assert!(!response_headers_are_inspectable(
+            b"HTTP/1.1 200 OK\r\nContent-Encoding: gzip"
+        ));
+    }
 }
