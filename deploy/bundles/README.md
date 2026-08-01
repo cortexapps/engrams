@@ -57,6 +57,16 @@ deploy/bundles/ide/build.sh         out/ide.squashfs           # needs Docker
 # unpacked trees for local dev (ProcessBackend):  use `just bundles`
 ```
 
+`just bundles-squashfs` skips any bundle whose inputs did not change. It
+fingerprints each bundle (see `_cache.sh`) and reuses the `<sha>.squashfs` those
+inputs produced last time, so a Tilt trigger no longer restarts a container and
+re-downloads node/code-server/the CLIs for nothing. The fingerprint covers
+tracked files, the pinned download versions, the host arch, and — for the
+bundles built from an artifact (`agentd`, `harness-claude`, `harness-codex`) —
+the staged tree. It does **not** cover the floating `apt-get` set or the Docker
+base image behind its tag: run `ENGRAM_BUNDLES_FORCE=1 just bundles-squashfs` to
+refresh those.
+
 ## Distribution
 
 CI builds + publishes each bundle as an OCI artifact to GHCR. The FC-host
