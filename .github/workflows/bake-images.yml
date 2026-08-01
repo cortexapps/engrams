@@ -264,6 +264,23 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # GHCR is eventually consistent: a tag applied immediately after a
+          # successful push can 404 on the manifest the registry just accepted
+          # (main went red this way on 2026-08-01 — `oras push` reported
+          # "Pushed", the very next `oras tag` said "not found"). Retry briefly
+          # rather than wedge the publish on a registry race.
+          tag_with_retry() {
+            local ref="$1" tag="$2" attempt
+            for attempt in 1 2 3 4 5; do
+              if oras tag "$ref" "$tag"; then
+                return 0
+              fi
+              echo "oras tag $ref -> $tag failed (attempt $attempt/5); retrying in 3s" >&2
+              sleep 3
+            done
+            echo "oras tag $ref -> $tag failed after 5 attempts" >&2
+            return 1
+          }
           REPO="ghcr.io/${{ github.repository }}/host-binaries"
           SHORT="${SHA:0:7}"
           # Push the two static binaries as a single OCI artifact tagged by
@@ -274,9 +291,9 @@ jobs:
             engram-host-agent:application/octet-stream \
             engram-uffd-handler:application/octet-stream
           # Convenience tags. `oras tag` is a cheap registry-side re-point.
-          oras tag "$REPO:$SHA" "$SHORT"
+          tag_with_retry "$REPO:$SHA" "$SHORT"
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-            oras tag "$REPO:$SHA" "main"
+            tag_with_retry "$REPO:$SHA" "main"
           fi
           echo "Published host-binaries -> $REPO:{$SHA,$SHORT}"
 
@@ -500,6 +517,23 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # GHCR is eventually consistent: a tag applied immediately after a
+          # successful push can 404 on the manifest the registry just accepted
+          # (main went red this way on 2026-08-01 — `oras push` reported
+          # "Pushed", the very next `oras tag` said "not found"). Retry briefly
+          # rather than wedge the publish on a registry race.
+          tag_with_retry() {
+            local ref="$1" tag="$2" attempt
+            for attempt in 1 2 3 4 5; do
+              if oras tag "$ref" "$tag"; then
+                return 0
+              fi
+              echo "oras tag $ref -> $tag failed (attempt $attempt/5); retrying in 3s" >&2
+              sleep 3
+            done
+            echo "oras tag $ref -> $tag failed after 5 attempts" >&2
+            return 1
+          }
           REPO="ghcr.io/${{ github.repository }}/cli-tools"
           SHORT="${SHA:0:7}"
           # `oras pull <repo>/cli-tools:<ref>` drops the binaries into cwd
@@ -509,9 +543,9 @@ jobs:
             engrams:application/octet-stream \
             engrams-linux-arm64:application/octet-stream \
             engrams-darwin-arm64:application/octet-stream
-          oras tag "$REPO:$SHA" "$SHORT"
+          tag_with_retry "$REPO:$SHA" "$SHORT"
           if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-            oras tag "$REPO:$SHA" "main"
+            tag_with_retry "$REPO:$SHA" "main"
           fi
           echo "Published cli-tools -> $REPO:{$SHA,$SHORT}"
 
@@ -739,6 +773,23 @@ jobs:
           SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
+          # GHCR is eventually consistent: a tag applied immediately after a
+          # successful push can 404 on the manifest the registry just accepted
+          # (main went red this way on 2026-08-01 — `oras push` reported
+          # "Pushed", the very next `oras tag` said "not found"). Retry briefly
+          # rather than wedge the publish on a registry race.
+          tag_with_retry() {
+            local ref="$1" tag="$2" attempt
+            for attempt in 1 2 3 4 5; do
+              if oras tag "$ref" "$tag"; then
+                return 0
+              fi
+              echo "oras tag $ref -> $tag failed (attempt $attempt/5); retrying in 3s" >&2
+              sleep 3
+            done
+            echo "oras tag $ref -> $tag failed after 5 attempts" >&2
+            return 1
+          }
           SHORT="${SHA:0:7}"
           for name in sentinel skills integrations-cli browser ide harness-claude harness-codex agentd guest-tools; do
             REPO="ghcr.io/${{ github.repository }}/bundle-$name"
@@ -746,9 +797,9 @@ jobs:
             oras push "$REPO:$SHA" \
               --artifact-type "application/vnd.engrams.ro-bundle.v1" \
               "$name.squashfs:application/octet-stream"
-            oras tag "$REPO:$SHA" "$SHORT"
+            tag_with_retry "$REPO:$SHA" "$SHORT"
             if [[ "${{ github.event_name }}" == "push" && "${{ github.ref }}" == "refs/heads/main" ]]; then
-              oras tag "$REPO:$SHA" "main"
+              tag_with_retry "$REPO:$SHA" "main"
             fi
             echo "Published bundle-$name -> $REPO:{$SHA,$SHORT}"
           done
