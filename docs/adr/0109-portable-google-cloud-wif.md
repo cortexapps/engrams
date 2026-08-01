@@ -45,17 +45,15 @@ The compiler keeps this tuple intact while it produces the immutable session
 policy. Session launch also stores a non-secret snapshot of each selected
 connection. Later connection edits do not change that session snapshot.
 
-Existing provider credentials become deterministic default connections. Existing
-profile capabilities migrate to structured grants on those connections. The
-coordinator can continue to persist its provider capability projection for
-provider-specific token scoping, but it is no longer the profile API.
-
-### Restricted profiles
-
-A profile can be organization-readable or restricted. A restricted profile has
-explicit principal launch grants. Administrators can always launch it. A profile
-that binds a Google Cloud connection must be restricted. Profile list, get, and
-task create all enforce the same rule on the server.
+Existing provider credentials receive ordinary default connections with opaque
+IDs. Existing profile capabilities migrate to structured grants on those
+connections. Migration state is not encoded in connection IDs or runtime
+branches. The coordinator can continue to persist its provider capability
+projection for provider-specific token scoping, but it is no longer the profile
+API. Google
+Cloud connections follow the same organization-wide profile authorization model
+as existing integrations. User-scoped integration identities are a separate
+future concern.
 
 ### WIF-only authentication
 
@@ -82,11 +80,12 @@ coordinator. The coordinator accepts that requested UUID from its authenticated
 orchestrator client. On a create failure, the orchestrator removes the provisional
 rows. It registers event listeners only after the coordinator accepts the create.
 
-ADR 0056's mint path uses a typed credential source. GitHub App credentials use
-a built-in provider source. Google Cloud uses a named-connection source. Both
-sources return the same `ScopedCredential` shape and use the same boot, refresh,
-header-rendering, and host-proxy injection code. There is no encoded provider
-marker and no Google branch in the host agent or guest agent.
+ADR 0056's mint path uses a typed connection source. GitHub App credentials and
+Google Cloud both carry the opaque connection ID selected by the profile. The
+provider is separate routing metadata and is never inferred from that ID. Both
+return the same `ScopedCredential` shape and use the same boot, refresh,
+header-rendering, and host-proxy injection code. There is no Google branch in
+the host agent or guest agent.
 
 The coordinator calls one authenticated orchestrator-internal connection
 credential endpoint when a named source needs a credential. The broker resolves
@@ -144,8 +143,8 @@ headers.
 
 ## Phasing
 
-1. Add named connections, structured grants, restricted profile launch grants,
-   and the orchestrator-selected session UUID.
+1. Add named connections, structured grants, and the orchestrator-selected
+   session UUID.
 2. Add the OIDC issuer, signing-key rotation, WIF broker, and Google connector.
 3. Add metadata compatibility, verified upstream TLS, HTTP/2, and credential API
    denials in the egress proxy.

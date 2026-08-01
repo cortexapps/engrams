@@ -49,6 +49,25 @@ pub struct IntegrationPolicy {
     /// the proxy substitutes only on its `allow_hosts`.
     #[serde(default)]
     pub secrets: Vec<IntegrationSecret>,
+    /// Enable the session-local Google metadata-compatible ADC endpoint. The
+    /// host egress proxy serves the endpoint; the guest receives no Google
+    /// credential.
+    #[serde(default)]
+    pub google_adc: bool,
+}
+
+/// Host-side authority used to mint a short-lived credential for one inject.
+///
+/// Every source names the configured connection selected by the profile. The
+/// provider is explicit routing metadata; callers never infer it from the
+/// opaque connection ID. Neither field contains a credential.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum CredentialMintSource {
+    Connection {
+        connection_id: String,
+        provider: String,
+    },
 }
 
 /// ADR 0057: one profile-defined secret the session injects. The value lives in
@@ -72,19 +91,6 @@ pub struct IntegrationSecret {
     pub allow_host_patterns: Vec<String>,
 }
 
-/// The authority that mints a short-lived credential for an egress inject.
-///
-/// This type replaces the provider-name string marker so future credential
-/// sources can use the same broker and refresh path without overloading a
-/// provider identifier. It contains routing metadata only. It never contains a
-/// credential value.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum CredentialMintSource {
-    /// Mint through the built-in integration provider registry.
-    Provider { provider: String },
-}
-
 /// One Plane-B injection: on an outbound request to `hosts` matching the
 /// request policy (`methods` + `path_globs`), the proxy injects
 /// `header_name: <header_template with "{}" → the resolved secret>`. The
@@ -100,12 +106,10 @@ pub struct IntegrationInject {
     /// this is a `mint_source` entry (the value is minted, not stored).
     #[serde(default)]
     pub secret_ref: String,
-    /// ADR 0056 amendment: when present, the inject value is **minted** — the
-    /// coordinator resolves it through the named credential source,
-    /// scoped to the session's bound capabilities, instead of from `secret_ref`.
-    /// This is how a *mint* provider (e.g. github) rides the same egress inject
-    /// plane as a static-secret (*inject*) provider; the scoped token never
-    /// enters the guest. Mutually exclusive with `secret_ref`. NEVER a value.
+    /// When present, the inject value is minted through the shared credential
+    /// broker instead of read from `secret_ref`. The source always names the
+    /// selected connection, including existing singleton providers.
+    /// Mutually exclusive with `secret_ref`. NEVER a value.
     #[serde(default)]
     pub mint_source: Option<CredentialMintSource>,
     /// Request shapes this injection gates + applies to. Empty = any.
@@ -286,7 +290,8 @@ mod tests {
                 header_name: String::new(),
                 header_template: String::new(),
                 secret_ref: String::new(),
-                mint_source: Some(CredentialMintSource::Provider {
+                mint_source: Some(CredentialMintSource::Connection {
+                    connection_id: "github-default".into(),
                     provider: "github".into(),
                 }),
                 methods: vec!["POST".into()],

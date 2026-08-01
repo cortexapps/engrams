@@ -1,12 +1,21 @@
 import { expect, test, describe, beforeAll, afterAll } from "bun:test";
 import { ConnectError, Code, createClient, createRouterTransport } from "@connectrpc/connect";
+import { create } from "@bufbuild/protobuf";
 
 import { registerProfiles } from "../rpc/profiles.ts";
 import type { ProfileDeps, ImagesClient, GetSession, HarnessCatalogClient } from "../rpc/profiles.ts";
 import type { ProfileRow, ProfileStore, ProfileInput } from "../db/profiles.ts";
-import { ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
+import { ProfileIntegrationGrantSchema, ProfileService } from "../gen/engram/app/v1/profile_pb.ts";
 import type { MountCatalogClient } from "../skills/catalog.ts";
 import { PR_REVIEW_CAPABILITY } from "../tools/review.ts";
+import { capabilityGrant } from "../integrations/grants.ts";
+import type { IntegrationConnectionStore } from "../db/integration-connections.ts";
+
+const protoGrant = (capability: string) =>
+  create(ProfileIntegrationGrantSchema, capabilityGrant(
+    capability,
+    `default-${capability.slice(0, capability.indexOf(":"))}`,
+  ));
 
 /** Fake catalog whose live uploaded skills are `uploadedNames` (builtins are implicit). */
 const fakeCatalog = (uploadedNames: string[] = []): MountCatalogClient => ({
@@ -106,7 +115,33 @@ async function spawn(deps: ProfileDeps) {
   // ADR 0063: a profile always validates its harness against the catalog —
   // default to the fake so tests don't reach the live (coord) client. Specific
   // tests can still override.
-  const withCatalog: ProfileDeps = { harnessCatalog: fakeHarnessCatalog(), ...deps };
+  const connections: IntegrationConnectionStore = {
+    list: async () => [],
+    get: async (id) => id.startsWith("default-") ? {
+      id,
+      alias: id,
+      provider: id.slice(8),
+      displayName: id,
+      isDefault: true,
+      config: {},
+      enabled: true,
+      testedAt: new Date(0),
+      createdAt: new Date(0),
+      updatedAt: new Date(0),
+    } : null,
+    getDefault: async (provider) => connections.get(`default-${provider}`),
+    create: async () => { throw new Error("unused"); },
+    update: async () => { throw new Error("unused"); },
+    delete: async () => { throw new Error("unused"); },
+    markTested: async () => { throw new Error("unused"); },
+    setEnabled: async () => { throw new Error("unused"); },
+    ensureDefault: async (provider) => (await connections.get(`default-${provider}`))!,
+  };
+  const withCatalog: ProfileDeps = {
+    harnessCatalog: fakeHarnessCatalog(),
+    connections,
+    ...deps,
+  };
   const transport = createRouterTransport((router) => registerProfiles(router, withCatalog));
   return {
     client: createClient(ProfileService, transport),
@@ -122,7 +157,7 @@ async function expectErr(p: Promise<unknown>, code: Code) {
 const archived: ProfileRow = {
   id: "arch", name: "Archived", description: "", icon: "Bot", imageId: "img-1",
   harness: "claude", model: null, effort: null,
-  includeUserTokens: false, envVars: { K: "V" }, skills: [], capabilities: [], createdAt: new Date(0), updatedAt: new Date(0),
+  includeUserTokens: false, envVars: { K: "V" }, skills: [], integrationGrants: [], createdAt: new Date(0), updatedAt: new Date(0),
   network: { default: "deny", allowHosts: [], allowHostPatterns: [] }, secrets: [],
   isDefault: false,
   portExposures: [],
@@ -308,7 +343,11 @@ describe("ProfileService — auth + field filtering", () => {
     });
     try {
       await expectErr(
-        s.client.createProfile({ name: "x", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {}, capabilities: ["github"] }),
+        s.client.createProfile({
+          name: "x", description: "", icon: "Bot", imageId: "img-1", harness: "claude",
+          includeUserTokens: false, envVars: {},
+          integrationGrants: [{ connectionId: "default-github", operation: "", resourceConstraints: [] }],
+        }),
         Code.InvalidArgument,
       );
     } finally { await s.close(); }
@@ -322,9 +361,15 @@ describe("ProfileService — auth + field filtering", () => {
     try {
       const r = await s.client.createProfile({
         name: "Capable", description: "", icon: "Bot", imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
-        capabilities: ["github:issues:write", "datadog:metrics:read@idx-1"],
+        integrationGrants: [
+          protoGrant("github:issues:write"),
+          protoGrant("datadog:metrics:read@idx-1"),
+        ],
       });
-      expect(r.profile!.capabilities).toEqual(["github:issues:write", "datadog:metrics:read@idx-1"]);
+      expect(r.profile!.integrationGrants).toEqual([
+        protoGrant("github:issues:write"),
+        protoGrant("datadog:metrics:read@idx-1"),
+      ]);
     } finally { await s.close(); }
   });
 
@@ -339,16 +384,16 @@ describe("ProfileService — auth + field filtering", () => {
       const created = await s.client.createProfile({
         name: "Reviewer", description: "", icon: "ScanSearch", imageId: "img-1",
         harness: "claude", includeUserTokens: false, envVars: {},
-        capabilities: [PR_REVIEW_CAPABILITY],
+        integrationGrants: [protoGrant(PR_REVIEW_CAPABILITY)],
       });
-      expect(created.profile!.capabilities).toEqual([PR_REVIEW_CAPABILITY]);
+      expect(created.profile!.integrationGrants).toEqual([protoGrant(PR_REVIEW_CAPABILITY)]);
 
       const updated = await s.client.updateProfile({
         id: created.profile!.id, name: "Reviewer Updated", description: "", icon: "ScanSearch",
         imageId: "img-1", harness: "claude", includeUserTokens: false, envVars: {},
-        capabilities: [PR_REVIEW_CAPABILITY],
+        integrationGrants: [protoGrant(PR_REVIEW_CAPABILITY)],
       });
-      expect(updated.profile!.capabilities).toEqual([PR_REVIEW_CAPABILITY]);
+      expect(updated.profile!.integrationGrants).toEqual([protoGrant(PR_REVIEW_CAPABILITY)]);
     } finally { await s.close(); }
   });
 
@@ -363,9 +408,74 @@ describe("ProfileService — auth + field filtering", () => {
       await expectErr(s.client.createProfile({
         name: "Bogus", description: "", icon: "Bot", imageId: "img-1",
         harness: "claude", includeUserTokens: false, envVars: {},
-        capabilities: ["bogus:thing"],
+        integrationGrants: [protoGrant("bogus:thing")],
       }), Code.InvalidArgument);
     } finally { await s.close(); }
+  });
+
+  test("Google Cloud grants require a known endpoint-backed operation", async () => {
+    const googleConnections: IntegrationConnectionStore = {
+      list: async () => [],
+      get: async (id) => id === "gcp-1" ? {
+        id,
+        alias: "prod-readonly",
+        provider: "gcp",
+        displayName: "Production read only",
+        isDefault: false,
+        config: {
+          workloadIdentityProvider:
+            "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
+          serviceAccountEmail: "reader@example-project.iam.gserviceaccount.com",
+          endpoints: ["compute.googleapis.com"],
+        },
+        enabled: true,
+        testedAt: new Date(0),
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      } : null,
+      getDefault: async () => null,
+      create: async () => { throw new Error("unused"); },
+      update: async () => { throw new Error("unused"); },
+      delete: async () => { throw new Error("unused"); },
+      markTested: async () => { throw new Error("unused"); },
+      setEnabled: async () => { throw new Error("unused"); },
+      ensureDefault: async () => { throw new Error("unused"); },
+    };
+    const s = await spawn({
+      getSession: makeGetSession("a", "admin"),
+      store: makeFakeStore(),
+      images: fakeImages(["img-1"]),
+      mountCatalog: fakeCatalog([]),
+      connections: googleConnections,
+    });
+    const request = {
+      name: "GCP",
+      description: "",
+      icon: "Bot",
+      imageId: "img-1",
+      harness: "claude",
+      includeUserTokens: false,
+      envVars: {},
+      integrationGrants: [{
+        connectionId: "gcp-1",
+        operation: "compute.instances.get",
+        resourceConstraints: [],
+      }],
+    };
+    try {
+      await expectErr(s.client.createProfile({
+        ...request,
+        integrationGrants: [{
+          connectionId: "gcp-1",
+          operation: "unknown.operation",
+          resourceConstraints: [],
+        }],
+      }), Code.InvalidArgument);
+      const created = await s.client.createProfile(request);
+      expect(created.profile?.integrationGrants[0]?.operation).toBe("compute.instances.get");
+    } finally {
+      await s.close();
+    }
   });
 
   // ADR 0064: declarative port exposures round-trip through create/update and

@@ -18,7 +18,7 @@ const baseInput = {
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
   network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
   secrets: [],
   isDefault: false,
@@ -111,7 +111,10 @@ describe("ProfileStore", () => {
       includeUserTokens: false,
       envVars: { ANTHROPIC_MODEL: "claude-opus-4-8" },
       skills: ["skills"],
-      capabilities: ["github:issues:write", "datadog:metrics:read"],
+      integrationGrants: [
+        { connectionId: "connection-github", operation: "issues:write", resourceConstraints: [] },
+        { connectionId: "connection-datadog", operation: "metrics:read", resourceConstraints: [] },
+      ],
       network: { default: "deny" as const, allowHosts: [], allowHostPatterns: [] },
       secrets: [],
       isDefault: false,
@@ -121,8 +124,7 @@ describe("ProfileStore", () => {
     try {
       expect(created.id).toBeDefined();
       expect(created.deletedAt).toBeNull();
-      // ADR 0056: capabilities round-trip through the store.
-      expect(created.capabilities).toEqual(["github:issues:write", "datadog:metrics:read"]);
+      expect(created.integrationGrants).toEqual(input.integrationGrants);
       // ADR 0064: port_exposures round-trip through the store.
       expect(created.portExposures).toEqual([3000, 8080]);
 

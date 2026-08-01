@@ -14,6 +14,7 @@ import {
   DEFAULT_PROFILE_NETWORK,
   type ProfileNetwork,
   type ProfileSecret,
+  type ProfileIntegrationGrant,
 } from "./schema.ts";
 
 export interface ProfileRow {
@@ -32,8 +33,8 @@ export interface ProfileRow {
   envVars: Record<string, string>;
   // ADR 0055: dynamic skill bundle names this profile's sessions mount.
   skills: string[];
-  // ADR 0056: integration capabilities ("provider:action[@resource]").
-  capabilities: string[];
+  // ADR 0109: structured named-connection authority.
+  integrationGrants: ProfileIntegrationGrant[];
   // ADR 0057: profile-defined egress allow-list + injected secrets.
   network: ProfileNetwork;
   secrets: ProfileSecret[];
@@ -60,7 +61,7 @@ export interface ProfileInput {
   includeUserTokens: boolean;
   envVars: Record<string, string>;
   skills: string[];
-  capabilities: string[];
+  integrationGrants: ProfileIntegrationGrant[];
   network: ProfileNetwork;
   secrets: ProfileSecret[];
   isDefault: boolean;
@@ -103,7 +104,7 @@ function toRow(r: typeof profileTable.$inferSelect): ProfileRow {
     includeUserTokens: r.includeUserTokens,
     envVars: (r.envVars ?? {}) as Record<string, string>,
     skills: (r.skills ?? []) as string[],
-    capabilities: (r.capabilities ?? []) as string[],
+    integrationGrants: (r.integrationGrants ?? []) as ProfileIntegrationGrant[],
     network: (r.network ?? DEFAULT_PROFILE_NETWORK) as ProfileNetwork,
     secrets: (r.secrets ?? []) as ProfileSecret[],
     isDefault: r.isDefault,

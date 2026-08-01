@@ -365,6 +365,7 @@ mod tests {
                 network_allow_hosts: vec![],
                 network_allow_host_patterns: vec![],
                 allow_all: false,
+                google_adc: false,
                 secrets: vec![],
                 injects: vec![
                     EgressInjectEntry {
@@ -393,7 +394,8 @@ mod tests {
                         graphql_operation: "mutation".into(),
                         graphql_field: "mergePullRequest".into(),
                         mint_source: Some(
-                            engram_core::types::integration::CredentialMintSource::Provider {
+                            engram_core::types::integration::CredentialMintSource::Connection {
+                                connection_id: "github-default".into(),
                                 provider: "github".into(),
                             },
                         ),
@@ -463,7 +465,8 @@ mod tests {
         assert_eq!(
             gql_inj.mint_source,
             Some(
-                engram_core::types::integration::CredentialMintSource::Provider {
+                engram_core::types::integration::CredentialMintSource::Connection {
+                    connection_id: "github-default".into(),
                     provider: "github".into(),
                 }
             )

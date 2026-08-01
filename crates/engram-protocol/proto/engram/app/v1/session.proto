@@ -192,6 +192,10 @@ message CreateSessionRequest {
   // `prompt` is unset. Validated against the selected harness's descriptor.
   // Not named `mode` — field 2 is the agent/dev_vm SessionMode.
   optional string harness_mode = 13;
+  // ADR 0109: the trusted orchestrator reserves this immutable ID before it
+  // stores the task-session authorization snapshot. Public HTTP callers cannot
+  // select session IDs.
+  optional string requested_session_id = 14;
 }
 
 message OAuthCredentialBinding {

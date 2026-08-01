@@ -37,6 +37,7 @@ import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
 import { useSkills, useUploadSkill } from "../../hooks/useSkills";
 import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
+import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import {
   useConnectorViews,
   type ConnectorView,
@@ -96,7 +97,13 @@ const schema = z.object({
   designation: z.boolean(),
   includeUserTokens: z.boolean(),
   skills: z.array(z.string()),
-  capabilities: z.array(z.string()),
+  integrationGrants: z.array(
+    z.object({
+      connectionId: z.string(),
+      operation: z.string(),
+      resourceConstraints: z.array(z.string()),
+    }),
+  ),
   envRows: z.array(z.custom<EnvRow>()),
   networkDefault: z.enum(["deny", "allow"]),
   allowHostsText: z.string(),
@@ -120,7 +127,7 @@ const EMPTY: ProfileFormValues = {
   designation: false,
   includeUserTokens: false,
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
   envRows: [],
   networkDefault: "deny",
   allowHostsText: "",
@@ -153,7 +160,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const { control, setValue, watch, reset, handleSubmit, formState } = form;
 
   // Live draft — the policy rail and derived network recompute as these change.
-  const capabilities = watch("capabilities");
+  const integrationGrants = watch("integrationGrants");
+  const capabilities = defaultCapabilitiesForGrants(integrationGrants, views);
   const skills = watch("skills");
   const includeUserTokens = watch("includeUserTokens");
   const imageId = watch("imageId");
@@ -188,7 +196,11 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       designation: p.designation === "pr_reviewer",
       includeUserTokens: p.includeUserTokens,
       skills: p.skills ?? [],
-      capabilities: p.capabilities ?? [],
+      integrationGrants: (p.integrationGrants ?? []).map((grant) => ({
+        connectionId: grant.connectionId,
+        operation: grant.operation,
+        resourceConstraints: [...grant.resourceConstraints],
+      })),
       envRows: mapToEnvRows(p.envVars),
       networkDefault: p.network?.default === "allow" ? "allow" : "deny",
       allowHostsText: (p.network?.allowHosts ?? []).join("\n"),
@@ -262,25 +274,38 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
   // --- capability helpers (enable→select) -----------------------------------
-  const setCaps = (next: string[]) => setValue("capabilities", next, { shouldDirty: true });
-  const capOn = (provider: string, action: string) => {
-    const cap = `${provider}:${action}`;
-    return capabilities.some((x) => x === cap || x.startsWith(`${cap}@`));
+  const setGrants = (next: typeof integrationGrants) =>
+    setValue("integrationGrants", next, { shouldDirty: true });
+  const capOn = (connectionId: string, action: string) => {
+    return integrationGrants.some(
+      (grant) => grant.connectionId === connectionId && grant.operation === action,
+    );
   };
-  const toggleCap = (provider: string, action: string, on: boolean) => {
-    const cap = `${provider}:${action}`;
-    const without = capabilities.filter((x) => x !== cap && !x.startsWith(`${cap}@`));
-    setCaps(on ? [...without, cap] : without);
+  const toggleCap = (connectionId: string, action: string, on: boolean) => {
+    const without = integrationGrants.filter(
+      (grant) => grant.connectionId !== connectionId || grant.operation !== action,
+    );
+    setGrants(
+      on ? [...without, { connectionId, operation: action, resourceConstraints: [] }] : without,
+    );
   };
   const enableProvider = (v: ConnectorView) => {
     const reads = v.capabilities.filter((c) => c.access === "read");
-    const pick = (reads.length ? reads : v.capabilities.slice(0, 1)).map(
-      (c) => `${v.provider}:${c.action}`,
-    );
-    setCaps([...new Set([...capabilities, ...pick])]);
+    const pick = reads.length ? reads : v.capabilities.slice(0, 1);
+    const next = [...integrationGrants];
+    for (const cap of pick) {
+      if (!capOn(v.defaultConnectionId, cap.action)) {
+        next.push({
+          connectionId: v.defaultConnectionId,
+          operation: cap.action,
+          resourceConstraints: [],
+        });
+      }
+    }
+    setGrants(next);
   };
   const disableProvider = (v: ConnectorView) =>
-    setCaps(capabilities.filter((x) => !x.startsWith(`${v.provider}:`)));
+    setGrants(integrationGrants.filter((grant) => grant.connectionId !== v.defaultConnectionId));
 
   const onSubmit = async (vals: ProfileFormValues) => {
     const payload = {
@@ -294,7 +319,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
       isDefault: vals.isDefault,
       includeUserTokens: vals.includeUserTokens,
       skills: vals.skills,
-      capabilities: vals.capabilities,
+      integrationGrants: vals.integrationGrants,
       envVars: envRowsToMap(vals.envRows),
       network: {
         default: vals.networkDefault,
@@ -608,7 +633,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
               <div className="flex flex-col gap-3">
                 {connected.map((v) => {
                   const grantedCount = v.capabilities.filter((c) =>
-                    capOn(v.provider, c.action),
+                    capOn(v.defaultConnectionId, c.action),
                   ).length;
                   const on = grantedCount > 0;
                   return (
@@ -664,8 +689,10 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                         <div className="border-t">
                           <PowerSelector
                             view={v}
-                            isOn={(action) => capOn(v.provider, action)}
-                            onToggle={(action, value) => toggleCap(v.provider, action, value)}
+                            isOn={(action) => capOn(v.defaultConnectionId, action)}
+                            onToggle={(action, value) =>
+                              toggleCap(v.defaultConnectionId, action, value)
+                            }
                           />
                         </div>
                       )}

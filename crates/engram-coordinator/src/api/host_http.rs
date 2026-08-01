@@ -1568,8 +1568,7 @@ pub async fn integration_asset_ingest(
 
 #[derive(Deserialize)]
 pub struct RefreshInjectRequest {
-    /// The source that minted the credential. The egress proxy stores this
-    /// routing metadata on the inject entry at boot.
+    /// Immutable host-side authority stored on the inject entry at boot.
     pub mint_source: engram_core::types::integration::CredentialMintSource,
 }
 
@@ -1604,7 +1603,7 @@ pub async fn refresh_inject(
             .await
             .ok_or_else(|| {
                 ApiError::Internal(format!(
-                    "inject refresh for source {:?} on session {session_id} could not be minted",
+                    "inject refresh for {:?} on session {session_id} could not be minted",
                     req.mint_source
                 ))
             })?;

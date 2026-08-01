@@ -666,7 +666,8 @@ mod tests {
             header_template: "Bearer {}".into(),
             allow: HostList::from_manifest(&["api.github.com".into()], &[]).unwrap(),
             policy: RequestPolicy::default(),
-            mint_source: Some(CredentialMintSource::Provider {
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "github-default".into(),
                 provider: "github".into(),
             }),
             cred: RefreshableCred::new(secret.into(), expires_at),

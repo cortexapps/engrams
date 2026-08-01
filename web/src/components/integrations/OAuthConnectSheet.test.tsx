@@ -18,6 +18,7 @@ beforeEach(() => {
 
 const view = (provider = "slack"): ConnectorView => ({
   provider,
+  defaultConnectionId: `connection-${provider}`,
   name: provider === "slack" ? "Slack" : "Acme",
   category: "Communication",
   blurb: "",
