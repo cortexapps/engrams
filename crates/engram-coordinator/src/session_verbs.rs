@@ -726,6 +726,30 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
     if !ctx.step("drain").await {
         return OpOutcome::Failed("fenced at drain".into());
     }
+    // One Deliver op owns the whole drain: this loop re-fetches
+    // `outbox_next_due` each pass, so any row a sibling was enqueued for
+    // is already ours. The shim's `op_pending_exists` guard is only
+    // ADVISORY (a racing wake slips duplicates through), and its "a
+    // duplicate finds no due rows and no-ops" assumption inverts when
+    // the head row is STUCK: every duplicate then churns the same
+    // failing forward. DST finding (ADR 0108 swarm, seed 33043259):
+    // duplicates accumulated against a hung host, and N≥3 Deliver ops —
+    // the one budget-less kind — mutually re-armed each other's capped
+    // backoff with their own deadline burns, an immortal claim cycle.
+    // Cancelling queued siblings on claim makes the invariant real:
+    // at most one Deliver op survives per session. Never lossy — the
+    // outbox rows are the durable state, and the shim's rescan
+    // re-enqueues if this op dies fenced mid-drain.
+    match state.services.meta.op_cancel_queued(id, OpKind::Deliver).await {
+        Ok(true) => {
+            tracing::debug!(session_id = %id, "deliver op: cancelled queued duplicate deliver ops");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(session_id = %id, error = %e,
+                "deliver op: duplicate-sweep failed; continuing (duplicates only cost churn)");
+        }
+    }
     loop {
         let row: OutboxRow = match state.services.meta.outbox_next_due(id).await {
             Ok(Some(r)) => r,
