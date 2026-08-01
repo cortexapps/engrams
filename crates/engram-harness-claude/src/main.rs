@@ -1054,7 +1054,7 @@ mod adapter {
                         .and_then(|input| input.get("file_path"))
                         .and_then(|p| p.as_str())
                         .unwrap_or("");
-                    if file_path.contains("/.claude/plans/") {
+                    if is_plan_document(file_path, &plans_home()) {
                         print_allow();
                     } else {
                         print_deny(
@@ -1139,6 +1139,38 @@ mod adapter {
         /// inherits the harness's). Falls back to the AUQ literal when the
         /// env is absent or corrupt so the load-bearing question path can
         /// never be silently allowed through.
+        /// Is this write the plan DOCUMENT — the one file a read-only design
+        /// pass legitimately produces?
+        ///
+        /// This gate is load-bearing: its `allow` overrides the CLI's own
+        /// plan-mode gating (the sibling Bash arm returns no-opinion for
+        /// exactly that reason), so a `contains("/.claude/plans/")` substring
+        /// test let `/root/.claude/plans/../../workspace/src/main.rs` through
+        /// — the OS resolves the `..` on write and the edit lands in the
+        /// workspace during a pass the user was told is read-only (PR #927
+        /// review). Compare COMPONENTS under the real plans directory, and
+        /// reject any `..` outright: the file need not exist yet, so its path
+        /// cannot be canonicalized, and a lexical parent is a lie.
+        ///
+        /// The VM is still the hard boundary; this defends the read-only
+        /// DISCIPLINE, which is the whole point of the mode.
+        pub(crate) fn is_plan_document(file_path: &str, home: &str) -> bool {
+            let path = std::path::Path::new(file_path);
+            if !path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                return false;
+            }
+            path.starts_with(std::path::Path::new(home).join(".claude").join("plans"))
+        }
+
+        /// The guest home the plan document lives under.
+        pub(super) fn plans_home() -> String {
+            std::env::var("HOME").unwrap_or_else(|_| "/root".to_string())
+        }
+
         pub(super) fn native_roundtrip_names() -> std::collections::HashSet<String> {
             let mut names: std::collections::HashSet<String> = super::manifest_from_env()
                 .iter()
@@ -2183,6 +2215,28 @@ mod adapter {
     struct QueuedPrompt {
         prompt_id: Option<String>,
         text: String,
+        /// ADR 0107: the mode directive THIS prompt carried, applied when its
+        /// turn starts. It has to ride the prompt rather than a process-global
+        /// latch: with type-ahead the queue holds several prompts, so latching
+        /// on arrival let a later prompt's mode decide an earlier prompt's turn
+        /// — including the unsafe direction, where a prompt sent during a
+        /// read-only pass ran with full write access because a later prompt had
+        /// switched back to build (PR #927 review). `None` = "no directive",
+        /// which inherits the session's current mode rather than resetting it.
+        mode: Option<String>,
+    }
+
+    /// Latch a prompt's mode directive at the moment its turn begins. Returns
+    /// the mode the next turn must run under (the stamp, post-write).
+    fn apply_prompt_mode(cli: &Cli, mode: Option<&str>) -> String {
+        if let Some(mode) = mode.filter(|m| !m.is_empty()) {
+            if let Err(e) =
+                engram_harness_sdk::mode_stamp::write_mode_stamp(mode_stamp_path(cli), mode)
+            {
+                tracing::warn!(error = %e, %mode, "mode stamp write failed");
+            }
+        }
+        engram_harness_sdk::mode_stamp::read_mode_stamp(mode_stamp_path(cli))
     }
 
     /// SIGINT a running `claude` child — the graceful "stop the current
@@ -2624,19 +2678,21 @@ mod adapter {
                                             turn = Some(ft);
                                         }
                                     } else {
+                                        // ADR 0107: the consumption boundary
+                                        // is where THIS prompt's directive
+                                        // takes effect — latch it, then
+                                        // respawn if the resulting mode is
+                                        // not the one this process runs
+                                        // under. Applying it here (rather
+                                        // than on arrival) is what keeps a
+                                        // later queued prompt's mode from
+                                        // deciding an earlier one's turn.
+                                        let next_mode = pending
+                                            .front()
+                                            .map(|qp| apply_prompt_mode(cli, qp.mode.as_deref()));
                                         match pending.pop_front() {
-                                            // ADR 0107: the consumption
-                                            // boundary is where a latched
-                                            // mode change takes effect — if
-                                            // the stamp no longer matches
-                                            // this process's permission
-                                            // mode, respawn before the next
-                                            // turn instead of starting it
-                                            // under the wrong mode.
                                             Some(qp)
-                                                if engram_harness_sdk::mode_stamp::read_mode_stamp(
-                                                    mode_stamp_path(cli),
-                                                ) != process_mode =>
+                                                if next_mode.as_deref() != Some(process_mode.as_str()) =>
                                             {
                                                 tracing::info!(
                                                     prompt_id =
@@ -2767,20 +2823,13 @@ mod adapter {
                 cmd = cmd_rx.recv() => {
                     match cmd {
                         Some(HarnessCommand::Prompt { prompt_id, text, mode }) => {
-                            // ADR 0107: latch the mode directive to the
-                            // workspace stamp — the durable source of truth
-                            // across evict/resume. The stamp decides the NEXT
-                            // spawn's argv; a directive that disagrees with
-                            // this process's mode forces a clean respawn at a
-                            // turn boundary.
-                            if let Some(mode) = &mode {
-                                if let Err(e) = engram_harness_sdk::mode_stamp::write_mode_stamp(
-                                    mode_stamp_path(cli),
-                                    mode,
-                                ) {
-                                    tracing::warn!(error = %e, %mode, "mode stamp write failed");
-                                }
-                            }
+                            // ADR 0107: the directive rides the PROMPT and is
+                            // latched to the workspace stamp when that
+                            // prompt's turn starts (see `apply_prompt_mode`),
+                            // NOT on arrival — a queued prompt must run under
+                            // the mode it was sent with. The stamp remains the
+                            // durable source of truth across evict/resume and
+                            // decides the next spawn's argv.
                             let mode_mismatch =
                                 mode.as_deref().is_some_and(|m| m != process_mode);
                             if !seen_prompt_ids.insert(prompt_id.clone()) {
@@ -2803,15 +2852,21 @@ mod adapter {
                                         current = %process_mode,
                                         "mode change: clean respawn before this prompt"
                                     );
+                                    // Latch BEFORE the respawn: the fresh
+                                    // process picks its argv off the stamp.
+                                    apply_prompt_mode(cli, mode.as_deref());
                                     pending.push_front(QueuedPrompt {
                                         prompt_id: Some(prompt_id),
                                         text,
+                                        mode,
                                     });
                                     resuming_for_deferred = true;
                                     sigint_child(&child);
                                     break;
                                 }
-                                // Idle: start the run immediately.
+                                // Idle: latch this prompt's mode, then start
+                                // its run immediately.
+                                apply_prompt_mode(cli, mode.as_deref());
                                 if let Some(s) = stdin.as_mut() {
                                     turn = Some(
                                         start_turn(
@@ -2842,6 +2897,7 @@ mod adapter {
                                 pending.push_back(QueuedPrompt {
                                     prompt_id: Some(prompt_id),
                                     text,
+                                    mode,
                                 });
                                 // Steering (ADR 0094 follow-through): a
                                 // prompt must not rot behind a long run —
@@ -6570,6 +6626,32 @@ mod adapter {
             }
         }
 
+        /// ADR 0107 (PR #927 review): the mode is applied when a prompt's turn
+        /// STARTS, from that prompt's own directive. A `None` directive must
+        /// INHERIT the session mode, never reset it — that inheritance is what
+        /// keeps a prompt sent during a read-only pass read-only when a later
+        /// queued prompt switches back to build.
+        #[tokio::test]
+        async fn applying_a_prompt_mode_latches_some_and_inherits_none() {
+            let (cli, _hook, _mcp) = deferred_engine_cli("/bin/true".into(), "apply-mode").await;
+            let stamp = std::path::PathBuf::from(cli.mode_stamp_file.clone().unwrap());
+
+            // No directive on a fresh session: the default, unchanged.
+            assert_eq!(apply_prompt_mode(&cli, None), "default");
+            // A directive latches.
+            assert_eq!(apply_prompt_mode(&cli, Some("plan")), "plan");
+            assert_eq!(
+                engram_harness_sdk::mode_stamp::read_mode_stamp(&stamp),
+                "plan"
+            );
+            // The load-bearing case: a later prompt WITHOUT a directive keeps
+            // the read-only pass instead of falling back to the default.
+            assert_eq!(apply_prompt_mode(&cli, None), "plan");
+            assert_eq!(apply_prompt_mode(&cli, Some("")), "plan");
+            // An explicit switch back still works.
+            assert_eq!(apply_prompt_mode(&cli, Some("default")), "default");
+        }
+
         /// The full ADR 0107 approve flow: an idle prompt with a `plan`
         /// directive respawns into `--permission-mode plan`; ExitPlanMode
         /// defers and parks; the approve result flips the stamp, respawns
@@ -6703,16 +6785,28 @@ mod adapter {
                 .expect("engine exits")
                 .expect("engine task does not panic");
 
-            // Argv trail: default (idle) → plan (the parked turn; the fake
-            // exits after tool_deferred) → plan again (the EOF respawn whose
-            // bootstrap re-announces the park) → default (the build turn).
+            // Argv SHAPE, not a spawn count: the bootstrap starts under the
+            // default, the plan prompt forces a `--permission-mode plan`
+            // respawn, and the approval brings the build turn back to the
+            // default. How many respawns sit in between depends on when the
+            // FAKE exits (its EOF re-announce), which is fixture timing, not
+            // an ADR 0107 guarantee — pinning it made this test fail on the
+            // Linux lane while macOS `just check` skipped it (cfg(linux)).
             let argvs = std::fs::read_to_string(&invocations).unwrap();
             let lines: Vec<&str> = argvs.lines().collect();
-            assert_eq!(lines.len(), 4, "four spawns: {argvs}");
-            assert!(!lines[0].contains("--permission-mode"));
-            assert!(lines[1].contains("--permission-mode plan"));
-            assert!(lines[2].contains("--permission-mode plan"));
-            assert!(!lines[3].contains("--permission-mode"));
+            assert!(lines.len() >= 3, "bootstrap → plan → build: {argvs}");
+            assert!(
+                !lines[0].contains("--permission-mode"),
+                "bootstrap: {argvs}"
+            );
+            assert!(
+                lines[1].contains("--permission-mode plan"),
+                "the plan prompt respawns into plan mode: {argvs}"
+            );
+            assert!(
+                !lines.last().unwrap().contains("--permission-mode"),
+                "the build turn runs under the default mode: {argvs}"
+            );
             // The build turn was injected as a user message.
             let stdin = std::fs::read_to_string(&stdin_log).unwrap();
             assert!(
@@ -6858,12 +6952,16 @@ mod adapter {
                 .await
                 .expect("engine exits")
                 .expect("engine task does not panic");
-            // Argv trail: default (idle) → plan (parked turn) → plan (EOF
-            // respawn park re-announce) → plan (the reject continuation).
+            // Argv SHAPE, not a spawn count (see the approve test): the
+            // bootstrap is default, and EVERY respawn after the plan prompt
+            // stays in plan mode — a reject must never hand back write access.
             let argvs = std::fs::read_to_string(&invocations).unwrap();
             let lines: Vec<&str> = argvs.lines().collect();
-            assert_eq!(lines.len(), 4, "four spawns: {argvs}");
-            assert!(!lines[0].contains("--permission-mode"));
+            assert!(lines.len() >= 2, "bootstrap → plan: {argvs}");
+            assert!(
+                !lines[0].contains("--permission-mode"),
+                "bootstrap: {argvs}"
+            );
             assert!(
                 lines[1..]
                     .iter()
@@ -8008,6 +8106,26 @@ mod tests {
                 .any(|event| matches!(event, HarnessEvent::AgentMessage { .. })),
             "post-defer MCP narrate-past text must be suppressed: {events:?}"
         );
+    }
+
+    /// PR #927 review: the plan-document allow OVERRIDES the CLI's own
+    /// plan-mode gating, so a substring test on the path was a way out of the
+    /// read-only pass.
+    #[test]
+    fn plan_document_gate_rejects_traversal_and_lookalike_paths() {
+        let ok = |p: &str| hook_bridge::is_plan_document(p, "/root");
+        assert!(ok("/root/.claude/plans/p.md"));
+        assert!(ok("/root/.claude/plans/nested/p.md"));
+
+        // The traversal the substring check let through.
+        assert!(!ok("/root/.claude/plans/../../workspace/src/main.rs"));
+        // A repo-local lookalike the model invented.
+        assert!(!ok("/workspace/repo/.claude/plans/p.md"));
+        // Prefix-adjacent, not inside.
+        assert!(!ok("/root/.claude/plans-evil/p.md"));
+        assert!(!ok("/workspace/src/main.rs"));
+        assert!(!ok("relative/.claude/plans/p.md"));
+        assert!(!ok(""));
     }
 
     /// ADR 0107 / session 28216894: a natively-bound deferred tool arrives as

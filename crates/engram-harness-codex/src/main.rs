@@ -873,17 +873,10 @@ async fn drive(
         tokio::select! {
             command = commands.recv() => match command {
                 Some(HarnessCommand::Prompt { prompt_id, text, mode }) => {
-                    // ADR 0107: latch the mode directive to the workspace
-                    // stamp; every subsequent turn start reads it (per-turn
-                    // sandbox + preamble — codex never respawns for a mode).
-                    if let Some(mode) = &mode {
-                        if let Err(e) = engram_harness_sdk::mode_stamp::write_mode_stamp(
-                            &server.mode_stamp_path,
-                            mode,
-                        ) {
-                            tracing::warn!(error = %e, %mode, "mode stamp write failed");
-                        }
-                    }
+                    // ADR 0107: the directive rides the PROMPT and is latched
+                    // in `start_turn` — not here. Latching on arrival let a
+                    // later queued prompt's mode decide an earlier prompt's
+                    // turn (PR #927 review).
                     if !seen.insert(prompt_id.clone()) {
                         if let Some(turn) = server.persisted_prompts.get(&prompt_id) {
                             if turn.steered {
@@ -906,8 +899,34 @@ async fn drive(
                         }
                         continue;
                     }
-                    let prompt = QueuedPrompt { prompt_id, text };
-                    if let Some(turn_id) = active.as_deref() {
+                    let prompt = QueuedPrompt {
+                        prompt_id,
+                        text,
+                        mode,
+                    };
+                    // ADR 0107: a prompt that CHANGES the mode must not be
+                    // steered into the running turn — that turn's sandbox was
+                    // fixed when it started, so a plan-mode prompt injected
+                    // into a full-access turn would run with write access (PR
+                    // #927 review). Interrupt instead; `turn/completed` drains
+                    // the queue and `start_turn` applies the new mode.
+                    let mode_change = prompt.mode.as_deref().is_some_and(|m| {
+                        m != engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path)
+                    });
+                    if let (Some(turn_id), true) = (active.as_deref(), mode_change) {
+                        emit(events, HarnessEvent::PromptQueued {
+                            prompt_id: prompt.prompt_id.clone(),
+                            summary: Some(engram_harness_sdk::truncate_utf8(&prompt.text, 1024)),
+                        }).await;
+                        queued.push_back(prompt);
+                        match server.send_request(
+                            "turn/interrupt",
+                            json!({"threadId": server.thread_id, "turnId": turn_id}),
+                        ).await {
+                            Ok(id) => { pending.insert(id, Pending::Interrupt); }
+                            Err(error) => tracing::error!(%error, "could not interrupt for a mode change"),
+                        }
+                    } else if let Some(turn_id) = active.as_deref() {
                         let id = server.send_request("turn/steer", json!({
                             "threadId": server.thread_id,
                             "expectedTurnId": turn_id,
@@ -1064,6 +1083,16 @@ async fn start_turn(server: &mut AppServer, prompt: &QueuedPrompt) -> Result<i64
     // override each time BECAUSE the app-server treats it as sticky ("this
     // turn and subsequent turns"), so the build turn after an approval must
     // restore the external-sandbox policy itself.
+    // ADR 0107: latch THIS prompt's directive at the moment its turn starts —
+    // not when the command arrived — so a queued prompt runs under the mode it
+    // was sent with. `None` inherits the session's current mode.
+    if let Some(mode) = prompt.mode.as_deref().filter(|m| !m.is_empty()) {
+        if let Err(error) =
+            engram_harness_sdk::mode_stamp::write_mode_stamp(&server.mode_stamp_path, mode)
+        {
+            tracing::warn!(%error, %mode, "mode stamp write failed");
+        }
+    }
     let plan_mode =
         engram_harness_sdk::mode_stamp::read_mode_stamp(&server.mode_stamp_path) == "plan";
     let text = if plan_mode {
@@ -1320,6 +1349,9 @@ async fn route_tool_result(
             queued.push_back(QueuedPrompt {
                 prompt_id: format!("plan-changes-{}", uuid::Uuid::new_v4()),
                 text,
+                // Inherit: the stamp is still `plan`, so the revision turn
+                // stays read-only.
+                mode: None,
             });
             return;
         }
@@ -1399,6 +1431,9 @@ async fn route_tool_result(
             queued.push_back(QueuedPrompt {
                 prompt_id: format!("plan-approved-{}", uuid::Uuid::new_v4()),
                 text: PLAN_APPROVED_MESSAGE.to_string(),
+                // Inherit: the approve handler already flipped the stamp to
+                // the default, so the build turn starts full-access.
+                mode: None,
             });
             return;
         }
@@ -1541,6 +1576,8 @@ async fn send_follow_up(
             &QueuedPrompt {
                 prompt_id: client_id,
                 text,
+                // Inherit: a late tool result never changes the session mode.
+                mode: None,
             },
         )
         .await?
