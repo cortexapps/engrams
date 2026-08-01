@@ -154,11 +154,27 @@ mod adapter {
             .filter(|tool| tool.native_bindings.claude.is_none())
     }
 
+    /// Every `tool_use` name whose hook PARKS the turn — both spellings.
+    ///
+    /// Injected tools arrive as `mcp__engrams__<name>`, but a natively-bound
+    /// deferred tool arrives under its native name (`ExitPlanMode`), and
+    /// `injected_tools` deliberately excludes those. Missing the native
+    /// spelling meant a parked plan never marked the call deferred, so the
+    /// model's "the call came back with an internal error, retrying" narration
+    /// reached the UI and stayed in the transcript across the resume (session
+    /// 28216894).
     pub fn deferred_tool_names(manifest: &ToolManifest) -> HashSet<String> {
-        injected_tools(manifest)
+        let mut names: HashSet<String> = injected_tools(manifest)
             .filter(|tool| tool.execution == ToolExecution::Deferred)
             .map(|tool| tool.name.clone())
-            .collect()
+            .collect();
+        names.extend(
+            manifest
+                .iter()
+                .filter(|tool| tool.execution == ToolExecution::Deferred)
+                .filter_map(|tool| tool.native_bindings.claude.clone()),
+        );
+        names
     }
 
     fn normalize_native_tool_event(event: &mut HarnessEvent, manifest: &[ManifestTool]) {
@@ -3943,7 +3959,12 @@ mod adapter {
                                 let is_deferred_manifest_tool = name
                                     .strip_prefix("mcp__engrams__")
                                     .is_some_and(|name| deferred_tool_names.contains(name));
-                                if name == "AskUserQuestion" || is_deferred_manifest_tool {
+                                // A natively-bound deferred tool (ExitPlanMode)
+                                // arrives unprefixed; the set carries both.
+                                if name == "AskUserQuestion"
+                                    || is_deferred_manifest_tool
+                                    || deferred_tool_names.contains(&name)
+                                {
                                     deferred_pending.insert(tcid.clone());
                                 }
                                 tool_call_starts.insert(
@@ -7986,6 +8007,80 @@ mod tests {
                 .iter()
                 .any(|event| matches!(event, HarnessEvent::AgentMessage { .. })),
             "post-defer MCP narrate-past text must be suppressed: {events:?}"
+        );
+    }
+
+    /// ADR 0107 / session 28216894: a natively-bound deferred tool arrives as
+    /// `ExitPlanMode`, NOT `mcp__engrams__exit_plan_mode`, and
+    /// `injected_tools` excludes natively-bound tools by design. The parked
+    /// call therefore never marked itself deferred, so the model's "the
+    /// exit-plan call came back with an internal error, retrying it"
+    /// narration streamed to the reviewer sitting in front of the plan card
+    /// — and survived into the transcript for the resume to re-read.
+    #[test]
+    fn narrate_past_after_deferred_native_tool_is_suppressed() {
+        let manifest = vec![ManifestTool {
+            name: "exit_plan_mode".into(),
+            description: "Present the plan".into(),
+            input_schema: serde_json::json!({"type":"object"}),
+            execution: ToolExecution::Deferred,
+            native_bindings: NativeBindings {
+                claude: Some("ExitPlanMode".into()),
+            },
+        }];
+        let deferred_names = deferred_tool_names(&manifest);
+        assert!(
+            deferred_names.contains("ExitPlanMode"),
+            "the native spelling has to be in the set: {deferred_names:?}"
+        );
+        let mut tool_calls = 0;
+        let mut pending = std::collections::HashSet::new();
+        let mut suppressed: Vec<String> = Vec::new();
+
+        let tool_use = r#"{"type":"assistant","message":{"id":"m1","content":[{"type":"tool_use","id":"toolu_PLAN","name":"ExitPlanMode","input":{"plan":"the plan"}}]}}"#;
+        translate_jsonl_with_deferred_tools(
+            tool_use,
+            "run-1",
+            &mut tool_calls,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
+            &deferred_names,
+            &mut pending,
+            &mut suppressed,
+        )
+        .unwrap();
+        assert!(
+            pending.contains("toolu_PLAN"),
+            "the parked plan is deferred"
+        );
+
+        let bogus = r#"{"type":"assistant","message":{"id":"m2","content":[{"type":"text","text":"The exit-plan call came back with an internal error rather than an approval decision. Retrying it:"}]}}"#;
+        let events = translate_jsonl_with_deferred_tools(
+            bogus,
+            "run-1",
+            &mut tool_calls,
+            50,
+            &mut None,
+            &mut std::collections::HashMap::new(),
+            &mut HashMap::new(),
+            &deferred_names,
+            &mut pending,
+            &mut suppressed,
+        )
+        .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, HarnessEvent::AgentMessage { .. })),
+            "post-defer plan narrate-past must be suppressed: {events:?}"
+        );
+        // ADR 0054 Part C: it also has to leave the transcript, or the resumed
+        // CLI reads its own confusion back and retries again.
+        assert!(
+            suppressed.contains(&"m2".to_string()),
+            "the suppressed id is recorded for the scrub: {suppressed:?}"
         );
     }
 
