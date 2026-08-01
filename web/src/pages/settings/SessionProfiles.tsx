@@ -28,6 +28,7 @@ import {
 import { ProfileIcon } from "../../components/profiles/ProfileIcon";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
 import { derivePolicy } from "../../lib/profilePolicy";
+import { legacyCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { PageHeading } from "../../components/page-heading";
 import { Button } from "@/components/ui/button";
 import { Badge } from "@/components/ui/badge";
@@ -51,7 +52,11 @@ interface ProfileLike {
   icon: string;
   imageId: string;
   archived: boolean;
-  capabilities: string[];
+  integrationGrants: Array<{
+    connectionId: string;
+    operation: string;
+    resourceConstraints: string[];
+  }>;
   network?: { default: string; allowHosts: string[]; allowHostPatterns: string[] };
   /** Default harness (catalog name) — resolves the harness's own egress hosts. */
   harness?: string | null;
@@ -86,7 +91,7 @@ function Row({
   const harnessEgress = harnesses?.find((h) => h.name === p.harness)?.descriptor?.egress;
   const policy = derivePolicy(
     {
-      capabilities: p.capabilities ?? [],
+      capabilities: legacyCapabilitiesForGrants(p.integrationGrants ?? []),
       network: {
         default: p.network?.default === "allow" ? "allow" : "deny",
         allowHosts: p.network?.allowHosts ?? [],

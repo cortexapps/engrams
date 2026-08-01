@@ -2,7 +2,7 @@
  * engrams task … — the product-level verbs (native TaskService).
  *
  * A task starts from a PROFILE (ADR 0053): `task create --profile <name|id>`
- * resolves the profile server-side to an image + skills + capabilities +
+ * resolves the profile server-side to an image + skills + integration grants +
  * network policy — the same compilation the web's composer runs. Sessions
  * created here are attributed to the caller (their name in the dashboard).
  */

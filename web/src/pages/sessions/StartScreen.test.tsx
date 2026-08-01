@@ -23,7 +23,9 @@ const BUGFIX = {
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: ["github:pulls:write"],
+  integrationGrants: [
+    { connectionId: "legacy:github", operation: "pulls:write", resourceConstraints: [] },
+  ],
   secrets: [],
 };
 const DOCS = {
@@ -35,7 +37,7 @@ const DOCS = {
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
   secrets: [],
 };
 // No connector powers, but raw network egress to an internal host: capCount 0
@@ -49,7 +51,7 @@ const NETONLY = {
   includeUserTokens: false,
   envVars: {},
   skills: [],
-  capabilities: [],
+  integrationGrants: [],
   network: { default: "deny", allowHosts: ["internal.acme.test"], allowHostPatterns: [] },
   secrets: [],
 };

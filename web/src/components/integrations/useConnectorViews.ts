@@ -51,8 +51,9 @@ export function useConnectorViews(): ConnectorViewsResult {
   const views: ConnectorView[] = (cat.data?.providers ?? []).map((e) => {
     const fb = fallbackIdentity(e.provider);
     const row = rowByProvider.get(e.provider);
-    const grantsProvider = (caps: string[]) => caps.some((c) => c.startsWith(`${e.provider}:`));
-    const used = allProfiles.filter((p) => grantsProvider(p.capabilities ?? []));
+    const used = allProfiles.filter((p) =>
+      (p.integrationGrants ?? []).some((grant) => grant.connectionId === `legacy:${e.provider}`),
+    );
     // Logo precedence (matches useProviderIdentity): bundled built-in →
     // uploaded overlay → monogram.
     const logo = builtinLogo(e.provider) ?? (e.display?.icon?.logo || undefined);

@@ -135,7 +135,10 @@ function makeFakeSessions(opts: {
       const next = created.shift();
       if (!next) throw new Error("No more fake sessions in queue");
       const sessionId = req.requestedSessionId ?? next.id;
-      byId.set(sessionId, { ...next, id: sessionId });
+      // The coordinator honors the caller-reserved ID. Keep the queued object
+      // itself in the live map so tests can model later session mutations.
+      next.id = sessionId;
+      byId.set(sessionId, next);
       return {
         sessionId,
         status: next.status,
@@ -1172,7 +1175,8 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
   let client: ReturnType<typeof makeClient>;
   let fakeSessions: ReturnType<typeof makeFakeSessions>;
   let createdTaskId: string;
-  const sessionId = `crud-sess-${Date.now()}`;
+  let sessionId = "";
+  const queuedSessionId = `crud-queued-${Date.now()}`;
   const db = dbReachable ? getDb() : null;
 
   beforeAll(async () => {
@@ -1193,7 +1197,7 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     fakeSessions = makeFakeSessions({
       created: [
         {
-          id: sessionId,
+          id: queuedSessionId,
           status: "active",
           image: "registry/img:latest",
           mode: "agent",
@@ -1238,17 +1242,18 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
     });
 
     expect(resp.task).toBeDefined();
+    expect(resp.task!.sessions).toHaveLength(1);
+    createdTaskId = resp.task!.id;
+    sessionId = resp.task!.sessions[0]!.sessionId;
     expect(resp.task!.type).toBe("chat");
     expect(resp.task!.title).toBe("CRUD test task");
     // Status derived from session "active" → "working".
     expect(resp.task!.status).toBe("working");
-    expect(resp.task!.sessions).toHaveLength(1);
-    expect(resp.task!.sessions[0]!.sessionId).toBe(sessionId);
+    expect(fakeSessions.createReqs[0]!.requestedSessionId).toBeDefined();
+    expect(sessionId).toBe(fakeSessions.createReqs[0]!.requestedSessionId!);
     expect(resp.task!.sessions[0]!.role).toBe("primary");
     // Session should be denormalized.
     expect(resp.task!.sessions[0]!.session).toBeDefined();
-
-    createdTaskId = resp.task!.id;
   });
 
   test.skipIf(!dbReachable)("ListTasks → shows own task with live session state", async () => {
@@ -1330,12 +1335,11 @@ describe("TaskService — member CRUD lifecycle (requires DB)", () => {
 
 describe("TaskService — rename (UpdateTask)", () => {
   const RENAME_PROFILE = "rename-profile";
-  const sessionId = `rename-sess-${Date.now()}`;
   const db = dbReachable ? getDb() : null;
   // The live session object the fake returns — mutate `.suggestedTitle` to
   // simulate a harness AI-title landing.
   const liveSession: FakeSession = {
-    id: sessionId,
+    id: `rename-queued-${Date.now()}`,
     status: "active",
     image: "registry/img:latest",
     mode: "agent",
@@ -1383,7 +1387,10 @@ describe("TaskService — rename (UpdateTask)", () => {
     if (!dbReachable) return;
     if (taskId) await db!.delete(taskTable).where(eq(taskTable.id, taskId)).catch(() => {});
     // See the CRUD suite's afterAll: the session_listeners row isn't cascaded.
-    await db!.delete(sessionListenerTable).where(eq(sessionListenerTable.sessionId, sessionId)).catch(() => {});
+    await db!
+      .delete(sessionListenerTable)
+      .where(eq(sessionListenerTable.sessionId, liveSession.id))
+      .catch(() => {});
     await db!.delete(profileTable).where(eq(profileTable.id, RENAME_PROFILE)).catch(() => {});
     await srvA?.close();
   });

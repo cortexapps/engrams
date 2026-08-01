@@ -31,6 +31,7 @@ import {
 
 import { createTask, listTasks } from "../../gen/engram/app/v1/task-TaskService_connectquery";
 import { useProfiles } from "../../hooks/useProfiles";
+import { legacyCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { useIntegrationCatalog } from "../../hooks/useIntegrations";
 import { useEnabledImages } from "../../hooks/useEnabledImages";
 import { useHarnessCatalog } from "../../hooks/useHarnessCatalog";
@@ -173,7 +174,7 @@ export function StartScreen() {
   const policy: DerivedPolicy | null = selected
     ? derivePolicy(
         {
-          capabilities: selected.capabilities ?? [],
+          capabilities: legacyCapabilitiesForGrants(selected.integrationGrants ?? []),
           network: {
             default: selected.network?.default === "allow" ? "allow" : "deny",
             allowHosts: selected.network?.allowHosts ?? [],
