@@ -740,7 +740,12 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
     // at most one Deliver op survives per session. Never lossy — the
     // outbox rows are the durable state, and the shim's rescan
     // re-enqueues if this op dies fenced mid-drain.
-    match state.services.meta.op_cancel_queued(id, OpKind::Deliver).await {
+    match state
+        .services
+        .meta
+        .op_cancel_queued(id, OpKind::Deliver)
+        .await
+    {
         Ok(true) => {
             tracing::debug!(session_id = %id, "deliver op: cancelled queued duplicate deliver ops");
         }

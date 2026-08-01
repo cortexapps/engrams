@@ -811,10 +811,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     };
     drop(heartbeat);
     let meta = &state.services.meta;
-    let terminal = !matches!(
-        outcome,
-        OpOutcome::Retry(_) | OpOutcome::RetryAfter(_, _)
-    );
+    let terminal = !matches!(outcome, OpOutcome::Retry(_) | OpOutcome::RetryAfter(_, _));
     let finished_done = matches!(outcome, OpOutcome::Done);
     let _ = match outcome {
         OpOutcome::Done => meta.op_finish(op.id, epoch, OpState::Done, None).await,

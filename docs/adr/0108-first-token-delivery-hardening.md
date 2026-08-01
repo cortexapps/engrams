@@ -133,6 +133,40 @@ interrupt on client run state, and thread an interrupt `source` tag onto the
 - A6 is a behavior change to `start_agent` (carries the initial prompt) and
   needs a harness re-bake. Double delivery is safe by dedup.
 
+## Findings from the swarm work (2026-07-31)
+
+Building the attach plane and oracles surfaced three coordinator defects:
+
+1. **Fixed in this PR (measured mechanism):** a claim-loop livelock in
+   `drive_session`. When every op attempt burns more virtual time than
+   its requeue delay (a down host: 3600 s evict burns, 120 s deliver
+   deadline burns, against a ≤60 s-capped backoff), each requeue leaves
+   the sibling already due and the loop never runs dry — the scheduler
+   stuck inside one step for 2.5 virtual years (640k claims on one op,
+   seed 33043259). Duplicate budget-less Deliver ops were the unbounded
+   fuel (the shim's pending-op guard is advisory). Fix: both retry arms
+   requeue with `attempt_elapsed + delay` (strictly additive pacing — a
+   claim cycle provably terminates), and the Deliver verb sweeps queued
+   duplicate Deliver ops at claim (outbox rows stay the durable state,
+   so the sweep is never lossy). An earlier `max(delay, elapsed)` clamp
+   on the `RetryAfter` arm alone was a measured no-op: the churn goes
+   through the `Retry` arm, and `max()` recreates the already-due
+   boundary at equality.
+2. **Follow-up:** a queued Deliver op starves the EvacResumer. The
+   exclusive claim treats ANY queued op as a busy lane, so an Evacuating
+   session that holds an undelivered prompt is never claimed — evacuation
+   starves. Needs a due-gated exclusive claim (with the ADR 0098 D4
+   conformance pass) or a Deliver verb that releases the lane on
+   Evacuating.
+3. **Follow-up:** the Deliver verb's Evicting rung-ascent cancels the
+   queued evict op on every retry, so an Evicting session whose VM is
+   gone never accumulates the attempt budget that routes it to the
+   HostLost fallback (issue #762 path).
+
+Until (2) and (3) land, the swarm's prompt step keeps its synthetic
+in-step ack and the attach plane's Idle announcement is scenario-opt-in;
+the attach gating, dial faults, and both oracles are always on.
+
 ## Rollout
 
 One PR carries this ADR (Proposed) plus A1–A5, B, the interrupt-attribution
