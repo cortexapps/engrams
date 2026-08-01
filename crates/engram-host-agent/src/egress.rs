@@ -128,6 +128,7 @@ impl HostEgress {
         ca_source: Arc<dyn CaSource>,
         bind_addr: SocketAddr,
         dns_bind_addr: Option<SocketAddr>,
+        metadata_bind_addr: Option<SocketAddr>,
         observe_sink: Option<engram_egress_proxy::ObserveSink>,
         inject_refresher: Option<Arc<dyn InjectRefresher>>,
     ) -> Result<Self, EgressError> {
@@ -146,6 +147,7 @@ impl HostEgress {
 
         let mut proxy_cfg = ProxyConfig::new(bind_addr, registry.clone(), mint);
         proxy_cfg.dns_bind_addr = dns_bind_addr;
+        proxy_cfg.metadata_bind_addr = metadata_bind_addr;
         proxy_cfg.observe_sink = observe_sink;
         proxy_cfg.inject_refresher = inject_refresher;
         let proxy = Proxy::new(proxy_cfg);
@@ -335,6 +337,7 @@ pub fn register_policy(
         secrets,
         injects,
         observes,
+        google_adc: policy.google_adc,
     });
     Ok(())
 }
@@ -365,7 +368,6 @@ mod tests {
                 network_allow_hosts: vec![],
                 network_allow_host_patterns: vec![],
                 allow_all: false,
-                google_adc: false,
                 secrets: vec![],
                 injects: vec![
                     EgressInjectEntry {
@@ -440,6 +442,7 @@ mod tests {
                         }),
                     },
                 ],
+                google_adc: false,
                 secret_mode: SecretMode::Broker,
             },
         )

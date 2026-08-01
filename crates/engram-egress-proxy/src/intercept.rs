@@ -83,6 +83,12 @@ pub enum InterceptError {
     InjectHeader(crate::inject::InjectHeaderError),
     InvalidServerName(String),
     InvalidInjectedHeader(String),
+    /// Google API calls that create reusable credentials are never a guest
+    /// surface, even when a broad endpoint policy matches.
+    CredentialRequestRejected {
+        method: String,
+        path: String,
+    },
 }
 
 impl std::fmt::Display for InterceptError {
@@ -115,6 +121,12 @@ impl std::fmt::Display for InterceptError {
             Self::InvalidServerName(s) => write!(f, "invalid SNI `{s}`"),
             Self::InvalidInjectedHeader(name) => {
                 write!(f, "invalid injected HTTP header `{name}`")
+            }
+            Self::CredentialRequestRejected { method, path } => {
+                write!(
+                    f,
+                    "credential-producing Google API request rejected: {method} {path}"
+                )
             }
         }
     }
@@ -325,6 +337,12 @@ where
         inject::request_line(&prefix).ok_or(InterceptError::MalformedRequest)?;
     if !request_target_is_origin_form(&parsed_request_line.1) {
         return Err(InterceptError::InvalidRequestTarget);
+    }
+    if rejects_google_credential_request(sni, &parsed_request_line.0, &parsed_request_line.1) {
+        return Err(InterceptError::CredentialRequestRejected {
+            method: parsed_request_line.0.clone(),
+            path: path_without_query(&parsed_request_line.1).to_string(),
+        });
     }
 
     // Parse the request line once if any inject/observe gating needs it
@@ -600,6 +618,10 @@ async fn process_h2_stream(
         .uri()
         .path_and_query()
         .map_or_else(|| "/".to_string(), ToString::to_string);
+    if rejects_google_credential_request(context.sni, &method, &path) {
+        deny_h2(&mut respond, http::StatusCode::FORBIDDEN)?;
+        return Ok(());
+    }
     let is_graphql = context
         .injects
         .iter()
@@ -1012,6 +1034,80 @@ impl<'a> PlaceholderTransformer<'a> {
         self.pending.drain(..cursor);
         Ok(output)
     }
+}
+
+/// Google STS and OAuth are never guest surfaces. IAM credential minting is
+/// denied even when an administrator selects a broad Google API endpoint.
+fn rejects_google_credential_request(sni: &str, method: &str, path: &str) -> bool {
+    if sni.eq_ignore_ascii_case("sts.googleapis.com")
+        || sni.eq_ignore_ascii_case("oauth2.googleapis.com")
+        || sni.eq_ignore_ascii_case("accounts.google.com")
+        || sni.eq_ignore_ascii_case("securetoken.googleapis.com")
+        || sni.eq_ignore_ascii_case("iamcredentials.googleapis.com")
+    {
+        return true;
+    }
+    let operation_path = normalized_operation_path(path);
+    if sni.to_ascii_lowercase().ends_with(".googleapis.com")
+        && [
+            ":generateaccesstoken",
+            ":generateidtoken",
+            ":signblob",
+            ":signjwt",
+        ]
+        .iter()
+        .any(|operation| operation_path.ends_with(operation))
+    {
+        return true;
+    }
+    if sni.eq_ignore_ascii_case("www.googleapis.com")
+        && operation_path.starts_with("/oauth2/")
+        && operation_path.ends_with("/token")
+    {
+        return true;
+    }
+    if !method.eq_ignore_ascii_case("POST") {
+        return false;
+    }
+    (sni.eq_ignore_ascii_case("iam.googleapis.com")
+        && (operation_path.contains("/serviceaccountkeys")
+            || (operation_path.contains("/serviceaccounts/") && operation_path.ends_with("/keys"))))
+        || (sni.eq_ignore_ascii_case("identitytoolkit.googleapis.com")
+            && [":signin", ":signup"]
+                .iter()
+                .any(|operation| operation_path.contains(operation)))
+}
+
+fn normalized_operation_path(path: &str) -> String {
+    let mut current = path.split('?').next().unwrap_or(path).as_bytes().to_vec();
+    // A Google frontend can decode percent escapes while it routes a
+    // transcoded API method. Check nested encodings before that router does.
+    for _ in 0..3 {
+        let mut decoded = Vec::with_capacity(current.len());
+        let mut index = 0;
+        while index < current.len() {
+            if current[index] == b'%' && index + 2 < current.len() {
+                let high = (current[index + 1] as char).to_digit(16);
+                let low = (current[index + 2] as char).to_digit(16);
+                if let (Some(high), Some(low)) = (high, low) {
+                    decoded.push(((high << 4) | low) as u8);
+                    index += 3;
+                    continue;
+                }
+            }
+            decoded.push(current[index]);
+            index += 1;
+        }
+        if decoded == current {
+            break;
+        }
+        current = decoded;
+    }
+    String::from_utf8_lossy(&current).to_ascii_lowercase()
+}
+
+fn path_without_query(path: &str) -> &str {
+    path.split('?').next().unwrap_or(path)
 }
 
 fn upstream_authority(sni: &str, port: u16) -> String {
@@ -1459,6 +1555,51 @@ mod hardening_tests {
         output.extend(transformer.push(b"placeholder-after", false).unwrap());
         output.extend(transformer.push(&[], true).unwrap());
         assert_eq!(output, b"before-host-secret-after");
+    }
+
+    #[test]
+    fn denies_google_credential_production_even_through_encoded_routes() {
+        for host in [
+            "sts.googleapis.com",
+            "oauth2.googleapis.com",
+            "accounts.google.com",
+            "securetoken.googleapis.com",
+            "iamcredentials.googleapis.com",
+        ] {
+            assert!(rejects_google_credential_request(host, "GET", "/"));
+        }
+        for operation in [
+            ":generateAccessToken",
+            ":generateIdToken",
+            ":signBlob",
+            ":signJwt",
+        ] {
+            assert!(rejects_google_credential_request(
+                "iam.googleapis.com",
+                "POST",
+                &format!("/v1/projects/-/serviceAccounts/account@example.com{operation}")
+            ));
+        }
+        assert!(rejects_google_credential_request(
+            "compute.googleapis.com",
+            "POST",
+            "/v1/projects/p/serviceAccounts/a%253AgenerateAccessToken"
+        ));
+        assert!(rejects_google_credential_request(
+            "iam.googleapis.com",
+            "POST",
+            "/v1/projects/p/serviceAccounts/account@example.com/keys"
+        ));
+        assert!(rejects_google_credential_request(
+            "identitytoolkit.googleapis.com",
+            "POST",
+            "/v1/accounts:signInWithCustomToken"
+        ));
+        assert!(!rejects_google_credential_request(
+            "compute.googleapis.com",
+            "POST",
+            "/compute/v1/projects/p/zones/z/instances/i/start"
+        ));
     }
 
     #[tokio::test]

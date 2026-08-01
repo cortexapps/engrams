@@ -1458,6 +1458,9 @@ fn kill_exec_process_group(pgid: Option<u32>, exec_id: &str) -> Result<(), Sandb
 #[cfg(test)]
 mod tests {
     use super::*;
+    use engram_core::types::egress::SessionEgressPolicy;
+    use engram_core::types::image::SecretMode;
+    use engram_core::SessionId;
     use std::fs;
 
     fn backend() -> (ProcessBackend, tempfile::TempDir) {
@@ -1495,6 +1498,31 @@ mod tests {
             stderr_offset: None,
             wake: None,
         }
+    }
+
+    #[tokio::test]
+    async fn rejects_google_adc_without_metadata_interception() {
+        let (backend, _dir) = backend();
+        let error = backend
+            .notify_session_policy(SessionEgressPolicy {
+                session_id: SessionId::new(),
+                sandbox_id: SandboxId::new(),
+                guest_ip: std::net::Ipv4Addr::LOCALHOST,
+                network_allow_hosts: Vec::new(),
+                network_allow_host_patterns: Vec::new(),
+                allow_all: false,
+                secrets: Vec::new(),
+                injects: Vec::new(),
+                observes: Vec::new(),
+                google_adc: true,
+                secret_mode: SecretMode::Broker,
+            })
+            .await
+            .expect_err("Process must reject Google ADC without metadata interception");
+
+        assert!(error
+            .to_string()
+            .contains("requires host egress metadata interception"));
     }
 
     fn durable_exec(exec_id: &str, argv: &[&str]) -> ExecRequest {

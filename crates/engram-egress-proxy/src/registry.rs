@@ -52,6 +52,8 @@ pub struct SessionState {
     /// emits an `IntegrationAsset` (the side-effect ⟹ event invariant). An
     /// observe-only host (no secret, no inject) is MITM'd purely to observe.
     pub observes: Vec<ObserveEntry>,
+    /// Serve the metadata-compatible Google ADC endpoint for this session.
+    pub google_adc: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -73,8 +75,8 @@ pub struct SecretEntry {
 /// `header_name: <header_template with "{}" → secret>`. The secret lives
 /// only in this struct, on the host.
 ///
-/// WS4: the credential is *refreshable*. A minted entry (`mint_source`
-/// present) carries a short-lived credential (a GitHub App installation
+/// The credential is refreshable. A minted entry (`mint_source` present)
+/// carries a short-lived credential (a GitHub App installation
 /// token, ~1h TTL) that the proxy re-mints via its [`InjectRefresher`] seam
 /// near expiry — closing the campaign's reads-401/writes-succeed asymmetry
 /// where the boot-time inject token was minted ONCE and went stale ~1h later.
@@ -87,9 +89,9 @@ pub struct InjectEntry {
     pub allow: HostList,
     /// Request shapes this injection gates + applies to.
     pub policy: RequestPolicy,
-    /// WS4: the source that minted this credential, or `None` for a static,
-    /// non-refreshable secret. A present source means that the proxy
-    /// re-mints `cred` via the [`InjectRefresher`] near expiry.
+    /// The typed provider or named-connection source for this credential.
+    /// `None` marks a static, non-refreshable secret. A source makes the proxy
+    /// re-mint `cred` through [`InjectRefresher`] near expiry.
     pub mint_source: Option<CredentialMintSource>,
     /// WS4: the refreshable credential cell. [`Self::secret`] reads the current
     /// value; [`Self::refresh_if_stale`] re-mints it (single-flighted) when a
@@ -285,8 +287,17 @@ impl RequestPolicy {
     }
 
     /// Glob path match over the whole path; empty `path_globs` = any path.
+    /// An internal `segment:` prefix makes each `*` stop at `/`. Google Cloud
+    /// policies use this stricter form so a resource segment cannot absorb a
+    /// nested API action.
     pub fn path_matches(&self, path: &str) -> bool {
-        self.path_globs.is_empty() || self.path_globs.iter().any(|p| glob_match(p, path))
+        self.path_globs.is_empty()
+            || self.path_globs.iter().any(|pattern| {
+                pattern.strip_prefix("segment:").map_or_else(
+                    || glob_match(pattern, path),
+                    |pattern| segment_glob_match(pattern, path),
+                )
+            })
     }
 }
 
@@ -295,6 +306,15 @@ impl RequestPolicy {
 /// recursion blow-up). `*` is the only metacharacter — connector match paths use
 /// nothing else.
 fn glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_with(pattern, text, true)
+}
+
+/// Google resource-path glob: `*` matches within one `/`-delimited segment.
+fn segment_glob_match(pattern: &str, text: &str) -> bool {
+    glob_match_with(pattern, text, false)
+}
+
+fn glob_match_with(pattern: &str, text: &str, star_matches_slash: bool) -> bool {
     let p = pattern.as_bytes();
     let t = text.as_bytes();
     let (mut pi, mut ti) = (0usize, 0usize);
@@ -310,6 +330,9 @@ fn glob_match(pattern: &str, text: &str) -> bool {
             ti += 1;
         } else if let Some(s) = star {
             // Mismatch under a `*`: let the `*` swallow one more char of `text`.
+            if !star_matches_slash && t[star_ti] == b'/' {
+                return false;
+            }
             pi = s + 1;
             star_ti += 1;
             ti = star_ti;
@@ -544,6 +567,7 @@ mod tests {
                 fetchable: Some("$.resp.html_url".into()),
                 url_fallback: None,
             }],
+            google_adc: false,
         }
     }
 
@@ -676,7 +700,7 @@ mod tests {
 
     #[tokio::test]
     async fn static_entry_never_refreshes() {
-        // No mint source means a static secret, even when a refresher is present.
+        // No mint source means a static secret, so refresh is a no-op.
         let e = InjectEntry {
             mint_source: None,
             ..mint_entry("static", None)
@@ -704,6 +728,48 @@ mod tests {
         e.refresh_if_stale(SessionId::new(), &r).await;
         assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
         assert_eq!(e.secret(), "current");
+    }
+
+    #[tokio::test]
+    async fn connection_entry_keeps_a_fresh_launch_time_credential() {
+        let e = InjectEntry {
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "connection-1".into(),
+                provider: "gcp".into(),
+            }),
+            ..mint_entry("current", Some(Utc::now() + Duration::hours(1)))
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: Some(RefreshedInject {
+                secret: "revalidated".into(),
+                expires_at: Utc::now() + Duration::hours(1),
+            }),
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert_eq!(e.secret(), "current");
+    }
+
+    #[tokio::test]
+    async fn connection_entry_uses_stale_credential_when_refresh_fails() {
+        let e = InjectEntry {
+            mint_source: Some(CredentialMintSource::Connection {
+                connection_id: "connection-1".into(),
+                provider: "gcp".into(),
+            }),
+            ..mint_entry(
+                "still-valid-but-disabled",
+                Some(Utc::now() + Duration::minutes(1)),
+            )
+        };
+        let r = StubRefresher {
+            calls: Default::default(),
+            result: None,
+        };
+        e.refresh_if_stale(SessionId::new(), &r).await;
+        assert_eq!(r.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(e.secret(), "still-valid-but-disabled");
     }
 
     #[tokio::test]
@@ -773,5 +839,16 @@ mod tests {
         // A bare `*` mid-pattern that must backtrack to a later literal.
         assert!(glob_match("/a/*/b", "/a/x/y/b"));
         assert!(!glob_match("/a/*/b", "/a/x/y/c"));
+
+        // Google resource patterns use segment globs. A resource wildcard must
+        // not authorize a nested action or subresource.
+        assert!(segment_glob_match(
+            "/compute/v1/projects/*/zones/*/instances/*",
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1"
+        ));
+        assert!(!segment_glob_match(
+            "/compute/v1/projects/*/zones/*/instances/*",
+            "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1/start"
+        ));
     }
 }

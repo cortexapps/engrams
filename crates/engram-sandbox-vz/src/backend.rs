@@ -71,12 +71,12 @@ pub struct VzConfig {
     /// engram arm64 kernel Image (ADR 0025/0096 — the same owned
     /// config prod's FC guests boot).
     pub kernel_path: PathBuf,
-    /// ADR 0096 D6: host egress proxy + DNS-proxy ports, passed to the
-    /// guest as `ENGRAM_EGRESS=<proxy>:<dns>` on the kernel cmdline so
-    /// the init shim installs the in-guest DNAT redirect (SOFT
-    /// enforcement — see the shim). `None` (tests, ad-hoc) boots with
-    /// open egress and no cmdline token.
-    pub egress_ports: Option<(u16, u16)>,
+    /// ADR 0096 D6: host egress, DNS, and metadata-proxy ports, passed
+    /// to the guest as `ENGRAM_EGRESS=<proxy>:<dns>:<metadata>` on the
+    /// kernel cmdline so the init shim installs in-guest DNAT redirects
+    /// (SOFT enforcement — see the shim). `None` (tests, ad-hoc) boots
+    /// with open egress and no cmdline token.
+    pub egress_ports: Option<(u16, u16, u16)>,
     /// Default RAM in MiB applied when `SandboxSpec::memory.max_mib`
     /// is zero or unset. VZ minimum is 128 MiB.
     pub default_memory_mib: u32,
@@ -111,8 +111,8 @@ impl VzConfig {
 
     /// ADR 0096 D6: pass the host egress proxy + DNS-proxy ports into
     /// every guest (in-guest soft steering).
-    pub fn with_egress_ports(mut self, proxy: u16, dns: u16) -> Self {
-        self.egress_ports = Some((proxy, dns));
+    pub fn with_egress_ports(mut self, proxy: u16, dns: u16, metadata: u16) -> Self {
+        self.egress_ports = Some((proxy, dns, metadata));
         self
     }
 }
