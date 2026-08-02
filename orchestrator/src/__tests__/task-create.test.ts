@@ -651,7 +651,7 @@ describe("compileSessionCreateInput", () => {
       isDefault: false,
       config: {
         workloadIdentityProvider:
-          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/dev",
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/engrams-dev",
         serviceAccountEmail: "dev-vm@example-project.iam.gserviceaccount.com",
         endpoints: ["compute.googleapis.com", "tunnel.cloudproxy.app"],
       },

@@ -331,6 +331,25 @@ describe("IntegrationService (native)", () => {
       expect(setup.gcloudScript).toContain("roles/iam.workloadIdentityUser");
       expect(setup.terraform).not.toContain("private_key");
 
+      // An operator pastes this into a shell. Without `set -euo pipefail` a
+      // failed pool creation is invisible — the next command runs anyway and
+      // the script "succeeds" with a half-built pool.
+      expect(setup.gcloudScript.startsWith("#!/usr/bin/env bash\nset -euo pipefail\n")).toBe(true);
+      // Re-running the setup is the normal thing to do after editing
+      // endpoints, so creation is describe-then-create rather than an
+      // ALREADY_EXISTS error.
+      expect(setup.gcloudScript).toContain("workload-identity-pools describe engrams");
+      expect(setup.gcloudScript).toContain("workload-identity-pools providers describe prod");
+
+      // Terraform resource names are ADDRESSES. Two connections in one project
+      // both emitted `...engrams`, so applying the second setup silently
+      // redefined the first. The address is derived from the provider id.
+      expect(setup.terraform).toContain('resource "google_iam_workload_identity_pool" "engrams_prod"');
+      expect(setup.terraform).toContain(
+        'workload_identity_pool_id          = google_iam_workload_identity_pool.engrams_prod.workload_identity_pool_id',
+      );
+      expect(setup.terraform).not.toContain('"google_iam_workload_identity_pool" "engrams"\n');
+
       expect((await s.client.testConnection({ id })).ok).toBe(true);
       expect(exchanged).toEqual([id]);
       expect((await s.client.setConnectionEnabled({ id, enabled: true })).connection!.enabled).toBe(true);

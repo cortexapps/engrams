@@ -45,6 +45,18 @@ export function googleOidcAudience(provider: string): string {
     : `//iam.googleapis.com/${provider.replace(/^\/+/, "")}`;
 }
 
+/**
+ * A full workload-identity provider resource.
+ *
+ * Google's own rule for a pool id and a provider id is 4-32 characters of
+ * lowercase letters, digits and hyphens, starting with a letter. The looser
+ * `[a-z0-9-]+` this used to allow accepted ids Google rejects — a one-character
+ * id, or one starting with a digit or a hyphen — so the connection stored
+ * cleanly and only failed later, during the operator's `gcloud` run.
+ */
+const WIF_PROVIDER_RESOURCE =
+  /^\/\/iam\.googleapis\.com\/projects\/[0-9]+\/locations\/global\/workloadIdentityPools\/[a-z][a-z0-9-]{3,31}\/providers\/[a-z][a-z0-9-]{3,31}$/;
+
 export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleCloudConnectionConfig {
   const allowedKeys = new Set(["workloadIdentityProvider", "serviceAccountEmail", "endpoints"]);
   const unknownKeys = Object.keys(value).filter((key) => !allowedKeys.has(key));
@@ -56,9 +68,18 @@ export function assertGoogleCloudConfig(value: Record<string, unknown>): GoogleC
   const endpoints = value.endpoints;
   if (
     typeof workloadIdentityProvider !== "string" ||
-    !/^\/\/iam\.googleapis\.com\/projects\/[0-9]+\/locations\/global\/workloadIdentityPools\/[a-z0-9-]+\/providers\/[a-z0-9-]+$/.test(workloadIdentityProvider)
+    !WIF_PROVIDER_RESOURCE.test(workloadIdentityProvider)
   ) {
     throw new Error("workload identity provider must be a full Google provider resource");
+  }
+  // Google reserves the `gcp-` prefix on both ids. A resource string carrying
+  // one can never be created, so accepting it here only defers the failure to
+  // the operator's `gcloud` run, after the connection is already stored.
+  const reserved = workloadIdentityProvider
+    .split("/")
+    .some((segment) => segment.startsWith("gcp-"));
+  if (reserved) {
+    throw new Error("Google reserves the `gcp-` prefix for pool and provider ids");
   }
   if (
     typeof serviceAccountEmail !== "string" ||

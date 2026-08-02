@@ -232,6 +232,11 @@ function googleSetup(row: IntegrationConnectionRow, issuer: string, deploymentId
   );
   if (!match) throw new Error("stored Google provider resource is invalid");
   const [, projectNumber, poolId, providerId] = match;
+  // Terraform resource names are addresses, not labels: two connections in the
+  // same project used to emit `google_iam_workload_identity_pool.engrams`
+  // twice, so applying the second setup silently redefined the first. Derive
+  // the address from the provider id, which is already unique per connection.
+  const tfName = `engrams_${providerId!.replace(/-/g, "_")}`;
   // `engrams_organization` carries the deployment id (the issuer URL already
   // rides in `issuer_uri`, so pinning the URL again added nothing).
   const condition =
@@ -246,20 +251,33 @@ function googleSetup(row: IntegrationConnectionRow, issuer: string, deploymentId
     `workloadIdentityPools/${poolId}/attribute.engrams_connection/${row.id}`;
   return {
     audience: google.workloadIdentityProvider,
+    // An operator pastes this into a shell. Without a shebang the lines run
+    // under whatever shell they happen to use, and without `set -euo pipefail`
+    // a failed pool creation is invisible: the next command runs anyway and the
+    // script "succeeds" with a half-built pool. Pool and provider creation are
+    // describe-then-create so re-running the setup — the normal thing to do
+    // after editing endpoints — is not an ALREADY_EXISTS error.
     gcloudScript: [
-      `gcloud iam workload-identity-pools create ${poolId} --location=global --project=${projectNumber}`,
-      `gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
+      `#!/usr/bin/env bash`,
+      `set -euo pipefail`,
+      ``,
+      `gcloud iam workload-identity-pools describe ${poolId} --location=global --project=${projectNumber} >/dev/null 2>&1 ||`,
+      `  gcloud iam workload-identity-pools create ${poolId} --location=global --project=${projectNumber}`,
+      ``,
+      `gcloud iam workload-identity-pools providers describe ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} >/dev/null 2>&1 ||`,
+      `  gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
+      ``,
       `gcloud iam service-accounts add-iam-policy-binding ${google.serviceAccountEmail} --project=${projectNumber} --role=roles/iam.workloadIdentityUser --member=${principalSet}`,
     ].join("\n"),
     terraform: [
-      `resource "google_iam_workload_identity_pool" "engrams" {`,
+      `resource "google_iam_workload_identity_pool" "${tfName}" {`,
       `  project                   = "${projectNumber}"`,
       `  workload_identity_pool_id = "${poolId}"`,
       `}`,
       ``,
-      `resource "google_iam_workload_identity_pool_provider" "engrams" {`,
+      `resource "google_iam_workload_identity_pool_provider" "${tfName}" {`,
       `  project                            = "${projectNumber}"`,
-      `  workload_identity_pool_id          = google_iam_workload_identity_pool.engrams.workload_identity_pool_id`,
+      `  workload_identity_pool_id          = google_iam_workload_identity_pool.${tfName}.workload_identity_pool_id`,
       `  workload_identity_pool_provider_id = "${providerId}"`,
       `  attribute_mapping = {`,
       `    "google.subject"                 = "assertion.sub"`,
@@ -273,7 +291,7 @@ function googleSetup(row: IntegrationConnectionRow, issuer: string, deploymentId
       `  }`,
       `}`,
       ``,
-      `resource "google_service_account_iam_member" "engrams" {`,
+      `resource "google_service_account_iam_member" "${tfName}" {`,
       `  service_account_id = "projects/${projectNumber}/serviceAccounts/${google.serviceAccountEmail}"`,
       `  role               = "roles/iam.workloadIdentityUser"`,
       `  member             = "${principalSet}"`,
