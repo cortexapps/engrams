@@ -133,31 +133,40 @@ const providerHarnessCatalog = (): HarnessCatalogClient => ({
   }),
 });
 
-const fakeConnections = (): IntegrationConnectionStore => ({
-  list: async () => [],
-  get: async (id) => {
-    const provider = id.startsWith("default-") ? id.slice("default-".length) : "gcp";
-    return {
-      id,
-      alias: id,
-      provider,
-      displayName: provider,
-      isDefault: id.startsWith("default-"),
-      config: {},
-      enabled: true,
-      testedAt: new Date(0),
-      createdAt: new Date(0),
-      updatedAt: new Date(0),
-    };
-  },
-  getDefault: async (provider) => fakeConnections().get(`default-${provider}`),
-  create: async () => { throw new Error("unused"); },
-  update: async () => { throw new Error("unused"); },
-  delete: async () => { throw new Error("unused"); },
-  markTested: async () => { throw new Error("unused"); },
-  setEnabled: async () => { throw new Error("unused"); },
-  ensureDefault: async (provider) => (await fakeConnections().get(`default-${provider}`))!,
-});
+const fakeConnections = (): IntegrationConnectionStore => {
+  const store: IntegrationConnectionStore = {
+    list: async () => [],
+    get: async (id) => {
+      const provider = id.startsWith("default-") ? id.slice("default-".length) : "gcp";
+      return {
+        id,
+        alias: id,
+        provider,
+        displayName: provider,
+        isDefault: id.startsWith("default-"),
+        config: {},
+        enabled: true,
+        testedAt: new Date(0),
+        createdAt: new Date(0),
+        updatedAt: new Date(0),
+      };
+    },
+    // Self-referencing so a test that overrides `store.get` also steers the
+    // batched lookup path.
+    getMany: async (ids) => {
+      const rows = await Promise.all(ids.map((id) => store.get(id)));
+      return rows.filter((row) => row != null);
+    },
+    getDefault: async (provider) => store.get(`default-${provider}`),
+    create: async () => { throw new Error("unused"); },
+    update: async () => { throw new Error("unused"); },
+    delete: async () => { throw new Error("unused"); },
+    markTested: async () => { throw new Error("unused"); },
+    setEnabled: async () => { throw new Error("unused"); },
+    ensureDefault: async (provider) => (await store.get(`default-${provider}`))!,
+  };
+  return store;
+};
 
 // Default the user token to present ("tok") — a human (chat) run now BLOCKS when
 // the harness's declared user_env is unset, so tests exercising other
@@ -736,6 +745,65 @@ describe("compileSessionCreateInput", () => {
     )).toBe(true);
     const manifest = JSON.parse(inp.harnessEnv!.ENGRAM_TOOLS!) as Array<{ name: string }>;
     expect(manifest.map((tool) => tool.name)).toEqual(["review_tool"]);
+  });
+
+  // O10: grant resolution is batched (one getMany per distinct id set) and
+  // memoized — a create never resolves the same connection id twice.
+  test("resolves each connection id at most once per create", async () => {
+    const store = fakeConnections();
+    let singleGets = 0;
+    const batchedIds: string[] = [];
+    const baseGet = store.get;
+    store.getMany = async (ids) => {
+      batchedIds.push(...ids);
+      const rows = await Promise.all(ids.map((id) => baseGet(id)));
+      return rows.filter((row) => row != null);
+    };
+    store.get = async (id) => {
+      singleGets += 1;
+      return baseGet(id);
+    };
+
+    await compileSessionCreateInput(
+      profile({
+        integrationGrants: [defaultGrant("memory:write"), defaultGrant("engram:pr_review")],
+      }),
+      { ...deps(), connections: store },
+    );
+
+    // The profile-capability pass reuses the effective-grant rows; nothing is
+    // fetched twice and nothing falls back to per-id gets.
+    expect(new Set(batchedIds).size).toBe(batchedIds.length);
+    expect(singleGets).toBe(0);
+  });
+
+  test("capabilityOverride skips profile-grant resolution entirely", async () => {
+    const store = fakeConnections();
+    const baseGet = store.get;
+    store.get = async (id) => (id === "missing-connection" ? null : baseGet(id));
+
+    const brokenProfile = profile({
+      integrationGrants: [{
+        connectionId: "missing-connection",
+        operation: "pr_review",
+        resourceConstraints: [],
+      }],
+    });
+
+    // Without an override the broken profile grant fails the create.
+    await expect(compileSessionCreateInput(
+      brokenProfile,
+      { ...deps(), connections: store },
+    )).rejects.toThrow(/does not exist/);
+
+    // An override replaces the session authority; the unused profile grants
+    // are never resolved, so the create succeeds.
+    const inp = await compileSessionCreateInput(
+      brokenProfile,
+      { ...deps(), connections: store },
+      { capabilityOverride: ["engram:pr_review"] },
+    );
+    expect(inp.capabilities).toEqual(["engram:pr_review"]);
   });
 
   test("session clamps replace capabilities/network and drop profile secrets/env", async () => {

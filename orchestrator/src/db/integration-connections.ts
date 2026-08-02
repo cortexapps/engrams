@@ -1,6 +1,6 @@
 /** Named integration connection store (ADR 0109). */
 
-import { and, asc, eq } from "drizzle-orm";
+import { and, asc, eq, inArray } from "drizzle-orm";
 
 import { getDb } from "./client.ts";
 import { integrationConnection as connectionTable } from "./schema.ts";
@@ -34,6 +34,8 @@ export interface IntegrationConnectionInput {
 export interface IntegrationConnectionStore {
   list(): Promise<IntegrationConnectionRow[]>;
   get(id: string): Promise<IntegrationConnectionRow | null>;
+  /** Fetch a set of connections in ONE query. Missing ids are simply absent. */
+  getMany(ids: readonly string[]): Promise<IntegrationConnectionRow[]>;
   getDefault(provider: string): Promise<IntegrationConnectionRow | null>;
   create(input: IntegrationConnectionInput): Promise<IntegrationConnectionRow>;
   update(id: string, input: Omit<IntegrationConnectionInput, "provider">): Promise<IntegrationConnectionRow | null>;
@@ -85,6 +87,15 @@ export function makeIntegrationConnectionStore(
         .where(eq(connectionTable.id, id))
         .limit(1);
       return rows[0] ? toRow(rows[0]) : null;
+    },
+
+    async getMany(ids) {
+      if (ids.length === 0) return [];
+      const rows = await db
+        .select()
+        .from(connectionTable)
+        .where(inArray(connectionTable.id, [...ids]));
+      return rows.map(toRow);
     },
 
     getDefault,

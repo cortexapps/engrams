@@ -137,6 +137,9 @@ function fakeConnectionStore(seed: IntegrationConnectionRow[] = []): Integration
     async get(id) {
       return rows.get(id) ?? null;
     },
+    async getMany(ids) {
+      return ids.map((id) => rows.get(id)).filter((row) => row != null);
+    },
     async getDefault(provider) {
       const existing = [...rows.values()].find((row) =>
         row.provider === provider && row.isDefault

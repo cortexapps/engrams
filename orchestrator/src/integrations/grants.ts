@@ -11,7 +11,7 @@ import type {
 const OPERATION_RE = /^[a-z][a-z0-9_.-]*(?::[a-z][a-z0-9_.-]*)*$/;
 
 /** Credential-producing Google operations remain blocked at every layer. */
-const FORBIDDEN_GOOGLE_OPERATIONS = new Set([
+export const FORBIDDEN_GOOGLE_OPERATIONS = new Set([
   "iam.serviceaccountkeys.create",
   "iam.generateaccesstoken",
   "iam.generateidtoken",
@@ -24,15 +24,47 @@ export interface ResolvedIntegrationGrant {
   connection: IntegrationConnectionRow;
 }
 
+/**
+ * Wrap a connection store with a per-request memo so one create resolves each
+ * connection id (and each provider default) at most once. Hand the SAME
+ * wrapper to every resolution step of a request; a fresh wrapper per request
+ * keeps rows from leaking across requests.
+ */
+export function withConnectionMemo(store: IntegrationConnectionStore): IntegrationConnectionStore {
+  const byId = new Map<string, IntegrationConnectionRow | null>();
+  const defaults = new Map<string, IntegrationConnectionRow | null>();
+  return {
+    ...store,
+    async get(id) {
+      if (!byId.has(id)) byId.set(id, await store.get(id));
+      return byId.get(id)!;
+    },
+    async getMany(ids) {
+      const missing = ids.filter((id) => !byId.has(id));
+      if (missing.length > 0) {
+        const rows = await store.getMany(missing);
+        const found = new Map(rows.map((row) => [row.id, row]));
+        for (const id of missing) byId.set(id, found.get(id) ?? null);
+      }
+      return ids
+        .map((id) => byId.get(id))
+        .filter((row): row is IntegrationConnectionRow => row != null);
+    },
+    async getDefault(provider) {
+      if (!defaults.has(provider)) defaults.set(provider, await store.getDefault(provider));
+      return defaults.get(provider)!;
+    },
+  };
+}
+
 export async function resolveIntegrationGrants(
   grants: readonly ProfileIntegrationGrant[],
   connections: IntegrationConnectionStore,
 ): Promise<ResolvedIntegrationGrant[]> {
   const uniqueIds = [...new Set(grants.map((grant) => grant.connectionId))];
-  const rows = await Promise.all(uniqueIds.map((id) => connections.get(id)));
-  const byId = new Map(
-    rows.filter((row): row is IntegrationConnectionRow => row != null).map((row) => [row.id, row]),
-  );
+  // ONE query for the whole grant set — not one per connection id.
+  const rows = uniqueIds.length > 0 ? await connections.getMany(uniqueIds) : [];
+  const byId = new Map(rows.map((row) => [row.id, row]));
 
   return grants.map((grant) => {
     const connection = byId.get(grant.connectionId);

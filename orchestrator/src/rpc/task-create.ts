@@ -61,6 +61,7 @@ import {
   defaultConnectionGrants,
   grantsToCapabilities,
   resolveIntegrationGrants,
+  withConnectionMemo,
 } from "../integrations/grants.ts";
 import { appendGooglePolicy } from "../integrations/google-policy.ts";
 
@@ -377,21 +378,19 @@ export async function compileSessionCreateInput(
     }
   }
   const registry = await loadRegistry(deps.connectors);
-  const resolvedProfileGrants = await resolveIntegrationGrants(
-    profile.integrationGrants,
-    deps.connections,
-  );
-  const profileCapabilities = grantsToCapabilities(resolvedProfileGrants);
+  // One memo per create: every grant-resolution step below reuses the rows the
+  // first step fetched, so a create resolves each connection id exactly once.
+  const connections = withConnectionMemo(deps.connections);
   const overrideGrants = await defaultConnectionGrants(
     opts.capabilityOverride ?? opts.extraCapabilities ?? [],
-    deps.connections,
+    connections,
   );
   const effectiveGrants = opts.capabilityOverride !== undefined
     ? overrideGrants
     : [...profile.integrationGrants, ...overrideGrants];
   const resolvedEffectiveGrants = await resolveIntegrationGrants(
     effectiveGrants,
-    deps.connections,
+    connections,
   );
   const disabledConnection = resolvedEffectiveGrants.find(({ connection }) => !connection.enabled);
   if (disabledConnection) {
@@ -405,9 +404,12 @@ export async function compileSessionCreateInput(
   // A capability override is the complete session authority and therefore
   // also owns its CLI/tool surface. Without one, preserve the narrower
   // profile-owned surface: extra integration grants do not add model tools.
+  // The profile-only resolution is LAZY: under an override it never runs (its
+  // result would be unused), and without one the memo makes it query-free
+  // (profile grants are a subset of the effective grants resolved above).
   const surfacedCapabilities = opts.capabilityOverride !== undefined
     ? capabilities
-    : profileCapabilities;
+    : grantsToCapabilities(await resolveIntegrationGrants(profile.integrationGrants, connections));
   const cliPlan = compileCliIntegrations(surfacedCapabilities, registry);
   for (const [k, v] of Object.entries(cliPlan.dummyEnv)) harness[k] = v;
   const enabledCli = [
