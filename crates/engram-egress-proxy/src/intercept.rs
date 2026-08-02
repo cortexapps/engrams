@@ -38,12 +38,20 @@ use crate::replayed::Replayed;
 use crate::resolver::{ResolveError, UpstreamResolver};
 use crate::substitute::{scan_for_violation, substitute};
 
-/// Cap on the request prefix we buffer before falling back to
-/// straight relay. 1 MiB covers every reasonable case — headers +
-/// JSON bodies are tens of KiB at the high end. Streaming uploads
-/// past this mark just don't get scanned (and a streaming upload
-/// with a placeholder at byte 1M+1 is not a realistic attack).
-const SCAN_BUDGET: usize = 1024 * 1024;
+/// Cap on the HTTP/1 request header block. The block MUST terminate inside this
+/// bound: every gate in this module (authority pinning, injected-header
+/// overwrite, the credential scan) walks only the buffered head, so a header
+/// that lands past the bound would reach the upstream unexamined. A guest that
+/// pads its headers past the bound is rejected, not relayed. 64 KiB is far
+/// above every real client — nginx, Google and GitHub all reject larger heads.
+const REQUEST_HEAD_BUDGET: usize = 64 * 1024;
+
+/// Cap on a request body we buffer in full so placeholder substitution can
+/// rewrite `Content-Length`. A body past this cap streams **unsubstituted**:
+/// the declared length then stays correct because the bytes are untouched.
+/// (A placeholder is not itself a secret, so relaying one to a permitted host
+/// is a failed API call, never a leak.)
+const REQUEST_BODY_BUDGET: usize = 1024 * 1024;
 
 /// ADR 0059: cap on the GraphQL request body we buffer before gating. A GraphQL
 /// endpoint's body must be read in full before we can decide (we cannot
@@ -70,6 +78,20 @@ pub enum InterceptError {
     },
     /// ADR 0056: an inject-gated request had no parseable HTTP/1.1 request line.
     MalformedRequest,
+    /// The HTTP/1 header block did not terminate inside [`REQUEST_HEAD_BUDGET`].
+    /// The gate sees only the buffered head, so a longer head would let the
+    /// remainder — a second `Host`, a guest `Authorization` — stream to the
+    /// upstream unexamined. Fail closed instead.
+    RequestHeadTooLarge,
+    /// The HTTP/1 header block used a line shape the gate cannot walk safely:
+    /// a bare LF terminator, an obsolete line fold, whitespace before the
+    /// colon, or a line with no colon. Every walker here splits on CRLF, so
+    /// these shapes are invisible to the gate but are still accepted as headers
+    /// by many upstreams — a request-smuggling primitive. `reason` is a static
+    /// tag for logs (never request bytes).
+    MalformedHeaderBlock {
+        reason: &'static str,
+    },
     /// The request target can carry an authority only in proxy form. This proxy
     /// authenticates the authority through SNI, so it accepts only origin form.
     InvalidRequestTarget,
@@ -107,6 +129,12 @@ impl std::fmt::Display for InterceptError {
             }
             Self::MalformedRequest => {
                 write!(f, "malformed HTTP/1.1 request line")
+            }
+            Self::RequestHeadTooLarge => {
+                write!(f, "HTTP/1.1 header block exceeds the inspection limit")
+            }
+            Self::MalformedHeaderBlock { reason } => {
+                write!(f, "malformed HTTP/1.1 header block: {reason}")
             }
             Self::InvalidRequestTarget => {
                 write!(f, "request target is not in origin form")
@@ -305,33 +333,21 @@ where
         .await;
     }
 
-    // Buffer the request prefix up to SCAN_BUDGET, scan for
-    // violations + substitute placeholders, then forward + bidir
-    // copy the rest.
+    // Buffer the WHOLE request head, then prove it is a shape this module's
+    // CRLF walkers read the same way the upstream does. Both steps fail closed:
+    // a head that outruns the budget, or that carries a bare LF / an obsolete
+    // fold, never reaches the upstream. Without them a guest could pad past the
+    // buffered prefix (or terminate a line with a bare LF) and smuggle its own
+    // `Host` or `Authorization` past the gate.
     let mut prefix = Vec::with_capacity(8192);
-    while prefix.len() < SCAN_BUDGET {
-        let mut chunk = [0u8; 8192];
-        let n = client_tls.read(&mut chunk).await?;
-        if n == 0 {
-            break;
-        }
-        prefix.extend_from_slice(&chunk[..n]);
-        // Don't keep buffering once the request body has clearly
-        // ended. For HTTP/1.1 a reasonable signal is a CRLF-CRLF
-        // followed by Content-Length bytes — but parsing that here
-        // would be overkill. The simple heuristic: stop once we see
-        // an `\r\n\r\n` AND the buffer is < 64 KiB (typical headers
-        // + small body). Anything bigger keeps reading.
-        if prefix.len() >= 64 * 1024
-            || (prefix.windows(4).any(|w| w == b"\r\n\r\n") && prefix.len() < 64 * 1024)
-        {
-            break;
-        }
-    }
+    let mut head_end = read_request_head(&mut client_tls, &mut prefix).await?;
+    validate_header_block(&prefix[..head_end])?;
 
     // Policy and upstream TLS identity are selected by SNI. Bind the cleartext
     // HTTP authority to that same name before any credential is attached.
-    prefix = bind_http1_authority(prefix, &upstream_authority(sni, port));
+    let bound = bind_http1_authority(std::mem::take(&mut prefix), &upstream_authority(sni, port));
+    head_end = head_end_of(&bound).ok_or(InterceptError::MalformedRequest)?;
+    prefix = bound;
 
     let parsed_request_line =
         inject::request_line(&prefix).ok_or(InterceptError::MalformedRequest)?;
@@ -376,20 +392,23 @@ where
     // `gh` (and standard GraphQL clients) send a Content-Length'd, identity-encoded
     // JSON body — chunked/compressed bodies are denied.
     let parsed_graphql: Option<ParsedGraphql> = if is_graphql {
-        let headers_end = prefix.windows(4).position(|w| w == b"\r\n\r\n").ok_or(
-            InterceptError::GraphqlRejected {
-                reason: "no header terminator",
-            },
-        )?;
-        let head = std::str::from_utf8(&prefix[..headers_end]).map_err(|_| {
+        let head = std::str::from_utf8(&prefix[..head_end]).map_err(|_| {
             InterceptError::GraphqlRejected {
                 reason: "non-utf8 headers",
             }
         })?;
         let content_length = graphql_content_length(head)?;
-        let body_start = headers_end + 4;
+        let body_start = head_end;
         let body_end = body_start + content_length;
-        read_to_content_length(&mut client_tls, &mut prefix, body_end).await?;
+        read_to_content_length(
+            &mut client_tls,
+            &mut prefix,
+            body_end,
+            InterceptError::GraphqlRejected {
+                reason: "truncated graphql body",
+            },
+        )
+        .await?;
         let body = &prefix[body_start..body_end];
         Some(
             graphql::parse_request_body(body).ok_or(InterceptError::GraphqlRejected {
@@ -458,7 +477,7 @@ where
             placeholder: ph.to_string(),
         });
     }
-    prefix = substitute(prefix, sni, secrets);
+    prefix = substitute_request(&mut client_tls, prefix, sni, secrets).await?;
 
     // ADR 0056 (Phase 4) / 0059: observe the response for any observe spec whose
     // request shape matches — REST by (method, path); GraphQL by a top-level
@@ -1128,6 +1147,278 @@ fn request_target_is_origin_form(target: &str) -> bool {
     target == "*" || target.starts_with('/')
 }
 
+/// Offset just past the CRLFCRLF that ends the HTTP/1 header block.
+fn head_end_of(request: &[u8]) -> Option<usize> {
+    request
+        .windows(4)
+        .position(|value| value == b"\r\n\r\n")
+        .map(|start| start + 4)
+}
+
+/// Read until the whole HTTP/1 header block is buffered. Returns the offset
+/// just past the terminator; bytes already read past it stay in `prefix` as the
+/// start of the body.
+///
+/// Fails closed when the block does not terminate inside
+/// [`REQUEST_HEAD_BUDGET`], or when the guest closes the connection first. The
+/// old code stopped at a fixed 64 KiB and relayed the remainder verbatim, so a
+/// guest that padded its headers past that mark could put its own `Host` or
+/// `Authorization` beyond the gate's view.
+async fn read_request_head<C>(
+    client_tls: &mut C,
+    prefix: &mut Vec<u8>,
+) -> Result<usize, InterceptError>
+where
+    C: AsyncRead + Unpin,
+{
+    // A terminator can straddle two reads, so each pass rescans the last three
+    // bytes of the previous one. Without the cursor a byte-at-a-time guest
+    // would make this quadratic.
+    let mut searched = 0_usize;
+    loop {
+        if let Some(start) = prefix[searched..]
+            .windows(4)
+            .position(|value| value == b"\r\n\r\n")
+        {
+            return Ok(searched + start + 4);
+        }
+        searched = prefix.len().saturating_sub(3);
+        if prefix.len() >= REQUEST_HEAD_BUDGET {
+            return Err(InterceptError::RequestHeadTooLarge);
+        }
+        let mut chunk = [0_u8; 8192];
+        let read = client_tls.read(&mut chunk).await?;
+        if read == 0 {
+            return Err(InterceptError::RequestHeadTooLarge);
+        }
+        prefix.extend_from_slice(&chunk[..read]);
+    }
+}
+
+/// Prove the header block is a shape this module's CRLF walkers read the same
+/// way the upstream will. Every rejection here is a smuggling primitive:
+///
+/// - A **bare LF** terminator is invisible to a CRLF walker but is accepted as
+///   a line end by many servers, so `…\nHost: attacker\r\n` slips a second
+///   authority past the gate.
+/// - An **obsolete line fold** (a line that starts with SP or HTAB) continues
+///   the previous header for the upstream while the walker reads it as its own
+///   line — the two disagree about how many headers exist.
+/// - A **line with no colon**, or **whitespace before the colon**, is rejected
+///   by RFC 9112 §5.1 for the same reason.
+/// - `Content-Length` **and** `Transfer-Encoding` together, or two disagreeing
+///   `Content-Length` values, let the two ends disagree about where the request
+///   body ends.
+fn validate_header_block(head: &[u8]) -> Result<(), InterceptError> {
+    let mut previous = 0_u8;
+    for byte in head {
+        if *byte == b'\n' && previous != b'\r' {
+            return Err(InterceptError::MalformedHeaderBlock {
+                reason: "bare line feed",
+            });
+        }
+        previous = *byte;
+    }
+
+    let mut content_length: Option<u64> = None;
+    let mut chunked = false;
+    // Skip the request line; it is checked by `request_line` + origin-form.
+    let mut cursor = match head.windows(2).position(|value| value == b"\r\n") {
+        Some(end) => end + 2,
+        None => {
+            return Err(InterceptError::MalformedHeaderBlock {
+                reason: "no request line",
+            })
+        }
+    };
+    while cursor < head.len() {
+        let Some(relative) = head[cursor..].windows(2).position(|value| value == b"\r\n") else {
+            break;
+        };
+        let line = &head[cursor..cursor + relative];
+        cursor += relative + 2;
+        if line.is_empty() {
+            break; // the blank line that ends the block
+        }
+        if line[0] == b' ' || line[0] == b'\t' {
+            return Err(InterceptError::MalformedHeaderBlock {
+                reason: "obsolete line fold",
+            });
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            return Err(InterceptError::MalformedHeaderBlock {
+                reason: "header line without a colon",
+            });
+        };
+        let name = &line[..colon];
+        if name.last().is_some_and(|byte| byte.is_ascii_whitespace()) {
+            return Err(InterceptError::MalformedHeaderBlock {
+                reason: "whitespace before the header colon",
+            });
+        }
+        let value = line[colon + 1..].trim_ascii();
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            chunked = true;
+        } else if name.eq_ignore_ascii_case(b"content-length") {
+            let parsed = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or(InterceptError::MalformedHeaderBlock {
+                    reason: "unparseable content-length",
+                })?;
+            if content_length
+                .replace(parsed)
+                .is_some_and(|first| first != parsed)
+            {
+                return Err(InterceptError::MalformedHeaderBlock {
+                    reason: "conflicting content-length",
+                });
+            }
+        }
+    }
+    if chunked && content_length.is_some() {
+        return Err(InterceptError::MalformedHeaderBlock {
+            reason: "content-length with transfer-encoding",
+        });
+    }
+    Ok(())
+}
+
+/// How the request declares the end of its body. Read from an already-validated
+/// header block, so the shapes that disagree with the upstream are gone.
+enum RequestBodyFraming {
+    None,
+    ContentLength(usize),
+    Chunked,
+}
+
+fn request_body_framing(head: &[u8]) -> RequestBodyFraming {
+    let mut cursor = match head.windows(2).position(|value| value == b"\r\n") {
+        Some(end) => end + 2,
+        None => return RequestBodyFraming::None,
+    };
+    while cursor < head.len() {
+        let Some(relative) = head[cursor..].windows(2).position(|value| value == b"\r\n") else {
+            break;
+        };
+        let line = &head[cursor..cursor + relative];
+        cursor += relative + 2;
+        if line.is_empty() {
+            break;
+        }
+        let Some(colon) = line.iter().position(|byte| *byte == b':') else {
+            continue;
+        };
+        let name = &line[..colon];
+        let value = line[colon + 1..].trim_ascii();
+        if name.eq_ignore_ascii_case(b"transfer-encoding") {
+            return RequestBodyFraming::Chunked;
+        }
+        if name.eq_ignore_ascii_case(b"content-length") {
+            if let Some(length) = std::str::from_utf8(value)
+                .ok()
+                .and_then(|value| value.parse::<usize>().ok())
+            {
+                return RequestBodyFraming::ContentLength(length);
+            }
+        }
+    }
+    RequestBodyFraming::None
+}
+
+/// Substitute placeholders across the head AND the body, and keep the declared
+/// body length honest.
+///
+/// A real secret rarely has the same length as its placeholder, so a
+/// substitution inside the body changes the body length. HTTP/2 has a
+/// structural length and simply drops `Content-Length`; HTTP/1 does not, so a
+/// stale length truncates the request or hangs the connection (the broker-mode
+/// symptom this closes). The body is therefore buffered in full and the
+/// declared length is rewritten from what we actually send.
+///
+/// A body we cannot bound (`Transfer-Encoding: chunked`) or cannot afford
+/// (past [`REQUEST_BODY_BUDGET`]) streams **untouched**, which keeps the
+/// original length correct. A placeholder is not itself a secret, so relaying
+/// one to a permitted host costs an API call, not a credential.
+async fn substitute_request<C>(
+    client_tls: &mut C,
+    prefix: Vec<u8>,
+    sni: &str,
+    secrets: &[&SecretEntry],
+) -> Result<Vec<u8>, InterceptError>
+where
+    C: AsyncRead + Unpin,
+{
+    if secrets.is_empty() {
+        return Ok(prefix);
+    }
+    let head_end = head_end_of(&prefix).ok_or(InterceptError::MalformedRequest)?;
+    let mut prefix = prefix;
+    let buffered_body = match request_body_framing(&prefix[..head_end]) {
+        RequestBodyFraming::ContentLength(length) if length <= REQUEST_BODY_BUDGET => {
+            read_to_content_length(
+                client_tls,
+                &mut prefix,
+                head_end + length,
+                InterceptError::MalformedRequest,
+            )
+            .await?;
+            true
+        }
+        _ => false,
+    };
+    let body = prefix.split_off(head_end);
+    let head = substitute(prefix, sni, secrets);
+    if !buffered_body {
+        let mut out = head;
+        out.extend_from_slice(&body);
+        return Ok(out);
+    }
+    let body = substitute(body, sni, secrets);
+    let mut out = rewrite_content_length(&head, body.len())?;
+    out.extend_from_slice(&body);
+    Ok(out)
+}
+
+/// Rewrite the request's `Content-Length` to `length`. The header block is
+/// already validated, so exactly one `Content-Length` is present.
+fn rewrite_content_length(head: &[u8], length: usize) -> Result<Vec<u8>, InterceptError> {
+    let request_line_end = head
+        .windows(2)
+        .position(|value| value == b"\r\n")
+        .ok_or(InterceptError::MalformedRequest)?
+        + 2;
+    let mut out = Vec::with_capacity(head.len() + 8);
+    out.extend_from_slice(&head[..request_line_end]);
+    let mut cursor = request_line_end;
+    let mut rewritten = false;
+    while cursor < head.len() {
+        let Some(relative) = head[cursor..].windows(2).position(|value| value == b"\r\n") else {
+            out.extend_from_slice(&head[cursor..]);
+            break;
+        };
+        let line_end = cursor + relative;
+        let line = &head[cursor..line_end];
+        let name = line
+            .iter()
+            .position(|byte| *byte == b':')
+            .map_or(line, |colon| &line[..colon]);
+        if name.eq_ignore_ascii_case(b"content-length") {
+            out.extend_from_slice(b"Content-Length: ");
+            out.extend_from_slice(length.to_string().as_bytes());
+            out.extend_from_slice(b"\r\n");
+            rewritten = true;
+        } else {
+            out.extend_from_slice(&head[cursor..line_end + 2]);
+        }
+        cursor = line_end + 2;
+    }
+    if !rewritten {
+        return Err(InterceptError::MalformedRequest);
+    }
+    Ok(out)
+}
+
 /// Replace every guest-supplied Host header with the SNI-authenticated
 /// authority. Duplicate or mixed-case Host headers cannot select a different
 /// virtual host after policy evaluation.
@@ -1213,36 +1504,66 @@ impl Http1ResponseFraming {
         }
     }
 
-    fn push(&mut self, mut input: &[u8]) {
-        while !input.is_empty() {
+    /// Consume `input`, advancing the framing state, and record the ranges of
+    /// `input` that carry text a credential can appear in: the header block,
+    /// the chunk data, the trailers, and a close-delimited body. Chunk-size
+    /// lines and the CRLF after each chunk are **excluded** — those are
+    /// framing, and redacting inside them would corrupt the response.
+    ///
+    /// The recorded ranges are what makes redaction chunk-aware. Joined in
+    /// order they form the decoded response text, so a credential split across
+    /// a chunk boundary is one contiguous match again.
+    fn classify(&mut self, input: &[u8], scannable: &mut Vec<(usize, usize)>) {
+        let mut pos = 0;
+        while pos < input.len() {
             match &mut self.state {
                 Http1ResponseState::Headers(buffer) => {
-                    let take = input
-                        .len()
-                        .min(RESPONSE_HEADER_BUDGET.saturating_sub(buffer.len()));
-                    buffer.extend_from_slice(&input[..take]);
-                    input = &input[take..];
-                    let Some(end) = buffer.windows(4).position(|value| value == b"\r\n\r\n") else {
-                        if buffer.len() == RESPONSE_HEADER_BUDGET {
+                    let room = RESPONSE_HEADER_BUDGET.saturating_sub(buffer.len());
+                    if room == 0 {
+                        self.state = Http1ResponseState::Invalid;
+                        return;
+                    }
+                    let take = (input.len() - pos).min(room);
+                    let before = buffer.len();
+                    buffer.extend_from_slice(&input[pos..pos + take]);
+                    // A terminator can straddle two reads, so rescan the last
+                    // three bytes of the previous pass.
+                    let search_from = before.saturating_sub(3);
+                    let found = buffer[search_from..]
+                        .windows(4)
+                        .position(|value| value == b"\r\n\r\n")
+                        .map(|offset| search_from + offset);
+                    let Some(end) = found else {
+                        push_range(scannable, pos, take);
+                        pos += take;
+                        if buffer.len() >= RESPONSE_HEADER_BUDGET {
                             self.state = Http1ResponseState::Invalid;
+                            return;
                         }
                         continue;
                     };
-                    let remainder = buffer.split_off(end + 4);
-                    let head = &buffer[..end];
-                    let Some(next) = response_body_framing(head, self.head_request) else {
+                    let consumed = (end + 4).saturating_sub(before);
+                    if consumed == 0 {
                         self.state = Http1ResponseState::Invalid;
-                        continue;
-                    };
-                    self.state = next;
-                    self.push(&remainder);
+                        return;
+                    }
+                    push_range(scannable, pos, consumed);
+                    pos += consumed;
+                    let head = buffer[..end].to_vec();
+                    self.state = response_body_framing(&head, self.head_request)
+                        .unwrap_or(Http1ResponseState::Invalid);
                 }
                 Http1ResponseState::ContentLength(remaining) => {
-                    let take = input.len().min(*remaining);
+                    let take = (input.len() - pos).min(*remaining);
+                    if take == 0 {
+                        self.state = Http1ResponseState::Invalid;
+                        return;
+                    }
+                    push_range(scannable, pos, take);
                     *remaining -= take;
-                    input = &input[take..];
+                    pos += take;
                     if *remaining == 0 {
-                        self.state = if input.is_empty() {
+                        self.state = if pos == input.len() {
                             Http1ResponseState::Complete
                         } else {
                             Http1ResponseState::Invalid
@@ -1250,20 +1571,28 @@ impl Http1ResponseFraming {
                     }
                 }
                 Http1ResponseState::Chunked(chunked) => {
-                    let consumed = chunked.push(input);
-                    input = &input[consumed..];
-                    if matches!(chunked, ChunkedFraming::Complete) {
-                        self.state = if input.is_empty() {
+                    let consumed = chunked.classify(&input[pos..], pos, scannable);
+                    let complete = matches!(chunked, ChunkedFraming::Complete);
+                    let invalid = matches!(chunked, ChunkedFraming::Invalid) || consumed == 0;
+                    pos += consumed;
+                    if invalid {
+                        self.state = Http1ResponseState::Invalid;
+                        return;
+                    }
+                    if complete {
+                        self.state = if pos == input.len() {
                             Http1ResponseState::Complete
                         } else {
                             Http1ResponseState::Invalid
                         };
-                    } else if matches!(chunked, ChunkedFraming::Invalid) {
-                        self.state = Http1ResponseState::Invalid;
                     }
                 }
-                Http1ResponseState::CloseDelimited => return,
+                Http1ResponseState::CloseDelimited => {
+                    push_range(scannable, pos, input.len() - pos);
+                    return;
+                }
                 Http1ResponseState::Complete | Http1ResponseState::Invalid => {
+                    push_range(scannable, pos, input.len() - pos);
                     self.state = Http1ResponseState::Invalid;
                     return;
                 }
@@ -1274,6 +1603,22 @@ impl Http1ResponseFraming {
     fn is_complete(&self) -> bool {
         matches!(self.state, Http1ResponseState::Complete)
     }
+}
+
+/// Append `(start, length)`, joining it to the previous range when the two
+/// touch. Trailers arrive a byte at a time, so joining keeps the range list
+/// short.
+fn push_range(ranges: &mut Vec<(usize, usize)>, start: usize, length: usize) {
+    if length == 0 {
+        return;
+    }
+    if let Some((last_start, last_length)) = ranges.last_mut() {
+        if *last_start + *last_length == start {
+            *last_length += length;
+            return;
+        }
+    }
+    ranges.push((start, length));
 }
 
 fn response_body_framing(head: &[u8], head_request: bool) -> Option<Http1ResponseState> {
@@ -1325,7 +1670,14 @@ fn response_body_framing(head: &[u8], head_request: bool) -> Option<Http1Respons
 }
 
 impl ChunkedFraming {
-    fn push(&mut self, input: &[u8]) -> usize {
+    /// Consume `input`, recording the ranges that carry decoded body text.
+    /// Offsets are reported relative to the caller's buffer through `base`.
+    fn classify(
+        &mut self,
+        input: &[u8],
+        base: usize,
+        scannable: &mut Vec<(usize, usize)>,
+    ) -> usize {
         let mut consumed = 0;
         while consumed < input.len() {
             match self {
@@ -1355,6 +1707,7 @@ impl ChunkedFraming {
                 }
                 Self::Data(remaining) => {
                     let take = (input.len() - consumed).min(*remaining);
+                    push_range(scannable, base + consumed, take);
                     *remaining -= take;
                     consumed += take;
                     if *remaining == 0 {
@@ -1375,6 +1728,8 @@ impl ChunkedFraming {
                 }
                 Self::TrailerLine(line) => {
                     let byte = input[consumed];
+                    // A trailer can reflect a credential, so it is scanned too.
+                    push_range(scannable, base + consumed, 1);
                     consumed += 1;
                     line.push(byte);
                     if line.len() > RESPONSE_HEADER_BUDGET {
@@ -1391,6 +1746,87 @@ impl ChunkedFraming {
             }
         }
         consumed
+    }
+}
+
+/// Redacts host credentials from a streaming HTTP/1 response.
+///
+/// The scan must run over the DECODED response text. A `Transfer-Encoding:
+/// chunked` upstream can split a credential across a chunk boundary, where the
+/// wire bytes carry `…\r\n<size>\r\n…` between the two halves and a raw scan
+/// finds nothing — the credential then reaches the guest. This type drives
+/// [`Http1ResponseFraming`], joins the scannable regions into one continuous
+/// stream, redacts that, and writes each match back at its wire position.
+/// Redaction replaces every byte with `*`, so lengths never change and the
+/// chunk sizes stay exact — no re-framing is needed.
+///
+/// An empty needle set makes this a pass-through that only tracks framing,
+/// which is what the response path needs to accept an unclean TLS EOF.
+struct Http1ResponseRedactor {
+    framing: Http1ResponseFraming,
+    needles: Vec<Vec<u8>>,
+    keep: usize,
+    /// Wire bytes buffered but not yet released to the guest.
+    pending: Vec<u8>,
+    /// Offsets into `pending` that carry scannable text, in wire order.
+    scannable: Vec<usize>,
+}
+
+impl Http1ResponseRedactor {
+    fn new(needles: &[Vec<u8>], head_request: bool) -> Self {
+        Self {
+            framing: Http1ResponseFraming::new(head_request),
+            needles: needles.to_vec(),
+            keep: needles
+                .iter()
+                .map(Vec::len)
+                .max()
+                .unwrap_or(1)
+                .saturating_sub(1),
+            pending: Vec::new(),
+            scannable: Vec::new(),
+        }
+    }
+
+    fn is_complete(&self) -> bool {
+        self.framing.is_complete()
+    }
+
+    fn push(&mut self, input: &[u8], final_chunk: bool) -> Vec<u8> {
+        let mut ranges = Vec::new();
+        self.framing.classify(input, &mut ranges);
+        let base = self.pending.len();
+        self.pending.extend_from_slice(input);
+        for (start, length) in ranges {
+            self.scannable.extend(base + start..base + start + length);
+        }
+
+        let mut joined: Vec<u8> = self.scannable.iter().map(|at| self.pending[*at]).collect();
+        redact_bytes(&mut joined, &self.needles);
+        for (index, at) in self.scannable.iter().enumerate() {
+            self.pending[*at] = joined[index];
+        }
+
+        // Hold back the last `keep` scannable bytes so a credential that
+        // straddles this read and the next is still one contiguous match on the
+        // next pass. Everything before the held region — including the framing
+        // between the held bytes — is released now.
+        let release_at = if final_chunk || self.keep == 0 {
+            self.pending.len()
+        } else if self.scannable.len() > self.keep {
+            self.scannable[self.scannable.len() - self.keep]
+        } else {
+            self.scannable
+                .first()
+                .copied()
+                .unwrap_or(self.pending.len())
+        };
+        let released: Vec<u8> = self.pending.drain(..release_at).collect();
+        self.scannable.retain(|at| *at >= release_at);
+        for at in &mut self.scannable {
+            *at -= release_at;
+        }
+        released
     }
 }
 
@@ -1503,9 +1939,7 @@ where
         ));
     }
 
-    let mut framing = Http1ResponseFraming::new(head_request);
-    framing.push(&prefix);
-    let mut redactor = ByteRedactor::new(needles);
+    let mut redactor = Http1ResponseRedactor::new(needles, head_request);
     let first = redactor.push(&prefix, false);
     if !first.is_empty() {
         writer.write_all(&first).await?;
@@ -1515,7 +1949,7 @@ where
         let read = match reader.read(&mut buffer).await {
             Ok(read) => read,
             Err(error)
-                if error.kind() == std::io::ErrorKind::UnexpectedEof && framing.is_complete() =>
+                if error.kind() == std::io::ErrorKind::UnexpectedEof && redactor.is_complete() =>
             {
                 0
             }
@@ -1528,7 +1962,6 @@ where
             }
             return writer.shutdown().await;
         }
-        framing.push(&buffer[..read]);
         let redacted = redactor.push(&buffer[..read], false);
         if !redacted.is_empty() {
             writer.write_all(&redacted).await?;
@@ -1615,11 +2048,13 @@ fn graphql_content_length(head: &str) -> Result<usize, InterceptError> {
 
 /// Read from `client_tls` into `prefix` until it holds `body_end` bytes (the body
 /// per Content-Length). Fail-closed on a truncated stream (client EOF before the
-/// declared length). `body_end` is already known `<= headers + cap`.
+/// declared length) with `on_truncation`. `body_end` is already known
+/// `<= headers + cap`.
 async fn read_to_content_length<C>(
     client_tls: &mut C,
     prefix: &mut Vec<u8>,
     body_end: usize,
+    on_truncation: InterceptError,
 ) -> Result<(), InterceptError>
 where
     C: AsyncRead + Unpin,
@@ -1628,9 +2063,7 @@ where
         let mut chunk = [0u8; 8192];
         let n = client_tls.read(&mut chunk).await?;
         if n == 0 {
-            return Err(InterceptError::GraphqlRejected {
-                reason: "truncated graphql body",
-            });
+            return Err(on_truncation);
         }
         prefix.extend_from_slice(&chunk[..n]);
     }
@@ -1673,11 +2106,9 @@ where
 
     let response_result = async {
         let mut resp_buf = Vec::new();
-        let mut redactor = ByteRedactor::new(response_redactions);
-        let mut framing = Http1ResponseFraming::new(head_request);
+        let mut redactor = Http1ResponseRedactor::new(response_redactions, head_request);
         if !response_redactions.is_empty() {
             let prefix = read_response_prefix(&mut up_rd).await?;
-            framing.push(&prefix);
             let headers_end = prefix
                 .windows(4)
                 .position(|value| value == b"\r\n\r\n")
@@ -1705,18 +2136,13 @@ where
                 Ok(n) => n,
                 Err(error)
                     if error.kind() == std::io::ErrorKind::UnexpectedEof
-                        && framing.is_complete() =>
+                        && redactor.is_complete() =>
                 {
                     break;
                 }
                 Err(error) => return Err(error.into()),
             };
-            framing.push(&tmp[..n]);
-            let output = if response_redactions.is_empty() {
-                tmp[..n].to_vec()
-            } else {
-                redactor.push(&tmp[..n], false)
-            };
+            let output = redactor.push(&tmp[..n], false);
             if client_wr.write_all(&output).await.is_err() {
                 break;
             }
@@ -1725,8 +2151,8 @@ where
                 resp_buf.extend_from_slice(&output[..take]);
             }
         }
-        if !response_redactions.is_empty() {
-            let tail = redactor.push(&[], true);
+        let tail = redactor.push(&[], true);
+        if !tail.is_empty() {
             client_wr.write_all(&tail).await?;
             if resp_buf.len() < budget {
                 let take = (budget - resp_buf.len()).min(tail.len());
@@ -1851,6 +2277,179 @@ mod hardening_tests {
         assert!(!writer.shutdown);
     }
 
+    #[tokio::test]
+    async fn rejects_a_header_block_past_the_inspection_budget() {
+        // A guest that pads its headers past the budget used to have the
+        // remainder relayed verbatim, which put a second `Host` beyond the gate.
+        let mut request = b"GET /v1 HTTP/1.1\r\nHost: api.example\r\n".to_vec();
+        while request.len() < REQUEST_HEAD_BUDGET {
+            request.extend_from_slice(b"X-Pad: 012345678901234567890123456789012345\r\n");
+        }
+        request.extend_from_slice(b"Host: attacker.example\r\n\r\n");
+        let mut reader: &[u8] = &request;
+        let mut prefix = Vec::new();
+
+        let error = read_request_head(&mut reader, &mut prefix)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(error, InterceptError::RequestHeadTooLarge));
+    }
+
+    #[tokio::test]
+    async fn reads_a_header_block_that_straddles_two_reads() {
+        struct Dribble(Vec<Vec<u8>>);
+        impl AsyncRead for Dribble {
+            fn poll_read(
+                mut self: Pin<&mut Self>,
+                _cx: &mut Context<'_>,
+                output: &mut ReadBuf<'_>,
+            ) -> Poll<std::io::Result<()>> {
+                if self.0.is_empty() {
+                    return Poll::Ready(Ok(()));
+                }
+                let next = self.0.remove(0);
+                output.put_slice(&next);
+                Poll::Ready(Ok(()))
+            }
+        }
+        // The CRLFCRLF terminator is split across the read boundary.
+        let mut reader = Dribble(vec![
+            b"GET /v1 HTTP/1.1\r\nHost: api.example\r".to_vec(),
+            b"\n\r\nbody".to_vec(),
+        ]);
+        let mut prefix = Vec::new();
+
+        let head_end = read_request_head(&mut reader, &mut prefix).await.unwrap();
+
+        assert_eq!(
+            &prefix[..head_end],
+            b"GET /v1 HTTP/1.1\r\nHost: api.example\r\n\r\n"
+        );
+        assert_eq!(&prefix[head_end..], b"body");
+    }
+
+    #[test]
+    fn rejects_smuggled_header_shapes() {
+        assert!(validate_header_block(b"GET /v1 HTTP/1.1\r\nHost: api.example\r\n\r\n").is_ok());
+        for (head, expected) in [
+            (
+                &b"GET /v1 HTTP/1.1\r\nHost: api.example\nHost: attacker.example\r\n\r\n"[..],
+                "bare line feed",
+            ),
+            (
+                &b"GET /v1 HTTP/1.1\r\nHost: api.example\r\n Host: attacker.example\r\n\r\n"[..],
+                "obsolete line fold",
+            ),
+            (
+                &b"GET /v1 HTTP/1.1\r\nHost : api.example\r\n\r\n"[..],
+                "whitespace before the header colon",
+            ),
+            (
+                &b"GET /v1 HTTP/1.1\r\nHost: api.example\r\nnonsense\r\n\r\n"[..],
+                "header line without a colon",
+            ),
+            (
+                &b"POST /v1 HTTP/1.1\r\nContent-Length: 5\r\nTransfer-Encoding: chunked\r\n\r\n"[..],
+                "content-length with transfer-encoding",
+            ),
+            (
+                &b"POST /v1 HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\n"[..],
+                "conflicting content-length",
+            ),
+        ] {
+            match validate_header_block(head) {
+                Err(InterceptError::MalformedHeaderBlock { reason }) => {
+                    assert_eq!(reason, expected);
+                }
+                other => panic!("expected `{expected}`, got {other:?}"),
+            }
+        }
+    }
+
+    fn placeholder_secret() -> SecretEntry {
+        SecretEntry {
+            placeholder: "engram_ph_x".into(),
+            real_value: "sk-a-much-longer-real-value".into(),
+            allow: HostList::from_manifest(&["api.example".into()], &[]).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn substitution_rewrites_the_declared_body_length() {
+        // A real secret is longer than its placeholder, so a stale
+        // Content-Length truncates the request or hangs the connection.
+        let secret = placeholder_secret();
+        let secrets = [&secret];
+        let body = br#"{"key":"engram_ph_x"}"#;
+        let mut request = format!(
+            "POST /v1 HTTP/1.1\r\nHost: api.example\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        request.extend_from_slice(body);
+        let mut reader: &[u8] = &[];
+
+        let out = substitute_request(&mut reader, request, "api.example", &secrets)
+            .await
+            .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        let expected = br#"{"key":"sk-a-much-longer-real-value"}"#.len();
+        assert!(
+            text.ends_with(r#"{"key":"sk-a-much-longer-real-value"}"#),
+            "{text}"
+        );
+        assert!(
+            text.contains(&format!("Content-Length: {expected}\r\n")),
+            "{text}"
+        );
+    }
+
+    #[tokio::test]
+    async fn substitution_buffers_a_body_that_arrives_after_the_head() {
+        let secret = placeholder_secret();
+        let secrets = [&secret];
+        let body = br#"{"key":"engram_ph_x"}"#;
+        let head = format!(
+            "POST /v1 HTTP/1.1\r\nHost: api.example\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        let mut reader: &[u8] = body;
+
+        let out = substitute_request(&mut reader, head, "api.example", &secrets)
+            .await
+            .unwrap();
+
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.ends_with(r#"{"key":"sk-a-much-longer-real-value"}"#),
+            "{text}"
+        );
+        assert!(text.contains("Content-Length: 37\r\n"), "{text}");
+    }
+
+    #[tokio::test]
+    async fn a_chunked_body_streams_untouched_so_its_framing_stays_valid() {
+        // We cannot rewrite chunk sizes mid-stream, so the body is relayed as
+        // sent. A placeholder is not a secret, so this costs an API call at
+        // worst — never a credential.
+        let secret = placeholder_secret();
+        let secrets = [&secret];
+        let request =
+            b"POST /v1 HTTP/1.1\r\nHost: api.example\r\nTransfer-Encoding: chunked\r\n\r\n\
+              15\r\n{\"key\":\"engram_ph_x\"}\r\n0\r\n\r\n"
+                .to_vec();
+        let mut reader: &[u8] = &[];
+
+        let out = substitute_request(&mut reader, request.clone(), "api.example", &secrets)
+            .await
+            .unwrap();
+
+        assert_eq!(out, request);
+    }
+
     #[test]
     fn binds_authority_to_sni_and_removes_duplicates() {
         let request = b"GET /v1 HTTP/1.1\r\nHost: allowed.example\r\nhOsT: attacker.example\r\nAccept: */*\r\n\r\n".to_vec();
@@ -1871,6 +2470,53 @@ mod hardening_tests {
         assert!(!request_target_is_origin_form(&target));
         assert!(request_target_is_origin_form("/v1?value=ok"));
         assert!(request_target_is_origin_form("*"));
+    }
+
+    #[tokio::test]
+    async fn redacts_a_credential_split_across_a_chunk_boundary() {
+        // The wire bytes hold `host-\r\nb\r\ntoken-value` — the framing sits
+        // between the two halves, so a raw scan finds nothing and the
+        // credential used to reach the guest whole.
+        let mut response = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+        response.extend_from_slice(b"5\r\nhost-\r\n");
+        response.extend_from_slice(b"b\r\ntoken-value\r\n");
+        response.extend_from_slice(b"0\r\n\r\n");
+        let mut reader: &[u8] = &response;
+        let mut writer = VecWriter::default();
+
+        copy_redacting_response(
+            &mut reader,
+            &mut writer,
+            &[b"host-token-value".to_vec()],
+            false,
+        )
+        .await
+        .unwrap();
+
+        let out = String::from_utf8(writer.bytes).unwrap();
+        assert!(!out.contains("host-token-value"), "{out}");
+        assert!(!out.contains("token-value"), "{out}");
+        // Redaction is length-preserving, so the chunk sizes still describe the
+        // bytes that follow them.
+        assert!(out.contains("5\r\n*****\r\n"), "{out}");
+        assert!(out.contains("b\r\n***********\r\n"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn redacts_a_credential_reflected_in_a_chunked_trailer() {
+        let mut response =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nTrailer: x-token\r\n\r\n".to_vec();
+        response.extend_from_slice(b"2\r\nok\r\n");
+        response.extend_from_slice(b"0\r\nx-token: host-token\r\n\r\n");
+        let mut reader: &[u8] = &response;
+        let mut writer = VecWriter::default();
+
+        copy_redacting_response(&mut reader, &mut writer, &[b"host-token".to_vec()], false)
+            .await
+            .unwrap();
+
+        let out = String::from_utf8(writer.bytes).unwrap();
+        assert!(out.contains("x-token: **********\r\n"), "{out}");
     }
 
     #[test]
