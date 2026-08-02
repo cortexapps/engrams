@@ -7,10 +7,11 @@
 //!
 //! Same composition discipline as `checkpoint_severs_exec_mid_stream`: real
 //! coordinator `exec_stream_core`, real FC protocol driver, real agentd
-//! journal handler; only the severed vsock transport is modeled. Real Tokio
-//! time (real subprocess I/O); FIFOs order every step — the only polling is
-//! a wedge-bounded wait on the transport counters between the re-attach and
-//! the second checkpoint.
+//! journal handler. Only the severed vsock transport is modeled. Its gate
+//! stays silent after each checkpoint. The production epoch wrapper converts
+//! that silence to EOF. The test uses real Tokio time for real subprocess I/O.
+//! FIFOs order every step. The only polling is a wedge-bounded wait on the
+//! transport counters between the re-attach and the second checkpoint.
 
 use std::collections::HashMap;
 use std::time::Duration;

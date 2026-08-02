@@ -9,12 +9,13 @@
 //!
 //! This scenario composes the real coordinator `exec_stream_core`, the real
 //! Firecracker host protocol driver, and a real agentd journal handler. Only
-//! the severed vsock transport is modeled. The test uses real Tokio time
-//! rather than `start_paused`: the command is a real subprocess, while
-//! paused-time auto-advance can consume the 40×25ms reconnect backoff and
-//! agentd's missing-pid grace window before wall-clock process I/O runs. A
-//! FIFO orders the checkpoint between the first chunk and command completion;
-//! no sleep establishes correctness.
+//! the severed vsock transport is modeled. Its gate stays silent after the
+//! checkpoint. The production epoch wrapper converts that silence to EOF.
+//! The test uses real Tokio time rather than `start_paused`: the command is a
+//! real subprocess, while paused-time auto-advance can consume the 40×25ms
+//! reconnect backoff and agentd's missing-pid grace window before wall-clock
+//! process I/O runs. A FIFO orders the checkpoint between the first chunk and
+//! command completion. No sleep establishes correctness.
 
 use std::collections::HashMap;
 use std::fmt::Debug;

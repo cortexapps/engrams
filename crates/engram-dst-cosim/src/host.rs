@@ -18,7 +18,7 @@
 //!   terminal destroy);
 //! * **durable exec** → the REAL Firecracker host reader and REAL agentd
 //!   journal handler over per-sandbox duplex connections; checkpoint steps
-//!   fake the EOF that follows vsock `TRANSPORT_RESET`;
+//!   quietly sever the modeled vsock transport;
 //! * **teardown-reconcile** → the REAL
 //!   [`reconcile_once`](engram_host_agent::teardown_reconcile::reconcile_once)
 //!   over [`CosimReconcileBackend`].
@@ -245,12 +245,18 @@ struct CosimSandbox {
 }
 
 /// Per-sandbox guest exec state. Every connection runs the real agentd
-/// handler; only the vsock transport itself is modeled.
+/// handler. Only the vsock transport is modeled.
+///
+/// Production snapshot capture gives the host no EOF. A gate holds each
+/// severed pipe open to model that silence. Only [`engram_sandbox_firecracker::EpochSeveredStream`]
+/// can convert the silence to EOF. A natural guest close still gives the
+/// host a real EOF through the gate.
 struct CosimExecPlane {
     journal: Arc<ExecJournal>,
     supervisor: Arc<HarnessSupervisor>,
     cacerts: Arc<CaCertInstaller>,
-    guest_connections: Vec<tokio::task::AbortHandle>,
+    epoch: tokio::sync::watch::Sender<u64>,
+    connection_tasks: Vec<tokio::task::AbortHandle>,
     severances: u64,
     connections_opened: u64,
 }
@@ -264,7 +270,8 @@ impl CosimExecPlane {
                 bundle: root.join("cacerts/ca-bundle"),
                 extra_cert: root.join("cacerts/engram.crt"),
             })),
-            guest_connections: Vec::new(),
+            epoch: tokio::sync::watch::channel(0).0,
+            connection_tasks: Vec::new(),
             severances: 0,
             connections_opened: 0,
         }
@@ -309,26 +316,52 @@ impl CosimExecPlane {
     }
 
     fn connect(&mut self) -> BoxExecIo {
-        let (host, guest) = tokio::io::duplex(64 * 1024);
-        let task = tokio::spawn(serve_connection_with_journal(
-            guest,
+        let (driver_end, mut gate_a) = tokio::io::duplex(64 * 1024);
+        let (mut gate_b, guest_end) = tokio::io::duplex(64 * 1024);
+        let guest_task = tokio::spawn(serve_connection_with_journal(
+            guest_end,
             None,
             self.supervisor.clone(),
             self.cacerts.clone(),
             self.journal.clone(),
         ));
-        self.guest_connections.push(task.abort_handle());
-        // Dropping the JoinHandle detaches the real handler. The abort handle
-        // remains the checkpoint's guest-side TRANSPORT_RESET control.
-        drop(task);
+        self.connection_tasks.push(guest_task.abort_handle());
+        // Dropping the join handle detaches the real handler. Drop keeps its
+        // abort handle for cleanup.
+        drop(guest_task);
+
+        let mut rx = self.epoch.subscribe();
+        let born = *rx.borrow();
+        let gate_task = tokio::spawn(async move {
+            let severed = tokio::select! {
+                _ = tokio::io::copy_bidirectional(&mut gate_a, &mut gate_b) => false,
+                changed = rx.wait_for(|epoch| *epoch > born) => {
+                    // Drop the borrowed watch value before this task parks.
+                    drop(changed);
+                    true
+                }
+            };
+            if severed {
+                // A checkpoint severed this connection. Firecracker sends
+                // no FIN or RST to the host. Hold both pipe ends open so
+                // the driver stays silent. Only EpochSeveredStream can
+                // convert this silence to EOF.
+                std::future::pending::<()>().await;
+            }
+        });
+        self.connection_tasks.push(gate_task.abort_handle());
+        // A severed gate can stay parked. Drop keeps its abort handle.
+        drop(gate_task);
+
         self.connections_opened += 1;
-        Box::new(host)
+        Box::new(engram_sandbox_firecracker::EpochSeveredStream::new(
+            driver_end,
+            self.epoch.subscribe(),
+        ))
     }
 
     fn sever(&mut self) {
-        for connection in self.guest_connections.drain(..) {
-            connection.abort();
-        }
+        self.epoch.send_modify(|epoch| *epoch += 1);
         self.severances += 1;
     }
 
@@ -339,8 +372,8 @@ impl CosimExecPlane {
 
 impl Drop for CosimExecPlane {
     fn drop(&mut self) {
-        for connection in self.guest_connections.drain(..) {
-            connection.abort();
+        for task in self.connection_tasks.drain(..) {
+            task.abort();
         }
     }
 }
@@ -597,8 +630,8 @@ impl CosimHost {
             .ok_or(SandboxError::NotFound)
     }
 
-    /// Model snapshot `TRANSPORT_RESET`: the guest forgets every connection.
-    /// The fake sends EOF after bytes that are already buffered.
+    /// Model snapshot `TRANSPORT_RESET`. The gate keeps the host side silent.
+    /// The epoch wrapper converts that silence to EOF.
     pub fn sever_exec_transports(&mut self, sandbox_id: SandboxId) {
         if let Some(sandbox) = self.sandboxes.get_mut(&sandbox_id) {
             sandbox.exec.sever();
