@@ -9,7 +9,6 @@ import {
   CopyIcon,
   DownloadIcon,
   Loader2Icon,
-  PlayIcon,
   ShieldCheckIcon,
   TerminalIcon,
   TriangleAlertIcon,
@@ -19,12 +18,12 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
+import { useGoogleCloudSetup, useIntegrationConnections } from "@/hooks/useIntegrations";
+import { errorMessage } from "@/lib/errors";
 import {
-  useGoogleCloudSetup,
-  useIntegrationConnections,
-  useSetConnectionEnabled,
-  useTestConnection,
-} from "@/hooks/useIntegrations";
+  ConnectionTestEnableControls,
+  type ConnectionControlResult,
+} from "./ConnectionTestEnableControls";
 import { GoogleCloudEndpointDialog } from "./GoogleCloudConnections";
 import type { SetupCodeLanguage } from "./SyntaxHighlightedCode";
 
@@ -38,8 +37,6 @@ export function GoogleCloudSetupPage() {
 export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: string }) {
   const connections = useIntegrationConnections();
   const setup = useGoogleCloudSetup(connectionId);
-  const test = useTestConnection();
-  const enable = useSetConnectionEnabled();
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
   const [editingEndpoints, setEditingEndpoints] = useState(false);
   const connection = connections.data?.connections.find((entry) => entry.id === connectionId);
@@ -59,16 +56,19 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
   const tested = Boolean(connection.testedAt) || testResult?.ok === true;
   const enabled = connection.enabled;
 
-  const runTest = async () => {
-    setTestResult(null);
-    const response = await test.mutateAsync({ id: connection.id });
-    setTestResult({ ok: response.ok, message: response.message });
-    if (response.ok) toast.success("Google Cloud connection verified");
-  };
-
-  const setEnabled = async () => {
-    await enable.mutateAsync({ id: connection.id, enabled: !enabled });
-    toast.success(enabled ? "Google Cloud connection disabled" : "Google Cloud connection enabled");
+  const onControlResult = (result: ConnectionControlResult) => {
+    if (result.kind === "test") {
+      setTestResult({ ok: result.ok, message: result.message });
+      if (result.ok) toast.success("Google Cloud connection verified");
+      return;
+    }
+    if (!result.ok) {
+      toast.error(result.message);
+      return;
+    }
+    toast.success(
+      result.enabled ? "Google Cloud connection enabled" : "Google Cloud connection disabled",
+    );
   };
 
   return (
@@ -168,7 +168,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
           {setup.error && (
             <div className="m-5 flex items-start gap-2 rounded-md border border-destructive/45 bg-destructive/[0.06] p-3 text-sm">
               <TriangleAlertIcon className="mt-0.5 size-4 shrink-0 text-destructive" />
-              <span>{String(setup.error)}</span>
+              <span>{errorMessage(setup.error)}</span>
             </div>
           )}
           {setup.data && (
@@ -219,22 +219,11 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
               </p>
             </div>
             <div className="flex items-center gap-2">
-              <Button
-                variant="outline"
-                disabled={test.isPending || !setup.data}
-                onClick={() => void runTest()}
-              >
-                {test.isPending ? (
-                  <Loader2Icon className="size-4 animate-spin" />
-                ) : (
-                  <PlayIcon className="size-4" />
-                )}
-                Test connection
-              </Button>
-              <Button disabled={!tested || enable.isPending} onClick={() => void setEnabled()}>
-                {enable.isPending && <Loader2Icon className="size-4 animate-spin" />}
-                {enabled ? "Disable connection" : "Enable connection"}
-              </Button>
+              <ConnectionTestEnableControls
+                connection={connection}
+                testDisabled={!setup.data}
+                onResult={onControlResult}
+              />
             </div>
           </div>
           {testResult && (
@@ -319,7 +308,12 @@ function SetupCode({
   value: string;
 }) {
   const copy = async () => {
-    await navigator.clipboard.writeText(value);
+    try {
+      await navigator.clipboard.writeText(value);
+    } catch (error) {
+      toast.error(errorMessage(error));
+      return;
+    }
     toast.success(`${label} copied`);
   };
 
