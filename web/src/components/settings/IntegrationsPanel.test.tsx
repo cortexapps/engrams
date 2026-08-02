@@ -310,17 +310,30 @@ describe("IntegrationsPanel (marketplace)", () => {
       },
     } as IntegrationConnection;
     const { transport } = installTransport({ connections: [connection] });
-    renderWithProviders(<GoogleCloudSetupWorkspace connectionId="connection-1" />, { transport });
+    const { container } = renderWithProviders(
+      <GoogleCloudSetupWorkspace connectionId="connection-1" />,
+      { transport },
+    );
     const user = userEvent.setup();
 
     expect(
       await screen.findByRole("heading", { name: "Set up Production read only" }),
     ).toBeTruthy();
-    expect(await screen.findByText(/google_iam_workload_identity_pool/)).toBeTruthy();
     expect(screen.queryByText(/gcloud iam workload-identity-pools create/)).toBeNull();
+    await waitFor(() => {
+      const terraformCode = container.querySelector(
+        'code[data-language="terraform"][data-highlighted="true"]',
+      );
+      expect(terraformCode?.textContent).toContain("google_iam_workload_identity_pool");
+    });
 
     await user.click(screen.getByRole("tab", { name: /gcloud/i }));
-    expect(await screen.findByText(/gcloud iam workload-identity-pools create/)).toBeTruthy();
+    await waitFor(() => {
+      const shellCode = container.querySelector(
+        'code[data-language="shellscript"][data-highlighted="true"]',
+      );
+      expect(shellCode?.textContent).toContain("gcloud iam workload-identity-pools create");
+    });
   });
 
   test("shows configured Google Cloud as a connected provider card", async () => {
