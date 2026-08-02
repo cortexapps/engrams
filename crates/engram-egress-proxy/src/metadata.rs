@@ -271,6 +271,8 @@ mod tests {
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(serve(listener, registry));
         let config = tempfile::tempdir().unwrap();
+        let config_path = config.path().to_path_buf();
+        let command_config_path = config_path.clone();
         let metadata_host = address.to_string();
         let output = tokio::task::spawn_blocking(move || {
             std::process::Command::new("gcloud")
@@ -280,7 +282,7 @@ mod tests {
                     "print-access-token",
                     "--quiet",
                 ])
-                .env("CLOUDSDK_CONFIG", config.path())
+                .env("CLOUDSDK_CONFIG", command_config_path)
                 .env("GCE_METADATA_HOST", &metadata_host)
                 .env("GCE_METADATA_IP", &metadata_host)
                 .env_remove("GOOGLE_APPLICATION_CREDENTIALS")
@@ -301,5 +303,9 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim() == PLACEHOLDER_TOKEN,
             "gcloud returned a token other than the fixed placeholder"
         );
+        assert!(!config_path.join("credentials.db").exists());
+        assert!(!config_path
+            .join("application_default_credentials.json")
+            .exists());
     }
 }

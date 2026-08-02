@@ -137,6 +137,7 @@ jobs:
       test_cosim: ${{ steps.lanes.outputs.test_cosim }}
       test_cli: ${{ steps.lanes.outputs.test_cli }}
       test_buf: ${{ steps.lanes.outputs.test_buf }}
+      test_integrations_cli: ${{ steps.lanes.outputs.test_integrations_cli }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -154,6 +155,27 @@ jobs:
             BASE="${{ github.event.pull_request.base.sha }}"
           fi
           python3 .github/scripts/detect-rebake-lanes.py --base "$BASE" --head HEAD
+
+  integrations-cli:
+    name: integrations CLI bundle
+    needs: detect
+    if: needs.detect.outputs.test_integrations_cli == 'true'
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install build dependencies
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+      - name: Build and start the bundle
+        run: |
+          deploy/bundles/integrations-cli/build.sh --stage var/integrations-cli
+          CLOUDSDK_CONFIG="$(mktemp -d)" var/integrations-cli/bin/gcloud --version
+      - name: Verify metadata ADC with the bundled gcloud
+        run: |
+          export PATH="$PWD/var/integrations-cli/bin:$PATH"
+          cargo test -p engram-egress-proxy \
+            metadata::tests::installed_gcloud_can_use_the_metadata_endpoint_as_adc \
+            -- --exact
 
   lint:
     name: fmt + clippy + check
@@ -2117,6 +2139,7 @@ jobs:
     if: always()
     needs:
       - detect
+      - integrations-cli
       - lint
       - test-linux
       - cross-musl-linux
