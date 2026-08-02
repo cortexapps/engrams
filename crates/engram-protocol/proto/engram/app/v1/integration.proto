@@ -173,6 +173,17 @@ message CatalogCapability {
   string action = 1;  // e.g. "issues:write"
   string access = 2;  // "read" | "write" (derived from the op's HTTP method)
   string asset = 3;   // asset kind this op surfaces, or "" when none
+  // ADR 0109 seam: operator-facing name. A named-connection provider serves
+  // its operation list here so the web renders from the SAME table the
+  // orchestrator compiles policy from — two hand-maintained copies drift, and
+  // the one the UI reads decides what an administrator can grant.
+  string label = 4;
+  // The exact host this operation calls; empty when its reach comes from the
+  // connection's own endpoint list instead.
+  string host = 5;
+  // For a host-less operation, the kind of endpoint that makes it usable:
+  // "google-api" | "non-google-api". Empty for a curated operation.
+  string endpoint_rule = 6;
 }
 
 message ProviderCatalogEntry {
@@ -184,6 +195,10 @@ message ProviderCatalogEntry {
   // Stable opaque ID for the provider's existing singleton credential slot.
   // New multi-connection surfaces list their instances separately.
   string default_connection_id = 6;
+  // ADR 0109 seam: "singleton" (one org-wide credential slot) or "named" (an
+  // administrator configures connections, each its own authority). The web
+  // used to decide this by hard-coding the one provider it knew was named.
+  string connection_model = 7;
 }
 
 message GetIntegrationCatalogRequest {}

@@ -55,10 +55,64 @@ const connectionsHolder = vi.hoisted(() => ({ value: [] as unknown[] }));
 vi.mock("../../hooks/useIntegrations", () => ({
   useIntegrationConnections: () => ({ data: { connections: connectionsHolder.value } }),
 }));
-// The editor derives its policy rail + connected-connector cards from the joined
-// catalog; mock it so the test needs no QueryClient/transport.
-vi.mock("../../components/integrations/useConnectorViews", () => ({
-  useConnectorViews: () => ({ views: [], isLoading: false, error: null }),
+// The editor derives its policy rail, its connected-connector cards AND — since
+// the provider seam — the named-connection blocks from the joined catalog. Mock
+// only the hook, keeping the real helpers, and serve the Google entry the
+// catalog now returns instead of the entry the web used to synthesize.
+const GOOGLE_CATALOG_VIEW = {
+  provider: "gcp",
+  defaultConnectionId: "",
+  name: "Google Cloud",
+  category: "cloud",
+  blurb: "Call Google Cloud APIs with a short-lived, policy-bound credential.",
+  icon: { mono: "GC", color: "#4285f4" },
+  credentialSource: "mint" as const,
+  hosts: ["compute.googleapis.com", "logging.googleapis.com"],
+  capabilities: [
+    {
+      action: "compute.instances.get",
+      access: "read" as const,
+      label: "Describe Compute Engine instances",
+      host: "compute.googleapis.com",
+    },
+    {
+      action: "compute.instances.start",
+      access: "write" as const,
+      label: "Start Compute Engine instances",
+      host: "compute.googleapis.com",
+    },
+    {
+      action: "logging.entries.list",
+      access: "read" as const,
+      label: "Read Cloud Logging entries",
+      host: "logging.googleapis.com",
+    },
+    {
+      action: "api.call",
+      access: "write" as const,
+      label: "Call configured Google APIs",
+      endpointRule: "google-api" as const,
+    },
+    {
+      action: "gke.api.call",
+      access: "write" as const,
+      label: "Call the configured GKE API server",
+      endpointRule: "non-google-api" as const,
+    },
+  ],
+  status: "connected" as const,
+  builtin: true,
+  usedBy: 0,
+  usedByProfiles: [],
+  connectionModel: "named" as const,
+};
+vi.mock("../../components/integrations/useConnectorViews", async (orig) => ({
+  ...(await orig<object>()),
+  useConnectorViews: () => ({
+    views: [GOOGLE_CATALOG_VIEW],
+    isLoading: false,
+    error: null,
+  }),
 }));
 vi.mock("@tanstack/react-router", async (orig) => ({
   ...(await orig()),

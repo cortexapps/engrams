@@ -319,9 +319,12 @@ const integrationDetailRoute = createRoute({
   beforeLoad: requireAdmin,
   component: IntegrationDetail,
 });
-const googleCloudSetupRoute = createRoute({
+// ADR 0109 seam: the setup page is per PROVIDER connection, not per Google
+// connection. The provider key rides the path so a second named-connection
+// provider needs no new route.
+const connectionSetupRoute = createRoute({
   getParentRoute: () => settingsLayoutRoute,
-  path: "integrations/gcp/$connectionId/setup",
+  path: "integrations/$provider/$connectionId/setup",
   beforeLoad: requireAdmin,
   component: GoogleCloudSetupPage,
 });
@@ -395,7 +398,7 @@ export const routeTree = rootRoute.addChildren([
       harnessesRoute,
       integrationsRoute,
       integrationDetailRoute,
-      googleCloudSetupRoute,
+      connectionSetupRoute,
       reviewedReposRoute,
       profilesRoute,
       profilesNewRoute,

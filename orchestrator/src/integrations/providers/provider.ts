@@ -93,6 +93,29 @@ export interface ProviderOperationCatalog {
   readonly passthrough: readonly string[];
   /** Operations that can mint a credential; never grantable. */
   readonly forbidden: ReadonlySet<string>;
+  /**
+   * What an operator sees, per operation. Served through the integration
+   * catalog so the web renders from THIS table rather than keeping its own —
+   * two hand-maintained copies of an operation list drift, and the copy the
+   * UI reads is the one that decides what an administrator can grant.
+   */
+  readonly describe: readonly ProviderOperationDescription[];
+}
+
+export interface ProviderOperationDescription {
+  action: string;
+  label: string;
+  access: "read" | "write";
+  /**
+   * The exact host this operation calls, or `null` when its reach comes from
+   * the connection's own endpoint list.
+   */
+  host: string | null;
+  /**
+   * For a host-less operation, the kind of endpoint that makes it usable.
+   * `null` for a curated operation, which needs its exact `host`.
+   */
+  endpointRule: "google-api" | "non-google-api" | null;
 }
 
 /** The guest-side CLI a connection to this provider makes usable. */

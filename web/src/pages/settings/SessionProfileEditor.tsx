@@ -41,20 +41,16 @@ import { useOrgSecretNames } from "../../hooks/useOrgSecrets";
 import { defaultCapabilitiesForGrants } from "../../lib/profileIntegrations";
 import { useIntegrationConnections } from "../../hooks/useIntegrations";
 import {
+  capabilityLabel,
+  operationsForEndpoints,
   useConnectorViews,
+  type ConnectorCapabilityView,
   type ConnectorView,
 } from "../../components/integrations/useConnectorViews";
 import { IconPicker } from "../../components/profiles/IconPicker";
 import { PowerSelector } from "../../components/profiles/PowerSelector";
 import { PolicyRail } from "../../components/profiles/PolicyRail";
 import { ProviderTile } from "../../components/integrations/ProviderTile";
-import {
-  GOOGLE_CLOUD_OPERATIONS,
-  GOOGLE_CLOUD_PROVIDER,
-  googleOperationLabel,
-  googleOperationsForEndpoints,
-  type GoogleCloudOperation,
-} from "../../components/integrations/googleCloud";
 import type { IntegrationConnection } from "../../gen/engram/app/v1/integration_pb";
 import { HostChip } from "../../components/integrations/chips";
 import {
@@ -155,10 +151,10 @@ function useFieldValue<K extends keyof ProfileFormValues>(
  */
 function googleConnectionView(
   connection: IntegrationConnection,
-  operations: readonly GoogleCloudOperation[],
+  operations: readonly ConnectorCapabilityView[],
 ): ConnectorView {
   return {
-    provider: GOOGLE_CLOUD_PROVIDER,
+    provider: connection.provider,
     defaultConnectionId: connection.id,
     name: connection.displayName,
     category: "Infrastructure",
@@ -166,7 +162,7 @@ function googleConnectionView(
     icon: { mono: "GC", color: "#4285f4" },
     credentialSource: "mint",
     hosts: connection.googleCloud?.endpoints ?? [],
-    capabilities: operations.map(({ action, access }) => ({ action, access })),
+    capabilities: [...operations],
     status: "connected",
     builtin: true,
     usedBy: 0,
@@ -340,8 +336,16 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
   // Disabled connections stay visible: editing a connection's endpoints
   // auto-disables it, and a hidden grant on a disabled connection blocked
   // every unrelated save of the profile with no way to remove it (web-H1).
-  const googleConnections = (connectionData?.connections ?? []).filter(
-    (connection) => connection.provider === "gcp",
+  // Every provider the catalog reports as named-connection. The editor renders
+  // a block per connection for each of them, so a second provider needs no
+  // change here.
+  const namedProviders = views.filter((view) => view.connectionModel === "named");
+  const namedProviderKeys = new Set(namedProviders.map((view) => view.provider));
+  const googleConnections = (connectionData?.connections ?? []).filter((connection) =>
+    namedProviderKeys.has(connection.provider),
+  );
+  const capabilitiesByProvider = new Map(
+    namedProviders.map((view) => [view.provider, view.capabilities]),
   );
   const imageUri = images?.find((i) => i.id === imageId)?.image_uri;
 
@@ -770,8 +774,10 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   );
                 })}
                 {googleConnections.map((connection) => {
+                  const googleCapabilities: ConnectorCapabilityView[] =
+                    capabilitiesByProvider.get(connection.provider) ?? [];
                   const endpoints = connection.googleCloud?.endpoints ?? [];
-                  const offered = googleOperationsForEndpoints(endpoints);
+                  const offered = operationsForEndpoints(googleCapabilities, endpoints);
                   const offeredActions = new Set(offered.map(({ action }) => action));
                   const grantedActions = new Set(
                     integrationGrants
@@ -780,7 +786,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                   );
                   // A grant can outlive its endpoint (the connection's APIs
                   // were edited): keep it visible so it can be removed.
-                  const orphaned = GOOGLE_CLOUD_OPERATIONS.filter(
+                  const orphaned = googleCapabilities.filter(
                     ({ action }) => grantedActions.has(action) && !offeredActions.has(action),
                   );
                   const view = googleConnectionView(connection, [...offered, ...orphaned]);
@@ -811,8 +817,8 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                           This connection is disabled — sessions cannot use these powers. Test and
                           enable it again from{" "}
                           <Link
-                            to="/settings/integrations/gcp/$connectionId/setup"
-                            params={{ connectionId: connection.id }}
+                            to="/settings/integrations/$provider/$connectionId/setup"
+                            params={{ provider: connection.provider, connectionId: connection.id }}
                             className="underline underline-offset-2"
                           >
                             its setup page
@@ -825,7 +831,7 @@ export function SessionProfileEditor({ mode }: { mode: "create" | "edit" }) {
                           view={view}
                           isOn={(action) => capOn(connection.id, action)}
                           onToggle={(action, value) => toggleCap(connection.id, action, value)}
-                          labelFor={googleOperationLabel}
+                          labelFor={(action) => capabilityLabel(googleCapabilities, action)}
                           noteFor={(action) =>
                             offeredActions.has(action)
                               ? undefined

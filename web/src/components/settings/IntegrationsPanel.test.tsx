@@ -72,6 +72,29 @@ const CATALOG = [
     },
     capabilities: [{ action: "logs:read", access: "read", asset: "query_result" }],
   },
+  // ADR 0109 seam: a named-connection provider comes from the catalog like any
+  // other. The web used to push a hand-written Google entry in after the fact.
+  {
+    provider: "gcp",
+    credentialSource: "mint",
+    connectionModel: "named",
+    hosts: ["compute.googleapis.com"],
+    display: {
+      name: "Google Cloud",
+      category: "cloud",
+      blurb: "Call Google Cloud APIs with a short-lived, policy-bound credential.",
+      icon: { mono: "GC", color: "#4285f4", logo: "" },
+    },
+    capabilities: [
+      {
+        action: "compute.instances.get",
+        access: "read",
+        asset: "",
+        label: "Describe Compute Engine instances",
+        host: "compute.googleapis.com",
+      },
+    ],
+  },
 ];
 
 // github available (needs connecting), datadog connected.

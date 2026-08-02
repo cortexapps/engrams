@@ -14,12 +14,22 @@ import { useProfiles } from "@/hooks/useProfiles";
 import { fallbackIdentity, type Access } from "@/lib/connectorModel";
 import { builtinLogo } from "@/lib/connectorLogos";
 import type { ProviderCatalogEntry } from "@/gen/engram/app/v1/integration_pb";
-import { GOOGLE_CLOUD_OPERATIONS, GOOGLE_CLOUD_PROVIDER } from "./googleCloud";
+
+/** Narrow the wire's free-form endpoint rule to the two shapes the UI knows. */
+function asEndpointRule(value: string): "google-api" | "non-google-api" | undefined {
+  return value === "google-api" || value === "non-google-api" ? value : undefined;
+}
 
 export interface ConnectorCapabilityView {
   action: string;
   access: Access;
   asset?: string;
+  /** Operator-facing name, served by a named-connection provider. */
+  label?: string;
+  /** The exact host a curated operation calls. */
+  host?: string;
+  /** For a host-less operation, the endpoint kind that makes it usable. */
+  endpointRule?: "google-api" | "non-google-api";
 }
 
 export interface ConnectorView {
@@ -38,7 +48,11 @@ export interface ConnectorView {
   usedBy: number;
   /** Profile {id,name,icon} that grant this provider's powers. */
   usedByProfiles: { id: string; name: string; icon: string }[];
-  /** Named connections exist for providers such as Google Cloud. */
+  /**
+   * "named" — an administrator configures connections, each its own authority
+   * (ADR 0109). Served by the catalog; the web used to hard-code the one
+   * provider it knew was named.
+   */
   connectionModel?: "named";
   connectionCount?: number;
 }
@@ -58,11 +72,29 @@ export function useConnectorViews(): ConnectorViewsResult {
   const rowByProvider = new Map((conns.data?.connectors ?? []).map((c) => [c.provider, c]));
   const allProfiles = profiles.data?.profiles ?? [];
 
+  const connectionsByProvider = new Map<string, { id: string; hosts: string[] }[]>();
+  for (const connection of namedConnections.data?.connections ?? []) {
+    const hosts = connection.googleCloud?.endpoints ?? [];
+    const bucket = connectionsByProvider.get(connection.provider);
+    if (bucket) bucket.push({ id: connection.id, hosts });
+    else connectionsByProvider.set(connection.provider, [{ id: connection.id, hosts }]);
+  }
+
   const views: ConnectorView[] = (cat.data?.providers ?? []).map((e) => {
     const fb = fallbackIdentity(e.provider);
     const row = rowByProvider.get(e.provider);
+    // A named provider has no singleton slot: a profile uses it when it grants
+    // ANY of its connections. A singleton provider is used when it grants the
+    // one default connection.
+    const named = e.connectionModel === "named";
+    const connections = connectionsByProvider.get(e.provider) ?? [];
+    const connectionIds = new Set(connections.map((connection) => connection.id));
     const used = allProfiles.filter((p) =>
-      (p.integrationGrants ?? []).some((grant) => grant.connectionId === e.defaultConnectionId),
+      (p.integrationGrants ?? []).some((grant) =>
+        named
+          ? connectionIds.has(grant.connectionId)
+          : grant.connectionId === e.defaultConnectionId,
+      ),
     );
     // Logo precedence (matches useProviderIdentity): bundled built-in →
     // uploaded overlay → monogram.
@@ -79,81 +111,38 @@ export function useConnectorViews(): ConnectorViewsResult {
         ...(logo ? { logo } : {}),
       },
       credentialSource: e.credentialSource === "mint" ? "mint" : "inject",
-      hosts: e.hosts,
+      // A named provider's reachable hosts are whatever its connections allow;
+      // the catalog's list is the curated superset it could offer.
+      hosts:
+        named && connections.length > 0
+          ? [...new Set(connections.flatMap((connection) => connection.hosts))]
+          : e.hosts,
       capabilities: e.capabilities.map((c) => ({
         action: c.action,
         access: c.access === "write" ? "write" : "read",
         ...(c.asset ? { asset: c.asset } : {}),
+        ...(c.label ? { label: c.label } : {}),
+        ...(c.host ? { host: c.host } : {}),
+        ...(c.endpointRule ? { endpointRule: asEndpointRule(c.endpointRule) } : {}),
       })),
-      status: row?.status === "connected" ? "connected" : "available",
-      builtin: row?.builtin ?? false,
+      status: named
+        ? connections.length > 0
+          ? "connected"
+          : "available"
+        : row?.status === "connected"
+          ? "connected"
+          : "available",
+      builtin: named ? true : (row?.builtin ?? false),
       usedBy: used.length,
       usedByProfiles: used.map((p) => ({ id: p.id, name: p.name, icon: p.icon })),
+      ...(named ? { connectionModel: "named" as const, connectionCount: connections.length } : {}),
     };
   });
-
-  const googleConnections = (namedConnections.data?.connections ?? []).filter(
-    (connection) => connection.provider === GOOGLE_CLOUD_PROVIDER,
-  );
-  views.push(googleCloudView(googleConnections, allProfiles));
 
   return {
     views,
     isLoading: cat.isLoading || conns.isLoading || namedConnections.isLoading,
     error: cat.error ?? conns.error ?? namedConnections.error,
-  };
-}
-
-interface GrantingProfileLike {
-  id: string;
-  name: string;
-  icon: string;
-  integrationGrants?: { connectionId: string }[];
-}
-
-interface GoogleConnectionLike {
-  id: string;
-  googleCloud?: { endpoints: string[] };
-}
-
-/**
- * The synthetic Google Cloud view (ADR 0109 named connections). Google has no
- * row in the connector catalog yet, so both view joins build its entry here —
- * with per-connection data when the caller can list connections (admin), and
- * a placeholder host when it cannot (member surfaces).
- */
-function googleCloudView(
-  connections: readonly GoogleConnectionLike[],
-  profiles: readonly GrantingProfileLike[],
-): ConnectorView {
-  const connectionIds = new Set(connections.map((connection) => connection.id));
-  const granting = profiles.filter((profile) =>
-    (profile.integrationGrants ?? []).some((grant) => connectionIds.has(grant.connectionId)),
-  );
-  const hosts = [
-    ...new Set(connections.flatMap((connection) => connection.googleCloud?.endpoints ?? [])),
-  ];
-  return {
-    provider: GOOGLE_CLOUD_PROVIDER,
-    defaultConnectionId: "",
-    name: "Google Cloud",
-    category: "Infrastructure",
-    blurb:
-      "Run gcloud against approved Google Cloud APIs through keyless Workload Identity Federation. Credentials remain outside the session.",
-    icon: { mono: "GC", color: "#4285f4" },
-    credentialSource: "mint",
-    hosts: hosts.length > 0 ? hosts : ["googleapis.com"],
-    capabilities: GOOGLE_CLOUD_OPERATIONS.map(({ action, access }) => ({ action, access })),
-    status: connections.length > 0 ? "connected" : "available",
-    builtin: true,
-    usedBy: granting.length,
-    usedByProfiles: granting.map((profile) => ({
-      id: profile.id,
-      name: profile.name,
-      icon: profile.icon,
-    })),
-    connectionModel: "named",
-    connectionCount: connections.length,
   };
 }
 
@@ -189,16 +178,51 @@ export function catalogToViews(providers: ProviderCatalogEntry[]): ConnectorView
         action: c.action,
         access: c.access === "write" ? "write" : "read",
         ...(c.asset ? { asset: c.asset } : {}),
+        ...(c.label ? { label: c.label } : {}),
+        ...(c.host ? { host: c.host } : {}),
+        ...(c.endpointRule ? { endpointRule: asEndpointRule(c.endpointRule) } : {}),
       })),
       status: "available" as const,
       builtin: false,
       usedBy: 0,
       usedByProfiles: [],
+      ...(e.connectionModel === "named" ? { connectionModel: "named" as const } : {}),
     };
   });
-  // Members cannot list named connections, so the launch receipt gets the
-  // placeholder-host Google view; it still names the powers a Google grant
-  // opens instead of dropping them (web-M1).
-  views.push(googleCloudView([], []));
+  // A member cannot list named connections, but the catalog still names the
+  // powers a grant on one opens — so the launch receipt shows them rather than
+  // dropping them (web-M1). No hand-written entry is pushed in any more.
   return views;
+}
+
+const isGoogleApiHost = (host: string) => host.endsWith(".googleapis.com");
+
+/**
+ * The operations a named connection can actually exercise, given its allowed
+ * endpoints.
+ *
+ * Mirrors the orchestrator's compile-time gate: a curated operation needs its
+ * exact `host` in the endpoint list; a host-less one needs an endpoint of the
+ * kind its `endpointRule` names. The rules travel WITH the capability now, so
+ * this no longer restates a table the orchestrator also keeps.
+ */
+export function operationsForEndpoints(
+  capabilities: readonly ConnectorCapabilityView[],
+  endpoints: readonly string[],
+): ConnectorCapabilityView[] {
+  return capabilities.filter((capability) => {
+    if (capability.endpointRule === "google-api") return endpoints.some(isGoogleApiHost);
+    if (capability.endpointRule === "non-google-api") {
+      return endpoints.some((host) => !isGoogleApiHost(host));
+    }
+    return capability.host !== undefined && endpoints.includes(capability.host);
+  });
+}
+
+/** The operator-facing name for an action, or the action itself. */
+export function capabilityLabel(
+  capabilities: readonly ConnectorCapabilityView[],
+  action: string,
+): string {
+  return capabilities.find((capability) => capability.action === action)?.label ?? action;
 }

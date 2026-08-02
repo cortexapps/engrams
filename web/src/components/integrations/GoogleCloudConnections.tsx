@@ -270,8 +270,8 @@ export function GoogleCloudConnectDialog({
       const id = response.connection.id;
       close();
       await navigate({
-        to: "/settings/integrations/gcp/$connectionId/setup",
-        params: { connectionId: id },
+        to: "/settings/integrations/$provider/$connectionId/setup",
+        params: { provider: "gcp", connectionId: id },
       });
     } catch {
       // Shown via create.error.
@@ -610,8 +610,8 @@ export function GoogleCloudConnections() {
                 <div className="flex items-center gap-2">
                   <Button asChild variant="outline" size="sm">
                     <Link
-                      to="/settings/integrations/gcp/$connectionId/setup"
-                      params={{ connectionId: connection.id }}
+                      to="/settings/integrations/$provider/$connectionId/setup"
+                      params={{ provider: connection.provider, connectionId: connection.id }}
                     >
                       Setup
                     </Link>

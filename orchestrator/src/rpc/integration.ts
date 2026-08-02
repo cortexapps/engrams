@@ -400,9 +400,14 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       await requireUser(ctx, getSession);
       const registry = await loadRegistry(connectors);
       const withLogo = new Set(await connectorLogos.listProviders());
-      const providers = await Promise.all(buildProviderCatalog(registry).map(async (e) => {
-        const defaultConnection = await connections.getDefault(e.provider);
-        if (!defaultConnection) {
+      const entries = await Promise.all(buildProviderCatalog(registry, providers).map(async (e) => {
+        // A NAMED provider has no singleton credential slot — an administrator
+        // creates its connections, and `ListConnections` returns them. Only a
+        // singleton provider must have a default.
+        const defaultConnection = e.connectionModel === "named"
+          ? null
+          : await connections.getDefault(e.provider);
+        if (!defaultConnection && e.connectionModel !== "named") {
           throw new ConnectError(
             `default integration connection for "${e.provider}" is unavailable`,
             Code.Internal,
@@ -422,11 +427,19 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
           },
           credentialSource: e.credentialSource,
           hosts: e.hosts,
-          capabilities: e.capabilities.map((c) => ({ action: c.action, access: c.access, asset: c.asset ?? "" })),
-          defaultConnectionId: defaultConnection.id,
+          capabilities: e.capabilities.map((c) => ({
+            action: c.action,
+            access: c.access,
+            asset: c.asset ?? "",
+            label: c.label ?? "",
+            host: c.host ?? "",
+            endpointRule: c.endpointRule ?? "",
+          })),
+          defaultConnectionId: defaultConnection?.id ?? "",
+          connectionModel: e.connectionModel,
         };
       }));
-      return { providers };
+      return { providers: entries };
     },
 
     // Admin-only: seal a mint kind's fields as org secrets `<kind>.<field>` so

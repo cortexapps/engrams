@@ -17,6 +17,7 @@ import type { ResolvedIntegrationGrant } from "../grants.ts";
 import {
   CURATED_GOOGLE_OPERATIONS,
   FORBIDDEN_GOOGLE_OPERATIONS,
+  GOOGLE_PASSTHROUGH_CATALOG,
   GOOGLE_PASSTHROUGH_OPERATIONS,
   appendGooglePolicy,
   validateGoogleGrants,
@@ -54,6 +55,22 @@ export function makeGoogleProvider(deps: GoogleProviderDeps): ConnectionProvider
       curated: Object.keys(CURATED_GOOGLE_OPERATIONS),
       passthrough: [...GOOGLE_PASSTHROUGH_OPERATIONS],
       forbidden: FORBIDDEN_GOOGLE_OPERATIONS,
+      describe: [
+        ...Object.entries(CURATED_GOOGLE_OPERATIONS).map(([action, policy]) => ({
+          action,
+          label: policy.label,
+          access: policy.access,
+          host: policy.host,
+          endpointRule: null,
+        })),
+        ...GOOGLE_PASSTHROUGH_OPERATIONS.map((action) => ({
+          action,
+          label: GOOGLE_PASSTHROUGH_CATALOG[action].label,
+          access: GOOGLE_PASSTHROUGH_CATALOG[action].access,
+          host: null,
+          endpointRule: GOOGLE_PASSTHROUGH_CATALOG[action].endpoint,
+        })),
+      ],
     },
     // Google delivers its credential through a metadata service, so a session
     // holding one of these connections needs the host-side endpoint.
