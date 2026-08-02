@@ -287,16 +287,21 @@ impl RequestPolicy {
     }
 
     /// Glob path match over the whole path; empty `path_globs` = any path.
-    /// An internal `segment:` prefix makes each `*` stop at `/`. Google Cloud
-    /// policies use this stricter form so a resource segment cannot absorb a
-    /// nested API action.
+    /// An internal `segment:` prefix makes each `*` stop at `/`.
+    /// `segment-path:` also excludes the query string from matching. Google
+    /// Cloud policies use the latter form because API clients add transport
+    /// parameters such as `alt=json`, while the permission boundary is the
+    /// resource path.
     pub fn path_matches(&self, path: &str) -> bool {
         self.path_globs.is_empty()
             || self.path_globs.iter().any(|pattern| {
-                pattern.strip_prefix("segment:").map_or_else(
-                    || glob_match(pattern, path),
-                    |pattern| segment_glob_match(pattern, path),
-                )
+                if let Some(pattern) = pattern.strip_prefix("segment-path:") {
+                    segment_glob_match(pattern, path.split_once('?').map_or(path, |(path, _)| path))
+                } else if let Some(pattern) = pattern.strip_prefix("segment:") {
+                    segment_glob_match(pattern, path)
+                } else {
+                    glob_match(pattern, path)
+                }
             })
     }
 }
@@ -849,6 +854,17 @@ mod tests {
         assert!(!segment_glob_match(
             "/compute/v1/projects/*/zones/*/instances/*",
             "/compute/v1/projects/prod/zones/us-central1-a/instances/vm-1/start"
+        ));
+
+        let google = RequestPolicy {
+            path_globs: vec!["segment-path:/v3/projects/*/metricDescriptors".into()],
+            ..RequestPolicy::default()
+        };
+        assert!(google.path_matches(
+            "/v3/projects/cortex-internal-tooling/metricDescriptors?alt=json&pageSize=1"
+        ));
+        assert!(!google.path_matches(
+            "/v3/projects/cortex-internal-tooling/metricDescriptors/delete?alt=json"
         ));
     }
 }
