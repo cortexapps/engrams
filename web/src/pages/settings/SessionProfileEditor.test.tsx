@@ -197,6 +197,19 @@ describe("SessionProfileEditor (create)", () => {
     await waitFor(() => expect(uploadSkill).toHaveBeenCalled());
     expect(uploadSkill.mock.calls[0][0]).toMatchObject({ name: "my-skill" });
   });
+
+  it("opens the skill file chooser from the primary upload action", () => {
+    render(<SessionProfileEditor mode="create" />);
+    openAdvanced();
+    const fileInput = screen.getByTestId("skill-upload-file") as HTMLInputElement;
+    const openFileChooser = vi.spyOn(fileInput, "click");
+
+    expect(screen.getByText(/archive with skill\.md at its root/i)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /choose skill file/i }));
+
+    expect(openFileChooser).toHaveBeenCalledOnce();
+    expect(uploadSkill).not.toHaveBeenCalled();
+  });
 });
 
 describe("SessionProfileEditor (edit)", () => {
