@@ -22,8 +22,8 @@ name: CI
 #                       NBD + root net / true-e2e) that share setup
 #                       via .github/actions/fc-setup. See the block
 #                       comment above the jobs for the batch split.
-#   - web:              pnpm install + oxlint + tsc + vite build +
-#                       vitest
+#   - web:              pnpm install + oxfmt + oxlint + tsc +
+#                       vite build + vitest
 #   - cli:              the `engrams` product CLI (cli/, Bun):
 #                       typecheck + stub-orchestrator tests + a
 #                       compiled-binary smoke
@@ -568,6 +568,9 @@ jobs:
 
       - name: pnpm install
         run: pnpm install --frozen-lockfile
+
+      - name: pnpm format check (oxfmt)
+        run: pnpm format:check
 
       # oxlint over src/. Fast (Rust-based) static gate; runs before the
       # build so lint failures surface without waiting on tsc + vite.
