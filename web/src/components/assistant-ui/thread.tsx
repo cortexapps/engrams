@@ -42,6 +42,7 @@ import {
 import { useSessionStatus } from "@/components/session-thread/session-status";
 import { useComposerActions } from "@/components/session-thread/composer-actions";
 import { isSubmitKey, useEnterToSend } from "@/hooks/useEnterToSend";
+import { ModeChip } from "@/components/ModeChip";
 import type { SessionState } from "@/lib/types";
 
 // The session transcript, on assistant-ui primitives. This is NOT a chatbot:
@@ -87,6 +88,9 @@ const ThreadMessage: FC = () => {
   // pressing Enter and landing authoritatively in the conversation log;
   // it shows here greyed and transitions in place to solid on consumption.
   const pending = useAuiState((s) => s.message.metadata.custom?.pending === true);
+  // ADR 0108: a durable user echo whose consuming run_started has not landed
+  // yet (delivery gap) — pending grey plus a "delivering…" caption.
+  const delivering = useAuiState((s) => s.message.metadata.custom?.delivering === true);
   const inner =
     role === "system" ? (
       <SystemMessage />
@@ -109,9 +113,16 @@ const ThreadMessage: FC = () => {
     return (
       <div
         className="opacity-50 transition-opacity"
-        title="Pending — not yet in the conversation log"
+        title={
+          delivering
+            ? "Delivering — the run has not started yet"
+            : "Pending — not yet in the conversation log"
+        }
       >
         {inner}
+        {delivering && (
+          <p className="mt-1 text-right text-xs text-muted-foreground italic">delivering…</p>
+        )}
       </div>
     );
   }
@@ -317,6 +328,12 @@ const QueuedRail: FC<{
   );
 };
 
+// ADR 0107: mid-session the composer offers the one alternate mode plan mode.
+// (The start screen drives its chip from the harness descriptor; a live session
+// has no catalog fetch, and the coordinator rejects a mode the harness never
+// declared, so an undeclared plan mode fails loudly rather than silently.)
+const PLAN_MODE = [{ id: "plan", label: "Plan" }];
+
 const Composer: FC = () => {
   const status = useSessionStatus();
   const banner = status ? COMPOSER_BANNER[status] : undefined;
@@ -327,8 +344,19 @@ const Composer: FC = () => {
   // prompt can be ENQUEUED while a run is in flight (type-ahead), ⌘↵ works
   // mid-run, and Esc interrupts. `submitMode="none"` disables the primitive's
   // own keyboard submit so plain Enter stays a newline and our keydown owns ⌘↵.
-  const { submit, interrupt, sendBlocked, canRecall, recall, queued, removeQueued } =
-    useComposerActions();
+  const {
+    submit,
+    interrupt,
+    sendBlocked,
+    canRecall,
+    recall,
+    queued,
+    removeQueued,
+    mode,
+    setMode,
+    planPending,
+  } = useComposerActions();
+  const planMode = mode === "plan";
   const isRunning = useAuiState((s) => s.thread.isRunning);
   const composer = useComposerRuntime();
   const text = useComposer((c) => c.text);
@@ -349,8 +377,10 @@ const Composer: FC = () => {
   // asked to keep that affordance regardless of text). ↑-recall is offered
   // only on an empty composer with something still queued. Both can coexist.
   const hints: string[] = [];
+  if (planPending) hints.push("the agent proposed a plan — review it above ↑");
   if (canRecall && isEmpty) hints.push("↑ to edit queued message");
   if (isRunning) hints.push("esc to interrupt");
+  if (planMode) hints.push("plan mode — a read-only design pass");
   const hintLine = hints.length ? hints.join(" · ") : hint;
 
   return (
@@ -364,10 +394,17 @@ const Composer: FC = () => {
           // submits. submitMode="none" leaves submit entirely to our keydown so
           // it isn't run-gated.
           submitMode="none"
+          // ADR 0108: the library default is a DOCUMENT-level capture-phase
+          // Esc handler with no isRunning gate — it fired a phantom interrupt
+          // from an idle page and double-fired next to our own Esc handler
+          // below. Our keydown handler is the single Esc path.
+          cancelOnEscape={false}
           placeholder={
-            enterToSend
-              ? "Reply to the task…   (↵ to send, ⇧↵ for newline)"
-              : "Reply to the task…   (⌘↵ to send)"
+            planMode
+              ? "Describe what to plan — the agent explores, it won't edit…"
+              : enterToSend
+                ? "Reply to the task…   (↵ to send, ⇧↵ for newline)"
+                : "Reply to the task…   (⌘↵ to send)"
           }
           className="max-h-40 min-h-9 flex-1 resize-none bg-transparent px-2 py-1.5 text-sm outline-none placeholder:text-muted-foreground/80"
           rows={1}
@@ -387,7 +424,7 @@ const Composer: FC = () => {
             // consume-on-result.
             if (e.key === "Escape" && isRunning) {
               e.preventDefault();
-              interrupt();
+              interrupt("esc");
               return;
             }
             // Plain ↑ on an empty composer recalls the newest queued message.
@@ -408,6 +445,11 @@ const Composer: FC = () => {
               }
             }
           }}
+        />
+        <ModeChip
+          modes={PLAN_MODE}
+          value={planMode ? "plan" : null}
+          onChange={(next) => setMode(next ?? "default")}
         />
         <ComposerAction />
       </div>
@@ -440,7 +482,7 @@ const ComposerAction: FC = () => {
         size="icon"
         className="size-8 rounded-full"
         aria-label="Stop the run"
-        onClick={() => interrupt()}
+        onClick={() => interrupt("stop-button")}
       >
         <SquareIcon className="size-3 fill-current" />
       </TooltipIconButton>

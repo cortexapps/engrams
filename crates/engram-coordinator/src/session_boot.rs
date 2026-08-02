@@ -28,6 +28,7 @@
 use std::collections::HashMap;
 
 use engram_core::traits::SessionFence;
+use engram_core::types::integration::CredentialMintSource;
 use engram_core::types::sandbox::AgentSpec;
 use engram_core::types::session::{SessionSpec, SessionState};
 use engram_core::types::BindingDisposition;
@@ -114,6 +115,10 @@ pub(crate) struct BootInputs {
     /// outbox via `send_prompt_core` — the same path every follow-up uses
     /// (ADR 0073). The boot pipeline itself no longer reads it.
     pub prompt: Option<String>,
+    /// ADR 0107: the session-mode directive riding the create-time initial
+    /// prompt (e.g. `plan`). Read together with `prompt` — meaningless
+    /// without one.
+    pub harness_mode: Option<String>,
 }
 
 /// The product of resolving a session's manifest / secrets / env /
@@ -198,6 +203,7 @@ pub(crate) async fn boot_on_reserved_host(
         // The create-time prompt was enqueued to the outbox by
         // `create_session_core`; the boot pipeline no longer delivers it.
         prompt: _,
+        harness_mode: _,
     } = inputs;
 
     // ADR 0056: the image ref doubles as the SecretContext for resolving the
@@ -321,16 +327,16 @@ pub(crate) async fn boot_on_reserved_host(
     // Egress policy from the resolved guest IP (None on backends without
     // one) + the injects/observes already resolved by the overlapped leg.
     let observes = build_observe_entries(integration_policy.as_ref());
-    let egress_policy = assemble_egress_policy(
-        state,
-        session_id,
-        sandbox_id,
-        egress_secrets,
-        &network,
+    let resolved_policy = ResolvedEgressPolicy {
+        secrets: egress_secrets,
         injects,
         observes,
-    )
-    .await;
+        google_adc: integration_policy
+            .as_ref()
+            .is_some_and(|policy| policy.google_adc),
+    };
+    let egress_policy =
+        assemble_egress_policy(state, session_id, sandbox_id, &network, resolved_policy).await;
 
     // ADR 0073: mint the binding generation for this fresh-spawn bind.
     // The epoch fences out any surviving older-generation harness for
@@ -385,6 +391,9 @@ pub(crate) async fn boot_on_reserved_host(
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
+        google_adc: integration_policy
+            .as_ref()
+            .is_some_and(|policy| policy.google_adc),
         // ADR 0057: vestigial wire field; substitution is per-entry.
         secret_mode: engram_core::types::image::SecretMode::Broker,
     });
@@ -517,14 +526,19 @@ fn map_restore_error(e: engram_core::SandboxError) -> ApiError {
 /// and assemble the final policy. `None` when the backend exposes no guest
 /// IP (process backend / some VZ configs) — the caller synthesizes an
 /// unspecified-IP fallback.
+struct ResolvedEgressPolicy {
+    secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
+    injects: Vec<engram_core::types::egress::EgressInjectEntry>,
+    observes: Vec<engram_core::types::egress::EgressObserveEntry>,
+    google_adc: bool,
+}
+
 async fn assemble_egress_policy(
     state: &SharedState,
     session_id: SessionId,
     sandbox_id: SandboxId,
-    egress_secrets: Vec<engram_core::types::egress::EgressSecretEntry>,
     network: &engram_core::types::image::NetworkPolicy,
-    injects: Vec<engram_core::types::egress::EgressInjectEntry>,
-    observes: Vec<engram_core::types::egress::EgressObserveEntry>,
+    resolved: ResolvedEgressPolicy,
 ) -> Option<engram_core::types::egress::SessionEgressPolicy> {
     let guest_ip = state.services.host.guest_ip(sandbox_id).await?;
     Some(engram_core::types::egress::SessionEgressPolicy {
@@ -536,9 +550,10 @@ async fn assemble_egress_policy(
         allow_all: false,
         // ADR 0057: precomputed in `prepare_inner`/resume from the policy secrets
         // (broker entries only; literals are already in the guest env).
-        secrets: egress_secrets,
-        injects,
-        observes,
+        secrets: resolved.secrets,
+        injects: resolved.injects,
+        observes: resolved.observes,
+        google_adc: resolved.google_adc,
         // ADR 0057: per-secret mode replaces a session-level mode; the proxy
         // substitutes per `EgressSecretEntry`. Kept Broker for the (vestigial)
         // wire field — substitution is driven by the entries, not this flag.
@@ -597,6 +612,7 @@ pub(crate) fn assemble_capture_egress_policy(
         secrets: Vec::new(),
         injects: Vec::new(),
         observes: Vec::new(),
+        google_adc: false,
         secret_mode: engram_core::types::image::SecretMode::Literal,
     })
 }
@@ -684,7 +700,7 @@ pub(crate) async fn resolve_inject_entries(
     };
     // ADR 0056 amendment: mint entries scope their token to the session's bound
     // capabilities. Fetch them once, only when a mint entry is actually present.
-    let caps = if policy.injects.iter().any(|i| !i.mint_provider.is_empty()) {
+    let caps = if policy.injects.iter().any(|i| i.mint_source.is_some()) {
         match state
             .services
             .meta
@@ -706,12 +722,12 @@ pub(crate) async fn resolve_inject_entries(
     };
     let mut out = Vec::with_capacity(policy.injects.len());
     for inj in &policy.injects {
-        let entry = if !inj.mint_provider.is_empty() {
+        let entry = if let Some(mint_source) = &inj.mint_source {
             // Minted: the GATING is policy-owned (this entry's hosts/methods/paths),
             // but the HEADER (name + rendered value) is the integration's — so the
             // auth scheme is the provider's, not hardcoded by the policy compiler.
             // The scoped credential never enters the guest.
-            match mint_inject_header(state, &inj.mint_provider, &caps).await {
+            match mint_inject_header(state, session_id, mint_source, &caps).await {
                 Some((h, expires_at)) => engram_core::types::egress::EgressInjectEntry {
                     secret: h.value,
                     header_name: h.name,
@@ -727,7 +743,7 @@ pub(crate) async fn resolve_inject_entries(
                     // WS4: a minted entry is refreshable — the proxy re-mints via
                     // its InjectRefresher near `expires_at` (this provider is the
                     // one the refresh route re-runs the mint for).
-                    mint_provider: inj.mint_provider.clone(),
+                    mint_source: Some(mint_source.clone()),
                     expires_at: Some(expires_at),
                 },
                 None => {
@@ -776,7 +792,7 @@ pub(crate) async fn resolve_inject_entries(
                 graphql_operation: inj.graphql_operation.clone(),
                 graphql_field: inj.graphql_field.clone(),
                 // WS4: a static secret is not refreshable (empty provider, no TTL).
-                mint_provider: String::new(),
+                mint_source: None,
                 expires_at: None,
             }
         };
@@ -785,7 +801,7 @@ pub(crate) async fn resolve_inject_entries(
     (out, failures)
 }
 
-/// ADR 0056 amendment: resolve a *mint* provider's egress inject header — mint a
+/// ADR 0056 amendment: resolve a connection's egress inject header — mint a
 /// credential scoped to the session's caps, then let the integration render it
 /// into a header (`Integration::inject_header`, e.g. github → `Bearer`). The
 /// scoped credential never enters the guest. Returns the rendered header AND the
@@ -795,12 +811,20 @@ pub(crate) async fn resolve_inject_entries(
 /// SigV4).
 async fn mint_inject_header(
     state: &SharedState,
-    provider: &str,
+    session_id: SessionId,
+    source: &CredentialMintSource,
     caps: &[engram_core::types::Capability],
 ) -> Option<(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
 )> {
+    let CredentialMintSource::Connection {
+        connection_id,
+        provider,
+    } = source;
+    if provider == "gcp" {
+        return mint_remote_connection_inject_header(session_id, connection_id).await;
+    }
     let engine = state
         .integrations
         .resolve(provider, &state.services.secrets)
@@ -808,7 +832,7 @@ async fn mint_inject_header(
     // Scope the mint to this provider's caps; owner from a cap's `@owner/repo`.
     let scoped: Vec<engram_core::types::Capability> = caps
         .iter()
-        .filter(|c| c.provider == provider)
+        .filter(|c| c.provider == *provider)
         .cloned()
         .collect();
     let owner = scoped
@@ -841,6 +865,104 @@ async fn mint_inject_header(
     }
 }
 
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionBrokerRequest<'a> {
+    session_id: String,
+    connection_id: &'a str,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ConnectionBrokerResponse {
+    kind: String,
+    token: String,
+    expires_at: String,
+}
+
+/// Ask the orchestrator's generic connection broker for a short-lived
+/// credential. Provider-specific exchange stays behind that broker. The
+/// credential travels only between host-side processes.
+async fn mint_remote_connection_inject_header(
+    session_id: SessionId,
+    connection_id: &str,
+) -> Option<(
+    engram_core::traits::InjectHeader,
+    chrono::DateTime<chrono::Utc>,
+)> {
+    let base = match std::env::var("ENGRAM_ORCHESTRATOR_INTERNAL_URL") {
+        Ok(value) if !value.trim().is_empty() => value.trim_end_matches('/').to_string(),
+        _ => {
+            tracing::warn!("connection credential mint requested but ENGRAM_ORCHESTRATOR_INTERNAL_URL is unset");
+            return None;
+        }
+    };
+    let bearer = match std::env::var("ENGRAM_CONNECTION_BROKER_BEARER") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => {
+            tracing::warn!(
+                "connection credential mint requested but no broker bearer is configured"
+            );
+            return None;
+        }
+    };
+    let response = match reqwest::Client::new()
+        .post(format!("{base}/internal/v1/integrations/credentials/mint"))
+        .bearer_auth(bearer.trim())
+        .json(&ConnectionBrokerRequest {
+            session_id: session_id.to_string(),
+            connection_id,
+        })
+        .send()
+        .await
+    {
+        Ok(response) if response.status().is_success() => response,
+        Ok(response) => {
+            tracing::warn!(
+                %session_id,
+                connection_id,
+                status = %response.status(),
+                "connection credential broker rejected mint request"
+            );
+            return None;
+        }
+        Err(error) => {
+            tracing::warn!(
+                %session_id,
+                connection_id,
+                %error,
+                "connection credential broker request failed"
+            );
+            return None;
+        }
+    };
+    let payload = match response.json::<ConnectionBrokerResponse>().await {
+        Ok(payload) => payload,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "connection credential broker returned an invalid response");
+            return None;
+        }
+    };
+    let expires_at = match payload.expires_at.parse::<chrono::DateTime<chrono::Utc>>() {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(%session_id, %error, "connection credential broker returned an invalid expiry");
+            return None;
+        }
+    };
+    let credential = match payload.kind.as_str() {
+        "bearer" => engram_core::traits::ScopedCredential::Bearer {
+            token: payload.token,
+            expires_at,
+        },
+        kind => {
+            tracing::warn!(%session_id, kind, "connection broker returned an unsupported credential kind");
+            return None;
+        }
+    };
+    engram_core::traits::default_inject_header(&credential).map(|header| (header, expires_at))
+}
+
 /// WS4: re-mint the egress inject header for a single provider on demand — the
 /// reusable core the proxy-refresh route (`POST /hosts/:id/sessions/:sid/
 /// inject/refresh`) runs when the proxy's minted credential nears expiry. Fetches
@@ -851,7 +973,7 @@ async fn mint_inject_header(
 pub(crate) async fn refresh_inject_header(
     state: &SharedState,
     session_id: SessionId,
-    provider: &str,
+    source: &CredentialMintSource,
 ) -> Option<(
     engram_core::traits::InjectHeader,
     chrono::DateTime<chrono::Utc>,
@@ -862,7 +984,7 @@ pub(crate) async fn refresh_inject_header(
         .get_session_capabilities(session_id)
         .await
         .unwrap_or_default();
-    mint_inject_header(state, provider, &caps).await
+    mint_inject_header(state, session_id, source, &caps).await
 }
 
 // Issue #535 (b): `persist_integration_policy` (ADR 0056 B′) retired — the

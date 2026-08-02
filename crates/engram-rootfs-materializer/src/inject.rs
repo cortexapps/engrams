@@ -281,7 +281,7 @@ for dev in /dev/vd*; do
 done
 mark bundles_mounted
 # ADR 0096 D6: SOFT egress steering on VZ. The VZ backend passes
-# ENGRAM_EGRESS=<proxy_port>:<dns_port> on the kernel cmdline (env
+# ENGRAM_EGRESS=<proxy_port>:<dns_port>:<metadata_port> on the kernel cmdline (env
 # form, so the kernel hands it to PID 1); FC never sets it — its
 # REDIRECT lives host-side in the netns. When present, DNAT guest
 # tcp/443 and {udp,tcp}/53 to the egress proxy on the NAT gateway,
@@ -312,12 +312,15 @@ if [ -n "${ENGRAM_EGRESS:-}" ]; then
             # little-endian: "0140A8C0" -> 192.168.64.1.
             gw="$((0x$(echo "$gw_hex" | cut -c7-8))).$((0x$(echo "$gw_hex" | cut -c5-6))).$((0x$(echo "$gw_hex" | cut -c3-4))).$((0x$(echo "$gw_hex" | cut -c1-2)))"
             ep="${ENGRAM_EGRESS%%:*}"
-            ed="${ENGRAM_EGRESS##*:}"
+            egress_rest="${ENGRAM_EGRESS#*:}"
+            ed="${egress_rest%%:*}"
+            em="${ENGRAM_EGRESS##*:}"
             if iptables -t nat -A OUTPUT -p tcp --dport 443 -j DNAT --to-destination "$gw:$ep" 2>/dev/null \
                && iptables -t nat -A OUTPUT -p udp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null \
-               && iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null; then
+               && iptables -t nat -A OUTPUT -p tcp --dport 53 -j DNAT --to-destination "$gw:$ed" 2>/dev/null \
+               && iptables -t nat -A OUTPUT -p tcp -d 169.254.169.254 --dport 80 -j DNAT --to-destination "$gw:$em" 2>/dev/null; then
                 egress_ok=1
-                echo "engram-init: egress steering active -> $gw:$ep (443) / $gw:$ed (53)" >&2
+                echo "engram-init: egress steering active -> $gw:$ep (443) / $gw:$ed (53) / $gw:$em (metadata)" >&2
             fi
         fi
     fi
@@ -560,6 +563,15 @@ mod tests {
             !dyn_loop_section.contains("mount -t ext4"),
             "dyn-mount loop must never attempt ext4 — that would match the CA drive",
         );
+    }
+
+    #[test]
+    fn init_shim_routes_only_link_local_metadata_to_the_host_emulator() {
+        assert!(DEFAULT_INIT_SHIM.contains("egress_rest=\"${ENGRAM_EGRESS#*:}\""));
+        assert!(DEFAULT_INIT_SHIM.contains("em=\"${ENGRAM_EGRESS##*:}\""));
+        assert!(DEFAULT_INIT_SHIM
+            .contains("-d 169.254.169.254 --dport 80 -j DNAT --to-destination \"$gw:$em\""));
+        assert!(!DEFAULT_INIT_SHIM.contains("-p tcp --dport 80 -j DNAT"));
     }
 
     /// The default injection substitutes both placeholders and lands the

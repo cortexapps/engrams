@@ -129,6 +129,9 @@ export interface ProfileSnapshotView {
 export interface SessionListItem extends Session {
   owner_email: string | null;
   owner_name: string | null;
+  /** ADR 0107: the owning task derived `awaiting_review` — the session is
+   * parked on a plan approval or an unanswered question. */
+  needsAttention?: boolean;
   /** `'system'` for warm-pool / automated sessions; `'user'` or absent for
    * human-launched sessions. Drives the OwnerCell badge choice. */
   owner_kind?: "user" | "system" | null;

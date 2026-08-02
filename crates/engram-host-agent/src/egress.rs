@@ -41,10 +41,14 @@ impl CoordInjectRefresher {
 
 #[async_trait]
 impl InjectRefresher for CoordInjectRefresher {
-    async fn refresh(&self, session_id: SessionId, mint_provider: &str) -> Option<RefreshedInject> {
+    async fn refresh(
+        &self,
+        session_id: SessionId,
+        mint_source: &engram_core::types::integration::CredentialMintSource,
+    ) -> Option<RefreshedInject> {
         match self
             .coord
-            .refresh_inject(self.host_id, session_id, mint_provider)
+            .refresh_inject(self.host_id, session_id, mint_source)
             .await
         {
             Ok(resp) => Some(RefreshedInject {
@@ -54,7 +58,7 @@ impl InjectRefresher for CoordInjectRefresher {
             Err(e) => {
                 // The proxy keeps the stale secret on `None` — a stale token 401s
                 // (recoverable), and a coord blip must not drop the guest's request.
-                tracing::warn!(%session_id, provider = %mint_provider, error = %e, "egress inject re-mint via coord failed");
+                tracing::warn!(%session_id, source = ?mint_source, error = %e, "egress inject re-mint via coord failed");
                 None
             }
         }
@@ -124,6 +128,7 @@ impl HostEgress {
         ca_source: Arc<dyn CaSource>,
         bind_addr: SocketAddr,
         dns_bind_addr: Option<SocketAddr>,
+        metadata_bind_addr: Option<SocketAddr>,
         observe_sink: Option<engram_egress_proxy::ObserveSink>,
         inject_refresher: Option<Arc<dyn InjectRefresher>>,
     ) -> Result<Self, EgressError> {
@@ -142,6 +147,7 @@ impl HostEgress {
 
         let mut proxy_cfg = ProxyConfig::new(bind_addr, registry.clone(), mint);
         proxy_cfg.dns_bind_addr = dns_bind_addr;
+        proxy_cfg.metadata_bind_addr = metadata_bind_addr;
         proxy_cfg.observe_sink = observe_sink;
         proxy_cfg.inject_refresher = inject_refresher;
         let proxy = Proxy::new(proxy_cfg);
@@ -273,7 +279,7 @@ pub fn register_policy(
             },
             // WS4: a minted entry (non-empty provider) carries a TTL the proxy
             // re-mints against near expiry; a static secret has neither.
-            mint_provider: i.mint_provider,
+            mint_source: i.mint_source,
             cred: engram_egress_proxy::RefreshableCred::new(i.secret, i.expires_at),
         });
     }
@@ -331,6 +337,7 @@ pub fn register_policy(
         secrets,
         injects,
         observes,
+        google_adc: policy.google_adc,
     });
     Ok(())
 }
@@ -373,7 +380,7 @@ mod tests {
                         path_globs: vec!["/api/v2/logs*".into()],
                         graphql_operation: String::new(),
                         graphql_field: String::new(),
-                        mint_provider: String::new(),
+                        mint_source: None,
                         expires_at: None,
                     },
                     // ADR 0059: a GraphQL inject (gated by operation+field).
@@ -388,7 +395,12 @@ mod tests {
                         path_globs: vec!["/graphql".into()],
                         graphql_operation: "mutation".into(),
                         graphql_field: "mergePullRequest".into(),
-                        mint_provider: "github".into(),
+                        mint_source: Some(
+                            engram_core::types::integration::CredentialMintSource::Connection {
+                                connection_id: "github-default".into(),
+                                provider: "github".into(),
+                            },
+                        ),
                         expires_at: Some(chrono::Utc::now() + chrono::Duration::hours(1)),
                     },
                 ],
@@ -430,6 +442,7 @@ mod tests {
                         }),
                     },
                 ],
+                google_adc: false,
                 secret_mode: SecretMode::Broker,
             },
         )
@@ -439,7 +452,7 @@ mod tests {
         assert_eq!(state.injects.len(), 2);
         let inj = &state.injects[0];
         assert_eq!(inj.secret(), "dd-secret");
-        assert_eq!(inj.mint_provider, ""); // static: never refreshed
+        assert!(inj.mint_source.is_none()); // static: never refreshed
         assert_eq!(inj.header_name, "DD-API-KEY");
         assert!(inj.allow.matches("api.datadoghq.com"));
         assert!(inj.policy.allows("GET", "/api/v2/logs/events"));
@@ -452,7 +465,15 @@ mod tests {
         // ADR 0059: the GraphQL inject translates into a RequestPolicy.graphql.
         let gql_inj = &state.injects[1];
         assert_eq!(gql_inj.secret(), "gh-token");
-        assert_eq!(gql_inj.mint_provider, "github"); // WS4: refreshable
+        assert_eq!(
+            gql_inj.mint_source,
+            Some(
+                engram_core::types::integration::CredentialMintSource::Connection {
+                    connection_id: "github-default".into(),
+                    provider: "github".into(),
+                }
+            )
+        ); // WS4: refreshable
         let g = gql_inj
             .policy
             .graphql

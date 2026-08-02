@@ -191,6 +191,26 @@ describe("parseOrchestratorFrame — SYNTH fixtures", () => {
     expect(SESSION_EVENT_KINDS).toContain("tool_result_submitted");
   });
 
+  // ADR 0107: a mode directive rode a prompt — unregistered kinds are
+  // silently dropped by EventSource, so the allowlist entry is load-bearing.
+  test("harness_mode_changed parses and is subscribed", () => {
+    const payload = {
+      type: "harness_mode_changed",
+      mode: "plan",
+      at: "2026-07-31T00:00:00Z",
+    };
+    const parsed = parseOrchestratorFrame(
+      JSON.stringify({
+        idx: 12,
+        kind: "harness_mode_changed",
+        payload_json: JSON.stringify(payload),
+      }),
+      "harness_mode_changed",
+    );
+    expect(parsed?.event).toEqual(payload);
+    expect(SESSION_EVENT_KINDS).toContain("harness_mode_changed");
+  });
+
   test("lagged returns null (not an IndexedEvent)", () => {
     expect(parse(SYNTH_LAGGED)).toBeNull();
   });

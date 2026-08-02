@@ -726,6 +726,35 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
     if !ctx.step("drain").await {
         return OpOutcome::Failed("fenced at drain".into());
     }
+    // One Deliver op owns the whole drain: this loop re-fetches
+    // `outbox_next_due` each pass, so any row a sibling was enqueued for
+    // is already ours. The shim's `op_pending_exists` guard is only
+    // ADVISORY (a racing wake slips duplicates through), and its "a
+    // duplicate finds no due rows and no-ops" assumption inverts when
+    // the head row is STUCK: every duplicate then churns the same
+    // failing forward. DST finding (ADR 0108 swarm, seed 33043259):
+    // duplicates accumulated against a hung host, and N≥3 Deliver ops —
+    // the one budget-less kind — mutually re-armed each other's capped
+    // backoff with their own deadline burns, an immortal claim cycle.
+    // Cancelling queued siblings on claim makes the invariant real:
+    // at most one Deliver op survives per session. Never lossy — the
+    // outbox rows are the durable state, and the shim's rescan
+    // re-enqueues if this op dies fenced mid-drain.
+    match state
+        .services
+        .meta
+        .op_cancel_queued(id, OpKind::Deliver)
+        .await
+    {
+        Ok(true) => {
+            tracing::debug!(session_id = %id, "deliver op: cancelled queued duplicate deliver ops");
+        }
+        Ok(false) => {}
+        Err(e) => {
+            tracing::debug!(session_id = %id, error = %e,
+                "deliver op: duplicate-sweep failed; continuing (duplicates only cost churn)");
+        }
+    }
     loop {
         let row: OutboxRow = match state.services.meta.outbox_next_due(id).await {
             Ok(Some(r)) => r,
@@ -879,10 +908,22 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
                 // Their scanners own the transition (evac resumer, queue
                 // scanner); the op retry keeps knocking.
                 other => {
-                    return OpOutcome::Retry(format!(
+                    let reason = format!(
                         "session is {} — not deliverable yet; its scanner owns recovery",
                         other.as_str()
-                    ));
+                    );
+                    // ADR 0108 A5: a boot in progress is a KNOWN, short
+                    // wait — fixed cadence, so the pre-Active deferrals
+                    // never inflate the backoff that paces post-Active
+                    // delivery (the 2026-07-31 40 s recovery cadence).
+                    // Every other state keeps the attempts-scaled
+                    // backoff: those waits are open-ended.
+                    return match other {
+                        SessionState::Pending | SessionState::Queued => {
+                            OpOutcome::RetryAfter(KNOWN_WAIT_RETRY, reason)
+                        }
+                        _ => OpOutcome::Retry(reason),
+                    };
                 }
             }
         }
@@ -901,45 +942,93 @@ async fn deliver(ctx: &OpCtx<'_>) -> OpOutcome {
                 ::metrics::counter!(crate::metrics::OUTBOX_DELIVERED_TOTAL).increment(1);
                 // Loop to the next due row — one resume covers the batch.
             }
-            Err(reason) => {
-                // Defer the ROW (its `attempts`-scaled backoff is the
-                // durable redelivery state, unchanged from ADR 0073) and
-                // retry the OP: preserve order — never skip ahead of a
-                // stuck head.
+            Err(deferral) => {
+                // Defer the ROW and retry the OP: preserve order — never
+                // skip ahead of a stuck head. A known-wait deferral (ADR
+                // 0108 A4/A5) uses its fixed cadence for both; an
+                // unknown failure keeps the attempts-scaled backoff (the
+                // durable redelivery state, unchanged from ADR 0073).
                 tracing::debug!(
                     session_id = %id,
                     prompt_id = %row.prompt_id,
                     attempts = row.attempts,
-                    %reason,
+                    reason = %deferral.reason,
                     "deliver op: delivery deferred",
                 );
+                let row_delay = deferral
+                    .retry_after
+                    .unwrap_or_else(|| failure_backoff(row.attempts));
                 let _ = state
                     .services
                     .meta
-                    .outbox_defer(&row.prompt_id, failure_backoff(row.attempts))
+                    .outbox_defer(&row.prompt_id, row_delay)
                     .await;
                 ::metrics::counter!(crate::metrics::OUTBOX_DEFERRED_TOTAL).increment(1);
-                return OpOutcome::Retry(reason);
+                return match deferral.retry_after {
+                    Some(delay) => OpOutcome::RetryAfter(delay, deferral.reason),
+                    None => OpOutcome::Retry(deferral.reason),
+                };
             }
         }
     }
 }
 
-/// Forward one outbox row to the session's live sandbox. `Err(reason)` =
+/// ADR 0108 A4: window after a boot/resume completes in which a
+/// `send_prompt` `NotFound` means "the harness has not attached YET",
+/// not "the harness is gone". Sized above the observed attach lag
+/// (50–200 ms) with a wide margin; past the window, the destructive
+/// reattach is the correct remedy again.
+const ATTACH_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// ADR 0108 A5: fixed cadence for deferrals whose cause is KNOWN and
+/// short-lived (a boot in progress, the attach grace). Never
+/// attempts-scaled: the wait is not a failure, and an inflated attempts
+/// counter must not slow the retries that follow it.
+const KNOWN_WAIT_RETRY: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// A retryable delivery failure. `retry_after: Some(_)` = the cause is
+/// known and short-lived; the caller uses the fixed cadence for both the
+/// row and the op. `None` = unknown cause; attempts-scaled backoff.
+struct ForwardDeferral {
+    reason: String,
+    retry_after: Option<std::time::Duration>,
+}
+
+impl ForwardDeferral {
+    fn backoff(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+            retry_after: None,
+        }
+    }
+}
+
+impl std::fmt::Display for ForwardDeferral {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.reason)
+    }
+}
+
+/// Forward one outbox row to the session's live sandbox. `Err` =
 /// retryable (the caller defers the row + requeues the op); terminal
 /// sessions never reach here (the verb's dispatch drops their rows).
 async fn forward_outbox_row(
     ctx: &OpCtx<'_>,
     row: &engram_core::types::outbox::OutboxRow,
-) -> Result<(), String> {
+) -> Result<(), ForwardDeferral> {
     use engram_core::types::outbox::OutboxKind;
     use engram_core::SandboxError;
     let state = ctx.state;
-    if retire_legacy_answer_row(state, row).await? {
+    if retire_legacy_answer_row(state, row)
+        .await
+        .map_err(ForwardDeferral::backoff)?
+    {
         return Ok(());
     }
     let Some(sandbox_id) = state.resolve_sandbox(row.session_id).await else {
-        return Err("no live sandbox on an Active session".into());
+        return Err(ForwardDeferral::backoff(
+            "no live sandbox on an Active session",
+        ));
     };
 
     let forward = || async {
@@ -951,10 +1040,16 @@ async fn forward_outbox_row(
                     .and_then(|t| t.as_str())
                     .unwrap_or_default()
                     .to_string();
+                // ADR 0107: the optional mode directive riding this prompt.
+                let mode = row
+                    .payload
+                    .get("mode")
+                    .and_then(|m| m.as_str())
+                    .map(|m| m.to_string());
                 state
                     .services
                     .host
-                    .send_prompt(sandbox_id, row.prompt_id.clone(), text)
+                    .send_prompt(sandbox_id, row.prompt_id.clone(), text, mode)
                     .await
             }
             OutboxKind::Answer => unreachable!("legacy answer rows retire before forwarding"),
@@ -981,17 +1076,48 @@ async fn forward_outbox_row(
     };
 
     match forward().await {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            // Delivered — the attach question is settled for this
+            // binding; drop the grace stamp.
+            state.attach_grace.remove(&row.session_id);
+            Ok(())
+        }
         Err(SandboxError::NotFound) => {
-            // The VM is alive but no harness is attached: the genuine
-            // harness-unbound desync (harness process gone, VM alive — the
-            // e35ed1fa class). The harness will NOT come back on its own —
-            // its connection loop only re-dials when its established link
-            // drops or agentd SIGUSR1s it — so `start_agent` is the remedy,
-            // immediately. (A #594-era "wait for in-guest self-reattach"
-            // window here was wrong twice over: an ADR 0074 rung-2 un-pause
-            // keeps the vsock connection INTACT — delivery succeeds and this
-            // arm never runs — and a real desync has nothing to wait for.)
+            // ADR 0108 A4: inside the attach grace, `NotFound` means the
+            // harness has not dialed YET (boot/resume completed moments
+            // ago; the attach follows 50–200 ms later). Firing the
+            // reattach here SIGUSR1s the very harness that is mid-attach
+            // — the 2026-07-31 boot race. Defer on the fixed cadence;
+            // the attach-signal wake (A3) re-runs this op the moment the
+            // harness announces itself.
+            if let Some(stamp) = state.attach_grace.get(&row.session_id).map(|e| *e.value()) {
+                let age = state.services.clock.now_utc().signed_duration_since(stamp);
+                if age
+                    < chrono::Duration::from_std(ATTACH_GRACE)
+                        .expect("ATTACH_GRACE fits chrono::Duration")
+                {
+                    return Err(ForwardDeferral {
+                        reason: "harness not attached yet (attach grace); \
+                                 deferring without a reattach nudge"
+                            .into(),
+                        retry_after: Some(KNOWN_WAIT_RETRY),
+                    });
+                }
+                // Grace expired without an attach: fall through to the
+                // destructive remedy and drop the stale stamp.
+                state.attach_grace.remove(&row.session_id);
+            }
+            // The VM is alive but no harness is attached past the grace:
+            // the genuine harness-unbound desync (harness process gone,
+            // VM alive — the e35ed1fa class). The harness will NOT come
+            // back on its own — its connection loop only re-dials when
+            // its established link drops or agentd SIGUSR1s it — so
+            // `start_agent` is the remedy. (A #594-era "wait for
+            // in-guest self-reattach" window here was wrong for a real
+            // desync; ADR 0108's grace is different — it keys on a
+            // boot/resume that JUST completed, where the attach is
+            // provably in flight, and A1's handshake bounds guarantee
+            // the wait converges.)
             match crate::api::snapshot::reattach_harness_in_place(
                 state,
                 row.session_id,
@@ -1000,12 +1126,16 @@ async fn forward_outbox_row(
             )
             .await
             {
-                Ok(true) => Err("harness reattach issued (start_agent fallback)".into()),
-                Ok(false) => Err("session moved off the sandbox mid-delivery".into()),
-                Err(e) => Err(format!("reattach failed: {e}")),
+                Ok(true) => Err(ForwardDeferral::backoff(
+                    "harness reattach issued (start_agent fallback)",
+                )),
+                Ok(false) => Err(ForwardDeferral::backoff(
+                    "session moved off the sandbox mid-delivery",
+                )),
+                Err(e) => Err(ForwardDeferral::backoff(format!("reattach failed: {e}"))),
             }
         }
-        Err(e) => Err(format!("forward: {e}")),
+        Err(e) => Err(ForwardDeferral::backoff(format!("forward: {e}"))),
     }
 }
 

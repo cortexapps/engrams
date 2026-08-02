@@ -1,0 +1,6 @@
+#!/bin/sh
+set -eu
+here="$(dirname "$(readlink -f "$0")")"
+export CLOUDSDK_PYTHON="$here/../python/bin/python3"
+export LD_LIBRARY_PATH="$here/../lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+exec "$here/../google-cloud-sdk/bin/gcloud" "$@"

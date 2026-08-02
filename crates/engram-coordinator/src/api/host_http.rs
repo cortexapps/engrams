@@ -679,42 +679,21 @@ pub async fn heartbeat(
     // 0015 M3). The scheduling payload itself lives in PG above — ADR
     // 0047 removed the in-memory scheduler mirror.
     state.host_registry.touch_seen(host_id);
-    // ADR 0073 phase 4: the demoted belt-and-braces liveness check.
-    // Compare the host's hub-attached set against OUR view (Active
-    // sessions bound to this host whose sandbox the host also reports
-    // running) and count disagreements — the metric's rate IS the
-    // health signal; nothing is healed from here (delivery redelivers
-    // via the outbox, detection reads the event log). Best-effort and
-    // deliberately coarse: sessions mid-create/resume legitimately
-    // have no attach yet, so only sessions the host itself lists as
-    // RUNNING but not ATTACHED count.
+    // ADR 0073 phase 4 → ADR 0108 A8: the disagreement check is a
+    // REPAIR now, not just an alarm. An Active session whose sandbox
+    // the host reports RUNNING but not hub-ATTACHED has a delivery
+    // hole: a forward into that hub reaches a socket with no reader,
+    // and the outbox row waits out the full ACK_TIMEOUT (prod
+    // 7eddce62). `harness_desync::run_once` recalls the waiting rows
+    // and enqueues the Deliver op directly; the decision logic lives
+    // there — not here — so the DST swarm drives it without this HTTP
+    // handler. Best-effort and deliberately coarse: sessions
+    // mid-create/resume legitimately have no attach yet, and the
+    // repair only recalls rows that were already waiting.
     if hb.running_sandboxes_known && !hb.running_sandboxes.is_empty() {
-        let attached: std::collections::HashSet<_> = hb.harness_attached.iter().collect();
-        if let Ok(resident) = state
-            .services
-            .meta
-            .list_resident_sandbox_assignments_on_host(host_id)
-            .await
-        {
-            // Active-only ON PURPOSE: a parked VM is paused, so "running
-            // but no attached harness" is its normal, healthy shape — it
-            // must not tick the disagreement alarm.
-            for (session_id, sandbox_id, _) in resident
-                .into_iter()
-                .filter(|(_, _, st)| *st == engram_core::types::SessionState::Active)
-            {
-                if hb.running_sandboxes.contains(&sandbox_id) && !attached.contains(&sandbox_id) {
-                    ::metrics::counter!(crate::metrics::HARNESS_ATTACH_DISAGREEMENT_TOTAL)
-                        .increment(1);
-                    tracing::debug!(
-                        host_id = %host_id,
-                        %session_id,
-                        %sandbox_id,
-                        "heartbeat: running sandbox with no attached harness (disagreement alarm)",
-                    );
-                }
-            }
-        }
+        let running: std::collections::BTreeSet<_> = hb.running_sandboxes.iter().copied().collect();
+        let attached: std::collections::BTreeSet<_> = hb.harness_attached.iter().copied().collect();
+        let _ = crate::harness_desync::run_once(&state, host_id, &running, &attached).await;
     }
 
     // ADR 0015 M5: ship the coord's authoritative enabled-images
@@ -1589,9 +1568,8 @@ pub async fn integration_asset_ingest(
 
 #[derive(Deserialize)]
 pub struct RefreshInjectRequest {
-    /// The mint provider whose credential to re-mint (e.g. `"github"`) — the
-    /// value the egress proxy stored on the inject entry at boot.
-    pub mint_provider: String,
+    /// Immutable host-side authority stored on the inject entry at boot.
+    pub mint_source: engram_core::types::integration::CredentialMintSource,
 }
 
 #[derive(Serialize)]
@@ -1620,24 +1598,19 @@ pub async fn refresh_inject(
     Path((host_id, session_id)): Path<(HostId, SessionId)>,
     Json(req): Json<RefreshInjectRequest>,
 ) -> Result<Json<RefreshInjectResponse>, ApiError> {
-    if req.mint_provider.is_empty() {
-        return Err(ApiError::BadRequest(
-            "mint_provider is required for an inject refresh".into(),
-        ));
-    }
     let (header, expires_at) =
-        crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_provider)
+        crate::session_boot::refresh_inject_header(&state, session_id, &req.mint_source)
             .await
             .ok_or_else(|| {
                 ApiError::Internal(format!(
-                    "inject refresh for provider {} on session {session_id} could not be minted",
-                    req.mint_provider
+                    "inject refresh for {:?} on session {session_id} could not be minted",
+                    req.mint_source
                 ))
             })?;
     tracing::debug!(
         %host_id,
         %session_id,
-        provider = %req.mint_provider,
+        source = ?req.mint_source,
         %expires_at,
         "re-minted egress inject credential for the proxy",
     );

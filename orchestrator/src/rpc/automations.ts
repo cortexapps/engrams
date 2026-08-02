@@ -228,6 +228,7 @@ function parseAction(value: ProtoAutomationAction | undefined): AutomationAction
     promptTemplate: action.promptTemplate,
     ...(titleTemplate !== undefined ? { titleTemplate } : {}),
     includeEventContext: action.includeEventContext,
+    ...(action.harnessMode ? { harnessMode: action.harnessMode } : {}),
   };
 }
 
@@ -261,6 +262,7 @@ function protoAction(action: AutomationAction): ProtoAutomationAction {
         promptTemplate: action.promptTemplate,
         ...(action.titleTemplate !== undefined ? { titleTemplate: action.titleTemplate } : {}),
         includeEventContext: action.includeEventContext,
+        ...(action.harnessMode !== undefined ? { harnessMode: action.harnessMode } : {}),
       },
     },
   });

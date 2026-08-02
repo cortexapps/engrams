@@ -302,6 +302,20 @@
       "when": 1785528000000,
       "tag": "0042_remove_codex_access_token",
       "breakpoints": true
+    },
+    {
+      "idx": 43,
+      "version": "7",
+      "when": 1785599431533,
+      "tag": "0043_round_mercury",
+      "breakpoints": true
+    },
+    {
+      "idx": 44,
+      "version": "7",
+      "when": 1785606009107,
+      "tag": "0044_google_cloud_wif",
+      "breakpoints": true
     }
   ]
 }

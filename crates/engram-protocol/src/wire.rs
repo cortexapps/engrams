@@ -114,7 +114,16 @@ use serde::{Deserialize, Serialize};
 // CancelExec coord↔host RPC. Lockstep coord+host roll.
 // v20 (ADR 0103 review hardening): ExecFrame carries terminal refusals as
 // their own oneof variant instead of collapsing them into Exit(None).
-pub const WIRE_VERSION: u32 = 20;
+// v21 (ADR 0109): `SessionEgressPolicy.google_adc` tells the host whether
+// to expose the session-local Google metadata endpoint. Trailing bincode
+// field addition. Lockstep coordinator and host roll.
+// v22 (issue: engrams-review outage 2026-08-01): `CredentialMintSource`
+// becomes externally tagged. The internally-tagged form (#931) bincode-
+// ENCODED as a map but could never DECODE (`deserialize_any`), so every
+// `SessionEgressPolicy` carrying a minted inject failed host-side at
+// boot — no peer ever decoded the old `Some(mint_source)` bytes. The
+// bump makes the mixed-fleet posture explicit. Lockstep coord+host roll.
+pub const WIRE_VERSION: u32 = 22;
 
 /// gRPC metadata (header) key carrying the caller's [`WIRE_VERSION`] on
 /// every coord→host request (issue #229). ASCII, lowercase — tonic

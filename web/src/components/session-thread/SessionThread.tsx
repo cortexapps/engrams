@@ -14,9 +14,9 @@ import {
   dequeueQueuedPrompt as dequeueQueuedPromptMethod,
   completeToolCall as completeToolCallMethod,
 } from "../../gen/engram/app/v1/session-SessionService_connectquery";
-import { buildMessages, INACTIVE_STATUSES } from "./buildMessages";
+import { buildMessages } from "./buildMessages";
 import { SessionStatusContext } from "./session-status";
-import { ComposerActionsContext } from "./composer-actions";
+import { ComposerActionsContext, type InterruptSource } from "./composer-actions";
 import { QuestionActionsContext } from "./question-actions";
 import type { IndexedEvent, SessionState } from "../../lib/types";
 
@@ -70,6 +70,8 @@ export function SessionThread({
     messages: serverMessages,
     isRunning,
     queue,
+    pendingPlan,
+    currentMode,
   } = useMemo(
     () => buildMessages(events, sessionId, status, streamingText),
     [events, sessionId, status, streamingText],
@@ -125,6 +127,18 @@ export function SessionThread({
     }
     return s;
   }, [events]);
+  // ADR 0108 (held-echo UX): prompt_ids whose durable user echo has landed.
+  // buildMessages now renders an unconsumed, unqueued echo as a pending bubble
+  // keyed by its prompt_id — the optimistic bubble (same id) must yield to it,
+  // or assistant-ui sees a duplicate message id.
+  const echoedPromptIds = useMemo(() => {
+    const s = new Set<string>();
+    for (const { event } of events) {
+      if (event.type === "agent_message" && event.role === "user" && event.prompt_id)
+        s.add(event.prompt_id);
+    }
+    return s;
+  }, [events]);
   // Server-confirmed queue membership (from `prompt_queued`, surfaced via
   // buildMessages' `queue`). An optimistic "immediate" send the server actually
   // queued (a run started just as it landed) moves to the rail once this knows.
@@ -148,7 +162,8 @@ export function SessionThread({
           e.sessionId === sessionId &&
           !e.queued &&
           !consumedPromptIds.has(e.promptId) &&
-          !queuedPromptIds.has(e.promptId),
+          !queuedPromptIds.has(e.promptId) &&
+          !echoedPromptIds.has(e.promptId),
       )
       .map((e) => ({
         role: "user",
@@ -157,7 +172,7 @@ export function SessionThread({
         metadata: { custom: { pending: true } },
       }));
     return optimistic.length ? [...serverMessages, ...optimistic] : serverMessages;
-  }, [serverMessages, pending, consumedPromptIds, queuedPromptIds, sessionId]);
+  }, [serverMessages, pending, consumedPromptIds, queuedPromptIds, echoedPromptIds, sessionId]);
 
   // The composer's queued-message rail (Claude-Code style): everything submitted
   // but not yet consumed into the conversation. Server-confirmed queue first
@@ -204,14 +219,16 @@ export function SessionThread({
 
   const sendBlocked = status ? SEND_BLOCKED.has(status) : false;
 
-  const submitAnswer = useCallback(
-    (toolCallId: string, answers: Record<string, string[]>) => {
+  // ADR 0107: the generic deferred-tool completion — questions and plan
+  // decisions ride the same CompleteToolCall + optimistic set.
+  const completeTool = useCallback(
+    (toolCallId: string, result: unknown) => {
       if (sendBlocked) return;
       setAnsweredToolCallIds((prev) => new Set(prev).add(toolCallId));
       const completion = completeToolCallMutation.mutateAsync({
         sessionId,
         toolCallId,
-        resultJson: JSON.stringify(answers),
+        resultJson: JSON.stringify(result),
       });
       completion.catch((err) => {
         setAnsweredToolCallIds((prev) => {
@@ -223,6 +240,11 @@ export function SessionThread({
       });
     },
     [sessionId, sendBlocked, completeToolCallMutation],
+  );
+
+  const submitAnswer = useCallback(
+    (toolCallId: string, answers: Record<string, string[]>) => completeTool(toolCallId, answers),
+    [completeTool],
   );
 
   // ADR 0052: ↑-in-empty-composer recall. Pull the most-recent still-queued
@@ -245,6 +267,17 @@ export function SessionThread({
   // run-gated send) so the composer can enqueue while a run is in flight. The
   // optimistic bubble (keyed by the client-minted prompt_id) covers the gap
   // until the server's role:user echo lands with the same id.
+  // ADR 0107: the composer's mode. The server truth is `currentMode`
+  // (derived from the event log); `modeOverride` is the user's not-yet-sent
+  // toggle. The next prompt carries `harnessMode` only when it CHANGES the
+  // mode, so a steady state never spams mode markers.
+  const [modeOverride, setModeOverride] = useState<string | null>(null);
+  const composerMode = modeOverride ?? currentMode;
+  const setMode = useCallback(
+    (next: string) => setModeOverride(next === currentMode ? null : next),
+    [currentMode],
+  );
+
   const submit = useCallback(
     (raw: string) => {
       const text = raw.trim();
@@ -255,13 +288,18 @@ export function SessionThread({
       // prompt_queued / run_started confirms which it is.
       setPending((p) => [...p, { sessionId, promptId, text, queued: isRunning }]);
       sentTextRef.current.set(promptId, text);
-      sendPromptMutation.mutateAsync({ sessionId, text, promptId }).catch((err) => {
-        // Send failed: drop the optimistic entry so it isn't stuck.
-        setPending((p) => p.filter((e) => e.promptId !== promptId));
-        console.warn("sendPrompt failed", err);
-      });
+      const harnessMode =
+        modeOverride !== null && modeOverride !== currentMode ? modeOverride : undefined;
+      setModeOverride(null);
+      sendPromptMutation
+        .mutateAsync({ sessionId, text, promptId, ...(harnessMode ? { harnessMode } : {}) })
+        .catch((err) => {
+          // Send failed: drop the optimistic entry so it isn't stuck.
+          setPending((p) => p.filter((e) => e.promptId !== promptId));
+          console.warn("sendPrompt failed", err);
+        });
     },
-    [sessionId, sendPromptMutation, isRunning],
+    [sessionId, sendPromptMutation, isRunning, modeOverride, currentMode],
   );
 
   // Cancel a specific queued message (the rail's × button): dequeue it server-
@@ -277,16 +315,33 @@ export function SessionThread({
     [sessionId, dequeueQueuedMutation],
   );
 
-  // ADR 0052/0030: interrupt the in-flight run (Esc / the Stop button). No-op
-  // once idle/terminal — the endpoint would 409 on the unbound sandbox. The
+  // ADR 0052/0030/0108: interrupt the in-flight run (Esc / the Stop button /
+  // the assistant-ui cancel adapter). Two gates, both required, so a phantom
+  // interrupt cannot fire from a page that is not visibly running:
+  //   1. client run state — the thread must believe a run is live (the same
+  //      `isRunning` the composer's Stop/Esc affordances key on);
+  //   2. session status — only states where a live run can exist. Never
+  //      `undefined` (page load) and never host_lost/idle/terminal (the
+  //      endpoint would 409 on the unbound sandbox anyway).
+  // `source` attributes the caller on InterruptRequest.source. The
   // run_interrupted event arrives over SSE and closes the run; a queued
   // message (if any) then runs next per the harness's consume-on-result.
-  const interrupt = useCallback(() => {
-    if (status && INACTIVE_STATUSES.has(status)) return;
-    interruptMutation
-      .mutateAsync({ sessionId })
-      .catch((err) => console.warn("interrupt failed", err));
-  }, [sessionId, status, interruptMutation]);
+  const interrupt = useCallback(
+    (source: InterruptSource) => {
+      if (!isRunning) {
+        console.debug("interrupt suppressed: no run is live", { source, status });
+        return;
+      }
+      if (status !== "active" && status !== "created" && status !== "evicting") {
+        console.debug("interrupt suppressed: session status has no live run", { source, status });
+        return;
+      }
+      interruptMutation
+        .mutateAsync({ sessionId, source })
+        .catch((err) => console.warn("interrupt failed", err));
+    },
+    [sessionId, status, isRunning, interruptMutation],
+  );
 
   const runtime = useExternalStoreRuntime({
     messages,
@@ -297,7 +352,9 @@ export function SessionThread({
     // it can enqueue mid-run); these adapters keep any assistant-ui-internal
     // submit/cancel path consistent with our own.
     onNew: async (message) => submit(appendText(message)),
-    onCancel: async () => interrupt(),
+    // Still reachable through the runtime's cancel API with cancelOnEscape
+    // off; gated inside `interrupt` like every other caller (ADR 0108).
+    onCancel: async () => interrupt("aui-cancel"),
   });
 
   return (
@@ -312,10 +369,13 @@ export function SessionThread({
             recall: recallQueued,
             queued: railItems,
             removeQueued,
+            mode: composerMode,
+            setMode,
+            planPending: pendingPlan != null,
           }}
         >
           <QuestionActionsContext.Provider
-            value={{ submitAnswer, answeredToolCallIds, sendBlocked }}
+            value={{ submitAnswer, completeTool, answeredToolCallIds, sendBlocked }}
           >
             <TooltipProvider>
               <Thread />

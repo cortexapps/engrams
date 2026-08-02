@@ -55,6 +55,10 @@ message CreateTaskRequest {
   optional string harness = 6;
   optional string model = 7;
   optional string effort = 8;
+  // ADR 0107: session mode for the initial prompt (e.g. "plan"). Passed
+  // through to CreateSessionRequest.harness_mode; validated against the
+  // selected harness's descriptor modes.
+  optional string harness_mode = 9;
 }
 
 message CreateTaskResponse {

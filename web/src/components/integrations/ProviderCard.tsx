@@ -21,9 +21,19 @@ export function ProviderCard({
 }) {
   const connected = view.status === "connected";
   const writes = writeCount(view.capabilities);
+  const usage =
+    view.connectionModel === "named"
+      ? `${view.connectionCount ?? 0} connection${view.connectionCount === 1 ? "" : "s"}`
+      : view.usedBy > 0
+        ? `${view.usedBy} profile${view.usedBy === 1 ? "" : "s"}`
+        : null;
 
   return (
-    <div className="flex min-h-[168px] flex-col gap-3 rounded-lg border bg-card p-4 shadow-xs">
+    <div
+      role="group"
+      aria-label={`${view.name} integration`}
+      className="flex min-h-[168px] flex-col gap-3 rounded-lg border bg-card p-4 shadow-xs"
+    >
       <div className="flex items-start gap-3">
         <ProviderTile {...view.icon} name={view.name} size={42} />
         <div className="min-w-0 flex-1">
@@ -72,10 +82,8 @@ export function ProviderCard({
                 Manage
               </Link>
             </Button>
-            {view.usedBy > 0 && (
-              <span className="text-xs whitespace-nowrap text-muted-foreground">
-                {view.usedBy} profile{view.usedBy === 1 ? "" : "s"}
-              </span>
+            {usage && (
+              <span className="text-xs whitespace-nowrap text-muted-foreground">{usage}</span>
             )}
           </>
         ) : (

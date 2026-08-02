@@ -1,0 +1,1 @@
+CREATE INDEX "pending_tool_calls_awaiting_idx" ON "pending_tool_calls" USING btree ("session_id") WHERE "pending_tool_calls"."handling" = 'session' AND "pending_tool_calls"."submitted_at" IS NULL;

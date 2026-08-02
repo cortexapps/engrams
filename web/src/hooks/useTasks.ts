@@ -81,6 +81,7 @@ export function taskToSessionListItem(task: Task): SessionListItem {
     titleIsCustom: task.titleIsCustom,
     // Session proto fields are strings (proto3 generated TS), matching SessionState/SessionMode.
     status: (sess?.status ?? "pending") as SessionListItem["status"],
+    needsAttention: task.status === "awaiting_review",
     image: sess?.image ?? "",
     mode: (sess?.mode ?? "agent") as SessionListItem["mode"],
     // Carry the raw attribution fact through for list consumers. Null for

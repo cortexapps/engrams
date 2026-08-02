@@ -133,6 +133,11 @@ struct Cli {
     #[arg(long, env = "ENGRAM_EGRESS_DNS_PORT", default_value_t = 5353)]
     egress_dns_port: u16,
 
+    /// TCP port for the session-scoped Google metadata-compatible ADC
+    /// endpoint. Firecracker and VZ steer 169.254.169.254:80 here.
+    #[arg(long, env = "ENGRAM_EGRESS_METADATA_PORT", default_value_t = 13338)]
+    egress_metadata_port: u16,
+
     /// Where the host-agent loads the deployment-wide egress-proxy
     /// CA from. Production uses `gcp-secret-manager` with Workload
     /// Identity; dev uses `local-disk` (auto-generates on first boot).
@@ -362,6 +367,7 @@ async fn main() -> Result<(), HostAgentError> {
             // and the proxy's DNS listener can never drift. Defaults to 5353.
             fc_cfg.egress_proxy_port = Some(cli.egress_proxy_port);
             fc_cfg.egress_dns_port = Some(cli.egress_dns_port);
+            fc_cfg.egress_metadata_port = Some(cli.egress_metadata_port);
             // ADR 0014 follow-up: pin CPUID to a Cascade Lake baseline
             // so warm snapshots stay portable across the bake-host CPU
             // (AMD on Blacksmith runners) vs the prod-host CPU (Intel
@@ -466,7 +472,11 @@ async fn main() -> Result<(), HostAgentError> {
                 // 0.0.0.0, reachable at the VZ NAT gateway).
                 let vz_cfg = engram_sandbox_vz::VzConfig::with_kernel(kernel)
                     .with_bundle_dir(engram_host_agent::bundles::bundle_dir_from_env())
-                    .with_egress_ports(cli.egress_proxy_port, cli.egress_dns_port);
+                    .with_egress_ports(
+                        cli.egress_proxy_port,
+                        cli.egress_dns_port,
+                        cli.egress_metadata_port,
+                    );
                 fc_for_reattach = None;
                 // ADR 0007: attach the chunk store so `snapshot()` chunks
                 // the rootfs clone and reports the manifest ref. Without
@@ -691,12 +701,12 @@ async fn build_host_egress(
     // and every guest gets ConnectionRefused, the exact split-brain the
     // fail-closed bind (ADR 0083) exists to kill. There is no `0 = off`
     // sentinel (egress is mandatory, issue #240), so reject it here.
-    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 {
+    if cli.egress_proxy_port == 0 || cli.egress_dns_port == 0 || cli.egress_metadata_port == 0 {
         return Err(format!(
-            "egress ports must be non-zero (got proxy={}, dns={}): the iptables \
+            "egress ports must be non-zero (got proxy={}, dns={}, metadata={}): the iptables \
              REDIRECT targets the configured port, so an ephemeral (0) bind \
              leaves :443/:53 redirected at a dead port",
-            cli.egress_proxy_port, cli.egress_dns_port,
+            cli.egress_proxy_port, cli.egress_dns_port, cli.egress_metadata_port,
         ));
     }
     let source: Arc<dyn engram_egress_proxy::CaSource> = match cli.ca_source {
@@ -734,10 +744,14 @@ async fn build_host_egress(
     let dns_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_dns_port)
         .parse()
         .map_err(|e| format!("parse dns bind addr: {e}"))?;
+    let metadata_bind: std::net::SocketAddr = format!("0.0.0.0:{}", cli.egress_metadata_port)
+        .parse()
+        .map_err(|e| format!("parse metadata bind addr: {e}"))?;
     engram_host_agent::egress::HostEgress::spawn(
         source,
         bind,
         Some(dns_bind),
+        Some(metadata_bind),
         observe_sink,
         inject_refresher,
     )

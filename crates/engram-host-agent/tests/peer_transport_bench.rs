@@ -104,6 +104,7 @@ mod peer_bench_support {
             _: SandboxId,
             _: String,
             _: String,
+            _mode: Option<String>,
         ) -> Result<(), SandboxError> {
             unreachable!()
         }

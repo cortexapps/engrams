@@ -66,6 +66,15 @@ pub enum OpOutcome {
     Done,
     /// Retryable failure: requeue with backoff.
     Retry(String),
+    /// ADR 0108 A5: retryable, with a caller-chosen delay instead of the
+    /// attempts-scaled backoff. For arms that KNOW their cadence — a
+    /// deliver waiting out a boot or an attach grace — the growing
+    /// backoff is wrong twice: the wait is not a failure, and the
+    /// inflated attempts counter then slows the retries that matter
+    /// (the 2026-07-31 incident recovered at a 40 s cadence for this
+    /// reason). The attempts counter still increments in the store;
+    /// only the pacing is fixed.
+    RetryAfter(Duration, String),
     /// Terminal failure.
     Failed(String),
     /// The op observed its cancel flag between steps and stopped at a
@@ -783,6 +792,10 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     // 180s reclaim on genuine executor death); Resume/CreateBoot leave only
     // an orphan-reaped half-restore or a reattach-idempotent half-spawn, and
     // Deliver/Destroy have no shared-sandbox cleanup, so those are bounded.
+    // Stamp the attempt start on the injected clock: the requeue arms
+    // below pace an op's next claim by its OWN attempt's elapsed time
+    // in addition to the backoff — see the pacing note at the arms.
+    let attempt_started = state.services.clock.now_utc();
     let outcome = match op_deadline(op.kind) {
         Some(deadline) => {
             match tokio::time::timeout(deadline, crate::session_verbs::dispatch(&ctx)).await {
@@ -798,7 +811,7 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
     };
     drop(heartbeat);
     let meta = &state.services.meta;
-    let terminal = !matches!(outcome, OpOutcome::Retry(_));
+    let terminal = !matches!(outcome, OpOutcome::Retry(_) | OpOutcome::RetryAfter(_, _));
     let finished_done = matches!(outcome, OpOutcome::Done);
     let _ = match outcome {
         OpOutcome::Done => meta.op_finish(op.id, epoch, OpState::Done, None).await,
@@ -808,10 +821,44 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             meta.op_finish(op.id, epoch, OpState::Failed, Some(&e))
                 .await
         }
+        // Both retry arms requeue with `attempt_elapsed + delay`, never
+        // the bare delay. DST finding (ADR 0108 swarm, seed 33043259):
+        // an attempt whose dispatch burns LONGER than its requeue delay
+        // — a hung host RPC resolved only by `op_deadline` (Deliver
+        // 120s) or by an in-verb bound (evict's capture timeout) —
+        // re-arms every SIBLING op on the session whose ≤60s-capped
+        // backoff it just outlasted. Two such ops mutually re-arm:
+        // each one's burn makes the other due again, `drive_session`'s
+        // claim loop never runs dry, and the lane churns hung RPCs
+        // back-to-back at 100% duty forever (measured: 854k claims /
+        // 426k attempts on one Deliver op, three virtual years inside
+        // ONE simulator step; Deliver has no attempt budget, so the
+        // pair is immortal). Adding the attempt's own elapsed time
+        // makes a PAIR provably terminate: a 2-cycle needs each burn to
+        // reach the other op's burn+delay, and summing both gives
+        // B_a + B_b ≥ B_a + B_b + d_a + d_b — impossible for delays
+        // > 0. Cycles of N≥3 ops can still self-sustain under any
+        // per-op pacing ((N-2)·Σburns ≥ Σdelays is satisfiable), which
+        // is why the op POPULATION is bounded too: Resume and Evict
+        // carry attempt budgets, and the deliver verb sweeps duplicate
+        // Deliver ops on claim (see `deliver`'s duplicate-sweep note).
+        // A `max(delay, elapsed)` clamp is NOT enough: it recreates the
+        // exact boundary (`not_before <= now`) every time the sibling's
+        // burn equals the pace, and the loop churns on. Fast failures
+        // (elapsed ≈ 0) keep their exact cadence, so the hot path and
+        // the ADR 0108 A5 fixed-cadence intent are unchanged — pacing
+        // is simply never finer than the work it paces, strictly.
+        // Event wakes (`op_wake_queued_kind`) still cut every pace
+        // short, so recovery latency stays wake-driven, not poll-bound.
         OpOutcome::Retry(e) => {
-            tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, error = %e, "op deferred (retryable)");
-            meta.op_requeue_with_backoff(op.id, epoch, backoff(op.attempts), &e)
-                .await
+            let paced = attempt_elapsed(state, attempt_started) + backoff(op.attempts);
+            tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, delay_ms = paced.as_millis() as u64, error = %e, "op deferred (retryable)");
+            meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await
+        }
+        OpOutcome::RetryAfter(delay, e) => {
+            let paced = attempt_elapsed(state, attempt_started) + delay;
+            tracing::debug!(op_id = op.id, session_id = %op.session_id, kind = op.kind.as_str(), attempts = op.attempts, delay_ms = paced.as_millis() as u64, error = %e, "op deferred (fixed cadence)");
+            meta.op_requeue_with_backoff(op.id, epoch, paced, &e).await
         }
     };
     // ADR 0079 + ADR 0094: the initial-prompt DELIVER op is deferred
@@ -852,6 +899,13 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             )
         };
         if wake {
+            // ADR 0108 A4: the boot/resume just completed, so the
+            // harness attach is expected within the grace window. Stamp
+            // it BEFORE the wake — the woken deliver consults the stamp
+            // and must never observe the pre-stamp state.
+            state
+                .attach_grace
+                .insert(op.session_id, state.services.clock.now_utc());
             if let Err(e) = meta
                 .op_wake_queued_kind(op.session_id, OpKind::Deliver)
                 .await
@@ -860,6 +914,22 @@ async fn drive_one(state: &SharedState, op: SessionOp) {
             }
         }
     }
+}
+
+/// The attempt's own duration on the injected clock — the pacing floor
+/// the retry arms in [`drive_one`] add to their delay (see the note
+/// there). Saturates to zero if the clock reads backwards.
+fn attempt_elapsed(
+    state: &SharedState,
+    attempt_started: chrono::DateTime<chrono::Utc>,
+) -> Duration {
+    state
+        .services
+        .clock
+        .now_utc()
+        .signed_duration_since(attempt_started)
+        .to_std()
+        .unwrap_or_default()
 }
 
 /// Linear backoff, capped — mirrors the outbox driver's posture: an op

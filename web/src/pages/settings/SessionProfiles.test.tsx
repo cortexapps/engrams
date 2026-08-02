@@ -16,7 +16,7 @@ vi.mock("../../hooks/useProfiles", () => ({
               description: "",
               icon: "Bot",
               imageId: "i",
-              capabilities: [],
+              integrationGrants: [],
               archived: true,
             },
           ]
@@ -27,7 +27,7 @@ vi.mock("../../hooks/useProfiles", () => ({
               description: "Node API",
               icon: "Server",
               imageId: "i",
-              capabilities: [],
+              integrationGrants: [],
               archived: false,
             },
           ],

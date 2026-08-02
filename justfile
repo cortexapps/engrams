@@ -611,18 +611,38 @@ bundles:
 # `nix develop`, which provides mksquashfs on darwin too. Re-run after
 # editing a skill — the stamp repoints and new sessions pick the fresh
 # generation up via the §3 swap.
+#
+# Unchanged bundles are NOT rebuilt: deploy/bundles/_cache.sh fingerprints each
+# bundle's inputs and reuses the <sha>.squashfs those inputs produced last time
+# (the Docker bundles each cost a container + apt-get + several downloads, paid
+# on every Tilt trigger before this). Run with ENGRAM_BUNDLES_FORCE=1 to ignore
+# the cache — the fingerprint covers tracked files and pinned versions, not the
+# floating apt/base-image layers the Docker bundles pull.
 bundles-squashfs:
     #!/usr/bin/env bash
     set -euo pipefail
     mkdir -p var/shared
+    . deploy/bundles/_cache.sh
     stamp="{"
     sep=""
+    add_stamp() { stamp="$stamp$sep\"$1\": \"$2\""; sep=", "; }
+    # The host arch selects a different download in several build scripts
+    # (ttyd, code-server, the CLIs), so it is part of every fingerprint.
+    arch="arch=$(uname -m)"
     # ADR 0055: `sentinel` rides every reserved dyn-* slot; skills/
     # integrations-cli/browser/ide are catalog skills swapped in per session;
     # guest-tools (ADR 0080 §D) carries the pinned static ttyd for the SHELL
     # tab (reserved slot dyn_2). Files are content-keyed (<sha>.squashfs);
     # the stamp maps logical name -> sha.
     for name in sentinel skills integrations-cli browser ide guest-tools; do
+        # These bundles assemble their own tree, so their inputs are exactly
+        # the bundle dir + the shared packer.
+        fp="$(bundle_fingerprint "deploy/bundles/$name" deploy/bundles/_pack.sh "$arch")"
+        if sha="$(bundle_cache_get var/shared "$name" "$fp")"; then
+            echo "==> $name bundle unchanged — reusing $sha.squashfs"
+            add_stamp "$name" "$sha"
+            continue
+        fi
         tmp="var/shared/.$name.build.squashfs"
         if ! "deploy/bundles/$name/build.sh" "$tmp"; then
             echo "$name bundle build failed; skipping (sessions degrade gracefully)" >&2
@@ -631,8 +651,8 @@ bundles-squashfs:
         fi
         sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
         mv "$tmp" "var/shared/$sha.squashfs"
-        stamp="$stamp$sep\"$name\": \"$sha\""
-        sep=", "
+        bundle_cache_put var/shared "$name" "$fp" "$sha"
+        add_stamp "$name" "$sha"
     done
     # ADR 0062: the built-in `claude` harness rides the stamp like a skill (key
     # `harness-claude`, mounted on dyn_0). Its tree — the engram-harness-claude
@@ -686,12 +706,21 @@ bundles-squashfs:
             echo "harness tree $harness_tree is missing an executable 'harness' entry binary" >&2
             exit 1
         }
-        tmp="var/shared/.harness-claude.build.squashfs"
-        deploy/bundles/harness-claude/build.sh "$harness_tree" "$tmp"
-        sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
-        mv "$tmp" "var/shared/$sha.squashfs"
-        stamp="$stamp$sep\"harness-claude\": \"$sha\""
-        sep=", "
+        # The tree IS the content here (build.sh only packs it), so fingerprint
+        # the staged tree rather than deploy/bundles/harness-claude. The cargo
+        # build above still runs — it is the only way to learn the binary's
+        # content — but an unchanged tree skips the pack.
+        fp="$(bundle_fingerprint "$harness_tree" deploy/bundles/harness-claude deploy/bundles/_pack.sh)"
+        if sha="$(bundle_cache_get var/shared harness-claude "$fp")"; then
+            echo "==> harness-claude bundle unchanged — reusing $sha.squashfs"
+        else
+            tmp="var/shared/.harness-claude.build.squashfs"
+            deploy/bundles/harness-claude/build.sh "$harness_tree" "$tmp"
+            sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+            mv "$tmp" "var/shared/$sha.squashfs"
+            bundle_cache_put var/shared harness-claude "$fp" "$sha"
+        fi
+        add_stamp harness-claude "$sha"
         # Drop the locally-built stage tree (keep the download cache); an
         # externally-provided ENGRAM_HARNESS_CLAUDE_TREE is left untouched.
         [ "$harness_tree" = "$PWD/var/shared/.harness-claude.stage" ] && rm -rf "$harness_tree"
@@ -722,12 +751,17 @@ bundles-squashfs:
             echo "Codex harness tree must contain executable harness + codex" >&2
             exit 1
         }
-        tmp="var/shared/.harness-codex.build.squashfs"
-        deploy/bundles/harness-codex/build.sh "$codex_tree" "$tmp"
-        sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
-        mv "$tmp" "var/shared/$sha.squashfs"
-        stamp="$stamp$sep\"harness-codex\": \"$sha\""
-        sep=", "
+        fp="$(bundle_fingerprint "$codex_tree" deploy/bundles/harness-codex deploy/bundles/_pack.sh)"
+        if sha="$(bundle_cache_get var/shared harness-codex "$fp")"; then
+            echo "==> harness-codex bundle unchanged — reusing $sha.squashfs"
+        else
+            tmp="var/shared/.harness-codex.build.squashfs"
+            deploy/bundles/harness-codex/build.sh "$codex_tree" "$tmp"
+            sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+            mv "$tmp" "var/shared/$sha.squashfs"
+            bundle_cache_put var/shared harness-codex "$fp" "$sha"
+        fi
+        add_stamp harness-codex "$sha"
         [ "$codex_tree" = "$PWD/var/shared/.harness-codex.stage" ] && rm -rf "$codex_tree"
     fi
     # ADR 0080: the agentd bundle (reserved slot dyn_1) — MANDATORY, not
@@ -744,12 +778,17 @@ bundles-squashfs:
         cargo build --release --target "$atarget" -p engram-agentd
         agentd_bin="target/$atarget/release/engram-agentd"
     fi
-    tmp="var/shared/.agentd.build.squashfs"
-    deploy/bundles/agentd/build.sh "$agentd_bin" "$tmp"
-    sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
-    mv "$tmp" "var/shared/$sha.squashfs"
-    stamp="$stamp$sep\"agentd\": \"$sha\""
-    sep=", "
+    fp="$(bundle_fingerprint "$agentd_bin" deploy/bundles/agentd deploy/bundles/_pack.sh)"
+    if sha="$(bundle_cache_get var/shared agentd "$fp")"; then
+        echo "==> agentd bundle unchanged — reusing $sha.squashfs"
+    else
+        tmp="var/shared/.agentd.build.squashfs"
+        deploy/bundles/agentd/build.sh "$agentd_bin" "$tmp"
+        sha="$(sha256sum "$tmp" | cut -d' ' -f1)"
+        mv "$tmp" "var/shared/$sha.squashfs"
+        bundle_cache_put var/shared agentd "$fp" "$sha"
+    fi
+    add_stamp agentd "$sha"
     echo "$stamp}" > var/shared/current.json
     cat var/shared/current.json
 

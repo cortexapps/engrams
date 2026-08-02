@@ -2,7 +2,7 @@
  * engrams task … — the product-level verbs (native TaskService).
  *
  * A task starts from a PROFILE (ADR 0053): `task create --profile <name|id>`
- * resolves the profile server-side to an image + skills + capabilities +
+ * resolves the profile server-side to an image + skills + integration grants +
  * network policy — the same compilation the web's composer runs. Sessions
  * created here are attributed to the caller (their name in the dashboard).
  */
@@ -48,6 +48,8 @@ export interface TaskCreateOpts {
   harness?: string;
   model?: string;
   effort?: string;
+  /** ADR 0107: session mode for the initial prompt (e.g. "plan"). */
+  mode?: string;
 }
 
 export async function create(c: Clients, opts: TaskCreateOpts, json: boolean): Promise<void> {
@@ -61,6 +63,7 @@ export async function create(c: Clients, opts: TaskCreateOpts, json: boolean): P
       harness: opts.harness,
       model: opts.model,
       effort: opts.effort,
+      harnessMode: opts.mode,
     })
     .catch(failWith);
   const t = resp.task;

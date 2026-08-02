@@ -47,6 +47,9 @@ vi.mock("../../hooks/useSkills", () => ({
   useUploadSkill: () => ({ mutateAsync: uploadSkill, isPending: false }),
 }));
 vi.mock("../../hooks/useOrgSecrets", () => ({ useOrgSecretNames: () => ({ data: [] }) }));
+vi.mock("../../hooks/useIntegrations", () => ({
+  useIntegrationConnections: () => ({ data: { connections: [] } }),
+}));
 // The editor derives its policy rail + connected-connector cards from the joined
 // catalog; mock it so the test needs no QueryClient/transport.
 vi.mock("../../components/integrations/useConnectorViews", () => ({
@@ -213,7 +216,13 @@ describe("SessionProfileEditor (edit)", () => {
         designation: "pr_reviewer",
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
-        capabilities: ["github:issues:read"],
+        integrationGrants: [
+          {
+            connectionId: "connection-github",
+            operation: "issues:read",
+            resourceConstraints: [],
+          },
+        ],
         skills: ["browser"],
         network: {
           default: "allow",
@@ -281,7 +290,13 @@ describe("SessionProfileEditor (edit)", () => {
       isDefault: true,
       includeUserTokens: true,
       envVars: { ANTHROPIC_MODEL: "claude-x" },
-      capabilities: ["github:issues:read"],
+      integrationGrants: [
+        {
+          connectionId: "connection-github",
+          operation: "issues:read",
+          resourceConstraints: [],
+        },
+      ],
       skills: ["browser"],
       network: {
         default: "allow",
@@ -320,7 +335,7 @@ describe("SessionProfileEditor (edit)", () => {
         designation: "pr_reviewer",
         includeUserTokens: false,
         envVars: {},
-        capabilities: [],
+        integrationGrants: [],
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
@@ -352,7 +367,7 @@ describe("SessionProfileEditor (edit)", () => {
         isDefault: false,
         includeUserTokens: false,
         envVars: {},
-        capabilities: [],
+        integrationGrants: [],
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],

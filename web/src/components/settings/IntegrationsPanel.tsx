@@ -16,6 +16,8 @@ import { ConnectSheet } from "@/components/integrations/ConnectSheet";
 import { CustomConnectorModal } from "@/components/integrations/CustomConnectorModal";
 import { ProviderCard } from "@/components/integrations/ProviderCard";
 import { CategoryFilter } from "@/components/integrations/CategoryFilter";
+import { GoogleCloudConnectDialog } from "@/components/integrations/GoogleCloudConnections";
+import { GOOGLE_CLOUD_PROVIDER } from "@/components/integrations/googleCloud";
 import { useConnectorViews, type ConnectorView } from "@/components/integrations/useConnectorViews";
 import { PageHeading } from "../page-heading";
 
@@ -110,7 +112,15 @@ export function IntegrationsPanel() {
         </>
       )}
 
-      {connectView && (
+      {connect === GOOGLE_CLOUD_PROVIDER && (
+        <GoogleCloudConnectDialog
+          open
+          onOpenChange={(open) => {
+            if (!open) setConnect(null);
+          }}
+        />
+      )}
+      {connectView && connectView.provider !== GOOGLE_CLOUD_PROVIDER && (
         <ConnectSheet
           view={connectView}
           onClose={() => setConnect(null)}

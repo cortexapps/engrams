@@ -120,10 +120,16 @@ fn driver_coverage_is_declared() {
         DriverKind::OutboxDelivery,
         DriverKind::GcSweeps,
     ];
-    const EXCLUDED: &[(&str, &str)] = &[(
-        "chunk_gc",
-        "pin-set mark pass spans the manifest/chunk data plane (7 unimplemented SimMeta list_* surfaces plus real manifest blobs); this is an open SimMeta deviation per ADR 0098, while bundle_gc and snapshot_blob_gc carry the GC row/lease semantics the sim can honestly drive",
-    )];
+    const EXCLUDED: &[(&str, &str)] = &[
+        (
+            "chunk_gc",
+            "pin-set mark pass spans the manifest/chunk data plane (7 unimplemented SimMeta list_* surfaces plus real manifest blobs); this is an open SimMeta deviation per ADR 0098, while bundle_gc and snapshot_blob_gc carry the GC row/lease semantics the sim can honestly drive",
+        ),
+        (
+            "harness_desync",
+            "not a timer driver, so no DriverKind: production runs run_once inside the host-heartbeat handler (api/host_http.rs), and the sim mirrors that exactly — Step::HostHeartbeats drives it with the world-derived running/attached sets right after touch_host_heartbeat (ADR 0108 A8; pinned in tests/ttft_attach.rs)",
+        ),
+    ];
 
     fn modules_for(kind: DriverKind) -> &'static [&'static str] {
         match kind {

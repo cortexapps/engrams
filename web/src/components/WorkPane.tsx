@@ -1,9 +1,10 @@
-import { useEffect, useState, type ComponentType } from "react";
+import { useEffect, useMemo, useState, type ComponentType } from "react";
 import {
   Activity,
   Code2,
-  Globe,
   GitPullRequestArrow,
+  Globe,
+  Map,
   Maximize2,
   Minimize2,
   PanelRightClose,
@@ -15,6 +16,7 @@ import { TerminalPane } from "./TerminalPane";
 import { BrowserPane } from "./BrowserPane";
 import { IdePane } from "./IdePane";
 import { DiagnosticsPanel } from "./SessionDiagnostics";
+import { PlanPane } from "./PlanPane";
 import { SideEffectsPanel } from "./SideEffectsPanel";
 import { Button } from "@/components/ui/button";
 import { textVariants } from "@/components/ui/text";
@@ -32,7 +34,7 @@ import type { IndexedEvent, Session } from "../lib/types";
 // with expand-to-fill) and the mobile overlay sheet (`variant="overlay"`, where
 // collapse means "close the sheet").
 
-export type PaneTabId = "shell" | "browser" | "ide" | "side-effects" | "diagnostics";
+export type PaneTabId = "shell" | "browser" | "ide" | "plan" | "side-effects" | "diagnostics";
 
 interface PaneTabDef {
   id: PaneTabId;
@@ -49,6 +51,7 @@ const SIDE_EFFECTS_TAB: PaneTabDef = {
   icon: GitPullRequestArrow,
 };
 const DIAGNOSTICS_TAB: PaneTabDef = { id: "diagnostics", label: "Diagnostics", icon: Activity };
+const PLAN_TAB: PaneTabDef = { id: "plan", label: "Plan", icon: Map };
 
 export interface WorkPaneProps {
   sessionId: string;
@@ -92,10 +95,21 @@ export function WorkPane({
   expanded = false,
   onToggleExpand,
 }: WorkPaneProps) {
+  // ADR 0107: the Plan tab appears once the session has proposed a plan —
+  // derived here (not threaded from SessionDetail) so the expanded strip and
+  // the collapsed edge rail can never disagree again.
+  const hasPlan = useMemo(
+    () =>
+      events.some(
+        (e) => e.event.type === "tool_call_requested" && e.event.name === "exit_plan_mode",
+      ),
+    [events],
+  );
   const tabs = [
     SHELL_TAB,
     ...(browserEnabled ? [BROWSER_TAB] : []),
     ...(ideEnabled ? [IDE_TAB] : []),
+    ...(hasPlan ? [PLAN_TAB] : []),
     SIDE_EFFECTS_TAB,
     DIAGNOSTICS_TAB,
   ];
@@ -195,6 +209,13 @@ export function WorkPane({
         {open && tab === "diagnostics" && (
           <div className="absolute inset-0 overflow-hidden">
             <DiagnosticsPanel session={session} sessionId={sessionId} events={events} />
+          </div>
+        )}
+        {/* ADR 0107: read-only plan reading surface — no socket, mount on
+            view only (the Diagnostics contract). */}
+        {open && tab === "plan" && (
+          <div className="absolute inset-0 overflow-hidden">
+            <PlanPane events={events} />
           </div>
         )}
         {open && tab === "side-effects" && (
