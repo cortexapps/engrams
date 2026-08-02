@@ -19,6 +19,7 @@ import {
   testConnector,
   listConnections,
   createConnection,
+  updateConnection,
   deleteConnection,
   testConnection,
   setConnectionEnabled,
@@ -120,6 +121,11 @@ function useInvalidateConnections() {
 export function useCreateConnection() {
   const invalidate = useInvalidateConnections();
   return useMutation(createConnection, { onSuccess: invalidate });
+}
+
+export function useUpdateConnection() {
+  const invalidate = useInvalidateConnections();
+  return useMutation(updateConnection, { onSuccess: invalidate });
 }
 
 export function useDeleteConnection() {

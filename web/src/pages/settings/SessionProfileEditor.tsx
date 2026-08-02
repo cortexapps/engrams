@@ -15,7 +15,7 @@
  * combo clips the corners in Chromium).
  */
 
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams, Link } from "@tanstack/react-router";
 import { Controller, useForm } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
@@ -1011,6 +1011,7 @@ function Advanced({
   const [skillDesc, setSkillDesc] = useState("");
   const [skillFile, setSkillFile] = useState<File | null>(null);
   const [uploadErr, setUploadErr] = useState<string | null>(null);
+  const skillFileInput = useRef<HTMLInputElement>(null);
   const [portInput, setPortInput] = useState("");
   const [portErr, setPortErr] = useState<string | null>(null);
 
@@ -1047,6 +1048,7 @@ function Advanced({
       setSkillName("");
       setSkillDesc("");
       setSkillFile(null);
+      if (skillFileInput.current) skillFileInput.current.value = "";
     } catch (e) {
       setUploadErr(e instanceof Error ? e.message : String(e));
     }
@@ -1099,13 +1101,23 @@ function Advanced({
             value={skillDesc}
             onChange={(e) => setSkillDesc(e.target.value)}
           />
+          <p className="text-sm text-muted-foreground">
+            Upload a lone SKILL.md or an archive with SKILL.md at its root.
+          </p>
           <input
+            ref={skillFileInput}
             data-testid="skill-upload-file"
             type="file"
             accept=".md,.markdown,.tar,.tar.gz,.tgz,.zip"
-            className="text-sm"
-            onChange={(e) => setSkillFile(e.target.files?.[0] ?? null)}
+            className="sr-only"
+            onChange={(e) => {
+              setSkillFile(e.target.files?.[0] ?? null);
+              setUploadErr(null);
+            }}
           />
+          <p className="text-sm text-muted-foreground" aria-live="polite">
+            {skillFile ? `Selected: ${skillFile.name}` : "No skill file selected"}
+          </p>
           {uploadErr && <p className="text-sm text-destructive">{uploadErr}</p>}
           <Button
             type="button"
@@ -1114,9 +1126,20 @@ function Advanced({
             className="self-start"
             data-testid="skill-upload-submit"
             disabled={uploadSkill.isPending}
-            onClick={onUploadSkill}
+            onClick={() => {
+              if (!skillFile) {
+                setUploadErr(null);
+                skillFileInput.current?.click();
+                return;
+              }
+              void onUploadSkill();
+            }}
           >
-            {uploadSkill.isPending ? "Uploading…" : "Upload skill"}
+            {uploadSkill.isPending
+              ? "Uploading…"
+              : skillFile
+                ? "Upload skill"
+                : "Choose skill file"}
           </Button>
         </div>
       </div>
