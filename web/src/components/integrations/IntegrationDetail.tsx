@@ -38,6 +38,8 @@ import { ProviderTile } from "./ProviderTile";
 import { AccessTag, HostChip, StatusDot } from "./chips";
 import { ReplaceCredentialSheet } from "./ReplaceCredentialSheet";
 import { useConnectorViews, type ConnectorView } from "./useConnectorViews";
+import { GoogleCloudConnections } from "./GoogleCloudConnections";
+import { GOOGLE_CLOUD_PROVIDER } from "./googleCloud";
 
 export function IntegrationDetail() {
   const { provider } = useParams({ strict: false }) as { provider?: string };
@@ -64,6 +66,14 @@ export function IntegrationDetail() {
       <div className="mx-auto max-w-3xl">
         <BackLink />
         <p className="mt-4 text-sm text-muted-foreground">No connector "{provider}".</p>
+      </div>
+    );
+  }
+  if (view.provider === GOOGLE_CLOUD_PROVIDER) {
+    return (
+      <div className="mx-auto flex max-w-3xl flex-col gap-4">
+        <BackLink />
+        <GoogleCloudConnections />
       </div>
     );
   }

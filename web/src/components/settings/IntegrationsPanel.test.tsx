@@ -9,12 +9,16 @@
 // A custom router transport captures the proto-shaped requests; no fetch mocks.
 
 import { afterEach, describe, expect, test, vi } from "vitest";
-import { cleanup, screen, waitFor } from "@testing-library/react";
+import { cleanup, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { createRouterTransport } from "@connectrpc/connect";
 import { renderWithProviders } from "../../test-utils";
 import { IntegrationsPanel } from "./IntegrationsPanel";
-import { IntegrationService, type Connector } from "../../gen/engram/app/v1/integration_pb";
+import {
+  IntegrationService,
+  type Connector,
+  type IntegrationConnection,
+} from "../../gen/engram/app/v1/integration_pb";
 import { MintService } from "../../gen/engram/app/v1/mint_pb";
 import { OrgSecretService } from "../../gen/engram/app/v1/org_secret_pb";
 import { ProfileService } from "../../gen/engram/app/v1/profile_pb";
@@ -82,7 +86,7 @@ const CONNECTORS: Connector[] = [
   },
 ] as Connector[];
 
-function installTransport(): Caps {
+function installTransport(options: { connections?: IntegrationConnection[] } = {}): Caps {
   const puts: Caps["puts"] = [];
   const upserts: string[] = [];
   const mints: Caps["mints"] = [];
@@ -114,7 +118,7 @@ function installTransport(): Caps {
         ok: true,
         message: "Reached api.github.com · HTTP 200 · credential accepted",
       }),
-      listConnections: () => ({ connections: [] }),
+      listConnections: () => ({ connections: options.connections ?? [] }),
       createConnection: (req) => {
         connectionCreates.push({
           alias: req.alias,
@@ -196,9 +200,12 @@ describe("IntegrationsPanel (marketplace)", () => {
     expect(screen.getByText("Datadog")).toBeTruthy();
     expect(screen.getByText("Connected")).toBeTruthy();
     expect(screen.getByText("Available")).toBeTruthy();
-    // github is available → Connect; datadog connected → Manage.
-    expect(screen.getByRole("button", { name: /^connect$/i })).toBeTruthy();
-    expect(screen.getByRole("link", { name: /manage/i })).toBeTruthy();
+    const github = screen.getByRole("group", { name: "GitHub integration" });
+    const datadog = screen.getByRole("group", { name: "Datadog integration" });
+    const googleCloud = screen.getByRole("group", { name: "Google Cloud integration" });
+    expect(within(github).getByRole("button", { name: /^connect$/i })).toBeTruthy();
+    expect(within(datadog).getByRole("link", { name: /manage/i })).toBeTruthy();
+    expect(within(googleCloud).getByRole("button", { name: /^connect$/i })).toBeTruthy();
   });
 
   test("Connect (mint) calls SetMintCredential with the kind + field values", async () => {
@@ -206,7 +213,8 @@ describe("IntegrationsPanel (marketplace)", () => {
     renderWithProviders(<IntegrationsPanel />, { transport });
     const user = userEvent.setup();
 
-    await user.click(await screen.findByRole("button", { name: /^connect$/i }));
+    const github = await screen.findByRole("group", { name: "GitHub integration" });
+    await user.click(within(github).getByRole("button", { name: /^connect$/i }));
     await user.type(await screen.findByLabelText(/app id/i), "1357924");
     await user.type(screen.getByLabelText(/private key/i), "-----BEGIN KEY-----");
     // Authenticate → Test → Review → Add.
@@ -253,7 +261,9 @@ describe("IntegrationsPanel (marketplace)", () => {
     renderWithProviders(<IntegrationsPanel />, { transport });
     const user = userEvent.setup();
 
-    await user.click(await screen.findByRole("button", { name: /add connection/i }));
+    const googleCloud = await screen.findByRole("group", { name: "Google Cloud integration" });
+    await user.click(within(googleCloud).getByRole("button", { name: /^connect$/i }));
+    expect(screen.getByRole("heading", { name: "Connect Google Cloud" })).toBeTruthy();
     await user.type(screen.getByLabelText(/connection alias/i), "prod-readonly");
     await user.type(screen.getByLabelText(/display name/i), "Production read only");
     await user.type(
@@ -280,5 +290,38 @@ describe("IntegrationsPanel (marketplace)", () => {
     });
     expect(await screen.findByText("Terraform")).toBeTruthy();
     expect(screen.getByText(/google_iam_workload_identity_pool/)).toBeTruthy();
+  });
+
+  test("shows configured Google Cloud as a connected provider card", async () => {
+    const { transport } = installTransport({
+      connections: [
+        {
+          id: "connection-1",
+          alias: "prod-readonly",
+          provider: "gcp",
+          displayName: "Production read only",
+          enabled: false,
+          testedAt: "",
+          createdAt: "",
+          updatedAt: "",
+          googleCloud: {
+            workloadIdentityProvider:
+              "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+            serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+            endpoints: ["logging.googleapis.com"],
+          },
+        } as IntegrationConnection,
+      ],
+    });
+    renderWithProviders(<IntegrationsPanel />, { transport });
+
+    const googleCloud = await screen.findByRole("group", { name: "Google Cloud integration" });
+    expect(within(googleCloud).getByText("connected", { exact: false })).toBeTruthy();
+    expect(within(googleCloud).getByText("1 connection")).toBeTruthy();
+    expect(
+      within(googleCloud)
+        .getByRole("link", { name: /manage/i })
+        .getAttribute("href"),
+    ).toBe("/settings/integrations/gcp");
   });
 });
