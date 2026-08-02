@@ -19,6 +19,7 @@ pub mod bypass;
 pub mod ca;
 pub mod cert_mint;
 pub mod dns;
+pub mod google_denylist;
 pub mod graphql;
 pub mod inject;
 pub mod intercept;
