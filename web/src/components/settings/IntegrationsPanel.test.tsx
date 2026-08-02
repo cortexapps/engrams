@@ -35,6 +35,13 @@ interface Caps {
     serviceAccountEmail: string;
     endpoints: string[];
   }>;
+  connectionUpdates: Array<{
+    id: string;
+    alias: string;
+    workloadIdentityProvider: string;
+    serviceAccountEmail: string;
+    endpoints: string[];
+  }>;
 }
 
 const CATALOG = [
@@ -97,6 +104,7 @@ function installTransport(options: { connections?: IntegrationConnection[] } = {
   const upserts: string[] = [];
   const mints: Caps["mints"] = [];
   const connectionCreates: Caps["connectionCreates"] = [];
+  const connectionUpdates: Caps["connectionUpdates"] = [];
   const transport = createRouterTransport((router) => {
     router.service(IntegrationService, {
       listConnectors: () => ({ connectors: CONNECTORS }),
@@ -135,6 +143,28 @@ function installTransport(options: { connections?: IntegrationConnection[] } = {
         return {
           connection: {
             id: "connection-1",
+            alias: req.alias,
+            provider: "gcp",
+            displayName: req.displayName,
+            enabled: false,
+            testedAt: "",
+            createdAt: "",
+            updatedAt: "",
+            googleCloud: req.googleCloud,
+          },
+        };
+      },
+      updateConnection: (req) => {
+        connectionUpdates.push({
+          id: req.id,
+          alias: req.alias,
+          workloadIdentityProvider: req.googleCloud?.workloadIdentityProvider ?? "",
+          serviceAccountEmail: req.googleCloud?.serviceAccountEmail ?? "",
+          endpoints: [...(req.googleCloud?.endpoints ?? [])],
+        });
+        return {
+          connection: {
+            id: req.id,
             alias: req.alias,
             provider: "gcp",
             displayName: req.displayName,
@@ -190,7 +220,7 @@ function installTransport(options: { connections?: IntegrationConnection[] } = {
       deleteProfile: () => ({}),
     });
   });
-  return { transport, puts, upserts, mints, connectionCreates };
+  return { transport, puts, upserts, mints, connectionCreates, connectionUpdates };
 }
 
 describe("IntegrationsPanel (marketplace)", () => {
@@ -333,6 +363,46 @@ describe("IntegrationsPanel (marketplace)", () => {
         'code[data-language="shellscript"][data-highlighted="true"]',
       );
       expect(shellCode?.textContent).toContain("gcloud iam workload-identity-pools create");
+    });
+  });
+
+  test("updates a Google Cloud connection's allowed APIs and preserves its WIF target", async () => {
+    const connection = {
+      id: "connection-1",
+      alias: "prod-readonly",
+      provider: "gcp",
+      displayName: "Production read only",
+      enabled: true,
+      testedAt: "2026-08-02T15:01:18Z",
+      createdAt: "",
+      updatedAt: "",
+      googleCloud: {
+        workloadIdentityProvider:
+          "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+        serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+        endpoints: ["logging.googleapis.com", "private-gke.example.com"],
+      },
+    } as IntegrationConnection;
+    const { transport, connectionUpdates } = installTransport({ connections: [connection] });
+    renderWithProviders(<GoogleCloudSetupWorkspace connectionId="connection-1" />, { transport });
+    const user = userEvent.setup();
+
+    await user.click(await screen.findByRole("button", { name: /edit apis/i }));
+    expect(screen.getByRole("heading", { name: /edit allowed google cloud apis/i })).toBeTruthy();
+    expect(
+      (screen.getByLabelText(/other allowed api hostnames/i) as HTMLTextAreaElement).value,
+    ).toBe("private-gke.example.com");
+    await user.click(screen.getByRole("checkbox", { name: /cloud monitoring/i }));
+    await user.click(screen.getByRole("button", { name: /save api changes/i }));
+
+    await waitFor(() => expect(connectionUpdates).toHaveLength(1));
+    expect(connectionUpdates[0]).toEqual({
+      id: "connection-1",
+      alias: "prod-readonly",
+      workloadIdentityProvider:
+        "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/oidc",
+      serviceAccountEmail: "reader@customer.iam.gserviceaccount.com",
+      endpoints: ["logging.googleapis.com", "monitoring.googleapis.com", "private-gke.example.com"],
     });
   });
 

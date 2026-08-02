@@ -25,6 +25,7 @@ import {
   useSetConnectionEnabled,
   useTestConnection,
 } from "@/hooks/useIntegrations";
+import { GoogleCloudEndpointDialog } from "./GoogleCloudConnections";
 import type { SetupCodeLanguage } from "./SyntaxHighlightedCode";
 
 const SyntaxHighlightedCode = lazy(() => import("./SyntaxHighlightedCode"));
@@ -40,6 +41,7 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
   const test = useTestConnection();
   const enable = useSetConnectionEnabled();
   const [testResult, setTestResult] = useState<{ ok: boolean; message: string } | null>(null);
+  const [editingEndpoints, setEditingEndpoints] = useState(false);
   const connection = connections.data?.connections.find((entry) => entry.id === connectionId);
 
   if (connections.isLoading) {
@@ -118,9 +120,14 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
           </section>
 
           <section className="rounded-lg border bg-card p-4">
-            <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
-              Connection boundary
-            </h2>
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="text-xs font-semibold tracking-wide text-muted-foreground uppercase">
+                Connection boundary
+              </h2>
+              <Button variant="ghost" size="sm" onClick={() => setEditingEndpoints(true)}>
+                Edit APIs
+              </Button>
+            </div>
             <dl className="mt-3 space-y-3 text-xs">
               <div>
                 <dt className="text-muted-foreground">Service account</dt>
@@ -248,6 +255,16 @@ export function GoogleCloudSetupWorkspace({ connectionId }: { connectionId: stri
           )}
         </section>
       </div>
+
+      <GoogleCloudEndpointDialog
+        connection={connection}
+        open={editingEndpoints}
+        onOpenChange={setEditingEndpoints}
+        onSaved={() => {
+          setTestResult(null);
+          toast.success("Allowed APIs updated; test the connection before enabling it");
+        }}
+      />
     </main>
   );
 }
