@@ -128,7 +128,7 @@ impl HostClient for CosimHostClient {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        let (io, severed) = self
+        let io = self
             .host
             .lock()
             .await
@@ -139,7 +139,7 @@ impl HostClient for CosimHostClient {
             let host = host.clone();
             async move { host.lock().await.redial_exec_transport(id) }
         });
-        drive_exec_protocol(id, io, cmd, true, Some(severed), Some(redial)).await
+        drive_exec_protocol(id, io, cmd, true, Some(redial)).await
     }
 
     // `cancel_exec` intentionally retains the HostClient default Unsupported

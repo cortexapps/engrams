@@ -298,8 +298,8 @@ impl Cosim {
             let mut host = self.world.host.lock().await;
             // Firecracker's `prepare_save` queues TRANSPORT_RESET for every
             // guest vsock connection on periodic captures. The guest forgets
-            // them without host EOF; the epoch is the host reader's only
-            // wakeup and re-attach signal (ADR 0103).
+            // them. The stream wrapper gives the host reader EOF so it can
+            // re-attach (ADR 0103).
             host.sever_exec_transports(sandbox);
             host.flush(sandbox).await
         };

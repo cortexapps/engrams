@@ -1,11 +1,9 @@
 //! ADR 0103 failure-matrix row 12, guest half: the reference consumer is a
 //! non-tty `git clone`, which prints NOTHING until it finishes. A silent
-//! exec gives the epoch race no output to prove liveness with — the reader
-//! is parked in `read_msg` for the entire run — so checkpoint severance
-//! during silence is the pure form of the incident. Two back-to-back
-//! checkpoints sever two consecutive connections; the driver must re-attach
-//! each time and deliver the real exit with exactly one spawn and zero
-//! fabricated output.
+//! exec gives the reader no output to prove liveness with. The reader stays
+//! in `read_msg` for the entire run. Two back-to-back checkpoints end two
+//! consecutive connections. The driver must re-attach each time and deliver
+//! the real exit with exactly one spawn and no fabricated output.
 //!
 //! Same composition discipline as `checkpoint_severs_exec_mid_stream`: real
 //! coordinator `exec_stream_core`, real FC protocol driver, real agentd

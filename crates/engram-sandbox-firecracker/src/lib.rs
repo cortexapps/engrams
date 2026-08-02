@@ -1711,23 +1711,18 @@ impl FirecrackerBackend {
                 agent_socket.display()
             ))
         })?;
-        // Direct-UDS variant (tests/dev): no FC snapshot machinery, so no
-        // severance signal to race the probe read against.
-        let durable_capable = probe_durable_exec(Box::new(probe), None).await?;
+        let durable_capable = probe_durable_exec(Box::new(probe)).await?;
         let conn = UnixStream::connect(agent_socket).await.map_err(|e| {
             vm_err(format!(
                 "connect to agent at {} after durable capability probe: {e}",
                 agent_socket.display()
             ))
         })?;
-        // Direct-UDS variant (tests/dev): no FC snapshot machinery, so no
-        // severance signal to watch.
         drive_exec_protocol(
             sandbox_id,
             Box::new(conn),
             cmd,
             durable_capable,
-            None,
             Some(ExecRedial::unix(agent_socket.to_path_buf())),
         )
         .await
@@ -1743,9 +1738,7 @@ impl FirecrackerBackend {
         let mut results = Vec::with_capacity(files.len());
         for file in files {
             let result = match UnixStream::connect(agent_socket).await {
-                // Direct-UDS variant: no snapshot machinery, no severance
-                // signal to race against.
-                Ok(conn) => upload_file_over_stream(conn, file, None).await,
+                Ok(conn) => upload_file_over_stream(conn, file).await,
                 Err(error) => write_file_failure(
                     file.path,
                     format!(
@@ -1766,47 +1759,47 @@ impl FirecrackerBackend {
     /// connected to the guest's listener on `port`. Documented at
     /// `firecracker/docs/vsock.md`.
     async fn exec_stream_via_fc_vsock(
+        sandboxes: &Arc<DashMap<SandboxId, LiveSandbox>>,
         sandbox_id: SandboxId,
         vsock_uds_path: &Path,
         port: u32,
         cmd: ExecRequest,
-        mut severed: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<ExecStream, SandboxError> {
-        let probe = Self::connect_fc_vsock(vsock_uds_path, port).await?;
-        // The probe's response read sits on an established vsock connection
-        // BEFORE the epoch-guarded reader loop exists — a checkpoint landing
-        // here severs it with no host EOF, so the read must race the same
-        // epoch watch or it wedges forever (the ADR 0103 incident, on the
-        // probe hop).
-        let durable_capable = probe_durable_exec(Box::new(probe), severed.as_mut()).await?;
-        let conn = Self::connect_fc_vsock(vsock_uds_path, port).await?;
+        let probe = Self::connect_fc_vsock(sandboxes, sandbox_id, vsock_uds_path, port).await?;
+        let durable_capable = probe_durable_exec(Box::new(probe)).await?;
+        let conn = Self::connect_fc_vsock(sandboxes, sandbox_id, vsock_uds_path, port).await?;
         drive_exec_protocol(
             sandbox_id,
             Box::new(conn),
             cmd,
             durable_capable,
-            severed,
-            Some(ExecRedial::firecracker(vsock_uds_path.to_path_buf(), port)),
+            Some(ExecRedial::firecracker(
+                sandboxes.clone(),
+                sandbox_id,
+                vsock_uds_path.to_path_buf(),
+                port,
+            )),
         )
         .await
     }
 
     async fn write_files_via_fc_vsock(
+        sandboxes: &Arc<DashMap<SandboxId, LiveSandbox>>,
         sandbox_id: SandboxId,
         vsock_uds_path: &Path,
         port: u32,
         files: Vec<WriteFileSpec>,
-        mut severed: Option<tokio::sync::watch::Receiver<u64>>,
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
         let mut results = Vec::with_capacity(files.len());
         for file in files {
-            let result = match Self::connect_fc_vsock(vsock_uds_path, port).await {
-                Ok(conn) => upload_file_over_stream(conn, file, severed.as_mut()).await,
-                Err(error) => write_file_failure(
-                    file.path,
-                    format!("sandbox {sandbox_id}: connect to agentd vsock: {error}"),
-                ),
-            };
+            let result =
+                match Self::connect_fc_vsock(sandboxes, sandbox_id, vsock_uds_path, port).await {
+                    Ok(conn) => upload_file_over_stream(conn, file).await,
+                    Err(error) => write_file_failure(
+                        file.path,
+                        format!("sandbox {sandbox_id}: connect to agentd vsock: {error}"),
+                    ),
+                };
             results.push(result);
         }
         Ok(results)
@@ -1828,9 +1821,20 @@ impl FirecrackerBackend {
     /// vsock driver and FC re-exits ~1 s later via `panic=1`-driven
     /// `KVM_EXIT_SHUTDOWN`; no host-side timeout fixes that.
     async fn connect_fc_vsock(
+        sandboxes: &Arc<DashMap<SandboxId, LiveSandbox>>,
+        sandbox_id: SandboxId,
         vsock_uds_path: &Path,
         port: u32,
-    ) -> Result<UnixStream, SandboxError> {
+    ) -> Result<EpochSeveredStream<UnixStream>, SandboxError> {
+        // Subscribe before the handshake. A capture can otherwise land after
+        // the dial starts and before application I/O starts. Keep the raw
+        // stream through the pre-application handshake so its EOF retry stays
+        // unchanged. Apply the wrapper only after CONNECT succeeds.
+        let epoch = sandboxes
+            .get(&sandbox_id)
+            .ok_or(SandboxError::NotFound)?
+            .vsock_epoch
+            .subscribe();
         // Post-`load_snapshot`, FC's vsock muxer has a brief window where it
         // accepts a host CONNECT and returns OK, then closes the connection
         // before the guest's accept-loop wakes — surfacing as `early eof` on
@@ -1859,7 +1863,7 @@ impl FirecrackerBackend {
         loop {
             attempt += 1;
             match Self::connect_fc_vsock_once(vsock_uds_path, port).await {
-                Ok(conn) => return Ok(conn),
+                Ok(conn) => return Ok(EpochSeveredStream::new(conn, epoch)),
                 Err(e) => {
                     let msg = format!("{e}");
                     let retryable = msg.contains("early eof")
@@ -2820,23 +2824,9 @@ impl FirecrackerBackend {
                 match listener.accept().await {
                     Ok((stream, _peer)) => match sink_slot.read().clone() {
                         Some(sink) => {
-                            let epoch = {
-                                sandboxes
-                                    .get(&sandbox_id)
-                                    .map(|live| live.vsock_epoch.subscribe())
-                            };
-                            match epoch {
-                                Some(epoch) => {
-                                    sink(Box::pin(EpochSeveredStream::new(stream, epoch)));
-                                }
-                                None => {
-                                    tracing::debug!(
-                                        %sandbox_id,
-                                        "sandbox left the live map before harness accept; using raw stream",
-                                    );
-                                    sink(Box::pin(stream));
-                                }
-                            }
+                            sink(Self::wrap_inbound_vsock_stream(
+                                &sandboxes, sandbox_id, stream, "harness",
+                            ));
                         }
                         None => {
                             tracing::warn!(
@@ -2853,6 +2843,28 @@ impl FirecrackerBackend {
             }
         });
         Ok(())
+    }
+
+    fn wrap_inbound_vsock_stream(
+        sandboxes: &Arc<DashMap<SandboxId, LiveSandbox>>,
+        sandbox_id: SandboxId,
+        stream: UnixStream,
+        channel: &'static str,
+    ) -> HarnessByteStream {
+        let epoch = sandboxes
+            .get(&sandbox_id)
+            .map(|live| live.vsock_epoch.subscribe());
+        match epoch {
+            Some(epoch) => Box::pin(EpochSeveredStream::new(stream, epoch)),
+            None => {
+                tracing::debug!(
+                    %sandbox_id,
+                    channel,
+                    "sandbox left the live map before vsock accept; using raw stream",
+                );
+                Box::pin(stream)
+            }
+        }
     }
 
     /// ADR 0023: per-sandbox accept loop for the in-guest forge helper
@@ -2876,12 +2888,15 @@ impl FirecrackerBackend {
             )
         })?;
         let sink_slot = self.forge_sink.clone();
+        let sandboxes = self.sandboxes.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer)) => match sink_slot.read().clone() {
                         Some(sink) => {
-                            sink(Box::pin(stream));
+                            sink(Self::wrap_inbound_vsock_stream(
+                                &sandboxes, sandbox_id, stream, "forge",
+                            ));
                         }
                         None => {
                             tracing::warn!(
@@ -2922,12 +2937,15 @@ impl FirecrackerBackend {
             )
         })?;
         let sink_slot = self.upload_sink.clone();
+        let sandboxes = self.sandboxes.clone();
         tokio::spawn(async move {
             loop {
                 match listener.accept().await {
                     Ok((stream, _peer)) => match sink_slot.read().clone() {
                         Some(sink) => {
-                            sink(Box::pin(stream));
+                            sink(Self::wrap_inbound_vsock_stream(
+                                &sandboxes, sandbox_id, stream, "upload",
+                            ));
                         }
                         None => {
                             tracing::warn!(
@@ -4451,7 +4469,7 @@ pub type BoxExecIo = Box<dyn ExecIo>;
 type ExecRedialFuture =
     Pin<Box<dyn Future<Output = Result<BoxExecIo, SandboxError>> + Send + 'static>>;
 
-/// Reconnection factory used after a snapshot severs an exec connection.
+/// Reconnection factory used after an exec connection ends.
 ///
 /// Production constructs this from private Unix/Firecracker helpers.
 /// [`ExecRedial::provided`] is the narrow co-simulation seam: each call can
@@ -4479,11 +4497,17 @@ impl ExecRedial {
         })
     }
 
-    fn firecracker(vsock_uds_path: PathBuf, port: u32) -> Self {
+    fn firecracker(
+        sandboxes: Arc<DashMap<SandboxId, LiveSandbox>>,
+        sandbox_id: SandboxId,
+        vsock_uds_path: PathBuf,
+        port: u32,
+    ) -> Self {
         Self::provided(move || {
+            let sandboxes = sandboxes.clone();
             let vsock_uds_path = vsock_uds_path.clone();
             async move {
-                FirecrackerBackend::connect_fc_vsock(&vsock_uds_path, port)
+                FirecrackerBackend::connect_fc_vsock(&sandboxes, sandbox_id, &vsock_uds_path, port)
                     .await
                     .map(|stream| Box::new(stream) as BoxExecIo)
             }
@@ -4506,7 +4530,7 @@ impl ExecRedial {
         (self.connect)().await
     }
 
-    async fn reconnect_after_snapshot(&self) -> Result<BoxExecIo, SandboxError> {
+    async fn reconnect_after_eof(&self) -> Result<BoxExecIo, SandboxError> {
         let mut last_error = None;
         for attempt in 0..40 {
             match self.connect().await {
@@ -4537,87 +4561,18 @@ enum LegacyWireRequest {
     Exec(LegacyWireExecRequest),
 }
 
-/// Race one I/O operation on an established guest vsock against the
-/// snapshot-severance epoch. A checkpoint drops established connections with
-/// no host-side EOF (`LiveSandbox::vsock_epoch`), so either a read or a large
-/// write can otherwise block forever. `biased` preserves a result that is
-/// already ready on the socket over a simultaneous epoch bump.
-async fn io_racing_severance<T>(
-    operation: impl Future<Output = T>,
-    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
-    what: &str,
-) -> Result<T, SandboxError> {
-    tokio::pin!(operation);
-    match severed {
-        Some(epoch) => tokio::select! {
-            biased;
-            result = &mut operation => Ok(result),
-            _ = epoch.changed() => Err(SandboxError::Unavailable(format!(
-                "snapshot capture severed the agentd vsock connection during {what}; re-dial and retry"
-            ))),
-        },
-        None => Ok(operation.await),
-    }
-}
-
-/// Read one `WireResponse`, racing the read against snapshot severance.
-async fn read_wire_response_racing_severance<S>(
-    io: &mut S,
-    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
-    what: &str,
-) -> Result<std::io::Result<WireResponse>, SandboxError>
-where
-    S: AsyncRead + Unpin,
-{
-    io_racing_severance(
-        read_msg::<_, WireResponse>(io),
-        severed,
-        &format!("the {what} response"),
-    )
-    .await
-}
-
-/// Write one framed request, racing a potentially backpressured write against
-/// snapshot severance.
-async fn write_wire_message_racing_severance<S, T>(
-    io: &mut S,
-    message: &T,
-    severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
-    what: &str,
-) -> Result<std::io::Result<()>, SandboxError>
-where
-    S: AsyncWrite + Unpin,
-    T: serde::Serialize,
-{
-    io_racing_severance(
-        write_msg(io, message),
-        severed,
-        &format!("the {what} write"),
-    )
-    .await
-}
-
-async fn probe_durable_exec(
-    mut io: BoxExecIo,
-    mut severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
-) -> Result<bool, SandboxError> {
-    // The write races the epoch like every other one-shot vsock I/O: the
-    // frame is tiny, but a checkpoint landing between dial and write still
-    // severs with no host-side EOF, and an unraced write is exactly the
-    // wedge shape ADR 0103 exists to close.
-    write_wire_message_racing_severance(
+async fn probe_durable_exec(mut io: BoxExecIo) -> Result<bool, SandboxError> {
+    write_msg(
         &mut io,
         &WireRequest::CancelExec {
             exec_id: engram_agentd::handler::DURABLE_EXEC_CAPABILITY_PROBE.into(),
         },
-        severed.as_deref_mut(),
-        "durable exec capability probe",
     )
-    .await?
-    .map_err(|error| vm_err(format!("durable exec capability probe send: {error}")))?;
-    match read_wire_response_racing_severance(&mut io, severed, "durable exec capability probe")
-        .await?
-    {
+    .await
+    .map_err(|error| {
+        SandboxError::Unavailable(format!("durable exec capability probe send: {error}"))
+    })?;
+    match read_msg::<_, WireResponse>(&mut io).await {
         Ok(WireResponse::ExecCancelled) => Ok(true),
         Ok(WireResponse::Error { kind, message }) => {
             tracing::warn!(
@@ -4630,32 +4585,25 @@ async fn probe_durable_exec(
         Ok(other) => Err(vm_err(format!(
             "durable exec capability probe returned unexpected response: {other:?}"
         ))),
-        Err(error) => Err(vm_err(format!(
+        Err(error) => Err(SandboxError::Unavailable(format!(
             "durable exec capability probe failed before command submission: {error}"
         ))),
     }
 }
 
 /// One `CancelExec` request/response round-trip against agentd. Split out of
-/// `SandboxBackend::cancel_exec` so the epoch-severance unit test can drive it
+/// `SandboxBackend::cancel_exec` so the severance unit test can drive it
 /// over a duplex pair without a live sandbox (run_once pattern, ADR 0098).
-async fn cancel_exec_roundtrip(
-    mut io: BoxExecIo,
-    exec_id: &str,
-    mut severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
-) -> Result<(), SandboxError> {
-    // Raced like every other one-shot vsock I/O (see probe_durable_exec).
-    write_wire_message_racing_severance(
+async fn cancel_exec_roundtrip(mut io: BoxExecIo, exec_id: &str) -> Result<(), SandboxError> {
+    write_msg(
         &mut io,
         &WireRequest::CancelExec {
             exec_id: exec_id.to_string(),
         },
-        severed.as_deref_mut(),
-        "CancelExec",
     )
-    .await?
-    .map_err(|error| vm_err(format!("send CancelExec({exec_id}): {error}")))?;
-    match read_wire_response_racing_severance(&mut io, severed, "CancelExec").await? {
+    .await
+    .map_err(|error| SandboxError::Unavailable(format!("send CancelExec({exec_id}): {error}")))?;
+    match read_msg::<_, WireResponse>(&mut io).await {
         Ok(WireResponse::ExecCancelled) => Ok(()),
         Ok(WireResponse::Error { kind, message }) => Err(vm_err(format!(
             "agentd rejected CancelExec({exec_id}) ({kind}): {message}"
@@ -4663,16 +4611,16 @@ async fn cancel_exec_roundtrip(
         Ok(other) => Err(vm_err(format!(
             "CancelExec({exec_id}) returned unexpected response: {other:?}"
         ))),
-        Err(error) => Err(vm_err(format!(
+        Err(error) => Err(SandboxError::Unavailable(format!(
             "CancelExec({exec_id}) response failed; likely host/guest version skew (old agentd without ADR 0103): {error}"
         ))),
     }
 }
 
 /// Drive one attach-or-start request and translate the guest's durable stream.
-/// A snapshot epoch bump re-dials from the exact per-stream byte cursors once
-/// the capability probe has succeeded; every generation must still begin with
-/// a matching `Started` frame.
+/// An EOF re-dials from the exact per-stream byte cursors once the capability
+/// probe has succeeded. Every generation must begin with a matching `Started`
+/// frame.
 ///
 /// Production enters through `SandboxBackend::exec_stream`; this is public
 /// only so `engram-dst-cosim` can pair the real reader with real agentd and
@@ -4682,7 +4630,6 @@ pub async fn drive_exec_protocol(
     mut io: BoxExecIo,
     cmd: ExecRequest,
     durable_capable: bool,
-    mut severed: Option<tokio::sync::watch::Receiver<u64>>,
     redial: Option<ExecRedial>,
 ) -> Result<ExecStream, SandboxError> {
     let exec_id = cmd
@@ -4693,14 +4640,9 @@ pub async fn drive_exec_protocol(
     let mut stderr_offset = cmd.stderr_offset.unwrap_or(0);
     if durable_capable {
         let req = agent_exec_request(&cmd, &exec_id, stdout_offset, stderr_offset, false);
-        write_wire_message_racing_severance(
-            &mut io,
-            &req,
-            severed.as_mut(),
-            "initial durable exec request",
-        )
-        .await?
-        .map_err(|e| vm_err(format!("send durable WireRequest::Exec: {e}")))?;
+        write_msg(&mut io, &req).await.map_err(|error| {
+            SandboxError::Unavailable(format!("send durable exec request: {error}"))
+        })?;
     } else {
         let req = LegacyWireRequest::Exec(LegacyWireExecRequest {
             command: cmd.command.clone(),
@@ -4709,14 +4651,9 @@ pub async fn drive_exec_protocol(
             workdir: cmd.workdir.clone(),
             timeout_ms: cmd.timeout.map(|duration| duration.as_millis() as u64),
         });
-        write_wire_message_racing_severance(
-            &mut io,
-            &req,
-            severed.as_mut(),
-            "initial stage-1 exec request",
-        )
-        .await?
-        .map_err(|e| vm_err(format!("send stage-1 WireRequest::Exec: {e}")))?;
+        write_msg(&mut io, &req).await.map_err(|error| {
+            SandboxError::Unavailable(format!("send stage-1 WireRequest::Exec: {error}"))
+        })?;
     }
 
     // 64 events of buffer is enough that a slow consumer doesn't
@@ -4730,156 +4667,94 @@ pub async fn drive_exec_protocol(
         let mut durable_capable = durable_capable;
         let mut expect_started = durable_capable;
         loop {
-            // A snapshot capture severs every vsock connection without an
-            // EOF on the host end (`LiveSandbox::vsock_epoch`); racing the
-            // read against the epoch watch is what turns that silent
-            // severance into stream termination. `changed()` erroring
-            // (sender dropped = sandbox destroyed) means the same thing.
-            // `biased` polls the read first: a frame already on the wire
-            // (e.g. a real Exit(code) buffered just before the capture)
-            // must win over the epoch bump — the epoch branch is only for
-            // reads that will never complete.
-            let msg = match severed.as_mut() {
-                Some(epoch) => tokio::select! {
-                    biased;
-                    msg = read_msg::<_, WireExecEvent>(&mut io) => msg,
-                    _ = epoch.changed() => {
-                        if !durable_capable {
-                            // An old/degraded agent has no spawn-dedupe
-                            // journal. A caller retry could double-run the
-                            // command, so terminate loudly at the stage-1
-                            // floor instead.
-                            durable_exec_fallback(
-                                &tx,
-                                sandbox_id,
-                                format!(
-                                    "{DURABLE_EXEC_SKEW}: snapshot severed exec before durable Started capability; guest agentd predates ADR 0103 or never acknowledged it"
-                                ),
-                            ).await;
-                            return;
-                        }
-                        let Some(connector) = redial.as_ref() else {
-                            // This host-local transport cannot re-dial, but
-                            // the guest journal is still authoritative. End
-                            // without Exit so a fresh coordinator call can
-                            // attach-or-start safely with the same ticket.
-                            tracing::warn!(
-                                %sandbox_id,
-                                %exec_id,
-                                stdout_offset,
-                                stderr_offset,
-                                "durable exec snapshot reattach unavailable; ending without Exit",
-                            );
-                            return;
-                        };
-                        match connector.reconnect_after_snapshot().await {
-                            Ok(mut next) => {
-                                let attach = agent_exec_request(
-                                    &cmd,
-                                    &exec_id,
-                                    stdout_offset,
-                                    stderr_offset,
-                                    true,
-                                );
-                                // Race the attach write against the epoch too:
-                                // the freshly-dialed socket buffer can fill
-                                // (a large stdin clones into the frame) before
-                                // the guest drains it, and a SECOND capture
-                                // severing this parked write would wedge the
-                                // reader forever — the same hazard as the
-                                // initial request write, on the reconnect hop.
-                                let write = write_wire_message_racing_severance(
-                                    &mut next,
-                                    &attach,
-                                    severed.as_mut(),
-                                    "reattach exec request",
-                                )
-                                .await;
-                                let write_result = match write {
-                                    Ok(inner) => inner.map_err(|e| e.to_string()),
-                                    // Severed again mid-write: transport-shaped,
-                                    // end without Exit for a fresh attach.
-                                    Err(severed_err) => Err(severed_err.to_string()),
-                                };
-                                if let Err(error) = write_result {
-                                    // A failed write did not reach a guest
-                                    // journal verdict. A fresh caller can
-                                    // safely retry the deduped attach.
-                                    tracing::warn!(
-                                        %sandbox_id,
-                                        %exec_id,
-                                        stdout_offset,
-                                        stderr_offset,
-                                        %error,
-                                        "durable exec reattach request transport failed; ending without Exit",
-                                    );
-                                    return;
-                                }
-                                tracing::info!(
-                                    %sandbox_id,
-                                    %exec_id,
-                                    stdout_offset,
-                                    stderr_offset,
-                                    "snapshot severed exec vsock; re-attached to guest journal",
-                                );
-                                io = next;
-                                expect_started = true;
-                                continue;
-                            }
-                            Err(error) => {
-                                // Connector failure is transport-shaped, not
-                                // proof that the guest journal is gone. Let
-                                // the caller establish a fresh host RPC.
-                                tracing::warn!(
-                                    %sandbox_id,
-                                    %exec_id,
-                                    stdout_offset,
-                                    stderr_offset,
-                                    %error,
-                                    "durable exec snapshot reconnect failed; ending without Exit",
-                                );
-                                return;
-                            }
-                        }
-                    }
-                },
-                None => read_msg::<_, WireExecEvent>(&mut io).await,
-            };
-            if expect_started {
-                match &msg {
-                    Ok(WireExecEvent::Started(_)) => {}
-                    Err(error) => {
-                        // EOF/read failure before Started is still only a
-                        // transport result. The durable ticket makes a fresh
-                        // attach-or-start safe.
+            let msg = match read_msg::<_, WireExecEvent>(&mut io).await {
+                Ok(msg) => msg,
+                Err(error) if !durable_capable => {
+                    // A legacy agent or a degraded journal has no safe retry.
+                    // A retry could run the command twice.
+                    durable_exec_fallback(
+                        &tx,
+                        sandbox_id,
+                        format!(
+                            "{DURABLE_EXEC_SKEW}: exec transport ended before a durable result: {error}"
+                        ),
+                    )
+                    .await;
+                    return;
+                }
+                Err(error) => {
+                    let Some(connector) = redial.as_ref() else {
+                        // The journal stays authoritative. End without Exit so
+                        // a fresh coordinator call can use the same ticket.
                         tracing::warn!(
                             %sandbox_id,
                             %exec_id,
                             stdout_offset,
                             stderr_offset,
                             %error,
-                            "durable exec connection ended before Started; ending without Exit",
+                            "durable exec transport ended; reattach is unavailable; ending without Exit",
+                        );
+                        return;
+                    };
+                    let mut next = match connector.reconnect_after_eof().await {
+                        Ok(next) => next,
+                        Err(reconnect_error) => {
+                            // A failed dial is not proof that the journal is
+                            // gone. Let the caller open a fresh host RPC.
+                            tracing::warn!(
+                                %sandbox_id,
+                                %exec_id,
+                                stdout_offset,
+                                stderr_offset,
+                                %error,
+                                %reconnect_error,
+                                "durable exec reconnect failed; ending without Exit",
+                            );
+                            return;
+                        }
+                    };
+                    let attach =
+                        agent_exec_request(&cmd, &exec_id, stdout_offset, stderr_offset, true);
+                    if let Err(write_error) = write_msg(&mut next, &attach).await {
+                        // A failed write did not reach a journal verdict. A
+                        // fresh caller can safely retry the deduped attach.
+                        tracing::warn!(
+                            %sandbox_id,
+                            %exec_id,
+                            stdout_offset,
+                            stderr_offset,
+                            %write_error,
+                            "durable exec reattach request transport failed; ending without Exit",
                         );
                         return;
                     }
-                    Ok(_) => {
-                        // A real but out-of-contract guest frame is protocol
-                        // skew/violation, not transport loss. Retrying could
-                        // cross into an agent that did not honor the ticket.
-                        durable_exec_fallback(
-                            &tx,
-                            sandbox_id,
-                            format!(
-                                "durable exec protocol violation: first frame for exec_id {exec_id} was not Started: {msg:?}"
-                            ),
-                        )
-                        .await;
-                        return;
-                    }
+                    tracing::info!(
+                        %sandbox_id,
+                        %exec_id,
+                        stdout_offset,
+                        stderr_offset,
+                        "durable exec transport ended; re-attached to guest journal",
+                    );
+                    io = next;
+                    expect_started = true;
+                    continue;
                 }
+            };
+            if expect_started && !matches!(&msg, WireExecEvent::Started(_)) {
+                // A real but out-of-contract guest frame is a protocol error.
+                // A retry could reach an agent that did not honor the ticket.
+                durable_exec_fallback(
+                    &tx,
+                    sandbox_id,
+                    format!(
+                        "durable exec protocol violation: first frame for exec_id {exec_id} was not Started: {msg:?}"
+                    ),
+                )
+                .await;
+                return;
             }
             match msg {
-                Ok(WireExecEvent::Started(started_id)) => {
+                WireExecEvent::Started(started_id) => {
                     if !expect_started || started_id != exec_id {
                         // The guest acknowledged a different lifecycle or
                         // ticket. Do not retry an identity-ambiguous exec.
@@ -4896,7 +4771,7 @@ pub async fn drive_exec_protocol(
                     durable_capable = true;
                     expect_started = false;
                 }
-                Ok(WireExecEvent::Degraded(reason)) => {
+                WireExecEvent::Degraded(reason) => {
                     durable_capable = false;
                     expect_started = false;
                     tracing::warn!(
@@ -4906,7 +4781,7 @@ pub async fn drive_exec_protocol(
                         "guest journal degraded; keeping stage-1 live stream",
                     );
                 }
-                Ok(WireExecEvent::Stdout(b)) => {
+                WireExecEvent::Stdout(b) => {
                     // An old agentd emits output/exit without Started. Keep
                     // serving its stage-1 stream, but never re-attach it: a
                     // retry would execute the command twice.
@@ -4916,49 +4791,19 @@ pub async fn drive_exec_protocol(
                         return;
                     }
                 }
-                Ok(WireExecEvent::Stderr(b)) => {
+                WireExecEvent::Stderr(b) => {
                     expect_started = false;
                     stderr_offset = stderr_offset.saturating_add(b.len() as u64);
                     if tx.send(ExecEvent::Stderr(Bytes::from(b))).await.is_err() {
                         return;
                     }
                 }
-                Ok(WireExecEvent::Exit(code)) => {
+                WireExecEvent::Exit(code) => {
                     let _ = tx.send(ExecEvent::Exit(code)).await;
                     return;
                 }
-                Ok(WireExecEvent::Refused { reason }) => {
+                WireExecEvent::Refused { reason } => {
                     let _ = tx.send(ExecEvent::Refused(reason)).await;
-                    return;
-                }
-                Err(e) => {
-                    if durable_capable {
-                        // EOF/read failure is not a journal verdict. End the
-                        // host event stream without Exit; the coordinator
-                        // turns that into a retryable error and the caller
-                        // re-attaches with these delivered offsets.
-                        tracing::warn!(
-                            %sandbox_id,
-                            %exec_id,
-                            stdout_offset,
-                            stderr_offset,
-                            error = %e,
-                            "durable exec connection ended without explicit Exit; ending event stream",
-                        );
-                        return;
-                    }
-                    // Legacy agentd and degraded journals have no safe
-                    // attach-or-start guarantee. Preserve the stage-1
-                    // terminal floor: retrying could double-spawn.
-                    tracing::warn!(
-                        %sandbox_id,
-                        %exec_id,
-                        stdout_offset,
-                        stderr_offset,
-                        error = %e,
-                        "legacy/degraded exec connection ended without explicit Exit; emitting Exit(None)",
-                    );
-                    let _ = tx.send(ExecEvent::Exit(None)).await;
                     return;
                 }
             }
@@ -5005,11 +4850,7 @@ async fn durable_exec_fallback(
     let _ = tx.send(ExecEvent::Exit(None)).await;
 }
 
-async fn upload_file_over_stream<S>(
-    mut stream: S,
-    file: WriteFileSpec,
-    mut severed: Option<&mut tokio::sync::watch::Receiver<u64>>,
-) -> WriteFileResult
+async fn upload_file_over_stream<S>(mut stream: S, file: WriteFileSpec) -> WriteFileResult
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
@@ -5019,36 +4860,23 @@ where
         bytes: file.content,
         mode: file.mode,
     };
-    match write_wire_message_racing_severance(
-        &mut stream,
-        &request,
-        severed.as_deref_mut(),
-        "Upload request",
-    )
-    .await
-    {
-        Ok(Ok(())) => {}
-        Ok(Err(error)) => {
+    match write_msg(&mut stream, &request).await {
+        Ok(()) => {}
+        Err(error) => {
             return write_file_failure(path, format!("send Upload request: {error}"));
         }
-        Err(error) => return write_file_failure(path, error.to_string()),
     }
-    // Same severance race as the exec probe: an Upload response read on an
-    // established vsock connection wedges forever if a checkpoint lands
-    // mid-round-trip. Uploads are content-idempotent, so the caller can
-    // always retry the reported failure.
-    match read_wire_response_racing_severance(&mut stream, severed, "Upload").await {
-        Ok(Ok(WireResponse::UploadOk)) => WriteFileResult {
+    match read_msg::<_, WireResponse>(&mut stream).await {
+        Ok(WireResponse::UploadOk) => WriteFileResult {
             path,
             ok: true,
             error: None,
         },
-        Ok(Ok(WireResponse::Error { kind, message })) => {
+        Ok(WireResponse::Error { kind, message }) => {
             write_file_failure(path, format!("agentd rejected Upload ({kind}): {message}"))
         }
-        Ok(Ok(other)) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
-        Ok(Err(error)) => write_file_failure(path, format!("read Upload response: {error}")),
-        Err(error) => write_file_failure(path, format!("{error}")),
+        Ok(other) => write_file_failure(path, format!("unexpected Upload response: {other:?}")),
+        Err(error) => write_file_failure(path, format!("read Upload response: {error}")),
     }
 }
 
@@ -5190,16 +5018,9 @@ impl SandboxBackend for FirecrackerBackend {
         id: SandboxId,
         cmd: ExecRequest,
     ) -> Result<ExecStream, SandboxError> {
-        let (vsock_uds_path, severed) = {
+        let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            // Subscribe BEFORE dialing: a capture that lands between the
-            // subscribe and the guest finishing the command still wakes
-            // this receiver; one that completed before the subscribe
-            // can't have severed a connection we haven't opened yet.
-            (
-                live.state.vsock_uds_path.clone(),
-                live.vsock_epoch.subscribe(),
-            )
+            live.state.vsock_uds_path.clone()
         };
         // ADR 0015 M1: no boot-race retry here. Sessions only reach
         // exec_stream after `start_agent` has returned, and
@@ -5207,23 +5028,25 @@ impl SandboxBackend for FirecrackerBackend {
         // agentd dials the host's ready port). If we hit `early eof`
         // here, agentd genuinely went away after readiness signal —
         // surface the error rather than masking with retries.
-        Self::exec_stream_via_fc_vsock(id, &vsock_uds_path, ENGRAM_AGENTD_PORT, cmd, Some(severed))
-            .await
+        Self::exec_stream_via_fc_vsock(
+            &self.sandboxes,
+            id,
+            &vsock_uds_path,
+            ENGRAM_AGENTD_PORT,
+            cmd,
+        )
+        .await
     }
 
     async fn cancel_exec(&self, id: SandboxId, exec_id: String) -> Result<(), SandboxError> {
-        let (vsock_uds_path, mut severed) = {
+        let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            // Subscribe BEFORE dialing (same ordering as exec_stream): the
-            // response read must race the severance watch or a checkpoint
-            // landing mid-round-trip wedges it forever.
-            (
-                live.state.vsock_uds_path.clone(),
-                live.vsock_epoch.subscribe(),
-            )
+            live.state.vsock_uds_path.clone()
         };
-        let connection = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
-        cancel_exec_roundtrip(Box::new(connection), &exec_id, Some(&mut severed)).await
+        let connection =
+            Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                .await?;
+        cancel_exec_roundtrip(Box::new(connection), &exec_id).await
     }
 
     async fn write_files(
@@ -5231,19 +5054,16 @@ impl SandboxBackend for FirecrackerBackend {
         id: SandboxId,
         files: Vec<WriteFileSpec>,
     ) -> Result<Vec<WriteFileResult>, SandboxError> {
-        let (vsock_uds_path, severed) = {
+        let vsock_uds_path = {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
-            (
-                live.state.vsock_uds_path.clone(),
-                live.vsock_epoch.subscribe(),
-            )
+            live.state.vsock_uds_path.clone()
         };
         Self::write_files_via_fc_vsock(
+            &self.sandboxes,
             id,
             &vsock_uds_path,
             ENGRAM_AGENTD_PORT,
             files,
-            Some(severed),
         )
         .await
     }
@@ -5263,7 +5083,7 @@ impl SandboxBackend for FirecrackerBackend {
             let live = self.sandboxes.get(&id).ok_or(SandboxError::NotFound)?;
             live.state.vsock_uds_path.clone()
         };
-        let conn = Self::connect_fc_vsock(&vsock_uds_path, port).await?;
+        let conn = Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, port).await?;
         Ok(Some(Box::pin(conn)))
     }
 
@@ -5756,9 +5576,10 @@ impl SandboxBackend for FirecrackerBackend {
         };
         let vsock_uds = Some(vsock_uds_path.clone());
         let fut = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .ok()?;
+            let mut conn =
+                Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .ok()?;
             engram_agentd::write_msg(&mut conn, &WireRequest::GuestIp)
                 .await
                 .ok()?;
@@ -5817,11 +5638,12 @@ impl SandboxBackend for FirecrackerBackend {
         };
 
         let round = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .map_err(|e| {
-                    SandboxError::Vm(format!("refresh_agent: vsock connect: {e}").into())
-                })?;
+            let mut conn =
+                Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Vm(format!("refresh_agent: vsock connect: {e}").into())
+                    })?;
             engram_agentd::write_msg(&mut conn, &WireRequest::RefreshAgent)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("refresh_agent: send: {e}").into()))?;
@@ -5866,9 +5688,14 @@ impl SandboxBackend for FirecrackerBackend {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
         loop {
             let probe = async {
-                let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                    .await
-                    .ok()?;
+                let mut conn = Self::connect_fc_vsock(
+                    &self.sandboxes,
+                    id,
+                    &vsock_uds_path,
+                    ENGRAM_AGENTD_PORT,
+                )
+                .await
+                .ok()?;
                 engram_agentd::write_msg(&mut conn, &WireRequest::Ping)
                     .await
                     .ok()?;
@@ -5913,9 +5740,12 @@ impl SandboxBackend for FirecrackerBackend {
         // 1024 is sufficient. The outer 15s timeout covers the
         // ttyd spawn (~150ms typical), not the boot race.
         let fut = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_shell: vsock connect: {e}").into()))?;
+            let mut conn =
+                Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Vm(format!("start_shell: vsock connect: {e}").into())
+                    })?;
             engram_agentd::write_msg(&mut conn, &WireRequest::StartShell { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_shell: send: {e}").into()))?;
@@ -5969,11 +5799,12 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
         let fut = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .map_err(|e| {
-                    SandboxError::Vm(format!("start_browser: vsock connect: {e}").into())
-                })?;
+            let mut conn =
+                Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Vm(format!("start_browser: vsock connect: {e}").into())
+                    })?;
             engram_agentd::write_msg(&mut conn, &WireRequest::StartBrowser { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_browser: send: {e}").into()))?;
@@ -6037,11 +5868,12 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
         let fut = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .map_err(|e| {
-                    SandboxError::Vm(format!("stop_browser: vsock connect: {e}").into())
-                })?;
+            let mut conn =
+                Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Vm(format!("stop_browser: vsock connect: {e}").into())
+                    })?;
             engram_agentd::write_msg(&mut conn, &WireRequest::StopBrowser)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("stop_browser: send: {e}").into()))?;
@@ -6078,9 +5910,12 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
         let fut = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("start_ide: vsock connect: {e}").into()))?;
+            let mut conn =
+                Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Vm(format!("start_ide: vsock connect: {e}").into())
+                    })?;
             engram_agentd::write_msg(&mut conn, &WireRequest::StartIde { port: None })
                 .await
                 .map_err(|e| SandboxError::Vm(format!("start_ide: send: {e}").into()))?;
@@ -6129,9 +5964,12 @@ impl SandboxBackend for FirecrackerBackend {
             live.state.vsock_uds_path.clone()
         };
         let fut = async {
-            let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT)
-                .await
-                .map_err(|e| SandboxError::Vm(format!("stop_ide: vsock connect: {e}").into()))?;
+            let mut conn =
+                Self::connect_fc_vsock(&self.sandboxes, id, &vsock_uds_path, ENGRAM_AGENTD_PORT)
+                    .await
+                    .map_err(|e| {
+                        SandboxError::Vm(format!("stop_ide: vsock connect: {e}").into())
+                    })?;
             engram_agentd::write_msg(&mut conn, &WireRequest::StopIde)
                 .await
                 .map_err(|e| SandboxError::Vm(format!("stop_ide: send: {e}").into()))?;
@@ -6406,7 +6244,13 @@ impl SandboxBackend for FirecrackerBackend {
             }
             let attempt_timeout = remaining.min(SPAWN_ATTEMPT_TIMEOUT);
             let inner = async {
-                let mut conn = Self::connect_fc_vsock(&vsock_uds_path, ENGRAM_AGENTD_PORT).await?;
+                let mut conn = Self::connect_fc_vsock(
+                    &self.sandboxes,
+                    id,
+                    &vsock_uds_path,
+                    ENGRAM_AGENTD_PORT,
+                )
+                .await?;
                 // ADR 0045 C1 tail diagnosis: split the handshake into
                 // host-visible sub-legs — a slow CONNECT means the guest
                 // isn't accepting (vCPUs starved / vsock not settled); a
@@ -7768,10 +7612,9 @@ mod tests {
             stderr_offset: None,
             wake: None,
         };
-        let stream =
-            drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, true, None, None)
-                .await
-                .expect("durable exec request write succeeds");
+        let stream = drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, true, None)
+            .await
+            .expect("durable exec request write succeeds");
 
         let _request: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
         write_msg(&mut guest_end, &WireExecEvent::Started(exec_id.into()))
@@ -7810,10 +7653,9 @@ mod tests {
             stderr_offset: None,
             wake: None,
         };
-        let stream =
-            drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, true, None, None)
-                .await
-                .expect("durable exec request write succeeds");
+        let stream = drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, true, None)
+            .await
+            .expect("durable exec request write succeeds");
 
         let _request: WireRequest = read_msg(&mut guest_end).await.expect("request frame");
         write_msg(&mut guest_end, &WireExecEvent::Started(exec_id.into()))
@@ -7852,15 +7694,19 @@ mod tests {
             stderr_offset: None,
             wake: None,
         };
-        let stream =
-            drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, false, None, None)
-                .await
-                .expect("legacy exec request write succeeds");
+        let stream = drive_exec_protocol(SandboxId::new(), Box::new(host_end), req, false, None)
+            .await
+            .expect("legacy exec request write succeeds");
 
         let _request: LegacyWireRequest = read_msg(&mut guest_end).await.expect("request frame");
         drop(guest_end);
 
         let mut events = stream.events;
+        assert!(matches!(
+            tokio::time::timeout(Duration::from_secs(5), events.next()).await,
+            Ok(Some(ExecEvent::Stderr(message)))
+                if String::from_utf8_lossy(&message).contains(DURABLE_EXEC_SKEW)
+        ));
         assert!(matches!(
             tokio::time::timeout(Duration::from_secs(5), events.next()).await,
             Ok(Some(ExecEvent::Exit(None)))
@@ -7872,12 +7718,9 @@ mod tests {
     }
 
     /// Prod 2026-07-22: a snapshot capture severs every vsock connection
-    /// with NO EOF on the host end (the guest silently forgets them when
-    /// it acks the capture's `TRANSPORT_RESET`; see
-    /// `LiveSandbox::vsock_epoch`). A reader parked in `read_msg` at that
-    /// moment must terminate with a synthetic `Exit(None)` when the epoch
-    /// bumps — it used to block forever, wedging the coord Exec stream
-    /// and its caller (review bootstraps hung mid-`git clone`).
+    /// without an EOF from Firecracker. `EpochSeveredStream` converts the
+    /// epoch bump to EOF. A legacy reader must then emit `Exit(None)`. It must
+    /// not block and wedge the coordinator Exec stream.
     #[tokio::test]
     async fn exec_reader_synthesizes_exit_when_snapshot_severs_vsock() {
         use futures_util::StreamExt;
@@ -7897,18 +7740,15 @@ mod tests {
         };
         let stream = drive_exec_protocol(
             SandboxId::new(),
-            Box::new(host_end),
+            Box::new(EpochSeveredStream::new(host_end, epoch_rx)),
             req,
             false,
-            Some(epoch_rx),
             None,
         )
         .await
         .expect("exec request write succeeds");
 
-        // Guest side: consume the request frame, emit one pre-severance
-        // stderr chunk, then go silent WITHOUT closing the connection —
-        // modeling the severed-but-never-EOF muxer UDS.
+        // Consume the request and buffer one frame before the severance.
         let _req: LegacyWireRequest = read_msg(&mut guest_end).await.expect("request frame");
         write_msg(
             &mut guest_end,
@@ -7925,7 +7765,7 @@ mod tests {
             other => panic!("expected the pre-severance stderr chunk, got {other:?}"),
         }
 
-        // The checkpoint fires: epoch bumps, connection stays open.
+        // The wrapper converts this bump to EOF after the buffered frame.
         epoch_tx.send_modify(|v| *v += 1);
 
         match tokio::time::timeout(Duration::from_secs(5), events.next()).await {
@@ -7943,13 +7783,11 @@ mod tests {
             Ok(None) => {}
             other => panic!("stream must end after the synthetic Exit, got {other:?}"),
         }
-        // Only now may the guest end drop: the property under test is
-        // termination WITHOUT any EOF from the connection.
         drop(guest_end);
     }
 
     #[tokio::test]
-    async fn exec_reader_reattaches_from_delivered_offsets_after_epoch_bump() {
+    async fn exec_reader_reattaches_from_delivered_offsets_after_eof() {
         use futures_util::StreamExt;
 
         let (host_end, mut first_guest) = tokio::io::duplex(4096);
@@ -7969,10 +7807,9 @@ mod tests {
         };
         let stream = drive_exec_protocol(
             SandboxId::new(),
-            Box::new(host_end),
+            Box::new(EpochSeveredStream::new(host_end, epoch_rx)),
             req,
             true,
-            Some(epoch_rx),
             Some(ExecRedial::provided({
                 let connection = Arc::new(tokio::sync::Mutex::new(Some(
                     Box::new(reattach_host) as BoxExecIo
@@ -8074,34 +7911,29 @@ mod tests {
             .await
             .expect("old agentd skew response");
         });
-        assert!(!probe_durable_exec(Box::new(host_end), None).await.unwrap());
+        assert!(!probe_durable_exec(Box::new(host_end)).await.unwrap());
         stub.await.unwrap();
     }
 
-    /// The capability probe runs on EVERY exec, on its own vsock connection,
-    /// BEFORE the epoch-guarded reader loop exists. A checkpoint landing
-    /// between the probe's request and agentd's response severs that
-    /// connection with no host EOF — the probe's read must race the epoch
-    /// watch and fail retryably (nothing was submitted, a re-dial is always
-    /// safe) instead of blocking forever.
+    /// A capability probe uses its own wrapped vsock connection. If a capture
+    /// lands before the response, EOF must fail the probe with a retryable
+    /// error. Nothing was submitted, so a retry is safe.
     #[tokio::test]
     async fn checkpoint_severing_the_probe_response_errors_retryably_instead_of_hanging() {
         let (host_end, mut guest_end) = tokio::io::duplex(4096);
-        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
 
         let severed_guest = tokio::spawn(async move {
-            // Consume the probe request, then go silent WITHOUT closing the
-            // connection — the severed-but-never-EOF muxer UDS.
+            // Consume the request, then keep the raw connection open.
             let request: WireRequest = read_msg(&mut guest_end).await.expect("probe request");
             assert!(matches!(request, WireRequest::CancelExec { .. }));
             epoch_tx.send_modify(|epoch| *epoch += 1);
-            // Hold the connection open until the probe has resolved.
             guest_end
         });
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            probe_durable_exec(Box::new(host_end), Some(&mut epoch_rx)),
+            probe_durable_exec(Box::new(EpochSeveredStream::new(host_end, epoch_rx))),
         )
         .await
         .expect("probe must resolve promptly after the epoch bump, not hang");
@@ -8112,12 +7944,11 @@ mod tests {
         drop(severed_guest.await.unwrap());
     }
 
-    /// Same severance window on the CancelExec round-trip: its response read
-    /// also sits on a bare established vsock connection.
+    /// The same EOF rule applies to the CancelExec response.
     #[tokio::test]
     async fn checkpoint_severing_cancel_exec_response_errors_retryably_instead_of_hanging() {
         let (host_end, mut guest_end) = tokio::io::duplex(4096);
-        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
 
         let severed_guest = tokio::spawn(async move {
             let request: WireRequest = read_msg(&mut guest_end).await.expect("cancel request");
@@ -8130,7 +7961,10 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            cancel_exec_roundtrip(Box::new(host_end), "exec-victim", Some(&mut epoch_rx)),
+            cancel_exec_roundtrip(
+                Box::new(EpochSeveredStream::new(host_end, epoch_rx)),
+                "exec-victim",
+            ),
         )
         .await
         .expect("cancel round-trip must resolve promptly after the epoch bump, not hang");
@@ -8141,19 +7975,20 @@ mod tests {
         drop(severed_guest.await.unwrap());
     }
 
-    /// The WRITE half of the CancelExec round-trip must race the epoch too:
-    /// a checkpoint landing between dial and write leaves the frame parked
-    /// on a full, never-drained socket buffer with no host-side EOF. The
-    /// probe write shares this exact code path (see `probe_durable_exec`).
+    /// The wrapper must fail a parked CancelExec write with `BrokenPipe`.
+    /// The protocol maps that error to retryable `Unavailable`.
     #[tokio::test]
     async fn checkpoint_severing_the_cancel_exec_write_errors_retryably_instead_of_hanging() {
-        // A buffer smaller than the frame parks the write; the guest never
-        // reads a byte — the severed-but-never-EOF muxer UDS.
+        // A buffer smaller than the frame parks the write.
         let (host_end, guest_end) = tokio::io::duplex(16);
-        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
 
         let cancel = tokio::spawn(async move {
-            cancel_exec_roundtrip(Box::new(host_end), "exec-victim", Some(&mut epoch_rx)).await
+            cancel_exec_roundtrip(
+                Box::new(EpochSeveredStream::new(host_end, epoch_rx)),
+                "exec-victim",
+            )
+            .await
         });
         // Let the write park on the tiny buffer, then sever.
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -8175,7 +8010,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_severing_the_upload_response_reports_failure_instead_of_hanging() {
         let (host_end, mut guest_end) = tokio::io::duplex(4096);
-        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
 
         let severed_guest = tokio::spawn(async move {
             let request: WireRequest = read_msg(&mut guest_end).await.expect("upload request");
@@ -8191,7 +8026,7 @@ mod tests {
         };
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            upload_file_over_stream(host_end, file, Some(&mut epoch_rx)),
+            upload_file_over_stream(EpochSeveredStream::new(host_end, epoch_rx), file),
         )
         .await
         .expect("upload must resolve promptly after the epoch bump, not hang");
@@ -8200,8 +8035,8 @@ mod tests {
             result
                 .error
                 .as_deref()
-                .is_some_and(|error| error.contains("severed")),
-            "failure must name the severance, got {:?}",
+                .is_some_and(|error| error.contains("read Upload response")),
+            "failure must name the failed response read, got {:?}",
             result.error
         );
         drop(severed_guest.await.unwrap());
@@ -8210,7 +8045,7 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_severing_the_upload_request_write_reports_failure_instead_of_hanging() {
         let (host_end, guest_end) = tokio::io::duplex(256);
-        let (epoch_tx, mut epoch_rx) = tokio::sync::watch::channel(0u64);
+        let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
         let severed_guest = tokio::spawn(async move {
             // Never read: the large Upload frame fills the tiny socket
             // buffer and leaves the host parked in write_msg.
@@ -8226,7 +8061,7 @@ mod tests {
 
         let result = tokio::time::timeout(
             Duration::from_secs(2),
-            upload_file_over_stream(host_end, file, Some(&mut epoch_rx)),
+            upload_file_over_stream(EpochSeveredStream::new(host_end, epoch_rx), file),
         )
         .await
         .expect("upload request write must resolve promptly after the epoch bump, not hang");
@@ -8272,10 +8107,9 @@ mod tests {
             Duration::from_secs(2),
             drive_exec_protocol(
                 SandboxId::new(),
-                Box::new(host_end),
+                Box::new(EpochSeveredStream::new(host_end, epoch_rx)),
                 req,
                 true,
-                Some(epoch_rx),
                 None,
             ),
         )
@@ -8290,10 +8124,9 @@ mod tests {
         drop(severed_guest.await.unwrap());
     }
 
-    /// The RECONNECT-hop attach write must race the epoch too: after one
-    /// severance the reader re-dials and writes the attach frame (which
-    /// clones the full stdin); a SECOND capture severing that parked write
-    /// must end the stream without Exit, not wedge the reader forever.
+    /// The reconnect stream uses the same wrapper. A second capture must fail
+    /// a parked attach write with `BrokenPipe`. The event stream must then end
+    /// without Exit.
     #[tokio::test]
     async fn checkpoint_severing_the_reattach_request_write_ends_without_hanging() {
         use futures_util::StreamExt;
@@ -8304,9 +8137,7 @@ mod tests {
         let (host_end, mut first_guest) = tokio::io::duplex(4 * 1024 * 1024);
         let (reattach_host, reattach_guest) = tokio::io::duplex(256);
         let (epoch_tx, epoch_rx) = tokio::sync::watch::channel(0u64);
-        // Fires when the reader actually re-dials, so the SECOND sever lands
-        // while the attach write is parked — the two bumps must not coalesce
-        // into one observed change (watch keeps only the latest).
+        // This signal places the second bump after the reconnect starts.
         let (redialed_tx, redialed_rx) = tokio::sync::oneshot::channel();
         let exec_id = "exec-severed-reattach-write";
         let req = ExecRequest {
@@ -8322,25 +8153,28 @@ mod tests {
         };
         let stream = drive_exec_protocol(
             SandboxId::new(),
-            Box::new(host_end),
+            Box::new(EpochSeveredStream::new(host_end, epoch_rx)),
             req,
             true,
-            Some(epoch_rx),
             Some(ExecRedial::provided({
-                let connection = Arc::new(tokio::sync::Mutex::new(Some(
-                    Box::new(reattach_host) as BoxExecIo
-                )));
+                let connection = Arc::new(tokio::sync::Mutex::new(Some(reattach_host)));
                 let redialed_tx = Arc::new(tokio::sync::Mutex::new(Some(redialed_tx)));
+                let epoch_tx = epoch_tx.clone();
                 move || {
                     let connection = connection.clone();
                     let redialed_tx = redialed_tx.clone();
+                    let epoch_tx = epoch_tx.clone();
                     async move {
                         if let Some(tx) = redialed_tx.lock().await.take() {
                             let _ = tx.send(());
                         }
-                        connection.lock().await.take().ok_or_else(|| {
+                        let stream = connection.lock().await.take().ok_or_else(|| {
                             vm_err("test durable exec redial connection already consumed")
-                        })
+                        })?;
+                        Ok(
+                            Box::new(EpochSeveredStream::new(stream, epoch_tx.subscribe()))
+                                as BoxExecIo,
+                        )
                     }
                 }
             })),
@@ -8368,9 +8202,8 @@ mod tests {
         ));
         let (_first_guest, epoch_tx) = epoch_after_first.await.unwrap();
 
-        // Sever #1 → the reader re-dials. Wait for the actual redial, so
-        // sever #2 lands strictly after (no coalescing) while the 2 MiB
-        // attach write is parked on the never-drained tiny buffer.
+        // The first EOF starts the reconnect. The second bump lands while the
+        // attach write is parked on the small buffer.
         epoch_tx.send_modify(|epoch| *epoch += 1);
         redialed_rx
             .await
@@ -8387,13 +8220,7 @@ mod tests {
         drop(reattach_guest);
     }
 
-    /// The severance race must not eat a real exit: when a genuine
-    /// `Exit(code)` frame is already buffered on the wire at the moment
-    /// the epoch bumps, the `biased` select delivers the true code
-    /// instead of the synthetic `Exit(None)` (which callers read as
-    /// failure). Without `biased`, the unordered select picks the epoch
-    /// branch ~half the time and a command that succeeded is reported
-    /// as severed.
+    /// The wrapper must deliver a buffered real exit before severance EOF.
     #[tokio::test]
     async fn exec_reader_prefers_buffered_exit_over_epoch_bump() {
         use futures_util::StreamExt;
@@ -8413,10 +8240,9 @@ mod tests {
         };
         let stream = drive_exec_protocol(
             SandboxId::new(),
-            Box::new(host_end),
+            Box::new(EpochSeveredStream::new(host_end, epoch_rx)),
             req,
             false,
-            Some(epoch_rx),
             None,
         )
         .await
