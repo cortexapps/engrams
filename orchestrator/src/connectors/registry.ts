@@ -305,20 +305,23 @@ export interface Connector {
 // ---------------------------------------------------------------------------
 
 /** One Plane-B injection, snake_case to match the Rust serde shape. */
+/** Externally-tagged to match the Rust serde shape — the enum also crosses
+ * the coord ↔ host bincode wire, which cannot decode a `kind`-tagged form. */
+export type CredentialMintSourceJson = {
+  connection: {
+    connection_id: string;
+    provider: string;
+  };
+};
+
 export interface IntegrationInjectJson {
   hosts: string[];
   header_name: string;
   header_template: string;
   /** Static-secret source (inject connectors). Empty for a mint entry. */
   secret_ref: string;
-  /**
-   * ADR 0056 amendment: when non-empty, the coordinator MINTS this inject's value
-   * via the IntegrationBroker for this provider (scoped to the session's caps)
-   * instead of resolving `secret_ref`. This is how a *mint* connector rides the
-   * same egress inject plane as a static-secret one; the token never enters the
-   * guest. Mutually exclusive with `secret_ref`.
-   */
-  mint_provider: string;
+  /** Host-side mint authority. `null` means a static `secret_ref` inject. */
+  mint_source: CredentialMintSourceJson | null;
   methods: string[];
   path_globs: string[];
   /** ADR 0059: GraphQL operation type for body-parsed gating ("query" |
@@ -373,6 +376,7 @@ export interface IntegrationPolicyJson {
   // these). Mirrors engram_core::types::IntegrationPolicy.
   network: IntegrationNetworkJson;
   secrets: IntegrationSecretJson[];
+  google_adc: boolean;
 }
 
 /** Profile-side inputs compiled into the policy's network + secrets (ADR 0057). */
@@ -387,6 +391,15 @@ export interface SessionPolicyInputs {
   }>;
 }
 
+/** Connection-aware authority consumed by policy compilation. Keeping this
+ * tuple intact prevents two identities for one provider from being merged. */
+export interface IntegrationGrantSelection {
+  connectionId: string;
+  provider: string;
+  operation: string;
+  resourceConstraints: readonly string[];
+}
+
 /** Whether a compiled policy carries anything worth shipping on CreateSession. */
 export function policyHasContent(p: IntegrationPolicyJson): boolean {
   return (
@@ -395,7 +408,8 @@ export function policyHasContent(p: IntegrationPolicyJson): boolean {
     p.secrets.length > 0 ||
     p.network.allow_hosts.length > 0 ||
     p.network.allow_host_patterns.length > 0 ||
-    p.network.default === "allow"
+    p.network.default === "allow" ||
+    p.google_adc
   );
 }
 
@@ -1152,7 +1166,7 @@ export function grantsCapability(
 }
 
 /**
- * Compile a profile's bound capabilities → the per-session IntegrationPolicy.
+ * Compile structured connection grants → the per-session IntegrationPolicy.
  *
  * For each capability, activate the operations whose `grants` include its
  * `action`, and for each activated operation emit:
@@ -1167,7 +1181,7 @@ export function grantsCapability(
  * entries are deduped.
  */
 export function compileIntegrationPolicy(
-  capabilities: string[],
+  grants: readonly IntegrationGrantSelection[],
   registry: Map<string, Connector> = connectorRegistry(),
   inputs?: SessionPolicyInputs,
 ): IntegrationPolicyJson {
@@ -1178,13 +1192,11 @@ export function compileIntegrationPolicy(
   // ADR 0057: hosts opened by a granted power (folded into the egress allow-list
   // below — you must be able to REACH a host you inject a credential onto).
   const grantedHosts = new Set<string>();
-  for (const capStr of capabilities) {
-    const cap = parseCapability(capStr);
-    if (!cap) continue;
-    const connector = registry.get(cap.provider);
+  for (const grant of grants) {
+    const connector = registry.get(grant.provider);
     if (!connector) continue;
     for (const op of connector.operations) {
-      if (!op.grants.includes(cap.action)) continue;
+      if (!op.grants.includes(grant.operation)) continue;
       for (const h of connector.hosts) grantedHosts.add(h);
       // ADR 0059: a GraphQL op gates `POST <graphqlEndpoint>` and is body-matched
       // by (operation, field); a REST op gates by (method, path glob). The path
@@ -1214,7 +1226,7 @@ export function compileIntegrationPolicy(
             header_name: inj.header,
             header_template: inj.template ?? "{}",
             secret_ref: inj.secretRef,
-            mint_provider: "",
+            mint_source: null,
             methods,
             path_globs,
             graphql_operation,
@@ -1239,7 +1251,12 @@ export function compileIntegrationPolicy(
           header_name: "",
           header_template: "",
           secret_ref: "",
-          mint_provider: connector.provider,
+          mint_source: {
+            connection: {
+              connection_id: grant.connectionId,
+              provider: connector.provider,
+            },
+          },
           methods,
           path_globs,
           graphql_operation,
@@ -1308,7 +1325,7 @@ export function compileIntegrationPolicy(
     allow_hosts: s.allowHosts ?? [],
     allow_host_patterns: s.allowHostPatterns ?? [],
   }));
-  return { injects, observes, network, secrets };
+  return { injects, observes, network, secrets, google_adc: false };
 }
 
 // ---------------------------------------------------------------------------

@@ -27,7 +27,8 @@
         "bin/airtable",
         "bin/figma",
         "bin/discord",
-        "bin/shopify"
+        "bin/shopify",
+        "bin/gcloud"
       ],
       "requires_env": "ENGRAM_CLI_INTEGRATIONS"
     }

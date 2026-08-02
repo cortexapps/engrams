@@ -30,6 +30,16 @@ import {
   type Connector,
 } from "../connectors/registry.ts";
 import { orgSecret as defaultOrgSecret, mint as defaultMint } from "../control-plane/client.ts";
+import {
+  makeIntegrationConnectionStore,
+  type GoogleCloudConnectionConfig,
+  type IntegrationConnectionRow,
+  type IntegrationConnectionStore,
+} from "../db/integration-connections.ts";
+import { makeProfileStore, type ProfileStore } from "../db/profiles.ts";
+import { makeIntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
+import { assertGoogleCloudConfig, makeGoogleWifBroker } from "../integrations/google-wif.ts";
+import { googleOidcIssuer } from "../routes/google-oidc.ts";
 
 /** Logo upload cap — comfortably fits an SVG (KBs) or a square PNG at icon size. */
 const LOGO_MAX_BYTES = 512 * 1024;
@@ -83,6 +93,11 @@ export interface IntegrationDeps {
   connectorLogos?: ConnectorLogoStore;
   orgSecret?: OrgSecretAccess;
   mint?: MintAccess;
+  connections?: IntegrationConnectionStore;
+  profiles?: ProfileStore;
+  now?: () => Date;
+  googleExchange?: ReturnType<typeof makeGoogleWifBroker>["exchange"];
+  issuer?: string;
 }
 
 async function requireAdmin(ctx: HandlerContext, getSession: GetSession): Promise<void> {
@@ -137,6 +152,130 @@ function statusOf(c: Connector, names: Set<string>, requiredByKind: Map<string, 
   return connectorStatus(c, names, required);
 }
 
+function googleConfigFromProto(value: {
+  workloadIdentityProvider: string;
+  serviceAccountEmail: string;
+  endpoints: string[];
+} | undefined): GoogleCloudConnectionConfig {
+  if (!value) throw new ConnectError("google_cloud config is required", Code.InvalidArgument);
+  try {
+    return assertGoogleCloudConfig({
+      workloadIdentityProvider: value.workloadIdentityProvider,
+      serviceAccountEmail: value.serviceAccountEmail,
+      endpoints: value.endpoints,
+    });
+  } catch (error) {
+    throw new ConnectError(error instanceof Error ? error.message : String(error), Code.InvalidArgument);
+  }
+}
+
+function connectionToProto(row: IntegrationConnectionRow) {
+  const google = row.provider === "gcp" ? assertGoogleCloudConfig(row.config) : undefined;
+  return {
+    id: row.id,
+    alias: row.alias,
+    provider: row.provider,
+    displayName: row.displayName,
+    isDefault: row.isDefault,
+    enabled: row.enabled,
+    testedAt: row.testedAt?.toISOString() ?? "",
+    createdAt: row.createdAt.toISOString(),
+    updatedAt: row.updatedAt.toISOString(),
+    googleCloud: google ? {
+      workloadIdentityProvider: google.workloadIdentityProvider,
+      serviceAccountEmail: google.serviceAccountEmail,
+      endpoints: google.endpoints,
+    } : undefined,
+  };
+}
+
+function assertConnectionNames(alias: string, displayName: string): void {
+  if (!/^[a-z][a-z0-9-]{1,62}$/.test(alias)) {
+    throw new ConnectError("alias must use 2-63 lowercase letters, digits, or hyphens", Code.InvalidArgument);
+  }
+  if (!displayName.trim()) throw new ConnectError("display_name is required", Code.InvalidArgument);
+}
+
+function assertGoogleIssuerAvailable(issuer: string): void {
+  let url: URL;
+  try {
+    url = new URL(issuer);
+  } catch {
+    throw new ConnectError("Google Cloud WIF requires a valid public issuer URL", Code.FailedPrecondition);
+  }
+  if (url.protocol !== "https:") {
+    throw new ConnectError(
+      "Google Cloud WIF requires ORCHESTRATOR_PUBLIC_URL to use public HTTPS",
+      Code.FailedPrecondition,
+    );
+  }
+  if (url.username || url.password || !url.hostname) {
+    throw new ConnectError(
+      "Google Cloud WIF requires a public issuer without URL credentials",
+      Code.FailedPrecondition,
+    );
+  }
+}
+
+function googleSetup(row: IntegrationConnectionRow, issuer: string): {
+  audience: string;
+  gcloudScript: string;
+  terraform: string;
+} {
+  const google = assertGoogleCloudConfig(row.config);
+  const match = google.workloadIdentityProvider.match(
+    /^\/\/iam\.googleapis\.com\/projects\/([0-9]+)\/locations\/global\/workloadIdentityPools\/([a-z0-9-]+)\/providers\/([a-z0-9-]+)$/,
+  );
+  if (!match) throw new Error("stored Google provider resource is invalid");
+  const [, projectNumber, poolId, providerId] = match;
+  const condition =
+    `assertion.engrams_organization == '${issuer}' && ` +
+    `assertion.engrams_connection == '${row.id}'`;
+  const mapping =
+    "google.subject=assertion.sub," +
+    "attribute.engrams_organization=assertion.engrams_organization," +
+    "attribute.engrams_connection=assertion.engrams_connection";
+  const principalSet =
+    `principalSet://iam.googleapis.com/projects/${projectNumber}/locations/global/` +
+    `workloadIdentityPools/${poolId}/attribute.engrams_connection/${row.id}`;
+  return {
+    audience: google.workloadIdentityProvider,
+    gcloudScript: [
+      `gcloud iam workload-identity-pools create ${poolId} --location=global --project=${projectNumber}`,
+      `gcloud iam workload-identity-pools providers create-oidc ${providerId} --location=global --workload-identity-pool=${poolId} --project=${projectNumber} --issuer-uri=${issuer} --allowed-audiences=${google.workloadIdentityProvider} --attribute-mapping=${mapping} --attribute-condition=\"${condition}\"`,
+      `gcloud iam service-accounts add-iam-policy-binding ${google.serviceAccountEmail} --project=${projectNumber} --role=roles/iam.workloadIdentityUser --member=${principalSet}`,
+    ].join("\n"),
+    terraform: [
+      `resource "google_iam_workload_identity_pool" "engrams" {`,
+      `  project                   = "${projectNumber}"`,
+      `  workload_identity_pool_id = "${poolId}"`,
+      `}`,
+      ``,
+      `resource "google_iam_workload_identity_pool_provider" "engrams" {`,
+      `  project                            = "${projectNumber}"`,
+      `  workload_identity_pool_id          = google_iam_workload_identity_pool.engrams.workload_identity_pool_id`,
+      `  workload_identity_pool_provider_id = "${providerId}"`,
+      `  attribute_mapping = {`,
+      `    "google.subject"                 = "assertion.sub"`,
+      `    "attribute.engrams_organization" = "assertion.engrams_organization"`,
+      `    "attribute.engrams_connection"   = "assertion.engrams_connection"`,
+      `  }`,
+      `  attribute_condition = "${condition}"`,
+      `  oidc {`,
+      `    issuer_uri        = "${issuer}"`,
+      `    allowed_audiences = ["${google.workloadIdentityProvider}"]`,
+      `  }`,
+      `}`,
+      ``,
+      `resource "google_service_account_iam_member" "engrams" {`,
+      `  service_account_id = "projects/${projectNumber}/serviceAccounts/${google.serviceAccountEmail}"`,
+      `  role               = "roles/iam.workloadIdentityUser"`,
+      `  member             = "${principalSet}"`,
+      `}`,
+    ].join("\n"),
+  };
+}
+
 export function registerIntegration(router: ConnectRouter, deps?: IntegrationDeps): void {
   const getSession: GetSession =
     deps?.getSession ??
@@ -145,6 +284,15 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
   const connectorLogos: ConnectorLogoStore = deps?.connectorLogos ?? makeConnectorLogoStore(getDb());
   const orgSecret: OrgSecretAccess = deps?.orgSecret ?? (defaultOrgSecret as unknown as OrgSecretAccess);
   const mint: MintAccess = deps?.mint ?? (defaultMint as unknown as MintAccess);
+  const connections = deps?.connections ?? makeIntegrationConnectionStore(getDb());
+  const profiles = deps?.profiles ?? makeProfileStore(getDb());
+  const now = deps?.now ?? (() => new Date());
+  const issuer = deps?.issuer ?? googleOidcIssuer();
+  const googleExchange = deps?.googleExchange ?? makeGoogleWifBroker({
+    keys: makeIntegrationOidcKeyStore(getDb()),
+    issuer,
+    now,
+  }).exchange;
 
   router.service(IntegrationService, {
     async listConnectors(_req, ctx) {
@@ -207,6 +355,7 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
         );
       }
       const row = await connectors.upsert(parsed.provider, raw);
+      await connections.ensureDefault(parsed.provider, `${parsed.display.name} (default)`);
       // The next loadRegistry() must see the new connector.
       invalidateRegistry();
       return {
@@ -244,21 +393,31 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
       await requireUser(ctx, getSession);
       const registry = await loadRegistry(connectors);
       const withLogo = new Set(await connectorLogos.listProviders());
-      const providers = buildProviderCatalog(registry).map((e) => ({
-        provider: e.provider,
-        display: {
-          name: e.display.name,
-          category: e.display.category,
-          blurb: e.display.blurb,
-          icon: {
-            mono: e.display.icon.mono,
-            color: e.display.icon.color,
-            logo: withLogo.has(e.provider) ? logoUrl(e.provider) : "",
+      const providers = await Promise.all(buildProviderCatalog(registry).map(async (e) => {
+        const defaultConnection = await connections.getDefault(e.provider);
+        if (!defaultConnection) {
+          throw new ConnectError(
+            `default integration connection for "${e.provider}" is unavailable`,
+            Code.Internal,
+          );
+        }
+        return {
+          provider: e.provider,
+          display: {
+            name: e.display.name,
+            category: e.display.category,
+            blurb: e.display.blurb,
+            icon: {
+              mono: e.display.icon.mono,
+              color: e.display.icon.color,
+              logo: withLogo.has(e.provider) ? logoUrl(e.provider) : "",
+            },
           },
-        },
-        credentialSource: e.credentialSource,
-        hosts: e.hosts,
-        capabilities: e.capabilities.map((c) => ({ action: c.action, access: c.access, asset: c.asset ?? "" })),
+          credentialSource: e.credentialSource,
+          hosts: e.hosts,
+          capabilities: e.capabilities.map((c) => ({ action: c.action, access: c.access, asset: c.asset ?? "" })),
+          defaultConnectionId: defaultConnection.id,
+        };
       }));
       return { providers };
     },
@@ -362,6 +521,119 @@ export function registerIntegration(router: ConnectRouter, deps?: IntegrationDep
             };
       const { ok, message } = await mint.runConnectorTest(spec);
       return { ok, message };
+    },
+
+    async listConnections(_req, ctx) {
+      await requireAdmin(ctx, getSession);
+      return { connections: (await connections.list()).map(connectionToProto) };
+    },
+
+    async createConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      assertGoogleIssuerAvailable(issuer);
+      if (req.provider !== "gcp") {
+        throw new ConnectError('provider must be "gcp"', Code.InvalidArgument);
+      }
+      assertConnectionNames(req.alias, req.displayName);
+      const google = googleConfigFromProto(req.googleCloud);
+      const row = await connections.create({
+        alias: req.alias,
+        provider: "gcp",
+        displayName: req.displayName.trim(),
+        config: { ...google },
+      });
+      return { connection: connectionToProto(row) };
+    },
+
+    async updateConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      assertGoogleIssuerAvailable(issuer);
+      assertConnectionNames(req.alias, req.displayName);
+      const current = await connections.get(req.id);
+      if (!current) throw new ConnectError("connection not found", Code.NotFound);
+      if (current.provider !== "gcp") {
+        throw new ConnectError("only Google Cloud connections can be updated here", Code.InvalidArgument);
+      }
+      const google = googleConfigFromProto(req.googleCloud);
+      const row = await connections.update(req.id, {
+        alias: req.alias,
+        displayName: req.displayName.trim(),
+        config: { ...google },
+      });
+      return { connection: connectionToProto(row!) };
+    },
+
+    async deleteConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const connection = await connections.get(req.id);
+      if (connection?.isDefault) {
+        throw new ConnectError(
+          "a provider's default connection cannot be deleted",
+          Code.FailedPrecondition,
+        );
+      }
+      const referenced = (await profiles.list({ includeArchived: true })).some(
+        (profile) => profile.integrationGrants.some((grant) => grant.connectionId === req.id),
+      );
+      if (referenced) {
+        throw new ConnectError("connection is still granted to a profile", Code.FailedPrecondition);
+      }
+      return { deleted: await connections.delete(req.id) };
+    },
+
+    async testConnection(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      assertGoogleIssuerAvailable(issuer);
+      const row = await connections.get(req.id);
+      if (!row || row.provider !== "gcp") throw new ConnectError("connection not found", Code.NotFound);
+      try {
+        const google = assertGoogleCloudConfig(row.config);
+        await googleExchange(google, {
+          sessionId: `connection-test:${row.id}`,
+          organizationId: issuer,
+          connectionId: row.id,
+          userId: "administrator",
+          profileSnapshotId: "connection-test",
+        });
+        await connections.markTested(row.id, now());
+        return { ok: true, message: "STS exchange and service account impersonation succeeded" };
+      } catch (error) {
+        return {
+          ok: false,
+          message: error instanceof Error ? error.message : "Google Cloud connection test failed",
+        };
+      }
+    },
+
+    async setConnectionEnabled(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      const current = await connections.get(req.id);
+      if (!current) throw new ConnectError("connection not found", Code.NotFound);
+      if (req.enabled && current.provider === "gcp") assertGoogleIssuerAvailable(issuer);
+      if (req.enabled && current.testedAt == null) {
+        throw new ConnectError(
+          "the connection must pass STS and impersonation tests before it can be enabled",
+          Code.FailedPrecondition,
+        );
+      }
+      const row = await connections.setEnabled(req.id, req.enabled);
+      return { connection: connectionToProto(row!) };
+    },
+
+    async getGoogleCloudSetup(req, ctx) {
+      await requireAdmin(ctx, getSession);
+      assertGoogleIssuerAvailable(issuer);
+      const row = await connections.get(req.id);
+      if (!row || row.provider !== "gcp") throw new ConnectError("connection not found", Code.NotFound);
+      const setup = googleSetup(row, issuer);
+      return {
+        issuer,
+        audience: setup.audience,
+        subjectAttribute: "google.subject=assertion.sub",
+        connectionAttribute: "attribute.engrams_connection=assertion.engrams_connection",
+        gcloudScript: setup.gcloudScript,
+        terraform: setup.terraform,
+      };
     },
   });
 }

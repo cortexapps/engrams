@@ -22,6 +22,7 @@ pub mod dns;
 pub mod graphql;
 pub mod inject;
 pub mod intercept;
+pub mod metadata;
 pub mod observe;
 pub mod policy;
 pub mod proxy;

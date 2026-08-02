@@ -1347,8 +1347,11 @@ dependencies = [
  "bytes",
  "chrono",
  "engram-core",
+ "futures-util",
+ "h2",
  "hex",
  "hickory-proto",
+ "http",
  "nom",
  "parking_lot",
  "rcgen",
@@ -1363,6 +1366,7 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
+ "webpki-roots 1.0.7",
  "workspace-hack",
 ]
 

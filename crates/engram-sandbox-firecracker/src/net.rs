@@ -299,6 +299,7 @@ pub fn tap_name_for(sandbox_id: SandboxId) -> String {
 pub fn host_startup_lines(
     proxy_port: Option<u16>,
     dns_port: Option<u16>,
+    metadata_port: Option<u16>,
     guest_otel_port: Option<u16>,
 ) -> Vec<String> {
     let dns_port = dns_port.unwrap_or(DEFAULT_DNS_PORT);
@@ -374,6 +375,12 @@ pub fn host_startup_lines(
             "-I INPUT 1 -s {pool} -p tcp --dport {dns_port} -j ACCEPT \
              -m comment --comment engram-proxy-dns-input",
         ));
+        if let Some(metadata_port) = metadata_port {
+            out.push(format!(
+                "-I INPUT 1 -s {pool} -p tcp --dport {metadata_port} -j ACCEPT \
+                 -m comment --comment engram-proxy-metadata-input",
+            ));
+        }
     }
     if let Some(port) = guest_otel_port {
         // In-guest OTLP export pinhole (see the doc comment). Must
@@ -425,6 +432,16 @@ pub fn host_startup_lines(
              -j REDIRECT --to-port {port} \
              -m comment --comment engram-proxy-redirect",
         ));
+        if let Some(metadata_port) = metadata_port {
+            for interface in ["tap-engr-+", "vh-engr-+"] {
+                out.push(format!(
+                    "-t nat -A PREROUTING -i {interface} -p tcp \
+                     -d 169.254.169.254 --dport 80 \
+                     -j REDIRECT --to-port {metadata_port} \
+                     -m comment --comment engram-metadata-redirect",
+                ));
+            }
+        }
         // 4b. REDIRECT VM DNS (both transports) to the local DNS
         //     proxy on :53. This catches queries to ANY upstream IP
         //     the guest tries — 1.1.1.1, 8.8.8.8, even attacker-
@@ -601,6 +618,7 @@ async fn run_iptables(line: &str) -> Result<(), NetError> {
 pub async fn host_startup(
     proxy_port: Option<u16>,
     dns_port: Option<u16>,
+    metadata_port: Option<u16>,
     guest_otel_port: Option<u16>,
 ) -> Result<(), NetError> {
     if let Err(e) = tokio::fs::write("/proc/sys/net/ipv4/ip_forward", b"1").await {
@@ -641,7 +659,7 @@ pub async fn host_startup(
     // never touch the FORWARD egress-deny) makes host_startup declarative:
     // the final ruleset depends only on the current args, not on history.
     purge_engram_proxy_rules().await;
-    for line in host_startup_lines(proxy_port, dns_port, guest_otel_port) {
+    for line in host_startup_lines(proxy_port, dns_port, metadata_port, guest_otel_port) {
         // Idempotency check: replace the leading `-A`/`-I` with `-C`
         // (or skip altogether for non-rule meta commands like
         // create-chain — none of our lines do that today). Order:
@@ -689,8 +707,10 @@ pub fn otel_endpoint_port(endpoint: &str) -> Option<u16> {
 const PURGEABLE_PROXY_COMMENTS: &[&str] = &[
     "engram-proxy-input",
     "engram-proxy-dns-input",
+    "engram-proxy-metadata-input",
     "engram-proxy-redirect",
     "engram-dns-redirect",
+    "engram-metadata-redirect",
     "engram-guest-otlp-input",
 ];
 
@@ -1369,6 +1389,7 @@ pub async fn reattach_netns_name(_netns_name: &str, _fc_pid: u32) -> Result<(), 
 pub async fn host_startup(
     _proxy_port: Option<u16>,
     _dns_port: Option<u16>,
+    _metadata_port: Option<u16>,
     _guest_otel_port: Option<u16>,
 ) -> Result<(), NetError> {
     Err(NetError::Spawn(
@@ -1710,7 +1731,7 @@ mod tests {
         // must never leave a guest with an unfiltered route. It keeps
         // the hard-isolation drops AND applies the final FORWARD
         // default-deny with NO public-resolver ACCEPT.
-        let lines = host_startup_lines(None, None, None).join("\n");
+        let lines = host_startup_lines(None, None, None, None).join("\n");
         // Inter-VM block.
         assert!(lines.contains("-s 10.200.0.0/16 -d 10.200.0.0/16 -j DROP"));
         // Host-LAN drops.
@@ -1731,7 +1752,7 @@ mod tests {
 
     #[test]
     fn host_startup_with_proxy_redirects_443_and_default_denies() {
-        let lines = host_startup_lines(Some(9443), None, None).join("\n");
+        let lines = host_startup_lines(Some(9443), None, None, None).join("\n");
         // Both cold-path (tap-engr-+, TAP in root netns) and warm-
         // path (vh-engr-+, host-side veth into per-VM netns) need a
         // REDIRECT rule. Pre-fix only the cold-path rule existed and
@@ -1750,7 +1771,7 @@ mod tests {
         // resolver; instead, REDIRECT every guest DNS query to the
         // local filtering proxy regardless of which upstream IP
         // they chose.
-        let lines = host_startup_lines(Some(9443), Some(5353), None);
+        let lines = host_startup_lines(Some(9443), Some(5353), None, None);
         let joined = lines.join("\n");
         // No more blanket ACCEPT for VM→1.1.1.1:53 in proxy mode.
         assert!(
@@ -1793,9 +1814,19 @@ mod tests {
         // None dns_port falls through to DEFAULT_DNS_PORT so the
         // operator only needs to override when something else on the
         // host already binds 5353.
-        let lines = host_startup_lines(Some(9443), None, None).join("\n");
+        let lines = host_startup_lines(Some(9443), None, None, None).join("\n");
         assert!(lines.contains("--to-port 5353"));
         assert!(lines.contains("--dport 5353 -j ACCEPT"));
+    }
+
+    #[test]
+    fn host_startup_routes_only_the_metadata_address_to_the_adc_listener() {
+        let lines = host_startup_lines(Some(8443), Some(5353), Some(13338), None).join("\n");
+        assert!(lines.contains("-i tap-engr-+ -p tcp -d 169.254.169.254 --dport 80"));
+        assert!(lines.contains("-i vh-engr-+ -p tcp -d 169.254.169.254 --dport 80"));
+        assert!(lines.contains("--to-port 13338"));
+        assert!(lines.contains("--dport 13338 -j ACCEPT"));
+        assert!(!lines.contains("-p tcp --dport 80 -j REDIRECT"));
     }
 
     #[test]
@@ -1807,7 +1838,7 @@ mod tests {
         // channel. With egress now mandatory, this lane drops the
         // hatch entirely. Before the fix this assertion fails (the
         // rule was present); after, it passes.
-        let lines = host_startup_lines(None, None, None).join("\n");
+        let lines = host_startup_lines(None, None, None, None).join("\n");
         assert!(
             !lines.contains("--dport 53 -d 1.1.1.1"),
             "no-proxy lane must not ACCEPT VM->1.1.1.1:53 (DNS-exfil hatch); \
@@ -1828,7 +1859,7 @@ mod tests {
         // the already-present blanket DROP, so every REDIRECTed proxy
         // packet is dropped and the session hangs at run_started.
         // Insert-at-top is order-independent of history.
-        for line in host_startup_lines(Some(8443), Some(5353), None) {
+        for line in host_startup_lines(Some(8443), Some(5353), None, None) {
             if line.contains("engram-proxy-input") || line.contains("engram-proxy-dns-input") {
                 assert!(
                     line.starts_with("-I INPUT 1 "),
@@ -1837,7 +1868,7 @@ mod tests {
             }
         }
         // The blanket DROP still appends (always last).
-        assert!(host_startup_lines(Some(8443), Some(5353), None)
+        assert!(host_startup_lines(Some(8443), Some(5353), None, None)
             .iter()
             .any(|l| l.starts_with("-A INPUT") && l.ends_with("engram-host-input")));
     }
@@ -1859,7 +1890,7 @@ mod tests {
         // blanket VM-INPUT drop catches the REDIRECTed proxy
         // traffic too. The two sit consecutively in the output;
         // assert ACCEPT line index < DROP line index.
-        let lines = host_startup_lines(Some(9443), None, None);
+        let lines = host_startup_lines(Some(9443), None, None, None);
         let accept_idx = lines.iter().position(|l| l.contains("engram-proxy-input"));
         let drop_idx = lines.iter().position(|l| {
             l.contains("comment engram-host-input ") || l.ends_with("comment engram-host-input")
@@ -1877,7 +1908,7 @@ mod tests {
     /// This test pins the rule's presence and ordering.
     #[test]
     fn host_startup_accepts_established_input_before_drop() {
-        let lines = host_startup_lines(Some(9443), Some(5353), None);
+        let lines = host_startup_lines(Some(9443), Some(5353), None, None);
         let est_idx = lines
             .iter()
             .position(|l| l.contains("engram-host-input-established"))
@@ -1903,7 +1934,7 @@ mod tests {
         );
         // Also assert the rule is present in no-proxy mode (which
         // operators use when egress filtering is disabled).
-        let nolines = host_startup_lines(None, None, None);
+        let nolines = host_startup_lines(None, None, None, None);
         assert!(
             nolines
                 .iter()
@@ -1917,7 +1948,7 @@ mod tests {
     /// host-INPUT DROP when configured; entirely absent when not.
     #[test]
     fn host_startup_guest_otlp_pinhole_is_scoped_and_precedes_drop() {
-        let lines = host_startup_lines(Some(9443), Some(5353), Some(4317));
+        let lines = host_startup_lines(Some(9443), Some(5353), None, Some(4317));
         let otlp_idx = lines
             .iter()
             .position(|l| l.contains("engram-guest-otlp-input"))
@@ -1940,7 +1971,7 @@ mod tests {
         );
         // Unconfigured (the default, and every deployment that hasn't
         // opted into in-guest export): no pinhole at all.
-        let nolines = host_startup_lines(Some(9443), Some(5353), None).join("\n");
+        let nolines = host_startup_lines(Some(9443), Some(5353), None, None).join("\n");
         assert!(
             !nolines.contains("engram-guest-otlp-input"),
             "no guest-otlp ACCEPT may render without a configured endpoint",

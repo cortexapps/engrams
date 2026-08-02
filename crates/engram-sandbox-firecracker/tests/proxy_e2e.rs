@@ -40,7 +40,10 @@ use engram_core::types::sandbox::{
 use engram_rootfs_materializer::{InitInjection, Transport};
 use engram_sandbox_firecracker::{FirecrackerBackend, FirecrackerConfig, ENGRAM_AGENTD_PORT};
 use parking_lot::Mutex;
-use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair, SanType};
+use rcgen::{
+    BasicConstraints, CertificateParams, DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose,
+    SanType,
+};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -74,10 +77,22 @@ fn require_root() -> bool {
     true
 }
 
-/// Spin up a TLS upstream that captures the first request and
-/// replies 200 OK. Self-signed cert; the proxy's client config
-/// skips upstream verification (host is the TCB).
-async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
+/// Spin up a TLS upstream that captures the first request and replies 200 OK.
+/// The test creates a private CA and gives only that CA to the proxy. This
+/// preserves the production certificate-verification path without network
+/// access or a public certificate.
+async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> (SocketAddr, rustls::RootCertStore) {
+    let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+    ca_params.distinguished_name = {
+        let mut dn = DistinguishedName::new();
+        dn.push(DnType::CommonName, "Engrams proxy e2e test CA");
+        dn
+    };
+    ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    ca_params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let ca_key = KeyPair::generate().unwrap();
+    let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
     let mut params = CertificateParams::new(vec![TEST_HOST.to_string()]).unwrap();
     params.distinguished_name = {
         let mut dn = DistinguishedName::new();
@@ -86,13 +101,14 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
     };
     params.subject_alt_names = vec![SanType::DnsName(TEST_HOST.try_into().unwrap())];
     let kp = KeyPair::generate().unwrap();
-    let cert = params.self_signed(&kp).unwrap();
+    let cert = params.signed_by(&kp, &ca_cert, &ca_key).unwrap();
     let cert_der = CertificateDer::from(cert.der().to_vec());
+    let ca_der = CertificateDer::from(ca_cert.der().to_vec());
     let key_der: PrivateKeyDer<'static> =
         PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(kp.serialize_der()));
     let cfg = ServerConfig::builder()
         .with_no_client_auth()
-        .with_single_cert(vec![cert_der], key_der)
+        .with_single_cert(vec![cert_der, ca_der.clone()], key_der)
         .unwrap();
     let acceptor = TlsAcceptor::from(Arc::new(cfg));
 
@@ -122,7 +138,9 @@ async fn fake_upstream(captured: Arc<Mutex<Vec<u8>>>) -> SocketAddr {
             });
         }
     });
-    addr
+    let mut roots = rustls::RootCertStore::empty();
+    roots.add(ca_der).unwrap();
+    (addr, roots)
 }
 
 /// Delete every `tap-engr-*` device on the host. Stale TAPs from
@@ -227,14 +245,17 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
 
     // ---- 2. Spin up the fake upstream + StaticResolver pointing at it ----
     let captured: Arc<Mutex<Vec<u8>>> = Arc::new(Mutex::new(Vec::new()));
-    let upstream_addr = fake_upstream(captured.clone()).await;
+    let (upstream_addr, upstream_test_roots) = fake_upstream(captured.clone()).await;
     let resolver =
         Arc::new(engram_egress_proxy::StaticResolver::new().with(TEST_HOST, upstream_addr));
 
     let proxy_port: u16 = 19443;
+    let metadata_port: u16 = 19338;
     let proxy_bind: SocketAddr = format!("0.0.0.0:{proxy_port}").parse().unwrap();
     let mut proxy_cfg = engram_egress_proxy::ProxyConfig::new(proxy_bind, registry.clone(), mint);
     proxy_cfg.resolver = resolver;
+    proxy_cfg.upstream_test_roots = Some(upstream_test_roots);
+    proxy_cfg.metadata_bind_addr = Some(format!("0.0.0.0:{metadata_port}").parse().unwrap());
     let proxy = engram_egress_proxy::Proxy::new(proxy_cfg);
     // Bind synchronously (ADR 0083) — the listener is up before serve
     // spawns, so no sleep-to-wait-for-bind is needed.
@@ -289,6 +310,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     cfg.bundle_dir = staged.bundle_dir.clone();
     cfg.net_pool = Some("10.200.0.0".parse().unwrap());
     cfg.egress_proxy_port = Some(proxy_port);
+    cfg.egress_metadata_port = Some(metadata_port);
     let backend = Arc::new(FirecrackerBackend::new(work.path(), cfg));
     backend.host_startup().await.expect("host_startup");
 
@@ -340,6 +362,7 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
         secrets: vec![secret],
         injects: Vec::new(),
         observes: Vec::new(),
+        google_adc: true,
     });
 
     // PID-1's env doesn't carry a PATH; child execs need one to
@@ -392,7 +415,10 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
                 "echo '1.2.3.4 {TEST_HOST}' >> /etc/hosts && \
                  curl -sS --max-time 10 \
                  -H 'Authorization: Bearer engram_ph_e2e_xxx' \
-                 https://{TEST_HOST}/v1/test"
+                 https://{TEST_HOST}/v1/test && printf '\n' && \
+                 curl -sS --max-time 10 \
+                 -H 'Metadata-Flavor: Google' \
+                 http://169.254.169.254/computeMetadata/v1/instance/service-accounts/default/token"
             ),
         ],
         stdin: None,
@@ -452,5 +478,9 @@ async fn proxy_substitutes_real_value_into_outbound_https() {
     assert!(
         !body.contains("engram_ph_e2e_xxx"),
         "placeholder must not survive into the upstream payload; got: {body}",
+    );
+    assert!(
+        stdout.contains(engram_egress_proxy::metadata::PLACEHOLDER_TOKEN),
+        "guest metadata discovery should receive only the placeholder token; got: {stdout}",
     );
 }

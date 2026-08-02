@@ -244,7 +244,13 @@ describe("SessionProfileEditor (edit)", () => {
         designation: "pr_reviewer",
         includeUserTokens: true,
         envVars: { ANTHROPIC_MODEL: "claude-x" },
-        capabilities: ["github:issues:read"],
+        integrationGrants: [
+          {
+            connectionId: "connection-github",
+            operation: "issues:read",
+            resourceConstraints: [],
+          },
+        ],
         skills: ["browser"],
         network: {
           default: "allow",
@@ -312,7 +318,13 @@ describe("SessionProfileEditor (edit)", () => {
       isDefault: true,
       includeUserTokens: true,
       envVars: { ANTHROPIC_MODEL: "claude-x" },
-      capabilities: ["github:issues:read"],
+      integrationGrants: [
+        {
+          connectionId: "connection-github",
+          operation: "issues:read",
+          resourceConstraints: [],
+        },
+      ],
       skills: ["browser"],
       network: {
         default: "allow",
@@ -351,7 +363,7 @@ describe("SessionProfileEditor (edit)", () => {
         designation: "pr_reviewer",
         includeUserTokens: false,
         envVars: {},
-        capabilities: [],
+        integrationGrants: [],
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],
@@ -383,7 +395,7 @@ describe("SessionProfileEditor (edit)", () => {
         isDefault: false,
         includeUserTokens: false,
         envVars: {},
-        capabilities: [],
+        integrationGrants: [],
         skills: [],
         network: { default: "deny", allowHosts: [], allowHostPatterns: [] },
         secrets: [],

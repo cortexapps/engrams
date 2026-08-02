@@ -517,6 +517,7 @@ async fn build_resume_egress_policy_core(
             &network,
             injects,
             observes,
+            policy.as_ref().is_some_and(|policy| policy.google_adc),
         )),
         resolution_failures: secret_failures + inject_failures,
     }
@@ -537,6 +538,7 @@ pub(crate) fn assemble_resume_egress_policy(
     network: &engram_core::types::image::NetworkPolicy,
     injects: Vec<engram_core::types::egress::EgressInjectEntry>,
     observes: Vec<engram_core::types::egress::EgressObserveEntry>,
+    google_adc: bool,
 ) -> engram_core::types::egress::SessionEgressPolicy {
     engram_core::types::egress::SessionEgressPolicy {
         session_id,
@@ -555,6 +557,7 @@ pub(crate) fn assemble_resume_egress_policy(
         // ADR 0056 (Phase 4): observe specs (from the persisted policy), so a
         // resumed session keeps emitting assets on the new host.
         observes,
+        google_adc,
         // ADR 0057: per-secret mode; the proxy substitutes per entry. Vestigial.
         secret_mode: engram_core::types::image::SecretMode::Broker,
     }
@@ -596,6 +599,11 @@ pub(crate) async fn load_session_secrets(
 
 #[derive(Deserialize)]
 pub struct CreateSessionRequest {
+    /// ADR 0109: trusted app-gRPC callers can reserve an ID so their external
+    /// authorization snapshot exists before the VM starts. The public JSON
+    /// surface cannot set this field.
+    #[serde(skip)]
+    pub requested_session_id: Option<SessionId>,
     /// Which baked image to boot. Required.
     pub image: ImageRef,
     /// How the session uses the image (ADR 0021 P1.3). Defaults to
@@ -1109,11 +1117,11 @@ pub(crate) async fn prepare_from_grpc(
         req.prompt.clone(),
         req.harness_mode.clone(),
         req.secrets.clone(),
-        // ADR 0098 D1: mint from the INJECTED entropy (in prod this is
-        // `OsEntropy`, identical randomness; the deterministic simulator
-        // needs the id to be seed-derived). A raw `SessionId::new()` here
-        // was a determinism leak — the session id diverged every replay.
-        SessionId::from(state.services.entropy.uuid()),
+        // ADR 0109: the trusted orchestrator reserves the ID before boot so it
+        // can persist the immutable authorization snapshot first. Other create
+        // paths keep using injected entropy for deterministic replay.
+        req.requested_session_id
+            .unwrap_or_else(|| SessionId::from(state.services.entropy.uuid())),
         bundle,
         req.selected_skills.clone(),
         req.capabilities.clone(),
@@ -2477,6 +2485,7 @@ mod tests {
             &network,
             Vec::new(),
             Vec::new(),
+            false,
         );
 
         // Real IP, not UNSPECIFIED.
@@ -2512,6 +2521,7 @@ mod tests {
             &NetworkPolicy::default(),
             Vec::new(),
             Vec::new(),
+            false,
         );
         assert_eq!(policy.guest_ip, guest_ip);
         assert!(policy.network_allow_hosts.is_empty());

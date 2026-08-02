@@ -256,7 +256,7 @@ mod tests {
         let warm = WarmMachineState {
             machine_identifier: vec![1, 2, 3],
             mac_address: "0a:00:00:00:00:01".into(),
-            kernel_cmdline: "console=hvc0 ENGRAM_EGRESS=1:2".into(),
+            kernel_cmdline: "console=hvc0 ENGRAM_EGRESS=1:2:3".into(),
             aux_ro_drives: vec![],
             memory_mib: 1024,
             vcpus: 2,

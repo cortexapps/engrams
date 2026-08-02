@@ -71,6 +71,7 @@ production the cache lives on each host-agent.
 | `ENGRAM_NBD_DEVICES`           | `/dev/nbd0,/dev/nbd1,…` for the chunked-disk NBD daemon. Empty / unset falls back to materialize-to-file (correct, slower cold start). |
 | `ENGRAM_EGRESS_PROXY_PORT`     | Mandatory TCP listener for the host-side TLS-MITM proxy (default `8443`). Must be non-zero; iptables REDIRECTs guest tcp/443 here. |
 | `ENGRAM_EGRESS_DNS_PORT`       | Mandatory UDP+TCP listener for filtering DNS (default `5353`). Must be non-zero and match the guest DNS REDIRECT target. |
+| `ENGRAM_EGRESS_METADATA_PORT`  | Mandatory TCP listener for session-scoped Google metadata ADC (default `13338`). Must be non-zero and match the guest metadata REDIRECT target. |
 | `ENGRAM_EGRESS_CA_SOURCE`      | `local-disk` (default) \| `env` \| `gcp-secret-manager`. See the Egress proxy section below for the per-source vars. |
 | `ENGRAM_LOG_FORMAT=json`       | Same as coordinator                                                  |
 
@@ -149,6 +150,7 @@ impls ship today, with one more impl per cloud later:
 |---------------------------------------|----------------------------------------------------------------------|
 | `ENGRAM_EGRESS_PROXY_PORT`            | Mandatory TCP listener port (default `8443`; must be non-zero)       |
 | `ENGRAM_EGRESS_DNS_PORT`              | Mandatory filtering DNS port (default `5353`; must be non-zero)      |
+| `ENGRAM_EGRESS_METADATA_PORT`         | Mandatory Google metadata ADC port (default `13338`; must be non-zero) |
 | `ENGRAM_EGRESS_CA_SOURCE`             | `env` \| `local-disk` \| `gcp-secret-manager`                        |
 | `ENGRAM_EGRESS_CA_CERT_VAR`           | Env var name holding the cert PEM (`--ca-source=env`)                |
 | `ENGRAM_EGRESS_CA_KEY_VAR`            | Env var name holding the key PEM (`--ca-source=env`)                 |

@@ -71,6 +71,29 @@ pub fn inject_headers(
     // entries commonly carry the same Authorization credential. Coalesce equal
     // rendered values so a multi-field query still emits exactly one HTTP header;
     // reject conflicting values instead of letting entry order choose a token.
+    let rendered = rendered_headers(entries)?;
+    let insert_at = end + 2; // just past the CRLF terminating the request line
+                             // Drop any existing header line whose name we're about to inject. The request
+                             // line is untouched, so `insert_at` is stable across the strip.
+    let prefix = strip_named_headers(&prefix, insert_at, entries);
+    let mut out = Vec::with_capacity(prefix.len() + 96 * rendered.len());
+    out.extend_from_slice(&prefix[..insert_at]);
+    for (name, value) in rendered {
+        out.extend_from_slice(name.as_bytes());
+        out.extend_from_slice(b": ");
+        out.extend_from_slice(value.as_bytes());
+        out.extend_from_slice(b"\r\n");
+    }
+    out.extend_from_slice(&prefix[insert_at..]);
+    Ok(out)
+}
+
+/// Render and coalesce the host-side headers for one authorized request. Both
+/// HTTP adapters use this function so conflict handling cannot drift by
+/// protocol.
+pub fn rendered_headers(
+    entries: &[&InjectEntry],
+) -> Result<Vec<(String, String)>, InjectHeaderError> {
     let mut rendered: Vec<(&InjectEntry, String)> = Vec::with_capacity(entries.len());
     for entry in entries {
         let value = entry.header_template.replace("{}", &entry.secret());
@@ -83,8 +106,8 @@ pub fn inject_headers(
             // policy entry. Values need not be byte-identical, but the same
             // provider + rendering template represents one credential class
             // for this session. Static or cross-provider conflicts stay fatal.
-            let equivalent_mint = !entry.mint_provider.is_empty()
-                && entry.mint_provider == existing_entry.mint_provider
+            let equivalent_mint = entry.mint_source.is_some()
+                && entry.mint_source == existing_entry.mint_source
                 && entry.header_template == existing_entry.header_template;
             if existing_value != &value && !equivalent_mint {
                 return Err(InjectHeaderError::ConflictingValues {
@@ -95,20 +118,10 @@ pub fn inject_headers(
         }
         rendered.push((entry, value));
     }
-    let insert_at = end + 2; // just past the CRLF terminating the request line
-                             // Drop any existing header line whose name we're about to inject. The request
-                             // line is untouched, so `insert_at` is stable across the strip.
-    let prefix = strip_named_headers(&prefix, insert_at, entries);
-    let mut out = Vec::with_capacity(prefix.len() + 96 * rendered.len());
-    out.extend_from_slice(&prefix[..insert_at]);
-    for (entry, value) in rendered {
-        out.extend_from_slice(entry.header_name.as_bytes());
-        out.extend_from_slice(b": ");
-        out.extend_from_slice(value.as_bytes());
-        out.extend_from_slice(b"\r\n");
-    }
-    out.extend_from_slice(&prefix[insert_at..]);
-    Ok(out)
+    Ok(rendered
+        .into_iter()
+        .map(|(entry, value)| (entry.header_name.clone(), value))
+        .collect())
 }
 
 /// Rebuild the request with any header line whose name (case-insensitively)
@@ -158,7 +171,7 @@ mod tests {
             header_template: template.into(),
             allow: HostList::from_manifest(&["api.datadoghq.com".into()], &[]).unwrap(),
             policy: RequestPolicy::default(),
-            mint_provider: String::new(),
+            mint_source: None,
             cred: crate::registry::RefreshableCred::new(secret.into(), None),
         }
     }
@@ -245,9 +258,14 @@ mod tests {
     fn coalesces_equivalent_minted_credentials_with_distinct_values() {
         let req = b"POST /graphql HTTP/1.1\r\nHost: api.github.com\r\n\r\n".to_vec();
         let mut first = entry("Authorization", "Bearer {}", "first-mint");
-        first.mint_provider = "github".into();
+        first.mint_source = Some(
+            engram_core::types::integration::CredentialMintSource::Connection {
+                connection_id: "github-default".into(),
+                provider: "github".into(),
+            },
+        );
         let mut second = entry("authorization", "Bearer {}", "second-mint");
-        second.mint_provider = "github".into();
+        second.mint_source = first.mint_source.clone();
 
         let out = inject_headers(req, &[&first, &second]).unwrap();
         let text = std::str::from_utf8(&out).unwrap();

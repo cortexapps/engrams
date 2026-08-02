@@ -232,13 +232,17 @@ pub trait SandboxBackend: Send + Sync {
     ///
     /// `RemoteSandboxBackend` forwards via the existing WS as a
     /// `NotifyKind::SessionEgressPolicy`. Local backends apply the
-    /// policy in-process (used by `--mode=all`). Default is a no-op
-    /// for backends with no egress proxy attached (Process /
-    /// in-test fixtures). ADR 0006.
-    async fn notify_session_policy(
-        &self,
-        _policy: SessionEgressPolicy,
-    ) -> Result<(), SandboxError> {
+    /// policy in-process (used by `--mode=all`). The default rejects a
+    /// policy that needs metadata interception because backends without
+    /// an egress proxy cannot stop a guest from reaching a deployment's
+    /// real metadata service. Other policies remain a no-op for Process
+    /// and in-test fixtures. ADR 0006 and ADR 0109.
+    async fn notify_session_policy(&self, policy: SessionEgressPolicy) -> Result<(), SandboxError> {
+        if policy.google_adc {
+            return Err(SandboxError::InvalidSpec(
+                "Google ADC requires host egress metadata interception".into(),
+            ));
+        }
         Ok(())
     }
 
