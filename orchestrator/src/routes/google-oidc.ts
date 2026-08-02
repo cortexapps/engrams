@@ -48,10 +48,11 @@ export function makeGoogleOidcRoute(deps: {
     });
   });
 
+  // Read-only by design: a public GET must never write. The startup key
+  // rotation driver (index.ts) creates the active key, so the set is
+  // non-empty before the server accepts traffic.
   app.get("/api/v1/integrations/google-cloud/oidc/jwks", async (c) => {
-    const publishedAt = now();
-    await keys.getOrCreateActive(publishedAt);
-    const published = await keys.listPublished(publishedAt);
+    const published = await keys.listPublished(now());
     c.header("cache-control", "public, max-age=300");
     return c.json({ keys: published.map((key) => key.publicJwk) });
   });

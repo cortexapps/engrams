@@ -1,6 +1,6 @@
 /** Google Workload Identity Federation token broker (ADR 0109). */
 
-import { createSign } from "node:crypto";
+import { createPrivateKey, createSign, type KeyObject } from "node:crypto";
 
 import type { IntegrationOidcKeyStore } from "../db/integration-oidc-keys.ts";
 import type { GoogleCloudConnectionConfig } from "../db/integration-connections.ts";
@@ -93,6 +93,19 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
   const now = deps.now ?? (() => new Date());
   const randomId = deps.randomId ?? (() => crypto.randomUUID());
   const fetchFn = deps.fetch ?? fetch;
+  // Parse each signing key's PEM once per kid instead of on every mint. A
+  // deployment publishes at most a handful of kids (active + retiring), so
+  // reset the cache if it ever grows past that.
+  const keyObjects = new Map<string, KeyObject>();
+  function keyObjectFor(kid: string, privateKeyPem: string): KeyObject {
+    let cached = keyObjects.get(kid);
+    if (!cached) {
+      if (keyObjects.size >= 8) keyObjects.clear();
+      cached = createPrivateKey(privateKeyPem);
+      keyObjects.set(kid, cached);
+    }
+    return cached;
+  }
 
   async function mintSubjectToken(
     config: GoogleCloudConnectionConfig,
@@ -118,7 +131,7 @@ export function makeGoogleWifBroker(deps: GoogleWifBrokerDeps) {
     const signer = createSign("RSA-SHA256");
     signer.update(input);
     signer.end();
-    return `${input}.${signer.sign(key.privateKeyPem, "base64url")}`;
+    return `${input}.${signer.sign(keyObjectFor(key.kid, key.privateKeyPem), "base64url")}`;
   }
 
   async function exchange(

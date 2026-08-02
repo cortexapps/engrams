@@ -92,6 +92,11 @@ export const taskSession = pgTable(
     // snapshot. This makes broker audit records attributable without consulting
     // mutable workflow state.
     integrationPrincipalId: text("integration_principal_id"),
+    // ADR 0109: content-hash of the compiled authorization snapshot
+    // (profileId + grants + connections). The broker emits it as the
+    // `engrams_profile_snapshot` OIDC claim, so Google-side audit logs join
+    // back to THIS row. Null means a pre-hash row.
+    integrationSnapshotHash: text("integration_snapshot_hash"),
     createdAt: timestamp("created_at").notNull().defaultNow(),
   },
   (t) => [

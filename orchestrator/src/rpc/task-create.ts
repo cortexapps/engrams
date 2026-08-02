@@ -60,6 +60,7 @@ import {
 import {
   defaultConnectionGrants,
   grantsToCapabilities,
+  integrationSnapshotHash,
   resolveIntegrationGrants,
   withConnectionMemo,
 } from "../integrations/grants.ts";
@@ -766,14 +767,21 @@ export async function createSessionForExistingTask(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      integrationSnapshotHash: integrationSnapshotHash({
+        profileId: profile.id,
+        integrationGrants: sessionInput.integrationGrants ?? [],
+        integrationConnections: sessionInput.integrationConnections ?? [],
+      }),
       ...(integrationPrincipalId ? { integrationPrincipalId } : {}),
     });
   });
 
+  let createdSessionId: string | undefined;
   try {
     // When prompt is omitted (as it is for the finder), the session boots idle
     // so deterministic bootstrap can finish before SendPrompt wakes it.
     const created = await deps.sessions.createSession(sessionInput);
+    createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
     }
@@ -783,19 +791,29 @@ export async function createSessionForExistingTask(
       });
     }
   } catch (err) {
+    // Compensation must never mask the original failure: guard every step and
+    // log what it could not undo. On an ID mismatch, the session that leaks is
+    // the one the coordinator ACTUALLY created, so delete that one.
     try {
-      await deps.sessions.deleteSession({ sessionId });
+      await deps.sessions.deleteSession({ sessionId: createdSessionId ?? sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId, err: delErr },
-        "task-create: failed to delete reserved session after create failure",
+        { sessionId: createdSessionId ?? sessionId, err: delErr },
+        "task-create: failed to delete session after create failure",
       );
     }
-    await deps.db.transaction(async (tx) => {
-      await tx
-        .delete(taskSessionTable)
-        .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
-    });
+    try {
+      await deps.db.transaction(async (tx) => {
+        await tx
+          .delete(taskSessionTable)
+          .where(and(eq(taskSessionTable.taskId, params.taskId), eq(taskSessionTable.sessionId, sessionId)));
+      });
+    } catch (dbErr) {
+      log.error(
+        { taskId: params.taskId, sessionId, err: dbErr },
+        "task-create: failed to remove task_session after create failure — manual cleanup needed",
+      );
+    }
     throw err;
   }
 
@@ -892,6 +910,11 @@ export async function createTaskWithSession(
       capabilities: sessionInput.capabilities ?? [],
       integrationGrants: sessionInput.integrationGrants ?? [],
       integrationConnections: sessionInput.integrationConnections ?? [],
+      integrationSnapshotHash: integrationSnapshotHash({
+        profileId: profile.id,
+        integrationGrants: sessionInput.integrationGrants ?? [],
+        integrationConnections: sessionInput.integrationConnections ?? [],
+      }),
       integrationPrincipalId: params.ownerUserId,
     });
     if (params.slackThreadWorkflowId !== undefined) {
@@ -902,8 +925,10 @@ export async function createTaskWithSession(
     }
   });
 
+  let createdSessionId: string | undefined;
   try {
     const created = await deps.sessions.createSession(sessionInput);
+    createdSessionId = created.sessionId;
     if (created.sessionId !== sessionId) {
       throw new Error("coordinator returned a different reserved session ID");
     }
@@ -911,17 +936,30 @@ export async function createTaskWithSession(
       await tx.insert(sessionListenerTable).values({ sessionId });
     });
   } catch (err) {
+    // Compensation must never mask the original failure: guard every step and
+    // log what it could not undo. On an ID mismatch, the session that leaks is
+    // the one the coordinator ACTUALLY created, so delete that one.
     try {
-      await deps.sessions.deleteSession({ sessionId });
+      await deps.sessions.deleteSession({ sessionId: createdSessionId ?? sessionId });
     } catch (delErr) {
       log.error(
-        { sessionId, err: delErr },
-        "task-create: failed to delete reserved session after create failure",
+        { sessionId: createdSessionId ?? sessionId, err: delErr },
+        "task-create: failed to delete session after create failure",
       );
     }
-    await deps.db.transaction(async (tx) => {
-      await tx.delete(taskTable).where(eq(taskTable.id, taskId));
-    });
+    try {
+      await deps.db.transaction(async (tx) => {
+        // slack_session has no FK to the task model; the task delete cascades
+        // task_session only, so remove the Slack binding explicitly.
+        await tx.delete(slackSessionTable).where(eq(slackSessionTable.sessionId, sessionId));
+        await tx.delete(taskTable).where(eq(taskTable.id, taskId));
+      });
+    } catch (dbErr) {
+      log.error(
+        { taskId, sessionId, err: dbErr },
+        "task-create: failed to remove task records after create failure — manual cleanup needed",
+      );
+    }
     throw err;
   }
 

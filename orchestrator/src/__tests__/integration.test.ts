@@ -292,6 +292,7 @@ describe("IntegrationService (native)", () => {
       connections,
       profiles: noProfiles,
       issuer: "https://tenant.example/api/v1/integrations/google-cloud/oidc",
+      deploymentId: "tenant.example",
       now: () => new Date("2026-07-31T12:02:00Z"),
       googleExchange: async (_config, identity) => {
         exchanged.push(identity.connectionId);
@@ -319,8 +320,13 @@ describe("IntegrationService (native)", () => {
         "//iam.googleapis.com/projects/123/locations/global/workloadIdentityPools/engrams/providers/prod",
       );
       expect(setup.terraform).toContain(`assertion.engrams_connection == '${id}'`);
+      // A-claims: the organization claim carries the DEPLOYMENT id, not the
+      // issuer URL (the URL already rides in issuer_uri).
       expect(setup.terraform).toContain(
-        "assertion.engrams_organization == 'https://tenant.example/api/v1/integrations/google-cloud/oidc'",
+        "assertion.engrams_organization == 'tenant.example'",
+      );
+      expect(setup.terraform).toContain(
+        'issuer_uri        = "https://tenant.example/api/v1/integrations/google-cloud/oidc"',
       );
       expect(setup.gcloudScript).toContain("roles/iam.workloadIdentityUser");
       expect(setup.terraform).not.toContain("private_key");

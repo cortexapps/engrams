@@ -1,8 +1,9 @@
 /** Connection-aware integration grant validation and policy projection (ADR 0109). */
 
 import { ConnectError, Code } from "@connectrpc/connect";
+import { createHash } from "node:crypto";
 
-import type { ProfileIntegrationGrant } from "../db/schema.ts";
+import type { IntegrationConnectionSnapshot, ProfileIntegrationGrant } from "../db/schema.ts";
 import type {
   IntegrationConnectionRow,
   IntegrationConnectionStore,
@@ -22,6 +23,45 @@ export const FORBIDDEN_GOOGLE_OPERATIONS = new Set([
 export interface ResolvedIntegrationGrant {
   grant: ProfileIntegrationGrant;
   connection: IntegrationConnectionRow;
+}
+
+/** The immutable authorization snapshot the hash covers. */
+export interface IntegrationSnapshot {
+  profileId: string | null;
+  integrationGrants: readonly ProfileIntegrationGrant[];
+  integrationConnections: readonly IntegrationConnectionSnapshot[];
+}
+
+/** Recursively sort object keys so the hash survives a JSONB round-trip
+ * (Postgres jsonb does not preserve object key order; arrays keep order). */
+function canonicalize(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(canonicalize);
+  if (value !== null && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, entry]) => [key, canonicalize(entry)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Content-hash of a session's compiled authorization snapshot (ADR 0109).
+ * Persisted on `task_session` at create and emitted by the broker as the
+ * `engrams_profile_snapshot` OIDC claim, so an external audit log entry
+ * identifies the EXACT immutable authority that produced the credential.
+ * Deterministic across the JSONB round-trip (canonical key order).
+ */
+export function integrationSnapshotHash(snapshot: IntegrationSnapshot): string {
+  const digest = createHash("sha256")
+    .update(JSON.stringify(canonicalize({
+      profileId: snapshot.profileId,
+      integrationGrants: snapshot.integrationGrants,
+      integrationConnections: snapshot.integrationConnections,
+    })))
+    .digest("hex");
+  return `sha256:${digest}`;
 }
 
 /**
